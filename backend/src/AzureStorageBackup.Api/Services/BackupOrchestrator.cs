@@ -1,0 +1,237 @@
+using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Models;
+
+namespace AzureStorageBackup.Api.Services;
+
+/// <summary>备份引擎的可调选项（忽略/不压缩/不分组规则 + 各阶段选项）。</summary>
+public sealed record BackupEngineOptions
+{
+    public IgnoreRuleSet Ignore { get; init; } = new([]);
+    public IgnoreRuleSet? DontCompress { get; init; }
+    public IgnoreRuleSet? DontGroup { get; init; }
+    public ScanOptions Scan { get; init; } = new();
+    public DiffOptions Diff { get; init; } = new();
+    public PlanOptions Plan { get; init; } = new();
+    public RetentionPolicy Retention { get; init; } = new();
+}
+
+/// <summary>一次备份执行请求。</summary>
+public sealed record BackupRequest
+{
+    public required Account Account { get; init; }
+    public required string Container { get; init; }
+    public required string LocalRoot { get; init; }
+    public required string Name { get; init; }
+    public string? Description { get; init; }
+    public string? Password { get; init; }
+    public AccessTier IndexTier { get; init; } = AccessTier.Hot;
+    public AccessTier DataTier { get; init; } = AccessTier.Hot;
+    public BackupEngineOptions Options { get; init; } = new();
+}
+
+/// <summary>一次备份执行结果。</summary>
+public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes);
+
+/// <summary>
+/// 备份编排器（M4 设计 §4）：串 Scan→Diff→Plan→Compress→Upload→WriteIndex→Finalize，产出一个新版本。
+/// data blob 与 pack 一律 7z 归档；data blob 按 fullHash 内容寻址去重。
+/// 压缩经共享 StagingArea（全局非并发 + 背压）。保留清理与进度上报为后续增量。
+/// </summary>
+public sealed class BackupOrchestrator(
+    LocalFileScanner scanner,
+    BackupDiffer differ,
+    GroupingPlanner planner,
+    IFileCompressor compressor,
+    IBlobUploader uploader,
+    IBlobClientFactory factory,
+    IBackupInfoStore store,
+    StagingArea staging)
+{
+    public async Task<BackupRunResult> RunAsync(BackupRequest request, CancellationToken ct = default)
+    {
+        var opts = request.Options;
+        var password = request.Password;
+
+        // 1. Scan
+        var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);
+
+        // 2. 载入上一版本
+        var info = await store.ReadInfoAsync(request.Account, request.Container, password, ct)
+            ?? NewInfo(request);
+        VersionIndex? previous = info.Versions.Count > 0
+            ? await store.ReadIndexAsync(request.Account, request.Container, info.Versions[^1].IndexBlob, password, ct)
+            : null;
+
+        // 3. Diff
+        var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
+
+        // 4. Plan（对 Added/Modified 决定 blob/pack）
+        var changed = diff.Changes
+            .Where(c => c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null)
+            .Select(c => new PlannedFile(c.Path, c.Current!.Length, c.FullHash!))
+            .ToList();
+        var plan = planner.Plan(changed, opts.Plan with
+        {
+            DontGroup = opts.DontGroup,
+            FirstPackNumber = NextPackNumber(info.Packs),
+        });
+
+        var storageByPath = new Dictionary<string, StorageRef>(StringComparer.Ordinal);
+
+        // 5. Compress + Upload
+        await UploadBlobsAsync(request, plan, storageByPath, ct);
+        await UploadPacksAsync(request, plan, info, storageByPath, ct);
+
+        // 6. 构建新版本第二级索引
+        var entries = BuildEntries(diff, storageByPath);
+        var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
+        var index = new VersionIndex
+        {
+            Version = version,
+            Entries = entries,
+            EmptyDirs = scan.EmptyDirs.ToList(),
+        };
+
+        // 7. WriteIndex（先上传第二级索引）
+        var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, ct);
+
+        // 8/9. Finalize（原子更新信息文件）
+        info.Versions.Add(new BackupVersion
+        {
+            Version = version,
+            CreatedAt = DateTimeOffset.UtcNow,
+            IndexBlob = indexBlob,
+            Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
+        });
+        await store.WriteInfoAsync(request.Account, request.Container, info, password, ct);
+
+        return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes);
+    }
+
+    private async Task UploadBlobsAsync(
+        BackupRequest request, BackupPlan plan, Dictionary<string, StorageRef> storageByPath, CancellationToken ct)
+    {
+        foreach (var blob in plan.Blobs)
+        {
+            storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
+
+            // 内容寻址去重：已存在则跳过压缩+上传。
+            if (await BlobExistsAsync(request, blob.Ref, ct))
+                continue;
+
+            var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
+            var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
+                request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, token), ct);
+            try
+            {
+                await uploader.UploadIfMissingAsync(
+                    request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: ct);
+            }
+            finally
+            {
+                staging.Release(staged);
+            }
+        }
+    }
+
+    private async Task UploadPacksAsync(
+        BackupRequest request, BackupPlan plan, BackupInfoFile info,
+        Dictionary<string, StorageRef> storageByPath, CancellationToken ct)
+    {
+        foreach (var pack in plan.Packs)
+        {
+            var packBlob = $"packs/{pack.PackId}.7z";
+            var entries = pack.Members.Select(m => m.EntryName).ToList();
+
+            var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
+                request, compressTemp, pack.PackId, entries, storeOnly: false, token), ct);
+            try
+            {
+                await uploader.UploadIfMissingAsync(
+                    request.Account, request.Container, packBlob, staged.Files[0], request.DataTier, ct: ct);
+            }
+            finally
+            {
+                staging.Release(staged);
+            }
+
+            foreach (var member in pack.Members)
+                storageByPath[member.Path] = new StorageRef { Kind = "pack", Ref = pack.PackId, EntryName = member.EntryName };
+
+            info.Packs[pack.PackId] = new PackInfo
+            {
+                Blob = packBlob,
+                Members = pack.Members.Select(m => m.FullHash).ToList(),
+                OriginalBytes = pack.OriginalBytes,
+                DeadBytes = 0,
+            };
+        }
+    }
+
+    private async Task<IReadOnlyList<string>> CompressAsync(
+        BackupRequest request, string compressTemp, string archiveName,
+        IReadOnlyList<string> entries, bool storeOnly, CancellationToken ct)
+    {
+        var output = Path.Combine(compressTemp, archiveName + ".7z");
+        var result = await compressor.CompressAsync(
+            new CompressionRequest(request.LocalRoot, entries, output, request.Password, StoreOnly: storeOnly), ct);
+        return result.VolumeFiles;
+    }
+
+    private static List<IndexEntry> BuildEntries(DiffResult diff, Dictionary<string, StorageRef> storageByPath)
+    {
+        var entries = new List<IndexEntry>();
+        foreach (var c in diff.Changes)
+        {
+            if (c.Kind == ChangeKind.Deleted || c.Current is null)
+                continue;
+
+            entries.Add(new IndexEntry
+            {
+                Path = c.Path,
+                Kind = c.Current.Kind == EntryKind.File ? "file" : "symlink",
+                Length = c.Current.Length,
+                Mtime = c.Current.ModifiedAt,
+                Permissions = c.Current.Permissions,
+                HeadHash = c.HeadHash,
+                FullHash = c.FullHash,
+                Target = c.Current.Target,
+                Storage = storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,
+            });
+        }
+        return entries;
+    }
+
+    private async Task<bool> BlobExistsAsync(BackupRequest request, string blobName, CancellationToken ct)
+    {
+        var blob = factory.CreateServiceClient(request.Account)
+            .GetBlobContainerClient(request.Container)
+            .GetBlobClient(blobName);
+        return (await blob.ExistsAsync(ct)).Value;
+    }
+
+    private static BackupInfoFile NewInfo(BackupRequest request) => new()
+    {
+        Backup = new BackupMeta
+        {
+            Name = request.Name,
+            Description = request.Description,
+            SourceRootHint = request.LocalRoot,
+            Encrypted = !string.IsNullOrEmpty(request.Password),
+            CreatedAt = DateTimeOffset.UtcNow,
+        },
+    };
+
+    private static int NextPackNumber(IReadOnlyDictionary<string, PackInfo> packs)
+    {
+        var max = 0;
+        foreach (var id in packs.Keys)
+        {
+            if (id.StartsWith('p') && int.TryParse(id.AsSpan(1), out var n) && n > max)
+                max = n;
+        }
+        return max + 1;
+    }
+
+    private static string SafeFileName(string fullHash) => fullHash.Replace(':', '_');
+}
