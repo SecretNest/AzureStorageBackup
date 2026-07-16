@@ -55,9 +55,11 @@ packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
   "version": 1,
   "entries": [
     { "path": "sub/a.txt", "kind": "file",
-      "length": 123, "mtime": "...", "permissions": "0644", "hash": "sha256:...",
-      "storage": { "kind": "blob", "ref": "data/sha256:..." } },
-    { "path": "sub/small.txt", "kind": "file", "length": 40, "hash": "...",
+      "length": 123, "mtime": "...", "permissions": "0644",
+      "headHash": "sha256:...", "fullHash": "sha256:...",
+      "storage": { "kind": "blob", "ref": "data/{fullHash}" } },
+    { "path": "sub/small.txt", "kind": "file", "length": 40,
+      "headHash": "...", "fullHash": "...",
       "storage": { "kind": "pack", "ref": "p0001", "entryName": "sub/small.txt" } }
   ],
   "emptyDirs": ["sub/empty1", "sub/empty2"]   // 空文件夹（备份需包含，还原需创建）
@@ -80,7 +82,7 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 1. **Scan**：遍历本地根，应用 gitignore 忽略规则（§5），产出条目（path/kind/length/mtime/permissions）。收集空文件夹。
 2. **Diff**（PRD 特别说明 A）：对比上一版本索引：
    - length 不同 → 变更，需处理。
-   - length 同、mtime 或权限不同 → 计算 hash；hash 不同 → 变更；hash 同 → 仅更新索引元数据（不重传）。
+   - length 同、mtime 或权限不同 → 先比 **headHash**（文件头部一小段，默认 4 KB，可配）：不同 → 变更；相同 → 再比 **fullHash**；fullHash 不同 → 变更；相同 → 仅更新索引元数据（不重传）。
    - 上版本有、本次无 → 删除（新版本排除）。
 3. **Plan**：对变更文件决定分组/单文件（§6），死重压实检查。
 4. **Compress**：7z 压缩/加密/分卷，经临时区状态机（§7）；处理后重校验（§9）。
@@ -154,11 +156,11 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 - **M4e — 上传与保留**：并发上传 + 重试退避 + Tier、版本保留清理。验证：上传到 Azurite、清理旧版本。
 - **M4f — 编排器与前端**：串联全流程 + 进度反馈、新建备份向导。验证：端到端跑一次真实备份（Azurite）。
 
-## 13. 遗留决策（供 review 时确认）
+## 13. 决策（已定，2026-07-16）
 
-1. **7z 实现方式**：容器内装 `p7zip`（调用 `7z` CLI）还是用 .NET 的 7z 库（如 SevenZipSharp，依赖原生库）？建议 **p7zip CLI**（成熟、支持分卷+加密），在 backend Dockerfile 装 `p7zip-full`。
-2. **hash 算法**：SHA-256（建议，去重键 + 校验）。
-3. **数据去重粒度**：整文件级（建议 M4 起步）还是分块（CDC，更省但复杂）？建议**整文件级**先行，分块留后续优化。
-4. **索引序列化**：JSON（可读、够用）；大索引可后续换更紧凑格式。建议 **JSON + 7z 压缩**。
-5. **检查「本地文件存在」是否纳入权限比对**：建议与 §4 Diff 一致（length→mtime/权限→hash）。
-6. 前端进度：轮询 `/api/backups/{id}/progress` 还是 SSE/WebSocket？建议 **轮询**先行（简单）。
+1. **7z 实现**：用**官方 7-Zip**——backend Dockerfile 装 Debian `7zip` 包（提供 `7zz`）。命令：`7zz a -p{pwd} -mhe=on -v{size} out.7z ...`（AES-256 + 头加密 + 分卷），解包 `7zz x out.7z.001`。若 apt 版本过旧则改用官网二进制。
+2. **hash 算法**：SHA-256（fullHash 与 headHash 均用）。
+3. **去重 / 变更检测**：整文件级去重（去重键 = fullHash）。变更检测用**两级 hash**——索引存 headHash（头部一小段，默认 4 KB，可配）+ fullHash；Diff 先比 headHash 快速预筛，相同再比 fullHash。分块（CDC）去重留后续优化。
+4. **索引序列化**：JSON + 7z 压缩（可读、够用；大索引后续可换紧凑格式）。
+5. **检查「本地文件存在」**：与 §4 Diff 一致（length → mtime/权限 → headHash → fullHash）。
+6. **前端进度**：先用轮询（`GET /api/backups/{id}/progress`），简单可靠；后续可升级 SSE。
