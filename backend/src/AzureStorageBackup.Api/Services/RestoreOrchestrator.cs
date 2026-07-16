@@ -25,27 +25,34 @@ public sealed class RestoreOrchestrator(
     IFileCompressor compressor,
     IFileHasher hasher,
     string tempRoot,
-    INotifier? notifier = null)
+    INotifier? notifier = null,
+    IOperationLog? opLog = null)
 {
     public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default)
     {
-        await Notify(NotificationEvents.RestoreStart, $"Restore started: {request.Container}", request.TargetRoot, ct);
+        var source = $"restore:{request.Container}";
+        await Record(NotificationEvents.RestoreStart, source, $"Restore started: {request.Container}", request.TargetRoot, ct);
         try
         {
             var result = await RunCoreAsync(request, ct);
-            await Notify(NotificationEvents.RestoreSuccess, $"Restore succeeded: {request.Container}",
+            await Record(NotificationEvents.RestoreSuccess, source, $"Restore succeeded: {request.Container}",
                 $"Restored {result.RestoredFiles} file(s) to {request.TargetRoot} (version {result.Version})", ct);
             return result;
         }
         catch (Exception ex)
         {
-            await Notify(NotificationEvents.RestoreFailure, $"Restore failed: {request.Container}", ex.Message, ct);
+            await Record(NotificationEvents.RestoreFailure, source, $"Restore failed: {request.Container}", ex.Message, ct);
             throw;
         }
     }
 
-    private Task Notify(NotificationEvents evt, string title, string body, CancellationToken ct) =>
-        notifier?.NotifyAsync(evt, title, body, ct) ?? Task.CompletedTask;
+    private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
+    {
+        if (opLog is not null)
+            await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct);
+        if (notifier is not null)
+            await notifier.NotifyAsync(evt, title, body, ct);
+    }
 
     private async Task<RestoreResult> RunCoreAsync(RestoreRequest request, CancellationToken ct)
     {

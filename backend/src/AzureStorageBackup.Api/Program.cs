@@ -70,9 +70,13 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "restore"),
-    sp.GetRequiredService<INotifier>()));
+    sp.GetRequiredService<INotifier>(),
+    sp.GetRequiredService<IOperationLog>()));
 builder.Services.AddSingleton<RestoreRunner>();
 builder.Services.AddScoped<BackupChecker>();
+
+// 操作日志（M8）
+builder.Services.AddScoped<IOperationLog, OperationLogService>();
 
 // 通知（M7）
 builder.Services.AddScoped<INotificationConfigService, NotificationConfigService>();
@@ -122,6 +126,7 @@ app.MapTaskEndpoints();
 app.MapBackupsEndpoints();
 app.MapBackupConfigEndpoints();
 app.MapNotificationEndpoints();
+app.MapLogEndpoints();
 app.MapSystemEndpoints();
 
 app.Run();

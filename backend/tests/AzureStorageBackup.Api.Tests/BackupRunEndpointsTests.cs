@@ -79,10 +79,16 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
             Assert.Equal("Completed", status!.Status);
             Assert.Equal(1, status.Version);
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
+
+            // 操作日志已记录本次备份（M8 接线验证）
+            var logs = await _client.GetFromJsonAsync<LogRow[]>($"/api/logs?source=backup:{containerName}");
+            Assert.Contains(logs!, l => l.message.Contains("Backup succeeded"));
         }
         finally
         {
             await container.DeleteIfExistsAsync();
         }
     }
+
+    private sealed record LogRow(int id, string source, string message);
 }

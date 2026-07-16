@@ -18,15 +18,19 @@ public static class SystemEndpoints
 
             var dataPath = ParseDataSource(config.GetConnectionString("Sqlite")) ?? "data/app.db";
 
-            var tempPath = config["Paths:Temp"];
+            // 备份引擎实际使用的临时区（供 docker 卷映射，PRD 6）。
+            var tempPath = config["Backup:TempPath"];
             if (string.IsNullOrWhiteSpace(tempPath))
-                tempPath = "temp";
+                tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
 
             return Results.Ok(new Dictionary<string, string>
             {
                 ["keysPath"] = SafeFullPath(keysPath),
                 ["dataPath"] = SafeFullPath(dataPath),
                 ["tempPath"] = SafeFullPath(tempPath),
+                ["compressTempPath"] = SafeFullPath(Path.Combine(tempPath, "compress")),
+                ["stagedTempPath"] = SafeFullPath(Path.Combine(tempPath, "staged")),
+                ["restoreTempPath"] = SafeFullPath(Path.Combine(tempPath, "restore")),
             });
         })
         .WithTags("System");

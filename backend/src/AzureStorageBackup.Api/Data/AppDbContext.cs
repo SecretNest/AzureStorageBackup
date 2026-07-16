@@ -17,6 +17,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<ScheduledTask> ScheduledTasks => Set<ScheduledTask>();
     public DbSet<BackupConfig> BackupConfigs => Set<BackupConfig>();
     public DbSet<NotificationConfig> NotificationConfigs => Set<NotificationConfig>();
+    public DbSet<LogEntry> LogEntries => Set<LogEntry>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -67,5 +68,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
         });
 
         modelBuilder.Entity<NotificationConfig>(e => e.HasKey(x => x.Id));
+
+        modelBuilder.Entity<LogEntry>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Source).IsRequired();
+            // DateTimeOffset 在 SQLite 上无法翻译范围比较：落库为 UtcTicks（可比较、可排序）。
+            e.Property(x => x.Timestamp).HasConversion(
+                v => v.UtcTicks,
+                v => new DateTimeOffset(v, TimeSpan.Zero));
+            e.HasIndex(x => x.Timestamp);
+        });
     }
 }
