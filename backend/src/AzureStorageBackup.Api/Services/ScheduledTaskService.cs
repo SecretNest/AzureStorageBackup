@@ -54,6 +54,16 @@ public class ScheduledTaskService(AppDbContext db) : IScheduledTaskService
         return true;
     }
 
+    public async Task SetLastRunAsync(int id, DateTimeOffset when, CancellationToken ct = default)
+    {
+        var existing = await db.ScheduledTasks.FirstOrDefaultAsync(t => t.Id == id, ct);
+        if (existing is null)
+            return;
+
+        existing.LastRunAt = when;
+        await db.SaveChangesAsync(ct);
+    }
+
     private static void Validate(ScheduledTask t)
     {
         if (string.IsNullOrWhiteSpace(t.CronExpression))

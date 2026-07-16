@@ -14,4 +14,7 @@ public interface IScheduledTaskService
     Task<ScheduledTask?> UpdateAsync(int id, ScheduledTask update, CancellationToken ct = default);
 
     Task<bool> DeleteAsync(int id, CancellationToken ct = default);
+
+    /// <summary>记录上次触发时刻（调度器用）。</summary>
+    Task SetLastRunAsync(int id, DateTimeOffset when, CancellationToken ct = default);
 }

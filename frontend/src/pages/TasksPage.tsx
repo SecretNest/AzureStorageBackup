@@ -84,6 +84,20 @@ export function TasksPage() {
     }
   }
 
+  const [running, setRunning] = useState<number | null>(null)
+  const runNow = async (t: ScheduledTask) => {
+    setError(null)
+    setRunning(t.id)
+    try {
+      await tasksApi.run(t.id)
+      loadTasks()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRunning(null)
+    }
+  }
+
   const remove = async (t: ScheduledTask) => {
     if (!window.confirm('Delete this task?')) return
     try {
@@ -153,12 +167,18 @@ export function TasksPage() {
                 </td>
                 <td>{t.enabled ? 'Yes' : 'No'}</td>
                 <td style={{ textAlign: 'right' }}>
+                  <button type="button" onClick={() => runNow(t)} disabled={running === t.id}>
+                    {running === t.id ? 'Running…' : 'Run now'}
+                  </button>{' '}
                   <button type="button" onClick={() => startEdit(t)}>
                     Edit
                   </button>{' '}
                   <button type="button" onClick={() => remove(t)}>
                     Delete
                   </button>
+                  <div style={{ fontSize: '0.75rem', color: '#888' }}>
+                    Last run: {t.lastRunAt ? new Date(t.lastRunAt).toLocaleString() : 'never'}
+                  </div>
                 </td>
               </tr>
             ))

@@ -19,6 +19,9 @@ public class TestWebAppFactory : WebApplicationFactory<Program>
     {
         _connection.Open();
 
+        // 测试中不启动常驻调度器，避免后台触发干扰
+        builder.UseSetting("Scheduler:Enabled", "false");
+
         builder.ConfigureServices(services =>
         {
             var descriptor = services.SingleOrDefault(

@@ -12,6 +12,10 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
     public async Task<BackupConfig?> GetAsync(int id, CancellationToken ct = default) =>
         await db.BackupConfigs.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id, ct);
 
+    public async Task<BackupConfig?> FindAsync(int accountId, string containerName, CancellationToken ct = default) =>
+        await db.BackupConfigs.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.AccountId == accountId && c.ContainerName == containerName, ct);
+
     public async Task<BackupConfig> CreateAsync(BackupConfig config, CancellationToken ct = default)
     {
         if (config.CreatedAt == default)

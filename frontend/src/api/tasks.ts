@@ -16,6 +16,7 @@ export interface ScheduledTask {
   cronExpression: string
   enabled: boolean
   createdAt: string
+  lastRunAt: string | null
 }
 
 export interface TaskInput {
@@ -33,4 +34,5 @@ export const tasksApi = {
   create: (t: TaskInput) => api.post<ScheduledTask>('/tasks', t),
   update: (id: number, t: TaskInput) => api.put<ScheduledTask>(`/tasks/${id}`, t),
   remove: (id: number) => api.del(`/tasks/${id}`),
+  run: (id: number) => api.post<ScheduledTask>(`/tasks/${id}/run`, {}),
 }

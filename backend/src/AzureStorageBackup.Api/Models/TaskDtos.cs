@@ -30,9 +30,10 @@ public record TaskResponse(
     ScheduledTaskType TaskType,
     string CronExpression,
     bool Enabled,
-    DateTimeOffset CreatedAt)
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? LastRunAt)
 {
     public static TaskResponse From(ScheduledTask t) => new(
         t.Id, t.TargetKind, t.AccountId, t.ContainerName, t.GroupId,
-        t.TaskType, t.CronExpression, t.Enabled, t.CreatedAt);
+        t.TaskType, t.CronExpression, t.Enabled, t.CreatedAt, t.LastRunAt);
 }

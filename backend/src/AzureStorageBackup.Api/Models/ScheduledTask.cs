@@ -36,4 +36,7 @@ public class ScheduledTask
     public string CronExpression { get; set; } = string.Empty;
     public bool Enabled { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; }
+
+    /// <summary>上次触发时刻（调度器维护）；用于计算下次是否到期，避免重启后重放。</summary>
+    public DateTimeOffset? LastRunAt { get; set; }
 }

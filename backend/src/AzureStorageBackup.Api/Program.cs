@@ -59,6 +59,7 @@ builder.Services.AddSingleton<IFileHasher, FileHasher>();
 builder.Services.AddSingleton<BackupDiffer>();
 builder.Services.AddSingleton<GroupingPlanner>();
 builder.Services.AddSingleton<RetentionEvaluator>();
+builder.Services.AddScoped<RetentionCleaner>();
 builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddScoped<BackupOrchestrator>();
@@ -71,6 +72,11 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
     Path.Combine(tempPath, "restore")));
 builder.Services.AddSingleton<RestoreRunner>();
 builder.Services.AddScoped<BackupChecker>();
+
+// 调度器（M6）：常驻后台按 cron 触发计划任务。测试环境用 Scheduler:Enabled=false 关闭。
+builder.Services.AddSingleton<TaskDispatcher>();
+if (builder.Configuration.GetValue("Scheduler:Enabled", true))
+    builder.Services.AddHostedService<SchedulerService>();
 
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()

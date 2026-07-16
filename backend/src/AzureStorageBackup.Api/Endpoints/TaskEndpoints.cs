@@ -49,6 +49,18 @@ public static class TaskEndpoints
         group.MapDelete("/{id:int}", async (int id, IScheduledTaskService svc, CancellationToken ct) =>
             await svc.DeleteAsync(id, ct) ? Results.NoContent() : Results.NotFound());
 
+        // 立即执行一次（"Run now"；调度器复用同一 dispatcher）
+        group.MapPost("/{id:int}/run", async (int id, IScheduledTaskService svc, TaskDispatcher dispatcher, CancellationToken ct) =>
+        {
+            var task = await svc.GetAsync(id, ct);
+            if (task is null)
+                return Results.NotFound();
+
+            await dispatcher.DispatchAsync(task, ct);
+            await svc.SetLastRunAsync(id, DateTimeOffset.UtcNow, ct);
+            return Results.Ok(TaskResponse.From((await svc.GetAsync(id, ct))!));
+        });
+
         return app;
     }
 }

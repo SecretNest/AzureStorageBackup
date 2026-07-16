@@ -1,6 +1,3 @@
-using Azure.Storage.Blobs.Models;
-using AzureStorageBackup.Api.Models;
-
 namespace AzureStorageBackup.Api.Services;
 
 public enum RunStatus
@@ -70,7 +67,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
 
             var result = await orchestrator.RunAsync(
-                BuildRequest(config, account), new StateProgress(state), CancellationToken.None);
+                BackupRequestMapper.From(config, account), new StateProgress(state), CancellationToken.None);
 
             state.Version = result.Version;
             state.Status = RunStatus.Completed;
@@ -81,50 +78,6 @@ public sealed class BackupRunner(IServiceScopeFactory scopes)
             state.Status = RunStatus.Failed;
         }
     }
-
-    private static BackupRequest BuildRequest(BackupConfig config, Account account) => new()
-    {
-        Account = account,
-        Container = config.ContainerName,
-        LocalRoot = config.LocalRoot,
-        Name = config.Name,
-        Description = config.Description,
-        Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
-        IndexTier = MapTier(config.IndexTier),
-        DataTier = MapTier(config.DataTier),
-        Options = new BackupEngineOptions
-        {
-            Ignore = new IgnoreRuleSet(SplitLines(config.IgnoreRules)),
-            DontCompress = OptionalRules(config.DontCompressRules),
-            DontGroup = OptionalRules(config.DontGroupRules),
-            Scan = new ScanOptions { IncludeSymlinks = config.IncludeSymlinks },
-            Plan = new PlanOptions
-            {
-                SingleFileThresholdBytes = config.SingleFileThresholdBytes,
-                GroupCapBytes = config.GroupCapBytes,
-            },
-            Retention = new RetentionPolicy
-            {
-                MaxVersions = config.MaxVersions,
-                MaxAgeDays = config.MaxAgeDays,
-                Mode = config.RetentionMode,
-            },
-        },
-    };
-
-    private static AccessTier MapTier(StorageTier tier) => tier switch
-    {
-        StorageTier.Cool => AccessTier.Cool,
-        StorageTier.Cold => AccessTier.Cold,
-        StorageTier.Archive => AccessTier.Archive,
-        _ => AccessTier.Hot,
-    };
-
-    private static IgnoreRuleSet? OptionalRules(string? text) =>
-        string.IsNullOrWhiteSpace(text) ? null : new IgnoreRuleSet(SplitLines(text));
-
-    private static IEnumerable<string> SplitLines(string? text) =>
-        (text ?? "").Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
     private sealed class StateProgress(BackupRunState state) : IProgress<BackupProgress>
     {

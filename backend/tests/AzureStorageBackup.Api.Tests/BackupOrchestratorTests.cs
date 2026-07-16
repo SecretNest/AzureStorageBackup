@@ -70,7 +70,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionEvaluator());
+            new RetentionCleaner(factory, store, new RetentionEvaluator()));
         return (orchestrator, store, factory);
     }
 
