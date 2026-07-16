@@ -18,6 +18,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<BackupConfig> BackupConfigs => Set<BackupConfig>();
     public DbSet<NotificationConfig> NotificationConfigs => Set<NotificationConfig>();
     public DbSet<LogEntry> LogEntries => Set<LogEntry>();
+    public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -68,6 +69,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
         });
 
         modelBuilder.Entity<NotificationConfig>(e => e.HasKey(x => x.Id));
+        modelBuilder.Entity<GlobalSettings>(e => e.HasKey(x => x.Id));
 
         modelBuilder.Entity<LogEntry>(e =>
         {

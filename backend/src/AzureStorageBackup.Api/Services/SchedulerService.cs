@@ -50,11 +50,10 @@ public sealed class SchedulerService(
 
         var now = DateTimeOffset.UtcNow;
 
-        // 日志保留清理（PRD 3.6）
+        // 日志保留清理（PRD 3.6），上限取自全局设置
+        var settings = await scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
         await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
-            config.GetValue<int?>("Logs:MaxEntries") ?? 10_000,
-            config.GetValue<int?>("Logs:MaxAgeDays") ?? 180,
-            now, ct);
+            settings.LogMaxEntries, settings.LogMaxAgeDays, now, ct);
 
         foreach (var task in await tasks.ListAsync(ct))
         {

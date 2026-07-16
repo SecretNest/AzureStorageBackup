@@ -6,8 +6,9 @@ import { GroupsPage } from './pages/GroupsPage'
 import { TasksPage } from './pages/TasksPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { LogsPage } from './pages/LogsPage'
+import { SettingsPage } from './pages/SettingsPage'
 
-type Tab = 'accounts' | 'backups' | 'discovered' | 'groups' | 'tasks' | 'notifications' | 'logs'
+type Tab = 'accounts' | 'backups' | 'discovered' | 'groups' | 'tasks' | 'notifications' | 'logs' | 'settings'
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'accounts', label: 'Accounts' },
@@ -17,6 +18,7 @@ const tabs: { key: Tab; label: string }[] = [
   { key: 'tasks', label: 'Tasks' },
   { key: 'notifications', label: 'Notifications' },
   { key: 'logs', label: 'Logs' },
+  { key: 'settings', label: 'Settings' },
 ]
 
 function App() {
@@ -44,6 +46,7 @@ function App() {
       {tab === 'tasks' && <TasksPage />}
       {tab === 'notifications' && <NotificationsPage />}
       {tab === 'logs' && <LogsPage />}
+      {tab === 'settings' && <SettingsPage />}
     </div>
   )
 }

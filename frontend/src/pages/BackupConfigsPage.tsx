@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
+import { settingsApi, type GlobalSettings } from '../api/settings'
 import {
   backupConfigsApi,
   StorageTier,
@@ -55,9 +56,11 @@ export function BackupConfigsPage() {
   const load = () => {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(String(e)))
   }
+  const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
   useEffect(load, [])
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
+    settingsApi.get().then(setDefaults).catch(() => {})
   }, [])
 
   const set = <K extends keyof BackupConfigInput>(k: K, v: BackupConfigInput[K]) =>
@@ -65,7 +68,26 @@ export function BackupConfigsPage() {
 
   const startNew = () => {
     setEditing(null)
-    setForm({ ...emptyForm, accountId: accounts[0]?.id ?? 0 })
+    // 用全局设置的默认值预填（PRD §11「使用默认」）
+    const d = defaults
+    setForm({
+      ...emptyForm,
+      accountId: accounts[0]?.id ?? 0,
+      ...(d && {
+        indexTier: d.defaultIndexTier,
+        dataTier: d.defaultDataTier,
+        maxVersions: d.defaultMaxVersions,
+        maxAgeDays: d.defaultMaxAgeDays,
+        retentionMode: d.defaultRetentionMode,
+        singleFileThresholdBytes: d.defaultSingleFileThresholdBytes,
+        groupCapBytes: d.defaultGroupCapBytes,
+        volumeBytes: d.defaultVolumeBytes,
+        includeSymlinks: d.defaultIncludeSymlinks,
+        ignoreRules: d.defaultIgnoreRules ?? '',
+        dontCompressRules: d.defaultDontCompressRules ?? '',
+        dontGroupRules: d.defaultDontGroupRules ?? '',
+      }),
+    })
     setStep(1)
     setError(null)
     setShowForm(true)

@@ -83,8 +83,9 @@ builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>()));
 
-// 操作日志（M8）
+// 操作日志（M8）+ 全局设置
 builder.Services.AddScoped<IOperationLog, OperationLogService>();
+builder.Services.AddScoped<IGlobalSettingsService, GlobalSettingsService>();
 
 // 通知（M7）
 builder.Services.AddScoped<INotificationConfigService, NotificationConfigService>();
@@ -135,6 +136,7 @@ app.MapBackupsEndpoints();
 app.MapBackupConfigEndpoints();
 app.MapNotificationEndpoints();
 app.MapLogEndpoints();
+app.MapSettingsEndpoints();
 app.MapSystemEndpoints();
 
 app.Run();

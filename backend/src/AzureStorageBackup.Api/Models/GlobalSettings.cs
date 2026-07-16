@@ -1,0 +1,30 @@
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Models;
+
+/// <summary>
+/// 全局设置（单例，Id=1）。新建备份的默认值（PRD §11「使用默认」）+ 全局项（日志保留、并发）。
+/// </summary>
+public class GlobalSettings
+{
+    public int Id { get; set; }
+
+    // 新建备份默认
+    public StorageTier DefaultIndexTier { get; set; } = StorageTier.Hot;
+    public StorageTier DefaultDataTier { get; set; } = StorageTier.Hot;
+    public int DefaultMaxVersions { get; set; } = 100;
+    public int DefaultMaxAgeDays { get; set; } = 180;
+    public RetentionMode DefaultRetentionMode { get; set; } = RetentionMode.EitherTriggers;
+    public long DefaultSingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
+    public long DefaultGroupCapBytes { get; set; } = 100 * 1024 * 1024;
+    public long? DefaultVolumeBytes { get; set; }
+    public bool DefaultIncludeSymlinks { get; set; }
+    public string? DefaultIgnoreRules { get; set; }
+    public string? DefaultDontCompressRules { get; set; }
+    public string? DefaultDontGroupRules { get; set; }
+
+    // 全局
+    public int UploadConcurrency { get; set; } = 5;
+    public int LogMaxEntries { get; set; } = 10_000;
+    public int LogMaxAgeDays { get; set; } = 180;
+}
