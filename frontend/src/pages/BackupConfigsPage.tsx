@@ -168,16 +168,71 @@ export function BackupConfigsPage() {
     }
   }
 
+  const [importing, setImporting] = useState(false)
+  const [importForm, setImportForm] = useState({ accountId: 0, containerName: '', password: '' })
+  const doImport = async () => {
+    setError(null)
+    try {
+      await backupConfigsApi.import(
+        importForm.accountId || accounts[0]?.id || 0,
+        importForm.containerName,
+        importForm.password || null,
+      )
+      setImporting(false)
+      setImportForm({ accountId: 0, containerName: '', password: '' })
+      load()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const accountName = (id: number) => accounts.find((a) => a.id === id)?.name ?? `#${id}`
 
   return (
     <section>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h1>Backups</h1>
-        <button type="button" onClick={startNew} disabled={accounts.length === 0}>
-          New Backup
-        </button>
+        <div>
+          <button type="button" onClick={() => setImporting((v) => !v)} disabled={accounts.length === 0}>
+            Import existing
+          </button>{' '}
+          <button type="button" onClick={startNew} disabled={accounts.length === 0}>
+            New Backup
+          </button>
+        </div>
       </div>
+
+      {importing && (
+        <div style={{ margin: '1rem 0', padding: '0.8rem', border: '1px solid #ccc' }}>
+          <strong>Import existing backup</strong> (reads the container's info file)
+          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+            <select
+              value={importForm.accountId || accounts[0]?.id || 0}
+              onChange={(e) => setImportForm((f) => ({ ...f, accountId: Number(e.target.value) }))}
+            >
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+            <input
+              placeholder="container name"
+              value={importForm.containerName}
+              onChange={(e) => setImportForm((f) => ({ ...f, containerName: e.target.value }))}
+            />
+            <input
+              type="password"
+              placeholder="password (if encrypted)"
+              value={importForm.password}
+              onChange={(e) => setImportForm((f) => ({ ...f, password: e.target.value }))}
+            />
+            <button type="button" onClick={doImport} disabled={!importForm.containerName}>
+              Import
+            </button>
+          </div>
+        </div>
+      )}
       {accounts.length === 0 && <p style={{ color: '#666' }}>Add an account first.</p>}
       {error && <p style={{ color: 'crimson' }}>{error}</p>}
 

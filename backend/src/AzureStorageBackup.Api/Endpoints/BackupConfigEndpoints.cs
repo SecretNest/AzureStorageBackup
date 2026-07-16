@@ -23,6 +23,38 @@ public static class BackupConfigEndpoints
         })
         .WithName("GetBackupConfig");
 
+        // 导入已有备份：读 container 的信息文件恢复配置（roadmap，PRD 1.5）
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, IBackupInfoStore store, IBackupConfigService svc, CancellationToken ct) =>
+        {
+            var account = await accounts.GetAsync(req.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            BackupInfoFile? info;
+            try
+            {
+                info = await store.ReadInfoAsync(account, req.ContainerName, req.Password, ct);
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
+            }
+            if (info is null)
+                return Results.NotFound(new { error = "No backup found in this container." });
+
+            var config = new BackupConfig
+            {
+                AccountId = req.AccountId,
+                ContainerName = req.ContainerName,
+                Name = info.Backup.Name,
+                Description = info.Backup.Description,
+                LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
+                Password = info.Backup.Encrypted ? req.Password : null,
+            };
+            var created = await svc.CreateAsync(config, ct);
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
+        });
+
         group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
