@@ -1,0 +1,67 @@
+using AzureStorageBackup.Api.Models;
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Endpoints;
+
+/// <summary>账户管理端点。响应不含敏感字段；更新时空的敏感字段保留原值。</summary>
+public static class AccountEndpoints
+{
+    public static IEndpointRouteBuilder MapAccountEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/accounts").WithTags("Accounts");
+
+        group.MapGet("/", async (IAccountService svc, CancellationToken ct) =>
+        {
+            var list = await svc.ListAsync(ct);
+            return Results.Ok(list.Select(AccountResponse.From));
+        });
+
+        group.MapGet("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
+        {
+            var a = await svc.GetAsync(id, ct);
+            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a));
+        })
+        .WithName("GetAccount");
+
+        group.MapPost("/", async (AccountRequest req, IAccountService svc, CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.AccountKey))
+                return Results.BadRequest(new { error = "AccountKey is required." });
+
+            var created = await svc.CreateAsync(req.ToAccount(), ct);
+            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created));
+        });
+
+        group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, CancellationToken ct) =>
+        {
+            var existing = await svc.GetAsync(id, ct);
+            if (existing is null)
+                return Results.NotFound();
+
+            var update = req.ToAccount();
+            // 空的敏感字段表示保留原值
+            if (string.IsNullOrEmpty(req.AccountKey))
+                update.AccountKey = existing.AccountKey;
+            if (string.IsNullOrEmpty(req.ProxyPassword))
+                update.ProxyPassword = existing.ProxyPassword;
+
+            var result = await svc.UpdateAsync(id, update, ct);
+            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result));
+        });
+
+        group.MapDelete("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
+        {
+            var ok = await svc.DeleteAsync(id, ct);
+            return ok ? Results.NoContent() : Results.NotFound();
+        });
+
+        // 用未保存的配置测试连通（不落库）
+        group.MapPost("/test-connection", async (AccountRequest req, IBlobClientFactory factory, CancellationToken ct) =>
+        {
+            var result = await factory.TestConnectionAsync(req.ToAccount(), ct);
+            return Results.Ok(result);
+        });
+
+        return app;
+    }
+}

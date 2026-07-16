@@ -1,0 +1,93 @@
+using System.Net;
+using System.Net.Http.Json;
+using AzureStorageBackup.Api.Models;
+
+namespace AzureStorageBackup.Api.Tests;
+
+public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
+{
+    private readonly HttpClient _client = factory.CreateClient();
+
+    private static AccountRequest SampleRequest(string name = "prod") => new(
+        Name: name,
+        Description: "primary",
+        BlobEndpoint: "https://prod.blob.core.windows.net",
+        Region: AzureRegion.Global,
+        AccountKey: "dGVzdGtleQ==",
+        UseProxy: false,
+        ProxyMode: ProxyMode.Independent,
+        ProxyHost: null,
+        ProxyPort: null,
+        ProxyUsername: null,
+        ProxyPassword: null);
+
+    [Fact]
+    public async Task Post_Creates_Account_And_Returns_201()
+    {
+        var res = await _client.PostAsJsonAsync("/api/accounts", SampleRequest());
+
+        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
+        var created = await res.Content.ReadFromJsonAsync<AccountResponse>();
+        Assert.NotNull(created);
+        Assert.True(created!.Id > 0);
+        Assert.Equal("prod", created.Name);
+    }
+
+    [Fact]
+    public async Task Post_Then_Get_Returns_Account()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("get-test"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        var get = await _client.GetAsync($"/api/accounts/{created!.Id}");
+
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        var fetched = await get.Content.ReadFromJsonAsync<AccountResponse>();
+        Assert.Equal("get-test", fetched!.Name);
+    }
+
+    [Fact]
+    public async Task Response_Does_Not_Expose_Secrets()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("secret-test"));
+        var body = await post.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("dGVzdGtleQ==", body);
+        Assert.DoesNotContain("accountKey", body, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Get_Missing_Returns_404()
+    {
+        var res = await _client.GetAsync("/api/accounts/999999");
+        Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Delete_Removes_Account()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("del-test"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        var del = await _client.DeleteAsync($"/api/accounts/{created!.Id}");
+        Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
+
+        var get = await _client.GetAsync($"/api/accounts/{created.Id}");
+        Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+    }
+
+    [Fact]
+    public async Task Put_Updates_Name()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("before"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        var update = SampleRequest("after") with { AccountKey = null }; // 不改 key
+        var put = await _client.PutAsJsonAsync($"/api/accounts/{created!.Id}", update);
+        Assert.Equal(HttpStatusCode.OK, put.StatusCode);
+
+        var get = await _client.GetAsync($"/api/accounts/{created.Id}");
+        var fetched = await get.Content.ReadFromJsonAsync<AccountResponse>();
+        Assert.Equal("after", fetched!.Name);
+    }
+}

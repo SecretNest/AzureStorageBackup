@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AzureStorageBackup.Api/AzureStorageBackup.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj" />
+  </Folder>
+</Solution>

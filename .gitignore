@@ -1,0 +1,26 @@
+# --- .NET ---
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+.vs/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+.vite/
+
+# --- 数据 / 密钥 / 临时 ---
+data/
+keys/
+temp/
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# --- 编辑器 / 系统 ---
+.idea/
+.vscode/
+*.swp
+.DS_Store

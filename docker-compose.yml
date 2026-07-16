@@ -1,0 +1,32 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      # SQLite 落在容器内 /app/data，由下方 volume 持久化
+      - ConnectionStrings__Sqlite=Data Source=/app/data/app.db
+      # Azure Storage 连接串：请在 .env 中提供（见 .env.example）
+      - ConnectionStrings__AzureStorage=${AZURE_STORAGE_CONNECTION_STRING:-}
+      # Data Protection 密钥环路径（务必持久化，否则重启后无法解密已存的密钥）
+      - DataProtection__KeysPath=/app/keys
+      # 临时目录（备份压缩等，M4 使用）
+      - Paths__Temp=/app/temp
+    volumes:
+      - backend-data:/app/data
+      - backend-keys:/app/keys
+      - backend-temp:/app/temp
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  backend-keys:
+  backend-temp:
