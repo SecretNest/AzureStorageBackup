@@ -10,13 +10,18 @@
 - **信息记录文件**：container 内的权威元数据 blob，保存配置 + 版本列表 + 分组包元数据。跨设备恢复的唯一真相源（PRD 1.5）。平时不读取（PRD 1.7），仅导入/检查时读。
 - **本地缓存**：本地 SQLite 缓存备份状态（上一版本索引、pack 元数据），加速对比，避免每次读 container。恢复时从信息文件重建。
 
+> **实现更新（以代码为准，2026-07）**：
+> - hash 用 **XxHash128**（`xxh128:` 前缀），本文档 §2/§3.2 中出现的 `sha256:` 示例均按 §13.2 读作 `xxh128:`。
+> - 信息文件与第二级索引为**紧凑二进制序列化**（§13.4，`IndexSerializer` BinaryWriter），blob 名仍字面保留 `.json[.enc]` 后缀；§3.1/§3.2 的 JSON 示例仅描述**逻辑结构**，非磁盘字节格式。
+> - data blob 与 pack 均可**分卷**：多卷时实际 blob 名为 `data/{hash}.001/.002…`、`packs/{id}.7z.001/.002…`（单卷用基名），读写/清理经 `VolumeBlobIO` 按分卷族处理。
+
 ## 2. 存储布局（container 内 blob 组织）
 
 ```
-azurestoragebackup.index.json          # 信息记录文件（非加密版）
+azurestoragebackup.index.json          # 信息记录文件（非加密版；内容为二进制，见上）
 azurestoragebackup.index.json.enc      # 加密版（与非加密二选一；两者都在用非加密，PRD 1.6）
-indexes/v{N}.json[.enc]                # 第二级：每版本一个文件级索引
-data/{sha256}                          # 数据 blob，按内容哈希寻址（天然去重）
+indexes/v{N}.json[.enc]                # 第二级：每版本一个文件级索引（二进制）
+data/{xxh128}[.001,.002,...]           # 数据 blob，按内容哈希寻址（天然去重）；大 blob 分卷
 packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
 ```
 
@@ -108,6 +113,10 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 - **死重压实**（默认 30%）：pack 内文件被删/变更后旧数据留存；当死重比例（原始尺寸）> 阈值，pack 中**仍有效**的文件重新参与处理（按当前尺寸限制/不分组列表重新决定分组），旧 pack 在本次备份完成后删除。
   - **死重判定**：仅当所有有效版本都不再引用该文件，才算死重（§10 保留策略影响）。
 
+> **实现现状（以代码为准）**：
+> - `GroupingPlanner` 对本次全部变更文件（Added **与** Modified）统一套用尺寸阈值/不分组列表；「仅对新增文件生效」的语义（保持已分组/未分组文件状态不变）依赖死重压实，见下——当前尚未据此区分。
+> - **死重压实尚未接入管线**：`DeadWeightAnalyzer` 已实现（纯逻辑，含默认 30% 阈值），但 `BackupOrchestrator` 的 Plan 阶段尚未调用它，故 pack 不会因死重自动重打包、旧 pack 不会因死重删除（仅在整个版本退役、pack 不再被引用时由保留清理删除，§10）。这是一处**已知未实现**项，待后续 followup 接入；接入前个人备份规模下死重仅表现为存储轻微膨胀，不影响正确性。
+
 ## 7. 临时区状态机（PRD 3.3.2.4）
 
 两个目录：
@@ -139,6 +148,7 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 - 保留策略：最大版本数（默认 100）+ 最长时间（默认 180 天），超量判断方式（两者都到/任一到/仅版本/仅时间）。
 - 清理时机：备份完成时 + 计划任务 Cleanup。
 - 删除版本 → 删其第二级索引 + 不再被任何有效版本引用的数据 blob/pack。
+  - **分卷清理（以代码为准）**：`RetentionCleaner` 在比对引用时把 data blob 名 `data/{hash}.NNN` 归一化回基名，pack 按 `packId` 归组枚举 `packs/` 前缀，确保「删除时整个分卷族一起删、被引用的分卷不会被误删」（§7）。
 
 ## 11. 前端：新建备份流程（PRD 备份设计 §1）
 
