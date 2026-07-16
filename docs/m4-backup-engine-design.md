@@ -1,0 +1,164 @@
+# M4 — 备份引擎设计
+
+> 对应 PRD 第 3 章、backup-feature-design.md。本文件是 M4 的详细设计，供 review。
+> 已确认前提：密码=加密（单开关）、symlink 默认跳过、变更判定用 hash、Tier 无 Smart（Hot/Cool/Cold[/Archive]）。
+
+## 1. 核心概念
+
+- **备份（Backup）**：一个 container 内的一份备份，由 `(Account, Container)` 标识（每 container 最多一个，PRD 1.3）。含配置、多个版本、索引、数据。
+- **版本（Version）**：每次执行备份产生一个不可变版本。版本引用文件清单（第二级索引）。
+- **信息记录文件**：container 内的权威元数据 blob，保存配置 + 版本列表 + 分组包元数据。跨设备恢复的唯一真相源（PRD 1.5）。平时不读取（PRD 1.7），仅导入/检查时读。
+- **本地缓存**：本地 SQLite 缓存备份状态（上一版本索引、pack 元数据），加速对比，避免每次读 container。恢复时从信息文件重建。
+
+## 2. 存储布局（container 内 blob 组织）
+
+```
+azurestoragebackup.index.json          # 信息记录文件（非加密版）
+azurestoragebackup.index.json.enc      # 加密版（与非加密二选一；两者都在用非加密，PRD 1.6）
+indexes/v{N}.json[.enc]                # 第二级：每版本一个文件级索引
+data/{sha256}                          # 数据 blob，按内容哈希寻址（天然去重）
+packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
+```
+
+**两级索引**（PRD 特别说明 B）：
+- 第一级 = 信息记录文件里的 `versions[]`（版本号、时间、第二级索引引用、统计）——小，每次备份只追加+更新。
+- 第二级 = `indexes/v{N}.json`——该版本全部文件清单。新版本只写新的第二级，不改旧的（除非分组死重导致，见 §6）。
+
+避免单一巨型索引反复重写；索引文件本身也压缩、加密（PRD 特别说明 B）。
+
+## 3. 数据模型
+
+### 3.1 信息记录文件 schema（草案）
+```jsonc
+{
+  "schemaVersion": 1,
+  "backup": {
+    "name": "...", "description": "...",
+    "sourceRootHint": "/data/photos",     // 仅提示；恢复时用户重新指定
+    "encrypted": true,
+    "createdAt": "...",
+    "settings": { /* 本备份生效的设置（默认值的解析结果快照） */ }
+  },
+  "versions": [
+    { "version": 1, "createdAt": "...", "indexBlob": "indexes/v1.json.enc",
+      "stats": { "files": 1200, "bytes": 3.4e9, "changedFiles": 12, "changedBytes": 5e7 } }
+  ],
+  "packs": {
+    "p0001": { "blob": "packs/p0001.7z", "members": ["sha_a","sha_b"], "originalBytes": 900000, "deadBytes": 0 }
+  }
+}
+```
+
+### 3.2 第二级索引 schema（indexes/v{N}.json）
+```jsonc
+{
+  "version": 1,
+  "entries": [
+    { "path": "sub/a.txt", "kind": "file",
+      "length": 123, "mtime": "...", "permissions": "0644", "hash": "sha256:...",
+      "storage": { "kind": "blob", "ref": "data/sha256:..." } },
+    { "path": "sub/small.txt", "kind": "file", "length": 40, "hash": "...",
+      "storage": { "kind": "pack", "ref": "p0001", "entryName": "sub/small.txt" } }
+  ],
+  "emptyDirs": ["sub/empty1", "sub/empty2"]   // 空文件夹（备份需包含，还原需创建）
+}
+```
+- 权限、mtime、length、hash 均记录（PRD 特别说明 A）。
+- symlink：默认跳过；若用户选包含，则 `kind:"symlink"` + `target` 字段。
+
+### 3.3 本地状态（SQLite，新增表）
+- `LocalBackupState`：AccountId, ContainerName, LastVersion, LastIndexCacheJson（或引用本地缓存文件）, UpdatedAt。
+- `PackState`：packId, members(hash 列表), originalBytes, deadBytes（跟踪死重）。
+- 本地缓存是优化；权威在 container 信息文件。
+
+## 4. 备份流程（状态机）
+
+```
+Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → Finalize → Cleanup
+```
+
+1. **Scan**：遍历本地根，应用 gitignore 忽略规则（§5），产出条目（path/kind/length/mtime/permissions）。收集空文件夹。
+2. **Diff**（PRD 特别说明 A）：对比上一版本索引：
+   - length 不同 → 变更，需处理。
+   - length 同、mtime 或权限不同 → 计算 hash；hash 不同 → 变更；hash 同 → 仅更新索引元数据（不重传）。
+   - 上版本有、本次无 → 删除（新版本排除）。
+3. **Plan**：对变更文件决定分组/单文件（§6），死重压实检查。
+4. **Compress**：7z 压缩/加密/分卷，经临时区状态机（§7）；处理后重校验（§9）。
+5. **Upload**：并发上传 data/pack blob，设置 Tier（索引=索引 Tier，数据=数据 Tier），重试退避（PRD 4.1）。
+6. **WriteIndex**：写第二级 `indexes/v{N}.json`（先上传，成功）。
+7. **Finalize**：原子更新信息记录文件（§8）——先写新内容到临时 blob，成功后覆盖，避免网络失败导致整体损坏（PRD 特别说明 C）。
+8. **Cleanup**：按保留策略清理超期版本及其独占数据（§10）。
+
+进度反馈（PRD 备份设计 §2）：百分比 + 变更文件数/尺寸（未压缩、分组前，删除不计）。
+
+## 5. gitignore 规则引擎（统一组件）
+
+三处复用（忽略 3.3.1 / 不压缩 3.3.2.2 / 不分组 3.3.3.2），语法一致（gitignore 风格，支持否定 `!` 特例）。
+- 输入：规则集 + 相对路径 → 命中判定。
+- 单一实现，三处各持一份规则集。
+
+## 6. 分组打包与死重压实（PRD 3.3.3）
+
+- **分组**：同一目录（不含子目录）的小文件合并成一个 7z pack，减少 blob 数。
+  - 尺寸限制（默认 5M）：超过者不入组，单文件处理。仅对新增文件生效。
+  - 不分组列表（gitignore 语法）：命中者单文件处理。
+  - 单组上限（默认 100M，压缩前）。
+- **死重压实**（默认 30%）：pack 内文件被删/变更后旧数据留存；当死重比例（原始尺寸）> 阈值，pack 中**仍有效**的文件重新参与处理（按当前尺寸限制/不分组列表重新决定分组），旧 pack 在本次备份完成后删除。
+  - **死重判定**：仅当所有有效版本都不再引用该文件，才算死重（§10 保留策略影响）。
+
+## 7. 临时区状态机（PRD 3.3.2.4）
+
+两个目录：
+- **压缩临时文件夹**（compress-temp）：7z 的输出目标。
+- **压缩后临时区**（staged-temp，默认上限 1GB）：压缩结果移入，供上传。
+
+规则：
+- 压缩先输出到 compress-temp → 完成后**移动**整套分卷到 staged-temp（避免压缩中分卷被改动）。
+- **压缩全局非并发**（跨备份也不并发）——单一压缩队列/锁。
+- staged-temp 未达上限 → 分发下一个压缩任务；已超量 → 暂停新压缩，直到上传腾出空间。
+- 允许「新加入的一个压缩结果导致暂时超限」。
+- 上传完成即从 staged-temp 删除。
+
+## 8. 索引/信息文件原子性（PRD 特别说明 C）
+
+- 数据/pack blob：内容寻址，先传数据再改索引；重复传等价（幂等）。
+- 第二级索引：新版本写新文件，不覆盖旧。
+- 信息记录文件更新：写到临时 blob → 校验 → 覆盖正式名（或用 blob 版本/ETag 乐观并发）。网络失败时旧文件仍完整。
+
+## 9. 处理后重校验与反复保护（PRD 特别说明 D）
+
+- 每个文件处理后重查 mtime/权限 → 变则重算 hash → hash 变则重处理。
+- 反复达阈值（默认 5，env 可配）→ 报警，以当前版本保存，停重试。
+- 分组文件：压缩后对组内原始文件重校验；变更的移出分组，放当前目录下一个分组，无则单文件。
+- 收尾检查：全部处理结束、上传索引前再校验一遍，已报警的跳过。
+
+## 10. 版本保留与清理（PRD 3.2、9）
+
+- 保留策略：最大版本数（默认 100）+ 最长时间（默认 180 天），超量判断方式（两者都到/任一到/仅版本/仅时间）。
+- 清理时机：备份完成时 + 计划任务 Cleanup。
+- 删除版本 → 删其第二级索引 + 不再被任何有效版本引用的数据 blob/pack。
+
+## 11. 前端：新建备份流程（PRD 备份设计 §1）
+
+两步向导：
+1. 基础信息（创建后不可改，除名字/描述）：账户+container（可新建 container）、本地根路径、名字、描述、密码（可选=加密）、索引 Tier、数据 Tier。
+2. 基于默认值的本备份设置（逐项或勾选「使用默认」）：忽略/压缩/分组规则、版本保留、并发、symlink（默认跳过）、执行记录保留。
+完成后「立即备份」或「暂不执行」。
+
+## 12. 子任务拆分（建议分阶段实现，每阶段可独立验证）
+
+- **M4a — 扫描与索引基础**：gitignore 引擎、本地扫描、索引 schema + 序列化（含加密）、信息文件读写 + 原子更新、本地状态缓存。验证：对一个目录产出/读取索引往返（Azurite）。
+- **M4b — 对比引擎**：版本 diff（length/mtime/权限/hash），仅元数据变更只更新索引。验证：改动文件→正确识别变更/仅元数据/删除。
+- **M4c — 压缩与临时区**：7z 封装（压缩/加密/分卷）、临时区状态机（非并发、超量阻塞、先临时后移动）、处理后重校验。验证：压缩产出分卷 + 临时区调度。
+- **M4d — 分组与死重**：分组打包、死重压实。验证：小文件合并、死重触发重组。
+- **M4e — 上传与保留**：并发上传 + 重试退避 + Tier、版本保留清理。验证：上传到 Azurite、清理旧版本。
+- **M4f — 编排器与前端**：串联全流程 + 进度反馈、新建备份向导。验证：端到端跑一次真实备份（Azurite）。
+
+## 13. 遗留决策（供 review 时确认）
+
+1. **7z 实现方式**：容器内装 `p7zip`（调用 `7z` CLI）还是用 .NET 的 7z 库（如 SevenZipSharp，依赖原生库）？建议 **p7zip CLI**（成熟、支持分卷+加密），在 backend Dockerfile 装 `p7zip-full`。
+2. **hash 算法**：SHA-256（建议，去重键 + 校验）。
+3. **数据去重粒度**：整文件级（建议 M4 起步）还是分块（CDC，更省但复杂）？建议**整文件级**先行，分块留后续优化。
+4. **索引序列化**：JSON（可读、够用）；大索引可后续换更紧凑格式。建议 **JSON + 7z 压缩**。
+5. **检查「本地文件存在」是否纳入权限比对**：建议与 §4 Diff 一致（length→mtime/权限→hash）。
+6. 前端进度：轮询 `/api/backups/{id}/progress` 还是 SSE/WebSocket？建议 **轮询**先行（简单）。
