@@ -135,8 +135,10 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         foreach (var e in index.Entries)
         {
-            var blobName = e.Storage!.Kind == "pack" ? $"packs/{e.Storage.Ref}.7z" : e.Storage.Ref;
-            Assert.True(await container.GetBlobClient(blobName).ExistsAsync(), $"missing blob {blobName} for {e.Path}");
+            // 用 VolumeBlobIO.ExistsAsync：单卷查基名，多卷查首卷 .001。
+            var baseRef = e.Storage!.Kind == "pack" ? $"packs/{e.Storage.Ref}.7z" : e.Storage.Ref;
+            Assert.True(await VolumeBlobIO.ExistsAsync(container, baseRef, CancellationToken.None),
+                $"missing blob {baseRef} for {e.Path}");
         }
     }
 
@@ -228,6 +230,53 @@ public sealed class BackupOrchestratorTests : IDisposable
             Assert.False(await container.GetBlobClient(v1IndexBlob).ExistsAsync()); // v1 index blob deleted
             Assert.False(await container.GetBlobClient("packs/p0001.7z").ExistsAsync()); // v1 pack blob deleted
             Assert.True(await container.GetBlobClient("packs/p0002.7z").ExistsAsync());  // still referenced
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task Retention_Keeps_Volume_Split_Blobs_Still_Referenced()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchvs-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        // 6MB 随机（不可压缩）文件 → 单文件 data blob，且 1MB 分卷 → 多卷 data/{hash}.001/.002...
+        var buf = new byte[6_000_000];
+        new Random(42).NextBytes(buf);
+        File.WriteAllBytes(Path.Combine(_root, "big.bin"), buf);
+
+        BackupRequest Req() => Request(account, name) with
+        {
+            Options = new BackupEngineOptions
+            {
+                Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                VolumeBytes = 1_000_000,
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
+            },
+        };
+
+        try
+        {
+            await orchestrator.RunAsync(Req());        // v1
+            await orchestrator.RunAsync(Req());        // v2 → cleanup 退役 v1；big.bin 未变仍被 v2 引用
+
+            var hash = await new FileHasher().FullHashAsync(Path.Combine(_root, "big.bin"));
+            // 仍被 v2 引用的分卷 data blob 必须保留（修复前会被误删 → 数据丢失）。
+            Assert.True(await container.GetBlobClient($"data/{hash}.001").ExistsAsync(),
+                "referenced volume-split data blob was deleted by retention cleanup");
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            await AssertReferencedBlobsExist(container, idx);
         }
         finally
         {
