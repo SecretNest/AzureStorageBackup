@@ -1,5 +1,3 @@
-using System.Diagnostics;
-
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
@@ -22,21 +20,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
     }
 
     /// <summary>在 PATH 上探测 7-Zip 可执行文件（7zz→7z→7za），找不到返回 null。</summary>
-    public static string? TryResolveExecutable()
-    {
-        var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
-        var dirs = pathVar.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
-        foreach (var candidate in new[] { "7zz", "7z", "7za" })
-        {
-            foreach (var dir in dirs)
-            {
-                var full = Path.Combine(dir, candidate);
-                if (File.Exists(full))
-                    return full;
-            }
-        }
-        return null;
-    }
+    public static string? TryResolveExecutable() => SevenZipCli.TryResolveExecutable();
 
     public async Task<byte[]> EncodeAsync(byte[] content, string? password, CancellationToken ct = default)
     {
@@ -96,37 +80,8 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
         return dir;
     }
 
-    private async Task RunAsync(IReadOnlyList<string> args, CancellationToken ct)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = _exe,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        foreach (var a in args)
-            psi.ArgumentList.Add(a);
-
-        using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException($"Failed to start '{_exe}'.");
-
-        // 关闭 stdin：若归档加密而未提供密码，7z 会等待输入 —— 给它 EOF 使其失败而非挂起。
-        proc.StandardInput.Close();
-
-        var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-        await proc.WaitForExitAsync(ct);
-        var stderr = await stderrTask;
-        await stdoutTask;
-
-        // 7z 退出码：0=OK，1=警告，>=2=错误（含密码错误）。
-        if (proc.ExitCode >= 2)
-            throw new InvalidOperationException(
-                $"7-Zip failed (exit {proc.ExitCode}): {stderr.Trim()}");
-    }
+    private Task RunAsync(IReadOnlyList<string> args, CancellationToken ct) =>
+        SevenZipCli.RunAsync(_exe, args, ct);
 
     private static void TryDelete(string dir)
     {
