@@ -68,7 +68,8 @@ public sealed class BackupOrchestrator(
     StagingArea staging,
     RetentionCleaner cleaner,
     INotifier? notifier = null,
-    IOperationLog? opLog = null)
+    IOperationLog? opLog = null,
+    ProcessingVerifier? verifier = null)
 {
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
@@ -195,16 +196,35 @@ public sealed class BackupOrchestrator(
             if (!await BlobExistsAsync(request, blob.Ref, ct))
             {
                 var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
-                var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
-                    request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, token), ct);
-                try
+
+                async Task ProcessAsync(CancellationToken token)
                 {
-                    await uploader.UploadIfMissingAsync(
-                        request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: ct);
+                    var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
+                        request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, t), token);
+                    try
+                    {
+                        await uploader.UploadIfMissingAsync(
+                            request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: token);
+                    }
+                    finally
+                    {
+                        staging.Release(staged);
+                    }
                 }
-                finally
+
+                // 处理后重校验（§9）：文件在处理期间反复变化达阈值 → 报 UnrecoverableError，以当前版本保存。
+                if (verifier is not null)
                 {
-                    staging.Release(staged);
+                    var localPath = Path.Combine(request.LocalRoot, blob.Path.Replace('/', Path.DirectorySeparatorChar));
+                    var vr = await verifier.RunAsync(localPath, blob.FullHash, ProcessAsync, ct: ct);
+                    if (vr.Outcome == ProcessingOutcome.Alarmed)
+                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                            $"File kept changing during backup: {blob.Path}",
+                            $"Saved with current content after {vr.Attempts} attempts", ct);
+                }
+                else
+                {
+                    await ProcessAsync(ct);
                 }
             }
 
