@@ -28,6 +28,21 @@ public class BlobClientFactoryTests
     }
 
     [Fact]
+    public void ParseAccountName_HostStyle_Uses_First_Host_Label() =>
+        Assert.Equal("prod", BlobClientFactory.ParseAccountName(
+            new Uri("https://prod.blob.core.windows.net")));
+
+    [Fact]
+    public void ParseAccountName_PathStyle_Ip_Uses_First_Path_Segment() =>
+        Assert.Equal("devstoreaccount1", BlobClientFactory.ParseAccountName(
+            new Uri("http://127.0.0.1:10000/devstoreaccount1")));
+
+    [Fact]
+    public void ParseAccountName_PathStyle_Localhost_Uses_First_Path_Segment() =>
+        Assert.Equal("myacct", BlobClientFactory.ParseAccountName(
+            new Uri("http://localhost:10000/myacct")));
+
+    [Fact]
     public void ProxyHandler_NoProxy_Disables_Proxy()
     {
         var acct = Sample();

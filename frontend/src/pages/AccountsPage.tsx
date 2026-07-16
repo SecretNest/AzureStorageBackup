@@ -8,6 +8,7 @@ import {
   type AccountInput,
   type ConnectionResult,
 } from '../api/accounts'
+import { ContainersPage } from './ContainersPage'
 
 const emptyForm: AccountInput = {
   name: '',
@@ -31,6 +32,7 @@ export function AccountsPage() {
   const [testResult, setTestResult] = useState<ConnectionResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [viewing, setViewing] = useState<Account | null>(null)
 
   const load = () => {
     accountsApi.list().then(setAccounts).catch((e) => setError(String(e)))
@@ -69,10 +71,17 @@ export function AccountsPage() {
     setBusy(true)
     setError(null)
     try {
-      if (editing) await accountsApi.update(editing.id, form)
-      else await accountsApi.create(form)
-      setShowForm(false)
-      load()
+      if (editing) {
+        await accountsApi.update(editing.id, form)
+        setShowForm(false)
+        load()
+      } else {
+        const created = await accountsApi.create(form)
+        setShowForm(false)
+        load()
+        // 新账户创建后直接进入 container 列举界面（PRD 1.4）
+        setViewing(created)
+      }
     } catch (e) {
       setError(String(e))
     } finally {
@@ -104,6 +113,18 @@ export function AccountsPage() {
 
   const set = <K extends keyof AccountInput>(k: K, v: AccountInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
+
+  if (viewing) {
+    return (
+      <ContainersPage
+        account={viewing}
+        onBack={() => {
+          setViewing(null)
+          load()
+        }}
+      />
+    )
+  }
 
   return (
     <section>
@@ -141,6 +162,9 @@ export function AccountsPage() {
                 <td>{regionLabels[a.region]}</td>
                 <td>{a.useProxy ? 'Yes' : 'No'}</td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  <button type="button" onClick={() => setViewing(a)}>
+                    Containers
+                  </button>{' '}
                   <button type="button" onClick={() => startEdit(a)}>
                     Edit
                   </button>{' '}

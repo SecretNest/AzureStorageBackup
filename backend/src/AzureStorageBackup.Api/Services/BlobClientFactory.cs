@@ -8,10 +8,23 @@ namespace AzureStorageBackup.Api.Services;
 
 public class BlobClientFactory : IBlobClientFactory
 {
+    /// <summary>
+    /// 从 endpoint 解析账户名：host-style（account.blob.core.windows.net）取 host 首段；
+    /// path-style（Azurite 等，http://127.0.0.1:10000/account）取首个路径段。
+    /// </summary>
+    public static string ParseAccountName(Uri uri)
+    {
+        var isPathStyle = IPAddress.TryParse(uri.Host, out _) ||
+                          uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+        if (isPathStyle && uri.Segments.Length > 1)
+            return uri.Segments[1].Trim('/');
+        return uri.Host.Split('.')[0];
+    }
+
     public BlobServiceClient CreateServiceClient(Account account)
     {
         var uri = new Uri(account.BlobEndpoint);
-        var accountName = uri.Host.Split('.')[0];
+        var accountName = ParseAccountName(uri);
         var credential = new StorageSharedKeyCredential(accountName, account.AccountKey);
 
         var options = new BlobClientOptions

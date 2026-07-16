@@ -37,6 +37,7 @@ builder.Services.AddScoped<IAzureStorageService, AzureStorageService>();
 builder.Services.AddScoped<IBackupService, BackupService>();
 builder.Services.AddScoped<IAccountService, AccountService>();
 builder.Services.AddSingleton<IBlobClientFactory, BlobClientFactory>();
+builder.Services.AddScoped<IContainerService, ContainerService>();
 
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
@@ -71,6 +72,7 @@ app.UseCors(CorsPolicy);
 app.MapHealthEndpoints();
 app.MapBackupEndpoints();
 app.MapAccountEndpoints();
+app.MapContainerEndpoints();
 app.MapSystemEndpoints();
 
 app.Run();
