@@ -61,7 +61,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         File.WriteAllBytes(full, new byte[size]);
     }
 
-    private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build()
+    private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
+        IBlobUploader? uploader = null, ProcessingVerifier? verifier = null)
     {
         var factory = new BlobClientFactory();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -69,9 +70,36 @@ public sealed class BackupOrchestratorTests : IDisposable
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), stagedLimitBytes: 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()));
+            new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), verifier: verifier);
         return (orchestrator, store, factory);
+    }
+
+    /// <summary>记录同时在飞的上传数，验证上传并发。</summary>
+    private sealed class ConcurrencyTrackingUploader(IBlobUploader inner) : IBlobUploader
+    {
+        private int _current;
+        private int _max;
+        private readonly Lock _l = new();
+        public int MaxConcurrent { get { lock (_l) return _max; } }
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default)
+        {
+            lock (_l) { _current++; _max = Math.Max(_max, _current); }
+            try
+            {
+                await Task.Delay(250, ct); // 让上传明显长于压缩，使并发窗口稳定可观测
+                return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct);
+            }
+            finally { lock (_l) _current--; }
+        }
+
+        public Task UploadBatchAsync(
+            Account account, string container, IReadOnlyList<UploadItem> items,
+            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
+            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
     private BackupRequest Request(Account account, string container) => new()
@@ -217,6 +245,57 @@ public sealed class BackupOrchestratorTests : IDisposable
             Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.TotalItems == 2);
             Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.UploadedItems == p.TotalItems && p.Percent == 100);
             Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.ChangedFiles == 2);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task Blobs_Are_Uploaded_Concurrently_Up_To_The_Limit()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factoryProbe = new BlobClientFactory();
+        var tracker = new ConcurrencyTrackingUploader(new BlobUploader(factoryProbe));
+        var (orchestrator, store, factory) = Build(uploader: tracker);
+        var account = AzuriteAccount();
+        var name = RandomName("orchc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 4 个 > 阈值的单文件 blob（内容各异，避免去重跳过）。
+            for (var i = 0; i < 4; i++)
+            {
+                var bytes = new byte[6_000_000];
+                bytes[0] = (byte)i;
+                File.WriteAllBytes(Path.Combine(_root, $"big{i}.bin"), bytes);
+            }
+
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    UploadConcurrency = 3,
+                },
+            };
+
+            var r = await orchestrator.RunAsync(request);
+
+            Assert.Equal(1, r.Version);
+            Assert.True(tracker.MaxConcurrent >= 2,
+                $"expected concurrent uploads, saw max {tracker.MaxConcurrent}");
+            Assert.True(tracker.MaxConcurrent <= 3, $"exceeded concurrency limit: {tracker.MaxConcurrent}");
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            Assert.Equal(4, idx.Entries.Count);
+            await AssertReferencedBlobsExist(container, idx);
         }
         finally
         {

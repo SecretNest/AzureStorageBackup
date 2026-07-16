@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
@@ -144,21 +145,24 @@ public sealed class BackupOrchestrator(
             FirstPackNumber = NextPackNumber(info.Packs),
         });
 
-        var storageByPath = new Dictionary<string, StorageRef>(StringComparer.Ordinal);
+        var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
 
-        // 5. Compress + Upload
+        // 5. Compress + Upload。压缩仍经单例 StagingArea 全局串行；仅上传按 UploadConcurrency 并行（PRD 3.4）。
         var total = plan.Blobs.Count + plan.Packs.Count;
         var uploaded = 0;
         void ReportItem()
         {
-            uploaded++;
+            var done = Interlocked.Increment(ref uploaded);
             progress?.Report(new BackupProgress(
-                BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+                BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, done, total));
         }
         progress?.Report(new BackupProgress(BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, 0, total));
 
-        await UploadBlobsAsync(request, plan, storageByPath, ReportItem, ct);
-        await UploadPacksAsync(request, plan, info, storageByPath, ReportItem, ct);
+        using var uploadGate = new SemaphoreSlim(
+            Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
+
+        await UploadBlobsAsync(request, plan, storageByPath, uploadGate, ReportItem, ct);
+        await UploadPacksAsync(request, plan, info, storageByPath, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath);
@@ -194,91 +198,106 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task UploadBlobsAsync(
-        BackupRequest request, BackupPlan plan, Dictionary<string, StorageRef> storageByPath,
-        Action onItem, CancellationToken ct)
+        BackupRequest request, BackupPlan plan, ConcurrentDictionary<string, StorageRef> storageByPath,
+        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        => await Task.WhenAll(plan.Blobs.Select(blob =>
+            HandleBlobAsync(request, blob, storageByPath, uploadGate, onItem, ct)));
+
+    private async Task HandleBlobAsync(
+        BackupRequest request, BlobEntry blob, ConcurrentDictionary<string, StorageRef> storageByPath,
+        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
     {
-        foreach (var blob in plan.Blobs)
+        storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
+
+        var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+
+        // 内容寻址去重：已存在（单卷或多卷）则跳过压缩+上传。
+        if (!await VolumeBlobIO.ExistsAsync(cc, blob.Ref, ct))
         {
-            storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
+            var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
 
-            var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
-
-            // 内容寻址去重：已存在（单卷或多卷）则跳过压缩+上传。
-            if (!await VolumeBlobIO.ExistsAsync(cc, blob.Ref, ct))
+            async Task ProcessAsync(CancellationToken token)
             {
-                var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
-
-                async Task ProcessAsync(CancellationToken token)
+                // 压缩经 StagingArea 全局串行；上传按 uploadGate 并发。
+                var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
+                    request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, t), token);
+                await uploadGate.WaitAsync(token);
+                try
                 {
-                    var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
-                        request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, t), token);
-                    try
-                    {
-                        await VolumeBlobIO.UploadAsync(
-                            uploader, request.Account, request.Container, blob.Ref, staged.Files,
-                            request.DataTier, request.Options.Upload, token);
-                    }
-                    finally
-                    {
-                        staging.Release(staged);
-                    }
+                    await VolumeBlobIO.UploadAsync(
+                        uploader, request.Account, request.Container, blob.Ref, staged.Files,
+                        request.DataTier, request.Options.Upload, token);
                 }
-
-                // 处理后重校验（§9）：文件在处理期间反复变化达阈值 → 报 UnrecoverableError，以当前版本保存。
-                if (verifier is not null)
+                finally
                 {
-                    var localPath = Path.Combine(request.LocalRoot, blob.Path.Replace('/', Path.DirectorySeparatorChar));
-                    var vr = await verifier.RunAsync(localPath, blob.FullHash, ProcessAsync, ct: ct);
-                    if (vr.Outcome == ProcessingOutcome.Alarmed)
-                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
-                            $"File kept changing during backup: {blob.Path}",
-                            $"Saved with current content after {vr.Attempts} attempts", ct);
-                }
-                else
-                {
-                    await ProcessAsync(ct);
+                    uploadGate.Release();
+                    staging.Release(staged);
                 }
             }
 
-            onItem();
+            // 处理后重校验（§9）：文件在处理期间反复变化达阈值 → 报 UnrecoverableError，以当前版本保存。
+            if (verifier is not null)
+            {
+                var localPath = Path.Combine(request.LocalRoot, blob.Path.Replace('/', Path.DirectorySeparatorChar));
+                var vr = await verifier.RunAsync(localPath, blob.FullHash, ProcessAsync, ct: ct);
+                if (vr.Outcome == ProcessingOutcome.Alarmed)
+                    await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                        $"File kept changing during backup: {blob.Path}",
+                        $"Saved with current content after {vr.Attempts} attempts", ct);
+            }
+            else
+            {
+                await ProcessAsync(ct);
+            }
         }
+
+        onItem();
     }
 
     private async Task UploadPacksAsync(
         BackupRequest request, BackupPlan plan, BackupInfoFile info,
-        Dictionary<string, StorageRef> storageByPath, Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, StorageRef> storageByPath, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
+        => await Task.WhenAll(plan.Packs.Select(pack =>
+            HandlePackAsync(request, pack, info, storageByPath, uploadGate, onItem, ct)));
+
+    private async Task HandlePackAsync(
+        BackupRequest request, PlannedPack pack, BackupInfoFile info,
+        ConcurrentDictionary<string, StorageRef> storageByPath, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
     {
-        foreach (var pack in plan.Packs)
+        var packBlob = $"packs/{pack.PackId}.7z";
+        var entries = pack.Members.Select(m => m.EntryName).ToList();
+
+        var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
+            request, compressTemp, pack.PackId, entries, storeOnly: false, token), ct);
+        await uploadGate.WaitAsync(ct);
+        try
         {
-            var packBlob = $"packs/{pack.PackId}.7z";
-            var entries = pack.Members.Select(m => m.EntryName).ToList();
-
-            var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
-                request, compressTemp, pack.PackId, entries, storeOnly: false, token), ct);
-            try
-            {
-                await VolumeBlobIO.UploadAsync(
-                    uploader, request.Account, request.Container, packBlob, staged.Files,
-                    request.DataTier, request.Options.Upload, ct);
-            }
-            finally
-            {
-                staging.Release(staged);
-            }
-
-            onItem();
-
-            foreach (var member in pack.Members)
-                storageByPath[member.Path] = new StorageRef { Kind = "pack", Ref = pack.PackId, EntryName = member.EntryName };
-
-            info.Packs[pack.PackId] = new PackInfo
-            {
-                Blob = packBlob,
-                Members = pack.Members.Select(m => m.FullHash).ToList(),
-                OriginalBytes = pack.OriginalBytes,
-                DeadBytes = 0,
-            };
+            await VolumeBlobIO.UploadAsync(
+                uploader, request.Account, request.Container, packBlob, staged.Files,
+                request.DataTier, request.Options.Upload, ct);
         }
+        finally
+        {
+            uploadGate.Release();
+            staging.Release(staged);
+        }
+
+        onItem();
+
+        foreach (var member in pack.Members)
+            storageByPath[member.Path] = new StorageRef { Kind = "pack", Ref = pack.PackId, EntryName = member.EntryName };
+
+        var packInfo = new PackInfo
+        {
+            Blob = packBlob,
+            Members = pack.Members.Select(m => m.FullHash).ToList(),
+            OriginalBytes = pack.OriginalBytes,
+            DeadBytes = 0,
+        };
+        lock (info.Packs)
+            info.Packs[pack.PackId] = packInfo;
     }
 
     private async Task<IReadOnlyList<string>> CompressAsync(
@@ -292,7 +311,7 @@ public sealed class BackupOrchestrator(
         return result.VolumeFiles;
     }
 
-    private static List<IndexEntry> BuildEntries(DiffResult diff, Dictionary<string, StorageRef> storageByPath)
+    private static List<IndexEntry> BuildEntries(DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath)
     {
         var entries = new List<IndexEntry>();
         foreach (var c in diff.Changes)
