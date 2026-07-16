@@ -3,12 +3,23 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>
 /// 常驻调度器（M6、PRD 2.2/2.3）：每分钟检查启用的计划任务，到期即触发（fire-and-forget，
 /// 组内由 TaskDispatcher 依次执行）。触发前先记录 LastRunAt，避免同一时刻重复触发或重启后重放。
-/// MVP 用 UTC 求值 cron。
+/// cron 时区由 Scheduler:TimeZone（IANA id）配置，缺省/非法则 UTC。
 /// </summary>
 public sealed class SchedulerService(
-    IServiceScopeFactory scopes, TaskDispatcher dispatcher, ILogger<SchedulerService> logger) : BackgroundService
+    IServiceScopeFactory scopes, TaskDispatcher dispatcher, IConfiguration config, ILogger<SchedulerService> logger)
+    : BackgroundService
 {
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
+    private readonly TimeZoneInfo _tz = ResolveTimeZone(config["Scheduler:TimeZone"]);
+
+    /// <summary>解析 IANA/系统时区 id；空或非法回退 UTC。</summary>
+    public static TimeZoneInfo ResolveTimeZone(string? id)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return TimeZoneInfo.Utc;
+        try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
+        catch { return TimeZoneInfo.Utc; }
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -40,7 +51,7 @@ public sealed class SchedulerService(
         var now = DateTimeOffset.UtcNow;
         foreach (var task in await tasks.ListAsync(ct))
         {
-            if (!SchedulerPlanner.IsDue(task, now, TimeZoneInfo.Utc))
+            if (!SchedulerPlanner.IsDue(task, now, _tz))
                 continue;
 
             await tasks.SetLastRunAsync(task.Id, now, ct); // 先记录，防止重复触发
