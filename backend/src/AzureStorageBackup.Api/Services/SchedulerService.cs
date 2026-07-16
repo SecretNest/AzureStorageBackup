@@ -49,6 +49,13 @@ public sealed class SchedulerService(
         var tasks = scope.ServiceProvider.GetRequiredService<IScheduledTaskService>();
 
         var now = DateTimeOffset.UtcNow;
+
+        // 日志保留清理（PRD 3.6）
+        await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
+            config.GetValue<int?>("Logs:MaxEntries") ?? 10_000,
+            config.GetValue<int?>("Logs:MaxAgeDays") ?? 180,
+            now, ct);
+
         foreach (var task in await tasks.ListAsync(ct))
         {
             if (!SchedulerPlanner.IsDue(task, now, _tz))

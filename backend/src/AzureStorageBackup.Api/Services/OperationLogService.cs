@@ -27,6 +27,9 @@ public interface IOperationLog
         CancellationToken ct = default);
 
     Task ClearAsync(CancellationToken ct = default);
+
+    /// <summary>保留清理（PRD 3.6）：删除超期或超出最大条数的记录；两个上限"达到之一即删"。</summary>
+    Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default);
 }
 
 public sealed class OperationLogService(AppDbContext db) : IOperationLog
@@ -68,5 +71,24 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
     {
         db.LogEntries.RemoveRange(db.LogEntries);
         await db.SaveChangesAsync(ct);
+    }
+
+    public async Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
+    {
+        if (maxAgeDays is int days and > 0)
+        {
+            var cutoff = now.AddDays(-days);
+            await db.LogEntries.Where(e => e.Timestamp < cutoff).ExecuteDeleteAsync(ct);
+        }
+
+        if (maxEntries is int max and > 0)
+        {
+            // 保留最新 max 条：删除 Id 小于"最新 max 条中最小 Id"的记录。
+            var minKeepId = await db.LogEntries
+                .OrderByDescending(e => e.Id)
+                .Take(max)
+                .MinAsync(e => (int?)e.Id, ct) ?? 0;
+            await db.LogEntries.Where(e => e.Id < minKeepId).ExecuteDeleteAsync(ct);
+        }
     }
 }

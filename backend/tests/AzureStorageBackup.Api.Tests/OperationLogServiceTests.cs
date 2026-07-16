@@ -96,4 +96,38 @@ public sealed class OperationLogServiceTests : IDisposable
 
         Assert.Empty(await _sut.QueryAsync(null, null, null, null, 100));
     }
+
+    [Fact]
+    public async Task Trim_By_Max_Entries_Keeps_Newest()
+    {
+        for (var i = 0; i < 5; i++)
+            await _sut.AppendAsync(OperationLogLevel.Info, "s", $"m{i}");
+
+        await _sut.TrimAsync(maxEntries: 2, maxAgeDays: null, DateTimeOffset.UtcNow);
+
+        var kept = await _sut.QueryAsync(null, null, null, null, 100);
+        Assert.Equal(2, kept.Count);
+        Assert.Equal(["m4", "m3"], kept.Select(x => x.Message)); // 最新两条
+    }
+
+    [Fact]
+    public async Task Trim_By_Age_Deletes_Old()
+    {
+        _db.LogEntries.Add(new LogEntry { Timestamp = DateTimeOffset.UtcNow.AddDays(-40), Level = OperationLogLevel.Info, Source = "s", Message = "old" });
+        _db.LogEntries.Add(new LogEntry { Timestamp = DateTimeOffset.UtcNow, Level = OperationLogLevel.Info, Source = "s", Message = "new" });
+        await _db.SaveChangesAsync();
+
+        await _sut.TrimAsync(maxEntries: null, maxAgeDays: 30, DateTimeOffset.UtcNow);
+
+        var kept = await _sut.QueryAsync(null, null, null, null, 100);
+        Assert.Equal("new", Assert.Single(kept).Message);
+    }
+
+    [Fact]
+    public async Task Trim_With_No_Limits_Does_Nothing()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "m");
+        await _sut.TrimAsync(null, null, DateTimeOffset.UtcNow);
+        Assert.Single(await _sut.QueryAsync(null, null, null, null, 100));
+    }
 }
