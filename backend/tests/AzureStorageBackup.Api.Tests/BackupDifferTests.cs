@@ -126,7 +126,7 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     [Fact]
-    public async Task Length_Change_Is_Modified_Without_Head_Precheck()
+    public async Task Length_Change_Is_Modified_And_Records_Both_Hashes()
     {
         var path = Write("a.txt", "hello");
         var previous = await SnapshotAsync();
@@ -136,9 +136,13 @@ public sealed class BackupDifferTests : IDisposable
         var counter = new CountingHasher(new FileHasher());
         var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
 
-        Assert.Equal(ChangeKind.Modified, Change(diff, "a.txt").Kind);
-        Assert.Equal(0, counter.HeadCalls);   // 长度已不同，无需 head 预筛
-        Assert.Equal(1, counter.FullCalls);    // 仍需 fullHash 作去重键
+        var c = Change(diff, "a.txt");
+        Assert.Equal(ChangeKind.Modified, c.Kind);
+        // 索引条目须含完整哈希：headHash + fullHash 都记录
+        Assert.NotNull(c.HeadHash);
+        Assert.NotNull(c.FullHash);
+        Assert.Equal(1, counter.HeadCalls);
+        Assert.Equal(1, counter.FullCalls);
     }
 
     [Fact]

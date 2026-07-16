@@ -52,7 +52,9 @@ public sealed class BackupCheckerTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator()));
-        return (backup, new BackupChecker(factory, store), factory);
+        var checker = new BackupChecker(
+            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+        return (backup, checker, factory);
     }
 
     private BackupRequest Req(Account a, string c) => new()
@@ -111,6 +113,59 @@ public sealed class BackupCheckerTests : IDisposable
 
             Assert.False(result.Ok);
             Assert.Contains("packs/p0001.7z", result.MissingRefs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Deep_Check_Passes_On_Intact_Backup()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            var result = await checker.CheckAsync(account, name, null, null, deep: true);
+
+            Assert.True(result.Ok);
+            Assert.Empty(result.CorruptedPaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Deep_Check_Reports_Corrupted_Content()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            // 用垃圾覆盖 pack blob（存在但解不开）→ 深度校验报损坏
+            await container.GetBlobClient("packs/p0001.7z").UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
+
+            var result = await checker.CheckAsync(account, name, null, null, deep: true);
+
+            Assert.False(result.Ok);
+            Assert.Contains("a.txt", result.CorruptedPaths);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

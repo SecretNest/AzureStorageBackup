@@ -73,7 +73,14 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>()));
 builder.Services.AddSingleton<RestoreRunner>();
-builder.Services.AddScoped<BackupChecker>();
+builder.Services.AddScoped(sp => new BackupChecker(
+    sp.GetRequiredService<IBlobClientFactory>(),
+    sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IFileCompressor>(),
+    sp.GetRequiredService<IFileHasher>(),
+    Path.Combine(tempPath, "check"),
+    sp.GetRequiredService<INotifier>(),
+    sp.GetRequiredService<IOperationLog>()));
 
 // 操作日志（M8）
 builder.Services.AddScoped<IOperationLog, OperationLogService>();

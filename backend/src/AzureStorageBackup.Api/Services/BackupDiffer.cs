@@ -145,8 +145,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
+        // 记录完整的 headHash + fullHash（索引条目须含原文件哈希/尺寸/权限，供后续 diff 与还原比对）。
+        var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
         var fullHash = await hasher.FullHashAsync(full, ct);
-        return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, fullHash, null);
+        return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
     }
 
     private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>

@@ -63,7 +63,7 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
 
             case ScheduledTaskType.Check:
                 var result = await sp.GetRequiredService<BackupChecker>()
-                    .CheckAsync(account, container, password, null, ct);
+                    .CheckAsync(account, container, password, null, deep: false, ct);
                 if (!result.Ok)
                     logger.LogWarning("Check for {Account}/{Container} found {Missing} missing object(s)",
                         accountId, container, result.MissingRefs.Count);
