@@ -11,6 +11,7 @@ import {
   type BackupConfigInput,
   type BackupRun,
   type RestoreRun,
+  type CheckResult,
 } from '../api/backupConfigs'
 
 const MB = 1024 * 1024
@@ -42,6 +43,7 @@ export function BackupConfigsPage() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
+  const [checks, setChecks] = useState<Record<number, CheckResult | 'checking'>>({})
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
@@ -151,6 +153,21 @@ export function BackupConfigsPage() {
     }
   }
 
+  const check = async (c: BackupConfig) => {
+    setError(null)
+    setChecks((s) => ({ ...s, [c.id]: 'checking' }))
+    try {
+      const result = await backupConfigsApi.check(c.id)
+      setChecks((s) => ({ ...s, [c.id]: result }))
+    } catch (e) {
+      setChecks((s) => {
+        const { [c.id]: _removed, ...rest } = s
+        return rest
+      })
+      setError(String(e))
+    }
+  }
+
   const accountName = (id: number) => accounts.find((a) => a.id === id)?.name ?? `#${id}`
 
   return (
@@ -205,6 +222,13 @@ export function BackupConfigsPage() {
                   >
                     {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore'}
                   </button>{' '}
+                  <button
+                    type="button"
+                    onClick={() => check(c)}
+                    disabled={checks[c.id] === 'checking'}
+                  >
+                    {checks[c.id] === 'checking' ? 'Checking…' : 'Check'}
+                  </button>{' '}
                   <button type="button" onClick={() => startEdit(c)}>
                     Edit
                   </button>{' '}
@@ -213,6 +237,9 @@ export function BackupConfigsPage() {
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
                   {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
+                  {checks[c.id] && checks[c.id] !== 'checking' && (
+                    <CheckStatus result={checks[c.id] as CheckResult} />
+                  )}
                 </td>
               </tr>
             ))
@@ -384,6 +411,18 @@ function RunStatus({ run }: { run: BackupRun }) {
   return (
     <div style={{ fontSize: '0.8rem', color: '#555' }}>
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
+    </div>
+  )
+}
+
+function CheckStatus({ result }: { result: CheckResult }) {
+  return result.ok ? (
+    <div style={{ color: 'green', fontSize: '0.8rem' }}>
+      Check OK — {result.checkedRefs} object(s), version {result.version}
+    </div>
+  ) : (
+    <div style={{ color: 'crimson', fontSize: '0.8rem' }}>
+      Check failed — {result.missingRefs.length} missing: {result.missingRefs.join(', ')}
     </div>
   )
 }

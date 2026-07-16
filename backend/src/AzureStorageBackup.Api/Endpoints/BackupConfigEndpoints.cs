@@ -90,6 +90,21 @@ public static class BackupConfigEndpoints
             return state is null ? Results.NotFound() : Results.Ok(RestoreRunResponse.From(state));
         });
 
+        // 完整性检查（校验索引引用的 blob 是否都存在）
+        group.MapPost("/{id:int}/check", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var result = await checker.CheckAsync(account, config.ContainerName, password, version, ct);
+            return Results.Ok(result);
+        });
+
         return app;
     }
 }

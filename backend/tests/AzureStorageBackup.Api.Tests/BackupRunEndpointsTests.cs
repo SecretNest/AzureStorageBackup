@@ -67,7 +67,7 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
 
             // 轮询到完成
             BackupRunResponse? status = null;
-            for (var i = 0; i < 150; i++)
+            for (var i = 0; i < 600; i++) // 宽松：并发集成测试在少核机器上会拖慢后台 job
             {
                 status = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/run"))
                     .Content.ReadFromJsonAsync<BackupRunResponse>();

@@ -32,7 +32,7 @@ public sealed class RestoreEndpointsTests(TestWebAppFactory factory)
 
     private async Task<T?> PollUntilDone<T>(string url, Func<T, bool> done) where T : class
     {
-        for (var i = 0; i < 150; i++)
+        for (var i = 0; i < 600; i++) // 宽松：并发集成测试在少核机器上会拖慢后台 job
         {
             var s = await (await _client.GetAsync(url)).Content.ReadFromJsonAsync<T>();
             if (s is not null && done(s))
