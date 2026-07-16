@@ -57,8 +57,9 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
         switch (type)
         {
             case ScheduledTaskType.Backup:
+                var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
                 await sp.GetRequiredService<BackupOrchestrator>()
-                    .RunAsync(BackupRequestMapper.From(config, account), null, ct);
+                    .RunAsync(BackupRequestMapper.From(config, account, settings), null, ct);
                 break;
 
             case ScheduledTaskType.Check:

@@ -27,4 +27,9 @@ public class GlobalSettings
     public int UploadConcurrency { get; set; } = 5;
     public int LogMaxEntries { get; set; } = 10_000;
     public int LogMaxAgeDays { get; set; } = 180;
+
+    // 网络重试退避（PRD 4.1）：逗号分隔的秒序列 + 总时长上限（分钟）。
+    // 默认 5s、30s、90s、300s，之后每 300s（= 序列最后一项），累计上限 2h。
+    public string RetryBackoffSeconds { get; set; } = "5,30,90,300";
+    public int RetryMaxTotalMinutes { get; set; } = 120;
 }

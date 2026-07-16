@@ -41,6 +41,8 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.UploadConcurrency = s.UploadConcurrency;
         existing.LogMaxEntries = s.LogMaxEntries;
         existing.LogMaxAgeDays = s.LogMaxAgeDays;
+        existing.RetryBackoffSeconds = s.RetryBackoffSeconds;
+        existing.RetryMaxTotalMinutes = s.RetryMaxTotalMinutes;
         await db.SaveChangesAsync(ct);
         return existing;
     }

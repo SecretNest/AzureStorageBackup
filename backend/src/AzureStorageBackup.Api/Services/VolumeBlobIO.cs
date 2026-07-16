@@ -13,15 +13,15 @@ public static class VolumeBlobIO
     /// <summary>上传压缩产出的卷文件。单卷→baseRef；多卷→baseRef.001、baseRef.002...</summary>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
-        IReadOnlyList<string> volumeFiles, AccessTier tier, CancellationToken ct)
+        IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default)
     {
         if (volumeFiles.Count == 1)
         {
-            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, ct: ct);
+            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct);
             return;
         }
         for (var i = 0; i < volumeFiles.Count; i++)
-            await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, ct: ct);
+            await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct);
     }
 
     /// <summary>归档是否存在（单卷或多卷首卷）。</summary>

@@ -16,6 +16,8 @@ export interface GlobalSettings {
   uploadConcurrency: number
   logMaxEntries: number
   logMaxAgeDays: number
+  retryBackoffSeconds: string
+  retryMaxTotalMinutes: number
 }
 
 export const settingsApi = {

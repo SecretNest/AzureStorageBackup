@@ -59,15 +59,17 @@ public sealed class BackupRunner(IServiceScopeFactory scopes)
             var sp = scope.ServiceProvider;
             var configs = sp.GetRequiredService<IBackupConfigService>();
             var accounts = sp.GetRequiredService<IAccountService>();
+            var settingsSvc = sp.GetRequiredService<IGlobalSettingsService>();
             var orchestrator = sp.GetRequiredService<BackupOrchestrator>();
 
             var config = await configs.GetAsync(configId)
                 ?? throw new InvalidOperationException($"Backup config {configId} not found.");
             var account = await accounts.GetAsync(config.AccountId)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
+            var settings = await settingsSvc.GetAsync();
 
             var result = await orchestrator.RunAsync(
-                BackupRequestMapper.From(config, account), new StateProgress(state), CancellationToken.None);
+                BackupRequestMapper.From(config, account, settings), new StateProgress(state), CancellationToken.None);
 
             state.Version = result.Version;
             state.Status = RunStatus.Completed;

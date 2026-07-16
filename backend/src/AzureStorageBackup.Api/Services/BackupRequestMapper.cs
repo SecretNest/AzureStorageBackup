@@ -6,7 +6,7 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>把持久化的 BackupConfig 映射为引擎的 BackupRequest（BackupRunner 与调度器共用）。</summary>
 public static class BackupRequestMapper
 {
-    public static BackupRequest From(BackupConfig config, Account account) => new()
+    public static BackupRequest From(BackupConfig config, Account account, GlobalSettings? settings = null) => new()
     {
         Account = account,
         Container = config.ContainerName,
@@ -29,8 +29,36 @@ public static class BackupRequestMapper
             },
             VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
             Retention = RetentionOf(config),
+            UploadConcurrency = settings is { UploadConcurrency: > 0 } ? settings.UploadConcurrency : 5,
+            Upload = RetryOf(settings),
         },
     };
+
+    /// <summary>把全局设置的网络重试退避（PRD 4.1）映射为上传路径的 RetryOptions。</summary>
+    public static RetryOptions RetryOf(GlobalSettings? settings)
+    {
+        if (settings is null)
+            return new RetryOptions();
+
+        var sequence = ParseSeconds(settings.RetryBackoffSeconds);
+        if (sequence.Count == 0)
+            return new RetryOptions();
+
+        return new RetryOptions
+        {
+            Backoff = sequence,
+            SteadyInterval = sequence[^1],
+            MaxTotalDelay = TimeSpan.FromMinutes(Math.Max(1, settings.RetryMaxTotalMinutes)),
+        };
+    }
+
+    private static IReadOnlyList<TimeSpan> ParseSeconds(string? text) =>
+        (text ?? "")
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => double.TryParse(s, out var v) && v > 0 ? v : -1)
+            .Where(v => v > 0)
+            .Select(TimeSpan.FromSeconds)
+            .ToList();
 
     public static RetentionPolicy RetentionOf(BackupConfig config) => new()
     {

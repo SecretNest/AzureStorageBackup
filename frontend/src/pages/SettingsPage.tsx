@@ -87,6 +87,13 @@ export function SettingsPage() {
       <Field label="Log max age (days)">
         <Num value={s.logMaxAgeDays} onChange={(v) => set('logMaxAgeDays', v)} />
       </Field>
+      <Field label="Retry backoff (seconds)">
+        <input style={{ width: 300, fontFamily: 'monospace' }} value={s.retryBackoffSeconds}
+          onChange={(e) => set('retryBackoffSeconds', e.target.value)} placeholder="5,30,90,300" />
+      </Field>
+      <Field label="Retry max total (min)">
+        <Num value={s.retryMaxTotalMinutes} onChange={(v) => set('retryMaxTotalMinutes', v)} />
+      </Field>
 
       <div style={{ marginTop: '1rem' }}>
         <button type="button" onClick={save}>Save</button>

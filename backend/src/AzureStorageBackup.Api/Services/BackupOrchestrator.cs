@@ -16,6 +16,12 @@ public sealed record BackupEngineOptions
 
     /// <summary>分卷大小（字节）；null=不分卷（单归档）。大文件/大 pack 拆成多卷 blob（§7）。</summary>
     public long? VolumeBytes { get; init; }
+
+    /// <summary>并发上传上限（PRD 3.4，默认 5）。压缩仍全局串行；仅上传并行。</summary>
+    public int UploadConcurrency { get; init; } = 5;
+
+    /// <summary>上传的网络重试退避策略（PRD 4.1）。</summary>
+    public RetryOptions Upload { get; init; } = new();
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -209,7 +215,8 @@ public sealed class BackupOrchestrator(
                     try
                     {
                         await VolumeBlobIO.UploadAsync(
-                            uploader, request.Account, request.Container, blob.Ref, staged.Files, request.DataTier, token);
+                            uploader, request.Account, request.Container, blob.Ref, staged.Files,
+                            request.DataTier, request.Options.Upload, token);
                     }
                     finally
                     {
@@ -251,7 +258,8 @@ public sealed class BackupOrchestrator(
             try
             {
                 await VolumeBlobIO.UploadAsync(
-                    uploader, request.Account, request.Container, packBlob, staged.Files, request.DataTier, ct);
+                    uploader, request.Account, request.Container, packBlob, staged.Files,
+                    request.DataTier, request.Options.Upload, ct);
             }
             finally
             {
