@@ -177,11 +177,11 @@ export function BackupConfigsPage() {
     }
   }
 
-  const check = async (c: BackupConfig) => {
+  const check = async (c: BackupConfig, deep = false) => {
     setError(null)
     setChecks((s) => ({ ...s, [c.id]: 'checking' }))
     try {
-      const result = await backupConfigsApi.check(c.id)
+      const result = await backupConfigsApi.check(c.id, deep)
       setChecks((s) => ({ ...s, [c.id]: result }))
     } catch (e) {
       setChecks((s) => {
@@ -307,6 +307,14 @@ export function BackupConfigsPage() {
                     disabled={checks[c.id] === 'checking'}
                   >
                     {checks[c.id] === 'checking' ? 'Checking…' : 'Check'}
+                  </button>{' '}
+                  <button
+                    type="button"
+                    onClick={() => check(c, true)}
+                    disabled={checks[c.id] === 'checking'}
+                    title="Download, decompress and re-hash every object to detect corruption"
+                  >
+                    Deep check
                   </button>{' '}
                   <button type="button" onClick={() => startEdit(c)}>
                     Edit
@@ -504,13 +512,20 @@ function RunStatus({ run }: { run: BackupRun }) {
 }
 
 function CheckStatus({ result }: { result: CheckResult }) {
-  return result.ok ? (
-    <div style={{ color: 'green', fontSize: '0.8rem' }}>
-      Check OK — {result.checkedRefs} object(s), version {result.version}
-    </div>
-  ) : (
+  if (result.ok)
+    return (
+      <div style={{ color: 'green', fontSize: '0.8rem' }}>
+        Check OK — {result.checkedRefs} object(s), version {result.version}
+      </div>
+    )
+
+  const problems = [
+    result.missingRefs.length > 0 && `${result.missingRefs.length} missing: ${result.missingRefs.join(', ')}`,
+    result.corruptedPaths.length > 0 && `${result.corruptedPaths.length} corrupted: ${result.corruptedPaths.join(', ')}`,
+  ].filter(Boolean)
+  return (
     <div style={{ color: 'crimson', fontSize: '0.8rem' }}>
-      Check failed — {result.missingRefs.length} missing: {result.missingRefs.join(', ')}
+      Check failed — {problems.join('; ')}
     </div>
   )
 }

@@ -106,6 +106,7 @@ export interface CheckResult {
   version: number
   checkedRefs: number
   missingRefs: string[]
+  corruptedPaths: string[]
   ok: boolean
 }
 
@@ -123,5 +124,6 @@ export const backupConfigsApi = {
   restore: (id: number, targetRoot: string | null, version: number | null) =>
     api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version }),
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
-  check: (id: number) => api.post<CheckResult>(`/backup-configs/${id}/check`, {}),
+  check: (id: number, deep = false) =>
+    api.post<CheckResult>(`/backup-configs/${id}/check${deep ? '?deep=true' : ''}`, {}),
 }
