@@ -69,7 +69,8 @@ public sealed class BackupOrchestratorTests : IDisposable
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), stagedLimitBytes: 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging);
+            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+            new RetentionEvaluator());
         return (orchestrator, store, factory);
     }
 
@@ -137,6 +138,49 @@ public sealed class BackupOrchestratorTests : IDisposable
             var idx3 = await store.ReadIndexAsync(account, name, info3.Versions[^1].IndexBlob, null);
             Assert.Equal(3, idx3.Entries.Count);
             await AssertReferencedBlobsExist(container, idx3);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task Retention_Deletes_Old_Versions_And_Their_Exclusive_Data()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchr-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        BackupRequest Req() => Request(account, name) with
+        {
+            Options = new BackupEngineOptions
+            {
+                Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 2 },
+            },
+        };
+
+        try
+        {
+            WriteText("f.txt", "v1"); await orchestrator.RunAsync(Req());
+            var info1 = await store.ReadInfoAsync(account, name, null);
+            var v1IndexBlob = info1!.Versions[0].IndexBlob;
+
+            WriteText("f.txt", "v2"); await orchestrator.RunAsync(Req());
+            WriteText("f.txt", "v3"); await orchestrator.RunAsync(Req());
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            Assert.Equal([2, 3], info!.Versions.Select(v => v.Version)); // v1 retired
+            Assert.DoesNotContain("p0001", info.Packs.Keys);              // v1's exclusive pack removed from info
+            Assert.False(await container.GetBlobClient(v1IndexBlob).ExistsAsync()); // v1 index blob deleted
+            Assert.False(await container.GetBlobClient("packs/p0001.7z").ExistsAsync()); // v1 pack blob deleted
+            Assert.True(await container.GetBlobClient("packs/p0002.7z").ExistsAsync());  // still referenced
         }
         finally
         {

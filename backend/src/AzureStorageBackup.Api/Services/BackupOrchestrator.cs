@@ -45,7 +45,8 @@ public sealed class BackupOrchestrator(
     IBlobUploader uploader,
     IBlobClientFactory factory,
     IBackupInfoStore store,
-    StagingArea staging)
+    StagingArea staging,
+    RetentionEvaluator retention)
 {
     public async Task<BackupRunResult> RunAsync(BackupRequest request, CancellationToken ct = default)
     {
@@ -105,7 +106,65 @@ public sealed class BackupOrchestrator(
         });
         await store.WriteInfoAsync(request.Account, request.Container, info, password, ct);
 
+        // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
+        await CleanupAsync(request, info, index, ct);
+
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes);
+    }
+
+    private async Task CleanupAsync(
+        BackupRequest request, BackupInfoFile info, VersionIndex currentIndex, CancellationToken ct)
+    {
+        var toDelete = retention.VersionsToDelete(
+            info.Versions.Select(v => new VersionRef(v.Version, v.CreatedAt)).ToList(),
+            request.Options.Retention,
+            DateTimeOffset.UtcNow);
+        if (toDelete.Count == 0)
+            return;
+
+        var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+        var deleted = new HashSet<int>(toDelete);
+
+        // 删除退役版本的第二级索引，并从信息文件移除。
+        foreach (var v in info.Versions.Where(v => deleted.Contains(v.Version)))
+            await container.GetBlobClient(v.IndexBlob).DeleteIfExistsAsync(cancellationToken: ct);
+        info.Versions.RemoveAll(v => deleted.Contains(v.Version));
+
+        // 收集剩余版本仍引用的 data blob 与 pack。
+        var referencedBlobs = new HashSet<string>(StringComparer.Ordinal);
+        var referencedPacks = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var v in info.Versions)
+        {
+            var vi = v.Version == currentIndex.Version
+                ? currentIndex
+                : await store.ReadIndexAsync(request.Account, request.Container, v.IndexBlob, request.Password, ct);
+
+            foreach (var e in vi.Entries)
+            {
+                if (e.Storage is null)
+                    continue;
+                if (e.Storage.Kind == "pack")
+                    referencedPacks.Add(e.Storage.Ref);
+                else
+                    referencedBlobs.Add(e.Storage.Ref);
+            }
+        }
+
+        // 删除不再被引用的 pack。
+        foreach (var packId in info.Packs.Keys.Where(id => !referencedPacks.Contains(id)).ToList())
+        {
+            await container.GetBlobClient(info.Packs[packId].Blob).DeleteIfExistsAsync(cancellationToken: ct);
+            info.Packs.Remove(packId);
+        }
+
+        // 删除不再被引用的 data blob（枚举 data/ 前缀）。
+        await foreach (var blob in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", ct))
+        {
+            if (!referencedBlobs.Contains(blob.Name))
+                await container.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct);
+        }
+
+        await store.WriteInfoAsync(request.Account, request.Container, info, request.Password, ct);
     }
 
     private async Task UploadBlobsAsync(
