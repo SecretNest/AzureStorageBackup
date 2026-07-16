@@ -1,0 +1,95 @@
+using System.Text.Json.Nodes;
+
+namespace AzureStorageBackup.Api.Models;
+
+// 信息记录文件（权威元数据 blob，PRD 1.5）与第二级版本索引的数据模型（M4 设计 §3）。
+
+/// <summary>信息记录文件（§3.1）：配置 + 版本列表 + 分组包元数据。跨设备恢复的唯一真相源。</summary>
+public sealed record BackupInfoFile
+{
+    public int SchemaVersion { get; init; } = 1;
+    public required BackupMeta Backup { get; init; }
+    public List<BackupVersion> Versions { get; init; } = [];
+    public Dictionary<string, PackInfo> Packs { get; init; } = [];
+}
+
+/// <summary>备份配置快照（创建后不可改，除名字/描述）。</summary>
+public sealed record BackupMeta
+{
+    public required string Name { get; init; }
+    public string? Description { get; init; }
+
+    /// <summary>源根路径提示，仅供参考；恢复时用户重新指定（§3.1）。</summary>
+    public string? SourceRootHint { get; init; }
+
+    public bool Encrypted { get; init; }
+    public DateTimeOffset CreatedAt { get; init; }
+
+    /// <summary>本备份生效的设置（默认值解析结果快照）。schema 待 M4 设置页定稿，暂用开放对象。</summary>
+    public JsonObject? Settings { get; init; }
+}
+
+/// <summary>一个不可变版本（§3.1 versions[]），引用其第二级索引。</summary>
+public sealed record BackupVersion
+{
+    public int Version { get; init; }
+    public DateTimeOffset CreatedAt { get; init; }
+    public required string IndexBlob { get; init; }
+    public required VersionStats Stats { get; init; }
+}
+
+/// <summary>版本统计（进度/展示用；删除不计入 changed）。</summary>
+public sealed record VersionStats(long Files, long Bytes, long ChangedFiles, long ChangedBytes);
+
+/// <summary>分组包元数据（§6 死重压实跟踪）。</summary>
+public sealed record PackInfo
+{
+    public required string Blob { get; init; }
+    public List<string> Members { get; init; } = [];
+    public long OriginalBytes { get; init; }
+    public long DeadBytes { get; init; }
+}
+
+/// <summary>第二级版本索引（§3.2）：该版本全部文件清单 + 空文件夹。</summary>
+public sealed record VersionIndex
+{
+    public int Version { get; init; }
+    public List<IndexEntry> Entries { get; init; } = [];
+
+    /// <summary>空文件夹（备份需包含，还原需创建）。</summary>
+    public List<string> EmptyDirs { get; init; } = [];
+}
+
+/// <summary>索引条目：一个文件/符号链接及其存储位置。</summary>
+public sealed record IndexEntry
+{
+    public required string Path { get; init; }
+
+    /// <summary>"file" | "symlink"。</summary>
+    public required string Kind { get; init; }
+
+    public long Length { get; init; }
+    public DateTimeOffset Mtime { get; init; }
+    public required string Permissions { get; init; }
+
+    public string? HeadHash { get; init; }
+    public string? FullHash { get; init; }
+
+    /// <summary>symlink 目标（仅 kind=symlink）。</summary>
+    public string? Target { get; init; }
+
+    public StorageRef? Storage { get; init; }
+}
+
+/// <summary>条目存储位置：单文件 blob 或分组 pack 内成员。</summary>
+public sealed record StorageRef
+{
+    /// <summary>"blob" | "pack"。</summary>
+    public required string Kind { get; init; }
+
+    /// <summary>blob: data/{fullHash}；pack: packId。</summary>
+    public required string Ref { get; init; }
+
+    /// <summary>pack 内条目名（仅 kind=pack）。</summary>
+    public string? EntryName { get; init; }
+}
