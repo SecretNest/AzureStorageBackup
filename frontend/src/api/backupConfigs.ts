@@ -92,6 +92,14 @@ export interface BackupRun {
   error: string | null
 }
 
+export interface RestoreRun {
+  status: 'Running' | 'Completed' | 'Failed'
+  version: number | null
+  restoredFiles: number | null
+  skippedFiles: number | null
+  error: string | null
+}
+
 export const backupConfigsApi = {
   list: () => api.get<BackupConfig[]>('/backup-configs'),
   get: (id: number) => api.get<BackupConfig>(`/backup-configs/${id}`),
@@ -101,4 +109,7 @@ export const backupConfigsApi = {
   remove: (id: number) => api.del(`/backup-configs/${id}`),
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
+  restore: (id: number, targetRoot: string | null, version: number | null) =>
+    api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version }),
+  restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
 }

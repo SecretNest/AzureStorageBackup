@@ -10,6 +10,7 @@ import {
   type BackupConfig,
   type BackupConfigInput,
   type BackupRun,
+  type RestoreRun,
 } from '../api/backupConfigs'
 
 const MB = 1024 * 1024
@@ -40,6 +41,7 @@ export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
+  const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
@@ -132,6 +134,23 @@ export function BackupConfigsPage() {
     }
   }
 
+  const restore = async (c: BackupConfig) => {
+    const target = window.prompt('Restore to which local path?', c.localRoot)
+    if (target === null) return
+    setError(null)
+    try {
+      let state = await backupConfigsApi.restore(c.id, target || null, null)
+      setRestores((r) => ({ ...r, [c.id]: state }))
+      while (state.status === 'Running') {
+        await delay(1000)
+        state = await backupConfigsApi.restoreStatus(c.id)
+        setRestores((r) => ({ ...r, [c.id]: state }))
+      }
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const accountName = (id: number) => accounts.find((a) => a.id === id)?.name ?? `#${id}`
 
   return (
@@ -179,6 +198,13 @@ export function BackupConfigsPage() {
                   >
                     {runs[c.id]?.status === 'Running' ? 'Running…' : 'Run'}
                   </button>{' '}
+                  <button
+                    type="button"
+                    onClick={() => restore(c)}
+                    disabled={restores[c.id]?.status === 'Running'}
+                  >
+                    {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore'}
+                  </button>{' '}
                   <button type="button" onClick={() => startEdit(c)}>
                     Edit
                   </button>{' '}
@@ -186,6 +212,7 @@ export function BackupConfigsPage() {
                     Delete
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
+                  {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
                 </td>
               </tr>
             ))
@@ -359,6 +386,18 @@ function RunStatus({ run }: { run: BackupRun }) {
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
     </div>
   )
+}
+
+function RestoreStatus({ run }: { run: RestoreRun }) {
+  if (run.status === 'Failed')
+    return <div style={{ color: 'crimson', fontSize: '0.8rem' }}>Restore failed: {run.error}</div>
+  if (run.status === 'Completed')
+    return (
+      <div style={{ color: 'green', fontSize: '0.8rem' }}>
+        Restored {run.restoredFiles} file(s), skipped {run.skippedFiles} — version {run.version}
+      </div>
+    )
+  return <div style={{ fontSize: '0.8rem', color: '#555' }}>Restoring…</div>
 }
 
 function TierSelect({

@@ -32,6 +32,9 @@ public record BackupConfigResponse(
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.CreatedAt);
 }
 
+/// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。</summary>
+public record RestoreRequestBody(string? TargetRoot, int? Version);
+
 /// <summary>创建/更新备份配置请求体。更新时 Password 为空表示保留原值。</summary>
 public record BackupConfigRequest(
     int AccountId,

@@ -159,8 +159,8 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 ## 13. 决策（已定，2026-07-16）
 
 1. **7z 实现**：用**官方 7-Zip**——backend Dockerfile 装 Debian `7zip` 包（提供 `7zz`）。命令：`7zz a -p{pwd} -mhe=on -v{size} out.7z ...`（AES-256 + 头加密 + 分卷），解包 `7zz x out.7z.001`。若 apt 版本过旧则改用官网二进制。
-2. **hash 算法**：SHA-256（fullHash 与 headHash 均用）。
+2. **hash 算法**：**XxHash128**（fullHash 与 headHash 均用；`xxh128:` 前缀，16 字节）。原定 SHA-256，后改为非加密的 XxHash128——更快、更短（索引体积减半），128 位对个人备份规模的内容寻址去重碰撞概率可忽略。**不用 CRC**：CRC 碰撞率太高，作去重键会丢数据。
 3. **去重 / 变更检测**：整文件级去重（去重键 = fullHash）。变更检测用**两级 hash**——索引存 headHash（头部一小段，默认 4 KB，可配）+ fullHash；Diff 先比 headHash 快速预筛，相同再比 fullHash。分块（CDC）去重留后续优化。
-4. **索引序列化**：JSON + 7z 压缩（可读、够用；大索引后续可换紧凑格式）。
+4. **索引序列化**：**紧凑自定义二进制** + 7z 压缩。原定 JSON，后改为二进制以减小体积——hash 存 16 字节裸字节（而非 `xxh128:`+hex 文本）、枚举/时间/长度定宽编码。`IndexSerializer` 公开 API 不变（字节数组往返），备份/还原/blob 存储透明。
 5. **检查「本地文件存在」**：与 §4 Diff 一致（length → mtime/权限 → headHash → fullHash）。
 6. **前端进度**：先用轮询（`GET /api/backups/{id}/progress`），简单可靠；后续可升级 SSE。

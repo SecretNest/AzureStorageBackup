@@ -72,6 +72,24 @@ public static class BackupConfigEndpoints
             return state is null ? Results.NotFound() : Results.Ok(BackupRunResponse.From(state));
         });
 
+        // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
+        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+
+            var target = string.IsNullOrWhiteSpace(body.TargetRoot) ? config.LocalRoot : body.TargetRoot;
+            var state = runner.Start(id, target, body.Version);
+            return Results.Accepted($"/api/backup-configs/{id}/restore", RestoreRunResponse.From(state));
+        });
+
+        group.MapGet("/{id:int}/restore", (int id, RestoreRunner runner) =>
+        {
+            var state = runner.Get(id);
+            return state is null ? Results.NotFound() : Results.Ok(RestoreRunResponse.From(state));
+        });
+
         return app;
     }
 }

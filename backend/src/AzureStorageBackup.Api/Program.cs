@@ -63,6 +63,13 @@ builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddScoped<BackupOrchestrator>();
 builder.Services.AddSingleton<BackupRunner>();
+builder.Services.AddScoped(sp => new RestoreOrchestrator(
+    sp.GetRequiredService<IBlobClientFactory>(),
+    sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IFileCompressor>(),
+    sp.GetRequiredService<IFileHasher>(),
+    Path.Combine(tempPath, "restore")));
+builder.Services.AddSingleton<RestoreRunner>();
 
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
