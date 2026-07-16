@@ -22,25 +22,30 @@ public sealed record VerificationOptions
 /// <summary>
 /// 处理后重校验（M4 设计 §9）：处理完重查 mtime/权限 → 变则重算 hash → hash 变则重处理。
 /// 反复达阈值即报警、以当前版本保存、停重试。
+/// <para>
+/// <paramref name="process"/> 接收「本次应使用的 fullHash」：内容寻址的存储名由该 hash 决定，
+/// 因此内容在处理中变化时会用新 hash 重处理（重命名 blob），避免存储名与内容不符（§9、PRD 特别说明 D）。
+/// 报警前仍以最终内容的 hash 再处理一次，保证 blob 以正确名字落库、不留悬挂引用。
+/// </para>
 /// </summary>
 public sealed class ProcessingVerifier(IFileHasher hasher)
 {
     public async Task<ProcessingResult> RunAsync(
         string path,
         string expectedFullHash,
-        Func<CancellationToken, Task> process,
+        Func<string, CancellationToken, Task> process,
         VerificationOptions? options = null,
         CancellationToken ct = default)
     {
         options ??= new VerificationOptions();
         var expected = expectedFullHash;
+        var before = Stat(path);
         var attempts = 0;
 
         while (true)
         {
             attempts++;
-            var before = Stat(path);
-            await process(ct);
+            await process(expected, ct);
             var after = Stat(path);
 
             // mtime+权限+length 都没变 → 处理期间文件稳定。
@@ -52,10 +57,15 @@ public sealed class ProcessingVerifier(IFileHasher hasher)
             if (current == expected)
                 return new ProcessingResult(ProcessingOutcome.Stable, attempts, expected);
 
-            // 内容变了：以新内容为准重处理；达阈值则报警并停。
-            expected = current;
+            // 内容变了：达阈值则以最终内容的 hash 再处理一次后报警；否则以新内容为准重处理。
             if (attempts >= options.MaxAttempts)
-                return new ProcessingResult(ProcessingOutcome.Alarmed, attempts, expected);
+            {
+                await process(current, ct);
+                return new ProcessingResult(ProcessingOutcome.Alarmed, attempts, current);
+            }
+
+            before = after;
+            expected = current;
         }
     }
 

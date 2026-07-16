@@ -62,7 +62,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator()));
+            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
         return (backup, restore, store, factory);

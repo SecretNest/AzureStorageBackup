@@ -62,7 +62,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
-        IBlobUploader? uploader = null, ProcessingVerifier? verifier = null)
+        IBlobUploader? uploader = null, ProcessingVerifier? verifier = null, IFileCompressor? compressor = null)
     {
         var factory = new BlobClientFactory();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -70,9 +70,28 @@ public sealed class BackupOrchestratorTests : IDisposable
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), stagedLimitBytes: 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), verifier: verifier);
+            compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), verifier: verifier);
         return (orchestrator, store, factory);
+    }
+
+    /// <summary>压缩含目标文件后，篡改其源文件一次，模拟「文件在处理中变化」（§9、PRD 特别说明 D）。</summary>
+    private sealed class MutatingCompressor(IFileCompressor inner, string relPath, string newContent) : IFileCompressor
+    {
+        private int _fired;
+        public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var result = await inner.CompressAsync(request, ct);
+            if (request.Entries.Contains(relPath) && Interlocked.Exchange(ref _fired, 1) == 0)
+            {
+                var full = Path.Combine(request.SourceDirectory, relPath.Replace('/', Path.DirectorySeparatorChar));
+                File.WriteAllText(full, newContent);
+                File.SetLastWriteTimeUtc(full, File.GetLastWriteTimeUtc(full).AddSeconds(7));
+            }
+            return result;
+        }
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
     }
 
     /// <summary>记录同时在飞的上传数，验证上传并发。</summary>
@@ -295,6 +314,87 @@ public sealed class BackupOrchestratorTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             Assert.Equal(4, idx.Entries.Count);
+            await AssertReferencedBlobsExist(container, idx);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task Single_File_Changed_During_Processing_Is_Stored_Under_New_Hash()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var mutating = new MutatingCompressor(new SevenZipCompressor(), "a.txt", "changed-content!!");
+        var (orchestrator, store, factory) = Build(
+            verifier: new ProcessingVerifier(new FileHasher()), compressor: mutating);
+        var account = AzuriteAccount();
+        var name = RandomName("orchv-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "original");
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            };
+
+            await orchestrator.RunAsync(request);
+
+            var expected = await new FileHasher().FullHashAsync(Path.Combine(_root, "a.txt")); // 稳定后的新内容 hash
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var entry = Assert.Single(idx.Entries);
+
+            Assert.Equal(expected, entry.FullHash);                 // 索引 fullHash 用新内容
+            Assert.Equal("data/" + expected, entry.Storage!.Ref);   // blob 名用新 hash
+            Assert.Equal("changed-content!!".Length, entry.Length); // 元数据一并更新
+            Assert.True(await container.GetBlobClient("data/" + expected).ExistsAsync(),
+                "referenced blob must exist under the new hash");
+            await AssertReferencedBlobsExist(container, idx);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task Pack_Member_Changed_During_Compression_Is_Moved_To_Single_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var mutating = new MutatingCompressor(new SevenZipCompressor(), "d/y.txt", "yyyy-CHANGED");
+        var (orchestrator, store, factory) = Build(
+            verifier: new ProcessingVerifier(new FileHasher()), compressor: mutating);
+        var account = AzuriteAccount();
+        var name = RandomName("orchpk-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("d/x.txt", "xxxx"); // 同目录两小文件 → 合并成一个 pack
+            WriteText("d/y.txt", "yyyy");
+
+            await orchestrator.RunAsync(Request(account, name)); // 默认 5M 阈值 → 分组
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var x = idx.Entries.Single(e => e.Path == "d/x.txt");
+            var y = idx.Entries.Single(e => e.Path == "d/y.txt");
+
+            Assert.Equal("pack", x.Storage!.Kind);                  // 未变成员仍在 pack
+            Assert.Equal("blob", y.Storage!.Kind);                  // 变更成员移出分组 → 单文件
+            var expectedY = await new FileHasher().FullHashAsync(Path.Combine(_root, "d/y.txt"));
+            Assert.Equal(expectedY, y.FullHash);
+            Assert.Equal("data/" + expectedY, y.Storage.Ref);
             await AssertReferencedBlobsExist(container, idx);
         }
         finally

@@ -77,6 +77,7 @@ public sealed class BackupOrchestrator(
     IBackupInfoStore store,
     StagingArea staging,
     RetentionCleaner cleaner,
+    IFileHasher hasher,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     ProcessingVerifier? verifier = null)
@@ -146,6 +147,8 @@ public sealed class BackupOrchestrator(
         });
 
         var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
+        // 处理中内容变化的文件：以稳定后的新 hash/元数据覆盖 diff 时的索引条目（§9、PRD 特别说明 D）。
+        var overrides = new ConcurrentDictionary<string, EntryOverride>(StringComparer.Ordinal);
 
         // 5. Compress + Upload。压缩仍经单例 StagingArea 全局串行；仅上传按 UploadConcurrency 并行（PRD 3.4）。
         var total = plan.Blobs.Count + plan.Packs.Count;
@@ -161,11 +164,11 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
-        await UploadBlobsAsync(request, plan, storageByPath, uploadGate, ReportItem, ct);
-        await UploadPacksAsync(request, plan, info, storageByPath, uploadGate, ReportItem, ct);
+        await UploadBlobsAsync(request, plan, storageByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadPacksAsync(request, plan, info, storageByPath, overrides, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
-        var entries = BuildEntries(diff, storageByPath);
+        var entries = BuildEntries(diff, storageByPath, overrides);
         var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
         var index = new VersionIndex
         {
@@ -199,83 +202,180 @@ public sealed class BackupOrchestrator(
 
     private async Task UploadBlobsAsync(
         BackupRequest request, BackupPlan plan, ConcurrentDictionary<string, StorageRef> storageByPath,
-        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
         => await Task.WhenAll(plan.Blobs.Select(blob =>
-            HandleBlobAsync(request, blob, storageByPath, uploadGate, onItem, ct)));
+            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash),
+                storageByPath, overrides, uploadGate, onItem, ct)));
 
+    /// <summary>
+    /// 处理单文件内容寻址 blob：压缩+上传 data/{hash}，经重校验循环（§9）。
+    /// 内容在处理中变化时，用稳定后的新 hash 决定 blob 名并回写索引覆盖，避免存储名与内容不符（PRD 特别说明 D）。
+    /// </summary>
     private async Task HandleBlobAsync(
-        BackupRequest request, BlobEntry blob, ConcurrentDictionary<string, StorageRef> storageByPath,
-        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        BackupRequest request, PlannedFile file, ConcurrentDictionary<string, StorageRef> storageByPath,
+        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
     {
-        storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
-
+        var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
+        var storeOnly = request.Options.DontCompress?.IsIgnored(file.Path) ?? false;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 内容寻址去重：已存在（单卷或多卷）则跳过压缩+上传。
-        if (!await VolumeBlobIO.ExistsAsync(cc, blob.Ref, ct))
+        // 用当前 hash 决定 blob 名；内容寻址去重（已存在则跳过）。verifier 会在内容变化时用新 hash 重调。
+        async Task ProcessAsync(string hash, CancellationToken token)
         {
-            var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
-
-            async Task ProcessAsync(CancellationToken token)
+            var blobRef = "data/" + hash;
+            if (await VolumeBlobIO.ExistsAsync(cc, blobRef, token))
+                return;
+            var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
+                request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
+            await uploadGate.WaitAsync(token);
+            try
             {
-                // 压缩经 StagingArea 全局串行；上传按 uploadGate 并发。
-                var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
-                    request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, t), token);
-                await uploadGate.WaitAsync(token);
-                try
-                {
-                    await VolumeBlobIO.UploadAsync(
-                        uploader, request.Account, request.Container, blob.Ref, staged.Files,
-                        request.DataTier, request.Options.Upload, token);
-                }
-                finally
-                {
-                    uploadGate.Release();
-                    staging.Release(staged);
-                }
+                await VolumeBlobIO.UploadAsync(
+                    uploader, request.Account, request.Container, blobRef, staged.Files,
+                    request.DataTier, request.Options.Upload, token);
+            }
+            finally
+            {
+                uploadGate.Release();
+                staging.Release(staged);
+            }
+        }
+
+        var finalHash = file.FullHash;
+        if (verifier is not null)
+        {
+            var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, ct: ct);
+            finalHash = vr.FullHash;
+            if (vr.Outcome == ProcessingOutcome.Alarmed)
+                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                    $"File kept changing during backup: {file.Path}",
+                    $"Saved with current content after {vr.Attempts} attempts", ct);
+        }
+        else
+        {
+            await ProcessAsync(file.FullHash, ct);
+        }
+
+        storageByPath[file.Path] = new StorageRef { Kind = "blob", Ref = "data/" + finalHash };
+        // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
+        if (finalHash != file.FullHash)
+            overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
+
+        onItem();
+    }
+
+    private async Task<EntryOverride> BuildOverrideAsync(
+        string localPath, string fullHash, int headBytes, CancellationToken ct)
+    {
+        var info = new FileInfo(localPath);
+        var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
+        return new EntryOverride(fullHash, head, info.Length, new DateTimeOffset(info.LastWriteTimeUtc));
+    }
+
+    private async Task UploadPacksAsync(
+        BackupRequest request, BackupPlan plan, BackupInfoFile info,
+        ConcurrentDictionary<string, StorageRef> storageByPath,
+        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
+        => await Task.WhenAll(plan.Packs.Select(pack =>
+            HandlePackAsync(request, pack, info, storageByPath, overrides, uploadGate, onItem, ct)));
+
+    /// <summary>
+    /// 压缩+上传一个 pack；启用重校验时（§9）对组内成员在压缩后重校验：内容变化的成员移出分组，
+    /// 改走单文件内容寻址 blob（在那里做重命名/重校验），其余成员重新压缩。反复变化达阈值即报警、以当前归档保存。
+    /// </summary>
+    private async Task HandlePackAsync(
+        BackupRequest request, PlannedPack pack, BackupInfoFile info,
+        ConcurrentDictionary<string, StorageRef> storageByPath,
+        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
+        Action onItem, CancellationToken ct)
+    {
+        var members = pack.Members.ToList();
+
+        if (verifier is null)
+        {
+            var staged = await CompressPackAsync(request, pack.PackId, members, ct);
+            await UploadStagedPackAsync(request, pack.PackId, staged, uploadGate, ct);
+            RecordPack(request, pack.PackId, members, info, storageByPath);
+            onItem();
+            return;
+        }
+
+        const int maxAttempts = 5; // 与 VerificationOptions 默认一致
+        for (var attempt = 1; ; attempt++)
+        {
+            if (members.Count == 0)
+                break; // 全部成员移出分组，无 pack 可传
+
+            var before = members.ToDictionary(m => m.Path, m => Stat(Local(request, m.Path)));
+            var staged = await CompressPackAsync(request, pack.PackId, members, ct);
+
+            // 压缩后重校验组内成员：元数据变且内容 hash 变 → 该成员在压缩期间变化。
+            var changed = new List<PackEntry>();
+            foreach (var m in members)
+            {
+                var local = Local(request, m.Path);
+                if (Stat(local) != before[m.Path] && await hasher.FullHashAsync(local, ct) != m.FullHash)
+                    changed.Add(m);
             }
 
-            // 处理后重校验（§9）：文件在处理期间反复变化达阈值 → 报 UnrecoverableError，以当前版本保存。
-            if (verifier is not null)
+            if (changed.Count == 0)
             {
-                var localPath = Path.Combine(request.LocalRoot, blob.Path.Replace('/', Path.DirectorySeparatorChar));
-                var vr = await verifier.RunAsync(localPath, blob.FullHash, ProcessAsync, ct: ct);
-                if (vr.Outcome == ProcessingOutcome.Alarmed)
-                    await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
-                        $"File kept changing during backup: {blob.Path}",
-                        $"Saved with current content after {vr.Attempts} attempts", ct);
+                await UploadStagedPackAsync(request, pack.PackId, staged, uploadGate, ct);
+                RecordPack(request, pack.PackId, members, info, storageByPath);
+                break;
             }
-            else
+
+            // 有成员在压缩期间变化 → 丢弃本次归档，移出这些成员改走单文件（用稳定后的新 hash），其余重压。
+            staging.Release(staged);
+            members = members.Where(m => !changed.Contains(m)).ToList();
+            await Task.WhenAll(changed.Select(async m =>
             {
-                await ProcessAsync(ct);
+                var local = Local(request, m.Path);
+                var newHash = await hasher.FullHashAsync(local, ct);
+                // 该成员内容已变（≠ diff 时的 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
+                overrides[m.Path] = await BuildOverrideAsync(local, newHash, request.Options.Diff.HeadHashBytes, ct);
+                await HandleBlobAsync(request, new PlannedFile(m.Path, new FileInfo(local).Length, newHash),
+                    storageByPath, overrides, uploadGate, static () => { }, ct);
+            }));
+
+            if (attempt >= maxAttempts)
+            {
+                // 反复变化达阈值：把剩余成员做最后一次压缩上传并报警（不再重校验）。
+                if (members.Count > 0)
+                {
+                    var staged2 = await CompressPackAsync(request, pack.PackId, members, ct);
+                    await UploadStagedPackAsync(request, pack.PackId, staged2, uploadGate, ct);
+                    RecordPack(request, pack.PackId, members, info, storageByPath);
+                }
+                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                    $"Pack members kept changing during backup: {pack.PackId}",
+                    $"Stabilized after moving changing members out over {attempt} attempts", ct);
+                break;
             }
         }
 
         onItem();
     }
 
-    private async Task UploadPacksAsync(
-        BackupRequest request, BackupPlan plan, BackupInfoFile info,
-        ConcurrentDictionary<string, StorageRef> storageByPath, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
-        => await Task.WhenAll(plan.Packs.Select(pack =>
-            HandlePackAsync(request, pack, info, storageByPath, uploadGate, onItem, ct)));
-
-    private async Task HandlePackAsync(
-        BackupRequest request, PlannedPack pack, BackupInfoFile info,
-        ConcurrentDictionary<string, StorageRef> storageByPath, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
+    private Task<StagedItem> CompressPackAsync(
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, CancellationToken ct)
     {
-        var packBlob = $"packs/{pack.PackId}.7z";
-        var entries = pack.Members.Select(m => m.EntryName).ToList();
+        var entries = members.Select(m => m.EntryName).ToList();
+        return staging.StageAsync((compressTemp, token) => CompressAsync(
+            request, compressTemp, packId, entries, storeOnly: false, token), ct);
+    }
 
-        var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
-            request, compressTemp, pack.PackId, entries, storeOnly: false, token), ct);
+    private async Task UploadStagedPackAsync(
+        BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate, CancellationToken ct)
+    {
         await uploadGate.WaitAsync(ct);
         try
         {
             await VolumeBlobIO.UploadAsync(
-                uploader, request.Account, request.Container, packBlob, staged.Files,
+                uploader, request.Account, request.Container, $"packs/{packId}.7z", staged.Files,
                 request.DataTier, request.Options.Upload, ct);
         }
         finally
@@ -283,21 +383,34 @@ public sealed class BackupOrchestrator(
             uploadGate.Release();
             staging.Release(staged);
         }
+    }
 
-        onItem();
-
-        foreach (var member in pack.Members)
-            storageByPath[member.Path] = new StorageRef { Kind = "pack", Ref = pack.PackId, EntryName = member.EntryName };
+    private static void RecordPack(
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
+        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
+    {
+        foreach (var m in members)
+            storageByPath[m.Path] = new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName };
 
         var packInfo = new PackInfo
         {
-            Blob = packBlob,
-            Members = pack.Members.Select(m => m.FullHash).ToList(),
-            OriginalBytes = pack.OriginalBytes,
+            Blob = $"packs/{packId}.7z",
+            Members = members.Select(m => m.FullHash).ToList(),
+            OriginalBytes = members.Sum(m => m.Length),
             DeadBytes = 0,
         };
         lock (info.Packs)
-            info.Packs[pack.PackId] = packInfo;
+            info.Packs[packId] = packInfo;
+    }
+
+    private static string Local(BackupRequest request, string relPath) =>
+        Path.Combine(request.LocalRoot, relPath.Replace('/', Path.DirectorySeparatorChar));
+
+    private static (long Mtime, long Length, int Mode) Stat(string path)
+    {
+        var info = new FileInfo(path);
+        var mode = OperatingSystem.IsWindows() ? 0 : (int)File.GetUnixFileMode(path);
+        return (info.LastWriteTimeUtc.Ticks, info.Length, mode);
     }
 
     private async Task<IReadOnlyList<string>> CompressAsync(
@@ -311,7 +424,12 @@ public sealed class BackupOrchestrator(
         return result.VolumeFiles;
     }
 
-    private static List<IndexEntry> BuildEntries(DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath)
+    /// <summary>处理中内容变化的文件：稳定后的 hash/元数据覆盖 diff 时的索引条目（§9）。</summary>
+    private sealed record EntryOverride(string FullHash, string? HeadHash, long Length, DateTimeOffset Mtime);
+
+    private static List<IndexEntry> BuildEntries(
+        DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
+        IReadOnlyDictionary<string, EntryOverride> overrides)
     {
         var entries = new List<IndexEntry>();
         foreach (var c in diff.Changes)
@@ -319,15 +437,16 @@ public sealed class BackupOrchestrator(
             if (c.Kind == ChangeKind.Deleted || c.Current is null)
                 continue;
 
+            var ov = overrides.GetValueOrDefault(c.Path);
             entries.Add(new IndexEntry
             {
                 Path = c.Path,
                 Kind = c.Current.Kind == EntryKind.File ? "file" : "symlink",
-                Length = c.Current.Length,
-                Mtime = c.Current.ModifiedAt,
+                Length = ov?.Length ?? c.Current.Length,
+                Mtime = ov?.Mtime ?? c.Current.ModifiedAt,
                 Permissions = c.Current.Permissions,
-                HeadHash = c.HeadHash,
-                FullHash = c.FullHash,
+                HeadHash = ov?.HeadHash ?? c.HeadHash,
+                FullHash = ov?.FullHash ?? c.FullHash,
                 Target = c.Current.Target,
                 Storage = storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,
             });

@@ -36,7 +36,7 @@ public sealed class ProcessingVerifierTests : IDisposable
         var expected = await Hash(path);
         var processed = 0;
 
-        var result = await Verifier().RunAsync(path, expected, _ => { processed++; return Task.CompletedTask; });
+        var result = await Verifier().RunAsync(path, expected, (_, _) => { processed++; return Task.CompletedTask; });
 
         Assert.Equal(ProcessingOutcome.Stable, result.Outcome);
         Assert.Equal(1, result.Attempts);
@@ -51,7 +51,7 @@ public sealed class ProcessingVerifierTests : IDisposable
         var expected = await Hash(path);
 
         // 处理中仅 mtime 变，内容不变 → 重算 hash 相同 → 稳定，不重处理。
-        var result = await Verifier().RunAsync(path, expected, _ =>
+        var result = await Verifier().RunAsync(path, expected, (_, _) =>
         {
             File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(10));
             return Task.CompletedTask;
@@ -69,7 +69,7 @@ public sealed class ProcessingVerifierTests : IDisposable
         var expected = await Hash(path);
         var attempt = 0;
 
-        var result = await Verifier().RunAsync(path, expected, _ =>
+        var result = await Verifier().RunAsync(path, expected, (_, _) =>
         {
             if (attempt++ == 0) // 只在第一次处理时把文件改掉
             {
@@ -91,7 +91,7 @@ public sealed class ProcessingVerifierTests : IDisposable
         var expected = await Hash(path);
         var n = 0;
 
-        var result = await Verifier().RunAsync(path, expected, _ =>
+        var result = await Verifier().RunAsync(path, expected, (_, _) =>
         {
             n++;
             File.WriteAllText(path, "v" + n + Guid.NewGuid().ToString("N"));
@@ -101,5 +101,57 @@ public sealed class ProcessingVerifierTests : IDisposable
 
         Assert.Equal(ProcessingOutcome.Alarmed, result.Outcome);
         Assert.Equal(3, result.Attempts);
+    }
+
+    [Fact]
+    public async Task Process_Receives_Current_Hash_Which_Updates_After_Content_Change()
+    {
+        var path = Write("a.txt", "original");
+        var original = await Hash(path);
+        var attempt = 0;
+        var hashesSeen = new List<string>();
+
+        var result = await Verifier().RunAsync(path, original, (hash, _) =>
+        {
+            hashesSeen.Add(hash);
+            if (attempt++ == 0)
+            {
+                File.WriteAllText(path, "changed!!");
+                File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(5));
+            }
+            return Task.CompletedTask;
+        });
+
+        var changed = await Hash(path);
+        Assert.Equal(ProcessingOutcome.Stable, result.Outcome);
+        Assert.Equal(original, hashesSeen[0]);           // 首次用 diff 时的 hash
+        Assert.Equal(changed, hashesSeen[1]);            // 内容变后用新 hash 重处理（决定 blob 名）
+        Assert.Equal(changed, result.FullHash);
+    }
+
+    [Fact]
+    public async Task Alarm_Processes_Final_Content_Under_Its_Own_Hash()
+    {
+        var path = Write("a.txt", "v0");
+        var original = await Hash(path);
+        var n = 0;
+        var hashesSeen = new List<string>();
+
+        var result = await Verifier().RunAsync(path, original, (hash, _) =>
+        {
+            hashesSeen.Add(hash);
+            n++;
+            if (n <= 3) // 前三次处理都改内容；第四次（收尾落库）保持不变
+            {
+                File.WriteAllText(path, "v" + n);
+                File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(n));
+            }
+            return Task.CompletedTask;
+        }, new VerificationOptions { MaxAttempts = 3 });
+
+        Assert.Equal(ProcessingOutcome.Alarmed, result.Outcome);
+        // 报警后仍以最终内容的 hash 再处理一次，保证 blob 以正确名字落库、无悬挂引用。
+        Assert.Equal(result.FullHash, hashesSeen[^1]);
+        Assert.Equal(await Hash(path), result.FullHash);
     }
 }
