@@ -32,6 +32,26 @@ public sealed record BackupRequest
 /// <summary>一次备份执行结果。</summary>
 public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes);
 
+/// <summary>备份管线阶段。</summary>
+public enum BackupStage
+{
+    Scanning,
+    Diffing,
+    Uploading,
+    WritingIndex,
+    Finalizing,
+    CleaningUp,
+    Completed,
+}
+
+/// <summary>进度快照（PRD 备份设计 §2：百分比 + 变更文件数/尺寸）。前端轮询用。</summary>
+public sealed record BackupProgress(
+    BackupStage Stage, int ChangedFiles, long ChangedBytes, int UploadedItems, int TotalItems)
+{
+    public int Percent => TotalItems == 0 ? (Stage == BackupStage.Completed ? 100 : 0)
+        : (int)(100L * UploadedItems / TotalItems);
+}
+
 /// <summary>
 /// 备份编排器（M4 设计 §4）：串 Scan→Diff→Plan→Compress→Upload→WriteIndex→Finalize，产出一个新版本。
 /// data blob 与 pack 一律 7z 归档；data blob 按 fullHash 内容寻址去重。
@@ -48,12 +68,14 @@ public sealed class BackupOrchestrator(
     StagingArea staging,
     RetentionEvaluator retention)
 {
-    public async Task<BackupRunResult> RunAsync(BackupRequest request, CancellationToken ct = default)
+    public async Task<BackupRunResult> RunAsync(
+        BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
     {
         var opts = request.Options;
         var password = request.Password;
 
         // 1. Scan
+        progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);
 
         // 2. 载入上一版本
@@ -64,6 +86,7 @@ public sealed class BackupOrchestrator(
             : null;
 
         // 3. Diff
+        progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
         var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
 
         // 4. Plan（对 Added/Modified 决定 blob/pack）
@@ -80,8 +103,18 @@ public sealed class BackupOrchestrator(
         var storageByPath = new Dictionary<string, StorageRef>(StringComparer.Ordinal);
 
         // 5. Compress + Upload
-        await UploadBlobsAsync(request, plan, storageByPath, ct);
-        await UploadPacksAsync(request, plan, info, storageByPath, ct);
+        var total = plan.Blobs.Count + plan.Packs.Count;
+        var uploaded = 0;
+        void ReportItem()
+        {
+            uploaded++;
+            progress?.Report(new BackupProgress(
+                BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+        }
+        progress?.Report(new BackupProgress(BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, 0, total));
+
+        await UploadBlobsAsync(request, plan, storageByPath, ReportItem, ct);
+        await UploadPacksAsync(request, plan, info, storageByPath, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath);
@@ -94,9 +127,11 @@ public sealed class BackupOrchestrator(
         };
 
         // 7. WriteIndex（先上传第二级索引）
+        progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, ct);
 
         // 8/9. Finalize（原子更新信息文件）
+        progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         info.Versions.Add(new BackupVersion
         {
             Version = version,
@@ -107,8 +142,10 @@ public sealed class BackupOrchestrator(
         await store.WriteInfoAsync(request.Account, request.Container, info, password, ct);
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
+        progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         await CleanupAsync(request, info, index, ct);
 
+        progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes);
     }
 
@@ -168,34 +205,37 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task UploadBlobsAsync(
-        BackupRequest request, BackupPlan plan, Dictionary<string, StorageRef> storageByPath, CancellationToken ct)
+        BackupRequest request, BackupPlan plan, Dictionary<string, StorageRef> storageByPath,
+        Action onItem, CancellationToken ct)
     {
         foreach (var blob in plan.Blobs)
         {
             storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
 
             // 内容寻址去重：已存在则跳过压缩+上传。
-            if (await BlobExistsAsync(request, blob.Ref, ct))
-                continue;
+            if (!await BlobExistsAsync(request, blob.Ref, ct))
+            {
+                var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
+                var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
+                    request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, token), ct);
+                try
+                {
+                    await uploader.UploadIfMissingAsync(
+                        request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: ct);
+                }
+                finally
+                {
+                    staging.Release(staged);
+                }
+            }
 
-            var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
-            var staged = await staging.StageAsync((compressTemp, token) => CompressAsync(
-                request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, token), ct);
-            try
-            {
-                await uploader.UploadIfMissingAsync(
-                    request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: ct);
-            }
-            finally
-            {
-                staging.Release(staged);
-            }
+            onItem();
         }
     }
 
     private async Task UploadPacksAsync(
         BackupRequest request, BackupPlan plan, BackupInfoFile info,
-        Dictionary<string, StorageRef> storageByPath, CancellationToken ct)
+        Dictionary<string, StorageRef> storageByPath, Action onItem, CancellationToken ct)
     {
         foreach (var pack in plan.Packs)
         {
@@ -213,6 +253,8 @@ public sealed class BackupOrchestrator(
             {
                 staging.Release(staged);
             }
+
+            onItem();
 
             foreach (var member in pack.Members)
                 storageByPath[member.Path] = new StorageRef { Kind = "pack", Ref = pack.PackId, EntryName = member.EntryName };

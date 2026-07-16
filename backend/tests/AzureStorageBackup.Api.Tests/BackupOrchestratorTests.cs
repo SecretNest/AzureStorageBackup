@@ -188,6 +188,42 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
+    private sealed class SyncProgress(List<BackupProgress> sink) : IProgress<BackupProgress>
+    {
+        public void Report(BackupProgress value) { lock (sink) sink.Add(value); }
+    }
+
+    [SkippableFact]
+    public async Task Progress_Is_Reported_Through_Stages()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha");
+            WriteText("dir/b.txt", "bravo"); // 两个目录 → 2 个 pack
+
+            var reports = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(reports));
+
+            Assert.Equal(BackupStage.Completed, reports[^1].Stage);
+            Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.TotalItems == 2);
+            Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.UploadedItems == p.TotalItems && p.Percent == 100);
+            Assert.Contains(reports, p => p.Stage == BackupStage.Uploading && p.ChangedFiles == 2);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
     [SkippableFact]
     public async Task Encrypted_Backup_RoundTrips_Through_Info_And_Index()
     {
