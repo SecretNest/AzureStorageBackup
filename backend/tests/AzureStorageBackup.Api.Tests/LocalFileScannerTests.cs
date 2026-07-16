@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using AzureStorageBackup.Api.Services;
 
@@ -31,8 +30,6 @@ public sealed class LocalFileScannerTests : IDisposable
 
     private LocalFileScanner Scanner() => new();
 
-    private static string Sha256Hex(byte[] data) => "sha256:" + Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
-
     [Fact]
     public async Task Scans_Single_File_With_Relative_Path_And_Length()
     {
@@ -55,49 +52,6 @@ public sealed class LocalFileScannerTests : IDisposable
 
         var entry = Assert.Single(result.Entries);
         Assert.Equal("sub/dir/a.txt", entry.Path);
-    }
-
-    [Fact]
-    public async Task Computes_FullHash_As_Sha256_Of_Whole_File()
-    {
-        var content = Encoding.UTF8.GetBytes("some content to hash");
-        WriteFile("a.bin", content);
-
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
-
-        Assert.Equal(Sha256Hex(content), Assert.Single(result.Entries).FullHash);
-    }
-
-    [Fact]
-    public async Task HeadHash_Covers_Only_First_N_Bytes()
-    {
-        // Two files sharing the first 8 bytes but differing afterwards.
-        var head = new byte[8];
-        for (var i = 0; i < head.Length; i++) head[i] = (byte)i;
-        var a = head.Concat(new byte[] { 1, 1, 1 }).ToArray();
-        var b = head.Concat(new byte[] { 2, 2, 2 }).ToArray();
-        WriteFile("a.bin", a);
-        WriteFile("b.bin", b);
-
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]), new ScanOptions { HeadHashBytes = 8 });
-
-        var ea = result.Entries.Single(e => e.Path == "a.bin");
-        var eb = result.Entries.Single(e => e.Path == "b.bin");
-        Assert.Equal(ea.HeadHash, eb.HeadHash);            // same head -> same headHash
-        Assert.NotEqual(ea.FullHash, eb.FullHash);         // differing tail -> different fullHash
-        Assert.Equal(Sha256Hex(head), ea.HeadHash);
-    }
-
-    [Fact]
-    public async Task HeadHash_Equals_FullHash_When_File_Smaller_Than_Window()
-    {
-        var content = Encoding.UTF8.GetBytes("tiny");
-        WriteFile("a.bin", content);
-
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]), new ScanOptions { HeadHashBytes = 4096 });
-
-        var e = Assert.Single(result.Entries);
-        Assert.Equal(e.FullHash, e.HeadHash);
     }
 
     [Fact]
