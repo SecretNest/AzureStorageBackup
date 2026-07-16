@@ -1,14 +1,16 @@
 import { useState } from 'react'
 import { AccountsPage } from './pages/AccountsPage'
+import { BackupConfigsPage } from './pages/BackupConfigsPage'
 import { BackupsPage } from './pages/BackupsPage'
 import { GroupsPage } from './pages/GroupsPage'
 import { TasksPage } from './pages/TasksPage'
 
-type Tab = 'accounts' | 'backups' | 'groups' | 'tasks'
+type Tab = 'accounts' | 'backups' | 'discovered' | 'groups' | 'tasks'
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'accounts', label: 'Accounts' },
   { key: 'backups', label: 'Backups' },
+  { key: 'discovered', label: 'Discovered' },
   { key: 'groups', label: 'Groups' },
   { key: 'tasks', label: 'Tasks' },
 ]
@@ -32,7 +34,8 @@ function App() {
       </nav>
 
       {tab === 'accounts' && <AccountsPage />}
-      {tab === 'backups' && <BackupsPage />}
+      {tab === 'backups' && <BackupConfigsPage />}
+      {tab === 'discovered' && <BackupsPage />}
       {tab === 'groups' && <GroupsPage />}
       {tab === 'tasks' && <TasksPage />}
     </div>
