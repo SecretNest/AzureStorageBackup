@@ -14,6 +14,12 @@ RUN dotnet publish src/AzureStorageBackup.Api/AzureStorageBackup.Api.csproj \
 # --- 运行阶段 ---
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
+
+# 备份引擎用官方 7-Zip 做压缩/加密/分卷（M4 决策 §13.1，提供 7zz）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends 7zip \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/publish ./
 
 # 容器内监听 8080；SQLite 数据落在 /app/data（由 compose 挂载 volume 持久化）

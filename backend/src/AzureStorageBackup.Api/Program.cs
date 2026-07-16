@@ -41,6 +41,10 @@ builder.Services.AddScoped<IGroupService, GroupService>();
 builder.Services.AddScoped<IScheduledTaskService, ScheduledTaskService>();
 builder.Services.AddScoped<IBackupInventoryService, BackupInventoryService>();
 
+// 备份引擎（M4）：7z 编解码 + 信息文件/索引读写。codec 按需构造（首次解析时探测 7z）。
+builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
+builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
+
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
     ?? ["http://localhost:5173"];
