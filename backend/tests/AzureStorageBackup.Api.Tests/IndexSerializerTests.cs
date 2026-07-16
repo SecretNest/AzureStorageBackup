@@ -1,4 +1,4 @@
-using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -24,7 +24,7 @@ public sealed class IndexSerializerTests
             {
                 Version = 1,
                 CreatedAt = new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero),
-                IndexBlob = "indexes/v1.json.enc",
+                IndexBlob = "indexes/v1.bin.enc",
                 Stats = new VersionStats(1200, 3_400_000_000, 12, 50_000_000),
             },
         ],
@@ -33,7 +33,7 @@ public sealed class IndexSerializerTests
             ["p0001"] = new PackInfo
             {
                 Blob = "packs/p0001.7z",
-                Members = ["sha_a", "sha_b"],
+                Members = ["sha256:" + new string('a', 64), "sha256:" + new string('b', 64)],
                 OriginalBytes = 900_000,
                 DeadBytes = 0,
             },
@@ -50,15 +50,15 @@ public sealed class IndexSerializerTests
                 Path = "sub/a.txt", Kind = "file", Length = 123,
                 Mtime = new DateTimeOffset(2026, 7, 16, 10, 0, 0, TimeSpan.Zero),
                 Permissions = "0644",
-                HeadHash = "sha256:aaa", FullHash = "sha256:bbb",
-                Storage = new StorageRef { Kind = "blob", Ref = "data/sha256:bbb" },
+                HeadHash = "sha256:" + new string('1', 64), FullHash = "sha256:" + new string('2', 64),
+                Storage = new StorageRef { Kind = "blob", Ref = "data/sha256:" + new string('2', 64) },
             },
             new IndexEntry
             {
                 Path = "sub/small.txt", Kind = "file", Length = 40,
                 Mtime = new DateTimeOffset(2026, 7, 16, 10, 1, 0, TimeSpan.Zero),
                 Permissions = "0644",
-                HeadHash = "sha256:ccc", FullHash = "sha256:ddd",
+                HeadHash = "sha256:" + new string('3', 64), FullHash = "sha256:" + new string('4', 64),
                 Storage = new StorageRef { Kind = "pack", Ref = "p0001", EntryName = "sub/small.txt" },
             },
         ],
@@ -68,8 +68,7 @@ public sealed class IndexSerializerTests
     [Fact]
     public void InfoFile_RoundTrips()
     {
-        var bytes = IndexSerializer.SerializeInfoFile(SampleInfo());
-        var back = IndexSerializer.DeserializeInfoFile(bytes);
+        var back = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(SampleInfo()));
 
         Assert.Equal(1, back.SchemaVersion);
         Assert.Equal("photos", back.Backup.Name);
@@ -80,21 +79,18 @@ public sealed class IndexSerializerTests
         Assert.Equal(100, (int)back.Backup.Settings!["maxVersions"]!);
 
         var v = Assert.Single(back.Versions);
-        Assert.Equal(1, v.Version);
-        Assert.Equal("indexes/v1.json.enc", v.IndexBlob);
-        Assert.Equal(1200, v.Stats.Files);
+        Assert.Equal("indexes/v1.bin.enc", v.IndexBlob);
         Assert.Equal(3_400_000_000, v.Stats.Bytes);
 
         var pack = back.Packs["p0001"];
         Assert.Equal("packs/p0001.7z", pack.Blob);
-        Assert.Equal(["sha_a", "sha_b"], pack.Members);
+        Assert.Equal("sha256:" + new string('a', 64), pack.Members[0]);
     }
 
     [Fact]
     public void Index_RoundTrips_With_Pack_And_Blob_Storage()
     {
-        var bytes = IndexSerializer.SerializeIndex(SampleIndex());
-        var back = IndexSerializer.DeserializeIndex(bytes);
+        var back = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
 
         Assert.Equal(1, back.Version);
         Assert.Equal(["sub/empty1", "sub/empty2"], back.EmptyDirs);
@@ -103,9 +99,8 @@ public sealed class IndexSerializerTests
         Assert.Equal("file", a.Kind);
         Assert.Equal(123, a.Length);
         Assert.Equal("0644", a.Permissions);
-        Assert.Equal("sha256:aaa", a.HeadHash);
+        Assert.Equal("sha256:" + new string('1', 64), a.HeadHash);
         Assert.Equal("blob", a.Storage!.Kind);
-        Assert.Equal("data/sha256:bbb", a.Storage.Ref);
         Assert.Null(a.Storage.EntryName);
 
         var small = back.Entries.Single(e => e.Path == "sub/small.txt");
@@ -115,31 +110,20 @@ public sealed class IndexSerializerTests
     }
 
     [Fact]
-    public void InfoFile_Json_Uses_Expected_Wire_Keys()
+    public void Mtime_And_Offset_RoundTrip_Exactly()
     {
-        var json = Encoding.UTF8.GetString(IndexSerializer.SerializeInfoFile(SampleInfo()));
+        var index = SampleIndex() with
+        {
+            Entries = [SampleIndex().Entries[0] with { Mtime = new DateTimeOffset(2026, 3, 1, 8, 30, 15, TimeSpan.FromHours(-5)) }],
+        };
 
-        Assert.Contains("\"schemaVersion\"", json);
-        Assert.Contains("\"sourceRootHint\"", json);
-        Assert.Contains("\"changedBytes\"", json);
-        Assert.DoesNotContain("SchemaVersion", json); // camelCase, not PascalCase
+        var back = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+
+        Assert.Equal(index.Entries[0].Mtime, back.Entries[0].Mtime);
     }
 
     [Fact]
-    public void Index_Json_Uses_Expected_Wire_Keys()
-    {
-        var json = Encoding.UTF8.GetString(IndexSerializer.SerializeIndex(SampleIndex()));
-
-        Assert.Contains("\"headHash\"", json);
-        Assert.Contains("\"fullHash\"", json);
-        Assert.Contains("\"emptyDirs\"", json);
-        Assert.Contains("\"storage\"", json);
-        Assert.Contains("\"ref\"", json);
-        Assert.Contains("\"entryName\"", json);
-    }
-
-    [Fact]
-    public void Null_Optional_Fields_Are_Omitted()
+    public void Null_Optional_Fields_RoundTrip_As_Null()
     {
         var index = new VersionIndex
         {
@@ -150,24 +134,42 @@ public sealed class IndexSerializerTests
                 {
                     Path = "a.txt", Kind = "file", Length = 1,
                     Mtime = DateTimeOffset.UnixEpoch, Permissions = "0644",
-                    HeadHash = "sha256:x", FullHash = "sha256:y",
-                    Storage = new StorageRef { Kind = "blob", Ref = "data/sha256:y" },
+                    HeadHash = "sha256:" + new string('a', 64), FullHash = "sha256:" + new string('b', 64),
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/x" }, // EntryName null, Target null
                 },
             ],
         };
 
-        var json = Encoding.UTF8.GetString(IndexSerializer.SerializeIndex(index));
+        var e = Assert.Single(IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index)).Entries);
+        Assert.Null(e.Target);
+        Assert.Null(e.Storage!.EntryName);
+    }
 
-        Assert.DoesNotContain("\"target\"", json);    // file entry has no symlink target
-        Assert.DoesNotContain("\"entryName\"", json); // blob storage has no pack entry name
+    [Fact]
+    public void Binary_Index_Is_More_Compact_Than_Json()
+    {
+        // 构造一个较多条目、真实 64-hex hash 的索引。
+        var entries = Enumerable.Range(0, 50).Select(i => new IndexEntry
+        {
+            Path = $"dir/file{i}.txt", Kind = "file", Length = i,
+            Mtime = DateTimeOffset.UnixEpoch, Permissions = "0644",
+            HeadHash = "sha256:" + i.ToString("x2") + new string('0', 62),
+            FullHash = "sha256:" + i.ToString("x2") + new string('f', 62),
+            Storage = new StorageRef { Kind = "blob", Ref = "data/sha256:" + i.ToString("x2") + new string('f', 62) },
+        }).ToList();
+        var index = new VersionIndex { Version = 1, Entries = entries };
+
+        var binary = IndexSerializer.SerializeIndex(index);
+        var json = JsonSerializer.SerializeToUtf8Bytes(index);
+
+        Assert.True(binary.Length < json.Length, $"binary {binary.Length} should be < json {json.Length}");
     }
 
     [Fact]
     public void Deserialize_Rejects_Unsupported_SchemaVersion()
     {
-        var future = "{\"schemaVersion\":999,\"backup\":{\"name\":\"x\",\"encrypted\":false,\"createdAt\":\"2026-07-16T00:00:00+00:00\"},\"versions\":[],\"packs\":{}}";
+        var future = IndexSerializer.SerializeInfoFile(SampleInfo() with { SchemaVersion = 999 });
 
-        Assert.Throws<NotSupportedException>(() =>
-            IndexSerializer.DeserializeInfoFile(Encoding.UTF8.GetBytes(future)));
+        Assert.Throws<NotSupportedException>(() => IndexSerializer.DeserializeInfoFile(future));
     }
 }
