@@ -81,6 +81,21 @@ public sealed class BackupInfoStoreTests
     }
 
     [SkippableFact]
+    public async Task WriteInfo_Applies_Access_Tier()
+    {
+        var (store, container, account, name) = await SetupContainerAsync();
+        try
+        {
+            await store.WriteInfoAsync(account, name, SampleInfo(), password: null,
+                tier: Azure.Storage.Blobs.Models.AccessTier.Cool);
+
+            var props = await container.GetBlobClient(BackupDiscovery.IndexBlobName).GetPropertiesAsync();
+            Assert.Equal("Cool", props.Value.AccessTier);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Info_Plain_RoundTrips()
     {
         var (store, container, account, name) = await SetupContainerAsync();

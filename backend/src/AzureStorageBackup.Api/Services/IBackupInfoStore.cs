@@ -1,3 +1,4 @@
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -12,12 +13,12 @@ public interface IBackupInfoStore
     /// <summary>读取信息记录文件；不存在返回 null。优先非加密（PRD 1.6）。</summary>
     Task<BackupInfoFile?> ReadInfoAsync(Account account, string container, string? password, CancellationToken ct = default);
 
-    /// <summary>原子写入信息记录文件（覆盖）。</summary>
-    Task WriteInfoAsync(Account account, string container, BackupInfoFile info, string? password, CancellationToken ct = default);
+    /// <summary>原子写入信息记录文件（覆盖）。tier 为空则用默认（Hot）。</summary>
+    Task WriteInfoAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier = null, CancellationToken ct = default);
 
     /// <summary>读取指定 blob 名的第二级索引。</summary>
     Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, CancellationToken ct = default);
 
-    /// <summary>写入某版本的第二级索引，返回其 blob 名（记入信息文件 versions[].indexBlob）。</summary>
-    Task<string> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, CancellationToken ct = default);
+    /// <summary>写入某版本的第二级索引，返回其 blob 名（记入信息文件 versions[].indexBlob）。tier 为空则用默认。</summary>
+    Task<string> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default);
 }

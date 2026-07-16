@@ -1,4 +1,5 @@
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -23,7 +24,7 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     }
 
     public async Task WriteInfoAsync(
-        Account account, string container, BackupInfoFile info, string? password, CancellationToken ct = default)
+        Account account, string container, BackupInfoFile info, string? password, AccessTier? tier = null, CancellationToken ct = default)
     {
         var cc = Container(account, container);
         var name = string.IsNullOrEmpty(password)
@@ -31,7 +32,7 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
             : BackupDiscovery.EncryptedIndexBlobName;
 
         var json = IndexSerializer.SerializeInfoFile(info);
-        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeInfoFile(b), ct);
+        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeInfoFile(b), tier, ct);
     }
 
     public async Task<VersionIndex> ReadIndexAsync(
@@ -43,22 +44,23 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     }
 
     public async Task<string> WriteIndexAsync(
-        Account account, string container, int version, VersionIndex index, string? password, CancellationToken ct = default)
+        Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default)
     {
         var cc = Container(account, container);
         var name = $"indexes/v{version}.json" + (string.IsNullOrEmpty(password) ? "" : ".enc");
 
         var json = IndexSerializer.SerializeIndex(index);
-        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeIndex(b), ct);
+        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeIndex(b), tier, ct);
         return name;
     }
 
     /// <summary>
-    /// 原子写：编码→写临时 blob→下载校验（解码+反序列化）→写正式名→删临时。
+    /// 原子写：编码→写临时 blob→下载校验（解码+反序列化）→写正式名（带 tier）→删临时。
     /// 校验失败不触碰正式名；正式名单 blob 提交是原子的，失败时旧文件完好（§8）。
     /// </summary>
     private async Task WriteAtomicAsync(
-        BlobContainerClient cc, string finalName, byte[] json, string? password, Action<byte[]> verify, CancellationToken ct)
+        BlobContainerClient cc, string finalName, byte[] json, string? password, Action<byte[]> verify,
+        AccessTier? tier, CancellationToken ct)
     {
         var encoded = await codec.EncodeAsync(json, password, ct);
         var temp = cc.GetBlobClient(finalName + ".writing." + Guid.NewGuid().ToString("N"));
@@ -68,7 +70,10 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
 
             verify(await DownloadDecodeAsync(temp, password, ct));
 
-            await cc.GetBlobClient(finalName).UploadAsync(BinaryData.FromBytes(encoded), overwrite: true, ct);
+            var options = new BlobUploadOptions();
+            if (tier is { } t)
+                options.AccessTier = t;
+            await cc.GetBlobClient(finalName).UploadAsync(BinaryData.FromBytes(encoded).ToStream(), options, ct);
         }
         finally
         {

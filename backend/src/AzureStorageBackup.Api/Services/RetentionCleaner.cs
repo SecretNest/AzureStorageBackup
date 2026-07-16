@@ -67,6 +67,6 @@ public sealed class RetentionCleaner(IBlobClientFactory factory, IBackupInfoStor
                 await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct);
         }
 
-        await store.WriteInfoAsync(account, container, info, password, ct);
+        await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
     }
 }

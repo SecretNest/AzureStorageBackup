@@ -162,7 +162,7 @@ public sealed class BackupOrchestrator(
 
         // 7. WriteIndex（先上传第二级索引）
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, ct);
+        var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
 
         // 8/9. Finalize（原子更新信息文件）
         progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -173,7 +173,7 @@ public sealed class BackupOrchestrator(
             IndexBlob = indexBlob,
             Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
         });
-        await store.WriteInfoAsync(request.Account, request.Container, info, password, ct);
+        await store.WriteInfoAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
