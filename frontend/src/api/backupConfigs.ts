@@ -53,6 +53,7 @@ export interface BackupConfig {
   retentionMode: number
   singleFileThresholdBytes: number
   groupCapBytes: number
+  volumeBytes: number | null
   createdAt: string
 }
 
@@ -74,6 +75,7 @@ export interface BackupConfigInput {
   retentionMode: number
   singleFileThresholdBytes: number
   groupCapBytes: number
+  volumeBytes: number | null
 }
 
 export interface BackupProgress {

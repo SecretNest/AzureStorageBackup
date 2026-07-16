@@ -118,6 +118,48 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Volume_Split_Backup_RoundTrips_Through_Restore()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstv-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("big.bin", new string('x', 60_000));
+            var req = BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    // 阈值调低 → big.bin 走单文件 blob；不压缩 + 20KB 分卷 → 多卷
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1000 },
+                    DontCompress = new IgnoreRuleSet(["*.bin"]),
+                    VolumeBytes = 20_000,
+                },
+            };
+            await backup.RunAsync(req);
+
+            // 应产出多卷 data blob（data/{hash}.001 存在）
+            var volumeBlobs = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", default))
+                volumeBlobs.Add(b.Name);
+            Assert.Contains(volumeBlobs, n => n.EndsWith(".001"));
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal(60_000, new FileInfo(Path.Combine(_dst, "big.bin")).Length);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Second_Restore_Skips_Unchanged_Files()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

@@ -13,6 +13,9 @@ public sealed record BackupEngineOptions
     public DiffOptions Diff { get; init; } = new();
     public PlanOptions Plan { get; init; } = new();
     public RetentionPolicy Retention { get; init; } = new();
+
+    /// <summary>分卷大小（字节）；null=不分卷（单归档）。大文件/大 pack 拆成多卷 blob（§7）。</summary>
+    public long? VolumeBytes { get; init; }
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -192,8 +195,10 @@ public sealed class BackupOrchestrator(
         {
             storageByPath[blob.Path] = new StorageRef { Kind = "blob", Ref = blob.Ref };
 
-            // 内容寻址去重：已存在则跳过压缩+上传。
-            if (!await BlobExistsAsync(request, blob.Ref, ct))
+            var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+
+            // 内容寻址去重：已存在（单卷或多卷）则跳过压缩+上传。
+            if (!await VolumeBlobIO.ExistsAsync(cc, blob.Ref, ct))
             {
                 var storeOnly = request.Options.DontCompress?.IsIgnored(blob.Path) ?? false;
 
@@ -203,8 +208,8 @@ public sealed class BackupOrchestrator(
                         request, compressTemp, SafeFileName(blob.FullHash), [blob.Path], storeOnly, t), token);
                     try
                     {
-                        await uploader.UploadIfMissingAsync(
-                            request.Account, request.Container, blob.Ref, staged.Files[0], request.DataTier, ct: token);
+                        await VolumeBlobIO.UploadAsync(
+                            uploader, request.Account, request.Container, blob.Ref, staged.Files, request.DataTier, token);
                     }
                     finally
                     {
@@ -245,8 +250,8 @@ public sealed class BackupOrchestrator(
                 request, compressTemp, pack.PackId, entries, storeOnly: false, token), ct);
             try
             {
-                await uploader.UploadIfMissingAsync(
-                    request.Account, request.Container, packBlob, staged.Files[0], request.DataTier, ct: ct);
+                await VolumeBlobIO.UploadAsync(
+                    uploader, request.Account, request.Container, packBlob, staged.Files, request.DataTier, ct);
             }
             finally
             {
@@ -274,7 +279,8 @@ public sealed class BackupOrchestrator(
     {
         var output = Path.Combine(compressTemp, archiveName + ".7z");
         var result = await compressor.CompressAsync(
-            new CompressionRequest(request.LocalRoot, entries, output, request.Password, StoreOnly: storeOnly), ct);
+            new CompressionRequest(request.LocalRoot, entries, output, request.Password,
+                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly), ct);
         return result.VolumeFiles;
     }
 
@@ -302,13 +308,6 @@ public sealed class BackupOrchestrator(
         return entries;
     }
 
-    private async Task<bool> BlobExistsAsync(BackupRequest request, string blobName, CancellationToken ct)
-    {
-        var blob = factory.CreateServiceClient(request.Account)
-            .GetBlobContainerClient(request.Container)
-            .GetBlobClient(blobName);
-        return (await blob.ExistsAsync(ct)).Value;
-    }
 
     private static BackupInfoFile NewInfo(BackupRequest request) => new()
     {

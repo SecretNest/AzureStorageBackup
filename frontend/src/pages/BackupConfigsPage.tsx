@@ -34,6 +34,7 @@ const emptyForm: BackupConfigInput = {
   retentionMode: RetentionMode.EitherTriggers,
   singleFileThresholdBytes: 5 * MB,
   groupCapBytes: 100 * MB,
+  volumeBytes: null,
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -90,6 +91,7 @@ export function BackupConfigsPage() {
       retentionMode: c.retentionMode,
       singleFileThresholdBytes: c.singleFileThresholdBytes,
       groupCapBytes: c.groupCapBytes,
+      volumeBytes: c.volumeBytes,
     })
     setStep(1)
     setError(null)
@@ -431,6 +433,15 @@ export function BackupConfigsPage() {
                   type="number"
                   value={Math.round(form.groupCapBytes / MB)}
                   onChange={(e) => set('groupCapBytes', Number(e.target.value) * MB)}
+                />
+              </Field>
+              <Field label="Volume size (MB, 0=off)">
+                <input
+                  type="number"
+                  value={form.volumeBytes ? Math.round(form.volumeBytes / MB) : 0}
+                  onChange={(e) =>
+                    set('volumeBytes', Number(e.target.value) > 0 ? Number(e.target.value) * MB : null)
+                  }
                 />
               </Field>
 

@@ -27,6 +27,7 @@ public static class BackupRequestMapper
                 SingleFileThresholdBytes = config.SingleFileThresholdBytes,
                 GroupCapBytes = config.GroupCapBytes,
             },
+            VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
             Retention = RetentionOf(config),
         },
     };

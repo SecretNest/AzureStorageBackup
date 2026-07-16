@@ -50,5 +50,8 @@ public class BackupConfig
     public long SingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
     public long GroupCapBytes { get; set; } = 100 * 1024 * 1024;
 
+    /// <summary>分卷大小（字节）；null/0=不分卷（§7）。</summary>
+    public long? VolumeBytes { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 }

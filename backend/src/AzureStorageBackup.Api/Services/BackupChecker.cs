@@ -80,7 +80,7 @@ public sealed class BackupChecker(
         var missing = new List<string>();
         foreach (var name in refs)
         {
-            if (!(await cc.GetBlobClient(name).ExistsAsync(ct)).Value)
+            if (!await VolumeBlobIO.ExistsAsync(cc, name, ct))
                 missing.Add(name);
         }
 
@@ -119,11 +119,10 @@ public sealed class BackupChecker(
                 try
                 {
                     if (Directory.Exists(extractDir)) Directory.Delete(extractDir, recursive: true);
-                    var archive = Path.Combine(work, "arc.7z");
-                    if (File.Exists(archive)) File.Delete(archive);
+                    foreach (var f in Directory.EnumerateFiles(work, "arc.7z*")) File.Delete(f);
 
-                    await cc.GetBlobClient(group.Key).DownloadToAsync(archive, ct);
-                    await compressor.ExtractAsync(archive, extractDir, password, ct);
+                    var firstVolume = await VolumeBlobIO.DownloadAsync(cc, group.Key, work, ct);
+                    await compressor.ExtractAsync(firstVolume, extractDir, password, ct);
 
                     foreach (var e in members)
                     {

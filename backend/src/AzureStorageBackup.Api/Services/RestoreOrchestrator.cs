@@ -115,13 +115,12 @@ public sealed class RestoreOrchestrator(
                 var storage = group.First().Storage!;
                 var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
 
-                var archive = Path.Combine(work, "arc.7z");
                 var extractDir = Path.Combine(work, "x");
-                if (File.Exists(archive)) File.Delete(archive);
+                foreach (var f in Directory.EnumerateFiles(work, "arc.7z*")) File.Delete(f);
                 if (Directory.Exists(extractDir)) Directory.Delete(extractDir, recursive: true);
 
-                await container.GetBlobClient(blobName).DownloadToAsync(archive, ct);
-                await compressor.ExtractAsync(archive, extractDir, request.Password, ct);
+                var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, work, ct);
+                await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
                 foreach (var e in needed)
                 {

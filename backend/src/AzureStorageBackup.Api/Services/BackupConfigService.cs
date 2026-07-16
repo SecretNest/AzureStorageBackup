@@ -49,6 +49,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.RetentionMode = update.RetentionMode;
         existing.SingleFileThresholdBytes = update.SingleFileThresholdBytes;
         existing.GroupCapBytes = update.GroupCapBytes;
+        existing.VolumeBytes = update.VolumeBytes;
 
         await db.SaveChangesAsync(ct);
         return existing;
