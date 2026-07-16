@@ -1,34 +1,22 @@
 import { api } from './client'
 
-// 与后端 BackupJob 契约对应的类型。随需求扩展。
-export type BackupJobStatus = 'Pending' | 'Running' | 'Succeeded' | 'Failed'
-
-export interface BackupJob {
-  id: number
-  name: string
-  sourcePath: string
-  containerName: string
-  status: BackupJobStatus
-  createdAt: string
-  completedAt: string | null
+// 已发现的备份（来自各账户 container 发现，PRD 2.1）
+export const backupPresenceLabels: Record<number, string> = {
+  1: 'Plain',
+  2: 'Encrypted',
 }
 
-export interface CreateBackupJobRequest {
-  name: string
-  sourcePath: string
+export interface DiscoveredBackup {
+  accountId: number
+  accountName: string
   containerName: string
+  presence: number
 }
+
+// 备份的稳定标识：account + container
+export const backupKey = (b: { accountId: number; containerName: string }) =>
+  `${b.accountId}/${b.containerName}`
 
 export const backupsApi = {
-  list: () => api.get<BackupJob[]>('/backups'),
-  get: (id: number) => api.get<BackupJob>(`/backups/${id}`),
-  create: (req: CreateBackupJobRequest) => api.post<BackupJob>('/backups', req),
-}
-
-export interface HealthStatus {
-  status: string
-}
-
-export const healthApi = {
-  check: () => api.get<HealthStatus>('/health'),
+  list: () => api.get<DiscoveredBackup[]>('/backups'),
 }

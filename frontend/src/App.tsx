@@ -1,8 +1,17 @@
 import { useState } from 'react'
 import { AccountsPage } from './pages/AccountsPage'
 import { BackupsPage } from './pages/BackupsPage'
+import { GroupsPage } from './pages/GroupsPage'
+import { TasksPage } from './pages/TasksPage'
 
-type Tab = 'accounts' | 'backups'
+type Tab = 'accounts' | 'backups' | 'groups' | 'tasks'
+
+const tabs: { key: Tab; label: string }[] = [
+  { key: 'accounts', label: 'Accounts' },
+  { key: 'backups', label: 'Backups' },
+  { key: 'groups', label: 'Groups' },
+  { key: 'tasks', label: 'Tasks' },
+]
 
 function App() {
   const [tab, setTab] = useState<Tab>('accounts')
@@ -10,23 +19,22 @@ function App() {
   return (
     <div style={{ maxWidth: 900, margin: '2rem auto', padding: '0 1rem' }}>
       <nav style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
-        <button
-          type="button"
-          onClick={() => setTab('accounts')}
-          style={{ fontWeight: tab === 'accounts' ? 'bold' : 'normal' }}
-        >
-          Accounts
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab('backups')}
-          style={{ fontWeight: tab === 'backups' ? 'bold' : 'normal' }}
-        >
-          Backups
-        </button>
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => setTab(t.key)}
+            style={{ fontWeight: tab === t.key ? 'bold' : 'normal' }}
+          >
+            {t.label}
+          </button>
+        ))}
       </nav>
 
-      {tab === 'accounts' ? <AccountsPage /> : <BackupsPage />}
+      {tab === 'accounts' && <AccountsPage />}
+      {tab === 'backups' && <BackupsPage />}
+      {tab === 'groups' && <GroupsPage />}
+      {tab === 'tasks' && <TasksPage />}
     </div>
   )
 }
