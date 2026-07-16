@@ -69,9 +69,15 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IBackupInfoStore>(),
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
-    Path.Combine(tempPath, "restore")));
+    Path.Combine(tempPath, "restore"),
+    sp.GetRequiredService<INotifier>()));
 builder.Services.AddSingleton<RestoreRunner>();
 builder.Services.AddScoped<BackupChecker>();
+
+// 通知（M7）
+builder.Services.AddScoped<INotificationConfigService, NotificationConfigService>();
+builder.Services.AddSingleton<INotificationSender, NotificationSender>();
+builder.Services.AddScoped<INotifier, NotificationService>();
 
 // 调度器（M6）：常驻后台按 cron 触发计划任务。测试环境用 Scheduler:Enabled=false 关闭。
 builder.Services.AddSingleton<TaskDispatcher>();
@@ -115,6 +121,7 @@ app.MapGroupEndpoints();
 app.MapTaskEndpoints();
 app.MapBackupsEndpoints();
 app.MapBackupConfigEndpoints();
+app.MapNotificationEndpoints();
 app.MapSystemEndpoints();
 
 app.Run();

@@ -12,10 +12,33 @@ public sealed record CheckResult(int Version, int CheckedRefs, IReadOnlyList<str
 /// 备份完整性检查（M5、PRD 2.3）：读某版本索引，校验其引用的 data blob 与 pack 是否都存在。
 /// 存在性检查快且不下载；深度校验（下载+重算 hash）留后续。
 /// </summary>
-public sealed class BackupChecker(IBlobClientFactory factory, IBackupInfoStore store)
+public sealed class BackupChecker(IBlobClientFactory factory, IBackupInfoStore store, INotifier? notifier = null)
 {
     public async Task<CheckResult> CheckAsync(
         Account account, string container, string? password, int? version, CancellationToken ct = default)
+    {
+        await Notify(NotificationEvents.CheckStart, $"Check started: {container}", "", ct);
+        try
+        {
+            var result = await CheckCoreAsync(account, container, password, version, ct);
+            await Notify(
+                result.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure,
+                $"Check {(result.Ok ? "passed" : "failed")}: {container}",
+                result.Ok ? $"{result.CheckedRefs} object(s) OK" : $"{result.MissingRefs.Count} missing object(s)", ct);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            await Notify(NotificationEvents.CheckFailure, $"Check failed: {container}", ex.Message, ct);
+            throw;
+        }
+    }
+
+    private Task Notify(NotificationEvents evt, string title, string body, CancellationToken ct) =>
+        notifier?.NotifyAsync(evt, title, body, ct) ?? Task.CompletedTask;
+
+    private async Task<CheckResult> CheckCoreAsync(
+        Account account, string container, string? password, int? version, CancellationToken ct)
     {
         var info = await store.ReadInfoAsync(account, container, password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");

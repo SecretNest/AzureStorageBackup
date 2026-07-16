@@ -66,10 +66,32 @@ public sealed class BackupOrchestrator(
     IBlobClientFactory factory,
     IBackupInfoStore store,
     StagingArea staging,
-    RetentionCleaner cleaner)
+    RetentionCleaner cleaner,
+    INotifier? notifier = null)
 {
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
+    {
+        await Notify(NotificationEvents.BackupStart, $"Backup started: {request.Name}", request.Container, ct);
+        try
+        {
+            var result = await RunCoreAsync(request, progress, ct);
+            await Notify(NotificationEvents.BackupSuccess, $"Backup succeeded: {request.Name}",
+                $"Version {result.Version}, {result.ChangedFiles} changed file(s)", ct);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            await Notify(NotificationEvents.BackupFailure, $"Backup failed: {request.Name}", ex.Message, ct);
+            throw;
+        }
+    }
+
+    private Task Notify(NotificationEvents evt, string title, string body, CancellationToken ct) =>
+        notifier?.NotifyAsync(evt, title, body, ct) ?? Task.CompletedTask;
+
+    private async Task<BackupRunResult> RunCoreAsync(
+        BackupRequest request, IProgress<BackupProgress>? progress, CancellationToken ct)
     {
         var opts = request.Options;
         var password = request.Password;

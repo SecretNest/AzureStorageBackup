@@ -24,9 +24,30 @@ public sealed class RestoreOrchestrator(
     IBackupInfoStore store,
     IFileCompressor compressor,
     IFileHasher hasher,
-    string tempRoot)
+    string tempRoot,
+    INotifier? notifier = null)
 {
     public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default)
+    {
+        await Notify(NotificationEvents.RestoreStart, $"Restore started: {request.Container}", request.TargetRoot, ct);
+        try
+        {
+            var result = await RunCoreAsync(request, ct);
+            await Notify(NotificationEvents.RestoreSuccess, $"Restore succeeded: {request.Container}",
+                $"Restored {result.RestoredFiles} file(s) to {request.TargetRoot} (version {result.Version})", ct);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            await Notify(NotificationEvents.RestoreFailure, $"Restore failed: {request.Container}", ex.Message, ct);
+            throw;
+        }
+    }
+
+    private Task Notify(NotificationEvents evt, string title, string body, CancellationToken ct) =>
+        notifier?.NotifyAsync(evt, title, body, ct) ?? Task.CompletedTask;
+
+    private async Task<RestoreResult> RunCoreAsync(RestoreRequest request, CancellationToken ct)
     {
         var info = await store.ReadInfoAsync(request.Account, request.Container, request.Password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");
