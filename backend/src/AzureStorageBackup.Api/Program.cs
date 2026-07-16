@@ -40,6 +40,7 @@ builder.Services.AddScoped<IContainerService, ContainerService>();
 builder.Services.AddScoped<IGroupService, GroupService>();
 builder.Services.AddScoped<IScheduledTaskService, ScheduledTaskService>();
 builder.Services.AddScoped<IBackupInventoryService, BackupInventoryService>();
+builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 
 // 备份引擎（M4）：7z 编解码 + 信息文件/索引读写。codec 按需构造（首次解析时探测 7z）。
 builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
@@ -81,6 +82,7 @@ app.MapContainerEndpoints();
 app.MapGroupEndpoints();
 app.MapTaskEndpoints();
 app.MapBackupsEndpoints();
+app.MapBackupConfigEndpoints();
 app.MapSystemEndpoints();
 
 app.Run();

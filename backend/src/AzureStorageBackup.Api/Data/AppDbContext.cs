@@ -15,6 +15,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<Group> Groups => Set<Group>();
     public DbSet<GroupMember> GroupMembers => Set<GroupMember>();
     public DbSet<ScheduledTask> ScheduledTasks => Set<ScheduledTask>();
+    public DbSet<BackupConfig> BackupConfigs => Set<BackupConfig>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -53,6 +54,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
         {
             e.HasKey(x => x.Id);
             e.Property(x => x.CronExpression).IsRequired();
+        });
+
+        modelBuilder.Entity<BackupConfig>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Name).IsRequired().HasMaxLength(200);
+            e.Property(x => x.ContainerName).IsRequired();
+            e.Property(x => x.LocalRoot).IsRequired();
+            e.Property(x => x.Password).HasConversion(encryptNullable); // 加密落库
         });
     }
 }
