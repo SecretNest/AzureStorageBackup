@@ -153,9 +153,9 @@ public sealed class IndexSerializerTests
         {
             Path = $"dir/file{i}.txt", Kind = "file", Length = i,
             Mtime = DateTimeOffset.UnixEpoch, Permissions = "0644",
-            HeadHash = "sha256:" + i.ToString("x2") + new string('0', 62),
-            FullHash = "sha256:" + i.ToString("x2") + new string('f', 62),
-            Storage = new StorageRef { Kind = "blob", Ref = "data/sha256:" + i.ToString("x2") + new string('f', 62) },
+            HeadHash = "xxh128:" + i.ToString("x2") + new string('0', 30),
+            FullHash = "xxh128:" + i.ToString("x2") + new string('f', 30),
+            Storage = new StorageRef { Kind = "blob", Ref = "data/xxh128:" + i.ToString("x2") + new string('f', 30) },
         }).ToList();
         var index = new VersionIndex { Version = 1, Entries = entries };
 

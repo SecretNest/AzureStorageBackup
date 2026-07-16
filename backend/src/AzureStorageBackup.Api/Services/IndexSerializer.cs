@@ -250,7 +250,9 @@ public static class IndexSerializer
         return new DateTimeOffset(utcTicks + offset.Ticks, offset);
     }
 
-    // hash 编码：0=null；1=sha256 的 32 字节裸字节；2=任意字符串（兜底）。
+    // hash 编码：0=null；1=xxh128 的 16 字节裸字节；2=任意字符串（兜底）。
+    private const string HashPrefix = "xxh128:";
+
     private static void WriteHash(BinaryWriter w, string? hash)
     {
         if (hash is null)
@@ -260,17 +262,17 @@ public static class IndexSerializer
         }
 
         byte[]? raw = null;
-        if (hash.StartsWith("sha256:", StringComparison.Ordinal))
+        if (hash.StartsWith(HashPrefix, StringComparison.Ordinal))
         {
-            var hex = hash["sha256:".Length..];
-            if (hex.Length == 64)
+            var hex = hash[HashPrefix.Length..];
+            if (hex.Length == 32)
             {
                 try { raw = Convert.FromHexString(hex); }
                 catch (FormatException) { /* 非 hex，走兜底 */ }
             }
         }
 
-        if (raw is { Length: 32 })
+        if (raw is { Length: 16 })
         {
             w.Write((byte)1);
             w.Write(raw);
@@ -285,7 +287,7 @@ public static class IndexSerializer
     private static string? ReadHash(BinaryReader r) => r.ReadByte() switch
     {
         0 => null,
-        1 => "sha256:" + Convert.ToHexString(r.ReadBytes(32)).ToLowerInvariant(),
+        1 => HashPrefix + Convert.ToHexString(r.ReadBytes(16)).ToLowerInvariant(),
         _ => r.ReadString(),
     };
 }

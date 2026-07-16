@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+using System.IO.Hashing;
 using System.Text;
 using AzureStorageBackup.Api.Services;
 
@@ -26,18 +26,18 @@ public sealed class FileHasherTests : IDisposable
         return full;
     }
 
-    private static string Sha256Hex(byte[] data) =>
-        "sha256:" + Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+    private static string Xxh128Hex(byte[] data) =>
+        "xxh128:" + Convert.ToHexString(XxHash128.Hash(data)).ToLowerInvariant();
 
     [Fact]
-    public async Task FullHash_Is_Sha256_Of_Whole_File()
+    public async Task FullHash_Is_Xxh128_Of_Whole_File()
     {
         var content = Encoding.UTF8.GetBytes("some content to hash");
         var path = Write("a.bin", content);
 
         var hash = await new FileHasher().FullHashAsync(path);
 
-        Assert.Equal(Sha256Hex(content), hash);
+        Assert.Equal(Xxh128Hex(content), hash);
     }
 
     [Fact]
@@ -53,7 +53,7 @@ public sealed class FileHasherTests : IDisposable
         var headB = await hasher.HeadHashAsync(b, 8);
 
         Assert.Equal(headA, headB);
-        Assert.Equal(Sha256Hex(head), headA);
+        Assert.Equal(Xxh128Hex(head), headA);
         Assert.NotEqual(await hasher.FullHashAsync(a), await hasher.FullHashAsync(b));
     }
 
