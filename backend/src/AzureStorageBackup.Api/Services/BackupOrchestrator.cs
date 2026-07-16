@@ -74,6 +74,11 @@ public sealed class BackupOrchestrator(
         var opts = request.Options;
         var password = request.Password;
 
+        // 0. 确保 container 存在（HTTP 触发的备份自足）
+        await factory.CreateServiceClient(request.Account)
+            .GetBlobContainerClient(request.Container)
+            .CreateIfNotExistsAsync(cancellationToken: ct);
+
         // 1. Scan
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);

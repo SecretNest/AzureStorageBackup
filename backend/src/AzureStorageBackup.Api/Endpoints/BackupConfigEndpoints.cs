@@ -55,6 +55,23 @@ public static class BackupConfigEndpoints
             return ok ? Results.NoContent() : Results.NotFound();
         });
 
+        // 启动一次备份（后台运行，进度轮询）
+        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, CancellationToken ct) =>
+        {
+            if (await svc.GetAsync(id, ct) is null)
+                return Results.NotFound();
+
+            var state = runner.Start(id);
+            return Results.Accepted($"/api/backup-configs/{id}/run", BackupRunResponse.From(state));
+        });
+
+        // 查询运行进度/状态
+        group.MapGet("/{id:int}/run", (int id, BackupRunner runner) =>
+        {
+            var state = runner.Get(id);
+            return state is null ? Results.NotFound() : Results.Ok(BackupRunResponse.From(state));
+        });
+
         return app;
     }
 }

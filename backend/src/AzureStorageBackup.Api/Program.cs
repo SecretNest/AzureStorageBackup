@@ -46,6 +46,24 @@ builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
 builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
 
+// 引擎组件（无状态用单例；StagingArea 单例以保证压缩全局非并发，跨备份也不并发）。
+var tempPath = builder.Configuration["Backup:TempPath"];
+if (string.IsNullOrWhiteSpace(tempPath))
+    tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
+var stagedLimit = builder.Configuration.GetValue<long?>("Backup:StagedLimitBytes") ?? 1_073_741_824L; // 1GB
+builder.Services.AddSingleton(new StagingArea(
+    Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"), stagedLimit));
+
+builder.Services.AddSingleton<LocalFileScanner>();
+builder.Services.AddSingleton<IFileHasher, FileHasher>();
+builder.Services.AddSingleton<BackupDiffer>();
+builder.Services.AddSingleton<GroupingPlanner>();
+builder.Services.AddSingleton<RetentionEvaluator>();
+builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
+builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
+builder.Services.AddScoped<BackupOrchestrator>();
+builder.Services.AddSingleton<BackupRunner>();
+
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
     ?? ["http://localhost:5173"];
