@@ -13,6 +13,10 @@ public sealed record RestoreRequest
 
     /// <summary>下载并发上限（PRD 3.4，默认 5）。</summary>
     public int DownloadConcurrency { get; init; } = 5;
+
+    /// <summary>不可恢复文件的替代来源：路径 → 用哪个版本的该文件内容替代（用户逐个选，可批量）。</summary>
+    public IReadOnlyDictionary<string, int> Substitutions { get; init; } =
+        new Dictionary<string, int>(StringComparer.Ordinal);
 }
 
 /// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。</summary>
@@ -77,14 +81,34 @@ public sealed class RestoreOrchestrator(
         var restored = 0;
         var skipped = 0;
 
+        // 逐路径生效条目：默认取本版本；被替代的路径改用指定版本的同路径条目（内容+元数据取该版本）。
+        var byPath = index.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+        foreach (var grp in request.Substitutions.GroupBy(kv => kv.Value))
+        {
+            var sv = info.Versions.FirstOrDefault(x => x.Version == grp.Key);
+            if (sv is null)
+                continue;
+            var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, ct);
+            var srcByPath = srcIndex.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+            foreach (var kv in grp)
+                if (srcByPath.TryGetValue(kv.Key, out var se))
+                    byPath[kv.Key] = se;
+        }
+
+        // 不可恢复且未指定替代 → 跳过（不尝试还原，否则会因 blob 缺失报错）。
+        var unresolved = index.UnrecoverablePaths.Where(p => !request.Substitutions.ContainsKey(p)).ToHashSet(StringComparer.Ordinal);
+        skipped += unresolved.Count;
+
         // 空文件夹（还原需重建）
         foreach (var dir in index.EmptyDirs)
             Directory.CreateDirectory(Path.Combine(request.TargetRoot, ToLocal(dir)));
 
         // symlink 与文件分开处理
         var fileEntries = new List<IndexEntry>();
-        foreach (var e in index.Entries)
+        foreach (var e in byPath.Values)
         {
+            if (unresolved.Contains(e.Path))
+                continue;
             if (e.Kind == "symlink")
             {
                 if (RestoreSymlink(request.TargetRoot, e)) restored++;

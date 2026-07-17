@@ -79,6 +79,49 @@ public sealed class RestoreOrchestratorTests : IDisposable
     };
 
     [SkippableFact]
+    public async Task Restore_Substitutes_Unrecoverable_File_From_Chosen_Version()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rsub-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "version one");
+            WriteSrc("keep.txt", "unchanged file");
+            await backup.RunAsync(BackupReq(account, name));   // v1
+            WriteSrc("a.txt", "version two");
+            await backup.RunAsync(BackupReq(account, name));   // v2
+
+            // 把 v2 的 a.txt 标记为不可恢复（模拟修复后无法从本地恢复）。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v2 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v2.IndexBlob, null);
+            idx.UnrecoverablePaths.Add("a.txt");
+            await store.WriteIndexAsync(account, name, v2.Version, idx, null);
+
+            // 不给替代 → a.txt 跳过（其余照常）。
+            await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst, Version = 2 });
+            Assert.False(File.Exists(Path.Combine(_dst, "a.txt")));
+            Assert.True(File.Exists(Path.Combine(_dst, "keep.txt")));
+
+            // 指定用 v1 替代 → a.txt 还原为 v1 内容。
+            await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst, Version = 2,
+                Substitutions = new Dictionary<string, int> { ["a.txt"] = 1 },
+            });
+            Assert.Equal("version one", File.ReadAllText(Path.Combine(_dst, "a.txt")));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Encrypted_Keyed_Backup_RoundTrips_Through_Restore()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
