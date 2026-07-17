@@ -172,36 +172,20 @@ public static class BackupConfigEndpoints
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
-        // 从本地修复云端损坏/缺失的 blob（显式动作）；修不了的文件标记不可恢复。经忙碌守卫。
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, IBackupConfigService svc, IAccountService accounts, BackupRepairer repairer, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
+        // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
-            var account = await accounts.GetAsync(config.AccountId, ct);
-            if (account is null)
-                return Results.BadRequest(new { error = "Account not found." });
+            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate);
+            return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
+        });
 
-            if (!busy.TryAcquire(account.Id, config.ContainerName))
-                return Results.Conflict(new { error = "Backup is busy with another operation." });
-            try
-            {
-                var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
-                var settings = await settingsSvc.GetAsync(ct);
-                var options = new CheckOptions
-                {
-                    Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
-                    RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
-                };
-                var report = await repairer.RepairAsync(account, config.ContainerName, password, config.LocalRoot, version,
-                    options, BackupRequestMapper.MapTier(config.DataTier),
-                    config.VolumeBytes is > 0 ? config.VolumeBytes : settings.DefaultVolumeBytes, ct);
-                return Results.Ok(report);
-            }
-            finally
-            {
-                busy.Release(account.Id, config.ContainerName);
-            }
+        group.MapGet("/{id:int}/repair", (int id, RepairRunner runner) =>
+        {
+            var state = runner.Get(id);
+            return state is null ? Results.NotFound() : Results.Ok(RepairRunResponse.From(state));
         });
 
         group.MapGet("/{id:int}/restore", (int id, RestoreRunner runner) =>

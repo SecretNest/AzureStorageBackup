@@ -17,7 +17,7 @@ import {
   type BackupRun,
   type RestoreRun,
   type CheckReport,
-  type RepairReport,
+  type RepairRun,
   type FileVersionOption,
 } from '../api/backupConfigs'
 
@@ -598,7 +598,7 @@ function CheckModal({
   const [running, setRunning] = useState(false)
   const [report, setReport] = useState<CheckReport | null>(null)
   const [repairing, setRepairing] = useState(false)
-  const [repairReport, setRepairReport] = useState<RepairReport | null>(null)
+  const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
 
   useEffect(() => {
     backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
@@ -621,8 +621,17 @@ function CheckModal({
   const runRepair = async () => {
     setRepairing(true)
     try {
-      setRepairReport(await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg()))
-      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+      // 修复是后台 job（持锁到完成）；轮询状态。
+      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg())
+      setRepairReport(run)
+      while (run.status === 'Running') {
+        await delay(1500)
+        run = await backupConfigsApi.repairStatus(config.id)
+        setRepairReport(run)
+      }
+      if (run.status === 'Completed')
+        setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+      else if (run.error) onError(run.error)
     } catch (e) {
       onError(String(e))
     } finally {
@@ -677,11 +686,17 @@ function CheckModal({
 
         {repairReport && (
           <div style={{ fontSize: '0.85rem', marginBottom: '0.6rem' }}>
-            Repaired {repairReport.repaired.length} file(s);{' '}
-            <span style={{ color: repairReport.unrecoverable.length ? 'crimson' : 'inherit' }}>
-              {repairReport.unrecoverable.length} unrecoverable
-            </span>
-            {repairReport.unrecoverable.length > 0 && `: ${repairReport.unrecoverable.join(', ')}`}
+            {repairReport.status === 'Running' && 'Repairing (backup is locked until done)…'}
+            {repairReport.status === 'Failed' && <span style={{ color: 'crimson' }}>Repair failed: {repairReport.error}</span>}
+            {repairReport.status === 'Completed' && (
+              <>
+                Repaired {repairReport.repaired?.length ?? 0} file(s);{' '}
+                <span style={{ color: repairReport.unrecoverable?.length ? 'crimson' : 'inherit' }}>
+                  {repairReport.unrecoverable?.length ?? 0} unrecoverable
+                </span>
+                {(repairReport.unrecoverable?.length ?? 0) > 0 && `: ${repairReport.unrecoverable!.join(', ')}`}
+              </>
+            )}
           </div>
         )}
 

@@ -86,6 +86,7 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>()));
 builder.Services.AddSingleton<RestoreRunner>();
+builder.Services.AddSingleton<RepairRunner>();
 builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),

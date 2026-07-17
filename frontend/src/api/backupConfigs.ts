@@ -141,6 +141,13 @@ export interface RepairReport {
   unrecoverable: string[]
 }
 
+export interface RepairRun {
+  status: 'Running' | 'Completed' | 'Failed'
+  repaired: string[] | null
+  unrecoverable: string[] | null
+  error: string | null
+}
+
 export interface FileVersionOption {
   version: number
   createdAt: string
@@ -179,6 +186,7 @@ export const backupConfigsApi = {
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
-    return api.post<RepairReport>(`/backup-configs/${id}/repair?${p.toString()}`, {})
+    return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
+  repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
 }

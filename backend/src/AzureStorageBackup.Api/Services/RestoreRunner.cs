@@ -15,8 +15,12 @@ public sealed record RestoreRunResponse(
         s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles, s.Error);
 }
 
-/// <summary>后台还原运行器：按配置 id 在后台跑 RestoreOrchestrator，状态存内存供轮询。</summary>
-public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
+/// <summary>
+/// 后台还原运行器：按配置 id 在后台跑 RestoreOrchestrator，状态存内存供轮询。
+/// **不占用 BackupBusyTracker**——还原只读云端，可与备份并行；长时（如等 Archive 活化）也不挡备份（用户要求）。
+/// 仅限每配置同时一个还原（避免同目标并发写）。
+/// </summary>
+public sealed class RestoreRunner(IServiceScopeFactory scopes)
 {
     private readonly Dictionary<int, RestoreRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -60,30 +64,18 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            if (!busy.TryAcquire(account.Id, config.ContainerName))
+            // 不占忙碌锁：还原与备份可并行。
+            state.Result = await orchestrator.RunAsync(new RestoreRequest
             {
-                state.Error = "This backup is busy with another operation.";
-                state.Status = RunStatus.Failed;
-                return;
-            }
-            try
-            {
-                state.Result = await orchestrator.RunAsync(new RestoreRequest
-                {
-                    Account = account,
-                    Container = config.ContainerName,
-                    TargetRoot = targetRoot,
-                    Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
-                    Version = version,
-                    DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
-                    Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
-                });
-                state.Status = RunStatus.Completed;
-            }
-            finally
-            {
-                busy.Release(account.Id, config.ContainerName);
-            }
+                Account = account,
+                Container = config.ContainerName,
+                TargetRoot = targetRoot,
+                Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
+                Version = version,
+                DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
+                Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
+            });
+            state.Status = RunStatus.Completed;
         }
         catch (Exception ex)
         {
