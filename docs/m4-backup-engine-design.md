@@ -19,6 +19,12 @@
 > - **加密备份密钥化寻址（防指纹识别）**：加密备份的 data blob 名改为 `data/{HMAC(key, fullHash)[:16]}`（key = HKDF(password, `BackupMeta.KdfSalt`)），碰撞元数据改为不透明 `v = HMAC(key, fullHash|len|head)`，不泄露长度/头部。未授权者即使能列 container 也无法用公开 hash 反推「是否备份过某文件」。去重照常（同内容→同地址）。非加密备份仍明文寻址。仅编排器创建 blob 时用密钥；还原/检查/清理用索引里记录的实际地址。残余泄露：blob 数量与大小。见 `BlobAddressScheme`。
 > - **原始文件直传（PRD 3.3.2，`StorageRef.Raw`）**：单文件 data blob 若**命中不压缩列表(store-only) + 无密码 + 单卷内(≤VolumeBytes)**，则直接把原文件拷到待上传区、上传**原始字节**（不走 7z 封装），`StorageRef.Raw=true`；raw 属性同时记入 blob 元数据(`raw=1`)，去重时以既有 blob 为准（同内容不同 don't-compress 状态也正确）。还原直接写回、深度检查直接重算 hash，均不解压。因单文件 blob 内容寻址去重可被多路径引用，还原/检查对同一 blob 复制/校验给**每个**引用条目。加密（keyed）备份永不 raw。见 `BackupOrchestrator.CopyRawAsync`。
 > - **计划任务遇忙碌跳过（`BackupBusyTracker`）**：备份按 账户/container 标识忙碌态；备份/还原/检查任一操作期间标记忙碌。计划任务（`TaskDispatcher`）目标忙碌 → 记 Warning 报警并跳过该目标，不打断在执行的任务；HTTP 备份/还原忙碌则拒绝并发，手动检查忙碌返回 409。
+> - **去重碰撞加固：三段 hash**。data blob 碰撞元数据由「长度 + 头 4KB hash」增加「尾 4KB hash」（`IFileHasher.TailHashAsync`）。误去重需 fullHash(128 位全文件)+长度+头+尾 同时相同，实际不可能——无需逐字节全文件比对。`TailHash` 一并存入索引条目（`IndexEntry.TailHash`，序列化 format 2）。加密备份的不透明校验 `v` 也纳入尾部。
+> - **单文件 blob 去重纯本地化（自建备份零云端读，`LocalDedupResolver`）**：自建备份的本地缓存已含每个 blob 的内容身份（fullHash+长度+头+尾）与存储信息（ref/raw/分卷数），故备份时**不发云端 HEAD**判断去重/碰撞：
+>   - 跨版本：从保留版本索引建「内容身份 → 既有 blob」映射直接命中。
+>   - 同一次备份内：运行内预约表（每 ref 一个 `TaskCompletionSource`）协调——同内容后到者等首个上传者完成，拿到相同 (ref, raw, 分卷数)（顺带修一个潜在竞态：同内容但不压缩设置不同的两文件曾各写各的 raw 标志、还原时损坏）；不同内容撞同址避让到 …~N；上传失败则令等待者一并失败，绝不去重到未成功写入的 blob。
+>   - **权威判定**：本地有状态（`TrackedInfoStore.HasLocalAsync`）或全新无版本时启用本地解析；**导入未同步**的备份回退到云端存在性检查（`ResolveDataRefAsync`）。
+>   - **行为取舍**（与「尽量不读云端」一致）：备份信任本地索引＝云端真相，不再自动重传被外部误删的 blob——该漂移交由**检查(Check)**发现。
 
 ## 2. 存储布局（container 内 blob 组织）
 
