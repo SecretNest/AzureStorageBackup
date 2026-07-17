@@ -20,6 +20,11 @@
 > - **原始文件直传（PRD 3.3.2，`StorageRef.Raw`）**：单文件 data blob 若**命中不压缩列表(store-only) + 无密码 + 单卷内(≤VolumeBytes)**，则直接把原文件拷到待上传区、上传**原始字节**（不走 7z 封装），`StorageRef.Raw=true`；raw 属性同时记入 blob 元数据(`raw=1`)，去重时以既有 blob 为准（同内容不同 don't-compress 状态也正确）。还原直接写回、深度检查直接重算 hash，均不解压。因单文件 blob 内容寻址去重可被多路径引用，还原/检查对同一 blob 复制/校验给**每个**引用条目。加密（keyed）备份永不 raw。见 `BackupOrchestrator.CopyRawAsync`。
 > - **计划任务遇忙碌跳过（`BackupBusyTracker`）**：备份按 账户/container 标识忙碌态；备份/还原/检查任一操作期间标记忙碌。计划任务（`TaskDispatcher`）目标忙碌 → 记 Warning 报警并跳过该目标，不打断在执行的任务；HTTP 备份/还原忙碌则拒绝并发，手动检查忙碌返回 409。
 > - **去重碰撞加固：三段 hash**。data blob 碰撞元数据由「长度 + 头 4KB hash」增加「尾 4KB hash」（`IFileHasher.TailHashAsync`）。误去重需 fullHash(128 位全文件)+长度+头+尾 同时相同，实际不可能——无需逐字节全文件比对。`TailHash` 一并存入索引条目（`IndexEntry.TailHash`，序列化 format 2）。加密备份的不透明校验 `v` 也纳入尾部。
+> - **分级检查 + 本地修复 + 不可恢复标记 + 还原替代**（PRD 2.3 扩展）：
+>   - **检查双轴**（`CheckOptions`，替换旧 `deep` 布尔）：云端 `CloudCheckLevel`（不查 / 元数据比对本地缓存 / 存在+尺寸（默认，HEAD 比对索引里存的 `VolumeSizes`，免下载识破截断/错包）/ 内容（下载重算 hash，Archive 可选活化 tier））；本地 `LocalCheckLevel`（不查 / 存在+尺寸+权限 / 内容 hash（默认，＝可从本地修复的判据））。结果 `CheckReport` 按文件给 `CloudState`/`LocalState`/`Repairable`。计划任务的 Check 也带这两级（`ScheduledTask.Check*Level`）。
+>   - **每分卷尺寸入索引**：`StorageRef.VolumeSizes` / `PackInfo.VolumeSizes`（序列化 format 3/2），供上面「存在+尺寸」级。
+>   - **从本地修复**（`BackupRepairer`，显式动作）：对云端坏掉的 blob，从本地文件（hash 校验）重压并**完整替换**（先删旧全部分卷）；单文件 blob 更新所有引用版本的尺寸/卷数（去重共享），pack 按所有版本存活成员整体重压。修不了（本地删/hash 变）→ 该文件在相关版本 `VersionIndex.UnrecoverablePaths` 标记不可恢复。归档内 mtime 不重要（展示用索引元数据，还原重设时间/权限）。
+>   - **还原替代**（`RestoreRequest.Substitutions` path→版本）：不可恢复文件由用户逐个（可批量、就近优先）选另一版本替代；未指定的不可恢复文件跳过（不报错）。候选由 `GET /file-versions?path=` 给出。
 > - **单文件 blob 去重纯本地化（自建备份零云端读，`LocalDedupResolver`）**：自建备份的本地缓存已含每个 blob 的内容身份（fullHash+长度+头+尾）与存储信息（ref/raw/分卷数），故备份时**不发云端 HEAD**判断去重/碰撞：
 >   - 跨版本：从保留版本索引建「内容身份 → 既有 blob」映射直接命中。
 >   - 同一次备份内：运行内预约表（每 ref 一个 `TaskCompletionSource`）协调——同内容后到者等首个上传者完成，拿到相同 (ref, raw, 分卷数)（顺带修一个潜在竞态：同内容但不压缩设置不同的两文件曾各写各的 raw 标志、还原时损坏）；不同内容撞同址避让到 …~N；上传失败则令等待者一并失败，绝不去重到未成功写入的 blob。
