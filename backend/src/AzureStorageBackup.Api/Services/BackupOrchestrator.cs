@@ -87,7 +87,8 @@ public sealed class BackupOrchestrator(
     IFileHasher hasher,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
-    ProcessingVerifier? verifier = null)
+    ProcessingVerifier? verifier = null,
+    ILocalIndexCache? indexCache = null)
 {
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
@@ -131,12 +132,18 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);
 
-        // 2. 载入上一版本
+        // 2. 载入上一版本。信息文件从云端读（权威）；大的版本索引优先走本地缓存（§3.3），避免每次下载解压。
         var info = await store.ReadInfoAsync(request.Account, request.Container, password, ct)
             ?? NewInfo(request);
-        VersionIndex? previous = info.Versions.Count > 0
-            ? await store.ReadIndexAsync(request.Account, request.Container, info.Versions[^1].IndexBlob, password, ct)
-            : null;
+        var identity = info.Backup.CreatedAt.UtcTicks;
+        VersionIndex? previous = null;
+        if (info.Versions.Count > 0)
+        {
+            var last = info.Versions[^1];
+            previous = indexCache is not null
+                ? await indexCache.ReadAsync(request.Account, request.Container, last.Version, identity, last.IndexBlob, password, ct)
+                : await store.ReadIndexAsync(request.Account, request.Container, last.IndexBlob, password, ct);
+        }
 
         // data blob 寻址方案：加密备份用密钥化地址防指纹识别（密钥从密码 + 信息文件里的盐派生）。
         var addressing = new BlobAddressScheme(password, info.Backup.KdfSalt);
@@ -190,6 +197,8 @@ public sealed class BackupOrchestrator(
         // 7. WriteIndex（先上传第二级索引）
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
+        if (indexCache is not null)
+            await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
 
         // 8/9. Finalize（原子更新信息文件）
         progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));

@@ -27,7 +27,7 @@ public sealed record CleanupOptions
 /// </summary>
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
-    DeadWeightCompactor? compactor = null)
+    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null)
 {
     /// <summary>独立清理：自行读取信息文件。</summary>
     public async Task CleanupAsync(
@@ -52,9 +52,15 @@ public sealed class RetentionCleaner(
         var container_ = factory.CreateServiceClient(account).GetBlobContainerClient(container);
         var deleted = new HashSet<int>(toDelete);
 
-        // 删除退役版本的第二级索引，并从信息文件移除。
+        var identity = info.Backup.CreatedAt.UtcTicks;
+
+        // 删除退役版本的第二级索引（云端 + 本地缓存），并从信息文件移除。
         foreach (var v in info.Versions.Where(v => deleted.Contains(v.Version)))
+        {
             await container_.GetBlobClient(v.IndexBlob).DeleteIfExistsAsync(cancellationToken: ct);
+            if (indexCache is not null)
+                await indexCache.RemoveAsync(account.Id, container, v.Version, ct);
+        }
         info.Versions.RemoveAll(v => deleted.Contains(v.Version));
 
         // 收集剩余版本仍引用的 data blob、pack，以及每个 pack 仍有效的成员（供死重压实）。
@@ -63,7 +69,9 @@ public sealed class RetentionCleaner(
         var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
         foreach (var v in info.Versions)
         {
-            var vi = await store.ReadIndexAsync(account, container, v.IndexBlob, password, ct);
+            var vi = indexCache is not null
+                ? await indexCache.ReadAsync(account, container, v.Version, identity, v.IndexBlob, password, ct)
+                : await store.ReadIndexAsync(account, container, v.IndexBlob, password, ct);
             foreach (var e in vi.Entries)
             {
                 if (e.Storage is null)

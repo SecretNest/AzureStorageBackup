@@ -19,6 +19,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<NotificationConfig> NotificationConfigs => Set<NotificationConfig>();
     public DbSet<LogEntry> LogEntries => Set<LogEntry>();
     public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
+    public DbSet<CachedVersionIndex> CachedVersionIndexes => Set<CachedVersionIndex>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -80,6 +81,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
                 v => v.UtcTicks,
                 v => new DateTimeOffset(v, TimeSpan.Zero));
             e.HasIndex(x => x.Timestamp);
+        });
+
+        modelBuilder.Entity<CachedVersionIndex>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Container).IsRequired();
+            e.HasIndex(x => new { x.AccountId, x.Container, x.Version }).IsUnique();
         });
     }
 }

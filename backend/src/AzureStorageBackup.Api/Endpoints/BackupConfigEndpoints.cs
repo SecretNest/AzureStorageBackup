@@ -23,8 +23,8 @@ public static class BackupConfigEndpoints
         })
         .WithName("GetBackupConfig");
 
-        // 导入已有备份：读 container 的信息文件恢复配置（roadmap，PRD 1.5）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, IBackupInfoStore store, IBackupConfigService svc, CancellationToken ct) =>
+        // 导入已有备份：读 container 的信息文件恢复配置，并把全部版本索引下载入本地缓存（roadmap，PRD 1.5、§3.3）
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, IBackupInfoStore store, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -52,6 +52,12 @@ public static class BackupConfigEndpoints
                 Password = info.Backup.Encrypted ? req.Password : null,
             };
             var created = await svc.CreateAsync(config, ct);
+
+            // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：之后备份/清理平时不再下载云端索引。
+            var identity = info.Backup.CreatedAt.UtcTicks;
+            foreach (var v in info.Versions)
+                await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
+
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
         });
 

@@ -45,6 +45,7 @@ builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 // 备份引擎（M4）：7z 编解码 + 信息文件/索引读写。codec 按需构造（首次解析时探测 7z）。
 builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
 builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
+builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
 
 // 引擎组件（无状态用单例；StagingArea 单例以保证压缩全局非并发，跨备份也不并发）。
 var tempPath = builder.Configuration["Backup:TempPath"];

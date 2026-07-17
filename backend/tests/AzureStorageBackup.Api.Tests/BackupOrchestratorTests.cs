@@ -1,9 +1,9 @@
 using System.Net.Sockets;
-using System.Text;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -94,6 +94,58 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+    }
+
+    /// <summary>统计 ReadIndexAsync 调用次数的 store 装饰器（验证本地缓存命中）。</summary>
+    private sealed class CountingStore(IBackupInfoStore inner) : IBackupInfoStore
+    {
+        public int IndexReads { get; private set; }
+        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, CancellationToken ct = default)
+        {
+            IndexReads++;
+            return inner.ReadIndexAsync(a, c, b, p, ct);
+        }
+        public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) => inner.ReadInfoAsync(a, c, p, ct);
+        public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
+        public Task<string> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteIndexAsync(a, c, v, i, p, t, ct);
+    }
+
+    [SkippableFact]
+    public async Task Second_Backup_Reads_Previous_Index_From_Local_Cache()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var counting = new CountingStore(new BackupInfoStore(factory, new SevenZipArchiveCodec()));
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        conn.Open();
+        var opts = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>()
+            .UseSqlite(conn).Options;
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
+            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        db.Database.EnsureCreated();
+        var cache = new LocalIndexCache(db, counting);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
+            new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(), indexCache: cache);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchlc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha");
+            await orchestrator.RunAsync(Request(account, name)); // v1：无上一版本，写完缓存 v1
+            await orchestrator.RunAsync(Request(account, name)); // v2：上一版本索引应命中本地缓存
+
+            Assert.Equal(0, counting.IndexReads); // 从未下载云端第二级索引
+        }
+        finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>记录同时在飞的上传数，验证上传并发。</summary>
