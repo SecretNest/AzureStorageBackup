@@ -32,7 +32,7 @@ public class BackupConfig
     public string? Password { get; set; }
 
     public StorageTier IndexTier { get; set; } = StorageTier.Hot;
-    public StorageTier DataTier { get; set; } = StorageTier.Hot;
+    public StorageTier DataTier { get; set; } = StorageTier.Archive;
 
     // 规则（gitignore 语法，每行一条）
     public string? IgnoreRules { get; set; }

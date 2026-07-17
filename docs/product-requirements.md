@@ -46,8 +46,8 @@
 
 - **3.1 Tier**（分别对索引文件、数据文件设置）：
   - 索引文件：Hot（默认）、Cool、Cold
-  - 数据文件：Hot（默认）、Cool、Cold、Archive
-  - **实现说明（以代码为准）**：`StorageTier` 枚举为 `Hot/Cool/Cold/Archive`，**不含 Smart**（backup-feature-design.md「已确认」段：Azure SDK 不作为可选项，故删去）。数据文件默认由早先设想的 Archive 改为 **Hot**——Archive 数据在还原前须先 rehydrate（可长达数小时）且有取回成本，对个人备份工具即时还原不友好；Archive 仍可显式选择。如需恢复 Archive 默认，改 `GlobalSettings.DefaultDataTier` 与 `BackupConfig.DataTier` 即可。
+  - 数据文件：Hot、Cool、Cold、**Archive（默认）**
+  - **实现说明（以代码为准）**：`StorageTier` 枚举为 `Hot/Cool/Cold/Archive`，**不含 Smart**（backup-feature-design.md「已确认」段：Azure SDK 不作为可选项，故删去）。数据文件默认 **Archive**（成本最优；还原前需 rehydrate，属备份归档语义的预期）。
 - **3.2 版本与时间**：最大版本数（默认 100）、最长时间（默认 180 天）、超量判断方式（两者都达到 / 任一达到 / 只看版本数 / 只看时间）。
 - **3.3 本地文件**：
   - **3.3.1 忽略**：符合规则的路径/文件被忽略，支持特例（被包含），语法参考 gitignore。若已有备份含这些文件，则新版本中予以排除（如同删除）。

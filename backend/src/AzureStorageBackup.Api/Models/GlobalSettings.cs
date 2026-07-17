@@ -11,7 +11,7 @@ public class GlobalSettings
 
     // 新建备份默认
     public StorageTier DefaultIndexTier { get; set; } = StorageTier.Hot;
-    public StorageTier DefaultDataTier { get; set; } = StorageTier.Hot;
+    public StorageTier DefaultDataTier { get; set; } = StorageTier.Archive;
     public int DefaultMaxVersions { get; set; } = 100;
     public int DefaultMaxAgeDays { get; set; } = 180;
     public RetentionMode DefaultRetentionMode { get; set; } = RetentionMode.EitherTriggers;

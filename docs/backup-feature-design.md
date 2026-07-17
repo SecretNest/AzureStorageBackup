@@ -118,9 +118,8 @@
 4. **还原「覆盖仅当变更时」用 hash 比对**（与索引中的 hash 对齐）。
 5. **Tier / Smart（已查证 Azure .NET SDK）**：`AccessTier` 只支持 Hot/Cool/Cold/Archive；「Smart tier」是**账户级自动分层**功能，不是可对单个 blob 设置的 tier。故本工具**不提供 Smart 选项**：
    - 索引文件 Tier = Hot（默认）/ Cool / Cold
-   - 数据文件 Tier = Hot（默认）/ Cool / Cold / Archive
+   - 数据文件 Tier = Hot / Cool / Cold / Archive（默认）
    - Cold 需 SDK ≥ 12.15.0（当前 12.29.1 满足）。
-   - **默认变更（以代码为准）**：数据文件默认由 Archive 改为 **Hot**——Archive 还原前须 rehydrate、有取回成本，对即时还原不友好；Archive 仍可选。见 product-requirements.md 3.1 实现说明。
 
 ### 留到 M4 设计文档提方案
 - 信息文件完整 schema
