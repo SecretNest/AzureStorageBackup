@@ -94,13 +94,13 @@ public sealed class DeadWeightCompactorTests : IDisposable
                 },
             },
         };
-        // b、c 仍被有效版本引用；a 死重（1/3 > 30%）。
+        // b、c 仍被有效版本引用；a 死重（1/3 > 30%）。liveByPack 按 entryName 归组。
         var live = new Dictionary<string, Dictionary<string, LivePackMember>>
         {
-            ["p0001"] = new()
+            ["p0001"] = new(StringComparer.Ordinal)
             {
-                [hashB] = new LivePackMember("b.txt", 2000),
-                [hashC] = new LivePackMember("c.txt", 2000),
+                ["b.txt"] = new LivePackMember("b.txt", 2000, hashB),
+                ["c.txt"] = new LivePackMember("c.txt", 2000, hashC),
             },
         };
         return (info, live, container, account);
@@ -165,6 +165,62 @@ public sealed class DeadWeightCompactorTests : IDisposable
             Assert.Equal(3, info.Packs["p0001"].Members.Count); // 未压实
             Assert.Equal(2000, info.Packs["p0001"].DeadBytes);  // 死重被记录
             Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container)); // pack 原样
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Keeps_Both_Members_That_Share_Identical_Content()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var account = AzuriteAccount();
+        var name = RandomName("dwc-dup-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // pack 含 a(死重) + b、d 两个**内容相同**的成员（去重后同 fullHash，但仍是两条独立成员）。
+            Write(_packSrc, "a.txt", new string('a', 2000));
+            Write(_packSrc, "b.txt", new string('s', 2000));
+            Write(_packSrc, "d.txt", new string('s', 2000)); // 与 b 内容一致
+
+            var hasher = new FileHasher();
+            var hashA = await hasher.FullHashAsync(Path.Combine(_packSrc, "a.txt"));
+            var hashDup = await hasher.FullHashAsync(Path.Combine(_packSrc, "b.txt"));
+            Assert.Equal(hashDup, await hasher.FullHashAsync(Path.Combine(_packSrc, "d.txt")));
+
+            var output = Path.Combine(_temp, "p0001.7z");
+            var result = await new SevenZipCompressor().CompressAsync(
+                new CompressionRequest(_packSrc, ["a.txt", "b.txt", "d.txt"], output, null));
+            await new BlobUploader(factory).UploadIfMissingAsync(
+                account, name, "packs/p0001.7z", result.VolumeFiles[0], AccessTier.Hot);
+
+            var info = new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },
+                Packs = { ["p0001"] = new PackInfo { Blob = "packs/p0001.7z", Members = [hashA, hashDup, hashDup], OriginalBytes = 6000 } },
+            };
+            // b、d 都有效（同 hash 但不同 entryName）；a 死重。若按 hash 归组会把 b、d 折叠成一个 → 丢数据。
+            var live = new Dictionary<string, Dictionary<string, LivePackMember>>
+            {
+                ["p0001"] = new(StringComparer.Ordinal)
+                {
+                    ["b.txt"] = new LivePackMember("b.txt", 2000, hashDup),
+                    ["d.txt"] = new LivePackMember("d.txt", 2000, hashDup),
+                },
+            };
+            Write(_local, "b.txt", new string('s', 2000));
+            Write(_local, "d.txt", new string('s', 2000));
+
+            await Compactor().CompactAsync(account, container, null, info, live,
+                AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
+
+            // 关键：两个同内容成员都必须保留（含各自 entryName），否则索引仍引用却已丢失 → 数据丢失。
+            Assert.Equal(["b.txt", "d.txt"], await PackEntriesAsync(container));
+            Assert.Equal(2, info.Packs["p0001"].Members.Count);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

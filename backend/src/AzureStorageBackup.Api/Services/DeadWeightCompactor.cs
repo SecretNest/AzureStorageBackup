@@ -4,8 +4,9 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>某 pack 内仍被有效版本引用的成员：fullHash → (归档条目名, 原始尺寸)。</summary>
-public sealed record LivePackMember(string EntryName, long Length);
+/// <summary>某 pack 内仍被有效版本引用的成员。按 entryName（归档条目名，pack 内唯一）标识——
+/// 同内容不同路径会去重成同 fullHash 但仍是**两个**独立成员，故不可用 fullHash 作身份，否则压实会漏掉其一。</summary>
+public sealed record LivePackMember(string EntryName, long Length, string FullHash);
 
 /// <summary>
 /// 死重压实（M4 设计 §6）：pack 内成员被删/变更且所有有效版本都不再引用后成为死重。
@@ -54,7 +55,7 @@ public sealed class DeadWeightCompactor(
                 {
                     info.Packs[packId] = packInfo with
                     {
-                        Members = [.. live.Keys],
+                        Members = [.. live.Values.Select(m => m.FullHash)],
                         OriginalBytes = liveBytes,
                         DeadBytes = 0,
                         Volumes = newVolumes,
@@ -99,11 +100,11 @@ public sealed class DeadWeightCompactor(
         {
             // 本地文件内容一致者直接采用（须 hash 确认，即便长度/时间/权限相同）；其余需从云端 pack 补齐。
             var needFromPack = new List<string>();
-            foreach (var (fullHash, member) in live)
+            foreach (var member in live.Values)
             {
                 var localPath = LocalPath(localRoot, member.EntryName);
                 if (localPath is not null && File.Exists(localPath)
-                    && await hasher.FullHashAsync(localPath, ct) == fullHash)
+                    && await hasher.FullHashAsync(localPath, ct) == member.FullHash)
                     CopyInto(composeDir, member.EntryName, localPath);
                 else
                     needFromPack.Add(member.EntryName);

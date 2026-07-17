@@ -86,7 +86,9 @@ public sealed class RetentionCleaner(
                         var members = liveByPack.TryGetValue(e.Storage.Ref, out var m)
                             ? m
                             : liveByPack[e.Storage.Ref] = new Dictionary<string, LivePackMember>(StringComparer.Ordinal);
-                        members[e.FullHash] = new LivePackMember(e.Storage.EntryName ?? e.Path, e.Length);
+                        // 按 entryName 归组（pack 内唯一）：同内容不同路径去重成同 fullHash 但仍是两个成员，不可用 hash 作 key。
+                        var entryName = e.Storage.EntryName ?? e.Path;
+                        members[entryName] = new LivePackMember(entryName, e.Length, e.FullHash);
                     }
                 }
                 else
