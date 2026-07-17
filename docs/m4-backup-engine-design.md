@@ -14,6 +14,8 @@
 > - hash 用 **XxHash128**（`xxh128:` 前缀），本文档 §2/§3.2 中出现的 `sha256:` 示例均按 §13.2 读作 `xxh128:`。
 > - 信息文件与第二级索引为**紧凑二进制序列化**（§13.4，`IndexSerializer` BinaryWriter），blob 名仍字面保留 `.json[.enc]` 后缀；§3.1/§3.2 的 JSON 示例仅描述**逻辑结构**，非磁盘字节格式。
 > - data blob 与 pack 均可**分卷**：多卷时实际 blob 名为 `data/{hash}.001/.002…`、`packs/{id}.7z.001/.002…`（单卷用基名），读写/清理经 `VolumeBlobIO` 按分卷族处理。
+> - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失；多卷**倒序上传**（.001 最后写）作为「整族齐全」提交标记。
+> - **hash 碰撞避让**：data blob 元数据存原始长度 + headHash；去重时须元数据一致才跳过，否则判为碰撞、改用备用名 `data/{hash}~1/~2…` 并报 UnrecoverableError。索引 `StorageRef.Ref` 记实际名，还原/检查/清理据此。（残余「同 hash+同长度+同 headHash」碰撞概率可忽略，不再下载内容比对。）
 
 ## 2. 存储布局（container 内 blob 组织）
 
