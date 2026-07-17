@@ -43,6 +43,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.LogMaxAgeDays = s.LogMaxAgeDays;
         existing.RetryBackoffSeconds = s.RetryBackoffSeconds;
         existing.RetryMaxTotalMinutes = s.RetryMaxTotalMinutes;
+        existing.DeadWeightThresholdPercent = s.DeadWeightThresholdPercent;
         await db.SaveChangesAsync(ct);
         return existing;
     }

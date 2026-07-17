@@ -71,8 +71,9 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
                 break;
 
             case ScheduledTaskType.Cleanup:
+                var cleanupSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
                 await sp.GetRequiredService<RetentionCleaner>()
-                    .CleanupAsync(account, container, password, BackupRequestMapper.RetentionOf(config), ct);
+                    .CleanupAsync(account, container, password, BackupRequestMapper.CleanupOf(config, cleanupSettings), ct);
                 break;
         }
     }

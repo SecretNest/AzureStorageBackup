@@ -94,6 +94,9 @@ export function SettingsPage() {
       <Field label="Retry max total (min)">
         <Num value={s.retryMaxTotalMinutes} onChange={(v) => set('retryMaxTotalMinutes', v)} />
       </Field>
+      <Field label="Dead-weight threshold (%)">
+        <Num value={s.deadWeightThresholdPercent} onChange={(v) => set('deadWeightThresholdPercent', v)} />
+      </Field>
 
       <div style={{ marginTop: '1rem' }}>
         <button type="button" onClick={save}>Save</button>

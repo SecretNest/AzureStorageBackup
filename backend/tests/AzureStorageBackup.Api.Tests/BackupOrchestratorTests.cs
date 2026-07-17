@@ -68,10 +68,12 @@ public sealed class BackupOrchestratorTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), stagedLimitBytes: 200_000_000);
+        var compactor = new DeadWeightCompactor(
+            new BlobUploader(factory), new SevenZipCompressor(), Path.Combine(_temp, "compact"));
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), verifier: verifier);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), new FileHasher(), verifier: verifier);
         return (orchestrator, store, factory);
     }
 
@@ -276,6 +278,53 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            await AssertReferencedBlobsExist(container, idx);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task DeadWeight_Compaction_Rewrites_Pack_Dropping_Unreferenced_Members()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchdw-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        // 同目录三个等大小文件 → 合并成一个 pack p0001（3 成员）。
+        WriteText("d/a.txt", new string('a', 2000));
+        WriteText("d/b.txt", new string('b', 2000));
+        WriteText("d/c.txt", new string('c', 2000));
+
+        BackupRequest Req() => Request(account, name) with
+        {
+            Options = new BackupEngineOptions
+            {
+                Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
+            },
+        };
+
+        try
+        {
+            await orchestrator.RunAsync(Req());        // v1: p0001{a,b,c}
+            WriteText("d/a.txt", new string('A', 2000)); // 改 a（等长不同内容）
+            await orchestrator.RunAsync(Req());        // v2: a→p0002；退役 v1 → p0001 中 a_old 死重(1/3>30%)→压实
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var p1 = info!.Packs["p0001"];
+            Assert.Equal(2, p1.Members.Count); // a_old 被丢弃，仅保留 b、c
+            Assert.Equal(0, p1.DeadBytes);
+
+            // 压实后 pack 仍可用：v2 索引引用的对象都在，且还原 b/c 成功。
+            var idx = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
             await AssertReferencedBlobsExist(container, idx);
         }
         finally

@@ -23,6 +23,9 @@ public sealed record BackupEngineOptions
 
     /// <summary>上传的网络重试退避策略（PRD 4.1）。</summary>
     public RetryOptions Upload { get; init; } = new();
+
+    /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
+    public double DeadWeightThreshold { get; init; } = 0.30;
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -194,7 +197,13 @@ public sealed class BackupOrchestrator(
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        await cleaner.CleanupAsync(request.Account, request.Container, password, request.Options.Retention, info, ct);
+        await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+        {
+            Retention = request.Options.Retention,
+            DataTier = request.DataTier,
+            VolumeBytes = request.Options.VolumeBytes,
+            DeadWeightThreshold = request.Options.DeadWeightThreshold,
+        }, info, ct);
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes);

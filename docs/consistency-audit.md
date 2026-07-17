@@ -9,7 +9,7 @@
 |---|------|------|------|
 | A1 | 保留清理误删**被引用的分卷 data blob** → 数据丢失 | 代码 bug | ✅ 改代码：`RetentionCleaner` 分卷名归一化后比对 |
 | A2 | 保留清理只删 pack 基名，漏删分卷 pack → 存储泄漏 | 代码 bug | ✅ 改代码：按 packId 归组枚举 `packs/` 删除 |
-| A3 | 死重压实（§6）设计存在、`DeadWeightAnalyzer` 已实现但**从未接入管线** | 功能缺口 | 📝 记为「已知未实现」：m4 §6 + roadmap 标注（个人规模下仅轻微存储膨胀，不影响正确性） |
+| A3 | 死重压实（§6）设计存在、`DeadWeightAnalyzer` 已实现但**从未接入管线** | 功能缺口 | ✅ 改代码：`DeadWeightCompactor` 接入 `RetentionCleaner`，原地重压回收死重（Archive tier 跳过） |
 | F1 | 前端 `CheckResult` 缺 `corruptedPaths`、`check()` 不传 `deep` → 深度校验结果不可见 | 代码缺口 | ✅ 改前端：补字段 + Deep check 按钮 + 展示损坏条目 |
 | T1 | 数据 Tier 默认：文档=Archive，代码=Hot | 设计默认冲突 | ✅ 改**代码**对齐文档：默认恢复为 **Archive**（成本最优，备份归档语义；用户 2026-07-17 确认）。测试显式用 Hot 便于评估。 |
 | D1 | PRD/设计仍写「Smart」tier | 文档过时 | ✅ 改文档：明确不提供 Smart |

@@ -113,9 +113,12 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 - **死重压实**（默认 30%）：pack 内文件被删/变更后旧数据留存；当死重比例（原始尺寸）> 阈值，pack 中**仍有效**的文件重新参与处理（按当前尺寸限制/不分组列表重新决定分组），旧 pack 在本次备份完成后删除。
   - **死重判定**：仅当所有有效版本都不再引用该文件，才算死重（§10 保留策略影响）。
 
-> **实现现状（以代码为准）**：
-> - `GroupingPlanner` 对本次全部变更文件（Added **与** Modified）统一套用尺寸阈值/不分组列表；「仅对新增文件生效」的语义（保持已分组/未分组文件状态不变）依赖死重压实，见下——当前尚未据此区分。
-> - **死重压实尚未接入管线**：`DeadWeightAnalyzer` 已实现（纯逻辑，含默认 30% 阈值），但 `BackupOrchestrator` 的 Plan 阶段尚未调用它，故 pack 不会因死重自动重打包、旧 pack 不会因死重删除（仅在整个版本退役、pack 不再被引用时由保留清理删除，§10）。这是一处**已知未实现**项，待后续 followup 接入；接入前个人备份规模下死重仅表现为存储轻微膨胀，不影响正确性。
+> **实现说明（以代码为准）**：
+> - `GroupingPlanner` 对本次全部变更文件（Added **与** Modified）统一套用尺寸阈值/不分组列表。
+> - **死重压实已接入清理管线**（`DeadWeightCompactor` + `RetentionCleaner`，2026-07-17）：采用**原地重压**而非「重新参与规划」——
+>   pack 死重比例超阈值（默认 30%，`GlobalSettings.DeadWeightThresholdPercent`）时，下载该 pack→解压→**仅保留仍有效成员**重压→覆盖同 packId blob（删旧分卷）。
+>   因 pack 按 `packId+entryName` 引用、有效成员 entryName 不变，**无需改写任何版本索引**（比 §6 原始「重新决定分组」更简单且避免跨版本改索引）。仅在版本退役时触发（死重只在此时增加）。
+> - **限制**：压实需下载 pack，故对 `Archive` tier 的 pack 无法在线执行（下载失败会被捕获、跳过并记录，仅更新 `DeadBytes` 以便观测）；对 Hot/Cool/Cold 有效。默认数据 tier 为 Archive，故压实主要在显式使用可读 tier 时生效。
 
 ## 7. 临时区状态机（PRD 3.3.2.4）
 

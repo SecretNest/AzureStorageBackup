@@ -59,6 +59,11 @@ builder.Services.AddSingleton<IFileHasher, FileHasher>();
 builder.Services.AddSingleton<BackupDiffer>();
 builder.Services.AddSingleton<GroupingPlanner>();
 builder.Services.AddSingleton<RetentionEvaluator>();
+builder.Services.AddSingleton(sp => new DeadWeightCompactor(
+    sp.GetRequiredService<IBlobUploader>(),
+    sp.GetRequiredService<IFileCompressor>(),
+    Path.Combine(tempPath, "compact"),
+    sp.GetService<ILogger<DeadWeightCompactor>>()));
 builder.Services.AddScoped<RetentionCleaner>();
 builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();

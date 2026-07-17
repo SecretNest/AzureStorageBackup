@@ -32,4 +32,7 @@ public class GlobalSettings
     // 默认 5s、30s、90s、300s，之后每 300s（= 序列最后一项），累计上限 2h。
     public string RetryBackoffSeconds { get; set; } = "5,30,90,300";
     public int RetryMaxTotalMinutes { get; set; } = 120;
+
+    // 死重压实阈值（PRD 3.3.3.4，M4 §6）：pack 死重比例超过此百分比时原地重压回收空间。
+    public int DeadWeightThresholdPercent { get; set; } = 30;
 }

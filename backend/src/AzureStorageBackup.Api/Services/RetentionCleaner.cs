@@ -3,28 +3,43 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
+/// <summary>清理选项：保留策略 + 死重压实所需的数据 tier / 分卷 / 阈值。</summary>
+public sealed record CleanupOptions
+{
+    public required RetentionPolicy Retention { get; init; }
+    public AccessTier DataTier { get; init; } = AccessTier.Hot;
+    public long? VolumeBytes { get; init; }
+
+    /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
+    public double DeadWeightThreshold { get; init; } = 0.30;
+}
+
 /// <summary>
-/// 版本保留清理（M4 §10）：退役超期版本，删其第二级索引及不再被任何有效版本引用的 data blob/pack。
+/// 版本保留清理（M4 §10）：退役超期版本，删其第二级索引及不再被任何有效版本引用的 data blob/pack；
+/// 随后对仍存活但死重超阈值的 pack 做原地压实（§6，经 <see cref="DeadWeightCompactor"/>）。
 /// 编排器备份完成时与调度器的 Cleanup 任务共用。
 /// </summary>
-public sealed class RetentionCleaner(IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention)
+public sealed class RetentionCleaner(
+    IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
+    DeadWeightCompactor? compactor = null)
 {
     /// <summary>独立清理：自行读取信息文件。</summary>
     public async Task CleanupAsync(
-        Account account, string container, string? password, RetentionPolicy policy, CancellationToken ct = default)
+        Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default)
     {
         var info = await store.ReadInfoAsync(account, container, password, ct);
         if (info is not null && info.Versions.Count > 0)
-            await CleanupAsync(account, container, password, policy, info, ct);
+            await CleanupAsync(account, container, password, options, info, ct);
     }
 
     /// <summary>已持有信息文件时清理（编排器备份完成后调用）。</summary>
     public async Task CleanupAsync(
-        Account account, string container, string? password, RetentionPolicy policy, BackupInfoFile info, CancellationToken ct = default)
+        Account account, string container, string? password, CleanupOptions options,
+        BackupInfoFile info, CancellationToken ct = default)
     {
         var toDelete = retention.VersionsToDelete(
             info.Versions.Select(v => new VersionRef(v.Version, v.CreatedAt)).ToList(),
-            policy, DateTimeOffset.UtcNow);
+            options.Retention, DateTimeOffset.UtcNow);
         if (toDelete.Count == 0)
             return;
 
@@ -36,9 +51,10 @@ public sealed class RetentionCleaner(IBlobClientFactory factory, IBackupInfoStor
             await container_.GetBlobClient(v.IndexBlob).DeleteIfExistsAsync(cancellationToken: ct);
         info.Versions.RemoveAll(v => deleted.Contains(v.Version));
 
-        // 收集剩余版本仍引用的 data blob 与 pack。
+        // 收集剩余版本仍引用的 data blob、pack，以及每个 pack 仍有效的成员（供死重压实）。
         var referencedBlobs = new HashSet<string>(StringComparer.Ordinal);
         var referencedPacks = new HashSet<string>(StringComparer.Ordinal);
+        var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
         foreach (var v in info.Versions)
         {
             var vi = await store.ReadIndexAsync(account, container, v.IndexBlob, password, ct);
@@ -47,9 +63,20 @@ public sealed class RetentionCleaner(IBlobClientFactory factory, IBackupInfoStor
                 if (e.Storage is null)
                     continue;
                 if (e.Storage.Kind == "pack")
+                {
                     referencedPacks.Add(e.Storage.Ref);
+                    if (e.FullHash is not null)
+                    {
+                        var members = liveByPack.TryGetValue(e.Storage.Ref, out var m)
+                            ? m
+                            : liveByPack[e.Storage.Ref] = new Dictionary<string, LivePackMember>(StringComparer.Ordinal);
+                        members[e.FullHash] = new LivePackMember(e.Storage.EntryName ?? e.Path, e.Length);
+                    }
+                }
                 else
+                {
                     referencedBlobs.Add(e.Storage.Ref);
+                }
             }
         }
 
@@ -71,6 +98,12 @@ public sealed class RetentionCleaner(IBlobClientFactory factory, IBackupInfoStor
             if (!referencedBlobs.Contains(BaseRef(blob.Name)))
                 await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct);
         }
+
+        // 死重压实（§6）：对仍存活但死重超阈值的 pack 原地重压。仅在版本退役后（死重可能增加）才检查。
+        if (compactor is not null)
+            await compactor.CompactAsync(
+                account, container_, password, info, liveByPack,
+                options.DataTier, options.VolumeBytes, options.DeadWeightThreshold, ct);
 
         await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
     }

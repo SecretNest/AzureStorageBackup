@@ -31,6 +31,8 @@ public static class BackupRequestMapper
             Retention = RetentionOf(config),
             UploadConcurrency = settings is { UploadConcurrency: > 0 } ? settings.UploadConcurrency : 5,
             Upload = RetryOf(settings),
+            DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
+                ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
         },
     };
 
@@ -65,6 +67,16 @@ public static class BackupRequestMapper
         MaxVersions = config.MaxVersions,
         MaxAgeDays = config.MaxAgeDays,
         Mode = config.RetentionMode,
+    };
+
+    /// <summary>清理选项（保留 + 死重压实所需 tier/分卷/阈值），调度器 Cleanup 任务用。</summary>
+    public static CleanupOptions CleanupOf(BackupConfig config, GlobalSettings? settings = null) => new()
+    {
+        Retention = RetentionOf(config),
+        DataTier = MapTier(config.DataTier),
+        VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
+        DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
+            ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
     };
 
     public static string? Password(BackupConfig config) =>

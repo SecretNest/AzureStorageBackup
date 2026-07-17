@@ -18,6 +18,7 @@ export interface GlobalSettings {
   logMaxAgeDays: number
   retryBackoffSeconds: string
   retryMaxTotalMinutes: number
+  deadWeightThresholdPercent: number
 }
 
 export const settingsApi = {
