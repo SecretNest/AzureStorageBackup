@@ -3,8 +3,8 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>已存在的单文件 data blob：实际存储名 + 是否原始字节 + 分卷数。</summary>
-public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes);
+/// <summary>已存在的单文件 data blob：实际存储名 + 是否原始字节 + 分卷数 + 各分卷尺寸。</summary>
+public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
 
 /// <summary>
 /// 纯本地的单文件 blob 去重/碰撞解析（不读云端）。自建备份的本地缓存索引已含每个 blob 的
@@ -45,7 +45,7 @@ public sealed class LocalDedupResolver
                 if (e.Storage is not { Kind: "blob" } s || e.FullHash is null)
                     continue;
                 var ck = ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
-                byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes));
+                byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
                 refs[s.Ref] = ck;
             }
         }
@@ -70,7 +70,7 @@ public sealed class LocalDedupResolver
                 if (priorCk != ck)
                     continue;                                     // 旧版本不同内容占此址 → 避让
                 return Resolution.ForExisting(                     // 理论上已被 _priorByContent 命中，稳妥兜底
-                    new ResolvedBlob(refName, false, 1), collision);
+                    new ResolvedBlob(refName, false, 1, []), collision);
             }
 
             var mine = new Reservation(ck);
@@ -95,7 +95,8 @@ public sealed class LocalDedupResolver
 
         public string ContentKey => contentKey;
         public Task<ResolvedBlob> Completion => _tcs.Task;
-        public void Complete(string refName, bool raw, int volumes) => _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes));
+        public void Complete(string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
+            _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes, volumeSizes));
         public void Fail(Exception ex) => _tcs.TrySetException(ex);
     }
 
@@ -125,7 +126,8 @@ public sealed class LocalDedupResolver
             new(@ref, collision, exists: false, null, reservation);
 
         /// <summary>上传成功后调用，供同批同内容的后到者拿到相同存储信息。</summary>
-        public void Complete(bool raw, int volumes) => _reservation?.Complete(Ref, raw, volumes);
+        public void Complete(bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
+            _reservation?.Complete(Ref, raw, volumes, volumeSizes);
 
         /// <summary>上传失败时调用，令等待的后到者一并失败（不会错误去重到不存在的 blob）。</summary>
         public void Fail(Exception ex) => _reservation?.Fail(ex);

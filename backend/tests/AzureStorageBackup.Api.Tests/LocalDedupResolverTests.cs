@@ -70,13 +70,14 @@ public sealed class LocalDedupResolverTests
         var secondTask = r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
         Assert.False(secondTask.IsCompleted);
 
-        first.Complete(raw: true, volumes: 2); // 首个上传成功
+        first.Complete(raw: true, volumes: 2, volumeSizes: [111, 222]); // 首个上传成功
         var second = await secondTask;
 
         Assert.True(second.Exists);                  // 同批去重
         Assert.Equal(first.Ref, second.Ref);
         Assert.True(second.Existing!.Raw);           // 拿到与首个一致的 raw
         Assert.Equal(2, second.Existing.Volumes);    // 与首个一致的分卷数
+        Assert.Equal([111L, 222L], second.Existing.VolumeSizes); // 与首个一致的分卷尺寸
     }
 
     [Fact]

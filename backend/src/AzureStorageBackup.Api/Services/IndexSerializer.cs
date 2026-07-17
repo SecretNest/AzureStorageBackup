@@ -13,8 +13,8 @@ public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
     // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
-    private const byte InfoFormat = 1;
-    private const byte IndexFormat = 2; // format 2: 每条目增加 TailHash（去重碰撞加固 + 纯本地去重）
+    private const byte InfoFormat = 2;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）
+    private const byte IndexFormat = 3;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths
 
     // ---- 信息记录文件 ----
 
@@ -57,7 +57,8 @@ public static class IndexSerializer
                 WriteHash(w, m);
             w.Write(pack.OriginalBytes);
             w.Write(pack.DeadBytes);
-            w.Write(pack.Volumes); // format 2
+            w.Write(pack.Volumes);
+            WriteLongs(w, pack.VolumeSizes); // info format 2
         }
 
         w.Flush();
@@ -121,6 +122,7 @@ public static class IndexSerializer
                 OriginalBytes = originalBytes,
                 DeadBytes = deadBytes,
                 Volumes = r.ReadInt32(),
+                VolumeSizes = format >= 2 ? ReadLongs(r) : [],
             };
         }
 
@@ -164,6 +166,7 @@ public static class IndexSerializer
                 WriteNullableString(w, s.EntryName);
                 w.Write(s.Volumes);
                 w.Write(s.Raw);
+                WriteLongs(w, s.VolumeSizes); // index format 3
             }
             else
             {
@@ -174,6 +177,10 @@ public static class IndexSerializer
         w.Write(index.EmptyDirs.Count);
         foreach (var dir in index.EmptyDirs)
             w.Write(dir);
+
+        w.Write(index.UnrecoverablePaths.Count); // index format 3
+        foreach (var p in index.UnrecoverablePaths)
+            w.Write(p);
 
         w.Flush();
         return ms.ToArray();
@@ -214,6 +221,7 @@ public static class IndexSerializer
                     EntryName = ReadNullableString(r),
                     Volumes = r.ReadInt32(),
                     Raw = r.ReadBoolean(),
+                    VolumeSizes = format >= 3 ? ReadLongs(r) : [],
                 };
             }
 
@@ -237,7 +245,21 @@ public static class IndexSerializer
         for (var i = 0; i < dirCount; i++)
             emptyDirs.Add(r.ReadString());
 
-        return new VersionIndex { Version = version, Entries = entries, EmptyDirs = emptyDirs };
+        var unrecoverable = new List<string>();
+        if (format >= 3)
+        {
+            var uCount = r.ReadInt32();
+            for (var i = 0; i < uCount; i++)
+                unrecoverable.Add(r.ReadString());
+        }
+
+        return new VersionIndex
+        {
+            Version = version,
+            Entries = entries,
+            EmptyDirs = emptyDirs,
+            UnrecoverablePaths = unrecoverable,
+        };
     }
 
     // ---- 编码原语 ----
@@ -250,6 +272,22 @@ public static class IndexSerializer
     }
 
     private static string? ReadNullableString(BinaryReader r) => r.ReadBoolean() ? r.ReadString() : null;
+
+    private static void WriteLongs(BinaryWriter w, IReadOnlyList<long> values)
+    {
+        w.Write(values.Count);
+        foreach (var v in values)
+            w.Write(v);
+    }
+
+    private static List<long> ReadLongs(BinaryReader r)
+    {
+        var count = r.ReadInt32();
+        var list = new List<long>(count);
+        for (var i = 0; i < count; i++)
+            list.Add(r.ReadInt64());
+        return list;
+    }
 
     private static void WriteNullableBytes(BinaryWriter w, byte[]? value)
     {

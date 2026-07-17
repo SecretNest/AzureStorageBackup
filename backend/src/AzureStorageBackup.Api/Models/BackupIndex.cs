@@ -57,6 +57,9 @@ public sealed record PackInfo
 
     /// <summary>pack 归档的分卷数（1=未分卷）。压实会改变，随 PackInfo 一并更新，供检查核验全部分卷存在（§7）。</summary>
     public int Volumes { get; init; } = 1;
+
+    /// <summary>各分卷字节尺寸（按 .001..N 顺序）。供「存在+尺寸」级检查免下载发现截断/错包。旧信息文件可能为空（→仅验存在）。</summary>
+    public List<long> VolumeSizes { get; init; } = [];
 }
 
 /// <summary>第二级版本索引（§3.2）：该版本全部文件清单 + 空文件夹。</summary>
@@ -67,6 +70,10 @@ public sealed record VersionIndex
 
     /// <summary>空文件夹（备份需包含，还原需创建）。</summary>
     public List<string> EmptyDirs { get; init; } = [];
+
+    /// <summary>此版本中已无法恢复的文件路径（云端损坏且本地也无法修复）。由修复流程写入；
+    /// 还原时据此让用户逐个从其它版本替代。</summary>
+    public List<string> UnrecoverablePaths { get; init; } = [];
 }
 
 /// <summary>索引条目：一个文件/符号链接及其存储位置。</summary>
@@ -118,4 +125,7 @@ public sealed record StorageRef
     /// 仅单文件 blob；还原/检查据此直接复制/哈希，不解压。
     /// </summary>
     public bool Raw { get; init; }
+
+    /// <summary>各分卷字节尺寸（按 .001..N 顺序）。供「存在+尺寸」级检查免下载发现截断/错包。旧索引可能为空（→仅验存在）。</summary>
+    public List<long> VolumeSizes { get; init; } = [];
 }

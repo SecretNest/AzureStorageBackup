@@ -49,16 +49,17 @@ public sealed class DeadWeightCompactor(
 
             try
             {
-                var newVolumes = await RecompactAsync(
+                var newSizes = await RecompactAsync(
                     account, container, password, packId, live, localRoot, dataTier, allowDownload, volumeBytes, ct);
-                if (newVolumes > 0)
+                if (newSizes.Count > 0)
                 {
                     info.Packs[packId] = packInfo with
                     {
                         Members = [.. live.Values.Select(m => m.FullHash)],
                         OriginalBytes = liveBytes,
                         DeadBytes = 0,
-                        Volumes = newVolumes,
+                        Volumes = newSizes.Count,
+                        VolumeSizes = [.. newSizes],
                     };
                     logger?.LogInformation(
                         "Compacted pack {Pack}: dropped {Dead} bytes of dead weight ({Ratio:P0})", packId, deadBytes, ratio);
@@ -80,8 +81,8 @@ public sealed class DeadWeightCompactor(
         }
     }
 
-    /// <returns>&gt;0=已重压（新分卷数）；0=本地缺失成员且不允许下载，放弃。</returns>
-    private async Task<int> RecompactAsync(
+    /// <returns>非空=已重压（新各分卷尺寸）；空=本地缺失成员且不允许下载，放弃。</returns>
+    private async Task<IReadOnlyList<long>> RecompactAsync(
         Account account, BlobContainerClient container, string? password, string packId,
         Dictionary<string, LivePackMember> live, string? localRoot, AccessTier dataTier,
         bool allowDownload, long? volumeBytes, CancellationToken ct)
@@ -91,7 +92,7 @@ public sealed class DeadWeightCompactor(
         // 优化：先按「存在性」判断是否有本地缺失成员；若缺失且不允许下载，直接放弃（不做任何 hash 比对）。
         var hasAbsentLocal = live.Values.Any(m => !File.Exists(LocalPath(localRoot, m.EntryName)));
         if (hasAbsentLocal && !allowDownload)
-            return 0;
+            return [];
 
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         var composeDir = Path.Combine(work, "compose");
@@ -113,7 +114,7 @@ public sealed class DeadWeightCompactor(
             if (needFromPack.Count > 0)
             {
                 if (!allowDownload)
-                    return 0;
+                    return [];
 
                 // 下载并解压旧 pack，取出本地缺失的成员。
                 var extractDir = Path.Combine(work, "x");
@@ -136,7 +137,7 @@ public sealed class DeadWeightCompactor(
 
             await VolumeBlobIO.UploadAsync(
                 uploader, account, container.Name, baseRef, result.VolumeFiles, dataTier, retry: null, ct);
-            return result.VolumeFiles.Count;
+            return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
         }
         finally
         {

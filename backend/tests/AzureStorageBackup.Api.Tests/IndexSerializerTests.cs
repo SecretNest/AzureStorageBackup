@@ -190,6 +190,33 @@ public sealed class IndexSerializerTests
     }
 
     [Fact]
+    public void Volume_Sizes_And_Unrecoverable_Paths_RoundTrip()
+    {
+        var info = SampleInfo();
+        info.Packs["p0001"] = info.Packs["p0001"] with { VolumeSizes = [100, 200, 50] };
+        var index = SampleIndex() with
+        {
+            Entries = [SampleIndex().Entries[0] with { Storage = SampleIndex().Entries[0].Storage! with { VolumeSizes = [4096, 512] } }],
+            UnrecoverablePaths = ["gone/a.txt", "changed/b.bin"],
+        };
+
+        var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
+        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+
+        Assert.Equal([100L, 200L, 50L], backInfo.Packs["p0001"].VolumeSizes);       // pack 分卷尺寸（信息文件）
+        Assert.Equal([4096L, 512L], backIndex.Entries[0].Storage!.VolumeSizes);     // 单文件 blob 分卷尺寸（索引）
+        Assert.Equal(["gone/a.txt", "changed/b.bin"], backIndex.UnrecoverablePaths); // 不可恢复标记
+    }
+
+    [Fact]
+    public void New_Fields_Default_Empty()
+    {
+        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
+        Assert.Empty(backIndex.Entries[0].Storage!.VolumeSizes);
+        Assert.Empty(backIndex.UnrecoverablePaths);
+    }
+
+    [Fact]
     public void Deserialize_Rejects_Unsupported_SchemaVersion()
     {
         var future = IndexSerializer.SerializeInfoFile(SampleInfo() with { SchemaVersion = 999 });

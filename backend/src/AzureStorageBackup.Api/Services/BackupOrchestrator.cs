@@ -302,18 +302,21 @@ public sealed class BackupOrchestrator(
         // 内容寻址去重 + hash 碰撞避让：本地权威时纯本地判定（不发云端 HEAD，见 localResolver）；否则回退云端存在性检查。
         // 不同内容碰撞到同 hash 时改用备用名 …~N 并报警。verifier 内容变化时用新 hash 重调。
         var uploadedVolumes = 0;
-        int? dedupVolumes = null;      // 去重命中时的既有分卷数（免云端 CountVolumes）
+        IReadOnlyList<long> uploadedSizes = [];   // 本次上传的各分卷尺寸
+        int? dedupVolumes = null;                 // 去重命中时的既有分卷数（免云端 CountVolumes）
+        IReadOnlyList<long>? dedupSizes = null;   // 去重命中时的既有分卷尺寸
         var chosenRef = addressing.DataAddress(file.FullHash);
         var collided = false;
         var wasRaw = false;
         string? finalTail = null;      // 最终内容的尾部 hash，回填索引条目
 
-        // data/{hash}（或避让后的 …~N）不存在时：压缩/直传并上传，记录卷数。
+        // data/{hash}（或避让后的 …~N）不存在时：压缩/直传并上传，记录卷数/尺寸。
         async Task UploadNewAsync(string blobRef, string hash, long length, string head, string tail, bool raw, CancellationToken token)
         {
             var staged = await staging.StageAsync((compressTemp, t) => raw
                 ? CopyRawAsync(localPath, compressTemp, SafeFileName(hash), t)
                 : CompressAsync(request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
+            var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
             await uploadGate.WaitAsync(token);
             try
             {
@@ -324,6 +327,7 @@ public sealed class BackupOrchestrator(
                     uploader, request.Account, request.Container, blobRef, staged.Files,
                     request.DataTier, request.Options.Upload, token, meta);
                 uploadedVolumes = staged.Files.Count;
+                uploadedSizes = sizes;
             }
             finally
             {
@@ -352,13 +356,14 @@ public sealed class BackupOrchestrator(
                 {
                     wasRaw = res.Existing!.Raw;   // 以既有 blob 的实际 raw 为准（同批同内容也一致）
                     dedupVolumes = res.Existing.Volumes;
+                    dedupSizes = res.Existing.VolumeSizes;
                     return;
                 }
                 try
                 {
                     await UploadNewAsync(res.Ref, hash, length, head, tail, raw, token);
                     wasRaw = raw;
-                    res.Complete(raw, uploadedVolumes); // 唤醒同批同内容的后到者，给它们相同存储信息
+                    res.Complete(raw, uploadedVolumes, uploadedSizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                 }
                 catch (Exception ex)
                 {
@@ -406,9 +411,12 @@ public sealed class BackupOrchestrator(
         var volumes = uploadedVolumes > 0
             ? uploadedVolumes
             : dedupVolumes ?? await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
+        // 分卷尺寸：本次上传取实测；去重取既有；云端回退路径无从得知则留空（尺寸检查降级为仅验存在）。
+        var volumeSizes = uploadedVolumes > 0 ? uploadedSizes : dedupSizes ?? [];
         storageByPath[file.Path] = new StorageRef
         {
             Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes), Raw = wasRaw,
+            VolumeSizes = [.. volumeSizes],
         };
         if (finalTail is not null)
             tailByPath[file.Path] = finalTail;
@@ -596,11 +604,11 @@ public sealed class BackupOrchestrator(
             request, compressTemp, packId, entries, storeOnly: false, token), ct);
     }
 
-    /// <returns>该 pack 归档的分卷数（供记录，核验分卷完整性用）。</returns>
-    private async Task<int> UploadStagedPackAsync(
+    /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
+    private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate, CancellationToken ct)
     {
-        var volumes = staged.Files.Count;
+        var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         await uploadGate.WaitAsync(ct);
         try
         {
@@ -613,11 +621,11 @@ public sealed class BackupOrchestrator(
             uploadGate.Release();
             staging.Release(staged);
         }
-        return volumes;
+        return sizes;
     }
 
     private static void RecordPack(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, int volumes,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, IReadOnlyList<long> volumeSizes,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
     {
         foreach (var m in members)
@@ -629,7 +637,8 @@ public sealed class BackupOrchestrator(
             Members = members.Select(m => m.FullHash).ToList(),
             OriginalBytes = members.Sum(m => m.Length),
             DeadBytes = 0,
-            Volumes = Math.Max(1, volumes),
+            Volumes = Math.Max(1, volumeSizes.Count),
+            VolumeSizes = [.. volumeSizes],
         };
         lock (info.Packs)
             info.Packs[packId] = packInfo;
