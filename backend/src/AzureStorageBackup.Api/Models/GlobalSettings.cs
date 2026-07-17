@@ -44,8 +44,12 @@ public class GlobalSettings
     // 全局
     public int UploadConcurrency { get; set; } = 5;
     public int DownloadConcurrency { get; set; } = 5; // 还原/深度检查下载并发（PRD 3.4）
-    public int LogMaxEntries { get; set; } = 10_000;
-    public int LogMaxAgeDays { get; set; } = 180;
+
+    /// <summary>短存(debug/info)日志保留天数（PRD 3.6，默认 14）。长存审计日志不受此限。</summary>
+    public int LogEphemeralMaxAgeDays { get; set; } = 14;
+
+    /// <summary>新建备份默认是否写 debug 级日志（含操作文件名）。默认关（可按备份单独开启）。</summary>
+    public bool DefaultVerboseLogging { get; set; }
 
     // 网络重试退避（PRD 4.1）：逗号分隔的秒序列 + 总时长上限（分钟）。
     // 默认 5s、30s、90s、300s，之后每 300s（= 序列最后一项），累计上限 2h。

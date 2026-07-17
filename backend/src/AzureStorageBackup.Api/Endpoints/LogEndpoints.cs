@@ -23,9 +23,13 @@ public static class LogEndpoints
             return Results.Ok(entries.Select(e => new LogEntryResponse(e.Id, e.Timestamp, e.Level, e.Source, e.Message)));
         });
 
-        group.MapDelete("/", async (IOperationLog log, CancellationToken ct) =>
+        // before 指定则删除早于该时间的全部日志（含长存审计，PRD 3.6 手工清理）；否则清空全部。
+        group.MapDelete("/", async (IOperationLog log, DateTimeOffset? before, CancellationToken ct) =>
         {
-            await log.ClearAsync(ct);
+            if (before is { } cutoff)
+                await log.PurgeBeforeAsync(cutoff, ct);
+            else
+                await log.ClearAsync(ct);
             return Results.NoContent();
         });
 

@@ -88,9 +88,12 @@ public static class BackupConfigEndpoints
             return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result));
         });
 
-        group.MapDelete("/{id:int}", async (int id, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, IBackupConfigService svc, IOperationLog log, CancellationToken ct) =>
         {
+            var config = await svc.GetAsync(id, ct);
             var ok = await svc.DeleteAsync(id, ct);
+            if (ok && config is not null)
+                await log.DeleteForContainerAsync(config.ContainerName, ct); // 删除备份时连带删其审计日志（PRD 3.6）
             return ok ? Results.NoContent() : Results.NotFound();
         });
 

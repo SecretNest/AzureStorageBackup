@@ -28,6 +28,9 @@ public sealed record BackupEngineOptions
     /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
     public double DeadWeightThreshold { get; init; } = 0.30;
 
+    /// <summary>是否写 debug 级日志（含操作文件名，短存）。</summary>
+    public bool VerboseLogging { get; init; }
+
     /// <summary>死重重 pack 时本地缺失成员是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
     public bool AllowRepackDownload { get; init; } = true;
 }
@@ -120,9 +123,25 @@ public sealed class BackupOrchestrator(
         try
         {
             if (opLog is not null)
-                await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct);
+                await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
             if (notifier is not null)
                 await notifier.NotifyAsync(evt, title, body, ct);
+        }
+        finally
+        {
+            _recordGate.Release();
+        }
+    }
+
+    // verbose 时按文件写 debug 日志（含文件名，短存）。经 _recordGate 串行化，避免并发访问共享 DbContext。
+    private async Task LogFileAsync(BackupRequest request, string path, CancellationToken ct)
+    {
+        if (!request.Options.VerboseLogging || opLog is null)
+            return;
+        await _recordGate.WaitAsync(ct);
+        try
+        {
+            await opLog.AppendAsync(OperationLogLevel.Debug, $"backup:{request.Container}", $"Backed up {path}", ct, durable: false);
         }
         finally
         {
@@ -344,6 +363,7 @@ public sealed class BackupOrchestrator(
         if (finalHash != file.FullHash)
             overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
 
+        await LogFileAsync(request, file.Path, ct);
         onItem();
     }
 
@@ -448,6 +468,7 @@ public sealed class BackupOrchestrator(
                 var staged0 = await CompressPackAsync(request, packId, members, ct);
                 var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
                 RecordPack(request, packId, members, vols0, info, storageByPath);
+                foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem();
                 continue;
             }
@@ -468,6 +489,7 @@ public sealed class BackupOrchestrator(
             {
                 var vols = await UploadStagedPackAsync(request, packId, staged, uploadGate, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
+                foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem();
                 continue;
             }
@@ -480,6 +502,7 @@ public sealed class BackupOrchestrator(
                 var staged2 = await CompressPackAsync(request, packId, stable, ct);
                 var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
+                foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
                 onItem();
             }
 

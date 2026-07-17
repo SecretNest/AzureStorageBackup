@@ -50,7 +50,7 @@ public sealed class BackupChecker(
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
     {
         if (opLog is not null)
-            await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct);
+            await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
         if (notifier is not null)
             await notifier.NotifyAsync(evt, title, body, ct);
     }

@@ -19,8 +19,8 @@ export interface GlobalSettings {
   defaultDontGroupRules: string | null
   uploadConcurrency: number
   downloadConcurrency: number
-  logMaxEntries: number
-  logMaxAgeDays: number
+  logEphemeralMaxAgeDays: number
+  defaultVerboseLogging: boolean
   retryBackoffSeconds: string
   retryMaxTotalMinutes: number
   deadWeightThresholdPercent: number

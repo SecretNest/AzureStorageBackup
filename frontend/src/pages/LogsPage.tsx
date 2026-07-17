@@ -43,6 +43,21 @@ export function LogsPage() {
     }
   }
 
+  // 删除早于某时间的全部日志（含长存审计）。用 "To" 值作截止点。
+  const purgeBefore = async () => {
+    if (!to) {
+      setError('Set the "To" time to purge everything before it.')
+      return
+    }
+    if (!window.confirm(`Delete ALL logs before ${to}?`)) return
+    try {
+      await logsApi.purgeBefore(new Date(to).toISOString())
+      load()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   return (
     <section>
       <h1>Logs</h1>
@@ -53,6 +68,7 @@ export function LogsPage() {
           Level:{' '}
           <select value={minLevel} onChange={(e) => setMinLevel(e.target.value === '' ? '' : Number(e.target.value))}>
             <option value="">All</option>
+            <option value={OperationLogLevel.Debug}>Debug+</option>
             <option value={OperationLogLevel.Info}>Info+</option>
             <option value={OperationLogLevel.Warning}>Warning+</option>
             <option value={OperationLogLevel.Error}>Error</option>
@@ -71,8 +87,11 @@ export function LogsPage() {
         <button type="button" onClick={load}>
           Refresh
         </button>
+        <button type="button" onClick={purgeBefore}>
+          Delete before "To"
+        </button>
         <button type="button" onClick={clear}>
-          Clear
+          Clear all
         </button>
       </div>
 

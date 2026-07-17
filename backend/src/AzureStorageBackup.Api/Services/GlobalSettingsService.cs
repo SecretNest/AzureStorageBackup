@@ -44,8 +44,8 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DefaultDontGroupRules = s.DefaultDontGroupRules;
         existing.UploadConcurrency = s.UploadConcurrency;
         existing.DownloadConcurrency = s.DownloadConcurrency;
-        existing.LogMaxEntries = s.LogMaxEntries;
-        existing.LogMaxAgeDays = s.LogMaxAgeDays;
+        existing.LogEphemeralMaxAgeDays = s.LogEphemeralMaxAgeDays;
+        existing.DefaultVerboseLogging = s.DefaultVerboseLogging;
         existing.RetryBackoffSeconds = s.RetryBackoffSeconds;
         existing.RetryMaxTotalMinutes = s.RetryMaxTotalMinutes;
         existing.DeadWeightThresholdPercent = s.DeadWeightThresholdPercent;

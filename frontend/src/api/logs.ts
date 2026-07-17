@@ -1,7 +1,7 @@
 import { api } from './client'
 
-export const OperationLogLevel = { Info: 0, Warning: 1, Error: 2 } as const
-export const levelLabels: Record<number, string> = { 0: 'Info', 1: 'Warning', 2: 'Error' }
+export const OperationLogLevel = { Debug: 0, Info: 1, Warning: 2, Error: 3 } as const
+export const levelLabels: Record<number, string> = { 0: 'Debug', 1: 'Info', 2: 'Warning', 3: 'Error' }
 
 export interface LogEntry {
   id: number
@@ -31,4 +31,6 @@ export const logsApi = {
     return api.get<LogEntry[]>(`/logs${qs ? `?${qs}` : ''}`)
   },
   clear: () => api.del('/logs'),
+  // 删除早于 cutoff（ISO）的全部日志（含长存审计）。
+  purgeBefore: (cutoffIso: string) => api.del(`/logs?before=${encodeURIComponent(cutoffIso)}`),
 }

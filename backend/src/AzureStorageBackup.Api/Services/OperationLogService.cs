@@ -20,7 +20,10 @@ public static class EventLog
 /// <summary>操作日志的记录与查询（PRD 5）。按等级/来源/时间过滤，可清空。</summary>
 public interface IOperationLog
 {
-    Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default);
+    /// <param name="durable">
+    /// null=按级别自动判定（Warning 及以上长存，其余短存）；true=长存（审计，保留至删备份/手工清）；false=短存(14 天)。
+    /// </param>
+    Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null);
 
     Task<IReadOnlyList<LogEntry>> QueryAsync(
         OperationLogLevel? minLevel, string? source, DateTimeOffset? from, DateTimeOffset? to, int limit,
@@ -28,13 +31,20 @@ public interface IOperationLog
 
     Task ClearAsync(CancellationToken ct = default);
 
-    /// <summary>保留清理（PRD 3.6）：删除超期或超出最大条数的记录；两个上限"达到之一即删"。</summary>
-    Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default);
+    /// <summary>删除某备份（container）的全部日志（删除备份时调用，PRD 3.6"长存日志保留至删除备份"）。</summary>
+    Task DeleteForContainerAsync(string container, CancellationToken ct = default);
+
+    /// <summary>手工清理：删除早于 cutoff 的**全部**日志（长存+短存，PRD 3.6"指定时间早于此全删"）。</summary>
+    Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default);
+
+    /// <summary>短存日志保留清理（PRD 3.6）：删除超期(默认 14 天)的短存(ephemeral)日志；长存不受影响。</summary>
+    Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default);
 }
 
 public sealed class OperationLogService(AppDbContext db) : IOperationLog
 {
-    public async Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default)
+    public async Task AppendAsync(
+        OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null)
     {
         db.LogEntries.Add(new LogEntry
         {
@@ -42,6 +52,7 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
             Level = level,
             Source = source,
             Message = message,
+            Ephemeral = !(durable ?? level >= OperationLogLevel.Warning),
         });
         await db.SaveChangesAsync(ct);
     }
@@ -73,22 +84,21 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
         await db.SaveChangesAsync(ct);
     }
 
-    public async Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
+    public async Task DeleteForContainerAsync(string container, CancellationToken ct = default)
     {
-        if (maxAgeDays is int days and > 0)
-        {
-            var cutoff = now.AddDays(-days);
-            await db.LogEntries.Where(e => e.Timestamp < cutoff).ExecuteDeleteAsync(ct);
-        }
+        // 来源形如 "backup:{container}"、"check:{container}"、"restore:{container}"、"schedule:{container}"。
+        var suffix = ":" + container;
+        await db.LogEntries.Where(e => e.Source.EndsWith(suffix)).ExecuteDeleteAsync(ct);
+    }
 
-        if (maxEntries is int max and > 0)
-        {
-            // 保留最新 max 条：删除 Id 小于"最新 max 条中最小 Id"的记录。
-            var minKeepId = await db.LogEntries
-                .OrderByDescending(e => e.Id)
-                .Take(max)
-                .MinAsync(e => (int?)e.Id, ct) ?? 0;
-            await db.LogEntries.Where(e => e.Id < minKeepId).ExecuteDeleteAsync(ct);
-        }
+    public async Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+        => await db.LogEntries.Where(e => e.Timestamp < cutoff).ExecuteDeleteAsync(ct);
+
+    public async Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
+    {
+        var days = maxAgeDays is > 0 ? maxAgeDays.Value : 14; // 默认 14 天
+        var cutoff = now.AddDays(-days);
+        // 仅删短存(ephemeral)日志；长存(审计)日志保留至删除备份或手工清。
+        await db.LogEntries.Where(e => e.Ephemeral && e.Timestamp < cutoff).ExecuteDeleteAsync(ct);
     }
 }

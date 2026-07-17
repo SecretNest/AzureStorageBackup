@@ -36,6 +36,7 @@ const emptyForm: BackupConfigInput = {
   singleFileThresholdBytes: 5 * MB,
   groupCapBytes: 100 * MB,
   volumeBytes: null,
+  verboseLogging: false,
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -82,6 +83,7 @@ export function BackupConfigsPage() {
         singleFileThresholdBytes: d.defaultSingleFileThresholdBytes,
         groupCapBytes: d.defaultGroupCapBytes,
         volumeBytes: d.defaultVolumeBytes,
+        verboseLogging: d.defaultVerboseLogging,
         includeSymlinks: d.defaultIncludeSymlinks,
         ignoreRules: d.defaultIgnoreRules ?? '',
         dontCompressRules: d.defaultDontCompressRules ?? '',
@@ -108,6 +110,7 @@ export function BackupConfigsPage() {
       dontCompressRules: c.dontCompressRules ?? '',
       dontGroupRules: c.dontGroupRules ?? '',
       includeSymlinks: c.includeSymlinks,
+      verboseLogging: c.verboseLogging,
       maxVersions: c.maxVersions,
       maxAgeDays: c.maxAgeDays,
       retentionMode: c.retentionMode,
@@ -449,6 +452,13 @@ export function BackupConfigsPage() {
                   type="checkbox"
                   checked={form.includeSymlinks}
                   onChange={(e) => set('includeSymlinks', e.target.checked)}
+                />
+              </Field>
+              <Field label="Verbose (debug) logging">
+                <input
+                  type="checkbox"
+                  checked={form.verboseLogging}
+                  onChange={(e) => set('verboseLogging', e.target.checked)}
                 />
               </Field>
               <Field label="Max versions">

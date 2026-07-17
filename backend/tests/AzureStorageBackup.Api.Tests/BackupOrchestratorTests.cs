@@ -602,7 +602,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         private int _active;
         public int MaxConcurrent { get; private set; }
-        public async Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default)
+        public async Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null)
         {
             var now = Interlocked.Increment(ref _active);
             lock (this) MaxConcurrent = Math.Max(MaxConcurrent, now);
@@ -612,7 +612,63 @@ public sealed class BackupOrchestratorTests : IDisposable
         public Task<IReadOnlyList<LogEntry>> QueryAsync(OperationLogLevel? l, string? s, DateTimeOffset? f, DateTimeOffset? t, int n, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<LogEntry>>([]);
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    /// <summary>捕获 AppendAsync 调用（等级/是否长存/消息）。</summary>
+    private sealed class CapturingLog : IOperationLog
+    {
+        public List<(OperationLogLevel Level, bool? Durable, string Message)> Entries { get; } = [];
+        public Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null)
+        {
+            lock (Entries) Entries.Add((level, durable, message));
+            return Task.CompletedTask;
+        }
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(OperationLogLevel? l, string? s, DateTimeOffset? f, DateTimeOffset? t, int n, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    [SkippableFact]
+    public async Task Verbose_Logging_Emits_Ephemeral_Debug_Per_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var log = new CapturingLog();
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchvb-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("dir/note.txt", "hello");
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions { VerboseLogging = true },
+            };
+            await orchestrator.RunAsync(request);
+
+            // 含文件名的 Debug 短存(durable=false)日志。
+            Assert.Contains(log.Entries, e =>
+                e.Level == OperationLogLevel.Debug && e.Durable == false && e.Message.Contains("dir/note.txt"));
+            // 起止事件是长存(durable=true)。
+            Assert.Contains(log.Entries, e => e.Durable == true && e.Message.Contains("succeeded"));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
     }
 
     [SkippableFact]

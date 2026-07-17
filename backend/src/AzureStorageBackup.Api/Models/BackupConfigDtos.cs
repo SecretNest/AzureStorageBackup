@@ -23,6 +23,7 @@ public record BackupConfigResponse(
     long SingleFileThresholdBytes,
     long GroupCapBytes,
     long? VolumeBytes,
+    bool VerboseLogging,
     DateTimeOffset CreatedAt)
 {
     public static BackupConfigResponse From(BackupConfig c) => new(
@@ -30,7 +31,7 @@ public record BackupConfigResponse(
         !string.IsNullOrEmpty(c.Password), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
-        c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.CreatedAt);
+        c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt);
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。</summary>
@@ -58,11 +59,13 @@ public record BackupConfigRequest(
     RetentionMode RetentionMode,
     long SingleFileThresholdBytes,
     long GroupCapBytes,
-    long? VolumeBytes = null)
+    long? VolumeBytes = null,
+    bool VerboseLogging = false)
 {
     public BackupConfig ToConfig() => new()
     {
         VolumeBytes = VolumeBytes,
+        VerboseLogging = VerboseLogging,
         AccountId = AccountId,
         ContainerName = ContainerName,
         Name = Name,

@@ -13,7 +13,7 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         var s = await _client.GetFromJsonAsync<GlobalSettings>("/api/settings");
         Assert.NotNull(s);
         Assert.Equal(100, s!.DefaultMaxVersions);
-        Assert.Equal(180, s.LogMaxAgeDays);
+        Assert.Equal(14, s.LogEphemeralMaxAgeDays);
     }
 
     [Fact]
@@ -22,7 +22,7 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         var s = await _client.GetFromJsonAsync<GlobalSettings>("/api/settings");
         s!.DefaultMaxVersions = 42;
         s.DefaultIncludeSymlinks = true;
-        s.LogMaxEntries = 500;
+        s.LogEphemeralMaxAgeDays = 7;
         s.DefaultDataTier = StorageTier.Cool;
 
         (await _client.PutAsJsonAsync("/api/settings", s)).EnsureSuccessStatusCode();
@@ -30,7 +30,7 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         var back = await _client.GetFromJsonAsync<GlobalSettings>("/api/settings");
         Assert.Equal(42, back!.DefaultMaxVersions);
         Assert.True(back.DefaultIncludeSymlinks);
-        Assert.Equal(500, back.LogMaxEntries);
+        Assert.Equal(7, back.LogEphemeralMaxAgeDays);
         Assert.Equal(StorageTier.Cool, back.DefaultDataTier);
     }
 }

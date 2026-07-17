@@ -53,5 +53,8 @@ public class BackupConfig
     /// <summary>分卷大小（字节）；null/0=不分卷（§7）。</summary>
     public long? VolumeBytes { get; set; }
 
+    /// <summary>是否写 debug 级日志（含操作文件名，短存 14 天）。默认关。</summary>
+    public bool VerboseLogging { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 }

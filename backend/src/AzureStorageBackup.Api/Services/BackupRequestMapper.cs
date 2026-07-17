@@ -34,6 +34,7 @@ public static class BackupRequestMapper
             DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
                 ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
             AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
+            VerboseLogging = config.VerboseLogging,
         },
     };
 

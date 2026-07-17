@@ -54,6 +54,7 @@ export interface BackupConfig {
   singleFileThresholdBytes: number
   groupCapBytes: number
   volumeBytes: number | null
+  verboseLogging: boolean
   createdAt: string
 }
 
@@ -76,6 +77,7 @@ export interface BackupConfigInput {
   singleFileThresholdBytes: number
   groupCapBytes: number
   volumeBytes: number | null
+  verboseLogging: boolean
 }
 
 export interface BackupProgress {

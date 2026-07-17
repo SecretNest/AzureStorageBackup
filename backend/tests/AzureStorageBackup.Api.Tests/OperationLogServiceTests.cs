@@ -98,36 +98,58 @@ public sealed class OperationLogServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Trim_By_Max_Entries_Keeps_Newest()
+    public async Task Trim_Deletes_Old_Ephemeral_But_Keeps_Durable()
     {
-        for (var i = 0; i < 5; i++)
-            await _sut.AppendAsync(OperationLogLevel.Info, "s", $"m{i}");
-
-        await _sut.TrimAsync(maxEntries: 2, maxAgeDays: null, DateTimeOffset.UtcNow);
-
-        var kept = await _sut.QueryAsync(null, null, null, null, 100);
-        Assert.Equal(2, kept.Count);
-        Assert.Equal(["m4", "m3"], kept.Select(x => x.Message)); // 最新两条
-    }
-
-    [Fact]
-    public async Task Trim_By_Age_Deletes_Old()
-    {
-        _db.LogEntries.Add(new LogEntry { Timestamp = DateTimeOffset.UtcNow.AddDays(-40), Level = OperationLogLevel.Info, Source = "s", Message = "old" });
-        _db.LogEntries.Add(new LogEntry { Timestamp = DateTimeOffset.UtcNow, Level = OperationLogLevel.Info, Source = "s", Message = "new" });
+        var now = DateTimeOffset.UtcNow;
+        _db.LogEntries.Add(new LogEntry { Timestamp = now.AddDays(-40), Level = OperationLogLevel.Debug, Source = "s", Message = "old-ephemeral", Ephemeral = true });
+        _db.LogEntries.Add(new LogEntry { Timestamp = now.AddDays(-40), Level = OperationLogLevel.Error, Source = "s", Message = "old-durable", Ephemeral = false });
+        _db.LogEntries.Add(new LogEntry { Timestamp = now, Level = OperationLogLevel.Debug, Source = "s", Message = "new-ephemeral", Ephemeral = true });
         await _db.SaveChangesAsync();
 
-        await _sut.TrimAsync(maxEntries: null, maxAgeDays: 30, DateTimeOffset.UtcNow);
+        await _sut.TrimAsync(maxAgeDays: 14, now);
 
-        var kept = await _sut.QueryAsync(null, null, null, null, 100);
-        Assert.Equal("new", Assert.Single(kept).Message);
+        var kept = (await _sut.QueryAsync(null, null, null, null, 100)).Select(x => x.Message).ToHashSet();
+        Assert.DoesNotContain("old-ephemeral", kept);      // 超期短存 → 删
+        Assert.Contains("old-durable", kept);              // 长存不受年龄影响
+        Assert.Contains("new-ephemeral", kept);            // 未超期短存保留
     }
 
     [Fact]
-    public async Task Trim_With_No_Limits_Does_Nothing()
+    public async Task Append_Defaults_Info_To_Ephemeral_And_Warning_To_Durable()
     {
-        await _sut.AppendAsync(OperationLogLevel.Info, "s", "m");
-        await _sut.TrimAsync(null, null, DateTimeOffset.UtcNow);
-        Assert.Single(await _sut.QueryAsync(null, null, null, null, 100));
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "info");
+        await _sut.AppendAsync(OperationLogLevel.Warning, "s", "warn");
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "forced-durable", durable: true);
+
+        var all = await _db.LogEntries.ToListAsync();
+        Assert.True(all.Single(e => e.Message == "info").Ephemeral);
+        Assert.False(all.Single(e => e.Message == "warn").Ephemeral);
+        Assert.False(all.Single(e => e.Message == "forced-durable").Ephemeral);
+    }
+
+    [Fact]
+    public async Task PurgeBefore_Deletes_All_Before_Cutoff()
+    {
+        var now = DateTimeOffset.UtcNow;
+        _db.LogEntries.Add(new LogEntry { Timestamp = now.AddDays(-2), Level = OperationLogLevel.Error, Source = "s", Message = "old", Ephemeral = false });
+        _db.LogEntries.Add(new LogEntry { Timestamp = now, Level = OperationLogLevel.Error, Source = "s", Message = "new", Ephemeral = false });
+        await _db.SaveChangesAsync();
+
+        await _sut.PurgeBeforeAsync(now.AddDays(-1));
+
+        Assert.Equal("new", Assert.Single(await _sut.QueryAsync(null, null, null, null, 100)).Message);
+    }
+
+    [Fact]
+    public async Task DeleteForContainer_Removes_That_Backups_Logs()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:photos", "a", durable: true);
+        await _sut.AppendAsync(OperationLogLevel.Info, "check:photos", "b", durable: true);
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:docs", "c", durable: true);
+
+        await _sut.DeleteForContainerAsync("photos");
+
+        var kept = await _sut.QueryAsync(null, null, null, null, 100);
+        Assert.Equal("c", Assert.Single(kept).Message); // 仅 docs 的日志保留
     }
 }

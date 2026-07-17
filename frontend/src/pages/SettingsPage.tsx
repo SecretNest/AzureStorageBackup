@@ -92,11 +92,11 @@ export function SettingsPage() {
       <Field label="Download concurrency">
         <Num value={s.downloadConcurrency} onChange={(v) => set('downloadConcurrency', v)} />
       </Field>
-      <Field label="Log max entries">
-        <Num value={s.logMaxEntries} onChange={(v) => set('logMaxEntries', v)} />
+      <Field label="Ephemeral log retention (days)">
+        <Num value={s.logEphemeralMaxAgeDays} onChange={(v) => set('logEphemeralMaxAgeDays', v)} />
       </Field>
-      <Field label="Log max age (days)">
-        <Num value={s.logMaxAgeDays} onChange={(v) => set('logMaxAgeDays', v)} />
+      <Field label="Verbose (debug) logging default">
+        <input type="checkbox" checked={s.defaultVerboseLogging} onChange={(e) => set('defaultVerboseLogging', e.target.checked)} />
       </Field>
       <Field label="Retry backoff (seconds)">
         <input style={{ width: 300, fontFamily: 'monospace' }} value={s.retryBackoffSeconds}
