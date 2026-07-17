@@ -13,7 +13,8 @@ public sealed class VolumeBlobIOTests
 
         public Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
-            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default)
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
         {
             Order.Add(blobName);
             return Task.FromResult(true);

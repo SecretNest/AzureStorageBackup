@@ -17,15 +17,16 @@ public static class VolumeBlobIO
     /// </summary>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
-        IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default)
+        IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+        IReadOnlyDictionary<string, string>? metadata = null)
     {
         if (volumeFiles.Count == 1)
         {
-            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct);
+            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct, metadata);
             return;
         }
         for (var i = volumeFiles.Count - 1; i >= 0; i--)
-            await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct);
+            await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct, metadata);
     }
 
     /// <summary>归档是否存在（单卷或多卷首卷）。多卷上传倒序，故 .001 在即代表整族齐全。</summary>

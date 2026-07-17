@@ -106,13 +106,14 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         public async Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
-            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default)
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
         {
             lock (_l) { _current++; _max = Math.Max(_max, _current); }
             try
             {
                 await Task.Delay(250, ct); // 让上传明显长于压缩，使并发窗口稳定可观测
-                return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct);
+                return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
             }
             finally { lock (_l) _current--; }
         }
@@ -500,6 +501,49 @@ public sealed class BackupOrchestratorTests : IDisposable
         {
             await container.DeleteIfExistsAsync();
         }
+    }
+
+    [SkippableFact]
+    public async Task Hash_Collision_Falls_Back_To_Alternate_Name()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchhc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("x.txt", "hello");
+            var hash = await new FileHasher().FullHashAsync(Path.Combine(_root, "x.txt"));
+
+            // 预置一个 data/{hash}，其元数据代表「不同内容」——模拟 hash 碰撞。
+            await container.GetBlobClient($"data/{hash}").UploadAsync(
+                BinaryData.FromString("other content"),
+                new BlobUploadOptions
+                {
+                    Metadata = new Dictionary<string, string> { ["len"] = "999999", ["head"] = "xxh128:00" },
+                });
+
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            };
+            await orchestrator.RunAsync(request);
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var e = Assert.Single(idx.Entries);
+
+            Assert.Equal($"data/{hash}~1", e.Storage!.Ref);   // 避让到备用名，不覆盖既有 blob
+            Assert.Equal(hash, e.FullHash);                   // 索引仍记内容 hash
+            Assert.True(await container.GetBlobClient($"data/{hash}~1").ExistsAsync());
+            await AssertReferencedBlobsExist(container, idx);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
     }
 
     [SkippableFact]

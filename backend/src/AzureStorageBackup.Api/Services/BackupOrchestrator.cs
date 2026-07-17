@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
@@ -233,23 +234,36 @@ public sealed class BackupOrchestrator(
     {
         var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
         var storeOnly = request.Options.DontCompress?.IsIgnored(file.Path) ?? false;
+        var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 用当前 hash 决定 blob 名；内容寻址去重（已存在则跳过）。verifier 会在内容变化时用新 hash 重调。
+        // 内容寻址去重 + hash 碰撞避让：按 (hash) 定位 blob，但用元数据(原始长度+headHash)确认确实同内容才去重；
+        // 不同内容碰撞到同 hash 时改用备用名 data/{hash}~N 并报警，避免覆盖/丢数据。verifier 内容变化时用新 hash 重调。
         var uploadedVolumes = 0;
+        var chosenRef = "data/" + file.FullHash;
+        var collided = false;
         async Task ProcessAsync(string hash, CancellationToken token)
         {
-            var blobRef = "data/" + hash;
-            if (await VolumeBlobIO.ExistsAsync(cc, blobRef, token))
-                return;
+            var length = new FileInfo(localPath).Length;
+            var head = await hasher.HeadHashAsync(localPath, headBytes, token);
+            var (blobRef, exists, collision) = await ResolveDataRefAsync(cc, hash, length, head, token);
+            chosenRef = blobRef;
+            collided = collision;
+            if (exists)
+                return; // 确认同内容 → 去重跳过
             var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
                 request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
             await uploadGate.WaitAsync(token);
             try
             {
+                var meta = new Dictionary<string, string>
+                {
+                    ["len"] = length.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["head"] = head,
+                };
                 await VolumeBlobIO.UploadAsync(
                     uploader, request.Account, request.Container, blobRef, staged.Files,
-                    request.DataTier, request.Options.Upload, token);
+                    request.DataTier, request.Options.Upload, token, meta);
                 uploadedVolumes = staged.Files.Count;
             }
             finally
@@ -274,19 +288,60 @@ public sealed class BackupOrchestrator(
             await ProcessAsync(file.FullHash, ct);
         }
 
+        if (collided)
+            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                $"Hash collision avoided: {file.Path}",
+                $"Different content shares hash {finalHash}; stored at {chosenRef}", ct);
+
         // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；若去重跳过则统计云端现存卷数。
         var volumes = uploadedVolumes > 0
             ? uploadedVolumes
-            : await VolumeBlobIO.CountVolumesAsync(cc, "data/" + finalHash, ct);
+            : await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
         storageByPath[file.Path] = new StorageRef
         {
-            Kind = "blob", Ref = "data/" + finalHash, Volumes = Math.Max(1, volumes),
+            Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes),
         };
         // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
         if (finalHash != file.FullHash)
             overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
 
         onItem();
+    }
+
+    /// <summary>
+    /// 定位 data blob 的实际存储名并判断是否可去重。以 (length, headHash) 元数据确认同内容才去重；
+    /// 内容不同却 hash 相同（碰撞）时顺延到备用名 data/{hash}~1、~2…。老 blob 无元数据时按同内容处理（向后兼容）。
+    /// </summary>
+    private static async Task<(string Ref, bool Exists, bool Collision)> ResolveDataRefAsync(
+        BlobContainerClient cc, string hash, long length, string headHash, CancellationToken ct)
+    {
+        for (var n = 0; ; n++)
+        {
+            var refName = n == 0 ? $"data/{hash}" : $"data/{hash}~{n}";
+            var meta = await ReadBlobMetaAsync(cc, refName, ct);
+            if (meta is null)
+                return (refName, false, n > 0);            // 空位 → 在此上传（n>0=已避让碰撞）
+            if (meta.Value.Len is null || (meta.Value.Len == length && meta.Value.Head == headHash))
+                return (refName, true, n > 0);             // 确认同内容（或老 blob 无元数据）→ 去重
+            // 长度/headHash 不同 → 碰撞，试下一个备用名。
+        }
+    }
+
+    private static async Task<(long? Len, string? Head)?> ReadBlobMetaAsync(
+        BlobContainerClient cc, string baseRef, CancellationToken ct)
+    {
+        var blob = cc.GetBlobClient(baseRef);
+        if (!(await blob.ExistsAsync(ct)).Value)
+        {
+            blob = cc.GetBlobClient(baseRef + ".001"); // 多卷首卷
+            if (!(await blob.ExistsAsync(ct)).Value)
+                return null;
+        }
+        var md = (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.Metadata;
+        long? len = md.TryGetValue("len", out var l)
+            && long.TryParse(l, System.Globalization.CultureInfo.InvariantCulture, out var lv) ? lv : null;
+        var head = md.TryGetValue("head", out var h) ? h : null;
+        return (len, head);
     }
 
     private async Task<EntryOverride> BuildOverrideAsync(
