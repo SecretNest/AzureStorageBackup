@@ -112,6 +112,61 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Staged_Backup_By_Removing_Ignores_Final_Version_Equals_Whole()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rststg-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a/1.txt", "alpha");
+            WriteSrc("b/2.txt", "bravo");
+            WriteSrc("c/3.txt", "charlie");
+
+            BackupRequest Req(params string[] ignore) => BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    Ignore = new IgnoreRuleSet(ignore),
+                },
+            };
+
+            var v1 = await backup.RunAsync(Req("b/", "c/")); // 阶段1：只 a
+            var v2 = await backup.RunAsync(Req("c/"));       // 阶段2：去掉 b → 加 b
+            var v3 = await backup.RunAsync(Req());           // 阶段3：去掉 c → 加 c（完整）
+
+            // 各阶段只处理新解禁的文件，旧的结转不重传。
+            Assert.Equal(1, v1.ChangedFiles);
+            Assert.Equal(1, v2.ChangedFiles); // 只 b/2.txt
+            Assert.Equal(1, v3.ChangedFiles); // 只 c/3.txt
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx1 = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var idx3 = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
+            Assert.Equal(["a/1.txt"], idx1.Entries.Select(e => e.Path).OrderBy(x => x)); // v1 不全
+            Assert.Equal(["a/1.txt", "b/2.txt", "c/3.txt"], idx3.Entries.Select(e => e.Path).OrderBy(x => x)); // v3 完整
+
+            // 还原最终版本 = 全部文件。
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+            Assert.Equal(3, result.RestoredFiles);
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "a", "1.txt")));
+            Assert.Equal("bravo", File.ReadAllText(Path.Combine(_dst, "b", "2.txt")));
+            Assert.Equal("charlie", File.ReadAllText(Path.Combine(_dst, "c", "3.txt")));
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
     public async Task Raw_Stored_File_RoundTrips_Through_Restore()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
