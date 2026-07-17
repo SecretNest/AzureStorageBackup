@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { containersApi, backupPresenceLabels, type ContainerInfo } from '../api/containers'
+import { containersApi, backupPresenceLabels, infoFileName, type ContainerInfo } from '../api/containers'
 import type { Account } from '../api/accounts'
 
 export function ContainersPage({ account, onBack }: { account: Account; onBack: () => void }) {
@@ -84,7 +84,14 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
             {containers.map((c) => (
               <tr key={c.name} style={{ borderBottom: '1px solid #eee' }}>
                 <td>{c.name}</td>
-                <td>{backupPresenceLabels[c.backup] ?? 'Unknown'}</td>
+                <td>
+                  {backupPresenceLabels[c.backup] ?? 'Unknown'}
+                  {infoFileName(c.backup) && (
+                    <span style={{ color: '#888', fontSize: '0.8rem', marginLeft: '0.4rem' }}>
+                      ({infoFileName(c.backup)})
+                    </span>
+                  )}
+                </td>
                 <td style={{ textAlign: 'right' }}>
                   <button type="button" onClick={() => remove(c.name)}>
                     Delete

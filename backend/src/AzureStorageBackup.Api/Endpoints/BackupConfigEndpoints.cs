@@ -153,7 +153,7 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, bool? deep, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, bool? deep, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -162,11 +162,21 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
-            var settings = await settingsSvc.GetAsync(ct);
-            var result = await checker.CheckAsync(account, config.ContainerName, password, version, deep ?? false, ct,
-                downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
-            return Results.Ok(result);
+            // 检查也是对该备份的操作 → 纳入忙碌；备份正忙则拒绝，检查期间也标记忙碌使计划任务跳过。
+            if (!busy.TryAcquire(account.Id, config.ContainerName))
+                return Results.Conflict(new { error = "Backup is busy with another operation." });
+            try
+            {
+                var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+                var settings = await settingsSvc.GetAsync(ct);
+                var result = await checker.CheckAsync(account, config.ContainerName, password, version, deep ?? false, ct,
+                    downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
+                return Results.Ok(result);
+            }
+            finally
+            {
+                busy.Release(account.Id, config.ContainerName);
+            }
         });
 
         return app;

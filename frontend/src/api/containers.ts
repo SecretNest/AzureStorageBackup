@@ -9,6 +9,14 @@ export const backupPresenceLabels: Record<number, string> = {
   2: 'Backup (encrypted)',
 }
 
+// 信息记录文件的约定文件名（后端 BackupDiscovery，PRD 1.3）。用于展示。
+export const infoFileName = (presence: number): string | null =>
+  presence === BackupPresence.Plain
+    ? 'azurestoragebackup.index.json'
+    : presence === BackupPresence.Encrypted
+      ? 'azurestoragebackup.index.json.enc'
+      : null
+
 export interface ContainerInfo {
   name: string
   backup: number

@@ -190,9 +190,24 @@ export function BackupConfigsPage() {
 
   const check = async (c: BackupConfig, deep = false) => {
     setError(null)
+    let version: number | null = null
+    try {
+      const versions = await backupConfigsApi.versions(c.id)
+      if (versions.length > 1) {
+        const latest = versions[versions.length - 1].version
+        const ans = window.prompt(
+          `Check which version? (blank = latest ${latest})\nAvailable: ${versions.map((v) => v.version).join(', ')}`,
+          String(latest),
+        )
+        if (ans === null) return
+        version = ans.trim() === '' ? null : Number(ans.trim())
+      }
+    } catch {
+      /* 版本列举失败则退回检查最新 */
+    }
     setChecks((s) => ({ ...s, [c.id]: 'checking' }))
     try {
-      const result = await backupConfigsApi.check(c.id, deep)
+      const result = await backupConfigsApi.check(c.id, deep, version)
       setChecks((s) => ({ ...s, [c.id]: result }))
     } catch (e) {
       setChecks((s) => {

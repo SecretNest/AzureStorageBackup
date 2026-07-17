@@ -133,6 +133,11 @@ export const backupConfigsApi = {
   restore: (id: number, targetRoot: string | null, version: number | null) =>
     api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version }),
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
-  check: (id: number, deep = false) =>
-    api.post<CheckResult>(`/backup-configs/${id}/check${deep ? '?deep=true' : ''}`, {}),
+  check: (id: number, deep = false, version: number | null = null) => {
+    const p = new URLSearchParams()
+    if (deep) p.set('deep', 'true')
+    if (version != null) p.set('version', String(version))
+    const qs = p.toString()
+    return api.post<CheckResult>(`/backup-configs/${id}/check${qs ? `?${qs}` : ''}`, {})
+  },
 }
