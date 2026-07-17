@@ -10,6 +10,9 @@ public sealed record RestoreRequest
     public required string TargetRoot { get; init; }
     public string? Password { get; init; }
     public int? Version { get; init; }
+
+    /// <summary>下载并发上限（PRD 3.4，默认 5）。</summary>
+    public int DownloadConcurrency { get; init; } = 5;
 }
 
 /// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。</summary>
@@ -93,45 +96,15 @@ public sealed class RestoreOrchestrator(
             }
         }
 
+        // 按存储分组：同一 pack 只下载/解压一次。各组并发下载（PRD 3.4），每组独立临时子目录避免冲突。
         var work = NewTempDir();
+        using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
         {
-            // 按存储分组：同一 pack 只下载/解压一次。
-            foreach (var group in fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)))
-            {
-                ct.ThrowIfCancellationRequested();
-
-                var needed = new List<IndexEntry>();
-                foreach (var e in group)
-                {
-                    if (await NeedsRestoreAsync(request.TargetRoot, e, ct))
-                        needed.Add(e);
-                    else
-                        skipped++;
-                }
-                if (needed.Count == 0)
-                    continue;
-
-                var storage = group.First().Storage!;
-                var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
-
-                var extractDir = Path.Combine(work, "x");
-                foreach (var f in Directory.EnumerateFiles(work, "arc.7z*")) File.Delete(f);
-                if (Directory.Exists(extractDir)) Directory.Delete(extractDir, recursive: true);
-
-                var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, work, ct);
-                await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
-
-                foreach (var e in needed)
-                {
-                    var source = Path.Combine(extractDir, ToLocal(e.Path));
-                    var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                    File.Copy(source, dest, overwrite: true);
-                    ApplyMetadata(dest, e);
-                    restored++;
-                }
-            }
+            var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
+            var counts = await Task.WhenAll(groups.Select(g => RestoreGroupAsync(container, request, work, g.ToList(), gate, ct)));
+            restored += counts.Sum(c => c.Restored);
+            skipped += counts.Sum(c => c.Skipped);
         }
         finally
         {
@@ -139,6 +112,54 @@ public sealed class RestoreOrchestrator(
         }
 
         return new RestoreResult(version.Version, restored, skipped, index.EmptyDirs.Count);
+    }
+
+    private async Task<(int Restored, int Skipped)> RestoreGroupAsync(
+        Azure.Storage.Blobs.BlobContainerClient container, RestoreRequest request, string work,
+        List<IndexEntry> group, SemaphoreSlim gate, CancellationToken ct)
+    {
+        var skipped = 0;
+        var needed = new List<IndexEntry>();
+        foreach (var e in group)
+        {
+            if (await NeedsRestoreAsync(request.TargetRoot, e, ct))
+                needed.Add(e);
+            else
+                skipped++;
+        }
+        if (needed.Count == 0)
+            return (0, skipped);
+
+        var storage = group[0].Storage!;
+        var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
+
+        // 每组独立临时目录（并发安全）。
+        var groupDir = Path.Combine(work, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(groupDir);
+        var restored = 0;
+        await gate.WaitAsync(ct);
+        try
+        {
+            var extractDir = Path.Combine(groupDir, "x");
+            var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+            await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
+
+            foreach (var e in needed)
+            {
+                var source = Path.Combine(extractDir, ToLocal(e.Path));
+                var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                File.Copy(source, dest, overwrite: true);
+                ApplyMetadata(dest, e);
+                restored++;
+            }
+        }
+        finally
+        {
+            gate.Release();
+            try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+        }
+        return (restored, skipped);
     }
 
     private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, CancellationToken ct)

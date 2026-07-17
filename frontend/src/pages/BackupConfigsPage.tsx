@@ -164,8 +164,19 @@ export function BackupConfigsPage() {
     const target = window.prompt('Restore to which local path?', c.localRoot)
     if (target === null) return
     setError(null)
+    let version: number | null = null
     try {
-      let state = await backupConfigsApi.restore(c.id, target || null, null)
+      const versions = await backupConfigsApi.versions(c.id)
+      if (versions.length > 1) {
+        const latest = versions[versions.length - 1].version
+        const ans = window.prompt(
+          `Which version? (blank = latest ${latest})\nAvailable: ${versions.map((v) => v.version).join(', ')}`,
+          String(latest),
+        )
+        if (ans === null) return
+        version = ans.trim() === '' ? null : Number(ans.trim())
+      }
+      let state = await backupConfigsApi.restore(c.id, target || null, version)
       setRestores((r) => ({ ...r, [c.id]: state }))
       while (state.status === 'Running') {
         await delay(1000)

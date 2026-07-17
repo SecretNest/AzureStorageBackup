@@ -49,12 +49,14 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
             var sp = scope.ServiceProvider;
             var configs = sp.GetRequiredService<IBackupConfigService>();
             var accounts = sp.GetRequiredService<IAccountService>();
+            var settingsSvc = sp.GetRequiredService<IGlobalSettingsService>();
             var orchestrator = sp.GetRequiredService<RestoreOrchestrator>();
 
             var config = await configs.GetAsync(configId)
                 ?? throw new InvalidOperationException($"Backup config {configId} not found.");
             var account = await accounts.GetAsync(config.AccountId)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
+            var settings = await settingsSvc.GetAsync();
 
             state.Result = await orchestrator.RunAsync(new RestoreRequest
             {
@@ -63,6 +65,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 TargetRoot = targetRoot,
                 Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
                 Version = version,
+                DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
             });
             state.Status = RunStatus.Completed;
         }

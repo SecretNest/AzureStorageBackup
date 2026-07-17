@@ -43,6 +43,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DefaultDontCompressRules = s.DefaultDontCompressRules;
         existing.DefaultDontGroupRules = s.DefaultDontGroupRules;
         existing.UploadConcurrency = s.UploadConcurrency;
+        existing.DownloadConcurrency = s.DownloadConcurrency;
         existing.LogMaxEntries = s.LogMaxEntries;
         existing.LogMaxAgeDays = s.LogMaxAgeDays;
         existing.RetryBackoffSeconds = s.RetryBackoffSeconds;

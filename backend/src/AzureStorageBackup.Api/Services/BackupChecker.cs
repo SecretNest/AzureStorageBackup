@@ -24,13 +24,14 @@ public sealed class BackupChecker(
     IOperationLog? opLog = null)
 {
     public async Task<CheckResult> CheckAsync(
-        Account account, string container, string? password, int? version, bool deep = false, CancellationToken ct = default)
+        Account account, string container, string? password, int? version, bool deep = false,
+        CancellationToken ct = default, int downloadConcurrency = 5)
     {
         var source = $"check:{container}";
         await Record(NotificationEvents.CheckStart, source, $"Check started: {container}", "", ct);
         try
         {
-            var result = await CheckCoreAsync(account, container, password, version, deep, ct);
+            var result = await CheckCoreAsync(account, container, password, version, deep, downloadConcurrency, ct);
             await Record(
                 result.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure, source,
                 $"Check {(result.Ok ? "passed" : "failed")}: {container}",
@@ -55,7 +56,7 @@ public sealed class BackupChecker(
     }
 
     private async Task<CheckResult> CheckCoreAsync(
-        Account account, string container, string? password, int? version, bool deep, CancellationToken ct)
+        Account account, string container, string? password, int? version, bool deep, int downloadConcurrency, CancellationToken ct)
     {
         var info = await store.ReadInfoAsync(account, container, password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");
@@ -91,64 +92,70 @@ public sealed class BackupChecker(
         }
 
         var corrupted = deep
-            ? await DeepVerifyAsync(account, container, password, index, missing, ct)
+            ? await DeepVerifyAsync(account, container, password, index, missing, downloadConcurrency, ct)
             : [];
 
         return new CheckResult(ver.Version, refs.Count, missing, corrupted);
     }
 
-    /// <summary>深度校验：按存储分组下载解压，重算 fullHash 与索引比对；解不开或不符即损坏。</summary>
+    /// <summary>深度校验：按存储分组**并发**下载解压（PRD 3.4），重算 fullHash 与索引比对；解不开或不符即损坏。</summary>
     private async Task<IReadOnlyList<string>> DeepVerifyAsync(
-        Account account, string container, string? password, VersionIndex index, List<string> missing, CancellationToken ct)
+        Account account, string container, string? password, VersionIndex index, List<string> missing,
+        int downloadConcurrency, CancellationToken ct)
     {
         if (compressor is null || hasher is null || string.IsNullOrEmpty(tempRoot))
             throw new InvalidOperationException("Deep check requires compressor/hasher/tempRoot.");
 
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
-        var corrupted = new List<string>();
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
+        using var gate = new SemaphoreSlim(Math.Max(1, downloadConcurrency));
         try
         {
             var groups = index.Entries
-                .Where(e => e.Kind == "file" && e.Storage is not null)
-                .GroupBy(e => BlobNameOf(e.Storage!));
+                .Where(e => e.Kind == "file" && e.Storage is not null && !missing.Contains(BlobNameOf(e.Storage!)))
+                .GroupBy(e => BlobNameOf(e.Storage!))
+                .ToList();
 
-            foreach (var group in groups)
-            {
-                ct.ThrowIfCancellationRequested();
-                if (missing.Contains(group.Key))
-                    continue; // 缺失已单独报告
-
-                var members = group.ToList();
-                var extractDir = Path.Combine(work, "x");
-                try
-                {
-                    if (Directory.Exists(extractDir)) Directory.Delete(extractDir, recursive: true);
-                    foreach (var f in Directory.EnumerateFiles(work, "arc.7z*")) File.Delete(f);
-
-                    var firstVolume = await VolumeBlobIO.DownloadAsync(cc, group.Key, work, ct);
-                    await compressor.ExtractAsync(firstVolume, extractDir, password, ct);
-
-                    foreach (var e in members)
-                    {
-                        var path = Path.Combine(extractDir, e.Path.Replace('/', Path.DirectorySeparatorChar));
-                        if (!File.Exists(path) || (e.FullHash is not null && await hasher.FullHashAsync(path, ct) != e.FullHash))
-                            corrupted.Add(e.Path);
-                    }
-                }
-                catch
-                {
-                    // 下载/解压失败 → 整组视为损坏
-                    corrupted.AddRange(members.Select(m => m.Path));
-                }
-            }
+            var perGroup = await Task.WhenAll(groups.Select(g => VerifyGroupAsync(cc, work, g.Key, g.ToList(), password, gate, ct)));
+            return perGroup.SelectMany(x => x).ToList();
         }
         finally
         {
             try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
         }
+    }
 
+    private async Task<IReadOnlyList<string>> VerifyGroupAsync(
+        Azure.Storage.Blobs.BlobContainerClient cc, string work, string blobName, List<IndexEntry> members,
+        string? password, SemaphoreSlim gate, CancellationToken ct)
+    {
+        var corrupted = new List<string>();
+        var groupDir = Path.Combine(work, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(groupDir);
+        await gate.WaitAsync(ct);
+        try
+        {
+            var extractDir = Path.Combine(groupDir, "x");
+            var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
+            await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
+
+            foreach (var e in members)
+            {
+                var path = Path.Combine(extractDir, e.Path.Replace('/', Path.DirectorySeparatorChar));
+                if (!File.Exists(path) || (e.FullHash is not null && await hasher!.FullHashAsync(path, ct) != e.FullHash))
+                    corrupted.Add(e.Path);
+            }
+        }
+        catch
+        {
+            corrupted.AddRange(members.Select(m => m.Path)); // 下载/解压失败 → 整组损坏
+        }
+        finally
+        {
+            gate.Release();
+            try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+        }
         return corrupted;
     }
 

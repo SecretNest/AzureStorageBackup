@@ -129,8 +129,8 @@ public static class BackupConfigEndpoints
             return state is null ? Results.NotFound() : Results.Ok(RestoreRunResponse.From(state));
         });
 
-        // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, bool? deep, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, CancellationToken ct) =>
+        // 列出某备份的全部版本（供还原/检查选择版本）。走本地权威信息文件，平时不读云端。
+        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -140,7 +140,32 @@ public static class BackupConfigEndpoints
                 return Results.BadRequest(new { error = "Account not found." });
 
             var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
-            var result = await checker.CheckAsync(account, config.ContainerName, password, version, deep ?? false, ct);
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            var versions = (info?.Versions ?? []).Select(v => new
+            {
+                v.Version,
+                v.CreatedAt,
+                files = v.Stats.Files,
+                bytes = v.Stats.Bytes,
+                changedFiles = v.Stats.ChangedFiles,
+            });
+            return Results.Ok(versions);
+        });
+
+        // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
+        group.MapPost("/{id:int}/check", async (int id, int? version, bool? deep, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var settings = await settingsSvc.GetAsync(ct);
+            var result = await checker.CheckAsync(account, config.ContainerName, password, version, deep ?? false, ct,
+                downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
             return Results.Ok(result);
         });
 

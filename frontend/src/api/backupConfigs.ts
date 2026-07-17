@@ -102,6 +102,14 @@ export interface RestoreRun {
   error: string | null
 }
 
+export interface BackupVersionInfo {
+  version: number
+  createdAt: string
+  files: number
+  bytes: number
+  changedFiles: number
+}
+
 export interface CheckResult {
   version: number
   checkedRefs: number
@@ -121,6 +129,7 @@ export const backupConfigsApi = {
   remove: (id: number) => api.del(`/backup-configs/${id}`),
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
+  versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),
   restore: (id: number, targetRoot: string | null, version: number | null) =>
     api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version }),
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),

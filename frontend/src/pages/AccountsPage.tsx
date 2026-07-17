@@ -70,13 +70,15 @@ export function AccountsPage() {
   const save = async () => {
     setBusy(true)
     setError(null)
+    // 非 Global 分区仅代理下有效（PRD 1.1）：未启用代理则强制 Global。
+    const payload = form.useProxy ? form : { ...form, region: AzureRegion.Global }
     try {
       if (editing) {
-        await accountsApi.update(editing.id, form)
+        await accountsApi.update(editing.id, payload)
         setShowForm(false)
         load()
       } else {
-        const created = await accountsApi.create(form)
+        const created = await accountsApi.create(payload)
         setShowForm(false)
         load()
         // 新账户创建后直接进入 container 列举界面（PRD 1.4）
@@ -199,14 +201,17 @@ export function AccountsPage() {
             />
           </Field>
           <Field label="Region">
+            {/* 非 Global 分区仅在启用代理时可选（PRD 1.1）。 */}
             <select
-              value={form.region}
+              value={form.useProxy ? form.region : AzureRegion.Global}
+              disabled={!form.useProxy}
               onChange={(e) => set('region', Number(e.target.value))}
             >
               <option value={AzureRegion.Global}>Global</option>
               <option value={AzureRegion.China}>China</option>
               <option value={AzureRegion.UsGov}>US Gov</option>
             </select>
+            {!form.useProxy && <span style={{ color: '#888', fontSize: '0.8rem', marginLeft: '0.4rem' }}>enable proxy for other regions</span>}
           </Field>
           <Field label="Account Key">
             <input

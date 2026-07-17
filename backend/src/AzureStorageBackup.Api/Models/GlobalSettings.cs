@@ -43,6 +43,7 @@ public class GlobalSettings
 
     // 全局
     public int UploadConcurrency { get; set; } = 5;
+    public int DownloadConcurrency { get; set; } = 5; // 还原/深度检查下载并发（PRD 3.4）
     public int LogMaxEntries { get; set; } = 10_000;
     public int LogMaxAgeDays { get; set; } = 180;
 

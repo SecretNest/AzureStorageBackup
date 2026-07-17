@@ -96,15 +96,14 @@ public sealed class RetentionCleaner(
             }
         }
 
-        // 删除不再被引用的 pack（含其分卷 packs/{id}.7z.NNN）。枚举 packs/ 前缀，按 packId 归组，
-        // 避免仅删基名而漏删分卷（§7 分卷 pack）。
-        var deletedPackIds = info.Packs.Keys.Where(id => !referencedPacks.Contains(id)).ToHashSet(StringComparer.Ordinal);
+        // 删除不再被任何保留版本引用的 pack（含分卷 packs/{id}.7z.NNN，也清孤儿 pack）。枚举 packs/ 前缀按 packId 归组，
+        // 避免仅删基名漏删分卷（§7）；判据用「未被保留版本引用」，与 data blob 侧对称。
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "packs/", ct))
         {
-            if (deletedPackIds.Contains(PackIdOf(blob.Name)))
+            if (!referencedPacks.Contains(PackIdOf(blob.Name)))
                 await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct);
         }
-        foreach (var packId in deletedPackIds)
+        foreach (var packId in info.Packs.Keys.Where(id => !referencedPacks.Contains(id)).ToList())
             info.Packs.Remove(packId);
 
         // 删除不再被引用的 data blob（枚举 data/ 前缀）。分卷名 data/{hash}.NNN 归一化回基名后再比对，

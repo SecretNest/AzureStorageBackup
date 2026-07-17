@@ -18,6 +18,7 @@ export interface GlobalSettings {
   defaultDontCompressRules: string | null
   defaultDontGroupRules: string | null
   uploadConcurrency: number
+  downloadConcurrency: number
   logMaxEntries: number
   logMaxAgeDays: number
   retryBackoffSeconds: string

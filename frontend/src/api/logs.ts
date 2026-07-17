@@ -14,6 +14,8 @@ export interface LogEntry {
 export interface LogQuery {
   minLevel?: number
   source?: string
+  from?: string
+  to?: string
   limit?: number
 }
 
@@ -22,6 +24,8 @@ export const logsApi = {
     const p = new URLSearchParams()
     if (q.minLevel !== undefined) p.set('minLevel', String(q.minLevel))
     if (q.source) p.set('source', q.source)
+    if (q.from) p.set('from', q.from)
+    if (q.to) p.set('to', q.to)
     if (q.limit) p.set('limit', String(q.limit))
     const qs = p.toString()
     return api.get<LogEntry[]>(`/logs${qs ? `?${qs}` : ''}`)

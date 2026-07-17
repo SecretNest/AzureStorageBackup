@@ -8,17 +8,25 @@ export function LogsPage() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [minLevel, setMinLevel] = useState<number | ''>('')
   const [source, setSource] = useState('')
+  const [from, setFrom] = useState('')
+  const [to, setTo] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [paths, setPaths] = useState<Record<string, string>>({})
   const [version, setVersion] = useState('')
 
   const load = () => {
     logsApi
-      .query({ minLevel: minLevel === '' ? undefined : minLevel, source: source || undefined, limit: 300 })
+      .query({
+        minLevel: minLevel === '' ? undefined : minLevel,
+        source: source || undefined,
+        from: from ? new Date(from).toISOString() : undefined,
+        to: to ? new Date(to).toISOString() : undefined,
+        limit: 300,
+      })
       .then(setLogs)
       .catch((e) => setError(String(e)))
   }
-  useEffect(load, [minLevel, source])
+  useEffect(load, [minLevel, source, from, to])
 
   useEffect(() => {
     systemApi.paths().then(setPaths).catch(() => {})
@@ -53,6 +61,12 @@ export function LogsPage() {
         <label>
           Source:{' '}
           <input value={source} placeholder="e.g. backup:photos" onChange={(e) => setSource(e.target.value)} />
+        </label>
+        <label>
+          From: <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} />
+        </label>
+        <label>
+          To: <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} />
         </label>
         <button type="button" onClick={load}>
           Refresh

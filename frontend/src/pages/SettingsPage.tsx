@@ -89,6 +89,9 @@ export function SettingsPage() {
       <Field label="Upload concurrency">
         <Num value={s.uploadConcurrency} onChange={(v) => set('uploadConcurrency', v)} />
       </Field>
+      <Field label="Download concurrency">
+        <Num value={s.downloadConcurrency} onChange={(v) => set('downloadConcurrency', v)} />
+      </Field>
       <Field label="Log max entries">
         <Num value={s.logMaxEntries} onChange={(v) => set('logMaxEntries', v)} />
       </Field>
