@@ -21,7 +21,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker
     private readonly Dictionary<int, RestoreRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    public RestoreRunState Start(int configId, string targetRoot, int? version)
+    public RestoreRunState Start(int configId, string targetRoot, int? version,
+        IReadOnlyDictionary<string, int>? substitutions = null)
     {
         lock (_lock)
         {
@@ -30,7 +31,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker
 
             var state = new RestoreRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, targetRoot, version, state));
+            _ = Task.Run(() => RunAsync(configId, targetRoot, version, substitutions, state));
             return state;
         }
     }
@@ -41,7 +42,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker
             return _runs.GetValueOrDefault(configId);
     }
 
-    private async Task RunAsync(int configId, string targetRoot, int? version, RestoreRunState state)
+    private async Task RunAsync(int configId, string targetRoot, int? version,
+        IReadOnlyDictionary<string, int>? substitutions, RestoreRunState state)
     {
         try
         {
@@ -74,6 +76,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker
                     Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
                     Version = version,
                     DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
+                    Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
                 });
                 state.Status = RunStatus.Completed;
             }

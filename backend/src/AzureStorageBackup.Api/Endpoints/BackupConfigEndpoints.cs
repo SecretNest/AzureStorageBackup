@@ -122,8 +122,65 @@ public static class BackupConfigEndpoints
                 return Results.NotFound();
 
             var target = string.IsNullOrWhiteSpace(body.TargetRoot) ? config.LocalRoot : body.TargetRoot;
-            var state = runner.Start(id, target, body.Version);
+            var state = runner.Start(id, target, body.Version, body.Substitutions);
             return Results.Accepted($"/api/backup-configs/{id}/restore", RestoreRunResponse.From(state));
+        });
+
+        // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            var candidates = new List<object>();
+            foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
+            {
+                var idx = await store.ReadIndexAsync(account, config.ContainerName, v.IndexBlob, password, ct);
+                if (idx.UnrecoverablePaths.Contains(path))
+                    continue;
+                var e = idx.Entries.FirstOrDefault(x => x.Path == path && x.Storage is not null);
+                if (e is not null)
+                    candidates.Add(new { v.Version, v.CreatedAt, length = e.Length });
+            }
+            return Results.Ok(candidates);
+        });
+
+        // 从本地修复云端损坏/缺失的 blob（显式动作）；修不了的文件标记不可恢复。经忙碌守卫。
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, IBackupConfigService svc, IAccountService accounts, BackupRepairer repairer, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            if (!busy.TryAcquire(account.Id, config.ContainerName))
+                return Results.Conflict(new { error = "Backup is busy with another operation." });
+            try
+            {
+                var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+                var settings = await settingsSvc.GetAsync(ct);
+                var options = new CheckOptions
+                {
+                    Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
+                    RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                };
+                var report = await repairer.RepairAsync(account, config.ContainerName, password, config.LocalRoot, version,
+                    options, BackupRequestMapper.MapTier(config.DataTier),
+                    config.VolumeBytes is > 0 ? config.VolumeBytes : settings.DefaultVolumeBytes, ct);
+                return Results.Ok(report);
+            }
+            finally
+            {
+                busy.Release(account.Id, config.ContainerName);
+            }
         });
 
         group.MapGet("/{id:int}/restore", (int id, RestoreRunner runner) =>

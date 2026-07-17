@@ -38,6 +38,9 @@ public class ScheduledTaskService(AppDbContext db) : IScheduledTaskService
         existing.TaskType = update.TaskType;
         existing.CronExpression = update.CronExpression;
         existing.Enabled = update.Enabled;
+        existing.CheckCloudLevel = update.CheckCloudLevel;
+        existing.CheckLocalLevel = update.CheckLocalLevel;
+        existing.CheckRehydrateTier = update.CheckRehydrateTier;
 
         await db.SaveChangesAsync(ct);
         return existing;
