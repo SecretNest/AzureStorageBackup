@@ -17,6 +17,8 @@
 > - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失；多卷**倒序上传**（.001 最后写）作为「整族齐全」提交标记。
 > - **hash 碰撞避让**：data blob 元数据存原始长度 + headHash；去重时须元数据一致才跳过，否则判为碰撞、改用备用名 `data/{hash}~1/~2…` 并报 UnrecoverableError。索引 `StorageRef.Ref` 记实际名，还原/检查/清理据此。（残余「同 hash+同长度+同 headHash」碰撞概率可忽略，不再下载内容比对。）
 > - **加密备份密钥化寻址（防指纹识别）**：加密备份的 data blob 名改为 `data/{HMAC(key, fullHash)[:16]}`（key = HKDF(password, `BackupMeta.KdfSalt`)），碰撞元数据改为不透明 `v = HMAC(key, fullHash|len|head)`，不泄露长度/头部。未授权者即使能列 container 也无法用公开 hash 反推「是否备份过某文件」。去重照常（同内容→同地址）。非加密备份仍明文寻址。仅编排器创建 blob 时用密钥；还原/检查/清理用索引里记录的实际地址。残余泄露：blob 数量与大小。见 `BlobAddressScheme`。
+> - **原始文件直传（PRD 3.3.2，`StorageRef.Raw`）**：单文件 data blob 若**命中不压缩列表(store-only) + 无密码 + 单卷内(≤VolumeBytes)**，则直接把原文件拷到待上传区、上传**原始字节**（不走 7z 封装），`StorageRef.Raw=true`；raw 属性同时记入 blob 元数据(`raw=1`)，去重时以既有 blob 为准（同内容不同 don't-compress 状态也正确）。还原直接写回、深度检查直接重算 hash，均不解压。因单文件 blob 内容寻址去重可被多路径引用，还原/检查对同一 blob 复制/校验给**每个**引用条目。加密（keyed）备份永不 raw。见 `BackupOrchestrator.CopyRawAsync`。
+> - **计划任务遇忙碌跳过（`BackupBusyTracker`）**：备份按 账户/container 标识忙碌态；备份/还原/检查任一操作期间标记忙碌。计划任务（`TaskDispatcher`）目标忙碌 → 记 Warning 报警并跳过该目标，不打断在执行的任务；HTTP 备份/还原忙碌则拒绝并发，手动检查忙碌返回 409。
 
 ## 2. 存储布局（container 内 blob 组织）
 
@@ -131,7 +133,10 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
 > - **死重压实已接入清理管线**（`DeadWeightCompactor` + `RetentionCleaner`，2026-07-17）：采用**原地重压**而非「重新参与规划」——
 >   pack 死重比例超阈值（默认 30%，`GlobalSettings.DeadWeightThresholdPercent`）时，下载该 pack→解压→**仅保留仍有效成员**重压→覆盖同 packId blob（删旧分卷）。
 >   因 pack 按 `packId+entryName` 引用、有效成员 entryName 不变，**无需改写任何版本索引**（比 §6 原始「重新决定分组」更简单且避免跨版本改索引）。仅在版本退役时触发（死重只在此时增加）。
-> - **限制**：压实需下载 pack，故对 `Archive` tier 的 pack 无法在线执行（下载失败会被捕获、跳过并记录，仅更新 `DeadBytes` 以便观测）；对 Hot/Cool/Cold 有效。默认数据 tier 为 Archive，故压实主要在显式使用可读 tier 时生效。
+> - **成员内容来源：本地优先**。重压时先看仍有效成员在**本地是否有相同内容**（须 hash 确认，即便长度/时间/权限相同）：有则直接用本地、**无需下载**。仅本地缺失的成员才需从云端取回旧 pack 解压补齐。
+>   - 因此**全部有效成员本地可得时，Archive tier 的 pack 也能压实**（不读云端）。
+>   - 本地缺失成员时，是否下载云端 pack 由**按数据 tier 的开关**决定：`GlobalSettings.RepackDownload{Hot,Cool,Cold,Archive}`（默认 真/真/真/**假**——Archive 关，避免高成本取回/rehydrate）。不允许下载则**放弃该 pack 的重打包**（保留死重、记 `DeadBytes` 以便观测）。
+>   - 先按存在性判断本地缺失、再做 hash 比对（短路优化）。见 `DeadWeightCompactor`。
 
 ## 7. 临时区状态机（PRD 3.3.2.4）
 
