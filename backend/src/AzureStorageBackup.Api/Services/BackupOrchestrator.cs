@@ -110,12 +110,24 @@ public sealed class BackupOrchestrator(
         }
     }
 
+    // 日志/通知经 scoped 服务共享同一 EF DbContext（非线程安全）。碰撞/告警上报会在并发上传任务里发生，
+    // 故串行化整个上报，避免并发访问 DbContext 击穿备份。
+    private readonly SemaphoreSlim _recordGate = new(1, 1);
+
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
     {
-        if (opLog is not null)
-            await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct);
-        if (notifier is not null)
-            await notifier.NotifyAsync(evt, title, body, ct);
+        await _recordGate.WaitAsync(ct);
+        try
+        {
+            if (opLog is not null)
+                await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct);
+            if (notifier is not null)
+                await notifier.NotifyAsync(evt, title, body, ct);
+        }
+        finally
+        {
+            _recordGate.Release();
+        }
     }
 
     private async Task<BackupRunResult> RunCoreAsync(

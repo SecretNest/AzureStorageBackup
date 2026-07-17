@@ -597,6 +597,73 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
+    /// <summary>检测 AppendAsync 是否被并发调用（模拟共享 DbContext）。</summary>
+    private sealed class ConcurrencyProbeLog : IOperationLog
+    {
+        private int _active;
+        public int MaxConcurrent { get; private set; }
+        public async Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default)
+        {
+            var now = Interlocked.Increment(ref _active);
+            lock (this) MaxConcurrent = Math.Max(MaxConcurrent, now);
+            await Task.Delay(30, ct);
+            Interlocked.Decrement(ref _active);
+        }
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(OperationLogLevel? l, string? s, DateTimeOffset? f, DateTimeOffset? t, int n, CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxEntries, int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    [SkippableFact]
+    public async Task Event_Recording_Is_Serialized_Under_Concurrent_Uploads()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var log = new ConcurrencyProbeLog();
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchrec-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 4 个不同内容的单文件 blob，各预置一个元数据不符的 data/{hash} → 各触发一次碰撞 Record。
+            var hasher = new FileHasher();
+            for (var i = 0; i < 4; i++)
+            {
+                WriteText($"f{i}.txt", "content-" + i);
+                var hash = await hasher.FullHashAsync(Path.Combine(_root, $"f{i}.txt"));
+                await container.GetBlobClient($"data/{hash}").UploadAsync(
+                    BinaryData.FromString("x"),
+                    new BlobUploadOptions { Metadata = new Dictionary<string, string> { ["len"] = "999", ["head"] = "xxh128:00" } });
+            }
+
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    UploadConcurrency = 4,
+                },
+            };
+            await orchestrator.RunAsync(request);
+
+            Assert.True(log.MaxConcurrent >= 1);
+            Assert.Equal(1, log.MaxConcurrent); // Record 串行化，绝不并发访问共享 DbContext
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task Hash_Collision_Falls_Back_To_Alternate_Name()
     {
