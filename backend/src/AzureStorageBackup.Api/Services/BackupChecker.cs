@@ -138,12 +138,24 @@ public sealed class BackupChecker(
         {
             var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
 
-            if (members[0].Storage!.Raw)
+            if (members[0].Storage!.Kind == "blob")
             {
-                // 原始 blob：下载的即文件内容，直接重算 hash（无需解压）。
-                var e = members[0];
-                if (e.FullHash is not null && await hasher!.FullHashAsync(firstVolume, ct) != e.FullHash)
-                    corrupted.Add(e.Path);
+                // 单文件 blob：内容唯一（raw=原始字节；否则 7z 里唯一条目）；去重时可被多个条目引用，逐条比对。
+                string content;
+                if (members[0].Storage!.Raw)
+                {
+                    content = firstVolume;
+                }
+                else
+                {
+                    var extractDir = Path.Combine(groupDir, "x");
+                    await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
+                    content = Directory.EnumerateFiles(extractDir, "*", SearchOption.AllDirectories).First();
+                }
+                var actual = await hasher!.FullHashAsync(content, ct);
+                foreach (var e in members)
+                    if (e.FullHash is not null && actual != e.FullHash)
+                        corrupted.Add(e.Path);
             }
             else
             {

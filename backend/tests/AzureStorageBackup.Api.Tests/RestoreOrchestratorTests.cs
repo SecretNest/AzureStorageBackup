@@ -167,6 +167,48 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Deduped_Identical_Files_Both_Restore()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        foreach (var storeOnly in new[] { false, true }) // 非 raw(7z) 与 raw 两种单文件 blob
+        {
+            var (backup, restore, _, factory) = Build();
+            var account = AzuriteAccount();
+            var name = RandomName("rstdup-");
+            var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+            await container.CreateIfNotExistsAsync();
+            var dst = Path.Combine(_dst, storeOnly ? "raw" : "z");
+
+            try
+            {
+                WriteSrc("x.txt", "identical content");
+                WriteSrc("y.txt", "identical content"); // 同内容 → 同 hash → 共享一个 data blob（去重）
+
+                await backup.RunAsync(BackupReq(account, name) with
+                {
+                    Options = new BackupEngineOptions
+                    {
+                        Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // 单文件 blob
+                        DontCompress = storeOnly ? new IgnoreRuleSet(["*"]) : null,
+                    },
+                });
+
+                var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = dst });
+
+                Assert.Equal(2, result.RestoredFiles); // 两个引用同一 blob 的文件都还原
+                Assert.Equal("identical content", File.ReadAllText(Path.Combine(dst, "x.txt")));
+                Assert.Equal("identical content", File.ReadAllText(Path.Combine(dst, "y.txt")));
+            }
+            finally
+            {
+                await container.DeleteIfExistsAsync();
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task Raw_Stored_File_RoundTrips_Through_Restore()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

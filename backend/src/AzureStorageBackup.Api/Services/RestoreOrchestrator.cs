@@ -142,18 +142,33 @@ public sealed class RestoreOrchestrator(
         {
             var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
 
-            if (storage.Raw)
+            if (storage.Kind == "blob")
             {
-                // 原始 blob：下载的即文件内容，直接写回（单文件，无需解压）。
-                var e = needed[0];
-                var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
-                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                File.Copy(firstVolume, dest, overwrite: true);
-                ApplyMetadata(dest, e);
-                restored++;
+                // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
+                // 内容寻址去重时同一 blob 可被多个路径引用 → 复制给每个引用条目。
+                string content;
+                if (storage.Raw)
+                {
+                    content = firstVolume;
+                }
+                else
+                {
+                    var extractDir = Path.Combine(groupDir, "x");
+                    await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
+                    content = Directory.EnumerateFiles(extractDir, "*", SearchOption.AllDirectories).First();
+                }
+                foreach (var e in needed)
+                {
+                    var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    File.Copy(content, dest, overwrite: true);
+                    ApplyMetadata(dest, e);
+                    restored++;
+                }
             }
             else
             {
+                // pack：解压后按各成员的归档条目名复制。
                 var extractDir = Path.Combine(groupDir, "x");
                 await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
