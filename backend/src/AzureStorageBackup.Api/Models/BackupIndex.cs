@@ -48,6 +48,9 @@ public sealed record PackInfo
     public List<string> Members { get; init; } = [];
     public long OriginalBytes { get; init; }
     public long DeadBytes { get; init; }
+
+    /// <summary>pack 归档的分卷数（1=未分卷）。压实会改变，随 PackInfo 一并更新，供检查核验全部分卷存在（§7）。</summary>
+    public int Volumes { get; init; } = 1;
 }
 
 /// <summary>第二级版本索引（§3.2）：该版本全部文件清单 + 空文件夹。</summary>
@@ -92,4 +95,10 @@ public sealed record StorageRef
 
     /// <summary>pack 内条目名（仅 kind=pack）。</summary>
     public string? EntryName { get; init; }
+
+    /// <summary>
+    /// 单文件 blob 的分卷数（1=未分卷，§7）。内容寻址不可变，故计数稳定，供检查核验全部分卷存在。
+    /// pack 成员此值无意义（pack 分卷数记在 <see cref="PackInfo.Volumes"/>，因压实会改变）。
+    /// </summary>
+    public int Volumes { get; init; } = 1;
 }

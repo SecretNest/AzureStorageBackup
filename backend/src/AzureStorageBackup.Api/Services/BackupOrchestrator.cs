@@ -236,6 +236,7 @@ public sealed class BackupOrchestrator(
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
         // 用当前 hash 决定 blob 名；内容寻址去重（已存在则跳过）。verifier 会在内容变化时用新 hash 重调。
+        var uploadedVolumes = 0;
         async Task ProcessAsync(string hash, CancellationToken token)
         {
             var blobRef = "data/" + hash;
@@ -249,6 +250,7 @@ public sealed class BackupOrchestrator(
                 await VolumeBlobIO.UploadAsync(
                     uploader, request.Account, request.Container, blobRef, staged.Files,
                     request.DataTier, request.Options.Upload, token);
+                uploadedVolumes = staged.Files.Count;
             }
             finally
             {
@@ -272,7 +274,14 @@ public sealed class BackupOrchestrator(
             await ProcessAsync(file.FullHash, ct);
         }
 
-        storageByPath[file.Path] = new StorageRef { Kind = "blob", Ref = "data/" + finalHash };
+        // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；若去重跳过则统计云端现存卷数。
+        var volumes = uploadedVolumes > 0
+            ? uploadedVolumes
+            : await VolumeBlobIO.CountVolumesAsync(cc, "data/" + finalHash, ct);
+        storageByPath[file.Path] = new StorageRef
+        {
+            Kind = "blob", Ref = "data/" + finalHash, Volumes = Math.Max(1, volumes),
+        };
         // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
         if (finalHash != file.FullHash)
             overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
@@ -346,8 +355,8 @@ public sealed class BackupOrchestrator(
             if (verifier is null)
             {
                 var staged0 = await CompressPackAsync(request, packId, members, ct);
-                await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
-                RecordPack(request, packId, members, info, storageByPath);
+                var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
+                RecordPack(request, packId, members, vols0, info, storageByPath);
                 onItem();
                 continue;
             }
@@ -366,8 +375,8 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                await UploadStagedPackAsync(request, packId, staged, uploadGate, ct);
-                RecordPack(request, packId, members, info, storageByPath);
+                var vols = await UploadStagedPackAsync(request, packId, staged, uploadGate, ct);
+                RecordPack(request, packId, members, vols, info, storageByPath);
                 onItem();
                 continue;
             }
@@ -378,8 +387,8 @@ public sealed class BackupOrchestrator(
             if (stable.Count > 0)
             {
                 var staged2 = await CompressPackAsync(request, packId, stable, ct);
-                await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
-                RecordPack(request, packId, stable, info, storageByPath);
+                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
+                RecordPack(request, packId, stable, vols2, info, storageByPath);
                 onItem();
             }
 
@@ -418,9 +427,11 @@ public sealed class BackupOrchestrator(
             request, compressTemp, packId, entries, storeOnly: false, token), ct);
     }
 
-    private async Task UploadStagedPackAsync(
+    /// <returns>该 pack 归档的分卷数（供记录，核验分卷完整性用）。</returns>
+    private async Task<int> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate, CancellationToken ct)
     {
+        var volumes = staged.Files.Count;
         await uploadGate.WaitAsync(ct);
         try
         {
@@ -433,10 +444,11 @@ public sealed class BackupOrchestrator(
             uploadGate.Release();
             staging.Release(staged);
         }
+        return volumes;
     }
 
     private static void RecordPack(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, int volumes,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
     {
         foreach (var m in members)
@@ -448,6 +460,7 @@ public sealed class BackupOrchestrator(
             Members = members.Select(m => m.FullHash).ToList(),
             OriginalBytes = members.Sum(m => m.Length),
             DeadBytes = 0,
+            Volumes = Math.Max(1, volumes),
         };
         lock (info.Packs)
             info.Packs[packId] = packInfo;

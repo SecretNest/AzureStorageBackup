@@ -118,6 +118,48 @@ public sealed class BackupCheckerTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Missing_Volume_Of_Split_Blob_Is_Reported()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkv-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 6MB 随机文件 → 单文件 data blob，1MB 分卷 → 多卷 data/{hash}.001/.002...
+            var buf = new byte[6_000_000];
+            new Random(7).NextBytes(buf);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
+            var req = Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            };
+            await backup.RunAsync(req);
+
+            var hash = await new FileHasher().FullHashAsync(Path.Combine(_src, "big.bin"));
+            // 完整时通过。
+            Assert.True((await checker.CheckAsync(account, name, null, null)).Ok);
+
+            // 删一个中间分卷 → 按索引记录的分卷数核验应报缺失（旧 base-or-.001 检查会漏报）。
+            await container.GetBlobClient($"data/{hash}.002").DeleteIfExistsAsync();
+            var result = await checker.CheckAsync(account, name, null, null);
+
+            Assert.False(result.Ok);
+            Assert.Contains($"data/{hash}", result.MissingRefs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Deep_Check_Passes_On_Intact_Backup()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

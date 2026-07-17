@@ -166,6 +166,30 @@ public sealed class IndexSerializerTests
     }
 
     [Fact]
+    public void Volume_Counts_RoundTrip()
+    {
+        var info = SampleInfo();
+        info.Packs["p0001"] = info.Packs["p0001"] with { Volumes = 4 };
+        var index = SampleIndex() with
+        {
+            Entries = [SampleIndex().Entries[0] with { Storage = SampleIndex().Entries[0].Storage! with { Volumes = 3 } }],
+        };
+
+        var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
+        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+
+        Assert.Equal(4, backInfo.Packs["p0001"].Volumes);          // pack 分卷数（信息文件）
+        Assert.Equal(3, backIndex.Entries[0].Storage!.Volumes);    // 单文件 blob 分卷数（索引）
+    }
+
+    [Fact]
+    public void Defaults_To_One_Volume()
+    {
+        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
+        Assert.Equal(1, backIndex.Entries[0].Storage!.Volumes); // 未显式设置 → 1 卷
+    }
+
+    [Fact]
     public void Deserialize_Rejects_Unsupported_SchemaVersion()
     {
         var future = IndexSerializer.SerializeInfoFile(SampleInfo() with { SchemaVersion = 999 });

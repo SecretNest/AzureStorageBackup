@@ -12,8 +12,9 @@ namespace AzureStorageBackup.Api.Services;
 public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
-    private const byte InfoFormat = 1;
-    private const byte IndexFormat = 1;
+    // format 2：为分卷完整性核验增加分卷数（PackInfo.Volumes / StorageRef.Volumes，§7）。读取兼容 format 1（缺省 1 卷）。
+    private const byte InfoFormat = 2;
+    private const byte IndexFormat = 2;
 
     // ---- 信息记录文件 ----
 
@@ -55,6 +56,7 @@ public static class IndexSerializer
                 WriteHash(w, m);
             w.Write(pack.OriginalBytes);
             w.Write(pack.DeadBytes);
+            w.Write(pack.Volumes); // format 2
         }
 
         w.Flush();
@@ -108,12 +110,15 @@ public static class IndexSerializer
             var members = new List<string>(memberCount);
             for (var m = 0; m < memberCount; m++)
                 members.Add(ReadHash(r)!);
+            var originalBytes = r.ReadInt64();
+            var deadBytes = r.ReadInt64();
             packs[id] = new PackInfo
             {
                 Blob = blob,
                 Members = members,
-                OriginalBytes = r.ReadInt64(),
-                DeadBytes = r.ReadInt64(),
+                OriginalBytes = originalBytes,
+                DeadBytes = deadBytes,
+                Volumes = format >= 2 ? r.ReadInt32() : 1,
             };
         }
 
@@ -154,6 +159,7 @@ public static class IndexSerializer
                 w.Write((byte)(s.Kind == "pack" ? 1 : 0));
                 w.Write(s.Ref);
                 WriteNullableString(w, s.EntryName);
+                w.Write(s.Volumes); // format 2
             }
             else
             {
@@ -201,6 +207,7 @@ public static class IndexSerializer
                     Kind = r.ReadByte() == 1 ? "pack" : "blob",
                     Ref = r.ReadString(),
                     EntryName = ReadNullableString(r),
+                    Volumes = format >= 2 ? r.ReadInt32() : 1,
                 };
             }
 

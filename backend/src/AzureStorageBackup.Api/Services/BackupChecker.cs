@@ -69,18 +69,24 @@ public sealed class BackupChecker(
 
         var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
 
-        var refs = new HashSet<string>(StringComparer.Ordinal);
+        // blob 名 → 期望分卷数：单文件 blob 取索引条目 StorageRef.Volumes；pack 取 PackInfo.Volumes（压实会改，记在信息文件）。
+        var refs = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var e in index.Entries)
         {
-            if (e.Storage is { } s)
-                refs.Add(BlobNameOf(s));
+            if (e.Storage is not { } s)
+                continue;
+            var name = BlobNameOf(s);
+            var vols = s.Kind == "pack"
+                ? (info.Packs.TryGetValue(s.Ref, out var pi) ? pi.Volumes : 1)
+                : s.Volumes;
+            refs[name] = Math.Max(refs.GetValueOrDefault(name, 1), Math.Max(1, vols));
         }
 
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
         var missing = new List<string>();
-        foreach (var name in refs)
+        foreach (var (name, vols) in refs)
         {
-            if (!await VolumeBlobIO.ExistsAsync(cc, name, ct))
+            if (!await VolumeBlobIO.AllVolumesExistAsync(cc, name, vols, ct))
                 missing.Add(name);
         }
 
