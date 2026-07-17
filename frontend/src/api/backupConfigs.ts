@@ -112,12 +112,39 @@ export interface BackupVersionInfo {
   changedFiles: number
 }
 
-export interface CheckResult {
+// 分级检查（枚举按数值序列化，与后端一致）
+export const CloudCheckLevel = { None: 0, Metadata: 1, ExistenceSize: 2, Content: 3 } as const
+export const LocalCheckLevel = { None: 0, Attributes: 1, Content: 2 } as const
+export const CloudState = { NotChecked: 0, Ok: 1, MissingOrBad: 2 } as const
+export const LocalState = { NotChecked: 0, Ok: 1, Missing: 2, Changed: 3 } as const
+
+export interface FileFinding {
+  path: string
+  ref: string | null
+  cloud: number // CloudState
+  local: number // LocalState
+  repairable: boolean
+}
+
+export interface CheckReport {
   version: number
-  checkedRefs: number
+  findings: FileFinding[]
+  metadataIssue: string | null
+  ok: boolean
   missingRefs: string[]
   corruptedPaths: string[]
-  ok: boolean
+  repairablePaths: string[]
+}
+
+export interface RepairReport {
+  repaired: string[]
+  unrecoverable: string[]
+}
+
+export interface FileVersionOption {
+  version: number
+  createdAt: string
+  length: number
 }
 
 export const backupConfigsApi = {
@@ -132,14 +159,26 @@ export const backupConfigsApi = {
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
   versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),
-  restore: (id: number, targetRoot: string | null, version: number | null) =>
-    api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version }),
+  restore: (id: number, targetRoot: string | null, version: number | null, substitutions?: Record<string, number>) =>
+    api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version, substitutions }),
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
-  check: (id: number, deep = false, version: number | null = null) => {
+  fileVersions: (id: number, path: string) =>
+    api.get<FileVersionOption[]>(`/backup-configs/${id}/file-versions?path=${encodeURIComponent(path)}`),
+  unrecoverablePaths: (id: number, version: number | null) =>
+    api.get<string[]>(`/backup-configs/${id}/unrecoverable${version != null ? `?version=${version}` : ''}`),
+  check: (id: number, cloud: number, local: number, version: number | null = null, rehydrate: number | null = null) => {
     const p = new URLSearchParams()
-    if (deep) p.set('deep', 'true')
+    p.set('cloud', String(cloud))
+    p.set('local', String(local))
     if (version != null) p.set('version', String(version))
-    const qs = p.toString()
-    return api.post<CheckResult>(`/backup-configs/${id}/check${qs ? `?${qs}` : ''}`, {})
+    if (rehydrate != null) p.set('rehydrate', String(rehydrate))
+    return api.post<CheckReport>(`/backup-configs/${id}/check?${p.toString()}`, {})
+  },
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null) => {
+    const p = new URLSearchParams()
+    p.set('cloud', String(cloud))
+    if (version != null) p.set('version', String(version))
+    if (rehydrate != null) p.set('rehydrate', String(rehydrate))
+    return api.post<RepairReport>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
 }

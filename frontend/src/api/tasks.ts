@@ -6,6 +6,15 @@ export const ScheduledTaskType = { Backup: 0, Check: 1, Cleanup: 2 } as const
 export const taskTypeLabels: Record<number, string> = { 0: 'Backup', 1: 'Check', 2: 'Cleanup' }
 export const targetKindLabels: Record<number, string> = { 0: 'Backup', 1: 'Group' }
 
+export const CloudCheckLevel = { None: 0, Metadata: 1, ExistenceSize: 2, Content: 3 } as const
+export const LocalCheckLevel = { None: 0, Attributes: 1, Content: 2 } as const
+export const cloudCheckLabels: Record<number, string> = {
+  0: "Don't check cloud", 1: 'Metadata', 2: 'Existence + size', 3: 'Content (download)',
+}
+export const localCheckLabels: Record<number, string> = {
+  0: "Don't check local", 1: 'Attributes', 2: 'Content hash',
+}
+
 export interface ScheduledTask {
   id: number
   targetKind: number
@@ -17,6 +26,9 @@ export interface ScheduledTask {
   enabled: boolean
   createdAt: string
   lastRunAt: string | null
+  checkCloudLevel: number
+  checkLocalLevel: number
+  checkRehydrateTier: number | null
 }
 
 export interface TaskInput {
@@ -27,6 +39,9 @@ export interface TaskInput {
   taskType: number
   cronExpression: string
   enabled: boolean
+  checkCloudLevel?: number
+  checkLocalLevel?: number
+  checkRehydrateTier?: number | null
 }
 
 export const tasksApi = {

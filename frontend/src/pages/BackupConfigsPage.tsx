@@ -1,10 +1,14 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import {
   backupConfigsApi,
   StorageTier,
   RetentionMode,
+  CloudCheckLevel,
+  LocalCheckLevel,
+  CloudState,
+  LocalState,
   tierLabels,
   retentionModeLabels,
   backupStageLabels,
@@ -12,8 +16,26 @@ import {
   type BackupConfigInput,
   type BackupRun,
   type RestoreRun,
-  type CheckResult,
+  type CheckReport,
+  type RepairReport,
+  type FileVersionOption,
 } from '../api/backupConfigs'
+
+const cloudLevelLabels: Record<number, string> = {
+  [CloudCheckLevel.None]: "Don't check cloud",
+  [CloudCheckLevel.Metadata]: 'Metadata vs local cache',
+  [CloudCheckLevel.ExistenceSize]: 'Existence + size',
+  [CloudCheckLevel.Content]: 'Content (download + hash)',
+}
+const localLevelLabels: Record<number, string> = {
+  [LocalCheckLevel.None]: "Don't check local",
+  [LocalCheckLevel.Attributes]: 'Existence + size + permissions',
+  [LocalCheckLevel.Content]: 'Content hash',
+}
+const cloudStateLabel = (s: number) =>
+  s === CloudState.Ok ? 'OK' : s === CloudState.MissingOrBad ? 'MISSING/BAD' : '—'
+const localStateLabel = (s: number) =>
+  s === LocalState.Ok ? 'OK' : s === LocalState.Missing ? 'missing' : s === LocalState.Changed ? 'changed' : '—'
 
 const MB = 1024 * 1024
 
@@ -46,7 +68,8 @@ export function BackupConfigsPage() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
-  const [checks, setChecks] = useState<Record<number, CheckResult | 'checking'>>({})
+  const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
+  const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
@@ -163,61 +186,12 @@ export function BackupConfigsPage() {
     }
   }
 
-  const restore = async (c: BackupConfig) => {
-    const target = window.prompt('Restore to which local path?', c.localRoot)
-    if (target === null) return
-    setError(null)
-    let version: number | null = null
-    try {
-      const versions = await backupConfigsApi.versions(c.id)
-      if (versions.length > 1) {
-        const latest = versions[versions.length - 1].version
-        const ans = window.prompt(
-          `Which version? (blank = latest ${latest})\nAvailable: ${versions.map((v) => v.version).join(', ')}`,
-          String(latest),
-        )
-        if (ans === null) return
-        version = ans.trim() === '' ? null : Number(ans.trim())
-      }
-      let state = await backupConfigsApi.restore(c.id, target || null, version)
-      setRestores((r) => ({ ...r, [c.id]: state }))
-      while (state.status === 'Running') {
-        await delay(1000)
-        state = await backupConfigsApi.restoreStatus(c.id)
-        setRestores((r) => ({ ...r, [c.id]: state }))
-      }
-    } catch (e) {
-      setError(String(e))
-    }
-  }
-
-  const check = async (c: BackupConfig, deep = false) => {
-    setError(null)
-    let version: number | null = null
-    try {
-      const versions = await backupConfigsApi.versions(c.id)
-      if (versions.length > 1) {
-        const latest = versions[versions.length - 1].version
-        const ans = window.prompt(
-          `Check which version? (blank = latest ${latest})\nAvailable: ${versions.map((v) => v.version).join(', ')}`,
-          String(latest),
-        )
-        if (ans === null) return
-        version = ans.trim() === '' ? null : Number(ans.trim())
-      }
-    } catch {
-      /* 版本列举失败则退回检查最新 */
-    }
-    setChecks((s) => ({ ...s, [c.id]: 'checking' }))
-    try {
-      const result = await backupConfigsApi.check(c.id, deep, version)
-      setChecks((s) => ({ ...s, [c.id]: result }))
-    } catch (e) {
-      setChecks((s) => {
-        const { [c.id]: _removed, ...rest } = s
-        return rest
-      })
-      setError(String(e))
+  const pollRestore = async (id: number, state: RestoreRun) => {
+    setRestores((r) => ({ ...r, [id]: state }))
+    while (state.status === 'Running') {
+      await delay(1000)
+      state = await backupConfigsApi.restoreStatus(id)
+      setRestores((r) => ({ ...r, [id]: state }))
     }
   }
 
@@ -325,25 +299,13 @@ export function BackupConfigsPage() {
                   </button>{' '}
                   <button
                     type="button"
-                    onClick={() => restore(c)}
+                    onClick={() => setRestoreModal(c)}
                     disabled={restores[c.id]?.status === 'Running'}
                   >
-                    {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore'}
+                    {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore…'}
                   </button>{' '}
-                  <button
-                    type="button"
-                    onClick={() => check(c)}
-                    disabled={checks[c.id] === 'checking'}
-                  >
-                    {checks[c.id] === 'checking' ? 'Checking…' : 'Check'}
-                  </button>{' '}
-                  <button
-                    type="button"
-                    onClick={() => check(c, true)}
-                    disabled={checks[c.id] === 'checking'}
-                    title="Download, decompress and re-hash every object to detect corruption"
-                  >
-                    Deep check
+                  <button type="button" onClick={() => setCheckModal(c)}>
+                    Check / Repair…
                   </button>{' '}
                   <button type="button" onClick={() => startEdit(c)}>
                     Edit
@@ -353,9 +315,6 @@ export function BackupConfigsPage() {
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
                   {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
-                  {checks[c.id] && checks[c.id] !== 'checking' && (
-                    <CheckStatus result={checks[c.id] as CheckResult} />
-                  )}
                 </td>
               </tr>
             ))
@@ -526,6 +485,26 @@ export function BackupConfigsPage() {
           )}
         </div>
       )}
+
+      {checkModal && (
+        <CheckModal
+          config={checkModal}
+          onClose={() => setCheckModal(null)}
+          onError={(e) => setError(e)}
+        />
+      )}
+      {restoreModal && (
+        <RestoreModal
+          config={restoreModal}
+          onClose={() => setRestoreModal(null)}
+          onError={(e) => setError(e)}
+          onStarted={(state) => {
+            const id = restoreModal.id
+            setRestoreModal(null)
+            void pollRestore(id, state)
+          }}
+        />
+      )}
     </section>
   )
 }
@@ -543,25 +522,6 @@ function RunStatus({ run }: { run: BackupRun }) {
   return (
     <div style={{ fontSize: '0.8rem', color: '#555' }}>
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
-    </div>
-  )
-}
-
-function CheckStatus({ result }: { result: CheckResult }) {
-  if (result.ok)
-    return (
-      <div style={{ color: 'green', fontSize: '0.8rem' }}>
-        Check OK — {result.checkedRefs} object(s), version {result.version}
-      </div>
-    )
-
-  const problems = [
-    result.missingRefs.length > 0 && `${result.missingRefs.length} missing: ${result.missingRefs.join(', ')}`,
-    result.corruptedPaths.length > 0 && `${result.corruptedPaths.length} corrupted: ${result.corruptedPaths.join(', ')}`,
-  ].filter(Boolean)
-  return (
-    <div style={{ color: 'crimson', fontSize: '0.8rem' }}>
-      Check failed — {problems.join('; ')}
     </div>
   )
 }
@@ -615,5 +575,251 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span style={{ width: 200, display: 'inline-block' }}>{label}</span>
       {children}
     </label>
+  )
+}
+
+const overlayStyle: CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+  display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: '4vh', zIndex: 50,
+}
+const panelStyle: CSSProperties = {
+  background: '#fff', padding: '1.5rem', borderRadius: 6, minWidth: 620, maxWidth: '90vw',
+  maxHeight: '88vh', overflow: 'auto',
+}
+
+function CheckModal({
+  config, onClose, onError,
+}: { config: BackupConfig; onClose: () => void; onError: (e: string) => void }) {
+  const [versions, setVersions] = useState<number[]>([])
+  const [version, setVersion] = useState<number | null>(null)
+  const [cloud, setCloud] = useState<number>(CloudCheckLevel.ExistenceSize)
+  const [local, setLocal] = useState<number>(LocalCheckLevel.Content)
+  const [rehydrate, setRehydrate] = useState<number | null>(null)
+  const [running, setRunning] = useState(false)
+  const [report, setReport] = useState<CheckReport | null>(null)
+  const [repairing, setRepairing] = useState(false)
+  const [repairReport, setRepairReport] = useState<RepairReport | null>(null)
+
+  useEffect(() => {
+    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+  }, [config.id])
+
+  const rehydrateArg = () => (cloud === CloudCheckLevel.Content ? rehydrate : null)
+
+  const runCheck = async () => {
+    setRunning(true)
+    setRepairReport(null)
+    try {
+      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const runRepair = async () => {
+    setRepairing(true)
+    try {
+      setRepairReport(await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg()))
+      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      setRepairing(false)
+    }
+  }
+
+  const problems = report ? report.findings.filter((f) => f.cloud === CloudState.MissingOrBad) : []
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Check / Repair — {config.name}</h3>
+
+        <Field label="Version">
+          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
+            <option value="">Latest</option>
+            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </Field>
+        <Field label="Cloud check">
+          <select value={cloud} onChange={(e) => setCloud(Number(e.target.value))}>
+            {Object.entries(cloudLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+        </Field>
+        <Field label="Local check">
+          <select value={local} onChange={(e) => setLocal(Number(e.target.value))}>
+            {Object.entries(localLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+        </Field>
+        {cloud === CloudCheckLevel.Content && (
+          <Field label="Rehydrate Archive to">
+            <select value={rehydrate ?? ''} onChange={(e) => setRehydrate(e.target.value === '' ? null : Number(e.target.value))}>
+              <option value="">Don't rehydrate</option>
+              <option value={StorageTier.Hot}>Hot</option>
+              <option value={StorageTier.Cool}>Cool</option>
+            </select>
+          </Field>
+        )}
+
+        <div style={{ margin: '0.8rem 0' }}>
+          <button type="button" onClick={runCheck} disabled={running || repairing}>
+            {running ? 'Checking…' : 'Run check'}
+          </button>{' '}
+          {problems.some((f) => f.repairable) && (
+            <button type="button" onClick={runRepair} disabled={repairing || running}>
+              {repairing ? 'Repairing…' : 'Repair from local'}
+            </button>
+          )}{' '}
+          <button type="button" onClick={onClose}>Close</button>
+        </div>
+
+        {repairReport && (
+          <div style={{ fontSize: '0.85rem', marginBottom: '0.6rem' }}>
+            Repaired {repairReport.repaired.length} file(s);{' '}
+            <span style={{ color: repairReport.unrecoverable.length ? 'crimson' : 'inherit' }}>
+              {repairReport.unrecoverable.length} unrecoverable
+            </span>
+            {repairReport.unrecoverable.length > 0 && `: ${repairReport.unrecoverable.join(', ')}`}
+          </div>
+        )}
+
+        {report && (
+          <div>
+            {report.metadataIssue && (
+              <div style={{ color: 'crimson', fontSize: '0.85rem' }}>Metadata drift: {report.metadataIssue}</div>
+            )}
+            <div style={{ fontSize: '0.85rem', margin: '0.4rem 0', color: report.ok ? 'green' : 'crimson' }}>
+              {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
+              {' '}(version {report.version})
+            </div>
+            {problems.length > 0 && (
+              <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+                <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
+                <tbody>
+                  {problems.map((f) => (
+                    <tr key={f.path}>
+                      <td style={{ fontFamily: 'monospace' }}>{f.path}</td>
+                      <td style={{ textAlign: 'center', color: 'crimson' }}>{cloudStateLabel(f.cloud)}</td>
+                      <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
+                      <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function RestoreModal({
+  config, onClose, onError, onStarted,
+}: { config: BackupConfig; onClose: () => void; onError: (e: string) => void; onStarted: (s: RestoreRun) => void }) {
+  const [versions, setVersions] = useState<number[]>([])
+  const [version, setVersion] = useState<number | null>(null)
+  const [target, setTarget] = useState(config.localRoot)
+  const [unrecoverable, setUnrecoverable] = useState<string[]>([])
+  const [options, setOptions] = useState<Record<string, FileVersionOption[]>>({})
+  const [choices, setChoices] = useState<Record<string, number>>({})
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+  }, [config.id])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    ;(async () => {
+      try {
+        const paths = await backupConfigsApi.unrecoverablePaths(config.id, version)
+        if (cancelled) return
+        setUnrecoverable(paths)
+        const opts: Record<string, FileVersionOption[]> = {}
+        const ch: Record<string, number> = {}
+        for (const p of paths) {
+          const cands = await backupConfigsApi.fileVersions(config.id, p)
+          opts[p] = cands
+          ch[p] = cands.length > 0 ? cands[0].version : 0 // 0 = skip
+        }
+        if (cancelled) return
+        setOptions(opts)
+        setChoices(ch)
+      } catch (e) {
+        if (!cancelled) onError(String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [config.id, version, onError])
+
+  const setAllNearest = () => {
+    const ch: Record<string, number> = {}
+    for (const p of unrecoverable) ch[p] = options[p]?.length ? options[p][0].version : 0
+    setChoices(ch)
+  }
+
+  const start = async () => {
+    try {
+      const subs: Record<string, number> = {}
+      for (const [p, v] of Object.entries(choices)) if (v > 0) subs[p] = v
+      const state = await backupConfigsApi.restore(config.id, target || null, version, subs)
+      onStarted(state)
+    } catch (e) {
+      onError(String(e))
+    }
+  }
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
+        <Field label="Restore to">
+          <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
+        </Field>
+        <Field label="Version">
+          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
+            <option value="">Latest</option>
+            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </Field>
+
+        {loading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
+        {!loading && unrecoverable.length > 0 && (
+          <div style={{ margin: '0.6rem 0' }}>
+            <div style={{ fontSize: '0.85rem', marginBottom: '0.3rem' }}>
+              {unrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
+              {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
+            </div>
+            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+              <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Substitute from</th></tr></thead>
+              <tbody>
+                {unrecoverable.map((p) => (
+                  <tr key={p}>
+                    <td style={{ fontFamily: 'monospace' }}>{p}</td>
+                    <td style={{ textAlign: 'center' }}>
+                      <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
+                        <option value={0}>Skip (don't restore)</option>
+                        {(options[p] ?? []).map((o) => <option key={o.version} value={o.version}>Version {o.version}</option>)}
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div style={{ marginTop: '0.8rem' }}>
+          <button type="button" onClick={start} disabled={loading}>Start restore</button>{' '}
+          <button type="button" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
   )
 }

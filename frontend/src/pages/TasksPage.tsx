@@ -3,6 +3,10 @@ import {
   tasksApi,
   TaskTargetKind,
   ScheduledTaskType,
+  CloudCheckLevel,
+  LocalCheckLevel,
+  cloudCheckLabels,
+  localCheckLabels,
   taskTypeLabels,
   targetKindLabels,
   type ScheduledTask,
@@ -20,6 +24,9 @@ const emptyForm: TaskInput = {
   taskType: ScheduledTaskType.Backup,
   cronExpression: '0 2 * * *',
   enabled: true,
+  checkCloudLevel: CloudCheckLevel.ExistenceSize,
+  checkLocalLevel: LocalCheckLevel.Content,
+  checkRehydrateTier: null,
 }
 
 export function TasksPage() {
@@ -67,6 +74,9 @@ export function TasksPage() {
       taskType: t.taskType,
       cronExpression: t.cronExpression,
       enabled: t.enabled,
+      checkCloudLevel: t.checkCloudLevel,
+      checkLocalLevel: t.checkLocalLevel,
+      checkRehydrateTier: t.checkRehydrateTier,
     })
     setError(null)
     setShowForm(true)
@@ -246,6 +256,23 @@ export function TasksPage() {
               <option value={ScheduledTaskType.Cleanup}>Cleanup</option>
             </select>
           </label>
+
+          {form.taskType === ScheduledTaskType.Check && (
+            <div style={{ margin: '0.5rem 0', paddingLeft: '1rem', borderLeft: '2px solid #eee' }}>
+              <label style={{ display: 'block', margin: '0.3rem 0' }}>
+                Cloud check{' '}
+                <select value={form.checkCloudLevel ?? CloudCheckLevel.ExistenceSize} onChange={(e) => set('checkCloudLevel', Number(e.target.value))}>
+                  {Object.entries(cloudCheckLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              </label>
+              <label style={{ display: 'block', margin: '0.3rem 0' }}>
+                Local check{' '}
+                <select value={form.checkLocalLevel ?? LocalCheckLevel.Content} onChange={(e) => set('checkLocalLevel', Number(e.target.value))}>
+                  {Object.entries(localCheckLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              </label>
+            </div>
+          )}
 
           <div style={{ margin: '0.5rem 0' }}>
             <div>Schedule</div>

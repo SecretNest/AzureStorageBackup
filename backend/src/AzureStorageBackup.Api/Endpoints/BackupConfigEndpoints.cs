@@ -151,6 +151,27 @@ public static class BackupConfigEndpoints
             return Results.Ok(candidates);
         });
 
+        // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            if (info is null || info.Versions.Count == 0)
+                return Results.Ok(Array.Empty<string>());
+            var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
+            if (ver is null)
+                return Results.Ok(Array.Empty<string>());
+            var idx = await store.ReadIndexAsync(account, config.ContainerName, ver.IndexBlob, password, ct);
+            return Results.Ok(idx.UnrecoverablePaths);
+        });
+
         // 从本地修复云端损坏/缺失的 blob（显式动作）；修不了的文件标记不可恢复。经忙碌守卫。
         group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, IBackupConfigService svc, IAccountService accounts, BackupRepairer repairer, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
         {
