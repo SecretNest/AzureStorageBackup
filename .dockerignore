@@ -1,0 +1,18 @@
+# 构建上下文精简：只保留源码，其余由镜像内构建生成。
+**/bin
+**/obj
+**/node_modules
+**/dist
+frontend/.vite
+backend/**/TestResults
+**/*.db
+**/*.db-shm
+**/*.db-wal
+data/
+keys/
+.git
+.github
+.claude
+.vs
+.vscode
+*.user

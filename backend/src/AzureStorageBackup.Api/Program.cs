@@ -151,6 +151,10 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors(CorsPolicy);
 
+// 托管构建后的前端静态资源（Docker 镜像里位于 wwwroot）；开发时 wwwroot 为空，前端走 Vite。
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 app.MapHealthEndpoints();
 app.MapAccountEndpoints();
 app.MapContainerEndpoints();
@@ -162,6 +166,9 @@ app.MapNotificationEndpoints();
 app.MapLogEndpoints();
 app.MapSettingsEndpoints();
 app.MapSystemEndpoints();
+
+// 前端客户端路由回退到 index.html（非 /api 的未匹配路径）；wwwroot 无 index.html 时返回 404（开发无害）。
+app.MapFallbackToFile("index.html");
 
 app.Run();
 

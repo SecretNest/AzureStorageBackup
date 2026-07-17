@@ -1,41 +1,40 @@
 # Azure Storage Backup
 
-将本地文件备份到 Azure Storage Account 的应用。单用户、无身份验证。
+A single-user, no-authentication application that backs up local files to an Azure Storage account (Blob only).
 
-## 技术栈
+## Stack
 
-- **后端**：.NET 10 Minimal API + EF Core（SQLite）+ Azure.Storage.Blobs
-- **前端**：Vite + React + TypeScript
-- **部署**：Docker，前端 nginx 托管静态资源并反代 `/api` 到后端
+- **Backend**: .NET 10 Minimal API + EF Core (SQLite) + Azure.Storage.Blobs
+- **Frontend**: Vite + React + TypeScript
+- **Packaging**: a single multi-arch Docker image (`linux/amd64` + `linux/arm64`) in which the backend serves both the API and the built frontend. Compression uses 7-Zip (`p7zip-full`) bundled in the image.
 
-## 目录结构
+## Repository layout
 
 ```
 .
-├── backend/                     # .NET 10 Minimal API
-│   ├── src/AzureStorageBackup.Api/
-│   │   ├── Endpoints/           # Minimal API 端点分组
-│   │   ├── Services/            # 业务逻辑（Azure 存储 / 备份编排）
-│   │   ├── Data/                # EF Core DbContext
-│   │   ├── Models/              # 实体与 DTO
-│   │   └── Program.cs           # 组装入口
-│   └── tests/                   # xUnit 测试
-├── frontend/                    # Vite + React + TS
-│   └── src/{api,components,pages}/
+├── backend/                          # .NET 10 Minimal API
+│   └── src/AzureStorageBackup.Api/
+│       ├── Endpoints/                # Minimal API endpoint groups (all under /api)
+│       ├── Services/                 # Business logic (Azure storage / backup engine)
+│       ├── Data/                     # EF Core DbContext + migrations
+│       ├── Models/                   # Entities and DTOs
+│       └── Program.cs                # Composition root
+├── frontend/                         # Vite + React + TS  (src/{api,components,pages})
+├── Dockerfile                        # Multi-stage, multi-arch image
 ├── docker-compose.yml
-└── .env.example
+└── .github/workflows/docker-publish.yml
 ```
 
-## 本地开发
+## Local development
 
-**后端**（端口 5122）：
+**Backend** (port 5122):
 
 ```bash
 cd backend
 dotnet run --project src/AzureStorageBackup.Api
 ```
 
-**前端**（端口 5173，`/api` 经 Vite proxy 转发到后端）：
+**Frontend** (port 5173; `/api` is proxied to the backend by Vite):
 
 ```bash
 cd frontend
@@ -43,43 +42,72 @@ npm install
 npm run dev
 ```
 
-## 测试
+## Tests
 
 ```bash
 cd backend && dotnet test
 ```
 
-## Docker 部署
+Integration tests that talk to Azure use [Azurite](https://github.com/Azure/Azurite); they are skipped automatically when Azurite is not reachable on `127.0.0.1:10000`.
+
+## Docker
+
+The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.
+
+Build and run locally:
 
 ```bash
-cp .env.example .env      # 填入 AZURE_STORAGE_CONNECTION_STRING
-docker compose up --build
+docker build -t azurestoragebackup .
+docker run -d --name asb -p 8080:8080 \
+  -e ConnectionStrings__AzureStorage="<your Azure Storage connection string>" \
+  -v asb-data:/data -v asb-keys:/keys -v asb-temp:/temp \
+  -v /path/to/files:/backup-source \
+  azurestoragebackup
 ```
 
-启动后访问 http://localhost:8080 。前端容器（nginx）托管静态资源并把 `/api` 反代到后端容器。
+Then open <http://localhost:8080>. Inside the app, set a backup's *local root* (and any restore target) to a path that exists **inside the container**, e.g. `/backup-source`.
 
-## 配置
+Or with Docker Compose (`docker compose up --build`), after copying `.env.example` to `.env`.
 
-| 配置项 | 说明 | 默认 |
+### Environment variables
+
+ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). All are optional; defaults shown are the in-container defaults set by the image.
+
+| Variable | Purpose | Default (image) |
 | --- | --- | --- |
-| `ConnectionStrings__Sqlite` | SQLite 连接串 | `Data Source=data/app.db` |
-| `ConnectionStrings__AzureStorage` | Azure Storage 账户连接串 | 空（回退到本地 Azurite `UseDevelopmentStorage=true`） |
-| `Cors__AllowedOrigins__0` | 允许的前端来源 | `http://localhost:5173` |
-| `DataProtection__KeysPath` | 敏感信息加密密钥环目录（**须持久化**，否则重启后无法解密已存密钥） | `keys` |
-| `Paths__Temp` | 临时目录（备份压缩等，M4 使用） | `temp` |
+| `ConnectionStrings__AzureStorage` | Azure Storage account connection string. If empty, falls back to `UseDevelopmentStorage=true` (local Azurite) so the process still starts. | *(empty)* |
+| `ConnectionStrings__Sqlite` | SQLite connection string (app database). | `Data Source=/data/app.db` |
+| `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
+| `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
+| `Backup__StagedLimitBytes` | Max bytes kept in the staging area before back-pressure. | `1073741824` (1 GiB) |
+| `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
+| `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
+| `Cors__AllowedOrigins__0` | Allowed browser origin. Not needed for the single-image deployment (frontend is same-origin); relevant only when hosting the SPA separately. | `http://localhost:5173` |
+| `ASPNETCORE_URLS` | Listen address. | `http://+:8080` |
+| `ASPNETCORE_ENVIRONMENT` | ASP.NET environment. | `Production` |
 
-### 持久化卷（docker）
+### Volumes / mounts
 
-| 容器路径 | 用途 | compose 卷 |
+| Container path | Purpose | Persist? |
 | --- | --- | --- |
-| `/app/data` | SQLite 数据库 | `backend-data` |
-| `/app/keys` | Data Protection 密钥环（丢失则密钥不可解） | `backend-keys` |
-| `/app/temp` | 备份临时区 | `backend-temp` |
+| `/data` | SQLite database (`app.db`). | **Yes** |
+| `/keys` | Data Protection key ring. Losing it makes stored account keys/passwords undecryptable. | **Yes** |
+| `/temp` | Backup/restore working area (compress, staged, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
+| *(your choice, e.g. `/backup-source`)* | Host directories to back up. Mount **read-only** if you only back up. A backup's *local root* is set to this in-container path. | Bind mount |
+| *(your choice, e.g. `/restore-target`)* | Where restores write. Mount read-write. | Bind mount |
 
-运行时可通过 `GET /api/system/paths` 查看这些路径的绝对位置（对应 PRD 第 6 章「目录」）。
+`GET /api/system/paths` returns the resolved absolute paths at runtime (PRD §6 "Directories"), useful when configuring Docker volume mappings.
 
-## 状态
+## Published image (GHCR)
 
-已完成：基础骨架 + **M1 账户管理**——账户 CRUD（敏感信息经 Data Protection 加密存储）、代理与分区配置、连通测试、系统路径/版本端点。
+Multi-arch images are published to the GitHub Container Registry:
 
-路线图见 `docs/roadmap.md`，完整需求见 `docs/product-requirements.md`。
+```
+ghcr.io/secretnest/azurestoragebackup:latest
+```
+
+Publishing is a **manual** GitHub Action (`.github/workflows/docker-publish.yml`, `workflow_dispatch`) that builds for `linux/amd64` and `linux/arm64` with Buildx and pushes to GHCR.
+
+## Documentation
+
+Roadmap: `docs/roadmap.md`. Full requirements: `docs/product-requirements.md`. Backup engine design: `docs/m4-backup-engine-design.md`.
