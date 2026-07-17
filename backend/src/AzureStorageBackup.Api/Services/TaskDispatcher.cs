@@ -28,7 +28,7 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
             }
             try
             {
-                await ExecuteAsync(sp, task.TaskType, accountId, container, ct);
+                await ExecuteAsync(sp, task, accountId, container, ct);
             }
             catch (Exception ex)
             {
@@ -57,18 +57,18 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
     }
 
     private async Task ExecuteAsync(
-        IServiceProvider sp, ScheduledTaskType type, int accountId, string container, CancellationToken ct)
+        IServiceProvider sp, ScheduledTask task, int accountId, string container, CancellationToken ct)
     {
         var config = await sp.GetRequiredService<IBackupConfigService>().FindAsync(accountId, container, ct);
         var account = await sp.GetRequiredService<IAccountService>().GetAsync(accountId, ct);
         if (config is null || account is null)
         {
-            logger.LogWarning("No backup config for {Account}/{Container}; skipping scheduled {Type}", accountId, container, type);
+            logger.LogWarning("No backup config for {Account}/{Container}; skipping scheduled {Type}", accountId, container, task.TaskType);
             return;
         }
 
         var password = BackupRequestMapper.Password(config);
-        switch (type)
+        switch (task.TaskType)
         {
             case ScheduledTaskType.Backup:
                 var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
@@ -77,10 +77,18 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
                 break;
 
             case ScheduledTaskType.Check:
+                var checkSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
+                var options = new CheckOptions
+                {
+                    Cloud = task.CheckCloudLevel,
+                    Local = task.CheckLocalLevel,
+                    RehydrateTier = task.CheckRehydrateTier is { } t ? BackupRequestMapper.MapTier(t) : null,
+                };
                 var result = await sp.GetRequiredService<BackupChecker>()
-                    .CheckAsync(account, container, password, null, deep: false, ct);
+                    .CheckAsync(account, container, password, null, options, config.LocalRoot, ct,
+                        downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5);
                 if (!result.Ok)
-                    logger.LogWarning("Check for {Account}/{Container} found {Missing} missing object(s)",
+                    logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",
                         accountId, container, result.MissingRefs.Count);
                 break;
 

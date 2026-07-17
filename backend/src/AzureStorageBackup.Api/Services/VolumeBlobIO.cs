@@ -1,3 +1,4 @@
+using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -46,6 +47,40 @@ public static class VolumeBlobIO
                 return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// 「存在 + 尺寸」检查：核验全部分卷存在，且当 <paramref name="expectedSizes"/> 非空时每卷尺寸匹配。
+    /// 只发 HEAD（GetProperties），不下载；Archive 亦可读属性无需活化。尺寸未知（为空）则只验存在。
+    /// </summary>
+    public static async Task<(bool Present, bool SizeOk)> VerifyVolumesAsync(
+        BlobContainerClient cc, string baseRef, int expectedVolumes, IReadOnlyList<long> expectedSizes, CancellationToken ct)
+    {
+        if (expectedVolumes <= 1)
+        {
+            var len = await LengthAsync(cc.GetBlobClient(baseRef), ct)
+                      ?? await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, 1)), ct);
+            if (len is null)
+                return (false, false);
+            return (true, expectedSizes.Count < 1 || len == expectedSizes[0]);
+        }
+
+        var sizeOk = true;
+        for (var i = 1; i <= expectedVolumes; i++)
+        {
+            var len = await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, i)), ct);
+            if (len is null)
+                return (false, false);
+            if (expectedSizes.Count >= i && len != expectedSizes[i - 1])
+                sizeOk = false;
+        }
+        return (true, sizeOk);
+    }
+
+    private static async Task<long?> LengthAsync(BlobClient blob, CancellationToken ct)
+    {
+        try { return (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.ContentLength; }
+        catch (RequestFailedException e) when (e.Status == 404) { return null; }
     }
 
     /// <summary>统计归档实际存在的分卷数（单卷=1；多卷=连续 .001..N 的 N；都不在=0）。dedup 记录分卷数用。</summary>

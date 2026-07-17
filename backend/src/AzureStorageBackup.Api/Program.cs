@@ -93,7 +93,8 @@ builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "check"),
     sp.GetRequiredService<INotifier>(),
-    sp.GetRequiredService<IOperationLog>()));
+    sp.GetRequiredService<IOperationLog>(),
+    sp.GetRequiredService<TrackedInfoStore>())); // 元数据漂移比对用本地权威缓存
 
 // 操作日志（M8）+ 全局设置
 builder.Services.AddScoped<IOperationLog, OperationLogService>();

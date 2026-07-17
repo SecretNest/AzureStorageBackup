@@ -156,7 +156,7 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, bool? deep, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -172,7 +172,13 @@ public static class BackupConfigEndpoints
             {
                 var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
                 var settings = await settingsSvc.GetAsync(ct);
-                var result = await checker.CheckAsync(account, config.ContainerName, password, version, deep ?? false, ct,
+                var options = new CheckOptions
+                {
+                    Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
+                    Local = local ?? LocalCheckLevel.Content,
+                    RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                };
+                var result = await checker.CheckAsync(account, config.ContainerName, password, version, options, config.LocalRoot, ct,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
                 return Results.Ok(result);
             }
