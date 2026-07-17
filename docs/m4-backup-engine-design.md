@@ -16,6 +16,7 @@
 > - data blob 与 pack 均可**分卷**：多卷时实际 blob 名为 `data/{hash}.001/.002…`、`packs/{id}.7z.001/.002…`（单卷用基名），读写/清理经 `VolumeBlobIO` 按分卷族处理。
 > - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失；多卷**倒序上传**（.001 最后写）作为「整族齐全」提交标记。
 > - **hash 碰撞避让**：data blob 元数据存原始长度 + headHash；去重时须元数据一致才跳过，否则判为碰撞、改用备用名 `data/{hash}~1/~2…` 并报 UnrecoverableError。索引 `StorageRef.Ref` 记实际名，还原/检查/清理据此。（残余「同 hash+同长度+同 headHash」碰撞概率可忽略，不再下载内容比对。）
+> - **加密备份密钥化寻址（防指纹识别）**：加密备份的 data blob 名改为 `data/{HMAC(key, fullHash)[:16]}`（key = HKDF(password, `BackupMeta.KdfSalt`)），碰撞元数据改为不透明 `v = HMAC(key, fullHash|len|head)`，不泄露长度/头部。未授权者即使能列 container 也无法用公开 hash 反推「是否备份过某文件」。去重照常（同内容→同地址）。非加密备份仍明文寻址。仅编排器创建 blob 时用密钥；还原/检查/清理用索引里记录的实际地址。残余泄露：blob 数量与大小。见 `BlobAddressScheme`。
 
 ## 2. 存储布局（container 内 blob 组织）
 
