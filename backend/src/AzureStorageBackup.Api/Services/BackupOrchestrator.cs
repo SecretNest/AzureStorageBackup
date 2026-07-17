@@ -292,7 +292,8 @@ public sealed class BackupOrchestrator(
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, token);
-            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, token);
+            var tail = await hasher.TailHashAsync(localPath, headBytes, token);
+            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, tail, token);
             chosenRef = blobRef;
             collided = collision;
             if (exists)
@@ -310,7 +311,7 @@ public sealed class BackupOrchestrator(
             await uploadGate.WaitAsync(token);
             try
             {
-                var meta = new Dictionary<string, string>(addressing.Metadata(hash, length, head));
+                var meta = new Dictionary<string, string>(addressing.Metadata(hash, length, head, tail));
                 if (raw)
                     meta["raw"] = "1";
                 await VolumeBlobIO.UploadAsync(
@@ -366,7 +367,7 @@ public sealed class BackupOrchestrator(
     /// 元数据确认同内容才去重，内容不同却 hash 相同（碰撞）时顺延到备用名 …~1、~2…。
     /// </summary>
     private static async Task<(string Ref, bool Exists, bool Collision, bool ExistingRaw)> ResolveDataRefAsync(
-        BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, CancellationToken ct)
+        BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, string tailHash, CancellationToken ct)
     {
         var baseAddr = addressing.DataAddress(hash);
         for (var n = 0; ; n++)
@@ -375,7 +376,7 @@ public sealed class BackupOrchestrator(
             var meta = await ReadBlobMetaAsync(cc, refName, ct);
             if (meta is null)
                 return (refName, false, n > 0, false);                            // 空位 → 在此上传（n>0=已避让碰撞）
-            if (addressing.MetadataMatches(meta, hash, length, headHash))
+            if (addressing.MetadataMatches(meta, hash, length, headHash, tailHash))
                 return (refName, true, n > 0, meta.TryGetValue("raw", out var r) && r == "1"); // 同内容 → 去重，带既有 raw 属性
             // 元数据不符 → 碰撞，试下一个备用名。
         }

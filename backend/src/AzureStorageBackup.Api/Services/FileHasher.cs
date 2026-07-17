@@ -10,6 +10,11 @@ namespace AzureStorageBackup.Api.Services;
 public interface IFileHasher
 {
     Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default);
+
+    /// <summary>文件末段（最多 tailBytes 字节）的 hash。与 headHash 一起作为去重碰撞检测的强化元数据：
+    /// 内容不同却 fullHash+长度+头 全等的残余碰撞，若差异不在文件中段即可被尾部 hash 识破。</summary>
+    Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default);
+
     Task<string> FullHashAsync(string path, CancellationToken ct = default);
 }
 
@@ -23,6 +28,25 @@ public sealed class FileHasher : IFileHasher
         while (total < headBytes)
         {
             var read = await stream.ReadAsync(buffer.AsMemory(total, headBytes - total), ct);
+            if (read == 0)
+                break;
+            total += read;
+        }
+        return Format(XxHash128.Hash(buffer.AsSpan(0, total)));
+    }
+
+    public async Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default)
+    {
+        await using var stream = Open(path);
+        var len = stream.Length;
+        var take = (int)Math.Min(tailBytes, len);
+        if (take > 0)
+            stream.Seek(-take, SeekOrigin.End);
+        var buffer = new byte[take];
+        var total = 0;
+        while (total < take)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(total, take - total), ct);
             if (read == 0)
                 break;
             total += read;

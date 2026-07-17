@@ -34,33 +34,37 @@ public sealed class BlobAddressScheme
         ? "data/" + fullHash
         : "data/" + Hex(HMACSHA256.HashData(_key, Encoding.UTF8.GetBytes(fullHash)).AsSpan(0, 16));
 
-    /// <summary>上传时写入的碰撞检测元数据。</summary>
-    public IReadOnlyDictionary<string, string> Metadata(string fullHash, long length, string headHash) => _key is null
+    /// <summary>上传时写入的碰撞检测元数据（含头/尾段 hash，抓住内容不同却 fullHash+长度 相同的残余碰撞）。</summary>
+    public IReadOnlyDictionary<string, string> Metadata(string fullHash, long length, string headHash, string tailHash) => _key is null
         ? new Dictionary<string, string>
         {
             ["len"] = length.ToString(CultureInfo.InvariantCulture),
             ["head"] = headHash,
+            ["tail"] = tailHash,
         }
-        : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash) };
+        : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash, tailHash) };
 
-    /// <summary>去重时判断既有 blob 的元数据是否代表同内容（老 blob 无元数据 → 视为同内容，向后兼容）。</summary>
-    public bool MetadataMatches(IDictionary<string, string> meta, string fullHash, long length, string headHash)
+    /// <summary>去重时判断既有 blob 的元数据是否代表同内容（老 blob 缺某项 → 该项不参与判定，向后兼容）。</summary>
+    public bool MetadataMatches(IDictionary<string, string> meta, string fullHash, long length, string headHash, string tailHash)
     {
         if (_key is null)
         {
             if (!meta.TryGetValue("len", out var l))
                 return true; // 老 blob 无元数据
-            return l == length.ToString(CultureInfo.InvariantCulture)
-                && meta.TryGetValue("head", out var h) && h == headHash;
+            if (l != length.ToString(CultureInfo.InvariantCulture)
+                || !meta.TryGetValue("head", out var h) || h != headHash)
+                return false;
+            // tail 为后加项：老 blob 无 tail 时不据此否决（未投产，实际不会遇到）。
+            return !meta.TryGetValue("tail", out var t) || t == tailHash;
         }
         if (!meta.TryGetValue("v", out var v))
             return true;
-        return v == Verifier(fullHash, length, headHash);
+        return v == Verifier(fullHash, length, headHash, tailHash);
     }
 
-    private string Verifier(string fullHash, long length, string headHash) =>
+    private string Verifier(string fullHash, long length, string headHash, string tailHash) =>
         Hex(HMACSHA256.HashData(_key!, Encoding.UTF8.GetBytes(
-            string.Create(CultureInfo.InvariantCulture, $"{fullHash}|{length}|{headHash}"))));
+            string.Create(CultureInfo.InvariantCulture, $"{fullHash}|{length}|{headHash}|{tailHash}"))));
 
     private static string Hex(ReadOnlySpan<byte> bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 }
