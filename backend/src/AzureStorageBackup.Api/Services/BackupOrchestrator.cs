@@ -26,6 +26,9 @@ public sealed record BackupEngineOptions
 
     /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
     public double DeadWeightThreshold { get; init; } = 0.30;
+
+    /// <summary>死重重 pack 时本地缺失成员是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
+    public bool AllowRepackDownload { get; init; } = true;
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -203,6 +206,8 @@ public sealed class BackupOrchestrator(
             DataTier = request.DataTier,
             VolumeBytes = request.Options.VolumeBytes,
             DeadWeightThreshold = request.Options.DeadWeightThreshold,
+            LocalRoot = request.LocalRoot,
+            AllowRepackDownload = request.Options.AllowRepackDownload,
         }, info, ct);
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));

@@ -18,6 +18,22 @@ public class GlobalSettings
     public long DefaultSingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
     public long DefaultGroupCapBytes { get; set; } = 100 * 1024 * 1024;
     public long? DefaultVolumeBytes { get; set; }
+
+    // 死重压实（仅分组 pack 用到）：按数据 tier 决定重 pack 时若本地缺失成员是否允许下载云端 pack 补齐。
+    // 优先用本地文件（内容一致者）；本地缺失且此开关为假则放弃该 pack 的重打包。Archive 默认 false（避免高成本取回/rehydrate）。
+    public bool RepackDownloadHot { get; set; } = true;
+    public bool RepackDownloadCool { get; set; } = true;
+    public bool RepackDownloadCold { get; set; } = true;
+    public bool RepackDownloadArchive { get; set; }
+
+    /// <summary>某数据 tier 在死重重 pack 时是否允许下载云端 pack 补齐本地缺失成员。</summary>
+    public bool RepackDownloadAllowed(StorageTier tier) => tier switch
+    {
+        StorageTier.Cool => RepackDownloadCool,
+        StorageTier.Cold => RepackDownloadCold,
+        StorageTier.Archive => RepackDownloadArchive,
+        _ => RepackDownloadHot,
+    };
     public bool DefaultIncludeSymlinks { get; set; }
     public string? DefaultIgnoreRules { get; set; }
     public string? DefaultDontCompressRules { get; set; }

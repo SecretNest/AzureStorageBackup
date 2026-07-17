@@ -9,6 +9,10 @@ export interface GlobalSettings {
   defaultSingleFileThresholdBytes: number
   defaultGroupCapBytes: number
   defaultVolumeBytes: number | null
+  repackDownloadHot: boolean
+  repackDownloadCool: boolean
+  repackDownloadCold: boolean
+  repackDownloadArchive: boolean
   defaultIncludeSymlinks: boolean
   defaultIgnoreRules: string | null
   defaultDontCompressRules: string | null

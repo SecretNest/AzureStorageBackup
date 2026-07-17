@@ -33,6 +33,7 @@ public static class BackupRequestMapper
             Upload = RetryOf(settings),
             DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
                 ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
+            AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
         },
     };
 
@@ -77,6 +78,8 @@ public static class BackupRequestMapper
         VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
         DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
             ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
+        LocalRoot = config.LocalRoot,
+        AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
     };
 
     public static string? Password(BackupConfig config) =>

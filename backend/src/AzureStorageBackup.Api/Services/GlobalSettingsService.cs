@@ -34,6 +34,10 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DefaultSingleFileThresholdBytes = s.DefaultSingleFileThresholdBytes;
         existing.DefaultGroupCapBytes = s.DefaultGroupCapBytes;
         existing.DefaultVolumeBytes = s.DefaultVolumeBytes;
+        existing.RepackDownloadHot = s.RepackDownloadHot;
+        existing.RepackDownloadCool = s.RepackDownloadCool;
+        existing.RepackDownloadCold = s.RepackDownloadCold;
+        existing.RepackDownloadArchive = s.RepackDownloadArchive;
         existing.DefaultIncludeSymlinks = s.DefaultIncludeSymlinks;
         existing.DefaultIgnoreRules = s.DefaultIgnoreRules;
         existing.DefaultDontCompressRules = s.DefaultDontCompressRules;

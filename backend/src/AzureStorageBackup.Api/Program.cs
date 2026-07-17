@@ -62,6 +62,7 @@ builder.Services.AddSingleton<RetentionEvaluator>();
 builder.Services.AddSingleton(sp => new DeadWeightCompactor(
     sp.GetRequiredService<IBlobUploader>(),
     sp.GetRequiredService<IFileCompressor>(),
+    sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "compact"),
     sp.GetService<ILogger<DeadWeightCompactor>>()));
 builder.Services.AddScoped<RetentionCleaner>();

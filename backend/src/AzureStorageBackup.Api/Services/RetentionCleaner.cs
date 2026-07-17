@@ -12,6 +12,12 @@ public sealed record CleanupOptions
 
     /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
     public double DeadWeightThreshold { get; init; } = 0.30;
+
+    /// <summary>本地源根：死重重 pack 时优先用本地文件补齐成员。</summary>
+    public string? LocalRoot { get; init; }
+
+    /// <summary>本地缺失成员时是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
+    public bool AllowRepackDownload { get; init; } = true;
 }
 
 /// <summary>
@@ -103,7 +109,8 @@ public sealed class RetentionCleaner(
         if (compactor is not null)
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
-                options.DataTier, options.VolumeBytes, options.DeadWeightThreshold, ct);
+                options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
+                options.LocalRoot, options.AllowRepackDownload, ct);
 
         await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
     }
