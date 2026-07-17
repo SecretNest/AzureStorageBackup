@@ -26,7 +26,7 @@ public sealed record BackupRunResponse(string Status, BackupProgress? Progress, 
 /// 后台备份运行器：按配置 id 在后台跑 BackupOrchestrator，进度存内存供轮询。
 /// 同一配置正在运行时不重复启动。压缩全局非并发由单例 StagingArea 保证。
 /// </summary>
-public sealed class BackupRunner(IServiceScopeFactory scopes)
+public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
     private readonly Dictionary<int, BackupRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -68,11 +68,24 @@ public sealed class BackupRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            var result = await orchestrator.RunAsync(
-                BackupRequestMapper.From(config, account, settings), new StateProgress(state), CancellationToken.None);
-
-            state.Version = result.Version;
-            state.Status = RunStatus.Completed;
+            // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
+            if (!busy.TryAcquire(account.Id, config.ContainerName))
+            {
+                state.Error = "This backup is busy with another operation.";
+                state.Status = RunStatus.Failed;
+                return;
+            }
+            try
+            {
+                var result = await orchestrator.RunAsync(
+                    BackupRequestMapper.From(config, account, settings), new StateProgress(state), CancellationToken.None);
+                state.Version = result.Version;
+                state.Status = RunStatus.Completed;
+            }
+            finally
+            {
+                busy.Release(account.Id, config.ContainerName);
+            }
         }
         catch (Exception ex)
         {

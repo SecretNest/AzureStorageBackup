@@ -6,7 +6,7 @@ namespace AzureStorageBackup.Api.Services;
 /// 执行一个计划任务（M6）：解析目标（单备份或组成员），组内**依次**执行；
 /// 按类型分发到 备份/检查/清理。每个引擎调用在独立 scope 中解析 scoped 服务。
 /// </summary>
-public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger)
+public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy)
 {
     public async Task DispatchAsync(ScheduledTask task, CancellationToken ct = default)
     {
@@ -16,6 +16,16 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
         foreach (var (accountId, container) in await ResolveTargetsAsync(sp, task, ct))
         {
             ct.ThrowIfCancellationRequested();
+
+            // 目标忙碌（正在备份/检查/还原/清理）→ 记报警并跳过，不打断在执行的任务（用户要求）。
+            if (!busy.TryAcquire(accountId, container))
+            {
+                logger.LogWarning("Backup {Account}/{Container} is busy; skipping scheduled {Type}", accountId, container, task.TaskType);
+                await sp.GetRequiredService<IOperationLog>().AppendAsync(
+                    OperationLogLevel.Warning, $"schedule:{container}",
+                    $"Skipped scheduled {task.TaskType}: backup is busy with another operation", ct);
+                continue;
+            }
             try
             {
                 await ExecuteAsync(sp, task.TaskType, accountId, container, ct);
@@ -23,6 +33,10 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
             catch (Exception ex)
             {
                 logger.LogError(ex, "Scheduled {Type} for {Account}/{Container} failed", task.TaskType, accountId, container);
+            }
+            finally
+            {
+                busy.Release(accountId, container);
             }
         }
     }

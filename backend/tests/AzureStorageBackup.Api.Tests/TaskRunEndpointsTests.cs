@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Net.Sockets;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -76,6 +77,57 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
         }
     }
 
+    [SkippableFact]
+    public async Task Scheduled_Task_Skips_And_Warns_When_Backup_Busy()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        Directory.CreateDirectory(_root);
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "alpha");
+        var containerName = "taskbusy-" + Guid.NewGuid().ToString("N")[..8];
+
+        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
+            account!.Id, containerName, "photos", null, _root, null,
+            StorageTier.Hot, StorageTier.Hot, null, null, null, false,
+            100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000));
+        var task = await (await _client.PostAsJsonAsync("/api/tasks", new TaskRequest(
+            TaskTargetKind.Backup, account.Id, containerName, null,
+            ScheduledTaskType.Backup, "0 3 * * *", true)))
+            .Content.ReadFromJsonAsync<TaskResponse>();
+
+        var factoryClient = new BlobClientFactory();
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
+
+        // 预先把该备份标记为忙碌（模拟另一操作正在执行）。
+        var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
+        Assert.True(busy.TryAcquire(account.Id, containerName));
+        try
+        {
+            var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null);
+            res.EnsureSuccessStatusCode();
+
+            // 忙碌 → 跳过：不应产生任何备份（信息文件不存在）。
+            Assert.False(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
+
+            // 记录了一条 Warning 报警。
+            var logs = await _client.GetFromJsonAsync<List<LogRow>>("/api/logs?minLevel=1&limit=20");
+            Assert.Contains(logs!, l => l.message.Contains("busy", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            busy.Release(account.Id, containerName);
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
     // 后端 camelCase JSON 子集
     private sealed record TaskResponse(int id, DateTimeOffset? lastRunAt);
+    private sealed record LogRow(int level, string message);
 }

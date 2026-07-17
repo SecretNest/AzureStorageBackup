@@ -73,6 +73,7 @@ builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddSingleton<ProcessingVerifier>();
 builder.Services.AddScoped<BackupOrchestrator>();
+builder.Services.AddSingleton<BackupBusyTracker>();
 builder.Services.AddSingleton<BackupRunner>();
 builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IBlobClientFactory>(),

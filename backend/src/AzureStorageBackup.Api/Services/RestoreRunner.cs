@@ -16,7 +16,7 @@ public sealed record RestoreRunResponse(
 }
 
 /// <summary>后台还原运行器：按配置 id 在后台跑 RestoreOrchestrator，状态存内存供轮询。</summary>
-public sealed class RestoreRunner(IServiceScopeFactory scopes)
+public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
     private readonly Dictionary<int, RestoreRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -58,16 +58,29 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            state.Result = await orchestrator.RunAsync(new RestoreRequest
+            if (!busy.TryAcquire(account.Id, config.ContainerName))
             {
-                Account = account,
-                Container = config.ContainerName,
-                TargetRoot = targetRoot,
-                Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
-                Version = version,
-                DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
-            });
-            state.Status = RunStatus.Completed;
+                state.Error = "This backup is busy with another operation.";
+                state.Status = RunStatus.Failed;
+                return;
+            }
+            try
+            {
+                state.Result = await orchestrator.RunAsync(new RestoreRequest
+                {
+                    Account = account,
+                    Container = config.ContainerName,
+                    TargetRoot = targetRoot,
+                    Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
+                    Version = version,
+                    DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
+                });
+                state.Status = RunStatus.Completed;
+            }
+            finally
+            {
+                busy.Release(account.Id, config.ContainerName);
+            }
         }
         catch (Exception ex)
         {
