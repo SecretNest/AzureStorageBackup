@@ -32,9 +32,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         var outDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputArchivePath))!;
         Directory.CreateDirectory(outDir);
 
-        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
-        if (request.StoreOnly)
-            args.Add("-mx0");
+        // 压缩级别默认最大（PRD 3.3.2.1）；不压缩列表用 -mx0（仅封装）。
+        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", request.StoreOnly ? "-mx0" : "-mx9" };
         if (!string.IsNullOrEmpty(request.Password))
         {
             args.Add("-p" + request.Password);

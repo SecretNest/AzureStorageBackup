@@ -17,7 +17,9 @@ public class GlobalSettings
     public RetentionMode DefaultRetentionMode { get; set; } = RetentionMode.EitherTriggers;
     public long DefaultSingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
     public long DefaultGroupCapBytes { get; set; } = 100 * 1024 * 1024;
-    public long? DefaultVolumeBytes { get; set; }
+
+    /// <summary>目标包尺寸（默认 100M）作为压缩分卷大小（PRD 3.3.2.3）；0/null=不分卷。</summary>
+    public long? DefaultVolumeBytes { get; set; } = 100 * 1024 * 1024;
 
     // 死重压实（仅分组 pack 用到）：按数据 tier 决定重 pack 时若本地缺失成员是否允许下载云端 pack 补齐。
     // 优先用本地文件（内容一致者）；本地缺失且此开关为假则放弃该 pack 的重打包。Archive 默认 false（避免高成本取回/rehydrate）。

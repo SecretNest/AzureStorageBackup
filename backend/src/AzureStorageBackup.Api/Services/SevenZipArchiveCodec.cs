@@ -31,7 +31,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             var archive = Path.Combine(work, "out.7z");
             await File.WriteAllBytesAsync(input, content, ct);
 
-            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
+            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // 最大压缩（PRD 3.3.2.1）
             if (!string.IsNullOrEmpty(password))
             {
                 args.Add("-p" + password);
