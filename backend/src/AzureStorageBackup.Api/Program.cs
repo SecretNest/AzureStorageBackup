@@ -137,11 +137,11 @@ var dataDir = Path.GetDirectoryName(Path.GetFullPath(dataSource));
 if (!string.IsNullOrEmpty(dataDir))
     Directory.CreateDirectory(dataDir);
 
-// 骨架阶段用 EnsureCreated 建库；接入 EF 迁移后改为 db.Database.Migrate()。
+// 启动时按 EF 迁移建/升级库（含迁移历史）。旧的 EnsureCreated 建的库无迁移历史，需删库重建（当前无部署）。
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    db.Database.EnsureCreated();
+    db.Database.Migrate();
 }
 
 if (app.Environment.IsDevelopment())

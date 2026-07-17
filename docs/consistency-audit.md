@@ -37,5 +37,6 @@
   总长≤上限的一组小文件压缩+校验，压缩中变化的成员以稳定后的新 hash 重新入队，自然进入下一组（§9「放当前目录下一个分组」）；
   仅当变大到超阈值或反复变化达阈值时才降级为单文件。与设计 §9 字面一致。
 - **重校验的初始基准取处理开始时的 stat**：仅检测「处理期间」的内容变化；「diff 与处理之间」的极窄竞态未特殊处理（下次备份自愈）。
-- **生产前待办：EF 迁移**。启动仍用 `db.Database.EnsureCreated()`（`Program.cs`），只在库文件不存在时建表。近期新增了表（`CachedVersionIndexes`、`LocalBackupStates`）与列（`LogEntries.Ephemeral`、`ScheduledTasks.CheckCloudLevel/CheckLocalLevel/CheckRehydrateTier`），对**已存在**的库不会自动加。同理索引/信息文件序列化升到 index format 3 / info format 2（新增 `VolumeSizes`、`UnrecoverablePaths`）——旧格式可读（条件读），但旧本地缓存行需重建或重新拉取。因当前**未投产、可删旧库重建**，暂不阻塞；投产前应改用 `db.Database.Migrate()` + 迁移。同时 `OperationLogLevel` 枚举重编号（Debug=0/Info=1/Warning=2/Error=3，原 Info=0…），若届时有旧日志行需在迁移里把旧 `Level` +1 重映射（当前无旧库，无影响）。
+- ~~**生产前待办：EF 迁移**~~（已完成）：启动改用 `db.Database.Migrate()`（`Program.cs`），初始迁移 `InitialCreate` 固化当前全部 schema（含 `CachedVersionIndexes`、`LocalBackupStates`、`LogEntries.Ephemeral`、`ScheduledTasks.Check*Level` 等）。设计时用 `AppDbContextFactory`（`IDesignTimeDbContextFactory`）。**当前无部署**——旧 EnsureCreated 建的库无迁移历史，需删 `data/app.db` 重建。测试仍各自 `EnsureCreated`（一次性库，无需迁移历史）。
+  - 序列化侧：索引/信息文件 index format 3 / info format 2（新增 `VolumeSizes`、`UnrecoverablePaths`）——旧格式可读（条件读），旧本地缓存行会自动重建或重新拉取。因当前**未投产、可删旧库重建**，暂不阻塞；投产前应改用 `db.Database.Migrate()` + 迁移。同时 `OperationLogLevel` 枚举重编号（Debug=0/Info=1/Warning=2/Error=3，原 Info=0…），若届时有旧日志行需在迁移里把旧 `Level` +1 重映射（当前无旧库，无影响）。
 - ~~**verbose per-file 日志逐条 SaveChanges**~~（已解决）：逐文件 verbose 日志改落到按备份+按日期的文本文件（`VerboseFileLog`），不再每文件一次 DB 写。
