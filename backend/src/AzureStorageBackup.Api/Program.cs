@@ -95,6 +95,16 @@ builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
     sp.GetRequiredService<TrackedInfoStore>())); // 元数据漂移比对用本地权威缓存
+builder.Services.AddScoped(sp => new BackupRepairer(
+    sp.GetRequiredService<IBlobClientFactory>(),
+    sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IFileCompressor>(),
+    sp.GetRequiredService<IFileHasher>(),
+    sp.GetRequiredService<IBlobUploader>(),
+    Path.Combine(tempPath, "repair"),
+    sp.GetRequiredService<INotifier>(),
+    sp.GetRequiredService<IOperationLog>(),
+    sp.GetRequiredService<BackupChecker>()));
 
 // 操作日志（M8）+ 全局设置
 builder.Services.AddScoped<IOperationLog, OperationLogService>();

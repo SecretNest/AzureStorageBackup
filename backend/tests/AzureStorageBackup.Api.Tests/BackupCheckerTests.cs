@@ -57,6 +57,14 @@ public sealed class BackupCheckerTests : IDisposable
         return (backup, checker, factory);
     }
 
+    private BackupRepairer Repairer(BlobClientFactory factory, BackupChecker checker)
+    {
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        return new BackupRepairer(
+            factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
+            Path.Combine(_temp, "repair"), checker: checker);
+    }
+
     private BackupRequest Req(Account a, string c) => new()
     {
         Account = a, Container = c, LocalRoot = _src, Name = "photos",
@@ -149,6 +157,81 @@ public sealed class BackupCheckerTests : IDisposable
             var f = report.Findings.Single(x => x.Path == "a.txt");
             Assert.Equal(LocalState.Changed, f.Local);
             Assert.Equal(CloudState.NotChecked, f.Cloud);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Repair_From_Local_Fixes_Broken_Blob()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rep-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "repair me please");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // 云端 blob 丢失
+
+            var report = await Repairer(factory, checker).RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+
+            Assert.Contains("a.txt", report.Repaired);
+            Assert.Empty(report.Unrecoverable);
+
+            // 修复后内容检查通过。
+            var after = await checker.CheckAsync(account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src);
+            Assert.True(after.Ok);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Unrepairable_File_Is_Marked_Unrecoverable()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("repun-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "cannot repair this");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // 云端丢失
+            File.Delete(Path.Combine(_src, "a.txt"));                        // 本地也没了 → 无法修复
+
+            var report = await Repairer(factory, checker).RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+
+            Assert.Contains("a.txt", report.Unrecoverable);
+            Assert.Empty(report.Repaired);
+
+            // 版本索引里标记为不可恢复。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var index = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            Assert.Contains("a.txt", index.UnrecoverablePaths);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
