@@ -107,4 +107,10 @@ public sealed record StorageRef
     /// pack 成员此值无意义（pack 分卷数记在 <see cref="PackInfo.Volumes"/>，因压实会改变）。
     /// </summary>
     public int Volumes { get; init; } = 1;
+
+    /// <summary>
+    /// 该 blob 是**原始文件字节**而非 7z 归档（PRD 3.3.2：未压缩+未加密+无需分卷时直传原文件，省一次封装）。
+    /// 仅单文件 blob；还原/检查据此直接复制/哈希，不解压。
+    /// </summary>
+    public bool Raw { get; init; }
 }

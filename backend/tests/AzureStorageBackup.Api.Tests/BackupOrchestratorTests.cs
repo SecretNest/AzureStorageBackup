@@ -708,6 +708,44 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Store_Only_Unencrypted_Single_File_Is_Stored_Raw()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchraw-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha-raw-content");
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // 单文件 blob（不分组）
+                    DontCompress = new IgnoreRuleSet(["*"]),                 // store-only
+                },
+            };
+
+            await orchestrator.RunAsync(request);
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var e = Assert.Single(idx.Entries);
+            Assert.True(e.Storage!.Raw); // 标记为原始
+
+            // blob 内容就是原始文件字节（不是 7z 归档）。
+            var blob = await container.GetBlobClient(e.Storage.Ref).DownloadContentAsync();
+            Assert.Equal("alpha-raw-content", blob.Value.Content.ToString());
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Encrypted_Backup_Uses_Keyed_Blob_Addresses()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

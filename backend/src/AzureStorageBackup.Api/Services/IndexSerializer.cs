@@ -161,7 +161,8 @@ public static class IndexSerializer
                 w.Write((byte)(s.Kind == "pack" ? 1 : 0));
                 w.Write(s.Ref);
                 WriteNullableString(w, s.EntryName);
-                w.Write(s.Volumes); // format 2
+                w.Write(s.Volumes);
+                w.Write(s.Raw);
             }
             else
             {
@@ -210,6 +211,7 @@ public static class IndexSerializer
                     Ref = r.ReadString(),
                     EntryName = ReadNullableString(r),
                     Volumes = r.ReadInt32(),
+                    Raw = r.ReadBoolean(),
                 };
             }
 

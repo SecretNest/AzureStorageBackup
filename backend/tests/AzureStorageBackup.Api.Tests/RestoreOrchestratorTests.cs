@@ -112,6 +112,44 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Raw_Stored_File_RoundTrips_Through_Restore()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstraw-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("keep.bin", "raw bytes not compressed");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    DontCompress = new IgnoreRuleSet(["*"]), // store-only → 原始直传
+                },
+            });
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal("raw bytes not compressed", File.ReadAllText(Path.Combine(_dst, "keep.bin")));
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
     public async Task Restores_Files_And_Empty_Dirs_To_Target()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

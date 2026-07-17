@@ -274,23 +274,35 @@ public sealed class BackupOrchestrator(
         var uploadedVolumes = 0;
         var chosenRef = addressing.DataAddress(file.FullHash);
         var collided = false;
+        var wasRaw = false;
         async Task ProcessAsync(string hash, CancellationToken token)
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, token);
-            var (blobRef, exists, collision) = await ResolveDataRefAsync(cc, addressing, hash, length, head, token);
+            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, token);
             chosenRef = blobRef;
             collided = collision;
             if (exists)
-                return; // 确认同内容 → 去重跳过
-            var staged = await staging.StageAsync((compressTemp, t) => CompressAsync(
-                request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
+            {
+                wasRaw = existingRaw; // 去重：以既有 blob 的实际 raw 属性为准
+                return;
+            }
+            // 原始直传（PRD 3.3.2）：不压缩(store-only) + 未加密 + 无需分卷(≤分卷大小) → 直接拷原文件，省一次 7z 封装。
+            var raw = storeOnly && string.IsNullOrEmpty(request.Password)
+                && (request.Options.VolumeBytes is not { } vb || length <= vb);
+            wasRaw = raw;
+            var staged = await staging.StageAsync((compressTemp, t) => raw
+                ? CopyRawAsync(localPath, compressTemp, SafeFileName(hash), t)
+                : CompressAsync(request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
             await uploadGate.WaitAsync(token);
             try
             {
+                var meta = new Dictionary<string, string>(addressing.Metadata(hash, length, head));
+                if (raw)
+                    meta["raw"] = "1";
                 await VolumeBlobIO.UploadAsync(
                     uploader, request.Account, request.Container, blobRef, staged.Files,
-                    request.DataTier, request.Options.Upload, token, addressing.Metadata(hash, length, head));
+                    request.DataTier, request.Options.Upload, token, meta);
                 uploadedVolumes = staged.Files.Count;
             }
             finally
@@ -326,7 +338,7 @@ public sealed class BackupOrchestrator(
             : await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
         storageByPath[file.Path] = new StorageRef
         {
-            Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes),
+            Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes), Raw = wasRaw,
         };
         // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
         if (finalHash != file.FullHash)
@@ -339,7 +351,7 @@ public sealed class BackupOrchestrator(
     /// 定位 data blob 的实际存储名并判断是否可去重。基名由寻址方案给出（加密备份为密钥化地址）；
     /// 元数据确认同内容才去重，内容不同却 hash 相同（碰撞）时顺延到备用名 …~1、~2…。
     /// </summary>
-    private static async Task<(string Ref, bool Exists, bool Collision)> ResolveDataRefAsync(
+    private static async Task<(string Ref, bool Exists, bool Collision, bool ExistingRaw)> ResolveDataRefAsync(
         BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, CancellationToken ct)
     {
         var baseAddr = addressing.DataAddress(hash);
@@ -348,9 +360,9 @@ public sealed class BackupOrchestrator(
             var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
             var meta = await ReadBlobMetaAsync(cc, refName, ct);
             if (meta is null)
-                return (refName, false, n > 0);                                   // 空位 → 在此上传（n>0=已避让碰撞）
+                return (refName, false, n > 0, false);                            // 空位 → 在此上传（n>0=已避让碰撞）
             if (addressing.MetadataMatches(meta, hash, length, headHash))
-                return (refName, true, n > 0);                                    // 确认同内容 → 去重
+                return (refName, true, n > 0, meta.TryGetValue("raw", out var r) && r == "1"); // 同内容 → 去重，带既有 raw 属性
             // 元数据不符 → 碰撞，试下一个备用名。
         }
     }
@@ -560,6 +572,17 @@ public sealed class BackupOrchestrator(
         var info = new FileInfo(path);
         var mode = OperatingSystem.IsWindows() ? 0 : (int)File.GetUnixFileMode(path);
         return (info.LastWriteTimeUtc.Ticks, info.Length, mode);
+    }
+
+    /// <summary>原始直传：直接把原文件拷到压缩临时区（单卷），不走 7z 封装（PRD 3.3.2）。</summary>
+    private static async Task<IReadOnlyList<string>> CopyRawAsync(
+        string localPath, string compressTemp, string name, CancellationToken ct)
+    {
+        var dest = Path.Combine(compressTemp, name);
+        await using var src = File.OpenRead(localPath);
+        await using var dst = File.Create(dest);
+        await src.CopyToAsync(dst, ct);
+        return [dest];
     }
 
     private async Task<IReadOnlyList<string>> CompressAsync(

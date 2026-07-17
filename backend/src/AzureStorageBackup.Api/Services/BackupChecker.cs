@@ -136,15 +136,26 @@ public sealed class BackupChecker(
         await gate.WaitAsync(ct);
         try
         {
-            var extractDir = Path.Combine(groupDir, "x");
             var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
-            await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
 
-            foreach (var e in members)
+            if (members[0].Storage!.Raw)
             {
-                var path = Path.Combine(extractDir, e.Path.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(path) || (e.FullHash is not null && await hasher!.FullHashAsync(path, ct) != e.FullHash))
+                // 原始 blob：下载的即文件内容，直接重算 hash（无需解压）。
+                var e = members[0];
+                if (e.FullHash is not null && await hasher!.FullHashAsync(firstVolume, ct) != e.FullHash)
                     corrupted.Add(e.Path);
+            }
+            else
+            {
+                var extractDir = Path.Combine(groupDir, "x");
+                await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
+
+                foreach (var e in members)
+                {
+                    var path = Path.Combine(extractDir, e.Path.Replace('/', Path.DirectorySeparatorChar));
+                    if (!File.Exists(path) || (e.FullHash is not null && await hasher!.FullHashAsync(path, ct) != e.FullHash))
+                        corrupted.Add(e.Path);
+                }
             }
         }
         catch

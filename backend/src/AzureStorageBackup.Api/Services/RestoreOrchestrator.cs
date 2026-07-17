@@ -140,18 +140,32 @@ public sealed class RestoreOrchestrator(
         await gate.WaitAsync(ct);
         try
         {
-            var extractDir = Path.Combine(groupDir, "x");
             var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
-            await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
-            foreach (var e in needed)
+            if (storage.Raw)
             {
-                var source = Path.Combine(extractDir, ToLocal(e.Path));
+                // 原始 blob：下载的即文件内容，直接写回（单文件，无需解压）。
+                var e = needed[0];
                 var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
                 Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                File.Copy(source, dest, overwrite: true);
+                File.Copy(firstVolume, dest, overwrite: true);
                 ApplyMetadata(dest, e);
                 restored++;
+            }
+            else
+            {
+                var extractDir = Path.Combine(groupDir, "x");
+                await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
+
+                foreach (var e in needed)
+                {
+                    var source = Path.Combine(extractDir, ToLocal(e.Path));
+                    var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    File.Copy(source, dest, overwrite: true);
+                    ApplyMetadata(dest, e);
+                    restored++;
+                }
             }
         }
         finally
