@@ -463,7 +463,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
-    public async Task Pack_Member_Changed_During_Compression_Is_Moved_To_Single_File()
+    public async Task Pack_Member_Changed_During_Compression_Rejoins_Grouping()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -478,7 +478,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            WriteText("d/x.txt", "xxxx"); // 同目录两小文件 → 合并成一个 pack
+            WriteText("d/x.txt", "xxxx"); // 同目录两小文件 → 增量分组
             WriteText("d/y.txt", "yyyy");
 
             await orchestrator.RunAsync(Request(account, name)); // 默认 5M 阈值 → 分组
@@ -488,11 +488,12 @@ public sealed class BackupOrchestratorTests : IDisposable
             var x = idx.Entries.Single(e => e.Path == "d/x.txt");
             var y = idx.Entries.Single(e => e.Path == "d/y.txt");
 
-            Assert.Equal("pack", x.Storage!.Kind);                  // 未变成员仍在 pack
-            Assert.Equal("blob", y.Storage!.Kind);                  // 变更成员移出分组 → 单文件
+            Assert.Equal("pack", x.Storage!.Kind);                 // 未变成员在 pack
+            // 变更成员以新 hash 重新入队 → 进入下一组（仍是 pack），而非单文件。
+            Assert.Equal("pack", y.Storage!.Kind);
+            Assert.NotEqual(x.Storage.Ref, y.Storage.Ref);         // 落在不同的 pack
             var expectedY = await new FileHasher().FullHashAsync(Path.Combine(_root, "d/y.txt"));
-            Assert.Equal(expectedY, y.FullHash);
-            Assert.Equal("data/" + expectedY, y.Storage.Ref);
+            Assert.Equal(expectedY, y.FullHash);                   // fullHash 用稳定后的新内容
             await AssertReferencedBlobsExist(container, idx);
         }
         finally

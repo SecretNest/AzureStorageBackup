@@ -62,7 +62,7 @@ public sealed record BackupProgress(
     BackupStage Stage, int ChangedFiles, long ChangedBytes, int UploadedItems, int TotalItems)
 {
     public int Percent => TotalItems == 0 ? (Stage == BackupStage.Completed ? 100 : 0)
-        : (int)(100L * UploadedItems / TotalItems);
+        : (int)Math.Min(100L, 100L * UploadedItems / TotalItems);
 }
 
 /// <summary>
@@ -168,7 +168,7 @@ public sealed class BackupOrchestrator(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
         await UploadBlobsAsync(request, plan, storageByPath, overrides, uploadGate, ReportItem, ct);
-        await UploadPacksAsync(request, plan, info, storageByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadGroupablesAsync(request, plan, info, storageByPath, overrides, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath, overrides);
@@ -283,45 +283,74 @@ public sealed class BackupOrchestrator(
         return new EntryOverride(fullHash, head, info.Length, new DateTimeOffset(info.LastWriteTimeUtc));
     }
 
-    private async Task UploadPacksAsync(
+    /// <summary>
+    /// 处理可分组小文件（§6/§9）：按目录**增量成组**——每次从目录池取总长≤上限的一组压缩+校验，
+    /// 压缩中变化的成员以稳定后的新 hash **重新入队**（自然进入下一组），而非移出为单文件；
+    /// 仅当变大到超阈值、或反复变化达阈值时才降级为单文件（后者报警）。各目录并发，目录内顺序。
+    /// </summary>
+    private async Task UploadGroupablesAsync(
         BackupRequest request, BackupPlan plan, BackupInfoFile info,
         ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
-        => await Task.WhenAll(plan.Packs.Select(pack =>
-            HandlePackAsync(request, pack, info, storageByPath, overrides, uploadGate, onItem, ct)));
+    {
+        // 从计划重建每个目录的可分组文件池（顺序不变）；成组/压缩/校验在处理时增量进行。
+        var poolByDir = plan.Packs
+            .GroupBy(p => DirectoryOf(p.Members[0].Path), StringComparer.Ordinal)
+            .Select(g => g.SelectMany(p => p.Members)
+                .Select(m => new PlannedFile(m.Path, m.Length, m.FullHash)).ToList())
+            .ToList();
 
-    /// <summary>
-    /// 压缩+上传一个 pack；启用重校验时（§9）对组内成员在压缩后重校验：内容变化的成员移出分组，
-    /// 改走单文件内容寻址 blob（在那里做重命名/重校验），其余成员重新压缩。反复变化达阈值即报警、以当前归档保存。
-    /// </summary>
-    private async Task HandlePackAsync(
-        BackupRequest request, PlannedPack pack, BackupInfoFile info,
+        // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
+        var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
+        await Task.WhenAll(poolByDir.Select(pool =>
+            ProcessDirectoryAsync(request, pool, info, storageByPath, overrides, uploadGate, packCounter, onItem, ct)));
+    }
+
+    private async Task ProcessDirectoryAsync(
+        BackupRequest request, List<PlannedFile> pool, BackupInfoFile info,
         ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
+        int[] packCounter, Action onItem, CancellationToken ct)
     {
-        var members = pack.Members.ToList();
+        var cap = request.Options.Plan.GroupCapBytes;
+        var threshold = request.Options.Plan.SingleFileThresholdBytes;
+        var headBytes = request.Options.Diff.HeadHashBytes;
+        const int maxAttempts = 5;
+        var attempts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var queue = new List<PlannedFile>(pool);
 
-        if (verifier is null)
+        while (queue.Count > 0)
         {
-            var staged = await CompressPackAsync(request, pack.PackId, members, ct);
-            await UploadStagedPackAsync(request, pack.PackId, staged, uploadGate, ct);
-            RecordPack(request, pack.PackId, members, info, storageByPath);
-            onItem();
-            return;
-        }
+            // 取出目录中未处理、总长≤上限的一组（至少一个）。
+            var group = new List<PlannedFile>();
+            long bytes = 0;
+            var take = 0;
+            while (take < queue.Count)
+            {
+                var f = queue[take];
+                if (group.Count > 0 && bytes + f.Length > cap) break;
+                group.Add(f); bytes += f.Length; take++;
+            }
+            queue.RemoveRange(0, group.Count);
 
-        const int maxAttempts = 5; // 与 VerificationOptions 默认一致
-        for (var attempt = 1; ; attempt++)
-        {
-            if (members.Count == 0)
-                break; // 全部成员移出分组，无 pack 可传
+            var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
+            var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash, f.Length)).ToList();
+
+            // 无 verifier：直接压缩上传，不做成员重校验。
+            if (verifier is null)
+            {
+                var staged0 = await CompressPackAsync(request, packId, members, ct);
+                await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
+                RecordPack(request, packId, members, info, storageByPath);
+                onItem();
+                continue;
+            }
 
             var before = members.ToDictionary(m => m.Path, m => Stat(Local(request, m.Path)));
-            var staged = await CompressPackAsync(request, pack.PackId, members, ct);
+            var staged = await CompressPackAsync(request, packId, members, ct);
 
-            // 压缩后重校验组内成员：元数据变且内容 hash 变 → 该成员在压缩期间变化。
+            // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
             var changed = new List<PackEntry>();
             foreach (var m in members)
             {
@@ -332,41 +361,48 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                await UploadStagedPackAsync(request, pack.PackId, staged, uploadGate, ct);
-                RecordPack(request, pack.PackId, members, info, storageByPath);
-                break;
+                await UploadStagedPackAsync(request, packId, staged, uploadGate, ct);
+                RecordPack(request, packId, members, info, storageByPath);
+                onItem();
+                continue;
             }
 
-            // 有成员在压缩期间变化 → 丢弃本次归档，移出这些成员改走单文件（用稳定后的新 hash），其余重压。
+            // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
             staging.Release(staged);
-            members = members.Where(m => !changed.Contains(m)).ToList();
-            await Task.WhenAll(changed.Select(async m =>
+            var stable = members.Where(m => !changed.Contains(m)).ToList();
+            if (stable.Count > 0)
+            {
+                var staged2 = await CompressPackAsync(request, packId, stable, ct);
+                await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
+                RecordPack(request, packId, stable, info, storageByPath);
+                onItem();
+            }
+
+            foreach (var m in changed)
             {
                 var local = Local(request, m.Path);
                 var newHash = await hasher.FullHashAsync(local, ct);
-                // 该成员内容已变（≠ diff 时的 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
-                overrides[m.Path] = await BuildOverrideAsync(local, newHash, request.Options.Diff.HeadHashBytes, ct);
-                await HandleBlobAsync(request, new PlannedFile(m.Path, new FileInfo(local).Length, newHash),
-                    storageByPath, overrides, uploadGate, static () => { }, ct);
-            }));
+                var newLen = new FileInfo(local).Length;
+                // 内容已变（≠ diff 时 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
+                overrides[m.Path] = await BuildOverrideAsync(local, newHash, headBytes, ct);
 
-            if (attempt >= maxAttempts)
-            {
-                // 反复变化达阈值：把剩余成员做最后一次压缩上传并报警（不再重校验）。
-                if (members.Count > 0)
+                var n = attempts[m.Path] = attempts.GetValueOrDefault(m.Path) + 1;
+                if (newLen >= threshold || n >= maxAttempts)
                 {
-                    var staged2 = await CompressPackAsync(request, pack.PackId, members, ct);
-                    await UploadStagedPackAsync(request, pack.PackId, staged2, uploadGate, ct);
-                    RecordPack(request, pack.PackId, members, info, storageByPath);
+                    // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
+                    if (n >= maxAttempts)
+                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                            $"File kept changing during grouping: {m.Path}",
+                            $"Stored as single file after {n} attempts", ct);
+                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash),
+                        storageByPath, overrides, uploadGate, static () => { }, ct);
                 }
-                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
-                    $"Pack members kept changing during backup: {pack.PackId}",
-                    $"Stabilized after moving changing members out over {attempt} attempts", ct);
-                break;
+                else
+                {
+                    queue.Add(new PlannedFile(m.Path, newLen, newHash)); // 自然进入下一组
+                }
             }
         }
-
-        onItem();
     }
 
     private Task<StagedItem> CompressPackAsync(
@@ -414,6 +450,13 @@ public sealed class BackupOrchestrator(
 
     private static string Local(BackupRequest request, string relPath) =>
         Path.Combine(request.LocalRoot, relPath.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>直接父目录（不含文件名）；根目录为空串。用于按目录分组。</summary>
+    private static string DirectoryOf(string path)
+    {
+        var i = path.LastIndexOf('/');
+        return i < 0 ? "" : path[..i];
+    }
 
     private static (long Mtime, long Length, int Mode) Stat(string path)
     {
