@@ -38,4 +38,4 @@
   仅当变大到超阈值或反复变化达阈值时才降级为单文件。与设计 §9 字面一致。
 - **重校验的初始基准取处理开始时的 stat**：仅检测「处理期间」的内容变化；「diff 与处理之间」的极窄竞态未特殊处理（下次备份自愈）。
 - **生产前待办：EF 迁移**。启动仍用 `db.Database.EnsureCreated()`（`Program.cs`），只在库文件不存在时建表。近期新增了表（`CachedVersionIndexes`、`LocalBackupStates`）与列（`LogEntries.Ephemeral`），对**已存在**的库不会自动加。因当前**未投产、可删旧库重建**，暂不阻塞；投产前应改用 `db.Database.Migrate()` + 迁移。同时 `OperationLogLevel` 枚举重编号（Debug=0/Info=1/Warning=2/Error=3，原 Info=0…），若届时有旧日志行需在迁移里把旧 `Level` +1 重映射（当前无旧库，无影响）。
-- **verbose per-file 日志逐条 SaveChanges**：开启 verbose 时每文件一次 DB 写（经日志串行门），超大备份会拖慢；未来可批量化。仅性能，不影响正确性。
+- ~~**verbose per-file 日志逐条 SaveChanges**~~（已解决）：逐文件 verbose 日志改落到按备份+按日期的文本文件（`VerboseFileLog`），不再每文件一次 DB 写。

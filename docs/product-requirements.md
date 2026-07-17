@@ -69,7 +69,7 @@
   - **实现（以代码为准，2026-07-17，两级模型）**：日志分**长存**与**短存**两类。
     - **长存**（任务开始/结束/错误等审计，`LogEntry.Ephemeral=false`；`AppendAsync` 默认 Warning 及以上、引擎起止事件显式长存）：保留至**删除该备份**（删配置连带删其日志，`DeleteForContainerAsync`）或**手工按时间清**（`DELETE /api/logs?before=<时间>`，删早于该时间的全部）。
     - **短存**（info/debug 诊断，`Ephemeral=true`）：超期自动清，默认 `GlobalSettings.LogEphemeralMaxAgeDays`=14 天（调度器每分钟 `TrimAsync` 只删超期短存）。
-    - **verbose（debug）日志**（含操作文件名）默认**关**，可按备份（`BackupConfig.VerboseLogging`）或全局默认（`DefaultVerboseLogging`）开启；开启后每处理一个文件写一条短存 Debug 日志。
+    - **verbose（debug）日志**（含操作文件名）默认**关**，可按备份（`BackupConfig.VerboseLogging`）或全局默认（`DefaultVerboseLogging`）开启。开启后逐文件日志**不写 SQLite**，而是落到**按备份+按日期的文本文件**：`{tempPath}/verbose-logs/{container}/{yyyyMMdd}.log`（`VerboseFileLog`）——避免每文件一次 DB 写成为超大备份瓶颈，并把高频诊断与可查询审计分开。文本文件与短存同窗口按日期清理（调度器每分钟 `Trim`，默认 14 天），路径在「目录」页展示供 Docker 卷映射。
     - 原「按备份次数」的计数保留未实现——两级模型（长存至删备份 + 短存 14 天）已覆盖需求意图。
 
 ---

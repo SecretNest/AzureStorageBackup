@@ -31,6 +31,7 @@ public static class SystemEndpoints
                 ["compressTempPath"] = SafeFullPath(Path.Combine(tempPath, "compress")),
                 ["stagedTempPath"] = SafeFullPath(Path.Combine(tempPath, "staged")),
                 ["restoreTempPath"] = SafeFullPath(Path.Combine(tempPath, "restore")),
+                ["verboseLogPath"] = SafeFullPath(Path.Combine(tempPath, "verbose-logs")),
             });
         })
         .WithTags("System");

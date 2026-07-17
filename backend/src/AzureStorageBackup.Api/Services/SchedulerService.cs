@@ -6,7 +6,8 @@ namespace AzureStorageBackup.Api.Services;
 /// cron 时区由 Scheduler:TimeZone（IANA id）配置，缺省/非法则 UTC。
 /// </summary>
 public sealed class SchedulerService(
-    IServiceScopeFactory scopes, TaskDispatcher dispatcher, IConfiguration config, ILogger<SchedulerService> logger)
+    IServiceScopeFactory scopes, TaskDispatcher dispatcher, IConfiguration config, ILogger<SchedulerService> logger,
+    VerboseFileLog verboseLog)
     : BackgroundService
 {
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
@@ -54,6 +55,7 @@ public sealed class SchedulerService(
         var settings = await scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
         await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
             settings.LogEphemeralMaxAgeDays, now, ct);
+        verboseLog.Trim(settings.LogEphemeralMaxAgeDays, now); // verbose 文本日志同窗口按日期删旧文件
 
         foreach (var task in await tasks.ListAsync(ct))
         {

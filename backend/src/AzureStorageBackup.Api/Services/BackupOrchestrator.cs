@@ -92,7 +92,8 @@ public sealed class BackupOrchestrator(
     IOperationLog? opLog = null,
     ProcessingVerifier? verifier = null,
     ILocalIndexCache? indexCache = null,
-    TrackedInfoStore? trackedInfo = null)
+    TrackedInfoStore? trackedInfo = null,
+    VerboseFileLog? verboseLog = null)
 {
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
@@ -133,20 +134,13 @@ public sealed class BackupOrchestrator(
         }
     }
 
-    // verbose 时按文件写 debug 日志（含文件名，短存）。经 _recordGate 串行化，避免并发访问共享 DbContext。
+    // verbose 时按文件写 debug 日志（含文件名）：落到**按备份+按日期的文本文件**（VerboseFileLog），
+    // 而非 SQLite——避免每文件一次 DB 写成为超大备份的瓶颈，并把高频诊断与可查询审计日志分开。
     private async Task LogFileAsync(BackupRequest request, string path, CancellationToken ct)
     {
-        if (!request.Options.VerboseLogging || opLog is null)
+        if (!request.Options.VerboseLogging || verboseLog is null)
             return;
-        await _recordGate.WaitAsync(ct);
-        try
-        {
-            await opLog.AppendAsync(OperationLogLevel.Debug, $"backup:{request.Container}", $"Backed up {path}", ct, durable: false);
-        }
-        finally
-        {
-            _recordGate.Release();
-        }
+        await verboseLog.AppendAsync(request.Container, $"Backed up {path}", ct);
     }
 
     private async Task<BackupRunResult> RunCoreAsync(

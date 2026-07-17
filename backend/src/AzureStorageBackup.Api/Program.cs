@@ -56,6 +56,8 @@ if (string.IsNullOrWhiteSpace(tempPath))
 var stagedLimit = builder.Configuration.GetValue<long?>("Backup:StagedLimitBytes") ?? 1_073_741_824L; // 1GB
 builder.Services.AddSingleton(new StagingArea(
     Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"), stagedLimit));
+// verbose 逐文件 debug 日志的文件后端（按备份+按日期文本文件，PRD 3.6）。
+builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
 builder.Services.AddSingleton<LocalFileScanner>();
 builder.Services.AddSingleton<IFileHasher, FileHasher>();

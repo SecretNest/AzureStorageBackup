@@ -634,7 +634,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
-    public async Task Verbose_Logging_Emits_Ephemeral_Debug_Per_File()
+    public async Task Verbose_Logging_Writes_Per_File_To_Verbose_Text_Log()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -643,10 +643,13 @@ public sealed class BackupOrchestratorTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
         var log = new CapturingLog();
+        var vlogRoot = Path.Combine(_temp, "vlog");
+        var verboseLog = new VerboseFileLog(vlogRoot);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log);
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log,
+            verboseLog: verboseLog);
 
         var account = AzuriteAccount();
         var name = RandomName("orchvb-");
@@ -662,10 +665,11 @@ public sealed class BackupOrchestratorTests : IDisposable
             };
             await orchestrator.RunAsync(request);
 
-            // 含文件名的 Debug 短存(durable=false)日志。
-            Assert.Contains(log.Entries, e =>
-                e.Level == OperationLogLevel.Debug && e.Durable == false && e.Message.Contains("dir/note.txt"));
-            // 起止事件是长存(durable=true)。
+            // 逐文件日志落到按备份的文本文件（不再进 SQLite），含文件名。
+            var vfile = Directory.EnumerateFiles(Path.Combine(vlogRoot, name), "*.log").Single();
+            Assert.Contains("dir/note.txt", await File.ReadAllTextAsync(vfile));
+            Assert.DoesNotContain(log.Entries, e => e.Level == OperationLogLevel.Debug); // Debug 不再入库
+            // 起止事件仍是长存(durable=true)审计日志。
             Assert.Contains(log.Entries, e => e.Durable == true && e.Message.Contains("succeeded"));
         }
         finally { await container.DeleteIfExistsAsync(); }
