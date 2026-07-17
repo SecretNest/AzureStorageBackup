@@ -138,6 +138,9 @@ public sealed class BackupOrchestrator(
             ? await store.ReadIndexAsync(request.Account, request.Container, info.Versions[^1].IndexBlob, password, ct)
             : null;
 
+        // data blob 寻址方案：加密备份用密钥化地址防指纹识别（密钥从密码 + 信息文件里的盐派生）。
+        var addressing = new BlobAddressScheme(password, info.Backup.KdfSalt);
+
         // 3. Diff
         progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
         var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
@@ -171,8 +174,8 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
-        await UploadBlobsAsync(request, plan, storageByPath, overrides, uploadGate, ReportItem, ct);
-        await UploadGroupablesAsync(request, plan, info, storageByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadBlobsAsync(request, plan, addressing, storageByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadGroupablesAsync(request, plan, addressing, info, storageByPath, overrides, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath, overrides);
@@ -216,11 +219,12 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task UploadBlobsAsync(
-        BackupRequest request, BackupPlan plan, ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing,
+        ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
         => await Task.WhenAll(plan.Blobs.Select(blob =>
-            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash),
+            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing,
                 storageByPath, overrides, uploadGate, onItem, ct)));
 
     /// <summary>
@@ -228,7 +232,8 @@ public sealed class BackupOrchestrator(
     /// 内容在处理中变化时，用稳定后的新 hash 决定 blob 名并回写索引覆盖，避免存储名与内容不符（PRD 特别说明 D）。
     /// </summary>
     private async Task HandleBlobAsync(
-        BackupRequest request, PlannedFile file, ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, PlannedFile file, BlobAddressScheme addressing,
+        ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
     {
@@ -237,16 +242,16 @@ public sealed class BackupOrchestrator(
         var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 内容寻址去重 + hash 碰撞避让：按 (hash) 定位 blob，但用元数据(原始长度+headHash)确认确实同内容才去重；
-        // 不同内容碰撞到同 hash 时改用备用名 data/{hash}~N 并报警，避免覆盖/丢数据。verifier 内容变化时用新 hash 重调。
+        // 内容寻址去重 + hash 碰撞避让：按寻址方案定位 blob（加密备份为密钥化地址），用元数据确认确实同内容才去重；
+        // 不同内容碰撞到同 hash 时改用备用名 …~N 并报警，避免覆盖/丢数据。verifier 内容变化时用新 hash 重调。
         var uploadedVolumes = 0;
-        var chosenRef = "data/" + file.FullHash;
+        var chosenRef = addressing.DataAddress(file.FullHash);
         var collided = false;
         async Task ProcessAsync(string hash, CancellationToken token)
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, token);
-            var (blobRef, exists, collision) = await ResolveDataRefAsync(cc, hash, length, head, token);
+            var (blobRef, exists, collision) = await ResolveDataRefAsync(cc, addressing, hash, length, head, token);
             chosenRef = blobRef;
             collided = collision;
             if (exists)
@@ -256,14 +261,9 @@ public sealed class BackupOrchestrator(
             await uploadGate.WaitAsync(token);
             try
             {
-                var meta = new Dictionary<string, string>
-                {
-                    ["len"] = length.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    ["head"] = head,
-                };
                 await VolumeBlobIO.UploadAsync(
                     uploader, request.Account, request.Container, blobRef, staged.Files,
-                    request.DataTier, request.Options.Upload, token, meta);
+                    request.DataTier, request.Options.Upload, token, addressing.Metadata(hash, length, head));
                 uploadedVolumes = staged.Files.Count;
             }
             finally
@@ -309,25 +309,26 @@ public sealed class BackupOrchestrator(
     }
 
     /// <summary>
-    /// 定位 data blob 的实际存储名并判断是否可去重。以 (length, headHash) 元数据确认同内容才去重；
-    /// 内容不同却 hash 相同（碰撞）时顺延到备用名 data/{hash}~1、~2…。老 blob 无元数据时按同内容处理（向后兼容）。
+    /// 定位 data blob 的实际存储名并判断是否可去重。基名由寻址方案给出（加密备份为密钥化地址）；
+    /// 元数据确认同内容才去重，内容不同却 hash 相同（碰撞）时顺延到备用名 …~1、~2…。
     /// </summary>
     private static async Task<(string Ref, bool Exists, bool Collision)> ResolveDataRefAsync(
-        BlobContainerClient cc, string hash, long length, string headHash, CancellationToken ct)
+        BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, CancellationToken ct)
     {
+        var baseAddr = addressing.DataAddress(hash);
         for (var n = 0; ; n++)
         {
-            var refName = n == 0 ? $"data/{hash}" : $"data/{hash}~{n}";
+            var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
             var meta = await ReadBlobMetaAsync(cc, refName, ct);
             if (meta is null)
-                return (refName, false, n > 0);            // 空位 → 在此上传（n>0=已避让碰撞）
-            if (meta.Value.Len is null || (meta.Value.Len == length && meta.Value.Head == headHash))
-                return (refName, true, n > 0);             // 确认同内容（或老 blob 无元数据）→ 去重
-            // 长度/headHash 不同 → 碰撞，试下一个备用名。
+                return (refName, false, n > 0);                                   // 空位 → 在此上传（n>0=已避让碰撞）
+            if (addressing.MetadataMatches(meta, hash, length, headHash))
+                return (refName, true, n > 0);                                    // 确认同内容 → 去重
+            // 元数据不符 → 碰撞，试下一个备用名。
         }
     }
 
-    private static async Task<(long? Len, string? Head)?> ReadBlobMetaAsync(
+    private static async Task<IDictionary<string, string>?> ReadBlobMetaAsync(
         BlobContainerClient cc, string baseRef, CancellationToken ct)
     {
         var blob = cc.GetBlobClient(baseRef);
@@ -337,11 +338,7 @@ public sealed class BackupOrchestrator(
             if (!(await blob.ExistsAsync(ct)).Value)
                 return null;
         }
-        var md = (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.Metadata;
-        long? len = md.TryGetValue("len", out var l)
-            && long.TryParse(l, System.Globalization.CultureInfo.InvariantCulture, out var lv) ? lv : null;
-        var head = md.TryGetValue("head", out var h) ? h : null;
-        return (len, head);
+        return (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.Metadata;
     }
 
     private async Task<EntryOverride> BuildOverrideAsync(
@@ -358,7 +355,7 @@ public sealed class BackupOrchestrator(
     /// 仅当变大到超阈值、或反复变化达阈值时才降级为单文件（后者报警）。各目录并发，目录内顺序。
     /// </summary>
     private async Task UploadGroupablesAsync(
-        BackupRequest request, BackupPlan plan, BackupInfoFile info,
+        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, BackupInfoFile info,
         ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
@@ -373,11 +370,11 @@ public sealed class BackupOrchestrator(
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
         await Task.WhenAll(poolByDir.Select(pool =>
-            ProcessDirectoryAsync(request, pool, info, storageByPath, overrides, uploadGate, packCounter, onItem, ct)));
+            ProcessDirectoryAsync(request, pool, addressing, info, storageByPath, overrides, uploadGate, packCounter, onItem, ct)));
     }
 
     private async Task ProcessDirectoryAsync(
-        BackupRequest request, List<PlannedFile> pool, BackupInfoFile info,
+        BackupRequest request, List<PlannedFile> pool, BlobAddressScheme addressing, BackupInfoFile info,
         ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         int[] packCounter, Action onItem, CancellationToken ct)
@@ -463,7 +460,7 @@ public sealed class BackupOrchestrator(
                         await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
                             $"File kept changing during grouping: {m.Path}",
                             $"Stored as single file after {n} attempts", ct);
-                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash),
+                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing,
                         storageByPath, overrides, uploadGate, static () => { }, ct);
                 }
                 else
@@ -580,17 +577,23 @@ public sealed class BackupOrchestrator(
     }
 
 
-    private static BackupInfoFile NewInfo(BackupRequest request) => new()
+    private static BackupInfoFile NewInfo(BackupRequest request)
     {
-        Backup = new BackupMeta
+        var encrypted = !string.IsNullOrEmpty(request.Password);
+        return new BackupInfoFile
         {
-            Name = request.Name,
-            Description = request.Description,
-            SourceRootHint = request.LocalRoot,
-            Encrypted = !string.IsNullOrEmpty(request.Password),
-            CreatedAt = DateTimeOffset.UtcNow,
-        },
-    };
+            Backup = new BackupMeta
+            {
+                Name = request.Name,
+                Description = request.Description,
+                SourceRootHint = request.LocalRoot,
+                Encrypted = encrypted,
+                CreatedAt = DateTimeOffset.UtcNow,
+                // 加密备份：随机盐用于 data blob 密钥化寻址（防指纹识别）。
+                KdfSalt = encrypted ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(16) : null,
+            },
+        };
+    }
 
     private static int NextPackNumber(IReadOnlyDictionary<string, PackInfo> packs)
     {

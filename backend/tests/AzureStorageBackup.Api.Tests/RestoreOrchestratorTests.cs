@@ -79,6 +79,39 @@ public sealed class RestoreOrchestratorTests : IDisposable
     };
 
     [SkippableFact]
+    public async Task Encrypted_Keyed_Backup_RoundTrips_Through_Restore()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rste-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("dir/small.txt", "grouped");       // pack 成员
+            WriteSrc("big.bin", new string('y', 6_000_000)); // 密钥化寻址的单文件 data blob
+
+            await backup.RunAsync(BackupReq(account, name, password: "pw"));
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst, Password = "pw",
+            });
+
+            Assert.Equal(2, result.RestoredFiles);
+            Assert.Equal("grouped", File.ReadAllText(Path.Combine(_dst, "dir", "small.txt")));
+            Assert.Equal(6_000_000, new FileInfo(Path.Combine(_dst, "big.bin")).Length);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
     public async Task Restores_Files_And_Empty_Dirs_To_Target()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

@@ -12,9 +12,9 @@ namespace AzureStorageBackup.Api.Services;
 public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
-    // format 2：为分卷完整性核验增加分卷数（PackInfo.Volumes / StorageRef.Volumes，§7）。读取兼容 format 1（缺省 1 卷）。
-    private const byte InfoFormat = 2;
-    private const byte IndexFormat = 2;
+    // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
+    private const byte InfoFormat = 1;
+    private const byte IndexFormat = 1;
 
     // ---- 信息记录文件 ----
 
@@ -33,6 +33,7 @@ public static class IndexSerializer
         w.Write(b.Encrypted);
         WriteDto(w, b.CreatedAt);
         WriteNullableString(w, b.Settings?.ToJsonString());
+        WriteNullableBytes(w, b.KdfSalt);
 
         w.Write(info.Versions.Count);
         foreach (var v in info.Versions)
@@ -85,6 +86,7 @@ public static class IndexSerializer
             Encrypted = r.ReadBoolean(),
             CreatedAt = ReadDto(r),
             Settings = ReadNullableString(r) is { } s ? JsonNode.Parse(s)!.AsObject() : null,
+            KdfSalt = ReadNullableBytes(r),
         };
 
         var versionCount = r.ReadInt32();
@@ -118,7 +120,7 @@ public static class IndexSerializer
                 Members = members,
                 OriginalBytes = originalBytes,
                 DeadBytes = deadBytes,
-                Volumes = format >= 2 ? r.ReadInt32() : 1,
+                Volumes = r.ReadInt32(),
             };
         }
 
@@ -207,7 +209,7 @@ public static class IndexSerializer
                     Kind = r.ReadByte() == 1 ? "pack" : "blob",
                     Ref = r.ReadString(),
                     EntryName = ReadNullableString(r),
-                    Volumes = format >= 2 ? r.ReadInt32() : 1,
+                    Volumes = r.ReadInt32(),
                 };
             }
 
@@ -243,6 +245,18 @@ public static class IndexSerializer
     }
 
     private static string? ReadNullableString(BinaryReader r) => r.ReadBoolean() ? r.ReadString() : null;
+
+    private static void WriteNullableBytes(BinaryWriter w, byte[]? value)
+    {
+        w.Write(value is not null);
+        if (value is not null)
+        {
+            w.Write(value.Length);
+            w.Write(value);
+        }
+    }
+
+    private static byte[]? ReadNullableBytes(BinaryReader r) => r.ReadBoolean() ? r.ReadBytes(r.ReadInt32()) : null;
 
     private static void WriteDto(BinaryWriter w, DateTimeOffset value)
     {

@@ -27,6 +27,12 @@ public sealed record BackupMeta
 
     /// <summary>本备份生效的设置（默认值解析结果快照）。schema 待 M4 设置页定稿，暂用开放对象。</summary>
     public JsonObject? Settings { get; init; }
+
+    /// <summary>
+    /// 加密备份的密钥派生盐（首次创建时随机生成）。用于 data blob 的密钥化寻址（防指纹识别）：
+    /// key = HKDF(password, KdfSalt)，blob 名 = data/{HMAC(key, fullHash)}。非加密备份为 null。
+    /// </summary>
+    public byte[]? KdfSalt { get; init; }
 }
 
 /// <summary>一个不可变版本（§3.1 versions[]），引用其第二级索引。</summary>

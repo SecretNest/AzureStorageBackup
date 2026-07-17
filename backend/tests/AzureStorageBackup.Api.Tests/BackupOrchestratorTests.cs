@@ -547,6 +547,38 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Encrypted_Backup_Uses_Keyed_Blob_Addresses()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchke-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteBytes("big.bin", 6_000_000); // > 5M → 单文件 data blob
+            var request = Request(account, name) with { Password = "pw" };
+
+            await orchestrator.RunAsync(request);
+
+            var info = await store.ReadInfoAsync(account, name, "pw");
+            Assert.NotNull(info!.Backup.KdfSalt); // 加密备份生成了盐
+            var idx = await store.ReadIndexAsync(account, name, info.Versions[0].IndexBlob, "pw");
+            var e = Assert.Single(idx.Entries);
+
+            // 存储名是密钥化地址，不含公开 fullHash；明文 data/{fullHash} 不存在（防指纹识别）。
+            Assert.DoesNotContain(e.FullHash!, e.Storage!.Ref);
+            Assert.False(await container.GetBlobClient($"data/{e.FullHash}").ExistsAsync());
+            await AssertReferencedBlobsExist(container, idx); // 密钥化地址处的 blob 存在
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Encrypted_Backup_RoundTrips_Through_Info_And_Index()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
