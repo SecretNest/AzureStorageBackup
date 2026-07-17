@@ -218,6 +218,118 @@ public sealed class BackupOrchestratorTests : IDisposable
             => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
+    /// <summary>统计 data/ blob 上传次数（验证去重不重复上传）。</summary>
+    private sealed class CountingUploader(IBlobUploader inner) : IBlobUploader
+    {
+        private int _dataUploads;
+        public int DataUploads => Volatile.Read(ref _dataUploads);
+        public void Reset() => Volatile.Write(ref _dataUploads, 0);
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            if (blobName.StartsWith("data/", StringComparison.Ordinal))
+                Interlocked.Increment(ref _dataUploads);
+            return inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+
+        public Task UploadBatchAsync(
+            Account account, string container, IReadOnlyList<UploadItem> items,
+            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
+            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
+    }
+
+    private (BackupOrchestrator, IBackupInfoStore) BuildTracked(BlobClientFactory factory, IBlobUploader uploader, Microsoft.Data.Sqlite.SqliteConnection conn)
+    {
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
+        var db = new AzureStorageBackup.Api.Data.AppDbContext(
+            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        db.Database.EnsureCreated();
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), uploader, factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+            indexCache: new LocalIndexCache(db, store),
+            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+        return (orchestrator, store);
+    }
+
+    [SkippableFact]
+    public async Task Local_Dedup_Uploads_Identical_Content_Once_Per_Run()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var counting = new CountingUploader(new BlobUploader(factory));
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        conn.Open();
+        var (orchestrator, _) = BuildTracked(factory, counting, conn);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchdd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("x.txt", "identical payload");
+            WriteText("dir/y.txt", "identical payload"); // 同内容不同路径
+
+            await orchestrator.RunAsync(Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            Assert.Equal(1, counting.DataUploads); // 两个同内容文件只上传一份 data blob
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Cross_Version_Dedup_Uses_Local_Index_Without_Reading_Cloud()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var counting = new CountingUploader(new BlobUploader(factory));
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        conn.Open();
+        var (orchestrator, _) = BuildTracked(factory, counting, conn);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchxd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("a.txt", "shared body");
+            await orchestrator.RunAsync(Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            }); // v1
+
+            // 删掉云端的 data blob：若备份靠云端 HEAD 判存在，v2 会发现缺失并重传；靠本地索引则仍去重。
+            await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            counting.Reset();
+
+            WriteText("b.txt", "shared body"); // 新文件、与 a 同内容
+            var v2 = await orchestrator.RunAsync(Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            }); // v2
+
+            Assert.Equal(2, v2.Version);
+            Assert.Equal(0, counting.DataUploads); // 纯本地去重：未重传（证明未读云端存在性）
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     private BackupRequest Request(Account account, string container) => new()
     {
         Account = account,

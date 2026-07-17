@@ -176,6 +176,22 @@ public sealed class BackupOrchestrator(
         // data blob 寻址方案：加密备份用密钥化地址防指纹识别（密钥从密码 + 信息文件里的盐派生）。
         var addressing = new BlobAddressScheme(password, info.Backup.KdfSalt);
 
+        // 纯本地去重解析器（自建备份）：从本地缓存的保留版本索引建「内容身份→既有 blob」映射，
+        // 备份时用它判断去重/碰撞/分卷/raw，**不发任何云端 HEAD**。仅当本地权威（有本地状态，或全新无版本）时启用；
+        // 导入未同步的备份回退到云端存在性检查（见 ResolveDataRefAsync）。
+        LocalDedupResolver? localResolver = null;
+        if (indexCache is not null && trackedInfo is not null
+            && (info.Versions.Count == 0 || await trackedInfo.HasLocalAsync(request.Account, request.Container, ct)))
+        {
+            var lastVer = info.Versions.LastOrDefault()?.Version;
+            var indexes = new List<VersionIndex>(info.Versions.Count);
+            foreach (var v in info.Versions)
+                indexes.Add(previous is not null && v.Version == lastVer
+                    ? previous
+                    : await indexCache.ReadAsync(request.Account, request.Container, v.Version, identity, v.IndexBlob, password, ct));
+            localResolver = LocalDedupResolver.Build(addressing, indexes);
+        }
+
         // 3. Diff
         progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
         var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
@@ -192,6 +208,7 @@ public sealed class BackupOrchestrator(
         });
 
         var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
+        var tailByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal); // 单文件 blob 的尾部 hash → 索引条目
         // 处理中内容变化的文件：以稳定后的新 hash/元数据覆盖 diff 时的索引条目（§9、PRD 特别说明 D）。
         var overrides = new ConcurrentDictionary<string, EntryOverride>(StringComparer.Ordinal);
 
@@ -209,11 +226,11 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
-        await UploadBlobsAsync(request, plan, addressing, storageByPath, overrides, uploadGate, ReportItem, ct);
-        await UploadGroupablesAsync(request, plan, addressing, info, storageByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
-        var entries = BuildEntries(diff, storageByPath, overrides);
+        var entries = BuildEntries(diff, storageByPath, tailByPath, overrides);
         var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
         var index = new VersionIndex
         {
@@ -259,21 +276,21 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task UploadBlobsAsync(
-        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing,
-        ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
         => await Task.WhenAll(plan.Blobs.Select(blob =>
-            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing,
-                storageByPath, overrides, uploadGate, onItem, ct)));
+            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing, localResolver,
+                storageByPath, tailByPath, overrides, uploadGate, onItem, ct)));
 
     /// <summary>
     /// 处理单文件内容寻址 blob：压缩+上传 data/{hash}，经重校验循环（§9）。
     /// 内容在处理中变化时，用稳定后的新 hash 决定 blob 名并回写索引覆盖，避免存储名与内容不符（PRD 特别说明 D）。
     /// </summary>
     private async Task HandleBlobAsync(
-        BackupRequest request, PlannedFile file, BlobAddressScheme addressing,
-        ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
     {
@@ -282,29 +299,18 @@ public sealed class BackupOrchestrator(
         var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 内容寻址去重 + hash 碰撞避让：按寻址方案定位 blob（加密备份为密钥化地址），用元数据确认确实同内容才去重；
-        // 不同内容碰撞到同 hash 时改用备用名 …~N 并报警，避免覆盖/丢数据。verifier 内容变化时用新 hash 重调。
+        // 内容寻址去重 + hash 碰撞避让：本地权威时纯本地判定（不发云端 HEAD，见 localResolver）；否则回退云端存在性检查。
+        // 不同内容碰撞到同 hash 时改用备用名 …~N 并报警。verifier 内容变化时用新 hash 重调。
         var uploadedVolumes = 0;
+        int? dedupVolumes = null;      // 去重命中时的既有分卷数（免云端 CountVolumes）
         var chosenRef = addressing.DataAddress(file.FullHash);
         var collided = false;
         var wasRaw = false;
-        async Task ProcessAsync(string hash, CancellationToken token)
+        string? finalTail = null;      // 最终内容的尾部 hash，回填索引条目
+
+        // data/{hash}（或避让后的 …~N）不存在时：压缩/直传并上传，记录卷数。
+        async Task UploadNewAsync(string blobRef, string hash, long length, string head, string tail, bool raw, CancellationToken token)
         {
-            var length = new FileInfo(localPath).Length;
-            var head = await hasher.HeadHashAsync(localPath, headBytes, token);
-            var tail = await hasher.TailHashAsync(localPath, headBytes, token);
-            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, tail, token);
-            chosenRef = blobRef;
-            collided = collision;
-            if (exists)
-            {
-                wasRaw = existingRaw; // 去重：以既有 blob 的实际 raw 属性为准
-                return;
-            }
-            // 原始直传（PRD 3.3.2）：不压缩(store-only) + 未加密 + 无需分卷(≤分卷大小) → 直接拷原文件，省一次 7z 封装。
-            var raw = storeOnly && string.IsNullOrEmpty(request.Password)
-                && (request.Options.VolumeBytes is not { } vb || length <= vb);
-            wasRaw = raw;
             var staged = await staging.StageAsync((compressTemp, t) => raw
                 ? CopyRawAsync(localPath, compressTemp, SafeFileName(hash), t)
                 : CompressAsync(request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
@@ -324,6 +330,55 @@ public sealed class BackupOrchestrator(
                 uploadGate.Release();
                 staging.Release(staged);
             }
+        }
+
+        async Task ProcessAsync(string hash, CancellationToken token)
+        {
+            var length = new FileInfo(localPath).Length;
+            var head = await hasher.HeadHashAsync(localPath, headBytes, token);
+            var tail = await hasher.TailHashAsync(localPath, headBytes, token);
+            finalTail = tail;
+            // 原始直传（PRD 3.3.2）：不压缩(store-only) + 未加密 + 无需分卷(≤分卷大小) → 直接拷原文件，省一次 7z 封装。
+            var raw = storeOnly && string.IsNullOrEmpty(request.Password)
+                && (request.Options.VolumeBytes is not { } vb || length <= vb);
+
+            if (localResolver is not null)
+            {
+                // 纯本地判定：跨版本查映射、同批经预约协调（同内容共享 ref/raw/卷数，不同内容避让）。不读云端。
+                var res = await localResolver.ResolveAsync(hash, length, head, tail);
+                chosenRef = res.Ref;
+                collided = res.Collision;
+                if (res.Exists)
+                {
+                    wasRaw = res.Existing!.Raw;   // 以既有 blob 的实际 raw 为准（同批同内容也一致）
+                    dedupVolumes = res.Existing.Volumes;
+                    return;
+                }
+                try
+                {
+                    await UploadNewAsync(res.Ref, hash, length, head, tail, raw, token);
+                    wasRaw = raw;
+                    res.Complete(raw, uploadedVolumes); // 唤醒同批同内容的后到者，给它们相同存储信息
+                }
+                catch (Exception ex)
+                {
+                    res.Fail(ex);                        // 令等待者一并失败，绝不去重到未成功上传的 blob
+                    throw;
+                }
+                return;
+            }
+
+            // 回退：导入未同步的备份走云端存在性检查 + 元数据比对。
+            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, tail, token);
+            chosenRef = blobRef;
+            collided = collision;
+            if (exists)
+            {
+                wasRaw = existingRaw;
+                return;
+            }
+            await UploadNewAsync(blobRef, hash, length, head, tail, raw, token);
+            wasRaw = raw;
         }
 
         var finalHash = file.FullHash;
@@ -346,14 +401,17 @@ public sealed class BackupOrchestrator(
                 $"Hash collision avoided: {file.Path}",
                 $"Different content shares hash {finalHash}; stored at {chosenRef}", ct);
 
-        // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；若去重跳过则统计云端现存卷数。
+        // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；去重时用本地已知卷数（dedupVolumes），
+        // 仅云端回退路径且无从得知时才 CountVolumes（本地权威路径不读云端）。
         var volumes = uploadedVolumes > 0
             ? uploadedVolumes
-            : await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
+            : dedupVolumes ?? await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
         storageByPath[file.Path] = new StorageRef
         {
             Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes), Raw = wasRaw,
         };
+        if (finalTail is not null)
+            tailByPath[file.Path] = finalTail;
         // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
         if (finalHash != file.FullHash)
             overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
@@ -409,8 +467,9 @@ public sealed class BackupOrchestrator(
     /// 仅当变大到超阈值、或反复变化达阈值时才降级为单文件（后者报警）。各目录并发，目录内顺序。
     /// </summary>
     private async Task UploadGroupablesAsync(
-        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, BackupInfoFile info,
-        ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         Action onItem, CancellationToken ct)
     {
@@ -424,12 +483,13 @@ public sealed class BackupOrchestrator(
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
         await Task.WhenAll(poolByDir.Select(pool =>
-            ProcessDirectoryAsync(request, pool, addressing, info, storageByPath, overrides, uploadGate, packCounter, onItem, ct)));
+            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, uploadGate, packCounter, onItem, ct)));
     }
 
     private async Task ProcessDirectoryAsync(
-        BackupRequest request, List<PlannedFile> pool, BlobAddressScheme addressing, BackupInfoFile info,
-        ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRequest request, List<PlannedFile> pool, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
         int[] packCounter, Action onItem, CancellationToken ct)
     {
@@ -517,8 +577,8 @@ public sealed class BackupOrchestrator(
                         await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
                             $"File kept changing during grouping: {m.Path}",
                             $"Stored as single file after {n} attempts", ct);
-                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing,
-                        storageByPath, overrides, uploadGate, static () => { }, ct);
+                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                        storageByPath, tailByPath, overrides, uploadGate, static () => { }, ct);
                 }
                 else
                 {
@@ -619,6 +679,7 @@ public sealed class BackupOrchestrator(
 
     private static List<IndexEntry> BuildEntries(
         DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
+        IReadOnlyDictionary<string, string> tailByPath,
         IReadOnlyDictionary<string, EntryOverride> overrides)
     {
         var entries = new List<IndexEntry>();
@@ -636,6 +697,8 @@ public sealed class BackupOrchestrator(
                 Mtime = ov?.Mtime ?? c.Current.ModifiedAt,
                 Permissions = c.Current.Permissions,
                 HeadHash = ov?.HeadHash ?? c.HeadHash,
+                // 尾部 hash：本次上传的单文件 blob 用其算得值；未变/打包文件继承上一版本条目（打包成员为 null，不参与 blob 去重）。
+                TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.Previous?.TailHash,
                 FullHash = ov?.FullHash ?? c.FullHash,
                 Target = c.Current.Target,
                 Storage = storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,

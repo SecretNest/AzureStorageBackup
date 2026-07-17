@@ -82,6 +82,11 @@ public sealed record IndexEntry
     public required string Permissions { get; init; }
 
     public string? HeadHash { get; init; }
+
+    /// <summary>文件末段 hash（§ 去重碰撞加固）。与 HeadHash/Length/FullHash 一起构成内容身份，
+    /// 使自建备份可纯本地（不读云端）判断去重/碰撞。旧索引可能为 null。</summary>
+    public string? TailHash { get; init; }
+
     public string? FullHash { get; init; }
 
     /// <summary>symlink 目标（仅 kind=symlink）。</summary>

@@ -14,7 +14,7 @@ public static class IndexSerializer
     public const int CurrentSchemaVersion = 1;
     // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
     private const byte InfoFormat = 1;
-    private const byte IndexFormat = 1;
+    private const byte IndexFormat = 2; // format 2: 每条目增加 TailHash（去重碰撞加固 + 纯本地去重）
 
     // ---- 信息记录文件 ----
 
@@ -152,6 +152,7 @@ public static class IndexSerializer
             WriteDto(w, e.Mtime);
             w.Write(e.Permissions);
             WriteHash(w, e.HeadHash);
+            WriteHash(w, e.TailHash); // format 2
             WriteHash(w, e.FullHash);
             WriteNullableString(w, e.Target);
 
@@ -199,6 +200,7 @@ public static class IndexSerializer
             var mtime = ReadDto(r);
             var permissions = r.ReadString();
             var headHash = ReadHash(r);
+            var tailHash = format >= 2 ? ReadHash(r) : null; // format 2+
             var fullHash = ReadHash(r);
             var target = ReadNullableString(r);
 
@@ -223,6 +225,7 @@ public static class IndexSerializer
                 Mtime = mtime,
                 Permissions = permissions,
                 HeadHash = headHash,
+                TailHash = tailHash,
                 FullHash = fullHash,
                 Target = target,
                 Storage = storage,

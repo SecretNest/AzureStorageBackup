@@ -11,6 +11,10 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateStore state)
 {
+    /// <summary>本地是否已有权威状态（此备份由本工具建立并同步过）。为 true 时去重可纯本地判断，不读云端。</summary>
+    public async Task<bool> HasLocalAsync(Account account, string container, CancellationToken ct = default) =>
+        await state.TryGetAsync(account.Id, container, ct) is not null;
+
     /// <summary>加载信息文件：本地有则用本地（不读云端）；否则读云端并回填。均无返回 null（→ 新建）。</summary>
     public async Task<BackupInfoFile?> LoadAsync(Account account, string container, string? password, CancellationToken ct = default)
     {
