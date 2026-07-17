@@ -102,6 +102,7 @@ export interface RestoreRun {
   restoredFiles: number | null
   skippedFiles: number | null
   error: string | null
+  phase: string | null
 }
 
 export interface BackupVersionInfo {

@@ -1,3 +1,6 @@
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -17,6 +20,15 @@ public sealed record RestoreRequest
     /// <summary>不可恢复文件的替代来源：路径 → 用哪个版本的该文件内容替代（用户逐个选，可批量）。</summary>
     public IReadOnlyDictionary<string, int> Substitutions { get; init; } =
         new Dictionary<string, int>(StringComparer.Ordinal);
+
+    /// <summary>遇 Archive blob 的活化目标 tier（Archive 无法直接下载，需先活化，异步几小时）。</summary>
+    public AccessTier RehydrateTier { get; init; } = AccessTier.Hot;
+
+    /// <summary>活化轮询间隔秒（还原 job 不占锁，可长等）。</summary>
+    public int RehydratePollSeconds { get; init; } = 60;
+
+    /// <summary>还原完成后把活化过的 blob 重新归档回 Archive（默认 true，保持备份原 tier、避免长期热存费）。</summary>
+    public bool ReArchiveAfterRestore { get; init; } = true;
 }
 
 /// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。</summary>
@@ -35,13 +47,13 @@ public sealed class RestoreOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null)
 {
-    public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default)
+    public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default, IProgress<string>? phase = null)
     {
         var source = $"restore:{request.Container}";
         await Record(NotificationEvents.RestoreStart, source, $"Restore started: {request.Container}", request.TargetRoot, ct);
         try
         {
-            var result = await RunCoreAsync(request, ct);
+            var result = await RunCoreAsync(request, phase, ct);
             await Record(NotificationEvents.RestoreSuccess, source, $"Restore succeeded: {request.Container}",
                 $"Restored {result.RestoredFiles} file(s) to {request.TargetRoot} (version {result.Version})", ct);
             return result;
@@ -61,7 +73,7 @@ public sealed class RestoreOrchestrator(
             await notifier.NotifyAsync(evt, title, body, ct);
     }
 
-    private async Task<RestoreResult> RunCoreAsync(RestoreRequest request, CancellationToken ct)
+    private async Task<RestoreResult> RunCoreAsync(RestoreRequest request, IProgress<string>? phase, CancellationToken ct)
     {
         var info = await store.ReadInfoAsync(request.Account, request.Container, request.Password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");
@@ -122,11 +134,12 @@ public sealed class RestoreOrchestrator(
 
         // 按存储分组：同一 pack 只下载/解压一次。各组并发下载（PRD 3.4），每组独立临时子目录避免冲突。
         var work = NewTempDir();
+        var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // 活化过的 blob 基名，完成后重新归档
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
-            var counts = await Task.WhenAll(groups.Select(g => RestoreGroupAsync(container, request, work, g.ToList(), gate, ct)));
+            var counts = await Task.WhenAll(groups.Select(g => RestoreGroupAsync(container, request, work, g.ToList(), gate, rehydrated, phase, ct)));
             restored += counts.Sum(c => c.Restored);
             skipped += counts.Sum(c => c.Skipped);
         }
@@ -135,12 +148,21 @@ public sealed class RestoreOrchestrator(
             TryDelete(work);
         }
 
+        // 还原完成后把活化过的 blob 重新归档回 Archive（保持备份原 tier；best effort）。
+        if (request.ReArchiveAfterRestore && !rehydrated.IsEmpty)
+        {
+            phase?.Report($"Re-archiving {rehydrated.Distinct().Count()} object(s)…");
+            foreach (var baseRef in rehydrated.Distinct())
+                await SetTierForVolumesAsync(container, baseRef, AccessTier.Archive, ct);
+        }
+
         return new RestoreResult(version.Version, restored, skipped, index.EmptyDirs.Count);
     }
 
     private async Task<(int Restored, int Skipped)> RestoreGroupAsync(
-        Azure.Storage.Blobs.BlobContainerClient container, RestoreRequest request, string work,
-        List<IndexEntry> group, SemaphoreSlim gate, CancellationToken ct)
+        BlobContainerClient container, RestoreRequest request, string work,
+        List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
+        IProgress<string>? phase, CancellationToken ct)
     {
         var skipped = 0;
         var needed = new List<IndexEntry>();
@@ -164,7 +186,18 @@ public sealed class RestoreOrchestrator(
         await gate.WaitAsync(ct);
         try
         {
-            var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+            string firstVolume;
+            try
+            {
+                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+            }
+            catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
+            {
+                // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
+                await EnsureOnlineAsync(container, blobName, request.RehydrateTier, request.RehydratePollSeconds, phase, ct);
+                rehydrated.Add(blobName);
+                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+            }
 
             if (storage.Kind == "blob")
             {
@@ -257,6 +290,51 @@ public sealed class RestoreOrchestrator(
     }
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
+
+    /// <summary>确保某归档（含全部分卷）已从 Archive 活化为可下载：对未活化的发起活化，轮询到全部就绪。</summary>
+    private static async Task EnsureOnlineAsync(
+        BlobContainerClient container, string baseRef, AccessTier tier, int pollSeconds,
+        IProgress<string>? phase, CancellationToken ct)
+    {
+        var vols = new List<string>();
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
+            vols.Add(b.Name);
+
+        // 未开始活化的分卷发起活化（标准优先级）。
+        foreach (var name in vols)
+        {
+            var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
+            if (props.AccessTier == "Archive" && string.IsNullOrEmpty(props.ArchiveStatus))
+                await container.GetBlobClient(name).SetAccessTierAsync(tier, cancellationToken: ct);
+        }
+
+        // 轮询到全部分卷不再是 Archive（活化完成，几小时级）。
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var pending = 0;
+            foreach (var name in vols)
+            {
+                var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
+                if (props.AccessTier == "Archive")
+                    pending++;
+            }
+            if (pending == 0)
+                return;
+            phase?.Report($"Waiting for rehydration of {baseRef} — {pending} volume(s) still archived…");
+            await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, pollSeconds)), ct);
+        }
+    }
+
+    /// <summary>把某归档的全部分卷设为指定 tier（best effort，用于还原后重新归档）。</summary>
+    private static async Task SetTierForVolumesAsync(BlobContainerClient container, string baseRef, AccessTier tier, CancellationToken ct)
+    {
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
+        {
+            try { await container.GetBlobClient(b.Name).SetAccessTierAsync(tier, cancellationToken: ct); }
+            catch { /* best effort */ }
+        }
+    }
 
     private static string ToLocal(string relative) => relative.Replace('/', Path.DirectorySeparatorChar);
 

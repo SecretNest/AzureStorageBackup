@@ -6,13 +6,16 @@ public sealed class RestoreRunState
     public RunStatus Status { get; set; } = RunStatus.Running;
     public RestoreResult? Result { get; set; }
     public string? Error { get; set; }
+
+    /// <summary>当前阶段说明（如「等待活化…」），供前端显示长等待原因。</summary>
+    public string? Phase { get; set; }
 }
 
 public sealed record RestoreRunResponse(
-    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, string? Error)
+    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, string? Error, string? Phase)
 {
     public static RestoreRunResponse From(RestoreRunState s) => new(
-        s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles, s.Error);
+        s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles, s.Error, s.Phase);
 }
 
 /// <summary>
@@ -64,7 +67,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            // 不占忙碌锁：还原与备份可并行。
+            // 不占忙碌锁：还原与备份可并行。遇 Archive 自动发起活化并轮询（可长等），完成后重新归档。
+            var progress = new Progress<string>(p => state.Phase = p);
             state.Result = await orchestrator.RunAsync(new RestoreRequest
             {
                 Account = account,
@@ -74,7 +78,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 Version = version,
                 DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
                 Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
-            });
+            }, ct: default, phase: progress);
+            state.Phase = null;
             state.Status = RunStatus.Completed;
         }
         catch (Exception ex)

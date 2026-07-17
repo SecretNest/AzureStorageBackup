@@ -79,6 +79,48 @@ public sealed class RestoreOrchestratorTests : IDisposable
     };
 
     [SkippableFact]
+    public async Task Restore_Rehydrates_Archived_Blob_Then_Restores()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rhyd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "archived content");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            // 把 data blob 设为 Archive；若 Azurite 不支持则跳过。
+            try
+            {
+                await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                    await container.GetBlobClient(b.Name).SetAccessTierAsync(Azure.Storage.Blobs.Models.AccessTier.Archive);
+            }
+            catch (Azure.RequestFailedException)
+            {
+                Skip.If(true, "Azurite does not support Archive tier");
+            }
+
+            // 还原应自动活化后取回内容（轮询间隔设小）。
+            await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst, RehydratePollSeconds = 1,
+            });
+
+            Assert.Equal("archived content", File.ReadAllText(Path.Combine(_dst, "a.txt")));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Restore_Substitutes_Unrecoverable_File_From_Chosen_Version()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

@@ -535,7 +535,7 @@ function RestoreStatus({ run }: { run: RestoreRun }) {
         Restored {run.restoredFiles} file(s), skipped {run.skippedFiles} — version {run.version}
       </div>
     )
-  return <div style={{ fontSize: '0.8rem', color: '#555' }}>Restoring…</div>
+  return <div style={{ fontSize: '0.8rem', color: '#555' }}>{run.phase || 'Restoring…'}</div>
 }
 
 function TierSelect({
