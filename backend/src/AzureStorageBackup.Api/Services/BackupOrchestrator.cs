@@ -88,7 +88,8 @@ public sealed class BackupOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     ProcessingVerifier? verifier = null,
-    ILocalIndexCache? indexCache = null)
+    ILocalIndexCache? indexCache = null,
+    TrackedInfoStore? trackedInfo = null)
 {
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
@@ -132,8 +133,10 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);
 
-        // 2. 载入上一版本。信息文件从云端读（权威）；大的版本索引优先走本地缓存（§3.3），避免每次下载解压。
-        var info = await store.ReadInfoAsync(request.Account, request.Container, password, ct)
+        // 2. 载入上一版本。信息文件优先走本地权威副本（§3.3，避免读云端 Cold 信息文件）；大的版本索引优先走本地缓存。
+        var info = (trackedInfo is not null
+            ? await trackedInfo.LoadAsync(request.Account, request.Container, password, ct)
+            : await store.ReadInfoAsync(request.Account, request.Container, password, ct))
             ?? NewInfo(request);
         var identity = info.Backup.CreatedAt.UtcTicks;
         VersionIndex? previous = null;
@@ -209,7 +212,10 @@ public sealed class BackupOrchestrator(
             IndexBlob = indexBlob,
             Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
         });
-        await store.WriteInfoAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
+        if (trackedInfo is not null)
+            await trackedInfo.WriteAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
+        else
+            await store.WriteInfoAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));

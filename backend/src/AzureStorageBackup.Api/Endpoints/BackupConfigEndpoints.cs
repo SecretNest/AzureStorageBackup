@@ -23,24 +23,25 @@ public static class BackupConfigEndpoints
         })
         .WithName("GetBackupConfig");
 
-        // 导入已有备份：读 container 的信息文件恢复配置，并把全部版本索引下载入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, IBackupInfoStore store, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
+        // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            BackupInfoFile? info;
+            (BackupInfoFile Info, string ETag)? seeded;
             try
             {
-                info = await store.ReadInfoAsync(account, req.ContainerName, req.Password, ct);
+                seeded = await trackedInfo.SeedFromCloudAsync(account, req.ContainerName, req.Password, ct);
             }
             catch (Exception ex)
             {
                 return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
             }
-            if (info is null)
+            if (seeded is null)
                 return Results.NotFound(new { error = "No backup found in this container." });
+            var info = seeded.Value.Info;
 
             var config = new BackupConfig
             {

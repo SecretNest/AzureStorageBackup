@@ -46,6 +46,8 @@ builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
 builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
 builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
+builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();
+builder.Services.AddScoped<TrackedInfoStore>();
 
 // 引擎组件（无状态用单例；StagingArea 单例以保证压缩全局非并发，跨备份也不并发）。
 var tempPath = builder.Configuration["Backup:TempPath"];

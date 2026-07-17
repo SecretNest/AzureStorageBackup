@@ -27,13 +27,15 @@ public sealed record CleanupOptions
 /// </summary>
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
-    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null)
+    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null)
 {
-    /// <summary>独立清理：自行读取信息文件。</summary>
+    /// <summary>独立清理：自行读取信息文件（优先本地权威副本）。</summary>
     public async Task CleanupAsync(
         Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default)
     {
-        var info = await store.ReadInfoAsync(account, container, password, ct);
+        var info = trackedInfo is not null
+            ? await trackedInfo.LoadAsync(account, container, password, ct)
+            : await store.ReadInfoAsync(account, container, password, ct);
         if (info is not null && info.Versions.Count > 0)
             await CleanupAsync(account, container, password, options, info, ct);
     }
@@ -120,7 +122,10 @@ public sealed class RetentionCleaner(
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
                 options.LocalRoot, options.AllowRepackDownload, ct);
 
-        await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
+        if (trackedInfo is not null)
+            await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct);
+        else
+            await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
     }
 
     /// <summary>把分卷名 baseRef.NNN（3 位数字后缀）归一化回基名；非分卷名原样返回（§7）。</summary>

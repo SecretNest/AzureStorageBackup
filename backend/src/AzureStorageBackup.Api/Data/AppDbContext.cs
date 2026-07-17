@@ -20,6 +20,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<LogEntry> LogEntries => Set<LogEntry>();
     public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
     public DbSet<CachedVersionIndex> CachedVersionIndexes => Set<CachedVersionIndex>();
+    public DbSet<LocalBackupState> LocalBackupStates => Set<LocalBackupState>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -88,6 +89,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
             e.HasKey(x => x.Id);
             e.Property(x => x.Container).IsRequired();
             e.HasIndex(x => new { x.AccountId, x.Container, x.Version }).IsUnique();
+        });
+
+        modelBuilder.Entity<LocalBackupState>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Container).IsRequired();
+            e.HasIndex(x => new { x.AccountId, x.Container }).IsUnique();
         });
     }
 }

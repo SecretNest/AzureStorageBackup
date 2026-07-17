@@ -100,13 +100,16 @@ public sealed class BackupOrchestratorTests : IDisposable
     private sealed class CountingStore(IBackupInfoStore inner) : IBackupInfoStore
     {
         public int IndexReads { get; private set; }
+        public int InfoReads { get; private set; }
         public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, CancellationToken ct = default)
         {
             IndexReads++;
             return inner.ReadIndexAsync(a, c, b, p, ct);
         }
-        public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) => inner.ReadInfoAsync(a, c, p, ct);
+        public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) { InfoReads++; return inner.ReadInfoAsync(a, c, p, ct); }
+        public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) { InfoReads++; return inner.ReadInfoWithETagAsync(a, c, p, ct); }
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
+        public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => inner.WriteInfoConditionalAsync(a, c, i, p, t, e, ct);
         public Task<string> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteIndexAsync(a, c, v, i, p, t, ct);
     }
 
@@ -144,6 +147,45 @@ public sealed class BackupOrchestratorTests : IDisposable
             await orchestrator.RunAsync(Request(account, name)); // v2：上一版本索引应命中本地缓存
 
             Assert.Equal(0, counting.IndexReads); // 从未下载云端第二级索引
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Second_Backup_Does_Not_Read_Cloud_Info_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var counting = new CountingStore(new BackupInfoStore(factory, new SevenZipArchiveCodec()));
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        conn.Open();
+        var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
+            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        db.Database.EnsureCreated();
+        var tracked = new TrackedInfoStore(counting, new LocalBackupStateStore(db));
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
+            new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(),
+            indexCache: new LocalIndexCache(db, counting), trackedInfo: tracked);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchti-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha");
+            await orchestrator.RunAsync(Request(account, name)); // v1：本地无 → 读云端一次(返回空→新建)
+            var readsAfterFirst = counting.InfoReads;
+            await orchestrator.RunAsync(Request(account, name)); // v2：本地权威 → 不应再读云端信息文件
+
+            Assert.Equal(readsAfterFirst, counting.InfoReads); // 第二次备份零信息文件读
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

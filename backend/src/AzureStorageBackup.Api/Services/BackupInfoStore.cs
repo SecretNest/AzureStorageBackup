@@ -1,3 +1,4 @@
+using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -8,23 +9,31 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
 {
     public async Task<BackupInfoFile?> ReadInfoAsync(
         Account account, string container, string? password, CancellationToken ct = default)
+        => (await ReadInfoWithETagAsync(account, container, password, ct))?.Info;
+
+    public async Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(
+        Account account, string container, string? password, CancellationToken ct = default)
     {
         var cc = Container(account, container);
 
         // 优先非加密（PRD 1.6）。非加密仅压缩（空密码），加密用备份密码。
         var plain = cc.GetBlobClient(BackupDiscovery.IndexBlobName);
         if ((await plain.ExistsAsync(ct)).Value)
-            return IndexSerializer.DeserializeInfoFile(await DownloadDecodeAsync(plain, password: null, ct));
+            return await ReadWithETagAsync(plain, password: null, ct);
 
         var enc = cc.GetBlobClient(BackupDiscovery.EncryptedIndexBlobName);
         if ((await enc.ExistsAsync(ct)).Value)
-            return IndexSerializer.DeserializeInfoFile(await DownloadDecodeAsync(enc, password, ct));
+            return await ReadWithETagAsync(enc, password, ct);
 
         return null;
     }
 
-    public async Task WriteInfoAsync(
+    public Task WriteInfoAsync(
         Account account, string container, BackupInfoFile info, string? password, AccessTier? tier = null, CancellationToken ct = default)
+        => WriteInfoConditionalAsync(account, container, info, password, tier, ifMatch: null, ct);
+
+    public async Task<string> WriteInfoConditionalAsync(
+        Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
     {
         var cc = Container(account, container);
         var name = string.IsNullOrEmpty(password)
@@ -32,7 +41,7 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
             : BackupDiscovery.EncryptedIndexBlobName;
 
         var json = IndexSerializer.SerializeInfoFile(info);
-        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeInfoFile(b), tier, ct);
+        return await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeInfoFile(b), tier, ifMatch, ct);
     }
 
     public async Task<VersionIndex> ReadIndexAsync(
@@ -50,17 +59,17 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
         var name = $"indexes/v{version}.json" + (string.IsNullOrEmpty(password) ? "" : ".enc");
 
         var json = IndexSerializer.SerializeIndex(index);
-        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeIndex(b), tier, ct);
+        await WriteAtomicAsync(cc, name, json, password, b => IndexSerializer.DeserializeIndex(b), tier, ifMatch: null, ct);
         return name;
     }
 
     /// <summary>
-    /// 原子写：编码→写临时 blob→下载校验（解码+反序列化）→写正式名（带 tier）→删临时。
-    /// 校验失败不触碰正式名；正式名单 blob 提交是原子的，失败时旧文件完好（§8）。
+    /// 原子写：编码→写临时 blob→下载校验（解码+反序列化）→写正式名（带 tier，可选 If-Match）→删临时。返回正式名的新 ETag。
+    /// ifMatch 非空且外部已改动 → 正式写抛 RequestFailedException(412)，不触碰旧内容（§8）。
     /// </summary>
-    private async Task WriteAtomicAsync(
+    private async Task<string> WriteAtomicAsync(
         BlobContainerClient cc, string finalName, byte[] json, string? password, Action<byte[]> verify,
-        AccessTier? tier, CancellationToken ct)
+        AccessTier? tier, string? ifMatch, CancellationToken ct)
     {
         var encoded = await codec.EncodeAsync(json, password, ct);
         var temp = cc.GetBlobClient(finalName + ".writing." + Guid.NewGuid().ToString("N"));
@@ -73,12 +82,23 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
             var options = new BlobUploadOptions();
             if (tier is { } t)
                 options.AccessTier = t;
-            await cc.GetBlobClient(finalName).UploadAsync(BinaryData.FromBytes(encoded).ToStream(), options, ct);
+            if (ifMatch is not null)
+                options.Conditions = new BlobRequestConditions { IfMatch = new ETag(ifMatch) };
+
+            var resp = await cc.GetBlobClient(finalName).UploadAsync(BinaryData.FromBytes(encoded).ToStream(), options, ct);
+            return resp.Value.ETag.ToString();
         }
         finally
         {
             await temp.DeleteIfExistsAsync(cancellationToken: ct);
         }
+    }
+
+    private async Task<(BackupInfoFile Info, string ETag)> ReadWithETagAsync(BlobClient blob, string? password, CancellationToken ct)
+    {
+        var resp = (await blob.DownloadContentAsync(ct)).Value;
+        var decoded = await codec.DecodeAsync(resp.Content.ToArray(), password, ct);
+        return (IndexSerializer.DeserializeInfoFile(decoded), resp.Details.ETag.ToString());
     }
 
     private async Task<byte[]> DownloadDecodeAsync(BlobClient blob, string? password, CancellationToken ct)

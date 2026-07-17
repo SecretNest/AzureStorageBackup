@@ -1,0 +1,57 @@
+using Azure;
+using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Models;
+
+namespace AzureStorageBackup.Api.Services;
+
+/// <summary>
+/// 本地权威的信息文件读写（设计 §3.3）。正常备份**不从云端读信息文件**（它可能落 Cold，取回有费）：
+/// 本地有序列化副本就用本地；写入用 ETag <c>If-Match</c> 检测外部改动（多机/container 重建），冲突则清本地状态并报错重跑重同步。
+/// 仅本地无副本时（首次/导入前）才读云端并回填。
+/// </summary>
+public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateStore state)
+{
+    /// <summary>加载信息文件：本地有则用本地（不读云端）；否则读云端并回填。均无返回 null（→ 新建）。</summary>
+    public async Task<BackupInfoFile?> LoadAsync(Account account, string container, string? password, CancellationToken ct = default)
+    {
+        var local = await state.TryGetAsync(account.Id, container, ct);
+        if (local is not null)
+            return IndexSerializer.DeserializeInfoFile(local.Value.InfoBytes);
+
+        var cloud = await store.ReadInfoWithETagAsync(account, container, password, ct);
+        if (cloud is null)
+            return null;
+
+        await state.PutAsync(account.Id, container, IndexSerializer.SerializeInfoFile(cloud.Value.Info), cloud.Value.ETag, ct);
+        return cloud.Value.Info;
+    }
+
+    /// <summary>提交信息文件：以本地记录的 ETag 做 If-Match 写云端，成功后更新本地。外部已改动 → 清本地并抛异常。</summary>
+    public async Task WriteAsync(
+        Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, CancellationToken ct = default)
+    {
+        var local = await state.TryGetAsync(account.Id, container, ct);
+        try
+        {
+            var newEtag = await store.WriteInfoConditionalAsync(
+                account, container, info, password, tier, ifMatch: local?.ETag, ct);
+            await state.PutAsync(account.Id, container, IndexSerializer.SerializeInfoFile(info), newEtag, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 409)
+        {
+            await state.RemoveAsync(account.Id, container, ct);
+            throw new InvalidOperationException(
+                "Backup info file was modified elsewhere since last sync; local state cleared — re-run to re-sync.", ex);
+        }
+    }
+
+    /// <summary>导入：用云端信息文件回填本地权威状态（供之后备份不再读云端）。返回读到的信息文件。</summary>
+    public async Task<(BackupInfoFile Info, string ETag)?> SeedFromCloudAsync(
+        Account account, string container, string? password, CancellationToken ct = default)
+    {
+        var cloud = await store.ReadInfoWithETagAsync(account, container, password, ct);
+        if (cloud is not null)
+            await state.PutAsync(account.Id, container, IndexSerializer.SerializeInfoFile(cloud.Value.Info), cloud.Value.ETag, ct);
+        return cloud;
+    }
+}
