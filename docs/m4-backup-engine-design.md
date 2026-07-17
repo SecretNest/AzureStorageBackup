@@ -77,9 +77,19 @@ packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
 - symlink：默认跳过；若用户选包含，则 `kind:"symlink"` + `target` 字段。
 
 ### 3.3 本地状态（SQLite，新增表）
-- `LocalBackupState`：AccountId, ContainerName, LastVersion, LastIndexCacheJson（或引用本地缓存文件）, UpdatedAt。
-- `PackState`：packId, members(hash 列表), originalBytes, deadBytes（跟踪死重）。
-- 本地缓存是优化；权威在 container 信息文件。
+
+> **已实现（2026-07，`CachedVersionIndex` 表 + `LocalIndexCache`）**：
+> - 缓存**版本索引**（大）：按 (AccountId, Container, Version) 存序列化索引字节。版本索引写入即不可变，故命中即有效；
+>   `IdentityTicks`=备份创建时间戳，用于识别 container 删后重建（版本号复用但内容不同）→ 不匹配即失效重下。
+> - **信息文件**（小、权威）仍每次备份从云端读，取版本列表；只有大的版本索引走本地缓存。
+> - 命中/回填：编排器 diff 读上一版本索引走缓存、写完新版本回填缓存；保留清理读保留版本索引走缓存、退役版本从缓存移除；
+>   **导入时下载全部版本索引入缓存**——之后（除导入/深度检查/重 pack 外）备份/清理平时不再下载云端版本索引与数据。
+> - 缓存存的是**解密后**的索引元数据（路径/hash）；与密钥化寻址的威胁模型一致（攻击者只有云端 list 权限，本机是可信端、源文件本就在此）。
+>
+> 原设计草案（未采用其字段布局，仅保留意图参考）：
+> - `LocalBackupState`：AccountId, ContainerName, LastVersion, LastIndexCacheJson, UpdatedAt。
+> - `PackState`：packId, members, originalBytes, deadBytes。
+> - 本地缓存是优化；权威在 container 信息文件。
 
 ## 4. 备份流程（状态机）
 
