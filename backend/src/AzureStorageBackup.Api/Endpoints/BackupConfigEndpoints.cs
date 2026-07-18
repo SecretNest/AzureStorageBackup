@@ -1,4 +1,5 @@
 using Azure;
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 
@@ -385,7 +386,10 @@ public static class BackupConfigEndpoints
                 {
                     Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
                     Local = local ?? LocalCheckLevel.Content,
-                    RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                    // 显式转为 AccessTier?：AccessTier 有 string 隐式转换构造函数，三元表达式与裸 null 混用时
+                    // 编译器会走「null→string→AccessTier(string)」这条隐式转换路径而非「AccessTier→AccessTier?」，
+                    // 导致 rehydrate 为空时对 AccessTier(string) 传 null 触发 ArgumentNullException（真实生产 bug）。
+                    RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     ListOrphans = listOrphans ?? false,
                 };
                 var result = await checker.CheckAsync(account, config.ContainerName, password, version, options, config.LocalRoot, ct,

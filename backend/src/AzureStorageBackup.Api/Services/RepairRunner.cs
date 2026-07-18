@@ -1,3 +1,4 @@
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -72,7 +73,8 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 var options = new CheckOptions
                 {
                     Cloud = cloud,
-                    RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                    // 显式转为 AccessTier?：见 BackupConfigEndpoints.cs /check 端点同处注释（真实生产 bug 修复）。
+                    RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     ListOrphans = cleanupOrphans,
                 };
                 state.Report = await sp.GetRequiredService<BackupRepairer>().RepairAsync(

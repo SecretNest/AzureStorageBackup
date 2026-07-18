@@ -91,6 +91,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         catch { return false; }
     }
 
+    private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
+
     [SkippableFact]
     [Trait("Category", "Integration")]
     public async Task Delete_Config_Optionally_Deletes_Cloud_Container()
@@ -253,5 +255,243 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     {
         Assert.Equal(HttpStatusCode.NotFound,
             (await _client.PostAsync("/api/backup-configs/999999/reset-status", null)).StatusCode);
+    }
+
+    // ---- §5.8: /check, /repair, /versions, /file-versions, /unrecoverable, /tree, /restore-estimate ----
+
+    private async Task<AccountResponse> CreateAzuriteAccountAsync()
+    {
+        var req = new AccountRequest("azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint,
+            AzureRegion.Global, AzuriteKey, false, ProxyMode.Independent, null, null, null, null);
+        return (await (await _client.PostAsJsonAsync("/api/accounts", req)).Content.ReadFromJsonAsync<AccountResponse>())!;
+    }
+
+    /// <summary>直接写本地权威信息文件（TrackedInfoStore.LoadAsync 命中本地则不读云端），供 /versions、/tree、
+    /// /file-versions、/unrecoverable 端点做无需 Azurite 的本地态测试。返回 identityTicks（=Backup.CreatedAt.UtcTicks），
+    /// 供 /tree 端点匹配 CachedVersionIndex.IdentityTicks。</summary>
+    private long SeedLocalInfo(int accountId, string container, List<BackupVersion> versions)
+    {
+        var createdAt = DateTimeOffset.UtcNow;
+        var info = new BackupInfoFile
+        {
+            Backup = new BackupMeta { Name = "seed", CreatedAt = createdAt, Encrypted = false },
+            Versions = versions,
+        };
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.LocalBackupStates.Add(new LocalBackupState
+        {
+            AccountId = accountId, Container = container,
+            InfoBytes = IndexSerializer.SerializeInfoFile(info), ETag = "seed-etag",
+        });
+        db.SaveChanges();
+        return createdAt.UtcTicks;
+    }
+
+    private sealed record VersionSummary(int version, DateTimeOffset createdAt, long files, long bytes, long changedFiles);
+    private sealed record FileVersionCandidate(int version, DateTimeOffset createdAt, long length);
+    private sealed record RestoreEstimateResult(long downloadBytes, long uncompressedBytes, int fileCount, int archivedObjects, int rehydratePending);
+
+    [Fact]
+    public async Task Versions_Endpoint_Returns_Seeded_Version_Stats()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-versions") with { AccountId = account.Id, ContainerName = "ep-versions-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion
+            {
+                Version = 1, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = "v1.index",
+                Stats = new VersionStats(Files: 2, Bytes: 100, ChangedFiles: 2, ChangedBytes: 100),
+            },
+        ]);
+
+        var res = await _client.GetAsync($"/api/backup-configs/{created.Id}/versions");
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var rows = await res.Content.ReadFromJsonAsync<List<VersionSummary>>();
+        var row = Assert.Single(rows!);
+        Assert.Equal(1, row.version);
+        Assert.Equal(2, row.files);
+        Assert.Equal(100, row.bytes);
+    }
+
+    [Fact]
+    public async Task Tree_Endpoint_Returns_Root_Children()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-tree") with { AccountId = account.Id, ContainerName = "ep-tree-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var identityTicks = SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion
+            {
+                Version = 1, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = "v1.index",
+                Stats = new VersionStats(1, 5, 1, 5),
+            },
+        ]);
+
+        var index = new VersionIndex
+        {
+            Version = 1,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    Path = "a.txt", Kind = "file", Length = 5, Mtime = DateTimeOffset.UtcNow, Permissions = "644",
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/abc" },
+                },
+            ],
+        };
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.CachedVersionIndexes.Add(new CachedVersionIndex
+            {
+                AccountId = account.Id, Container = created.ContainerName, Version = 1,
+                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var res = await _client.GetAsync($"/api/backup-configs/{created.Id}/tree?version=1");
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var nodes = await res.Content.ReadFromJsonAsync<List<TreeNode>>();
+        var node = Assert.Single(nodes!);
+        Assert.Equal("a.txt", node.Name);
+        Assert.False(node.IsDir);
+        Assert.Equal(5, node.Length);
+    }
+
+    [Fact]
+    public async Task File_Versions_And_Unrecoverable_Return_Empty_Array_When_No_Versions_Exist()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-fv-empty") with { AccountId = account.Id, ContainerName = "ep-fv-empty-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        SeedLocalInfo(account.Id, created!.ContainerName, []); // 无版本 → 两端点均短路，不触碰云端
+
+        var fv = await _client.GetFromJsonAsync<List<FileVersionCandidate>>(
+            $"/api/backup-configs/{created.Id}/file-versions?path=a.txt");
+        Assert.Empty(fv!);
+
+        var unrec = await _client.GetFromJsonAsync<List<string>>($"/api/backup-configs/{created.Id}/unrecoverable");
+        Assert.Empty(unrec!);
+    }
+
+    [Fact]
+    public async Task Check_Endpoint_Returns_Conflict_When_Backup_Busy()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-check-busy") with { AccountId = account.Id, ContainerName = "ep-check-busy-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
+        Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName));
+        try
+        {
+            var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/check", null);
+            Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+        }
+        finally
+        {
+            busy.Release(created.AccountId, created.ContainerName);
+        }
+    }
+
+    [Fact]
+    public async Task Read_And_Action_Endpoints_On_Missing_Config_Return_404()
+    {
+        const int missingId = 999999;
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/versions")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/file-versions?path=a.txt")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/unrecoverable")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/tree")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.PostAsync($"/api/backup-configs/{missingId}/check", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.PostAsync($"/api/backup-configs/{missingId}/repair", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await _client.PostAsJsonAsync($"/api/backup-configs/{missingId}/restore-estimate",
+                new RestoreEstimateRequestBody(null, []))).StatusCode);
+    }
+
+    [SkippableFact]
+    [Trait("Category", "Integration")]
+    public async Task Check_Repair_RestoreEstimate_FileVersions_Unrecoverable_Endpoints_Work_After_Backup()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var localRoot = Path.Combine(Path.GetTempPath(), "asb-ep-cre-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(localRoot);
+        await File.WriteAllTextAsync(Path.Combine(localRoot, "a.txt"), "alpha");
+
+        var containerName = "ep-cre-" + Guid.NewGuid().ToString("N")[..8];
+        var account = await CreateAzuriteAccountAsync();
+        var config = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-cre") with { AccountId = account.Id, ContainerName = containerName, LocalRoot = localRoot }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var factoryClient = new BlobClientFactory();
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
+
+        try
+        {
+            await _client.PostAsync($"/api/backup-configs/{config!.Id}/run", null);
+            BackupRunResponse? backup = null;
+            for (var i = 0; i < 600; i++)
+            {
+                backup = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/run")).Content.ReadFromJsonAsync<BackupRunResponse>();
+                if (backup!.Status != "Running") break;
+                await Task.Delay(200);
+            }
+            Assert.Equal("Completed", backup!.Status);
+
+            // /check：健康备份 → ok=true，单文件在案
+            var checkRes = await _client.PostAsync($"/api/backup-configs/{config.Id}/check", null);
+            Assert.Equal(HttpStatusCode.OK, checkRes.StatusCode);
+            var checkReport = await checkRes.Content.ReadFromJsonAsync<CheckReport>();
+            Assert.True(checkReport!.Ok);
+            Assert.Single(checkReport.Findings);
+
+            // /repair：无需修复 → Completed
+            var repairStart = await _client.PostAsync($"/api/backup-configs/{config.Id}/repair", null);
+            Assert.Equal(HttpStatusCode.Accepted, repairStart.StatusCode);
+            RepairRunResponse? repair = null;
+            for (var i = 0; i < 600; i++)
+            {
+                repair = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/repair")).Content.ReadFromJsonAsync<RepairRunResponse>();
+                if (repair!.Status != "Running") break;
+                await Task.Delay(200);
+            }
+            Assert.Equal("Completed", repair!.Status);
+
+            // /restore-estimate：单文件下载量估算
+            var estimateRes = await _client.PostAsJsonAsync($"/api/backup-configs/{config.Id}/restore-estimate",
+                new RestoreEstimateRequestBody(null, ["a.txt"]));
+            Assert.Equal(HttpStatusCode.OK, estimateRes.StatusCode);
+            var estimate = await estimateRes.Content.ReadFromJsonAsync<RestoreEstimateResult>();
+            Assert.Equal(1, estimate!.fileCount);
+            Assert.True(estimate.downloadBytes > 0);
+
+            // /file-versions + /unrecoverable：健康备份下 candidate 存在、无不可恢复项
+            var fv = await _client.GetFromJsonAsync<List<FileVersionCandidate>>($"/api/backup-configs/{config.Id}/file-versions?path=a.txt");
+            var candidate = Assert.Single(fv!);
+            Assert.Equal(1, candidate.version);
+
+            var unrec = await _client.GetFromJsonAsync<List<string>>($"/api/backup-configs/{config.Id}/unrecoverable");
+            Assert.Empty(unrec!);
+        }
+        finally
+        {
+            try { Directory.Delete(localRoot, recursive: true); } catch { /* best effort */ }
+            await container.DeleteIfExistsAsync();
+        }
     }
 }
