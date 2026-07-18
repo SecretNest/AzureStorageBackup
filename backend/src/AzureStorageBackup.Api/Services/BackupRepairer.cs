@@ -31,7 +31,10 @@ public sealed class BackupRepairer(
         Account account, string container, string? password, string localRoot, int? version,
         CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, CancellationToken ct = default)
     {
-        var info = await store.ReadInfoAsync(account, container, password, ct)
+        // 本地权威优先读（与编排器/检查器一致）：本地有则零云读，无则读云端并回填；写侧已走 trackedInfo。
+        var info = (trackedInfo is not null
+                ? await trackedInfo.LoadAsync(account, container, password, ct)
+                : await store.ReadInfoAsync(account, container, password, ct))
             ?? throw new InvalidOperationException("No backup found in container.");
         if (info.Versions.Count == 0)
             throw new InvalidOperationException("Backup has no versions.");
