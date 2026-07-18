@@ -53,4 +53,22 @@ public sealed class VolumeBlobIOTests
 
         Assert.Equal(["data/h"], up.Order);
     }
+
+    [Theory]
+    // 自身卷：基名、卷后缀（含 >3 位数）
+    [InlineData("data/abc", "data/abc", true)]
+    [InlineData("data/abc", "data/abc.001", true)]
+    [InlineData("data/abc", "data/abc.1000", true)]
+    [InlineData("packs/1.7z", "packs/1.7z.002", true)]
+    // 碰撞避让兄弟：同前缀但内容不同，必须排除（ReplaceAsync 删残留卷时不得误删）
+    [InlineData("data/abc", "data/abc~1", false)]
+    [InlineData("data/abc", "data/abc~1.001", false)]
+    [InlineData("data/abc~1", "data/abc~10", false)]
+    [InlineData("data/abc~1", "data/abc~1.001", true)]
+    // 其它同前缀噪声
+    [InlineData("data/abc", "data/abcd", false)]
+    [InlineData("data/abc", "data/abc.00x", false)]
+    [InlineData("data/abc", "data/abc.", false)]
+    public void IsVolumeOf_Matches_Only_Own_Volumes_Not_Collision_Siblings(string baseRef, string name, bool expected)
+        => Assert.Equal(expected, VolumeBlobIO.IsVolumeOf(baseRef, name));
 }

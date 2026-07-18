@@ -49,10 +49,26 @@ public static class VolumeBlobIO
             await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
 
         // 2) 删除不属于新卷集的残留旧卷（如旧卷数 > 新卷数的尾部，或单卷↔多卷切换后的旧命名）。
+        //    只删本归档自身的卷（baseRef 精确 或 baseRef.<数字> 卷后缀）——前缀扫描会连带匹配到
+        //    碰撞避让兄弟 data/{hash}~N（内容不同、独立引用），必须排除，否则会误删他人数据。
         var keep = new HashSet<string>(newNames, StringComparer.Ordinal);
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
-            if (!keep.Contains(b.Name))
+            if (IsVolumeOf(baseRef, b.Name) && !keep.Contains(b.Name))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+    }
+
+    /// <summary>
+    /// <paramref name="name"/> 是否为归档 <paramref name="baseRef"/> 自身的卷：等于基名，或形如 基名.NNN（后缀为 <c>.</c>+纯数字）。
+    /// 用于按前缀枚举后精确过滤，排除同前缀但内容不同的碰撞避让兄弟（如 data/{hash}~1、data/{hash}~1.001）。
+    /// </summary>
+    public static bool IsVolumeOf(string baseRef, string name)
+    {
+        if (name == baseRef)
+            return true;
+        if (!name.StartsWith(baseRef + ".", StringComparison.Ordinal))
+            return false;
+        var suffix = name[(baseRef.Length + 1)..];
+        return suffix.Length > 0 && suffix.All(char.IsAsciiDigit);
     }
 
     /// <summary>
