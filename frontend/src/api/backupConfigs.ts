@@ -34,6 +34,10 @@ export const backupStageLabels: Record<number, string> = {
   6: 'Completed',
 }
 
+// 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态见 BackupActivity（派生，不落库）。
+export const BackupStatus = { Normal: 0, Error: 1 } as const
+export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing'
+
 export interface BackupConfig {
   id: number
   accountId: number
@@ -56,6 +60,10 @@ export interface BackupConfig {
   volumeBytes: number | null
   verboseLogging: boolean
   createdAt: string
+  status: number // BackupStatus
+  lastError: string | null
+  lastErrorAt: string | null
+  activity: BackupActivity
 }
 
 export interface BackupConfigInput {
@@ -168,6 +176,7 @@ export const backupConfigsApi = {
   update: (id: number, input: BackupConfigInput) =>
     api.put<BackupConfig>(`/backup-configs/${id}`, input),
   remove: (id: number) => api.del(`/backup-configs/${id}`),
+  resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
   versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),

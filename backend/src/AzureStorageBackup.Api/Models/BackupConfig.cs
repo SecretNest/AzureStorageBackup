@@ -57,4 +57,9 @@ public class BackupConfig
     public bool VerboseLogging { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
+
+    // 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态（备份中/还原中…）不落库，DTO 时派生。
+    public BackupStatus Status { get; set; } = BackupStatus.Normal;
+    public string? LastError { get; set; }
+    public DateTimeOffset? LastErrorAt { get; set; }
 }

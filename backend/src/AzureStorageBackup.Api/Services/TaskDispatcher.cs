@@ -59,7 +59,8 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
     private async Task ExecuteAsync(
         IServiceProvider sp, ScheduledTask task, int accountId, string container, CancellationToken ct)
     {
-        var config = await sp.GetRequiredService<IBackupConfigService>().FindAsync(accountId, container, ct);
+        var configs = sp.GetRequiredService<IBackupConfigService>();
+        var config = await configs.FindAsync(accountId, container, ct);
         var account = await sp.GetRequiredService<IAccountService>().GetAsync(accountId, ct);
         if (config is null || account is null)
         {
@@ -68,35 +69,48 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
         }
 
         var password = BackupRequestMapper.Password(config);
-        switch (task.TaskType)
+        try
         {
-            case ScheduledTaskType.Backup:
-                var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                await sp.GetRequiredService<BackupOrchestrator>()
-                    .RunAsync(BackupRequestMapper.From(config, account, settings), null, ct);
-                break;
+            switch (task.TaskType)
+            {
+                case ScheduledTaskType.Backup:
+                    var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
+                    await sp.GetRequiredService<BackupOrchestrator>()
+                        .RunAsync(BackupRequestMapper.From(config, account, settings), null, ct);
+                    break;
 
-            case ScheduledTaskType.Check:
-                var checkSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                var options = new CheckOptions
-                {
-                    Cloud = task.CheckCloudLevel,
-                    Local = task.CheckLocalLevel,
-                    RehydrateTier = task.CheckRehydrateTier is { } t ? BackupRequestMapper.MapTier(t) : null,
-                };
-                var result = await sp.GetRequiredService<BackupChecker>()
-                    .CheckAsync(account, container, password, null, options, config.LocalRoot, ct,
-                        downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5);
-                if (!result.Ok)
-                    logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",
-                        accountId, container, result.MissingRefs.Count);
-                break;
+                case ScheduledTaskType.Check:
+                    var checkSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
+                    var options = new CheckOptions
+                    {
+                        Cloud = task.CheckCloudLevel,
+                        Local = task.CheckLocalLevel,
+                        RehydrateTier = task.CheckRehydrateTier is { } t ? BackupRequestMapper.MapTier(t) : null,
+                    };
+                    var result = await sp.GetRequiredService<BackupChecker>()
+                        .CheckAsync(account, container, password, null, options, config.LocalRoot, ct,
+                            downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5);
+                    if (!result.Ok)
+                        logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",
+                            accountId, container, result.MissingRefs.Count);
+                    break;
 
-            case ScheduledTaskType.Cleanup:
-                var cleanupSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                await sp.GetRequiredService<RetentionCleaner>()
-                    .CleanupAsync(account, container, password, BackupRequestMapper.CleanupOf(config, cleanupSettings), ct);
-                break;
+                case ScheduledTaskType.Cleanup:
+                    var cleanupSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
+                    await sp.GetRequiredService<RetentionCleaner>()
+                        .CleanupAsync(account, container, password, BackupRequestMapper.CleanupOf(config, cleanupSettings), ct);
+                    break;
+            }
         }
+        catch (Exception ex)
+        {
+            // 落库 Error（决策 2），best-effort：写状态失败不应掩盖原始异常。
+            // 外层 DispatchAsync 的 catch 负责记日志，这里用 `throw;` 保留原始异常与调用栈。
+            try { await configs.SetErrorAsync(config.Id, ex.Message, ct); } catch { /* best-effort */ }
+            throw;
+        }
+
+        // 成功落库 Normal（决策 2），best-effort：写状态失败不应把已成功的运行误判为失败。
+        try { await configs.SetNormalAsync(config.Id, ct); } catch { /* best-effort */ }
     }
 }

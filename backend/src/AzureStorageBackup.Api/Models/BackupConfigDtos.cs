@@ -2,7 +2,11 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>备份配置响应体。刻意不含 Password，仅暴露 HasPassword（是否加密）。</summary>
+/// <summary>
+/// 备份配置响应体。刻意不含 Password，仅暴露 HasPassword（是否加密）。
+/// <c>Status</c>/<c>LastError</c>/<c>LastErrorAt</c> 为持久状态（§4.2 决策 2）；
+/// <c>Activity</c> 为派生瞬时态（Idle/BackingUp/Restoring/Checking/Repairing），不落库，调用方按需计算后传入。
+/// </summary>
 public record BackupConfigResponse(
     int Id,
     int AccountId,
@@ -24,14 +28,19 @@ public record BackupConfigResponse(
     long GroupCapBytes,
     long? VolumeBytes,
     bool VerboseLogging,
-    DateTimeOffset CreatedAt)
+    DateTimeOffset CreatedAt,
+    BackupStatus Status,
+    string? LastError,
+    DateTimeOffset? LastErrorAt,
+    string Activity)
 {
-    public static BackupConfigResponse From(BackupConfig c) => new(
+    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle") => new(
         c.Id, c.AccountId, c.ContainerName, c.Name, c.Description, c.LocalRoot,
         !string.IsNullOrEmpty(c.Password), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
-        c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt);
+        c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
+        c.Status, c.LastError, c.LastErrorAt, activity);
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。</summary>

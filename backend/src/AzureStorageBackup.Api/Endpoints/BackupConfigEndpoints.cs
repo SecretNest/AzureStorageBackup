@@ -10,18 +10,30 @@ public static class BackupConfigEndpoints
     {
         var group = app.MapGroup("/api/backup-configs").WithTags("BackupConfigs");
 
-        group.MapGet("/", async (IBackupConfigService svc, CancellationToken ct) =>
+        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
-            return Results.Ok(list.Select(BackupConfigResponse.From));
+            return Results.Ok(list.Select(c =>
+                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy))));
         });
 
-        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var c = await svc.GetAsync(id, ct);
-            return c is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(c));
+            return c is null
+                ? Results.NotFound()
+                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy)));
         })
         .WithName("GetBackupConfig");
+
+        // 手动清错（决策 2）：与「下次成功自动清错」同语义，供用户主动 dismiss。
+        group.MapPost("/{id:int}/reset-status", async (int id, IBackupConfigService svc, CancellationToken ct) =>
+        {
+            if (await svc.GetAsync(id, ct) is null)
+                return Results.NotFound();
+            await svc.ResetStatusAsync(id, ct);
+            return Results.NoContent();
+        });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
         group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
@@ -243,7 +255,15 @@ public static class BackupConfigEndpoints
                 };
                 var result = await checker.CheckAsync(account, config.ContainerName, password, version, options, config.LocalRoot, ct,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
+                // Check 完成（无论是否发现问题）算成功；只有异常才置 Error（决策 2）。
+                // best-effort：状态回写失败不应把已成功的检查结果变成 500。
+                try { await svc.SetNormalAsync(id, ct); } catch { /* best-effort */ }
                 return Results.Ok(result);
+            }
+            catch (Exception ex)
+            {
+                try { await svc.SetErrorAsync(id, ex.Message, ct); } catch { /* best-effort */ }
+                throw;
             }
             finally
             {
@@ -252,5 +272,25 @@ public static class BackupConfigEndpoints
         });
 
         return app;
+    }
+
+    /// <summary>
+    /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态
+    /// （BackupRunner/RestoreRunner/RepairRunner 已各自暴露 <c>Get(id)</c>，无需新增 accessor）；
+    /// 都没有但 BackupBusyTracker 显示该 (账户,container) 忙碌，则视为 Checking——
+    /// 检查端点 (/check) 与计划任务的备份/清理都同步持锁运行，不经过任何 Runner。
+    /// </summary>
+    private static string DeriveActivity(
+        BackupConfig c, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy)
+    {
+        if (backupRunner.Get(c.Id)?.Status == RunStatus.Running)
+            return "BackingUp";
+        if (restoreRunner.Get(c.Id)?.Status == RunStatus.Running)
+            return "Restoring";
+        if (repairRunner.Get(c.Id)?.Status == RunStatus.Running)
+            return "Repairing";
+        if (busy.IsBusy(c.AccountId, c.ContainerName))
+            return "Checking";
+        return "Idle";
     }
 }

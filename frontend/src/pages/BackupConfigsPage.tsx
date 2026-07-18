@@ -9,6 +9,7 @@ import {
   LocalCheckLevel,
   CloudState,
   LocalState,
+  BackupStatus,
   tierLabels,
   retentionModeLabels,
   backupStageLabels,
@@ -171,6 +172,15 @@ export function BackupConfigsPage() {
     }
   }
 
+  const resetStatus = async (c: BackupConfig) => {
+    try {
+      await backupConfigsApi.resetStatus(c.id)
+      load()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const run = async (c: BackupConfig) => {
     setError(null)
     try {
@@ -270,13 +280,14 @@ export function BackupConfigsPage() {
             <th>Account / Container</th>
             <th>Local Root</th>
             <th>Encrypted</th>
+            <th>Status</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
           {configs.length === 0 ? (
             <tr>
-              <td colSpan={5} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={6} style={{ padding: '1rem 0', color: '#666' }}>
                 No backups yet.
               </td>
             </tr>
@@ -289,6 +300,9 @@ export function BackupConfigsPage() {
                 </td>
                 <td style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>{c.localRoot}</td>
                 <td>{c.hasPassword ? 'Yes' : 'No'}</td>
+                <td>
+                  <StatusBadge config={c} onReset={() => resetStatus(c)} />
+                </td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button
                     type="button"
@@ -524,6 +538,33 @@ function RunStatus({ run }: { run: BackupRun }) {
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
     </div>
   )
+}
+
+// 状态徽标（§4.2 决策 2）：进行中（蓝，派生 activity）优先于持久 Error（红，tooltip + Reset）；否则不显示。
+function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () => void }) {
+  if (config.activity !== 'Idle') {
+    return (
+      <span style={{ color: '#1a73e8', fontSize: '0.8rem', fontWeight: 600 }}>
+        {config.activity}
+      </span>
+    )
+  }
+  if (config.status === BackupStatus.Error) {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
+        <span
+          title={config.lastError ?? 'Unknown error'}
+          style={{ color: 'crimson', fontSize: '0.8rem', fontWeight: 600, cursor: 'help' }}
+        >
+          Error
+        </span>
+        <button type="button" onClick={onReset} style={{ fontSize: '0.75rem' }}>
+          Reset
+        </button>
+      </span>
+    )
+  }
+  return <span style={{ color: '#999', fontSize: '0.8rem' }}>—</span>
 }
 
 function RestoreStatus({ run }: { run: RestoreRun }) {

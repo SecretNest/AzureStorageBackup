@@ -65,4 +65,31 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         await db.SaveChangesAsync(ct);
         return true;
     }
+
+    public async Task SetErrorAsync(int id, string message, CancellationToken ct = default)
+    {
+        var existing = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
+        if (existing is null)
+            return;
+
+        existing.Status = BackupStatus.Error;
+        existing.LastError = message;
+        existing.LastErrorAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task SetNormalAsync(int id, CancellationToken ct = default)
+    {
+        var existing = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
+        if (existing is null)
+            return;
+
+        existing.Status = BackupStatus.Normal;
+        existing.LastError = null;
+        existing.LastErrorAt = null;
+        await db.SaveChangesAsync(ct);
+    }
+
+    // 手动 reset 与「成功自清」同实现（决策 2）。
+    public Task ResetStatusAsync(int id, CancellationToken ct = default) => SetNormalAsync(id, ct);
 }

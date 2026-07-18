@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -74,5 +75,83 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created!.Id}")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+    }
+
+    [Fact]
+    public async Task New_Config_Reports_Normal_Status_And_Idle_Activity()
+    {
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-idle")))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        Assert.Equal(BackupStatus.Normal, created!.Status);
+        Assert.Null(created.LastError);
+        Assert.Equal("Idle", created.Activity);
+
+        var fetched = await (await _client.GetAsync($"/api/backup-configs/{created.Id}"))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal("Idle", fetched!.Activity);
+    }
+
+    [Fact]
+    public async Task Busy_Config_Reports_Checking_Activity_In_List_And_Detail()
+    {
+        var req = SampleRequest("status-busy") with { ContainerName = "busy-container" };
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", req))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        // 模拟 /check 端点持有的忙碌锁（无专属 runner，靠 BackupBusyTracker 兜底判定 Checking）。
+        var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
+        Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName));
+        try
+        {
+            var list = await (await _client.GetAsync("/api/backup-configs"))
+                .Content.ReadFromJsonAsync<List<BackupConfigResponse>>();
+            Assert.Equal("Checking", list!.Single(c => c.Id == created.Id).Activity);
+
+            var single = await (await _client.GetAsync($"/api/backup-configs/{created.Id}"))
+                .Content.ReadFromJsonAsync<BackupConfigResponse>();
+            Assert.Equal("Checking", single!.Activity);
+        }
+        finally
+        {
+            busy.Release(created.AccountId, created.ContainerName);
+        }
+
+        var afterRelease = await (await _client.GetAsync($"/api/backup-configs/{created.Id}"))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal("Idle", afterRelease!.Activity);
+    }
+
+    [Fact]
+    public async Task Failed_Operation_Sets_Error_And_Reset_Status_Clears_It()
+    {
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-error")))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        // 模拟某个 runner 写状态点因操作失败落库 Error（决策 2）。
+        using (var scope = factory.Services.CreateScope())
+            await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
+                .SetErrorAsync(created!.Id, "simulated failure");
+
+        var afterFailure = await (await _client.GetAsync($"/api/backup-configs/{created!.Id}"))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal(BackupStatus.Error, afterFailure!.Status);
+        Assert.Equal("simulated failure", afterFailure.LastError);
+        Assert.NotNull(afterFailure.LastErrorAt);
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.PostAsync($"/api/backup-configs/{created.Id}/reset-status", null)).StatusCode);
+
+        var afterReset = await (await _client.GetAsync($"/api/backup-configs/{created.Id}"))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal(BackupStatus.Normal, afterReset!.Status);
+        Assert.Null(afterReset.LastError);
+    }
+
+    [Fact]
+    public async Task Reset_Status_On_Missing_Config_Returns_404()
+    {
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await _client.PostAsync("/api/backup-configs/999999/reset-status", null)).StatusCode);
     }
 }
