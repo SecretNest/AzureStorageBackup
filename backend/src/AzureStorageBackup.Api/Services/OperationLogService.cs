@@ -31,8 +31,10 @@ public interface IOperationLog
 
     Task ClearAsync(CancellationToken ct = default);
 
-    /// <summary>删除某备份（container）的全部日志（删除备份时调用，PRD 3.6"长存日志保留至删除备份"）。</summary>
-    Task DeleteForContainerAsync(string container, CancellationToken ct = default);
+    /// <summary>删除某备份（account+container）的全部日志（删除备份时调用，PRD 3.6"长存日志保留至删除备份"）。
+    /// 按 accountId 精确限定：<c>BackupConfig</c> 在 (AccountId, ContainerName) 上唯一索引，不同 account 可有
+    /// 同名 container，绝不能用 container-only 匹配（会跨 account 误删审计日志）。</summary>
+    Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default);
 
     /// <summary>手工清理：删除早于 cutoff 的**全部**日志（长存+短存，PRD 3.6"指定时间早于此全删"）。</summary>
     Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default);
@@ -84,17 +86,16 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
         await db.SaveChangesAsync(ct);
     }
 
-    public async Task DeleteForContainerAsync(string container, CancellationToken ct = default)
+    public async Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default)
     {
         // 来源形如 "backup:{accountId}/{container}"、"check:{accountId}/{container}"、
-        // "restore:{accountId}/{container}"、"schedule:{accountId}/{container}"（§5.3）。
-        // 同时兼容改版前写入的旧格式 "{op}:{container}"（历史行不重写，避免遗留孤儿日志）。
-        // 按 container 而非 accountId+container 精确匹配是有意的粗粒度过渡：Task 5 会把接口收紧到
-        // account+container 精确前缀，从根本上避免"同名不同 account 的 container"误删。
-        var newSuffix = "/" + container;
-        var oldSuffix = ":" + container;
+        // "restore:{accountId}/{container}"、"schedule:{accountId}/{container}"（§5.3）。冒号在 accountId 前，
+        // 故 ":{accountId}/{container}" 后缀精确定位该 account 的该 container，绝不匹配其他 account 的同名 container。
+        // 项目尚未上线，格式可自由演进：改版前遗留的旧格式行 "{op}:{container}"（无 account 维度、无法安全归属
+        // 某个 account）故意不做兜底匹配——宁可留下少量孤儿旧日志，也不能有跨 account 误删的风险。
+        var suffix = $":{accountId}/{container}";
         await db.LogEntries
-            .Where(e => e.Source.EndsWith(newSuffix) || e.Source.EndsWith(oldSuffix))
+            .Where(e => e.Source.EndsWith(suffix))
             .ExecuteDeleteAsync(ct);
     }
 

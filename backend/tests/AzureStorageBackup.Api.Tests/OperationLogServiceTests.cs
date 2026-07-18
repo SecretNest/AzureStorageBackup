@@ -140,34 +140,37 @@ public sealed class OperationLogServiceTests : IDisposable
         Assert.Equal("new", Assert.Single(await _sut.QueryAsync(null, null, null, null, 100)).Message);
     }
 
+    /// <summary>§5.3：source 携带 account 维度（"{op}:{accountId}/{container}"）。
+    /// DeleteForContainerAsync 按 accountId+container 精确匹配（":{accountId}/{container}" 后缀）：
+    /// 删除某 account 下某 container 的日志时，同一 container 的其他 account 日志、以及同 account 下
+    /// 其他 container 的日志都必须保留（BackupConfig 在 (AccountId, ContainerName) 唯一索引，
+    /// 两个 account 可有同名 container——container-only 匹配会跨 account 误删，故不可用）。</summary>
     [Fact]
-    public async Task DeleteForContainer_Removes_That_Backups_Logs()
-    {
-        await _sut.AppendAsync(OperationLogLevel.Info, "backup:photos", "a", durable: true);
-        await _sut.AppendAsync(OperationLogLevel.Info, "check:photos", "b", durable: true);
-        await _sut.AppendAsync(OperationLogLevel.Info, "backup:docs", "c", durable: true);
-
-        await _sut.DeleteForContainerAsync("photos");
-
-        var kept = await _sut.QueryAsync(null, null, null, null, 100);
-        Assert.Equal("c", Assert.Single(kept).Message); // 仅 docs 的日志保留
-    }
-
-    /// <summary>§5.3：source 现携带 account 维度（"{op}:{accountId}/{container}"）。DeleteForContainerAsync
-    /// 须继续按 container 匹配到这些行（同时兼容改版前遗留的旧格式行，见 DeleteForContainer_Removes_That_Backups_Logs）。</summary>
-    [Fact]
-    public async Task DeleteForContainer_Removes_Logs_In_Account_Scoped_Format()
+    public async Task DeleteForContainer_Removes_Only_That_Accounts_Container_Logs()
     {
         await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/photos", "a", durable: true);
         await _sut.AppendAsync(OperationLogLevel.Info, "check:3/photos", "b", durable: true);
         await _sut.AppendAsync(OperationLogLevel.Info, "restore:3/photos", "c", durable: true);
-        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/docs", "d", durable: true);
-        // 同名 container 挂在另一个 account 下：当前粗粒度实现仍会一并删除（按 container 而非
-        // account+container 匹配是有意的过渡，见 DeleteForContainerAsync 注释），故不在此断言其保留。
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/docs", "d", durable: true);      // 同 account，不同 container → 保留
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:5/photos", "e", durable: true);    // 不同 account，同名 container → 保留
+        await _sut.AppendAsync(OperationLogLevel.Info, "check:5/photos", "f", durable: true);     // 不同 account，同名 container → 保留
 
-        await _sut.DeleteForContainerAsync("photos");
+        await _sut.DeleteForContainerAsync(3, "photos");
+
+        var kept = (await _sut.QueryAsync(null, null, null, null, 100)).Select(e => e.Message).ToHashSet();
+        Assert.Equal(new HashSet<string> { "d", "e", "f" }, kept); // 仅 account 3 的 photos 日志被删
+    }
+
+    /// <summary>改版前遗留的旧格式行（"{op}:{container}"，无 account 维度）故意不再兜底匹配——
+    /// 项目尚未上线，宁可留极少量孤儿旧日志，也不能有跨 account 误删风险（见 DeleteForContainerAsync 注释）。</summary>
+    [Fact]
+    public async Task DeleteForContainer_Does_Not_Match_Legacy_Account_Less_Format()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:photos", "legacy", durable: true);
+
+        await _sut.DeleteForContainerAsync(3, "photos");
 
         var kept = await _sut.QueryAsync(null, null, null, null, 100);
-        Assert.Equal("d", Assert.Single(kept).Message);
+        Assert.Equal("legacy", Assert.Single(kept).Message); // 未被删除
     }
 }

@@ -27,7 +27,7 @@ public sealed class OperationLogSourceTests
             CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
 
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task DeleteForContainerAsync(string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
         public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }

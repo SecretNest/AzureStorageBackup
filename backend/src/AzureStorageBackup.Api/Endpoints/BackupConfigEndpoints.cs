@@ -127,7 +127,7 @@ public static class BackupConfigEndpoints
 
             var ok = await svc.DeleteAsync(id, ct);
             if (ok)
-                await log.DeleteForContainerAsync(config.ContainerName, ct); // 删除备份时连带删其审计日志（PRD 3.6）
+                await log.DeleteForContainerAsync(config.AccountId, config.ContainerName, ct); // 删除备份时连带删其审计日志（PRD 3.6）
             return ok ? Results.NoContent() : Results.NotFound();
         });
 

@@ -780,7 +780,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         public Task<IReadOnlyList<LogEntry>> QueryAsync(OperationLogLevel? l, string? s, DateTimeOffset? f, DateTimeOffset? t, int n, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<LogEntry>>([]);
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task DeleteForContainerAsync(string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
         public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
@@ -796,7 +796,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
         public Task<IReadOnlyList<LogEntry>> QueryAsync(OperationLogLevel? l, string? s, DateTimeOffset? f, DateTimeOffset? t, int n, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task DeleteForContainerAsync(string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
         public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
