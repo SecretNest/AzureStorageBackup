@@ -112,7 +112,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -133,11 +133,17 @@ public static class BackupConfigEndpoints
             var ok = await svc.DeleteAsync(id, ct);
             if (ok)
             {
-                await log.DeleteForContainerAsync(accountId, container, ct); // 删除备份时连带删其审计日志（PRD 3.6）
+                // 善后清理各自 best-effort：配置行已删（主操作成功），单步失败不应回 500、也不阻断其余步骤。
+                // 残留的孤儿日志/缓存/状态无害且可被后续清理/重建覆盖。
+                var logger = loggerFactory.CreateLogger("BackupConfigDelete");
+                await BestEffort(logger, "delete audit logs",
+                    () => log.DeleteForContainerAsync(accountId, container, ct)); // 连带删审计日志（PRD 3.6）
                 // 连带清本地权威缓存/状态（本地权威原则，设计 §3.3）：否则同 account+container 重建备份时会
                 // 命中孤儿的 CachedVersionIndex/LocalBackupState 行，与新备份的版本身份错配。
-                await indexCache.RemoveForContainerAsync(accountId, container, ct);
-                await localState.RemoveAsync(accountId, container, ct);
+                await BestEffort(logger, "evict local index cache",
+                    () => indexCache.RemoveForContainerAsync(accountId, container, ct));
+                await BestEffort(logger, "remove local backup state",
+                    () => localState.RemoveAsync(accountId, container, ct));
             }
             return ok ? Results.NoContent() : Results.NotFound();
         });
@@ -431,5 +437,12 @@ public static class BackupConfigEndpoints
         // 非 Runner 的持锁操作（手动 /check、计划 备份/检查/清理）：读忙碌跟踪记录的实际操作标签，
         // 避免把计划备份/清理一律误标为 Checking。
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
+    }
+
+    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。</summary>
+    private static async Task BestEffort(ILogger logger, string what, Func<Task> action)
+    {
+        try { await action(); }
+        catch (Exception ex) { logger.LogWarning(ex, "Backup config delete: failed to {What}", what); }
     }
 }
