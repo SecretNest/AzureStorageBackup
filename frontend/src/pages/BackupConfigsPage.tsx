@@ -531,8 +531,9 @@ function RestoreStatus({ run }: { run: RestoreRun }) {
     return <div style={{ color: 'crimson', fontSize: '0.8rem' }}>Restore failed: {run.error}</div>
   if (run.status === 'Completed')
     return (
-      <div style={{ color: 'green', fontSize: '0.8rem' }}>
-        Restored {run.restoredFiles} file(s), skipped {run.skippedFiles} — version {run.version}
+      <div style={{ color: run.failedFiles ? 'darkorange' : 'green', fontSize: '0.8rem' }}>
+        Restored {run.restoredFiles} file(s), skipped {run.skippedFiles}
+        {run.failedFiles ? `, failed ${run.failedFiles}` : ''} — version {run.version}
       </div>
     )
   return <div style={{ fontSize: '0.8rem', color: '#555' }}>{run.phase || 'Restoring…'}</div>

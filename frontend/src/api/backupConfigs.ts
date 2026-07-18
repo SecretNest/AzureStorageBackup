@@ -101,6 +101,7 @@ export interface RestoreRun {
   version: number | null
   restoredFiles: number | null
   skippedFiles: number | null
+  failedFiles: number | null
   error: string | null
   phase: string | null
 }

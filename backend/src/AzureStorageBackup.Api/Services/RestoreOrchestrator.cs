@@ -31,8 +31,8 @@ public sealed record RestoreRequest
     public bool ReArchiveAfterRestore { get; init; } = true;
 }
 
-/// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。</summary>
-public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFiles, int RestoredDirs);
+/// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。FailedFiles = 所在存储分组下载/解压失败而未能还原。</summary>
+public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFiles, int RestoredDirs, int FailedFiles);
 
 /// <summary>
 /// 还原编排器（M5、PRD 1.5）：读信息文件+第二级索引，下载 data blob / pack 并 7z 解压，
@@ -95,20 +95,24 @@ public sealed class RestoreOrchestrator(
 
         // 逐路径生效条目：默认取本版本；被替代的路径改用指定版本的同路径条目（内容+元数据取该版本）。
         var byPath = index.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+        var resolved = new HashSet<string>(StringComparer.Ordinal); // 真正解析成功的替代路径
         foreach (var grp in request.Substitutions.GroupBy(kv => kv.Value))
         {
             var sv = info.Versions.FirstOrDefault(x => x.Version == grp.Key);
             if (sv is null)
-                continue;
+                continue; // 替代版本已被保留清理删除 → 该组全部回落跳过
             var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, ct);
             var srcByPath = srcIndex.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
             foreach (var kv in grp)
                 if (srcByPath.TryGetValue(kv.Key, out var se))
+                {
                     byPath[kv.Key] = se;
+                    resolved.Add(kv.Key);
+                }
         }
 
-        // 不可恢复且未指定替代 → 跳过（不尝试还原，否则会因 blob 缺失报错）。
-        var unresolved = index.UnrecoverablePaths.Where(p => !request.Substitutions.ContainsKey(p)).ToHashSet(StringComparer.Ordinal);
+        // 不可恢复且未「解析成功」替代 → 跳过（声明了意图但替代不可得的也回落跳过，不报错）。
+        var unresolved = index.UnrecoverablePaths.Where(p => !resolved.Contains(p)).ToHashSet(StringComparer.Ordinal);
         skipped += unresolved.Count;
 
         // 空文件夹（还原需重建）
@@ -136,12 +140,24 @@ public sealed class RestoreOrchestrator(
         var work = NewTempDir();
         var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // 活化过的 blob 基名，完成后重新归档
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
+        var failed = 0;
         try
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
-            var counts = await Task.WhenAll(groups.Select(g => RestoreGroupAsync(container, request, work, g.ToList(), gate, rehydrated, phase, ct)));
+            var tasks = groups.Select(async g =>
+            {
+                try { return await RestoreGroupAsync(container, request, work, g.ToList(), gate, rehydrated, phase, ct); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    phase?.Report($"Group failed ({g.Key}): {ex.Message}");
+                    return (Restored: 0, Skipped: 0, Failed: g.Count());
+                }
+            });
+            var counts = await Task.WhenAll(tasks);
             restored += counts.Sum(c => c.Restored);
             skipped += counts.Sum(c => c.Skipped);
+            failed += counts.Sum(c => c.Failed);
         }
         finally
         {
@@ -156,10 +172,10 @@ public sealed class RestoreOrchestrator(
                 await SetTierForVolumesAsync(container, baseRef, AccessTier.Archive, ct);
         }
 
-        return new RestoreResult(version.Version, restored, skipped, index.EmptyDirs.Count);
+        return new RestoreResult(version.Version, restored, skipped, index.EmptyDirs.Count, failed);
     }
 
-    private async Task<(int Restored, int Skipped)> RestoreGroupAsync(
+    private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
         BlobContainerClient container, RestoreRequest request, string work,
         List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
         IProgress<string>? phase, CancellationToken ct)
@@ -174,7 +190,7 @@ public sealed class RestoreOrchestrator(
                 skipped++;
         }
         if (needed.Count == 0)
-            return (0, skipped);
+            return (0, skipped, 0);
 
         var storage = group[0].Storage!;
         var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
@@ -245,7 +261,7 @@ public sealed class RestoreOrchestrator(
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }
-        return (restored, skipped);
+        return (restored, skipped, 0);
     }
 
     private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, CancellationToken ct)

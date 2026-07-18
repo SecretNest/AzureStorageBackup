@@ -12,10 +12,11 @@ public sealed class RestoreRunState
 }
 
 public sealed record RestoreRunResponse(
-    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, string? Error, string? Phase)
+    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, int? FailedFiles, string? Error, string? Phase)
 {
     public static RestoreRunResponse From(RestoreRunState s) => new(
-        s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles, s.Error, s.Phase);
+        s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles,
+        s.Result?.FailedFiles, s.Error, s.Phase);
 }
 
 /// <summary>
