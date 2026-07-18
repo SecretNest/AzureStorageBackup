@@ -365,6 +365,11 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal("a.txt", node.Name);
         Assert.False(node.IsDir);
         Assert.Equal(5, node.Length);
+
+        // 指定不存在的版本 → 200 空数组（与 /unrecoverable、/file-versions 一致，非 404）。
+        var missingVer = await _client.GetAsync($"/api/backup-configs/{created.Id}/tree?version=999");
+        Assert.Equal(HttpStatusCode.OK, missingVer.StatusCode);
+        Assert.Empty((await missingVer.Content.ReadFromJsonAsync<List<TreeNode>>())!);
     }
 
     [Fact]

@@ -236,7 +236,7 @@ public static class BackupConfigEndpoints
                 return Results.Ok(Array.Empty<TreeNode>());
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
-                return Results.NotFound(new { error = "Version not found." });
+                return Results.Ok(Array.Empty<TreeNode>()); // 指定版本不存在 → 空结果，与 /unrecoverable、/file-versions 一致
 
             var identity = info.Backup.CreatedAt.UtcTicks;
             var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
