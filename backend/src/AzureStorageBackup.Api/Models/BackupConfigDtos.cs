@@ -46,6 +46,9 @@ public record BackupConfigResponse(
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。</summary>
 public record RestoreRequestBody(string? TargetRoot, int? Version, Dictionary<string, int>? Substitutions = null);
 
+/// <summary>还原量估算请求体（§4.1b，需求 A）：选中路径的下载/解压量预估。Version 为空则用最新版本。</summary>
+public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
+
 /// <summary>导入已有备份请求：读 container 的信息文件恢复配置（roadmap，PRD 1.5）。加密备份需提供密码。</summary>
 public record ImportRequest(int AccountId, string ContainerName, string? Password);
 

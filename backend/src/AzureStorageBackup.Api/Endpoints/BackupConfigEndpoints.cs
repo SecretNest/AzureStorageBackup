@@ -1,3 +1,4 @@
+using Azure;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 
@@ -229,6 +230,83 @@ public static class BackupConfigEndpoints
             var identity = info.Backup.CreatedAt.UtcTicks;
             var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
             return Results.Ok(VersionTreeService.Children(idx, path));
+        });
+
+        // 还原下载量/解压量估算（§4.1b，需求 A + 决策 5）：选中路径先本地纯算下载量（去重后的存储对象体积合计，
+        // 共享 pack/去重 blob 只计一次）与解压量，再对各去重对象首卷发起 HEAD 查活化状态（Archive/待就绪）。
+        group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            if (info is null || info.Versions.Count == 0)
+                return Results.NotFound(new { error = "No versions found." });
+            var ver = body.Version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
+            if (ver is null)
+                return Results.NotFound(new { error = "Version not found." });
+
+            var identity = info.Backup.CreatedAt.UtcTicks;
+            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
+            var estimate = RestoreEstimator.Compute(idx, info, body.Paths ?? []);
+
+            // 各去重存储对象的首卷 blob 名 + 分卷数（pack 用 PackInfo.Volumes；blob 用该 Ref 首个条目的 StorageRef.Volumes）。
+            var volumesByKey = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var e in idx.Entries)
+            {
+                if (e.Storage is null) continue;
+                var key = e.Storage.Kind == "pack" ? "pack:" + e.Storage.Ref : "blob:" + e.Storage.Ref;
+                if (volumesByKey.ContainsKey(key)) continue;
+                volumesByKey[key] = e.Storage.Kind == "pack"
+                    ? (info.Packs.TryGetValue(e.Storage.Ref, out var pack) ? pack.Volumes : 1)
+                    : e.Storage.Volumes;
+            }
+
+            var container = factory.CreateServiceClient(account).GetBlobContainerClient(config.ContainerName);
+            var settings = await settingsSvc.GetAsync(ct);
+            var concurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5;
+            using var gate = new SemaphoreSlim(Math.Max(1, concurrency));
+            var archived = 0;
+            var rehydratePending = 0;
+            await Task.WhenAll(estimate.DistinctObjects.Select(async key =>
+            {
+                await gate.WaitAsync(ct);
+                try
+                {
+                    var baseName = key.StartsWith("pack:", StringComparison.Ordinal) ? $"packs/{key[5..]}.7z" : key[5..];
+                    var volumes = volumesByKey.GetValueOrDefault(key, 1);
+                    var firstVolume = VolumeBlobIO.VolumeNames(baseName, volumes)[0];
+                    var props = (await container.GetBlobClient(firstVolume).GetPropertiesAsync(cancellationToken: ct)).Value;
+                    if (props.AccessTier == "Archive")
+                        Interlocked.Increment(ref archived);
+                    if (!string.IsNullOrEmpty(props.ArchiveStatus))
+                        Interlocked.Increment(ref rehydratePending);
+                }
+                catch (RequestFailedException)
+                {
+                    // best effort：单个对象 HEAD 失败（如已被删）不影响其余对象的估算，直接跳过其活化计数。
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }));
+
+            return Results.Ok(new
+            {
+                downloadBytes = estimate.DownloadBytes,
+                uncompressedBytes = estimate.UncompressedBytes,
+                fileCount = estimate.FileCount,
+                archivedObjects = archived,
+                rehydratePending,
+            });
         });
 
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
