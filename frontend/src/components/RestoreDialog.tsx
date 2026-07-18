@@ -239,9 +239,13 @@ export function RestoreDialog({
     return n === files.length ? 'checked' : 'indeterminate'
   }
 
+  // 与选中集的交集：选择性还原时，替代表只对"实际会被还原"的不可恢复路径有意义
+  // （后端按 SelectedPaths 过滤生效集，替代路径若未被勾选则替代是空操作）。未选中任何项 = 还原整版本，全部展示。
+  const relevantUnrecoverable = selected.size === 0 ? unrecoverable : unrecoverable.filter((p) => selected.has(p))
+
   const setAllNearest = () => {
     const ch: Record<string, number> = {}
-    for (const p of unrecoverable) ch[p] = options[p]?.length ? options[p][0].version : 0
+    for (const p of relevantUnrecoverable) ch[p] = options[p]?.length ? options[p][0].version : 0
     setChoices(ch)
   }
 
@@ -277,16 +281,16 @@ export function RestoreDialog({
         </Field>
 
         {subsLoading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
-        {!subsLoading && unrecoverable.length > 0 && (
+        {!subsLoading && relevantUnrecoverable.length > 0 && (
           <div style={{ margin: '0.6rem 0' }}>
             <div style={{ fontSize: '0.85rem', marginBottom: '0.3rem' }}>
-              {unrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
+              {relevantUnrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
               {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
             </div>
             <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
               <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Substitute from</th></tr></thead>
               <tbody>
-                {unrecoverable.map((p) => (
+                {relevantUnrecoverable.map((p) => (
                   <tr key={p}>
                     <td style={{ fontFamily: 'monospace' }}>{p}</td>
                     <td style={{ textAlign: 'center' }}>
