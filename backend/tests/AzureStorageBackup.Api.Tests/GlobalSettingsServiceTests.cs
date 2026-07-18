@@ -47,4 +47,16 @@ public sealed class GlobalSettingsServiceTests : IDisposable
         var s = await _sut.GetAsync();
         Assert.Equal(5, s.ProcessingMaxAttempts);
     }
+
+    [Fact]
+    public async Task GetAsync_Normalizes_Zero_Migrated_Columns_To_Defaults()
+    {
+        // 模拟迁移遗留行：新列 SQL 默认 0。
+        _db.GlobalSettings.Add(new Models.GlobalSettings { StagedLimitBytes = 0, ProcessingMaxAttempts = 0 });
+        await _db.SaveChangesAsync();
+
+        var s = await _sut.GetAsync();
+        Assert.Equal(2L * 1024 * 1024 * 1024, s.StagedLimitBytes); // 2GB 默认
+        Assert.Equal(5, s.ProcessingMaxAttempts);
+    }
 }

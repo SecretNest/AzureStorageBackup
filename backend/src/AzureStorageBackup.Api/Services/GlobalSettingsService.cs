@@ -13,8 +13,21 @@ public interface IGlobalSettingsService
 
 public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
 {
-    public async Task<GlobalSettings> GetAsync(CancellationToken ct = default) =>
-        await db.GlobalSettings.AsNoTracking().FirstOrDefaultAsync(ct) ?? new GlobalSettings();
+    public async Task<GlobalSettings> GetAsync(CancellationToken ct = default)
+    {
+        var s = await db.GlobalSettings.AsNoTracking().FirstOrDefaultAsync(ct);
+        if (s is null)
+            return new GlobalSettings();
+
+        // 迁移新列（StagedLimitBytes/ProcessingMaxAttempts）对既有行 SQL 默认 0，
+        // 规范化为模型默认，使 GET /settings 与引擎行为（>0?:回退）一致，避免 UI 显示 0。
+        var defaults = new GlobalSettings();
+        if (s.StagedLimitBytes <= 0)
+            s.StagedLimitBytes = defaults.StagedLimitBytes;
+        if (s.ProcessingMaxAttempts <= 0)
+            s.ProcessingMaxAttempts = defaults.ProcessingMaxAttempts;
+        return s;
+    }
 
     public async Task<GlobalSettings> UpsertAsync(GlobalSettings s, CancellationToken ct = default)
     {
