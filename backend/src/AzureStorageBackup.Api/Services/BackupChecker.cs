@@ -231,12 +231,9 @@ public sealed class BackupChecker(
     private static bool IsArchived(RequestFailedException ex) =>
         ex.ErrorCode == "BlobArchived" || ex.Status == 409;
 
-    private static async Task RehydrateAsync(BlobContainerClient cc, string baseRef, AccessTier tier, CancellationToken ct)
-    {
-        // 对归档首卷发起活化（异步，几小时后需用户重跑检查）；忽略失败（best effort）。
-        try { await cc.GetBlobClient(baseRef).SetAccessTierAsync(tier, cancellationToken: ct); }
-        catch { /* best effort */ }
-    }
+    private static Task RehydrateAsync(BlobContainerClient cc, string baseRef, AccessTier tier, CancellationToken ct) =>
+        // 对归档全部分卷发起活化（异步，几小时后需用户重跑检查）；忽略失败（best effort）。
+        BlobRehydration.BeginAsync(cc, baseRef, tier, ct);
 
     /// <summary>本地源文件状态。localRoot 缺失或本地轴关闭 → NotChecked。</summary>
     private async Task<LocalState> LocalCheckAsync(IndexEntry e, string? localRoot, LocalCheckLevel level, CancellationToken ct)
