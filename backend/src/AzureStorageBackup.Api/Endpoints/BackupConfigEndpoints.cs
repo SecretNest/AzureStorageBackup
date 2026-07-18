@@ -366,7 +366,7 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -396,12 +396,12 @@ public static class BackupConfigEndpoints
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
                 // Check 完成（无论是否发现问题）算成功；只有异常才置 Error（决策 2）。
                 // best-effort：状态回写失败不应把已成功的检查结果变成 500。
-                try { await svc.SetNormalAsync(id, ct); } catch { /* best-effort */ }
+                await svc.WriteStatusAsync(id, error: null, loggerFactory.CreateLogger("BackupStatus"), ct);
                 return Results.Ok(result);
             }
             catch (Exception ex)
             {
-                try { await svc.SetErrorAsync(id, ex.Message, ct); } catch { /* best-effort */ }
+                await svc.WriteStatusAsync(id, ex.Message, loggerFactory.CreateLogger("BackupStatus"), ct);
                 throw;
             }
             finally

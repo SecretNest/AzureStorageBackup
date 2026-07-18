@@ -114,11 +114,11 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
         {
             // 落库 Error（决策 2），best-effort：写状态失败不应掩盖原始异常。
             // 外层 DispatchAsync 的 catch 负责记日志，这里用 `throw;` 保留原始异常与调用栈。
-            try { await configs.SetErrorAsync(config.Id, ex.Message, ct); } catch { /* best-effort */ }
+            await configs.WriteStatusAsync(config.Id, ex.Message, logger, ct);
             throw;
         }
 
         // 成功落库 Normal（决策 2），best-effort：写状态失败不应把已成功的运行误判为失败。
-        try { await configs.SetNormalAsync(config.Id, ct); } catch { /* best-effort */ }
+        await configs.WriteStatusAsync(config.Id, error: null, logger, ct);
     }
 }
