@@ -330,6 +330,56 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    [SkippableFact]
+    public async Task Info_Write_Conflict_Does_Not_Leave_Ghost_Version_In_Index_Cache()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        conn.Open();
+        var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
+            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        db.Database.EnsureCreated();
+        var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+            indexCache: new LocalIndexCache(db, store), trackedInfo: tracked);
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchconf-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha");
+            await orchestrator.RunAsync(Request(account, name)); // v1：成功，本地记录云端 ETag=E1
+
+            // 模拟外部改动云端信息文件（另一台机器备份 / container 被重建）：绕过 tracked 直接
+            // 无条件改写云端，令云端 ETag 前进，而本地权威状态仍停留在旧 ETag（未同步）。
+            var cloudInfo = await store.ReadInfoAsync(account, name, null);
+            Assert.NotNull(cloudInfo);
+            await store.WriteInfoAsync(account, name, cloudInfo!, null);
+
+            WriteText("b.txt", "beta");
+            // v2：finalize 阶段 trackedInfo.WriteAsync 用陈旧本地 ETag 做 If-Match → 云端 412 → 包装异常抛出。
+            await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(Request(account, name)));
+
+            // 冲突后：本次未提交的版本 2 绝不能出现在本地索引缓存中（否则下次备份会把它当作已提交版本读取，产生幽灵 diff 基线）。
+            var ghost = await db.CachedVersionIndexes
+                .FirstOrDefaultAsync(x => x.AccountId == account.Id && x.Container == name && x.Version == 2);
+            Assert.Null(ghost);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     private BackupRequest Request(Account account, string container) => new()
     {
         Account = account,

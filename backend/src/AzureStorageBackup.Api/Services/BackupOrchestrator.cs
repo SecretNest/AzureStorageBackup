@@ -242,8 +242,7 @@ public sealed class BackupOrchestrator(
         // 7. WriteIndex（先上传第二级索引）
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
-        if (indexCache is not null)
-            await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
+        // 本地索引缓存 Put 推迟到信息文件提交成功后（见下），避免信息文件写冲突时留下未提交版本的幽灵缓存。
 
         // 8/9. Finalize（原子更新信息文件）
         progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -258,6 +257,10 @@ public sealed class BackupOrchestrator(
             await trackedInfo.WriteAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
         else
             await store.WriteInfoAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
+
+        // 信息文件已提交 → 现在把版本索引写入本地缓存（冲突已在上一步抛出，不会到这里）。
+        if (indexCache is not null)
+            await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
