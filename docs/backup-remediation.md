@@ -47,6 +47,7 @@
 - 前端合并重复枚举 label 到 `constants/labels.ts`。
 - 补 8 个 HTTP 端点级测试。
 - 新增 `.github/workflows/ci.yml`：起 Azurite + 7-Zip，使 `[Integration]` 测试在 CI 实跑（原本全跳过，引擎主链路零 CI 验证）。
+  - CI 首跑暴露并修复了一个**并发 flaky**：xUnit 跨测试类并行，各 `TestWebAppFactory` 的 `StagingArea` 单例共享默认 `/tmp/azurestoragebackup` 压缩临时区，并行备份相同小内容→同压缩输出名→跨主机撞车。修法：每个测试主机独立 `Backup:TempPath`。修复后 CI 连续多次全绿。
 
 ## 3. 评审额外发现并修复的缺陷
 逐项两阶段评审在计划外发现并修复 3 个真实缺陷：
