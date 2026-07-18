@@ -344,7 +344,7 @@ export function BackupConfigsPage() {
 
           {step === 1 ? (
             <>
-              <Field label="Account">
+              <Field label={editing ? 'Account (locked)' : 'Account'}>
                 <select
                   value={form.accountId}
                   disabled={!!editing}
@@ -357,17 +357,18 @@ export function BackupConfigsPage() {
                   ))}
                 </select>
               </Field>
-              <Field label="Container">
+              <Field label={editing ? 'Container (locked)' : 'Container'}>
                 <input
                   value={form.containerName}
                   disabled={!!editing}
                   onChange={(e) => set('containerName', e.target.value)}
                 />
               </Field>
-              <Field label="Local Root">
+              <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
                 <input
                   placeholder="/data/photos"
                   value={form.localRoot}
+                  disabled={!!editing}
                   onChange={(e) => set('localRoot', e.target.value)}
                 />
               </Field>
@@ -380,21 +381,36 @@ export function BackupConfigsPage() {
                   onChange={(e) => set('description', e.target.value)}
                 />
               </Field>
-              <Field label="Password">
+              <Field label={editing ? 'Password (locked)' : 'Password'}>
                 <input
                   type="password"
                   placeholder={
-                    editing ? 'Leave blank to keep current' : 'Optional — set to encrypt'
+                    editing
+                      ? editing.hasPassword
+                        ? 'Encrypted — cannot be changed after creation'
+                        : 'Not encrypted — cannot be changed after creation'
+                      : 'Optional — set to encrypt'
                   }
                   value={form.password ?? ''}
+                  disabled={!!editing}
                   onChange={(e) => set('password', e.target.value)}
                 />
               </Field>
-              <Field label="Index Tier">
-                <TierSelect value={form.indexTier} onChange={(v) => set('indexTier', v)} archive={false} />
+              <Field label={editing ? 'Index Tier (locked)' : 'Index Tier'}>
+                <TierSelect
+                  value={form.indexTier}
+                  onChange={(v) => set('indexTier', v)}
+                  archive={false}
+                  disabled={!!editing}
+                />
               </Field>
-              <Field label="Data Tier">
-                <TierSelect value={form.dataTier} onChange={(v) => set('dataTier', v)} archive />
+              <Field label={editing ? 'Data Tier (locked)' : 'Data Tier'}>
+                <TierSelect
+                  value={form.dataTier}
+                  onChange={(v) => set('dataTier', v)}
+                  archive
+                  disabled={!!editing}
+                />
               </Field>
 
               <div style={{ marginTop: '1rem' }}>
@@ -584,13 +600,15 @@ function TierSelect({
   value,
   onChange,
   archive,
+  disabled,
 }: {
   value: number
   onChange: (v: number) => void
   archive: boolean
+  disabled?: boolean
 }) {
   return (
-    <select value={value} onChange={(e) => onChange(Number(e.target.value))}>
+    <select value={value} disabled={disabled} onChange={(e) => onChange(Number(e.target.value))}>
       <option value={StorageTier.Hot}>{tierLabels[StorageTier.Hot]}</option>
       <option value={StorageTier.Cool}>{tierLabels[StorageTier.Cool]}</option>
       <option value={StorageTier.Cold}>{tierLabels[StorageTier.Cold]}</option>

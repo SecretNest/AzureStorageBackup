@@ -26,20 +26,31 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         return config;
     }
 
+    /// <summary>
+    /// 更新配置。基础字段（AccountId/ContainerName/LocalRoot/Password 加密性/IndexTier/DataTier）创建后锁定
+    /// （§4.5）：本地权威状态（TrackedInfoStore/LocalIndexCache）按 账户+container 键控，改这些字段会与云端/本地
+    /// 索引失步。检测到变更时抛 <see cref="InvalidOperationException"/>，端点映射为 400。
+    /// </summary>
     public async Task<BackupConfig?> UpdateAsync(int id, BackupConfig update, CancellationToken ct = default)
     {
         var existing = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
         if (existing is null)
             return null;
 
-        existing.AccountId = update.AccountId;
-        existing.ContainerName = update.ContainerName;
+        if (existing.AccountId != update.AccountId
+            || existing.ContainerName != update.ContainerName
+            || existing.LocalRoot != update.LocalRoot
+            || existing.IndexTier != update.IndexTier
+            || existing.DataTier != update.DataTier)
+            throw new InvalidOperationException("Base fields cannot be changed after creation.");
+
+        // 空密码 = 保留原值（沿用端点/现有约定，见 BackupConfigEndpoints PUT）；非空且与原值不同
+        // （含加密性从无到有变化）= 基础字段变更，拒绝。
+        if (!string.IsNullOrEmpty(update.Password) && update.Password != existing.Password)
+            throw new InvalidOperationException("Base fields cannot be changed after creation.");
+
         existing.Name = update.Name;
         existing.Description = update.Description;
-        existing.LocalRoot = update.LocalRoot;
-        existing.Password = update.Password;
-        existing.IndexTier = update.IndexTier;
-        existing.DataTier = update.DataTier;
         existing.IgnoreRules = update.IgnoreRules;
         existing.DontCompressRules = update.DontCompressRules;
         existing.DontGroupRules = update.DontGroupRules;
@@ -50,6 +61,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.SingleFileThresholdBytes = update.SingleFileThresholdBytes;
         existing.GroupCapBytes = update.GroupCapBytes;
         existing.VolumeBytes = update.VolumeBytes;
+        existing.VerboseLogging = update.VerboseLogging;
 
         await db.SaveChangesAsync(ct);
         return existing;

@@ -96,8 +96,16 @@ public static class BackupConfigEndpoints
             if (string.IsNullOrEmpty(req.Password))
                 update.Password = existing.Password;
 
-            var result = await svc.UpdateAsync(id, update, ct);
-            return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result));
+            try
+            {
+                var result = await svc.UpdateAsync(id, update, ct);
+                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result));
+            }
+            catch (InvalidOperationException ex)
+            {
+                // 基础字段创建后锁定（§4.5）：账户/container/本地根/Tier/加密性变更被拒。
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         group.MapDelete("/{id:int}", async (int id, IBackupConfigService svc, IOperationLog log, CancellationToken ct) =>
