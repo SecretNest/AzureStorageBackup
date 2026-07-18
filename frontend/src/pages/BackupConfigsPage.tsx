@@ -1,6 +1,9 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { settingsApi, type GlobalSettings } from '../api/settings'
+import { RestoreDialog } from '../components/RestoreDialog'
+import { Field } from '../components/modal'
+import { overlayStyle, panelStyle } from '../components/modalStyles'
 import {
   backupConfigsApi,
   StorageTier,
@@ -19,7 +22,6 @@ import {
   type RestoreRun,
   type CheckReport,
   type RepairRun,
-  type FileVersionOption,
 } from '../api/backupConfigs'
 
 const cloudLevelLabels: Record<number, string> = {
@@ -525,7 +527,7 @@ export function BackupConfigsPage() {
         />
       )}
       {restoreModal && (
-        <RestoreModal
+        <RestoreDialog
           config={restoreModal}
           onClose={() => setRestoreModal(null)}
           onError={(e) => setError(e)}
@@ -635,24 +637,6 @@ function RuleBox({ value, onChange }: { value: string | null; onChange: (v: stri
       onChange={(e) => onChange(e.target.value)}
     />
   )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', margin: '0.4rem 0' }}>
-      <span style={{ width: 200, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
-  )
-}
-
-const overlayStyle: CSSProperties = {
-  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
-  display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: '4vh', zIndex: 50,
-}
-const panelStyle: CSSProperties = {
-  background: '#fff', padding: '1.5rem', borderRadius: 6, minWidth: 620, maxWidth: '90vw',
-  maxHeight: '88vh', overflow: 'auto',
 }
 
 // 删除确认（§4.3）：默认只删本地配置/缓存/日志，云端 container 保留。勾选 deleteContainer 时二次
@@ -856,114 +840,6 @@ function CheckModal({
             )}
           </div>
         )}
-      </div>
-    </div>
-  )
-}
-
-function RestoreModal({
-  config, onClose, onError, onStarted,
-}: { config: BackupConfig; onClose: () => void; onError: (e: string) => void; onStarted: (s: RestoreRun) => void }) {
-  const [versions, setVersions] = useState<number[]>([])
-  const [version, setVersion] = useState<number | null>(null)
-  const [target, setTarget] = useState(config.localRoot)
-  const [unrecoverable, setUnrecoverable] = useState<string[]>([])
-  const [options, setOptions] = useState<Record<string, FileVersionOption[]>>({})
-  const [choices, setChoices] = useState<Record<string, number>>({})
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
-  }, [config.id])
-
-  useEffect(() => {
-    let cancelled = false
-    setLoading(true)
-    ;(async () => {
-      try {
-        const paths = await backupConfigsApi.unrecoverablePaths(config.id, version)
-        if (cancelled) return
-        setUnrecoverable(paths)
-        const opts: Record<string, FileVersionOption[]> = {}
-        const ch: Record<string, number> = {}
-        for (const p of paths) {
-          const cands = await backupConfigsApi.fileVersions(config.id, p)
-          opts[p] = cands
-          ch[p] = cands.length > 0 ? cands[0].version : 0 // 0 = skip
-        }
-        if (cancelled) return
-        setOptions(opts)
-        setChoices(ch)
-      } catch (e) {
-        if (!cancelled) onError(String(e))
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    })()
-    return () => { cancelled = true }
-  }, [config.id, version, onError])
-
-  const setAllNearest = () => {
-    const ch: Record<string, number> = {}
-    for (const p of unrecoverable) ch[p] = options[p]?.length ? options[p][0].version : 0
-    setChoices(ch)
-  }
-
-  const start = async () => {
-    try {
-      const subs: Record<string, number> = {}
-      for (const [p, v] of Object.entries(choices)) if (v > 0) subs[p] = v
-      const state = await backupConfigsApi.restore(config.id, target || null, version, subs)
-      onStarted(state)
-    } catch (e) {
-      onError(String(e))
-    }
-  }
-
-  return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
-        <Field label="Restore to">
-          <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
-        </Field>
-        <Field label="Version">
-          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
-            <option value="">Latest</option>
-            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
-          </select>
-        </Field>
-
-        {loading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
-        {!loading && unrecoverable.length > 0 && (
-          <div style={{ margin: '0.6rem 0' }}>
-            <div style={{ fontSize: '0.85rem', marginBottom: '0.3rem' }}>
-              {unrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
-              {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
-            </div>
-            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
-              <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Substitute from</th></tr></thead>
-              <tbody>
-                {unrecoverable.map((p) => (
-                  <tr key={p}>
-                    <td style={{ fontFamily: 'monospace' }}>{p}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
-                        <option value={0}>Skip (don't restore)</option>
-                        {(options[p] ?? []).map((o) => <option key={o.version} value={o.version}>Version {o.version}</option>)}
-                      </select>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        <div style={{ marginTop: '0.8rem' }}>
-          <button type="button" onClick={start} disabled={loading}>Start restore</button>{' '}
-          <button type="button" onClick={onClose}>Cancel</button>
-        </div>
       </div>
     </div>
   )

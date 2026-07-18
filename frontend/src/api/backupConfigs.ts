@@ -178,6 +178,27 @@ export interface FileVersionOption {
   length: number
 }
 
+// 还原树浏览节点（§4.1a）：目录的直接子节点，懒加载展开用。
+export interface TreeNode {
+  name: string
+  path: string
+  isDir: boolean
+  hasChildren: boolean
+  length: number | null
+  mtime: string | null
+  storageKind: string | null
+  storageRef: string | null
+}
+
+// 还原量估算（§4.1b）：本地纯算下载量/解压量/文件数，再对去重存储对象 HEAD 查活化状态。
+export interface RestoreEstimate {
+  downloadBytes: number
+  uncompressedBytes: number
+  fileCount: number
+  archivedObjects: number
+  rehydratePending: number
+}
+
 export const backupConfigsApi = {
   list: () => api.get<BackupConfig[]>('/backup-configs'),
   get: (id: number) => api.get<BackupConfig>(`/backup-configs/${id}`),
@@ -192,6 +213,13 @@ export const backupConfigsApi = {
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
   versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),
+  tree: (id: number, version: number | null, path: string | null) =>
+    api.get<TreeNode[]>(`/backup-configs/${id}/tree?${new URLSearchParams({
+      ...(version != null ? { version: String(version) } : {}),
+      ...(path ? { path } : {}),
+    })}`),
+  restoreEstimate: (id: number, version: number | null, paths: string[]) =>
+    api.post<RestoreEstimate>(`/backup-configs/${id}/restore-estimate`, { version, paths }),
   restore: (
     id: number,
     targetRoot: string | null,

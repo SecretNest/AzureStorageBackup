@@ -1,0 +1,465 @@
+import { useEffect, useState } from 'react'
+import {
+  backupConfigsApi,
+  RestoreConflictMode,
+  restoreConflictModeLabels,
+  RestoreRehydratePriority,
+  type BackupConfig,
+  type FileVersionOption,
+  type RestoreEstimate,
+  type RestoreRun,
+  type TreeNode,
+} from '../api/backupConfigs'
+import { Field } from './modal'
+import { overlayStyle, panelStyle } from './modalStyles'
+
+const rehydratePriorityLabels: Record<number, string> = {
+  [RestoreRehydratePriority.Standard]: 'Standard',
+  [RestoreRehydratePriority.High]: 'High (faster, more expensive)',
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let v = n / 1024
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${v.toFixed(1)} ${units[i]}`
+}
+
+// 还原对话框（§4.1a-d）：选版本 → 懒加载树浏览 + 勾选 → 防抖估算 → 冲突模式/活化优先级 → 目标根路径 → 开始还原。
+// 同时保留原有的"不可恢复文件按版本替代"能力（§4.1，需求 unrecoverable substitution）。
+export function RestoreDialog({
+  config, onClose, onError, onStarted,
+}: { config: BackupConfig; onClose: () => void; onError: (e: string) => void; onStarted: (s: RestoreRun) => void }) {
+  const [versions, setVersions] = useState<number[]>([])
+  const [version, setVersion] = useState<number | null>(null)
+  const [target, setTarget] = useState(config.localRoot)
+
+  // 不可恢复文件的按版本替代（沿用既有能力）
+  const [unrecoverable, setUnrecoverable] = useState<string[]>([])
+  const [options, setOptions] = useState<Record<string, FileVersionOption[]>>({})
+  const [choices, setChoices] = useState<Record<string, number>>({})
+  const [subsLoading, setSubsLoading] = useState(false)
+
+  // 懒加载树浏览 + 勾选选择（§4.1a/d）
+  const [treeCache, setTreeCache] = useState<Record<string, TreeNode[]>>({})
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set())
+  const [cascading, setCascading] = useState<Set<string>>(new Set())
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  // 估算 + 冲突模式 + 活化优先级（§4.1b/c/d）
+  const [estimate, setEstimate] = useState<RestoreEstimate | null>(null)
+  const [estimating, setEstimating] = useState(false)
+  const [conflict, setConflict] = useState<number>(RestoreConflictMode.OverwriteIfChanged)
+  const [rehydratePriority, setRehydratePriority] = useState<number>(RestoreRehydratePriority.Standard)
+  const [starting, setStarting] = useState(false)
+
+  useEffect(() => {
+    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+  }, [config.id])
+
+  useEffect(() => {
+    let cancelled = false
+    setSubsLoading(true)
+    ;(async () => {
+      try {
+        const paths = await backupConfigsApi.unrecoverablePaths(config.id, version)
+        if (cancelled) return
+        setUnrecoverable(paths)
+        const opts: Record<string, FileVersionOption[]> = {}
+        const ch: Record<string, number> = {}
+        for (const p of paths) {
+          const cands = await backupConfigsApi.fileVersions(config.id, p)
+          opts[p] = cands
+          ch[p] = cands.length > 0 ? cands[0].version : 0 // 0 = skip
+        }
+        if (cancelled) return
+        setOptions(opts)
+        setChoices(ch)
+      } catch (e) {
+        if (!cancelled) onError(String(e))
+      } finally {
+        if (!cancelled) setSubsLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [config.id, version, onError])
+
+  // 版本切换时重置树浏览状态并加载根目录（本地权威索引读，快，不触云）。
+  useEffect(() => {
+    setTreeCache({})
+    setExpanded(new Set())
+    setSelected(new Set())
+    setEstimate(null)
+    let cancelled = false
+    setLoadingDirs((s) => new Set(s).add(''))
+    ;(async () => {
+      try {
+        const kids = await backupConfigsApi.tree(config.id, version, null)
+        if (!cancelled) setTreeCache((c) => ({ ...c, '': kids }))
+      } catch (e) {
+        if (!cancelled) onError(String(e))
+      } finally {
+        if (!cancelled) {
+          setLoadingDirs((s) => {
+            const n = new Set(s)
+            n.delete('')
+            return n
+          })
+        }
+      }
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line -- oxlint 未启用 exhaustive-deps；onError 每次渲染新引用，特意不纳入依赖避免树重复抓取
+  }, [config.id, version])
+
+  // 勾选变化防抖 ~400ms 调 restoreEstimate；未选中任何项时视为"还原整版本"，不展示估算。
+  useEffect(() => {
+    if (selected.size === 0) {
+      setEstimate(null)
+      return
+    }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      setEstimating(true)
+      backupConfigsApi
+        .restoreEstimate(config.id, version, Array.from(selected))
+        .then((est) => {
+          if (!cancelled) setEstimate(est)
+        })
+        .catch((e) => {
+          if (!cancelled) onError(String(e))
+        })
+        .finally(() => {
+          if (!cancelled) setEstimating(false)
+        })
+    }, 400)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+    // eslint-disable-next-line -- 同上，onError 不纳入依赖
+  }, [config.id, version, selected])
+
+  const toggleExpand = async (node: TreeNode) => {
+    const path = node.path
+    const willExpand = !expanded.has(path)
+    setExpanded((e) => {
+      const n = new Set(e)
+      if (willExpand) n.add(path)
+      else n.delete(path)
+      return n
+    })
+    if (willExpand && !treeCache[path]) {
+      setLoadingDirs((s) => new Set(s).add(path))
+      try {
+        const kids = await backupConfigsApi.tree(config.id, version, path)
+        setTreeCache((c) => ({ ...c, [path]: kids }))
+      } catch (e) {
+        onError(String(e))
+      } finally {
+        setLoadingDirs((s) => {
+          const n = new Set(s)
+          n.delete(path)
+          return n
+        })
+      }
+    }
+  }
+
+  // 递归拉取整棵子树的全部文件路径（本地索引读，快）。同时把沿途目录塞进 children 缓存供浏览复用。
+  const fetchAllFiles = async (dirPath: string): Promise<string[]> => {
+    const kids = await backupConfigsApi.tree(config.id, version, dirPath || null)
+    setTreeCache((c) => ({ ...c, [dirPath]: kids }))
+    const nested = await Promise.all(
+      kids.map(async (k) => {
+        if (k.isDir) return k.hasChildren ? fetchAllFiles(k.path) : []
+        return [k.path]
+      }),
+    )
+    return nested.flat()
+  }
+
+  // 文件夹勾选级联全选/取消整棵子树（递归抓取，非仅已加载节点，避免"漏选未展开子目录"的坑）。
+  const toggleFolder = async (node: TreeNode) => {
+    setCascading((s) => new Set(s).add(node.path))
+    try {
+      const files = node.hasChildren ? await fetchAllFiles(node.path) : []
+      setSelected((sel) => {
+        const next = new Set(sel)
+        const allSelected = files.length > 0 && files.every((f) => next.has(f))
+        for (const f of files) {
+          if (allSelected) next.delete(f)
+          else next.add(f)
+        }
+        return next
+      })
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      setCascading((s) => {
+        const n = new Set(s)
+        n.delete(node.path)
+        return n
+      })
+    }
+  }
+
+  const toggleFile = (path: string) => {
+    setSelected((sel) => {
+      const next = new Set(sel)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }
+
+  // 文件夹勾选态（checked/indeterminate/unchecked）仅基于已加载（缓存中）的后代文件——尚未展开的
+  // 子目录不计入。这与 toggleFolder 的即时递归抓取不同：抓取完成后缓存已补齐，态会立即反映最新选择。
+  const collectLoadedFiles = (dirPath: string): string[] => {
+    const kids = treeCache[dirPath]
+    if (!kids) return []
+    let out: string[] = []
+    for (const k of kids) {
+      if (k.isDir) out = out.concat(collectLoadedFiles(k.path))
+      else out.push(k.path)
+    }
+    return out
+  }
+  const folderState = (dirPath: string): 'checked' | 'indeterminate' | 'unchecked' => {
+    const files = collectLoadedFiles(dirPath)
+    if (files.length === 0) return 'unchecked'
+    const n = files.filter((f) => selected.has(f)).length
+    if (n === 0) return 'unchecked'
+    return n === files.length ? 'checked' : 'indeterminate'
+  }
+
+  const setAllNearest = () => {
+    const ch: Record<string, number> = {}
+    for (const p of unrecoverable) ch[p] = options[p]?.length ? options[p][0].version : 0
+    setChoices(ch)
+  }
+
+  const start = async () => {
+    setStarting(true)
+    try {
+      const subs: Record<string, number> = {}
+      for (const [p, v] of Object.entries(choices)) if (v > 0) subs[p] = v
+      const selectedPaths = selected.size > 0 ? Array.from(selected) : undefined
+      const state = await backupConfigsApi.restore(
+        config.id, target || null, version, subs, selectedPaths, conflict, rehydratePriority,
+      )
+      onStarted(state)
+    } catch (e) {
+      onError(String(e))
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
+        <Field label="Restore to">
+          <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
+        </Field>
+        <Field label="Version">
+          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
+            <option value="">Latest</option>
+            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </Field>
+
+        {subsLoading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
+        {!subsLoading && unrecoverable.length > 0 && (
+          <div style={{ margin: '0.6rem 0' }}>
+            <div style={{ fontSize: '0.85rem', marginBottom: '0.3rem' }}>
+              {unrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
+              {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
+            </div>
+            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+              <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Substitute from</th></tr></thead>
+              <tbody>
+                {unrecoverable.map((p) => (
+                  <tr key={p}>
+                    <td style={{ fontFamily: 'monospace' }}>{p}</td>
+                    <td style={{ textAlign: 'center' }}>
+                      <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
+                        <option value={0}>Skip (don't restore)</option>
+                        {(options[p] ?? []).map((o) => <option key={o.version} value={o.version}>Version {o.version}</option>)}
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div style={{ margin: '0.8rem 0 0.3rem', fontWeight: 600, fontSize: '0.9rem' }}>
+          Select files/folders (optional)
+        </div>
+        <div style={{ fontSize: '0.8rem', color: '#666', marginBottom: '0.4rem' }}>
+          Leave nothing selected to restore the entire version. Checking a folder selects its whole subtree
+          (fetched recursively — may take a moment for large folders).
+        </div>
+        <div style={{ maxHeight: 260, overflow: 'auto', border: '1px solid #ddd', padding: '0.4rem', fontFamily: 'monospace' }}>
+          {loadingDirs.has('') ? (
+            <div style={{ fontSize: '0.8rem', color: '#888' }}>Loading…</div>
+          ) : (
+            <TreeBrowser
+              dirPath=""
+              depth={0}
+              tree={treeCache}
+              expanded={expanded}
+              loadingDirs={loadingDirs}
+              cascading={cascading}
+              selected={selected}
+              folderState={folderState}
+              onToggleExpand={toggleExpand}
+              onToggleFolder={toggleFolder}
+              onToggleFile={toggleFile}
+            />
+          )}
+        </div>
+        <div style={{ fontSize: '0.8rem', color: '#555', margin: '0.3rem 0 0.8rem' }}>
+          {selected.size} file(s) selected
+          {selected.size > 0 && (
+            <>{' '}<button type="button" onClick={() => setSelected(new Set())}>Clear selection</button></>
+          )}
+        </div>
+
+        {selected.size > 0 && (
+          <div style={{ margin: '0.4rem 0 0.8rem', padding: '0.6rem', border: '1px solid #ddd', fontSize: '0.85rem' }}>
+            {estimating && <div style={{ color: '#888' }}>Estimating…</div>}
+            {!estimating && estimate && (
+              <>
+                <div>
+                  Download: {formatBytes(estimate.downloadBytes)} — Uncompressed: {formatBytes(estimate.uncompressedBytes)}
+                  {' '}— {estimate.fileCount} file(s)
+                </div>
+                {estimate.archivedObjects > 0 && (
+                  <div style={{ color: '#b06a00', marginTop: '0.4rem' }}>
+                    {estimate.archivedObjects} archived object(s) need rehydration before download
+                    (typically several hours){estimate.rehydratePending > 0 && ` — ${estimate.rehydratePending} already rehydrating`}.
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {selected.size > 0 && estimate && estimate.archivedObjects > 0 && (
+          <Field label="Rehydrate priority">
+            <select value={rehydratePriority} onChange={(e) => setRehydratePriority(Number(e.target.value))}>
+              {Object.entries(rehydratePriorityLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </Field>
+        )}
+
+        <Field label="On conflict">
+          <select value={conflict} onChange={(e) => setConflict(Number(e.target.value))}>
+            {Object.entries(restoreConflictModeLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+        </Field>
+
+        <div style={{ marginTop: '0.8rem' }}>
+          <button type="button" onClick={start} disabled={subsLoading || starting}>
+            {starting ? 'Starting…' : 'Start restore'}
+          </button>{' '}
+          <button type="button" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function TreeBrowser({
+  dirPath, depth, tree, expanded, loadingDirs, cascading, selected, folderState,
+  onToggleExpand, onToggleFolder, onToggleFile,
+}: {
+  dirPath: string
+  depth: number
+  tree: Record<string, TreeNode[]>
+  expanded: Set<string>
+  loadingDirs: Set<string>
+  cascading: Set<string>
+  selected: Set<string>
+  folderState: (dirPath: string) => 'checked' | 'indeterminate' | 'unchecked'
+  onToggleExpand: (node: TreeNode) => void
+  onToggleFolder: (node: TreeNode) => void
+  onToggleFile: (path: string) => void
+}) {
+  const nodes = tree[dirPath] ?? []
+  if (nodes.length === 0) {
+    return depth === 0 ? <div style={{ fontSize: '0.8rem', color: '#888' }}>Empty version</div> : null
+  }
+  return (
+    <>
+      {nodes.map((node) => {
+        const state = node.isDir ? folderState(node.path) : undefined
+        return (
+          <div key={node.path}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', paddingLeft: depth * 16, fontSize: '0.82rem' }}>
+              {node.isDir ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => onToggleExpand(node)}
+                    disabled={!node.hasChildren}
+                    style={{ width: 18, padding: 0, background: 'none', border: 'none', cursor: node.hasChildren ? 'pointer' : 'default' }}
+                  >
+                    {node.hasChildren ? (expanded.has(node.path) ? '▾' : '▸') : ' '}
+                  </button>
+                  <input
+                    type="checkbox"
+                    checked={state === 'checked'}
+                    ref={(el) => {
+                      if (el) el.indeterminate = state === 'indeterminate'
+                    }}
+                    disabled={cascading.has(node.path)}
+                    onChange={() => onToggleFolder(node)}
+                  />
+                  <span style={{ fontWeight: 500 }}>{node.name}/</span>
+                  {cascading.has(node.path) && <span style={{ color: '#888' }}>loading…</span>}
+                </>
+              ) : (
+                <>
+                  <span style={{ width: 18, display: 'inline-block' }} />
+                  <input type="checkbox" checked={selected.has(node.path)} onChange={() => onToggleFile(node.path)} />
+                  <span>{node.name}</span>
+                  {node.length != null && <span style={{ color: '#888', marginLeft: 6 }}>{formatBytes(node.length)}</span>}
+                </>
+              )}
+            </div>
+            {node.isDir && expanded.has(node.path) && (
+              loadingDirs.has(node.path) ? (
+                <div style={{ paddingLeft: (depth + 1) * 16, fontSize: '0.8rem', color: '#888' }}>Loading…</div>
+              ) : (
+                <TreeBrowser
+                  dirPath={node.path}
+                  depth={depth + 1}
+                  tree={tree}
+                  expanded={expanded}
+                  loadingDirs={loadingDirs}
+                  cascading={cascading}
+                  selected={selected}
+                  folderState={folderState}
+                  onToggleExpand={onToggleExpand}
+                  onToggleFolder={onToggleFolder}
+                  onToggleFile={onToggleFile}
+                />
+              )
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
+}
