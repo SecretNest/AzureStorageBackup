@@ -80,6 +80,7 @@ export function BackupConfigsPage() {
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [postCreate, setPostCreate] = useState<BackupConfig | null>(null)
 
   const load = () => {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(String(e)))
@@ -154,8 +155,13 @@ export function BackupConfigsPage() {
     setBusy(true)
     setError(null)
     try {
-      if (editing) await backupConfigsApi.update(editing.id, form)
-      else await backupConfigsApi.create(form)
+      if (editing) {
+        await backupConfigsApi.update(editing.id, form)
+      } else {
+        // §4.6: 新建成功后不直接关闭，而是提示是否立即运行首次备份。
+        const created = await backupConfigsApi.create(form)
+        setPostCreate(created)
+      }
       setShowForm(false)
       load()
     } catch (e) {
@@ -545,6 +551,16 @@ export function BackupConfigsPage() {
           onConfirm={(deleteContainer) => remove(deleteModal, deleteContainer)}
         />
       )}
+      {postCreate && (
+        <PostCreateModal
+          config={postCreate}
+          onRunNow={() => {
+            setPostCreate(null)
+            void run(postCreate)
+          }}
+          onNotNow={() => setPostCreate(null)}
+        />
+      )}
     </section>
   )
 }
@@ -678,6 +694,29 @@ function DeleteModal({
           </button>{' '}
           <button type="button" onClick={onClose}>
             Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// §4.6：新建配置成功后，提示是否立即运行首次备份。"Run now" 复用表格行同款 run+poll 逻辑
+// （进度显示在该配置所在行，无独立进度页）。
+function PostCreateModal({
+  config, onRunNow, onNotNow,
+}: { config: BackupConfig; onRunNow: () => void; onNotNow: () => void }) {
+  return (
+    <div style={overlayStyle} onClick={onNotNow}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Backup Created — {config.name}</h3>
+        <p>Run the first backup now?</p>
+        <div style={{ marginTop: '1rem' }}>
+          <button type="button" onClick={onRunNow}>
+            Run first backup now
+          </button>{' '}
+          <button type="button" onClick={onNotNow}>
+            Not now
           </button>
         </div>
       </div>
