@@ -81,7 +81,7 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 
             // 操作日志已记录本次备份（M8 接线验证）
-            var logs = await _client.GetFromJsonAsync<LogRow[]>($"/api/logs?source=backup:{containerName}");
+            var logs = await _client.GetFromJsonAsync<LogRow[]>($"/api/logs?source=backup:{account.Id}/{containerName}");
             Assert.Contains(logs!, l => l.message.Contains("Backup succeeded"));
         }
         finally
