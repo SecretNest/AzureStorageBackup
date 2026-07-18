@@ -61,4 +61,41 @@ public sealed class NotificationRequestBuilderTests
 
         Assert.Equal("text/plain", req.Content!.Headers.ContentType!.MediaType);
     }
+
+    [Fact]
+    public async Task Post_With_Plain_ContentType_Defaults_CharSet_To_Utf8()
+    {
+        // Backward-compat: StringContent used to always declare "; charset=utf-8" on the wire.
+        // Configuring a bare content-type (no charset param) must still yield that on the header.
+        var cfg = new NotificationConfig
+        {
+            Url = "https://hook.example/notify",
+            Method = NotificationMethod.Post,
+            BodyTemplate = "{}",
+            ContentType = "application/json",
+        };
+
+        using var req = NotificationRequestBuilder.Build(cfg, "t", "b");
+
+        Assert.Equal("application/json", req.Content!.Headers.ContentType!.MediaType);
+        Assert.Equal("utf-8", req.Content.Headers.ContentType!.CharSet);
+    }
+
+    [Fact]
+    public async Task Post_With_Explicit_CharSet_Is_Preserved()
+    {
+        // An explicitly-configured charset must not be silently overwritten with utf-8.
+        var cfg = new NotificationConfig
+        {
+            Url = "https://hook.example/notify",
+            Method = NotificationMethod.Post,
+            BodyTemplate = "{}",
+            ContentType = "application/json; charset=utf-16",
+        };
+
+        using var req = NotificationRequestBuilder.Build(cfg, "t", "b");
+
+        Assert.Equal("application/json", req.Content!.Headers.ContentType!.MediaType);
+        Assert.Equal("utf-16", req.Content.Headers.ContentType!.CharSet);
+    }
 }

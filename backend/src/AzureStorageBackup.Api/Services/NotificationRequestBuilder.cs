@@ -21,8 +21,14 @@ public static class NotificationRequestBuilder
         // Use the 2-arg StringContent ctor + MediaTypeHeaderValue.Parse rather than the 3-arg ctor,
         // because StringContent's mediaType parameter rejects parameterized values (e.g. "; charset=utf-8")
         // with a FormatException. MediaTypeHeaderValue.Parse handles the full media-type grammar.
+        var mediaType = MediaTypeHeaderValue.Parse(contentType);
+        // Preserve prior wire behavior: StringContent used to always declare "; charset=utf-8"
+        // for content-types that didn't specify one. Only default it in when the configured
+        // content-type omits a charset param; an explicitly-configured charset is left untouched.
+        if (string.IsNullOrEmpty(mediaType.CharSet))
+            mediaType.CharSet = "utf-8";
         var content = new StringContent(payload, Encoding.UTF8);
-        content.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
+        content.Headers.ContentType = mediaType;
         req.Content = content;
         return req;
     }
