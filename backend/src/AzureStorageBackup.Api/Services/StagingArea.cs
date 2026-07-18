@@ -50,18 +50,27 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, lo
         {
             try { File.Delete(file); } catch { /* best effort */ }
         }
+        // 删空的 GUID 子目录。
+        foreach (var dir in item.Files.Select(Path.GetDirectoryName).Distinct())
+        {
+            try { if (dir is not null && !Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir); }
+            catch { /* best effort */ }
+        }
         Interlocked.Add(ref _stagedBytes, -item.Bytes);
         _releaseSignal.Release();
     }
 
     private StagedItem MoveToStaged(IReadOnlyList<string> producedFiles)
     {
+        // 每次暂存独立 GUID 子目录：不同备份即使产出同名文件也不互相覆盖（跨 container 并发安全）。
+        var subDir = Path.Combine(stagedTempDir, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(subDir);
         var staged = new List<string>(producedFiles.Count);
         long bytes = 0;
         foreach (var src in producedFiles)
         {
-            var dest = Path.Combine(stagedTempDir, Path.GetFileName(src));
-            File.Move(src, dest, overwrite: true);
+            var dest = Path.Combine(subDir, Path.GetFileName(src));
+            File.Move(src, dest, overwrite: false);
             bytes += new FileInfo(dest).Length;
             staged.Add(dest);
         }

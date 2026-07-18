@@ -42,10 +42,35 @@ public sealed class StagingAreaTests : IDisposable
 
         Assert.Empty(Directory.GetFiles(_compressTemp));               // moved out of compress-temp
         var staged = Assert.Single(item.Files);
-        Assert.Equal(_stagedTemp, Path.GetDirectoryName(staged));       // now in staged-temp
+        // 现在暂存文件在 staged-temp 的 GUID 子目录里（跨备份隔离，防同名覆盖）。
+        Assert.Equal(_stagedTemp, Path.GetDirectoryName(Path.GetDirectoryName(staged)));
         Assert.True(File.Exists(staged));
         Assert.Equal(500, item.Bytes);
         Assert.Equal(500, area.StagedBytes);
+    }
+
+    [Fact]
+    public async Task Concurrent_Same_Named_Outputs_Do_Not_Collide()
+    {
+        using var area = Area(limit: 1_000_000);
+
+        // 两次暂存产出「同名」文件（模拟不同 container 都从 p0001.7z 起）。
+        // 压缩串行，但两份必须落在不同子目录、内容各自完整。
+        var item1 = await area.StageAsync(Produce("p0001.7z", 100));
+        var item2 = await area.StageAsync(Produce("p0001.7z", 200));
+
+        var f1 = Assert.Single(item1.Files);
+        var f2 = Assert.Single(item2.Files);
+        Assert.NotEqual(f1, f2);                       // 不同路径
+        Assert.True(File.Exists(f1) && File.Exists(f2));
+        Assert.Equal(100, new FileInfo(f1).Length);    // 各自内容完整、未被覆盖
+        Assert.Equal(200, new FileInfo(f2).Length);
+        Assert.Equal(300, area.StagedBytes);
+
+        area.Release(item1);
+        Assert.False(File.Exists(f1));
+        Assert.False(Directory.Exists(Path.GetDirectoryName(f1)));  // 空子目录一并清除
+        Assert.True(File.Exists(f2));
     }
 
     [Fact]
