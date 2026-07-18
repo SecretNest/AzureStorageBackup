@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 using Microsoft.Extensions.DependencyInjection;
@@ -75,6 +76,61 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created!.Id}")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+    }
+
+    // Azurite 的 well-known 账户与密钥（与其它集成测试一致，见 BackupRunEndpointsTests）。
+    private const string AzuriteKey =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    private const string AzuriteEndpoint = "http://127.0.0.1:10000/devstoreaccount1";
+
+    private static bool AzuriteReachable()
+    {
+        try { using var c = new TcpClient(); c.Connect("127.0.0.1", 10000); return true; }
+        catch { return false; }
+    }
+
+    [SkippableFact]
+    [Trait("Category", "Integration")]
+    public async Task Delete_Config_Optionally_Deletes_Cloud_Container()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var containerName = "del-" + Guid.NewGuid().ToString("N")[..8];
+
+        var accountReq = new AccountRequest("azurite", null, AzuriteEndpoint, AzureRegion.Global,
+            AzuriteKey, false, ProxyMode.Independent, null, null, null, null);
+        var account = await (await _client.PostAsJsonAsync("/api/accounts", accountReq))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var factoryClient = new BlobClientFactory();
+        var azuriteAccount = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var cc = factoryClient.CreateServiceClient(azuriteAccount).GetBlobContainerClient(containerName);
+        await cc.CreateIfNotExistsAsync();
+
+        try
+        {
+            // deleteContainer=false（默认）：本地配置删除，云端 container 仍在。
+            var config1 = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                    SampleRequest("del-keep") with { AccountId = account!.Id, ContainerName = containerName }))
+                .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+            Assert.Equal(HttpStatusCode.NoContent,
+                (await _client.DeleteAsync($"/api/backup-configs/{config1!.Id}?deleteContainer=false")).StatusCode);
+            Assert.True((await cc.ExistsAsync()).Value);
+
+            // deleteContainer=true：另建一个指向同 container 的配置，删除时云端 container 一并被删。
+            var config2 = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                    SampleRequest("del-purge") with { AccountId = account.Id, ContainerName = containerName }))
+                .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+            Assert.Equal(HttpStatusCode.NoContent,
+                (await _client.DeleteAsync($"/api/backup-configs/{config2!.Id}?deleteContainer=true")).StatusCode);
+            Assert.False((await cc.ExistsAsync()).Value);
+        }
+        finally
+        {
+            await cc.DeleteIfExistsAsync();
+        }
     }
 
     [Fact]

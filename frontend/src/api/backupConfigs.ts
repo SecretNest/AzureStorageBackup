@@ -175,7 +175,8 @@ export const backupConfigsApi = {
     api.post<BackupConfig>('/backup-configs/import', { accountId, containerName, password }),
   update: (id: number, input: BackupConfigInput) =>
     api.put<BackupConfig>(`/backup-configs/${id}`, input),
-  remove: (id: number) => api.del(`/backup-configs/${id}`),
+  remove: (id: number, deleteContainer = false) =>
+    api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`),
   resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),

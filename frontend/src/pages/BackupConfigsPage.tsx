@@ -71,6 +71,7 @@ export function BackupConfigsPage() {
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
+  const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
@@ -162,10 +163,10 @@ export function BackupConfigsPage() {
     }
   }
 
-  const remove = async (c: BackupConfig) => {
-    if (!window.confirm(`Delete backup "${c.name}"?`)) return
+  const remove = async (c: BackupConfig, deleteContainer: boolean) => {
     try {
-      await backupConfigsApi.remove(c.id)
+      await backupConfigsApi.remove(c.id, deleteContainer)
+      setDeleteModal(null)
       load()
     } catch (e) {
       setError(String(e))
@@ -324,7 +325,7 @@ export function BackupConfigsPage() {
                   <button type="button" onClick={() => startEdit(c)}>
                     Edit
                   </button>{' '}
-                  <button type="button" onClick={() => remove(c)}>
+                  <button type="button" onClick={() => setDeleteModal(c)}>
                     Delete
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
@@ -535,6 +536,13 @@ export function BackupConfigsPage() {
           }}
         />
       )}
+      {deleteModal && (
+        <DeleteModal
+          config={deleteModal}
+          onClose={() => setDeleteModal(null)}
+          onConfirm={(deleteContainer) => remove(deleteModal, deleteContainer)}
+        />
+      )}
     </section>
   )
 }
@@ -645,6 +653,52 @@ const overlayStyle: CSSProperties = {
 const panelStyle: CSSProperties = {
   background: '#fff', padding: '1.5rem', borderRadius: 6, minWidth: 620, maxWidth: '90vw',
   maxHeight: '88vh', overflow: 'auto',
+}
+
+// 删除确认（§4.3）：默认只删本地配置/缓存/日志，云端 container 保留。勾选 deleteContainer 时二次
+// window.confirm 强调不可逆，避免误删整个 container。
+function DeleteModal({
+  config, onClose, onConfirm,
+}: { config: BackupConfig; onClose: () => void; onConfirm: (deleteContainer: boolean) => void }) {
+  const [deleteContainer, setDeleteContainer] = useState(false)
+
+  const confirm = () => {
+    if (deleteContainer) {
+      const sure = window.confirm(
+        `This will PERMANENTLY delete the Azure container "${config.containerName}" and ALL backup data in it. ` +
+          'This cannot be undone. Are you absolutely sure?',
+      )
+      if (!sure) return
+    }
+    onConfirm(deleteContainer)
+  }
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Delete Backup — {config.name}</h3>
+        <p>This removes the local backup configuration, cached index, and logs.</p>
+        <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.8rem 0' }}>
+          <input
+            type="checkbox"
+            checked={deleteContainer}
+            onChange={(e) => setDeleteContainer(e.target.checked)}
+          />
+          <span style={{ color: deleteContainer ? 'crimson' : undefined }}>
+            Also delete cloud container (irreversible — erases all backup data)
+          </span>
+        </label>
+        <div style={{ marginTop: '1rem' }}>
+          <button type="button" onClick={confirm}>
+            Delete
+          </button>{' '}
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function CheckModal({
