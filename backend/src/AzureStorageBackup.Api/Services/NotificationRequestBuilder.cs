@@ -1,3 +1,4 @@
+using System.Net.Http.Headers;
 using System.Text;
 using AzureStorageBackup.Api.Models;
 
@@ -16,8 +17,13 @@ public static class NotificationRequestBuilder
 
         var req = new HttpRequestMessage(HttpMethod.Post, url);
         var payload = Substitute(config.BodyTemplate ?? "", title, body, urlEncode: false);
-        req.Content = new StringContent(payload, Encoding.UTF8,
-            string.IsNullOrWhiteSpace(config.ContentType) ? "text/plain" : config.ContentType);
+        var contentType = string.IsNullOrWhiteSpace(config.ContentType) ? "text/plain" : config.ContentType;
+        // Use the 2-arg StringContent ctor + MediaTypeHeaderValue.Parse rather than the 3-arg ctor,
+        // because StringContent's mediaType parameter rejects parameterized values (e.g. "; charset=utf-8")
+        // with a FormatException. MediaTypeHeaderValue.Parse handles the full media-type grammar.
+        var content = new StringContent(payload, Encoding.UTF8);
+        content.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
+        req.Content = content;
         return req;
     }
 

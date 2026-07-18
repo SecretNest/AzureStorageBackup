@@ -52,6 +52,35 @@ public sealed class NotificationSenderTests
     }
 
     [Fact]
+    public async Task Post_With_Charset_Content_Type_Does_Not_Throw()
+    {
+        var port = FreePort();
+        using var listener = new HttpListener();
+        listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        listener.Start();
+
+        var serverTask = System.Threading.Tasks.Task.Run(async () =>
+        {
+            var ctx = await listener.GetContextAsync();
+            ctx.Response.StatusCode = 200;
+            ctx.Response.Close();
+        });
+
+        var cfg = new NotificationConfig
+        {
+            Url = $"http://127.0.0.1:{port}/hook",
+            Method = NotificationMethod.Post,
+            BodyTemplate = "{}",
+            ContentType = "application/json; charset=utf-8",
+        };
+
+        var ex = await Record.ExceptionAsync(() => new NotificationSender().SendAsync(cfg, "t", "b"));
+
+        Assert.Null(ex);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task Throws_On_Server_Error()
     {
         var port = FreePort();
