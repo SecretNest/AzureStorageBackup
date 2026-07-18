@@ -11,10 +11,11 @@ public sealed class RepairRunState
 }
 
 public sealed record RepairRunResponse(
-    string Status, IReadOnlyList<string>? Repaired, IReadOnlyList<string>? Unrecoverable, string? Error)
+    string Status, IReadOnlyList<string>? Repaired, IReadOnlyList<string>? Unrecoverable,
+    IReadOnlyList<string>? DeletedOrphans, string? Error)
 {
     public static RepairRunResponse From(RepairRunState s) => new(
-        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Error);
+        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Report?.DeletedOrphans, s.Error);
 }
 
 /// <summary>
@@ -27,7 +28,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, RepairRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate)
+    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans)
     {
         lock (_lock)
         {
@@ -36,7 +37,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var state = new RepairRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, state));
+            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, state));
             return state;
         }
     }
@@ -47,7 +48,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
-    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, RepairRunState state)
+    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, RepairRunState state)
     {
         try
         {
@@ -71,6 +72,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 {
                     Cloud = cloud,
                     RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                    ListOrphans = cleanupOrphans,
                 };
                 state.Report = await sp.GetRequiredService<BackupRepairer>().RepairAsync(
                     account, config.ContainerName, string.IsNullOrEmpty(config.Password) ? null : config.Password,

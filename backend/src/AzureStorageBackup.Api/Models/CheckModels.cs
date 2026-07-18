@@ -39,6 +39,12 @@ public sealed record CheckOptions
 
     /// <summary>Content 级遇 Archive blob 时的活化目标 tier（null=不活化，遇 Archive 记为待活化）。</summary>
     public AccessTier? RehydrateTier { get; init; }
+
+    /// <summary>
+    /// 云端列表检查（§4.8）：枚举 container 全部 blob，报告未被任何保留版本引用的孤儿（陈旧卷/失败上传残留/
+    /// ETag 冲突遗留的孤儿索引等）。仅**报告**；删除只在显式修复时发生。默认 false。
+    /// </summary>
+    public bool ListOrphans { get; init; }
 }
 
 /// <summary>某文件的云端状态。</summary>
@@ -58,6 +64,12 @@ public sealed record FileFinding(string Path, string? Ref, CloudState Cloud, Loc
 public sealed record CheckReport(int Version, IReadOnlyList<FileFinding> Findings, string? MetadataIssue = null)
 {
     public bool Ok => MetadataIssue is null && Findings.All(f => f.Cloud != CloudState.MissingOrBad);
+
+    /// <summary>
+    /// 云端列表检查（§4.8）发现的未被引用 blob 名（孤儿/垃圾）。仅在 <see cref="CheckOptions.ListOrphans"/> 时填充。
+    /// 孤儿**不影响** <see cref="Ok"/>（它们不是数据损坏，只是可回收的多余占用）。默认空。
+    /// </summary>
+    public IReadOnlyList<string> OrphanBlobs { get; init; } = [];
 
     /// <summary>坏掉的 blob 名（去重，兼容旧前端）。</summary>
     public IReadOnlyList<string> MissingRefs =>

@@ -92,7 +92,90 @@ public sealed class BackupChecker(
             findings.Add(new FileFinding(e.Path, refName, cloud, local));
         }
 
-        return new CheckReport(ver.Version, findings, metaIssue);
+        var orphans = options.ListOrphans
+            ? await ListOrphansAsync(cc, account, container, password, info, ct)
+            : [];
+
+        return new CheckReport(ver.Version, findings, metaIssue) { OrphanBlobs = orphans };
+    }
+
+    /// <summary>
+    /// 云端列表检查（§4.8）：枚举 container 全部 blob 减去引用集 = 孤儿。构不出**完整**引用集
+    /// （缺版本索引且云端读失败）→ 放弃列举、记 Warning、返回空（绝不据不完整信息把被引用 blob 当孤儿）。
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ListOrphansAsync(
+        BlobContainerClient cc, Account account, string container, string? password, BackupInfoFile info, CancellationToken ct)
+    {
+        HashSet<string> referenced;
+        try
+        {
+            referenced = await BuildReferencedSetAsync(account, container, password, info, ct);
+        }
+        catch (Exception ex)
+        {
+            if (opLog is not null)
+                await opLog.AppendAsync(OperationLogLevel.Warning, $"check:{container}",
+                    $"Orphan detection skipped: could not build the full reference set ({ex.Message}).", ct, durable: true);
+            return [];
+        }
+
+        var orphans = new List<string>();
+        await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
+            if (!referenced.Contains(b.Name))
+                orphans.Add(b.Name);
+        return orphans;
+    }
+
+    /// <summary>
+    /// 构造全部保留版本引用的 blob 名集合：读全部版本的第二级索引（本地权威 store），再调纯函数
+    /// <see cref="ReferencedBlobNames"/>。任一版本索引读不到（本地缺且云端读失败）会抛出——调用方据此放弃删除。
+    /// </summary>
+    public async Task<HashSet<string>> BuildReferencedSetAsync(
+        Account account, string container, string? password, BackupInfoFile info, CancellationToken ct = default)
+    {
+        var indexes = new Dictionary<int, VersionIndex>();
+        foreach (var ver in info.Versions)
+            indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+        return ReferencedBlobNames(info, indexes);
+    }
+
+    /// <summary>
+    /// **纯函数**：给定信息文件 + 全部保留版本索引，返回一切被引用的 blob 名（删除孤儿的承重安全依据）。涵盖：
+    /// 信息文件（明文 + 加密两种命名都保护）；每个版本的 <c>IndexBlob</c>；每个 <see cref="StorageRef"/> 的**全部分卷**
+    /// （单文件 blob 按 <see cref="StorageRef.Volumes"/>；pack 按 <see cref="PackInfo.Volumes"/>）——跨全部版本，
+    /// 含仅被旧版本引用者。pack 被引用却在 <c>info.Packs</c> 缺元数据 → 无法确定分卷数 → 抛错（迫使放弃删除）。
+    /// </summary>
+    public static HashSet<string> ReferencedBlobNames(BackupInfoFile info, IReadOnlyDictionary<int, VersionIndex> indexes)
+    {
+        var refs = new HashSet<string>(StringComparer.Ordinal)
+        {
+            // 信息文件：两种命名都纳入引用集，任何情况下都不当孤儿删除。
+            BackupDiscovery.IndexBlobName,
+            BackupDiscovery.EncryptedIndexBlobName,
+        };
+
+        // 每个版本的第二级索引 blob（即便某版本索引未在 indexes 中提供，其名也须保护）。
+        foreach (var v in info.Versions)
+            refs.Add(v.IndexBlob);
+
+        // 每个版本索引的每个存储引用的全部分卷。
+        foreach (var idx in indexes.Values)
+            foreach (var e in idx.Entries)
+            {
+                if (e.Storage is not { } s)
+                    continue;
+                var baseName = BlobNameOf(s);
+                var volumes = s.Kind == "pack"
+                    ? info.Packs.TryGetValue(s.Ref, out var pi)
+                        ? pi.Volumes
+                        : throw new InvalidOperationException(
+                            $"Pack '{s.Ref}' is referenced but missing from info.Packs; cannot determine its volumes.")
+                    : s.Volumes;
+                foreach (var name in VolumeBlobIO.VolumeNames(baseName, volumes))
+                    refs.Add(name);
+            }
+
+        return refs;
     }
 
     /// <summary>

@@ -4,8 +4,9 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>修复结果：已修复的路径、判为不可恢复的路径。</summary>
-public sealed record RepairReport(IReadOnlyList<string> Repaired, IReadOnlyList<string> Unrecoverable);
+/// <summary>修复结果：已修复的路径、判为不可恢复的路径、被回收删除的孤儿 blob 名（§4.8）。</summary>
+public sealed record RepairReport(
+    IReadOnlyList<string> Repaired, IReadOnlyList<string> Unrecoverable, IReadOnlyList<string> DeletedOrphans);
 
 /// <summary>
 /// 从**本地文件**修复云端损坏/缺失/分卷不全的 blob（显式动作，PRD 检查）：
@@ -38,57 +39,96 @@ public sealed class BackupRepairer(
             ? info.Versions.FirstOrDefault(x => x.Version == v) ?? throw new InvalidOperationException($"Version {v} not found.")
             : info.Versions[^1];
 
-        // 找出云端坏掉的 blob：用检查器（按所选深度）扫目标版本。
+        // 找出云端坏掉的 blob：用检查器（按所选深度）扫目标版本。孤儿列举留到删除步骤自行重算（TOCTOU 安全）。
         var report = await (checker ?? throw new InvalidOperationException("Repair requires a checker."))
             .CheckAsync(account, container, password, target.Version,
-                checkOptions with { Local = LocalCheckLevel.None }, localRoot, ct);
+                checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, ct);
         var badBlobs = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
-        if (badBlobs.Count == 0)
-            return new RepairReport([], []);
 
-        // 载入全部版本索引（pack 成员跨版本聚合 + 修复后同步尺寸/标记不可恢复）。
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
-        var indexes = new Dictionary<int, VersionIndex>();
-        foreach (var ver in info.Versions)
-            indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
-
         var repaired = new List<string>();
         var unrecoverable = new List<string>();
-        var changedVersions = new HashSet<int>();
+        var deletedOrphans = new List<string>();
 
-        foreach (var badRef in badBlobs)
+        if (badBlobs.Count > 0)
         {
-            if (badRef.StartsWith("packs/", StringComparison.Ordinal))
-                await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                    repaired, unrecoverable, changedVersions, ct);
+            // 载入全部版本索引（pack 成员跨版本聚合 + 修复后同步尺寸/标记不可恢复）。
+            var indexes = new Dictionary<int, VersionIndex>();
+            foreach (var ver in info.Versions)
+                indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+
+            var changedVersions = new HashSet<int>();
+            foreach (var badRef in badBlobs)
+            {
+                if (badRef.StartsWith("packs/", StringComparison.Ordinal))
+                    await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
+                        repaired, unrecoverable, changedVersions, ct);
+                else
+                    await RepairBlobAsync(account, cc, badRef, indexes, localRoot, dataTier, volumeBytes,
+                        repaired, unrecoverable, changedVersions, ct);
+            }
+
+            // 持久化被改动的版本索引 + 信息文件（经本地权威状态机，保持 ETag/缓存一致，避免下次备份 412）。
+            var identity = info.Backup.CreatedAt.UtcTicks;
+            foreach (var vnum in changedVersions)
+            {
+                await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
+                if (indexCache is not null)
+                    await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
+            }
+            if (trackedInfo is not null)
+                await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
             else
-                await RepairBlobAsync(account, cc, badRef, indexes, localRoot, dataTier, volumeBytes,
-                    repaired, unrecoverable, changedVersions, ct);
+                await store.WriteInfoAsync(account, container, info, password, ct: ct);
         }
 
-        // 持久化被改动的版本索引 + 信息文件（经本地权威状态机，保持 ETag/缓存一致，避免下次备份 412）。
-        var identity = info.Backup.CreatedAt.UtcTicks;
-        foreach (var vnum in changedVersions)
-        {
-            await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
-            if (indexCache is not null)
-                await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
-        }
-        if (trackedInfo is not null)
-            await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
-        else
-            await store.WriteInfoAsync(account, container, info, password, ct: ct);
+        // 孤儿回收（§4.8）：修复写入已落地后进行——删除前**重新**构引用集（TOCTOU 安全）。
+        if (checkOptions.ListOrphans)
+            await DeleteOrphansAsync(account, container, cc, password, deletedOrphans, ct);
 
         await Record(NotificationEvents.CheckSuccess, $"repair:{container}",
             $"Repair finished: {container}",
-            $"{repaired.Distinct().Count()} repaired, {unrecoverable.Distinct().Count()} unrecoverable", ct);
+            $"{repaired.Distinct().Count()} repaired, {unrecoverable.Distinct().Count()} unrecoverable, {deletedOrphans.Count} orphan(s) deleted", ct);
         if (unrecoverable.Count > 0)
             await Record(NotificationEvents.UnrecoverableError, $"repair:{container}",
                 $"Unrecoverable files after repair: {container}", string.Join(", ", unrecoverable.Distinct().Take(20)), ct);
 
-        return new RepairReport(repaired.Distinct().ToList(), unrecoverable.Distinct().ToList());
+        return new RepairReport(repaired.Distinct().ToList(), unrecoverable.Distinct().ToList(), deletedOrphans);
+    }
+
+    /// <summary>
+    /// 删除未被任何保留版本引用的孤儿 blob（§4.8）。**TOCTOU 安全**：删除前立刻**重新读**信息文件 + 全部版本索引
+    /// 构造引用集（反映本次修复刚落地的改动）。构不出完整引用集（信息文件消失或某版本索引读失败）→ **放弃删除**、
+    /// 记 Warning、一个都不删。绝不删除信息文件 / 索引 / 任何被引用卷（它们都在引用集内）。
+    /// </summary>
+    private async Task DeleteOrphansAsync(
+        Account account, string container, BlobContainerClient cc, string? password, List<string> deletedOrphans, CancellationToken ct)
+    {
+        HashSet<string> referenced;
+        try
+        {
+            var freshInfo = await store.ReadInfoAsync(account, container, password, ct)
+                ?? throw new InvalidOperationException("Info file not found.");
+            referenced = await (checker ?? throw new InvalidOperationException("Repair requires a checker."))
+                .BuildReferencedSetAsync(account, container, password, freshInfo, ct);
+        }
+        catch (Exception ex)
+        {
+            if (opLog is not null)
+                await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{container}",
+                    $"Orphan cleanup abandoned: could not build the full reference set ({ex.Message}). No blobs were deleted.", ct, durable: true);
+            return;
+        }
+
+        await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
+        {
+            if (referenced.Contains(b.Name))
+                continue;
+            await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+            deletedOrphans.Add(b.Name);
+        }
     }
 
     /// <summary>修复单文件 data blob：从任一引用路径的本地文件（hash 校验）重造并替换；更新全部引用版本的尺寸。</summary>

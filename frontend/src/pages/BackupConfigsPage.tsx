@@ -596,6 +596,7 @@ function CheckModal({
   const [cloud, setCloud] = useState<number>(CloudCheckLevel.ExistenceSize)
   const [local, setLocal] = useState<number>(LocalCheckLevel.Content)
   const [rehydrate, setRehydrate] = useState<number | null>(null)
+  const [listOrphans, setListOrphans] = useState(false)
   const [running, setRunning] = useState(false)
   const [report, setReport] = useState<CheckReport | null>(null)
   const [repairing, setRepairing] = useState(false)
@@ -611,7 +612,7 @@ function CheckModal({
     setRunning(true)
     setRepairReport(null)
     try {
-      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
     } catch (e) {
       onError(String(e))
     } finally {
@@ -623,7 +624,7 @@ function CheckModal({
     setRepairing(true)
     try {
       // 修复是后台 job（持锁到完成）；轮询状态。
-      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg())
+      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans)
       setRepairReport(run)
       while (run.status === 'Running') {
         await delay(1500)
@@ -631,7 +632,7 @@ function CheckModal({
         setRepairReport(run)
       }
       if (run.status === 'Completed')
-        setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg()))
+        setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
       else if (run.error) onError(run.error)
     } catch (e) {
       onError(String(e))
@@ -672,12 +673,18 @@ function CheckModal({
             </select>
           </Field>
         )}
+        <Field label="Unreferenced blobs">
+          <label style={{ fontSize: '0.85rem' }}>
+            <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
+            {' '}Detect unreferenced blobs (repair deletes them)
+          </label>
+        </Field>
 
         <div style={{ margin: '0.8rem 0' }}>
           <button type="button" onClick={runCheck} disabled={running || repairing}>
             {running ? 'Checking…' : 'Run check'}
           </button>{' '}
-          {problems.some((f) => f.repairable) && (
+          {(problems.some((f) => f.repairable) || (report?.orphanBlobs?.length ?? 0) > 0) && (
             <button type="button" onClick={runRepair} disabled={repairing || running}>
               {repairing ? 'Repairing…' : 'Repair from local'}
             </button>
@@ -696,6 +703,8 @@ function CheckModal({
                   {repairReport.unrecoverable?.length ?? 0} unrecoverable
                 </span>
                 {(repairReport.unrecoverable?.length ?? 0) > 0 && `: ${repairReport.unrecoverable!.join(', ')}`}
+                {(repairReport.deletedOrphans?.length ?? 0) > 0 &&
+                  `; deleted ${repairReport.deletedOrphans!.length} unreferenced blob(s)`}
               </>
             )}
           </div>
@@ -710,6 +719,13 @@ function CheckModal({
               {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
               {' '}(version {report.version})
             </div>
+            {listOrphans && (
+              <div style={{ fontSize: '0.85rem', margin: '0.4rem 0', color: report.orphanBlobs.length ? '#b06a00' : 'green' }}>
+                {report.orphanBlobs.length === 0
+                  ? 'No unreferenced blobs found'
+                  : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
+              </div>
+            )}
             {problems.length > 0 && (
               <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
                 <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>

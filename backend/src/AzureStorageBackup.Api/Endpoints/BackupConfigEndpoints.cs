@@ -173,12 +173,12 @@ public static class BackupConfigEndpoints
         });
 
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
-            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate);
+            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false);
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 
@@ -218,7 +218,7 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -239,6 +239,7 @@ public static class BackupConfigEndpoints
                     Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
                     Local = local ?? LocalCheckLevel.Content,
                     RehydrateTier = rehydrate is { } t ? BackupRequestMapper.MapTier(t) : null,
+                    ListOrphans = listOrphans ?? false,
                 };
                 var result = await checker.CheckAsync(account, config.ContainerName, password, version, options, config.LocalRoot, ct,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);

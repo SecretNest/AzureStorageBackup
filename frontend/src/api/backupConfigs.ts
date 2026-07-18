@@ -136,17 +136,20 @@ export interface CheckReport {
   missingRefs: string[]
   corruptedPaths: string[]
   repairablePaths: string[]
+  orphanBlobs: string[]
 }
 
 export interface RepairReport {
   repaired: string[]
   unrecoverable: string[]
+  deletedOrphans: string[]
 }
 
 export interface RepairRun {
   status: 'Running' | 'Completed' | 'Failed'
   repaired: string[] | null
   unrecoverable: string[] | null
+  deletedOrphans: string[] | null
   error: string | null
 }
 
@@ -175,19 +178,21 @@ export const backupConfigsApi = {
     api.get<FileVersionOption[]>(`/backup-configs/${id}/file-versions?path=${encodeURIComponent(path)}`),
   unrecoverablePaths: (id: number, version: number | null) =>
     api.get<string[]>(`/backup-configs/${id}/unrecoverable${version != null ? `?version=${version}` : ''}`),
-  check: (id: number, cloud: number, local: number, version: number | null = null, rehydrate: number | null = null) => {
+  check: (id: number, cloud: number, local: number, version: number | null = null, rehydrate: number | null = null, listOrphans = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     p.set('local', String(local))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
+    if (listOrphans) p.set('listOrphans', 'true')
     return api.post<CheckReport>(`/backup-configs/${id}/check?${p.toString()}`, {})
   },
-  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null) => {
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
+    if (cleanupOrphans) p.set('cleanupOrphans', 'true')
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),

@@ -55,9 +55,12 @@ public static class VolumeBlobIO
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
     }
 
-    /// <summary>新卷 blob 名集合：单卷→[baseRef]；多卷→[baseRef.001..count]。</summary>
-    private static IReadOnlyList<string> VolumeNames(string baseRef, int count)
-        => count == 1
+    /// <summary>
+    /// 归档的全部分卷 blob 名：单卷（count≤1）→[baseRef]；多卷→[baseRef.001..count]。
+    /// 单一命名真相源——上传/替换/引用集构造共用，避免各处各自拼名而漂移。
+    /// </summary>
+    public static IReadOnlyList<string> VolumeNames(string baseRef, int count)
+        => count <= 1
             ? [baseRef]
             : Enumerable.Range(1, count).Select(i => VolumeName(baseRef, i)).ToList();
 

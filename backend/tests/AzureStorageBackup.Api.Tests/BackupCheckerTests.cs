@@ -307,6 +307,75 @@ public sealed class BackupCheckerTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task List_Check_Detects_Orphans_And_Repair_Deletes_Them_Keeping_Referenced()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orph-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // v1：小文件 a.txt → pack p0001（引用），大文件 big.bin → 多卷 data blob（引用）。
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            var buf = new byte[6_000_000];
+            new Random(11).NextBytes(buf);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var hash = await new FileHasher().FullHashAsync(Path.Combine(_src, "big.bin"));
+
+            // 手动往 container 塞真孤儿 + 残余旧卷（模拟非原子替换/失败上传遗留）。
+            await container.GetBlobClient("data/ZZZ").UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
+            await container.GetBlobClient("packs/p0001.7z.099").UploadAsync(BinaryData.FromString("stale pack volume"), overwrite: true);
+            await container.GetBlobClient($"data/{hash}.099").UploadAsync(BinaryData.FromString("stale data volume"), overwrite: true);
+
+            // 列表检查：报告恰好这些孤儿；被引用/信息/索引不在孤儿中。
+            var check = await checker.CheckAsync(account, name, null, null, new CheckOptions { ListOrphans = true }, _src);
+            Assert.Contains("data/ZZZ", check.OrphanBlobs);
+            Assert.Contains("packs/p0001.7z.099", check.OrphanBlobs);
+            Assert.Contains($"data/{hash}.099", check.OrphanBlobs);
+            Assert.DoesNotContain("packs/p0001.7z", check.OrphanBlobs);
+            Assert.DoesNotContain($"data/{hash}.001", check.OrphanBlobs);
+            Assert.DoesNotContain(BackupDiscovery.IndexBlobName, check.OrphanBlobs);
+            Assert.True(check.Ok); // 孤儿不影响 Ok
+
+            // 修复删孤儿（cleanupOrphans）：即便无坏 blob 也执行删除。
+            var report = await Repairer(factory, checker).RepairAsync(
+                account, name, null, _src, null,
+                new CheckOptions { ListOrphans = true }, Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+
+            Assert.Contains("data/ZZZ", report.DeletedOrphans);
+            Assert.Contains("packs/p0001.7z.099", report.DeletedOrphans);
+            Assert.Contains($"data/{hash}.099", report.DeletedOrphans);
+
+            // 孤儿已删。
+            Assert.False((await container.GetBlobClient("data/ZZZ").ExistsAsync()).Value);
+            Assert.False((await container.GetBlobClient("packs/p0001.7z.099").ExistsAsync()).Value);
+            Assert.False((await container.GetBlobClient($"data/{hash}.099").ExistsAsync()).Value);
+            // 被引用 blob + 信息文件仍在。
+            Assert.True((await container.GetBlobClient("packs/p0001.7z").ExistsAsync()).Value);
+            Assert.True((await container.GetBlobClient($"data/{hash}.001").ExistsAsync()).Value);
+            Assert.True((await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync()).Value);
+
+            // 修复后备份仍完好。
+            Assert.True((await checker.CheckAsync(account, name, null, null, new CheckOptions())).Ok);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Deep_Check_Passes_On_Intact_Backup()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
