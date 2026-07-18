@@ -3,7 +3,7 @@
 ## 0. 范围与方法
 
 本 spec 覆盖 2026-07-18 备份功能全面审查（见 `memory/backup-audit-gaps.md`）发现的**全部**欠账：
-🔴 高危数据完整性 1 项、🟠 中危 bug 5 项、🟡 需求缺口 7 组、⚪ 低危清理 9 项，外加用户本轮追加的 2 个还原增强需求。
+🔴 高危数据完整性 1 项、🟠 中危 bug 5 项、🟡 需求缺口 8 组（含用户本轮追加的云端列表检查+孤儿回收）、⚪ 低危清理 9 项，外加用户本轮追加的 2 个还原增强需求（选择性还原估算 + pack 语义）。
 
 **执行方法**：每一项走 TDD（先写失败测试→实现→绿）。按优先级顺序：🔴 → 🟠 → 🟡 → ⚪。
 每项独立 commit。收尾要求：`dotnet build -c Release` 0 警告、非集成单测全绿、前端 build+lint 干净、CI 起 Azurite 后集成测试实跑。
@@ -76,8 +76,9 @@
 
 **修复**：引入**可覆盖上传**并改顺序为"**先传新、后删残留旧卷**"。
 - `IBlobUploader` 增 `UploadOverwriteAsync`（或给 `UploadIfMissingAsync` 加 `overwrite` 参数）；`VolumeBlobIO` 增 `ReplaceAsync(volumes...)`：以 overwrite 上传新卷 `.001..M`，**上传全部成功后**再枚举删除残留的旧 `.(M+1)..N`（新卷数 ≤ 旧卷数时）。
-- 崩溃窗口从"整 blob 丢失"降为"新旧卷混合"——数据仍在，深度检查可发现、修复可从本地重建，属可恢复态。单用户场景下此改进足够（完整两阶段 temp-blob+swap 成本高、边际收益小，不采）。
+- 崩溃窗口从"整 blob 丢失"降为"新旧卷混合"——数据仍在，深度检查可发现、修复可从本地重建，属可恢复态。单用户场景下此改进足够（完整两阶段 temp-blob+swap 成本高、边际收益小，不采）。**用户已确认接受此残余窗口**。
 - 应用点：`DeadWeightCompactor.RecompactAsync`、`BackupRepairer.ReplaceBlobAsync` + `RepairPackAsync`。
+- **配套**：残余"新旧卷混合"里多出来的旧卷（`.M+1..N` 若删除失败），以及其它来源的孤儿 blob，由新增的 **§4.8 云端列表检查 + 孤儿回收** 统一发现并在修复时删除。
 
 **测试**：装饰 uploader 在"删旧后、传新前"注入崩溃（抛异常）→ 断言旧卷仍在（未被提前删空）；正常路径断言新内容替换成功、无残留多余旧卷。
 
@@ -154,8 +155,8 @@
 ### 4.5 向导"创建后锁定基础字段"前后端强制
 **问题**：`BackupMeta` 注释称"配置创建后不可改，除名字/描述"，但 `PUT /{id}` 与前端均未强制——改 `ContainerName`/`AccountId`/`LocalRoot`/`Password`/加密性/Tier 会使本地状态（`TrackedInfoStore`/`LocalIndexCache` 按 account+container 键）与云端错位。
 **修复**：
-- 后端 `BackupConfigService.UpdateAsync`：创建后**仅允许改** `Name`/`Description`/规则（Ignore/DontCompress/DontGroup）/保留策略/`VolumeBytes`/`VerboseLogging`/并发无关项；对基础字段（AccountId/ContainerName/LocalRoot/Password/IndexTier/DataTier/加密）若与现值不同则拒绝（400，明确报"基础字段创建后不可修改"）。
-  - 注：`LocalRoot` 是否算"可改"存疑——跨设备恢复需重指定根，但那是**新建/导入**场景。此处编辑同一配置时锁定 LocalRoot 更安全。**在 spec 评审时确认**：倾向锁定，跨设备用"导入"。
+- 后端 `BackupConfigService.UpdateAsync`：创建后**仅允许改** `Name`/`Description`/规则（Ignore/DontCompress/DontGroup）/保留策略/`VolumeBytes`/`VerboseLogging`/并发无关项；对基础字段（AccountId/ContainerName/**LocalRoot**/Password/IndexTier/DataTier/加密）若与现值不同则拒绝（400，明确报"基础字段创建后不可修改"）。
+  - **`LocalRoot` 纳入锁定**（用户已确认）：编辑同一配置时不可改根，跨设备重指定根走**导入**流程。
 - 前端编辑态：基础字段渲染为只读（现向导已"编辑时字段锁定"，需确认与后端一致并补齐所有基础字段）。
 
 **测试**：`PUT` 改 ContainerName → 400；改 Name/规则 → 200。
@@ -166,12 +167,34 @@
 **测试**：前端组件测试（若有）或手动冒烟；至少保证不回归 build/lint。
 
 ### 4.7 临时区尺寸经 Settings UI 配（决策 4）
-- `GlobalSettings` 增 `StagedLimitBytes`（默认取现 `Backup:StagedLimitBytes` 或 sensible default，如 2GB）。
+- `GlobalSettings` 增 `StagedLimitBytes`（**默认 2GB** = `2L * 1024 * 1024 * 1024`，用户已确认；启动首次迁移时若 appsettings `Backup:StagedLimitBytes` 有值则作初始值）。
 - `StagingArea` 从"构造固定 `stagedLimitBytes`"改为**注入一个 provider**（`Func<long>` 或轻量 `IStagedLimitProvider`），背压判断 `while (StagedBytes >= _limit())` 每次实时读（决策 4 立即生效）。provider 实现从 `GlobalSettings` 读（带短缓存避免每次打库，或直接读单例服务）。
 - DI：`StagingArea` 单例仍全局串行压缩；provider 从 scoped `IGlobalSettingsService` 取值（用 `IServiceScopeFactory` 或缓存快照）。
 - 前端 Settings 增"Staging area size limit (MB)"字段。
 
 **测试**：provider 返回不同值 → 背压阈值随之变（单测注入可变 provider，断言超阈值阻塞、调低后放行）。
+
+### 4.8 云端列表检查 + 孤儿回收（用户本轮追加）
+
+**动机**：容器里可能残留**未被任何保留版本引用的垃圾 blob**——来源包括 §3.4 非原子窗口的残余旧卷、失败上传的半成品、ETag 冲突留下的孤儿索引 blob（§3.3）、外部误操作等。它们只占用存储、不影响还原正确性，但应能被发现并清理。
+
+**设计**：给云端检查加一个**列表检查**维度（container-wide，区别于现有按文件的 CloudCheckLevel）。
+- `CheckOptions` 增 `bool ListOrphans`（默认 false；前端"云端列表检查"勾选项触发）。
+- 开启时，`BackupChecker` 枚举 container 下全部 blob（`GetBlobsAsync`），构造**引用集** = 以下全部 blob 名的并集：
+  - 信息文件 blob（`.json` / `.json.enc`）；
+  - **每个保留版本**的 `IndexBlob`（遍历 `info.Versions`，不止被检查的那个版本）；
+  - **全部保留版本索引**里每个 `StorageRef`（data blob / pack）**含其所有分卷**（`.001..N`，按 `Volumes`/`VolumeSizes` 或前缀枚举）。
+  - 注意需读取**所有**保留版本的索引（本地权威缓存优先），否则只被旧版本引用的 blob 会被误判孤儿。
+- 引用集之外的 blob = **孤儿**，计入 `CheckReport.OrphanBlobs`（新字段 `IReadOnlyList<string>`）。检查结果 `Ok` 不因孤儿转 false（孤儿是"可清理"而非"损坏"），但报告里单独列出、前端展示数量与列表。
+- **修复删除**：`BackupRepairer.RepairAsync` 在开启列表检查/传入孤儿集时，删除 `OrphanBlobs`（`DeleteIfExistsAsync`，含分卷）。为安全起见，孤儿删除**只在显式修复**时执行（检查只报告不删），且删除前再次确认不在引用集（防 TOCTOU：删除阶段重新读一次信息文件 + 全版本索引构引用集）。
+- 端点：`/check` 增 `listOrphans=bool` 参；`/repair` 增 `cleanupOrphans=bool` 参（或复用 check 级别推导）。`RepairReport` 增 `DeletedOrphans` 字段。
+
+**安全边界**：绝不删信息文件、任何保留版本的索引 blob、任何被引用的数据/pack 卷。删除集严格 = 实际列出 − 引用集。跨设备/未同步场景（本地无全部版本索引缓存）应回落云端读全部版本索引再比对；若无法取全引用集则**放弃孤儿删除**（记 Warning，不冒险删）。
+
+**测试**：
+- 构造 container：投入 1 个被引用 pack（多卷）+ 1 个只被旧版本引用的 data blob + 1 个真正孤儿 blob + 残余旧卷 → 断言 `OrphanBlobs` 恰含孤儿与残余旧卷，**不含**被任何保留版本引用者与信息/索引 blob。
+- 修复删除后重列 container：孤儿消失，引用 blob 全在。
+- 无法取全引用集（模拟缺版本索引）→ 放弃删除、记 Warning。
 
 ---
 
@@ -194,7 +217,7 @@
 ## 6. 测试与验证策略
 
 - **纯逻辑/单测**（无需 Azurite）：StagingArea 竞态、还原替代判据、冲突模式命名、目录规则祖先匹配、估算去重、状态机迁移、原子上传顺序（fake IO）、多卷活化枚举、staging provider。
-- **集成/Azurite**：选择性还原端到端、删 container、修复后备份不 412、树/估算端点。CI 起 Azurite 后这些实跑。
+- **集成/Azurite**：选择性还原端到端、删 container、修复后备份不 412、树/估算端点、云端列表检查发现孤儿 + 修复删除。CI 起 Azurite 后这些实跑。
 - **收尾门槛**：`dotnet build -c Release` 0 警告；非集成单测全绿；CI Azurite 下集成绿；前端 build+lint 干净；真实进程冒烟（选择性还原 + 状态徽标 + 临时区尺寸改后生效）。
 
 ---
@@ -203,15 +226,15 @@
 
 1. 🔴 §2 StagingArea GUID 隔离
 2. 🟠 §3.1 还原替代判据 → §3.2 修复状态机 → §3.3 ETag 缓存失效 → §3.4 原子上传 → §3.5 多卷活化
-3. 🟡 §4.7 临时区可配（小、独立）→ §4.4 目录规则（小）→ §4.2 状态持久化（迁移，多处联动）→ §4.5 锁定基础字段 → §4.3 删 container → §4.1 还原大件（树/估算/选择性/冲突/优先级/前端）→ §4.6 向导立即备份
+3. 🟡 §4.7 临时区可配（小、独立）→ §4.4 目录规则（小）→ §4.8 云端列表检查 + 孤儿回收（承 §3.4）→ §4.2 状态持久化（迁移，多处联动）→ §4.5 锁定基础字段 → §4.3 删 container → §4.1 还原大件（树/估算/选择性/冲突/优先级/前端）→ §4.6 向导立即备份
 4. ⚪ §5.1–5.8 清理 → §5.9 CI Azurite（最后，让全部集成测试实跑验证）
 
 > §4.1 是最大件，内部再拆：树端点 → 估算端点 → RestoreRequest 选择性+冲突+优先级 → 前端。每子件独立 TDD。
 
 ---
 
-## 待评审确认点
+## 评审确认点（已定）
 
-1. §4.5 `LocalRoot` 是否纳入"创建后锁定"（倾向锁定，跨设备走导入）。
-2. §3.4 原子性采"先传新后删旧卷 + 可覆盖上传"（不采完整 temp-blob+swap），是否接受残余"新旧卷混合"窗口（可经检查/修复恢复）。
-3. §4.7 `StagedLimitBytes` 默认值（建议 2GB 或沿用现 appsettings 值）。
+1. **§4.5** `LocalRoot` **纳入创建后锁定**（用户确认），跨设备走导入。
+2. **§3.4** 原子性采"先传新卷 + 可覆盖上传，后删残留旧卷"，**接受**残余"新旧卷混合"窗口；用户追加要求：残余旧卷及其它孤儿由 **§4.8 云端列表检查 + 修复删除** 统一回收。
+3. **§4.7** `StagedLimitBytes` 默认 **2GB**（用户确认）。
