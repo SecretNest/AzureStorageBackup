@@ -111,7 +111,7 @@ public sealed class BackupChecker(
         {
             referenced = await BuildReferencedSetAsync(account, container, password, info, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             if (opLog is not null)
                 await opLog.AppendAsync(OperationLogLevel.Warning, $"check:{account.Id}/{container}",

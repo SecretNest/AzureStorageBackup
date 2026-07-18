@@ -117,7 +117,7 @@ public sealed class BackupRepairer(
             referenced = await (checker ?? throw new InvalidOperationException("Repair requires a checker."))
                 .BuildReferencedSetAsync(account, container, password, freshInfo, ct);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             if (opLog is not null)
                 await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{container}",
@@ -129,8 +129,18 @@ public sealed class BackupRepairer(
         {
             if (referenced.Contains(b.Name))
                 continue;
-            await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
-            deletedOrphans.Add(b.Name);
+            // 逐个 best-effort：单个孤儿删除失败只记 Warning 并继续，不中断其余（引用集外才到这里，绝不删有效数据）。
+            try
+            {
+                await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+                deletedOrphans.Add(b.Name);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (opLog is not null)
+                    await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{container}",
+                        $"Failed to delete orphan blob {b.Name}: {ex.Message}", ct, durable: true);
+            }
         }
     }
 
