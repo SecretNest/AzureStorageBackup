@@ -30,6 +30,37 @@ public static class VolumeBlobIO
             await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct, metadata);
     }
 
+    /// <summary>
+    /// 替换某归档全部分卷：以**覆盖**方式上传新卷（单卷→baseRef；多卷→baseRef.001..M），
+    /// 全部成功后再删除残留旧卷（尾部 .M+1..N，或旧单卷/新多卷时的旧基名等不属于新卷集者）。
+    /// **先传后删**——崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可经检查/修复恢复）。
+    /// 与 <see cref="UploadAsync"/> 同命名，并沿用**倒序上传**（.001 最后写）——首卷 .001 仍是「整族齐全」提交标记，
+    /// 使部分上传不被存在性检查误判为已完成（§7）。
+    /// </summary>
+    public static async Task ReplaceAsync(
+        IBlobUploader uploader, Account account, BlobContainerClient container, string baseRef,
+        IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+        IReadOnlyDictionary<string, string>? metadata = null)
+    {
+        var newNames = VolumeNames(baseRef, volumeFiles.Count);
+
+        // 1) 覆盖上传新卷。倒序（.00M 先、.001 最后）保持提交标记语义。单卷时循环仅一次写 baseRef。
+        for (var i = volumeFiles.Count - 1; i >= 0; i--)
+            await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
+
+        // 2) 删除不属于新卷集的残留旧卷（如旧卷数 > 新卷数的尾部，或单卷↔多卷切换后的旧命名）。
+        var keep = new HashSet<string>(newNames, StringComparer.Ordinal);
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
+            if (!keep.Contains(b.Name))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+    }
+
+    /// <summary>新卷 blob 名集合：单卷→[baseRef]；多卷→[baseRef.001..count]。</summary>
+    private static IReadOnlyList<string> VolumeNames(string baseRef, int count)
+        => count == 1
+            ? [baseRef]
+            : Enumerable.Range(1, count).Select(i => VolumeName(baseRef, i)).ToList();
+
     /// <summary>归档是否存在（单卷或多卷首卷）。多卷上传倒序，故 .001 在即代表整族齐全。</summary>
     public static async Task<bool> ExistsAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
         => (await cc.GetBlobClient(baseRef).ExistsAsync(ct)).Value

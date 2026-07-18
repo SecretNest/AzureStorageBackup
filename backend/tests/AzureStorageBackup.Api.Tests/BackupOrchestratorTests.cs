@@ -212,6 +212,12 @@ public sealed class BackupOrchestratorTests : IDisposable
             finally { lock (_l) _current--; }
         }
 
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
         public Task UploadBatchAsync(
             Account account, string container, IReadOnlyList<UploadItem> items,
             int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
@@ -233,6 +239,16 @@ public sealed class BackupOrchestratorTests : IDisposable
             if (blobName.StartsWith("data/", StringComparison.Ordinal))
                 Interlocked.Increment(ref _dataUploads);
             return inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            if (blobName.StartsWith("data/", StringComparison.Ordinal))
+                Interlocked.Increment(ref _dataUploads);
+            return inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
         }
 
         public Task UploadBatchAsync(

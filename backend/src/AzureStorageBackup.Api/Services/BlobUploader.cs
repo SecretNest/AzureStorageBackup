@@ -16,6 +16,13 @@ public interface IBlobUploader
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null);
 
+    /// <summary>覆盖上传文件到 blob（带 Tier + 可选元数据），**不做**存在性短路——目标存在也直接覆盖。
+    /// 原子替换用：先覆盖上传新卷、再删残留旧卷，使崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可修复）。</summary>
+    Task UploadOverwriteAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+        IReadOnlyDictionary<string, string>? metadata = null);
+
     /// <summary>并发上传一批项，上限 maxConcurrency。</summary>
     Task UploadBatchAsync(
         Account account, string container, IReadOnlyList<UploadItem> items,
@@ -24,16 +31,30 @@ public interface IBlobUploader
 
 public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
 {
-    public async Task<bool> UploadIfMissingAsync(
+    public Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null)
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata);
+
+    public async Task UploadOverwriteAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+        IReadOnlyDictionary<string, string>? metadata = null)
+        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata);
+
+    /// <summary>上传核心：overwrite=false 时若 blob 已存在则短路返回 false（if-missing 语义）；
+    /// overwrite=true 时直接覆盖上传。返回是否实际上传。</summary>
+    private async Task<bool> UploadCoreAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, bool overwrite, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata)
     {
         var blob = factory.CreateServiceClient(account)
             .GetBlobContainerClient(container)
             .GetBlobClient(blobName);
 
-        if ((await blob.ExistsAsync(ct)).Value)
+        if (!overwrite && (await blob.ExistsAsync(ct)).Value)
             return false;
 
         var options = new BlobUploadOptions { AccessTier = tier };

@@ -225,6 +225,126 @@ public sealed class DeadWeightCompactorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>装饰 uploader：上传（if-missing 与 overwrite 皆然）一律抛异常，模拟"传新阶段"崩溃。</summary>
+    private sealed class FailingUploader(IBlobUploader inner) : IBlobUploader
+    {
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new IOException("injected upload failure");
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new IOException("injected upload failure");
+
+        public Task UploadBatchAsync(
+            Account account, string container, IReadOnlyList<UploadItem> items,
+            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
+            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
+    }
+
+    /// <summary>记录 overwrite 上传顺序、并真正委托 inner 上传（供 ReplaceAsync 残留删除生效）。</summary>
+    private sealed class RecordingUploader(IBlobUploader inner) : IBlobUploader
+    {
+        public List<string> OverwriteOrder { get; } = [];
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            OverwriteOrder.Add(blobName);
+            return inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+
+        public Task UploadBatchAsync(
+            Account account, string container, IReadOnlyList<UploadItem> items,
+            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
+            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
+    }
+
+    // 传新阶段崩溃：旧 pack 分卷仍完整存在（此前 delete-first 会导致这里被删空 → 整 blob 丢失）。
+    [SkippableFact]
+    public async Task Recompact_Failure_During_Upload_Leaves_Old_Volumes_Intact()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var name = RandomName("dwc-failupload-");
+        var (info, live, container, account) = await SetupAsync(name);
+        try
+        {
+            Write(_local, "b.txt", new string('b', 2000));
+            Write(_local, "c.txt", new string('c', 2000));
+
+            // 用「上传即抛」的装饰 uploader；CompactAsync 逐 pack 吞掉异常，关键是旧数据须在失败后仍在。
+            var compactor = new DeadWeightCompactor(
+                new FailingUploader(new BlobUploader(new BlobClientFactory())),
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact-fail"));
+
+            await compactor.CompactAsync(account, container, null, info, live,
+                AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
+
+            var remaining = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                BlobTraits.None, BlobStates.None, "packs/p0001.7z", CancellationToken.None))
+                remaining.Add(b.Name);
+            Assert.NotEmpty(remaining); // delete-first 会让这里为空
+
+            // 旧 pack 内容未被破坏，仍是原 3 成员。
+            Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container));
+            // 死重被记录、成员未变（本次压实放弃）。
+            Assert.Equal(3, info.Packs["p0001"].Members.Count);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    // ReplaceAsync：覆盖上传新卷（倒序，.001 最后作提交标记）+ 删除残留旧卷（新卷数 < 旧卷数的尾部）。
+    [SkippableFact]
+    public async Task ReplaceAsync_Overwrites_New_Deletes_Residual_And_Uploads_First_Volume_Last()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var factory = new BlobClientFactory();
+        var account = AzuriteAccount();
+        var name = RandomName("vbio-replace-");
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await cc.CreateIfNotExistsAsync();
+        try
+        {
+            const string baseRef = "data/x.7z";
+            // 旧：3 卷。
+            await cc.GetBlobClient(baseRef + ".001").UploadAsync(BinaryData.FromString("OLD1"), overwrite: true);
+            await cc.GetBlobClient(baseRef + ".002").UploadAsync(BinaryData.FromString("OLD2"), overwrite: true);
+            await cc.GetBlobClient(baseRef + ".003").UploadAsync(BinaryData.FromString("OLD3"), overwrite: true);
+
+            // 新：2 卷。
+            var f1 = Path.Combine(_temp, "n1"); File.WriteAllText(f1, "NEW1");
+            var f2 = Path.Combine(_temp, "n2"); File.WriteAllText(f2, "NEW2");
+
+            var rec = new RecordingUploader(new BlobUploader(factory));
+            await VolumeBlobIO.ReplaceAsync(rec, account, cc, baseRef, [f1, f2], AccessTier.Hot, retry: null, CancellationToken.None);
+
+            // 倒序上传：.002 先、.001 最后（提交标记）。
+            Assert.Equal([baseRef + ".002", baseRef + ".001"], rec.OverwriteOrder);
+            // 新内容覆盖旧卷。
+            Assert.Equal("NEW1", (await cc.GetBlobClient(baseRef + ".001").DownloadContentAsync()).Value.Content.ToString());
+            Assert.Equal("NEW2", (await cc.GetBlobClient(baseRef + ".002").DownloadContentAsync()).Value.Content.ToString());
+            // 残留旧卷 .003 已删。
+            Assert.False((await cc.GetBlobClient(baseRef + ".003").ExistsAsync()).Value);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task Downloads_To_Fill_Missing_Members_When_Download_Enabled()
     {

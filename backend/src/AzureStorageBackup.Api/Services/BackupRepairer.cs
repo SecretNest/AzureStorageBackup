@@ -189,14 +189,13 @@ public sealed class BackupRepairer(
                 return;
             }
 
-            // 用可得成员重压，覆盖同 packId（先删旧全部分卷）。
+            // 用可得成员重压，替换同 packId：先覆盖上传新卷、后删残留旧卷（不再先删空）。
             var outDir = Path.Combine(work, "out");
             Directory.CreateDirectory(outDir);
             var output = Path.Combine(outDir, packId + ".7z");
             var result = await compressor.CompressAsync(
                 new CompressionRequest(composeDir, available, output, password, VolumeBytes: volumeBytes, StoreOnly: false), ct);
-            await DeleteVolumesAsync(cc, packBlobRef, ct);
-            await VolumeBlobIO.UploadAsync(uploader, account, cc.Name, packBlobRef, result.VolumeFiles, dataTier, retry: null, ct);
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, packBlobRef, result.VolumeFiles, dataTier, retry: null, ct);
             var newSizes = result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
 
             if (info.Packs.TryGetValue(packId, out var pi))
@@ -214,15 +213,13 @@ public sealed class BackupRepairer(
         }
     }
 
-    /// <summary>删旧全部分卷 + 上传新内容替换单文件 blob。返回新各分卷尺寸。</summary>
+    /// <summary>上传新内容替换单文件 blob：先覆盖上传新卷、后删残留旧卷（不再先删空）。返回新各分卷尺寸。</summary>
     private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier, long? volumeBytes, CancellationToken ct)
     {
-        await DeleteVolumesAsync(cc, blobRef, ct);
-
         if (raw)
         {
-            await VolumeBlobIO.UploadAsync(uploader, account, cc.Name, blobRef, [localSource], dataTier, retry: null, ct,
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct,
                 new Dictionary<string, string> { ["raw"] = "1" });
             return [new FileInfo(localSource).Length];
         }
@@ -236,19 +233,13 @@ public sealed class BackupRepairer(
             var entry = Path.GetFileName(localSource);
             var result = await compressor.CompressAsync(
                 new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), null, VolumeBytes: volumeBytes, StoreOnly: false), ct);
-            await VolumeBlobIO.UploadAsync(uploader, account, cc.Name, blobRef, result.VolumeFiles, dataTier, retry: null, ct);
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct);
             return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
         }
         finally
         {
             try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
         }
-    }
-
-    private static async Task DeleteVolumesAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
-    {
-        await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
-            await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
     }
 
     private static void MarkUnrecoverable(

@@ -20,6 +20,15 @@ public sealed class VolumeBlobIOTests
             return Task.FromResult(true);
         }
 
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            Order.Add(blobName);
+            return Task.CompletedTask;
+        }
+
         public Task UploadBatchAsync(
             Account account, string container, IReadOnlyList<UploadItem> items,
             int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)

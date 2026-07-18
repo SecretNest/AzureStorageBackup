@@ -124,7 +124,7 @@ public sealed class DeadWeightCompactor(
                     CopyInto(composeDir, entryName, Path.Combine(extractDir, ToLocal(entryName)));
             }
 
-            // 用仍有效成员重压成新归档，覆盖同 packId（先删旧全部分卷）。
+            // 用仍有效成员重压成新归档，替换同 packId：先覆盖上传新卷、后删残留旧卷（不再先删空）。
             var outDir = Path.Combine(work, "out");
             Directory.CreateDirectory(outDir);
             var output = Path.Combine(outDir, packId + ".7z");
@@ -132,11 +132,8 @@ public sealed class DeadWeightCompactor(
                 new CompressionRequest(composeDir, [.. live.Values.Select(m => m.EntryName)], output, password,
                     VolumeBytes: volumeBytes, StoreOnly: false), ct);
 
-            await foreach (var blob in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
-                await container.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct);
-
-            await VolumeBlobIO.UploadAsync(
-                uploader, account, container.Name, baseRef, result.VolumeFiles, dataTier, retry: null, ct);
+            await VolumeBlobIO.ReplaceAsync(
+                uploader, account, container, baseRef, result.VolumeFiles, dataTier, retry: null, ct);
             return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
         }
         finally
