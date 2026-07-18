@@ -22,7 +22,9 @@ public sealed class BackupRepairer(
     string tempRoot,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
-    BackupChecker? checker = null)
+    BackupChecker? checker = null,
+    TrackedInfoStore? trackedInfo = null,
+    ILocalIndexCache? indexCache = null)
 {
     public async Task<RepairReport> RepairAsync(
         Account account, string container, string? password, string localRoot, int? version,
@@ -66,13 +68,18 @@ public sealed class BackupRepairer(
                     repaired, unrecoverable, changedVersions, ct);
         }
 
-        // 持久化被改动的版本索引 + 信息文件。
+        // 持久化被改动的版本索引 + 信息文件（经本地权威状态机，保持 ETag/缓存一致，避免下次备份 412）。
+        var identity = info.Backup.CreatedAt.UtcTicks;
         foreach (var vnum in changedVersions)
         {
-            var ver = info.Versions.First(x => x.Version == vnum);
             await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
+            if (indexCache is not null)
+                await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
         }
-        await store.WriteInfoAsync(account, container, info, password, ct: ct);
+        if (trackedInfo is not null)
+            await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
+        else
+            await store.WriteInfoAsync(account, container, info, password, ct: ct);
 
         await Record(NotificationEvents.CheckSuccess, $"repair:{container}",
             $"Repair finished: {container}",

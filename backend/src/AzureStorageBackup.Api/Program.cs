@@ -105,7 +105,9 @@ builder.Services.AddScoped(sp => new BackupRepairer(
     Path.Combine(tempPath, "repair"),
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
-    sp.GetRequiredService<BackupChecker>()));
+    sp.GetRequiredService<BackupChecker>(),
+    sp.GetRequiredService<TrackedInfoStore>(),
+    sp.GetRequiredService<ILocalIndexCache>())); // 修复经本地权威状态机，避免下次备份 412（§3.2）
 
 // 操作日志（M8）+ 全局设置
 builder.Services.AddScoped<IOperationLog, OperationLogService>();
