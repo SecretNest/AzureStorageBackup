@@ -51,7 +51,7 @@ public sealed class GroupingPlanner
         foreach (var file in files)
         {
             var singleFile = file.Length >= options.SingleFileThresholdBytes
-                || (options.DontGroup?.IsIgnored(file.Path) ?? false);
+                || (options.DontGroup?.MatchesFileOrAncestorDir(file.Path) ?? false);
 
             if (singleFile)
                 blobs.Add(new BlobEntry(file.Path, file.FullHash));

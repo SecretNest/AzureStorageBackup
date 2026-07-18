@@ -96,4 +96,14 @@ public class IgnoreRuleSetTests
         Assert.True(r.IsIgnored("sub/a.txt"));
         Assert.False(r.IsIgnored("other/sub/a.txt"));
     }
+
+    [Fact]
+    public void Directory_Rule_Matches_Files_Beneath_It()
+    {
+        var rules = Rules("logs/", "*.iso"); // 目录规则 + 文件规则
+        Assert.True(rules.MatchesFileOrAncestorDir("logs/app.log"));   // 祖先目录 logs/ 命中
+        Assert.True(rules.MatchesFileOrAncestorDir("a/logs/b/c.bin")); // 深层祖先命中
+        Assert.True(rules.MatchesFileOrAncestorDir("disk.iso"));       // 文件规则直接命中
+        Assert.False(rules.MatchesFileOrAncestorDir("src/main.cs"));   // 不命中
+    }
 }

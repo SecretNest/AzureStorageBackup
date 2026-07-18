@@ -298,7 +298,7 @@ public sealed class BackupOrchestrator(
         Action onItem, CancellationToken ct)
     {
         var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
-        var storeOnly = request.Options.DontCompress?.IsIgnored(file.Path) ?? false;
+        var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
         var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 

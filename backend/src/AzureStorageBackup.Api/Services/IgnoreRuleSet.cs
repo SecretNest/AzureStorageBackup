@@ -68,6 +68,25 @@ public sealed class IgnoreRuleSet
         return decision ?? false;
     }
 
+    /// <summary>文件是否命中：自身以文件判定命中，或任一祖先目录以目录判定命中
+    /// （使 `logs/` 这类目录规则对其下文件生效，与忽略列表按目录遍历的行为一致）。</summary>
+    public bool MatchesFileOrAncestorDir(string relativePath)
+    {
+        if (IsIgnored(relativePath, isDirectory: false))
+            return true;
+
+        var parts = relativePath.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var prefix = "";
+        for (var i = 0; i < parts.Length - 1; i++) // 逐级祖先目录
+        {
+            prefix = prefix.Length == 0 ? parts[i] : prefix + "/" + parts[i];
+            if (IsIgnored(prefix, isDirectory: true))
+                return true;
+        }
+
+        return false;
+    }
+
     private static string GlobToRegex(string glob, bool anchored)
     {
         var sb = new StringBuilder();
