@@ -19,7 +19,13 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
             ct.ThrowIfCancellationRequested();
 
             // 目标忙碌（正在备份/检查/还原/清理）→ 记报警并跳过，不打断在执行的任务（用户要求）。
-            if (!busy.TryAcquire(accountId, container))
+            var activity = task.TaskType switch
+            {
+                ScheduledTaskType.Backup => "BackingUp",
+                ScheduledTaskType.Cleanup => "CleaningUp",
+                _ => "Checking",
+            };
+            if (!busy.TryAcquire(accountId, container, activity))
             {
                 logger.LogWarning("Backup {Account}/{Container} is busy; skipping scheduled {Type}", accountId, container, task.TaskType);
                 await sp.GetRequiredService<IOperationLog>().AppendAsync(

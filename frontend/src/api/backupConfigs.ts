@@ -47,7 +47,7 @@ export const restoreConflictModeLabels: Record<number, string> = {
 
 // Archive 活化优先级（与后端 enum 数值对应）
 export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
-export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing'
+export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing' | 'CleaningUp'
 
 export interface BackupConfig {
   id: number

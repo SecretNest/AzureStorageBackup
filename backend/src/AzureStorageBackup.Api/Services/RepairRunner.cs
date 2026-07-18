@@ -62,7 +62,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync();
 
-            if (!busy.TryAcquire(account.Id, config.ContainerName))
+            if (!busy.TryAcquire(account.Id, config.ContainerName, "Repairing"))
             {
                 state.Error = "This backup is busy with another operation.";
                 state.Status = RunStatus.Failed;

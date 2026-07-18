@@ -69,7 +69,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var settings = await settingsSvc.GetAsync();
 
             // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
-            if (!busy.TryAcquire(account.Id, config.ContainerName))
+            if (!busy.TryAcquire(account.Id, config.ContainerName, "BackingUp"))
             {
                 state.Error = "This backup is busy with another operation.";
                 state.Status = RunStatus.Failed;

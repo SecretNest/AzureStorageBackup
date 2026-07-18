@@ -416,8 +416,8 @@ public static class BackupConfigEndpoints
     /// <summary>
     /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态
     /// （BackupRunner/RestoreRunner/RepairRunner 已各自暴露 <c>Get(id)</c>，无需新增 accessor）；
-    /// 都没有但 BackupBusyTracker 显示该 (账户,container) 忙碌，则视为 Checking——
-    /// 检查端点 (/check) 与计划任务的备份/清理都同步持锁运行，不经过任何 Runner。
+    /// 都没有但 BackupBusyTracker 显示忙碌，则取其记录的操作标签（BackingUp/Checking/CleaningUp）——
+    /// 检查端点 (/check) 与计划任务的备份/检查/清理都同步持锁运行，不经过任何 Runner。
     /// </summary>
     private static string DeriveActivity(
         BackupConfig c, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy)
@@ -428,8 +428,8 @@ public static class BackupConfigEndpoints
             return "Restoring";
         if (repairRunner.Get(c.Id)?.Status == RunStatus.Running)
             return "Repairing";
-        if (busy.IsBusy(c.AccountId, c.ContainerName))
-            return "Checking";
-        return "Idle";
+        // 非 Runner 的持锁操作（手动 /check、计划 备份/检查/清理）：读忙碌跟踪记录的实际操作标签，
+        // 避免把计划备份/清理一律误标为 Checking。
+        return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
 }

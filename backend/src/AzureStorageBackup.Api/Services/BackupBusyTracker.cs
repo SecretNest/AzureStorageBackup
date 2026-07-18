@@ -6,16 +6,23 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public sealed class BackupBusyTracker
 {
-    private readonly HashSet<string> _busy = new(StringComparer.Ordinal);
+    // key → 当前操作的瞬时态标签（BackingUp/Checking/CleaningUp/Repairing…），供派生活动准确显示。
+    private readonly Dictionary<string, string> _busy = new(StringComparer.Ordinal);
     private readonly Lock _lock = new();
 
     private static string Key(int accountId, string container) => $"{accountId}/{container}";
 
-    /// <summary>尝试标记忙碌；已忙碌返回 false（不获取）。</summary>
-    public bool TryAcquire(int accountId, string container)
+    /// <summary>尝试标记忙碌并记录操作标签；已忙碌返回 false（不获取）。</summary>
+    public bool TryAcquire(int accountId, string container, string activity = "Checking")
     {
         lock (_lock)
-            return _busy.Add(Key(accountId, container));
+        {
+            var key = Key(accountId, container);
+            if (_busy.ContainsKey(key))
+                return false;
+            _busy[key] = activity;
+            return true;
+        }
     }
 
     /// <summary>释放忙碌标记。</summary>
@@ -29,6 +36,13 @@ public sealed class BackupBusyTracker
     public bool IsBusy(int accountId, string container)
     {
         lock (_lock)
-            return _busy.Contains(Key(accountId, container));
+            return _busy.ContainsKey(Key(accountId, container));
+    }
+
+    /// <summary>当前占用该目标的操作标签；不忙则 null。供瞬时态派生（避免把计划备份/清理误标为 Checking）。</summary>
+    public string? CurrentActivity(int accountId, string container)
+    {
+        lock (_lock)
+            return _busy.GetValueOrDefault(Key(accountId, container));
     }
 }
