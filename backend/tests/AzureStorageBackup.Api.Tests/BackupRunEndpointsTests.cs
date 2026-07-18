@@ -76,7 +76,8 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
                 await Task.Delay(200);
             }
 
-            Assert.Equal("Completed", status!.Status);
+            Assert.True(status!.Status == "Completed",
+                $"Expected Completed but was '{status.Status}'. Error: {status.Error ?? "(none)"}");
             Assert.Equal(1, status.Version);
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 

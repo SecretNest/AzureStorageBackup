@@ -21,6 +21,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y 7zip || sudo apt-get install -y p7zip-full
+          echo "--- resolved 7-Zip binaries ---"
+          for b in 7zz 7z 7za; do
+            if command -v "$b" >/dev/null; then
+              echo "$b -> $(command -v "$b")"; "$b" 2>/dev/null | head -2
+            else
+              echo "$b: absent"
+            fi
+          done
 
       - name: Start Azurite
         run: |
