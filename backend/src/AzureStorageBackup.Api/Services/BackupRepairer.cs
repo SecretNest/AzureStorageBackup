@@ -88,11 +88,11 @@ public sealed class BackupRepairer(
         if (checkOptions.ListOrphans)
             await DeleteOrphansAsync(account, container, cc, password, deletedOrphans, ct);
 
-        await Record(NotificationEvents.CheckSuccess, $"repair:{container}",
+        await Record(NotificationEvents.CheckSuccess, $"repair:{account.Id}/{container}",
             $"Repair finished: {container}",
             $"{repaired.Distinct().Count()} repaired, {unrecoverable.Distinct().Count()} unrecoverable, {deletedOrphans.Count} orphan(s) deleted", ct);
         if (unrecoverable.Count > 0)
-            await Record(NotificationEvents.UnrecoverableError, $"repair:{container}",
+            await Record(NotificationEvents.UnrecoverableError, $"repair:{account.Id}/{container}",
                 $"Unrecoverable files after repair: {container}", string.Join(", ", unrecoverable.Distinct().Take(20)), ct);
 
         return new RepairReport(repaired.Distinct().ToList(), unrecoverable.Distinct().ToList(), deletedOrphans);
@@ -117,7 +117,7 @@ public sealed class BackupRepairer(
         catch (Exception ex)
         {
             if (opLog is not null)
-                await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{container}",
+                await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{container}",
                     $"Orphan cleanup abandoned: could not build the full reference set ({ex.Message}). No blobs were deleted.", ct, durable: true);
             return;
         }

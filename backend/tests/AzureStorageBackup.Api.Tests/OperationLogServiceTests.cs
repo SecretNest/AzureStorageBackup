@@ -152,4 +152,22 @@ public sealed class OperationLogServiceTests : IDisposable
         var kept = await _sut.QueryAsync(null, null, null, null, 100);
         Assert.Equal("c", Assert.Single(kept).Message); // 仅 docs 的日志保留
     }
+
+    /// <summary>§5.3：source 现携带 account 维度（"{op}:{accountId}/{container}"）。DeleteForContainerAsync
+    /// 须继续按 container 匹配到这些行（同时兼容改版前遗留的旧格式行，见 DeleteForContainer_Removes_That_Backups_Logs）。</summary>
+    [Fact]
+    public async Task DeleteForContainer_Removes_Logs_In_Account_Scoped_Format()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/photos", "a", durable: true);
+        await _sut.AppendAsync(OperationLogLevel.Info, "check:3/photos", "b", durable: true);
+        await _sut.AppendAsync(OperationLogLevel.Info, "restore:3/photos", "c", durable: true);
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/docs", "d", durable: true);
+        // 同名 container 挂在另一个 account 下：当前粗粒度实现仍会一并删除（按 container 而非
+        // account+container 匹配是有意的过渡，见 DeleteForContainerAsync 注释），故不在此断言其保留。
+
+        await _sut.DeleteForContainerAsync("photos");
+
+        var kept = await _sut.QueryAsync(null, null, null, null, 100);
+        Assert.Equal("d", Assert.Single(kept).Message);
+    }
 }

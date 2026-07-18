@@ -22,7 +22,7 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
             {
                 logger.LogWarning("Backup {Account}/{Container} is busy; skipping scheduled {Type}", accountId, container, task.TaskType);
                 await sp.GetRequiredService<IOperationLog>().AppendAsync(
-                    OperationLogLevel.Warning, $"schedule:{container}",
+                    OperationLogLevel.Warning, $"schedule:{accountId}/{container}",
                     $"Skipped scheduled {task.TaskType}: backup is busy with another operation", ct);
                 continue;
             }

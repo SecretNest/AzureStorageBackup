@@ -25,7 +25,7 @@ public sealed class BackupChecker(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
         CancellationToken ct = default, int downloadConcurrency = 5)
     {
-        var source = $"check:{container}";
+        var source = $"check:{account.Id}/{container}";
         await Record(NotificationEvents.CheckStart, source, $"Check started: {container}", "", ct);
         try
         {
@@ -114,7 +114,7 @@ public sealed class BackupChecker(
         catch (Exception ex)
         {
             if (opLog is not null)
-                await opLog.AppendAsync(OperationLogLevel.Warning, $"check:{container}",
+                await opLog.AppendAsync(OperationLogLevel.Warning, $"check:{account.Id}/{container}",
                     $"Orphan detection skipped: could not build the full reference set ({ex.Message}).", ct, durable: true);
             return [];
         }

@@ -86,9 +86,16 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
 
     public async Task DeleteForContainerAsync(string container, CancellationToken ct = default)
     {
-        // 来源形如 "backup:{container}"、"check:{container}"、"restore:{container}"、"schedule:{container}"。
-        var suffix = ":" + container;
-        await db.LogEntries.Where(e => e.Source.EndsWith(suffix)).ExecuteDeleteAsync(ct);
+        // 来源形如 "backup:{accountId}/{container}"、"check:{accountId}/{container}"、
+        // "restore:{accountId}/{container}"、"schedule:{accountId}/{container}"（§5.3）。
+        // 同时兼容改版前写入的旧格式 "{op}:{container}"（历史行不重写，避免遗留孤儿日志）。
+        // 按 container 而非 accountId+container 精确匹配是有意的粗粒度过渡：Task 5 会把接口收紧到
+        // account+container 精确前缀，从根本上避免"同名不同 account 的 container"误删。
+        var newSuffix = "/" + container;
+        var oldSuffix = ":" + container;
+        await db.LogEntries
+            .Where(e => e.Source.EndsWith(newSuffix) || e.Source.EndsWith(oldSuffix))
+            .ExecuteDeleteAsync(ct);
     }
 
     public async Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default)

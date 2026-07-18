@@ -101,7 +101,7 @@ public sealed class BackupOrchestrator(
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
     {
-        var source = $"backup:{request.Container}";
+        var source = $"backup:{request.Account.Id}/{request.Container}";
         await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
         try
         {
@@ -399,7 +399,7 @@ public sealed class BackupOrchestrator(
             var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
             finalHash = vr.FullHash;
             if (vr.Outcome == ProcessingOutcome.Alarmed)
-                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                     $"File kept changing during backup: {file.Path}",
                     $"Saved with current content after {vr.Attempts} attempts", ct);
         }
@@ -409,7 +409,7 @@ public sealed class BackupOrchestrator(
         }
 
         if (collided)
-            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                 $"Hash collision avoided: {file.Path}",
                 $"Different content shares hash {finalHash}; stored at {chosenRef}", ct);
 
@@ -589,7 +589,7 @@ public sealed class BackupOrchestrator(
                 {
                     // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
                     if (n >= maxAttempts)
-                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",
+                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                             $"File kept changing during grouping: {m.Path}",
                             $"Stored as single file after {n} attempts", ct);
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,

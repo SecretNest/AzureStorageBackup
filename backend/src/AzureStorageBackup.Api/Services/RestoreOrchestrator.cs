@@ -59,7 +59,7 @@ public sealed class RestoreOrchestrator(
 {
     public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default, IProgress<string>? phase = null)
     {
-        var source = $"restore:{request.Container}";
+        var source = $"restore:{request.Account.Id}/{request.Container}";
         await Record(NotificationEvents.RestoreStart, source, $"Restore started: {request.Container}", request.TargetRoot, ct);
         try
         {
