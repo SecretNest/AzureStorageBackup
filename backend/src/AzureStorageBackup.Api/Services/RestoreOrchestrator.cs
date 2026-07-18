@@ -317,7 +317,15 @@ public sealed class RestoreOrchestrator(
             vols.Add(b.Name);
 
         // 未开始活化的分卷发起活化（标准优先级；全部分卷，非仅首卷）。
-        await BlobRehydration.BeginAsync(container, baseRef, tier, ct);
+        // 注意：此处故意不复用 BlobRehydration.BeginAsync（它逐卷吞掉 SetAccessTierAsync 异常）——
+        // 本方法持有下载并发 gate 并无限期轮询，活化请求失败必须快速传播为还原失败，
+        // 否则会在吞掉异常后无限期挂起并占住 gate。
+        foreach (var name in vols)
+        {
+            var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
+            if (props.AccessTier == "Archive" && string.IsNullOrEmpty(props.ArchiveStatus))
+                await container.GetBlobClient(name).SetAccessTierAsync(tier, cancellationToken: ct);
+        }
 
         // 轮询到全部分卷不再是 Archive（活化完成，几小时级）。
         while (true)
