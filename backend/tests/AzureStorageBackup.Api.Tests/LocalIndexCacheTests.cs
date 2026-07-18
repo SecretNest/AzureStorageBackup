@@ -117,4 +117,24 @@ public sealed class LocalIndexCacheTests : IDisposable
 
         Assert.Equal(1, store.Reads);
     }
+
+    /// <summary>删配置连带清本地版本索引缓存（P2T6 review follow-up）：按 (accountId, container) 精确清除
+    /// 全部版本，不同 account 或不同 container 的缓存不受影响（避免跨备份误删）。</summary>
+    [Fact]
+    public async Task RemoveForContainer_Evicts_All_Versions_But_Not_Other_Account_Or_Container()
+    {
+        var store = new FakeStore(Index(1, "x"));
+        var cache = new LocalIndexCache(_db, store);
+
+        await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
+        await cache.PutAsync(1, "c", 2, 100, Index(2, "b.txt"));
+        await cache.PutAsync(1, "other-c", 1, 100, Index(1, "keep-other-container.txt"));
+        await cache.PutAsync(2, "c", 1, 100, Index(1, "keep-other-account.txt"));
+
+        await cache.RemoveForContainerAsync(1, "c");
+
+        Assert.Equal(2, await _db.CachedVersionIndexes.CountAsync());
+        Assert.True(await _db.CachedVersionIndexes.AnyAsync(x => x.AccountId == 1 && x.Container == "other-c"));
+        Assert.True(await _db.CachedVersionIndexes.AnyAsync(x => x.AccountId == 2 && x.Container == "c"));
+    }
 }

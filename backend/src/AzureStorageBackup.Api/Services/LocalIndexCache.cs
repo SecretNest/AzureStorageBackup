@@ -20,6 +20,10 @@ public interface ILocalIndexCache
 
     /// <summary>移除某版本缓存（版本被保留策略退役后调用）。</summary>
     Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default);
+
+    /// <summary>移除某 (账户,container) 的全部版本索引缓存（删除备份配置时调用），避免同 account+container
+    /// 重建备份后残留旧身份的缓存索引导致数据错配。</summary>
+    Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default);
 }
 
 public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : ILocalIndexCache
@@ -57,6 +61,13 @@ public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : I
             db.CachedVersionIndexes.Remove(row);
             await db.SaveChangesAsync(ct);
         }
+    }
+
+    public async Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
+    {
+        await db.CachedVersionIndexes
+            .Where(x => x.AccountId == accountId && x.Container == container)
+            .ExecuteDeleteAsync(ct);
     }
 
     private async Task UpsertAsync(

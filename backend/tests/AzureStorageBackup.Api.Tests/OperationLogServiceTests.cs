@@ -173,4 +173,18 @@ public sealed class OperationLogServiceTests : IDisposable
         var kept = await _sut.QueryAsync(null, null, null, null, 100);
         Assert.Equal("legacy", Assert.Single(kept).Message); // 未被删除
     }
+
+    /// <summary>回归锁定（§5.5）：DeleteForContainerAsync 按 source 后缀匹配，不区分 level/Ephemeral，
+    /// 故短存(ephemeral) Debug/verbose 日志与长存日志一样，在删配置时一并被清——不会遗留孤儿诊断日志。</summary>
+    [Fact]
+    public async Task DeleteForContainer_Removes_All_Levels_Including_Debug()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Debug, "backup:3/c", "verbose file x");
+        await _sut.AppendAsync(OperationLogLevel.Warning, "backup:3/c", "done");
+
+        await _sut.DeleteForContainerAsync(3, "c");
+
+        var remaining = await _sut.QueryAsync(null, "backup:3/c", null, null, 100);
+        Assert.Empty(remaining);
+    }
 }

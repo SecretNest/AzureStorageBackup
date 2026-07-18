@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -130,6 +132,48 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         finally
         {
             await cc.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>P2T6 review follow-up：删配置连带清本地权威缓存/状态（CachedVersionIndex + LocalBackupState），
+    /// 否则同 account+container 重建备份会命中孤儿行、与新备份的版本身份错配。按 (accountId, container) 精确
+    /// 清除，不同 account 或不同 container 的行必须保留（不可越界误删）。</summary>
+    [Fact]
+    public async Task Delete_Config_Purges_Local_Index_Cache_And_Local_Backup_State_Scoped_To_Account_Container()
+    {
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("del-cache") with { ContainerName = "del-cache-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        var accountId = created!.AccountId;
+        var container = created.ContainerName;
+        var otherContainer = "del-cache-other-container";
+        var otherAccountId = accountId + 999;
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = accountId, Container = container, Version = 1, IdentityTicks = 1, Bytes = [1] });
+            db.LocalBackupStates.Add(new LocalBackupState { AccountId = accountId, Container = container, InfoBytes = [1], ETag = "e1" });
+            // 同 account，不同 container → 必须保留
+            db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = accountId, Container = otherContainer, Version = 1, IdentityTicks = 1, Bytes = [1] });
+            db.LocalBackupStates.Add(new LocalBackupState { AccountId = accountId, Container = otherContainer, InfoBytes = [1], ETag = "e2" });
+            // 不同 account，同名 container → 必须保留
+            db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = otherAccountId, Container = container, Version = 1, IdentityTicks = 1, Bytes = [1] });
+            db.LocalBackupStates.Add(new LocalBackupState { AccountId = otherAccountId, Container = container, InfoBytes = [1], ETag = "e3" });
+            await db.SaveChangesAsync();
+        }
+
+        Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.CachedVersionIndexes.AnyAsync(x => x.AccountId == accountId && x.Container == container));
+            Assert.False(await db.LocalBackupStates.AnyAsync(x => x.AccountId == accountId && x.Container == container));
+            Assert.True(await db.CachedVersionIndexes.AnyAsync(x => x.AccountId == accountId && x.Container == otherContainer));
+            Assert.True(await db.LocalBackupStates.AnyAsync(x => x.AccountId == accountId && x.Container == otherContainer));
+            Assert.True(await db.CachedVersionIndexes.AnyAsync(x => x.AccountId == otherAccountId && x.Container == container));
+            Assert.True(await db.LocalBackupStates.AnyAsync(x => x.AccountId == otherAccountId && x.Container == container));
         }
     }
 
