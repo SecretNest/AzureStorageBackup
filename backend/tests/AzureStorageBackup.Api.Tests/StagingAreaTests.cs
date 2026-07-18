@@ -159,4 +159,36 @@ public sealed class StagingAreaTests : IDisposable
 
         Assert.False(File.Exists(path));
     }
+
+    [Fact]
+    public async Task Empty_Produce_Leaves_No_Subdir()
+    {
+        using var area = Area(limit: 1_000_000);
+
+        var item = await area.StageAsync((_, _) => Task.FromResult<IReadOnlyList<string>>([]));
+
+        Assert.Empty(item.Files);
+        Assert.Equal(0, item.Bytes);
+        Assert.Equal(0, area.StagedBytes);
+        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // 不留空 GUID 子目录
+    }
+
+    [Fact]
+    public async Task Partial_Move_Failure_Cleans_Up_And_Does_Not_Leak_Or_Miscredit()
+    {
+        using var area = Area(limit: 1_000_000);
+
+        // 产出两个路径：第一个真实存在，第二个不存在 → 第二次 File.Move 抛（源缺失）。
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (dir, ct) =>
+        {
+            var ok = Path.Combine(dir, "ok.7z");
+            await File.WriteAllBytesAsync(ok, new byte[10], ct);
+            return [ok, Path.Combine(dir, "missing.7z")];
+        };
+
+        await Assert.ThrowsAnyAsync<Exception>(() => area.StageAsync(produce));
+
+        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // 已移动文件 + 子目录被清理，不泄漏
+        Assert.Equal(0, area.StagedBytes);                    // 异常路径不错记字节
+    }
 }

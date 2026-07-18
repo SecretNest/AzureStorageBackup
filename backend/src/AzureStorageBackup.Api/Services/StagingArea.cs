@@ -63,17 +63,29 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 
     private StagedItem MoveToStaged(IReadOnlyList<string> producedFiles)
     {
+        if (producedFiles.Count == 0)
+            return new StagedItem([], 0); // 无产出：不建子目录，避免留下空 GUID 目录
+
         // 每次暂存独立 GUID 子目录：不同备份即使产出同名文件也不互相覆盖（跨 container 并发安全）。
         var subDir = Path.Combine(stagedTempDir, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(subDir);
         var staged = new List<string>(producedFiles.Count);
         long bytes = 0;
-        foreach (var src in producedFiles)
+        try
         {
-            var dest = Path.Combine(subDir, Path.GetFileName(src));
-            File.Move(src, dest, overwrite: false);
-            bytes += new FileInfo(dest).Length;
-            staged.Add(dest);
+            foreach (var src in producedFiles)
+            {
+                var dest = Path.Combine(subDir, Path.GetFileName(src));
+                File.Move(src, dest, overwrite: false);
+                bytes += new FileInfo(dest).Length;
+                staged.Add(dest);
+            }
+        }
+        catch
+        {
+            // 中途失败：清理已移动文件 + 子目录，不泄漏。异常沿 StageAsync 抛出，调用方不会把 bytes 记入 _stagedBytes。
+            try { Directory.Delete(subDir, recursive: true); } catch { /* best effort */ }
+            throw;
         }
         return new StagedItem(staged, bytes);
     }
