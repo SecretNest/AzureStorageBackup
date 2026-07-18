@@ -156,7 +156,7 @@ public static class BackupConfigEndpoints
                 return Results.NotFound();
 
             var target = string.IsNullOrWhiteSpace(body.TargetRoot) ? config.LocalRoot : body.TargetRoot;
-            var state = runner.Start(id, target, body.Version, body.Substitutions);
+            var state = runner.Start(id, target, body.Version, body.Substitutions, body.SelectedPaths, body.Conflict, body.RehydratePriority);
             return Results.Accepted($"/api/backup-configs/{id}/restore", RestoreRunResponse.From(state));
         });
 

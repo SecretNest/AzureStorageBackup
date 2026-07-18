@@ -30,7 +30,10 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
     private readonly Lock _lock = new();
 
     public RestoreRunState Start(int configId, string targetRoot, int? version,
-        IReadOnlyDictionary<string, int>? substitutions = null)
+        IReadOnlyDictionary<string, int>? substitutions = null,
+        IReadOnlyList<string>? selectedPaths = null,
+        RestoreConflictMode conflict = RestoreConflictMode.OverwriteIfChanged,
+        RestoreRehydratePriority rehydratePriority = RestoreRehydratePriority.Standard)
     {
         lock (_lock)
         {
@@ -39,7 +42,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
 
             var state = new RestoreRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, targetRoot, version, substitutions, state));
+            _ = Task.Run(() => RunAsync(configId, targetRoot, version, substitutions, selectedPaths, conflict, rehydratePriority, state));
             return state;
         }
     }
@@ -51,7 +54,9 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
     }
 
     private async Task RunAsync(int configId, string targetRoot, int? version,
-        IReadOnlyDictionary<string, int>? substitutions, RestoreRunState state)
+        IReadOnlyDictionary<string, int>? substitutions,
+        IReadOnlyList<string>? selectedPaths, RestoreConflictMode conflict, RestoreRehydratePriority rehydratePriority,
+        RestoreRunState state)
     {
         try
         {
@@ -79,6 +84,9 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 Version = version,
                 DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
                 Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
+                SelectedPaths = selectedPaths,
+                Conflict = conflict,
+                RehydratePriority = rehydratePriority,
             }, ct: default, phase: progress);
             state.Phase = null;
             state.Status = RunStatus.Completed;

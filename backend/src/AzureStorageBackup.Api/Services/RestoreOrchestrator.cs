@@ -21,6 +21,16 @@ public sealed record RestoreRequest
     public IReadOnlyDictionary<string, int> Substitutions { get; init; } =
         new Dictionary<string, int>(StringComparer.Ordinal);
 
+    /// <summary>选择性还原（需求 B）：为 null 时还原整版本（现状）；非 null 时只还原恰好这些路径。
+    /// 过滤在分组前生效——pack 因此只下载一次、只写选中成员，不会 over-restore 未选成员。</summary>
+    public IReadOnlyList<string>? SelectedPaths { get; init; }
+
+    /// <summary>冲突处理模式（决策 3）。默认 OverwriteIfChanged = 现状。</summary>
+    public RestoreConflictMode Conflict { get; init; } = RestoreConflictMode.OverwriteIfChanged;
+
+    /// <summary>Archive blob 活化优先级（透传 Azure RehydratePriority）。默认 Standard。</summary>
+    public RestoreRehydratePriority RehydratePriority { get; init; } = RestoreRehydratePriority.Standard;
+
     /// <summary>遇 Archive blob 的活化目标 tier（Archive 无法直接下载，需先活化，异步几小时）。</summary>
     public AccessTier RehydrateTier { get; init; } = AccessTier.Hot;
 
@@ -111,13 +121,26 @@ public sealed class RestoreOrchestrator(
                 }
         }
 
+        // 选择性还原（需求 B）：把生效集限制到用户选中的路径。过滤在分组前生效，
+        // 于是每个 pack 仍只下载一次，但只写选中成员——未选成员根本不进入 fileEntries，不会 over-restore。
+        HashSet<string>? selected = request.SelectedPaths is null
+            ? null
+            : new HashSet<string>(request.SelectedPaths, StringComparer.Ordinal);
+        if (selected is not null)
+            foreach (var key in byPath.Keys.Where(k => !selected.Contains(k)).ToList())
+                byPath.Remove(key);
+
         // 不可恢复且未「解析成功」替代 → 跳过（声明了意图但替代不可得的也回落跳过，不报错）。
-        var unresolved = index.UnrecoverablePaths.Where(p => !resolved.Contains(p)).ToHashSet(StringComparer.Ordinal);
+        // 选择性还原时只计入选中的不可恢复路径。
+        var unresolved = index.UnrecoverablePaths
+            .Where(p => !resolved.Contains(p) && (selected is null || selected.Contains(p)))
+            .ToHashSet(StringComparer.Ordinal);
         skipped += unresolved.Count;
 
-        // 空文件夹（还原需重建）
-        foreach (var dir in index.EmptyDirs)
-            Directory.CreateDirectory(Path.Combine(request.TargetRoot, ToLocal(dir)));
+        // 空文件夹（还原需重建）——选择性还原只针对选中文件，不重建整棵空目录树。
+        if (selected is null)
+            foreach (var dir in index.EmptyDirs)
+                Directory.CreateDirectory(Path.Combine(request.TargetRoot, ToLocal(dir)));
 
         // symlink 与文件分开处理
         var fileEntries = new List<IndexEntry>();
@@ -172,7 +195,7 @@ public sealed class RestoreOrchestrator(
                 await SetTierForVolumesAsync(container, baseRef, AccessTier.Archive, ct);
         }
 
-        return new RestoreResult(version.Version, restored, skipped, index.EmptyDirs.Count, failed);
+        return new RestoreResult(version.Version, restored, skipped, selected is null ? index.EmptyDirs.Count : 0, failed);
     }
 
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
@@ -184,7 +207,7 @@ public sealed class RestoreOrchestrator(
         var needed = new List<IndexEntry>();
         foreach (var e in group)
         {
-            if (await NeedsRestoreAsync(request.TargetRoot, e, ct))
+            if (await NeedsRestoreAsync(request.TargetRoot, e, request.Conflict, ct))
                 needed.Add(e);
             else
                 skipped++;
@@ -210,7 +233,7 @@ public sealed class RestoreOrchestrator(
             catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
             {
                 // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
-                await EnsureOnlineAsync(container, blobName, request.RehydrateTier, request.RehydratePollSeconds, phase, ct);
+                await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
                 rehydrated.Add(blobName);
                 firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
             }
@@ -232,10 +255,7 @@ public sealed class RestoreOrchestrator(
                 }
                 foreach (var e in needed)
                 {
-                    var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                    File.Copy(content, dest, overwrite: true);
-                    ApplyMetadata(dest, e);
+                    WriteRestoredFile(request, e, content);
                     restored++;
                 }
             }
@@ -248,10 +268,7 @@ public sealed class RestoreOrchestrator(
                 foreach (var e in needed)
                 {
                     var source = Path.Combine(extractDir, ToLocal(e.Path));
-                    var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
-                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                    File.Copy(source, dest, overwrite: true);
-                    ApplyMetadata(dest, e);
+                    WriteRestoredFile(request, e, source);
                     restored++;
                 }
             }
@@ -264,14 +281,32 @@ public sealed class RestoreOrchestrator(
         return (restored, skipped, 0);
     }
 
-    private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, CancellationToken ct)
+    private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, RestoreConflictMode conflict, CancellationToken ct)
     {
         var dest = Path.Combine(targetRoot, ToLocal(entry.Path));
-        if (!File.Exists(dest) || entry.FullHash is null)
+        if (!File.Exists(dest))
             return true;
 
-        // 覆盖仅当变更时：本地已是相同内容则跳过。
+        // Skip：目标存在即跳过（无论内容异同）。
+        if (conflict == RestoreConflictMode.Skip)
+            return false;
+
+        // OverwriteIfChanged / RenameKeep：本地已是相同内容则跳过；FullHash 缺失无从比较则视为需还原。
+        if (entry.FullHash is null)
+            return true;
         return await hasher.FullHashAsync(dest, ct) != entry.FullHash;
+    }
+
+    /// <summary>把还原内容写到目标路径。RenameKeep 且目标已存在（能进到这一步即内容不同或无法比较）→
+    /// 先把现有本地文件改名为 {name}.bak-{ts} 保留旧内容，再写还原内容到原名（旧内容永不丢失）。</summary>
+    private static void WriteRestoredFile(RestoreRequest request, IndexEntry entry, string sourceFile)
+    {
+        var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
+        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+        if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
+            RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
+        File.Copy(sourceFile, dest, overwrite: true);
+        ApplyMetadata(dest, entry);
     }
 
     private bool RestoreSymlink(string targetRoot, IndexEntry entry)
@@ -308,8 +343,11 @@ public sealed class RestoreOrchestrator(
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
 
     /// <summary>确保某归档（含全部分卷）已从 Archive 活化为可下载：对未活化的发起活化，轮询到全部就绪。</summary>
+    private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>
+        p == RestoreRehydratePriority.High ? RehydratePriority.High : RehydratePriority.Standard;
+
     private static async Task EnsureOnlineAsync(
-        BlobContainerClient container, string baseRef, AccessTier tier, int pollSeconds,
+        BlobContainerClient container, string baseRef, AccessTier tier, RehydratePriority priority, int pollSeconds,
         IProgress<string>? phase, CancellationToken ct)
     {
         var vols = new List<string>();
@@ -324,7 +362,7 @@ public sealed class RestoreOrchestrator(
         {
             var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
             if (props.AccessTier == "Archive" && string.IsNullOrEmpty(props.ArchiveStatus))
-                await container.GetBlobClient(name).SetAccessTierAsync(tier, cancellationToken: ct);
+                await container.GetBlobClient(name).SetAccessTierAsync(tier, rehydratePriority: priority, cancellationToken: ct);
         }
 
         // 轮询到全部分卷不再是 Archive（活化完成，几小时级）。

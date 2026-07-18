@@ -486,6 +486,117 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Selective_Restore_Writes_Only_Selected_Pack_Members()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstsel-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 三个小文件 → 同一个 pack（默认阈值 5M 以下走分组）。
+            WriteSrc("dir/a.txt", "alpha");
+            WriteSrc("dir/b.txt", "bravo");
+            WriteSrc("dir/c.txt", "charlie");
+            await backup.RunAsync(BackupReq(account, name));
+
+            // 确认确实打成了一个 pack（一次下载语义的前提）。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            var packRefs = idx.Entries.Where(e => e.Storage?.Kind == "pack").Select(e => e.Storage!.Ref).Distinct().ToList();
+            Assert.Single(packRefs); // 三个成员同属一个 pack
+
+            // 只选中 pack 内一个成员 → 只该成员落地，其余不 over-restore。
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+                SelectedPaths = ["dir/a.txt"],
+            });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "dir", "b.txt"))); // 未选成员不落地
+            Assert.False(File.Exists(Path.Combine(_dst, "dir", "c.txt")));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Conflict_Skip_Leaves_Existing_File_Untouched()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstskip-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "cloud content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            // 目标已存在且内容不同 → Skip 模式应原样保留，不覆盖，不新增。
+            Directory.CreateDirectory(_dst);
+            File.WriteAllText(Path.Combine(_dst, "a.txt"), "local content");
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+                Conflict = RestoreConflictMode.Skip,
+            });
+
+            Assert.Equal(0, result.RestoredFiles);
+            Assert.Equal(1, result.SkippedFiles);
+            Assert.Equal("local content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 未被覆盖
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Conflict_RenameKeep_Preserves_Existing_And_Writes_Restored()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstrk-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "cloud content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            // 目标已存在且内容不同 → RenameKeep：旧内容改名保留，还原内容落原名。
+            Directory.CreateDirectory(_dst);
+            File.WriteAllText(Path.Combine(_dst, "a.txt"), "local content");
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+                Conflict = RestoreConflictMode.RenameKeep,
+            });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal("cloud content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 原名 = 还原内容
+            var baks = Directory.GetFiles(_dst, "a.txt.bak-*");
+            Assert.Single(baks);
+            Assert.Equal("local content", File.ReadAllText(baks[0])); // 旧内容永不丢失
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Restores_Encrypted_Backup_With_Password()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");

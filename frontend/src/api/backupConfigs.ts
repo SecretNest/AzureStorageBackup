@@ -36,6 +36,17 @@ export const backupStageLabels: Record<number, string> = {
 
 // 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态见 BackupActivity（派生，不落库）。
 export const BackupStatus = { Normal: 0, Error: 1 } as const
+
+// 还原冲突模式（§4.1c 决策 3，与后端 enum 数值对应）
+export const RestoreConflictMode = { OverwriteIfChanged: 0, Skip: 1, RenameKeep: 2 } as const
+export const restoreConflictModeLabels: Record<number, string> = {
+  0: 'Overwrite if changed',
+  1: 'Skip existing',
+  2: 'Keep existing (rename)',
+}
+
+// Archive 活化优先级（与后端 enum 数值对应）
+export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
 export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing'
 
 export interface BackupConfig {
@@ -181,8 +192,24 @@ export const backupConfigsApi = {
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
   versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),
-  restore: (id: number, targetRoot: string | null, version: number | null, substitutions?: Record<string, number>) =>
-    api.post<RestoreRun>(`/backup-configs/${id}/restore`, { targetRoot, version, substitutions }),
+  restore: (
+    id: number,
+    targetRoot: string | null,
+    version: number | null,
+    substitutions?: Record<string, number>,
+    // 选择性还原（需求 B）：为空则还原整版本；非空则只还原恰好这些路径（pack 只下一次、只写选中成员）。
+    selectedPaths?: string[] | null,
+    conflict: number = RestoreConflictMode.OverwriteIfChanged, // 冲突模式（决策 3）
+    rehydratePriority: number = RestoreRehydratePriority.Standard, // Archive 活化优先级
+  ) =>
+    api.post<RestoreRun>(`/backup-configs/${id}/restore`, {
+      targetRoot,
+      version,
+      substitutions,
+      selectedPaths,
+      conflict,
+      rehydratePriority,
+    }),
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
   fileVersions: (id: number, path: string) =>
     api.get<FileVersionOption[]>(`/backup-configs/${id}/file-versions?path=${encodeURIComponent(path)}`),

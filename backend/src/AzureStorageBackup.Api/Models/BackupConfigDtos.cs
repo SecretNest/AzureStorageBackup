@@ -43,8 +43,16 @@ public record BackupConfigResponse(
         c.Status, c.LastError, c.LastErrorAt, activity);
 }
 
-/// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。</summary>
-public record RestoreRequestBody(string? TargetRoot, int? Version, Dictionary<string, int>? Substitutions = null);
+/// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。
+/// SelectedPaths 为空则还原整版本；非空则只还原恰好这些路径（需求 B，pack 只下一次、只写选中成员）。
+/// Conflict 为冲突模式（决策 3）；RehydratePriority 为 Archive 活化优先级。</summary>
+public record RestoreRequestBody(
+    string? TargetRoot,
+    int? Version,
+    Dictionary<string, int>? Substitutions = null,
+    List<string>? SelectedPaths = null,
+    RestoreConflictMode Conflict = RestoreConflictMode.OverwriteIfChanged,
+    RestoreRehydratePriority RehydratePriority = RestoreRehydratePriority.Standard);
 
 /// <summary>还原量估算请求体（§4.1b，需求 A）：选中路径的下载/解压量预估。Version 为空则用最新版本。</summary>
 public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
