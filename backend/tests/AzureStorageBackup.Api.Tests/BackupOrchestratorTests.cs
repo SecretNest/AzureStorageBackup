@@ -67,7 +67,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var factory = new BlobClientFactory();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
-            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), stagedLimitBytes: 200_000_000);
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"));
         var orchestrator = new BackupOrchestrator(
@@ -129,7 +129,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
         db.Database.EnsureCreated();
         var cache = new LocalIndexCache(db, counting);
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
@@ -166,7 +166,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
         db.Database.EnsureCreated();
         var tracked = new TrackedInfoStore(counting, new LocalBackupStateStore(db));
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
@@ -264,7 +264,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var db = new AzureStorageBackup.Api.Data.AppDbContext(
             opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
         db.Database.EnsureCreated();
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
@@ -361,7 +361,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
         db.Database.EnsureCreated();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
@@ -819,7 +819,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         var factory = new BlobClientFactory();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var log = new CapturingLog();
         var vlogRoot = Path.Combine(_temp, "vlog");
         var verboseLog = new VerboseFileLog(vlogRoot);
@@ -861,7 +861,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         var factory = new BlobClientFactory();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
-        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), 200_000_000);
+        var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var log = new ConcurrencyProbeLog();
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),

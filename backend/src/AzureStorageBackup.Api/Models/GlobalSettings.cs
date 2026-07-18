@@ -58,4 +58,7 @@ public class GlobalSettings
 
     // 死重压实阈值（PRD 3.3.3.4，M4 §6）：pack 死重比例超过此百分比时原地重压回收空间。
     public int DeadWeightThresholdPercent { get; set; } = 30;
+
+    /// <summary>压缩临时区（staged-temp）字节上限，背压阈值（决策 4，可经 Settings 实时改）。默认 2GB。</summary>
+    public long StagedLimitBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 }

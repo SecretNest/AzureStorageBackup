@@ -9,7 +9,7 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// staged-temp 有字节上限：未达上限才启动下一个压缩（允许单个结果临时超限）；
 /// 超限则阻塞新压缩，直到上传调用 Release 腾出空间。
 /// </summary>
-public sealed class StagingArea(string compressTempDir, string stagedTempDir, long stagedLimitBytes) : IDisposable
+public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit) : IDisposable
 {
     private readonly SemaphoreSlim _compressLock = new(1, 1);
     private readonly SemaphoreSlim _releaseSignal = new(0);
@@ -26,7 +26,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, lo
         try
         {
             // 背压：超限时等待上传腾出空间（从上限以下起步则允许本次结果临时超限）。
-            while (Interlocked.Read(ref _stagedBytes) >= stagedLimitBytes)
+            // 每次实时读当前上限（决策 4：Settings 改动立即生效）。
+            while (Interlocked.Read(ref _stagedBytes) >= stagedLimit())
                 await _releaseSignal.WaitAsync(ct);
 
             Directory.CreateDirectory(compressTempDir);

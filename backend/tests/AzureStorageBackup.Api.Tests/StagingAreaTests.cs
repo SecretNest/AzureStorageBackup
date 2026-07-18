@@ -22,7 +22,9 @@ public sealed class StagingAreaTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
-    private StagingArea Area(long limit) => new(_compressTemp, _stagedTemp, limit);
+    private StagingArea Area(long limit) => new(_compressTemp, _stagedTemp, () => limit);
+
+    private StagingArea AreaP(Func<long> limit) => new(_compressTemp, _stagedTemp, limit);
 
     /// <summary>假压缩：在 compress-temp 写一个 size 字节的卷文件。</summary>
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> Produce(string name, int size)
@@ -124,6 +126,26 @@ public sealed class StagingAreaTests : IDisposable
         var item = await second.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(secondStarted);
         Assert.Equal(10, item.Bytes);
+    }
+
+    [Fact]
+    public async Task Backpressure_Reads_Limit_Live_From_Provider()
+    {
+        long limit = 100;                      // 初始极小上限
+        using var area = AreaP(() => limit);
+
+        // 首个结果允许临时超限（从上限以下起步）。
+        var first = await area.StageAsync(Produce("a", 500));
+        Assert.Equal(500, area.StagedBytes);   // 已超过 100
+
+        // 第二个压缩应被背压阻塞（StagedBytes 500 >= limit 100）。
+        var blocked = area.StageAsync(Produce("b", 10));
+        Assert.False(blocked.IsCompleted);
+
+        // 调大上限 → 唤醒需要一次 Release 触发信号；这里改为先 Release 首个腾出空间。
+        area.Release(first);                   // StagedBytes -> 0，唤醒
+        var second = await blocked;
+        Assert.Equal(10, area.StagedBytes);
     }
 
     [Fact]

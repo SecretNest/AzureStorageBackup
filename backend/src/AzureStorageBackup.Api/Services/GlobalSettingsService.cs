@@ -49,6 +49,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.RetryBackoffSeconds = s.RetryBackoffSeconds;
         existing.RetryMaxTotalMinutes = s.RetryMaxTotalMinutes;
         existing.DeadWeightThresholdPercent = s.DeadWeightThresholdPercent;
+        existing.StagedLimitBytes = s.StagedLimitBytes;
         await db.SaveChangesAsync(ct);
         return existing;
     }

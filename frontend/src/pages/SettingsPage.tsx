@@ -108,6 +108,9 @@ export function SettingsPage() {
       <Field label="Dead-weight threshold (%)">
         <Num value={s.deadWeightThresholdPercent} onChange={(v) => set('deadWeightThresholdPercent', v)} />
       </Field>
+      <Field label="Staging area size limit (MB)">
+        <Num value={Math.round(s.stagedLimitBytes / MB)} onChange={(v) => set('stagedLimitBytes', v * MB)} />
+      </Field>
 
       <div style={{ marginTop: '1rem' }}>
         <button type="button" onClick={save}>Save</button>

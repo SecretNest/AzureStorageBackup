@@ -53,9 +53,19 @@ builder.Services.AddScoped<TrackedInfoStore>();
 var tempPath = builder.Configuration["Backup:TempPath"];
 if (string.IsNullOrWhiteSpace(tempPath))
     tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
-var stagedLimit = builder.Configuration.GetValue<long?>("Backup:StagedLimitBytes") ?? 1_073_741_824L; // 1GB
-builder.Services.AddSingleton(new StagingArea(
-    Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"), stagedLimit));
+builder.Services.AddSingleton(sp =>
+{
+    var compress = Path.Combine(tempPath, "compress");
+    var staged = Path.Combine(tempPath, "staged");
+    // 上限实时从 GlobalSettings 读（带 scope，短读一次），决策 4：Settings 改动立即生效。
+    long Limit()
+    {
+        using var scope = sp.GetRequiredService<IServiceScopeFactory>().CreateScope();
+        var settings = scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync().GetAwaiter().GetResult();
+        return settings.StagedLimitBytes > 0 ? settings.StagedLimitBytes : 2L * 1024 * 1024 * 1024;
+    }
+    return new StagingArea(compress, staged, Limit);
+});
 // verbose 逐文件 debug 日志的文件后端（按备份+按日期文本文件，PRD 3.6）。
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 

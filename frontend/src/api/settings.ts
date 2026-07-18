@@ -24,6 +24,7 @@ export interface GlobalSettings {
   retryBackoffSeconds: string
   retryMaxTotalMinutes: number
   deadWeightThresholdPercent: number
+  stagedLimitBytes: number
 }
 
 export const settingsApi = {
