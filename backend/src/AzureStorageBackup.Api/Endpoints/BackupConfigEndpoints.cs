@@ -205,6 +205,32 @@ public static class BackupConfigEndpoints
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
+        // 还原懒加载目录树（§4.1a，决策 1）：返回 path 目录的直接子节点（子目录+文件），供前端逐层展开，
+        // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
+        group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            if (info is null || info.Versions.Count == 0)
+                return Results.Ok(Array.Empty<TreeNode>());
+            var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
+            if (ver is null)
+                return Results.NotFound(new { error = "Version not found." });
+
+            var identity = info.Backup.CreatedAt.UtcTicks;
+            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
+            return Results.Ok(VersionTreeService.Children(idx, path));
+        });
+
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
         group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
         {
