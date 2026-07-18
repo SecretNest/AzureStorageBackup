@@ -88,4 +88,20 @@ public class GroupServiceTests : IDisposable
 
         Assert.Equal(2, all.Count);
     }
+
+    [Fact]
+    public async Task Group_Members_Are_Returned_In_Stable_Order()
+    {
+        var outOfOrder = new List<GroupMember>
+        {
+            new() { AccountId = 1, ContainerName = "c" },
+            new() { AccountId = 1, ContainerName = "a" },
+            new() { AccountId = 1, ContainerName = "b" },
+        };
+        var created = await _sut.CreateAsync("stable-order", outOfOrder);
+
+        var g = await _sut.GetAsync(created.Id);
+
+        Assert.Equal(new[] { "a", "b", "c" }, g!.Members.Select(m => m.ContainerName).ToArray());
+    }
 }

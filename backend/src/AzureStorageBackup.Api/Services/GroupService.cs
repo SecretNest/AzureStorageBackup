@@ -7,16 +7,20 @@ namespace AzureStorageBackup.Api.Services;
 public class GroupService(AppDbContext db) : IGroupService
 {
     public async Task<IReadOnlyList<Group>> ListAsync(CancellationToken ct = default) =>
-        await db.Groups.Include(g => g.Members).AsNoTracking()
+        await db.Groups
+            .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
+            .AsNoTracking()
             .OrderBy(g => g.Name).ToListAsync(ct);
 
     public async Task<Group?> GetAsync(int id, CancellationToken ct = default) =>
-        await db.Groups.Include(g => g.Members).AsNoTracking()
+        await db.Groups
+            .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
+            .AsNoTracking()
             .FirstOrDefaultAsync(g => g.Id == id, ct);
 
     public async Task<Group> CreateAsync(string name, IEnumerable<GroupMember> members, CancellationToken ct = default)
     {
-        var list = members.ToList();
+        var list = SortMembers(members);
         if (list.Count == 0)
             throw new ArgumentException("A group must contain at least one backup.", nameof(members));
 
@@ -33,7 +37,7 @@ public class GroupService(AppDbContext db) : IGroupService
 
     public async Task<Group?> UpdateAsync(int id, string name, IEnumerable<GroupMember> members, CancellationToken ct = default)
     {
-        var list = members.ToList();
+        var list = SortMembers(members);
         if (list.Count == 0)
             throw new ArgumentException("A group must contain at least one backup.", nameof(members));
 
@@ -48,6 +52,10 @@ public class GroupService(AppDbContext db) : IGroupService
         await db.SaveChangesAsync(ct);
         return group;
     }
+
+    /// <summary>组成员稳定排序：按 (AccountId, ContainerName)，避免插入序导致的 UI 抖动（§5.6）。</summary>
+    private static List<GroupMember> SortMembers(IEnumerable<GroupMember> members) =>
+        members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName, StringComparer.Ordinal).ToList();
 
     public async Task<bool> DeleteAsync(int id, CancellationToken ct = default)
     {
