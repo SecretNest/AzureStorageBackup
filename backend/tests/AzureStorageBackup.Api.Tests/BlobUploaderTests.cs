@@ -97,21 +97,4 @@ public sealed class BlobUploaderTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    [SkippableFact]
-    public async Task Batch_Uploads_All_Items_Concurrently()
-    {
-        var (uploader, container, account, name) = await SetupAsync();
-        try
-        {
-            var items = Enumerable.Range(0, 6)
-                .Select(i => new UploadItem($"data/b{i}", WriteFile($"f{i}.bin", "c" + i), AccessTier.Hot))
-                .ToList();
-
-            await uploader.UploadBatchAsync(account, name, items, maxConcurrency: 3);
-
-            foreach (var item in items)
-                Assert.True(await container.GetBlobClient(item.BlobName).ExistsAsync());
-        }
-        finally { await container.DeleteIfExistsAsync(); }
-    }
 }

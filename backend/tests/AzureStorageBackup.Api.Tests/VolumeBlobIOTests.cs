@@ -28,11 +28,6 @@ public sealed class VolumeBlobIOTests
             Order.Add(blobName);
             return Task.CompletedTask;
         }
-
-        public Task UploadBatchAsync(
-            Account account, string container, IReadOnlyList<UploadItem> items,
-            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
-            => Task.CompletedTask;
     }
 
     private static Account Acc() => new() { Name = "a", BlobEndpoint = "http://x", AccountKey = "k" };

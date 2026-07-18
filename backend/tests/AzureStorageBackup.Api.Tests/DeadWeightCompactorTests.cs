@@ -226,7 +226,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
     }
 
     /// <summary>装饰 uploader：上传（if-missing 与 overwrite 皆然）一律抛异常，模拟"传新阶段"崩溃。</summary>
-    private sealed class FailingUploader(IBlobUploader inner) : IBlobUploader
+    private sealed class FailingUploader : IBlobUploader
     {
         public Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
@@ -239,11 +239,6 @@ public sealed class DeadWeightCompactorTests : IDisposable
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
             => throw new IOException("injected upload failure");
-
-        public Task UploadBatchAsync(
-            Account account, string container, IReadOnlyList<UploadItem> items,
-            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
-            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
     /// <summary>记录 overwrite 上传顺序、并真正委托 inner 上传（供 ReplaceAsync 残留删除生效）。</summary>
@@ -265,11 +260,6 @@ public sealed class DeadWeightCompactorTests : IDisposable
             OverwriteOrder.Add(blobName);
             return inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
         }
-
-        public Task UploadBatchAsync(
-            Account account, string container, IReadOnlyList<UploadItem> items,
-            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
-            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
     // 传新阶段崩溃：旧 pack 分卷仍完整存在（此前 delete-first 会导致这里被删空 → 整 blob 丢失）。
@@ -288,7 +278,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
             // 用「上传即抛」的装饰 uploader；CompactAsync 逐 pack 吞掉异常，关键是旧数据须在失败后仍在。
             var compactor = new DeadWeightCompactor(
-                new FailingUploader(new BlobUploader(new BlobClientFactory())),
+                new FailingUploader(),
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact-fail"));
 
             await compactor.CompactAsync(account, container, null, info, live,

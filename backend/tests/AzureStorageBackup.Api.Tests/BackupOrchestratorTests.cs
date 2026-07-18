@@ -217,11 +217,6 @@ public sealed class BackupOrchestratorTests : IDisposable
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
             => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
-
-        public Task UploadBatchAsync(
-            Account account, string container, IReadOnlyList<UploadItem> items,
-            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
-            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
     /// <summary>统计 data/ blob 上传次数（验证去重不重复上传）。</summary>
@@ -250,11 +245,6 @@ public sealed class BackupOrchestratorTests : IDisposable
                 Interlocked.Increment(ref _dataUploads);
             return inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
         }
-
-        public Task UploadBatchAsync(
-            Account account, string container, IReadOnlyList<UploadItem> items,
-            int maxConcurrency, RetryOptions? retry = null, CancellationToken ct = default)
-            => inner.UploadBatchAsync(account, container, items, maxConcurrency, retry, ct);
     }
 
     private (BackupOrchestrator, IBackupInfoStore) BuildTracked(BlobClientFactory factory, IBlobUploader uploader, Microsoft.Data.Sqlite.SqliteConnection conn)
