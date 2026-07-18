@@ -111,6 +111,9 @@ export function SettingsPage() {
       <Field label="Staging area size limit (MB)">
         <Num value={Math.round(s.stagedLimitBytes / MB)} onChange={(v) => set('stagedLimitBytes', v * MB)} />
       </Field>
+      <Field label="Processing re-verify max attempts">
+        <Num value={s.processingMaxAttempts} onChange={(v) => set('processingMaxAttempts', v)} />
+      </Field>
 
       <div style={{ marginTop: '1rem' }}>
         <button type="button" onClick={save}>Save</button>

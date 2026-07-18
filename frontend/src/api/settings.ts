@@ -25,6 +25,7 @@ export interface GlobalSettings {
   retryMaxTotalMinutes: number
   deadWeightThresholdPercent: number
   stagedLimitBytes: number
+  processingMaxAttempts: number
 }
 
 export const settingsApi = {

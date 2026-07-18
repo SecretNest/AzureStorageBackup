@@ -33,6 +33,9 @@ public sealed record BackupEngineOptions
 
     /// <summary>死重重 pack 时本地缺失成员是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
     public bool AllowRepackDownload { get; init; } = true;
+
+    /// <summary>处理后重校验（<see cref="ProcessingVerifier"/>）反复重处理上限（PRD §5.1，默认 5）。</summary>
+    public int ProcessingMaxAttempts { get; init; } = 5;
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -392,7 +395,8 @@ public sealed class BackupOrchestrator(
         var finalHash = file.FullHash;
         if (verifier is not null)
         {
-            var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, ct: ct);
+            var verificationOptions = new VerificationOptions { MaxAttempts = request.Options.ProcessingMaxAttempts };
+            var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
             finalHash = vr.FullHash;
             if (vr.Outcome == ProcessingOutcome.Alarmed)
                 await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Container}",

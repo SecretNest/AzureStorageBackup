@@ -35,6 +35,7 @@ public static class BackupRequestMapper
                 ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
             AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
             VerboseLogging = config.VerboseLogging,
+            ProcessingMaxAttempts = settings is { ProcessingMaxAttempts: > 0 } ? settings.ProcessingMaxAttempts : 5,
         },
     };
 
