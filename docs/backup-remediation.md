@@ -55,14 +55,15 @@
 3. **rehydrate tier 空引用崩溃**：`rehydrate is {} t ? MapTier(t) : null` 因 `AccessTier` 隐式 string 转换，在未指定 tier 时对 /check、/repair、计划 Check 全部抛 `ArgumentNullException`（默认路径）→ 3 处显式 `(AccessTier?)` 转换。
 
 ## 4. 验证
-- `dotnet build -c Release` 0 警告；后端全量含集成 **317/317 通过、0 跳过**（Azurite + 7-Zip 在场）；前端 build + lint 干净。
+- `dotnet build -c Release` 0 警告；后端全量含集成 **330/330 通过、0 跳过**（Azurite + 7-Zip 在场；含收尾 follow-up 的新测试）；前端 build + lint 干净。
 - 逐项 TDD（失败测试→实现→绿）+ 逐项 spec/质量评审 + 整分支复审（判可合并，零 Critical/Important）。
 
-## 5. 待办（Minor / follow-up）
-- `VolumeBlobIO.ReplaceAsync` 删残留卷用前缀 `data/{hash}` 扫描，理论上会误匹配碰撞避让兄弟 `data/{hash}~1`（**既有行为**，需真实三段 hash 碰撞才触发，近乎不可能）——可改为排除 `~` 兄弟或按已知旧卷数删除。
-- 迁移新列（`StagedLimitBytes`/`ProcessingMaxAttempts`）SQL 默认 0，升级实例 `GET /settings` 在重存前显示 0（后端经 `>0?:回退` 安全）——可考虑 seed/HasDefaultValue。
-- 派生 `Checking` 活动也覆盖计划 Backup/Cleanup（无独立 runner 信号，展示性误标）。
-- `WriteStatusAsync` 五处重复、状态写失败静默吞（best-effort 侧通道）。
-- `/tree` 未知版本返回 404 而 `/unrecoverable` 返回 200 `[]`（端点语义微不一致）。
-- 删配置多步清理非事务（中途异常留部分清理 + 500；各步幂等可重试）。
-- `BackupRepairer.RepairAsync` 仍以 `store.ReadInfoAsync` 读信息文件（写侧 If-Match 仍安全）。
+## 5. 收尾 follow-up（全部已修，2026-07-18 第二批）
+终审列出的 Minor 已逐项修复（全量含集成 330/330 通过、0 警告）：
+- **`VolumeBlobIO.ReplaceAsync` 前缀删卷**：新增 `IsVolumeOf`（仅匹配基名或 `基名.<数字>` 卷后缀），删除时按它过滤，排除碰撞避让兄弟 `data/{hash}~N`。
+- **迁移新列默认 0 显示**：`GlobalSettingsService.GetAsync` 规范化非正值到模型默认（`StagedLimitBytes`→2GB、`ProcessingMaxAttempts`→5），`GET /settings` 不再显示 0。
+- **派生活动误标**：`BackupBusyTracker` 记录操作标签，`DeriveActivity` 读实际标签；`TaskDispatcher` 按任务类型传 `BackingUp/Checking/CleaningUp`（前端 `BackupActivity` 加 `CleaningUp`）。
+- **`WriteStatusAsync` 重复 + 静默吞**：抽 `IBackupConfigService.WriteStatusAsync` 扩展（五处共用），失败记 Warning。
+- **`/tree` 语义**：未知版本改返回 200 `[]`，与 `/unrecoverable`、`/file-versions` 一致。
+- **删配置清理非事务**：三步善后（日志/索引缓存/本地状态）各自 best-effort，单步失败记 Warning、不阻断其余、不 500。
+- **修复读信息文件**：`BackupRepairer.RepairAsync` 改走 `TrackedInfoStore.LoadAsync`（本地权威优先），与编排器/检查器一致。
