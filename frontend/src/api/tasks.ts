@@ -6,8 +6,9 @@ export const ScheduledTaskType = { Backup: 0, Check: 1, Cleanup: 2 } as const
 export const taskTypeLabels: Record<number, string> = { 0: 'Backup', 1: 'Check', 2: 'Cleanup' }
 export const targetKindLabels: Record<number, string> = { 0: 'Backup', 1: 'Group' }
 
-export const CloudCheckLevel = { None: 0, Metadata: 1, ExistenceSize: 2, Content: 3 } as const
-export const LocalCheckLevel = { None: 0, Attributes: 1, Content: 2 } as const
+// CloudCheckLevel/LocalCheckLevel 与 api/backupConfigs.ts 共用同一份定义，
+// 见 constants/labels.ts（§5.7 合并重复 label 字典）。
+export { CloudCheckLevel, LocalCheckLevel } from '../constants/labels'
 export const cloudCheckLabels: Record<number, string> = {
   0: "Don't check cloud", 1: 'Metadata', 2: 'Existence + size', 3: 'Content (download)',
 }

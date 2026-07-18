@@ -133,9 +133,9 @@ export interface BackupVersionInfo {
   changedFiles: number
 }
 
-// 分级检查（枚举按数值序列化，与后端一致）
-export const CloudCheckLevel = { None: 0, Metadata: 1, ExistenceSize: 2, Content: 3 } as const
-export const LocalCheckLevel = { None: 0, Attributes: 1, Content: 2 } as const
+// 分级检查（枚举按数值序列化，与后端一致）。CloudCheckLevel/LocalCheckLevel 与 api/tasks.ts
+// 共用同一份定义，见 constants/labels.ts（§5.7 合并重复 label 字典）。
+export { CloudCheckLevel, LocalCheckLevel } from '../constants/labels'
 export const CloudState = { NotChecked: 0, Ok: 1, MissingOrBad: 2 } as const
 export const LocalState = { NotChecked: 0, Ok: 1, Missing: 2, Changed: 3 } as const
 
