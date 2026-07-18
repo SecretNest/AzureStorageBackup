@@ -56,7 +56,7 @@
 3. **rehydrate tier 空引用崩溃**：`rehydrate is {} t ? MapTier(t) : null` 因 `AccessTier` 隐式 string 转换，在未指定 tier 时对 /check、/repair、计划 Check 全部抛 `ArgumentNullException`（默认路径）→ 3 处显式 `(AccessTier?)` 转换。
 
 ## 4. 验证
-- `dotnet build -c Release` 0 警告；后端全量含集成 **330/330 通过、0 跳过**（Azurite + 7-Zip 在场；含收尾 follow-up 的新测试）；前端 build + lint 干净。
+- `dotnet build -c Release` 0 警告；后端全量含集成 **332/332 通过、0 跳过**（Azurite + 7-Zip 在场）；前端 build + lint 干净。
 - 逐项 TDD（失败测试→实现→绿）+ 逐项 spec/质量评审 + 整分支复审（判可合并，零 Critical/Important）。
 
 ## 5. 收尾 follow-up（全部已修，2026-07-18 第二批）
@@ -68,3 +68,9 @@
 - **`/tree` 语义**：未知版本改返回 200 `[]`，与 `/unrecoverable`、`/file-versions` 一致。
 - **删配置清理非事务**：三步善后（日志/索引缓存/本地状态）各自 best-effort，单步失败记 Warning、不阻断其余、不 500。
 - **修复读信息文件**：`BackupRepairer.RepairAsync` 改走 `TrackedInfoStore.LoadAsync`（本地权威优先），与编排器/检查器一致。
+
+**零残留清理（评审曾判「可发布」的 5 个 cosmetic/既有 Minor，也一并清掉）**：
+- `StagingArea.MoveToStaged`：空产出不建 GUID 子目录；`File.Move` 中途失败清理子目录后重抛（异常路径不错记字节）。
+- `BlobRehydration.BeginAsync`：直接读 List Blobs 返回的 AccessTier/ArchiveStatus，免每卷单独 `GetProperties`。
+- 孤儿引用集构造的 `catch` 排除 `OperationCanceledException`（取消正常传播，而非被当作「放弃删除」吞掉）。
+- 孤儿删除循环逐个 best-effort：单个 `DeleteIfExists` 失败记 Warning 并继续，不中断其余（引用集外才删，绝不碰有效数据）。
