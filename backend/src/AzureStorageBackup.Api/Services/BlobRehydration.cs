@@ -15,12 +15,10 @@ public static class BlobRehydration
     /// <summary>枚举 baseRef 前缀全部分卷，对需活化者发起 SetAccessTier（best effort）。</summary>
     public static async Task BeginAsync(BlobContainerClient container, string baseRef, AccessTier tier, CancellationToken ct)
     {
+        // AccessTier/ArchiveStatus 已随 List Blobs 返回，直接读列表项，免每卷再发一次 GetProperties。
         var snapshot = new List<(string, string?, string?)>();
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
-        {
-            var props = (await container.GetBlobClient(b.Name).GetPropertiesAsync(cancellationToken: ct)).Value;
-            snapshot.Add((b.Name, props.AccessTier, props.ArchiveStatus));
-        }
+            snapshot.Add((b.Name, b.Properties.AccessTier?.ToString(), b.Properties.ArchiveStatus?.ToString()));
         foreach (var name in SelectToBegin(snapshot))
         {
             try { await container.GetBlobClient(name).SetAccessTierAsync(tier, cancellationToken: ct); }
