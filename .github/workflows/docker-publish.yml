@@ -11,6 +11,7 @@ on:
 
 env:
   IMAGE: ghcr.io/secretnest/azurestoragebackup
+  ACR_IMAGE: ${{ secrets.ACR_REGISTRY }}/secretnest/azurestoragebackup
 
 jobs:
   build-and-push:
@@ -35,11 +36,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
       - name: Compute tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
+          images: |
+            ${{ env.IMAGE }}
+            ${{ env.ACR_IMAGE }}
           tags: |
             type=raw,value=${{ inputs.tag }}
             type=sha
