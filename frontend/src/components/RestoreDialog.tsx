@@ -12,6 +12,7 @@ import {
 } from '../api/backupConfigs'
 import { Field } from './modal'
 import { overlayStyle, panelStyle } from './modalStyles'
+import { PathBrowser } from './PathBrowser'
 
 const rehydratePriorityLabels: Record<number, string> = {
   [RestoreRehydratePriority.Standard]: 'Standard',
@@ -38,6 +39,7 @@ export function RestoreDialog({
   const [versions, setVersions] = useState<number[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [target, setTarget] = useState(config.localRoot)
+  const [browsing, setBrowsing] = useState(false)
 
   // 不可恢复文件的按版本替代（沿用既有能力）
   const [unrecoverable, setUnrecoverable] = useState<string[]>([])
@@ -272,7 +274,20 @@ export function RestoreDialog({
         <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
         <Field label="Restore to">
           <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
+          <button type="button" onClick={() => setBrowsing(true)}>
+            Browse
+          </button>
         </Field>
+        {browsing && (
+          <PathBrowser
+            initialPath={target || undefined}
+            onPick={(p) => {
+              setTarget(p)
+              setBrowsing(false)
+            }}
+            onClose={() => setBrowsing(false)}
+          />
+        )}
         <Field label="Version">
           <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
             <option value="">Latest</option>
