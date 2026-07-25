@@ -1,6 +1,8 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Endpoints;
 using AzureStorageBackup.Api.Services;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
@@ -130,11 +132,57 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
-// --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
-var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-    ?? ["http://localhost:5173"];
+// --- 预置密码访问控制（设计 §2/§3）---
+var authGate = new AuthGate(builder.Configuration);
+builder.Services.AddSingleton(authGate);
+
+if (authGate.Required)
+{
+    builder.Services
+        .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+        .AddCookie(options =>
+        {
+            options.Cookie.Name = "asb_auth";
+            options.Cookie.HttpOnly = true;
+            options.Cookie.SameSite = SameSiteMode.Lax;
+            // 镜像默认监听 HTTP；硬编码 Always 会让浏览器根本不回传 cookie，
+            // 症状是「登录成功但立刻又被要求登录」。跟随请求协议才对。
+            options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+            options.ExpireTimeSpan = TimeSpan.FromDays(30);
+            options.SlidingExpiration = true;
+            // SPA + fetch：未认证返回 401，重定向只会让 fetch 拿到一份 HTML。
+            options.Events.OnRedirectToLogin = ctx =>
+            {
+                ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return Task.CompletedTask;
+            };
+            options.Events.OnRedirectToAccessDenied = ctx =>
+            {
+                ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return Task.CompletedTask;
+            };
+        });
+
+    // 默认全保护：将来新增端点自动受保护，漏加的后果是「多挡一个」而非「漏开一个洞」。
+    builder.Services.AddAuthorization(options =>
+        options.FallbackPolicy = new AuthorizationPolicyBuilder()
+            .RequireAuthenticatedUser()
+            .Build());
+}
+
+// --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源，不需要 CORS）---
+// dev-server 地址只写在 appsettings.Development.json 里（唯一真源）；未配置就是空列表——
+// 总不能让生产环境默认放行一个本地地址的带凭据跨域请求。
+var configuredOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+// 通配来源 + AllowCredentials() 是 CORS 协议禁止的组合，留着它会让任何跨域请求 500
+// （策略是惰性构建的，启动时不报错，只在第一个带 Origin 的请求上炸）。
+// 本轮加 AllowCredentials() 之前 "*" 是合法配置，所以只能丢弃它并告警，不能让老配置直接坏掉。
+var hasWildcardOrigin = configuredOrigins.Contains("*");
+var allowedOrigins = hasWildcardOrigin
+    ? configuredOrigins.Where(o => o != "*").ToArray()
+    : configuredOrigins;
 builder.Services.AddCors(options => options.AddPolicy(CorsPolicy, policy =>
-    policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod()));
+    policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
 builder.Services.AddOpenApi();
 
@@ -160,6 +208,11 @@ using (var scope = app.Services.CreateScope())
             "Data protection keyring cannot decrypt stored secrets; entering recovery mode.");
 }
 
+if (hasWildcardOrigin)
+    app.Logger.LogWarning(
+        "Cors:AllowedOrigins contains \"*\", which cannot be combined with credentials; the wildcard entry was ignored. "
+            + "List every allowed origin explicitly.");
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -171,10 +224,21 @@ app.UseCors(CorsPolicy);
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+if (authGate.Required)
+{
+    app.UseAuthentication();
+    app.UseAuthorization();
+}
+else
+{
+    app.Logger.LogWarning("Authentication is disabled: Auth__Password is not set.");
+}
+
 // 深度防御（设计 §3.1）：漏网的 SecretUnavailableException 统一映射为 409 keyring_lost，
 // 而不是裸 500。必须在端点之前入列才能包住端点执行。
 app.UseSecretUnavailableMapping();
 
+app.MapAuthEndpoints();
 app.MapHealthEndpoints();
 app.MapAccountEndpoints();
 app.MapContainerEndpoints();
@@ -188,7 +252,7 @@ app.MapSettingsEndpoints();
 app.MapSystemEndpoints();
 
 // 前端客户端路由回退到 index.html（非 /api 的未匹配路径）；wwwroot 无 index.html 时返回 404（开发无害）。
-app.MapFallbackToFile("index.html");
+app.MapFallbackToFile("index.html").AllowAnonymous();
 
 app.Run();
 
