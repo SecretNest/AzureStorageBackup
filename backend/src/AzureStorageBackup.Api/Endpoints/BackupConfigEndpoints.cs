@@ -149,8 +149,10 @@ public static class BackupConfigEndpoints
         });
 
         // 启动一次备份（后台运行，进度轮询）
-        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
 
@@ -166,8 +168,10 @@ public static class BackupConfigEndpoints
         });
 
         // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
-        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -335,8 +339,10 @@ public static class BackupConfigEndpoints
         });
 
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();

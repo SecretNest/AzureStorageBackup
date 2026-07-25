@@ -44,8 +44,20 @@ public sealed class SchedulerService(
         }
     }
 
-    private async Task TickAsync(CancellationToken ct)
+    /// <summary>单次 tick（internal 供测试直接驱动，覆盖密钥环跳过分支）。</summary>
+    internal async Task TickAsync(CancellationToken ct)
     {
+        using var scope = scopes.CreateScope();
+        var now = DateTimeOffset.UtcNow;
+
+        // 短存日志保留清理（PRD 3.6），天数取自全局设置。与密钥环状态无关，
+        // 即便密钥环丢失也要继续清理——密钥环丢失可能持续很久，此时日志膨胀的危害
+        // 与日志对排障的重要性都更高，故置于密钥环闸门之前（不受跳过影响）。
+        var settings = await scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
+        await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
+            settings.LogEphemeralMaxAgeDays, now, ct);
+        verboseLog.Trim(settings.LogEphemeralMaxAgeDays, now); // verbose 文本日志同窗口按日期删旧文件
+
         if (keyring.Status == KeyringStatus.Lost)
         {
             // 每 tick 只记一条汇总，不逐任务记——否则日志会被刷爆（设计 §3.3）
@@ -53,16 +65,7 @@ public sealed class SchedulerService(
             return;
         }
 
-        using var scope = scopes.CreateScope();
         var tasks = scope.ServiceProvider.GetRequiredService<IScheduledTaskService>();
-
-        var now = DateTimeOffset.UtcNow;
-
-        // 短存日志保留清理（PRD 3.6），天数取自全局设置
-        var settings = await scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-        await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
-            settings.LogEphemeralMaxAgeDays, now, ct);
-        verboseLog.Trim(settings.LogEphemeralMaxAgeDays, now); // verbose 文本日志同窗口按日期删旧文件
 
         foreach (var task in await tasks.ListAsync(ct))
         {
