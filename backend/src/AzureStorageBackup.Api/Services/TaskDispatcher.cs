@@ -8,7 +8,7 @@ namespace AzureStorageBackup.Api.Services;
 /// 按类型分发到 备份/检查/清理。每个引擎调用在独立 scope 中解析 scoped 服务。
 /// </summary>
 public sealed class TaskDispatcher(
-    IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets)
+    IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets, PathBoundary boundary)
 {
     public async Task DispatchAsync(ScheduledTask task, CancellationToken ct = default)
     {
@@ -73,6 +73,14 @@ public sealed class TaskDispatcher(
         if (config is null || account is null)
         {
             logger.LogWarning("No backup config for {Account}/{Container}; skipping scheduled {Type}", accountId, container, task.TaskType);
+            return;
+        }
+
+        if (!boundary.IsInside(config.LocalRoot))
+        {
+            logger.LogError(
+                "Scheduled task skipped: local root '{Root}' is outside the configured Backup__Root.",
+                config.LocalRoot);
             return;
         }
 
