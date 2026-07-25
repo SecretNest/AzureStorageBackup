@@ -20,16 +20,23 @@ export function PathBrowser({
   const [path, setPath] = useState<string | undefined>(initialPath)
 
   useEffect(() => {
+    // 目录快速切换时，取消上一个还没返回的请求，防止慢响应后到达
+    // 覆盖了新目录的数据（乱序响应）。
+    const controller = new AbortController()
     setError(null)
     browseApi
-      .list(path)
+      .list(path, controller.signal)
       .then(setData)
-      .catch((e) => setError(String(e)))
+      .catch((e) => {
+        if (controller.signal.aborted) return
+        setError(String(e))
+      })
+    return () => controller.abort()
   }, [path])
 
   return (
-    <div style={overlayStyle}>
-      <div style={panelStyle}>
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Choose a folder</h3>
 
         <p style={{ fontFamily: 'monospace', fontSize: '0.85rem', wordBreak: 'break-all' }}>
