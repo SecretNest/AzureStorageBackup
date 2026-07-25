@@ -79,6 +79,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
 | `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
+| `Auth__Password` | Password required to open the UI. Unset or empty = no authentication (the app logs a warning at startup). There is no username. | *(unset)* |
 | `Cors__AllowedOrigins__0` | Allowed browser origin. Not needed for the single-image deployment (frontend is same-origin); relevant only when hosting the SPA separately. | `http://localhost:5173` |
 | `ASPNETCORE_URLS` | Listen address. | `http://+:8080` |
 | `ASPNETCORE_ENVIRONMENT` | ASP.NET environment. | `Production` |
@@ -86,6 +87,10 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](docs/keyring-loss-recovery-design.md).
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
+
+> Setting `Auth__Password` puts a single password in front of the whole UI — there is no username, and changing the password means changing the variable and restarting. The session cookie is signed with the Data Protection key ring in `/keys`, so losing that directory signs you out and you will have to log in again; the password itself is read straight from the environment, so a lost key ring never locks you out.
+>
+> **Serve this behind an HTTPS reverse proxy in production.** Over plain HTTP both the password and the session cookie travel in the clear — the password gate keeps out people who do not know it, not anyone who can watch the traffic.
 
 ### Volumes / mounts
 
