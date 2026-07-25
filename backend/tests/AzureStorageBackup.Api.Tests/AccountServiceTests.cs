@@ -1,7 +1,6 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -19,11 +18,10 @@ public class AccountServiceTests : IDisposable
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
 
-        var encryption = new EncryptionService(new EphemeralDataProtectionProvider());
         var options = new DbContextOptionsBuilder<AppDbContext>()
             .UseSqlite(_connection)
             .Options;
-        _db = new AppDbContext(options, encryption);
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
 
         _sut = new AccountService(_db);
@@ -42,19 +40,21 @@ public class AccountServiceTests : IDisposable
         Description = "primary",
         BlobEndpoint = "https://prod.blob.core.windows.net",
         Region = AzureRegion.Global,
-        AccountKey = "the-secret-key==",
+        AccountKeyProtected = TestSecrets.Protect("the-secret-key=="),
         CreatedAt = DateTimeOffset.UtcNow
     };
 
     [Fact]
-    public async Task Create_Then_Get_Returns_Same_AccountKey()
+    public async Task Create_Then_Get_Keeps_Key_Ciphertext_That_Reader_Reveals()
     {
         var created = await _sut.CreateAsync(SampleAccount());
 
         var fetched = await _sut.GetAsync(created.Id);
 
         Assert.NotNull(fetched);
-        Assert.Equal("the-secret-key==", fetched!.AccountKey);
+        // 实体里始终是密文；明文只经 ISecretReader 取（设计 §3.1）。
+        Assert.NotEqual("the-secret-key==", fetched!.AccountKeyProtected);
+        Assert.Equal("the-secret-key==", TestSecrets.Reader.RevealAccountKey(fetched));
         Assert.Equal("prod", fetched.Name);
     }
 
@@ -63,7 +63,7 @@ public class AccountServiceTests : IDisposable
     {
         var created = await _sut.CreateAsync(SampleAccount());
 
-        // 绕过 EF converter 直接读原始列，验证落库确为密文
+        // 直接读原始列，验证落库确为密文
         await using var cmd = _connection.CreateCommand();
         cmd.CommandText = "SELECT AccountKey FROM Accounts WHERE Id = $id";
         cmd.Parameters.AddWithValue("$id", created.Id);
@@ -124,7 +124,7 @@ public class AccountServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task ProxyPassword_RoundTrips()
+    public async Task ProxyPassword_RoundTrips_As_Ciphertext()
     {
         var acct = SampleAccount();
         acct.UseProxy = true;
@@ -132,12 +132,14 @@ public class AccountServiceTests : IDisposable
         acct.ProxyHost = "proxy.local";
         acct.ProxyPort = 8080;
         acct.ProxyUsername = "user";
-        acct.ProxyPassword = "proxy-pass";
+        acct.ProxyPasswordProtected = TestSecrets.Protect("proxy-pass");
 
         var created = await _sut.CreateAsync(acct);
         var fetched = await _sut.GetAsync(created.Id);
 
-        Assert.Equal("proxy-pass", fetched!.ProxyPassword);
+        Assert.NotNull(fetched);
+        Assert.NotEqual("proxy-pass", fetched!.ProxyPasswordProtected);
+        Assert.Equal("proxy-pass", TestSecrets.Reader.RevealProxyPassword(fetched));
         Assert.Equal(8080, fetched.ProxyPort);
     }
 }

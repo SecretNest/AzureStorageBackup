@@ -16,7 +16,7 @@ public sealed class BackupInfoStoreTests
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -32,7 +32,7 @@ public sealed class BackupInfoStoreTests
 
     private static (BackupInfoStore Store, BlobClientFactory Factory) NewStore()
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         return (new BackupInfoStore(factory, new SevenZipArchiveCodec()), factory);
     }
 

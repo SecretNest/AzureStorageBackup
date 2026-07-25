@@ -36,7 +36,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -60,7 +60,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
     private async Task<(BackupInfoFile Info, Dictionary<string, Dictionary<string, LivePackMember>> Live,
         Azure.Storage.Blobs.BlobContainerClient Container, Account Account)> SetupAsync(string name)
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var account = AzuriteAccount();
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
@@ -107,7 +107,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
     }
 
     private DeadWeightCompactor Compactor() =>
-        new(new BlobUploader(new BlobClientFactory()), new SevenZipCompressor(), new FileHasher(),
+        new(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), new SevenZipCompressor(), new FileHasher(),
             Path.Combine(_temp, "compact"));
 
     private async Task<List<string>> PackEntriesAsync(Azure.Storage.Blobs.BlobContainerClient container)
@@ -175,7 +175,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var account = AzuriteAccount();
         var name = RandomName("dwc-dup-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -304,7 +304,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var account = AzuriteAccount();
         var name = RandomName("vbio-replace-");
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);

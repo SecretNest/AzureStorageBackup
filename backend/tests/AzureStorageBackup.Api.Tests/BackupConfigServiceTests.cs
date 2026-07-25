@@ -1,7 +1,6 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -18,9 +17,8 @@ public sealed class BackupConfigServiceTests : IDisposable
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
 
-        var encryption = new EncryptionService(new EphemeralDataProtectionProvider());
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options;
-        _db = new AppDbContext(options, encryption);
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
 
         _sut = new BackupConfigService(_db);
@@ -38,14 +36,14 @@ public sealed class BackupConfigServiceTests : IDisposable
         ContainerName = "photos",
         Name = name,
         LocalRoot = "/data/photos",
-        Password = "s3cret",
+        PasswordProtected = TestSecrets.Protect("s3cret"),
         DataTier = StorageTier.Cool,
         MaxVersions = 50,
         RetentionMode = RetentionMode.BothRequired,
     };
 
     [Fact]
-    public async Task Create_Then_Get_RoundTrips_Including_Password()
+    public async Task Create_Then_Get_Keeps_Password_Ciphertext_That_Reader_Reveals()
     {
         var created = await _sut.CreateAsync(Sample());
 
@@ -54,7 +52,9 @@ public sealed class BackupConfigServiceTests : IDisposable
 
         var fetched = await _sut.GetAsync(created.Id);
         Assert.Equal("photos", fetched!.Name);
-        Assert.Equal("s3cret", fetched.Password); // 透明解密
+        // 实体里始终是密文；明文只经 ISecretReader 取（设计 §3.1）。
+        Assert.NotEqual("s3cret", fetched.PasswordProtected);
+        Assert.Equal("s3cret", TestSecrets.Reader.RevealBackupPassword(fetched));
         Assert.Equal(StorageTier.Cool, fetched.DataTier);
         Assert.Equal(RetentionMode.BothRequired, fetched.RetentionMode);
     }
@@ -89,6 +89,7 @@ public sealed class BackupConfigServiceTests : IDisposable
         var created = await _sut.CreateAsync(Sample());
 
         var update = Sample();
+        update.PasswordProtected = null; // 更新请求不带密码（创建后不可更改，见 Clone 注释）
         update.Name = "renamed";
         update.MaxVersions = 10;
         var result = await _sut.UpdateAsync(created.Id, update);
@@ -104,6 +105,8 @@ public sealed class BackupConfigServiceTests : IDisposable
     }
 
     // BackupConfig 是 class（非 record），用逐字段克隆代替 `with` 表达式来构造更新请求。
+    // 刻意**不**复制 PasswordProtected：密码创建后不可更改（决策 8），更新请求一律不带密码
+    // （端点侧 BackupConfigRequest.Password 为空时 PasswordProtected 就是 null）。
     private static BackupConfig Clone(BackupConfig c) => new()
     {
         Id = c.Id,
@@ -112,7 +115,6 @@ public sealed class BackupConfigServiceTests : IDisposable
         Name = c.Name,
         Description = c.Description,
         LocalRoot = c.LocalRoot,
-        Password = c.Password,
         IndexTier = c.IndexTier,
         DataTier = c.DataTier,
         IgnoreRules = c.IgnoreRules,
@@ -157,10 +159,6 @@ public sealed class BackupConfigServiceTests : IDisposable
         changeDataTier.DataTier = StorageTier.Hot;
         await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, changeDataTier));
 
-        var changePassword = Clone(created);
-        changePassword.Password = "different-secret";
-        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, changePassword));
-
         // Name/规则/保留策略等可变字段可以正常更新。
         var ok = Clone(created);
         ok.Name = "renamed";
@@ -172,19 +170,35 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Equal(7, result.MaxVersions);
     }
 
+    // 密码创建后不可更改（决策 8）：密文含随机 IV，「是不是同一个密码」不可比较，
+    // 所以只要带了密码就拒绝——无论是新密码，还是原样回传的原密文。
+    [Fact]
+    public async Task Update_Rejects_Any_Non_Empty_Password()
+    {
+        var created = await _sut.CreateAsync(Sample());
+
+        var changePassword = Clone(created);
+        changePassword.PasswordProtected = TestSecrets.Protect("different-secret");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, changePassword));
+
+        var resubmitSameCiphertext = Clone(created);
+        resubmitSameCiphertext.PasswordProtected = created.PasswordProtected;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, resubmitSameCiphertext));
+    }
+
     [Fact]
     public async Task Update_Empty_Password_Preserves_Existing_Without_Rejecting()
     {
-        var created = await _sut.CreateAsync(Sample()); // Password = "s3cret"
+        var created = await _sut.CreateAsync(Sample()); // 密码明文 "s3cret"
 
-        var update = Clone(created);
-        update.Password = null; // 空密码 = 保留原值（约定见 BackupConfigEndpoints PUT），不算基础字段变更
+        var update = Clone(created); // 不带密码 = 保留原值（约定见 BackupConfigEndpoints PUT）
         update.Name = "renamed";
 
         var result = await _sut.UpdateAsync(created.Id, update);
 
         Assert.Equal("renamed", result!.Name);
-        Assert.Equal("s3cret", (await _sut.GetAsync(created.Id))!.Password);
+        var fetched = await _sut.GetAsync(created.Id);
+        Assert.Equal("s3cret", TestSecrets.Reader.RevealBackupPassword(fetched!));
     }
 
     [Fact]

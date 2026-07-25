@@ -30,7 +30,7 @@ public sealed class BlobUploaderTests : IDisposable
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -52,7 +52,7 @@ public sealed class BlobUploaderTests : IDisposable
     private async Task<(BlobUploader Uploader, BlobContainerClient Container, Account Account, string Name)> SetupAsync()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running on 127.0.0.1:10000");
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var account = AzuriteAccount();
         var name = RandomName("up-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);

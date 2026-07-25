@@ -1,7 +1,9 @@
 using Azure;
 using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
@@ -12,19 +14,19 @@ public static class BackupConfigEndpoints
     {
         var group = app.MapGroup("/api/backup-configs").WithTags("BackupConfigs");
 
-        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
             return Results.Ok(list.Select(c =>
-                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy))));
+                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c))));
         });
 
-        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var c = await svc.GetAsync(id, ct);
             return c is null
                 ? Results.NotFound()
-                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy)));
+                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c)));
         })
         .WithName("GetBackupConfig");
 
@@ -38,7 +40,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -48,6 +50,12 @@ public static class BackupConfigEndpoints
             try
             {
                 seeded = await trackedInfo.SeedFromCloudAsync(account, req.ContainerName, req.Password, ct);
+            }
+            catch (SecretUnavailableException)
+            {
+                // 密钥环丢失导致读不了账户密钥，与备份密码无关——不能把责任推给用户输的密码
+                // （与 reset-password 同处理）。
+                return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
             }
             catch (Exception ex)
             {
@@ -64,7 +72,10 @@ public static class BackupConfigEndpoints
                 Name = info.Backup.Name,
                 Description = info.Backup.Description,
                 LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
-                Password = info.Backup.Encrypted ? req.Password : null,
+                // 请求体里的密码是明文，落到实体上时立即加密（设计 §3.1）。
+                PasswordProtected = info.Backup.Encrypted && !string.IsNullOrEmpty(req.Password)
+                    ? encryption.Encrypt(req.Password)
+                    : null,
             };
             var created = await svc.CreateAsync(config, ct);
 
@@ -73,35 +84,32 @@ public static class BackupConfigEndpoints
             foreach (var v in info.Versions)
                 await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
 
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
             if (string.IsNullOrWhiteSpace(req.ContainerName))
                 return Results.BadRequest(new { error = "ContainerName is required." });
 
-            var created = await svc.CreateAsync(req.ToConfig(), ct);
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
+            var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
-        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
-            var existing = await svc.GetAsync(id, ct);
-            if (existing is null)
+            if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
 
-            var update = req.ToConfig();
-            // 空密码表示保留原值（不清除加密）
-            if (string.IsNullOrEmpty(req.Password))
-                update.Password = existing.Password;
+            // 空密码 = 保留原值、非空 = 拒绝（决策 8），均由服务层判定：密文含随机 IV，不能在此比较。
+            var update = req.ToConfig(encryption);
 
             try
             {
                 var result = await svc.UpdateAsync(id, update, ct);
-                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result));
+                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result, secretsUnavailable: Pending(keyring, encryption, result)));
             }
             catch (InvalidOperationException ex)
             {
@@ -112,7 +120,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -124,6 +132,11 @@ public static class BackupConfigEndpoints
 
             if (deleteContainer ?? false)
             {
+                // 只有连删云端 container 这一支需要账户密钥 → 密钥环丢失时 409。
+                // deleteContainer=false 那一支纯本地，必须保持不设闸门：它是决策 6 下
+                // 「想不起备份密码」的唯一出口，恢复模式里也得能走。
+                if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
                 var account = await accounts.GetAsync(accountId, ct);
                 if (account is null)
                     return Results.BadRequest(new { error = "Account not found." });
@@ -144,13 +157,19 @@ public static class BackupConfigEndpoints
                     () => indexCache.RemoveForContainerAsync(accountId, container, ct));
                 await BestEffort(logger, "remove local backup state",
                     () => localState.RemoveAsync(accountId, container, ct));
+
+                // 删掉的可能正是唯一一条待重设的解不开的密文（备份密码）：不收尾就翻不回 Healthy，
+                // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
+                await recovery.TryCompleteAsync(ct);
             }
             return ok ? Results.NoContent() : Results.NotFound();
         });
 
         // 启动一次备份（后台运行，进度轮询）
-        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
 
@@ -166,8 +185,10 @@ public static class BackupConfigEndpoints
         });
 
         // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
-        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -178,8 +199,10 @@ public static class BackupConfigEndpoints
         });
 
         // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
-        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -187,7 +210,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var candidates = new List<object>();
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
@@ -203,8 +226,10 @@ public static class BackupConfigEndpoints
         });
 
         // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
-        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -212,7 +237,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.Ok(Array.Empty<string>());
@@ -227,8 +252,10 @@ public static class BackupConfigEndpoints
         // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            CancellationToken ct) =>
+            ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -236,7 +263,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.Ok(Array.Empty<TreeNode>());
@@ -253,8 +280,10 @@ public static class BackupConfigEndpoints
         // 共享 pack/去重 blob 只计一次）与解压量，再对各去重对象首卷发起 HEAD 查活化状态（Archive/待就绪）。
         group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -262,7 +291,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.NotFound(new { error = "No versions found." });
@@ -327,8 +356,10 @@ public static class BackupConfigEndpoints
         });
 
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -349,8 +380,10 @@ public static class BackupConfigEndpoints
         });
 
         // 列出某备份的全部版本（供还原/检查选择版本）。走本地权威信息文件，平时不读云端。
-        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -358,7 +391,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var versions = (info?.Versions ?? []).Select(v => new
             {
@@ -372,8 +405,10 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, IKeyringHealth keyring, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -386,7 +421,7 @@ public static class BackupConfigEndpoints
                 return Results.Conflict(new { error = "Backup is busy with another operation." });
             try
             {
-                var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+                var password = secrets.RevealBackupPassword(config);
                 var settings = await settingsSvc.GetAsync(ct);
                 var options = new CheckOptions
                 {
@@ -416,8 +451,65 @@ public static class BackupConfigEndpoints
             }
         });
 
+        // 备份密码重设（设计 §3.4）。验证依据：加密备份的信息文件本身就是用该密码加密的 7z，
+        // 它是元数据根节点、容器内最小的加密对象，解得开即证明密码正确。
+        group.MapPost("/{id:int}/reset-password", async (
+            int id, ResetBackupPasswordRequest req, IBackupConfigService svc, IAccountService accounts,
+            IBackupInfoStore store, IEncryptionService encryption, AppDbContext db,
+            KeyringRecovery recovery, CancellationToken ct) =>
+        {
+            if (string.IsNullOrEmpty(req.Password))
+                return Results.BadRequest(new { error = "Password is required." });
+
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            if (string.IsNullOrEmpty(config.PasswordProtected))
+                return Results.BadRequest(new { error = "This backup is not encrypted; there is no password to restore." });
+
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            // 顺序依赖：连云需要账户密钥，故账户必须先恢复。
+            try
+            {
+                // 纯读，不可用 TrackedInfoStore.SeedFromCloudAsync——那会回填本地权威状态。
+                var info = await store.ReadInfoWithETagAsync(account, config.ContainerName, req.Password, ct);
+                if (info is null)
+                    return Results.BadRequest(new { error = "No backup info file found in the container." });
+                // ReadInfoWithETagAsync 优先探测未加密 blob 名——若容器里恰好有一份未加密的信息文件，
+                // 它会用 password: null 读回来，提交的密码根本没被用于解密。必须核对返回内容确实来自
+                // 加密对象，否则会把任意字符串当密码落库，真密码永久丢失。
+                if (!info.Value.Info.Backup.Encrypted)
+                    return Results.BadRequest(new { error = "This container's backup is not encrypted; the password cannot be verified." });
+            }
+            catch (SecretUnavailableException)
+            {
+                return Results.BadRequest(new { error = "Re-enter this backup's account credentials first." });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = $"Verification failed: {ex.Message}" });
+            }
+
+            var row = await db.BackupConfigs.FirstAsync(c => c.Id == id, ct);
+            row.PasswordProtected = encryption.Encrypt(req.Password);
+            await db.SaveChangesAsync(ct);
+
+            await recovery.TryCompleteAsync(ct);
+            return Results.NoContent();
+        });
+
         return app;
     }
+
+    /// <summary>
+    /// 该备份配置是否仍待重设密码。Healthy 时短路，列表端点不触发任何解密（设计 §3.1 的核心性质）；
+    /// Lost 时逐条试解，使已重设成功的备份立刻停止显示「待重设」（设计 §3.3）。
+    /// </summary>
+    private static bool Pending(IKeyringHealth keyring, IEncryptionService encryption, BackupConfig config) =>
+        keyring.Status == KeyringStatus.Lost && SecretAvailability.Unreadable(encryption, config);
 
     /// <summary>
     /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态

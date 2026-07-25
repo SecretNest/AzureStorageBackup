@@ -6,7 +6,8 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-public class BlobClientFactory : IBlobClientFactory
+/// <summary>账户凭据（key/代理密码）在此解密——云端调用的唯一咽喉（设计 §3.1）。</summary>
+public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
 {
     /// <summary>
     /// 从 endpoint 解析账户名：host-style（account.blob.core.windows.net）取 host 首段；
@@ -25,7 +26,7 @@ public class BlobClientFactory : IBlobClientFactory
     {
         var uri = new Uri(account.BlobEndpoint);
         var accountName = ParseAccountName(uri);
-        var credential = new StorageSharedKeyCredential(accountName, account.AccountKey);
+        var credential = new StorageSharedKeyCredential(accountName, secrets.RevealAccountKey(account));
 
         var options = new BlobClientOptions
         {
@@ -50,7 +51,7 @@ public class BlobClientFactory : IBlobClientFactory
     }
 
     /// <summary>根据账户代理设置构造 HttpClientHandler（公开以便单元测试）。</summary>
-    public static HttpClientHandler CreateProxyHandler(Account account)
+    public HttpClientHandler CreateProxyHandler(Account account)
     {
         var handler = new HttpClientHandler();
 
@@ -71,7 +72,8 @@ public class BlobClientFactory : IBlobClientFactory
         {
             var proxy = new WebProxy($"http://{account.ProxyHost}:{account.ProxyPort}");
             if (!string.IsNullOrEmpty(account.ProxyUsername))
-                proxy.Credentials = new NetworkCredential(account.ProxyUsername, account.ProxyPassword);
+                proxy.Credentials = new NetworkCredential(
+                    account.ProxyUsername, secrets.RevealProxyPassword(account));
             handler.Proxy = proxy;
         }
 

@@ -12,4 +12,19 @@ public class EncryptionService : IEncryptionService
     public string Encrypt(string plaintext) => _protector.Protect(plaintext);
 
     public string Decrypt(string ciphertext) => _protector.Unprotect(ciphertext);
+
+    public bool TryDecrypt(string ciphertext, out string plaintext)
+    {
+        try
+        {
+            plaintext = _protector.Unprotect(ciphertext);
+            return true;
+        }
+        catch (Exception)
+        {
+            // 密钥环换过、密文被截断或根本不是密文——一律视为不可用
+            plaintext = string.Empty;
+            return false;
+        }
+    }
 }

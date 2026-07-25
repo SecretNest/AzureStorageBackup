@@ -1,5 +1,8 @@
 using System.Reflection;
+using AzureStorageBackup.Api.Data;
+using AzureStorageBackup.Api.Services;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
@@ -40,6 +43,38 @@ public static class SystemEndpoints
         {
             var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
             return Results.Ok(new Dictionary<string, string> { ["version"] = version });
+        })
+        .WithTags("System");
+
+        // 密钥环状态与待重设计数（设计 §3.3），供顶部横幅与恢复清单使用。
+        app.MapGet("/api/system/keyring", async (
+            IKeyringHealth keyring, AppDbContext db, IEncryptionService encryption, CancellationToken ct) =>
+        {
+            if (keyring.Status == KeyringStatus.Healthy)
+                return Results.Ok(new
+                {
+                    status = nameof(KeyringStatus.Healthy),
+                    accountsPending = 0,
+                    backupConfigsPending = 0,
+                });
+
+            // 必须逐条试解，不能按全局状态一刀切：恢复流程会经过「账户已全部重设、备份密码仍是旧密文」
+            // 的中间态，此时状态仍是 Lost，但 accountsPending 必须归零，否则前端的顺序依赖
+            // （账户未清零则禁用备份密码重设）会把恢复流程锁死（见 SecretAvailability）。
+            var accounts = await db.Accounts.AsNoTracking()
+                .Select(a => new { a.AccountKeyProtected, a.ProxyPasswordProtected }).ToListAsync(ct);
+            var backupPasswords = await db.BackupConfigs.AsNoTracking()
+                .Where(c => c.PasswordProtected != null && c.PasswordProtected != "")
+                .Select(c => c.PasswordProtected!).ToListAsync(ct);
+
+            return Results.Ok(new
+            {
+                status = nameof(KeyringStatus.Lost),
+                accountsPending = accounts.Count(a =>
+                    SecretAvailability.Unreadable(encryption, a.AccountKeyProtected)
+                    || SecretAvailability.Unreadable(encryption, a.ProxyPasswordProtected)),
+                backupConfigsPending = backupPasswords.Count(p => SecretAvailability.Unreadable(encryption, p)),
+            });
         })
         .WithTags("System");
 

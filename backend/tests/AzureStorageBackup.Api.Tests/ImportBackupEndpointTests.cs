@@ -51,8 +51,8 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
         try
@@ -85,6 +85,63 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         }
     }
 
+    // 导入加密备份：请求体里的密码是明文，落库必须是密文（设计 §3.1）。存错了的话
+    // /versions（经 ISecretReader 取密码再读信息文件）会抛 SecretUnavailableException 或解不开信息文件。
+    [SkippableFact]
+    public async Task Import_Encrypted_Backup_Stores_Password_So_Versions_Still_Readable()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        Directory.CreateDirectory(_root);
+        await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "alpha");
+        var containerName = "impenc-" + Guid.NewGuid().ToString("N")[..8];
+
+        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var config = await (await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
+            account!.Id, containerName, "secret-photos", null, _root, "pw",
+            StorageTier.Hot, StorageTier.Hot, null, null, null, false,
+            100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.True(config!.HasPassword);
+
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
+        var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
+
+        try
+        {
+            await _client.PostAsync($"/api/backup-configs/{config.Id}/run", null);
+            for (var i = 0; i < 600; i++)
+            {
+                var s = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/run")).Content.ReadFromJsonAsync<RunRow>();
+                if (s!.status != "Running") break;
+                await Task.Delay(200);
+            }
+
+            await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
+
+            var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
+                new ImportRequest(account.Id, containerName, "pw"));
+            Assert.Equal(HttpStatusCode.Created, res.StatusCode);
+
+            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
+            Assert.True(imported!.HasPassword);
+
+            var versions = await _client.GetAsync($"/api/backup-configs/{imported.Id}/versions");
+            Assert.Equal(HttpStatusCode.OK, versions.StatusCode);
+            Assert.Single((await versions.Content.ReadFromJsonAsync<List<VersionRow>>())!);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
     [SkippableFact]
     public async Task Import_From_Empty_Container_Is_404()
     {
@@ -96,8 +153,8 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             .Content.ReadFromJsonAsync<AccountResponse>();
 
         var empty = "empty-" + Guid.NewGuid().ToString("N")[..8];
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(empty);
         await container.CreateIfNotExistsAsync();
         try
@@ -110,4 +167,6 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
     }
 
     private sealed record RunRow(string status);
+
+    private sealed record VersionRow(int version);
 }

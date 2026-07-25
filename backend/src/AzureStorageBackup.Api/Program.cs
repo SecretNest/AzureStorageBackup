@@ -1,4 +1,3 @@
-using Azure.Storage.Blobs;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Endpoints;
 using AzureStorageBackup.Api.Services;
@@ -21,19 +20,12 @@ if (string.IsNullOrWhiteSpace(keysPath))
     keysPath = "keys";
 Directory.CreateDirectory(keysPath);
 builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(keysPath));
-builder.Services.AddScoped<IEncryptionService, EncryptionService>();
-
-// --- Azure Blob Storage ---
-// 连接串来自配置 / 环境变量；未配置时回退到本地 Azurite 开发存储，保证进程可启动。
-var storageConn = builder.Configuration.GetConnectionString("AzureStorage");
-if (string.IsNullOrWhiteSpace(storageConn))
-    storageConn = builder.Configuration["Azure:Storage:ConnectionString"];
-if (string.IsNullOrWhiteSpace(storageConn))
-    storageConn = "UseDevelopmentStorage=true";
-builder.Services.AddSingleton(_ => new BlobServiceClient(storageConn));
+// 单例：EncryptionService 无状态、IDataProtector 线程安全；且单例 BlobClientFactory 依赖 ISecretReader，
+// 注入 Scoped 会在启动时触发作用域校验异常。
+builder.Services.AddSingleton<IEncryptionService, EncryptionService>();
+builder.Services.AddSingleton<ISecretReader, SecretReader>();
 
 // --- 业务服务 ---
-builder.Services.AddScoped<IAzureStorageService, AzureStorageService>();
 builder.Services.AddScoped<IAccountService, AccountService>();
 builder.Services.AddSingleton<IBlobClientFactory, BlobClientFactory>();
 builder.Services.AddScoped<IContainerService, ContainerService>();
@@ -128,6 +120,11 @@ builder.Services.AddScoped<INotificationConfigService, NotificationConfigService
 builder.Services.AddSingleton<INotificationSender, NotificationSender>();
 builder.Services.AddScoped<INotifier, NotificationService>();
 
+// 密钥环健康判定（设计 §3.2）
+builder.Services.AddSingleton<IKeyringHealth, KeyringHealth>();
+builder.Services.AddScoped<KeyringProbe>();
+builder.Services.AddScoped<KeyringRecovery>();
+
 // 调度器（M6）：常驻后台按 cron 触发计划任务。测试环境用 Scheduler:Enabled=false 关闭。
 builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
@@ -154,6 +151,13 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.Migrate();
+
+    // 密钥环健康判定（设计 §3.2）：纯本地，不访问云端。
+    var status = await scope.ServiceProvider.GetRequiredService<KeyringProbe>().EvaluateAsync();
+    app.Services.GetRequiredService<IKeyringHealth>().Set(status);
+    if (status == KeyringStatus.Lost)
+        app.Services.GetRequiredService<ILogger<Program>>().LogError(
+            "Data protection keyring cannot decrypt stored secrets; entering recovery mode.");
 }
 
 if (app.Environment.IsDevelopment())
@@ -166,6 +170,10 @@ app.UseCors(CorsPolicy);
 // 托管构建后的前端静态资源（Docker 镜像里位于 wwwroot）；开发时 wwwroot 为空，前端走 Vite。
 app.UseDefaultFiles();
 app.UseStaticFiles();
+
+// 深度防御（设计 §3.1）：漏网的 SecretUnavailableException 统一映射为 409 keyring_lost，
+// 而不是裸 500。必须在端点之前入列才能包住端点执行。
+app.UseSecretUnavailableMapping();
 
 app.MapHealthEndpoints();
 app.MapAccountEndpoints();

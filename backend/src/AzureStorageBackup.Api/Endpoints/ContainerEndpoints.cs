@@ -14,9 +14,13 @@ public static class ContainerEndpoints
     {
         var group = app.MapGroup("/api/accounts/{accountId:int}/containers").WithTags("Containers");
 
+        // 列/建/删 container 都要连云（设计 §3.1 明列「列容器」为需要凭据的动作），
+        // 密钥环丢失时必须在入口 409，而不是让 SecretReader 在深处抛异常。
         group.MapGet("/", async (
-            int accountId, IAccountService accounts, IContainerService containers, CancellationToken ct) =>
+            int accountId, IAccountService accounts, IContainerService containers, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var account = await accounts.GetAsync(accountId, ct);
             if (account is null)
                 return Results.NotFound();
@@ -27,8 +31,10 @@ public static class ContainerEndpoints
 
         group.MapPost("/", async (
             int accountId, CreateContainerRequest req,
-            IAccountService accounts, IContainerService containers, CancellationToken ct) =>
+            IAccountService accounts, IContainerService containers, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var account = await accounts.GetAsync(accountId, ct);
             if (account is null)
                 return Results.NotFound();
@@ -39,8 +45,10 @@ public static class ContainerEndpoints
 
         group.MapDelete("/{name}", async (
             int accountId, string name,
-            IAccountService accounts, IContainerService containers, CancellationToken ct) =>
+            IAccountService accounts, IContainerService containers, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var account = await accounts.GetAsync(accountId, ct);
             if (account is null)
                 return Results.NotFound();

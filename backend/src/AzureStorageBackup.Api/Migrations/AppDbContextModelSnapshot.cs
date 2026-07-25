@@ -23,9 +23,10 @@ namespace AzureStorageBackup.Api.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
 
-                    b.Property<string>("AccountKey")
+                    b.Property<string>("AccountKeyProtected")
                         .IsRequired()
-                        .HasColumnType("TEXT");
+                        .HasColumnType("TEXT")
+                        .HasColumnName("AccountKey");
 
                     b.Property<string>("BlobEndpoint")
                         .IsRequired()
@@ -48,8 +49,9 @@ namespace AzureStorageBackup.Api.Migrations
                     b.Property<int>("ProxyMode")
                         .HasColumnType("INTEGER");
 
-                    b.Property<string>("ProxyPassword")
-                        .HasColumnType("TEXT");
+                    b.Property<string>("ProxyPasswordProtected")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("ProxyPassword");
 
                     b.Property<int?>("ProxyPort")
                         .HasColumnType("INTEGER");
@@ -129,8 +131,9 @@ namespace AzureStorageBackup.Api.Migrations
                         .HasMaxLength(200)
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("Password")
-                        .HasColumnType("TEXT");
+                    b.Property<string>("PasswordProtected")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("Password");
 
                     b.Property<int>("RetentionMode")
                         .HasColumnType("INTEGER");
@@ -313,6 +316,24 @@ namespace AzureStorageBackup.Api.Migrations
                     b.HasIndex("GroupId");
 
                     b.ToTable("GroupMembers");
+                });
+
+            modelBuilder.Entity("AzureStorageBackup.Api.Models.KeyringCanary", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Ciphertext")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("KeyringCanaries");
                 });
 
             modelBuilder.Entity("AzureStorageBackup.Api.Models.LocalBackupState", b =>

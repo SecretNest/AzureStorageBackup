@@ -15,7 +15,7 @@ public class ContainerServiceTests
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global
     };
 
@@ -39,7 +39,7 @@ public class ContainerServiceTests
     public async Task Create_List_Delete_Container()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running on 127.0.0.1:10000");
-        var svc = new ContainerService(new BlobClientFactory());
+        var svc = new ContainerService(new BlobClientFactory(TestSecrets.Reader));
         var acct = AzuriteAccount();
         var name = RandomName("test-");
 
@@ -56,7 +56,7 @@ public class ContainerServiceTests
     public async Task Container_Without_Index_Is_None()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
-        var svc = new ContainerService(new BlobClientFactory());
+        var svc = new ContainerService(new BlobClientFactory(TestSecrets.Reader));
         var acct = AzuriteAccount();
         var name = RandomName("noidx-");
 
@@ -76,7 +76,7 @@ public class ContainerServiceTests
     public async Task Container_With_Plain_Index_Is_Plain()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var svc = new ContainerService(factory);
         var acct = AzuriteAccount();
         var name = RandomName("plain-");

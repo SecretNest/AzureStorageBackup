@@ -13,7 +13,7 @@ public enum StorageTier
 
 /// <summary>
 /// 一个备份的本地配置（PRD §11 新建备份向导产物）。
-/// 记录设备本地的根路径与设置；加密密码在应用层为明文，落库经 ValueConverter 加密（仿 M1）。
+/// 记录设备本地的根路径与设置；加密密码在应用层与库中均为密文，解密只经 ISecretReader（设计 §3.1）。
 /// </summary>
 public class BackupConfig
 {
@@ -28,8 +28,8 @@ public class BackupConfig
     /// <summary>本地根路径（设备本地；跨设备恢复时重新指定）。</summary>
     public string LocalRoot { get; set; } = string.Empty;
 
-    /// <summary>加密密码（应用态明文；落库加密）。空 = 不加密。</summary>
-    public string? Password { get; set; }
+    /// <summary>加密密码密文。空 = 不加密。取明文用 ISecretReader.RevealBackupPassword。</summary>
+    public string? PasswordProtected { get; set; }
 
     public StorageTier IndexTier { get; set; } = StorageTier.Hot;
     public StorageTier DataTier { get; set; } = StorageTier.Archive;

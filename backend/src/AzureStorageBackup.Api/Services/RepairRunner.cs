@@ -78,7 +78,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     ListOrphans = cleanupOrphans,
                 };
                 state.Report = await sp.GetRequiredService<BackupRepairer>().RepairAsync(
-                    account, config.ContainerName, string.IsNullOrEmpty(config.Password) ? null : config.Password,
+                    account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                     config.LocalRoot, version, options, BackupRequestMapper.MapTier(config.DataTier),
                     config.VolumeBytes is > 0 ? config.VolumeBytes : settings.DefaultVolumeBytes);
                 state.Status = RunStatus.Completed;

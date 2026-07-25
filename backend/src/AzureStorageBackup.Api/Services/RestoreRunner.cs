@@ -80,7 +80,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 Account = account,
                 Container = config.ContainerName,
                 TargetRoot = targetRoot,
-                Password = string.IsNullOrEmpty(config.Password) ? null : config.Password,
+                Password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                 Version = version,
                 DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
                 Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),

@@ -50,8 +50,13 @@ public static class TaskEndpoints
             await svc.DeleteAsync(id, ct) ? Results.NoContent() : Results.NotFound());
 
         // 立即执行一次（"Run now"；调度器复用同一 dispatcher）
-        group.MapPost("/{id:int}/run", async (int id, IScheduledTaskService svc, TaskDispatcher dispatcher, CancellationToken ct) =>
+        group.MapPost("/{id:int}/run", async (int id, IScheduledTaskService svc, TaskDispatcher dispatcher, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            // 手动触发计划的备份/检查/清理，与 /backup-configs/{id}/run 同性质，须同样闸门（设计 §3.3）。
+            // 缺了这道闸门时：dispatcher 内部解密备份密码抛出，被 DispatchAsync 的 catch 吞成一条日志，
+            // 端点照样推进 LastRunAt 并返回 200，UI 的「Run now」显示成功——什么都没做却报成功。
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var task = await svc.GetAsync(id, ct);
             if (task is null)
                 return Results.NotFound();

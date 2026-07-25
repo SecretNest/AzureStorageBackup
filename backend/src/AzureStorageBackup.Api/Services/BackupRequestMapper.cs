@@ -6,14 +6,19 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>把持久化的 BackupConfig 映射为引擎的 BackupRequest（BackupRunner 与调度器共用）。</summary>
 public static class BackupRequestMapper
 {
-    public static BackupRequest From(BackupConfig config, Account account, GlobalSettings? settings = null) => new()
+    /// <summary>
+    /// <paramref name="password"/> 是**明文**，由调用方经 ISecretReader.RevealBackupPassword 取得
+    /// （设计 §3.1：解密只在咽喉处；映射器是静态的，拿不到 ISecretReader）。
+    /// </summary>
+    public static BackupRequest From(
+        BackupConfig config, Account account, string? password, GlobalSettings? settings = null) => new()
     {
         Account = account,
         Container = config.ContainerName,
         LocalRoot = config.LocalRoot,
         Name = config.Name,
         Description = config.Description,
-        Password = Password(config),
+        Password = password,
         IndexTier = MapTier(config.IndexTier),
         DataTier = MapTier(config.DataTier),
         Options = new BackupEngineOptions
@@ -84,8 +89,7 @@ public static class BackupRequestMapper
         AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
     };
 
-    public static string? Password(BackupConfig config) =>
-        string.IsNullOrEmpty(config.Password) ? null : config.Password;
+    // 备份密码改由 ISecretReader.RevealBackupPassword 提供（设计 §3.1），此处不再暴露。
 
     public static AccessTier MapTier(StorageTier tier) => tier switch
     {

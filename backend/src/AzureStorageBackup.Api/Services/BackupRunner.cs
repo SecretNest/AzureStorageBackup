@@ -67,6 +67,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var account = await accounts.GetAsync(config.AccountId)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
+            var password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config);
 
             // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
             if (!busy.TryAcquire(account.Id, config.ContainerName, "BackingUp"))
@@ -78,7 +79,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             try
             {
                 var result = await orchestrator.RunAsync(
-                    BackupRequestMapper.From(config, account, settings), new StateProgress(state), CancellationToken.None);
+                    BackupRequestMapper.From(config, account, password, settings), new StateProgress(state), CancellationToken.None);
                 state.Version = result.Version;
                 state.Status = RunStatus.Completed;
             }

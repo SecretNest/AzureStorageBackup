@@ -1,7 +1,6 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -18,7 +17,7 @@ public sealed class OperationLogServiceTests : IDisposable
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options;
-        _db = new AppDbContext(options, new EncryptionService(new EphemeralDataProtectionProvider()));
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
         _sut = new OperationLogService(_db);
     }

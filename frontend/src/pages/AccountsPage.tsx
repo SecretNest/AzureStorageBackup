@@ -8,6 +8,8 @@ import {
   type AccountInput,
   type ConnectionResult,
 } from '../api/accounts'
+import { refreshKeyringStatus } from '../api/keyring'
+import { overlayStyle, panelStyle } from '../components/modalStyles'
 import { ContainersPage } from './ContainersPage'
 
 const emptyForm: AccountInput = {
@@ -33,6 +35,7 @@ export function AccountsPage() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [viewing, setViewing] = useState<Account | null>(null)
+  const [resetting, setResetting] = useState<Account | null>(null)
 
   const load = () => {
     accountsApi.list().then(setAccounts).catch((e) => setError(String(e)))
@@ -116,6 +119,34 @@ export function AccountsPage() {
   const set = <K extends keyof AccountInput>(k: K, v: AccountInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
 
+  // 密钥环丢失恢复(设计 §3.5)：重新录入账户密钥/代理密码，后端会连云验证后才落库。
+  const startReset = (a: Account) => {
+    setResetting(a)
+    setError(null)
+  }
+
+  const closeReset = () => {
+    setResetting(null)
+    setError(null)
+  }
+
+  const submitReset = async (accountKey: string, proxyPassword: string) => {
+    if (!resetting) return
+    setBusy(true)
+    try {
+      await accountsApi.resetSecrets(resetting.id, accountKey, proxyPassword || null)
+      setResetting(null)
+      load()
+      // 顶部横幅与备份页的顺序依赖都读同一份状态：重设成功后必须立刻刷新，
+      // 否则横幅会一直挂着已经过期的告警(设计 §3.5)。
+      void refreshKeyringStatus()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (viewing) {
     return (
       <ContainersPage
@@ -159,7 +190,17 @@ export function AccountsPage() {
           ) : (
             accounts.map((a) => (
               <tr key={a.id} style={{ borderBottom: '1px solid #eee' }}>
-                <td>{a.name}</td>
+                <td>
+                  {a.name}
+                  {a.secretsUnavailable && (
+                    <>
+                      <span style={{ color: '#b45309', marginLeft: '0.5rem' }}>Credential required</span>{' '}
+                      <button type="button" onClick={() => startReset(a)}>
+                        Re-enter
+                      </button>
+                    </>
+                  )}
+                </td>
                 <td>{a.blobEndpoint}</td>
                 <td>{regionLabels[a.region]}</td>
                 <td>{a.useProxy ? 'Yes' : 'No'}</td>
@@ -299,7 +340,77 @@ export function AccountsPage() {
           )}
         </div>
       )}
+
+      {resetting && (
+        <ResetSecretsModal
+          account={resetting}
+          busy={busy}
+          error={error}
+          onSubmit={submitReset}
+          onClose={closeReset}
+        />
+      )}
     </section>
+  )
+}
+
+// 密钥环丢失恢复弹窗：重新录入账户密钥(必填)与代理密码(仅代理账户需要)。后端会用它连云验证，
+// 验证通过才落库；验证失败以 400 携带 "Verification failed: ..." 返回，原样显示。
+function ResetSecretsModal({
+  account, busy, error, onSubmit, onClose,
+}: {
+  account: Account
+  busy: boolean
+  error: string | null
+  onSubmit: (accountKey: string, proxyPassword: string) => void
+  onClose: () => void
+}) {
+  const [accountKey, setAccountKey] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Re-enter Credentials — {account.name}</h3>
+        <p>
+          The data protection keys used to store this account's credentials were lost.
+          Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
+          it will be verified against the live storage account before being saved.
+        </p>
+
+        <Field label="Account Key">
+          <input
+            type="password"
+            value={accountKey}
+            onChange={(e) => setAccountKey(e.target.value)}
+          />
+        </Field>
+        {account.useProxy && (
+          <Field label="Proxy Password">
+            <input
+              type="password"
+              value={proxyPassword}
+              onChange={(e) => setProxyPassword(e.target.value)}
+            />
+          </Field>
+        )}
+
+        {error && <p style={{ color: 'crimson' }}>{error}</p>}
+
+        <div style={{ marginTop: '1rem' }}>
+          <button
+            type="button"
+            onClick={() => onSubmit(accountKey, proxyPassword)}
+            disabled={busy || !accountKey}
+          >
+            Submit
+          </button>{' '}
+          <button type="button" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 

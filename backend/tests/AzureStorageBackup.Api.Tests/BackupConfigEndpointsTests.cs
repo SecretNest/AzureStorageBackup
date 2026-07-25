@@ -106,8 +106,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var account = await (await _client.PostAsJsonAsync("/api/accounts", accountReq))
             .Content.ReadFromJsonAsync<AccountResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azuriteAccount = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azuriteAccount = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var cc = factoryClient.CreateServiceClient(azuriteAccount).GetBlobContainerClient(containerName);
         await cc.CreateIfNotExistsAsync();
 
@@ -442,8 +442,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                 SampleRequest("ep-cre") with { AccountId = account.Id, ContainerName = containerName, LocalRoot = localRoot }))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
         try

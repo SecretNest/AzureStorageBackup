@@ -32,15 +32,22 @@ public record BackupConfigResponse(
     BackupStatus Status,
     string? LastError,
     DateTimeOffset? LastErrorAt,
-    string Activity)
+    string Activity,
+    bool SecretsUnavailable)
 {
-    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle") => new(
+    /// <summary>
+    /// <paramref name="secretsUnavailable"/> 必须按该配置密文的实际可解性传入
+    /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
+    /// 已重设成功的备份必须停止显示「待重设」。无密码的备份没有密文可丢，恒为 false。
+    /// </summary>
+    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle", bool secretsUnavailable = false) => new(
         c.Id, c.AccountId, c.ContainerName, c.Name, c.Description, c.LocalRoot,
-        !string.IsNullOrEmpty(c.Password), c.IndexTier, c.DataTier,
+        !string.IsNullOrEmpty(c.PasswordProtected), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
-        c.Status, c.LastError, c.LastErrorAt, activity);
+        c.Status, c.LastError, c.LastErrorAt, activity,
+        secretsUnavailable && !string.IsNullOrEmpty(c.PasswordProtected));
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。
@@ -59,6 +66,9 @@ public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
 
 /// <summary>导入已有备份请求：读 container 的信息文件恢复配置（roadmap，PRD 1.5）。加密备份需提供密码。</summary>
 public record ImportRequest(int AccountId, string ContainerName, string? Password);
+
+/// <summary>备份密码重设请求。必须是当初加密云端包的那个密码——不支持更改密码（设计决策 6、8）。</summary>
+public record ResetBackupPasswordRequest(string Password);
 
 /// <summary>创建/更新备份配置请求体。更新时 Password 为空表示保留原值。</summary>
 public record BackupConfigRequest(
@@ -82,7 +92,8 @@ public record BackupConfigRequest(
     long? VolumeBytes = null,
     bool VerboseLogging = false)
 {
-    public BackupConfig ToConfig() => new()
+    /// <summary>请求体里的 Password 是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。</summary>
+    public BackupConfig ToConfig(IEncryptionService encryption) => new()
     {
         VolumeBytes = VolumeBytes,
         VerboseLogging = VerboseLogging,
@@ -91,7 +102,7 @@ public record BackupConfigRequest(
         Name = Name,
         Description = Description,
         LocalRoot = LocalRoot,
-        Password = Password,
+        PasswordProtected = string.IsNullOrEmpty(Password) ? null : encryption.Encrypt(Password),
         IndexTier = IndexTier,
         DataTier = DataTier,
         IgnoreRules = IgnoreRules,

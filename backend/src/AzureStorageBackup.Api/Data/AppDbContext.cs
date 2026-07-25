@@ -1,15 +1,12 @@
 using AzureStorageBackup.Api.Models;
-using AzureStorageBackup.Api.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace AzureStorageBackup.Api.Data;
 
 /// <summary>
-/// 应用数据上下文（SQLite）。敏感字段通过 ValueConverter 在落库边界自动加解密。
+/// 应用数据上下文（SQLite）。敏感字段在库与实体中均为密文，不在此处加解密（设计 §3.1）。
 /// </summary>
-public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionService encryption)
-    : DbContext(options)
+public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
 {
     public DbSet<Account> Accounts => Set<Account>();
     public DbSet<Group> Groups => Set<Group>();
@@ -21,24 +18,18 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
     public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
     public DbSet<CachedVersionIndex> CachedVersionIndexes => Set<CachedVersionIndex>();
     public DbSet<LocalBackupState> LocalBackupStates => Set<LocalBackupState>();
+    public DbSet<KeyringCanary> KeyringCanaries => Set<KeyringCanary>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        // 敏感字段落库加密：应用层读写明文，Provider 边界自动加解密。
-        var encrypt = new ValueConverter<string, string>(
-            v => encryption.Encrypt(v),
-            v => encryption.Decrypt(v));
-        var encryptNullable = new ValueConverter<string?, string?>(
-            v => v == null ? null : encryption.Encrypt(v),
-            v => v == null ? null : encryption.Decrypt(v));
-
         modelBuilder.Entity<Account>(entity =>
         {
             entity.HasKey(e => e.Id);
             entity.Property(e => e.Name).IsRequired().HasMaxLength(200);
             entity.Property(e => e.BlobEndpoint).IsRequired();
-            entity.Property(e => e.AccountKey).IsRequired().HasConversion(encrypt);
-            entity.Property(e => e.ProxyPassword).HasConversion(encryptNullable);
+            // 属性名带 Protected 后缀，列名保持原样（无 schema 变更）。
+            entity.Property(e => e.AccountKeyProtected).IsRequired().HasColumnName("AccountKey");
+            entity.Property(e => e.ProxyPasswordProtected).HasColumnName("ProxyPassword");
         });
 
         modelBuilder.Entity<Group>(e =>
@@ -67,7 +58,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
             e.Property(x => x.Name).IsRequired().HasMaxLength(200);
             e.Property(x => x.ContainerName).IsRequired();
             e.Property(x => x.LocalRoot).IsRequired();
-            e.Property(x => x.Password).HasConversion(encryptNullable); // 加密落库
+            e.Property(x => x.PasswordProtected).HasColumnName("Password"); // 密文落库，列名不变
         });
 
         modelBuilder.Entity<NotificationConfig>(e => e.HasKey(x => x.Id));
@@ -96,6 +87,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, IEncryptionSer
             e.HasKey(x => x.Id);
             e.Property(x => x.Container).IsRequired();
             e.HasIndex(x => new { x.AccountId, x.Container }).IsUnique();
+        });
+
+        modelBuilder.Entity<KeyringCanary>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Ciphertext).IsRequired();
         });
     }
 }
