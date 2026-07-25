@@ -7,7 +7,10 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public sealed class PathBoundary
 {
-    /// <summary>符号链接展开深度上限。超限判定为越界，而不是抛异常或死循环。</summary>
+    /// <summary>
+    /// 符号链接**展开次数**上限（与 Linux 的 40 次一致）。只数展开，不数普通路径段，
+    /// 否则一个没有任何软链的深目录也会被误判。超限判定为越界，而不是抛异常或死循环。
+    /// </summary>
     private const int MaxLinkDepth = 40;
 
     private readonly string? _realRoot;
@@ -15,9 +18,22 @@ public sealed class PathBoundary
     public PathBoundary(IConfiguration config)
     {
         var configured = config["Backup:Root"];
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            // 未配置 = 无边界，全部放行（既有约定）。
+            _realRoot = null;
+            return;
+        }
+
         // 根自身可能是软链：必须先解析成真实路径，否则后续比较全部基于一个假地址，
         // 会把所有合法路径都误拒。
-        _realRoot = string.IsNullOrWhiteSpace(configured) ? null : ResolveReal(configured);
+        // 配了根却解析不出来（成环 / 组件不可读）必须**炸在启动期**：若沿用 null，
+        // Enabled 会变成 false，边界静默消失、一切放行——配置错误伪装成「没配置」，
+        // 是这里最坏的结果。
+        _realRoot = ResolveReal(configured)
+            ?? throw new InvalidOperationException(
+                $"Backup root '{configured}' could not be resolved to a real path " +
+                "(symlink cycle or unreadable component). Fix Backup__Root or the filesystem.");
     }
 
     /// <summary>是否启用边界。未配置根时为 false，一切放行。</summary>
@@ -39,7 +55,33 @@ public sealed class PathBoundary
     }
 
     /// <summary>
-    /// 逐段展开符号链接，得到真实路径。链接成环（超过 <see cref="MaxLinkDepth"/>）时返回 null。
+    /// 真正的 realpath：从文件系统根出发逐段前进，得到完全解析后的真实路径。
+    /// 软链展开次数超过 <see cref="MaxLinkDepth"/>（成环）时返回 null。
+    /// <para>
+    /// 算法：维护一个**待处理段**栈和一个**已完全解析**的前缀 <c>resolved</c>，每次弹出一段：
+    /// <list type="bullet">
+    /// <item><c>.</c> 跳过；</item>
+    /// <item><c>..</c> 砍掉 <c>resolved</c> 的最后一段（不越过文件系统根）；</item>
+    /// <item>其余先拼到 <c>resolved</c>，再看这个新路径是不是软链——是的话把**目标的各段
+    /// 压回待处理栈**（目标为绝对路径时同时把 <c>resolved</c> 重置回文件系统根），
+    /// 让目标本身也被逐段重走。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 两处关键性质，缺一个就是可越界的洞：
+    /// </para>
+    /// <para>
+    /// 1) **绝不预先用 <c>Path.GetFullPath</c> 折叠 <c>..</c>**。GetFullPath 是**词法**折叠，
+    /// 而 POSIX 的 <c>..</c> 在软链展开**之后**才结算，两者只在跟着软链走时不一致——
+    /// 而那正是攻击面：<c>&lt;root&gt;/escape/../secret</c> 词法折叠成 <c>&lt;root&gt;/secret</c>（界内），
+    /// 实际却落在 <c>escape</c> 目标的父目录里（界外）。这里 <c>..</c> 作用在已解析前缀上，
+    /// 顺序与内核一致。相对**输入**仍需变成绝对路径，但只做拼接，不折叠。
+    /// </para>
+    /// <para>
+    /// 2) **软链目标必须重走，不能整体替换**。若把 <c>resolved</c> 直接换成目标的未解析字符串，
+    /// 目标里位于末段之前的组件就永远不会被检查：<c>b -&gt; &lt;界外&gt;</c>、<c>a -&gt; &lt;root&gt;/b/c</c> 时
+    /// <c>a</c> 会被判成 <c>&lt;root&gt;/b/c</c>（界内），实际是 <c>&lt;界外&gt;/c</c>。
+    /// </para>
     /// <para>
     /// 不能用 <c>Directory.ResolveLinkTarget(p, returnFinalTarget: true)</c> 代替：它只展开
     /// **最后一段**。若 <c>/nas/link</c> 是指向 <c>/etc</c> 的软链，查询 <c>/nas/link/passwd</c>
@@ -52,42 +94,94 @@ public sealed class PathBoundary
     /// </summary>
     public static string? ResolveReal(string path)
     {
-        var full = Path.GetFullPath(path);
-        var sep = Path.DirectorySeparatorChar;
-        var root = Path.GetPathRoot(full) ?? sep.ToString();
-        var segments = full[root.Length..].Split(sep, StringSplitOptions.RemoveEmptyEntries);
+        // Path/FileInfo 遇到 \0 会抛 ArgumentException；这里当成不可解析，
+        // 让调用方（IsInside）得到一次干净的拒绝而不是未处理异常。
+        if (string.IsNullOrEmpty(path) || path.Contains('\0'))
+            return null;
 
-        var current = root;
-        var depth = 0;
+        // 相对输入按当前工作目录变成绝对路径——只拼接，不做任何 `..` 折叠。
+        var absolute = Path.IsPathRooted(path)
+            ? path
+            : Path.Join(Directory.GetCurrentDirectory(), path);
 
-        foreach (var segment in segments)
+        var fsRoot = Path.GetPathRoot(absolute);
+        if (string.IsNullOrEmpty(fsRoot))
+            return null;
+
+        var pending = new Stack<string>();
+        PushSegments(pending, absolute[fsRoot.Length..]);
+
+        var resolved = fsRoot;
+        var expansions = 0;
+
+        while (pending.Count > 0)
         {
-            current = Path.Combine(current, segment);
+            var segment = pending.Pop();
 
-            // 一段可能连环指向另一个链接，循环展开到不再是链接为止
-            while (true)
+            if (segment is ".")
+                continue;
+
+            if (segment is "..")
             {
-                if (++depth > MaxLinkDepth)
+                // resolved 此刻已完全解析，所以这一步与内核的求值顺序一致。
+                var parent = Path.GetDirectoryName(resolved);
+                resolved = string.IsNullOrEmpty(parent) ? fsRoot : parent;
+                continue;
+            }
+
+            var candidate = Path.Combine(resolved, segment);
+
+            // FileSystemInfo.LinkTarget 底层是 lstat，不关心目标是文件还是目录；
+            // 路径不存在时返回 null，正是我们要的（不存在的段不是链接）。
+            var target = new FileInfo(candidate).LinkTarget;
+            if (target is null)
+            {
+                resolved = candidate;
+                continue;
+            }
+
+            if (++expansions > MaxLinkDepth)
+                return null;
+
+            if (Path.IsPathRooted(target))
+            {
+                var targetRoot = Path.GetPathRoot(target);
+                if (string.IsNullOrEmpty(targetRoot))
                     return null;
-
-                // FileSystemInfo.LinkTarget 底层是 lstat，不关心目标是文件还是目录；
-                // 路径不存在时返回 null，正是我们要的（不存在的段不是链接）。
-                var target = new FileInfo(current).LinkTarget;
-                if (target is null)
-                    break;
-
-                current = Path.IsPathRooted(target)
-                    ? Path.GetFullPath(target)
-                    : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(current) ?? root, target));
+                PushSegments(pending, target[targetRoot.Length..]);
+                resolved = targetRoot; // 绝对目标：从文件系统根重新走
+            }
+            else
+            {
+                // 相对目标以链接自身所在目录为基准，也就是当前的 resolved，不动它。
+                PushSegments(pending, target);
             }
         }
 
-        return current;
+        return resolved;
+    }
+
+    /// <summary>把一段路径拆成各段，倒序压栈，使弹出顺序等于从左到右。</summary>
+    private static void PushSegments(Stack<string> pending, string path)
+    {
+        var parts = path.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries);
+        for (var i = parts.Length - 1; i >= 0; i--)
+            pending.Push(parts[i]);
     }
 
     /// <summary>
     /// 纯词法的包含判定：规范化后按**路径段边界**比较，不解析符号链接。
     /// <c>/target</c> 不包含 <c>/targetx</c>。还原写入用它防索引数据里的 <c>..</c>。
+    /// <para>
+    /// **相对路径注意**：本方法只做词法处理，不碰文件系统（所以 <see cref="ResolveReal"/>
+    /// 的软链问题与它无关），但 <c>root</c>/<c>candidate</c> 若是**相对**路径，会被
+    /// <c>Path.GetFullPath</c> 按**进程当前工作目录**规范化——那几乎肯定不是调用方想要的基准。
+    /// 还原写入必须**先把索引里的相对路径拼到目标根上**再调用本方法，例如
+    /// <c>IsWithin(targetRoot, Path.Combine(targetRoot, entryPath))</c>，
+    /// 不要把 <c>entryPath</c> 直接传进来。
+    /// </para>
     /// </summary>
     public static bool IsWithin(string root, string candidate)
     {

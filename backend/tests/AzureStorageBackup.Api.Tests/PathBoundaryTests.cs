@@ -179,6 +179,112 @@ public class PathBoundaryTests : IDisposable
     }
 
     [Fact]
+    public void Rejects_Dot_Dot_Applied_After_An_Escaping_Symlink()
+    {
+        // POSIX 里 `..` 在软链展开**之后**才结算：先词法折叠 `..` 会把
+        // `<root>/escape/../secret` 变成 `<root>/secret`，从而放行一个实际落在
+        // `<base>/secret` 的路径。内核 realpath 给出的是 `<base>/secret`。
+        var root = Dir("nas");
+        var outside = Dir("outside");
+        Directory.CreateDirectory(Path.Combine(_base, "secret"));
+        Directory.CreateSymbolicLink(Path.Combine(root, "escape"), outside);
+        var sut = Boundary(root);
+
+        var query = Path.Combine(root, "escape", "..", "secret");
+        Assert.Equal(Path.Combine(_base, "secret"), PathBoundary.ResolveReal(query));
+        Assert.False(sut.IsInside(query));
+    }
+
+    [Fact]
+    public void Rejects_A_Symlink_Whose_Target_Passes_Through_Another_Escaping_Symlink()
+    {
+        // 软链目标必须被**重新逐段展开**，不能整体替换后就跳过：
+        // b -> <base>/outside（越界），a -> <root>/b/c（字面看在界内）。
+        // 只有重走 b 才能发现 a 实际落在 <base>/outside/c。
+        var root = Dir("nas");
+        var outside = Dir("outside");
+        Directory.CreateDirectory(Path.Combine(outside, "c"));
+        Directory.CreateSymbolicLink(Path.Combine(root, "b"), outside);
+        Directory.CreateSymbolicLink(Path.Combine(root, "a"), Path.Combine(root, "b", "c"));
+        var sut = Boundary(root);
+
+        var query = Path.Combine(root, "a");
+        Assert.Equal(Path.Combine(outside, "c"), PathBoundary.ResolveReal(query));
+        Assert.False(sut.IsInside(query));
+    }
+
+    [Fact]
+    public void Accepts_A_Deep_Path_With_No_Symlinks_At_All()
+    {
+        // 深度上限只该数**软链展开次数**；普通深目录不能因为段数多就被拒。
+        var root = Dir("nas");
+        var deep = root;
+        for (var i = 0; i < 60; i++)
+            deep = Path.Combine(deep, "d" + i);
+        var sut = Boundary(root);
+
+        Assert.True(sut.IsInside(deep));
+    }
+
+    [Fact]
+    public void Throws_When_The_Configured_Root_Cannot_Be_Resolved()
+    {
+        // 根解析不出来时必须在启动期炸掉：静默退化成「无边界」等于边界消失。
+        var a = Path.Combine(_base, "cyclic-a");
+        var b = Path.Combine(_base, "cyclic-b");
+        Directory.CreateSymbolicLink(a, b);
+        Directory.CreateSymbolicLink(b, a);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => Boundary(a));
+        Assert.Contains(a, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Enabled_And_Root_Report_The_Resolved_Root()
+    {
+        var real = Dir("real-storage");
+        var link = Path.Combine(_base, "nas-link");
+        Directory.CreateSymbolicLink(link, real);
+        var sut = Boundary(link);
+
+        Assert.True(sut.Enabled);
+        Assert.Equal(real, sut.Root);
+    }
+
+    [Fact]
+    public void Rejects_A_Relative_Symlink_Target_Pointing_Outside()
+    {
+        // 相对目标分支此前完全没有用例覆盖
+        var root = Dir("nas");
+        Dir("outside");
+        Directory.CreateSymbolicLink(Path.Combine(root, "escape"), Path.Combine("..", "outside"));
+        var sut = Boundary(root);
+
+        Assert.Equal(Path.Combine(_base, "outside"), PathBoundary.ResolveReal(Path.Combine(root, "escape")));
+        Assert.False(sut.IsInside(Path.Combine(root, "escape", "a.jpg")));
+    }
+
+    [Fact]
+    public void Accepts_A_Relative_Symlink_Target_That_Stays_Inside()
+    {
+        var root = Dir("nas");
+        Directory.CreateDirectory(Path.Combine(root, "real"));
+        Directory.CreateSymbolicLink(Path.Combine(root, "alias"), "real");
+        var sut = Boundary(root);
+
+        Assert.True(sut.IsInside(Path.Combine(root, "alias", "a.jpg")));
+    }
+
+    [Fact]
+    public void Rejects_A_Path_Containing_A_Null_Character_Instead_Of_Throwing()
+    {
+        var root = Dir("nas");
+        var sut = Boundary(root);
+
+        Assert.False(sut.IsInside(Path.Combine(root, "a\0b")));
+    }
+
+    [Fact]
     public void IsWithin_Compares_On_Segment_Boundaries_Without_Resolving_Links()
     {
         // 还原写入用这个纯词法版本：它防的是索引数据里的 ..，不解析本地软链
@@ -186,5 +292,18 @@ public class PathBoundaryTests : IDisposable
         Assert.True(PathBoundary.IsWithin("/target", "/target/a/b.txt"));
         Assert.False(PathBoundary.IsWithin("/target", "/targetx/b.txt"));
         Assert.False(PathBoundary.IsWithin("/target", "/target/../etc/passwd"));
+    }
+
+    [Fact]
+    public void IsWithin_Tolerates_Trailing_Separators_And_A_Filesystem_Root()
+    {
+        Assert.True(PathBoundary.IsWithin("/target/", "/target"));
+        Assert.True(PathBoundary.IsWithin("/target", "/target/"));
+        Assert.True(PathBoundary.IsWithin("/target/", "/target/a/"));
+        Assert.False(PathBoundary.IsWithin("/target/", "/targetx/"));
+
+        // 根为 "/" 时一切绝对路径都在界内，且不能因 TrimEnd 把根削成空串而误判
+        Assert.True(PathBoundary.IsWithin("/", "/"));
+        Assert.True(PathBoundary.IsWithin("/", "/anything/at/all"));
     }
 }
