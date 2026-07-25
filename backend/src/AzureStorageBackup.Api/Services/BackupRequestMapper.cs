@@ -99,7 +99,10 @@ public static class BackupRequestMapper
         _ => AccessTier.Hot,
     };
 
-    private static IgnoreRuleSet? OptionalRules(string? text) =>
+    /// <summary>把一段可选的规则文本映射为规则集（空/空白 → null，表示「没有规则」）。
+    /// 公开是因为修复路径（RepairRunner → BackupRepairer）也要按同一套 DontCompress 规则决定是否只存不压，
+    /// 否则修好的归档与全新备份写出的压缩方式不一致。</summary>
+    public static IgnoreRuleSet? OptionalRules(string? text) =>
         string.IsNullOrWhiteSpace(text) ? null : new IgnoreRuleSet(SplitLines(text));
 
     private static IEnumerable<string> SplitLines(string? text) =>

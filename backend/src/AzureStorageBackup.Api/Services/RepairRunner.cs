@@ -80,7 +80,9 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 state.Report = await sp.GetRequiredService<BackupRepairer>().RepairAsync(
                     account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                     config.LocalRoot, version, options, BackupRequestMapper.MapTier(config.DataTier),
-                    config.VolumeBytes is > 0 ? config.VolumeBytes : settings.DefaultVolumeBytes);
+                    config.VolumeBytes is > 0 ? config.VolumeBytes : settings.DefaultVolumeBytes,
+                    // 与 BackupRequestMapper.From 取同一份规则：修好的归档要和全新备份写出的压缩方式一致。
+                    BackupRequestMapper.OptionalRules(config.DontCompressRules));
                 state.Status = RunStatus.Completed;
             }
             finally

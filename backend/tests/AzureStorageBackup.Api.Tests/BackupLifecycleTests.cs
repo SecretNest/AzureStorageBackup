@@ -492,7 +492,7 @@ public sealed class BackupLifecycleTests : IDisposable
             // ═══ 阶段 5：检查 + 修复 ═══
             var repair = await rig.Repairer.RepairAsync(
                 account, name, password, _root, version: null,
-                deep with { ListOrphans = true }, AccessTier.Hot, volumeBytes: null);
+                deep with { ListOrphans = true }, AccessTier.Hot, volumeBytes: null, dontCompress: null);
 
             Assert.Equal(damaged.CorruptedPaths.Order(), repair.Repaired.Order());
             Assert.Empty(repair.Unrecoverable);
@@ -561,7 +561,7 @@ public sealed class BackupLifecycleTests : IDisposable
             await DeleteArchiveAsync(cc, clip.Ref);
             var repair = await rig.Repairer.RepairAsync(
                 account, name, password, _root, version: null,
-                new CheckOptions { Cloud = CloudCheckLevel.ExistenceSize }, AccessTier.Hot, volumeBytes: null);
+                new CheckOptions { Cloud = CloudCheckLevel.ExistenceSize }, AccessTier.Hot, volumeBytes: null, dontCompress: null);
             Assert.Equal(["media/clip.bin"], repair.Repaired);
 
             // 修复写回的对象仍须加密。

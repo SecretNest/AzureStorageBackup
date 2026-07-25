@@ -107,10 +107,14 @@ public sealed class BackupRepairerTests : IDisposable
         return (backup, checker, repairer, tracked, indexCache, factory);
     }
 
-    private BackupRequest Req(Account a, string c) => new()
+    private BackupRequest Req(Account a, string c, IgnoreRuleSet? dontCompress = null, string? password = null) => new()
     {
-        Account = a, Container = c, LocalRoot = _src, Name = "photos",
-        Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+        Account = a, Container = c, LocalRoot = _src, Name = "photos", Password = password,
+        Options = new BackupEngineOptions
+        {
+            Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+            DontCompress = dontCompress,
+        },
     };
 
     [SkippableFact]
@@ -137,7 +141,8 @@ public sealed class BackupRepairerTests : IDisposable
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
 
             var report = await repairer.RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
             Assert.Contains("a.txt", report.Repaired);
             Assert.Empty(report.Unrecoverable);
 
@@ -153,6 +158,75 @@ public sealed class BackupRepairerTests : IDisposable
             var ex = await Record.ExceptionAsync(() =>
                 tracked.WriteAsync(account, name, info, null, Azure.Storage.Blobs.Models.AccessTier.Hot));
             Assert.Null(ex);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// F7：修复重压单文件 blob 时，StoreOnly 必须与全新备份对同一路径的推导一致（按配置的 DontCompress 规则），
+    /// 而不是硬编码 false。修好的归档才和全新备份写出的是同一种东西。
+    /// <para>
+    /// 两个方向一起验，防止「一律只存」蒙混过关：logs/big.log 命中规则（应只存 → 归档≈原文件大小），
+    /// data/big.bin 不命中（应压缩 → 归档远小于原文件）。两个文件内容都高度可压缩，故两种模式的
+    /// 归档尺寸相差一个数量级以上，断言不靠微小差异。
+    /// </para>
+    /// <para>修复前（硬编码 StoreOnly: false）：logs/big.log 被重压成 -mx9 的小归档，其尺寸断言失败。</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Repair_Derives_StoreOnly_From_The_DontCompress_Rules_Like_A_Fresh_Backup_Does()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        // 必须是**加密**备份：未加密的 store-only 文件走原始直传（CopyRawAsync），根本不过 7z，
+        // StoreOnly 参数对它没有作用。加密时 store-only 仍要过 7z（-mx0 + 密码），正是被测的那条路径。
+        const string password = "repair-store-only-pw";
+        var rules = new IgnoreRuleSet(["*.log"]);
+        var (backup, _, repairer, _, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("rep-store-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 高度可压缩的内容：-mx0 与 -mx9 的归档尺寸差一个数量级，断言不会卡在边界上。
+            // 两个文件内容必须不同——内容寻址会把同内容去重成一个 blob，那样就只剩一条路径可验了。
+            Directory.CreateDirectory(Path.Combine(_src, "logs"));
+            Directory.CreateDirectory(Path.Combine(_src, "data"));
+            await File.WriteAllTextAsync(Path.Combine(_src, "logs", "big.log"), new string('a', 200_000));
+            await File.WriteAllTextAsync(Path.Combine(_src, "data", "big.bin"), new string('b', 200_000));
+            await backup.RunAsync(Req(account, name, rules, password));
+
+            var info = await store.ReadInfoAsync(account, name, password);
+            var v1 = info!.Versions.Single();
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, password);
+            var logRef = idx.Entries.Single(e => e.Path == "logs/big.log").Storage!.Ref;
+            var binRef = idx.Entries.Single(e => e.Path == "data/big.bin").Storage!.Ref;
+            Assert.NotEqual(logRef, binRef); // 内容不同 → 两个独立的 blob，两条路径各自走各自的推导
+
+            async Task<long> SizeOf(string blobRef) =>
+                (await container.GetBlobClient(blobRef).GetPropertiesAsync()).Value.ContentLength;
+
+            var freshLog = await SizeOf(logRef);
+            var freshBin = await SizeOf(binRef);
+            // 先确认全新备份自己确实按规则分了道：只存的那个远大于压缩的那个。
+            Assert.True(freshLog > freshBin * 10, $"fresh backup did not honour the rules: log={freshLog} bin={freshBin}");
+
+            await container.GetBlobClient(logRef).DeleteIfExistsAsync();
+            await container.GetBlobClient(binRef).DeleteIfExistsAsync();
+
+            var report = await repairer.RepairAsync(
+                account, name, password, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: rules);
+            Assert.Contains("logs/big.log", report.Repaired);
+            Assert.Contains("data/big.bin", report.Repaired);
+
+            // 修好的归档尺寸与全新备份写出的一致（同内容 + 同 StoreOnly → 同一个 7z 命令）。
+            var repairedLog = await SizeOf(logRef);
+            var repairedBin = await SizeOf(binRef);
+            Assert.InRange(repairedLog, (long)(freshLog * 0.9), (long)(freshLog * 1.1));
+            Assert.InRange(repairedBin, (long)(freshBin * 0.9), (long)(freshBin * 1.1));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -225,7 +299,7 @@ public sealed class BackupRepairerTests : IDisposable
             await container.GetBlobClient(blobRef).DeleteIfExistsAsync();
 
             var report = await repairer.RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null);
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
             Assert.Contains("a.txt", report.Repaired);
 
             var meta = (await container.GetBlobClient(blobRef).GetPropertiesAsync()).Value.Metadata;
@@ -265,7 +339,7 @@ public sealed class BackupRepairerTests : IDisposable
             await container.GetBlobClient(blobRef).DeleteIfExistsAsync();
 
             var report = await repairer.RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null);
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
             Assert.Contains("a.txt", report.Repaired);
 
             // 退化确实发生了：写出的对象不带 head/tail。

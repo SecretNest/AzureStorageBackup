@@ -121,7 +121,7 @@ public sealed class OperationLogSourceTests
             uploader: null!, tempRoot: Path.GetTempPath(), checker: checker);
         var account = new Account { Id = 7, Name = "acct7" };
 
-        try { await repairer.RepairAsync(account, "photos", null, "/tmp", null, new CheckOptions(), AccessTier.Hot, null); }
+        try { await repairer.RepairAsync(account, "photos", null, "/tmp", null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null); }
         catch (InvalidOperationException) { /* expected: fake store throws inside checker.CheckAsync */ }
 
         Assert.Contains(log.Entries, e => e.Source == "check:7/photos");
