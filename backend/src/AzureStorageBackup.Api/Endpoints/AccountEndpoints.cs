@@ -1,5 +1,7 @@
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
@@ -62,6 +64,47 @@ public static class AccountEndpoints
         {
             var result = await factory.TestConnectionAsync(req.ToAccount(encryption), ct);
             return Results.Ok(result);
+        });
+
+        // 凭据重设（设计 §3.4）。不复用 PUT——PUT 在恢复模式下受限，且此处必须验证后才落库。
+        group.MapPost("/{id:int}/reset-secrets", async (
+            int id, ResetAccountSecretsRequest req, IAccountService svc, IBlobClientFactory factory,
+            IEncryptionService encryption, AppDbContext db, CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.AccountKey))
+                return Results.BadRequest(new { error = "AccountKey is required." });
+
+            var existing = await svc.GetAsync(id, ct);
+            if (existing is null)
+                return Results.NotFound();
+
+            // 用待验证的凭据构造一个临时账户对象去连云；验证不过则不落库。
+            var candidate = new Account
+            {
+                Id = existing.Id,
+                Name = existing.Name,
+                BlobEndpoint = existing.BlobEndpoint,
+                Region = existing.Region,
+                UseProxy = existing.UseProxy,
+                ProxyMode = existing.ProxyMode,
+                ProxyHost = existing.ProxyHost,
+                ProxyPort = existing.ProxyPort,
+                ProxyUsername = existing.ProxyUsername,
+                AccountKeyProtected = encryption.Encrypt(req.AccountKey),
+                ProxyPasswordProtected = string.IsNullOrEmpty(req.ProxyPassword)
+                    ? null : encryption.Encrypt(req.ProxyPassword),
+            };
+
+            var check = await factory.TestConnectionAsync(candidate, ct);
+            if (!check.Success)
+                return Results.BadRequest(new { error = $"Verification failed: {check.Error}" });
+
+            var row = await db.Accounts.FirstAsync(a => a.Id == id, ct);
+            row.AccountKeyProtected = candidate.AccountKeyProtected;
+            row.ProxyPasswordProtected = candidate.ProxyPasswordProtected;
+            await db.SaveChangesAsync(ct);
+
+            return Results.NoContent();
         });
 
         return app;

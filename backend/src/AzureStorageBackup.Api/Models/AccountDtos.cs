@@ -54,3 +54,6 @@ public record AccountRequest(
         ProxyUsername = ProxyUsername,
     };
 }
+
+/// <summary>凭据重设请求。AccountKey 必填；ProxyPassword 为空表示清空代理密码。</summary>
+public record ResetAccountSecretsRequest(string AccountKey, string? ProxyPassword);
