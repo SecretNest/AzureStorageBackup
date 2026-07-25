@@ -13,6 +13,7 @@ public sealed class PathBoundary
     /// </summary>
     private const int MaxLinkDepth = 40;
 
+    private readonly string? _configuredRoot;
     private readonly string? _realRoot;
 
     public PathBoundary(IConfiguration config)
@@ -21,6 +22,7 @@ public sealed class PathBoundary
         if (string.IsNullOrWhiteSpace(configured))
         {
             // 未配置 = 无边界，全部放行（既有约定）。
+            _configuredRoot = null;
             _realRoot = null;
             return;
         }
@@ -32,6 +34,7 @@ public sealed class PathBoundary
         // 是这里最坏的结果。
         // 注：「组件不可读」不是这里的成因——.NET 的 Unix ReadLink 会吞掉 EACCES，
         // chmod 000 的目录在 LinkTarget 上仍返回 null，被当成普通段处理，不会导致解析失败。
+        _configuredRoot = configured;
         _realRoot = ResolveReal(configured)
             ?? throw new InvalidOperationException(
                 $"Backup root '{configured}' could not be resolved to a real path " +
@@ -41,8 +44,20 @@ public sealed class PathBoundary
     /// <summary>是否启用边界。未配置根时为 false，一切放行。</summary>
     public bool Enabled => _realRoot is not null;
 
-    /// <summary>解析后的真实根；未启用时为 null。用于错误消息。</summary>
-    public string? Root => _realRoot;
+    /// <summary>
+    /// 操作员在 <c>Backup:Root</c> 里配的原始字符串，**未经符号链接解析**。
+    /// 面向操作员的场合——拒绝消息、越界提示、未来任何把根展示给人看的地方——
+    /// 一律用这个：拒绝时应该说操作员敲过的那个路径，而不是主机内部真正指向
+    /// 的地方（例如配的是 <c>/nas</c>，实际指向 <c>/mnt/disk1</c>，操作员大概率
+    /// 认不出后者）。未启用边界时为 null。
+    /// </summary>
+    public string? ConfiguredRoot => _configuredRoot;
+
+    /// <summary>
+    /// 解析后的真实根（符号链接已展开）。**只用于路径比较**，不面向操作员展示——
+    /// 拿它拼错误消息只会让人看见一个自己从没打过的路径。未启用边界时为 null。
+    /// </summary>
+    public string? RealRoot => _realRoot;
 
     /// <summary>
     /// 路径是否在边界之内。未启用边界时恒为 true。
@@ -159,13 +174,26 @@ public sealed class PathBoundary
             if (++expansions > MaxLinkDepth)
                 return null;
 
-            if (Path.IsPathRooted(target))
+            if (Path.IsPathFullyQualified(target))
             {
+                // 用 IsPathFullyQualified 而不是 IsPathRooted：在 Windows 上
+                // "C:foo" 满足 IsPathRooted 但不满足 IsPathFullyQualified——
+                // 它是「盘符相对」路径，真正的锚点是该盘符当时的当前目录，
+                // 边界组件没有资格替调用方猜。POSIX 下二者永远等价，这条分支
+                // 的语义在 Linux/Docker 部署目标上不变。
                 var targetRoot = Path.GetPathRoot(target);
                 if (string.IsNullOrEmpty(targetRoot))
                     return null;
                 PushSegments(pending, target[targetRoot.Length..]);
                 resolved = targetRoot; // 绝对目标：从文件系统根重新走
+            }
+            else if (Path.IsPathRooted(target))
+            {
+                // 有根但不完全限定（如 Windows 的 "C:foo"、"\foo"）：目标锚点
+                // 依赖进程当前盘符/当前工作目录，不是一个确定的目录。宁可判
+                // 定解析失败（IsInside 会把它当越界拒绝），也不要猜一个锚点
+                // 继续走——猜错了就是一个悄悄放行的洞。仅在 Windows 上可达。
+                return null;
             }
             else
             {

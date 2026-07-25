@@ -245,7 +245,7 @@ public class PathBoundaryTests : IDisposable
     }
 
     [Fact]
-    public void Enabled_And_Root_Report_The_Resolved_Root()
+    public void Enabled_And_RealRoot_Report_The_Resolved_Root()
     {
         var real = Dir("real-storage");
         var link = Path.Combine(_base, "nas-link");
@@ -253,7 +253,43 @@ public class PathBoundaryTests : IDisposable
         var sut = Boundary(link);
 
         Assert.True(sut.Enabled);
-        Assert.Equal(real, sut.Root);
+        Assert.Equal(real, sut.RealRoot);
+    }
+
+    [Fact]
+    public void ConfiguredRoot_Keeps_What_The_Operator_Typed_Not_The_Resolved_Target()
+    {
+        // M1：当配置的根本身是软链时，ConfiguredRoot 必须原样保留操作员敲过的
+        // 那个字符串（用于错误消息/未来 UI），RealRoot 才是解析后的真实路径——
+        // 两者在软链根上必须真的不同，否则这条用例什么都没证明。
+        var real = Dir("real-storage");
+        var link = Path.Combine(_base, "nas-link");
+        Directory.CreateSymbolicLink(link, real);
+        var sut = Boundary(link);
+
+        Assert.Equal(link, sut.ConfiguredRoot);
+        Assert.Equal(real, sut.RealRoot);
+        Assert.NotEqual(sut.ConfiguredRoot, sut.RealRoot);
+    }
+
+    [Fact]
+    public void A_Rejection_Can_Be_Reported_Against_The_Configured_Root_Not_The_Resolved_One()
+    {
+        // M1 的核心断言：调用方拼错误消息时，应该用 ConfiguredRoot（操作员敲的
+        // /nas-link），而不是 RealRoot（内部真正指向的 real-storage）——否则
+        // 拒绝消息里出现的路径操作员从没打过、也认不出来。
+        var real = Dir("real-storage");
+        var link = Path.Combine(_base, "nas-link");
+        Directory.CreateSymbolicLink(link, real);
+        var outside = Dir("outside");
+        var sut = Boundary(link);
+
+        var rejected = Path.Combine(outside, "secret");
+        Assert.False(sut.IsInside(rejected));
+
+        var message = $"Path '{rejected}' is outside the configured root '{sut.ConfiguredRoot}'.";
+        Assert.Contains(link, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(real, message, StringComparison.Ordinal);
     }
 
     [Fact]
