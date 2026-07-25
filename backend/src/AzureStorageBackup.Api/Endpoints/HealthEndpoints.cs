@@ -10,7 +10,8 @@ public static class HealthEndpoints
         // 存活探针：进程是否在跑。
         app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }))
             .WithName("Health")
-            .WithTags("Health");
+            .WithTags("Health")
+            .AllowAnonymous();
 
         // 就绪探针：仅检查本地依赖——SQLite 可连、密钥环可用。不访问云端（运行期零云读）。
         app.MapGet("/api/health/ready", async (
@@ -27,7 +28,8 @@ public static class HealthEndpoints
             return dbOk && keyringOk ? Results.Ok(body) : Results.Json(body, statusCode: 503);
         })
         .WithName("HealthReady")
-        .WithTags("Health");
+        .WithTags("Health")
+        .AllowAnonymous();
 
         return app;
     }

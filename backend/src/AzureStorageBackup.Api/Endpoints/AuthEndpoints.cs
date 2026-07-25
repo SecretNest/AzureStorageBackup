@@ -1,0 +1,59 @@
+using AzureStorageBackup.Api.Services;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using System.Security.Claims;
+
+namespace AzureStorageBackup.Api.Endpoints;
+
+/// <summary>预置密码登录（设计 §4.1）。三个端点均 AllowAnonymous——否则永远登不进来。</summary>
+public static class AuthEndpoints
+{
+    /// <summary>登录失败的固定延迟，使在线爆破不划算（设计 §4.3）。</summary>
+    private static readonly TimeSpan FailureDelay = TimeSpan.FromSeconds(1);
+
+    public static IEndpointRouteBuilder MapAuthEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/auth").WithTags("Auth").AllowAnonymous();
+
+        group.MapPost("/login", async (LoginRequest req, AuthGate gate, HttpContext ctx) =>
+        {
+            if (!gate.Required)
+                return Results.NoContent(); // 认证关闭时登录是空操作
+
+            if (!gate.Verify(req.Password))
+            {
+                await Task.Delay(FailureDelay);
+                return Results.Json(new { error = "Incorrect password." },
+                    statusCode: StatusCodes.Status401Unauthorized);
+            }
+
+            var identity = new ClaimsIdentity(
+                [new Claim(ClaimTypes.Name, "owner")],
+                CookieAuthenticationDefaults.AuthenticationScheme);
+            await ctx.SignInAsync(
+                CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+
+            return Results.NoContent();
+        });
+
+        group.MapPost("/logout", async (AuthGate gate, HttpContext ctx) =>
+        {
+            if (gate.Required)
+                await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            return Results.NoContent();
+        });
+
+        group.MapGet("/status", (AuthGate gate, HttpContext ctx) =>
+            Results.Ok(new AuthStatusResponse(
+                Required: gate.Required,
+                Authenticated: !gate.Required || ctx.User.Identity?.IsAuthenticated == true)));
+
+        return app;
+    }
+}
+
+/// <summary>登录请求体。无用户名（设计决策 1）。</summary>
+public record LoginRequest(string Password);
+
+/// <summary>认证状态。Required=false 时 Authenticated 恒为 true，前端据此直接进主界面。</summary>
+public record AuthStatusResponse(bool Required, bool Authenticated);
