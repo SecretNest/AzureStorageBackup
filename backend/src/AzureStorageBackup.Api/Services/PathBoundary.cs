@@ -86,6 +86,32 @@ public sealed class PathBoundary
     }
 
     /// <summary>
+    /// 把一个已确认落在边界内的真实路径（<see cref="RealRoot"/> 为前缀）翻译成操作员
+    /// 可见的形式：用 <see cref="ConfiguredRoot"/> 替换掉 <see cref="RealRoot"/> 前缀。
+    /// 调用方必须先用 <see cref="IsInside"/> 确认该真实路径确实落在边界内——本方法不做
+    /// 校验，传一个界外真实路径进来只会原样返回，不代表它安全。未启用边界时原样返回。
+    /// <para>
+    /// 用途：像「上级目录」这类需要基于真实路径（跟随符号链接）计算、又要展示给用户
+    /// 的场合——不能直接展示 <see cref="RealRoot"/>（配的是 <c>/nas</c>、实际指向
+    /// <c>/mnt/disk1</c> 时，操作员不认识后者），但也不能图省事改用词法折叠去算上级
+    /// （<see cref="ResolveReal"/> 文档里那个跟着软链走会算错的洞）。
+    /// </para>
+    /// </summary>
+    public string ToDisplayPath(string real)
+    {
+        if (_realRoot is null || _configuredRoot is null)
+            return real;
+
+        if (string.Equals(real, _realRoot, StringComparison.Ordinal))
+            return _configuredRoot;
+
+        if (real.StartsWith(_realRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            return _configuredRoot + real[_realRoot.Length..];
+
+        return real;
+    }
+
+    /// <summary>
     /// 真正的 realpath：从文件系统根出发逐段前进，得到完全解析后的真实路径。
     /// 软链展开次数超过 <see cref="MaxLinkDepth"/>（成环）时返回 null。
     /// <para>
