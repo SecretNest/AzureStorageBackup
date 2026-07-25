@@ -103,7 +103,11 @@ public static class AccountEndpoints
             if (!check.Success)
                 return Results.BadRequest(new { error = $"Verification failed: {check.Error}" });
 
-            var row = await db.Accounts.FirstAsync(a => a.Id == id, ct);
+            // 前面的存在性检查与这次写之间，账户可能已被删除（验证要连云，窗口不短）：
+            // FirstAsync 会抛成 500，而全仓约定是 404。
+            var row = await db.Accounts.FirstOrDefaultAsync(a => a.Id == id, ct);
+            if (row is null)
+                return Results.NotFound();
             row.AccountKeyProtected = candidate.AccountKeyProtected;
             row.ProxyPasswordProtected = candidate.ProxyPasswordProtected;
             await db.SaveChangesAsync(ct);

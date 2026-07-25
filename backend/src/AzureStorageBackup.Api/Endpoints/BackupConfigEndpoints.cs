@@ -57,8 +57,10 @@ public static class BackupConfigEndpoints
                 // （与 reset-password 同处理）。
                 return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消（客户端断开 / 进程关停）不是「密码不对」：吞掉会把它伪装成用户错误，
+                // 与仓库既有约定一致（见 a3ac967「孤儿清理不吞取消」），一律放行上抛。
                 return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
             }
             if (seeded is null)
@@ -440,8 +442,10 @@ public static class BackupConfigEndpoints
                 await svc.WriteStatusAsync(id, error: null, loggerFactory.CreateLogger("BackupStatus"), ct);
                 return Results.Ok(result);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消不是检查失败：不能把「客户端断开 / 进程关停」写成该备份的 Error 状态
+                // （与 a3ac967 同一约定）。异常本就原样上抛，busy 锁在 finally 里照常释放。
                 await svc.WriteStatusAsync(id, ex.Message, loggerFactory.CreateLogger("BackupStatus"), ct);
                 throw;
             }
@@ -488,12 +492,18 @@ public static class BackupConfigEndpoints
             {
                 return Results.BadRequest(new { error = "Re-enter this backup's account credentials first." });
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消（客户端断开 / 进程关停）不是「验证失败」，不能伪装成用户的密码错误
+                // （与 a3ac967「孤儿清理不吞取消」同一约定）：放行上抛。
                 return Results.BadRequest(new { error = $"Verification failed: {ex.Message}" });
             }
 
-            var row = await db.BackupConfigs.FirstAsync(c => c.Id == id, ct);
+            // 验证要连云，与前面的存在性检查之间窗口不短：配置行可能已被删除。
+            // FirstAsync 会抛成 500，而全仓约定是 404。
+            var row = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
+            if (row is null)
+                return Results.NotFound();
             row.PasswordProtected = encryption.Encrypt(req.Password);
             await db.SaveChangesAsync(ct);
 
@@ -531,10 +541,15 @@ public static class BackupConfigEndpoints
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
 
-    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。</summary>
+    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。
+    /// 取消除外——那不是「这一步失败了」，而是整条请求该停下（与 a3ac967 的孤儿清理同一约定）；
+    /// 吞掉只会给每个剩余步骤各记一条误导性 Warning。</summary>
     private static async Task BestEffort(ILogger logger, string what, Func<Task> action)
     {
         try { await action(); }
-        catch (Exception ex) { logger.LogWarning(ex, "Backup config delete: failed to {What}", what); }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Backup config delete: failed to {What}", what);
+        }
     }
 }
