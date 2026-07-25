@@ -131,6 +131,10 @@ builder.Services.AddScoped<INotificationConfigService, NotificationConfigService
 builder.Services.AddSingleton<INotificationSender, NotificationSender>();
 builder.Services.AddScoped<INotifier, NotificationService>();
 
+// 密钥环健康判定（设计 §3.2）
+builder.Services.AddSingleton<IKeyringHealth, KeyringHealth>();
+builder.Services.AddScoped<KeyringProbe>();
+
 // 调度器（M6）：常驻后台按 cron 触发计划任务。测试环境用 Scheduler:Enabled=false 关闭。
 builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
@@ -157,6 +161,13 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.Migrate();
+
+    // 密钥环健康判定（设计 §3.2）：纯本地，不访问云端。
+    var status = await scope.ServiceProvider.GetRequiredService<KeyringProbe>().EvaluateAsync();
+    app.Services.GetRequiredService<IKeyringHealth>().Set(status);
+    if (status == KeyringStatus.Lost)
+        app.Services.GetRequiredService<ILogger<Program>>().LogError(
+            "Data protection keyring cannot decrypt stored secrets; entering recovery mode.");
 }
 
 if (app.Environment.IsDevelopment())

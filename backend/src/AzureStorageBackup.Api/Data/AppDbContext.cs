@@ -18,6 +18,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
     public DbSet<CachedVersionIndex> CachedVersionIndexes => Set<CachedVersionIndex>();
     public DbSet<LocalBackupState> LocalBackupStates => Set<LocalBackupState>();
+    public DbSet<KeyringCanary> KeyringCanaries => Set<KeyringCanary>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -86,6 +87,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.HasKey(x => x.Id);
             e.Property(x => x.Container).IsRequired();
             e.HasIndex(x => new { x.AccountId, x.Container }).IsUnique();
+        });
+
+        modelBuilder.Entity<KeyringCanary>(e =>
+        {
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Ciphertext).IsRequired();
         });
     }
 }
