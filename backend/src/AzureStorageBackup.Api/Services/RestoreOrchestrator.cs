@@ -138,9 +138,14 @@ public sealed class RestoreOrchestrator(
         skipped += unresolved.Count;
 
         // 空文件夹（还原需重建）——选择性还原只针对选中文件，不重建整棵空目录树。
+        // 同样来自云端索引：目录名含 .. 时会创到目标根之外，越界的目录条目跳过、不创建。
         if (selected is null)
             foreach (var dir in index.EmptyDirs)
-                Directory.CreateDirectory(Path.Combine(request.TargetRoot, ToLocal(dir)));
+            {
+                var dest = Path.Combine(request.TargetRoot, ToLocal(dir));
+                if (PathBoundary.IsWithin(request.TargetRoot, dest))
+                    Directory.CreateDirectory(dest);
+            }
 
         // symlink 与文件分开处理
         var fileEntries = new List<IndexEntry>();
@@ -204,6 +209,7 @@ public sealed class RestoreOrchestrator(
         IProgress<string>? phase, CancellationToken ct)
     {
         var skipped = 0;
+        var skippedUnsafe = 0;
         var needed = new List<IndexEntry>();
         foreach (var e in group)
         {
@@ -255,8 +261,16 @@ public sealed class RestoreOrchestrator(
                 }
                 foreach (var e in needed)
                 {
-                    WriteRestoredFile(request, e, content);
-                    restored++;
+                    try
+                    {
+                        WriteRestoredFile(request, e, content);
+                        restored++;
+                    }
+                    catch (UnsafeRestorePathException ex)
+                    {
+                        phase?.Report(ex.Message);
+                        skippedUnsafe++;
+                    }
                 }
             }
             else
@@ -268,8 +282,16 @@ public sealed class RestoreOrchestrator(
                 foreach (var e in needed)
                 {
                     var source = Path.Combine(extractDir, ToLocal(e.Path));
-                    WriteRestoredFile(request, e, source);
-                    restored++;
+                    try
+                    {
+                        WriteRestoredFile(request, e, source);
+                        restored++;
+                    }
+                    catch (UnsafeRestorePathException ex)
+                    {
+                        phase?.Report(ex.Message);
+                        skippedUnsafe++;
+                    }
                 }
             }
         }
@@ -278,7 +300,7 @@ public sealed class RestoreOrchestrator(
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }
-        return (restored, skipped, 0);
+        return (restored, skipped, skippedUnsafe);
     }
 
     private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, RestoreConflictMode conflict, CancellationToken ct)
@@ -302,6 +324,12 @@ public sealed class RestoreOrchestrator(
     private static void WriteRestoredFile(RestoreRequest request, IndexEntry entry, string sourceFile)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
+
+        // 索引来自云端（可能是 /import 导入的任意容器）：条目路径含 .. 时会写到目标根之外。
+        // 跳过该条目而不是中断整次还原——与既有的逐组容错语义一致。
+        if (!PathBoundary.IsWithin(request.TargetRoot, dest))
+            throw new UnsafeRestorePathException(entry.Path);
+
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
         if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
             RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
@@ -315,6 +343,11 @@ public sealed class RestoreOrchestrator(
             return false;
 
         var dest = Path.Combine(targetRoot, ToLocal(entry.Path));
+
+        // 同 WriteRestoredFile：索引条目路径含 .. 时会把链接建到目标根之外，跳过。
+        if (!PathBoundary.IsWithin(targetRoot, dest))
+            return false;
+
         var info = new FileInfo(dest);
         if (info.Exists && info.LinkTarget == entry.Target)
             return false; // 未变
@@ -407,3 +440,7 @@ public sealed class RestoreOrchestrator(
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
     }
 }
+
+/// <summary>还原条目的目标路径逃出了 TargetRoot（索引被篡改或来自不可信容器）。</summary>
+public sealed class UnsafeRestorePathException(string entryPath)
+    : Exception($"Restore entry path escapes the target root: {entryPath}");

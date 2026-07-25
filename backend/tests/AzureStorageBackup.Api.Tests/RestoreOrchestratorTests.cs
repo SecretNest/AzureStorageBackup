@@ -597,6 +597,49 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task Restore_Skips_Index_Entry_That_Would_Escape_Target_Root()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstesc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 阈值调到 1 字节 → a.txt 走单文件 data blob（而非 pack），
+            // 使得还原时内容按 blob 整体复用、不依赖归档内的条目名——
+            // 这样恶意条目才会真的把内容写到它自己声明的（越界）路径上，
+            // 忠实重现 /import 场景下可信度为零的索引所能触发的写入。
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            // 模拟一条被篡改/来自不可信容器（/import 可导入任意容器）的索引：追加一条
+            // Path 含 .. 的条目，复用 a.txt 的 Storage（同一个下载分组），
+            // 验证写入前的越界检查会拦下它，而不是让它落到 TargetRoot 之外。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            idx.Entries.Add(aEntry with { Path = "../pwned.txt" });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));       // 正常条目照常还原
+            Assert.False(File.Exists(Path.Combine(_base, "pwned.txt"))); // 越界条目未写到目标根之外
+            Assert.Equal(1, result.FailedFiles);                         // 计入失败数，其余照常，不中断整次还原
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Restores_Encrypted_Backup_With_Password()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
