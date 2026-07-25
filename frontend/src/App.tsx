@@ -60,7 +60,12 @@ function App() {
         {auth.required && (
           <button
             type="button"
-            onClick={() => authApi.logout().then(() => setAuth({ required: true, authenticated: false }))}
+            // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
+            // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
+            onClick={() => {
+              const signedOut = () => setAuth({ required: true, authenticated: false })
+              authApi.logout().then(signedOut, signedOut)
+            }}
             style={{ marginLeft: 'auto' }}
           >
             Log out
