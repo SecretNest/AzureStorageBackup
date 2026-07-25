@@ -16,4 +16,12 @@ internal static class TestSecrets
     public static readonly ISecretReader Reader = new SecretReader(Encryption);
 
     public static string Protect(string plaintext) => Encryption.Encrypt(plaintext);
+
+    /// <summary>
+    /// 用一套一次性的、与被测宿主无关的密钥环加密：模拟 <c>/keys</c> 丢失后遗留在库里、
+    /// 当前密钥环解不开的旧密文。仅翻转 <see cref="IKeyringHealth"/> 并不能制造这种密文——
+    /// 那样库里的值仍然解得开，逐条试解的判定会（正确地）报告「无需重设」。
+    /// </summary>
+    public static string Stale(string plaintext) =>
+        new EncryptionService(new EphemeralDataProtectionProvider()).Encrypt(plaintext);
 }

@@ -14,20 +14,19 @@ public static class BackupConfigEndpoints
     {
         var group = app.MapGroup("/api/backup-configs").WithTags("BackupConfigs");
 
-        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
-            var keyringLost = keyring.Status == KeyringStatus.Lost;
             return Results.Ok(list.Select(c =>
-                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), keyringLost)));
+                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c))));
         });
 
-        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var c = await svc.GetAsync(id, ct);
             return c is null
                 ? Results.NotFound()
-                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), keyring.Status == KeyringStatus.Lost));
+                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c)));
         })
         .WithName("GetBackupConfig");
 
@@ -79,7 +78,7 @@ public static class BackupConfigEndpoints
             foreach (var v in info.Versions)
                 await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
 
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, keyringLost: keyring.Status == KeyringStatus.Lost));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
         group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
@@ -90,7 +89,7 @@ public static class BackupConfigEndpoints
                 return Results.BadRequest(new { error = "ContainerName is required." });
 
             var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, keyringLost: keyring.Status == KeyringStatus.Lost));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
         group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
@@ -104,7 +103,7 @@ public static class BackupConfigEndpoints
             try
             {
                 var result = await svc.UpdateAsync(id, update, ct);
-                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result, keyringLost: keyring.Status == KeyringStatus.Lost));
+                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result, secretsUnavailable: Pending(keyring, encryption, result)));
             }
             catch (InvalidOperationException ex)
             {
@@ -489,6 +488,13 @@ public static class BackupConfigEndpoints
 
         return app;
     }
+
+    /// <summary>
+    /// 该备份配置是否仍待重设密码。Healthy 时短路，列表端点不触发任何解密（设计 §3.1 的核心性质）；
+    /// Lost 时逐条试解，使已重设成功的备份立刻停止显示「待重设」（设计 §3.3）。
+    /// </summary>
+    private static bool Pending(IKeyringHealth keyring, IEncryptionService encryption, BackupConfig config) =>
+        keyring.Status == KeyringStatus.Lost && SecretAvailability.Unreadable(encryption, config);
 
     /// <summary>
     /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态

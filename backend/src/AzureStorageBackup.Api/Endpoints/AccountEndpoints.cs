@@ -12,17 +12,16 @@ public static class AccountEndpoints
     {
         var group = app.MapGroup("/api/accounts").WithTags("Accounts");
 
-        group.MapGet("/", async (IAccountService svc, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/", async (IAccountService svc, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
-            var keyringLost = keyring.Status == KeyringStatus.Lost;
-            return Results.Ok(list.Select(a => AccountResponse.From(a, keyringLost)));
+            return Results.Ok(list.Select(a => AccountResponse.From(a, Pending(keyring, encryption, a))));
         });
 
-        group.MapGet("/{id:int}", async (int id, IAccountService svc, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IAccountService svc, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var a = await svc.GetAsync(id, ct);
-            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a, keyring.Status == KeyringStatus.Lost));
+            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a, Pending(keyring, encryption, a)));
         })
         .WithName("GetAccount");
 
@@ -32,7 +31,7 @@ public static class AccountEndpoints
                 return Results.BadRequest(new { error = "AccountKey is required." });
 
             var created = await svc.CreateAsync(req.ToAccount(encryption), ct);
-            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created, keyring.Status == KeyringStatus.Lost));
+            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created, Pending(keyring, encryption, created)));
         });
 
         group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
@@ -49,8 +48,9 @@ public static class AccountEndpoints
                 update.ProxyPasswordProtected = existing.ProxyPasswordProtected;
 
             var result = await svc.UpdateAsync(id, update, ct);
-            // 保留原密文的分支恰恰是密钥环丢失时解不开的那份密文，必须如实上报 SecretsUnavailable。
-            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result, keyring.Status == KeyringStatus.Lost));
+            // 保留原密文的分支恰恰是密钥环丢失时解不开的那份密文，必须如实上报 SecretsUnavailable；
+            // 而提交了新凭据的分支写入的是当前密钥环的密文，逐条试解会如实返回 false。
+            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result, Pending(keyring, encryption, result)));
         });
 
         group.MapDelete("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
@@ -110,4 +110,11 @@ public static class AccountEndpoints
 
         return app;
     }
+
+    /// <summary>
+    /// 该账户是否仍待重设。Healthy 时短路，列表端点不触发任何解密（设计 §3.1 的核心性质）；
+    /// Lost 时逐条试解，使已重设成功的账户立刻停止显示「待重设」（设计 §3.3）。
+    /// </summary>
+    private static bool Pending(IKeyringHealth keyring, IEncryptionService encryption, Account account) =>
+        keyring.Status == KeyringStatus.Lost && SecretAvailability.Unreadable(encryption, account);
 }

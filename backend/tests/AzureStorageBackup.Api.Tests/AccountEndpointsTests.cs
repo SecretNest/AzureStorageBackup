@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -105,6 +107,15 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     {
         var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("keyring-lost-put"));
         var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        // /keys 丢失：库里的密文换成另一套密钥环的产物。标记按逐条实际可解性判定（设计 §3.3），
+        // 只翻转 IKeyringHealth 而不动密文，是「密钥环还在、状态被误设」而非真的丢失。
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Accounts.FirstAsync(a => a.Id == created!.Id)).AccountKeyProtected = TestSecrets.Stale("old-key");
+            await db.SaveChangesAsync();
+        }
 
         Keyring.Set(KeyringStatus.Lost);
         try

@@ -17,11 +17,15 @@ public record AccountResponse(
     DateTimeOffset CreatedAt,
     bool SecretsUnavailable)
 {
-    /// <summary>账户密钥必填，密钥环 Lost 时必然解不开，故 SecretsUnavailable 原样取自 keyringLost。</summary>
-    public static AccountResponse From(Account a, bool keyringLost = false) => new(
+    /// <summary>
+    /// <paramref name="secretsUnavailable"/> 必须按该账户密文的实际可解性传入
+    /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
+    /// 已重设成功的账户必须停止显示「待重设」。
+    /// </summary>
+    public static AccountResponse From(Account a, bool secretsUnavailable = false) => new(
         a.Id, a.Name, a.Description, a.BlobEndpoint, a.Region,
         a.UseProxy, a.ProxyMode, a.ProxyHost, a.ProxyPort, a.ProxyUsername, a.CreatedAt,
-        keyringLost);
+        secretsUnavailable);
 }
 
 /// <summary>创建/更新账户请求体。更新时 AccountKey/ProxyPassword 为空表示保留原值。</summary>

@@ -35,15 +35,19 @@ public record BackupConfigResponse(
     string Activity,
     bool SecretsUnavailable)
 {
-    /// <summary>Password 可空：无密码的备份没有密文可丢，密钥环 Lost 时也不受影响，不计不标。</summary>
-    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle", bool keyringLost = false) => new(
+    /// <summary>
+    /// <paramref name="secretsUnavailable"/> 必须按该配置密文的实际可解性传入
+    /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
+    /// 已重设成功的备份必须停止显示「待重设」。无密码的备份没有密文可丢，恒为 false。
+    /// </summary>
+    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle", bool secretsUnavailable = false) => new(
         c.Id, c.AccountId, c.ContainerName, c.Name, c.Description, c.LocalRoot,
         !string.IsNullOrEmpty(c.PasswordProtected), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
         c.Status, c.LastError, c.LastErrorAt, activity,
-        keyringLost && !string.IsNullOrEmpty(c.PasswordProtected));
+        secretsUnavailable && !string.IsNullOrEmpty(c.PasswordProtected));
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。

@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -61,6 +63,8 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
     /// 验证计数/标记规则不对称的两条边：账户密钥必填 → 全计全标；
     /// 备份密码可空 → 只有真正带密码的记录才计数/标记，未加密的备份即便密钥环 Lost 也不受影响。
     /// 若计数规则被反转（比如漏过滤未加密配置、或漏计全部账户），此测试应当失败。
+    /// 注意：必须把库里的密文换成另一套密钥环的产物，仅翻转 IKeyringHealth 是不够的——
+    /// 计数按逐条实际可解性判定（设计 §3.3）。
     /// </summary>
     [Fact]
     public async Task Reports_Lost_With_Correct_Counts_And_Per_Record_Flags()
@@ -81,6 +85,17 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
             .Content.ReadFromJsonAsync<List<BackupConfigResponse>>();
         Assert.All(accountsBefore!, a => Assert.False(a.SecretsUnavailable));
         Assert.All(configsBefore!, c => Assert.False(c.SecretsUnavailable));
+
+        // 模拟 /keys 丢失：库里全部密文换成另一套密钥环的产物。
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            foreach (var a in await db.Accounts.ToListAsync())
+                a.AccountKeyProtected = TestSecrets.Stale("account-key");
+            foreach (var c in await db.BackupConfigs.Where(c => c.PasswordProtected != null).ToListAsync())
+                c.PasswordProtected = TestSecrets.Stale("backup-password");
+            await db.SaveChangesAsync();
+        }
 
         Keyring.Set(KeyringStatus.Lost);
         try
