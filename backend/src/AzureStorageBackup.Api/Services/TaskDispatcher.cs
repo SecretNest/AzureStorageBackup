@@ -81,6 +81,14 @@ public sealed class TaskDispatcher(
             logger.LogError(
                 "Scheduled task skipped: local root '{Root}' is outside the configured Backup__Root.",
                 config.LocalRoot);
+            // 与忙碌跳过分支同形（上方 TryAcquire 失败处）：把「这个计划任务没跑」写进操作员能看见的
+            // 操作日志，而不是只留一条容器日志里的 LogError——单用户无人值守部署下没人会去翻它。
+            // 配置本身按设计保留、不删（越界即拒跑，直到操作员修正 LocalRoot 或 Backup__Root），
+            // 消息里带上违规的本地根与当前配置的根，让操作员一眼知道改哪个。
+            await sp.GetRequiredService<IOperationLog>().AppendAsync(
+                OperationLogLevel.Error, $"schedule:{accountId}/{container}",
+                $"Skipped scheduled {task.TaskType}: local root '{config.LocalRoot}' is outside the configured root '{boundary.ConfiguredRoot}'",
+                ct);
             return;
         }
 
