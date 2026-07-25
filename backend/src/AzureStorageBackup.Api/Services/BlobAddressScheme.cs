@@ -9,7 +9,8 @@ namespace AzureStorageBackup.Api.Services;
 /// 未授权者即使能列出 container，也无法用公开 hash 反推「是否备份过某已知文件」。
 /// <para>
 /// 加密（有密码 + kdfSalt）：key = HKDF(password, kdfSalt)；地址 = data/{HMAC(key, fullHash)[:16]}；
-/// 碰撞检测元数据为不透明 v = HMAC(key, fullHash|len|head)，不泄露长度/头部指纹。
+/// 碰撞检测元数据为不透明 v = HMAC(key, fullHash|len|head|tail)，不泄露长度/头部指纹；
+/// head/tail 未知（修复老索引条目）时退为窄校验值 v1 = HMAC(key, "v1"|fullHash|len)，同样不泄露长度。
 /// 非加密：明文 data/{fullHash} + 元数据 len/head（本就不隐藏内容）。
 /// </para>
 /// 还原/检查/清理只用索引里已存的实际地址，无需密钥；仅备份创建 blob 时用到本方案。
@@ -42,6 +43,10 @@ public sealed class BlobAddressScheme
     /// 受影响的键，而不是写空串：<see cref="MetadataMatches"/> 把「键缺失」当作不参与判定、把「键存在
     /// 但值不同」当作碰撞，写空串会让同内容被判成碰撞，改用 ~N 备用地址并误报「已避让碰撞」。
     /// </para>
+    /// <para>
+    /// 非密钥化下省略是无痛的：剩下的键（尤其 len）照样参与判定。密钥化下省不掉单项（v 四项合一），
+    /// 故改发只覆盖已知项的窄校验值 v1，避免防护整体归零。
+    /// </para>
     /// </summary>
     public IReadOnlyDictionary<string, string> Metadata(string fullHash, long length, string? headHash, string? tailHash)
     {
@@ -57,10 +62,14 @@ public sealed class BlobAddressScheme
                 meta["tail"] = tailHash;
             return meta;
         }
-        // 密钥化时 v 是 fullHash|len|head|tail 合一的不透明值，无法只省其中一项：
-        // 任一项未知就整体省略 v，退化成「老 blob 无元数据」——不参与判定，而不是给出错误的判定依据。
+        // 密钥化时 v 是 fullHash|len|head|tail 合一的不透明值，无法只省其中一项。但整体省略 v 会让
+        // 该对象**一点**防护都不剩（MetadataMatches 见不到 v 就无条件放行），比非密钥化分支还弱——
+        // 那边至少还留着 len。故任一项未知时改发窄校验值 v1 = HMAC(key, "v1"|fullHash|len)：
+        // 只覆盖确实已知的两项，让长度继续参与判定，又不像明文 len 那样泄露长度指纹
+        // （密钥化的初衷就是防止旁观者按长度做内容指纹，见类注释）。
+        // 全新备份四项永远齐全，只发 v、不发 v1——写出的元数据一字不变。
         return headHash is null || tailHash is null
-            ? new Dictionary<string, string>()
+            ? new Dictionary<string, string> { ["v1"] = NarrowVerifier(fullHash, length) }
             : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash, tailHash) };
     }
 
@@ -88,14 +97,30 @@ public sealed class BlobAddressScheme
                 return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;
         }
-        if (!meta.TryGetValue("v", out var v))
-            return true;
-        return v == Verifier(fullHash, length, headHash, tailHash);
+        // 顺序即优先级，且必须保持向后兼容：
+        // · 带 v 的对象（含全部历史对象）照旧只按 v 判定，判定结果与本改动前逐字节相同；
+        // · 只带 v1 的对象（修复老索引条目时写出）退而按「fullHash+长度」判定——比无条件放行强；
+        // · 两个都没有的才是真正的老 blob，仍按「无元数据 → 不参与判定」放行，不新增拒绝面。
+        if (meta.TryGetValue("v", out var v))
+            return v == Verifier(fullHash, length, headHash, tailHash);
+        if (meta.TryGetValue("v1", out var v1))
+            return v1 == NarrowVerifier(fullHash, length);
+        return true; // 老 blob 无元数据
     }
 
     private string Verifier(string fullHash, long length, string headHash, string tailHash) =>
         Hex(HMACSHA256.HashData(_key!, Encoding.UTF8.GetBytes(
             string.Create(CultureInfo.InvariantCulture, $"{fullHash}|{length}|{headHash}|{tailHash}"))));
+
+    /// <summary>
+    /// 窄校验值：只覆盖 fullHash + 长度，用于 head/tail 未知（老索引条目）时。
+    /// 前缀 "v1|" 做域分隔，保证它与四项版 <see cref="Verifier"/> 的输入串不可能相等——
+    /// 否则理论上可拿一个域的值冒充另一个域（fullHash 由 FileHasher 产出，形如 xxh128:…，永不以 "v1|" 开头，
+    /// 但域分隔不该依赖调用方的取值习惯）。
+    /// </summary>
+    private string NarrowVerifier(string fullHash, long length) =>
+        Hex(HMACSHA256.HashData(_key!, Encoding.UTF8.GetBytes(
+            string.Create(CultureInfo.InvariantCulture, $"v1|{fullHash}|{length}"))));
 
     private static string Hex(ReadOnlySpan<byte> bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 }
