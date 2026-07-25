@@ -171,10 +171,16 @@ if (authGate.Required)
 }
 
 // --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源，不需要 CORS）---
-// AllowCredentials() 已开启：dev-server 兜底地址只在 Development 生效，
-// 否则未配置就是空列表——总不能让生产环境默认放行一个本地地址的带凭据跨域请求。
-var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-    ?? (builder.Environment.IsDevelopment() ? ["http://localhost:5173"] : []);
+// dev-server 地址只写在 appsettings.Development.json 里（唯一真源）；未配置就是空列表——
+// 总不能让生产环境默认放行一个本地地址的带凭据跨域请求。
+var configuredOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+// 通配来源 + AllowCredentials() 是 CORS 协议禁止的组合，留着它会让任何跨域请求 500
+// （策略是惰性构建的，启动时不报错，只在第一个带 Origin 的请求上炸）。
+// 本轮加 AllowCredentials() 之前 "*" 是合法配置，所以只能丢弃它并告警，不能让老配置直接坏掉。
+var hasWildcardOrigin = configuredOrigins.Contains("*");
+var allowedOrigins = hasWildcardOrigin
+    ? configuredOrigins.Where(o => o != "*").ToArray()
+    : configuredOrigins;
 builder.Services.AddCors(options => options.AddPolicy(CorsPolicy, policy =>
     policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
@@ -201,6 +207,11 @@ using (var scope = app.Services.CreateScope())
         app.Services.GetRequiredService<ILogger<Program>>().LogError(
             "Data protection keyring cannot decrypt stored secrets; entering recovery mode.");
 }
+
+if (hasWildcardOrigin)
+    app.Logger.LogWarning(
+        "Cors:AllowedOrigins contains \"*\", which cannot be combined with credentials; the wildcard entry was ignored. "
+            + "List every allowed origin explicitly.");
 
 if (app.Environment.IsDevelopment())
 {

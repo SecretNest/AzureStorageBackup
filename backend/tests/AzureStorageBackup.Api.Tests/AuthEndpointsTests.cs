@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using AzureStorageBackup.Api.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -195,5 +197,66 @@ public class AuthEndpointsTests
         // 登录成功后应当能看到恢复所需的状态端点
         var keyring = await client.GetAsync("/api/system/keyring");
         Assert.Equal(HttpStatusCode.OK, keyring.StatusCode);
+    }
+
+    [Fact]
+    public async Task Concurrent_Failed_Logins_Are_Serialized()
+    {
+        // 「失败后睡 1 秒」逐请求生效时挡不住并发爆破：N 个请求同时在飞，
+        // 摊到每次尝试的代价接近 0，设计 §4.3 说的「让在线爆破不划算」并没有兑现。
+        // 失败路径全局串行后，3 次并发失败必须花掉约 3 秒真实时间。
+        const int attempts = 3;
+        using var factory = Factory("s3cret");
+        var client = Client(factory);
+
+        var sw = Stopwatch.StartNew();
+        var responses = await Task.WhenAll(Enumerable.Range(0, attempts).Select(_ =>
+            client.PostAsJsonAsync("/api/auth/login", new { password = "wrong" })));
+        sw.Stop();
+
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode));
+        // 串行 = 每次失败各占满 1 秒；留 0.5 秒余量吸收调度抖动。
+        Assert.True(
+            sw.Elapsed >= TimeSpan.FromMilliseconds(1000 * attempts - 500),
+            $"{attempts} concurrent failed logins took {sw.ElapsedMilliseconds} ms; "
+                + "the failure delay is not serialized, so parallel brute force pays almost nothing.");
+    }
+
+    [Fact]
+    public async Task Ready_Probe_Hides_Component_Detail_From_Anonymous_Callers()
+    {
+        // 探针必须匿名可达，但匿名调用者不该借它读出「这台正处于密钥环恢复模式」。
+        using var factory = Factory("s3cret");
+        var client = Client(factory);
+
+        var anonymous = await client.GetAsync("/api/health/ready");
+        Assert.Equal(HttpStatusCode.OK, anonymous.StatusCode); // 状态码是探针唯一消费的东西，不能变
+        var anonymousBody = JsonDocument.Parse(await anonymous.Content.ReadAsStringAsync()).RootElement;
+        Assert.Equal("ready", anonymousBody.GetProperty("status").GetString());
+        Assert.False(anonymousBody.TryGetProperty("database", out _));
+        Assert.False(anonymousBody.TryGetProperty("keyring", out _));
+
+        await client.PostAsJsonAsync("/api/auth/login", new { password = "s3cret" });
+
+        var authenticated = await client.GetAsync("/api/health/ready");
+        Assert.Equal(HttpStatusCode.OK, authenticated.StatusCode);
+        var authenticatedBody = JsonDocument.Parse(await authenticated.Content.ReadAsStringAsync()).RootElement;
+        Assert.True(authenticatedBody.GetProperty("database").GetBoolean());
+        Assert.True(authenticatedBody.GetProperty("keyring").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Ready_Probe_Keeps_Its_Detail_When_Authentication_Is_Disabled()
+    {
+        // 未设密码时行为必须与本轮之前完全一致
+        using var factory = Factory(null);
+        var client = Client(factory);
+
+        var response = await client.GetAsync("/api/health/ready");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
+        Assert.True(body.GetProperty("database").GetBoolean());
+        Assert.True(body.GetProperty("keyring").GetBoolean());
     }
 }
