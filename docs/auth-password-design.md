@@ -12,7 +12,7 @@
 | 2 | 未设密码时 | **放行**，启动记一条 Warning。认证是可选加固，现有部署升级后行为不变。不做 UI 横幅 |
 | 3 | 密码存放 | 环境变量明文 `Auth__Password`。不做 hash 预生成——那要求用户先跑一个工具算 hash，对自建单用户工具是不成比例的负担 |
 | 4 | 保护范围 | 只拦 `/api/*`；静态资源不保护 |
-| 5 | 豁免 | `/api/health`、`/api/health/ready`、`POST /api/auth/login`、`GET /api/auth/status` |
+| 5 | 豁免 | 恰好六个：`GET /api/health`、`GET /api/health/ready`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/status`、SPA 回退。**逐端点**标注，不标在 group 上（否则将来加进 `/api/auth` 的端点会默默继承匿名）。这份清单由测试钉死 |
 | 6 | 未认证响应 | **401**，不重定向。前端是 SPA + `fetch`，重定向只会让 `fetch` 拿到一份 HTML |
 | 7 | 会话有效期 | 滑动过期 30 天 |
 | 8 | 与密钥环恢复的关系 | 登录门在密钥环闸门**之外**。密码比对不经密钥环，故 `Lost` 时仍可登录 |
@@ -65,10 +65,13 @@ UseCors → UseDefaultFiles → UseStaticFiles → [认证] → UseSecretUnavail
 
 健康探针必须豁免。否则 `docker healthcheck` 与编排层探针一律得到 401，容器被判定不健康并反复重启——一个由「加强安全」直接导致的可用性故障。
 
+但豁免的是**可达性**，不是**信息量**：`/api/health/ready` 的 200/503 保持不变（那才是探针消费的东西），而 `database`/`keyring` 两个布尔只在「认证已通过」或「未启用认证」时返回。否则任何匿名探测者都能读出「这台正处于密钥环恢复模式」。
+
 ### 4.3 安全细节
 
 - 密码比对用 `CryptographicOperations.FixedTimeEquals`（对 UTF-8 字节比较）。防时序侧信道，零成本
-- 登录失败后固定延迟约 1 秒，使在线爆破不划算。**不做账户锁定**——单用户工具锁定等于把自己关在门外
+- 登录失败后固定延迟约 1 秒，且该延迟**全进程串行**（`SemaphoreSlim(1,1)`），使在线爆破不划算。逐请求各睡 1 秒是挡不住的：N 个请求同时在飞，摊到每次尝试的代价接近 0；串行后 N 次失败要花 N 秒真实时间。只串行失败路径，登录成功永不排队。**不做账户锁定**——单用户工具锁定等于把自己关在门外
+- 每次登录失败记一条 Warning（只记来源 IP，**绝不记提交的密码**），让爆破留下痕迹
 - 密码永不写入日志、永不出现在错误响应里
 
 ### 4.4 CORS（仅影响本地开发）
@@ -102,7 +105,7 @@ UseCors → UseDefaultFiles → UseStaticFiles → [认证] → UseSecretUnavail
 
 `api/client.ts` 增加 401 处理：任何 API 响应 401 即把认证状态打回未登录，App 自动切回登录页。这覆盖「cookie 过期后继续操作界面」的情形。
 
-`fetch` 的 `credentials` 默认为 `same-origin`，同源部署下 cookie 自动携带，现有请求代码无需改动。
+`fetch` 的 `credentials` 默认为 `same-origin`：同源部署下 cookie 自动携带，但**跨域部署下浏览器根本不会带上 cookie**，后端为此开的 `AllowCredentials()` 就白开了。因此 `api/client.ts` 统一设 `credentials: 'include'`（是 `same-origin` 的超集，同源部署行为不变）。
 
 界面文案一律英文。登录页只含一个密码输入框与一个按钮，沿用现有页面的内联样式风格。
 
