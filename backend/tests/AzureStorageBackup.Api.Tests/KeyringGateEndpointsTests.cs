@@ -73,6 +73,38 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
         }
     }
 
+    /// <summary>
+    /// 全分支复审 Finding 2：计划任务的手动触发（"Run now"）是备份/检查/清理的入口之一，
+    /// 与 /backup-configs/{id}/run 同性质。缺闸门时 dispatcher 内解密备份密码抛出、被吞成日志，
+    /// 端点仍推进 LastRunAt 并返回 200——UI 显示成功而实际什么都没做。
+    /// 必须 409，且 LastRunAt 必须保持未推进。
+    /// </summary>
+    [Fact]
+    public async Task Manual_Task_Run_Returns_409_KeyringLost_And_Does_Not_Advance_LastRunAt()
+    {
+        var task = (await (await _client.PostAsJsonAsync("/api/tasks", new TaskRequest(
+                TaskTargetKind.Backup, 1, "gate-task-run-container", null,
+                ScheduledTaskType.Backup, "0 3 * * *", true)))
+            .Content.ReadFromJsonAsync<TaskResponse>())!;
+        Assert.Null(task.LastRunAt);
+
+        Keyring.Set(KeyringStatus.Lost);
+        try
+        {
+            var res = await _client.PostAsync($"/api/tasks/{task.Id}/run", null);
+            Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+            Assert.Equal("keyring_lost", (await res.Content.ReadFromJsonAsync<KeyringLostError>())!.code);
+        }
+        finally
+        {
+            Keyring.Set(KeyringStatus.Healthy);
+        }
+
+        var after = await (await _client.GetAsync($"/api/tasks/{task.Id}"))
+            .Content.ReadFromJsonAsync<TaskResponse>();
+        Assert.Null(after!.LastRunAt);
+    }
+
     /// <summary>整个恢复模式的存在意义：即便密钥环丢失，只读列表端点也不能跟着一起 409。</summary>
     [Fact]
     public async Task List_Endpoint_Still_Returns_200_When_Keyring_Is_Lost()
