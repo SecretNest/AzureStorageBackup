@@ -79,9 +79,11 @@ public sealed class BlobAddressScheme
             // 这次放宽的实际风险面（判断爆炸半径时别再重新推一遍）：
             // · tail 缺失只可能来自 format 1 的索引（IndexSerializer 里 tail 是 `format >= 2` 才读的后加项）——
             //   而 format 1 **未投产**，现网不会遇到；
-            // · head 在**每个** format 下都是无条件读的，故 head 缺失（→ 上面这条 TryGetValue 落空）
-            //   在现网几乎不可达，只有人为构造/损坏的索引才到得了。
-            // 也就是说：放宽的是一条现实中打不到的分支，换来的是「Metadata 省略键」与此处判定的语义对称。
+            // · head 缺失不再只是人为构造/损坏索引才会出现——修复(BackupRepairer)对 HeadHash 为 null 的
+            //   老条目也会发布不带 head 键的对象。但爆炸半径仍窄：MetadataMatches 只在云端回退导入路径
+            //   （localResolver 为 null，见 BackupOrchestrator.ResolveDataRefAsync）才会被调用；正常去重走
+            //   本地权威的 LocalDedupResolver.ResolveAsync，按 ContentKey（fullHash+len+head+tail 精确字符串
+            //   比对）判定，缺字段的条目在那里天然配不上任何键，根本走不到这条放宽的分支。
             if (meta.TryGetValue("head", out var h) && h != headHash)
                 return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;
