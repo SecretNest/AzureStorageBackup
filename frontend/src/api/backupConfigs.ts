@@ -75,6 +75,7 @@ export interface BackupConfig {
   lastError: string | null
   lastErrorAt: string | null
   activity: BackupActivity
+  secretsUnavailable: boolean
 }
 
 export interface BackupConfigInput {
@@ -261,4 +262,6 @@ export const backupConfigsApi = {
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
+  resetPassword: (id: number, password: string) =>
+    api.post<void>(`/backup-configs/${id}/reset-password`, { password }),
 }

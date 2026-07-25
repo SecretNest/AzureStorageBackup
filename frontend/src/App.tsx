@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { KeyringBanner } from './components/KeyringBanner'
 import { AccountsPage } from './pages/AccountsPage'
 import { BackupConfigsPage } from './pages/BackupConfigsPage'
 import { BackupsPage } from './pages/BackupsPage'
@@ -38,6 +39,8 @@ function App() {
           </button>
         ))}
       </nav>
+
+      <KeyringBanner onGoToAccounts={() => setTab('accounts')} />
 
       {tab === 'accounts' && <AccountsPage />}
       {tab === 'backups' && <BackupConfigsPage />}

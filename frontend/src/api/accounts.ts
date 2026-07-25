@@ -22,6 +22,7 @@ export interface Account {
   proxyPort: number | null
   proxyUsername: string | null
   createdAt: string
+  secretsUnavailable: boolean
 }
 
 export interface AccountInput {
@@ -51,4 +52,6 @@ export const accountsApi = {
   remove: (id: number) => api.del(`/accounts/${id}`),
   testConnection: (input: AccountInput) =>
     api.post<ConnectionResult>('/accounts/test-connection', input),
+  resetSecrets: (id: number, accountKey: string, proxyPassword: string | null) =>
+    api.post<void>(`/accounts/${id}/reset-secrets`, { accountKey, proxyPassword }),
 }

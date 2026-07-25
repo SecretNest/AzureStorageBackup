@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
+import { keyringApi, type KeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { Field } from '../components/modal'
@@ -81,6 +82,8 @@ export function BackupConfigsPage() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [postCreate, setPostCreate] = useState<BackupConfig | null>(null)
+  const [resettingPassword, setResettingPassword] = useState<BackupConfig | null>(null)
+  const [keyring, setKeyring] = useState<KeyringStatus | null>(null)
 
   const load = () => {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(String(e)))
@@ -90,7 +93,37 @@ export function BackupConfigsPage() {
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
+    keyringApi.status().then(setKeyring).catch(() => {})
   }, [])
+
+  // 密钥环丢失恢复(设计 §3.5)：顺序依赖是真实的——验证备份密码需要连云，连云需要账户密钥先恢复。
+  // 账户仍有待重设项时禁用重设按钮，避免用户在账户没修好前白试一遍备份密码。
+  const accountsStillPending = (keyring?.accountsPending ?? 0) > 0
+
+  const startResetPassword = (c: BackupConfig) => {
+    setResettingPassword(c)
+    setError(null)
+  }
+
+  const closeResetPassword = () => {
+    setResettingPassword(null)
+    setError(null)
+  }
+
+  const submitResetPassword = async (password: string) => {
+    if (!resettingPassword) return
+    setBusy(true)
+    try {
+      await backupConfigsApi.resetPassword(resettingPassword.id, password)
+      setResettingPassword(null)
+      load()
+      keyringApi.status().then(setKeyring).catch(() => {})
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const set = <K extends keyof BackupConfigInput>(k: K, v: BackupConfigInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
@@ -303,7 +336,22 @@ export function BackupConfigsPage() {
           ) : (
             configs.map((c) => (
               <tr key={c.id} style={{ borderBottom: '1px solid #eee', verticalAlign: 'top' }}>
-                <td>{c.name}</td>
+                <td>
+                  {c.name}
+                  {c.secretsUnavailable && (
+                    <>
+                      <span style={{ color: '#b45309', marginLeft: '0.5rem' }}>Password required</span>{' '}
+                      <button
+                        type="button"
+                        onClick={() => startResetPassword(c)}
+                        disabled={accountsStillPending}
+                        title={accountsStillPending ? 'Re-enter account credentials first' : undefined}
+                      >
+                        Re-enter
+                      </button>
+                    </>
+                  )}
+                </td>
                 <td>
                   {accountName(c.accountId)} / {c.containerName}
                 </td>
@@ -561,6 +609,15 @@ export function BackupConfigsPage() {
           onNotNow={() => setPostCreate(null)}
         />
       )}
+      {resettingPassword && (
+        <ResetPasswordModal
+          config={resettingPassword}
+          busy={busy}
+          error={error}
+          onSubmit={submitResetPassword}
+          onClose={closeResetPassword}
+        />
+      )}
     </section>
   )
 }
@@ -717,6 +774,51 @@ function PostCreateModal({
           </button>{' '}
           <button type="button" onClick={onNotNow}>
             Not now
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 密钥环丢失恢复弹窗：重新录入原始备份密码。密码本身不提供更改功能——只能核对，核对通过
+// (解密云端 info 文件成功)才落库；错误以 400 携带 "Verification failed: ..." 返回，原样显示。
+function ResetPasswordModal({
+  config, busy, error, onSubmit, onClose,
+}: {
+  config: BackupConfig
+  busy: boolean
+  error: string | null
+  onSubmit: (password: string) => void
+  onClose: () => void
+}) {
+  const [password, setPassword] = useState('')
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Re-enter Password — {config.name}</h3>
+        <p>
+          Enter the original password used to encrypt this backup. It cannot be changed — a
+          different password will fail verification.
+        </p>
+
+        <Field label="Password">
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+
+        {error && <p style={{ color: 'crimson' }}>{error}</p>}
+
+        <div style={{ marginTop: '1rem' }}>
+          <button type="button" onClick={() => onSubmit(password)} disabled={busy || !password}>
+            Submit
+          </button>{' '}
+          <button type="button" onClick={onClose} disabled={busy}>
+            Cancel
           </button>
         </div>
       </div>
