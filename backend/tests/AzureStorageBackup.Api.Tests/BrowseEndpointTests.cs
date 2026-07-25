@@ -27,7 +27,7 @@ public class BrowseEndpointTests : IDisposable
         DateTimeOffset ModifiedAt, bool OutsideRoot);
 
     private sealed record BrowseDto(
-        string Path, string? Parent, bool Truncated, List<BrowseEntryDto> Entries);
+        string Path, string? Parent, bool Truncated, int Skipped, List<BrowseEntryDto> Entries);
 
     private sealed class RootedFactory(string root) : TestWebAppFactory
     {
@@ -205,13 +205,14 @@ public class BrowseEndpointTests : IDisposable
         Assert.Contains(body!.Entries, e => e.Name == "photos");
     }
 
-    // B5: DefaultBrowseStart joins the process CWD onto a relative Backup__Root without folding
-    // `..` (folding is deliberately avoided elsewhere for symlink correctness — see
-    // PathBoundary.ResolveReal's docs). That join is an internal implementation detail; it must
-    // not leak into the response. Path and every entry's FullPath should read back exactly the
-    // operator's own ConfiguredRoot string, not `<cwd>/../../relative/root`.
+    // F1 (final review): a relative Backup__Root is normalised to an absolute path once, in the
+    // PathBoundary constructor, so everything the browse response hands out is rooted. Every one
+    // of these three strings is fed straight back into an API that runs it through IsInside —
+    // which rejects any non-rooted path outright — so a relative form here means an unusable
+    // picker (409 on the first click). Pinning "rooted" is what makes the follow-a-link test below
+    // meaningful rather than accidental.
     [Fact]
-    public async Task Defaults_To_The_Configured_Root_Without_Leaking_The_CWD_Join_Into_The_Response()
+    public async Task A_Relative_Root_Is_Reported_As_An_Absolute_Path()
     {
         var relativeRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), _root);
 
@@ -221,11 +222,45 @@ public class BrowseEndpointTests : IDisposable
         var body = await client.GetFromJsonAsync<BrowseDto>("/api/system/browse");
 
         Assert.NotNull(body);
-        Assert.Equal(relativeRoot, body!.Path);
-        Assert.DoesNotContain(Directory.GetCurrentDirectory(), body.Path, StringComparison.Ordinal);
+        Assert.True(Path.IsPathRooted(body!.Path));
         var photos = Assert.Single(body.Entries, e => e.Name == "photos");
-        Assert.Equal(Path.Combine(relativeRoot, "photos"), photos.FullPath);
-        Assert.DoesNotContain(Directory.GetCurrentDirectory(), photos.FullPath, StringComparison.Ordinal);
+        Assert.True(Path.IsPathRooted(photos.FullPath));
+        // 归一化**只拼 CWD、不折叠 `..`**（折叠是词法的，CWD 自身经软链时会算到别的目录去——
+        // 正是 PathBoundary.ResolveReal 文档里那个坑），所以字符串里会留着拼接痕迹。
+        // 断言看的是它指向哪儿，不是它长什么样。
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(_root, "photos")), Path.GetFullPath(photos.FullPath));
+    }
+
+    // F1 (final review): the composition test. Each piece was locally correct before — the
+    // response shape was asserted, the boundary was asserted — but nothing ever *followed* a
+    // link, so a listing whose FullPath/Parent could not be handed back to the very endpoint
+    // that produced them went unnoticed. Walk the picker's real click path: list the root, click
+    // into a subfolder using the fullPath as given, then click ".. (up)" using parent as given.
+    [Fact]
+    public async Task Every_Listed_Path_Can_Be_Browsed_Again_When_The_Root_Is_Relative()
+    {
+        var relativeRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), _root);
+
+        using var factory = new RootedFactory(relativeRoot);
+        var client = factory.CreateClient();
+
+        var start = await client.GetFromJsonAsync<BrowseDto>("/api/system/browse");
+        var photos = Assert.Single(start!.Entries, e => e.Name == "photos");
+
+        // 1) 点进子目录：把列表给出的 fullPath 一字不改地当 ?path= 送回去。
+        var downRes = await client.GetAsync(
+            $"/api/system/browse?path={Uri.EscapeDataString(photos.FullPath)}");
+        Assert.Equal(HttpStatusCode.OK, downRes.StatusCode);
+        var down = await downRes.Content.ReadFromJsonAsync<BrowseDto>();
+
+        // 2) 点「.. (up)」：把它返回的 parent 一字不改地送回去，应当回到根的列表。
+        Assert.NotNull(down!.Parent);
+        var upRes = await client.GetAsync(
+            $"/api/system/browse?path={Uri.EscapeDataString(down.Parent!)}");
+        Assert.Equal(HttpStatusCode.OK, upRes.StatusCode);
+        var up = await upRes.Content.ReadFromJsonAsync<BrowseDto>();
+        Assert.Contains(up!.Entries, e => e.Name == "photos");
     }
 
     // F6a: 未配根、也不传 path 的默认起点此前完全没有测试覆盖——所有既有用例要么显式
@@ -327,6 +362,47 @@ public class BrowseEndpointTests : IDisposable
         {
             // 恢复权限，好让 Dispose() 里的递归删除（需要能打开 locked 本身列目录）能成功
             File.SetUnixFileMode(locked,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+#pragma warning restore CA1416
+    }
+
+    // F2 (final review): 单项 catch 分支此前被判定为「无法确定性构造」——mode 000 在**枚举**
+    // 就失败（走的是上面那条 403），悬空软链和非法 UTF-8 名字也都不触发。漏掉的是 mode `r--`：
+    // 可读但**不可执行**的目录 readdir 拿得到名字，对子项 stat 却被拒，而 FileInfo.Attributes
+    // 在这种目录下是**抛** UnauthorizedAccessException，不是返回 -1 哨兵值。于是枚举成功、
+    // 每一项都落进单项 catch：200 + 空列表 + Skipped == 子项数。
+    // 与上面的 403 用例同样的理由：root 下 mode 位不是屏障，两个子项都会被正常列出，
+    // 断言会为完全错误的原因变绿——那种环境下宁可 Skip。
+    [SkippableFact]
+    public async Task Entries_Whose_Attributes_Cannot_Be_Read_Are_Skipped_And_Counted()
+    {
+        Skip.If(Environment.IsPrivilegedProcess, "running as a privileged user; chmod 400 is not a barrier");
+
+        var listable = Path.Combine(_root, "listable");
+        Directory.CreateDirectory(Path.Combine(listable, "child-dir"));
+        File.WriteAllText(Path.Combine(listable, "child-file.txt"), "x");
+#pragma warning disable CA1416 // tests run on Linux only
+        // r-- ：可 readdir（拿得到名字），不可 stat 子项（缺 x 位）。
+        File.SetUnixFileMode(listable, UnixFileMode.UserRead);
+        try
+        {
+            using var factory = new RootedFactory(_root);
+            var client = factory.CreateClient();
+
+            var res = await client.GetAsync(
+                $"/api/system/browse?path={Uri.EscapeDataString(listable)}");
+
+            Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+            var body = await res.Content.ReadFromJsonAsync<BrowseDto>();
+            Assert.Empty(body!.Entries);
+            // 空列表本身还不够：Skipped 才把「跳过了两项」与「真的是空目录」区分开。
+            Assert.Equal(2, body.Skipped);
+            Assert.False(body.Truncated);
+        }
+        finally
+        {
+            File.SetUnixFileMode(listable,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 #pragma warning restore CA1416

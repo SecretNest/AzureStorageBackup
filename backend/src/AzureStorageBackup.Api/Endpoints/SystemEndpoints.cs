@@ -84,30 +84,17 @@ public static class SystemEndpoints
         // 本地目录浏览（设计 §6）。懒加载，只返回直接子项。
         app.MapGet("/api/system/browse", (string? path, PathBoundary boundary) =>
         {
-            var usingDefaultStart = string.IsNullOrWhiteSpace(path);
-            var start = usingDefaultStart ? DefaultBrowseStart(boundary) : path!;
+            var start = string.IsNullOrWhiteSpace(path) ? DefaultBrowseStart(boundary) : path!;
 
             if (PathBoundaryGuard.Blocked(boundary, start) is { } outside)
                 return outside;
-
-            // B5：DefaultBrowseStart 故意不折叠 `..`（拼接方式必须与 ResolveReal 一致，见其
-            // 文档——折叠有可能在根内含「符号链接+..」组合时算出错误的真实位置，是比丑更坏的
-            // 正确性问题）。因此配了相对根时，`start` 会带字面 `<CWD>/../nas` 这种拼接痕迹。
-            // 这串字符串只能用来做真正的文件系统调用/边界判定（下面 Directory.Exists、
-            // EnumerateFileSystemEntries、IsInside 全部继续用 start，不受影响）；展示给用户的
-            // 版本换回操作员敲的原始 ConfiguredRoot——纯字符串替换，不重新解析，不改变指向的
-            // 文件，只是不让进程 CWD 这种实现细节泄漏到响应里。
-            var displayStart = usingDefaultStart
-                && boundary.ConfiguredRoot is { } configuredRoot
-                && !Path.IsPathRooted(configuredRoot)
-                ? configuredRoot
-                : start;
 
             if (!Directory.Exists(start))
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
 
             var entries = new List<BrowseEntry>();
             var truncated = false;
+            var skipped = 0;
 
             // Directory.Exists 为 true 不代表目录可读：实测在这台机器上，UnauthorizedAccessException
             // 在拿到迭代器的那一刻（GetEnumerator，底层已经在开 fd）就抛出，比 foreach 文档里说的
@@ -173,9 +160,9 @@ public static class SystemEndpoints
                     var name = Path.GetFileName(item);
                     entries.Add(new BrowseEntry(
                         name,
-                        // displayStart == start 时（绝大多数请求）这就是 item 本身；仅在默认
-                        // 相对根那一支才会换成不带 CWD 拼接痕迹的展示形式，见上面 displayStart 注释。
-                        displayStart == start ? item : Path.Combine(displayStart, name),
+                        // 绝对路径，原样可作为下一次 `?path=` 或 localRoot 送回（picker 就是这么
+                        // 用的）。ConfiguredRoot 恒为绝对路径，所以 start 也一定是绝对的。
+                        item,
                         isDir,
                         // 软链的 Length 是 lstat 值（链接自身的字节数，通常几十字节），
                         // 不是目标文件的大小——不会把目标内容的大小泄漏出去，但前端picker
@@ -187,7 +174,12 @@ public static class SystemEndpoints
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
                 {
-                    // 单项读取失败（权限不足等）跳过该项，不让整个请求失败
+                    // 单项读取失败跳过该项，不让整个请求失败。真实成因是「目录可读但不可执行」
+                    // （mode `r--`）：readdir 拿得到名字，对子项 stat 却被拒，FileInfo.Attributes
+                    // 在这种目录下会**抛** UnauthorizedAccessException，而不是返回 -1 哨兵值。
+                    // 跳过是对的（少给一项好过整个列表 403），但静默跳过会让这种目录渲染成
+                    // 「空目录」，用户完全看不出差别——所以计数并随响应返回，与 Truncated 同理。
+                    skipped++;
                 }
             }
 
@@ -211,7 +203,7 @@ public static class SystemEndpoints
                 ? boundary.ToDisplayPath(realParent)
                 : null;
 
-            return Results.Ok(new BrowseResponse(displayStart, parent, truncated, entries));
+            return Results.Ok(new BrowseResponse(start, parent, truncated, skipped, entries));
         })
         .WithTags("System");
 
@@ -220,22 +212,12 @@ public static class SystemEndpoints
 
     /// <summary>
     /// 未传 <c>path</c> 时的默认起点：配了根就从根开始，否则从文件系统根开始。
-    /// <c>Backup:Root</c> 允许配成相对路径（<see cref="PathBoundary.ResolveReal"/> 会按
-    /// 进程当前工作目录解析），但 <see cref="PathBoundary.IsInside"/> 只接受绝对输入——
-    /// 直接把 <see cref="PathBoundary.ConfiguredRoot"/> 当 start 用，遇到相对根时会被
-    /// IsInside 当场拒绝，反过来拿根自己的路径去比对根，自相矛盾地 409。
-    /// 这里把相对根拼成绝对路径再作为 start，拼接方式与 ResolveReal 对相对输入的处理
-    /// 完全一致（只拼 CWD，不做任何 <c>..</c> 折叠），确保两边解析到同一个真实位置。
+    /// <see cref="PathBoundary.ConfiguredRoot"/> 恒为绝对路径（相对配置在
+    /// <see cref="PathBoundary"/> 构造时就已归一化），所以可以直接当 start 用，
+    /// 不会撞上 <see cref="PathBoundary.IsInside"/> 只认绝对输入这条规则。
     /// </summary>
-    private static string DefaultBrowseStart(PathBoundary boundary)
-    {
-        if (boundary.ConfiguredRoot is not { } configuredRoot)
-            return Path.GetPathRoot(Path.GetFullPath("/")) ?? "/";
-
-        return Path.IsPathRooted(configuredRoot)
-            ? configuredRoot
-            : Path.Join(Directory.GetCurrentDirectory(), configuredRoot);
-    }
+    private static string DefaultBrowseStart(PathBoundary boundary) =>
+        boundary.ConfiguredRoot ?? Path.GetPathRoot(Path.GetFullPath("/")) ?? "/";
 
     private static string? ParseDataSource(string? conn)
     {
@@ -252,9 +234,14 @@ public static class SystemEndpoints
     }
 }
 
-/// <summary>浏览结果。Parent 为 null 表示已在根（或边界）处，不能再往上。</summary>
+/// <summary>
+/// 浏览结果。Parent 为 null 表示已在根（或边界）处，不能再往上。
+/// <para><c>Skipped</c>：读不出属性因而未列出的子项数（典型成因是目录 mode 为 <c>r--</c>——
+/// 可 readdir、不可 stat 子项）。与 <c>Truncated</c> 同一用途：少给了东西必须说出来，
+/// 否则这种目录看起来就是个普通空目录。</para>
+/// </summary>
 public record BrowseResponse(
-    string Path, string? Parent, bool Truncated, IReadOnlyList<BrowseEntry> Entries);
+    string Path, string? Parent, bool Truncated, int Skipped, IReadOnlyList<BrowseEntry> Entries);
 
 /// <summary>
 /// OutsideRoot=true 表示该项（通常是指向根外的软链）不可选，但仍列出以免用户困惑。

@@ -34,10 +34,22 @@ public sealed class PathBoundary
         // 是这里最坏的结果。
         // 注：「组件不可读」不是这里的成因——.NET 的 Unix ReadLink 会吞掉 EACCES，
         // chmod 000 的目录在 LinkTarget 上仍返回 null，被当成普通段处理，不会导致解析失败。
-        _configuredRoot = configured;
-        _realRoot = ResolveReal(configured)
+        // 相对根在这里一次性拼成绝对路径，之后 ConfiguredRoot 恒为绝对路径。
+        // 原因是 ConfiguredRoot 不只是给人看的：浏览端点用它做展示前缀（ToDisplayPath）
+        // 发给前端，前端再把同一串字符串原样当 `?path=` / `localRoot` 送回来，而 IsInside
+        // **只接受绝对输入**。保留相对形式，这条回路的每一跳都会被自己的边界拒成 409——
+        // 点进子目录、点「上一级」、点「Use this folder」全部不可用（各处单独看都正确，
+        // 组合起来才断）。在唯一的入口归一化，比让每个下游各自打补丁可靠。
+        // 拼接方式与 ResolveReal 对相对输入的处理完全一致：只拼进程当前工作目录，
+        // **绝不折叠 `..`**（理由见 ResolveReal 文档），保证两边解析到同一个真实位置。
+        // 这一步**不是**符号链接解析——拼 CWD 不跟随任何链接，ConfiguredRoot 依旧不等于
+        // 也不泄漏 RealRoot（根自身是软链时二者仍然不同）。
+        _configuredRoot = Path.IsPathRooted(configured)
+            ? configured
+            : Path.Join(Directory.GetCurrentDirectory(), configured);
+        _realRoot = ResolveReal(_configuredRoot)
             ?? throw new InvalidOperationException(
-                $"Backup root '{configured}' could not be resolved to a real path " +
+                $"Backup root '{_configuredRoot}' could not be resolved to a real path " +
                 "(symlink cycle). Fix Backup__Root or the filesystem.");
     }
 
@@ -45,11 +57,14 @@ public sealed class PathBoundary
     public bool Enabled => _realRoot is not null;
 
     /// <summary>
-    /// 操作员在 <c>Backup:Root</c> 里配的原始字符串，**未经符号链接解析**。
-    /// 面向操作员的场合——拒绝消息、越界提示、未来任何把根展示给人看的地方——
+    /// 操作员在 <c>Backup:Root</c> 里配的路径，**未经符号链接解析**（相对配置会在构造时
+    /// 拼上进程当前工作目录，除此之外原样保留）。
+    /// 面向操作员的场合——拒绝消息、越界提示、目录浏览响应里的展示路径——
     /// 一律用这个：拒绝时应该说操作员敲过的那个路径，而不是主机内部真正指向
     /// 的地方（例如配的是 <c>/nas</c>，实际指向 <c>/mnt/disk1</c>，操作员大概率
     /// 认不出后者）。未启用边界时为 null。
+    /// <para>启用时**恒为绝对路径**（见构造函数），因此它自己一定能通过
+    /// <see cref="IsInside"/>，可以安全地回传给前端再送回来。</para>
     /// </summary>
     public string? ConfiguredRoot => _configuredRoot;
 

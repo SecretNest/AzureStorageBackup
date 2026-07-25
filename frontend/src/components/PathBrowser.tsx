@@ -72,6 +72,12 @@ export function PathBrowser({
           {data?.truncated && (
             <p style={{ color: '#b45309' }}>Too many entries — this listing was truncated.</p>
           )}
+          {/* 少给了东西就必须说出来：不可 stat 的子项被跳过时，目录看上去和空目录一模一样。 */}
+          {!!data?.skipped && (
+            <p style={{ color: '#b45309' }}>
+              {data.skipped} item(s) could not be read and are not listed.
+            </p>
+          )}
         </div>
 
         <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>

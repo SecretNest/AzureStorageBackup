@@ -13,6 +13,8 @@ export interface BrowseResult {
   path: string
   parent: string | null
   truncated: boolean
+  /** 属性读不出来因而未列出的子项数（例如目录 mode 为 r--：可 readdir、不可 stat 子项）。 */
+  skipped: number
   entries: BrowseEntry[]
 }
 
