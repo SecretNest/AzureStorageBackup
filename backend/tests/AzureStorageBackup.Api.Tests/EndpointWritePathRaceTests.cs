@@ -301,8 +301,14 @@ public sealed class EndpointWritePathRaceTests
             "/api/backup-configs/import", new ImportRequest(account!.Id, "import-container", "the-real-password"));
         var body = await res.Content.ReadAsStringAsync();
 
-        // 取消一路上抛（宿主渲染成 500），不是 400「密码不对？」。
+        // 取消一路上抛（宿主渲染成 500），不是被端点的某个 catch 接住、包成任何一种「处理过」的响应
+        // （本端点所有 Results.XXX 分支——400/404/201——都回 application/json）。只断言
+        // NotEqual(BadRequest) 不够：换个分支把取消吞成别的非 400 状态（比如误判 404）一样能溜过去。
+        // 用 Content-Type 而非状态码/正文文本做判据：不管宿主把未处理异常渲染成什么（开发者异常页只在
+        // Development 下才有——ASPNETCORE_ENVIRONMENT=Production 下没有该中间件），只要它不是本端点
+        // 自己写出的 application/json，就足以证明取消没被当成「已处理」的请求结果。
         Assert.NotEqual(HttpStatusCode.BadRequest, res.StatusCode);
+        Assert.NotEqual("application/json", res.Content.Headers.ContentType?.MediaType);
         Assert.DoesNotContain("wrong password", body, StringComparison.OrdinalIgnoreCase);
 
         // 也没有半路建出配置行来。

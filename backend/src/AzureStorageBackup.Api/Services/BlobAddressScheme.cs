@@ -92,7 +92,10 @@ public sealed class BlobAddressScheme
             //   老条目也会发布不带 head 键的对象。但爆炸半径仍窄：MetadataMatches 只在云端回退导入路径
             //   （localResolver 为 null，见 BackupOrchestrator.ResolveDataRefAsync）才会被调用；正常去重走
             //   本地权威的 LocalDedupResolver.ResolveAsync，按 ContentKey（fullHash+len+head+tail 精确字符串
-            //   比对）判定，缺字段的条目在那里天然配不上任何键，根本走不到这条放宽的分支。
+            //   比对）判定，缺字段的条目在那里天然配不上任何键，根本走不到这条放宽的分支——而且并非只是
+            //   「绕过了检查」：该老条目的 ContentKey 形如 `hash\nlen\n\n`（LocalDedupResolver.ContentKey），
+            //   仍会占住 _priorRefs 里的基址，把同内容的新引用挤到 …~1 并标 collision:true（ResolveAsync
+            //   本就有的避让逻辑），本地路径其实另有一套与本改动无关的既有兜底，并非依赖这里的放宽。
             if (meta.TryGetValue("head", out var h) && h != headHash)
                 return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;

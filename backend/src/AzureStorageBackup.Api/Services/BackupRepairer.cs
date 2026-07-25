@@ -211,7 +211,8 @@ public sealed class BackupRepairer(
         var newSizes = await ReplaceBlobAsync(
             account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, ct);
 
-        // 省略元数据 = 该对象的碰撞防护被削弱（密钥化时 v 整体缺失，等于没有防护）。
+        // 省略元数据 = 该对象的碰撞防护被削弱（密钥化时改发窄校验值 v1，退化为 fullHash+长度，
+        // 而非无防护——head/tail 未知时 Metadata 已改发 v1，见 BlobAddressScheme）。
         // 这本身是正确处置（写空串更糟），但不留痕就是不可见的退化：记一条可审计的 Warning。
         if (opLog is not null && (metaEntry.HeadHash is null || metaEntry.TailHash is null))
         {
