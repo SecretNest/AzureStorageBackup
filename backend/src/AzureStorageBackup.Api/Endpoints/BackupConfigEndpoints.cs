@@ -40,7 +40,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -80,6 +80,20 @@ public static class BackupConfigEndpoints
                     : null,
             };
             var created = await svc.CreateAsync(config, ct);
+
+            // B2：无 SourceRootHint 时 LocalRoot 落成空串，一旦设了 Backup__Root，这条配置之后
+            // 任何操作都会撞上和「本地根真的越界」一模一样的 409 path_outside_root——IsInside 对
+            // 空串和真正界外路径给出的是同一个拒绝，操作员从响应里分不清是自己配错了根，还是这份
+            // 导入压根没抓到路径提示。这里在导入当下就把原因摊开，写进操作日志，而不是留到下次
+            // 手滑点了 run 才让人一头雾水。
+            if (string.IsNullOrEmpty(info.Backup.SourceRootHint))
+            {
+                await log.AppendAsync(
+                    OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
+                    $"Imported '{config.Name}' without a local root hint (LocalRoot is empty); " +
+                    "set Local Root on this backup before running it.",
+                    ct);
+            }
 
             // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：之后备份/清理平时不再下载云端索引。
             var identity = info.Backup.CreatedAt.UtcTicks;

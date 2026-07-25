@@ -78,6 +78,9 @@ public sealed class TaskDispatcher(
 
         if (!boundary.IsInside(config.LocalRoot))
         {
+            // 有意比上方忙碌跳过（LogWarning）高一级：忙碌是瞬态，下一轮调度大概率自愈；
+            // 根越界是一个持续到操作员改配置为止的站定问题，每一轮调度都会再跳过一次，
+            // 值得用 Error 让它在容器日志聚合/告警里更显眼，而不是被当成普通噪音过滤掉。
             logger.LogError(
                 "Scheduled task skipped: local root '{Root}' is outside the configured Backup__Root.",
                 config.LocalRoot);

@@ -89,7 +89,9 @@ public sealed class PathBoundary
     /// 把一个已确认落在边界内的真实路径（<see cref="RealRoot"/> 为前缀）翻译成操作员
     /// 可见的形式：用 <see cref="ConfiguredRoot"/> 替换掉 <see cref="RealRoot"/> 前缀。
     /// 调用方必须先用 <see cref="IsInside"/> 确认该真实路径确实落在边界内——本方法不做
-    /// 校验，传一个界外真实路径进来只会原样返回，不代表它安全。未启用边界时原样返回。
+    /// 校验，传一个界外真实路径进来会抛 <see cref="InvalidOperationException"/>，而不是悄悄
+    /// 原样返回一个带着 <see cref="RealRoot"/> 前缀的字符串（那个字符串一旦流到响应里就是
+    /// 主机真实路径泄漏）。未启用边界时原样返回。
     /// <para>
     /// 用途：像「上级目录」这类需要基于真实路径（跟随符号链接）计算、又要展示给用户
     /// 的场合——不能直接展示 <see cref="RealRoot"/>（配的是 <c>/nas</c>、实际指向
@@ -108,7 +110,13 @@ public sealed class PathBoundary
         if (real.StartsWith(_realRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
             return _configuredRoot + real[_realRoot.Length..];
 
-        return real;
+        // B4：这里本该到不了——调用方的契约是先用 IsInside 确认过。静默原样返回等于把一个
+        // 不带 RealRoot 前缀信号的字符串交还给调用方，对方毫无察觉地把主机真实路径（例如
+        // /mnt/disk1，而不是操作员认识的 /nas）继续往下传，最坏情况传进 HTTP 响应。炸在这里，
+        // 比在生产环境悄悄泄漏主机路径好得多。
+        throw new InvalidOperationException(
+            "PathBoundary.ToDisplayPath received a real path outside RealRoot; " +
+            $"the caller must verify IsInside(real) before calling this method. real='{real}'.");
     }
 
     /// <summary>

@@ -386,4 +386,37 @@ public class PathBoundaryTests : IDisposable
         Assert.False(PathBoundary.IsWithin("", "/target/a"));
         Assert.False(PathBoundary.IsWithin("/target", ""));
     }
+
+    [Fact]
+    public void ToDisplayPath_Replaces_The_Real_Root_Prefix_With_The_Configured_Root()
+    {
+        var real = Dir("real-storage");
+        var link = Path.Combine(_base, "nas-link");
+        Directory.CreateSymbolicLink(link, real);
+        var sut = Boundary(link);
+
+        Assert.Equal(link, sut.ToDisplayPath(real));
+        Assert.Equal(Path.Combine(link, "photos"), sut.ToDisplayPath(Path.Combine(real, "photos")));
+    }
+
+    [Fact]
+    public void ToDisplayPath_Returns_Input_Unchanged_When_The_Boundary_Is_Disabled()
+    {
+        var sut = Boundary(null);
+        Assert.Equal("/anywhere/at/all", sut.ToDisplayPath("/anywhere/at/all"));
+    }
+
+    // B4: 调用方必须先用 IsInside 确认过才能调传本方法——这里传一个真正落在 RealRoot
+    // 之外的真实路径，模拟违反契约的调用方。旧实现会原样返回这个字符串（对携带
+    // RealRoot 前缀的场景，等于把主机真实路径悄悄递给调用方，一路传到响应里就是泄漏）；
+    // 现在必须炸在这里，而不是悄悄放行。
+    [Fact]
+    public void ToDisplayPath_Throws_When_The_Real_Path_Is_Not_Under_The_Real_Root()
+    {
+        var root = Dir("nas");
+        var outside = Dir("outside");
+        var sut = Boundary(root);
+
+        Assert.Throws<InvalidOperationException>(() => sut.ToDisplayPath(outside));
+    }
 }

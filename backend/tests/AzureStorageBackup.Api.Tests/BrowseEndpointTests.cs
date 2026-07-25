@@ -64,6 +64,12 @@ public class BrowseEndpointTests : IDisposable
 
         Assert.NotNull(body);
         Assert.Contains(body!.Entries, e => e.Name == "photos");
+        // B6: every entry of the default (no `path`) browse is inside the root that produced it —
+        // OutsideRoot must be false throughout. Without this, `!boundary.IsInside(item)` could be
+        // mutated to something always-true on this code path and no test would catch it: the only
+        // other coverage of OutsideRoot=false is An_Entry_Inside_A_Configured_Root_Is_Not_Marked_Outside,
+        // which always passes an explicit `path`, never exercising the default-start branch.
+        Assert.All(body.Entries, e => Assert.False(e.OutsideRoot));
     }
 
     [Fact]
@@ -197,6 +203,29 @@ public class BrowseEndpointTests : IDisposable
 
         var body = await res.Content.ReadFromJsonAsync<BrowseDto>();
         Assert.Contains(body!.Entries, e => e.Name == "photos");
+    }
+
+    // B5: DefaultBrowseStart joins the process CWD onto a relative Backup__Root without folding
+    // `..` (folding is deliberately avoided elsewhere for symlink correctness — see
+    // PathBoundary.ResolveReal's docs). That join is an internal implementation detail; it must
+    // not leak into the response. Path and every entry's FullPath should read back exactly the
+    // operator's own ConfiguredRoot string, not `<cwd>/../../relative/root`.
+    [Fact]
+    public async Task Defaults_To_The_Configured_Root_Without_Leaking_The_CWD_Join_Into_The_Response()
+    {
+        var relativeRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), _root);
+
+        using var factory = new RootedFactory(relativeRoot);
+        var client = factory.CreateClient();
+
+        var body = await client.GetFromJsonAsync<BrowseDto>("/api/system/browse");
+
+        Assert.NotNull(body);
+        Assert.Equal(relativeRoot, body!.Path);
+        Assert.DoesNotContain(Directory.GetCurrentDirectory(), body.Path, StringComparison.Ordinal);
+        var photos = Assert.Single(body.Entries, e => e.Name == "photos");
+        Assert.Equal(Path.Combine(relativeRoot, "photos"), photos.FullPath);
+        Assert.DoesNotContain(Directory.GetCurrentDirectory(), photos.FullPath, StringComparison.Ordinal);
     }
 
     // F6a: 未配根、也不传 path 的默认起点此前完全没有测试覆盖——所有既有用例要么显式

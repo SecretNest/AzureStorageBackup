@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Net.Sockets;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -164,6 +165,63 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    // B2: importing a container whose info file carries no SourceRootHint (e.g. written by
+    // a pre-Backup__Root version, or by hand) leaves LocalRoot = "". From then on every guarded
+    // endpoint 409s it with path_outside_root — indistinguishable, from the response alone, from a
+    // config whose LocalRoot genuinely points outside the configured root. The import handler must
+    // surface the real cause at import time, in the operation log, so the operator isn't left
+    // guessing between "fix Backup__Root" and "set Local Root".
+    [SkippableFact]
+    public async Task Import_Without_A_Source_Root_Hint_Logs_Why_The_Config_Will_Be_Unrunnable()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var containerName = "imp-nohint-" + Guid.NewGuid().ToString("N")[..8];
+        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
+        var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 手工写一份没有 SourceRootHint 的信息文件——模拟旧版本产物/手工改库，
+            // 而不是经本应用的备份流程（那条路径总会填 SourceRootHint = config.LocalRoot）。
+            // 用独立的 BackupInfoStore（配 TestSecrets.Reader，与上面手工加密 azurite.AccountKeyProtected
+            // 用的是同一套密钥）直接写，绕开 DI 容器里那个用真实 keyring 的 ISecretReader——
+            // 后者解不开这里手工构造的密文。
+            var infoStore = new BackupInfoStore(factoryClient, new SevenZipArchiveCodec());
+            await infoStore.WriteInfoAsync(azurite, containerName, new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = "no-hint-backup", CreatedAt = DateTimeOffset.UtcNow },
+            }, password: null);
+
+            var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
+                new ImportRequest(account!.Id, containerName, null));
+            Assert.Equal(HttpStatusCode.Created, res.StatusCode);
+
+            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
+            Assert.Equal(string.Empty, imported!.LocalRoot);
+
+            using var scope = factory.Services.CreateScope();
+            var log = scope.ServiceProvider.GetRequiredService<IOperationLog>();
+            var entries = await log.QueryAsync(null, null, null, null, 100, CancellationToken.None);
+            Assert.Contains(entries, e =>
+                e.Source == $"import:{account.Id}/{containerName}" &&
+                e.Level == OperationLogLevel.Warning &&
+                e.Message.Contains("without a local root hint", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
     }
 
     private sealed record RunRow(string status);

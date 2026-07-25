@@ -84,12 +84,24 @@ public static class SystemEndpoints
         // 本地目录浏览（设计 §6）。懒加载，只返回直接子项。
         app.MapGet("/api/system/browse", (string? path, PathBoundary boundary) =>
         {
-            var start = string.IsNullOrWhiteSpace(path)
-                ? DefaultBrowseStart(boundary)
-                : path;
+            var usingDefaultStart = string.IsNullOrWhiteSpace(path);
+            var start = usingDefaultStart ? DefaultBrowseStart(boundary) : path!;
 
             if (PathBoundaryGuard.Blocked(boundary, start) is { } outside)
                 return outside;
+
+            // B5：DefaultBrowseStart 故意不折叠 `..`（拼接方式必须与 ResolveReal 一致，见其
+            // 文档——折叠有可能在根内含「符号链接+..」组合时算出错误的真实位置，是比丑更坏的
+            // 正确性问题）。因此配了相对根时，`start` 会带字面 `<CWD>/../nas` 这种拼接痕迹。
+            // 这串字符串只能用来做真正的文件系统调用/边界判定（下面 Directory.Exists、
+            // EnumerateFileSystemEntries、IsInside 全部继续用 start，不受影响）；展示给用户的
+            // 版本换回操作员敲的原始 ConfiguredRoot——纯字符串替换，不重新解析，不改变指向的
+            // 文件，只是不让进程 CWD 这种实现细节泄漏到响应里。
+            var displayStart = usingDefaultStart
+                && boundary.ConfiguredRoot is { } configuredRoot
+                && !Path.IsPathRooted(configuredRoot)
+                ? configuredRoot
+                : start;
 
             if (!Directory.Exists(start))
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
@@ -108,6 +120,14 @@ public static class SystemEndpoints
             {
                 iterator = Directory.EnumerateFileSystemEntries(start).GetEnumerator();
             }
+            // B3：DirectoryNotFoundException 派生自 IOException，必须先于下面那个更宽的
+            // IOException 分支单独捕获——否则 Directory.Exists 检查和这里取迭代器之间的
+            // TOCTOU 窗口里目录被删掉，会报成「读不了」(403) 而不是「不存在」(404)，
+            // 状态码对不上真实原因。窗口本身天然存在、无法消除，这里只保证报对状态码。
+            catch (DirectoryNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
+            }
             catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
             {
                 return Results.Json(
@@ -124,6 +144,11 @@ public static class SystemEndpoints
                     if (!iterator.MoveNext())
                         break;
                     item = iterator.Current;
+                }
+                // 同上：目录在迭代中途被整个删掉（而不是权限问题/挂载点掉线）也要报 404。
+                catch (DirectoryNotFoundException)
+                {
+                    return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
                 {
@@ -145,9 +170,12 @@ public static class SystemEndpoints
                 {
                     var info = new FileInfo(item);
                     var isDir = (info.Attributes & FileAttributes.Directory) != 0;
+                    var name = Path.GetFileName(item);
                     entries.Add(new BrowseEntry(
-                        Path.GetFileName(item),
-                        item,
+                        name,
+                        // displayStart == start 时（绝大多数请求）这就是 item 本身；仅在默认
+                        // 相对根那一支才会换成不带 CWD 拼接痕迹的展示形式，见上面 displayStart 注释。
+                        displayStart == start ? item : Path.Combine(displayStart, name),
                         isDir,
                         // 软链的 Length 是 lstat 值（链接自身的字节数，通常几十字节），
                         // 不是目标文件的大小——不会把目标内容的大小泄漏出去，但前端picker
@@ -183,7 +211,7 @@ public static class SystemEndpoints
                 ? boundary.ToDisplayPath(realParent)
                 : null;
 
-            return Results.Ok(new BrowseResponse(start, parent, truncated, entries));
+            return Results.Ok(new BrowseResponse(displayStart, parent, truncated, entries));
         })
         .WithTags("System");
 
