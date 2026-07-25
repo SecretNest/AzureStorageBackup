@@ -12,19 +12,20 @@ public static class BackupConfigEndpoints
     {
         var group = app.MapGroup("/api/backup-configs").WithTags("BackupConfigs");
 
-        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
+            var keyringLost = keyring.Status == KeyringStatus.Lost;
             return Results.Ok(list.Select(c =>
-                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy))));
+                BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), keyringLost)));
         });
 
-        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var c = await svc.GetAsync(id, ct);
             return c is null
                 ? Results.NotFound()
-                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy)));
+                : Results.Ok(BackupConfigResponse.From(c, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), keyring.Status == KeyringStatus.Lost));
         })
         .WithName("GetBackupConfig");
 
@@ -38,7 +39,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -76,10 +77,10 @@ public static class BackupConfigEndpoints
             foreach (var v in info.Versions)
                 await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
 
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, keyringLost: keyring.Status == KeyringStatus.Lost));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
@@ -87,10 +88,10 @@ public static class BackupConfigEndpoints
                 return Results.BadRequest(new { error = "ContainerName is required." });
 
             var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, keyringLost: keyring.Status == KeyringStatus.Lost));
         });
 
-        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, CancellationToken ct) =>
+        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
@@ -101,7 +102,7 @@ public static class BackupConfigEndpoints
             try
             {
                 var result = await svc.UpdateAsync(id, update, ct);
-                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result));
+                return result is null ? Results.NotFound() : Results.Ok(BackupConfigResponse.From(result, keyringLost: keyring.Status == KeyringStatus.Lost));
             }
             catch (InvalidOperationException ex)
             {

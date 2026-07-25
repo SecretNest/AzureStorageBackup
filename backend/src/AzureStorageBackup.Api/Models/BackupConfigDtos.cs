@@ -32,15 +32,18 @@ public record BackupConfigResponse(
     BackupStatus Status,
     string? LastError,
     DateTimeOffset? LastErrorAt,
-    string Activity)
+    string Activity,
+    bool SecretsUnavailable)
 {
-    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle") => new(
+    /// <summary>Password 可空：无密码的备份没有密文可丢，密钥环 Lost 时也不受影响，不计不标。</summary>
+    public static BackupConfigResponse From(BackupConfig c, string activity = "Idle", bool keyringLost = false) => new(
         c.Id, c.AccountId, c.ContainerName, c.Name, c.Description, c.LocalRoot,
         !string.IsNullOrEmpty(c.PasswordProtected), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
-        c.Status, c.LastError, c.LastErrorAt, activity);
+        c.Status, c.LastError, c.LastErrorAt, activity,
+        keyringLost && !string.IsNullOrEmpty(c.PasswordProtected));
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。

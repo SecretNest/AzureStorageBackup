@@ -14,11 +14,14 @@ public record AccountResponse(
     string? ProxyHost,
     int? ProxyPort,
     string? ProxyUsername,
-    DateTimeOffset CreatedAt)
+    DateTimeOffset CreatedAt,
+    bool SecretsUnavailable)
 {
-    public static AccountResponse From(Account a) => new(
+    /// <summary>账户密钥必填，密钥环 Lost 时必然解不开，故 SecretsUnavailable 原样取自 keyringLost。</summary>
+    public static AccountResponse From(Account a, bool keyringLost = false) => new(
         a.Id, a.Name, a.Description, a.BlobEndpoint, a.Region,
-        a.UseProxy, a.ProxyMode, a.ProxyHost, a.ProxyPort, a.ProxyUsername, a.CreatedAt);
+        a.UseProxy, a.ProxyMode, a.ProxyHost, a.ProxyPort, a.ProxyUsername, a.CreatedAt,
+        keyringLost);
 }
 
 /// <summary>创建/更新账户请求体。更新时 AccountKey/ProxyPassword 为空表示保留原值。</summary>

@@ -10,16 +10,17 @@ public static class AccountEndpoints
     {
         var group = app.MapGroup("/api/accounts").WithTags("Accounts");
 
-        group.MapGet("/", async (IAccountService svc, CancellationToken ct) =>
+        group.MapGet("/", async (IAccountService svc, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
-            return Results.Ok(list.Select(AccountResponse.From));
+            var keyringLost = keyring.Status == KeyringStatus.Lost;
+            return Results.Ok(list.Select(a => AccountResponse.From(a, keyringLost)));
         });
 
-        group.MapGet("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IAccountService svc, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var a = await svc.GetAsync(id, ct);
-            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a));
+            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a, keyring.Status == KeyringStatus.Lost));
         })
         .WithName("GetAccount");
 
