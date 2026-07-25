@@ -1,7 +1,9 @@
 using Azure;
 using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
@@ -433,6 +435,51 @@ public static class BackupConfigEndpoints
             {
                 busy.Release(account.Id, config.ContainerName);
             }
+        });
+
+        // 备份密码重设（设计 §3.4）。验证依据：加密备份的信息文件本身就是用该密码加密的 7z，
+        // 它是元数据根节点、容器内最小的加密对象，解得开即证明密码正确。
+        group.MapPost("/{id:int}/reset-password", async (
+            int id, ResetBackupPasswordRequest req, IBackupConfigService svc, IAccountService accounts,
+            IBackupInfoStore store, IEncryptionService encryption, AppDbContext db,
+            KeyringRecovery recovery, CancellationToken ct) =>
+        {
+            if (string.IsNullOrEmpty(req.Password))
+                return Results.BadRequest(new { error = "Password is required." });
+
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            if (string.IsNullOrEmpty(config.PasswordProtected))
+                return Results.BadRequest(new { error = "This backup is not encrypted; there is no password to restore." });
+
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            // 顺序依赖：连云需要账户密钥，故账户必须先恢复。
+            try
+            {
+                // 纯读，不可用 TrackedInfoStore.SeedFromCloudAsync——那会回填本地权威状态。
+                var info = await store.ReadInfoWithETagAsync(account, config.ContainerName, req.Password, ct);
+                if (info is null)
+                    return Results.BadRequest(new { error = "No backup info file found in the container." });
+            }
+            catch (SecretUnavailableException)
+            {
+                return Results.BadRequest(new { error = "Re-enter this backup's account credentials first." });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = $"Verification failed: {ex.Message}" });
+            }
+
+            var row = await db.BackupConfigs.FirstAsync(c => c.Id == id, ct);
+            row.PasswordProtected = encryption.Encrypt(req.Password);
+            await db.SaveChangesAsync(ct);
+
+            await recovery.TryCompleteAsync(ct);
+            return Results.NoContent();
         });
 
         return app;

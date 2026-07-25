@@ -134,6 +134,7 @@ builder.Services.AddScoped<INotifier, NotificationService>();
 // 密钥环健康判定（设计 §3.2）
 builder.Services.AddSingleton<IKeyringHealth, KeyringHealth>();
 builder.Services.AddScoped<KeyringProbe>();
+builder.Services.AddScoped<KeyringRecovery>();
 
 // 调度器（M6）：常驻后台按 cron 触发计划任务。测试环境用 Scheduler:Enabled=false 关闭。
 builder.Services.AddSingleton<TaskDispatcher>();

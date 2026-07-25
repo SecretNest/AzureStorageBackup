@@ -63,6 +63,9 @@ public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
 /// <summary>导入已有备份请求：读 container 的信息文件恢复配置（roadmap，PRD 1.5）。加密备份需提供密码。</summary>
 public record ImportRequest(int AccountId, string ContainerName, string? Password);
 
+/// <summary>备份密码重设请求。必须是当初加密云端包的那个密码——不支持更改密码（设计决策 6、8）。</summary>
+public record ResetBackupPasswordRequest(string Password);
+
 /// <summary>创建/更新备份配置请求体。更新时 Password 为空表示保留原值。</summary>
 public record BackupConfigRequest(
     int AccountId,

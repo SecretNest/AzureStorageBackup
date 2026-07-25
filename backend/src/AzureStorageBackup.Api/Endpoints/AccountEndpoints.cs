@@ -69,7 +69,7 @@ public static class AccountEndpoints
         // 凭据重设（设计 §3.4）。不复用 PUT——PUT 在恢复模式下受限，且此处必须验证后才落库。
         group.MapPost("/{id:int}/reset-secrets", async (
             int id, ResetAccountSecretsRequest req, IAccountService svc, IBlobClientFactory factory,
-            IEncryptionService encryption, AppDbContext db, CancellationToken ct) =>
+            IEncryptionService encryption, AppDbContext db, KeyringRecovery recovery, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.AccountKey))
                 return Results.BadRequest(new { error = "AccountKey is required." });
@@ -104,6 +104,7 @@ public static class AccountEndpoints
             row.ProxyPasswordProtected = candidate.ProxyPasswordProtected;
             await db.SaveChangesAsync(ct);
 
+            await recovery.TryCompleteAsync(ct);
             return Results.NoContent();
         });
 
