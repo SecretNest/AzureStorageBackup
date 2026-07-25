@@ -32,12 +32,12 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string prefix) => prefix + Guid.NewGuid().ToString("N")[..8];
 
-    private static BackupInfoFile SampleInfo() => new()
+    private static BackupInfoFile SampleInfo(bool encrypted = true) => new()
     {
         Backup = new BackupMeta
         {
             Name = "reset-pw-fixture",
-            Encrypted = true,
+            Encrypted = encrypted,
             CreatedAt = new DateTimeOffset(2026, 7, 16, 12, 0, 0, TimeSpan.Zero),
         },
         Versions =
@@ -67,6 +67,24 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         var cc = blobFactory.CreateServiceClient(account).GetBlobContainerClient(container);
         await cc.CreateIfNotExistsAsync();
         await store.WriteInfoAsync(account, container, SampleInfo(), password);
+    }
+
+    /// <summary>Finding 1 回归夹具：容器里放一份*未加密*的信息文件（用 password: null 写到未加密 blob 名），
+    /// 模拟本地配置认为已加密、但云端实际是明文对象的错配场景。ReadInfoWithETagAsync 优先探测未加密 blob 名，
+    /// 若不核对 Backup.Encrypted，端点会把提交的任意字符串当密码落库而根本没验证过。</summary>
+    private static async Task SeedPlaintextInfoAsync(string container)
+    {
+        var blobFactory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
+        var account = new Account
+        {
+            BlobEndpoint = AzuriteEndpoint,
+            AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
+            Region = AzureRegion.Global,
+        };
+        var cc = blobFactory.CreateServiceClient(account).GetBlobContainerClient(container);
+        await cc.CreateIfNotExistsAsync();
+        await store.WriteInfoAsync(account, container, SampleInfo(encrypted: false), password: null);
     }
 
     private async Task<(AccountResponse Account, BackupConfigResponse Config)> CreateAccountAndConfigAsync(
@@ -159,6 +177,49 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
 
             var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
             Assert.Equal("original-value-untouched", encryption.Decrypt(row.PasswordProtected!));
+
+            Assert.Empty(await db.LocalBackupStates
+                .Where(s => s.AccountId == account.Id && s.Container == container).ToListAsync());
+            Assert.Empty(await db.CachedVersionIndexes
+                .Where(c => c.AccountId == account.Id && c.Container == container).ToListAsync());
+        }
+        finally
+        {
+            var blobFactory = new BlobClientFactory(TestSecrets.Reader);
+            var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
+            await blobFactory.CreateServiceClient(azurite).GetBlobContainerClient(container).DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// 回归 Finding 1：本地配置认为已加密（PasswordProtected 非空），但云端容器里放的其实是
+    /// *未加密*的信息文件。ReadInfoWithETagAsync 优先探测未加密 blob 名，会用 password: null
+    /// 读回成功——如果端点不核对返回内容确实来自加密对象，就会把提交的任意字符串当密码落库，
+    /// 而真密码从未被验证过。必须拒绝，且原密文原封不动。
+    /// </summary>
+    [SkippableFact]
+    public async Task Plaintext_Info_Blob_In_Encrypted_Config_Container_Is_Rejected_Without_Using_Password()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var container = RandomName("rpw-plain-");
+        await SeedPlaintextInfoAsync(container);
+
+        var (account, config) = await CreateAccountAndConfigAsync(container, initialPassword: "original-value-untouched-3");
+
+        try
+        {
+            var reset = await _client.PostAsJsonAsync(
+                $"/api/backup-configs/{config.Id}/reset-password", new ResetBackupPasswordRequest("any-guessed-password"));
+            Assert.Equal(HttpStatusCode.BadRequest, reset.StatusCode);
+
+            using var scope = factory.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
+
+            var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
+            Assert.Equal("original-value-untouched-3", encryption.Decrypt(row.PasswordProtected!));
 
             Assert.Empty(await db.LocalBackupStates
                 .Where(s => s.AccountId == account.Id && s.Container == container).ToListAsync());

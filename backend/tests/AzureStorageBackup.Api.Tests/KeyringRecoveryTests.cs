@@ -68,4 +68,32 @@ public class KeyringRecoveryTests : IDisposable
         Assert.True(await Sut().TryCompleteAsync());
         Assert.Equal(KeyringStatus.Healthy, _health.Status);
     }
+
+    /// <summary>三族密文之一：代理密码。回归覆盖——若查询被误删，本用例会拿掉才能捕获。</summary>
+    [Fact]
+    public async Task Does_Not_Flip_While_A_Proxy_Password_Is_Still_Undecryptable()
+    {
+        _db.Accounts.Add(new Account
+        {
+            Name = "a", BlobEndpoint = "https://a.blob.core.windows.net",
+            AccountKeyProtected = _current.Encrypt("k"),
+            ProxyPasswordProtected = Stale("proxy-pw"),
+        });
+        await _db.SaveChangesAsync();
+
+        Assert.False(await Sut().TryCompleteAsync());
+        Assert.Equal(KeyringStatus.Lost, _health.Status);
+    }
+
+    /// <summary>三族密文之一：备份密码。回归覆盖——若查询被误删，本用例会拿掉才能捕获。</summary>
+    [Fact]
+    public async Task Does_Not_Flip_While_A_Backup_Password_Is_Still_Undecryptable()
+    {
+        _db.Accounts.Add(new Account { Name = "a", BlobEndpoint = "https://a.blob.core.windows.net", AccountKeyProtected = _current.Encrypt("k") });
+        _db.BackupConfigs.Add(new BackupConfig { Name = "docs", ContainerName = "c", LocalRoot = "/d", PasswordProtected = Stale("backup-pw") });
+        await _db.SaveChangesAsync();
+
+        Assert.False(await Sut().TryCompleteAsync());
+        Assert.Equal(KeyringStatus.Lost, _health.Status);
+    }
 }

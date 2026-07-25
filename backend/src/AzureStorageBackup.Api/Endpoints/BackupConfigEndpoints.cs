@@ -464,6 +464,11 @@ public static class BackupConfigEndpoints
                 var info = await store.ReadInfoWithETagAsync(account, config.ContainerName, req.Password, ct);
                 if (info is null)
                     return Results.BadRequest(new { error = "No backup info file found in the container." });
+                // ReadInfoWithETagAsync 优先探测未加密 blob 名——若容器里恰好有一份未加密的信息文件，
+                // 它会用 password: null 读回来，提交的密码根本没被用于解密。必须核对返回内容确实来自
+                // 加密对象，否则会把任意字符串当密码落库，真密码永久丢失。
+                if (!info.Value.Info.Backup.Encrypted)
+                    return Results.BadRequest(new { error = "This container's backup is not encrypted; the password cannot be verified." });
             }
             catch (SecretUnavailableException)
             {
