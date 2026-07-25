@@ -326,6 +326,13 @@ public sealed class BackupChecker(
 
         var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
 
+        // e.Path 来自云端索引，/import 之后即攻击者可控（设计 §5）：`..` 或绝对路径能让
+        // Path.Combine 把探测点甩到 localRoot 之外，变成一个「文件是否存在 / 内容是否等于
+        // 某个 hash」的确认预言机。判越界一律当 Missing——本地拿不出可用副本，既不读它、
+        // 也不让它成为修复来源，与「本地文件不在」处置一致。
+        if (!PathBoundary.IsWithin(localRoot, local))
+            return LocalState.Missing;
+
         if (e.Kind == "symlink")
         {
             var target = TryLinkTarget(local);

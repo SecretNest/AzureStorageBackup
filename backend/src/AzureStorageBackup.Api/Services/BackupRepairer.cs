@@ -177,6 +177,12 @@ public sealed class BackupRepairer(
         foreach (var (_, e) in refs)
         {
             var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
+            // e.Path 来自云端索引，/import 之后即攻击者可控（设计 §5）：越过 localRoot 的
+            // 条目会把「本地是否存在内容 hash 等于 X 的文件」变成一个可探测的确认预言机，
+            // 而且探到之后还会把根外文件的内容上传到云端。跳过该候选路径——同内容的其它
+            // 合法引用仍可继续尝试；一条都不可用时照常走「标记不可恢复」。
+            if (!PathBoundary.IsWithin(localRoot, local))
+                continue;
             if (File.Exists(local) && fullHash is not null && await hasher.FullHashAsync(local, ct) == fullHash)
             {
                 localSource = local;
@@ -264,6 +270,17 @@ public sealed class BackupRepairer(
             foreach (var (entryName, m) in members)
             {
                 var local = Path.Combine(localRoot, entryName.Replace('/', Path.DirectorySeparatorChar));
+                // entryName 来自云端索引，/import 之后即攻击者可控（设计 §5）。这一条检查同时
+                // 守住两侧：读侧的 local（根外确认预言机 + 把根外内容重新上传），以及写侧的
+                // dest = Path.Combine(composeDir, <同一个相对片段>)——两者拼接的是同一段字符串，
+                // 越界与否完全一致，所以一次判定即可。越界成员按「本地取不到」处置：
+                // 走 else 分支标记不可恢复，绝不悄悄当成可用成员。
+                if (!PathBoundary.IsWithin(localRoot, local))
+                {
+                    foreach (var (vnum, path) in m.Refs)
+                        MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
+                    continue;
+                }
                 if (File.Exists(local) && m.Hash is not null && await hasher.FullHashAsync(local, ct) == m.Hash)
                 {
                     var dest = Path.Combine(composeDir, entryName.Replace('/', Path.DirectorySeparatorChar));

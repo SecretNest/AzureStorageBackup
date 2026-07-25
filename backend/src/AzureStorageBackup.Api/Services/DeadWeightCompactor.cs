@@ -81,21 +81,39 @@ public sealed class DeadWeightCompactor(
         }
     }
 
-    /// <returns>非空=已重压（新各分卷尺寸）；空=本地缺失成员且不允许下载，放弃。</returns>
+    /// <returns>非空=已重压（新各分卷尺寸）；空=放弃重压（本地缺失成员且不允许下载，
+    /// 或索引里的成员名越出 compose 目录）。</returns>
     private async Task<IReadOnlyList<long>> RecompactAsync(
         Account account, BlobContainerClient container, string? password, string packId,
         Dictionary<string, LivePackMember> live, string? localRoot, AccessTier dataTier,
         bool allowDownload, long? volumeBytes, CancellationToken ct)
     {
         var baseRef = $"packs/{packId}.7z";
+        var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
+        var composeDir = Path.Combine(work, "compose");
+
+        // EntryName 来自云端索引，/import 之后即攻击者可控（设计 §5）。ToLocal 之后若含 `..`
+        // 或是绝对路径，下面每一处 Path.Combine 都会落到目标目录之外：
+        //   - LocalPath → localRoot 之外的存在性探测（无 hash 门，纯预言机）；
+        //   - CopyInto 的 dest → composeDir 之外的**任意写**，内容还是从 pack 里解压出来的；
+        //   - 补齐分支的 source → extractDir 之外的读取。
+        // 三处拼的是同一段字符串，越界与否一致，所以在入口一次判完。
+        // 处置是**整包放弃压实**，不是「跳过该成员」：跳过会悄悄丢掉一个仍被引用的成员，
+        // 而放弃只是保留死重——返回 [] 走的正是既有那条安全空操作路径（成员本地缺失且
+        // 不允许下载）。压实本就是纯优化，宁可不做。
+        if (live.Values.Any(m => !PathBoundary.IsWithin(composeDir, Path.Combine(composeDir, ToLocal(m.EntryName)))))
+        {
+            logger?.LogWarning(
+                "Dead-weight compaction skipped for pack {Pack}: an index entry name escapes the compose directory",
+                packId);
+            return [];
+        }
 
         // 优化：先按「存在性」判断是否有本地缺失成员；若缺失且不允许下载，直接放弃（不做任何 hash 比对）。
         var hasAbsentLocal = live.Values.Any(m => !File.Exists(LocalPath(localRoot, m.EntryName)));
         if (hasAbsentLocal && !allowDownload)
             return [];
 
-        var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
-        var composeDir = Path.Combine(work, "compose");
         Directory.CreateDirectory(composeDir);
         try
         {
