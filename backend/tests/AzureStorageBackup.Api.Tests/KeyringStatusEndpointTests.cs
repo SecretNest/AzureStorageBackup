@@ -25,6 +25,8 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
         var body = await res.Content.ReadFromJsonAsync<KeyringStatusResponse>();
         Assert.Equal("Healthy", body!.Status);
         Assert.Equal(0, body.AccountsPending);
+        // 两个计数都必须是 0——只断言其一，备份侧的计数写错也照样通过。
+        Assert.Equal(0, body.BackupConfigsPending);
     }
 
     private static AccountRequest SampleAccount(string name) => new(

@@ -32,6 +32,22 @@ public class SecretReaderTests
         Assert.Contains("prod", ex.Message);
     }
 
+    /// <summary>
+    /// 账户密钥是必填项，没有「未设置即 null」的语义（与代理密码/备份密码相反）：
+    /// 空串（新建实体的默认值、或历史遗留的空行）必须同样抛出，**不得**回退成空密钥去连云——
+    /// 那会拿一个空的 SharedKey 去签名，失败在 Azure 侧、消息与真实原因无关。
+    /// </summary>
+    [Fact]
+    public void RevealAccountKey_Throws_When_Not_Set()
+    {
+        var (sut, _) = Create();
+
+        Assert.Throws<SecretUnavailableException>(
+            () => sut.RevealAccountKey(new Account { Id = 5, Name = "no-key" }));       // 默认值（空串）
+        Assert.Throws<SecretUnavailableException>(
+            () => sut.RevealAccountKey(new Account { Id = 5, Name = "no-key", AccountKeyProtected = "" }));
+    }
+
     [Fact]
     public void RevealProxyPassword_Returns_Null_When_Not_Set()
     {

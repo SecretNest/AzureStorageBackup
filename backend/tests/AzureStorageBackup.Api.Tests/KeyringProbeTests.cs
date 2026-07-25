@@ -172,4 +172,76 @@ public class KeyringProbeTests : IDisposable
 
         Assert.Equal(KeyringStatus.Lost, await new KeyringProbe(_db, NewKeyring()).EvaluateAsync());
     }
+
+    /// <summary>
+    /// 回退分支的另一侧：老库、无账户、只有一个加密备份配置，且密文**解得开**。
+    /// 只覆盖 Lost 那侧的话，一个恒判 Lost 的回退实现也照样通过——而那会让「只用备份配置、
+    /// 不建账户」的老库升级后开机即锁死。必须 Healthy 且补写哨兵。
+    /// </summary>
+    [Fact]
+    public async Task Falls_Back_To_Backup_Config_And_Is_Healthy_When_It_Decrypts()
+    {
+        var enc = NewKeyring();
+        _db.BackupConfigs.Add(new BackupConfig
+        {
+            Id = 1, Name = "docs", ContainerName = "c", LocalRoot = "/data",
+            PasswordProtected = enc.Encrypt("pw"),
+        });
+        await _db.SaveChangesAsync();
+        _db.ChangeTracker.Clear();
+
+        Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, enc).EvaluateAsync());
+        Assert.Equal(1, await _db.KeyringCanaries.CountAsync());
+    }
+
+    /// <summary>
+    /// 与 <see cref="Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql"/> 同一理由（设计 §决策4 的确定性），
+    /// 补上另外两条探测查询。SQLite 的 INTEGER PRIMARY KEY 就是 rowid，无 ORDER BY 也会碰巧按 Id 升序，
+    /// 故只能直接断言生成的 SQL——否则删掉 OrderBy 不会被任何断言发现。
+    /// </summary>
+    [Fact]
+    public async Task Canary_Query_Is_Ordered_By_Id_In_Sql()
+    {
+        var good = NewKeyring();
+        // Id 2 是另一套密钥环的哨兵；判定必须只看 Id 最小的那条（Id 1），故为 Healthy。
+        _db.KeyringCanaries.Add(new KeyringCanary
+        { Id = 1, Ciphertext = good.Encrypt(KeyringProbe.CanaryPlaintext), CreatedAt = DateTimeOffset.UtcNow });
+        _db.KeyringCanaries.Add(new KeyringCanary
+        { Id = 2, Ciphertext = NewKeyring().Encrypt(KeyringProbe.CanaryPlaintext), CreatedAt = DateTimeOffset.UtcNow });
+        await _db.SaveChangesAsync();
+        _db.ChangeTracker.Clear();
+        _sqlLog.Clear();
+
+        // 哨兵解得开 → 直接 Healthy 返回，不会再走 WriteCanaryAsync（那会多产生一条无序查询）。
+        Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, good).EvaluateAsync());
+
+        var canaryQuery = Assert.Single(_sqlLog, s => s.Contains("FROM \"KeyringCanaries\""));
+        Assert.Contains("ORDER BY", canaryQuery);
+    }
+
+    [Fact]
+    public async Task Backup_Config_Fallback_Query_Is_Ordered_By_Id_In_Sql()
+    {
+        // 无账户 → 走备份配置回退。Id 1 用另一套密钥环，Id 2 用当前的：
+        // 只有确实取 Id 最小的那条，结果才是 Lost。
+        var current = NewKeyring();
+        _db.BackupConfigs.Add(new BackupConfig
+        {
+            Id = 1, Name = "docs", ContainerName = "c1", LocalRoot = "/data",
+            PasswordProtected = NewKeyring().Encrypt("pw"),
+        });
+        _db.BackupConfigs.Add(new BackupConfig
+        {
+            Id = 2, Name = "pics", ContainerName = "c2", LocalRoot = "/data",
+            PasswordProtected = current.Encrypt("pw"),
+        });
+        await _db.SaveChangesAsync();
+        _db.ChangeTracker.Clear();
+        _sqlLog.Clear();
+
+        Assert.Equal(KeyringStatus.Lost, await new KeyringProbe(_db, current).EvaluateAsync());
+
+        var configQuery = Assert.Single(_sqlLog, s => s.Contains("FROM \"BackupConfigs\""));
+        Assert.Contains("ORDER BY", configQuery);
+    }
 }

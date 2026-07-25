@@ -83,18 +83,32 @@ public class CiphertextAtRestTests : IDisposable
         Assert.Throws<SecretUnavailableException>(() => reader.RevealAccountKey(accounts[0]));
     }
 
-    [Fact]
-    public async Task Column_Names_Are_Unchanged()
+    private async Task<List<string>> ColumnNamesAsync(string table)
     {
         await using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "SELECT name FROM pragma_table_info('Accounts')";
+        cmd.CommandText = $"SELECT name FROM pragma_table_info('{table}')";
         var columns = new List<string>();
         await using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
             columns.Add(reader.GetString(0));
+        return columns;
+    }
 
-        Assert.Contains("AccountKey", columns);
-        Assert.Contains("ProxyPassword", columns);
-        Assert.DoesNotContain("AccountKeyProtected", columns);
+    /// <summary>实体属性改名成 *Protected，但**不得**产生 schema 变更：列名必须还是历史那几个。</summary>
+    [Fact]
+    public async Task Column_Names_Are_Unchanged()
+    {
+        var accounts = await ColumnNamesAsync("Accounts");
+
+        Assert.Contains("AccountKey", accounts);
+        Assert.Contains("ProxyPassword", accounts);
+        Assert.DoesNotContain("AccountKeyProtected", accounts);
+        Assert.DoesNotContain("ProxyPasswordProtected", accounts);
+
+        // 备份密码同样只是改了属性名（PasswordProtected），列名仍是 Password。
+        var configs = await ColumnNamesAsync("BackupConfigs");
+
+        Assert.Contains("Password", configs);
+        Assert.DoesNotContain("PasswordProtected", configs);
     }
 }

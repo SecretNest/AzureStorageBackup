@@ -106,6 +106,44 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         return (account, config!);
     }
 
+    private sealed record KeyringSnapshot(IReadOnlyList<KeyringCanary> Canaries, KeyringStatus Status);
+
+    private KeyringSnapshot SnapshotKeyring()
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return new KeyringSnapshot(
+            db.KeyringCanaries.AsNoTracking().ToList(),
+            factory.Services.GetRequiredService<IKeyringHealth>().Status);
+    }
+
+    /// <summary>
+    /// 用例自己的收尾。三个用例共用同一个宿主（<c>IClassFixture</c>），今天靠随机 container 名互不干扰，
+    /// 所以只删容器也算正确；但留在夹具库里的 Account / BackupConfig 行，以及重设成功时
+    /// <see cref="KeyringRecovery"/> 重写的哨兵与翻回的状态位，都是跨用例可见的残留——
+    /// 夹具一旦改成跨测试类共享，邻居用例那套「逐条试解」的待重设计数就会被这些行悄悄改写，
+    /// 且失败现场与真正的成因隔着一个测试类。故用完即还原。
+    /// </summary>
+    private async Task CleanUpAsync(string container, int accountId, int configId, KeyringSnapshot before)
+    {
+        var blobFactory = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account
+        { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
+        await blobFactory.CreateServiceClient(azurite).GetBlobContainerClient(container).DeleteIfExistsAsync();
+
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.BackupConfigs.Where(c => c.Id == configId).ExecuteDeleteAsync();
+        await db.Accounts.Where(a => a.Id == accountId).ExecuteDeleteAsync();
+
+        // 哨兵按内容还原（Id 交给库重新生成——判定只看「最小 Id 那一行的密文」，不看具体 Id）。
+        await db.KeyringCanaries.ExecuteDeleteAsync();
+        db.KeyringCanaries.AddRange(before.Canaries.Select(
+            k => new KeyringCanary { Ciphertext = k.Ciphertext, CreatedAt = k.CreatedAt }));
+        await db.SaveChangesAsync();
+        factory.Services.GetRequiredService<IKeyringHealth>().Set(before.Status);
+    }
+
     /// <summary>
     /// 对密码：验证通过、新密文落库，且验证路径没有回填任何本地权威状态
     /// （用的是纯读 ReadInfoWithETagAsync，不是会 seed 的 TrackedInfoStore.SeedFromCloudAsync）。
@@ -116,6 +154,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
+        var keyringBefore = SnapshotKeyring();
         var container = RandomName("rpw-ok-");
         const string correctPassword = "the-real-password";
         await SeedEncryptedInfoAsync(container, correctPassword);
@@ -143,9 +182,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         }
         finally
         {
-            var blobFactory = new BlobClientFactory(TestSecrets.Reader);
-            var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
-            await blobFactory.CreateServiceClient(azurite).GetBlobContainerClient(container).DeleteIfExistsAsync();
+            await CleanUpAsync(container, account.Id, config.Id, keyringBefore);
         }
     }
 
@@ -159,6 +196,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
+        var keyringBefore = SnapshotKeyring();
         var container = RandomName("rpw-bad-");
         const string correctPassword = "the-real-password-2";
         await SeedEncryptedInfoAsync(container, correctPassword);
@@ -185,9 +223,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         }
         finally
         {
-            var blobFactory = new BlobClientFactory(TestSecrets.Reader);
-            var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
-            await blobFactory.CreateServiceClient(azurite).GetBlobContainerClient(container).DeleteIfExistsAsync();
+            await CleanUpAsync(container, account.Id, config.Id, keyringBefore);
         }
     }
 
@@ -203,6 +239,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
+        var keyringBefore = SnapshotKeyring();
         var container = RandomName("rpw-plain-");
         await SeedPlaintextInfoAsync(container);
 
@@ -228,9 +265,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         }
         finally
         {
-            var blobFactory = new BlobClientFactory(TestSecrets.Reader);
-            var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
-            await blobFactory.CreateServiceClient(azurite).GetBlobContainerClient(container).DeleteIfExistsAsync();
+            await CleanUpAsync(container, account.Id, config.Id, keyringBefore);
         }
     }
 }
