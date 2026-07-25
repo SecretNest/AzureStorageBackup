@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
-import { keyringApi, type KeyringStatus } from '../api/keyring'
+import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { Field } from '../components/modal'
@@ -83,7 +83,7 @@ export function BackupConfigsPage() {
   const [busy, setBusy] = useState(false)
   const [postCreate, setPostCreate] = useState<BackupConfig | null>(null)
   const [resettingPassword, setResettingPassword] = useState<BackupConfig | null>(null)
-  const [keyring, setKeyring] = useState<KeyringStatus | null>(null)
+  const keyring = useKeyringStatus()
 
   const load = () => {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(String(e)))
@@ -93,12 +93,18 @@ export function BackupConfigsPage() {
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
-    keyringApi.status().then(setKeyring).catch(() => {})
   }, [])
 
   // 密钥环丢失恢复(设计 §3.5)：顺序依赖是真实的——验证备份密码需要连云，连云需要账户密钥先恢复。
   // 账户仍有待重设项时禁用重设按钮，避免用户在账户没修好前白试一遍备份密码。
   const accountsStillPending = (keyring?.accountsPending ?? 0) > 0
+
+  // 恢复模式下备份/还原/检查/修复一律 409(设计 §3.3)：按钮直接禁用并说明原因，
+  // 而不是让用户点了以后看到一坨原始的 409 响应体。
+  const keyringLost = keyring?.status === 'Lost'
+  const keyringLostHint = keyringLost
+    ? 'Data protection keys were lost — re-enter credentials before running this action.'
+    : undefined
 
   const startResetPassword = (c: BackupConfig) => {
     setResettingPassword(c)
@@ -117,7 +123,7 @@ export function BackupConfigsPage() {
       await backupConfigsApi.resetPassword(resettingPassword.id, password)
       setResettingPassword(null)
       load()
-      keyringApi.status().then(setKeyring).catch(() => {})
+      void refreshKeyringStatus()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -272,7 +278,12 @@ export function BackupConfigsPage() {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h1>Backups</h1>
         <div>
-          <button type="button" onClick={() => setImporting((v) => !v)} disabled={accounts.length === 0}>
+          <button
+            type="button"
+            onClick={() => setImporting((v) => !v)}
+            disabled={accounts.length === 0 || keyringLost}
+            title={keyringLostHint}
+          >
             Import existing
           </button>{' '}
           <button type="button" onClick={startNew} disabled={accounts.length === 0}>
@@ -364,18 +375,25 @@ export function BackupConfigsPage() {
                   <button
                     type="button"
                     onClick={() => run(c)}
-                    disabled={runs[c.id]?.status === 'Running'}
+                    disabled={keyringLost || runs[c.id]?.status === 'Running'}
+                    title={keyringLostHint}
                   >
                     {runs[c.id]?.status === 'Running' ? 'Running…' : 'Run'}
                   </button>{' '}
                   <button
                     type="button"
                     onClick={() => setRestoreModal(c)}
-                    disabled={restores[c.id]?.status === 'Running'}
+                    disabled={keyringLost || restores[c.id]?.status === 'Running'}
+                    title={keyringLostHint}
                   >
                     {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore…'}
                   </button>{' '}
-                  <button type="button" onClick={() => setCheckModal(c)}>
+                  <button
+                    type="button"
+                    onClick={() => setCheckModal(c)}
+                    disabled={keyringLost}
+                    title={keyringLostHint}
+                  >
                     Check / Repair…
                   </button>{' '}
                   <button type="button" onClick={() => startEdit(c)}>

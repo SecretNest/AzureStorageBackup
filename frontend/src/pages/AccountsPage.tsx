@@ -8,6 +8,7 @@ import {
   type AccountInput,
   type ConnectionResult,
 } from '../api/accounts'
+import { refreshKeyringStatus } from '../api/keyring'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
 import { ContainersPage } from './ContainersPage'
 
@@ -136,6 +137,9 @@ export function AccountsPage() {
       await accountsApi.resetSecrets(resetting.id, accountKey, proxyPassword || null)
       setResetting(null)
       load()
+      // 顶部横幅与备份页的顺序依赖都读同一份状态：重设成功后必须立刻刷新，
+      // 否则横幅会一直挂着已经过期的告警(设计 §3.5)。
+      void refreshKeyringStatus()
     } catch (e) {
       setError(String(e))
     } finally {
