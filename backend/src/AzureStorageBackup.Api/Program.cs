@@ -132,6 +132,9 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
+// 本地路径边界（设计 §3）：Backup:Root 未配置时无边界，行为不变
+builder.Services.AddSingleton<PathBoundary>();
+
 // --- 预置密码访问控制（设计 §2/§3）---
 var authGate = new AuthGate(builder.Configuration);
 builder.Services.AddSingleton(authGate);
