@@ -525,12 +525,11 @@ public sealed class BackupLifecycleTests : IDisposable
     /// 加密备份的机密性必须跨越修复：从本地重造并替换一个单文件 data blob 之后，
     /// 云端对象仍须是**加密**归档。
     /// <para>
-    /// ⚠ 本用例目前**失败**，暴露真实产品缺陷：<see cref="BackupRepairer"/> 的 <c>ReplaceBlobAsync</c>
-    /// 在重压时把 <c>CompressionRequest.Password</c> 硬编码为 <c>null</c>（同类的 <c>RepairPackAsync</c>
-    /// 却正确传了密码）。于是加密备份一经修复，该 data blob 就以**明文 7z** 落到云端：
-    /// 谁能读到存储谁就能解开内容，而功能上毫无症状（7z 对未加密归档忽略 <c>-p</c>，
-    /// 检查与还原照样通过）——静默的机密性丢失。
-    /// 按任务要求不迁就产品代码改写断言：修好产品后本用例即转绿。
+    /// 回归背景：<see cref="BackupRepairer"/> 的 <c>ReplaceBlobAsync</c> 曾把
+    /// <c>CompressionRequest.Password</c> 硬编码为 <c>null</c>（同类的 <c>RepairPackAsync</c>
+    /// 却正确传了密码），于是加密备份一经修复，该 data blob 就以明文 7z 落到云端。
+    /// 该缺陷**功能上毫无症状**——7z 对未加密归档忽略 <c>-p</c>，检查与还原照样通过——
+    /// 所以只能在存储层探测，不能靠「还原得出来」来判定。本用例即为此守护。
     /// </para>
     /// </summary>
     [SkippableFact]
