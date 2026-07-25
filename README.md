@@ -98,6 +98,10 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > `Backup__Root` is a **safety filter only**: it never rewrites or shortens a path, and it is not a base for relative paths. Paths are stored and displayed in full — with a root of `/nas`, a backup source still reads `/nas/photos/2024`. It constrains paths **inside the container**, so use it together with your volume mounts: mount everything you want to back up beneath that one directory.
 >
 > Symbolic links are resolved before the check, so a link inside the root that points outside it is rejected — including when the link is a middle segment of the path. Backup configurations whose local root falls outside the root are kept but refuse to run, so setting this on an existing install tells you which ones need attention instead of silently dropping them.
+>
+> **Restores are confined to the restore target, not to `Backup__Root`.** A restore never writes through a symbolic link that leads out of the target directory — not even one pointing somewhere else inside `Backup__Root` — because the index being restored is not trusted to describe where writes should land. If the target already contains such a link, every file under it is skipped and counted in the restore's failed-file total, and the run reports it. Restore into an empty directory, or remove links from the target first.
+>
+> A relative `Backup__Root` is resolved once at startup against the container's working directory and is shown in full from then on, so the folder picker and the paths it hands back are always absolute. Prefer an absolute value.
 
 ### Volumes / mounts
 

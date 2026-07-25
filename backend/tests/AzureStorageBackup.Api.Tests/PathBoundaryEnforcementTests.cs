@@ -54,6 +54,28 @@ public class PathBoundaryEnforcementTests
         return created.Id;
     }
 
+    /// <summary>
+    /// 与 <see cref="CreateOutOfRootConfigAsync"/> 对称的正向夹具：本地根落在 <c>Backup__Root</c>
+    /// **之内**的配置。用服务层而不是端点建，是为了让被测的四个闸门成为该请求路径上唯一
+    /// 一道边界检查——否则创建端点上的闸门先过一遍，正向用例会变成在测创建闸门。
+    /// <para><paramref name="accountId"/> 允许传一个不存在的账户：四个闸门都在账户查找之前，
+    /// 让账户缺失来终止请求，能拿到一个快速、确定、不碰网络的非 409 结果。</para>
+    /// </summary>
+    private static async Task<int> CreateInRootConfigAsync(
+        TestWebAppFactory factory, int accountId, string container, string name, string root)
+    {
+        using var scope = factory.Services.CreateScope();
+        var configs = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
+        var created = await configs.CreateAsync(new BackupConfig
+        {
+            AccountId = accountId,
+            ContainerName = container,
+            Name = name,
+            LocalRoot = Path.Combine(root, "photos"),
+        });
+        return created.Id;
+    }
+
     [Fact]
     public async Task Creating_A_Config_Outside_The_Root_Is_Rejected()
     {
@@ -299,4 +321,106 @@ public class PathBoundaryEnforcementTests
         var body = await res.Content.ReadFromJsonAsync<PathOutsideRootError>();
         Assert.Equal("path_outside_root", body!.code);
     }
+
+    // ---- F3（终审）：四个闸门的**放行**方向 ----
+    // 上面五条只钉住拒绝方向。少了放行方向，任何一个闸门把参数传错——例如
+    // `PathBoundaryGuard.Blocked(boundary, config.ContainerName)`——全部 510 条测试仍会绿：
+    // 容器名不是绝对路径，IsInside 直接返回 false，拒绝用例照样 409。
+    // 下面每个端点各一条：本地根在根内 → 必须走过闸门，拿到该端点自己的后续结果。
+    // 用一个不存在的账户 id，好让请求在闸门之后、任何网络动作之前就确定性地终止。
+
+    private const int MissingAccountId = 999999;
+
+    [Fact]
+    public async Task Run_Endpoint_Accepts_A_Config_Inside_The_Root()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+
+        var configId = await CreateInRootConfigAsync(
+            factory, MissingAccountId, "run-pass-test-container", "inside-root-run", root);
+
+        var res = await client.PostAsync($"/api/backup-configs/{configId}/run", null);
+
+        Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Restore_Endpoint_Accepts_A_Config_Inside_The_Root()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+
+        var configId = await CreateInRootConfigAsync(
+            factory, MissingAccountId, "restore-pass-test-container", "inside-root-restore", root);
+
+        // TargetRoot 留空 → 端点落回 config.LocalRoot（根内），与拒绝用例走的是同一条取值分支。
+        var res = await client.PostAsJsonAsync(
+            $"/api/backup-configs/{configId}/restore", new RestoreRequestBody(null, null));
+
+        Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Repair_Endpoint_Accepts_A_Config_Inside_The_Root()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+
+        var configId = await CreateInRootConfigAsync(
+            factory, MissingAccountId, "repair-pass-test-container", "inside-root-repair", root);
+
+        var res = await client.PostAsync($"/api/backup-configs/{configId}/repair", null);
+
+        Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Check_Endpoint_Accepts_A_Config_Inside_The_Root()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+
+        var configId = await CreateInRootConfigAsync(
+            factory, MissingAccountId, "check-pass-test-container", "inside-root-check", root);
+
+        var res = await client.PostAsync($"/api/backup-configs/{configId}/check", null);
+
+        // 闸门就在账户查找之前：拿到 400（账户不存在）就证明这一步已经走过去了。
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+    }
+
+    /// <summary>
+    /// F1（终审）：picker 的「Use this folder」回路。浏览端点返回的 <c>path</c> 会被前端原样
+    /// 当作 <c>localRoot</c> POST 回来——配了**相对**根时，这个值必须仍然能过创建端点的闸门。
+    /// 之前它是操作员敲的相对字符串，IsInside 只认绝对输入，于是选中根目录本身必然 409。
+    /// </summary>
+    [Fact]
+    public async Task The_Browse_Default_Path_Can_Be_Used_As_A_Local_Root_When_The_Root_Is_Relative()
+    {
+        var root = TempRoot();
+        var relativeRoot = Path.GetRelativePath(Directory.GetCurrentDirectory(), root);
+        using var factory = new RootedFactory(relativeRoot);
+        var client = factory.CreateClient();
+        var acct = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount()))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var browsed = await client.GetFromJsonAsync<BrowsePathOnly>("/api/system/browse");
+
+        var res = await client.PostAsJsonAsync("/api/backup-configs", new
+        {
+            accountId = acct!.Id,
+            containerName = "picker-round-trip-container",
+            name = "picked",
+            localRoot = browsed!.path,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, res.StatusCode);
+    }
+
+    private sealed record BrowsePathOnly(string path);
 }
