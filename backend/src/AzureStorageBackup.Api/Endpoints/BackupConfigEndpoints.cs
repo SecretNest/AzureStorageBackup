@@ -178,8 +178,10 @@ public static class BackupConfigEndpoints
         });
 
         // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
-        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -203,8 +205,10 @@ public static class BackupConfigEndpoints
         });
 
         // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
-        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -227,8 +231,10 @@ public static class BackupConfigEndpoints
         // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            ISecretReader secrets, CancellationToken ct) =>
+            ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -253,8 +259,10 @@ public static class BackupConfigEndpoints
         // 共享 pack/去重 blob 只计一次）与解压量，再对各去重对象首卷发起 HEAD 查活化状态（Archive/待就绪）。
         group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, CancellationToken ct) =>
+            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -349,8 +357,10 @@ public static class BackupConfigEndpoints
         });
 
         // 列出某备份的全部版本（供还原/检查选择版本）。走本地权威信息文件，平时不读云端。
-        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
+        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
@@ -372,8 +382,10 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, IKeyringHealth keyring, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();

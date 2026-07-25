@@ -7,7 +7,7 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public sealed class SchedulerService(
     IServiceScopeFactory scopes, TaskDispatcher dispatcher, IConfiguration config, ILogger<SchedulerService> logger,
-    VerboseFileLog verboseLog)
+    VerboseFileLog verboseLog, IKeyringHealth keyring)
     : BackgroundService
 {
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
@@ -46,6 +46,13 @@ public sealed class SchedulerService(
 
     private async Task TickAsync(CancellationToken ct)
     {
+        if (keyring.Status == KeyringStatus.Lost)
+        {
+            // 每 tick 只记一条汇总，不逐任务记——否则日志会被刷爆（设计 §3.3）
+            logger.LogWarning("Keyring lost; skipping all scheduled tasks until credentials are re-entered.");
+            return;
+        }
+
         using var scope = scopes.CreateScope();
         var tasks = scope.ServiceProvider.GetRequiredService<IScheduledTaskService>();
 
