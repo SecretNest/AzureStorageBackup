@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -103,6 +105,103 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
         var after = await (await _client.GetAsync($"/api/tasks/{task.Id}"))
             .Content.ReadFromJsonAsync<TaskResponse>();
         Assert.Null(after!.LastRunAt);
+    }
+
+    /// <summary>
+    /// 全分支复审 Finding 4/5：列容器在设计 §3.1 里就被点名为「需要凭据的动作」，
+    /// 而连删云端 container 的删除分支同样需要账户密钥。二者此前都没有闸门，密钥环丢失时
+    /// 一路走到 SecretReader 抛异常，客户端拿到裸 500。必须 409 keyring_lost。
+    /// </summary>
+    [Fact]
+    public async Task Container_Listing_And_Cloud_Deleting_Delete_Return_409_KeyringLost()
+    {
+        var account = (await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+                "gate-containers", null, "https://gate.blob.core.windows.net", AzureRegion.Global,
+                "dGVzdGtleQ==", false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>())!;
+        var config = await CreateConfigAsync("gate-delete-container");
+
+        Keyring.Set(KeyringStatus.Lost);
+        try
+        {
+            var list = await _client.GetAsync($"/api/accounts/{account.Id}/containers");
+            Assert.Equal(HttpStatusCode.Conflict, list.StatusCode);
+            Assert.Equal("keyring_lost", (await list.Content.ReadFromJsonAsync<KeyringLostError>())!.code);
+
+            var create = await _client.PostAsJsonAsync($"/api/accounts/{account.Id}/containers", new { name = "x" });
+            Assert.Equal(HttpStatusCode.Conflict, create.StatusCode);
+
+            var dropContainer = await _client.DeleteAsync($"/api/accounts/{account.Id}/containers/x");
+            Assert.Equal(HttpStatusCode.Conflict, dropContainer.StatusCode);
+
+            var dropCloud = await _client.DeleteAsync($"/api/backup-configs/{config.Id}?deleteContainer=true");
+            Assert.Equal(HttpStatusCode.Conflict, dropCloud.StatusCode);
+            Assert.Equal("keyring_lost", (await dropCloud.Content.ReadFromJsonAsync<KeyringLostError>())!.code);
+
+            // 纯本地删除必须仍然放行：决策 6 下这是「想不起备份密码」的唯一出口。
+            var dropLocal = await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
+            Assert.Equal(HttpStatusCode.NoContent, dropLocal.StatusCode);
+        }
+        finally
+        {
+            Keyring.Set(KeyringStatus.Healthy);
+        }
+    }
+
+    /// <summary>
+    /// 深度防御（设计 §3.1）：密钥环在进程运行期间被换掉，canary 还没重新判定，
+    /// 于是全局状态仍是 Healthy、闸门放行，解密在咽喉处才失败。没有映射时客户端拿到裸 500
+    /// （Program.cs 未注册任何异常处理中间件）。必须仍是 409 keyring_lost。
+    /// 这条同时把闸门与映射区分开：状态是 Healthy，KeyringGuard 根本不会触发。
+    /// </summary>
+    [Fact]
+    public async Task Undecryptable_Secret_Maps_To_409_Even_While_Status_Is_Healthy()
+    {
+        var account = (await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+                "gate-deep-defence", null, "https://deep.blob.core.windows.net", AzureRegion.Global,
+                "dGVzdGtleQ==", false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>())!;
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Accounts.FirstAsync(a => a.Id == account.Id)).AccountKeyProtected = TestSecrets.Stale("swapped-out");
+            await db.SaveChangesAsync();
+        }
+
+        Assert.Equal(KeyringStatus.Healthy, Keyring.Status);
+
+        var res = await _client.GetAsync($"/api/accounts/{account.Id}/containers");
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+        Assert.Equal("keyring_lost", (await res.Content.ReadFromJsonAsync<KeyringLostError>())!.code);
+    }
+
+    /// <summary>
+    /// 全分支复审 Finding 5：/import 的宽泛 catch 把「读不了账户密钥」说成
+    /// "Could not read info file (wrong password?)"，把密钥环问题赖到用户输的密码头上。
+    /// 必须给出指向账户凭据的提示。
+    /// </summary>
+    [Fact]
+    public async Task Import_Blames_Account_Credentials_Not_The_Password_When_The_Key_Is_Undecryptable()
+    {
+        var account = (await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+                "gate-import", null, "https://import.blob.core.windows.net", AzureRegion.Global,
+                "dGVzdGtleQ==", false, ProxyMode.Independent, null, null, null, null)))
+            .Content.ReadFromJsonAsync<AccountResponse>())!;
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Accounts.FirstAsync(a => a.Id == account.Id)).AccountKeyProtected = TestSecrets.Stale("lost-key");
+            await db.SaveChangesAsync();
+        }
+
+        var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
+            new ImportRequest(account.Id, "gate-import-container", "some-password"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+        Assert.Equal("Re-enter this account's credentials first.", body!["error"]);
     }
 
     /// <summary>整个恢复模式的存在意义：即便密钥环丢失，只读列表端点也不能跟着一起 409。</summary>

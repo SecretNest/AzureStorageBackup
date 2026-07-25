@@ -51,6 +51,12 @@ public static class BackupConfigEndpoints
             {
                 seeded = await trackedInfo.SeedFromCloudAsync(account, req.ContainerName, req.Password, ct);
             }
+            catch (SecretUnavailableException)
+            {
+                // 密钥环丢失导致读不了账户密钥，与备份密码无关——不能把责任推给用户输的密码
+                // （与 reset-password 同处理）。
+                return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
+            }
             catch (Exception ex)
             {
                 return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
@@ -114,7 +120,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -126,6 +132,11 @@ public static class BackupConfigEndpoints
 
             if (deleteContainer ?? false)
             {
+                // 只有连删云端 container 这一支需要账户密钥 → 密钥环丢失时 409。
+                // deleteContainer=false 那一支纯本地，必须保持不设闸门：它是决策 6 下
+                // 「想不起备份密码」的唯一出口，恢复模式里也得能走。
+                if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
                 var account = await accounts.GetAsync(accountId, ct);
                 if (account is null)
                     return Results.BadRequest(new { error = "Account not found." });

@@ -171,6 +171,10 @@ app.UseCors(CorsPolicy);
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+// 深度防御（设计 §3.1）：漏网的 SecretUnavailableException 统一映射为 409 keyring_lost，
+// 而不是裸 500。必须在端点之前入列才能包住端点执行。
+app.UseSecretUnavailableMapping();
+
 app.MapHealthEndpoints();
 app.MapAccountEndpoints();
 app.MapContainerEndpoints();
