@@ -62,10 +62,54 @@ public class KeyringProbeTests : IDisposable
     [Fact]
     public async Task Existing_Canary_That_Fails_To_Decrypt_Is_Lost()
     {
-        await new KeyringProbe(_db, NewKeyring()).EvaluateAsync();
+        var old = NewKeyring();
+        await new KeyringProbe(_db, old).EvaluateAsync();
+        // 库里必须还留着解不开的密文——那才是「有东西要重设」的真实丢失场景。
+        _db.Accounts.Add(AddAccount(old, 1, "prod"));
+        await _db.SaveChangesAsync();
         _db.ChangeTracker.Clear();
 
         // 新密钥环 = /keys 丢失后重新生成
+        Assert.Equal(KeyringStatus.Lost, await new KeyringProbe(_db, NewKeyring()).EvaluateAsync());
+    }
+
+    /// <summary>
+    /// 全分支复审 Finding 3：哨兵陈旧、但库里已经没有任何解不开的密文（用户放弃恢复、
+    /// 把账户与加密备份配置删光）。此前 EvaluateAsync 只在哨兵**缺失**时才重写它，于是
+    /// 陈旧哨兵把进程永久钉在 Lost：/api/health/ready 恒 503、调度器全跳过、一切动作 409，
+    /// 而横幅只写「0 credentials need to be re-entered」——没有任何出口。
+    /// 必须重建哨兵并回到 Healthy。
+    /// </summary>
+    [Fact]
+    public async Task Stale_Canary_With_No_Remaining_Secrets_Rebuilds_Canary_And_Is_Healthy()
+    {
+        await new KeyringProbe(_db, NewKeyring()).EvaluateAsync();
+        _db.ChangeTracker.Clear();
+        var stale = await _db.KeyringCanaries.AsNoTracking().SingleAsync();
+
+        var current = NewKeyring(); // /keys 丢失后重新生成的密钥环
+        Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, current).EvaluateAsync());
+
+        var rebuilt = await _db.KeyringCanaries.AsNoTracking().SingleAsync();
+        Assert.NotEqual(stale.Ciphertext, rebuilt.Ciphertext);
+        Assert.True(current.TryDecrypt(rebuilt.Ciphertext, out var plain));
+        Assert.Equal(KeyringProbe.CanaryPlaintext, plain);
+    }
+
+    /// <summary>陈旧哨兵 + 仍有解不开的备份密码（账户已删光）：仍须判 Lost，否则
+    /// 上面那条放行分支会把「还有东西要重设」的真实丢失也一起放过去。</summary>
+    [Fact]
+    public async Task Stale_Canary_With_A_Remaining_Backup_Password_Is_Still_Lost()
+    {
+        await new KeyringProbe(_db, NewKeyring()).EvaluateAsync();
+        _db.BackupConfigs.Add(new BackupConfig
+        {
+            Id = 1, Name = "docs", ContainerName = "c", LocalRoot = "/data",
+            PasswordProtected = NewKeyring().Encrypt("pw"),
+        });
+        await _db.SaveChangesAsync();
+        _db.ChangeTracker.Clear();
+
         Assert.Equal(KeyringStatus.Lost, await new KeyringProbe(_db, NewKeyring()).EvaluateAsync());
     }
 

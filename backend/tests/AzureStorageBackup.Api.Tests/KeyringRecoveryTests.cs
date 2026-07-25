@@ -31,7 +31,7 @@ public class KeyringRecoveryTests : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    private KeyringRecovery Sut() => new(_db, _current, _health, new KeyringProbe(_db, _current));
+    private KeyringRecovery Sut() => new(_health, new KeyringProbe(_db, _current));
 
     private static string Stale(string v) =>
         new EncryptionService(new EphemeralDataProtectionProvider()).Encrypt(v);
