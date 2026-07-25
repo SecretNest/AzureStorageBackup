@@ -26,7 +26,7 @@ public class AuthEndpointsTests
         }
     }
 
-    /// <summary>不跟随重定向、保留 cookie 的客户端。</summary>
+    /// <summary>保留 cookie（跨请求自动携带）的客户端；重定向策略用 HttpClient 默认值（跟随）。</summary>
     private static HttpClient Client(WebApplicationFactory<Program> f) =>
         f.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = true });
 
@@ -41,6 +41,31 @@ public class AuthEndpointsTests
 
         var accounts = await client.GetAsync("/api/accounts");
         Assert.Equal(HttpStatusCode.OK, accounts.StatusCode);
+    }
+
+    [Fact]
+    public async Task Without_A_Password_Login_Is_A_No_Op()
+    {
+        // 认证关闭时没有注册任何 scheme；:20-21 的 gate.Required 短路要是被删掉，
+        // SignInAsync 会抛 InvalidOperationException 变成 500。
+        using var factory = Factory(null);
+        var client = Client(factory);
+
+        var login = await client.PostAsJsonAsync("/api/auth/login", new { password = "anything" });
+
+        Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
+    }
+
+    [Fact]
+    public async Task Without_A_Password_Logout_Is_A_No_Op()
+    {
+        // 同上，:41 的 gate.Required 短路守着 SignOutAsync。
+        using var factory = Factory(null);
+        var client = Client(factory);
+
+        var logout = await client.PostAsync("/api/auth/logout", null);
+
+        Assert.Equal(HttpStatusCode.NoContent, logout.StatusCode);
     }
 
     [Fact]
@@ -105,6 +130,27 @@ public class AuthEndpointsTests
 
         var status = await client.GetFromJsonAsync<AuthStatus>("/api/auth/status");
         Assert.True(status!.Authenticated);
+    }
+
+    [Fact]
+    public async Task Correct_Password_Issues_A_Persistent_Cookie()
+    {
+        // 设计 §1 决策 7/§3：30 天滑动会话。Program.cs 的 ExpireTimeSpan/SlidingExpiration
+        // 只管服务端票据；没有 IsPersistent=true，Set-Cookie 就不带 Max-Age/Expires，
+        // 浏览器关闭即丢 cookie——配置在骗人。
+        using var factory = Factory("s3cret");
+        // 不用 HandleCookies 客户端：那样看不到原始 Set-Cookie 头。
+        var client = factory.CreateClient();
+
+        var login = await client.PostAsJsonAsync("/api/auth/login", new { password = "s3cret" });
+
+        Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
+        Assert.True(login.Headers.TryGetValues("Set-Cookie", out var setCookieValues));
+        var setCookie = Assert.Single(setCookieValues!);
+        Assert.True(
+            setCookie.Contains("max-age", StringComparison.OrdinalIgnoreCase)
+                || setCookie.Contains("expires", StringComparison.OrdinalIgnoreCase),
+            $"expected a persistence directive in Set-Cookie, got: {setCookie}");
     }
 
     [Fact]

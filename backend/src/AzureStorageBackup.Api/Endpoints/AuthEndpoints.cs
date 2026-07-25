@@ -31,7 +31,9 @@ public static class AuthEndpoints
                 [new Claim(ClaimTypes.Name, "owner")],
                 CookieAuthenticationDefaults.AuthenticationScheme);
             await ctx.SignInAsync(
-                CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                new ClaimsPrincipal(identity),
+                new AuthenticationProperties { IsPersistent = true }); // 落地 30 天滑动会话（设计 §1 决策 7）
 
             return Results.NoContent();
         });

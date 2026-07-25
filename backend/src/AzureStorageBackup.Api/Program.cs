@@ -170,9 +170,11 @@ if (authGate.Required)
             .Build());
 }
 
-// --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源）---
+// --- CORS（开发时前端 dev server 直连用；生产走 nginx 反代同源，不需要 CORS）---
+// AllowCredentials() 已开启：dev-server 兜底地址只在 Development 生效，
+// 否则未配置就是空列表——总不能让生产环境默认放行一个本地地址的带凭据跨域请求。
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-    ?? ["http://localhost:5173"];
+    ?? (builder.Environment.IsDevelopment() ? ["http://localhost:5173"] : []);
 builder.Services.AddCors(options => options.AddPolicy(CorsPolicy, policy =>
     policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
