@@ -132,6 +132,11 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
+// 本地路径边界（设计 §3）：Backup:Root 未配置时无边界，行为不变。
+// 这里**立即构造**（而不是交给容器懒加载），让「配了根但解析不出来」在启动期就炸掉，
+// 而不是拖到第一个请求——边界失效是配置错误，越早暴露越好。
+builder.Services.AddSingleton(new PathBoundary(builder.Configuration));
+
 // --- 预置密码访问控制（设计 §2/§3）---
 var authGate = new AuthGate(builder.Configuration);
 builder.Services.AddSingleton(authGate);

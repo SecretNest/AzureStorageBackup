@@ -8,7 +8,7 @@ namespace AzureStorageBackup.Api.Services;
 /// 按类型分发到 备份/检查/清理。每个引擎调用在独立 scope 中解析 scoped 服务。
 /// </summary>
 public sealed class TaskDispatcher(
-    IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets)
+    IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets, PathBoundary boundary)
 {
     public async Task DispatchAsync(ScheduledTask task, CancellationToken ct = default)
     {
@@ -73,6 +73,25 @@ public sealed class TaskDispatcher(
         if (config is null || account is null)
         {
             logger.LogWarning("No backup config for {Account}/{Container}; skipping scheduled {Type}", accountId, container, task.TaskType);
+            return;
+        }
+
+        if (!boundary.IsInside(config.LocalRoot))
+        {
+            // 有意比上方忙碌跳过（LogWarning）高一级：忙碌是瞬态，下一轮调度大概率自愈；
+            // 根越界是一个持续到操作员改配置为止的站定问题，每一轮调度都会再跳过一次，
+            // 值得用 Error 让它在容器日志聚合/告警里更显眼，而不是被当成普通噪音过滤掉。
+            logger.LogError(
+                "Scheduled task skipped: local root '{Root}' is outside the configured Backup__Root.",
+                config.LocalRoot);
+            // 与忙碌跳过分支同形（上方 TryAcquire 失败处）：把「这个计划任务没跑」写进操作员能看见的
+            // 操作日志，而不是只留一条容器日志里的 LogError——单用户无人值守部署下没人会去翻它。
+            // 配置本身按设计保留、不删（越界即拒跑，直到操作员修正 LocalRoot 或 Backup__Root），
+            // 消息里带上违规的本地根与当前配置的根，让操作员一眼知道改哪个。
+            await sp.GetRequiredService<IOperationLog>().AppendAsync(
+                OperationLogLevel.Error, $"schedule:{accountId}/{container}",
+                $"Skipped scheduled {task.TaskType}: local root '{config.LocalRoot}' is outside the configured root '{boundary.ConfiguredRoot}'",
+                ct);
             return;
         }
 

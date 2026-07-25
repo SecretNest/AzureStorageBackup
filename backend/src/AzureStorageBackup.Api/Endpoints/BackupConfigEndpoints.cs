@@ -40,7 +40,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -81,6 +81,20 @@ public static class BackupConfigEndpoints
             };
             var created = await svc.CreateAsync(config, ct);
 
+            // B2：无 SourceRootHint 时 LocalRoot 落成空串，一旦设了 Backup__Root，这条配置之后
+            // 任何操作都会撞上和「本地根真的越界」一模一样的 409 path_outside_root——IsInside 对
+            // 空串和真正界外路径给出的是同一个拒绝，操作员从响应里分不清是自己配错了根，还是这份
+            // 导入压根没抓到路径提示。这里在导入当下就把原因摊开，写进操作日志，而不是留到下次
+            // 手滑点了 run 才让人一头雾水。
+            if (string.IsNullOrEmpty(info.Backup.SourceRootHint))
+            {
+                await log.AppendAsync(
+                    OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
+                    $"Imported '{config.Name}' without a local root hint (LocalRoot is empty); " +
+                    "set Local Root on this backup before running it.",
+                    ct);
+            }
+
             // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：之后备份/清理平时不再下载云端索引。
             var identity = info.Backup.CreatedAt.UtcTicks;
             foreach (var v in info.Versions)
@@ -89,12 +103,13 @@ public static class BackupConfigEndpoints
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
             if (string.IsNullOrWhiteSpace(req.ContainerName))
                 return Results.BadRequest(new { error = "ContainerName is required." });
+            if (PathBoundaryGuard.Blocked(boundary, req.LocalRoot) is { } outside) return outside;
 
             var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, secretsUnavailable: Pending(keyring, encryption, created)));
@@ -168,12 +183,14 @@ public static class BackupConfigEndpoints
         });
 
         // 启动一次备份（后台运行，进度轮询）
-        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
-            if (await svc.GetAsync(id, ct) is null)
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
                 return Results.NotFound();
+            if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
 
             var state = runner.Start(id);
             return Results.Accepted($"/api/backup-configs/{id}/run", BackupRunResponse.From(state));
@@ -187,7 +204,7 @@ public static class BackupConfigEndpoints
         });
 
         // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
-        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -196,6 +213,7 @@ public static class BackupConfigEndpoints
                 return Results.NotFound();
 
             var target = string.IsNullOrWhiteSpace(body.TargetRoot) ? config.LocalRoot : body.TargetRoot;
+            if (PathBoundaryGuard.Blocked(boundary, target) is { } outside) return outside;
             var state = runner.Start(id, target, body.Version, body.Substitutions, body.SelectedPaths, body.Conflict, body.RehydratePriority);
             return Results.Accepted($"/api/backup-configs/{id}/restore", RestoreRunResponse.From(state));
         });
@@ -358,13 +376,14 @@ public static class BackupConfigEndpoints
         });
 
         // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
+            if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
             var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false);
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
@@ -407,13 +426,14 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, IKeyringHealth keyring, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, IKeyringHealth keyring, ILoggerFactory loggerFactory, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
+            if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
             var account = await accounts.GetAsync(config.AccountId, ct);
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });

@@ -5,6 +5,13 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
+/// <summary>同步收集 phase 上报（Progress&lt;T&gt; 会把回调排到同步上下文，测试里读不到）。</summary>
+internal sealed class SyncProgress : IProgress<string>
+{
+    public List<string> Messages { get; } = [];
+    public void Report(string value) { lock (Messages) Messages.Add(value); }
+}
+
 [Trait("Category", "Integration")]
 public sealed class RestoreOrchestratorTests : IDisposable
 {
@@ -592,6 +599,490 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var baks = Directory.GetFiles(_dst, "a.txt.bak-*");
             Assert.Single(baks);
             Assert.Equal("local content", File.ReadAllText(baks[0])); // 旧内容永不丢失
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Restore_Skips_Index_Entry_That_Would_Escape_Target_Root()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstesc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 阈值调到 1 字节 → a.txt 走单文件 data blob（而非 pack），
+            // 使得还原时内容按 blob 整体复用、不依赖归档内的条目名——
+            // 这样恶意条目才会真的把内容写到它自己声明的（越界）路径上，
+            // 忠实重现 /import 场景下可信度为零的索引所能触发的写入。
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            // 模拟一条被篡改/来自不可信容器（/import 可导入任意容器）的索引：追加一条
+            // Path 含 .. 的条目，复用 a.txt 的 Storage（同一个下载分组），
+            // 验证写入前的越界检查会拦下它，而不是让它落到 TargetRoot 之外。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            idx.Entries.Add(aEntry with { Path = "../pwned.txt" });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));       // 正常条目照常还原
+            Assert.False(File.Exists(Path.Combine(_base, "pwned.txt"))); // 越界条目未写到目标根之外
+            Assert.Equal(1, result.FailedFiles);                         // 计入失败数，其余照常，不中断整次还原
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// C1（Critical）：还原**先**建 symlink 条目、**后**写文件条目。索引里一条
+    /// <c>evil -&gt; &lt;根外&gt;</c> 加一条 <c>evil/x</c>，词法判定看 <c>&lt;root&gt;/evil/x</c> 完全在根内，
+    /// 而 File.Copy 会跟随那条链接把内容落到根外——没有竞态，纯靠还原自身的顺序。
+    /// 判定必须作用在解析后的真实路径上才拦得住。
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_Does_Not_Write_Through_A_Symlink_Entry_That_Points_Outside_The_Target()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstsym1-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        var outside = Path.Combine(_base, "outside");
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            // 阈值 1 → a.txt 走单文件 data blob，内容按条目声明的路径整体复制，
+            // 于是恶意条目真的会把内容写到它声明的位置（忠实重现 /import 场景）。
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+
+            // 恶意索引：一条指向根外目录的软链条目 + 一条「在它下面」的文件条目。
+            idx.Entries.Add(aEntry with { Path = "evil", Kind = "symlink", Target = outside, Storage = null });
+            idx.Entries.Add(aEntry with { Path = "evil/x" });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            // 核心断言：目标根之外不能出现任何东西。
+            Assert.False(Path.Exists(Path.Combine(outside, "x")));
+            Assert.Empty(Directory.GetFileSystemEntries(outside));
+
+            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 合法条目照常
+            Assert.Equal(1, result.FailedFiles);                                          // 穿链写入被计入失败
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>C6：symlink 条目自身的路径越界（<c>../</c>）必须被拦下，并计入失败而不是静默跳过（C3）。</summary>
+    [SkippableFact]
+    public async Task Restore_Rejects_Symlink_Entry_Whose_Own_Path_Escapes_The_Target_Root()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstsym2-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        var outside = Path.Combine(_base, "outside");
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            idx.Entries.Add(aEntry with { Path = "../evil-link", Kind = "symlink", Target = outside, Storage = null });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var reports = new SyncProgress();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                phase: reports);
+
+            Assert.False(Path.Exists(Path.Combine(_base, "evil-link"))); // 根外没建出链接
+            Assert.Equal(1, result.FailedFiles);                         // 计入失败，不是跳过
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));
+
+            // C3：安全检查被触发必须可见，不能和「未变」一样静默。
+            Assert.Contains(reports.Messages, m => m.Contains("../evil-link", StringComparison.Ordinal));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// C6：空目录条目的两条越界路线——词法 <c>../</c>，以及穿过一条**上次还原留下**的指向根外的软链。
+    /// 同时钉住 C4：RestoredDirs 报的是真正创建成功的数量。
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_Skips_Empty_Dir_Entries_That_Would_Escape_Target_Root()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstdir-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        var outside = Path.Combine(_base, "outside");
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            Directory.CreateDirectory(Path.Combine(_src, "emptydir"));
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            Assert.Contains("emptydir", idx.EmptyDirs);
+            idx.EmptyDirs.Add("../pwned-dir");   // 词法越界
+            idx.EmptyDirs.Add("leftover/sub");   // 穿过既有软链越界
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            // 真实软链：模拟上一次还原（或用户自己）在根内留下的、指向根外的链接。
+            Directory.CreateDirectory(_dst);
+            Directory.CreateSymbolicLink(Path.Combine(_dst, "leftover"), outside);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.False(Directory.Exists(Path.Combine(_base, "pwned-dir")));
+            Assert.False(Directory.Exists(Path.Combine(outside, "sub")));
+            Assert.Empty(Directory.GetFileSystemEntries(outside));
+            Assert.True(Directory.Exists(Path.Combine(_dst, "emptydir")));
+            Assert.Equal(1, result.RestoredDirs);  // C4：三条条目只成功创建了一条
+            Assert.Equal(2, result.FailedFiles);   // M1：两条越界的空目录条目也要算进失败，不能只走 phase 上报
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>M1：一份只含越界 EmptyDirs 的恶意索引，此前 FailedFiles 冻在 0——唯一信号是 phase 流。
+    /// 与 symlink 越界（C3）同一原则：安全检查触发必须计入 FailedFiles，操作者的汇总才是他们真正会看的东西。</summary>
+    [SkippableFact]
+    public async Task Restore_With_Only_Escaping_Empty_Dirs_Reports_Nonzero_FailedFiles()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstdironly-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            idx.EmptyDirs.Clear();               // 只留恶意越界条目，没有任何合法空目录条目
+            idx.EmptyDirs.Add("../pwned-dir-only");
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.False(Directory.Exists(Path.Combine(_base, "pwned-dir-only")));
+            Assert.Equal(0, result.RestoredDirs);
+            Assert.Equal(1, result.FailedFiles); // 唯一条目就是被拦下的越界目录 —— 不能是 0
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// C2：越界条目在「是否需要还原」阶段就被拦下。此前它会先对根外路径做 File.Exists +
+    /// 全量 hash（存在性/内容旁道），且根外已有同内容文件时被判成「跳过」——
+    /// 于是走不到写入处的检查，既不计失败也不上报，一次被拦下的越界完全不可见。
+    /// </summary>
+    [SkippableFact]
+    public async Task Escaping_Entry_Whose_Out_Of_Root_Twin_Exists_Is_Counted_As_Failed_Not_Skipped()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstorc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            idx.Entries.Add(aEntry with { Path = "../twin.txt" });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            // 根外已存在同内容的「孪生」文件 → 旧代码会判定「无需还原」并计成跳过。
+            Directory.CreateDirectory(_base);
+            File.WriteAllText(Path.Combine(_base, "twin.txt"), "safe content");
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal(1, result.FailedFiles);
+            Assert.Equal(0, result.SkippedFiles);
+            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_base, "twin.txt"))); // 根外文件未被动过
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 目标根**自身**经软链到达时还原必须照常工作——判定同时解析根，否则每一条合法条目
+    /// 都会被误判成越界。这是把判定改成「解析后路径」的主要回归风险。
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_Into_A_Target_Root_Reached_Through_A_Symlink_Still_Works()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstlnkroot-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        var real = Path.Combine(_base, "real-dst");
+        var link = Path.Combine(_base, "link-dst");
+        Directory.CreateDirectory(real);
+        Directory.CreateSymbolicLink(link, real); // 真实软链，非 mock
+
+        try
+        {
+            WriteSrc("a.txt", "alpha");
+            WriteSrc("dir/b.txt", "bravo");
+            Directory.CreateDirectory(Path.Combine(_src, "emptydir"));
+            await backup.RunAsync(BackupReq(account, name));
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = link });
+
+            Assert.Equal(0, result.FailedFiles);
+            Assert.Equal(2, result.RestoredFiles);
+            Assert.Equal(1, result.RestoredDirs);
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(real, "a.txt")));
+            Assert.Equal("bravo", File.ReadAllText(Path.Combine(real, "dir", "b.txt")));
+            Assert.True(Directory.Exists(Path.Combine(real, "emptydir")));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 合法备份会如实记录指向根外的**绝对**软链，还原它是正确行为（被禁止的只是穿过链接写）。
+    /// 重复还原同一条链接必须仍判「未变」，不能因为末段已是那条链接就被判成越界。
+    /// </summary>
+    [SkippableFact]
+    public async Task Symlink_Entry_Targeting_Outside_The_Root_Restores_And_Second_Restore_Is_A_No_Op()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstsym3-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        var outside = Path.Combine(_base, "outside");
+        Directory.CreateDirectory(outside);
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            idx.Entries.Add(aEntry with { Path = "dir/link", Kind = "symlink", Target = outside, Storage = null });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var req = new RestoreRequest { Account = account, Container = name, TargetRoot = _dst };
+
+            var first = await restore.RunAsync(req);
+            Assert.Equal(0, first.FailedFiles);
+            Assert.Equal(outside, new FileInfo(Path.Combine(_dst, "dir", "link")).LinkTarget);
+
+            var second = await restore.RunAsync(req); // 幂等：链接未变 → 跳过，不是越界失败
+            Assert.Equal(0, second.FailedFiles);
+            Assert.Equal(outside, new FileInfo(Path.Combine(_dst, "dir", "link")).LinkTarget);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// M3：symlink 条目缺 Target（云端索引损坏/被篡改）此前被判成 <c>SymlinkOutcome.Unchanged</c>——
+    /// 与「链接已经是对的，无事发生」同一个结果，但畸形条目从没成功还原过，操作者应该看得见、
+    /// 应该算进 FailedFiles，不能套上「未变」的名义悄悄计成 Skipped。
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_Symlink_Entry_With_Missing_Target_Fails_That_Entry_Not_Marked_Unchanged()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstmalsym-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            // 畸形 symlink 条目：Kind=symlink 但 Target 缺失。
+            idx.Entries.Add(aEntry with { Path = "malformed-link", Kind = "symlink", Target = null, Storage = null });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var reports = new SyncProgress();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                phase: reports);
+
+            Assert.False(Path.Exists(Path.Combine(_dst, "malformed-link"))); // 没能还原，什么都没建出来
+            Assert.Equal(1, result.FailedFiles); // 算失败，不是 SkippedFiles——「未变」语义不适用于「从没成功过」
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));
+            Assert.Contains(reports.Messages, m => m.Contains("malformed-link", StringComparison.Ordinal));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// M6：索引里两条条目共享同一个 Path（/import 可导入任意容器，索引本身可自相矛盾）。
+    /// 此前 <c>index.Entries.ToDictionary(e =&gt; e.Path, ...)</c> 直接抛 <see cref="ArgumentException"/>，
+    /// 中止整次还原——包括 keep.txt 这样完全无关、完全正常的条目也一并遭殃。
+    /// 决策：两条互相矛盾，无法判断哪条权威，选择两条都不写（不猜 last-wins/first-wins），
+    /// 该 Path 只算一次失败，其余条目照常还原。
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_With_Duplicate_Index_Entry_Path_Fails_That_One_Entry_Not_The_Whole_Run()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstdup2-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "safe content");
+            WriteSrc("keep.txt", "unrelated file");
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
+            // 重复 Path：索引本身自相矛盾。此前这里的 ToDictionary 直接抛出，整次还原被中止。
+            idx.Entries.Add(aEntry with { Path = "dup.txt" });
+            idx.Entries.Add(aEntry with { Path = "dup.txt" });
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.False(File.Exists(Path.Combine(_dst, "dup.txt"))); // 两条都不写——无法判断哪条权威
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));    // 其余条目未被中止的整次还原拖累
+            Assert.True(File.Exists(Path.Combine(_dst, "keep.txt")));
+            Assert.Equal(1, result.FailedFiles); // 一个重复 Path 只算一次失败，不是每条重复各算一次
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// C5：畸形条目（Path 为 "" / "." → 目标就是 TargetRoot 本身）只能失败它自己。
+    /// 此前文件条目会让**整组**合法条目一起判失败，symlink 条目更是让**整次还原**抛出中止。
+    /// </summary>
+    [SkippableFact]
+    public async Task Degenerate_Entry_Path_Fails_Only_That_Entry()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstdeg-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 两个小文件同属一个 pack：畸形条目若冒泡到组处理器，会把它们一起判失败。
+            WriteSrc("dir/a.txt", "alpha");
+            WriteSrc("dir/b.txt", "bravo");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "dir/a.txt");
+            idx.Entries.Add(aEntry with { Path = "" });                                            // 文件条目 → 目标 = 根（目录）
+            idx.Entries.Add(aEntry with { Path = ".", Kind = "symlink", Target = "/tmp", Storage = null }); // symlink 条目 → 抛出
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal(2, result.RestoredFiles); // 合法条目全部还原
+            Assert.Equal(2, result.FailedFiles);   // 两条畸形条目各算一条
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
+            Assert.Equal("bravo", File.ReadAllText(Path.Combine(_dst, "dir", "b.txt")));
+            Assert.True(Directory.Exists(_dst));   // 根仍是目录，没被覆写
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

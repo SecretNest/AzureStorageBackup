@@ -41,7 +41,11 @@ public sealed record RestoreRequest
     public bool ReArchiveAfterRestore { get; init; } = true;
 }
 
-/// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。FailedFiles = 所在存储分组下载/解压失败而未能还原。</summary>
+/// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。
+/// FailedFiles = 未能还原的条目数：所在存储分组下载/解压失败、条目会写到目标根之外
+/// （含 symlink 与空目录条目）、条目本身畸形导致写入抛错、symlink 条目缺 Target，
+/// 或索引中出现重复 Path（无法判断哪条权威，两条都不写）。
+/// RestoredDirs = **实际创建成功**的空目录数（越界/失败的不计）。</summary>
 public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFiles, int RestoredDirs, int FailedFiles);
 
 /// <summary>
@@ -100,11 +104,19 @@ public sealed class RestoreOrchestrator(
         Directory.CreateDirectory(request.TargetRoot);
         var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
+        // 目标根解析一次，全程复用（与 PathBoundary 同款单例思路：request.TargetRoot 本轮不变，
+        // 没必要让每个条目、每个文件条目两次地重新走一遍 lstat）。per-目标路径的解析仍在
+        // WriteStaysInsideRoot/LinkStaysInsideRoot 里逐条目进行——那一处必须每次都重新算，
+        // 因为它要抓的正是「本轮还原期间新建的链接」。
+        var realRoot = PathBoundary.ResolveReal(request.TargetRoot);
+
         var restored = 0;
         var skipped = 0;
+        var failed = 0;
 
         // 逐路径生效条目：默认取本版本；被替代的路径改用指定版本的同路径条目（内容+元数据取该版本）。
-        var byPath = index.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+        var byPath = IndexByPath(index.Entries, phase, out var duplicatePaths);
+        failed += duplicatePaths; // 重复 Path 的索引条目：两条都不写，各算一次失败，不中断整次还原。
         var resolved = new HashSet<string>(StringComparer.Ordinal); // 真正解析成功的替代路径
         foreach (var grp in request.Substitutions.GroupBy(kv => kv.Value))
         {
@@ -112,7 +124,9 @@ public sealed class RestoreOrchestrator(
             if (sv is null)
                 continue; // 替代版本已被保留清理删除 → 该组全部回落跳过
             var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, ct);
-            var srcByPath = srcIndex.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+            // 替代来源版本的索引同样来自云端，同样可能有重复 Path；解析不到的替代路径
+            // 走既有的「声明了意图但替代不可得」回落跳过语义（下面的 TryGetValue 找不到）。
+            var srcByPath = IndexByPath(srcIndex.Entries, phase, out _);
             foreach (var kv in grp)
                 if (srcByPath.TryGetValue(kv.Key, out var se))
                 {
@@ -138,9 +152,40 @@ public sealed class RestoreOrchestrator(
         skipped += unresolved.Count;
 
         // 空文件夹（还原需重建）——选择性还原只针对选中文件，不重建整棵空目录树。
+        // 同样来自云端索引：目录名含 .. 时会创到目标根之外，越界的目录条目跳过、不创建。
+        // 判定作用在**解析后的真实路径**上：CreateDirectory 会跟随路径中间段的软链，
+        // 前一次还原（或用户自己）在根内留下的一条指向根外的链接足以让「看起来在根内」
+        // 的目录落到根外。
+        var restoredDirs = 0;
         if (selected is null)
             foreach (var dir in index.EmptyDirs)
-                Directory.CreateDirectory(Path.Combine(request.TargetRoot, ToLocal(dir)));
+            {
+                var dest = Path.Combine(request.TargetRoot, ToLocal(dir));
+                if (!WriteStaysInsideRoot(realRoot, dest))
+                {
+                    // 与 symlink 路径同一原则（C3）：安全检查触发必须可见，且必须计入失败——
+                    // 只走 phase 上报会让一份只含越界 EmptyDirs 的恶意索引把 FailedFiles 冻在 0。
+                    phase?.Report($"Skipped unsafe directory entry (escapes the target root): {dir}");
+                    failed++;
+                    continue;
+                }
+
+                // 畸形目录条目（中间段是文件等）只失败它自己，不中断整次还原。
+                try
+                {
+                    Directory.CreateDirectory(dest);
+                    restoredDirs++;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    phase?.Report($"Failed to create directory '{dir}': {ex.Message}");
+                    failed++;
+                }
+            }
 
         // symlink 与文件分开处理
         var fileEntries = new List<IndexEntry>();
@@ -150,8 +195,45 @@ public sealed class RestoreOrchestrator(
                 continue;
             if (e.Kind == "symlink")
             {
-                if (RestoreSymlink(request.TargetRoot, e)) restored++;
-                else skipped++;
+                // 畸形条目（如 Path 为 "" / "."）会让 CreateSymbolicLink 抛错；
+                // 这里逐条兜住，否则一条脏条目会中断整次还原。
+                SymlinkOutcome outcome;
+                try
+                {
+                    outcome = RestoreSymlink(request.TargetRoot, realRoot, e);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    phase?.Report($"Failed to restore symlink '{e.Path}': {ex.Message}");
+                    failed++;
+                    continue;
+                }
+
+                switch (outcome)
+                {
+                    case SymlinkOutcome.Created:
+                        restored++;
+                        break;
+                    case SymlinkOutcome.Unchanged:
+                        skipped++;
+                        break;
+                    case SymlinkOutcome.Malformed:
+                        // entry.Target 缺失：与「未变」不是一回事——未变是无事发生，
+                        // 这条是没能还原，必须让用户看得见、算进失败，而不是套上
+                        // 「已是最新」的名义悄悄计成 Skipped（M3）。
+                        phase?.Report($"Skipped malformed symlink entry (missing target): {e.Path}");
+                        failed++;
+                        break;
+                    default:
+                        // 安全检查触发必须可见：与「未变」同样静默会让用户完全看不到被拦下的条目。
+                        phase?.Report(UnsafeRestorePathException.MessageFor(e.Path));
+                        failed++;
+                        break;
+                }
             }
             else
             {
@@ -163,13 +245,12 @@ public sealed class RestoreOrchestrator(
         var work = NewTempDir();
         var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // 活化过的 blob 基名，完成后重新归档
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
-        var failed = 0;
         try
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
             var tasks = groups.Select(async g =>
             {
-                try { return await RestoreGroupAsync(container, request, work, g.ToList(), gate, rehydrated, phase, ct); }
+                try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, ct); }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
@@ -195,25 +276,39 @@ public sealed class RestoreOrchestrator(
                 await SetTierForVolumesAsync(container, baseRef, AccessTier.Archive, ct);
         }
 
-        return new RestoreResult(version.Version, restored, skipped, selected is null ? index.EmptyDirs.Count : 0, failed);
+        return new RestoreResult(version.Version, restored, skipped, restoredDirs, failed);
     }
 
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
-        BlobContainerClient container, RestoreRequest request, string work,
+        BlobContainerClient container, RestoreRequest request, string? realRoot, string work,
         List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
         IProgress<string>? phase, CancellationToken ct)
     {
         var skipped = 0;
+        var failedEntries = 0;
         var needed = new List<IndexEntry>();
         foreach (var e in group)
         {
-            if (await NeedsRestoreAsync(request.TargetRoot, e, request.Conflict, ct))
+            // 边界判定必须在 NeedsRestoreAsync **之前**：后者会对目标做 File.Exists 与全量
+            // hash，越界条目等于让调用方拿一条索引记录去探测目标根之外任意路径的存在性与
+            // 内容（结果通过 RestoredFiles/SkippedFiles 计数可见）。更糟的是根外若已有同内容
+            // 文件，它会返回 false 而被计成「跳过」，于是根本走不到写入处的检查，
+            // 既不计入失败也不上报——一次被拦下的越界变成了完全不可见的无事发生。
+            var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
+            if (!WriteStaysInsideRoot(realRoot, dest))
+            {
+                phase?.Report(UnsafeRestorePathException.MessageFor(e.Path));
+                failedEntries++;
+                continue;
+            }
+
+            if (await NeedsRestoreAsync(dest, e, request.Conflict, ct))
                 needed.Add(e);
             else
                 skipped++;
         }
         if (needed.Count == 0)
-            return (0, skipped, 0);
+            return (0, skipped, failedEntries);
 
         var storage = group[0].Storage!;
         var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
@@ -255,8 +350,10 @@ public sealed class RestoreOrchestrator(
                 }
                 foreach (var e in needed)
                 {
-                    WriteRestoredFile(request, e, content);
-                    restored++;
+                    if (TryWriteRestoredFile(request, realRoot, e, content, phase))
+                        restored++;
+                    else
+                        failedEntries++;
                 }
             }
             else
@@ -268,8 +365,10 @@ public sealed class RestoreOrchestrator(
                 foreach (var e in needed)
                 {
                     var source = Path.Combine(extractDir, ToLocal(e.Path));
-                    WriteRestoredFile(request, e, source);
-                    restored++;
+                    if (TryWriteRestoredFile(request, realRoot, e, source, phase))
+                        restored++;
+                    else
+                        failedEntries++;
                 }
             }
         }
@@ -278,12 +377,13 @@ public sealed class RestoreOrchestrator(
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }
-        return (restored, skipped, 0);
+        return (restored, skipped, failedEntries);
     }
 
-    private async Task<bool> NeedsRestoreAsync(string targetRoot, IndexEntry entry, RestoreConflictMode conflict, CancellationToken ct)
+    /// <summary><paramref name="dest"/> 必须是**已通过边界检查**的目标路径（见 RestoreGroupAsync）：
+    /// 本方法会对它做 File.Exists 和全量 hash，绝不能作用在目标根之外的路径上。</summary>
+    private async Task<bool> NeedsRestoreAsync(string dest, IndexEntry entry, RestoreConflictMode conflict, CancellationToken ct)
     {
-        var dest = Path.Combine(targetRoot, ToLocal(entry.Path));
         if (!File.Exists(dest))
             return true;
 
@@ -297,11 +397,48 @@ public sealed class RestoreOrchestrator(
         return await hasher.FullHashAsync(dest, ct) != entry.FullHash;
     }
 
+    /// <summary>
+    /// 写一个条目，把失败圈在这一条上：越界、以及畸形条目（如 Path 为 ""/"." 使目标就是一个目录，
+    /// File.Copy 会抛 UnauthorizedAccess/IOException）都只让本条目失败并上报，
+    /// 绝不冒泡到分组处理器——那会把整组合法条目一起判失败。返回是否写入成功。
+    /// </summary>
+    private static bool TryWriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile, IProgress<string>? phase)
+    {
+        try
+        {
+            WriteRestoredFile(request, realRoot, entry, sourceFile);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (UnsafeRestorePathException ex)
+        {
+            phase?.Report(ex.Message);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            phase?.Report($"Failed to restore '{entry.Path}': {ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>把还原内容写到目标路径。RenameKeep 且目标已存在（能进到这一步即内容不同或无法比较）→
     /// 先把现有本地文件改名为 {name}.bak-{ts} 保留旧内容，再写还原内容到原名（旧内容永不丢失）。</summary>
-    private static void WriteRestoredFile(RestoreRequest request, IndexEntry entry, string sourceFile)
+    private static void WriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
+
+        // 索引来自云端（可能是 /import 导入的任意容器）：条目路径含 .. 时会写到目标根之外。
+        // 判定作用在**解析后的真实路径**上——纯词法判定挡不住「先建链接再穿过它写」：
+        // 索引里一条 symlink 条目（先于文件条目还原）指向根外，之后 <root>/link/x 词法上
+        // 完全在根内，File.Copy 却会跟随链接落到根外。
+        // 跳过该条目而不是中断整次还原——与既有的逐组容错语义一致。
+        if (!WriteStaysInsideRoot(realRoot, dest))
+            throw new UnsafeRestorePathException(entry.Path);
+
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
         if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
             RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
@@ -309,20 +446,95 @@ public sealed class RestoreOrchestrator(
         ApplyMetadata(dest, entry);
     }
 
-    private bool RestoreSymlink(string targetRoot, IndexEntry entry)
+    /// <summary>symlink 条目的还原结果。三者互不相同，不能互相顶替：
+    /// 「未变」是无事发生；「越界」是安全检查被触发，用户必须看得见；
+    /// 「畸形」（M3）是条目本身缺 Target，没能还原，同样必须可见——不能套上
+    /// 「未变」的名义悄悄计成 Skipped（那意味着链接已经是对的，畸形条目并非如此）。</summary>
+    private enum SymlinkOutcome
+    {
+        Created,
+        Unchanged,
+        Unsafe,
+        Malformed,
+    }
+
+    private SymlinkOutcome RestoreSymlink(string targetRoot, string? realRoot, IndexEntry entry)
     {
         if (entry.Target is null)
-            return false;
+            return SymlinkOutcome.Malformed;
 
         var dest = Path.Combine(targetRoot, ToLocal(entry.Path));
-        var info = new FileInfo(dest);
-        if (info.Exists && info.LinkTarget == entry.Target)
-            return false; // 未变
+
+        // 同 WriteRestoredFile：索引条目路径含 .. 或穿过一条指向根外的链接时，
+        // 链接会被建到目标根之外，拦下。
+        // 注意这里用的是「只解析父目录」的版本：entry.Target 指向根外是**合法**的
+        // （备份如实记录了原本的绝对软链，还原它是对的），被禁止的只是「穿过链接写」。
+        if (!LinkStaysInsideRoot(realRoot, dest))
+            return SymlinkOutcome.Unsafe;
+
+        // 用 LinkTarget（底层 lstat）判「未变」，不用 FileInfo.Exists：后者对**指向目录的**
+        // 软链恒为 false，于是这类链接永远判不出「未变」，第二次还原必然走到
+        // CreateSymbolicLink 并因已存在抛错（改动前这会中止整次还原）。
+        // LinkTarget 在「不是链接」和「不存在」时都为 null，正好是需要重建的两种情形。
+        var existingLink = new FileInfo(dest).LinkTarget;
+        if (existingLink == entry.Target)
+            return SymlinkOutcome.Unchanged; // 未变
 
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-        if (info.Exists) File.Delete(dest);
+        // 既有链接用 File.Delete 直接 unlink（不跟随），既有普通文件同样先删。
+        // Path.Exists 跟随链接，悬空链接靠 existingLink 兜住。
+        if (existingLink is not null || Path.Exists(dest)) File.Delete(dest);
         File.CreateSymbolicLink(dest, entry.Target);
-        return true;
+        return SymlinkOutcome.Created;
+    }
+
+    /// <summary>
+    /// 写入（文件/目录）前的越界判定，作用在**解析后的真实路径**上。
+    /// <para>
+    /// 纯词法的 <see cref="PathBoundary.IsWithin"/> 不足以守住这里：还原**先**建 symlink 条目、
+    /// **后**写文件条目，于是索引里一条 <c>evil -&gt; /etc/cron.d</c> 加一条 <c>evil/x</c> 就能让
+    /// <c>&lt;root&gt;/evil/x</c> 在词法上完全合规地通过检查，而 <c>File.Copy</c> / <c>CreateDirectory</c>
+    /// 会跟随该链接把内容落到 <c>/etc/cron.d/x</c>。判定必须和内核一样在软链展开之后结算。
+    /// </para>
+    /// <para>
+    /// <paramref name="realRoot"/> 是目标根**自身**解析后的真实路径，由调用方（<see cref="RunCoreAsync"/>）
+    /// 在本轮还原开始时算**一次**并全程复用——<c>request.TargetRoot</c> 本轮不变，没必要让
+    /// 每个条目（文件条目还两次）重新走一遍 lstat（对照 <see cref="PathBoundary"/> 对同一个值
+    /// 的「单例：构造时解析一次」）。<paramref name="dest"/> 这一侧**必须**每次都重新解析，
+    /// 不能一并缓存：它是本轮还原期间可能被新建/改变的候选路径，缓存会让「先建链接再穿过它写」
+    /// 这条攻击面探测不到。还原到一个本身经软链到达的目录（<c>/data -&gt; /mnt/disk1/data</c>）
+    /// 必须继续可用，所以根也必须解析，不能只解析候选路径。
+    /// </para>
+    /// <para>解析失败（成环 / 含 \0 / 空串）一律判越界——失败关闭。</para>
+    /// </summary>
+    private static bool WriteStaysInsideRoot(string? realRoot, string dest)
+    {
+        var realDest = PathBoundary.ResolveReal(dest);
+        return realRoot is not null && realDest is not null && PathBoundary.IsWithin(realRoot, realDest);
+    }
+
+    /// <summary>
+    /// 建 symlink 前的越界判定：<paramref name="realRoot"/> 同 <see cref="WriteStaysInsideRoot"/>——
+    /// 本轮还原开始时解析一次、全程复用；末段按名字拼接、**不解析**。
+    /// <para>
+    /// 末段不能解析，因为创建/删除链接本身不跟随末段（<c>symlinkat</c>/<c>unlinkat</c> 语义），
+    /// 而且合法备份里那条指向根外的绝对软链在第二次还原时，末段就是它自己——
+    /// 解析末段会把「重复还原一条合法链接」误判成越界。父目录仍然必须**每次重新**解析：
+    /// 链接建在哪个目录里，取决于路径中间段跟随后的真实位置，这一段可能在本轮还原期间改变。
+    /// </para>
+    /// </summary>
+    private static bool LinkStaysInsideRoot(string? realRoot, string dest)
+    {
+        var parent = Path.GetDirectoryName(dest);
+        if (string.IsNullOrEmpty(parent))
+            return false;
+
+        var realParent = PathBoundary.ResolveReal(parent);
+        if (realRoot is null || realParent is null)
+            return false;
+
+        // 末段可能是 ".."/"."（畸形条目）：交给 IsWithin 的词法规范化收口。
+        return PathBoundary.IsWithin(realRoot, Path.Combine(realParent, Path.GetFileName(dest)));
     }
 
     private static void ApplyMetadata(string dest, IndexEntry entry)
@@ -338,6 +550,32 @@ public sealed class RestoreOrchestrator(
             }
             catch (FormatException) { /* 非八进制权限，忽略 */ }
         }
+    }
+
+    /// <summary>
+    /// 按 Path 建索引，重复 Path 的**所有**条目一律不生效——两条互相矛盾时无法判断哪条权威，
+    /// 宁可都不写也不猜。索引来自云端（<c>/import</c> 可导入任意容器），重复 Path 是索引自身
+    /// 矛盾，按既有的逐条目容错原则处理：只让重复的路径失败，不能让 <c>ToDictionary</c> 的
+    /// <see cref="ArgumentException"/> 中止整次还原。
+    /// </summary>
+    private static Dictionary<string, IndexEntry> IndexByPath(
+        List<IndexEntry> entries, IProgress<string>? phase, out int duplicateCount)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var duplicates = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in entries)
+            if (!seen.Add(e.Path))
+                duplicates.Add(e.Path);
+
+        var map = new Dictionary<string, IndexEntry>(StringComparer.Ordinal);
+        foreach (var e in entries)
+            if (!duplicates.Contains(e.Path))
+                map[e.Path] = e;
+
+        foreach (var p in duplicates)
+            phase?.Report($"Skipped duplicate index entry (ambiguous which version is authoritative): {p}");
+        duplicateCount = duplicates.Count;
+        return map;
     }
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
@@ -406,4 +644,16 @@ public sealed class RestoreOrchestrator(
     {
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
     }
+}
+
+/// <summary>还原条目的目标路径逃出了 TargetRoot（索引被篡改或来自不可信容器）。</summary>
+public sealed class UnsafeRestorePathException(string entryPath)
+    : Exception(UnsafeRestorePathException.MessageFor(entryPath))
+{
+    /// <summary>
+    /// 共享的消息拼接：异常构造器与仅需一行文案的上报点（<see cref="RestoreOrchestrator"/>
+    /// 里越界目录/symlink/文件条目的 phase 上报）都用它，后者不必为了取一个字符串
+    /// 而分配一个异常对象。
+    /// </summary>
+    public static string MessageFor(string entryPath) => $"Restore entry path escapes the target root: {entryPath}";
 }

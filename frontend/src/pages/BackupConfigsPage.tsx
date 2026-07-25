@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
+import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { Field } from '../components/modal'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
@@ -76,6 +77,7 @@ export function BackupConfigsPage() {
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
   const [showForm, setShowForm] = useState(false)
+  const [browsing, setBrowsing] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
@@ -446,6 +448,9 @@ export function BackupConfigsPage() {
                   disabled={!!editing}
                   onChange={(e) => set('localRoot', e.target.value)}
                 />
+                <button type="button" onClick={() => setBrowsing(true)} disabled={!!editing}>
+                  Browse
+                </button>
               </Field>
               <Field label="Name">
                 <input value={form.name} onChange={(e) => set('name', e.target.value)} />
@@ -591,6 +596,16 @@ export function BackupConfigsPage() {
         </div>
       )}
 
+      {browsing && (
+        <PathBrowser
+          initialPath={form.localRoot || undefined}
+          onPick={(p) => {
+            set('localRoot', p)
+            setBrowsing(false)
+          }}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
       {checkModal && (
         <CheckModal
           config={checkModal}
