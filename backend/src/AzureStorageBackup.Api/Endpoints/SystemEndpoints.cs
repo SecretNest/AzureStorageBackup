@@ -11,6 +11,9 @@ namespace AzureStorageBackup.Api.Endpoints;
 /// </summary>
 public static class SystemEndpoints
 {
+    /// <summary>单次浏览返回的条目上限。超出即截断并在响应里标明，不静默少给。</summary>
+    private const int MaxBrowseEntries = 2000;
+
     public static IEndpointRouteBuilder MapSystemEndpoints(this IEndpointRouteBuilder app)
     {
         app.MapGet("/api/system/paths", (IConfiguration config) =>
@@ -78,6 +81,63 @@ public static class SystemEndpoints
         })
         .WithTags("System");
 
+        // 本地目录浏览（设计 §6）。懒加载，只返回直接子项。
+        app.MapGet("/api/system/browse", (string? path, PathBoundary boundary) =>
+        {
+            var start = string.IsNullOrWhiteSpace(path)
+                ? boundary.ConfiguredRoot ?? Path.GetPathRoot(Path.GetFullPath("/")) ?? "/"
+                : path;
+
+            if (PathBoundaryGuard.Blocked(boundary, start) is { } outside)
+                return outside;
+
+            if (!Directory.Exists(start))
+                return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
+
+            var entries = new List<BrowseEntry>();
+            var truncated = false;
+
+            foreach (var item in Directory.EnumerateFileSystemEntries(start))
+            {
+                if (entries.Count >= MaxBrowseEntries)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                try
+                {
+                    var info = new FileInfo(item);
+                    var isDir = (info.Attributes & FileAttributes.Directory) != 0;
+                    entries.Add(new BrowseEntry(
+                        Path.GetFileName(item),
+                        item,
+                        isDir,
+                        isDir ? null : info.Length,
+                        info.LastWriteTimeUtc,
+                        // 软链可能指向根外：返回但标记，前端灰显不可点
+                        !boundary.IsInside(item)));
+                }
+                catch (Exception)
+                {
+                    // 单项读取失败（权限不足等）跳过该项，不让整个请求失败
+                }
+            }
+
+            // 目录在前，各自按名称排序
+            entries.Sort((a, b) => a.IsDirectory != b.IsDirectory
+                ? (a.IsDirectory ? -1 : 1)
+                : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+
+            // 上级到根为止
+            var parent = Path.GetDirectoryName(Path.GetFullPath(start).TrimEnd(Path.DirectorySeparatorChar));
+            if (parent is not null && !boundary.IsInside(parent))
+                parent = null;
+
+            return Results.Ok(new BrowseResponse(start, parent, truncated, entries));
+        })
+        .WithTags("System");
+
         return app;
     }
 
@@ -95,3 +155,12 @@ public static class SystemEndpoints
         catch { return path; }
     }
 }
+
+/// <summary>浏览结果。Parent 为 null 表示已在根（或边界）处，不能再往上。</summary>
+public record BrowseResponse(
+    string Path, string? Parent, bool Truncated, IReadOnlyList<BrowseEntry> Entries);
+
+/// <summary>OutsideRoot=true 表示该项（通常是指向根外的软链）不可选，但仍列出以免用户困惑。</summary>
+public record BrowseEntry(
+    string Name, string FullPath, bool IsDirectory,
+    long? Length, DateTimeOffset ModifiedAt, bool OutsideRoot);
