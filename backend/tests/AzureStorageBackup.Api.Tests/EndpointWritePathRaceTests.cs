@@ -32,6 +32,15 @@ public sealed class EndpointWritePathRaceTests
         }
     }
 
+    /// <summary>一被要求建客户端就抛取消——用来把 OperationCanceledException 送进 BackupChecker 的云端调用里。</summary>
+    private sealed class CancelsOnCreateServiceClient : IBlobClientFactory
+    {
+        public BlobServiceClient CreateServiceClient(Account account) => throw new OperationCanceledException();
+
+        public Task<ConnectionResult> TestConnectionAsync(Account account, CancellationToken ct = default)
+            => throw new OperationCanceledException();
+    }
+
     /// <summary>连通测试「通过」，但在返回前把该账户行删掉——精确模拟验证成功到写库之间的删除竞争。</summary>
     private sealed class DeletesAccountOnTestConnection(IServiceScopeFactory scopes) : IBlobClientFactory
     {
@@ -182,11 +191,12 @@ public sealed class EndpointWritePathRaceTests
             $"/api/backup-configs/{config!.Id}/reset-password", new ResetBackupPasswordRequest("the-real-password"));
         var body = await res.Content.ReadAsStringAsync();
 
-        // 取消一路上抛（测试宿主的开发者异常页把它渲染成 500），而不是被伪装成用户的密码错误。
-        // 修复前这里是 400 + "Verification failed: The operation was canceled."。
+        // 取消一路上抛，而不是被伪装成用户的密码错误。修复前这里是
+        // 400 + "Verification failed: The operation was canceled."。
+        // 刻意不断言响应体里出现异常类型名——那只在开发者异常页在管道里时成立
+        // （ASPNETCORE_ENVIRONMENT=Production 下就没有），与被测行为无关。
         Assert.NotEqual(HttpStatusCode.BadRequest, res.StatusCode);
         Assert.DoesNotContain("Verification failed", body);
-        Assert.Contains(nameof(OperationCanceledException), body);
 
         // 密文原封不动：既没落库，也没被当成「验证通过」。
         using var scope = factory.Services.CreateScope();
@@ -194,5 +204,41 @@ public sealed class EndpointWritePathRaceTests
         var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
         var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config!.Id);
         Assert.Equal("initial-password", TestSecrets.Reveal(encryption, row.PasswordProtected!));
+    }
+
+    /// <summary>
+    /// F3 的另一处、也是唯一有**持久化副作用**的一处：POST /api/backup-configs/{id}/check 的
+    /// catch 会把异常消息写成该备份的 Error 状态。取消（客户端断开 / 进程关停）不是「检查失败」，
+    /// 修复前它会在配置行上留下 Status=Error + LastError="The operation was canceled."，
+    /// 用户界面从此显示一个不存在的故障，直到手动 reset。
+    /// </summary>
+    [Fact]
+    public async Task Check_Does_Not_Persist_Cancellation_As_An_Error_Status()
+    {
+        using var factory = new StubbedFactory(services =>
+        {
+            services.RemoveAll<IBlobClientFactory>();
+            services.AddSingleton<IBlobClientFactory, CancelsOnCreateServiceClient>();
+        });
+        var client = factory.CreateClient();
+
+        var account = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount("cancel-check")))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+        var config = await (await client.PostAsJsonAsync("/api/backup-configs", SampleConfig(account!.Id, "pw")))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.NotNull(config);
+
+        var res = await client.PostAsJsonAsync($"/api/backup-configs/{config!.Id}/check", new { });
+
+        // 取消原样上抛（宿主渲染成 500），不是 200「检查完成」。
+        Assert.NotEqual(HttpStatusCode.OK, res.StatusCode);
+
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
+
+        Assert.Equal(BackupStatus.Normal, row.Status);
+        Assert.Null(row.LastError);
+        Assert.Null(row.LastErrorAt);
     }
 }

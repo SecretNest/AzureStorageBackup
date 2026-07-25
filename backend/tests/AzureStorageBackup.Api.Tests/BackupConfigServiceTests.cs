@@ -59,12 +59,16 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Equal(RetentionMode.BothRequired, fetched.RetentionMode);
     }
 
+    /// <summary>
+    /// 钉住**列名**：实体属性叫 PasswordProtected，落库仍必须是历史列名 Password（无 schema 变更）。
+    /// 这条不再证明「加密」——密文是本测试自己经 CreateAsync 写进去的，断言只能说明它不等于明文。
+    /// </summary>
     [Fact]
-    public async Task Password_Is_Encrypted_At_Rest()
+    public async Task Password_Is_Written_To_The_Legacy_Password_Column()
     {
         var created = await _sut.CreateAsync(Sample());
 
-        // 直接读原始列，应为密文而非明文。
+        // 直接读原始列（列名写错就查不到表/列，测试失败）。
         var raw = _connection.CreateCommand();
         raw.CommandText = "SELECT Password FROM BackupConfigs WHERE Id = $id";
         raw.Parameters.AddWithValue("$id", created.Id);

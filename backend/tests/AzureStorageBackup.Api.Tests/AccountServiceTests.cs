@@ -58,12 +58,16 @@ public class AccountServiceTests : IDisposable
         Assert.Equal("prod", fetched.Name);
     }
 
+    /// <summary>
+    /// 钉住**列名**：实体属性叫 AccountKeyProtected，落库仍必须是历史列名 AccountKey（无 schema 变更）。
+    /// 这条不再证明「加密」——密文是本测试自己经 CreateAsync 写进去的，断言只能说明它不等于明文。
+    /// </summary>
     [Fact]
-    public async Task Create_Persists_AccountKey_Encrypted()
+    public async Task Create_Writes_To_The_Legacy_AccountKey_Column()
     {
         var created = await _sut.CreateAsync(SampleAccount());
 
-        // 直接读原始列，验证落库确为密文
+        // 直接读原始列（列名写错就查不到表/列，测试失败）
         await using var cmd = _connection.CreateCommand();
         cmd.CommandText = "SELECT AccountKey FROM Accounts WHERE Id = $id";
         cmd.Parameters.AddWithValue("$id", created.Id);

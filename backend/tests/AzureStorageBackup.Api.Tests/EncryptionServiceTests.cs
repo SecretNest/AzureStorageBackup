@@ -8,17 +8,8 @@ public class EncryptionServiceTests
     private static EncryptionService CreateSut()
         => new(new EphemeralDataProtectionProvider());
 
-    [Fact]
-    public void Encrypt_Then_Decrypt_Returns_Original()
-    {
-        var sut = CreateSut();
-        const string original = "super-secret-key==";
-
-        var cipher = sut.Encrypt(original);
-        var plain = TestSecrets.Reveal(sut, cipher);
-
-        Assert.Equal(original, plain);
-    }
+    // 注：曾有一条 Encrypt_Then_Decrypt_Returns_Original——生产侧的 Decrypt 移除后，
+    // 它只是绕 TestSecrets.Reveal 又跑了一遍 TryDecrypt，与下面那条完全重复，已删。
 
     [Fact]
     public void Encrypt_Produces_Ciphertext_Different_From_Plaintext()
