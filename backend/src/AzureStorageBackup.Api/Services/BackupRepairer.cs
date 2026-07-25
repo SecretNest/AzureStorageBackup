@@ -50,6 +50,8 @@ public sealed class BackupRepairer(
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
 
+        // 与备份路径同一套寻址方案：单文件 blob 修复时要重算与全新备份一致的碰撞检测元数据（§ defect 2）。
+        var addressing = new BlobAddressScheme(password, info.Backup.KdfSalt);
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
         var repaired = new List<string>();
         var unrecoverable = new List<string>();
@@ -69,7 +71,7 @@ public sealed class BackupRepairer(
                     await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
                         repaired, unrecoverable, changedVersions, ct);
                 else
-                    await RepairBlobAsync(account, cc, badRef, indexes, localRoot, dataTier, volumeBytes,
+                    await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
                         repaired, unrecoverable, changedVersions, ct);
             }
 
@@ -147,8 +149,8 @@ public sealed class BackupRepairer(
     /// <summary>修复单文件 data blob：从任一引用路径的本地文件（hash 校验）重造并替换；更新全部引用版本的尺寸。</summary>
     private async Task RepairBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, Dictionary<int, VersionIndex> indexes, string localRoot,
-        AccessTier dataTier, long? volumeBytes, List<string> repaired, List<string> unrecoverable,
-        HashSet<int> changedVersions, CancellationToken ct)
+        string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes, List<string> repaired,
+        List<string> unrecoverable, HashSet<int> changedVersions, CancellationToken ct)
     {
         // 全部版本中引用此 blob 的条目（同内容不同路径可有多个）。
         var refs = indexes.SelectMany(kv => kv.Value.Entries
@@ -157,8 +159,9 @@ public sealed class BackupRepairer(
             .ToList();
         if (refs.Count == 0)
             return;
-        var fullHash = refs[0].Entry.FullHash;
-        var raw = refs[0].Entry.Storage!.Raw;
+        var entry0 = refs[0].Entry;
+        var fullHash = entry0.FullHash;
+        var raw = entry0.Storage!.Raw;
 
         // 从任一引用路径找到内容一致的本地文件。
         string? localSource = null;
@@ -180,7 +183,11 @@ public sealed class BackupRepairer(
             return;
         }
 
-        var newSizes = await ReplaceBlobAsync(account, cc, blobRef, localSource, raw, dataTier, volumeBytes, ct);
+        // 碰撞检测元数据须与全新备份完全一致：直接复用该条目已记录的 length/head/tail
+        // （内容未变——已经过 fullHash 校验——故这些值不变），而非在此重新计算，
+        // 避免因 headBytes 配置漂移导致与同内容的其它引用元数据不一致。
+        var meta = addressing.Metadata(fullHash!, entry0.Length, entry0.HeadHash ?? "", entry0.TailHash ?? "");
+        var newSizes = await ReplaceBlobAsync(account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, ct);
 
         // 更新全部引用版本的分卷数/尺寸（内容不变故 ref 不变）。
         foreach (var (vnum, e) in refs)
@@ -266,14 +273,17 @@ public sealed class BackupRepairer(
         }
     }
 
-    /// <summary>上传新内容替换单文件 blob：先覆盖上传新卷、后删残留旧卷（不再先删空）。返回新各分卷尺寸。</summary>
+    /// <summary>上传新内容替换单文件 blob：先覆盖上传新卷、后删残留旧卷（不再先删空）。返回新各分卷尺寸。
+    /// <paramref name="metadata"/> 为与全新备份一致的碰撞检测元数据（len/head/tail 或加密时的 v）。</summary>
     private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
-        Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier, long? volumeBytes, CancellationToken ct)
+        Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier,
+        long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, CancellationToken ct)
     {
         if (raw)
         {
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct,
-                new Dictionary<string, string> { ["raw"] = "1" });
+            // raw 直传（未压缩）也要带上碰撞检测元数据，在其上叠加 raw 标记——与备份路径 UploadNewAsync 一致。
+            var rawMeta = new Dictionary<string, string>(metadata) { ["raw"] = "1" };
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct, rawMeta);
             return [new FileInfo(localSource).Length];
         }
 
@@ -284,9 +294,10 @@ public sealed class BackupRepairer(
         {
             var srcDir = Path.GetDirectoryName(localSource)!;
             var entry = Path.GetFileName(localSource);
+            // 必须带上原密码重压，否则加密备份的对象会被静默改写成明文 7z（机密性缺陷）。
             var result = await compressor.CompressAsync(
-                new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), null, VolumeBytes: volumeBytes, StoreOnly: false), ct);
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct);
+                new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), password, VolumeBytes: volumeBytes, StoreOnly: false), ct);
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct, metadata);
             return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
         }
         finally

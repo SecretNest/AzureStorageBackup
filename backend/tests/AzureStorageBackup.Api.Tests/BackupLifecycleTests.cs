@@ -356,6 +356,10 @@ public sealed class BackupLifecycleTests : IDisposable
             var clip1 = StorageOf(idx1, "media/clip.bin");
             Assert.Equal("blob", clip1.Kind);
 
+            // 全新备份写入的碰撞检测元数据基线（len/head/tail，或加密时的不透明 v）——修复后须与此完全一致。
+            var clipMetaBaseline = (await cc.GetBlobClient(clip1.Ref).GetPropertiesAsync()).Value.Metadata;
+            Assert.NotEmpty(clipMetaBaseline);
+
             // 加密备份的数据对象是密钥化地址，明文 data/{fullHash} 不得存在（防指纹识别）。
             if (password is not null)
             {
@@ -458,6 +462,7 @@ public sealed class BackupLifecycleTests : IDisposable
             var clip3 = StorageOf(idx3, "media/clip.bin");
             var abcPack = StorageOf(idx3, "docs/a.txt");
             Assert.Equal(docsPack2.Ref, abcPack.Ref); // v3 未改 a/b/c，仍沿用 v2 的 pack
+            Assert.Equal(clip1.Ref, clip3.Ref); // media/clip.bin 内容全程未变，地址稳定，可拿 v1 元数据基线做比对
 
             await DeleteArchiveAsync(cc, clip3.Ref);
             await CorruptInPlaceAsync(cc, $"packs/{abcPack.Ref}.7z");
@@ -492,6 +497,13 @@ public sealed class BackupLifecycleTests : IDisposable
             Assert.Equal(damaged.CorruptedPaths.Order(), repair.Repaired.Order());
             Assert.Empty(repair.Unrecoverable);
             Assert.Empty(repair.DeletedOrphans); // 修复只替换内容，不该造出或回收孤儿
+
+            // 修复重造的碰撞检测元数据必须与全新备份逐键相等——不是「存在就行」，值不同会让去重误判碰撞
+            // （defect 2：以前修复会整个丢掉 len/head/tail，静默关闭碰撞防护）。
+            var clipMetaAfterRepair = (await cc.GetBlobClient(clip3.Ref).GetPropertiesAsync()).Value.Metadata;
+            Assert.Equal(
+                clipMetaBaseline.OrderBy(kv => kv.Key, StringComparer.Ordinal),
+                clipMetaAfterRepair.OrderBy(kv => kv.Key, StringComparer.Ordinal));
 
             var afterRepair = await rig.Checker.CheckAsync(account, name, password, null, deep, _root);
             Assert.True(afterRepair.Ok);
