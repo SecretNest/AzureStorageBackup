@@ -62,6 +62,26 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         Assert.DoesNotContain("accountKey", body, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// F5：/test-connection 缺了 POST / 的空 key 校验。空 key → AccountKeyProtected = ""，
+    /// 到解密咽喉处抛 SecretUnavailableException，被深度防御映射成 409 keyring_lost——
+    /// 用户看到的是「密钥环解不开」，而真实原因只是没填 key。必须是 400 + 明确文案。
+    /// </summary>
+    [Fact]
+    public async Task TestConnection_Rejects_Empty_Key_Instead_Of_Blaming_The_Keyring()
+    {
+        foreach (var key in new[] { "", "   " })
+        {
+            var res = await _client.PostAsJsonAsync(
+                "/api/accounts/test-connection", SampleRequest("test-conn-empty-key") with { AccountKey = key });
+
+            Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+            var body = await res.Content.ReadAsStringAsync();
+            Assert.Contains("AccountKey is required.", body);
+            Assert.DoesNotContain("keyring", body, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     [Fact]
     public async Task Get_Missing_Returns_404()
     {
