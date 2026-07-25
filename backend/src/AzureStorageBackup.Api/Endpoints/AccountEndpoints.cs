@@ -24,16 +24,16 @@ public static class AccountEndpoints
         })
         .WithName("GetAccount");
 
-        group.MapPost("/", async (AccountRequest req, IAccountService svc, IEncryptionService encryption, CancellationToken ct) =>
+        group.MapPost("/", async (AccountRequest req, IAccountService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.AccountKey))
                 return Results.BadRequest(new { error = "AccountKey is required." });
 
             var created = await svc.CreateAsync(req.ToAccount(encryption), ct);
-            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created));
+            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created, keyring.Status == KeyringStatus.Lost));
         });
 
-        group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, IEncryptionService encryption, CancellationToken ct) =>
+        group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
         {
             var existing = await svc.GetAsync(id, ct);
             if (existing is null)
@@ -47,7 +47,8 @@ public static class AccountEndpoints
                 update.ProxyPasswordProtected = existing.ProxyPasswordProtected;
 
             var result = await svc.UpdateAsync(id, update, ct);
-            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result));
+            // 保留原密文的分支恰恰是密钥环丢失时解不开的那份密文，必须如实上报 SecretsUnavailable。
+            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result, keyring.Status == KeyringStatus.Lost));
         });
 
         group.MapDelete("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
