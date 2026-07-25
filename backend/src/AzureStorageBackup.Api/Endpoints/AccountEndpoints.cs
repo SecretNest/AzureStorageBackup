@@ -53,9 +53,13 @@ public static class AccountEndpoints
             return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result, Pending(keyring, encryption, result)));
         });
 
-        group.MapDelete("/{id:int}", async (int id, IAccountService svc, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, IAccountService svc, KeyringRecovery recovery, CancellationToken ct) =>
         {
             var ok = await svc.DeleteAsync(id, ct);
+            // 删掉的可能正是唯一一条待重设的解不开的密文：不收尾就翻不回 Healthy，
+            // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
+            if (ok)
+                await recovery.TryCompleteAsync(ct);
             return ok ? Results.NoContent() : Results.NotFound();
         });
 

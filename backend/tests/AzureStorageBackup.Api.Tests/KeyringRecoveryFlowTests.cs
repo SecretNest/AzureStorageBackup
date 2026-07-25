@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Json;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
@@ -108,6 +109,87 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
             var configs = await (await _client.GetAsync("/api/backup-configs"))
                 .Content.ReadFromJsonAsync<List<BackupConfigResponse>>();
             Assert.True(configs!.Single(c => c.Id == encrypted.Id).SecretsUnavailable);
+        }
+        finally
+        {
+            Keyring.Set(KeyringStatus.Healthy);
+        }
+    }
+
+    /// <summary>
+    /// 补审 Finding 1：TryCompleteAsync 此前只挂在 reset-secrets 上。用户放弃恢复、直接把
+    /// 唯一那条解不开的账户删掉时，若删除端点不收尾，进程会卡在「Lost 且待重设数为 0」——
+    /// KeyringProbe 的重启期兜底原本正是为消灭这个状态而写，运行期却仍会被删除路径撞见，
+    /// 必须等到下次重启才翻回 Healthy。删除必须立刻触发收尾。
+    /// </summary>
+    [Fact]
+    public async Task Deleting_The_Last_Stale_Account_Releases_Lost_Without_Restart()
+    {
+        var account = (await (await _client.PostAsJsonAsync("/api/accounts", SampleAccount("recovery-flow-del-acct")))
+            .Content.ReadFromJsonAsync<AccountResponse>())!;
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Accounts.FirstAsync(a => a.Id == account.Id)).AccountKeyProtected = TestSecrets.Stale("old-key");
+            await db.SaveChangesAsync();
+        }
+        Keyring.Set(KeyringStatus.Lost);
+
+        try
+        {
+            var before = await (await _client.GetAsync("/api/system/keyring"))
+                .Content.ReadFromJsonAsync<KeyringStatusResponse>();
+            Assert.Equal("Lost", before!.Status);
+            Assert.Equal(1, before.AccountsPending);
+
+            var del = await _client.DeleteAsync($"/api/accounts/{account.Id}");
+            Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
+
+            var after = await (await _client.GetAsync("/api/system/keyring"))
+                .Content.ReadFromJsonAsync<KeyringStatusResponse>();
+            Assert.Equal("Healthy", after!.Status);
+            Assert.Equal(0, after.AccountsPending);
+        }
+        finally
+        {
+            Keyring.Set(KeyringStatus.Healthy);
+        }
+    }
+
+    /// <summary>同上，另一端点：本地删除备份配置（不删云端 container，决策 6 的唯一出口）。</summary>
+    [Fact]
+    public async Task Deleting_The_Last_Stale_Backup_Config_Releases_Lost_Without_Restart()
+    {
+        var account = (await (await _client.PostAsJsonAsync("/api/accounts", SampleAccount("recovery-flow-del-cfg-acct")))
+            .Content.ReadFromJsonAsync<AccountResponse>())!;
+        var encrypted = (await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleConfig(account.Id, "recovery-flow-del-cfg", "s3cret")))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>())!;
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.BackupConfigs.FirstAsync(c => c.Id == encrypted.Id)).PasswordProtected = TestSecrets.Stale("old-pw");
+            await db.SaveChangesAsync();
+        }
+        Keyring.Set(KeyringStatus.Lost);
+
+        try
+        {
+            var before = await (await _client.GetAsync("/api/system/keyring"))
+                .Content.ReadFromJsonAsync<KeyringStatusResponse>();
+            Assert.Equal("Lost", before!.Status);
+            Assert.Equal(0, before.AccountsPending);
+            Assert.Equal(1, before.BackupConfigsPending);
+
+            var del = await _client.DeleteAsync($"/api/backup-configs/{encrypted.Id}");
+            Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
+
+            var after = await (await _client.GetAsync("/api/system/keyring"))
+                .Content.ReadFromJsonAsync<KeyringStatusResponse>();
+            Assert.Equal("Healthy", after!.Status);
+            Assert.Equal(0, after.BackupConfigsPending);
         }
         finally
         {

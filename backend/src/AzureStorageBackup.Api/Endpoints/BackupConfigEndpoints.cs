@@ -120,7 +120,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -157,6 +157,10 @@ public static class BackupConfigEndpoints
                     () => indexCache.RemoveForContainerAsync(accountId, container, ct));
                 await BestEffort(logger, "remove local backup state",
                     () => localState.RemoveAsync(accountId, container, ct));
+
+                // 删掉的可能正是唯一一条待重设的解不开的密文（备份密码）：不收尾就翻不回 Healthy，
+                // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
+                await recovery.TryCompleteAsync(ct);
             }
             return ok ? Results.NoContent() : Results.NotFound();
         });
