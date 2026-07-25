@@ -16,8 +16,8 @@ public enum ProxyMode
 }
 
 /// <summary>
-/// 一个 Azure Storage Account 配置。敏感字段（AccountKey、ProxyPassword）
-/// 在应用层为明文，落库时经 EF ValueConverter 自动加密。
+/// 一个 Azure Storage Account 配置。敏感字段（AccountKeyProtected、ProxyPasswordProtected）
+/// 在应用层与库中**均为密文**，解密只经 ISecretReader（设计 §3.1）。
 /// </summary>
 public class Account
 {
@@ -29,8 +29,8 @@ public class Account
     public string BlobEndpoint { get; set; } = string.Empty;
     public AzureRegion Region { get; set; } = AzureRegion.Global;
 
-    /// <summary>账户密钥（应用态明文；落库加密）。</summary>
-    public string AccountKey { get; set; } = string.Empty;
+    /// <summary>账户密钥密文。取明文用 ISecretReader.RevealAccountKey。</summary>
+    public string AccountKeyProtected { get; set; } = string.Empty;
 
     // 代理
     public bool UseProxy { get; set; }
@@ -39,8 +39,8 @@ public class Account
     public int? ProxyPort { get; set; }
     public string? ProxyUsername { get; set; }
 
-    /// <summary>代理密码（应用态明文；落库加密）。</summary>
-    public string? ProxyPassword { get; set; }
+    /// <summary>代理密码密文。取明文用 ISecretReader.RevealProxyPassword。</summary>
+    public string? ProxyPasswordProtected { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
 }

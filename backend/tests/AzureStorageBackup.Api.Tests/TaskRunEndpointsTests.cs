@@ -56,8 +56,8 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             ScheduledTaskType.Backup, "0 3 * * *", true)))
             .Content.ReadFromJsonAsync<TaskResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
         try
@@ -101,8 +101,8 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             ScheduledTaskType.Backup, "0 3 * * *", true)))
             .Content.ReadFromJsonAsync<TaskResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
         // 预先把该备份标记为忙碌（模拟另一操作正在执行）。

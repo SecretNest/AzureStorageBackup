@@ -30,7 +30,7 @@ public sealed class VolumeBlobIOTests
         }
     }
 
-    private static Account Acc() => new() { Name = "a", BlobEndpoint = "http://x", AccountKey = "k" };
+    private static Account Acc() => new() { Name = "a", BlobEndpoint = "http://x", AccountKeyProtected = TestSecrets.Protect("k") };
 
     [Fact]
     public async Task Multi_Volume_Uploads_First_Volume_Last_As_Commit_Marker()

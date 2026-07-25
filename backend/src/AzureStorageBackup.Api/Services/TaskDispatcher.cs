@@ -7,7 +7,8 @@ namespace AzureStorageBackup.Api.Services;
 /// 执行一个计划任务（M6）：解析目标（单备份或组成员），组内**依次**执行；
 /// 按类型分发到 备份/检查/清理。每个引擎调用在独立 scope 中解析 scoped 服务。
 /// </summary>
-public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy)
+public sealed class TaskDispatcher(
+    IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets)
 {
     public async Task DispatchAsync(ScheduledTask task, CancellationToken ct = default)
     {
@@ -75,7 +76,7 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
             return;
         }
 
-        var password = BackupRequestMapper.Password(config);
+        var password = secrets.RevealBackupPassword(config);
         try
         {
             switch (task.TaskType)
@@ -83,7 +84,7 @@ public sealed class TaskDispatcher(IServiceScopeFactory scopes, ILogger<TaskDisp
                 case ScheduledTaskType.Backup:
                     var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
                     await sp.GetRequiredService<BackupOrchestrator>()
-                        .RunAsync(BackupRequestMapper.From(config, account, settings), null, ct);
+                        .RunAsync(BackupRequestMapper.From(config, account, password, settings), null, ct);
                     break;
 
                 case ScheduledTaskType.Check:

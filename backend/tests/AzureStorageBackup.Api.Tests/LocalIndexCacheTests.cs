@@ -2,7 +2,6 @@ using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -18,7 +17,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options;
-        _db = new AppDbContext(options, new EncryptionService(new EphemeralDataProtectionProvider()));
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
     }
 
@@ -44,7 +43,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         public Task<string> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.FromResult("indexes/v.bin");
     }
 
-    private static Account Acc() => new() { Id = 1, Name = "a", BlobEndpoint = "http://x", AccountKey = "k" };
+    private static Account Acc() => new() { Id = 1, Name = "a", BlobEndpoint = "http://x", AccountKeyProtected = TestSecrets.Protect("k") };
 
     private static VersionIndex Index(int version, string path) => new()
     {

@@ -1,7 +1,6 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -17,9 +16,8 @@ public class GroupServiceTests : IDisposable
     {
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
-        var encryption = new EncryptionService(new EphemeralDataProtectionProvider());
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options;
-        _db = new AppDbContext(options, encryption);
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
         _sut = new GroupService(_db);
     }

@@ -2,7 +2,6 @@ using System.Net.Sockets;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
-using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -34,7 +33,7 @@ public sealed class BackupRepairerTests : IDisposable
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(_connection).Options;
-        _db = new AppDbContext(options, new EncryptionService(new EphemeralDataProtectionProvider()));
+        _db = new AppDbContext(options);
         _db.Database.EnsureCreated();
     }
 
@@ -50,7 +49,7 @@ public sealed class BackupRepairerTests : IDisposable
         Id = 1,
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -65,7 +64,7 @@ public sealed class BackupRepairerTests : IDisposable
 
     private (BackupOrchestrator Backup, BackupChecker Checker, BackupRepairer Repairer, TrackedInfoStore Tracked, ILocalIndexCache IndexCache, BlobClientFactory Factory) Build()
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var state = new LocalBackupStateStore(_db);
         var tracked = new TrackedInfoStore(store, state);

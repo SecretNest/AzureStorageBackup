@@ -12,14 +12,14 @@ public class BlobClientFactoryTests
     {
         Name = "prod",
         BlobEndpoint = "https://prod.blob.core.windows.net",
-        AccountKey = Key,
+        AccountKeyProtected = TestSecrets.Protect(Key),
         Region = AzureRegion.Global
     };
 
     [Fact]
     public void CreateServiceClient_Uses_Endpoint_And_AccountName()
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
 
         var client = factory.CreateServiceClient(Sample());
 
@@ -48,7 +48,7 @@ public class BlobClientFactoryTests
         var acct = Sample();
         acct.UseProxy = false;
 
-        var handler = BlobClientFactory.CreateProxyHandler(acct);
+        var handler = new BlobClientFactory(TestSecrets.Reader).CreateProxyHandler(acct);
 
         Assert.False(handler.UseProxy);
     }
@@ -62,9 +62,9 @@ public class BlobClientFactoryTests
         acct.ProxyHost = "proxy.local";
         acct.ProxyPort = 8080;
         acct.ProxyUsername = "u";
-        acct.ProxyPassword = "p";
+        acct.ProxyPasswordProtected = TestSecrets.Protect("p");
 
-        var handler = BlobClientFactory.CreateProxyHandler(acct);
+        var handler = new BlobClientFactory(TestSecrets.Reader).CreateProxyHandler(acct);
 
         Assert.True(handler.UseProxy);
         var proxy = Assert.IsType<WebProxy>(handler.Proxy);
@@ -83,7 +83,7 @@ public class BlobClientFactoryTests
         acct.ProxyHost = "proxy.local";
         acct.ProxyPort = 3128;
 
-        var handler = BlobClientFactory.CreateProxyHandler(acct);
+        var handler = new BlobClientFactory(TestSecrets.Reader).CreateProxyHandler(acct);
 
         var proxy = Assert.IsType<WebProxy>(handler.Proxy);
         Assert.Null(proxy.Credentials);
@@ -96,7 +96,7 @@ public class BlobClientFactoryTests
         acct.UseProxy = true;
         acct.ProxyMode = ProxyMode.DockerEnv;
 
-        var handler = BlobClientFactory.CreateProxyHandler(acct);
+        var handler = new BlobClientFactory(TestSecrets.Reader).CreateProxyHandler(acct);
 
         Assert.True(handler.UseProxy);
         Assert.NotNull(handler.Proxy);

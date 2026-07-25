@@ -36,7 +36,7 @@ public record BackupConfigResponse(
 {
     public static BackupConfigResponse From(BackupConfig c, string activity = "Idle") => new(
         c.Id, c.AccountId, c.ContainerName, c.Name, c.Description, c.LocalRoot,
-        !string.IsNullOrEmpty(c.Password), c.IndexTier, c.DataTier,
+        !string.IsNullOrEmpty(c.PasswordProtected), c.IndexTier, c.DataTier,
         c.IgnoreRules, c.DontCompressRules, c.DontGroupRules, c.IncludeSymlinks,
         c.MaxVersions, c.MaxAgeDays, c.RetentionMode,
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
@@ -82,7 +82,8 @@ public record BackupConfigRequest(
     long? VolumeBytes = null,
     bool VerboseLogging = false)
 {
-    public BackupConfig ToConfig() => new()
+    /// <summary>请求体里的 Password 是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。</summary>
+    public BackupConfig ToConfig(IEncryptionService encryption) => new()
     {
         VolumeBytes = VolumeBytes,
         VerboseLogging = VerboseLogging,
@@ -91,7 +92,7 @@ public record BackupConfigRequest(
         Name = Name,
         Description = Description,
         LocalRoot = LocalRoot,
-        Password = Password,
+        PasswordProtected = string.IsNullOrEmpty(Password) ? null : encryption.Encrypt(Password),
         IndexTier = IndexTier,
         DataTier = DataTier,
         IgnoreRules = IgnoreRules,

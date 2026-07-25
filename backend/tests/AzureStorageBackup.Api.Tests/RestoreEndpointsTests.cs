@@ -66,8 +66,8 @@ public sealed class RestoreEndpointsTests(TestWebAppFactory factory)
             100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        var factoryClient = new BlobClientFactory();
-        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKey = AzuriteKey, Region = AzureRegion.Global };
+        var factoryClient = new BlobClientFactory(TestSecrets.Reader);
+        var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
         try

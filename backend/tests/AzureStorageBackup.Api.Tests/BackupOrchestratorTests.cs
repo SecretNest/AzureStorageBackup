@@ -34,7 +34,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -64,7 +64,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
         IBlobUploader? uploader = null, ProcessingVerifier? verifier = null, IFileCompressor? compressor = null)
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
@@ -119,14 +119,13 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var counting = new CountingStore(new BackupInfoStore(factory, new SevenZipArchiveCodec()));
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
         conn.Open();
         var opts = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>()
             .UseSqlite(conn).Options;
-        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
-            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(opts);
         db.Database.EnsureCreated();
         var cache = new LocalIndexCache(db, counting);
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
@@ -157,13 +156,12 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var counting = new CountingStore(new BackupInfoStore(factory, new SevenZipArchiveCodec()));
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
         conn.Open();
         var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
-        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
-            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(opts);
         db.Database.EnsureCreated();
         var tracked = new TrackedInfoStore(counting, new LocalBackupStateStore(db));
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
@@ -251,8 +249,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
-        var db = new AzureStorageBackup.Api.Data.AppDbContext(
-            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        var db = new AzureStorageBackup.Api.Data.AppDbContext(opts);
         db.Database.EnsureCreated();
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
@@ -270,7 +267,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var counting = new CountingUploader(new BlobUploader(factory));
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
         conn.Open();
@@ -301,7 +298,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var counting = new CountingUploader(new BlobUploader(factory));
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
         conn.Open();
@@ -342,13 +339,12 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         using var conn = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
         conn.Open();
         var opts = new DbContextOptionsBuilder<AzureStorageBackup.Api.Data.AppDbContext>().UseSqlite(conn).Options;
-        using var db = new AzureStorageBackup.Api.Data.AppDbContext(
-            opts, new EncryptionService(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider()));
+        using var db = new AzureStorageBackup.Api.Data.AppDbContext(opts);
         db.Database.EnsureCreated();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
@@ -638,7 +634,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factoryProbe = new BlobClientFactory();
+        var factoryProbe = new BlobClientFactory(TestSecrets.Reader);
         var tracker = new ConcurrencyTrackingUploader(new BlobUploader(factoryProbe));
         var (orchestrator, store, factory) = Build(uploader: tracker);
         var account = AzuriteAccount();
@@ -807,7 +803,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var log = new CapturingLog();
@@ -849,7 +845,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var log = new ConcurrencyProbeLog();

@@ -31,7 +31,7 @@ public sealed class BackupCheckerTests : IDisposable
     {
         Name = "azurite",
         BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
-        AccountKey = AzuriteKey,
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
         Region = AzureRegion.Global,
     };
 
@@ -46,7 +46,7 @@ public sealed class BackupCheckerTests : IDisposable
 
     private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory) Build()
     {
-        var factory = new BlobClientFactory();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var backup = new BackupOrchestrator(

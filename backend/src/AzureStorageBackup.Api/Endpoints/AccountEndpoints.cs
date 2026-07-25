@@ -23,27 +23,27 @@ public static class AccountEndpoints
         })
         .WithName("GetAccount");
 
-        group.MapPost("/", async (AccountRequest req, IAccountService svc, CancellationToken ct) =>
+        group.MapPost("/", async (AccountRequest req, IAccountService svc, IEncryptionService encryption, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.AccountKey))
                 return Results.BadRequest(new { error = "AccountKey is required." });
 
-            var created = await svc.CreateAsync(req.ToAccount(), ct);
+            var created = await svc.CreateAsync(req.ToAccount(encryption), ct);
             return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created));
         });
 
-        group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, CancellationToken ct) =>
+        group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, IEncryptionService encryption, CancellationToken ct) =>
         {
             var existing = await svc.GetAsync(id, ct);
             if (existing is null)
                 return Results.NotFound();
 
-            var update = req.ToAccount();
-            // 空的敏感字段表示保留原值
+            var update = req.ToAccount(encryption);
+            // 空的敏感字段表示保留原值：直接搬运原密文，不必解密。
             if (string.IsNullOrEmpty(req.AccountKey))
-                update.AccountKey = existing.AccountKey;
+                update.AccountKeyProtected = existing.AccountKeyProtected;
             if (string.IsNullOrEmpty(req.ProxyPassword))
-                update.ProxyPassword = existing.ProxyPassword;
+                update.ProxyPasswordProtected = existing.ProxyPasswordProtected;
 
             var result = await svc.UpdateAsync(id, update, ct);
             return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result));
@@ -56,9 +56,9 @@ public static class AccountEndpoints
         });
 
         // 用未保存的配置测试连通（不落库）
-        group.MapPost("/test-connection", async (AccountRequest req, IBlobClientFactory factory, CancellationToken ct) =>
+        group.MapPost("/test-connection", async (AccountRequest req, IBlobClientFactory factory, IEncryptionService encryption, CancellationToken ct) =>
         {
-            var result = await factory.TestConnectionAsync(req.ToAccount(), ct);
+            var result = await factory.TestConnectionAsync(req.ToAccount(encryption), ct);
             return Results.Ok(result);
         });
 

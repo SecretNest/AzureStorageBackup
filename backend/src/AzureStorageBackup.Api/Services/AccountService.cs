@@ -32,13 +32,13 @@ public class AccountService(AppDbContext db) : IAccountService
         existing.Description = update.Description;
         existing.BlobEndpoint = update.BlobEndpoint;
         existing.Region = update.Region;
-        existing.AccountKey = update.AccountKey;
+        existing.AccountKeyProtected = update.AccountKeyProtected;
         existing.UseProxy = update.UseProxy;
         existing.ProxyMode = update.ProxyMode;
         existing.ProxyHost = update.ProxyHost;
         existing.ProxyPort = update.ProxyPort;
         existing.ProxyUsername = update.ProxyUsername;
-        existing.ProxyPassword = update.ProxyPassword;
+        existing.ProxyPasswordProtected = update.ProxyPasswordProtected;
 
         await db.SaveChangesAsync(ct);
         return existing;

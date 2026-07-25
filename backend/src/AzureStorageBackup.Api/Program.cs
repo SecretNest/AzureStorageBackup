@@ -21,7 +21,10 @@ if (string.IsNullOrWhiteSpace(keysPath))
     keysPath = "keys";
 Directory.CreateDirectory(keysPath);
 builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(keysPath));
-builder.Services.AddScoped<IEncryptionService, EncryptionService>();
+// 单例：EncryptionService 无状态、IDataProtector 线程安全；且单例 BlobClientFactory 依赖 ISecretReader，
+// 注入 Scoped 会在启动时触发作用域校验异常。
+builder.Services.AddSingleton<IEncryptionService, EncryptionService>();
+builder.Services.AddSingleton<ISecretReader, SecretReader>();
 
 // --- Azure Blob Storage ---
 // 连接串来自配置 / 环境变量；未配置时回退到本地 Azurite 开发存储，保证进程可启动。

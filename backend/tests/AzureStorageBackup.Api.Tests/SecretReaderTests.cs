@@ -16,7 +16,7 @@ public class SecretReaderTests
     public void RevealAccountKey_Returns_Plaintext()
     {
         var (sut, enc) = Create();
-        var account = new Account { AccountKey = enc.Encrypt("the-key==") };
+        var account = new Account { AccountKeyProtected = enc.Encrypt("the-key==") };
 
         Assert.Equal("the-key==", sut.RevealAccountKey(account));
     }
@@ -26,7 +26,7 @@ public class SecretReaderTests
     {
         var (sut, _) = Create();
         var foreign = new EncryptionService(new EphemeralDataProtectionProvider());
-        var account = new Account { Id = 7, Name = "prod", AccountKey = foreign.Encrypt("the-key==") };
+        var account = new Account { Id = 7, Name = "prod", AccountKeyProtected = foreign.Encrypt("the-key==") };
 
         var ex = Assert.Throws<SecretUnavailableException>(() => sut.RevealAccountKey(account));
         Assert.Contains("prod", ex.Message);
@@ -37,8 +37,8 @@ public class SecretReaderTests
     {
         var (sut, _) = Create();
 
-        Assert.Null(sut.RevealProxyPassword(new Account { ProxyPassword = null }));
-        Assert.Null(sut.RevealProxyPassword(new Account { ProxyPassword = "" }));
+        Assert.Null(sut.RevealProxyPassword(new Account { ProxyPasswordProtected = null }));
+        Assert.Null(sut.RevealProxyPassword(new Account { ProxyPasswordProtected = "" }));
     }
 
     [Fact]
@@ -46,8 +46,8 @@ public class SecretReaderTests
     {
         var (sut, _) = Create();
 
-        Assert.Null(sut.RevealBackupPassword(new BackupConfig { Password = null }));
-        Assert.Null(sut.RevealBackupPassword(new BackupConfig { Password = "" }));
+        Assert.Null(sut.RevealBackupPassword(new BackupConfig { PasswordProtected = null }));
+        Assert.Null(sut.RevealBackupPassword(new BackupConfig { PasswordProtected = "" }));
     }
 
     [Fact]
@@ -55,7 +55,7 @@ public class SecretReaderTests
     {
         var (sut, _) = Create();
         var foreign = new EncryptionService(new EphemeralDataProtectionProvider());
-        var config = new BackupConfig { Id = 3, Name = "docs", Password = foreign.Encrypt("pw") };
+        var config = new BackupConfig { Id = 3, Name = "docs", PasswordProtected = foreign.Encrypt("pw") };
 
         var ex = Assert.Throws<SecretUnavailableException>(() => sut.RevealBackupPassword(config));
         Assert.Contains("docs", ex.Message);

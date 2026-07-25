@@ -38,7 +38,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -64,7 +64,10 @@ public static class BackupConfigEndpoints
                 Name = info.Backup.Name,
                 Description = info.Backup.Description,
                 LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
-                Password = info.Backup.Encrypted ? req.Password : null,
+                // 请求体里的密码是明文，落到实体上时立即加密（设计 §3.1）。
+                PasswordProtected = info.Backup.Encrypted && !string.IsNullOrEmpty(req.Password)
+                    ? encryption.Encrypt(req.Password)
+                    : null,
             };
             var created = await svc.CreateAsync(config, ct);
 
@@ -76,27 +79,24 @@ public static class BackupConfigEndpoints
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
             if (string.IsNullOrWhiteSpace(req.ContainerName))
                 return Results.BadRequest(new { error = "ContainerName is required." });
 
-            var created = await svc.CreateAsync(req.ToConfig(), ct);
+            var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created));
         });
 
-        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, CancellationToken ct) =>
+        group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, CancellationToken ct) =>
         {
-            var existing = await svc.GetAsync(id, ct);
-            if (existing is null)
+            if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
 
-            var update = req.ToConfig();
-            // 空密码表示保留原值（不清除加密）
-            if (string.IsNullOrEmpty(req.Password))
-                update.Password = existing.Password;
+            // 空密码 = 保留原值、非空 = 拒绝（决策 8），均由服务层判定：密文含随机 IV，不能在此比较。
+            var update = req.ToConfig(encryption);
 
             try
             {
@@ -178,7 +178,7 @@ public static class BackupConfigEndpoints
         });
 
         // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
-        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -187,7 +187,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var candidates = new List<object>();
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
@@ -203,7 +203,7 @@ public static class BackupConfigEndpoints
         });
 
         // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
-        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -212,7 +212,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.Ok(Array.Empty<string>());
@@ -227,7 +227,7 @@ public static class BackupConfigEndpoints
         // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            CancellationToken ct) =>
+            ISecretReader secrets, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -236,7 +236,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.Ok(Array.Empty<TreeNode>());
@@ -253,7 +253,7 @@ public static class BackupConfigEndpoints
         // 共享 pack/去重 blob 只计一次）与解压量，再对各去重对象首卷发起 HEAD 查活化状态（Archive/待就绪）。
         group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
-            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+            IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -262,7 +262,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return Results.NotFound(new { error = "No versions found." });
@@ -349,7 +349,7 @@ public static class BackupConfigEndpoints
         });
 
         // 列出某备份的全部版本（供还原/检查选择版本）。走本地权威信息文件，平时不读云端。
-        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, CancellationToken ct) =>
+        group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -358,7 +358,7 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+            var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var versions = (info?.Versions ?? []).Select(v => new
             {
@@ -372,7 +372,7 @@ public static class BackupConfigEndpoints
         });
 
         // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -386,7 +386,7 @@ public static class BackupConfigEndpoints
                 return Results.Conflict(new { error = "Backup is busy with another operation." });
             try
             {
-                var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;
+                var password = secrets.RevealBackupPassword(config);
                 var settings = await settingsSvc.GetAsync(ct);
                 var options = new CheckOptions
                 {

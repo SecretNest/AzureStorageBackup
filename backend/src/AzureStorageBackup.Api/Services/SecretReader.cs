@@ -6,17 +6,17 @@ namespace AzureStorageBackup.Api.Services;
 public sealed class SecretReader(IEncryptionService encryption) : ISecretReader
 {
     public string RevealAccountKey(Account account) =>
-        Reveal(account.AccountKey, $"account '{account.Name}' (id {account.Id}) key")!;
+        Reveal(account.AccountKeyProtected, $"account '{account.Name}' (id {account.Id}) key")!;
 
     public string? RevealProxyPassword(Account account) =>
-        string.IsNullOrEmpty(account.ProxyPassword)
+        string.IsNullOrEmpty(account.ProxyPasswordProtected)
             ? null
-            : Reveal(account.ProxyPassword, $"account '{account.Name}' (id {account.Id}) proxy password");
+            : Reveal(account.ProxyPasswordProtected, $"account '{account.Name}' (id {account.Id}) proxy password");
 
     public string? RevealBackupPassword(BackupConfig config) =>
-        string.IsNullOrEmpty(config.Password)
+        string.IsNullOrEmpty(config.PasswordProtected)
             ? null
-            : Reveal(config.Password, $"backup '{config.Name}' (id {config.Id}) password");
+            : Reveal(config.PasswordProtected, $"backup '{config.Name}' (id {config.Id}) password");
 
     private string? Reveal(string ciphertext, string what) =>
         encryption.TryDecrypt(ciphertext, out var plain)

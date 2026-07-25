@@ -13,14 +13,14 @@ public sealed class BackupRequestMapperTests
         LocalRoot = "/data",
     };
 
-    private static Account Account() => new() { Name = "a", BlobEndpoint = "http://x", AccountKey = "k" };
+    private static Account Account() => new() { Name = "a", BlobEndpoint = "http://x", AccountKeyProtected = TestSecrets.Protect("k") };
 
     [Fact]
     public void Maps_Upload_Concurrency_From_Settings()
     {
         var settings = new GlobalSettings { UploadConcurrency = 9 };
 
-        var request = BackupRequestMapper.From(Config(), Account(), settings);
+        var request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
 
         Assert.Equal(9, request.Options.UploadConcurrency);
     }
@@ -30,7 +30,7 @@ public sealed class BackupRequestMapperTests
     {
         var settings = new GlobalSettings { RetryBackoffSeconds = "5,30,90,300", RetryMaxTotalMinutes = 120 };
 
-        var request = BackupRequestMapper.From(Config(), Account(), settings);
+        var request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
 
         var schedule = RetryPolicy.DelaySchedule(request.Options.Upload).ToList();
         Assert.Equal(TimeSpan.FromSeconds(5), schedule[0]);
@@ -43,7 +43,7 @@ public sealed class BackupRequestMapperTests
     [Fact]
     public void Without_Settings_Uses_Defaults()
     {
-        var request = BackupRequestMapper.From(Config(), Account());
+        var request = BackupRequestMapper.From(Config(), Account(), password: null);
 
         Assert.Equal(5, request.Options.UploadConcurrency);
     }
@@ -53,7 +53,7 @@ public sealed class BackupRequestMapperTests
     {
         var settings = new GlobalSettings { RetryBackoffSeconds = "   " };
 
-        var request = BackupRequestMapper.From(Config(), Account(), settings);
+        var request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
 
         // 空序列 → 计数模式（Backoff 为空），DelaySchedule 产出 MaxAttempts-1 项。
         Assert.Null(request.Options.Upload.Backoff);

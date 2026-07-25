@@ -1,3 +1,5 @@
+using AzureStorageBackup.Api.Services;
+
 namespace AzureStorageBackup.Api.Models;
 
 /// <summary>账户响应体。刻意不含 AccountKey/ProxyPassword，避免敏感信息外泄。</summary>
@@ -33,18 +35,19 @@ public record AccountRequest(
     string? ProxyUsername,
     string? ProxyPassword)
 {
-    public Account ToAccount() => new()
+    /// <summary>请求体里的凭据是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。空值保持空值，不加密。</summary>
+    public Account ToAccount(IEncryptionService encryption) => new()
     {
         Name = Name,
         Description = Description,
         BlobEndpoint = BlobEndpoint,
         Region = Region,
-        AccountKey = AccountKey ?? string.Empty,
+        AccountKeyProtected = string.IsNullOrEmpty(AccountKey) ? string.Empty : encryption.Encrypt(AccountKey),
+        ProxyPasswordProtected = string.IsNullOrEmpty(ProxyPassword) ? null : encryption.Encrypt(ProxyPassword),
         UseProxy = UseProxy,
         ProxyMode = ProxyMode,
         ProxyHost = ProxyHost,
         ProxyPort = ProxyPort,
         ProxyUsername = ProxyUsername,
-        ProxyPassword = ProxyPassword
     };
 }
