@@ -77,7 +77,6 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `ConnectionStrings__Sqlite` | SQLite connection string (app database). | `Data Source=/data/app.db` |
 | `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
-| `Backup__StagedLimitBytes` | Max bytes kept in the staging area before back-pressure. | `1073741824` (1 GiB) |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
 | `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
 | `Cors__AllowedOrigins__0` | Allowed browser origin. Not needed for the single-image deployment (frontend is same-origin); relevant only when hosting the SPA separately. | `http://localhost:5173` |
@@ -85,6 +84,8 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `ASPNETCORE_ENVIRONMENT` | ASP.NET environment. | `Production` |
 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](docs/keyring-loss-recovery-design.md).
+
+> Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
 
 ### Volumes / mounts
 
