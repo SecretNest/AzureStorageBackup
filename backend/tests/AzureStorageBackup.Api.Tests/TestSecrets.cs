@@ -18,6 +18,21 @@ internal static class TestSecrets
     public static string Protect(string plaintext) => Encryption.Encrypt(plaintext);
 
     /// <summary>
+    /// 断言用的解密助手：解得开就返回明文，解不开直接判测试失败。
+    /// <para>
+    /// 生产侧刻意只保留 <see cref="IEncryptionService.TryDecrypt"/>——「解密失败必须收口成
+    /// <see cref="SecretUnavailableException"/>」是项目约束，会裸抛 CryptographicException 的
+    /// Decrypt 是一条旁路，不该为了测试断言而让它继续活着（F1）。
+    /// </para>
+    /// </summary>
+    public static string Reveal(IEncryptionService encryption, string ciphertext)
+    {
+        Assert.True(encryption.TryDecrypt(ciphertext, out var plaintext),
+            "Ciphertext could not be decrypted with the current keyring.");
+        return plaintext;
+    }
+
+    /// <summary>
     /// 用一套一次性的、与被测宿主无关的密钥环加密：模拟 <c>/keys</c> 丢失后遗留在库里、
     /// 当前密钥环解不开的旧密文。仅翻转 <see cref="IKeyringHealth"/> 并不能制造这种密文——
     /// 那样库里的值仍然解得开，逐条试解的判定会（正确地）报告「无需重设」。

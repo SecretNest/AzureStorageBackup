@@ -57,8 +57,10 @@ public static class BackupConfigEndpoints
                 // （与 reset-password 同处理）。
                 return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消（客户端断开 / 进程关停）不是「密码不对」：吞掉会把它伪装成用户错误，
+                // 与仓库既有约定一致（见 a3ac967「孤儿清理不吞取消」），一律放行上抛。
                 return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
             }
             if (seeded is null)
@@ -440,8 +442,10 @@ public static class BackupConfigEndpoints
                 await svc.WriteStatusAsync(id, error: null, loggerFactory.CreateLogger("BackupStatus"), ct);
                 return Results.Ok(result);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消不是检查失败：不能把「客户端断开 / 进程关停」写成该备份的 Error 状态
+                // （与 a3ac967 同一约定）。异常本就原样上抛，busy 锁在 finally 里照常释放。
                 await svc.WriteStatusAsync(id, ex.Message, loggerFactory.CreateLogger("BackupStatus"), ct);
                 throw;
             }
@@ -481,6 +485,19 @@ public static class BackupConfigEndpoints
                 // ReadInfoWithETagAsync 优先探测未加密 blob 名——若容器里恰好有一份未加密的信息文件，
                 // 它会用 password: null 读回来，提交的密码根本没被用于解密。必须核对返回内容确实来自
                 // 加密对象，否则会把任意字符串当密码落库，真密码永久丢失。
+                //
+                // 这里查的是返回 JSON 里的自述标志位，而不是「解密成功」本身，看着像个洞，其实不是：
+                // 写侧最终只有 BackupInfoStore.WriteInfoConditionalAsync 一条路，它按 password 是否为空
+                // 二选一地决定 blob 名（IndexBlobName / EncryptedIndexBlobName），而 Backup.Encrypted
+                // 由同一次写入的内容携带。因此经本应用写出的信息文件，标志位与所在 blob 名（即是否加密）
+                // 不可能相左：Encrypted=true 意味着这份 JSON 只能来自 .enc 那条分支，也就意味着上面这次读
+                // 确实是用提交的密码解开的。
+                //
+                // 「只有一条路」是可核验的，别被调用点数量迷惑：接口上另有 IBackupInfoStore.WriteInfoAsync，
+                // 且 BackupOrchestrator / BackupRepairer / RetentionCleaner 都直接调它——但它的实现体本身
+                // 就是一句 `=> WriteInfoConditionalAsync(..., ifMatch: null, ct)`（BackupInfoStore.WriteInfoAsync），
+                // 并不自己拼 blob 名。故不变量成立的充要条件是：**WriteInfoAsync 继续保持这层委托，
+                // 且不新增第三个自行决定 blob 名的写入实现**。任一条被打破，此处必须改成以解密结果为准。
                 if (!info.Value.Info.Backup.Encrypted)
                     return Results.BadRequest(new { error = "This container's backup is not encrypted; the password cannot be verified." });
             }
@@ -488,12 +505,18 @@ public static class BackupConfigEndpoints
             {
                 return Results.BadRequest(new { error = "Re-enter this backup's account credentials first." });
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // 取消（客户端断开 / 进程关停）不是「验证失败」，不能伪装成用户的密码错误
+                // （与 a3ac967「孤儿清理不吞取消」同一约定）：放行上抛。
                 return Results.BadRequest(new { error = $"Verification failed: {ex.Message}" });
             }
 
-            var row = await db.BackupConfigs.FirstAsync(c => c.Id == id, ct);
+            // 验证要连云，与前面的存在性检查之间窗口不短：配置行可能已被删除。
+            // FirstAsync 会抛成 500，而全仓约定是 404。
+            var row = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
+            if (row is null)
+                return Results.NotFound();
             row.PasswordProtected = encryption.Encrypt(req.Password);
             await db.SaveChangesAsync(ct);
 
@@ -531,10 +554,15 @@ public static class BackupConfigEndpoints
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
 
-    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。</summary>
+    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。
+    /// 取消除外——那不是「这一步失败了」，而是整条请求该停下（与 a3ac967 的孤儿清理同一约定）；
+    /// 吞掉只会给每个剩余步骤各记一条误导性 Warning。</summary>
     private static async Task BestEffort(ILogger logger, string what, Func<Task> action)
     {
         try { await action(); }
-        catch (Exception ex) { logger.LogWarning(ex, "Backup config delete: failed to {What}", what); }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Backup config delete: failed to {What}", what);
+        }
     }
 }

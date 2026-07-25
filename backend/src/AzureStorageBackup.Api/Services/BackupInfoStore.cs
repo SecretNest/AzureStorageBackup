@@ -28,6 +28,12 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
         return null;
     }
 
+    /// <summary>
+    /// 无条件写（无 ETag 前提）。**必须保持为对 <see cref="WriteInfoConditionalAsync"/> 的纯委托**：
+    /// 「信息文件的 blob 名只由 WriteInfoConditionalAsync 按 password 是否为空决定」是 reset-password
+    /// 端点据以只查 <c>Backup.Encrypted</c> 标志位、而不必以解密结果为准的不变量
+    /// （见 BackupConfigEndpoints 的 reset-password 注释）。在此自行拼 blob 名会静默打破它。
+    /// </summary>
     public Task WriteInfoAsync(
         Account account, string container, BackupInfoFile info, string? password, AccessTier? tier = null, CancellationToken ct = default)
         => WriteInfoConditionalAsync(account, container, info, password, tier, ifMatch: null, ct);

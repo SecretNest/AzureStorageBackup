@@ -66,6 +66,11 @@ public static class AccountEndpoints
         // 用未保存的配置测试连通（不落库）
         group.MapPost("/test-connection", async (AccountRequest req, IBlobClientFactory factory, IEncryptionService encryption, CancellationToken ct) =>
         {
+            // 与 POST / 同一道校验：空 key 会变成空的 AccountKeyProtected，解密咽喉处抛
+            // SecretUnavailableException，用户看到的是「密钥环解不开」——真实原因只是没填 key。
+            if (string.IsNullOrWhiteSpace(req.AccountKey))
+                return Results.BadRequest(new { error = "AccountKey is required." });
+
             var result = await factory.TestConnectionAsync(req.ToAccount(encryption), ct);
             return Results.Ok(result);
         });
@@ -103,7 +108,11 @@ public static class AccountEndpoints
             if (!check.Success)
                 return Results.BadRequest(new { error = $"Verification failed: {check.Error}" });
 
-            var row = await db.Accounts.FirstAsync(a => a.Id == id, ct);
+            // 前面的存在性检查与这次写之间，账户可能已被删除（验证要连云，窗口不短）：
+            // FirstAsync 会抛成 500，而全仓约定是 404。
+            var row = await db.Accounts.FirstOrDefaultAsync(a => a.Id == id, ct);
+            if (row is null)
+                return Results.NotFound();
             row.AccountKeyProtected = candidate.AccountKeyProtected;
             row.ProxyPasswordProtected = candidate.ProxyPasswordProtected;
             await db.SaveChangesAsync(ct);

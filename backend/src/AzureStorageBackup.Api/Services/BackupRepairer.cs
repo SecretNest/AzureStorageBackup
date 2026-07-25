@@ -27,9 +27,14 @@ public sealed class BackupRepairer(
     TrackedInfoStore? trackedInfo = null,
     ILocalIndexCache? indexCache = null)
 {
+    /// <param name="dontCompress">
+    /// 配置的「不压缩」规则（BackupEngineOptions.DontCompress 的同一份），修复单文件 blob 时按被修复路径
+    /// 逐条推导 StoreOnly，使重压出来的归档与全新备份对同一文件写出的压缩方式一致。null = 无规则（一律压缩）。
+    /// </param>
     public async Task<RepairReport> RepairAsync(
         Account account, string container, string? password, string localRoot, int? version,
-        CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, CancellationToken ct = default)
+        CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, IgnoreRuleSet? dontCompress,
+        CancellationToken ct = default)
     {
         // 本地权威优先读（与编排器/检查器一致）：本地有则零云读，无则读云端并回填；写侧已走 trackedInfo。
         var info = (trackedInfo is not null
@@ -72,7 +77,7 @@ public sealed class BackupRepairer(
                         repaired, unrecoverable, changedVersions, ct);
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                        repaired, unrecoverable, changedVersions, ct);
+                        dontCompress, repaired, unrecoverable, changedVersions, ct);
             }
 
             // 持久化被改动的版本索引 + 信息文件（经本地权威状态机，保持 ETag/缓存一致，避免下次备份 412）。
@@ -149,7 +154,8 @@ public sealed class BackupRepairer(
     /// <summary>修复单文件 data blob：从任一引用路径的本地文件（hash 校验）重造并替换；更新全部引用版本的尺寸。</summary>
     private async Task RepairBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, Dictionary<int, VersionIndex> indexes, string localRoot,
-        string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes, List<string> repaired,
+        string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes,
+        IgnoreRuleSet? dontCompress, List<string> repaired,
         List<string> unrecoverable, HashSet<int> changedVersions, CancellationToken ct)
     {
         // 全部版本中引用此 blob 的条目（同内容不同路径可有多个）。
@@ -163,14 +169,18 @@ public sealed class BackupRepairer(
         var fullHash = entry0.FullHash;
         var raw = entry0.Storage!.Raw;
 
-        // 从任一引用路径找到内容一致的本地文件。
+        // 从任一引用路径找到内容一致的本地文件。同时记下它的备份内相对路径：DontCompress 是按路径匹配的，
+        // 推导 StoreOnly 得用真正被拿去重压的那条路径（同内容多路径共享一个 blob 时，全新备份也是按
+        // 实际上传的那一条推导的）。
         string? localSource = null;
+        string? sourcePath = null;
         foreach (var (_, e) in refs)
         {
             var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
             if (File.Exists(local) && fullHash is not null && await hasher.FullHashAsync(local, ct) == fullHash)
             {
                 localSource = local;
+                sourcePath = e.Path;
                 break;
             }
         }
@@ -183,11 +193,36 @@ public sealed class BackupRepairer(
             return;
         }
 
-        // 碰撞检测元数据须与全新备份完全一致：直接复用该条目已记录的 length/head/tail
+        // 碰撞检测元数据须与全新备份完全一致：直接复用条目已记录的 length/head/tail
         // （内容未变——已经过 fullHash 校验——故这些值不变），而非在此重新计算，
         // 避免因 headBytes 配置漂移导致与同内容的其它引用元数据不一致。
-        var meta = addressing.Metadata(fullHash!, entry0.Length, entry0.HeadHash ?? "", entry0.TailHash ?? "");
-        var newSizes = await ReplaceBlobAsync(account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, ct);
+        // head/tail 为 null（老索引条目缺字段）时原样传下去：Metadata 会省略该键，
+        // 而不是写空串——写空串会让同内容被后续去重判成碰撞并误报（见 BlobAddressScheme.Metadata）。
+        //
+        // 取哪一条：refs 的先后取决于字典枚举顺序，refs[0] 可能恰是缺 head/tail 的老索引条目，
+        // 而同内容的兄弟引用其实两项齐全——照 refs[0] 走会白白丢掉手里已有的碰撞防护，
+        // 平白拉长防护退化的窗口。优先挑两项齐全的那条；一条都没有才退回 entry0
+        // （内容一致，故各引用条目的 length/head/tail 本就应当相同）。
+        var metaEntry = refs.Select(r => r.Entry)
+            .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
+        var meta = addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash);
+        // 与全新备份同一套推导（BackupOrchestrator.HandleBlobAsync）：命中 DontCompress 的路径只存不压。
+        var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
+        var newSizes = await ReplaceBlobAsync(
+            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, ct);
+
+        // 省略元数据 = 该对象的碰撞防护被削弱（密钥化时改发窄校验值 v1，退化为 fullHash+长度，
+        // 而非无防护——head/tail 未知时 Metadata 已改发 v1，见 BlobAddressScheme）。
+        // 这本身是正确处置（写空串更糟），但不留痕就是不可见的退化：记一条可审计的 Warning。
+        if (opLog is not null && (metaEntry.HeadHash is null || metaEntry.TailHash is null))
+        {
+            var missing = metaEntry.HeadHash is null
+                ? (metaEntry.TailHash is null ? "head and tail" : "head")
+                : "tail";
+            await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{cc.Name}",
+                $"Collision guard degraded for {blobRef}: no index entry records the {missing} hash, " +
+                "so the repaired object was published without the omitted collision metadata.", ct, durable: true);
+        }
 
         // 更新全部引用版本的分卷数/尺寸（内容不变故 ref 不变）。
         foreach (var (vnum, e) in refs)
@@ -274,10 +309,12 @@ public sealed class BackupRepairer(
     }
 
     /// <summary>上传新内容替换单文件 blob：先覆盖上传新卷、后删残留旧卷（不再先删空）。返回新各分卷尺寸。
-    /// <paramref name="metadata"/> 为与全新备份一致的碰撞检测元数据（len/head/tail 或加密时的 v）。</summary>
+    /// <paramref name="metadata"/> 为与全新备份一致的碰撞检测元数据（len/head/tail 或加密时的 v/v1）；
+    /// <paramref name="storeOnly"/> 同样按配置的 DontCompress 规则由调用方推导，与全新备份一致。</summary>
     private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier,
-        long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, CancellationToken ct)
+        long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, bool storeOnly,
+        CancellationToken ct)
     {
         if (raw)
         {
@@ -295,8 +332,11 @@ public sealed class BackupRepairer(
             var srcDir = Path.GetDirectoryName(localSource)!;
             var entry = Path.GetFileName(localSource);
             // 必须带上原密码重压，否则加密备份的对象会被静默改写成明文 7z（机密性缺陷）。
+            // StoreOnly 由调用方按配置的 DontCompress 规则逐路径推导（与 BackupOrchestrator.HandleBlobAsync
+            // 同一套），修好的归档与全新备份对同一文件写出的压缩方式一致。
+            // （pack 那条路径不需要：全新备份的 CompressPackAsync 本来就是 storeOnly: false。）
             var result = await compressor.CompressAsync(
-                new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), password, VolumeBytes: volumeBytes, StoreOnly: false), ct);
+                new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), password, VolumeBytes: volumeBytes, StoreOnly: storeOnly), ct);
             await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct, metadata);
             return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
         }

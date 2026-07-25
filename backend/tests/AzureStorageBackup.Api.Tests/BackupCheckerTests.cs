@@ -185,7 +185,8 @@ public sealed class BackupCheckerTests : IDisposable
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // 云端 blob 丢失
 
             var report = await Repairer(factory, checker).RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
 
             Assert.Contains("a.txt", report.Repaired);
             Assert.Empty(report.Unrecoverable);
@@ -223,7 +224,8 @@ public sealed class BackupCheckerTests : IDisposable
             File.Delete(Path.Combine(_src, "a.txt"));                        // 本地也没了 → 无法修复
 
             var report = await Repairer(factory, checker).RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
 
             Assert.Contains("a.txt", report.Unrecoverable);
             Assert.Empty(report.Repaired);
@@ -354,7 +356,8 @@ public sealed class BackupCheckerTests : IDisposable
             // 修复删孤儿（cleanupOrphans）：即便无坏 blob 也执行删除。
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null,
-                new CheckOptions { ListOrphans = true }, Azure.Storage.Blobs.Models.AccessTier.Hot, null);
+                new CheckOptions { ListOrphans = true }, Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
 
             Assert.Contains("data/ZZZ", report.DeletedOrphans);
             Assert.Contains("packs/p0001.7z.099", report.DeletedOrphans);
