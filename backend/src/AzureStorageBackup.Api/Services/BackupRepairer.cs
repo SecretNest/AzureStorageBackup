@@ -186,7 +186,9 @@ public sealed class BackupRepairer(
         // 碰撞检测元数据须与全新备份完全一致：直接复用该条目已记录的 length/head/tail
         // （内容未变——已经过 fullHash 校验——故这些值不变），而非在此重新计算，
         // 避免因 headBytes 配置漂移导致与同内容的其它引用元数据不一致。
-        var meta = addressing.Metadata(fullHash!, entry0.Length, entry0.HeadHash ?? "", entry0.TailHash ?? "");
+        // head/tail 为 null（老索引条目缺字段）时原样传下去：Metadata 会省略该键，
+        // 而不是写空串——写空串会让同内容被后续去重判成碰撞并误报（见 BlobAddressScheme.Metadata）。
+        var meta = addressing.Metadata(fullHash!, entry0.Length, entry0.HeadHash, entry0.TailHash);
         var newSizes = await ReplaceBlobAsync(account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, ct);
 
         // 更新全部引用版本的分卷数/尺寸（内容不变故 ref 不变）。

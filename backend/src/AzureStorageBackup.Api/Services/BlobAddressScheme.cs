@@ -34,15 +34,35 @@ public sealed class BlobAddressScheme
         ? "data/" + fullHash
         : "data/" + Hex(HMACSHA256.HashData(_key, Encoding.UTF8.GetBytes(fullHash)).AsSpan(0, 16));
 
-    /// <summary>上传时写入的碰撞检测元数据（含头/尾段 hash，抓住内容不同却 fullHash+长度 相同的残余碰撞）。</summary>
-    public IReadOnlyDictionary<string, string> Metadata(string fullHash, long length, string headHash, string tailHash) => _key is null
-        ? new Dictionary<string, string>
+    /// <summary>
+    /// 上传时写入的碰撞检测元数据（含头/尾段 hash，抓住内容不同却 fullHash+长度 相同的残余碰撞）。
+    /// <para>
+    /// <paramref name="headHash"/>/<paramref name="tailHash"/> 为 null 表示「该项未知」——老索引条目
+    /// 可能缺这两个字段（全新备份的 BuildEntries 总会填齐，故这只在修复老备份时出现）。此时必须**省略**
+    /// 受影响的键，而不是写空串：<see cref="MetadataMatches"/> 把「键缺失」当作不参与判定、把「键存在
+    /// 但值不同」当作碰撞，写空串会让同内容被判成碰撞，改用 ~N 备用地址并误报「已避让碰撞」。
+    /// </para>
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Metadata(string fullHash, long length, string? headHash, string? tailHash)
+    {
+        if (_key is null)
         {
-            ["len"] = length.ToString(CultureInfo.InvariantCulture),
-            ["head"] = headHash,
-            ["tail"] = tailHash,
+            var meta = new Dictionary<string, string>
+            {
+                ["len"] = length.ToString(CultureInfo.InvariantCulture),
+            };
+            if (headHash is not null)
+                meta["head"] = headHash;
+            if (tailHash is not null)
+                meta["tail"] = tailHash;
+            return meta;
         }
-        : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash, tailHash) };
+        // 密钥化时 v 是 fullHash|len|head|tail 合一的不透明值，无法只省其中一项：
+        // 任一项未知就整体省略 v，退化成「老 blob 无元数据」——不参与判定，而不是给出错误的判定依据。
+        return headHash is null || tailHash is null
+            ? new Dictionary<string, string>()
+            : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash, tailHash) };
+    }
 
     /// <summary>去重时判断既有 blob 的元数据是否代表同内容（老 blob 缺某项 → 该项不参与判定，向后兼容）。</summary>
     public bool MetadataMatches(IDictionary<string, string> meta, string fullHash, long length, string headHash, string tailHash)
@@ -51,10 +71,12 @@ public sealed class BlobAddressScheme
         {
             if (!meta.TryGetValue("len", out var l))
                 return true; // 老 blob 无元数据
-            if (l != length.ToString(CultureInfo.InvariantCulture)
-                || !meta.TryGetValue("head", out var h) || h != headHash)
+            if (l != length.ToString(CultureInfo.InvariantCulture))
                 return false;
-            // tail 为后加项：老 blob 无 tail 时不据此否决（未投产，实际不会遇到）。
+            // head/tail 均按「缺失即不参与判定」处理，与 Metadata 的省略语义对称：
+            // 缺的那项本就无从比对，据此否决只会把同内容误判成碰撞。
+            if (meta.TryGetValue("head", out var h) && h != headHash)
+                return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;
         }
         if (!meta.TryGetValue("v", out var v))

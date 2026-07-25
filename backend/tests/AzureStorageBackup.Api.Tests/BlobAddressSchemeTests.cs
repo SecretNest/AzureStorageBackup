@@ -70,4 +70,68 @@ public sealed class BlobAddressSchemeTests
         var s = new BlobAddressScheme("pw", Salt);
         Assert.True(s.MetadataMatches(new Dictionary<string, string>(), Hash, 1, "xxh128:aa", "xxh128:bb"));
     }
+
+    /// <summary>
+    /// F4：老索引条目缺 head/tail 时（修复器会把 null 原样传进来），必须**省略**对应的键，
+    /// 而不是写空串。<see cref="BlobAddressScheme.MetadataMatches"/> 把「键缺失」当不参与判定、
+    /// 把「键存在但值不同」当碰撞——写空串会让同内容被判成碰撞。
+    /// </summary>
+    [Fact]
+    public void Unknown_Head_Or_Tail_Is_Omitted_Not_Blanked()
+    {
+        var s = new BlobAddressScheme(null, null);
+
+        var noTail = s.Metadata(Hash, 42, "xxh128:aa", null);
+        Assert.Equal("42", noTail["len"]);
+        Assert.Equal("xxh128:aa", noTail["head"]);
+        Assert.False(noTail.ContainsKey("tail")); // 空串会让下面的判定变成「碰撞」
+
+        var noHead = s.Metadata(Hash, 42, null, "xxh128:zz");
+        Assert.False(noHead.ContainsKey("head"));
+        Assert.Equal("xxh128:zz", noHead["tail"]);
+    }
+
+    /// <summary>
+    /// F4 的实际后果：以缺 tail 的元数据写出的 blob，后续以真实 tail 去重时必须判为同内容。
+    /// 若 Metadata 写的是 tail=""，这里会返回 false，同内容被改写到 ~N 备用地址并误报「已避让碰撞」。
+    /// </summary>
+    [Fact]
+    public void Omitted_Tail_Does_Not_Look_Like_A_Collision()
+    {
+        var s = new BlobAddressScheme(null, null);
+        var written = new Dictionary<string, string>(s.Metadata(Hash, 42, "xxh128:aa", null));
+
+        Assert.True(s.MetadataMatches(written, Hash, 42, "xxh128:aa", "xxh128:real-tail")); // 同内容
+        Assert.False(s.MetadataMatches(written, Hash, 43, "xxh128:aa", "xxh128:real-tail")); // 长度仍然管用
+
+        var noHead = new Dictionary<string, string>(s.Metadata(Hash, 42, null, "xxh128:zz"));
+        Assert.True(s.MetadataMatches(noHead, Hash, 42, "xxh128:real-head", "xxh128:zz"));
+        Assert.False(s.MetadataMatches(noHead, Hash, 42, "xxh128:real-head", "xxh128:other")); // tail 仍然管用
+    }
+
+    /// <summary>
+    /// 密钥化时 v 是四项合一的不透明值，省不掉其中一项：任一项未知就整体不写 v，
+    /// 退化成「老 blob 无元数据」（不参与判定），而不是给出一个用空串算出来的错误判定依据。
+    /// </summary>
+    [Fact]
+    public void Keyed_Omits_Verifier_Entirely_When_Head_Or_Tail_Unknown()
+    {
+        var s = new BlobAddressScheme("pw", Salt);
+
+        Assert.Empty(s.Metadata(Hash, 42, "xxh128:aa", null));
+        Assert.Empty(s.Metadata(Hash, 42, null, "xxh128:zz"));
+        Assert.True(s.Metadata(Hash, 42, "xxh128:aa", "xxh128:zz").ContainsKey("v")); // 齐全时照旧
+    }
+
+    /// <summary>全新备份写出的元数据不受 F4 影响：head/tail 齐全时三个键一个不少。</summary>
+    [Fact]
+    public void Fresh_Backup_Metadata_Is_Unchanged()
+    {
+        var meta = new BlobAddressScheme(null, null).Metadata(Hash, 42, "xxh128:aa", "xxh128:zz");
+
+        Assert.Equal(3, meta.Count);
+        Assert.Equal("42", meta["len"]);
+        Assert.Equal("xxh128:aa", meta["head"]);
+        Assert.Equal("xxh128:zz", meta["tail"]);
+    }
 }
