@@ -1,6 +1,6 @@
 # Azure Storage Backup
 
-A single-user, no-authentication application that backs up local files to an Azure Storage account (Blob only).
+A single-user application that backs up local files to an Azure Storage account (Blob only). Access is open by default; set `Auth__Password` to put a password in front of the UI.
 
 ## Stack
 
