@@ -183,13 +183,32 @@ public sealed class BackupRepairer(
             return;
         }
 
-        // 碰撞检测元数据须与全新备份完全一致：直接复用该条目已记录的 length/head/tail
+        // 碰撞检测元数据须与全新备份完全一致：直接复用条目已记录的 length/head/tail
         // （内容未变——已经过 fullHash 校验——故这些值不变），而非在此重新计算，
         // 避免因 headBytes 配置漂移导致与同内容的其它引用元数据不一致。
         // head/tail 为 null（老索引条目缺字段）时原样传下去：Metadata 会省略该键，
         // 而不是写空串——写空串会让同内容被后续去重判成碰撞并误报（见 BlobAddressScheme.Metadata）。
-        var meta = addressing.Metadata(fullHash!, entry0.Length, entry0.HeadHash, entry0.TailHash);
+        //
+        // 取哪一条：refs 的先后取决于字典枚举顺序，refs[0] 可能恰是缺 head/tail 的老索引条目，
+        // 而同内容的兄弟引用其实两项齐全——照 refs[0] 走会白白丢掉手里已有的碰撞防护，
+        // 平白拉长防护退化的窗口。优先挑两项齐全的那条；一条都没有才退回 entry0
+        // （内容一致，故各引用条目的 length/head/tail 本就应当相同）。
+        var metaEntry = refs.Select(r => r.Entry)
+            .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
+        var meta = addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash);
         var newSizes = await ReplaceBlobAsync(account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, ct);
+
+        // 省略元数据 = 该对象的碰撞防护被削弱（密钥化时 v 整体缺失，等于没有防护）。
+        // 这本身是正确处置（写空串更糟），但不留痕就是不可见的退化：记一条可审计的 Warning。
+        if (opLog is not null && (metaEntry.HeadHash is null || metaEntry.TailHash is null))
+        {
+            var missing = metaEntry.HeadHash is null
+                ? (metaEntry.TailHash is null ? "head and tail" : "head")
+                : "tail";
+            await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{cc.Name}",
+                $"Collision guard degraded for {blobRef}: no index entry records the {missing} hash, " +
+                "so the repaired object was published without the omitted collision metadata.", ct, durable: true);
+        }
 
         // 更新全部引用版本的分卷数/尺寸（内容不变故 ref 不变）。
         foreach (var (vnum, e) in refs)

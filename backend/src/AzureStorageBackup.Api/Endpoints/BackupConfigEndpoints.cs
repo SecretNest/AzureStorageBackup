@@ -487,12 +487,17 @@ public static class BackupConfigEndpoints
                 // 加密对象，否则会把任意字符串当密码落库，真密码永久丢失。
                 //
                 // 这里查的是返回 JSON 里的自述标志位，而不是「解密成功」本身，看着像个洞，其实不是：
-                // 写侧只有 BackupInfoStore.WriteInfoConditionalAsync 一条路，它按 password 是否为空
+                // 写侧最终只有 BackupInfoStore.WriteInfoConditionalAsync 一条路，它按 password 是否为空
                 // 二选一地决定 blob 名（IndexBlobName / EncryptedIndexBlobName），而 Backup.Encrypted
                 // 由同一次写入的内容携带。因此经本应用写出的信息文件，标志位与所在 blob 名（即是否加密）
                 // 不可能相左：Encrypted=true 意味着这份 JSON 只能来自 .enc 那条分支，也就意味着上面这次读
-                // 确实是用提交的密码解开的。**该不变量若被打破（新增绕过 WriteInfoConditionalAsync 的写入
-                // 路径），此处必须改成以解密结果为准。**
+                // 确实是用提交的密码解开的。
+                //
+                // 「只有一条路」是可核验的，别被调用点数量迷惑：接口上另有 IBackupInfoStore.WriteInfoAsync，
+                // 且 BackupOrchestrator / BackupRepairer / RetentionCleaner 都直接调它——但它的实现体本身
+                // 就是一句 `=> WriteInfoConditionalAsync(..., ifMatch: null, ct)`（BackupInfoStore.WriteInfoAsync），
+                // 并不自己拼 blob 名。故不变量成立的充要条件是：**WriteInfoAsync 继续保持这层委托，
+                // 且不新增第三个自行决定 blob 名的写入实现**。任一条被打破，此处必须改成以解密结果为准。
                 if (!info.Value.Info.Backup.Encrypted)
                     return Results.BadRequest(new { error = "This container's backup is not encrypted; the password cannot be verified." });
             }

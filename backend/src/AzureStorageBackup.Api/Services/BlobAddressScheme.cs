@@ -75,6 +75,13 @@ public sealed class BlobAddressScheme
                 return false;
             // head/tail 均按「缺失即不参与判定」处理，与 Metadata 的省略语义对称：
             // 缺的那项本就无从比对，据此否决只会把同内容误判成碰撞。
+            //
+            // 这次放宽的实际风险面（判断爆炸半径时别再重新推一遍）：
+            // · tail 缺失只可能来自 format 1 的索引（IndexSerializer 里 tail 是 `format >= 2` 才读的后加项）——
+            //   而 format 1 **未投产**，现网不会遇到；
+            // · head 在**每个** format 下都是无条件读的，故 head 缺失（→ 上面这条 TryGetValue 落空）
+            //   在现网几乎不可达，只有人为构造/损坏的索引才到得了。
+            // 也就是说：放宽的是一条现实中打不到的分支，换来的是「Metadata 省略键」与此处判定的语义对称。
             if (meta.TryGetValue("head", out var h) && h != headHash)
                 return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;
