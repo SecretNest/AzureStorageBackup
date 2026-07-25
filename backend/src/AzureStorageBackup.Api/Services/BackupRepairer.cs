@@ -297,6 +297,10 @@ public sealed class BackupRepairer(
             var srcDir = Path.GetDirectoryName(localSource)!;
             var entry = Path.GetFileName(localSource);
             // 必须带上原密码重压，否则加密备份的对象会被静默改写成明文 7z（机密性缺陷）。
+            // 已知外观差异（F7，未修）：全新备份这里按 Options.DontCompress 逐路径推导 StoreOnly，
+            // 修复器拿不到配置的 Options（要改 RepairAsync 的公开签名才能带进来），故固定 -mx9。
+            // 只影响该对象的压缩率，内容与碰撞检测元数据一致，还原/检查不受影响。
+            // （pack 那条路径无此差异：全新备份的 CompressPackAsync 本来就是 storeOnly: false。）
             var result = await compressor.CompressAsync(
                 new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), password, VolumeBytes: volumeBytes, StoreOnly: false), ct);
             await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct, metadata);
