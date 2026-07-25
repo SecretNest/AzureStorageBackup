@@ -2,6 +2,13 @@
 
 const BASE = '/api'
 
+// 会话过期时由 App 重新挂上登录页（设计 §6）。
+let onUnauthorized: (() => void) | null = null
+
+export function setUnauthorizedHandler(handler: () => void) {
+  onUnauthorized = handler
+}
+
 export class ApiError extends Error {
   status: number
 
@@ -19,6 +26,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
 
   if (!res.ok) {
+    if (res.status === 401) onUnauthorized?.()
     const text = await res.text().catch(() => '')
     throw new ApiError(res.status, text || res.statusText)
   }
