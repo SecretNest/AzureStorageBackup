@@ -1,4 +1,3 @@
-using Azure.Storage.Blobs;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Endpoints;
 using AzureStorageBackup.Api.Services;
@@ -26,17 +25,7 @@ builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(k
 builder.Services.AddSingleton<IEncryptionService, EncryptionService>();
 builder.Services.AddSingleton<ISecretReader, SecretReader>();
 
-// --- Azure Blob Storage ---
-// 连接串来自配置 / 环境变量；未配置时回退到本地 Azurite 开发存储，保证进程可启动。
-var storageConn = builder.Configuration.GetConnectionString("AzureStorage");
-if (string.IsNullOrWhiteSpace(storageConn))
-    storageConn = builder.Configuration["Azure:Storage:ConnectionString"];
-if (string.IsNullOrWhiteSpace(storageConn))
-    storageConn = "UseDevelopmentStorage=true";
-builder.Services.AddSingleton(_ => new BlobServiceClient(storageConn));
-
 // --- 业务服务 ---
-builder.Services.AddScoped<IAzureStorageService, AzureStorageService>();
 builder.Services.AddScoped<IAccountService, AccountService>();
 builder.Services.AddSingleton<IBlobClientFactory, BlobClientFactory>();
 builder.Services.AddScoped<IContainerService, ContainerService>();
