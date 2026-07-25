@@ -87,7 +87,7 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
         var row = await db.Accounts.AsNoTracking().FirstAsync(a => a.Id == created.Id);
 
-        Assert.Equal(AzuriteKey, encryption.Decrypt(row.AccountKeyProtected));
+        Assert.Equal(AzuriteKey, TestSecrets.Reveal(encryption, row.AccountKeyProtected));
     }
 
     /// <summary>
@@ -116,6 +116,6 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
         var row = await db.Accounts.AsNoTracking().FirstAsync(a => a.Id == created.Id);
 
-        Assert.Equal("original-key-value", encryption.Decrypt(row.AccountKeyProtected));
+        Assert.Equal("original-key-value", TestSecrets.Reveal(encryption, row.AccountKeyProtected));
     }
 }

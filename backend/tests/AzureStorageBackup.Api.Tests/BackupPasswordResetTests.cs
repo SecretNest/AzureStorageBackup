@@ -133,7 +133,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
             var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
 
             var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
-            Assert.Equal(correctPassword, encryption.Decrypt(row.PasswordProtected!));
+            Assert.Equal(correctPassword, TestSecrets.Reveal(encryption, row.PasswordProtected!));
 
             // 验证是纯读：不应该在本地权威状态里留下任何痕迹。
             Assert.Empty(await db.LocalBackupStates
@@ -176,7 +176,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
             var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
 
             var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
-            Assert.Equal("original-value-untouched", encryption.Decrypt(row.PasswordProtected!));
+            Assert.Equal("original-value-untouched", TestSecrets.Reveal(encryption, row.PasswordProtected!));
 
             Assert.Empty(await db.LocalBackupStates
                 .Where(s => s.AccountId == account.Id && s.Container == container).ToListAsync());
@@ -219,7 +219,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
             var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
 
             var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
-            Assert.Equal("original-value-untouched-3", encryption.Decrypt(row.PasswordProtected!));
+            Assert.Equal("original-value-untouched-3", TestSecrets.Reveal(encryption, row.PasswordProtected!));
 
             Assert.Empty(await db.LocalBackupStates
                 .Where(s => s.AccountId == account.Id && s.Container == container).ToListAsync());

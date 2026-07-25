@@ -15,7 +15,7 @@ public class EncryptionServiceTests
         const string original = "super-secret-key==";
 
         var cipher = sut.Encrypt(original);
-        var plain = sut.Decrypt(cipher);
+        var plain = TestSecrets.Reveal(sut, cipher);
 
         Assert.Equal(original, plain);
     }
