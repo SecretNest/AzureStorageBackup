@@ -13,8 +13,13 @@ public class PathBoundaryTests : IDisposable
 
     public PathBoundaryTests()
     {
-        _base = Path.Combine(Path.GetTempPath(), "asb-boundary-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_base);
+        var raw = Path.Combine(Path.GetTempPath(), "asb-boundary-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(raw);
+        // Path.GetTempPath() 本身可能含软链（如 macOS 的 /tmp -> /private/tmp，
+        // 或被重定向的 TMPDIR）。测试里凡是拿 _base 手工拼 Path.Combine 去比对
+        // ResolveReal/Root 的输出，比的都必须是解析后的真实路径，否则在这类主机上
+        // 会假失败——而假失败最危险的后果是有人为了让它「过」去削弱 Critical 复现断言。
+        _base = PathBoundary.ResolveReal(raw)!;
     }
 
     public void Dispose()
@@ -276,6 +281,25 @@ public class PathBoundaryTests : IDisposable
     }
 
     [Fact]
+    public void Rejects_A_Relative_Symlink_Whose_Target_Passes_Through_Another_Escaping_Relative_Symlink()
+    {
+        // 绝对目标那条 Critical 复现（见上面 Rejects_A_Symlink_Whose_Target_Passes_
+        // Through_Another_Escaping_Symlink）的相对版本：x -> ../outside（相对，越界），
+        // y -> x/z（相对，字面看在界内）。旧的整串替换实现会把 y 判成 <root>/x/z（界内）；
+        // 只有重走 x 才能发现 y 实际落在 <base>/outside/z（界外）。
+        var root = Dir("nas");
+        var outside = Dir("outside");
+        Directory.CreateDirectory(Path.Combine(outside, "z"));
+        Directory.CreateSymbolicLink(Path.Combine(root, "x"), Path.Combine("..", "outside"));
+        Directory.CreateSymbolicLink(Path.Combine(root, "y"), Path.Combine("x", "z"));
+        var sut = Boundary(root);
+
+        var query = Path.Combine(root, "y");
+        Assert.Equal(Path.Combine(outside, "z"), PathBoundary.ResolveReal(query));
+        Assert.False(sut.IsInside(query));
+    }
+
+    [Fact]
     public void Rejects_A_Path_Containing_A_Null_Character_Instead_Of_Throwing()
     {
         var root = Dir("nas");
@@ -305,5 +329,25 @@ public class PathBoundaryTests : IDisposable
         // 根为 "/" 时一切绝对路径都在界内，且不能因 TrimEnd 把根削成空串而误判
         Assert.True(PathBoundary.IsWithin("/", "/"));
         Assert.True(PathBoundary.IsWithin("/", "/anything/at/all"));
+    }
+
+    [Fact]
+    public void IsWithin_Returns_False_Instead_Of_Throwing_On_A_Null_Character()
+    {
+        // F1：IsWithin 的输入是索引供数据（restore-write 按设计要用它检查
+        // Path.Combine(targetRoot, entryPath)），entryPath 来自云端、可能是恶意或
+        // 损坏数据。Path.GetFullPath 对含 \0 的路径会抛 ArgumentException——
+        // root/candidate 任一位置都必须得到干净的 false，而不是把 500 甩给调用方。
+        Assert.False(PathBoundary.IsWithin("/target\0x", "/target/a"));
+        Assert.False(PathBoundary.IsWithin("/target", "/target/a\0b"));
+    }
+
+    [Fact]
+    public void IsWithin_Returns_False_Instead_Of_Throwing_On_An_Empty_String()
+    {
+        // F1：Path.GetFullPath("") 抛 ArgumentException（"The value cannot be an
+        // empty string"）；root/candidate 任一位置为空串都必须判定越界而不是抛异常。
+        Assert.False(PathBoundary.IsWithin("", "/target/a"));
+        Assert.False(PathBoundary.IsWithin("/target", ""));
     }
 }

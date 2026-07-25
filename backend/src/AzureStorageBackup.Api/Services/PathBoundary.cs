@@ -27,13 +27,15 @@ public sealed class PathBoundary
 
         // 根自身可能是软链：必须先解析成真实路径，否则后续比较全部基于一个假地址，
         // 会把所有合法路径都误拒。
-        // 配了根却解析不出来（成环 / 组件不可读）必须**炸在启动期**：若沿用 null，
+        // 配了根却解析不出来（成环）必须**炸在启动期**：若沿用 null，
         // Enabled 会变成 false，边界静默消失、一切放行——配置错误伪装成「没配置」，
         // 是这里最坏的结果。
+        // 注：「组件不可读」不是这里的成因——.NET 的 Unix ReadLink 会吞掉 EACCES，
+        // chmod 000 的目录在 LinkTarget 上仍返回 null，被当成普通段处理，不会导致解析失败。
         _realRoot = ResolveReal(configured)
             ?? throw new InvalidOperationException(
                 $"Backup root '{configured}' could not be resolved to a real path " +
-                "(symlink cycle or unreadable component). Fix Backup__Root or the filesystem.");
+                "(symlink cycle). Fix Backup__Root or the filesystem.");
     }
 
     /// <summary>是否启用边界。未配置根时为 false，一切放行。</summary>
@@ -42,12 +44,26 @@ public sealed class PathBoundary
     /// <summary>解析后的真实根；未启用时为 null。用于错误消息。</summary>
     public string? Root => _realRoot;
 
-    /// <summary>路径是否在边界之内。未启用边界时恒为 true。</summary>
+    /// <summary>
+    /// 路径是否在边界之内。未启用边界时恒为 true。
+    /// <para>
+    /// **只接受绝对路径**：相对路径一律拒绝，而不是像 <see cref="IsWithin"/> 那样接受
+    /// 后用文档提醒调用方注意基准。原因是本方法是端点、调度器、目录浏览 API 的公共
+    /// 入口，调用方众多且分散；若放行相对路径，底层 <see cref="ResolveReal"/> 会按**进程
+    /// 当前工作目录**把它变成绝对路径再判定，一旦调用方后续真正的文件操作用了别的基准
+    /// （例如某个显式指定的目录），判定结果和实际落盘位置就会不一致，且没有任何报错
+    /// 提示这一点。与其把这条风险写进文档指望每个调用方都读到，不如在入口直接堵死这类
+    /// 输入——这里的根**只做安全过滤**，从不作为相对路径基准，拒绝相对输入是这条原则
+    /// 最直接的落地。
+    /// </para>
+    /// </summary>
     public bool IsInside(string path)
     {
         if (_realRoot is null)
             return true;
         if (string.IsNullOrWhiteSpace(path))
+            return false;
+        if (!Path.IsPathRooted(path))
             return false;
 
         var real = ResolveReal(path);
@@ -182,15 +198,45 @@ public sealed class PathBoundary
     /// <c>IsWithin(targetRoot, Path.Combine(targetRoot, entryPath))</c>，
     /// 不要把 <c>entryPath</c> 直接传进来。
     /// </para>
+    /// <para>
+    /// **不抛异常**：<c>root</c>/<c>candidate</c> 可能来自云端索引——恶意或损坏的数据。
+    /// <c>Path.GetFullPath</c> 对含 <c>\0</c> 的路径和空字符串会抛 <see cref="ArgumentException"/>，
+    /// 这里一律转成「无法规范化 = 判定越界」返回 <c>false</c>，不能让一条脏索引记录
+    /// 变成未处理异常（500）。
+    /// </para>
     /// </summary>
     public static bool IsWithin(string root, string candidate)
     {
-        var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar);
-        var full = Path.GetFullPath(candidate).TrimEnd(Path.DirectorySeparatorChar);
+        if (!TryGetFullPath(root, out var fullRoot) || !TryGetFullPath(candidate, out var full))
+            return false;
 
         if (string.Equals(full, fullRoot, StringComparison.Ordinal))
             return true;
 
         return full.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>Path.GetFullPath</c> 的不抛异常版本：\0、空字符串，以及底层可能抛出的其他
+    /// <see cref="ArgumentException"/>，一律当成「无法规范化」返回 false。
+    /// </summary>
+    private static bool TryGetFullPath(string path, out string fullPath)
+    {
+        if (string.IsNullOrEmpty(path) || path.Contains('\0'))
+        {
+            fullPath = "";
+            return false;
+        }
+
+        try
+        {
+            fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            fullPath = "";
+            return false;
+        }
     }
 }
