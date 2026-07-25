@@ -78,6 +78,41 @@ public sealed class EndpointWritePathRaceTests
             => throw new NotSupportedException();
     }
 
+    /// <summary>删配置善后步骤里的第二步：一被调用就抛取消。其余方法不该被这些用例走到。</summary>
+    private sealed class CancelsOnEvictIndexCache : ILocalIndexCache
+    {
+        public Task<VersionIndex> ReadAsync(
+            Account account, string container, int version, long identityTicks,
+            string indexBlob, string? password, CancellationToken ct = default) => throw new NotSupportedException();
+
+        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
+            => throw new OperationCanceledException();
+    }
+
+    /// <summary>删配置善后步骤里的第三步：只记录自己有没有被调用过。</summary>
+    private sealed class RecordingStateStore : ILocalBackupStateStore
+    {
+        public bool Removed { get; private set; }
+
+        public Task<(byte[] InfoBytes, string ETag)?> TryGetAsync(int accountId, string container, CancellationToken ct = default)
+            => Task.FromResult<(byte[], string)?>(null);
+
+        public Task PutAsync(int accountId, string container, byte[] infoBytes, string etag, CancellationToken ct = default)
+            => Task.CompletedTask;
+
+        public Task RemoveAsync(int accountId, string container, CancellationToken ct = default)
+        {
+            Removed = true;
+            return Task.CompletedTask;
+        }
+    }
+
     private static BackupInfoFile EncryptedInfo() => new()
     {
         Backup = new BackupMeta
@@ -240,5 +275,73 @@ public sealed class EndpointWritePathRaceTests
         Assert.Equal(BackupStatus.Normal, row.Status);
         Assert.Null(row.LastError);
         Assert.Null(row.LastErrorAt);
+    }
+
+    /// <summary>
+    /// F3 的第三处：POST /api/backup-configs/import 的 catch 把「读信息文件失败」一律报成
+    /// 400「密码不对？」。取消（客户端断开 / 进程关停）不是密码错——把它伪装成用户错误，用户会去
+    /// 反复重输一个本来就正确的密码。修复前 catch (Exception) 会吞掉它。
+    /// </summary>
+    [Fact]
+    public async Task Import_Does_Not_Swallow_Cancellation_As_A_Wrong_Password()
+    {
+        using var factory = new StubbedFactory(services =>
+        {
+            services.RemoveAll<IBackupInfoStore>();
+            services.AddScoped<IBackupInfoStore>(_ => new StubInfoStore(
+                () => throw new OperationCanceledException()));
+        });
+        var client = factory.CreateClient();
+
+        var account = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount("cancel-import")))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+        Assert.NotNull(account);
+
+        var res = await client.PostAsJsonAsync(
+            "/api/backup-configs/import", new ImportRequest(account!.Id, "import-container", "the-real-password"));
+        var body = await res.Content.ReadAsStringAsync();
+
+        // 取消一路上抛（宿主渲染成 500），不是 400「密码不对？」。
+        Assert.NotEqual(HttpStatusCode.BadRequest, res.StatusCode);
+        Assert.DoesNotContain("wrong password", body, StringComparison.OrdinalIgnoreCase);
+
+        // 也没有半路建出配置行来。
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await db.BackupConfigs.AsNoTracking().AnyAsync(c => c.ContainerName == "import-container"));
+    }
+
+    /// <summary>
+    /// F3 的第四处：DELETE /api/backup-configs/{id} 的善后步骤走 BestEffort（吞异常记 Warning，
+    /// 一步失败不阻断其余）。取消是例外——它不是「这一步失败了」，而是整条请求该停下；吞掉会给
+    /// 每个剩余步骤各记一条误导性 Warning，还把一次被取消的请求报成 204 成功。
+    /// <para>修复前（catch (Exception) 不排除取消）：第二步被吞掉，第三步照常执行，端点回 204。</para>
+    /// </summary>
+    [Fact]
+    public async Task Delete_Does_Not_Swallow_Cancellation_In_The_Best_Effort_Cleanup()
+    {
+        var stateStore = new RecordingStateStore();
+        using var factory = new StubbedFactory(services =>
+        {
+            services.RemoveAll<ILocalIndexCache>();
+            services.AddScoped<ILocalIndexCache, CancelsOnEvictIndexCache>();
+            services.RemoveAll<ILocalBackupStateStore>();
+            services.AddScoped<ILocalBackupStateStore>(_ => stateStore);
+        });
+        var client = factory.CreateClient();
+
+        var account = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount("cancel-delete")))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+        var config = await (await client.PostAsJsonAsync("/api/backup-configs", SampleConfig(account!.Id, "pw")))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.NotNull(config);
+
+        var res = await client.DeleteAsync($"/api/backup-configs/{config!.Id}");
+
+        // 取消原样上抛（宿主渲染成 500），不是 204「删干净了」。
+        Assert.NotEqual(HttpStatusCode.NoContent, res.StatusCode);
+        // 而且**后续步骤没有继续跑**——这正是「吞掉取消」与「放行取消」的可观测分界：
+        // 吞掉的话第三步（清本地权威状态）会照常执行。
+        Assert.False(stateStore.Removed);
     }
 }

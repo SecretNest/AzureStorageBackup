@@ -215,7 +215,10 @@ public sealed class BlobAddressSchemeTests
     {
         var written = new Dictionary<string, string>(new BlobAddressScheme("pw", Salt).Metadata(Hash, 42, null, null));
 
-        Assert.DoesNotContain("42", written["v1"], StringComparison.Ordinal); // 长度不以明文形式出现
+        // 是个定长 HMAC-SHA256 摘要，不是可被旁观者直接读出的长度/hash。
+        // （刻意不写 DoesNotContain("42")：摘要是随机十六进制，偶尔真会含 "42" 子串，那种断言会随机变红。）
+        Assert.Equal(64, written["v1"].Length);
+        Assert.True(written["v1"].All(char.IsAsciiHexDigitLower));
         Assert.DoesNotContain(Hash, written["v1"], StringComparison.Ordinal);
         Assert.NotEqual(
             written["v1"],
