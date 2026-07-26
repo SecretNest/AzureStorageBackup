@@ -17,32 +17,32 @@ export function BackupsPage() {
         setBackups(b)
         setLoaded(true)
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false))
   }
 
   return (
     <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Backups</h1>
         <button type="button" onClick={refresh} disabled={loading}>
           {loading ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
-      <p style={{ color: '#666' }}>
+      <p className="text-muted">
         Discovered from your accounts&apos; containers. Not auto-refreshed.
       </p>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
       {!loaded ? (
-        <p>Click Refresh to discover backups.</p>
+        <p className="empty-state">Click Refresh to discover backups.</p>
       ) : backups.length === 0 ? (
-        <p>No backups found.</p>
+        <p className="empty-state">No backups found.</p>
       ) : (
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table>
           <thead>
-            <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+            <tr>
               <th>Account</th>
               <th>Container</th>
               <th>Type</th>
@@ -50,7 +50,7 @@ export function BackupsPage() {
           </thead>
           <tbody>
             {backups.map((b) => (
-              <tr key={backupKey(b)} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={backupKey(b)}>
                 <td>{b.accountName}</td>
                 <td>{b.containerName}</td>
                 <td>{backupPresenceLabels[b.presence] ?? 'Unknown'}</td>

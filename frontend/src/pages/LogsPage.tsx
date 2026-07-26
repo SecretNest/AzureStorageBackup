@@ -2,8 +2,6 @@ import { useEffect, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
 import { systemApi } from '../api/system'
 
-const levelColor: Record<number, string> = { 0: '#555', 1: '#b8860b', 2: 'crimson' }
-
 export function LogsPage() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [minLevel, setMinLevel] = useState<number | ''>('')
@@ -24,7 +22,7 @@ export function LogsPage() {
         limit: 300,
       })
       .then(setLogs)
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   useEffect(load, [minLevel, source, from, to])
 
@@ -39,7 +37,7 @@ export function LogsPage() {
       await logsApi.clear()
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -54,16 +52,18 @@ export function LogsPage() {
       await logsApi.purgeBefore(new Date(to).toISOString())
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
   return (
     <section>
-      <h1>Logs</h1>
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      <div className="page-header">
+        <h1>Logs</h1>
+      </div>
+      {error && <p className="text-danger">{error}</p>}
 
-      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '0.8rem' }}>
+      <div className="toolbar">
         <label>
           Level:{' '}
           <select value={minLevel} onChange={(e) => setMinLevel(e.target.value === '' ? '' : Number(e.target.value))}>
@@ -76,7 +76,12 @@ export function LogsPage() {
         </label>
         <label>
           Source:{' '}
-          <input value={source} placeholder="e.g. backup:photos" onChange={(e) => setSource(e.target.value)} />
+          <input
+            className="w-md"
+            value={source}
+            placeholder="e.g. backup:photos"
+            onChange={(e) => setSource(e.target.value)}
+          />
         </label>
         <label>
           From: <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} />
@@ -95,9 +100,9 @@ export function LogsPage() {
         </button>
       </div>
 
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <table>
         <thead>
-          <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+          <tr>
             <th>Time</th>
             <th>Level</th>
             <th>Source</th>
@@ -107,20 +112,26 @@ export function LogsPage() {
         <tbody>
           {logs.length === 0 ? (
             <tr>
-              <td colSpan={4} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={4} className="empty-state">
                 No log entries.
               </td>
             </tr>
           ) : (
             logs.map((l) => (
-              <tr key={l.id} style={{ borderBottom: '1px solid #eee' }}>
-                <td style={{ whiteSpace: 'nowrap', fontSize: '0.8rem' }}>
+              <tr key={l.id}>
+                <td className="text-faint" style={{ whiteSpace: 'nowrap' }}>
                   {new Date(l.timestamp).toLocaleString()}
                 </td>
-                <td style={{ color: levelColor[l.level], fontWeight: l.level === 2 ? 'bold' : 'normal' }}>
-                  {levelLabels[l.level]}
+                <td>
+                  <span className={
+                    l.level === 2 ? 'badge badge-danger'
+                    : l.level === 1 ? 'badge badge-warn'
+                    : 'badge'
+                  }>
+                    {levelLabels[l.level]}
+                  </span>
                 </td>
-                <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{l.source}</td>
+                <td className="mono text-faint">{l.source}</td>
                 <td>{l.message}</td>
               </tr>
             ))
@@ -128,10 +139,10 @@ export function LogsPage() {
         </tbody>
       </table>
 
-      <h2 style={{ marginTop: '2rem' }}>System</h2>
-      <p style={{ color: '#666' }}>Version: {version || '…'}</p>
-      <p style={{ color: '#666' }}>Temp directories (map these as docker volumes):</p>
-      <ul style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+      <h2>System</h2>
+      <p className="text-muted">Version: {version || '…'}</p>
+      <p className="text-muted">Temp directories (map these as docker volumes):</p>
+      <ul className="mono text-faint">
         {Object.entries(paths).map(([k, v]) => (
           <li key={k}>
             {k}: {v}
