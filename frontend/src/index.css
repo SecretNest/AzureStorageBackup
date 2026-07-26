@@ -461,8 +461,12 @@ tbody tr:hover {
   color: var(--danger);
   border-color: var(--danger-border);
 }
+/* color 必须在这里重申：.btn-ghost:hover 排在前面且设了 color，
+   同特异度下不写就会被它盖掉——而 hover 正是即将点下删除的那一刻，
+   最不该丢掉红色警示的时候。 */
 .btn-danger:hover:not(:disabled) {
   background: var(--danger-bg);
+  color: var(--danger);
 }
 
 /* ── Control widths ───────────────────────────────────────────────────────── */
