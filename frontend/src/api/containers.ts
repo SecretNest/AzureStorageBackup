@@ -27,5 +27,25 @@ export const containersApi = {
   create: (accountId: number, name: string) =>
     api.post<{ name: string }>(`/accounts/${accountId}/containers`, { name }),
   remove: (accountId: number, name: string) =>
-    api.del(`/accounts/${accountId}/containers/${name}`),
+    api.del(`/accounts/${accountId}/containers/${encodeURIComponent(name)}`),
+}
+
+/**
+ * Azure container 命名规则。与后端 Services/ContainerName.cs 保持等价——
+ * 后端是权威，这份存在只是为了在敲键时就给出反馈，而不是等一趟网络往返。
+ * 改动其中一处务必同步另一处。
+ */
+export const containerNameRule =
+  '3–63 characters; lowercase letters, digits, and hyphens only; must begin and end with a letter or digit; no consecutive hyphens.'
+
+export function validateContainerName(name: string): string | null {
+  if (name.length < 3 || name.length > 63)
+    return 'Container name must be between 3 and 63 characters long.'
+  if (!/^[a-z0-9-]+$/.test(name))
+    return 'Container name may only contain lowercase letters, digits, and hyphens.'
+  if (name.startsWith('-') || name.endsWith('-'))
+    return 'Container name must begin and end with a letter or a digit.'
+  if (name.includes('--'))
+    return 'Container name may not contain consecutive hyphens.'
+  return null
 }

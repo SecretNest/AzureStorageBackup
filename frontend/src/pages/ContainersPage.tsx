@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { containersApi, backupPresenceLabels, infoFileName, type ContainerInfo } from '../api/containers'
+import {
+  containersApi,
+  backupPresenceLabels,
+  infoFileName,
+  validateContainerName,
+  containerNameRule,
+  type ContainerInfo,
+} from '../api/containers'
 import type { Account } from '../api/accounts'
 
 export function ContainersPage({ account, onBack }: { account: Account; onBack: () => void }) {
@@ -14,20 +21,23 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
     containersApi
       .list(account.id)
       .then(setContainers)
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false))
   }, [account.id])
 
   useEffect(load, [load])
 
+  const trimmedName = newName.trim()
+  const nameError = trimmedName ? validateContainerName(trimmedName) : null
+
   const create = async () => {
-    if (!newName.trim()) return
+    if (!trimmedName || nameError) return
     try {
-      await containersApi.create(account.id, newName.trim())
+      await containersApi.create(account.id, trimmedName)
       setNewName('')
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -37,7 +47,7 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
       await containersApi.remove(account.id, name)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -62,9 +72,10 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
         />{' '}
-        <button type="button" onClick={create}>
+        <button type="button" onClick={create} disabled={!trimmedName || !!nameError}>
           Create Container
         </button>
+        <div>{nameError ?? containerNameRule}</div>
       </div>
 
       {loading ? (
