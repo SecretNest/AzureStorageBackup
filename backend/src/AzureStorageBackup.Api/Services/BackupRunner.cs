@@ -14,6 +14,12 @@ public sealed class BackupRunState
     public BackupProgress? Progress { get; set; }
     public int? Version { get; set; }
     public string? Error { get; set; }
+
+    /// <summary>
+    /// 内部机制，不进 HTTP 契约：该次运行到达终态（Completed/Failed）时触发一次。
+    /// 供 RunTrackedAsync 的短路分支等待，不给前端轮询用。
+    /// </summary>
+    internal TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 }
 
 public sealed record BackupRunResponse(string Status, BackupProgress? Progress, int? Version, string? Error)
@@ -57,13 +63,29 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     public async Task<BackupRunState> RunTrackedAsync(int configId, CancellationToken ct)
     {
         BackupRunState state;
+        bool alreadyRunning;
         lock (_lock)
         {
             if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
-                return existing;
+            {
+                state = existing;
+                alreadyRunning = true;
+            }
+            else
+            {
+                state = new BackupRunState();
+                _runs[configId] = state;
+                alreadyRunning = false;
+            }
+        }
 
-            state = new BackupRunState();
-            _runs[configId] = state;
+        if (alreadyRunning)
+        {
+            // 调用方约定本方法只返回终态：若原样返回这个仍是 Running 的 state，
+            // 调度器「Status == Failed 才算失败」的判断会把这次根本没跑的备份
+            // 当成静默成功。等它跑到终态（Completed/Failed）再返回。
+            await state.Completion.Task;
+            return state;
         }
 
         await RunCoreAsync(configId, state, ct);
@@ -94,6 +116,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         {
             state.Error = ex.Message;
             state.Status = RunStatus.Failed;
+            state.Completion.TrySetResult();
             return;
         }
 
@@ -102,6 +125,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         {
             state.Error = "This backup is busy with another operation.";
             state.Status = RunStatus.Failed;
+            state.Completion.TrySetResult();
             return;
         }
 
@@ -137,6 +161,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.Status = RunStatus.Completed;
 
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());
+            state.Completion.TrySetResult();
         }
         catch (Exception ex)
         {
@@ -146,6 +171,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             using var scope = scopes.CreateScope();
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<BackupRunner>>());
+            state.Completion.TrySetResult();
         }
     }
 

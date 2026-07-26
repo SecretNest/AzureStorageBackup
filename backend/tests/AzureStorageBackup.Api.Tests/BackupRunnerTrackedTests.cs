@@ -88,6 +88,21 @@ public class BackupRunnerTrackedTests(TestWebAppFactory factory) : IClassFixture
     }
 
     [Fact]
+    public async Task RunTrackedAsync_Waits_For_A_Concurrent_Start_To_Reach_A_Terminal_State()
+    {
+        var (_, configId, _) = await SeedAsync();
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+
+        // Start 在拿到忙碌锁之前，_runs 里已经登记了一个 Status == Running 的 state。
+        // 这里紧接着调用 RunTrackedAsync，命中的正是那个窗口：它必须等到该 state
+        // 跑到终态再返回，而不是把仍在 Running 的旧 state 原样递给调用方。
+        runner.Start(configId);
+        var state = await runner.RunTrackedAsync(configId, CancellationToken.None);
+
+        Assert.NotEqual(RunStatus.Running, state.Status);
+    }
+
+    [Fact]
     public async Task Start_Still_Acquires_The_Busy_Lock()
     {
         var (accountId, configId, container) = await SeedAsync();
