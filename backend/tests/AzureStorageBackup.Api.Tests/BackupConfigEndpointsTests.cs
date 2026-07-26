@@ -290,6 +290,65 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal("Idle", afterRelease!.Activity);
     }
 
+    // 前端 api/backupConfigs.ts 里的 BackupActivity 联合类型（'Idle' | 'BackingUp' | 'Restoring' |
+    // 'Checking' | 'Repairing' | 'CleaningUp'）镜像的正是这六个字符串，但那边没有对应的测试。
+    // 谁在后端改动了其中一个字面量，两边各自都还能编译通过——前端只会悄悄地不再轮询那一类。
+    // 这里逐一逼出 DeriveActivity 的六条分支（BackingUp/Checking/CleaningUp/Repairing 走
+    // BackupBusyTracker 的兜底渠道，与 TaskDispatcher.cs、BackupRunner.cs、RepairRunner.cs
+    // 里真实使用的字面量同源；Restoring 是唯一不占忙碌锁的一个——见 RestoreRunner.cs 顶部
+    // 注释，只能靠反射注入它自己的运行态来触发），断在字面量上，改名会在这里响亮地炸掉(Fix 8)。
+    [Fact]
+    public async Task Activity_Strings_Match_The_Frontend_BackupActivity_Union()
+    {
+        var accountId = await CreateAccountAsync("activity-strings");
+        var req = SampleRequest("activity-strings", accountId) with { ContainerName = "activity-strings-container" };
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", req))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        async Task<string> ActivityAsync() =>
+            (await (await _client.GetAsync($"/api/backup-configs/{created!.Id}")).Content.ReadFromJsonAsync<BackupConfigResponse>())!.Activity;
+
+        Assert.Equal("Idle", await ActivityAsync());
+
+        var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
+
+        // BackingUp/Checking/CleaningUp/Repairing：DeriveActivity 在没有对应 Runner 记录时
+        // 兜底读 BackupBusyTracker.CurrentActivity，这几个字面量正是 TaskDispatcher.cs 的
+        // switch 和 BackupRunner.cs / RepairRunner.cs 里 TryAcquire 调用真实传入的那几个。
+        foreach (var label in new[] { "BackingUp", "Checking", "CleaningUp", "Repairing" })
+        {
+            Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName, label));
+            try
+            {
+                Assert.Equal(label, await ActivityAsync());
+            }
+            finally
+            {
+                busy.Release(created.AccountId, created.ContainerName);
+            }
+        }
+
+        Assert.Equal("Idle", await ActivityAsync());
+
+        // Restoring 不占忙碌锁（RestoreRunner.cs 顶部注释：还原可与备份并行），DeriveActivity
+        // 只看 RestoreRunner 自己的运行态——直接反射进它的私有字典模拟一次"正在跑"的还原，
+        // 避免为了触发这一个分支去真的跑一次还原、依赖 Azure/Azurite 的时序。
+        var restoreRunner = factory.Services.GetRequiredService<RestoreRunner>();
+        var runsField = typeof(RestoreRunner).GetField("_runs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var runs = (Dictionary<int, RestoreRunState>)runsField.GetValue(restoreRunner)!;
+        runs[created!.Id] = new RestoreRunState { Status = RunStatus.Running };
+        try
+        {
+            Assert.Equal("Restoring", await ActivityAsync());
+        }
+        finally
+        {
+            runs.Remove(created.Id);
+        }
+
+        Assert.Equal("Idle", await ActivityAsync());
+    }
+
     [Fact]
     public async Task Failed_Operation_Sets_Error_And_Reset_Status_Clears_It()
     {

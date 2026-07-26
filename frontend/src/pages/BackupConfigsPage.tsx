@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
@@ -19,6 +19,7 @@ import {
   tierLabels,
   retentionModeLabels,
   backupStageLabels,
+  type BackupActivity,
   type BackupConfig,
   type BackupConfigInput,
   type BackupRun,
@@ -81,6 +82,7 @@ export function BackupConfigsPage() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
+  const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
@@ -105,6 +107,143 @@ export function BackupConfigsPage() {
   const [containerListError, setContainerListError] = useState<string | null>(null)
   const [newContainer, setNewContainer] = useState(false)
   useEffect(load, [])
+
+  // 供下面几个 effect 的 tick/cleanup 读取「当下最新」的 configs/restores，而不必把它们
+  // 放进依赖数组去触发 interval 重建——渲染期间直接赋值，提交后 effect 看到的必是最新值。
+  const configsRef = useRef(configs)
+  configsRef.current = configs
+  const restoresRef = useRef(restores)
+  restoresRef.current = restores
+
+  // 列表每 5 秒刷一次：纯本地查询（配置行 + 内存中的 activity），不连云。
+  // 这是无人触发的后台刷新：一次网络抖动不该弹一条错误横幅——它可能盖掉用户正在看的
+  // 另一条错误，且用户对这次刷新没有可做的动作。下一拍会自然重试(Fix 7)。
+  useEffect(() => {
+    const t = setInterval(() => {
+      backupConfigsApi.list().then(setConfigs).catch(() => {})
+    }, 5000)
+    return () => clearInterval(t)
+  }, [])
+
+  // 有活跃项时，只对活跃的那几份、且只拉该 activity 对应的那一个端点。
+  // 全空闲时不发这些请求。取代闭包里的循环：状态来自服务端，因此刷新页面、换标签页、
+  // 或备份由定时任务发起，看到的都一样。
+  // 配置列表每次 load() 返回时都用新数组引用替换，导致这个 effect 每 5 秒重建一次
+  // 及至更早的用户动作。改用派生的 activeKey（只包含活跃配置的 id 和 activity），
+  // 仅在实际有活动的配置改变时才重建 interval。
+  const activeKey = configs
+    .filter((c) => c.activity !== 'Idle')
+    .map((c) => `${c.id}:${c.activity}`)
+    .join(',')
+
+  useEffect(() => {
+    if (!activeKey) return
+
+    let cancelled = false
+    // 从 activeKey 字符串解析出 id 和 activity，避免依赖 configs 数组引用
+    const activeList = activeKey.split(',').map((item) => {
+      const [id, activity] = item.split(':')
+      // 断言回 BackupActivity：不断言的话 activity 是 string，下面几处与字面量的比较
+      // 就不再受编译器检查，写错一个字母会静默地不轮询那一类，而不是编译失败。
+      return { id: Number(id), activity: activity as BackupActivity }
+    })
+
+    // tick 本身是 async 的：一拍还没跑完（比如状态请求撞上 7z 正在吃满 CPU 那阵、比 1 秒慢）
+    // 就不该再叠加下一拍——叠起来的请求会顶着浏览器同源并发上限排队，连 5 秒的列表刷新都会
+    // 被一起拖住，页面恰恰在最需要更新时停摆(Fix 6)。
+    let inFlight = false
+
+    const tick = async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        await Promise.all(
+          activeList.map(async (item) => {
+            try {
+              const tasks: Promise<void>[] = []
+              if (item.activity === 'BackingUp') {
+                tasks.push(
+                  backupConfigsApi.runStatus(item.id).then((s) => {
+                    if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
+                  }),
+                )
+                // activity 是单值：并发还原时会被 BackingUp 盖住(见 RestoreRunner.cs 顶部注释——
+                // 还原不占忙碌锁，允许与备份并行)。本地若还记得这个配置的还原仍在跑，就不管
+                // activity 怎么说，独立地把还原状态也拉一次，否则并发结束时看不到还原的终态(Fix 2)。
+                if (restoresRef.current[item.id]?.status === 'Running') {
+                  tasks.push(
+                    backupConfigsApi.restoreStatus(item.id).then((s) => {
+                      if (!cancelled) setRestores((r) => ({ ...r, [item.id]: s }))
+                    }),
+                  )
+                }
+              } else if (item.activity === 'Restoring') {
+                tasks.push(
+                  backupConfigsApi.restoreStatus(item.id).then((s) => {
+                    if (!cancelled) setRestores((r) => ({ ...r, [item.id]: s }))
+                  }),
+                )
+              } else if (item.activity === 'Repairing') {
+                tasks.push(
+                  backupConfigsApi.repairStatus(item.id).then((s) => {
+                    if (!cancelled) setRepairs((r) => ({ ...r, [item.id]: s }))
+                  }),
+                )
+              }
+              // Checking 与 CleaningUp 没有状态端点：只显示徽章，不拉进度。
+              await Promise.all(tasks)
+            } catch {
+              // 单次轮询失败不值得打断整页，下一拍会重试。
+            }
+          }),
+        )
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const t = setInterval(tick, 1000)
+    void tick()
+    return () => {
+      cancelled = true
+      clearInterval(t)
+
+      // 这个 1 秒 tick 和上面 5 秒的列表刷新相位互相独立：如果恰好是后者把某配置的 activity
+      // 翻成 Idle、配置退出活跃集合，这个 cleanup 会先于下一拍跑到，状态就停在了最后一次
+      // 非终态上——按钮已经可点了，这一行却还显示着"Uploading 97%"。给每个真正离场
+      // （不再出现在最新 configs 里的活跃配置）的配置补一次收尾请求，而不是简单地取消了事(Fix 3)。
+      // 注意这里故意不检查 cancelled：那个标志只用来防止过期的周期性 tick 写状态，
+      // 收尾请求是离场处理本身，必须把结果写进去。
+      const stillActiveIds = new Set(configsRef.current.filter((c) => c.activity !== 'Idle').map((c) => c.id))
+      activeList
+        .filter((item) => !stillActiveIds.has(item.id))
+        .forEach((item) => {
+          if (item.activity === 'BackingUp') {
+            void backupConfigsApi
+              .runStatus(item.id)
+              .then((s) => setRuns((r) => ({ ...r, [item.id]: s })))
+              .catch(() => {})
+            if (restoresRef.current[item.id]?.status === 'Running') {
+              void backupConfigsApi
+                .restoreStatus(item.id)
+                .then((s) => setRestores((r) => ({ ...r, [item.id]: s })))
+                .catch(() => {})
+            }
+          } else if (item.activity === 'Restoring') {
+            void backupConfigsApi
+              .restoreStatus(item.id)
+              .then((s) => setRestores((r) => ({ ...r, [item.id]: s })))
+              .catch(() => {})
+          } else if (item.activity === 'Repairing') {
+            void backupConfigsApi
+              .repairStatus(item.id)
+              .then((s) => setRepairs((r) => ({ ...r, [item.id]: s })))
+              .catch(() => {})
+          }
+        })
+    }
+  }, [activeKey])
+
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
@@ -255,28 +394,22 @@ export function BackupConfigsPage() {
     }
   }
 
+  // 只负责发起——轮询交给上面按 activity 派发的统一机制（服务端是唯一真相源）。
   const run = async (c: BackupConfig) => {
     setError(null)
     try {
-      let state = await backupConfigsApi.run(c.id)
+      const state = await backupConfigsApi.run(c.id)
       setRuns((r) => ({ ...r, [c.id]: state }))
-      while (state.status === 'Running') {
-        await delay(1000)
-        state = await backupConfigsApi.runStatus(c.id)
-        setRuns((r) => ({ ...r, [c.id]: state }))
-      }
+      load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  const pollRestore = async (id: number, state: RestoreRun) => {
+  // 同上：只写入首个状态，后续进度由统一轮询接手。
+  const pollRestore = (id: number, state: RestoreRun) => {
     setRestores((r) => ({ ...r, [id]: state }))
-    while (state.status === 'Running') {
-      await delay(1000)
-      state = await backupConfigsApi.restoreStatus(id)
-      setRestores((r) => ({ ...r, [id]: state }))
-    }
+    load()
   }
 
   const [importing, setImporting] = useState(false)
@@ -402,19 +535,22 @@ export function BackupConfigsPage() {
                     type="button"
                     className="btn-ghost"
                     onClick={() => run(c)}
-                    disabled={keyringLost || runs[c.id]?.status === 'Running'}
+                    disabled={keyringLost || c.activity !== 'Idle'}
                     title={keyringLostHint}
                   >
-                    {runs[c.id]?.status === 'Running' ? 'Running…' : 'Run'}
+                    {c.activity === 'BackingUp' ? 'Backing up…' : 'Backup'}
                   </button>{' '}
                   <button
                     type="button"
                     className="btn-ghost"
                     onClick={() => setRestoreModal(c)}
-                    disabled={keyringLost || restores[c.id]?.status === 'Running'}
+                    // 还原不因为其它 activity 被禁用：后端刻意允许还原与备份/检查/修复并发执行且
+                    // 不占忙碌锁（见 RestoreRunner.cs 顶部注释），只有真的已经有一个还原在跑
+                    // （Restoring）时这个按钮才该变灰——否则一整晚的计划备份期间它会灰一整夜。
+                    disabled={keyringLost || c.activity === 'Restoring'}
                     title={keyringLostHint}
                   >
-                    {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore…'}
+                    {c.activity === 'Restoring' ? 'Restoring…' : 'Restore…'}
                   </button>{' '}
                   <button
                     type="button"
@@ -433,6 +569,7 @@ export function BackupConfigsPage() {
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
                   {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
+                  {repairs[c.id] && <RepairStatus run={repairs[c.id]} />}
                 </td>
               </tr>
             ))
@@ -903,6 +1040,15 @@ function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () =>
     )
   }
   return <span className="text-faint">—</span>
+}
+
+// 与 RunStatus 同形的三态展示；RepairRun 没有 version/progress 字段（见 api/backupConfigs.ts），故没有对应显示。
+function RepairStatus({ run }: { run: RepairRun }) {
+  if (run.status === 'Failed')
+    return <div className="text-danger">Repair failed: {run.error}</div>
+  if (run.status === 'Completed')
+    return <div className="text-ok">Repair completed</div>
+  return <div className="text-faint">Repairing…</div>
 }
 
 function RestoreStatus({ run }: { run: RestoreRun }) {
