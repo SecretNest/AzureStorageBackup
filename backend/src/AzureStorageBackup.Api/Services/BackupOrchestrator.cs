@@ -53,7 +53,7 @@ public sealed record BackupRequest
 }
 
 /// <summary>一次备份执行结果。</summary>
-public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes);
+public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes, int UnreadableFiles);
 
 /// <summary>备份管线阶段。</summary>
 public enum BackupStage
@@ -199,6 +199,11 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
         var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
 
+        // 读不开的文件既不算变更也不算删除，索引阶段会静默沿用旧条目——但操作员必须被告知。
+        // 放在 Plan 之前、diff 之后：这条路径每一轮都会执行，不依赖"是否有变更文件"这个后续分支，
+        // 否则一次全程读不开的备份会一条告警都不产生（信号最弱的最坏情形）。
+        await RecordUnreadableWarningsAsync(request, diff, ct);
+
         // 4. Plan（对 Added/Modified 决定 blob/pack）
         var changed = diff.Changes
             .Where(c => c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null)
@@ -278,7 +283,21 @@ public sealed class BackupOrchestrator(
         }, info, ct);
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes);
+        return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes,
+            diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable));
+    }
+
+    /// <summary>每个读不开的文件各记一条 Warning：源头一致沿用备份来源，消息保留系统给出的原因原文
+    /// （被占用/权限不足/设备读错误需要不同处理，压成一句「无法读取」等于让操作员无从下手）。
+    /// 同一文件连续多轮仍读不开时，每轮都要再报一次——静默会让操作员误以为问题自己好了（决策 8）。</summary>
+    private async Task RecordUnreadableWarningsAsync(BackupRequest request, DiffResult diff, CancellationToken ct)
+    {
+        if (opLog is null)
+            return;
+        var source = $"backup:{request.Account.Id}/{request.Container}";
+        foreach (var c in diff.Changes.Where(c => c.Kind == ChangeKind.Unreadable))
+            await opLog.AppendAsync(OperationLogLevel.Warning, source,
+                $"File unreadable, skipped: {c.Path} — {c.UnreadableReason}", ct, durable: true);
     }
 
     private async Task UploadBlobsAsync(
