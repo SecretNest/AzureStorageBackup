@@ -116,24 +116,37 @@ export function BackupConfigsPage() {
   // 有活跃项时，只对活跃的那几份、且只拉该 activity 对应的那一个端点。
   // 全空闲时不发这些请求。取代闭包里的循环：状态来自服务端，因此刷新页面、换标签页、
   // 或备份由定时任务发起，看到的都一样。
+  // 配置列表每次 load() 返回时都用新数组引用替换，导致这个 effect 每 5 秒重建一次
+  // 及至更早的用户动作。改用派生的 activeKey（只包含活跃配置的 id 和 activity），
+  // 仅在实际有活动的配置改变时才重建 interval。
+  const activeKey = configs
+    .filter((c) => c.activity !== 'Idle')
+    .map((c) => `${c.id}:${c.activity}`)
+    .join(',')
+
   useEffect(() => {
-    const active = configs.filter((c) => c.activity !== 'Idle')
-    if (active.length === 0) return
+    if (!activeKey) return
 
     let cancelled = false
+    // 从 activeKey 字符串解析出 id 和 activity，避免依赖 configs 数组引用
+    const activeList = activeKey.split(',').map((item) => {
+      const [id, activity] = item.split(':')
+      return { id: Number(id), activity }
+    })
+
     const tick = async () => {
       await Promise.all(
-        active.map(async (c) => {
+        activeList.map(async (item) => {
           try {
-            if (c.activity === 'BackingUp') {
-              const s = await backupConfigsApi.runStatus(c.id)
-              if (!cancelled) setRuns((r) => ({ ...r, [c.id]: s }))
-            } else if (c.activity === 'Restoring') {
-              const s = await backupConfigsApi.restoreStatus(c.id)
-              if (!cancelled) setRestores((r) => ({ ...r, [c.id]: s }))
-            } else if (c.activity === 'Repairing') {
-              const s = await backupConfigsApi.repairStatus(c.id)
-              if (!cancelled) setRepairs((r) => ({ ...r, [c.id]: s }))
+            if (item.activity === 'BackingUp') {
+              const s = await backupConfigsApi.runStatus(item.id)
+              if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
+            } else if (item.activity === 'Restoring') {
+              const s = await backupConfigsApi.restoreStatus(item.id)
+              if (!cancelled) setRestores((r) => ({ ...r, [item.id]: s }))
+            } else if (item.activity === 'Repairing') {
+              const s = await backupConfigsApi.repairStatus(item.id)
+              if (!cancelled) setRepairs((r) => ({ ...r, [item.id]: s }))
             }
             // Checking 与 CleaningUp 没有状态端点：只显示徽章，不拉进度。
           } catch {
@@ -149,7 +162,7 @@ export function BackupConfigsPage() {
       cancelled = true
       clearInterval(t)
     }
-  }, [configs])
+  }, [activeKey])
 
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
