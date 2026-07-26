@@ -19,14 +19,19 @@ public static class ContainerEndpoints
     /// </summary>
     private static IResult MapAzureFailure(RequestFailedException ex)
     {
-        // 4xx 是调用方能修的（名字非法、无权限、已被他人占用），原样透传状态码。
-        if (ex.Status is >= 400 and < 500)
+        // 4xx 是调用方能修的（名字非法、无权限、已被他人占用），原样透传状态码——
+        // 但排除 401：Azure 存储账户返回的 401 说的是「这次到存储账户的请求没有认证成功」，
+        // 不是「这个操作员的登录会话失效」。用 StorageSharedKeyCredential 时 Azure 本身认证失败会给
+        // 403,401 的现实来源是中间代理（本项目的中国区/美国政府云正是靠代理落地）。
+        // 如果把它原样透传，前端 client.ts 的 401 处理器会把操作员直接踢回登录页，
+        // 所以这里改走 502，和其他不可操作的失败归到一类。
+        if (ex.Status is >= 400 and < 500 and not StatusCodes.Status401Unauthorized)
             return Results.Json(
                 new { error = string.IsNullOrEmpty(ex.ErrorCode) ? ex.Message : $"{ex.ErrorCode}: {ex.Message}" },
                 statusCode: ex.Status);
 
-        // Status 0 表示请求没能拿到响应（DNS/代理/网络）。这和 5xx 一样是上游的问题，
-        // 不是本服务的问题——用 502 说清楚责任在哪一侧。
+        // Status 0 表示请求没能拿到响应（DNS/代理/网络）；401 同理归到这里——
+        // 都是上游的问题，不是本服务的问题，也不是用户会话的问题。用 502 说清楚责任在哪一侧。
         return Results.Json(
             new { error = "The storage account could not be reached. Check the endpoint, proxy, and network." },
             statusCode: StatusCodes.Status502BadGateway);

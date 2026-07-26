@@ -12,7 +12,7 @@
 
   --text: #18181b;
   --text-muted: #6b6b76;
-  --text-faint: #9a9aa4;
+  --text-faint: #75757f; /* 需 ≥4.5:1 对比度（WCAG AA），实测对 --bg 为 4.56:1 */
 
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
@@ -72,7 +72,7 @@
 
     --text: #e8e8ec;
     --text-muted: #9a9ba6;
-    --text-faint: #6e7080;
+    --text-faint: #7a7a8a; /* 需 ≥4.5:1 对比度（WCAG AA），实测对 --bg 为 4.51:1 */
 
     --accent: #60a5fa;
     --accent-hover: #93c5fd;
@@ -353,6 +353,7 @@ tbody tr:hover {
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
   }
   .sidebar {
     position: static;
@@ -440,15 +441,10 @@ tbody tr:hover {
   border-color: var(--accent-hover);
 }
 
-.btn-danger {
-  color: var(--danger);
-  border-color: var(--danger-border);
-}
-.btn-danger:hover:not(:disabled) {
-  background: var(--danger-bg);
-}
-
-/* 表格行内操作：一行里挤三四个按钮时，边框会把行切碎。 */
+/* 表格行内操作：一行里挤三四个按钮时，边框会把行切碎。
+   这条规则必须排在 .btn-danger（以及其他颜色变体）之前：两者特异度相同，
+   源码顺序在后的会赢；.btn-ghost 若排在后面会覆盖 .btn-danger.btn-ghost
+   组合上的颜色，导致删除按钮失去红色警示。 */
 .btn-ghost {
   border-color: transparent;
   background: transparent;
@@ -456,8 +452,17 @@ tbody tr:hover {
   padding: 0 var(--sp-2);
 }
 .btn-ghost:hover:not(:disabled) {
-  background: var(--bg-hover);
+  background: var(--bg-subtle);
+  border-color: var(--border);
   color: var(--text);
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-bg);
 }
 
 /* ── Control widths ───────────────────────────────────────────────────────── */

@@ -79,6 +79,38 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
     }
 
     [Fact]
+    public async Task Azure_409_Is_Also_Passed_Through_Generically()
+    {
+        // 和上面的 403 用例一起证明：透传是按状态码区间做的通用规则，
+        // 不是针对某个具体状态码特判的——409（容器已存在）是另一个真实会发生的例子。
+        var client = ClientThrowing(new RequestFailedException(409, "The specified container already exists.", "ContainerAlreadyExists", null));
+        var id = await CreateAccountAsync(client);
+
+        var res = await client.PostAsJsonAsync($"/api/accounts/{id}/containers", new { name = "valid-name" });
+
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<ErrorBody>();
+        Assert.Contains("ContainerAlreadyExists", body!.error);
+    }
+
+    [Fact]
+    public async Task Azure_401_Does_Not_Pass_Through_As_401()
+    {
+        // Azure 存储账户的 401 说的是「这次到存储账户的请求没认证成功」（现实里多半是代理捣的鬼），
+        // 不是「操作员的登录会话失效」。若原样透传成 401，前端会把这当成会话过期，
+        // 把操作员直接踢回登录页——这里钉住它必须变成 502。
+        var client = ClientThrowing(new RequestFailedException(401, "Server failed to authenticate the request.", "InvalidAuthenticationInfo", null));
+        var id = await CreateAccountAsync(client);
+
+        var res = await client.PostAsJsonAsync($"/api/accounts/{id}/containers", new { name = "valid-name" });
+
+        Assert.NotEqual(HttpStatusCode.Unauthorized, res.StatusCode);
+        Assert.Equal(HttpStatusCode.BadGateway, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<ErrorBody>();
+        Assert.Contains("could not be reached", body!.error);
+    }
+
+    [Fact]
     public async Task Unreachable_Storage_Account_Becomes_502()
     {
         // Status 0 是 SDK 表示「请求根本没发出去/没拿到响应」的方式。

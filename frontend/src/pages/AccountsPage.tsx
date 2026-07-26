@@ -194,7 +194,7 @@ export function AccountsPage() {
                 <td>
                   {a.name}
                   {a.secretsUnavailable && (
-                    <span className="row-inline">
+                    <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
                       <span className="badge badge-warn">Credential required</span>
                       <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
                         Re-enter
