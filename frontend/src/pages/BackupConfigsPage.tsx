@@ -764,8 +764,8 @@ function DeleteModal({
   }
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Delete Backup — {config.name}</h3>
         <p>This removes the local backup configuration, cached index, and logs.</p>
         <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.8rem 0' }}>
@@ -797,8 +797,8 @@ function PostCreateModal({
   config, onRunNow, onNotNow,
 }: { config: BackupConfig; onRunNow: () => void; onNotNow: () => void }) {
   return (
-    <div style={overlayStyle} onClick={onNotNow}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onNotNow}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Backup Created — {config.name}</h3>
         <p>Run the first backup now?</p>
         <div style={{ marginTop: '1rem' }}>
@@ -828,8 +828,8 @@ function ResetPasswordModal({
   const [password, setPassword] = useState('')
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Re-enter Password — {config.name}</h3>
         <p>
           Enter the original password used to encrypt this backup. It cannot be changed — a
@@ -915,8 +915,8 @@ function CheckModal({
   const problems = report ? report.findings.filter((f) => f.cloud === CloudState.MissingOrBad) : []
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Check / Repair — {config.name}</h3>
 
         <Field label="Version">

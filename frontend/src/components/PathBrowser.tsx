@@ -35,8 +35,8 @@ export function PathBrowser({
   }, [path])
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Choose a folder</h3>
 
         <p style={{ fontFamily: 'monospace', fontSize: '0.85rem', wordBreak: 'break-all' }}>

@@ -423,3 +423,172 @@ tbody tr:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
 }
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+}
+
+/* 表格行内操作：一行里挤三四个按钮时，边框会把行切碎。 */
+.btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0 var(--sp-2);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* ── Control widths ───────────────────────────────────────────────────────── */
+.w-sm { width: 160px; }
+.w-md { width: 280px; }
+.w-lg { width: 480px; }
+.w-full { width: 100%; }
+
+/* ── Blocks ───────────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+  margin-top: var(--sp-5);
+}
+.panel > h2:first-child,
+.panel > h3:first-child {
+  margin-top: 0;
+}
+
+.field {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: start;
+  margin: var(--sp-2) 0;
+}
+.field-label {
+  color: var(--text-muted);
+  padding-top: 6px;
+}
+
+@media (max-width: 900px) {
+  .field {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-1);
+  }
+  .field-label {
+    padding-top: 0;
+  }
+}
+
+.empty-state {
+  color: var(--text-muted);
+  padding: var(--sp-5) var(--sp-3);
+  text-align: center;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  align-items: center;
+  margin-bottom: var(--sp-3);
+}
+
+.row {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* ── Alerts & badges ──────────────────────────────────────────────────────── */
+.alert {
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+.alert-warn { border-color: var(--warn-border); background: var(--warn-bg); }
+.alert-error { border-color: var(--danger-border); background: var(--danger-bg); }
+.alert-ok { border-color: var(--ok-border); background: var(--ok-bg); }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  border-radius: 999px;
+  padding: 1px var(--sp-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.badge-ok { color: var(--ok); border-color: var(--ok-border); background: var(--ok-bg); }
+.badge-warn { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
+.badge-danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
+
+/* ── Text ─────────────────────────────────────────────────────────────────── */
+.text-muted { color: var(--text-muted); }
+.text-faint { color: var(--text-faint); font-size: 12px; }
+.text-danger { color: var(--danger); }
+.text-ok { color: var(--ok); }
+.text-warn { color: var(--warn); }
+
+/* ── Modal ────────────────────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4vh var(--sp-4);
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  overflow-y: auto;
+}
+.modal-panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-overlay);
+  padding: var(--sp-5);
+  min-width: 620px;
+  max-width: 90vw;
+  max-height: 88vh;
+  overflow: auto;
+}
+.modal-panel > h3:first-child {
+  margin-bottom: var(--sp-3);
+}
+
+@media (max-width: 900px) {
+  .modal-panel {
+    min-width: 0;
+    width: 100%;
+  }
+}

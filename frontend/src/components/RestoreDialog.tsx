@@ -269,8 +269,8 @@ export function RestoreDialog({
   }
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
         <Field label="Restore to">
           <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />

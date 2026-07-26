@@ -15,24 +15,14 @@ export function KeyringBanner({ onGoToAccounts }: { onGoToAccounts: () => void }
   const pending = status.accountsPending + status.backupConfigsPending
 
   return (
-    <div
-      role="alert"
-      style={{
-        border: '1px solid #b45309',
-        background: '#fffbeb',
-        color: '#7c2d12',
-        padding: '0.75rem 1rem',
-        borderRadius: 6,
-        marginBottom: '1rem',
-      }}
-    >
+    <div role="alert" className="alert alert-warn">
       <strong>Data protection keys were lost</strong> — {pending} credential
       {pending === 1 ? '' : 's'} need to be re-entered before backups can run.
       {status.accountsPending > 0 && (
         <>
           {' '}
           Start with{' '}
-          <button type="button" onClick={onGoToAccounts}>
+          <button type="button" className="btn-ghost" onClick={onGoToAccounts}>
             Accounts
           </button>
           {' '}({status.accountsPending} pending), then re-enter backup passwords

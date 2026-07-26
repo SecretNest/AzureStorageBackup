@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
+import { Field } from '../components/modal'
 
 const MB = 1024 * 1024
 
@@ -142,14 +143,5 @@ function Rules({ value, onChange }: { value: string | null; onChange: (v: string
   return (
     <textarea rows={2} style={{ width: 300, fontFamily: 'monospace', fontSize: '0.85rem' }}
       value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
-  )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.4rem 0' }}>
-      <span style={{ width: 200, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
   )
 }

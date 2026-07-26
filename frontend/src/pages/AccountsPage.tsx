@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import {
   accountsApi,
   regionLabels,
@@ -10,6 +10,7 @@ import {
 } from '../api/accounts'
 import { refreshKeyringStatus } from '../api/keyring'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
+import { Field } from '../components/modal'
 import { ContainersPage } from './ContainersPage'
 
 const emptyForm: AccountInput = {
@@ -369,8 +370,8 @@ function ResetSecretsModal({
   const [proxyPassword, setProxyPassword] = useState('')
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Re-enter Credentials — {account.name}</h3>
         <p>
           The data protection keys used to store this account's credentials were lost.
@@ -411,14 +412,5 @@ function ResetSecretsModal({
         </div>
       </div>
     </div>
-  )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', margin: '0.4rem 0' }}>
-      <span style={{ width: 140, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
   )
 }

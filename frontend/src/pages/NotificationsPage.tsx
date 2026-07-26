@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import {
   notificationsApi,
   NotificationMethod,
@@ -6,6 +6,7 @@ import {
   type NotificationConfig,
   type TestResult,
 } from '../api/notifications'
+import { Field } from '../components/modal'
 
 const emptyCfg: NotificationConfig = {
   enabled: false,
@@ -141,14 +142,5 @@ export function NotificationsPage() {
         </p>
       )}
     </section>
-  )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.4rem 0' }}>
-      <span style={{ width: 130, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
   )
 }
