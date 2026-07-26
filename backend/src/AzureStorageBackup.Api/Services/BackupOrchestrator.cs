@@ -704,6 +704,15 @@ public sealed class BackupOrchestrator(
             if (c.Kind == ChangeKind.Deleted || c.Current is null)
                 continue;
 
+            // 读不开：沿用上一版本条目（含 Storage，因此不重传任何内容、不影响去重），
+            // 仅追加 UnreadableAt。上一版本没有该文件时整条跳过——没有内容可指向。
+            if (c.Kind == ChangeKind.Unreadable)
+            {
+                if (c.Previous is not null)
+                    entries.Add(c.Previous with { UnreadableAt = DateTimeOffset.UtcNow });
+                continue;
+            }
+
             var ov = overrides.GetValueOrDefault(c.Path);
             entries.Add(new IndexEntry
             {

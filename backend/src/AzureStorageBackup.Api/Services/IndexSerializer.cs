@@ -14,7 +14,7 @@ public static class IndexSerializer
     public const int CurrentSchemaVersion = 1;
     // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
     private const byte InfoFormat = 2;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）
-    private const byte IndexFormat = 3;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths
+    private const byte IndexFormat = 4;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths；format 4: IndexEntry.UnreadableAt
 
     // ---- 信息记录文件 ----
 
@@ -157,6 +157,7 @@ public static class IndexSerializer
             WriteHash(w, e.TailHash); // format 2
             WriteHash(w, e.FullHash);
             WriteNullableString(w, e.Target);
+            WriteNullableDto(w, e.UnreadableAt); // index format 4
 
             if (e.Storage is { } s)
             {
@@ -210,6 +211,7 @@ public static class IndexSerializer
             var tailHash = format >= 2 ? ReadHash(r) : null; // format 2+
             var fullHash = ReadHash(r);
             var target = ReadNullableString(r);
+            var unreadableAt = format >= 4 ? ReadNullableDto(r) : null; // format 4+
 
             StorageRef? storage = null;
             if (r.ReadBoolean())
@@ -236,6 +238,7 @@ public static class IndexSerializer
                 TailHash = tailHash,
                 FullHash = fullHash,
                 Target = target,
+                UnreadableAt = unreadableAt,
                 Storage = storage,
             });
         }
@@ -313,6 +316,15 @@ public static class IndexSerializer
         var offset = TimeSpan.FromMinutes(r.ReadInt16());
         return new DateTimeOffset(utcTicks + offset.Ticks, offset);
     }
+
+    private static void WriteNullableDto(BinaryWriter w, DateTimeOffset? value)
+    {
+        w.Write(value.HasValue);
+        if (value.HasValue)
+            WriteDto(w, value.Value);
+    }
+
+    private static DateTimeOffset? ReadNullableDto(BinaryReader r) => r.ReadBoolean() ? ReadDto(r) : null;
 
     // hash 编码：0=null；1=xxh128 的 16 字节裸字节；2=任意字符串（兜底）。
     private const string HashPrefix = "xxh128:";
