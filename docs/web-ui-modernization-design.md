@@ -47,12 +47,14 @@ GET / POST / DELETE 三个端点各自捕获 `RequestFailedException`：
 - `Status` 落在 400–499 → 原样透传该状态码，消息含 `ErrorCode` 与 Azure 的说明
 - 其余（含 `Status == 0` 的连接失败、5xx）→ 映射为 **502**，消息为存储账户不可达
 
+响应体统一为项目既有形状 `new { error = "…" }`，与 `AccountEndpoints.cs` 等保持一致。
+
 逐端点捕获而非注册全局 handler：全局 handler 会一并接管本轮范围之外的所有未处理异常，改变既有失败语义。
 
 **前端**
 
 - `ContainersPage` 用一份与后端等价的 TypeScript 规则实现做提交前校验（规则重复实现于两端，后端为准、前端为提前反馈），非法时禁用创建按钮，并在输入框下方常驻规则说明。
-- `client.ts` 的 `request` 解析 ProblemDetails 响应体，取 `detail` 或 `title` 作为 `ApiError.message`，解析不出再回落到原文与 `statusText`。**此项对全站所有错误提示生效**，不限于 container。
+- `client.ts` 的 `request` 解析后端既有的错误响应形状 `{ error, code? }`（见 `AccountEndpoints.cs:31`、`KeyringGuard.cs:14` 等，全项目统一使用此形状而非 ProblemDetails），取 `error` 作为 `ApiError.message` 并保留 `code`，解析不出再回落到原文与 `statusText`。**此项对全站所有错误提示生效**，不限于 container。
 - `containersApi.remove` 拼 URL 时补 `encodeURIComponent`。
 
 ### 2.3 测试
@@ -120,7 +122,16 @@ GET / POST / DELETE 三个端点各自捕获 `RequestFailedException`：
 
 **字段宽度分档**：`.w-sm` 160px、`.w-md` 280px、`.w-lg` 480px、`.w-full`。Blob Endpoint、Account Key、Proxy Host、本地路径走 `.w-lg` 或 `.w-full`。
 
-**Field 组件去重**：当前存在**两份**实现——`components/modal.tsx`（label 宽 200）与 `pages/AccountsPage.tsx` 内的私有副本（label 宽 140）。统一为 `components/modal.tsx` 中的单一实现，布局改为 `grid-template-columns: 200px 1fr`，删除 `AccountsPage` 的副本。
+**Field 组件去重**：当前存在**四份**各不相同的实现：
+
+| 位置 | label 宽度 | 对齐 |
+|---|---|---|
+| `components/modal.tsx:4` | 200 | center |
+| `pages/AccountsPage.tsx:417` | 140 | center |
+| `pages/SettingsPage.tsx:148` | 200 | flex-start |
+| `pages/NotificationsPage.tsx:147` | 130 | flex-start |
+
+统一为 `components/modal.tsx` 中的单一实现，布局改为 `grid-template-columns: 200px 1fr`，`align-items: start`（对复选框与多行控件都成立），删除其余三份副本并改为导入。
 
 **表格**：表头用 `--bg-subtle`、12px 字号并放大字距；行 `hover` 高亮；单元格内边距 8px / 12px；行分隔用 1px `--border`。统一 `.empty-state` 呈现空列表。
 
