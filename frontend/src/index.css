@@ -264,7 +264,9 @@ thead th {
 tbody td {
   border-bottom: 1px solid var(--border);
   padding: var(--sp-2) var(--sp-3);
-  vertical-align: top;
+  /* 居中而非贴顶：行内有 32px 高的操作按钮时，贴顶会让同一行的纯文字明显偏高。
+     表格里几乎每一行都有操作列，所以居中是这里的常态。 */
+  vertical-align: middle;
 }
 tbody tr:hover {
   background: var(--bg-hover);
