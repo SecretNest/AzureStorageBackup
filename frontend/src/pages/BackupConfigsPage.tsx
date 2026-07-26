@@ -25,6 +25,13 @@ import {
   type CheckReport,
   type RepairRun,
 } from '../api/backupConfigs'
+import {
+  containersApi,
+  validateContainerName,
+  containerNameRule,
+  BackupPresence,
+  type ContainerInfo,
+} from '../api/containers'
 
 const cloudLevelLabels: Record<number, string> = {
   [CloudCheckLevel.None]: "Don't check cloud",
@@ -91,11 +98,35 @@ export function BackupConfigsPage() {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
+  // 选定账户后列举其容器（PRD 1.2 的接口，ContainersPage 已在用）。
+  // 列举要连云，失败不能挡住新建备份——降级为纯输入框。
+  const [containerList, setContainerList] = useState<ContainerInfo[] | null>(null)
+  const [containerListError, setContainerListError] = useState<string | null>(null)
+  const [newContainer, setNewContainer] = useState(false)
   useEffect(load, [])
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
   }, [])
+
+  // 编辑模式下账户与容器都锁定，不必列举。
+  useEffect(() => {
+    if (editing || !showForm || !form.accountId) return
+    let cancelled = false
+    setContainerList(null)
+    setContainerListError(null)
+    containersApi
+      .list(form.accountId)
+      .then((list) => {
+        if (!cancelled) setContainerList(list)
+      })
+      .catch((e) => {
+        if (!cancelled) setContainerListError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [form.accountId, editing, showForm])
 
   // 密钥环丢失恢复(设计 §3.5)：顺序依赖是真实的——验证备份密码需要连云，连云需要账户密钥先恢复。
   // 账户仍有待重设项时禁用重设按钮，避免用户在账户没修好前白试一遍备份密码。
@@ -428,7 +459,10 @@ export function BackupConfigsPage() {
                 <select
                   value={form.accountId}
                   disabled={!!editing}
-                  onChange={(e) => set('accountId', Number(e.target.value))}
+                  onChange={(e) => {
+                    setForm((f) => ({ ...f, accountId: Number(e.target.value), containerName: '' }))
+                    setNewContainer(false)
+                  }}
                 >
                   {accounts.map((a) => (
                     <option key={a.id} value={a.id}>
@@ -438,12 +472,69 @@ export function BackupConfigsPage() {
                 </select>
               </Field>
               <Field label={editing ? 'Container (locked)' : 'Container'}>
-                <input
-                  className="w-md mono"
-                  value={form.containerName}
-                  disabled={!!editing}
-                  onChange={(e) => set('containerName', e.target.value)}
-                />
+                {editing || containerListError || containerList === null ? (
+                  <>
+                    <input
+                      className="w-md mono"
+                      value={form.containerName}
+                      disabled={!!editing}
+                      onChange={(e) => set('containerName', e.target.value)}
+                    />
+                    {!editing && containerListError && (
+                      <div className="text-warn">
+                        Could not list containers ({containerListError}). Type the name instead.
+                      </div>
+                    )}
+                    {!editing && !containerListError && containerList === null && (
+                      <div className="text-faint">Loading containers…</div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <select
+                      className="w-md"
+                      value={newContainer ? ' new' : form.containerName}
+                      onChange={(e) => {
+                        if (e.target.value === ' new') {
+                          setNewContainer(true)
+                          set('containerName', '')
+                        } else {
+                          setNewContainer(false)
+                          set('containerName', e.target.value)
+                        }
+                      }}
+                    >
+                      <option value="">— select —</option>
+                      {containerList.map((c) => (
+                        <option key={c.name} value={c.name}>
+                          {c.name}
+                          {c.backup !== BackupPresence.None ? '  ● has backup' : ''}
+                        </option>
+                      ))}
+                      <option value={' new'}>+ New container…</option>
+                    </select>
+                    {newContainer && (
+                      <>
+                        <input
+                          className="w-md mono"
+                          placeholder="new-container-name"
+                          value={form.containerName}
+                          onChange={(e) => set('containerName', e.target.value)}
+                        />
+                        <div
+                          className={
+                            form.containerName && validateContainerName(form.containerName)
+                              ? 'text-danger'
+                              : 'text-faint'
+                          }
+                        >
+                          {(form.containerName && validateContainerName(form.containerName)) ||
+                            containerNameRule}
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
               </Field>
               <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
                 <input
@@ -499,7 +590,11 @@ export function BackupConfigsPage() {
               </Field>
 
               <div className="row" style={{ marginTop: '1rem' }}>
-                <button type="button" onClick={() => setStep(2)}>
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  disabled={newContainer && !!validateContainerName(form.containerName)}
+                >
                   Next
                 </button>
                 <button type="button" onClick={() => setShowForm(false)}>
