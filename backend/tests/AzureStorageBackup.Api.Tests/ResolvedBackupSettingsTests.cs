@@ -98,6 +98,8 @@ public class ResolvedBackupSettingsTests
 
     // 规则字段三态：null = 继承，"" = 明确没有规则，有内容 = 覆盖。
     // 空串必须活下来，否则「我不要任何忽略规则」就无法表达。
+    // 三个规则字段的迁移语义完全相同（这正是 Fix 1 漏掉的那类 bug），
+    // 因此三个都要单独钉住，不能只测 IgnoreRules 一个。
     [Theory]
     [InlineData(null, "global-ignore")]
     [InlineData("", "")]
@@ -106,6 +108,26 @@ public class ResolvedBackupSettingsTests
     {
         var r = ResolvedBackupSettings.From(new BackupConfig { IgnoreRules = configured }, Globals());
         Assert.Equal(expected, r.IgnoreRules);
+    }
+
+    [Theory]
+    [InlineData(null, "global-dontcompress")]
+    [InlineData("", "")]
+    [InlineData("x", "x")]
+    public void DontCompressRules_Have_Three_States(string? configured, string expected)
+    {
+        var r = ResolvedBackupSettings.From(new BackupConfig { DontCompressRules = configured }, Globals());
+        Assert.Equal(expected, r.DontCompressRules);
+    }
+
+    [Theory]
+    [InlineData(null, "global-dontgroup")]
+    [InlineData("", "")]
+    [InlineData("x", "x")]
+    public void DontGroupRules_Have_Three_States(string? configured, string expected)
+    {
+        var r = ResolvedBackupSettings.From(new BackupConfig { DontGroupRules = configured }, Globals());
+        Assert.Equal(expected, r.DontGroupRules);
     }
 
     [Fact]

@@ -774,7 +774,11 @@ export function BackupConfigsPage() {
                 onToggle={(useDefault) =>
                   set('volumeBytes', useDefault ? null : (editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0))
                 }
-                effectiveText={`${Math.round((editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0) / MB)} MB`}
+                effectiveText={(() => {
+                  const bytes = editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0
+                  // 0 = 关闭分卷，是这轮工作特意引入的表示法；这里应该显示 "off" 而不是 "0 MB"。
+                  return bytes > 0 ? `${Math.round(bytes / MB)} MB` : 'off'
+                })()}
               >
                 <input
                   className="w-sm"
