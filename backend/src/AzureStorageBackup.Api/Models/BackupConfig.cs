@@ -31,30 +31,35 @@ public class BackupConfig
     /// <summary>加密密码密文。空 = 不加密。取明文用 ISecretReader.RevealBackupPassword。</summary>
     public string? PasswordProtected { get; set; }
 
+    // Tier 创建后锁定（BackupConfigService.UpdateAsync），因此**不可继承**——
+    // 继承意味着随全局设置变化，那正是一次创建后的变更。新建时由前端以全局默认预填。
     public StorageTier IndexTier { get; set; } = StorageTier.Hot;
     public StorageTier DataTier { get; set; } = StorageTier.Archive;
 
+    // 以下字段：null = 继承全局设置（PRD §3「使用默认」），非 null = 本配置自己的覆盖值。
+    // 三个规则字段的 "" 表示「明确没有规则」，与继承区分开。
     // 规则（gitignore 语法，每行一条）
     public string? IgnoreRules { get; set; }
     public string? DontCompressRules { get; set; }
     public string? DontGroupRules { get; set; }
 
-    public bool IncludeSymlinks { get; set; }
+    public bool? IncludeSymlinks { get; set; }
 
     // 版本保留（§10）
-    public int MaxVersions { get; set; } = 100;
-    public int MaxAgeDays { get; set; } = 180;
-    public RetentionMode RetentionMode { get; set; } = RetentionMode.EitherTriggers;
+    public int? MaxVersions { get; set; }
+    public int? MaxAgeDays { get; set; }
+    public RetentionMode? RetentionMode { get; set; }
 
     // 分组（§6）
-    public long SingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
-    public long GroupCapBytes { get; set; } = 100 * 1024 * 1024;
+    public long? SingleFileThresholdBytes { get; set; }
+    public long? GroupCapBytes { get; set; }
 
-    /// <summary>分卷大小（字节）；null/0=不分卷（§7）。</summary>
+    // null = 继承；0 = 明确关闭分卷；>0 = 分卷大小。
+    // 「关闭」从 null 挪到 0，好让 null 在所有可继承字段上含义一致（Settings 页本就写着 0=off）。
     public long? VolumeBytes { get; set; }
 
     /// <summary>是否写 debug 级日志（含操作文件名，短存 14 天）。默认关。</summary>
-    public bool VerboseLogging { get; set; }
+    public bool? VerboseLogging { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
 

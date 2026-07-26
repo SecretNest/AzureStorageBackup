@@ -35,10 +35,10 @@ export function SettingsPage() {
       <div className="page-header">
         <h1>Settings</h1>
       </div>
-      <p className="text-muted">Defaults for new backups, plus global options.</p>
+      <p className="text-muted">Defaults for new backups, and for any existing backup field set to Use default.</p>
       {error && <p className="text-danger">{error}</p>}
 
-      <h2>New-backup defaults</h2>
+      <h2>Defaults</h2>
       <Field label="Index tier">
         <TierSelect value={s.defaultIndexTier} onChange={(v) => set('defaultIndexTier', v)} archive={false} />
       </Field>
@@ -138,7 +138,30 @@ function TierSelect({ value, onChange, archive }: { value: number; onChange: (v:
 }
 
 function Num({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  return <input type="number" className="w-sm" value={value} onChange={(e) => onChange(Number(e.target.value))} />
+  // 输入框本地维护原始文本，而不是直接受控于 value：这样清空输入框时，界面上
+  // 显示的是空白（而非被 value 立刻拉回原数字），但父状态仍保留上一个数值，
+  // 不会把 Number('') === 0 悄悄写进去。只有用户真正键入了一个数字才回写。
+  const [text, setText] = useState(String(value))
+  useEffect(() => setText(String(value)), [value])
+
+  return (
+    <input
+      type="number"
+      className="w-sm"
+      value={text}
+      onChange={(e) => {
+        const raw = e.target.value
+        setText(raw)
+        if (raw === '') return
+        const n = Number(raw)
+        if (!Number.isNaN(n)) onChange(n)
+      }}
+      // 离开输入框时把空白拉回真实值。否则清空后不再键入就保存，value 从未改变，
+      // 上面那个 useEffect 也就不会重跑，输入框会一直显示空白——屏幕说这项是空的，
+      // 实际存的却还是原来的数字。
+      onBlur={() => setText(String(value))}
+    />
+  )
 }
 
 function Rules({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {

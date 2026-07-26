@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
+import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { Field } from '../components/modal'
@@ -25,6 +26,13 @@ import {
   type CheckReport,
   type RepairRun,
 } from '../api/backupConfigs'
+import {
+  containersApi,
+  validateContainerName,
+  containerNameRule,
+  BackupPresence,
+  type ContainerInfo,
+} from '../api/containers'
 
 const cloudLevelLabels: Record<number, string> = {
   [CloudCheckLevel.None]: "Don't check cloud",
@@ -53,17 +61,17 @@ const emptyForm: BackupConfigInput = {
   password: '',
   indexTier: StorageTier.Hot,
   dataTier: StorageTier.Hot,
-  ignoreRules: '',
-  dontCompressRules: '',
-  dontGroupRules: '',
-  includeSymlinks: false,
-  maxVersions: 100,
-  maxAgeDays: 180,
-  retentionMode: RetentionMode.EitherTriggers,
-  singleFileThresholdBytes: 5 * MB,
-  groupCapBytes: 100 * MB,
+  ignoreRules: null,
+  dontCompressRules: null,
+  dontGroupRules: null,
+  includeSymlinks: null,
+  maxVersions: null,
+  maxAgeDays: null,
+  retentionMode: null,
+  singleFileThresholdBytes: null,
+  groupCapBytes: null,
   volumeBytes: null,
-  verboseLogging: false,
+  verboseLogging: null,
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -91,11 +99,35 @@ export function BackupConfigsPage() {
     backupConfigsApi.list().then(setConfigs).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
+  // 选定账户后列举其容器（PRD 1.2 的接口，ContainersPage 已在用）。
+  // 列举要连云，失败不能挡住新建备份——降级为纯输入框。
+  const [containerList, setContainerList] = useState<ContainerInfo[] | null>(null)
+  const [containerListError, setContainerListError] = useState<string | null>(null)
+  const [newContainer, setNewContainer] = useState(false)
   useEffect(load, [])
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
   }, [])
+
+  // 编辑模式下账户与容器都锁定，不必列举。
+  useEffect(() => {
+    if (editing || !showForm || !form.accountId) return
+    let cancelled = false
+    setContainerList(null)
+    setContainerListError(null)
+    containersApi
+      .list(form.accountId)
+      .then((list) => {
+        if (!cancelled) setContainerList(list)
+      })
+      .catch((e) => {
+        if (!cancelled) setContainerListError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [form.accountId, editing, showForm])
 
   // 密钥环丢失恢复(设计 §3.5)：顺序依赖是真实的——验证备份密码需要连云，连云需要账户密钥先恢复。
   // 账户仍有待重设项时禁用重设按钮，避免用户在账户没修好前白试一遍备份密码。
@@ -138,29 +170,20 @@ export function BackupConfigsPage() {
 
   const startNew = () => {
     setEditing(null)
-    // 用全局设置的默认值预填（PRD §11「使用默认」）
-    const d = defaults
+    // 11 个可继承字段留 null（= 使用默认，PRD §3）。tier 创建后锁定、不可继承，
+    // 因此仍以全局默认预填，保存即固定。
     setForm({
       ...emptyForm,
       accountId: accounts[0]?.id ?? 0,
-      ...(d && {
-        indexTier: d.defaultIndexTier,
-        dataTier: d.defaultDataTier,
-        maxVersions: d.defaultMaxVersions,
-        maxAgeDays: d.defaultMaxAgeDays,
-        retentionMode: d.defaultRetentionMode,
-        singleFileThresholdBytes: d.defaultSingleFileThresholdBytes,
-        groupCapBytes: d.defaultGroupCapBytes,
-        volumeBytes: d.defaultVolumeBytes,
-        verboseLogging: d.defaultVerboseLogging,
-        includeSymlinks: d.defaultIncludeSymlinks,
-        ignoreRules: d.defaultIgnoreRules ?? '',
-        dontCompressRules: d.defaultDontCompressRules ?? '',
-        dontGroupRules: d.defaultDontGroupRules ?? '',
+      ...(defaults && {
+        indexTier: defaults.defaultIndexTier,
+        dataTier: defaults.defaultDataTier,
       }),
     })
     setStep(1)
     setError(null)
+    // 此标志位独立于 form，重置表单时不会自动清除；陈旧的 true 会导致容器选择器误开自由文本输入模式
+    setNewContainer(false)
     setShowForm(true)
   }
 
@@ -175,9 +198,9 @@ export function BackupConfigsPage() {
       password: '',
       indexTier: c.indexTier,
       dataTier: c.dataTier,
-      ignoreRules: c.ignoreRules ?? '',
-      dontCompressRules: c.dontCompressRules ?? '',
-      dontGroupRules: c.dontGroupRules ?? '',
+      ignoreRules: c.ignoreRules,
+      dontCompressRules: c.dontCompressRules,
+      dontGroupRules: c.dontGroupRules,
       includeSymlinks: c.includeSymlinks,
       verboseLogging: c.verboseLogging,
       maxVersions: c.maxVersions,
@@ -189,6 +212,7 @@ export function BackupConfigsPage() {
     })
     setStep(1)
     setError(null)
+    setNewContainer(false)
     setShowForm(true)
   }
 
@@ -428,7 +452,10 @@ export function BackupConfigsPage() {
                 <select
                   value={form.accountId}
                   disabled={!!editing}
-                  onChange={(e) => set('accountId', Number(e.target.value))}
+                  onChange={(e) => {
+                    setForm((f) => ({ ...f, accountId: Number(e.target.value), containerName: '' }))
+                    setNewContainer(false)
+                  }}
                 >
                   {accounts.map((a) => (
                     <option key={a.id} value={a.id}>
@@ -438,12 +465,69 @@ export function BackupConfigsPage() {
                 </select>
               </Field>
               <Field label={editing ? 'Container (locked)' : 'Container'}>
-                <input
-                  className="w-md mono"
-                  value={form.containerName}
-                  disabled={!!editing}
-                  onChange={(e) => set('containerName', e.target.value)}
-                />
+                {editing || containerListError || containerList === null ? (
+                  <>
+                    <input
+                      className="w-md mono"
+                      value={form.containerName}
+                      disabled={!!editing}
+                      onChange={(e) => set('containerName', e.target.value)}
+                    />
+                    {!editing && containerListError && (
+                      <div className="text-warn">
+                        Could not list containers ({containerListError}). Type the name instead.
+                      </div>
+                    )}
+                    {!editing && !containerListError && containerList === null && (
+                      <div className="text-faint">Loading containers…</div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <select
+                      className="w-md"
+                      value={newContainer ? ' new' : form.containerName}
+                      onChange={(e) => {
+                        if (e.target.value === ' new') {
+                          setNewContainer(true)
+                          set('containerName', '')
+                        } else {
+                          setNewContainer(false)
+                          set('containerName', e.target.value)
+                        }
+                      }}
+                    >
+                      <option value="">— select —</option>
+                      {containerList.map((c) => (
+                        <option key={c.name} value={c.name}>
+                          {c.name}
+                          {c.backup !== BackupPresence.None ? '  ● has backup' : ''}
+                        </option>
+                      ))}
+                      <option value={' new'}>+ New container…</option>
+                    </select>
+                    {newContainer && (
+                      <>
+                        <input
+                          className="w-md mono"
+                          placeholder="new-container-name"
+                          value={form.containerName}
+                          onChange={(e) => set('containerName', e.target.value)}
+                        />
+                        <div
+                          className={
+                            form.containerName && validateContainerName(form.containerName)
+                              ? 'text-danger'
+                              : 'text-faint'
+                          }
+                        >
+                          {(form.containerName && validateContainerName(form.containerName)) ||
+                            containerNameRule}
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
               </Field>
               <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
                 <input
@@ -499,7 +583,11 @@ export function BackupConfigsPage() {
               </Field>
 
               <div className="row" style={{ marginTop: '1rem' }}>
-                <button type="button" onClick={() => setStep(2)}>
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  disabled={newContainer && !!validateContainerName(form.containerName)}
+                >
                   Next
                 </button>
                 <button type="button" onClick={() => setShowForm(false)}>
@@ -509,49 +597,126 @@ export function BackupConfigsPage() {
             </>
           ) : (
             <>
-              <Field label="Ignore rules">
+              <DefaultableField
+                label="Ignore rules"
+                useDefault={form.ignoreRules === null}
+                onToggle={(useDefault) =>
+                  set('ignoreRules', useDefault ? null : (editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''))
+                }
+                effectiveText={(editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules) || '(none)'}
+              >
                 <RuleBox value={form.ignoreRules} onChange={(v) => set('ignoreRules', v)} />
-              </Field>
-              <Field label="Don't compress">
+              </DefaultableField>
+              <DefaultableField
+                label="Don't compress"
+                useDefault={form.dontCompressRules === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'dontCompressRules',
+                    useDefault ? null : (editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules ?? ''),
+                  )
+                }
+                effectiveText={(editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules) || '(none)'}
+              >
                 <RuleBox
                   value={form.dontCompressRules}
                   onChange={(v) => set('dontCompressRules', v)}
                 />
-              </Field>
-              <Field label="Don't group">
+              </DefaultableField>
+              <DefaultableField
+                label="Don't group"
+                useDefault={form.dontGroupRules === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'dontGroupRules',
+                    useDefault ? null : (editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules ?? ''),
+                  )
+                }
+                effectiveText={(editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules) || '(none)'}
+              >
                 <RuleBox value={form.dontGroupRules} onChange={(v) => set('dontGroupRules', v)} />
-              </Field>
-              <Field label="Include symlinks">
+              </DefaultableField>
+              <DefaultableField
+                label="Include symlinks"
+                useDefault={form.includeSymlinks === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'includeSymlinks',
+                    useDefault ? null : (editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false),
+                  )
+                }
+                effectiveText={String(editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false)}
+              >
                 <input
                   type="checkbox"
-                  checked={form.includeSymlinks}
+                  checked={form.includeSymlinks ?? false}
                   onChange={(e) => set('includeSymlinks', e.target.checked)}
                 />
-              </Field>
-              <Field label="Verbose (debug) logging">
+              </DefaultableField>
+              <DefaultableField
+                label="Verbose (debug) logging"
+                useDefault={form.verboseLogging === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'verboseLogging',
+                    useDefault ? null : (editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false),
+                  )
+                }
+                effectiveText={String(editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false)}
+              >
                 <input
                   type="checkbox"
-                  checked={form.verboseLogging}
+                  checked={form.verboseLogging ?? false}
                   onChange={(e) => set('verboseLogging', e.target.checked)}
                 />
-              </Field>
-              <Field label="Max versions">
+              </DefaultableField>
+              <DefaultableField
+                label="Max versions"
+                useDefault={form.maxVersions === null}
+                onToggle={(useDefault) =>
+                  set('maxVersions', useDefault ? null : (editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100))
+                }
+                effectiveText={String(editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100)}
+              >
                 <input
+                  className="w-sm"
                   type="number"
-                  value={form.maxVersions}
+                  value={form.maxVersions ?? 0}
                   onChange={(e) => set('maxVersions', Number(e.target.value))}
                 />
-              </Field>
-              <Field label="Max age (days)">
+              </DefaultableField>
+              <DefaultableField
+                label="Max age (days)"
+                useDefault={form.maxAgeDays === null}
+                onToggle={(useDefault) =>
+                  set('maxAgeDays', useDefault ? null : (editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180))
+                }
+                effectiveText={String(editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180)}
+              >
                 <input
+                  className="w-sm"
                   type="number"
-                  value={form.maxAgeDays}
+                  value={form.maxAgeDays ?? 0}
                   onChange={(e) => set('maxAgeDays', Number(e.target.value))}
                 />
-              </Field>
-              <Field label="Retention mode">
+              </DefaultableField>
+              <DefaultableField
+                label="Retention mode"
+                useDefault={form.retentionMode === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'retentionMode',
+                    useDefault ? null : (editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers),
+                  )
+                }
+                effectiveText={
+                  retentionModeLabels[
+                    editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers
+                  ]
+                }
+              >
                 <select
-                  value={form.retentionMode}
+                  value={form.retentionMode ?? RetentionMode.EitherTriggers}
                   onChange={(e) => set('retentionMode', Number(e.target.value))}
                 >
                   {Object.entries(retentionModeLabels).map(([v, label]) => (
@@ -560,30 +725,68 @@ export function BackupConfigsPage() {
                     </option>
                   ))}
                 </select>
-              </Field>
-              <Field label="Single-file threshold (MB)">
+              </DefaultableField>
+              <DefaultableField
+                label="Single-file threshold (MB)"
+                useDefault={form.singleFileThresholdBytes === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'singleFileThresholdBytes',
+                    useDefault
+                      ? null
+                      : (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB),
+                  )
+                }
+                effectiveText={`${Math.round(
+                  (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB) / MB,
+                )} MB`}
+              >
                 <input
+                  className="w-sm"
                   type="number"
-                  value={Math.round(form.singleFileThresholdBytes / MB)}
+                  value={Math.round((form.singleFileThresholdBytes ?? 0) / MB)}
                   onChange={(e) => set('singleFileThresholdBytes', Number(e.target.value) * MB)}
                 />
-              </Field>
-              <Field label="Group cap (MB)">
+              </DefaultableField>
+              <DefaultableField
+                label="Group cap (MB)"
+                useDefault={form.groupCapBytes === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'groupCapBytes',
+                    useDefault ? null : (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB),
+                  )
+                }
+                effectiveText={`${Math.round(
+                  (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB) / MB,
+                )} MB`}
+              >
                 <input
+                  className="w-sm"
                   type="number"
-                  value={Math.round(form.groupCapBytes / MB)}
+                  value={Math.round((form.groupCapBytes ?? 0) / MB)}
                   onChange={(e) => set('groupCapBytes', Number(e.target.value) * MB)}
                 />
-              </Field>
-              <Field label="Volume size (MB, 0=off)">
+              </DefaultableField>
+              <DefaultableField
+                label="Volume size (MB, 0 = off)"
+                useDefault={form.volumeBytes === null}
+                onToggle={(useDefault) =>
+                  set('volumeBytes', useDefault ? null : (editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0))
+                }
+                effectiveText={(() => {
+                  const bytes = editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0
+                  // 0 = 关闭分卷，是这轮工作特意引入的表示法；这里应该显示 "off" 而不是 "0 MB"。
+                  return bytes > 0 ? `${Math.round(bytes / MB)} MB` : 'off'
+                })()}
+              >
                 <input
+                  className="w-sm"
                   type="number"
-                  value={form.volumeBytes ? Math.round(form.volumeBytes / MB) : 0}
-                  onChange={(e) =>
-                    set('volumeBytes', Number(e.target.value) > 0 ? Number(e.target.value) * MB : null)
-                  }
+                  value={Math.round((form.volumeBytes ?? 0) / MB)}
+                  onChange={(e) => set('volumeBytes', Number(e.target.value) * MB)}
                 />
-              </Field>
+              </DefaultableField>
 
               <div className="row" style={{ marginTop: '1rem' }}>
                 <button type="button" onClick={() => setStep(1)}>
@@ -734,7 +937,7 @@ function TierSelect({
 function RuleBox({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
   return (
     <textarea
-      rows={3}
+      rows={2}
       placeholder="gitignore syntax, one per line"
       className="w-lg"
       value={value ?? ''}

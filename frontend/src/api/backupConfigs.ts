@@ -49,6 +49,21 @@ export const restoreConflictModeLabels: Record<number, string> = {
 export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
 export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing' | 'CleaningUp'
 
+/** 后端解析后的生效值（null 字段已用全局设置填充）。只读，仅供显示。 */
+export interface EffectiveBackupSettings {
+  ignoreRules: string | null
+  dontCompressRules: string | null
+  dontGroupRules: string | null
+  includeSymlinks: boolean
+  maxVersions: number
+  maxAgeDays: number
+  retentionMode: number
+  singleFileThresholdBytes: number
+  groupCapBytes: number
+  volumeBytes: number | null
+  verboseLogging: boolean
+}
+
 export interface BackupConfig {
   id: number
   accountId: number
@@ -62,14 +77,15 @@ export interface BackupConfig {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
-  includeSymlinks: boolean
-  maxVersions: number
-  maxAgeDays: number
-  retentionMode: number
-  singleFileThresholdBytes: number
-  groupCapBytes: number
+  includeSymlinks: boolean | null
+  maxVersions: number | null
+  maxAgeDays: number | null
+  retentionMode: number | null
+  singleFileThresholdBytes: number | null
+  groupCapBytes: number | null
   volumeBytes: number | null
-  verboseLogging: boolean
+  verboseLogging: boolean | null
+  effective: EffectiveBackupSettings
   createdAt: string
   status: number // BackupStatus
   lastError: string | null
@@ -90,14 +106,14 @@ export interface BackupConfigInput {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
-  includeSymlinks: boolean
-  maxVersions: number
-  maxAgeDays: number
-  retentionMode: number
-  singleFileThresholdBytes: number
-  groupCapBytes: number
+  includeSymlinks: boolean | null
+  maxVersions: number | null
+  maxAgeDays: number | null
+  retentionMode: number | null
+  singleFileThresholdBytes: number | null
+  groupCapBytes: number | null
   volumeBytes: number | null
-  verboseLogging: boolean
+  verboseLogging: boolean | null
 }
 
 export interface BackupProgress {

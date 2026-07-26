@@ -500,6 +500,21 @@ tbody tr:hover {
   padding-top: 6px;
 }
 
+/* 「Use default」行：勾选框在前，控件或只读生效值在后。 */
+.defaultable {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.defaultable-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 @media (max-width: 900px) {
   .field {
     grid-template-columns: minmax(0, 1fr);
