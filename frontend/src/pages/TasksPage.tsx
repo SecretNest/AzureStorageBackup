@@ -256,13 +256,13 @@ export function TasksPage() {
 
           {form.taskType === ScheduledTaskType.Check && (
             <div className="stack" style={{ paddingLeft: '1rem', borderLeft: '2px solid var(--border)' }}>
-              <label style={{ display: 'block', margin: '0.3rem 0' }}>
+              <label style={{ display: 'block' }}>
                 Cloud check{' '}
                 <select value={form.checkCloudLevel ?? CloudCheckLevel.ExistenceSize} onChange={(e) => set('checkCloudLevel', Number(e.target.value))}>
                   {Object.entries(cloudCheckLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                 </select>
               </label>
-              <label style={{ display: 'block', margin: '0.3rem 0' }}>
+              <label style={{ display: 'block' }}>
                 Local check{' '}
                 <select value={form.checkLocalLevel ?? LocalCheckLevel.Content} onChange={(e) => set('checkLocalLevel', Number(e.target.value))}>
                   {Object.entries(localCheckLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}

@@ -117,16 +117,18 @@ export function NotificationsPage() {
 
       <fieldset style={{ marginTop: '1rem' }}>
         <legend>Notify on events</legend>
-        {eventList.map((e) => (
-          <label key={e.bit} className="row" style={{ width: 200 }}>
-            <input
-              type="checkbox"
-              checked={(cfg.events & e.bit) !== 0}
-              onChange={(ev) => toggleEvent(e.bit, ev.target.checked)}
-            />
-            {e.label}
-          </label>
-        ))}
+        <div className="row" style={{ flexWrap: 'wrap' }}>
+          {eventList.map((e) => (
+            <label key={e.bit} className="row" style={{ width: 200 }}>
+              <input
+                type="checkbox"
+                checked={(cfg.events & e.bit) !== 0}
+                onChange={(ev) => toggleEvent(e.bit, ev.target.checked)}
+              />
+              {e.label}
+            </label>
+          ))}
+        </div>
       </fieldset>
 
       <div className="row" style={{ marginTop: '1rem' }}>
