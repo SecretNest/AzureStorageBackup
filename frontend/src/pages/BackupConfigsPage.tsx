@@ -19,6 +19,7 @@ import {
   tierLabels,
   retentionModeLabels,
   backupStageLabels,
+  type BackupActivity,
   type BackupConfig,
   type BackupConfigInput,
   type BackupRun,
@@ -131,7 +132,9 @@ export function BackupConfigsPage() {
     // 从 activeKey 字符串解析出 id 和 activity，避免依赖 configs 数组引用
     const activeList = activeKey.split(',').map((item) => {
       const [id, activity] = item.split(':')
-      return { id: Number(id), activity }
+      // 断言回 BackupActivity：不断言的话 activity 是 string，下面几处与字面量的比较
+      // 就不再受编译器检查，写错一个字母会静默地不轮询那一类，而不是编译失败。
+      return { id: Number(id), activity: activity as BackupActivity }
     })
 
     const tick = async () => {
