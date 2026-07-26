@@ -192,6 +192,8 @@ export function BackupConfigsPage() {
     })
     setStep(1)
     setError(null)
+    // 此标志位独立于 form，重置表单时不会自动清除；陈旧的 true 会导致容器选择器误开自由文本输入模式
+    setNewContainer(false)
     setShowForm(true)
   }
 
@@ -220,6 +222,7 @@ export function BackupConfigsPage() {
     })
     setStep(1)
     setError(null)
+    setNewContainer(false)
     setShowForm(true)
   }
 
