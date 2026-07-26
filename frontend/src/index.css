@@ -265,3 +265,161 @@ tbody td {
 tbody tr:hover {
   background: var(--bg-hover);
 }
+
+/* ── Shell ────────────────────────────────────────────────────────────────── */
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  min-height: 100svh;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-subtle);
+  border-right: 1px solid var(--border);
+  padding: var(--sp-4) 0;
+  position: sticky;
+  top: 0;
+  height: 100svh;
+}
+
+.sidebar-brand {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 var(--sp-2);
+  overflow-y: auto;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: var(--sp-4) var(--sp-3) 0;
+}
+
+/* 导航项是 <button>，所以要把按钮的默认外观整个抹掉再重画。 */
+.nav-item {
+  height: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+  font-weight: 500;
+}
+.nav-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.nav-item-active,
+.nav-item-active:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  border-left-color: var(--accent);
+  border-radius: 0 var(--r-md) var(--r-md) 0;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.app-main {
+  min-width: 0;
+  max-width: var(--content-max);
+  padding: var(--sp-5);
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+/* 窄屏：侧栏塌成顶部横向滚动的 tab 条。React 结构不变，只换 CSS。 */
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sidebar {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--sp-2);
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: var(--sp-2);
+    overflow-x: auto;
+  }
+  .sidebar-brand {
+    padding: 0 var(--sp-2);
+    white-space: nowrap;
+  }
+  .sidebar-nav {
+    flex-direction: row;
+    padding: 0;
+  }
+  .nav-item {
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+  }
+  .nav-item-active {
+    border-radius: var(--r-md);
+    border-left: none;
+    border-bottom-color: var(--accent);
+  }
+  .sidebar-footer {
+    margin-top: 0;
+    margin-left: auto;
+    padding: 0 var(--sp-2);
+  }
+  .app-main {
+    padding: var(--sp-4);
+  }
+}
+
+/* ── Auth ─────────────────────────────────────────────────────────────────── */
+.auth-page {
+  min-height: 100svh;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-4);
+}
+
+.auth-card {
+  width: 320px;
+  max-width: 100%;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-5);
+}
+.auth-card h1 {
+  margin-bottom: var(--sp-4);
+}
+.auth-card input,
+.auth-card button {
+  width: 100%;
+}
+.auth-card button {
+  margin-top: var(--sp-3);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+.auth-card button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}

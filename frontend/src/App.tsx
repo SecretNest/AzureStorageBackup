@@ -45,44 +45,51 @@ function App() {
     return <LoginPage onSignedIn={refreshAuth} />
 
   return (
-    <div style={{ maxWidth: 900, margin: '2rem auto', padding: '0 1rem' }}>
-      <nav style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            onClick={() => setTab(t.key)}
-            style={{ fontWeight: tab === t.key ? 'bold' : 'normal' }}
-          >
-            {t.label}
-          </button>
-        ))}
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand">Azure Storage Backup</div>
+        <nav className="sidebar-nav">
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setTab(t.key)}
+              className={tab === t.key ? 'nav-item nav-item-active' : 'nav-item'}
+              aria-current={tab === t.key ? 'page' : undefined}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
         {auth.required && (
-          <button
-            type="button"
-            // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
-            // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
-            onClick={() => {
-              const signedOut = () => setAuth({ required: true, authenticated: false })
-              authApi.logout().then(signedOut, signedOut)
-            }}
-            style={{ marginLeft: 'auto' }}
-          >
-            Log out
-          </button>
+          <div className="sidebar-footer">
+            <button
+              type="button"
+              // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
+              // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
+              onClick={() => {
+                const signedOut = () => setAuth({ required: true, authenticated: false })
+                authApi.logout().then(signedOut, signedOut)
+              }}
+            >
+              Log out
+            </button>
+          </div>
         )}
-      </nav>
+      </aside>
 
-      <KeyringBanner onGoToAccounts={() => setTab('accounts')} />
+      <main className="app-main">
+        <KeyringBanner onGoToAccounts={() => setTab('accounts')} />
 
-      {tab === 'accounts' && <AccountsPage />}
-      {tab === 'backups' && <BackupConfigsPage />}
-      {tab === 'discovered' && <BackupsPage />}
-      {tab === 'groups' && <GroupsPage />}
-      {tab === 'tasks' && <TasksPage />}
-      {tab === 'notifications' && <NotificationsPage />}
-      {tab === 'logs' && <LogsPage />}
-      {tab === 'settings' && <SettingsPage />}
+        {tab === 'accounts' && <AccountsPage />}
+        {tab === 'backups' && <BackupConfigsPage />}
+        {tab === 'discovered' && <BackupsPage />}
+        {tab === 'groups' && <GroupsPage />}
+        {tab === 'tasks' && <TasksPage />}
+        {tab === 'notifications' && <NotificationsPage />}
+        {tab === 'logs' && <LogsPage />}
+        {tab === 'settings' && <SettingsPage />}
+      </main>
     </div>
   )
 }
