@@ -88,7 +88,7 @@ export function BackupConfigsPage() {
   const keyring = useKeyringStatus()
 
   const load = () => {
-    backupConfigsApi.list().then(setConfigs).catch((e) => setError(String(e)))
+    backupConfigsApi.list().then(setConfigs).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
   useEffect(load, [])
@@ -127,7 +127,7 @@ export function BackupConfigsPage() {
       load()
       void refreshKeyringStatus()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -206,7 +206,7 @@ export function BackupConfigsPage() {
       setShowForm(false)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -218,7 +218,7 @@ export function BackupConfigsPage() {
       setDeleteModal(null)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -227,7 +227,7 @@ export function BackupConfigsPage() {
       await backupConfigsApi.resetStatus(c.id)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -242,7 +242,7 @@ export function BackupConfigsPage() {
         setRuns((r) => ({ ...r, [c.id]: state }))
       }
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -269,7 +269,7 @@ export function BackupConfigsPage() {
       setImportForm({ accountId: 0, containerName: '', password: '' })
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -277,9 +277,9 @@ export function BackupConfigsPage() {
 
   return (
     <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Backups</h1>
-        <div>
+        <div className="row">
           <button
             type="button"
             onClick={() => setImporting((v) => !v)}
@@ -287,17 +287,17 @@ export function BackupConfigsPage() {
             title={keyringLostHint}
           >
             Import existing
-          </button>{' '}
-          <button type="button" onClick={startNew} disabled={accounts.length === 0}>
+          </button>
+          <button type="button" className="btn-primary" onClick={startNew} disabled={accounts.length === 0}>
             New Backup
           </button>
         </div>
       </div>
 
       {importing && (
-        <div style={{ margin: '1rem 0', padding: '0.8rem', border: '1px solid #ccc' }}>
+        <div className="panel">
           <strong>Import existing backup</strong> (reads the container's info file)
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+          <div className="toolbar" style={{ marginTop: '0.5rem' }}>
             <select
               value={importForm.accountId || accounts[0]?.id || 0}
               onChange={(e) => setImportForm((f) => ({ ...f, accountId: Number(e.target.value) }))}
@@ -325,12 +325,12 @@ export function BackupConfigsPage() {
           </div>
         </div>
       )}
-      {accounts.length === 0 && <p style={{ color: '#666' }}>Add an account first.</p>}
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {accounts.length === 0 && <p className="text-muted">Add an account first.</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem' }}>
+      <table>
         <thead>
-          <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+          <tr>
             <th>Name</th>
             <th>Account / Container</th>
             <th>Local Root</th>
@@ -342,18 +342,18 @@ export function BackupConfigsPage() {
         <tbody>
           {configs.length === 0 ? (
             <tr>
-              <td colSpan={6} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={6} className="empty-state">
                 No backups yet.
               </td>
             </tr>
           ) : (
             configs.map((c) => (
-              <tr key={c.id} style={{ borderBottom: '1px solid #eee', verticalAlign: 'top' }}>
+              <tr key={c.id}>
                 <td>
                   {c.name}
                   {c.secretsUnavailable && (
-                    <>
-                      <span style={{ color: '#b45309', marginLeft: '0.5rem' }}>Password required</span>{' '}
+                    <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
+                      <span className="text-warn">Password required</span>
                       <button
                         type="button"
                         onClick={() => startResetPassword(c)}
@@ -362,13 +362,13 @@ export function BackupConfigsPage() {
                       >
                         Re-enter
                       </button>
-                    </>
+                    </span>
                   )}
                 </td>
                 <td>
                   {accountName(c.accountId)} / {c.containerName}
                 </td>
-                <td style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>{c.localRoot}</td>
+                <td className="mono text-faint">{c.localRoot}</td>
                 <td>{c.hasPassword ? 'Yes' : 'No'}</td>
                 <td>
                   <StatusBadge config={c} onReset={() => resetStatus(c)} />
@@ -376,6 +376,7 @@ export function BackupConfigsPage() {
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button
                     type="button"
+                    className="btn-ghost"
                     onClick={() => run(c)}
                     disabled={keyringLost || runs[c.id]?.status === 'Running'}
                     title={keyringLostHint}
@@ -384,6 +385,7 @@ export function BackupConfigsPage() {
                   </button>{' '}
                   <button
                     type="button"
+                    className="btn-ghost"
                     onClick={() => setRestoreModal(c)}
                     disabled={keyringLost || restores[c.id]?.status === 'Running'}
                     title={keyringLostHint}
@@ -392,16 +394,17 @@ export function BackupConfigsPage() {
                   </button>{' '}
                   <button
                     type="button"
+                    className="btn-ghost"
                     onClick={() => setCheckModal(c)}
                     disabled={keyringLost}
                     title={keyringLostHint}
                   >
                     Check / Repair…
                   </button>{' '}
-                  <button type="button" onClick={() => startEdit(c)}>
+                  <button type="button" className="btn-ghost" onClick={() => startEdit(c)}>
                     Edit
                   </button>{' '}
-                  <button type="button" onClick={() => setDeleteModal(c)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => setDeleteModal(c)}>
                     Delete
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
@@ -414,7 +417,7 @@ export function BackupConfigsPage() {
       </table>
 
       {showForm && (
-        <div style={{ marginTop: '1.5rem', padding: '1rem', border: '1px solid #ccc' }}>
+        <div className="panel">
           <h2>
             {editing ? `Edit: ${editing.name}` : 'New Backup'} — Step {step} of 2
           </h2>
@@ -436,6 +439,7 @@ export function BackupConfigsPage() {
               </Field>
               <Field label={editing ? 'Container (locked)' : 'Container'}>
                 <input
+                  className="w-md mono"
                   value={form.containerName}
                   disabled={!!editing}
                   onChange={(e) => set('containerName', e.target.value)}
@@ -443,6 +447,7 @@ export function BackupConfigsPage() {
               </Field>
               <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
                 <input
+                  className="w-lg mono"
                   placeholder="/data/photos"
                   value={form.localRoot}
                   disabled={!!editing}
@@ -493,10 +498,10 @@ export function BackupConfigsPage() {
                 />
               </Field>
 
-              <div style={{ marginTop: '1rem' }}>
+              <div className="row" style={{ marginTop: '1rem' }}>
                 <button type="button" onClick={() => setStep(2)}>
                   Next
-                </button>{' '}
+                </button>
                 <button type="button" onClick={() => setShowForm(false)}>
                   Cancel
                 </button>
@@ -580,13 +585,13 @@ export function BackupConfigsPage() {
                 />
               </Field>
 
-              <div style={{ marginTop: '1rem' }}>
+              <div className="row" style={{ marginTop: '1rem' }}>
                 <button type="button" onClick={() => setStep(1)}>
                   Back
-                </button>{' '}
-                <button type="button" onClick={save} disabled={busy}>
+                </button>
+                <button type="button" className="btn-primary" onClick={save} disabled={busy}>
                   {editing ? 'Save' : 'Create'}
-                </button>{' '}
+                </button>
                 <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
                   Cancel
                 </button>
@@ -657,16 +662,16 @@ export function BackupConfigsPage() {
 
 function RunStatus({ run }: { run: BackupRun }) {
   if (run.status === 'Failed')
-    return <div style={{ color: 'crimson', fontSize: '0.8rem' }}>Failed: {run.error}</div>
+    return <div className="text-danger">Failed: {run.error}</div>
   if (run.status === 'Completed')
     return (
-      <div style={{ color: 'green', fontSize: '0.8rem' }}>
+      <div className="text-ok">
         Completed — version {run.version}
       </div>
     )
   const p = run.progress
   return (
-    <div style={{ fontSize: '0.8rem', color: '#555' }}>
+    <div className="text-faint">
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
     </div>
   )
@@ -675,41 +680,34 @@ function RunStatus({ run }: { run: BackupRun }) {
 // 状态徽标（§4.2 决策 2）：进行中（蓝，派生 activity）优先于持久 Error（红，tooltip + Reset）；否则不显示。
 function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () => void }) {
   if (config.activity !== 'Idle') {
-    return (
-      <span style={{ color: '#1a73e8', fontSize: '0.8rem', fontWeight: 600 }}>
-        {config.activity}
-      </span>
-    )
+    return <span className="badge">{config.activity}</span>
   }
   if (config.status === BackupStatus.Error) {
     return (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
-        <span
-          title={config.lastError ?? 'Unknown error'}
-          style={{ color: 'crimson', fontSize: '0.8rem', fontWeight: 600, cursor: 'help' }}
-        >
+      <span className="row-inline">
+        <span title={config.lastError ?? 'Unknown error'} className="badge badge-danger">
           Error
         </span>
-        <button type="button" onClick={onReset} style={{ fontSize: '0.75rem' }}>
+        <button type="button" className="btn-ghost" onClick={onReset}>
           Reset
         </button>
       </span>
     )
   }
-  return <span style={{ color: '#999', fontSize: '0.8rem' }}>—</span>
+  return <span className="text-faint">—</span>
 }
 
 function RestoreStatus({ run }: { run: RestoreRun }) {
   if (run.status === 'Failed')
-    return <div style={{ color: 'crimson', fontSize: '0.8rem' }}>Restore failed: {run.error}</div>
+    return <div className="text-danger">Restore failed: {run.error}</div>
   if (run.status === 'Completed')
     return (
-      <div style={{ color: run.failedFiles ? 'darkorange' : 'green', fontSize: '0.8rem' }}>
+      <div className={run.failedFiles ? 'text-warn' : 'text-ok'}>
         Restored {run.restoredFiles} file(s), skipped {run.skippedFiles}
         {run.failedFiles ? `, failed ${run.failedFiles}` : ''} — version {run.version}
       </div>
     )
-  return <div style={{ fontSize: '0.8rem', color: '#555' }}>{run.phase || 'Restoring…'}</div>
+  return <div className="text-faint">{run.phase || 'Restoring…'}</div>
 }
 
 function TierSelect({
@@ -738,7 +736,7 @@ function RuleBox({ value, onChange }: { value: string | null; onChange: (v: stri
     <textarea
       rows={3}
       placeholder="gitignore syntax, one per line"
-      style={{ width: 320, fontFamily: 'monospace', fontSize: '0.85rem' }}
+      className="w-lg"
       value={value ?? ''}
       onChange={(e) => onChange(e.target.value)}
     />
@@ -774,14 +772,14 @@ function DeleteModal({
             checked={deleteContainer}
             onChange={(e) => setDeleteContainer(e.target.checked)}
           />
-          <span style={{ color: deleteContainer ? 'crimson' : undefined }}>
+          <span className={deleteContainer ? 'text-danger' : undefined}>
             Also delete cloud container (irreversible — erases all backup data)
           </span>
         </label>
-        <div style={{ marginTop: '1rem' }}>
-          <button type="button" onClick={confirm}>
+        <div className="row" style={{ marginTop: '1rem' }}>
+          <button type="button" className="btn-danger" onClick={confirm}>
             Delete
-          </button>{' '}
+          </button>
           <button type="button" onClick={onClose}>
             Cancel
           </button>
@@ -801,10 +799,10 @@ function PostCreateModal({
       <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Backup Created — {config.name}</h3>
         <p>Run the first backup now?</p>
-        <div style={{ marginTop: '1rem' }}>
-          <button type="button" onClick={onRunNow}>
+        <div className="row" style={{ marginTop: '1rem' }}>
+          <button type="button" className="btn-primary" onClick={onRunNow}>
             Run first backup now
-          </button>{' '}
+          </button>
           <button type="button" onClick={onNotNow}>
             Not now
           </button>
@@ -844,12 +842,12 @@ function ResetPasswordModal({
           />
         </Field>
 
-        {error && <p style={{ color: 'crimson' }}>{error}</p>}
+        {error && <p className="text-danger">{error}</p>}
 
-        <div style={{ marginTop: '1rem' }}>
-          <button type="button" onClick={() => onSubmit(password)} disabled={busy || !password}>
+        <div className="row" style={{ marginTop: '1rem' }}>
+          <button type="button" className="btn-primary" onClick={() => onSubmit(password)} disabled={busy || !password}>
             Submit
-          </button>{' '}
+          </button>
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
@@ -885,7 +883,7 @@ function CheckModal({
     try {
       setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
     } catch (e) {
-      onError(String(e))
+      onError(e instanceof Error ? e.message : String(e))
     } finally {
       setRunning(false)
     }
@@ -906,7 +904,7 @@ function CheckModal({
         setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
       else if (run.error) onError(run.error)
     } catch (e) {
-      onError(String(e))
+      onError(e instanceof Error ? e.message : String(e))
     } finally {
       setRepairing(false)
     }
@@ -945,32 +943,32 @@ function CheckModal({
           </Field>
         )}
         <Field label="Unreferenced blobs">
-          <label style={{ fontSize: '0.85rem' }}>
+          <label>
             <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
             {' '}Detect unreferenced blobs (repair deletes them)
           </label>
         </Field>
 
-        <div style={{ margin: '0.8rem 0' }}>
-          <button type="button" onClick={runCheck} disabled={running || repairing}>
+        <div className="row" style={{ margin: '0.8rem 0' }}>
+          <button type="button" className="btn-primary" onClick={runCheck} disabled={running || repairing}>
             {running ? 'Checking…' : 'Run check'}
-          </button>{' '}
+          </button>
           {(problems.some((f) => f.repairable) || (report?.orphanBlobs?.length ?? 0) > 0) && (
             <button type="button" onClick={runRepair} disabled={repairing || running}>
               {repairing ? 'Repairing…' : 'Repair from local'}
             </button>
-          )}{' '}
+          )}
           <button type="button" onClick={onClose}>Close</button>
         </div>
 
         {repairReport && (
-          <div style={{ fontSize: '0.85rem', marginBottom: '0.6rem' }}>
+          <div style={{ marginBottom: '0.6rem' }}>
             {repairReport.status === 'Running' && 'Repairing (backup is locked until done)…'}
-            {repairReport.status === 'Failed' && <span style={{ color: 'crimson' }}>Repair failed: {repairReport.error}</span>}
+            {repairReport.status === 'Failed' && <span className="text-danger">Repair failed: {repairReport.error}</span>}
             {repairReport.status === 'Completed' && (
               <>
                 Repaired {repairReport.repaired?.length ?? 0} file(s);{' '}
-                <span style={{ color: repairReport.unrecoverable?.length ? 'crimson' : 'inherit' }}>
+                <span className={repairReport.unrecoverable?.length ? 'text-danger' : undefined}>
                   {repairReport.unrecoverable?.length ?? 0} unrecoverable
                 </span>
                 {(repairReport.unrecoverable?.length ?? 0) > 0 && `: ${repairReport.unrecoverable!.join(', ')}`}
@@ -984,27 +982,27 @@ function CheckModal({
         {report && (
           <div>
             {report.metadataIssue && (
-              <div style={{ color: 'crimson', fontSize: '0.85rem' }}>Metadata drift: {report.metadataIssue}</div>
+              <div className="text-danger">Metadata drift: {report.metadataIssue}</div>
             )}
-            <div style={{ fontSize: '0.85rem', margin: '0.4rem 0', color: report.ok ? 'green' : 'crimson' }}>
+            <div className={report.ok ? 'text-ok' : 'text-danger'} style={{ margin: '0.4rem 0' }}>
               {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
               {' '}(version {report.version})
             </div>
             {listOrphans && (
-              <div style={{ fontSize: '0.85rem', margin: '0.4rem 0', color: report.orphanBlobs.length ? '#b06a00' : 'green' }}>
+              <div className={report.orphanBlobs.length ? 'text-warn' : 'text-ok'} style={{ margin: '0.4rem 0' }}>
                 {report.orphanBlobs.length === 0
                   ? 'No unreferenced blobs found'
                   : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
               </div>
             )}
             {problems.length > 0 && (
-              <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
-                <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
+              <table className="text-faint">
+                <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
                 <tbody>
                   {problems.map((f) => (
                     <tr key={f.path}>
-                      <td style={{ fontFamily: 'monospace' }}>{f.path}</td>
-                      <td style={{ textAlign: 'center', color: 'crimson' }}>{cloudStateLabel(f.cloud)}</td>
+                      <td className="mono">{f.path}</td>
+                      <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
                       <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
                       <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
                     </tr>

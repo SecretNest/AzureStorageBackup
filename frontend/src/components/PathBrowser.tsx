@@ -29,7 +29,7 @@ export function PathBrowser({
       .then(setData)
       .catch((e) => {
         if (controller.signal.aborted) return
-        setError(String(e))
+        setError(e instanceof Error ? e.message : String(e))
       })
     return () => controller.abort()
   }, [path])
@@ -39,16 +39,16 @@ export function PathBrowser({
       <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Choose a folder</h3>
 
-        <p style={{ fontFamily: 'monospace', fontSize: '0.85rem', wordBreak: 'break-all' }}>
+        <p className="mono text-faint" style={{ wordBreak: 'break-all' }}>
           {data?.path ?? path ?? ''}
         </p>
 
-        {error && <p style={{ color: '#b91c1c' }}>{error}</p>}
+        {error && <p className="text-danger">{error}</p>}
 
-        <div style={{ maxHeight: 320, overflowY: 'auto', border: '1px solid #ddd', padding: '0.5rem' }}>
+        <div style={{ maxHeight: 320, overflowY: 'auto', border: '1px solid var(--border)', padding: 'var(--sp-2)' }}>
           {data?.parent && (
             <div>
-              <button type="button" onClick={() => setPath(data.parent!)}>
+              <button type="button" className="btn-ghost" onClick={() => setPath(data.parent!)}>
                 .. (up)
               </button>
             </div>
@@ -58,6 +58,7 @@ export function PathBrowser({
               {e.isDirectory ? (
                 <button
                   type="button"
+                  className="btn-ghost"
                   disabled={e.outsideRoot}
                   title={e.outsideRoot ? 'Outside the configured root' : undefined}
                   onClick={() => setPath(e.fullPath)}
@@ -65,23 +66,23 @@ export function PathBrowser({
                   {e.name}/
                 </button>
               ) : (
-                <span style={{ color: '#888' }}>{e.name}</span>
+                <span className="text-faint">{e.name}</span>
               )}
             </div>
           ))}
           {data?.truncated && (
-            <p style={{ color: '#b45309' }}>Too many entries — this listing was truncated.</p>
+            <p className="text-warn">Too many entries — this listing was truncated.</p>
           )}
           {/* 少给了东西就必须说出来：不可 stat 的子项被跳过时，目录看上去和空目录一模一样。 */}
           {!!data?.skipped && (
-            <p style={{ color: '#b45309' }}>
+            <p className="text-warn">
               {data.skipped} item(s) could not be read and are not listed.
             </p>
           )}
         </div>
 
-        <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>
-          <button type="button" onClick={() => data && onPick(data.path)} disabled={!data}>
+        <div className="row" style={{ marginTop: '1rem' }}>
+          <button type="button" className="btn-primary" onClick={() => data && onPick(data.path)} disabled={!data}>
             Use this folder
           </button>
           <button type="button" onClick={onClose}>
