@@ -149,11 +149,11 @@ hr {
   margin: var(--sp-5) 0;
 }
 
-/* 焦点：内圈用背景色隔开，外圈用强调色，深浅底上都看得见。 */
+/* 焦点：用真正的 outline 描边，颜色只用强调色，不需要匹配任何底色；
+   outline 会自动跟随获焦元素自身的圆角。 */
 :focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
-  border-radius: var(--r-sm);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ── Controls ─────────────────────────────────────────────────────────────── */
@@ -175,6 +175,21 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* 无边框图标按钮：全局控件高度对需要与文字同行内联的字形（如折叠三角）是错的，
+   这里重置高宽、内边距与边框，让它随字形本身的行高排布。 */
+.icon-btn {
+  height: auto;
+  width: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+}
+.icon-btn:hover:not(:disabled) {
+  background: transparent;
+  color: var(--text);
 }
 
 input,

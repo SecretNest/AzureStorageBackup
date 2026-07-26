@@ -430,9 +430,10 @@ function TreeBrowser({
                 <>
                   <button
                     type="button"
+                    className="icon-btn"
                     onClick={() => onToggleExpand(node)}
                     disabled={!node.hasChildren}
-                    style={{ width: 18, padding: 0, background: 'none', border: 'none', cursor: node.hasChildren ? 'pointer' : 'default' }}
+                    style={{ width: 18, cursor: node.hasChildren ? 'pointer' : 'default' }}
                   >
                     {node.hasChildren ? (expanded.has(node.path) ? '▾' : '▸') : ' '}
                   </button>
