@@ -20,8 +20,8 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
 
     private sealed record KeyringLostError(string error, string code);
 
-    private static BackupConfigRequest SampleRequest(string name) => new(
-        AccountId: 1,
+    private static BackupConfigRequest SampleRequest(string name, int accountId) => new(
+        AccountId: accountId,
         ContainerName: name + "-container",
         Name: name,
         Description: null,
@@ -39,9 +39,24 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
         SingleFileThresholdBytes: 5_000_000,
         GroupCapBytes: 100_000_000);
 
+    /// <summary>建一个真实账户，供需要通过「Account not found.」闸门的配置创建使用。</summary>
+    private async Task<int> CreateAccountAsync(string name)
+    {
+        var req = new AccountRequest(
+            Name: "acct-" + name + "-" + Guid.NewGuid().ToString("N")[..6], Description: null,
+            BlobEndpoint: "https://example.blob.core.windows.net", Region: AzureRegion.Global,
+            AccountKey: "dGVzdGtleQ==", UseProxy: false, ProxyMode: ProxyMode.Independent,
+            ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null);
+        var res = await _client.PostAsJsonAsync("/api/accounts", req);
+        return (await res.Content.ReadFromJsonAsync<AccountResponse>())!.Id;
+    }
+
     private async Task<BackupConfigResponse> CreateConfigAsync(string name)
-        => (await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest(name)))
+    {
+        var accountId = await CreateAccountAsync(name);
+        return (await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest(name, accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>())!;
+    }
 
     private IKeyringHealth Keyring => factory.Services.GetRequiredService<IKeyringHealth>();
 

@@ -586,7 +586,12 @@ export function BackupConfigsPage() {
                 <button
                   type="button"
                   onClick={() => setStep(2)}
-                  disabled={newContainer && !!validateContainerName(form.containerName)}
+                  disabled={
+                    !form.accountId ||
+                    !form.containerName.trim() ||
+                    !form.localRoot.trim() ||
+                    (newContainer && !!validateContainerName(form.containerName))
+                  }
                 >
                   Next
                 </button>
@@ -792,7 +797,7 @@ export function BackupConfigsPage() {
                 <button type="button" onClick={() => setStep(1)}>
                   Back
                 </button>
-                <button type="button" className="btn-primary" onClick={save} disabled={busy}>
+                <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim()}>
                   {editing ? 'Save' : 'Create'}
                 </button>
                 <button type="button" onClick={() => setShowForm(false)} disabled={busy}>

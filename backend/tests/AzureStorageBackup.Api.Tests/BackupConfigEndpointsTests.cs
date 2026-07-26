@@ -13,8 +13,10 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 {
     private readonly HttpClient _client = factory.CreateClient();
 
-    private static BackupConfigRequest SampleRequest(string name = "photos") => new(
-        AccountId: 1,
+    // AccountId 默认 0：不是一个真实账户，调用方必须显式传入 CreateAccountAsync 建出的账户 id
+    // （否则从 P2T7 起会被「Account not found.」拦下）。仅当测试确实要断言这条拒绝时才保留 0/999999。
+    private static BackupConfigRequest SampleRequest(string name = "photos", int accountId = 0) => new(
+        AccountId: accountId,
         ContainerName: "photos",
         Name: name,
         Description: "family",
@@ -32,10 +34,28 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         SingleFileThresholdBytes: 5_000_000,
         GroupCapBytes: 100_000_000);
 
+    /// <summary>建一个真实账户，供需要通过「Account not found.」闸门的测试使用。</summary>
+    private async Task<int> CreateAccountAsync(string name)
+    {
+        var req = new AccountRequest(
+            Name: "acct-" + name + "-" + Guid.NewGuid().ToString("N")[..6],
+            Description: null,
+            BlobEndpoint: "https://example.blob.core.windows.net",
+            Region: AzureRegion.Global,
+            AccountKey: "dGVzdGtleQ==",
+            UseProxy: false,
+            ProxyMode: ProxyMode.Independent,
+            ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null);
+        var res = await _client.PostAsJsonAsync("/api/accounts", req);
+        var account = await res.Content.ReadFromJsonAsync<AccountResponse>();
+        return account!.Id;
+    }
+
     [Fact]
     public async Task Post_Creates_Config_And_Hides_Password()
     {
-        var res = await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest());
+        var accountId = await CreateAccountAsync("post-creates");
+        var res = await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest(accountId: accountId));
 
         Assert.Equal(HttpStatusCode.Created, res.StatusCode);
         var created = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
@@ -50,19 +70,45 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task Post_Without_LocalRoot_Returns_400()
     {
-        var res = await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest() with { LocalRoot = "" });
+        var accountId = await CreateAccountAsync("no-local-root");
+        var res = await _client.PostAsJsonAsync("/api/backup-configs",
+            SampleRequest(accountId: accountId) with { LocalRoot = "" });
 
         Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
     }
 
     [Fact]
+    public async Task Post_Without_Name_Returns_400()
+    {
+        var accountId = await CreateAccountAsync("no-name");
+        var res = await _client.PostAsJsonAsync("/api/backup-configs",
+            SampleRequest(accountId: accountId) with { Name = "   " });
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+        Assert.Equal("Name is required.", body!["error"]);
+    }
+
+    [Fact]
+    public async Task Post_With_Nonexistent_Account_Returns_400()
+    {
+        var res = await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest(accountId: 999_999));
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+        Assert.Equal("Account not found.", body!["error"]);
+    }
+
+    [Fact]
     public async Task Put_With_Empty_Password_Keeps_Existing()
     {
-        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("keep-pw")))
+        var accountId = await CreateAccountAsync("keep-pw");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("keep-pw", accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         var res = await _client.PutAsJsonAsync($"/api/backup-configs/{created!.Id}",
-            SampleRequest("keep-pw") with { Password = null, Name = "renamed" });
+            SampleRequest("keep-pw", accountId) with { Password = null, Name = "renamed" });
 
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
         var updated = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
@@ -71,9 +117,26 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     }
 
     [Fact]
+    public async Task Put_With_Blank_Name_Returns_400()
+    {
+        var accountId = await CreateAccountAsync("put-blank-name");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("put-blank-name", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PutAsJsonAsync($"/api/backup-configs/{created!.Id}",
+            SampleRequest("put-blank-name", accountId) with { Password = null, Name = "   " });
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+        Assert.Equal("Name is required.", body!["error"]);
+    }
+
+    [Fact]
     public async Task Delete_Removes_Config()
     {
-        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("del")))
+        var accountId = await CreateAccountAsync("del");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("del", accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created!.Id}")).StatusCode);
@@ -143,8 +206,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task Delete_Config_Purges_Local_Index_Cache_And_Local_Backup_State_Scoped_To_Account_Container()
     {
+        var acctId = await CreateAccountAsync("del-cache");
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
-                SampleRequest("del-cache") with { ContainerName = "del-cache-container" }))
+                SampleRequest("del-cache", acctId) with { ContainerName = "del-cache-container" }))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
         var accountId = created!.AccountId;
         var container = created.ContainerName;
@@ -182,7 +246,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task New_Config_Reports_Normal_Status_And_Idle_Activity()
     {
-        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-idle")))
+        var accountId = await CreateAccountAsync("status-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-idle", accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         Assert.Equal(BackupStatus.Normal, created!.Status);
@@ -197,7 +262,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task Busy_Config_Reports_Checking_Activity_In_List_And_Detail()
     {
-        var req = SampleRequest("status-busy") with { ContainerName = "busy-container" };
+        var accountId = await CreateAccountAsync("status-busy");
+        var req = SampleRequest("status-busy", accountId) with { ContainerName = "busy-container" };
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs", req))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
@@ -227,7 +293,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task Failed_Operation_Sets_Error_And_Reset_Status_Clears_It()
     {
-        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-error")))
+        var accountId = await CreateAccountAsync("status-error");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-error", accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         // 模拟某个 runner 写状态点因操作失败落库 Error（决策 2）。
