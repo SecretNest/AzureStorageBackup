@@ -519,6 +519,14 @@ tbody tr:hover {
   align-items: center;
 }
 
+/* .row 是块级 flex，若与同级文本放在一起（例如表格单元格里紧跟在文字后面），
+   会强制换行；这里用 inline-flex 让它留在行内继续参与文字流。 */
+.row-inline {
+  display: inline-flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
 .stack {
   display: flex;
   flex-direction: column;

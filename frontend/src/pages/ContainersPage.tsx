@@ -104,11 +104,13 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
               <tr key={c.name}>
                 <td>{c.name}</td>
                 <td>
-                  {backupPresenceLabels[c.backup] ?? 'Unknown'}
-                  {infoFileName(c.backup) && (
-                    <span className="text-faint">
-                      ({infoFileName(c.backup)})
+                  {infoFileName(c.backup) ? (
+                    <span className="row-inline">
+                      <span>{backupPresenceLabels[c.backup] ?? 'Unknown'}</span>
+                      <span className="text-faint">({infoFileName(c.backup)})</span>
                     </span>
+                  ) : (
+                    backupPresenceLabels[c.backup] ?? 'Unknown'
                   )}
                 </td>
                 <td style={{ textAlign: 'right' }}>
