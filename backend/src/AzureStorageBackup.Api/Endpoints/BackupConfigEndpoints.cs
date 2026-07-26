@@ -210,7 +210,7 @@ public static class BackupConfigEndpoints
                 return Results.NotFound();
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
 
-            var state = runner.Start(id);
+            var state = await runner.StartAsync(id);
             return Results.Accepted($"/api/backup-configs/{id}/run", BackupRunResponse.From(state));
         });
 

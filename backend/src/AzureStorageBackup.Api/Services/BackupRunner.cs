@@ -37,19 +37,68 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, BackupRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    /// <summary>界面用：抢忙碌锁并在后台跑。同一配置已在运行则返回现有状态。</summary>
-    public BackupRunState Start(int configId)
+    /// <summary>
+    /// 界面用：解析配置 → 抢忙碌锁 → 登记 → 后台跑。同一配置已在运行则返回现有状态。
+    /// 解析配置需要异步 I/O，故本方法整体是 async：必须先拿到锁再登记进 _runs（见下）。
+    /// </summary>
+    public async Task<BackupRunState> StartAsync(int configId)
     {
         lock (_lock)
         {
             if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
                 return existing;
-
-            var state = new BackupRunState();
-            _runs[configId] = state;
-            _ = Task.Run(() => RunOwningLockAsync(configId, state));
-            return state;
         }
+
+        int accountId;
+        string container;
+        try
+        {
+            using var scope = scopes.CreateScope();
+            var config = await scope.ServiceProvider.GetRequiredService<IBackupConfigService>().GetAsync(configId)
+                ?? throw new InvalidOperationException($"Backup config {configId} not found.");
+            accountId = config.AccountId;
+            container = config.ContainerName;
+        }
+        catch (Exception ex)
+        {
+            var failed = new BackupRunState { Error = ex.Message, Status = RunStatus.Failed };
+            failed.Completion.TrySetResult();
+            return failed;
+        }
+
+        // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
+        if (!busy.TryAcquire(accountId, container, "BackingUp"))
+        {
+            var failed = new BackupRunState { Error = "This backup is busy with another operation.", Status = RunStatus.Failed };
+            failed.Completion.TrySetResult();
+            return failed;
+        }
+
+        // _runs 只在已经拿到忙碌锁之后才写入：旧实现是先登记、后抢锁，两者之间有一个
+        // 窗口——_runs 里已经出现一条 Running 记录，但没有锁在保护它。调度器
+        // （TaskDispatcher.DispatchAsync）恰好会在这个窗口里抢到本该被这里持有的锁，
+        // 随后 RunTrackedAsync 看到这条“Running”记录就把这一轮调度当成“已有一次真正
+        // 在跑的备份”而转去等它，自己什么也不执行；而这边随后的 TryAcquire 必然落空，
+        // 把这个共享 state 标记成 Failed——于是整轮调度什么都没跑，却被记成了出错。
+        // 现在锁必须先到手，_runs 才会写入，一条 Running 记录就永远意味着真的有一次
+        // 运行持有着锁，这个窗口也就不存在了。
+        var state = new BackupRunState();
+        lock (_lock)
+            _runs[configId] = state;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunCoreAsync(configId, state, CancellationToken.None);
+            }
+            finally
+            {
+                busy.Release(accountId, container);
+            }
+        });
+
+        return state;
     }
 
     /// <summary>
@@ -96,47 +145,6 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         lock (_lock)
             return _runs.GetValueOrDefault(configId);
-    }
-
-    /// <summary>Start 的执行体：抢锁 → 跑 → 释放。</summary>
-    private async Task RunOwningLockAsync(int configId, BackupRunState state)
-    {
-        int accountId;
-        string container;
-        try
-        {
-            using var scope = scopes.CreateScope();
-            var sp = scope.ServiceProvider;
-            var config = await sp.GetRequiredService<IBackupConfigService>().GetAsync(configId)
-                ?? throw new InvalidOperationException($"Backup config {configId} not found.");
-            accountId = config.AccountId;
-            container = config.ContainerName;
-        }
-        catch (Exception ex)
-        {
-            state.Error = ex.Message;
-            state.Status = RunStatus.Failed;
-            state.Completion.TrySetResult();
-            return;
-        }
-
-        // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
-        if (!busy.TryAcquire(accountId, container, "BackingUp"))
-        {
-            state.Error = "This backup is busy with another operation.";
-            state.Status = RunStatus.Failed;
-            state.Completion.TrySetResult();
-            return;
-        }
-
-        try
-        {
-            await RunCoreAsync(configId, state, CancellationToken.None);
-        }
-        finally
-        {
-            busy.Release(accountId, container);
-        }
     }
 
     /// <summary>两个入口共用的执行体。**不碰忙碌锁**——锁由调用方负责。</summary>
