@@ -123,9 +123,10 @@ export function LogsPage() {
                   {new Date(l.timestamp).toLocaleString()}
                 </td>
                 <td>
+                  {/* 严重程度顺序须与 OperationLogLevel 一致：之前的映射有偏移，Error 会被渲染成和 Debug 一样的纯灰徽标。 */}
                   <span className={
-                    l.level === 2 ? 'badge badge-danger'
-                    : l.level === 1 ? 'badge badge-warn'
+                    l.level === OperationLogLevel.Error ? 'badge badge-danger'
+                    : l.level === OperationLogLevel.Warning ? 'badge badge-warn'
                     : 'badge'
                   }>
                     {levelLabels[l.level]}
