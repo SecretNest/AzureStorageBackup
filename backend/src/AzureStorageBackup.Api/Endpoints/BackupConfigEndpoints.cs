@@ -106,13 +106,20 @@ public static class BackupConfigEndpoints
             return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, importSettings, secretsUnavailable: Pending(keyring, encryption, created)));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IAccountService accounts, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
+            // 向导没有任何强校验的欠账（review 发现）：先做便宜的本地字符串检查，
+            // 再做不碰文件系统/数据库的路径边界检查，最后才是需要查库的账户存在性检查——
+            // 让最贵的检查排在最后，任何一步不合格都不必再往下走。
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
             if (string.IsNullOrWhiteSpace(req.ContainerName))
                 return Results.BadRequest(new { error = "ContainerName is required." });
+            if (string.IsNullOrWhiteSpace(req.Name))
+                return Results.BadRequest(new { error = "Name is required." });
             if (PathBoundaryGuard.Blocked(boundary, req.LocalRoot) is { } outside) return outside;
+            if (await accounts.GetAsync(req.AccountId, ct) is null)
+                return Results.BadRequest(new { error = "Account not found." });
 
             var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
             var settings = await settingsSvc.GetAsync(ct);
@@ -123,6 +130,10 @@ public static class BackupConfigEndpoints
         {
             if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
+            // LocalRoot/ContainerName/Tier/加密性创建后锁定，已由 BackupConfigService.UpdateAsync 拒绝；
+            // Name 不在锁定字段之列，仍可编辑，因此仍需在这里挡空白（与创建端点同一条规则）。
+            if (string.IsNullOrWhiteSpace(req.Name))
+                return Results.BadRequest(new { error = "Name is required." });
 
             // 空密码 = 保留原值、非空 = 拒绝（决策 8），均由服务层判定：密文含随机 IV，不能在此比较。
             var update = req.ToConfig(encryption);
