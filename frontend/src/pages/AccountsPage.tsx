@@ -39,7 +39,7 @@ export function AccountsPage() {
   const [resetting, setResetting] = useState<Account | null>(null)
 
   const load = () => {
-    accountsApi.list().then(setAccounts).catch((e) => setError(String(e)))
+    accountsApi.list().then(setAccounts).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   useEffect(load, [])
 
@@ -89,7 +89,7 @@ export function AccountsPage() {
         setViewing(created)
       }
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -101,7 +101,7 @@ export function AccountsPage() {
       await accountsApi.remove(a.id)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -111,7 +111,7 @@ export function AccountsPage() {
     try {
       setTestResult(await accountsApi.testConnection(form))
     } catch (e) {
-      setTestResult({ success: false, error: String(e) })
+      setTestResult({ success: false, error: e instanceof Error ? e.message : String(e) })
     } finally {
       setBusy(false)
     }
@@ -142,7 +142,7 @@ export function AccountsPage() {
       // 否则横幅会一直挂着已经过期的告警(设计 §3.5)。
       void refreshKeyringStatus()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -162,18 +162,18 @@ export function AccountsPage() {
 
   return (
     <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Accounts</h1>
-        <button type="button" onClick={startNew}>
+        <button type="button" className="btn-primary" onClick={startNew}>
           New Account
         </button>
       </div>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem' }}>
+      <table>
         <thead>
-          <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+          <tr>
             <th>Name</th>
             <th>Endpoint</th>
             <th>Region</th>
@@ -184,35 +184,35 @@ export function AccountsPage() {
         <tbody>
           {accounts.length === 0 ? (
             <tr>
-              <td colSpan={5} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={5} className="empty-state">
                 No accounts yet.
               </td>
             </tr>
           ) : (
             accounts.map((a) => (
-              <tr key={a.id} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={a.id}>
                 <td>
                   {a.name}
                   {a.secretsUnavailable && (
-                    <>
-                      <span style={{ color: '#b45309', marginLeft: '0.5rem' }}>Credential required</span>{' '}
-                      <button type="button" onClick={() => startReset(a)}>
+                    <span className="row">
+                      <span className="badge badge-warn">Credential required</span>
+                      <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
                         Re-enter
                       </button>
-                    </>
+                    </span>
                   )}
                 </td>
                 <td>{a.blobEndpoint}</td>
                 <td>{regionLabels[a.region]}</td>
                 <td>{a.useProxy ? 'Yes' : 'No'}</td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                  <button type="button" onClick={() => setViewing(a)}>
+                  <button type="button" className="btn-ghost" onClick={() => setViewing(a)}>
                     Containers
                   </button>{' '}
-                  <button type="button" onClick={() => startEdit(a)}>
+                  <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
                     Edit
                   </button>{' '}
-                  <button type="button" onClick={() => remove(a)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
                     Delete
                   </button>
                 </td>
@@ -223,7 +223,7 @@ export function AccountsPage() {
       </table>
 
       {showForm && (
-        <div style={{ marginTop: '1.5rem', padding: '1rem', border: '1px solid #ccc' }}>
+        <div className="panel">
           <h2>{editing ? `Edit: ${editing.name}` : 'New Account'}</h2>
 
           <Field label="Name">
@@ -237,6 +237,7 @@ export function AccountsPage() {
           </Field>
           <Field label="Blob Endpoint">
             <input
+              className="w-lg mono"
               placeholder="https://account.blob.core.windows.net"
               value={form.blobEndpoint}
               onChange={(e) => set('blobEndpoint', e.target.value)}
@@ -253,10 +254,11 @@ export function AccountsPage() {
               <option value={AzureRegion.China}>China</option>
               <option value={AzureRegion.UsGov}>US Gov</option>
             </select>
-            {!form.useProxy && <span style={{ color: '#888', fontSize: '0.8rem', marginLeft: '0.4rem' }}>enable proxy for other regions</span>}
+            {!form.useProxy && <span className="text-faint" style={{ marginLeft: '0.4rem' }}>enable proxy for other regions</span>}
           </Field>
           <Field label="Account Key">
             <input
+              className="w-lg mono"
               type="password"
               placeholder={editing ? 'Leave blank to keep current' : ''}
               value={form.accountKey ?? ''}
@@ -288,12 +290,14 @@ export function AccountsPage() {
                 <>
                   <Field label="Proxy Host">
                     <input
+                      className="w-md"
                       value={form.proxyHost ?? ''}
                       onChange={(e) => set('proxyHost', e.target.value)}
                     />
                   </Field>
                   <Field label="Proxy Port">
                     <input
+                      className="w-sm"
                       type="number"
                       value={form.proxyPort ?? ''}
                       onChange={(e) =>
@@ -303,12 +307,14 @@ export function AccountsPage() {
                   </Field>
                   <Field label="Proxy Username">
                     <input
+                      className="w-md"
                       value={form.proxyUsername ?? ''}
                       onChange={(e) => set('proxyUsername', e.target.value)}
                     />
                   </Field>
                   <Field label="Proxy Password">
                     <input
+                      className="w-md"
                       type="password"
                       placeholder={editing ? 'Leave blank to keep current' : ''}
                       value={form.proxyPassword ?? ''}
@@ -320,20 +326,20 @@ export function AccountsPage() {
             </>
           )}
 
-          <div style={{ marginTop: '1rem' }}>
-            <button type="button" onClick={save} disabled={busy}>
+          <div className="row" style={{ marginTop: '1rem' }}>
+            <button type="button" className="btn-primary" onClick={save} disabled={busy}>
               {editing ? 'Save' : 'Create'}
-            </button>{' '}
+            </button>
             <button type="button" onClick={test} disabled={busy}>
               Test Connection
-            </button>{' '}
+            </button>
             <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
               Cancel
             </button>
           </div>
 
           {testResult && (
-            <p style={{ color: testResult.success ? 'green' : 'crimson' }}>
+            <p className={testResult.success ? 'text-ok' : 'text-danger'}>
               {testResult.success
                 ? 'Connection succeeded.'
                 : `Connection failed: ${testResult.error}`}
@@ -372,7 +378,7 @@ function ResetSecretsModal({
   return (
     <div className={overlayStyle} onClick={onClose}>
       <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Re-enter Credentials — {account.name}</h3>
+        <h3>Re-enter Credentials — {account.name}</h3>
         <p>
           The data protection keys used to store this account's credentials were lost.
           Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
@@ -381,6 +387,7 @@ function ResetSecretsModal({
 
         <Field label="Account Key">
           <input
+            className="w-lg"
             type="password"
             value={accountKey}
             onChange={(e) => setAccountKey(e.target.value)}
@@ -389,6 +396,7 @@ function ResetSecretsModal({
         {account.useProxy && (
           <Field label="Proxy Password">
             <input
+              className="w-lg"
               type="password"
               value={proxyPassword}
               onChange={(e) => setProxyPassword(e.target.value)}
@@ -396,16 +404,17 @@ function ResetSecretsModal({
           </Field>
         )}
 
-        {error && <p style={{ color: 'crimson' }}>{error}</p>}
+        {error && <p className="text-danger">{error}</p>}
 
-        <div style={{ marginTop: '1rem' }}>
+        <div className="row" style={{ marginTop: '1rem' }}>
           <button
             type="button"
+            className="btn-primary"
             onClick={() => onSubmit(accountKey, proxyPassword)}
             disabled={busy || !accountKey}
           >
             Submit
-          </button>{' '}
+          </button>
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>

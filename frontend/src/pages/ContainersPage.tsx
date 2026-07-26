@@ -53,39 +53,47 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
 
   return (
     <section>
-      <button type="button" onClick={onBack}>
+      <button type="button" className="btn-ghost" onClick={onBack}>
         &larr; Back to accounts
       </button>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Containers — {account.name}</h1>
         <button type="button" onClick={load} disabled={loading}>
           Refresh
         </button>
       </div>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <div style={{ margin: '1rem 0' }}>
+      <div className="toolbar">
         <input
+          className="w-md"
           placeholder="New container name"
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
-        />{' '}
-        <button type="button" onClick={create} disabled={!trimmedName || !!nameError}>
+        />
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={create}
+          disabled={!trimmedName || !!nameError}
+        >
           Create Container
         </button>
-        <div>{nameError ?? containerNameRule}</div>
+        <span className={nameError ? 'text-danger' : 'text-faint'}>
+          {nameError ?? containerNameRule}
+        </span>
       </div>
 
       {loading ? (
         <p>Loading…</p>
       ) : containers.length === 0 ? (
-        <p>No containers yet. We suggest creating one to start a backup.</p>
+        <p className="empty-state">No containers yet. We suggest creating one to start a backup.</p>
       ) : (
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table>
           <thead>
-            <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+            <tr>
               <th>Name</th>
               <th>Status</th>
               <th></th>
@@ -93,18 +101,18 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
           </thead>
           <tbody>
             {containers.map((c) => (
-              <tr key={c.name} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={c.name}>
                 <td>{c.name}</td>
                 <td>
                   {backupPresenceLabels[c.backup] ?? 'Unknown'}
                   {infoFileName(c.backup) && (
-                    <span style={{ color: '#888', fontSize: '0.8rem', marginLeft: '0.4rem' }}>
+                    <span className="text-faint">
                       ({infoFileName(c.backup)})
                     </span>
                   )}
                 </td>
                 <td style={{ textAlign: 'right' }}>
-                  <button type="button" onClick={() => remove(c.name)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(c.name)}>
                     Delete
                   </button>
                 </td>
