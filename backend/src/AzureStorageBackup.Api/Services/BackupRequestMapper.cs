@@ -11,38 +11,42 @@ public static class BackupRequestMapper
     /// （设计 §3.1：解密只在咽喉处；映射器是静态的，拿不到 ISecretReader）。
     /// </summary>
     public static BackupRequest From(
-        BackupConfig config, Account account, string? password, GlobalSettings? settings = null) => new()
+        BackupConfig config, Account account, string? password, GlobalSettings? settings = null)
     {
-        Account = account,
-        Container = config.ContainerName,
-        LocalRoot = config.LocalRoot,
-        Name = config.Name,
-        Description = config.Description,
-        Password = password,
-        IndexTier = MapTier(config.IndexTier),
-        DataTier = MapTier(config.DataTier),
-        Options = new BackupEngineOptions
+        var r = ResolvedBackupSettings.From(config, settings);
+        return new BackupRequest
         {
-            Ignore = new IgnoreRuleSet(SplitLines(config.IgnoreRules)),
-            DontCompress = OptionalRules(config.DontCompressRules),
-            DontGroup = OptionalRules(config.DontGroupRules),
-            Scan = new ScanOptions { IncludeSymlinks = config.IncludeSymlinks },
-            Plan = new PlanOptions
+            Account = account,
+            Container = config.ContainerName,
+            LocalRoot = config.LocalRoot,
+            Name = config.Name,
+            Description = config.Description,
+            Password = password,
+            IndexTier = MapTier(config.IndexTier),
+            DataTier = MapTier(config.DataTier),
+            Options = new BackupEngineOptions
             {
-                SingleFileThresholdBytes = config.SingleFileThresholdBytes,
-                GroupCapBytes = config.GroupCapBytes,
+                Ignore = new IgnoreRuleSet(SplitLines(r.IgnoreRules)),
+                DontCompress = OptionalRules(r.DontCompressRules),
+                DontGroup = OptionalRules(r.DontGroupRules),
+                Scan = new ScanOptions { IncludeSymlinks = r.IncludeSymlinks },
+                Plan = new PlanOptions
+                {
+                    SingleFileThresholdBytes = r.SingleFileThresholdBytes,
+                    GroupCapBytes = r.GroupCapBytes,
+                },
+                VolumeBytes = r.VolumeBytes is > 0 ? r.VolumeBytes : null,
+                Retention = RetentionOf(config, settings),
+                UploadConcurrency = settings is { UploadConcurrency: > 0 } ? settings.UploadConcurrency : 5,
+                Upload = RetryOf(settings),
+                DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
+                    ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
+                AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
+                VerboseLogging = r.VerboseLogging,
+                ProcessingMaxAttempts = settings is { ProcessingMaxAttempts: > 0 } ? settings.ProcessingMaxAttempts : 5,
             },
-            VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
-            Retention = RetentionOf(config),
-            UploadConcurrency = settings is { UploadConcurrency: > 0 } ? settings.UploadConcurrency : 5,
-            Upload = RetryOf(settings),
-            DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
-                ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
-            AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
-            VerboseLogging = config.VerboseLogging,
-            ProcessingMaxAttempts = settings is { ProcessingMaxAttempts: > 0 } ? settings.ProcessingMaxAttempts : 5,
-        },
-    };
+        };
+    }
 
     /// <summary>把全局设置的网络重试退避（PRD 4.1）映射为上传路径的 RetryOptions。</summary>
     public static RetryOptions RetryOf(GlobalSettings? settings)
@@ -70,24 +74,32 @@ public static class BackupRequestMapper
             .Select(TimeSpan.FromSeconds)
             .ToList();
 
-    public static RetentionPolicy RetentionOf(BackupConfig config) => new()
+    public static RetentionPolicy RetentionOf(BackupConfig config, GlobalSettings? settings)
     {
-        MaxVersions = config.MaxVersions,
-        MaxAgeDays = config.MaxAgeDays,
-        Mode = config.RetentionMode,
-    };
+        var r = ResolvedBackupSettings.From(config, settings);
+        return new RetentionPolicy
+        {
+            MaxVersions = r.MaxVersions,
+            MaxAgeDays = r.MaxAgeDays,
+            Mode = r.RetentionMode,
+        };
+    }
 
     /// <summary>清理选项（保留 + 死重压实所需 tier/分卷/阈值），调度器 Cleanup 任务用。</summary>
-    public static CleanupOptions CleanupOf(BackupConfig config, GlobalSettings? settings = null) => new()
+    public static CleanupOptions CleanupOf(BackupConfig config, GlobalSettings? settings = null)
     {
-        Retention = RetentionOf(config),
-        DataTier = MapTier(config.DataTier),
-        VolumeBytes = config.VolumeBytes is > 0 ? config.VolumeBytes : null,
-        DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
-            ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
-        LocalRoot = config.LocalRoot,
-        AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
-    };
+        var r = ResolvedBackupSettings.From(config, settings);
+        return new CleanupOptions
+        {
+            Retention = RetentionOf(config, settings),
+            DataTier = MapTier(config.DataTier),
+            VolumeBytes = r.VolumeBytes is > 0 ? r.VolumeBytes : null,
+            DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
+                ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
+            LocalRoot = config.LocalRoot,
+            AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
+        };
+    }
 
     // 备份密码改由 ISecretReader.RevealBackupPassword 提供（设计 §3.1），此处不再暴露。
 
