@@ -101,9 +101,15 @@ public sealed class TaskDispatcher(
             switch (task.TaskType)
             {
                 case ScheduledTaskType.Backup:
-                    var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                    await sp.GetRequiredService<BackupOrchestrator>()
-                        .RunAsync(BackupRequestMapper.From(config, account, password, settings), null, ct);
+                    // 与界面按钮走同一条执行体，这样定时备份也有进度可查。
+                    // 用 RunTrackedAsync 而非 Start：DispatchAsync 已为该目标持有忙碌锁，
+                    // Start 会再抢一次并必然失败，把每一次定时备份都变成「busy」。
+                    var backupState = await sp.GetRequiredService<BackupRunner>()
+                        .RunTrackedAsync(config.Id, ct);
+                    // 执行体吞掉异常、只把失败写进 state，所以这里必须显式抛出，
+                    // 否则下方 catch 不会触发，失败会被 WriteStatusAsync(null) 记成成功。
+                    if (backupState.Status == RunStatus.Failed)
+                        throw new InvalidOperationException(backupState.Error ?? "Backup failed.");
                     break;
 
                 case ScheduledTaskType.Check:
