@@ -16,6 +16,13 @@ public sealed class BackupRunState
     public string? Error { get; set; }
 
     /// <summary>
+    /// 内部机制，不进 HTTP 契约：失败时的原始异常。RunCoreAsync 的 catch 里连 Error 一起设置，
+    /// 供 TaskDispatcher 在向上抛出时挂作 InnerException——容器日志因此保留 Azure 异常自带的
+    /// 状态码、请求 id 与真实堆栈，而不是只剩一句消息和从 throw 处开始的栈(Fix 4)。
+    /// </summary>
+    internal Exception? Failure { get; set; }
+
+    /// <summary>
     /// 内部机制，不进 HTTP 契约：该次运行到达终态（Completed/Failed）时触发一次。
     /// 供 RunTrackedAsync 的短路分支等待，不给前端轮询用。
     /// </summary>
@@ -133,7 +140,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             // 调用方约定本方法只返回终态：若原样返回这个仍是 Running 的 state，
             // 调度器「Status == Failed 才算失败」的判断会把这次根本没跑的备份
             // 当成静默成功。等它跑到终态（Completed/Failed）再返回。
-            await state.Completion.Task;
+            // 在锁先于登记的顺序下这个分支目前不可达，纯属防御性保留；但如果它以后又
+            // 变得可达，不带取消令牌的 await 会让调度器永远占着忙碌锁挂起，关机也无法
+            // 打断它——带上 ct，让它至少能跟着关机一起收尾(Fix 5)。
+            await state.Completion.Task.WaitAsync(ct);
             return state;
         }
 
@@ -174,6 +184,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         catch (Exception ex)
         {
             state.Error = ex.Message;
+            state.Failure = ex;
             state.Status = RunStatus.Failed;
             // 原 scope 可能已随异常释放（`using var scope` 在 try 块退出时释放）：另开一个写状态。
             using var scope = scopes.CreateScope();

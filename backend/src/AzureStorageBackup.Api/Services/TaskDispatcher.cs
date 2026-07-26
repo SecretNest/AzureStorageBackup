@@ -108,8 +108,12 @@ public sealed class TaskDispatcher(
                         .RunTrackedAsync(config.Id, ct);
                     // 执行体吞掉异常、只把失败写进 state，所以这里必须显式抛出，
                     // 否则下方 catch 不会触发，失败会被 WriteStatusAsync(null) 记成成功。
+                    // 把原始异常挂作 InnerException（Fix 4）：外层 DispatchAsync 的
+                    // LogError(ex, …) 原本收到的是编排器的真实异常——Azure 失败时带着状态码、
+                    // 请求 id 和有用的堆栈；只传消息的话，容器日志里就只剩一个从这里 throw
+                    // 开始的空壳堆栈，对无人值守部署这是最后一道诊断线索，不该丢。
                     if (backupState.Status == RunStatus.Failed)
-                        throw new InvalidOperationException(backupState.Error ?? "Backup failed.");
+                        throw new InvalidOperationException(backupState.Error ?? "Backup failed.", backupState.Failure);
                     break;
 
                 case ScheduledTaskType.Check:
