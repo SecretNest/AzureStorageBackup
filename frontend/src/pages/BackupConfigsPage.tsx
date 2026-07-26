@@ -81,6 +81,7 @@ export function BackupConfigsPage() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
+  const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
@@ -105,6 +106,51 @@ export function BackupConfigsPage() {
   const [containerListError, setContainerListError] = useState<string | null>(null)
   const [newContainer, setNewContainer] = useState(false)
   useEffect(load, [])
+
+  // 列表每 5 秒刷一次：纯本地查询（配置行 + 内存中的 activity），不连云。
+  useEffect(() => {
+    const t = setInterval(load, 5000)
+    return () => clearInterval(t)
+  }, [])
+
+  // 有活跃项时，只对活跃的那几份、且只拉该 activity 对应的那一个端点。
+  // 全空闲时不发这些请求。取代闭包里的循环：状态来自服务端，因此刷新页面、换标签页、
+  // 或备份由定时任务发起，看到的都一样。
+  useEffect(() => {
+    const active = configs.filter((c) => c.activity !== 'Idle')
+    if (active.length === 0) return
+
+    let cancelled = false
+    const tick = async () => {
+      await Promise.all(
+        active.map(async (c) => {
+          try {
+            if (c.activity === 'BackingUp') {
+              const s = await backupConfigsApi.runStatus(c.id)
+              if (!cancelled) setRuns((r) => ({ ...r, [c.id]: s }))
+            } else if (c.activity === 'Restoring') {
+              const s = await backupConfigsApi.restoreStatus(c.id)
+              if (!cancelled) setRestores((r) => ({ ...r, [c.id]: s }))
+            } else if (c.activity === 'Repairing') {
+              const s = await backupConfigsApi.repairStatus(c.id)
+              if (!cancelled) setRepairs((r) => ({ ...r, [c.id]: s }))
+            }
+            // Checking 与 CleaningUp 没有状态端点：只显示徽章，不拉进度。
+          } catch {
+            // 单次轮询失败不值得打断整页，下一拍会重试。
+          }
+        }),
+      )
+    }
+
+    const t = setInterval(tick, 1000)
+    void tick()
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [configs])
+
   useEffect(() => {
     accountsApi.list().then(setAccounts).catch(() => {})
     settingsApi.get().then(setDefaults).catch(() => {})
@@ -255,28 +301,22 @@ export function BackupConfigsPage() {
     }
   }
 
+  // 只负责发起——轮询交给上面按 activity 派发的统一机制（服务端是唯一真相源）。
   const run = async (c: BackupConfig) => {
     setError(null)
     try {
-      let state = await backupConfigsApi.run(c.id)
+      const state = await backupConfigsApi.run(c.id)
       setRuns((r) => ({ ...r, [c.id]: state }))
-      while (state.status === 'Running') {
-        await delay(1000)
-        state = await backupConfigsApi.runStatus(c.id)
-        setRuns((r) => ({ ...r, [c.id]: state }))
-      }
+      load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  const pollRestore = async (id: number, state: RestoreRun) => {
+  // 同上：只写入首个状态，后续进度由统一轮询接手。
+  const pollRestore = (id: number, state: RestoreRun) => {
     setRestores((r) => ({ ...r, [id]: state }))
-    while (state.status === 'Running') {
-      await delay(1000)
-      state = await backupConfigsApi.restoreStatus(id)
-      setRestores((r) => ({ ...r, [id]: state }))
-    }
+    load()
   }
 
   const [importing, setImporting] = useState(false)
@@ -402,19 +442,19 @@ export function BackupConfigsPage() {
                     type="button"
                     className="btn-ghost"
                     onClick={() => run(c)}
-                    disabled={keyringLost || runs[c.id]?.status === 'Running'}
+                    disabled={keyringLost || c.activity !== 'Idle'}
                     title={keyringLostHint}
                   >
-                    {runs[c.id]?.status === 'Running' ? 'Running…' : 'Run'}
+                    {c.activity === 'BackingUp' ? 'Backing up…' : 'Backup'}
                   </button>{' '}
                   <button
                     type="button"
                     className="btn-ghost"
                     onClick={() => setRestoreModal(c)}
-                    disabled={keyringLost || restores[c.id]?.status === 'Running'}
+                    disabled={keyringLost || c.activity !== 'Idle'}
                     title={keyringLostHint}
                   >
-                    {restores[c.id]?.status === 'Running' ? 'Restoring…' : 'Restore…'}
+                    {c.activity === 'Restoring' ? 'Restoring…' : 'Restore…'}
                   </button>{' '}
                   <button
                     type="button"
@@ -433,6 +473,7 @@ export function BackupConfigsPage() {
                   </button>
                   {runs[c.id] && <RunStatus run={runs[c.id]} />}
                   {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
+                  {repairs[c.id] && <RepairStatus run={repairs[c.id]} />}
                 </td>
               </tr>
             ))
@@ -903,6 +944,15 @@ function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () =>
     )
   }
   return <span className="text-faint">—</span>
+}
+
+// 与 RunStatus 同形的三态展示；RepairRun 没有 version/progress 字段（见 api/backupConfigs.ts），故没有对应显示。
+function RepairStatus({ run }: { run: RepairRun }) {
+  if (run.status === 'Failed')
+    return <div className="text-danger">Repair failed: {run.error}</div>
+  if (run.status === 'Completed')
+    return <div className="text-ok">Repair completed</div>
+  return <div className="text-faint">Repairing…</div>
 }
 
 function RestoreStatus({ run }: { run: RestoreRun }) {
