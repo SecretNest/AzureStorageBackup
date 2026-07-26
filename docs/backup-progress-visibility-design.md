@@ -15,31 +15,56 @@
 | 1 | 进度的存活范围 | **仅内存，活过刷新，不活过重启**。重启会杀掉正在跑的备份且无法自动恢复，落库只会留下一个百分比停在半途、实际早已死亡的记录，还要额外写一套「启动时标记孤儿」去清理自己制造的假象 |
 | 2 | 重启后的残留状态 | **无需处理**。`BackupRunner` 与 `BackupBusyTracker` 都是内存单例，随进程一起清空，不会有任何不一致 |
 | 3 | 定时任务接入方式 | **调度器改走 `BackupRunner`**，与界面按钮同一条路。进度、忙碌锁、错误处理自动一致，杜绝「两条路行为不同」这类缺陷再次发生 |
-| 4 | 调度器的等待语义 | `BackupRunState` 暴露其内部 `Task`；`Start()` 照常立即返回供界面使用，调度器 `await` 该 Task 以记录任务成败 |
+| 4 | 忙碌锁的归属 | **用方法选择表达，不用布尔参数**。`BackupRunner` 拆出一个不碰忙碌锁的 `RunTrackedAsync`；`Start()` 是「抢锁 + 即发即忘」的包装，调度器（已持锁）直接 `await RunTrackedAsync`。布尔开关错一次不是拒跑就是锁没人持有，方法名错不了 |
 | 5 | 前端状态来源 | **服务端权威**。列表每 5 秒刷新（纯本地查询），有活跃项时对其每秒拉一次进度；闭包内的循环删除 |
 | 6 | 推送方式 | **轮询，不引入 SSE / WebSocket**。长连接会带来重连、反向代理兼容等一堆问题，而这里轮询的是本地 SQLite 查询 |
 | 7 | 本轮范围 | 界面刷新后可恢复的是 **Backup / Restore / Repair** 三者。**Check 不在其中**——它是同步端点，服务端没有可查状态，见 §3.4。定时任务的进度只做 Backup |
 
 ## 2. 后端：让定时任务走同一条路
 
-### 2.1 改动
+### 2.1 障碍：两边都抢同一把忙碌锁
 
-`Services/BackupRunner.cs`：`BackupRunState` 增加一个只读的 `Task Completion`，在 `Start()` 中由 `Task.Run(...)` 的返回值填充。既有的 `Start()` / `Get()` 签名与行为不变。
+读代码确认，直接让调度器调 `Start()` **会让定时备份彻底停止工作**：
 
-`Services/TaskDispatcher.cs`：`ScheduledTaskType.Backup` 分支不再自行取设置、构造 `BackupRequest`、调用 `BackupOrchestrator`，改为：
+- `TaskDispatcher.DispatchAsync:29` 已经为该 (account, container) 抢了忙碌锁，并在 `:47` 的 `finally` 释放；
+- `BackupRunner.RunAsync:73` 也抢同一把锁，抢不到就把该次运行置为 `Failed`、错误写「This backup is busy with another operation.」。
+
+所以调度器持锁期间调 `Start()`，runner 必然抢锁失败，每一次定时备份都会立刻失败。
+
+两者还各自调用了 `WriteStatusAsync` 写持久状态，且 runner **吞掉异常不外抛**（`BackupRunner.cs:92-101`），因此调度器 `ExecuteAsync` 的 `catch` 永远不会触发——照搬会让失败被记成成功。
+
+### 2.2 解法：把锁的归属用方法选择表达
+
+`Services/BackupRunner.cs` 拆成两个入口，共用同一段执行体：
 
 ```csharp
-var state = sp.GetRequiredService<BackupRunner>().Start(config.Id);
-await state.Completion;
+/// <summary>界面用：抢忙碌锁并即发即忘。已在运行则返回现有状态。</summary>
+public BackupRunState Start(int configId)
+
+/// <summary>调度器用：调用方**已持有**该 (account, container) 的忙碌锁。
+/// 本方法不抢也不释放锁，只负责执行并登记状态供轮询。</summary>
+public Task<BackupRunState> RunTrackedAsync(int configId, CancellationToken ct)
 ```
 
-随后按 `state.Status` / `state.Error` 记录任务成败，替代原先依赖 `RunAsync` 抛异常的写法。
+锁的归属由**调用哪个方法**决定，而不是由一个布尔参数决定——布尔值错一次，不是拒跑就是锁没人持有，且两种都不会在编译期暴露。
 
-### 2.2 顺带消除的重复
+`Services/TaskDispatcher.cs` 的 `ScheduledTaskType.Backup` 分支改为：
 
-`BackupRunner.RunAsync` 已经自己取配置、账户、全局设置、备份密码，并调用 `busy.TryAcquire` 抢忙碌锁。`TaskDispatcher` 目前把这些又做了一遍。走同一条路之后，调度器 Backup 分支里的这些准备代码删除。
+```csharp
+var state = await sp.GetRequiredService<BackupRunner>().RunTrackedAsync(config.Id, ct);
+if (state.Status == RunStatus.Failed)
+    throw new InvalidOperationException(state.Error ?? "Backup failed.");
+```
 
-**注意**：`TaskDispatcher` 的忙碌检测与 `BackupRunner` 的 `TryAcquire` 语义必须核对一致后再删——若调度器原本在忙碌时是「跳过并记日志」，而 runner 是「置为失败」，两者对「这次计划执行算不算失败」的判断不同。实现时以调度器原有的可见行为为准。
+显式检查 `Failed` 并抛出，是为了保住 `ExecuteAsync` 现有的 `catch` → `WriteStatusAsync(错误)` → `throw` 语义。少了这一步，失败会被记成成功。
+
+`WriteStatusAsync` 的重复写入由执行体统一负责，调度器分支不再自行写。
+
+### 2.3 顺带消除的重复
+
+执行体已经自己取配置、账户、全局设置、备份密码。`TaskDispatcher` 的 Backup 分支目前把这些又做了一遍，走同一条路之后删除。
+
+调度器原有的「忙碌 → 跳过并记 Warning 与操作日志」分支**保持不变**：它发生在抢锁阶段，早于本次改动涉及的执行阶段。
 
 ### 2.3 不在范围
 
