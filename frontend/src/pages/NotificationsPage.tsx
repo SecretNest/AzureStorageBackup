@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import {
   notificationsApi,
   NotificationMethod,
@@ -6,6 +6,7 @@ import {
   type NotificationConfig,
   type TestResult,
 } from '../api/notifications'
+import { Field } from '../components/modal'
 
 const emptyCfg: NotificationConfig = {
   enabled: false,
@@ -28,7 +29,7 @@ export function NotificationsPage() {
     notificationsApi
       .get()
       .then((c) => setCfg({ ...c, bodyTemplate: c.bodyTemplate ?? '', proxyUrl: c.proxyUrl ?? '' }))
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
   const set = <K extends keyof NotificationConfig>(k: K, v: NotificationConfig[K]) =>
@@ -45,7 +46,7 @@ export function NotificationsPage() {
       await notificationsApi.update(cfg)
       setSaved(true)
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -57,7 +58,7 @@ export function NotificationsPage() {
     try {
       setTest(await notificationsApi.test(cfg))
     } catch (e) {
-      setTest({ success: false, error: String(e) })
+      setTest({ success: false, error: e instanceof Error ? e.message : String(e) })
     } finally {
       setBusy(false)
     }
@@ -65,15 +66,17 @@ export function NotificationsPage() {
 
   return (
     <section>
-      <h1>Notifications</h1>
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      <div className="page-header">
+        <h1>Notifications</h1>
+      </div>
+      {error && <p className="text-danger">{error}</p>}
 
       <Field label="Enabled">
         <input type="checkbox" checked={cfg.enabled} onChange={(e) => set('enabled', e.target.checked)} />
       </Field>
       <Field label="URL">
         <input
-          style={{ width: 380 }}
+          className="w-lg"
           placeholder="https://hook.example/notify?t={Title}"
           value={cfg.url}
           onChange={(e) => set('url', e.target.value)}
@@ -91,20 +94,21 @@ export function NotificationsPage() {
           <Field label="Body template">
             <textarea
               rows={3}
-              style={{ width: 380, fontFamily: 'monospace' }}
+              className="w-lg"
               placeholder="{Title} and {Body} placeholders"
               value={cfg.bodyTemplate ?? ''}
               onChange={(e) => set('bodyTemplate', e.target.value)}
             />
           </Field>
           <Field label="Content-Type">
-            <input value={cfg.contentType ?? ''} onChange={(e) => set('contentType', e.target.value)} />
+            <input className="w-md" value={cfg.contentType ?? ''} onChange={(e) => set('contentType', e.target.value)} />
           </Field>
         </>
       )}
 
       <Field label="Proxy URL">
         <input
+          className="w-md"
           placeholder="http://host:port (optional)"
           value={cfg.proxyUrl ?? ''}
           onChange={(e) => set('proxyUrl', e.target.value)}
@@ -113,42 +117,35 @@ export function NotificationsPage() {
 
       <fieldset style={{ marginTop: '1rem' }}>
         <legend>Notify on events</legend>
-        {eventList.map((e) => (
-          <label key={e.bit} style={{ display: 'inline-flex', gap: '0.3rem', width: 200, margin: '0.2rem 0' }}>
-            <input
-              type="checkbox"
-              checked={(cfg.events & e.bit) !== 0}
-              onChange={(ev) => toggleEvent(e.bit, ev.target.checked)}
-            />
-            {e.label}
-          </label>
-        ))}
+        <div className="row" style={{ flexWrap: 'wrap' }}>
+          {eventList.map((e) => (
+            <label key={e.bit} className="row" style={{ width: 200 }}>
+              <input
+                type="checkbox"
+                checked={(cfg.events & e.bit) !== 0}
+                onChange={(ev) => toggleEvent(e.bit, ev.target.checked)}
+              />
+              {e.label}
+            </label>
+          ))}
+        </div>
       </fieldset>
 
-      <div style={{ marginTop: '1rem' }}>
-        <button type="button" onClick={save} disabled={busy}>
+      <div className="row" style={{ marginTop: '1rem' }}>
+        <button type="button" className="btn-primary" onClick={save} disabled={busy}>
           Save
-        </button>{' '}
+        </button>
         <button type="button" onClick={runTest} disabled={busy}>
           Send test
         </button>
-        {saved && <span style={{ color: 'green', marginLeft: '0.6rem' }}>Saved.</span>}
+        {saved && <span className="text-ok">Saved.</span>}
       </div>
 
       {test && (
-        <p style={{ color: test.success ? 'green' : 'crimson' }}>
+        <p className={test.success ? 'text-ok' : 'text-danger'}>
           {test.success ? 'Test notification sent.' : `Test failed: ${test.error}`}
         </p>
       )}
     </section>
-  )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.4rem 0' }}>
-      <span style={{ width: 130, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
   )
 }

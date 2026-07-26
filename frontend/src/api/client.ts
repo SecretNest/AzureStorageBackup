@@ -11,10 +11,13 @@ export function setUnauthorizedHandler(handler: () => void) {
 
 export class ApiError extends Error {
   status: number
+  /** 后端在部分场景附带的机器可读码，例如 keyring_lost。 */
+  code?: string
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.status = status
+    this.code = code
     this.name = 'ApiError'
   }
 }
@@ -31,7 +34,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     if (res.status === 401) onUnauthorized?.()
     const text = await res.text().catch(() => '')
-    throw new ApiError(res.status, text || res.statusText)
+
+    // 后端统一用 { error, code? } 报错（见 AccountEndpoints.cs、KeyringGuard.cs）。
+    // 不解析的话，用户看到的是整段 JSON 原文，或者——响应体为空时——回落成
+    // "Internal Server Error" 这种毫无信息量的字样。
+    let message = text || res.statusText
+    let code: string | undefined
+    try {
+      const body = JSON.parse(text) as { error?: unknown; code?: unknown }
+      if (typeof body.error === 'string' && body.error) message = body.error
+      if (typeof body.code === 'string') code = body.code
+    } catch {
+      // 非 JSON（如反代返回的 HTML 错误页）：保留原文。
+    }
+
+    throw new ApiError(res.status, message, code)
   }
 
   // 204 无内容

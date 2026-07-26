@@ -1,11 +1,12 @@
 import type { ReactNode } from 'react'
 
-// 表单字段行组件，供各 Modal/Dialog/表单复用。
+// 表单字段行，供各页面与 Modal/Dialog 复用。
+// 曾经有四份各不相同的副本（label 宽 130/140/200、对齐方式不一），是界面参差不齐的主因之一。
 export function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', margin: '0.4rem 0' }}>
-      <span style={{ width: 200, display: 'inline-block' }}>{label}</span>
-      {children}
+    <label className="field">
+      <span className="field-label">{label}</span>
+      <span>{children}</span>
     </label>
   )
 }

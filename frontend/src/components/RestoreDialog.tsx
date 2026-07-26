@@ -84,7 +84,7 @@ export function RestoreDialog({
         setOptions(opts)
         setChoices(ch)
       } catch (e) {
-        if (!cancelled) onError(String(e))
+        if (!cancelled) onError(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) setSubsLoading(false)
       }
@@ -105,7 +105,7 @@ export function RestoreDialog({
         const kids = await backupConfigsApi.tree(config.id, version, null)
         if (!cancelled) setTreeCache((c) => ({ ...c, '': kids }))
       } catch (e) {
-        if (!cancelled) onError(String(e))
+        if (!cancelled) onError(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) {
           setLoadingDirs((s) => {
@@ -135,7 +135,7 @@ export function RestoreDialog({
           if (!cancelled) setEstimate(est)
         })
         .catch((e) => {
-          if (!cancelled) onError(String(e))
+          if (!cancelled) onError(e instanceof Error ? e.message : String(e))
         })
         .finally(() => {
           if (!cancelled) setEstimating(false)
@@ -163,7 +163,7 @@ export function RestoreDialog({
         const kids = await backupConfigsApi.tree(config.id, version, path)
         setTreeCache((c) => ({ ...c, [path]: kids }))
       } catch (e) {
-        onError(String(e))
+        onError(e instanceof Error ? e.message : String(e))
       } finally {
         setLoadingDirs((s) => {
           const n = new Set(s)
@@ -202,7 +202,7 @@ export function RestoreDialog({
         return next
       })
     } catch (e) {
-      onError(String(e))
+      onError(e instanceof Error ? e.message : String(e))
     } finally {
       setCascading((s) => {
         const n = new Set(s)
@@ -262,18 +262,18 @@ export function RestoreDialog({
       )
       onStarted(state)
     } catch (e) {
-      onError(String(e))
+      onError(e instanceof Error ? e.message : String(e))
     } finally {
       setStarting(false)
     }
   }
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={panelStyle} onClick={(e) => e.stopPropagation()}>
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
         <Field label="Restore to">
-          <input value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
+          <input className="mono" value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
           <button type="button" onClick={() => setBrowsing(true)}>
             Browse
           </button>
@@ -295,19 +295,19 @@ export function RestoreDialog({
           </select>
         </Field>
 
-        {subsLoading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
+        {subsLoading && <div className="text-faint">Loading…</div>}
         {!subsLoading && relevantUnrecoverable.length > 0 && (
-          <div style={{ margin: '0.6rem 0' }}>
-            <div style={{ fontSize: '0.85rem', marginBottom: '0.3rem' }}>
+          <div className="text-faint" style={{ margin: '0.6rem 0' }}>
+            <div style={{ marginBottom: '0.3rem' }}>
               {relevantUnrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
               {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
             </div>
-            <table style={{ width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
-              <thead><tr><th style={{ textAlign: 'left' }}>File</th><th>Substitute from</th></tr></thead>
+            <table>
+              <thead><tr><th>File</th><th>Substitute from</th></tr></thead>
               <tbody>
                 {relevantUnrecoverable.map((p) => (
                   <tr key={p}>
-                    <td style={{ fontFamily: 'monospace' }}>{p}</td>
+                    <td className="mono">{p}</td>
                     <td style={{ textAlign: 'center' }}>
                       <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
                         <option value={0}>Skip (don't restore)</option>
@@ -321,16 +321,16 @@ export function RestoreDialog({
           </div>
         )}
 
-        <div style={{ margin: '0.8rem 0 0.3rem', fontWeight: 600, fontSize: '0.9rem' }}>
-          Select files/folders (optional)
+        <div style={{ margin: '0.8rem 0 0.3rem' }}>
+          <strong>Select files/folders (optional)</strong>
         </div>
-        <div style={{ fontSize: '0.8rem', color: '#666', marginBottom: '0.4rem' }}>
+        <div className="text-faint" style={{ marginBottom: '0.4rem' }}>
           Leave nothing selected to restore the entire version. Checking a folder selects its whole subtree
           (fetched recursively — may take a moment for large folders).
         </div>
-        <div style={{ maxHeight: 260, overflow: 'auto', border: '1px solid #ddd', padding: '0.4rem', fontFamily: 'monospace' }}>
+        <div className="mono" style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--border)', padding: '0.4rem' }}>
           {loadingDirs.has('') ? (
-            <div style={{ fontSize: '0.8rem', color: '#888' }}>Loading…</div>
+            <div className="text-faint">Loading…</div>
           ) : (
             <TreeBrowser
               dirPath=""
@@ -347,7 +347,7 @@ export function RestoreDialog({
             />
           )}
         </div>
-        <div style={{ fontSize: '0.8rem', color: '#555', margin: '0.3rem 0 0.8rem' }}>
+        <div className="text-faint" style={{ margin: '0.3rem 0 0.8rem' }}>
           {selected.size} file(s) selected
           {selected.size > 0 && (
             <>{' '}<button type="button" onClick={() => setSelected(new Set())}>Clear selection</button></>
@@ -355,8 +355,8 @@ export function RestoreDialog({
         </div>
 
         {selected.size > 0 && (
-          <div style={{ margin: '0.4rem 0 0.8rem', padding: '0.6rem', border: '1px solid #ddd', fontSize: '0.85rem' }}>
-            {estimating && <div style={{ color: '#888' }}>Estimating…</div>}
+          <div style={{ margin: '0.4rem 0 0.8rem', padding: '0.6rem', border: '1px solid var(--border)' }}>
+            {estimating && <div className="text-muted">Estimating…</div>}
             {!estimating && estimate && (
               <>
                 <div>
@@ -364,7 +364,7 @@ export function RestoreDialog({
                   {' '}— {estimate.fileCount} file(s)
                 </div>
                 {estimate.archivedObjects > 0 && (
-                  <div style={{ color: '#b06a00', marginTop: '0.4rem' }}>
+                  <div className="text-warn" style={{ marginTop: '0.4rem' }}>
                     {estimate.archivedObjects} archived object(s) need rehydration before download
                     (typically several hours){estimate.rehydratePending > 0 && ` — ${estimate.rehydratePending} already rehydrating`}.
                   </div>
@@ -388,10 +388,10 @@ export function RestoreDialog({
           </select>
         </Field>
 
-        <div style={{ marginTop: '0.8rem' }}>
-          <button type="button" onClick={start} disabled={subsLoading || starting}>
+        <div className="row" style={{ marginTop: '0.8rem' }}>
+          <button type="button" className="btn-primary" onClick={start} disabled={subsLoading || starting}>
             {starting ? 'Starting…' : 'Start restore'}
-          </button>{' '}
+          </button>
           <button type="button" onClick={onClose}>Cancel</button>
         </div>
       </div>
@@ -417,7 +417,7 @@ function TreeBrowser({
 }) {
   const nodes = tree[dirPath] ?? []
   if (nodes.length === 0) {
-    return depth === 0 ? <div style={{ fontSize: '0.8rem', color: '#888' }}>Empty version</div> : null
+    return depth === 0 ? <div className="text-faint">Empty version</div> : null
   }
   return (
     <>
@@ -425,14 +425,15 @@ function TreeBrowser({
         const state = node.isDir ? folderState(node.path) : undefined
         return (
           <div key={node.path}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', paddingLeft: depth * 16, fontSize: '0.82rem' }}>
+            <div className="row text-sm" style={{ paddingLeft: depth * 16 }}>
               {node.isDir ? (
                 <>
                   <button
                     type="button"
+                    className="icon-btn"
                     onClick={() => onToggleExpand(node)}
                     disabled={!node.hasChildren}
-                    style={{ width: 18, padding: 0, background: 'none', border: 'none', cursor: node.hasChildren ? 'pointer' : 'default' }}
+                    style={{ width: 18, cursor: node.hasChildren ? 'pointer' : 'default' }}
                   >
                     {node.hasChildren ? (expanded.has(node.path) ? '▾' : '▸') : ' '}
                   </button>
@@ -445,21 +446,21 @@ function TreeBrowser({
                     disabled={cascading.has(node.path)}
                     onChange={() => onToggleFolder(node)}
                   />
-                  <span style={{ fontWeight: 500 }}>{node.name}/</span>
-                  {cascading.has(node.path) && <span style={{ color: '#888' }}>loading…</span>}
+                  <span><strong>{node.name}</strong>/</span>
+                  {cascading.has(node.path) && <span className="text-muted">loading…</span>}
                 </>
               ) : (
                 <>
                   <span style={{ width: 18, display: 'inline-block' }} />
                   <input type="checkbox" checked={selected.has(node.path)} onChange={() => onToggleFile(node.path)} />
                   <span>{node.name}</span>
-                  {node.length != null && <span style={{ color: '#888', marginLeft: 6 }}>{formatBytes(node.length)}</span>}
+                  {node.length != null && <span className="text-muted" style={{ marginLeft: 6 }}>{formatBytes(node.length)}</span>}
                 </>
               )}
             </div>
             {node.isDir && expanded.has(node.path) && (
               loadingDirs.has(node.path) ? (
-                <div style={{ paddingLeft: (depth + 1) * 16, fontSize: '0.8rem', color: '#888' }}>Loading…</div>
+                <div className="text-faint" style={{ paddingLeft: (depth + 1) * 16 }}>Loading…</div>
               ) : (
                 <TreeBrowser
                   dirPath={node.path}

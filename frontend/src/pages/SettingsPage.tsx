@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
+import { Field } from '../components/modal'
 
 const MB = 1024 * 1024
 
@@ -10,7 +11,7 @@ export function SettingsPage() {
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
-    settingsApi.get().then(setS).catch((e) => setError(String(e)))
+    settingsApi.get().then(setS).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
   if (!s) return <section><h1>Settings</h1><p>Loading…</p></section>
@@ -25,15 +26,17 @@ export function SettingsPage() {
       setS(await settingsApi.update(s))
       setSaved(true)
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
   return (
     <section>
-      <h1>Settings</h1>
-      <p style={{ color: '#666' }}>Defaults for new backups, plus global options.</p>
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      <div className="page-header">
+        <h1>Settings</h1>
+      </div>
+      <p className="text-muted">Defaults for new backups, plus global options.</p>
+      {error && <p className="text-danger">{error}</p>}
 
       <h2>New-backup defaults</h2>
       <Field label="Index tier">
@@ -65,7 +68,7 @@ export function SettingsPage() {
         <Num value={s.defaultVolumeBytes ? Math.round(s.defaultVolumeBytes / MB) : 0} onChange={(v) => set('defaultVolumeBytes', v > 0 ? v * MB : null)} />
       </Field>
       <Field label="Repack: download by tier">
-        <span style={{ display: 'flex', gap: '0.8rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+        <span className="row" style={{ flexWrap: 'wrap' }}>
           <label><input type="checkbox" checked={s.repackDownloadHot} onChange={(e) => set('repackDownloadHot', e.target.checked)} /> Hot</label>
           <label><input type="checkbox" checked={s.repackDownloadCool} onChange={(e) => set('repackDownloadCool', e.target.checked)} /> Cool</label>
           <label><input type="checkbox" checked={s.repackDownloadCold} onChange={(e) => set('repackDownloadCold', e.target.checked)} /> Cold</label>
@@ -99,7 +102,7 @@ export function SettingsPage() {
         <input type="checkbox" checked={s.defaultVerboseLogging} onChange={(e) => set('defaultVerboseLogging', e.target.checked)} />
       </Field>
       <Field label="Retry backoff (seconds)">
-        <input style={{ width: 300, fontFamily: 'monospace' }} value={s.retryBackoffSeconds}
+        <input className="w-md mono" value={s.retryBackoffSeconds}
           onChange={(e) => set('retryBackoffSeconds', e.target.value)} placeholder="5,30,90,300" />
       </Field>
       <Field label="Retry max total (min)">
@@ -115,9 +118,9 @@ export function SettingsPage() {
         <Num value={s.processingMaxAttempts} onChange={(v) => set('processingMaxAttempts', v)} />
       </Field>
 
-      <div style={{ marginTop: '1rem' }}>
-        <button type="button" onClick={save}>Save</button>
-        {saved && <span style={{ color: 'green', marginLeft: '0.6rem' }}>Saved.</span>}
+      <div className="row" style={{ marginTop: '1rem' }}>
+        <button type="button" className="btn-primary" onClick={save}>Save</button>
+        {saved && <span className="text-ok">Saved.</span>}
       </div>
     </section>
   )
@@ -135,21 +138,12 @@ function TierSelect({ value, onChange, archive }: { value: number; onChange: (v:
 }
 
 function Num({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  return <input type="number" value={value} onChange={(e) => onChange(Number(e.target.value))} />
+  return <input type="number" className="w-sm" value={value} onChange={(e) => onChange(Number(e.target.value))} />
 }
 
 function Rules({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
   return (
-    <textarea rows={2} style={{ width: 300, fontFamily: 'monospace', fontSize: '0.85rem' }}
+    <textarea rows={2} className="w-lg"
       value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
-  )
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.4rem 0' }}>
-      <span style={{ width: 200, display: 'inline-block' }}>{label}</span>
-      {children}
-    </label>
   )
 }

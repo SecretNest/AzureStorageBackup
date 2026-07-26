@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { containersApi, backupPresenceLabels, infoFileName, type ContainerInfo } from '../api/containers'
+import {
+  containersApi,
+  backupPresenceLabels,
+  infoFileName,
+  validateContainerName,
+  containerNameRule,
+  type ContainerInfo,
+} from '../api/containers'
 import type { Account } from '../api/accounts'
 
 export function ContainersPage({ account, onBack }: { account: Account; onBack: () => void }) {
@@ -14,20 +21,23 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
     containersApi
       .list(account.id)
       .then(setContainers)
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false))
   }, [account.id])
 
   useEffect(load, [load])
 
+  const trimmedName = newName.trim()
+  const nameError = trimmedName ? validateContainerName(trimmedName) : null
+
   const create = async () => {
-    if (!newName.trim()) return
+    if (!trimmedName || nameError) return
     try {
-      await containersApi.create(account.id, newName.trim())
+      await containersApi.create(account.id, trimmedName)
       setNewName('')
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -37,44 +47,53 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
       await containersApi.remove(account.id, name)
       load()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
   return (
     <section>
-      <button type="button" onClick={onBack}>
+      <button type="button" className="btn-ghost" onClick={onBack}>
         &larr; Back to accounts
       </button>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Containers — {account.name}</h1>
         <button type="button" onClick={load} disabled={loading}>
           Refresh
         </button>
       </div>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <div style={{ margin: '1rem 0' }}>
+      <div className="toolbar">
         <input
+          className="w-md"
           placeholder="New container name"
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
-        />{' '}
-        <button type="button" onClick={create}>
+        />
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={create}
+          disabled={!trimmedName || !!nameError}
+        >
           Create Container
         </button>
+        <span className={nameError ? 'text-danger' : 'text-faint'}>
+          {nameError ?? containerNameRule}
+        </span>
       </div>
 
       {loading ? (
         <p>Loading…</p>
       ) : containers.length === 0 ? (
-        <p>No containers yet. We suggest creating one to start a backup.</p>
+        <p className="empty-state">No containers yet. We suggest creating one to start a backup.</p>
       ) : (
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table>
           <thead>
-            <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+            <tr>
               <th>Name</th>
               <th>Status</th>
               <th></th>
@@ -82,18 +101,20 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
           </thead>
           <tbody>
             {containers.map((c) => (
-              <tr key={c.name} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={c.name}>
                 <td>{c.name}</td>
                 <td>
-                  {backupPresenceLabels[c.backup] ?? 'Unknown'}
-                  {infoFileName(c.backup) && (
-                    <span style={{ color: '#888', fontSize: '0.8rem', marginLeft: '0.4rem' }}>
-                      ({infoFileName(c.backup)})
+                  {infoFileName(c.backup) ? (
+                    <span className="row-inline">
+                      <span>{backupPresenceLabels[c.backup] ?? 'Unknown'}</span>
+                      <span className="text-faint">({infoFileName(c.backup)})</span>
                     </span>
+                  ) : (
+                    backupPresenceLabels[c.backup] ?? 'Unknown'
                   )}
                 </td>
                 <td style={{ textAlign: 'right' }}>
-                  <button type="button" onClick={() => remove(c.name)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(c.name)}>
                     Delete
                   </button>
                 </td>

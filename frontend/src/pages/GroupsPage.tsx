@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { groupsApi, type Group, type GroupMember } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
+import { Field } from '../components/modal'
 
 export function GroupsPage() {
   const [groups, setGroups] = useState<Group[]>([])
@@ -12,7 +13,11 @@ export function GroupsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
 
-  const loadGroups = () => groupsApi.list().then(setGroups).catch((e) => setError(String(e)))
+  const loadGroups = () =>
+    groupsApi
+      .list()
+      .then(setGroups)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   useEffect(() => {
     loadGroups()
   }, [])
@@ -24,7 +29,7 @@ export function GroupsPage() {
         setPool(b)
         setPoolLoaded(true)
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
 
   const startNew = () => {
     setEditing(null)
@@ -70,7 +75,7 @@ export function GroupsPage() {
       setShowForm(false)
       loadGroups()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -80,7 +85,7 @@ export function GroupsPage() {
       await groupsApi.remove(g.id)
       loadGroups()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -89,18 +94,18 @@ export function GroupsPage() {
 
   return (
     <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Groups</h1>
         <button type="button" onClick={startNew}>
           New Group
         </button>
       </div>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem' }}>
+      <table>
         <thead>
-          <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+          <tr>
             <th>Name</th>
             <th>Backups</th>
             <th></th>
@@ -109,20 +114,20 @@ export function GroupsPage() {
         <tbody>
           {groups.length === 0 ? (
             <tr>
-              <td colSpan={3} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={3} className="empty-state">
                 No groups yet.
               </td>
             </tr>
           ) : (
             groups.map((g) => (
-              <tr key={g.id} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={g.id}>
                 <td>{g.name}</td>
                 <td>{g.members.length}</td>
                 <td style={{ textAlign: 'right' }}>
-                  <button type="button" onClick={() => startEdit(g)}>
+                  <button type="button" className="btn-ghost" onClick={() => startEdit(g)}>
                     Edit
                   </button>{' '}
-                  <button type="button" onClick={() => remove(g)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(g)}>
                     Delete
                   </button>
                 </td>
@@ -133,11 +138,11 @@ export function GroupsPage() {
       </table>
 
       {showForm && (
-        <div style={{ marginTop: '1.5rem', padding: '1rem', border: '1px solid #ccc' }}>
+        <div className="panel">
           <h2>{editing ? `Edit: ${editing.name}` : 'New Group'}</h2>
-          <label style={{ display: 'block', margin: '0.5rem 0' }}>
-            Name <input value={name} onChange={(e) => setName(e.target.value)} />
-          </label>
+          <Field label="Name">
+            <input className="w-md" value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
 
           <div style={{ margin: '0.5rem 0' }}>
             <strong>Backups</strong>{' '}
@@ -147,9 +152,12 @@ export function GroupsPage() {
           </div>
 
           {!poolLoaded && pool.length === 0 ? (
-            <p style={{ color: '#666' }}>Load backups to pick members.</p>
+            <p className="text-muted">Load backups to pick members.</p>
           ) : (
-            <div style={{ maxHeight: 200, overflow: 'auto', border: '1px solid #eee', padding: '0.5rem' }}>
+            <div
+              className="stack"
+              style={{ maxHeight: 200, overflow: 'auto', border: '1px solid var(--border)', padding: 'var(--sp-2)' }}
+            >
               {pool.map((b) => {
                 const key = backupKey(b)
                 return (
@@ -160,17 +168,17 @@ export function GroupsPage() {
                 )
               })}
               {extraKeys.map((key) => (
-                <label key={key} style={{ display: 'block', color: '#a60' }}>
+                <label key={key} className="text-warn" style={{ display: 'block' }}>
                   <input type="checkbox" checked onChange={() => toggle(key)} /> {key} (not in current list)
                 </label>
               ))}
             </div>
           )}
 
-          <div style={{ marginTop: '1rem' }}>
-            <button type="button" onClick={save}>
+          <div className="row" style={{ marginTop: '1rem' }}>
+            <button type="button" className="btn-primary" onClick={save}>
               {editing ? 'Save' : 'Create'}
-            </button>{' '}
+            </button>
             <button type="button" onClick={() => setShowForm(false)}>
               Cancel
             </button>
