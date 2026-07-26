@@ -156,6 +156,10 @@ function Num({ value, onChange }: { value: number; onChange: (v: number) => void
         const n = Number(raw)
         if (!Number.isNaN(n)) onChange(n)
       }}
+      // 离开输入框时把空白拉回真实值。否则清空后不再键入就保存，value 从未改变，
+      // 上面那个 useEffect 也就不会重跑，输入框会一直显示空白——屏幕说这项是空的，
+      // 实际存的却还是原来的数字。
+      onBlur={() => setText(String(value))}
     />
   )
 }
