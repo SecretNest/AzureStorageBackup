@@ -46,4 +46,23 @@ public class ContainerNameTests
 
     [Fact]
     public void Rejects_Consecutive_Hyphens() => AssertRejected("a--b", "consecutive");
+
+    // 前端将来会复制这个验证器到 TypeScript。需要锁定规则顺序，因为多条规则同时违反时
+    // 返回的错误消息是有顺序的：长度 > 字符集 > 首尾 > 连续连字符。
+    // 这个测试确保后续的重构或前端实现不会无意间改变优先级。
+    [Fact]
+    public void Precedence_When_Several_Rules_Are_Violated()
+    {
+        // Violates both character set (uppercase) and begins/ends (hyphens)
+        // → character set check comes first, so expect that message.
+        AssertRejected("-ABC-", "lowercase letters, digits, and hyphens");
+
+        // Violates both begins/ends (trailing hyphen) and consecutive hyphens
+        // → begins/ends check comes first, so expect that message.
+        AssertRejected("a--", "begin and end");
+
+        // Violates both length (2 < 3) and begins/ends (starts with hyphen)
+        // → length check comes first, so expect that message.
+        AssertRejected("-a", "3 and 63");
+    }
 }

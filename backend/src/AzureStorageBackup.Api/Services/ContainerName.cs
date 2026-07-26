@@ -3,7 +3,7 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>
 /// Azure Blob container 命名规则的本地校验。
 ///
-/// 存在的理由是错误消息：Azure 对非法名回的是 "The specifed resource name contains
+/// 存在的理由是错误消息：Azure 对非法名返回的是 "The specifed resource name contains
 /// invalid characters."，既不指出是哪个字符、也不说明规则，用户看到只能瞎猜。在连云之前
 /// 自己判一次，就能给出可操作的说明。
 /// </summary>
