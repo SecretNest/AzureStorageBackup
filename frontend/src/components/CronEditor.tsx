@@ -42,11 +42,11 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
 
   if (advanced) {
     return (
-      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+      <div className="row">
         <input
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          style={{ width: 220 }}
+          className="w-md mono"
           placeholder="min hour day-of-month month day-of-week"
         />
         <button type="button" onClick={() => setAdvanced(false)}>
@@ -57,7 +57,7 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
   }
 
   return (
-    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+    <div className="row" style={{ flexWrap: 'wrap' }}>
       <select value={freq} onChange={(e) => apply({ freq: e.target.value as Freq })}>
         <option value="hourly">Hourly</option>
         <option value="daily">Daily</option>
@@ -84,7 +84,7 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
             max={31}
             value={dom}
             onChange={(e) => apply({ dom: Number(e.target.value) })}
-            style={{ width: 50 }}
+            className="w-sm"
           />
         </label>
       )}
@@ -98,7 +98,7 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
             max={23}
             value={hour}
             onChange={(e) => apply({ hour: Number(e.target.value) })}
-            style={{ width: 50 }}
+            className="w-sm"
           />
           h
         </label>
@@ -112,7 +112,7 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
           max={59}
           value={minute}
           onChange={(e) => apply({ minute: Number(e.target.value) })}
-          style={{ width: 50 }}
+          className="w-sm"
         />
       </label>
 

@@ -15,6 +15,7 @@ import {
 import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
+import { Field } from '../components/modal'
 
 const emptyForm: TaskInput = {
   targetKind: TaskTargetKind.Backup,
@@ -39,7 +40,7 @@ export function TasksPage() {
   const [form, setForm] = useState<TaskInput>(emptyForm)
   const [error, setError] = useState<string | null>(null)
 
-  const loadTasks = () => tasksApi.list().then(setTasks).catch((e) => setError(String(e)))
+  const loadTasks = () => tasksApi.list().then(setTasks).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   useEffect(() => {
     loadTasks()
     groupsApi.list().then(setGroups).catch(() => {})
@@ -52,7 +53,7 @@ export function TasksPage() {
         setPool(b)
         setPoolLoaded(true)
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
 
   const set = <K extends keyof TaskInput>(k: K, v: TaskInput[K]) => setForm((f) => ({ ...f, [k]: v }))
 
@@ -90,7 +91,7 @@ export function TasksPage() {
       setShowForm(false)
       loadTasks()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -102,7 +103,7 @@ export function TasksPage() {
       await tasksApi.run(t.id)
       loadTasks()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setRunning(null)
     }
@@ -114,7 +115,7 @@ export function TasksPage() {
       await tasksApi.remove(t.id)
       loadTasks()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -139,18 +140,18 @@ export function TasksPage() {
 
   return (
     <section>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page-header">
         <h1>Scheduled Tasks</h1>
-        <button type="button" onClick={startNew}>
+        <button type="button" className="btn-primary" onClick={startNew}>
           New Task
         </button>
       </div>
 
-      {error && <p style={{ color: 'crimson' }}>{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
 
-      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem' }}>
+      <table>
         <thead>
-          <tr style={{ textAlign: 'left', borderBottom: '1px solid #ccc' }}>
+          <tr>
             <th>Target</th>
             <th>Type</th>
             <th>Schedule</th>
@@ -161,13 +162,13 @@ export function TasksPage() {
         <tbody>
           {tasks.length === 0 ? (
             <tr>
-              <td colSpan={5} style={{ padding: '1rem 0', color: '#666' }}>
+              <td colSpan={5} className="empty-state">
                 No tasks yet.
               </td>
             </tr>
           ) : (
             tasks.map((t) => (
-              <tr key={t.id} style={{ borderBottom: '1px solid #eee' }}>
+              <tr key={t.id}>
                 <td>
                   {targetKindLabels[t.targetKind]}: {describeTarget(t)}
                 </td>
@@ -177,16 +178,16 @@ export function TasksPage() {
                 </td>
                 <td>{t.enabled ? 'Yes' : 'No'}</td>
                 <td style={{ textAlign: 'right' }}>
-                  <button type="button" onClick={() => runNow(t)} disabled={running === t.id}>
+                  <button type="button" className="btn-ghost" onClick={() => runNow(t)} disabled={running === t.id}>
                     {running === t.id ? 'Running…' : 'Run now'}
                   </button>{' '}
-                  <button type="button" onClick={() => startEdit(t)}>
+                  <button type="button" className="btn-ghost" onClick={() => startEdit(t)}>
                     Edit
                   </button>{' '}
-                  <button type="button" onClick={() => remove(t)}>
+                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(t)}>
                     Delete
                   </button>
-                  <div style={{ fontSize: '0.75rem', color: '#888' }}>
+                  <div className="text-faint">
                     Last run: {t.lastRunAt ? new Date(t.lastRunAt).toLocaleString() : 'never'}
                   </div>
                 </td>
@@ -197,11 +198,10 @@ export function TasksPage() {
       </table>
 
       {showForm && (
-        <div style={{ marginTop: '1.5rem', padding: '1rem', border: '1px solid #ccc' }}>
+        <div className="panel">
           <h2>{editing ? 'Edit Task' : 'New Task'}</h2>
 
-          <label style={{ display: 'block', margin: '0.5rem 0' }}>
-            Target{' '}
+          <Field label="Target">
             <select
               value={form.targetKind}
               onChange={(e) => set('targetKind', Number(e.target.value))}
@@ -209,11 +209,10 @@ export function TasksPage() {
               <option value={TaskTargetKind.Backup}>Backup</option>
               <option value={TaskTargetKind.Group}>Group</option>
             </select>
-          </label>
+          </Field>
 
           {form.targetKind === TaskTargetKind.Backup ? (
-            <label style={{ display: 'block', margin: '0.5rem 0' }}>
-              Backup{' '}
+            <Field label="Backup">
               <select
                 value={form.accountId !== null ? `${form.accountId}/${form.containerName}` : ''}
                 onChange={(e) => pickBackup(e.target.value)}
@@ -230,10 +229,9 @@ export function TasksPage() {
                   Load backups
                 </button>
               )}
-            </label>
+            </Field>
           ) : (
-            <label style={{ display: 'block', margin: '0.5rem 0' }}>
-              Group{' '}
+            <Field label="Group">
               <select
                 value={form.groupId ?? ''}
                 onChange={(e) => set('groupId', e.target.value ? Number(e.target.value) : null)}
@@ -245,20 +243,19 @@ export function TasksPage() {
                   </option>
                 ))}
               </select>
-            </label>
+            </Field>
           )}
 
-          <label style={{ display: 'block', margin: '0.5rem 0' }}>
-            Task type{' '}
+          <Field label="Task type">
             <select value={form.taskType} onChange={(e) => set('taskType', Number(e.target.value))}>
               <option value={ScheduledTaskType.Backup}>Backup</option>
               <option value={ScheduledTaskType.Check}>Check</option>
               <option value={ScheduledTaskType.Cleanup}>Cleanup</option>
             </select>
-          </label>
+          </Field>
 
           {form.taskType === ScheduledTaskType.Check && (
-            <div style={{ margin: '0.5rem 0', paddingLeft: '1rem', borderLeft: '2px solid #eee' }}>
+            <div className="stack" style={{ paddingLeft: '1rem', borderLeft: '2px solid var(--border)' }}>
               <label style={{ display: 'block', margin: '0.3rem 0' }}>
                 Cloud check{' '}
                 <select value={form.checkCloudLevel ?? CloudCheckLevel.ExistenceSize} onChange={(e) => set('checkCloudLevel', Number(e.target.value))}>
@@ -279,19 +276,18 @@ export function TasksPage() {
             <CronEditor value={form.cronExpression} onChange={(c) => set('cronExpression', c)} />
           </div>
 
-          <label style={{ display: 'block', margin: '0.5rem 0' }}>
+          <Field label="Enabled">
             <input
               type="checkbox"
               checked={form.enabled}
               onChange={(e) => set('enabled', e.target.checked)}
-            />{' '}
-            Enabled
-          </label>
+            />
+          </Field>
 
-          <div style={{ marginTop: '1rem' }}>
-            <button type="button" onClick={save}>
+          <div className="row" style={{ marginTop: '1rem' }}>
+            <button type="button" className="btn-primary" onClick={save}>
               {editing ? 'Save' : 'Create'}
-            </button>{' '}
+            </button>
             <button type="button" onClick={() => setShowForm(false)}>
               Cancel
             </button>
