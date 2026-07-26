@@ -5,6 +5,7 @@
   --bg-subtle: #f7f7f8;
   --bg-raised: #ffffff;
   --bg-hover: #f1f1f4;
+  --overlay-scrim: rgba(0, 0, 0, 0.45); /* 深色模式需更深的半透明度，因为深色背景与对话框对比度不足 */
 
   --border: #e4e4e7;
   --border-strong: #cfcfd6;
@@ -63,6 +64,7 @@
     --bg-subtle: #16171d;
     --bg-raised: #1a1b22;
     --bg-hover: #21232c;
+    --overlay-scrim: rgba(0, 0, 0, 0.65);
 
     --border: #2a2c35;
     --border-strong: #3a3d48;
@@ -567,7 +569,7 @@ tbody tr:hover {
   align-items: flex-start;
   justify-content: center;
   padding: 4vh var(--sp-4);
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--overlay-scrim);
   backdrop-filter: blur(2px);
   overflow-y: auto;
 }
