@@ -31,6 +31,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, BackupRunState> _runs = [];
     private readonly Lock _lock = new();
 
+    /// <summary>界面用：抢忙碌锁并在后台跑。同一配置已在运行则返回现有状态。</summary>
     public BackupRunState Start(int configId)
     {
         lock (_lock)
@@ -40,9 +41,33 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var state = new BackupRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, state));
+            _ = Task.Run(() => RunOwningLockAsync(configId, state));
             return state;
         }
+    }
+
+    /// <summary>
+    /// 调度器用：调用方**已持有**该 (account, container) 的忙碌锁
+    /// （TaskDispatcher.DispatchAsync 在进入执行前就抢了）。本方法不抢也不释放，
+    /// 只负责执行并把状态登记进 _runs 供 GET 端点轮询。
+    ///
+    /// 锁的归属由「调用哪个方法」表达，而不是由一个布尔参数表达：布尔值传错一次，
+    /// 不是每次定时备份都拒跑，就是锁根本没人持有，而两种都不会在编译期暴露。
+    /// </summary>
+    public async Task<BackupRunState> RunTrackedAsync(int configId, CancellationToken ct)
+    {
+        BackupRunState state;
+        lock (_lock)
+        {
+            if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
+                return existing;
+
+            state = new BackupRunState();
+            _runs[configId] = state;
+        }
+
+        await RunCoreAsync(configId, state, ct);
+        return state;
     }
 
     public BackupRunState? Get(int configId)
@@ -51,42 +76,66 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
-    private async Task RunAsync(int configId, BackupRunState state)
+    /// <summary>Start 的执行体：抢锁 → 跑 → 释放。</summary>
+    private async Task RunOwningLockAsync(int configId, BackupRunState state)
+    {
+        int accountId;
+        string container;
+        try
+        {
+            using var scope = scopes.CreateScope();
+            var sp = scope.ServiceProvider;
+            var config = await sp.GetRequiredService<IBackupConfigService>().GetAsync(configId)
+                ?? throw new InvalidOperationException($"Backup config {configId} not found.");
+            accountId = config.AccountId;
+            container = config.ContainerName;
+        }
+        catch (Exception ex)
+        {
+            state.Error = ex.Message;
+            state.Status = RunStatus.Failed;
+            return;
+        }
+
+        // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
+        if (!busy.TryAcquire(accountId, container, "BackingUp"))
+        {
+            state.Error = "This backup is busy with another operation.";
+            state.Status = RunStatus.Failed;
+            return;
+        }
+
+        try
+        {
+            await RunCoreAsync(configId, state, CancellationToken.None);
+        }
+        finally
+        {
+            busy.Release(accountId, container);
+        }
+    }
+
+    /// <summary>两个入口共用的执行体。**不碰忙碌锁**——锁由调用方负责。</summary>
+    private async Task RunCoreAsync(int configId, BackupRunState state, CancellationToken ct)
     {
         try
         {
             using var scope = scopes.CreateScope();
             var sp = scope.ServiceProvider;
             var configs = sp.GetRequiredService<IBackupConfigService>();
-            var accounts = sp.GetRequiredService<IAccountService>();
-            var settingsSvc = sp.GetRequiredService<IGlobalSettingsService>();
-            var orchestrator = sp.GetRequiredService<BackupOrchestrator>();
 
-            var config = await configs.GetAsync(configId)
+            var config = await configs.GetAsync(configId, ct)
                 ?? throw new InvalidOperationException($"Backup config {configId} not found.");
-            var account = await accounts.GetAsync(config.AccountId)
+            var account = await sp.GetRequiredService<IAccountService>().GetAsync(config.AccountId, ct)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
-            var settings = await settingsSvc.GetAsync();
+            var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
             var password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config);
 
-            // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
-            if (!busy.TryAcquire(account.Id, config.ContainerName, "BackingUp"))
-            {
-                state.Error = "This backup is busy with another operation.";
-                state.Status = RunStatus.Failed;
-                return;
-            }
-            try
-            {
-                var result = await orchestrator.RunAsync(
-                    BackupRequestMapper.From(config, account, password, settings), new StateProgress(state), CancellationToken.None);
-                state.Version = result.Version;
-                state.Status = RunStatus.Completed;
-            }
-            finally
-            {
-                busy.Release(account.Id, config.ContainerName);
-            }
+            var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
+                BackupRequestMapper.From(config, account, password, settings), new StateProgress(state), ct);
+            state.Version = result.Version;
+            state.Status = RunStatus.Completed;
+
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());
         }
         catch (Exception ex)
