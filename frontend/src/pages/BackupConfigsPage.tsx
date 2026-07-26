@@ -680,7 +680,7 @@ function RunStatus({ run }: { run: BackupRun }) {
 // 状态徽标（§4.2 决策 2）：进行中（蓝，派生 activity）优先于持久 Error（红，tooltip + Reset）；否则不显示。
 function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () => void }) {
   if (config.activity !== 'Idle') {
-    return <span className="badge">{config.activity}</span>
+    return <span className="badge badge-info">{config.activity}</span>
   }
   if (config.status === BackupStatus.Error) {
     return (

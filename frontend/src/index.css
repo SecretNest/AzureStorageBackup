@@ -18,6 +18,7 @@
   --accent-hover: #1d4ed8;
   --accent-fg: #ffffff;
   --accent-subtle: rgba(37, 99, 235, 0.1);
+  --accent-border: rgba(37, 99, 235, 0.35);
 
   --ok: #15803d;
   --ok-bg: rgba(21, 128, 61, 0.1);
@@ -77,6 +78,7 @@
     --accent-hover: #93c5fd;
     --accent-fg: #0f1014;
     --accent-subtle: rgba(96, 165, 250, 0.15);
+    --accent-border: rgba(96, 165, 250, 0.35);
 
     --ok: #4ade80;
     --ok-bg: rgba(74, 222, 128, 0.12);
@@ -560,10 +562,12 @@ tbody tr:hover {
 .badge-ok { color: var(--ok); border-color: var(--ok-border); background: var(--ok-bg); }
 .badge-warn { color: var(--warn); border-color: var(--warn-border); background: var(--warn-bg); }
 .badge-danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
+.badge-info { color: var(--accent); border-color: var(--accent-border); background: var(--accent-subtle); }
 
 /* ── Text ─────────────────────────────────────────────────────────────────── */
 .text-muted { color: var(--text-muted); }
 .text-faint { color: var(--text-faint); font-size: 12px; }
+.text-sm { font-size: 12px; }
 .text-danger { color: var(--danger); }
 .text-ok { color: var(--ok); }
 .text-warn { color: var(--warn); }

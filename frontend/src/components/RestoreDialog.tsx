@@ -425,7 +425,7 @@ function TreeBrowser({
         const state = node.isDir ? folderState(node.path) : undefined
         return (
           <div key={node.path}>
-            <div className="row" style={{ paddingLeft: depth * 16 }}>
+            <div className="row text-sm" style={{ paddingLeft: depth * 16 }}>
               {node.isDir ? (
                 <>
                   <button
@@ -446,7 +446,7 @@ function TreeBrowser({
                     disabled={cascading.has(node.path)}
                     onChange={() => onToggleFolder(node)}
                   />
-                  <span>{node.name}/</span>
+                  <span><strong>{node.name}</strong>/</span>
                   {cascading.has(node.path) && <span className="text-muted">loading…</span>}
                 </>
               ) : (
