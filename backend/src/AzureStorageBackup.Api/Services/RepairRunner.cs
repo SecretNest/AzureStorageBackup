@@ -9,6 +9,9 @@ public sealed class RepairRunState
     public RunStatus Status { get; set; } = RunStatus.Running;
     public RepairReport? Report { get; set; }
     public string? Error { get; set; }
+
+    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。</summary>
+    internal CancellationTokenSource Cancellation { get; } = new();
 }
 
 public sealed record RepairRunResponse(
@@ -49,6 +52,19 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
+    /// <summary>停止正在跑的那次修复。返回 false = 当前没有在跑的修复。
+    /// Cancel() 在当前线程同步跑回调，故取记录用锁、取消不用（见 BackupRunner.Cancel 同处注释）。</summary>
+    public bool Cancel(int configId)
+    {
+        RepairRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running })
+            return false;
+        state.Cancellation.Cancel();
+        return true;
+    }
+
     private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, RepairRunState state)
     {
         try
@@ -86,7 +102,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     config.LocalRoot, version, options, BackupRequestMapper.MapTier(config.DataTier),
                     resolved.VolumeBytes is > 0 ? resolved.VolumeBytes : null,
                     // 与 BackupRequestMapper.From 取同一份规则：修好的归档要和全新备份写出的压缩方式一致。
-                    BackupRequestMapper.OptionalRules(resolved.DontCompressRules));
+                    BackupRequestMapper.OptionalRules(resolved.DontCompressRules), state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
             }
             finally
@@ -94,6 +110,11 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 busy.Release(account.Id, config.ContainerName);
             }
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<RepairRunner>>());
+        }
+        catch (OperationCanceledException)
+        {
+            // 用户按了停止：不是失败，不写 Error 状态（与 BackupRunner 同一约定）。
+            state.Status = RunStatus.Canceled;
         }
         catch (Exception ex)
         {

@@ -476,4 +476,59 @@ public sealed class BackupCheckerTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>检查的进度上报。改成后台 job 之后这是界面上唯一能看到的东西——一次内容级
+    /// 检查要把整个备份下载重算 hash，可以跑几小时，没有进度就与卡死无从区分。</summary>
+    [SkippableFact]
+    public async Task Check_Reports_What_Stage_It_Is_In_And_What_It_Is_Working_On()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            for (var i = 0; i < 12; i++)
+                await File.WriteAllTextAsync(Path.Combine(_src, $"f{i:D2}.txt"), new string('x', 300 + i));
+            await backup.RunAsync(Req(account, name));
+
+            var reports = new List<StageProgress>();
+            var result = await checker.CheckAsync(
+                account, name, null, null,
+                new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.Content },
+                _src, CancellationToken.None,
+                onProgress: d => { lock (reports) reports.Add(d); });
+
+            Assert.True(result.Ok);
+
+            // 每个阶段都要露面：改之前一个都没有，界面上只有一个不动的 "Checking" 徽章。
+            var stages = reports.Select(r => r.Stage).Distinct().ToList();
+            Assert.Contains("LoadingIndex", stages);
+            Assert.Contains("Cloud", stages);
+            Assert.Contains("Verifying", stages);
+            Assert.Contains("Local", stages);
+
+            // 本地阶段总数已知（就是索引里的条目数）→ 必须走到 100%，且报得出在查哪个文件。
+            var local = reports.Where(r => r.Stage == "Local").ToList();
+            Assert.Equal(12, local[^1].Total);
+            Assert.Equal(12, local[^1].Processed);
+            Assert.Equal(100, local[^1].Percent);
+            Assert.Contains(local, r => !string.IsNullOrEmpty(r.CurrentItem));
+
+            // 深度校验按**解压后**的大小计字节：这个阶段的时间就花在读解出来的内容算 hash 上，
+            // 按压缩后的大小算会报出一个与用户观感对不上的速度。
+            var verifying = reports.Where(r => r.Stage == "Verifying").ToList();
+            Assert.NotEmpty(verifying);
+            Assert.True(verifying[^1].Bytes > 0, "verified bytes should accumulate for the speed readout");
+
+            // 槽位计数恰好一次：在途项的起止不得参与计数（否则会越过 total）。
+            Assert.All(verifying, r => Assert.True(r.Processed <= r.Total));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

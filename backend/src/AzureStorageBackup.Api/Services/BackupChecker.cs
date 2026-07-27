@@ -21,15 +21,19 @@ public sealed class BackupChecker(
     IOperationLog? opLog = null,
     TrackedInfoStore? trackedInfo = null)
 {
+    /// <param name="onProgress">
+    /// 阶段进度回调（可空）。检查此前完全没有进度：内容级要把整个备份下载重算 hash，
+    /// 跑几小时是常态，界面上却只有一个转圈——分不清是在查还是挂死了。
+    /// </param>
     public async Task<CheckReport> CheckAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
-        CancellationToken ct = default, int downloadConcurrency = 5)
+        CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null)
     {
         var source = $"check:{account.Id}/{container}";
         await Record(NotificationEvents.CheckStart, source, $"Check started: {container}", "", ct);
         try
         {
-            var report = await CheckCoreAsync(account, container, password, version, options, localRoot, downloadConcurrency, ct);
+            var report = await CheckCoreAsync(account, container, password, version, options, localRoot, downloadConcurrency, onProgress, ct);
             var problems = report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
             await Record(
                 report.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure, source,
@@ -54,10 +58,18 @@ public sealed class BackupChecker(
             await notifier.NotifyAsync(evt, title, body, ct);
     }
 
+    /// <summary>阶段跟踪器的构造捷径：没人要进度就一路传 null，不产生任何开销。</summary>
+    private static StageTracker? Track(Action<StageProgress>? onProgress, string stage, int total) =>
+        onProgress is null ? null : new StageTracker(stage, total, onProgress);
+
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
-        int downloadConcurrency, CancellationToken ct)
+        int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
+        // 索引里有多少条目，要读完索引才知道 → 总数给 0，界面显示「… so far」而不是一个假百分比。
+        var loading = Track(onProgress, "LoadingIndex", 0);
+        loading?.Touch(container);
+
         var info = await store.ReadInfoAsync(account, container, password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");
         if (info.Versions.Count == 0)
@@ -69,31 +81,45 @@ public sealed class BackupChecker(
             : info.Versions[^1];
 
         var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+        loading?.Advance(0);
+        loading?.Complete();
 
-        var metaIssue = options.Cloud == CloudCheckLevel.Metadata
-            ? await CheckMetadataDriftAsync(account, container, password, info, ct)
-            : null;
+        string? metaIssue = null;
+        if (options.Cloud == CloudCheckLevel.Metadata)
+        {
+            var meta = Track(onProgress, "Metadata", 1);
+            metaIssue = await CheckMetadataDriftAsync(account, container, password, info, ct);
+            meta?.Advance(0);
+            meta?.Complete();
+        }
 
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
 
         // 云端状态（按文件）：只在 ExistenceSize/Content 级实际查数据 blob。
         var cloudBad = new HashSet<string>(StringComparer.Ordinal);
         if (options.Cloud >= CloudCheckLevel.ExistenceSize)
-            cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, ct);
+            cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, onProgress, ct);
 
+        // 本地轴：逐条目对源文件比对。Content 级要把每个文件完整读一遍算 hash，
+        // 和备份的 Diffing 一样慢，同样必须逐条报进度。
+        var localTracker = Track(onProgress, "Local", index.Entries.Count);
         var findings = new List<FileFinding>(index.Entries.Count);
         foreach (var e in index.Entries)
         {
+            localTracker?.Touch(e.Path);
             var refName = e.Storage is { } s ? BlobNameOf(s) : null;
             var cloud = options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
                 ? CloudState.NotChecked
                 : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
             var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
             findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt });
+            // 字节只在真的读了文件时才算，否则 Attributes/None 级会报出一个天文数字的"速度"。
+            localTracker?.Advance(options.Local == LocalCheckLevel.Content ? e.Length : 0);
         }
+        localTracker?.Complete();
 
         var orphans = options.ListOrphans
-            ? await ListOrphansAsync(cc, account, container, password, info, ct)
+            ? await ListOrphansAsync(cc, account, container, password, info, onProgress, ct)
             : [];
 
         return new CheckReport(ver.Version, findings, metaIssue) { OrphanBlobs = orphans };
@@ -104,7 +130,8 @@ public sealed class BackupChecker(
     /// （缺版本索引且云端读失败）→ 放弃列举、记 Warning、返回空（绝不据不完整信息把被引用 blob 当孤儿）。
     /// </summary>
     private async Task<IReadOnlyList<string>> ListOrphansAsync(
-        BlobContainerClient cc, Account account, string container, string? password, BackupInfoFile info, CancellationToken ct)
+        BlobContainerClient cc, Account account, string container, string? password, BackupInfoFile info,
+        Action<StageProgress>? onProgress, CancellationToken ct)
     {
         HashSet<string> referenced;
         try
@@ -119,10 +146,17 @@ public sealed class BackupChecker(
             return [];
         }
 
+        // 容器里有多少 blob 只能边列边知道 → 总数 0，报"已列举多少"。
+        var listing = Track(onProgress, "Orphans", 0);
         var orphans = new List<string>();
         await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
+        {
+            listing?.Touch(b.Name);
             if (!referenced.Contains(b.Name))
                 orphans.Add(b.Name);
+            listing?.Advance(0);
+        }
+        listing?.Complete();
         return orphans;
     }
 
@@ -184,7 +218,7 @@ public sealed class BackupChecker(
     /// </summary>
     private async Task<HashSet<string>> CloudCheckAsync(
         BlobContainerClient cc, BackupInfoFile info, VersionIndex index, CheckOptions options, string? password,
-        int downloadConcurrency, CancellationToken ct)
+        int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         var bad = new HashSet<string>(StringComparer.Ordinal);
 
@@ -194,9 +228,13 @@ public sealed class BackupChecker(
             .GroupBy(e => BlobNameOf(e.Storage!))
             .ToList();
 
+        // 数的是**存储对象**（包与单文件 blob），不是文件——一个包只查一次。
+        // 界面上的单位随之标为 objects，免得和文件数对不上被读成打包没生效。
+        var tracker = Track(onProgress, "Cloud", groups.Count);
         var presentGroups = new List<IGrouping<string, IndexEntry>>();
         foreach (var g in groups)
         {
+            tracker?.Touch(g.Key);
             var s = g.First().Storage!;
             var (vols, sizes) = ExpectedVolumes(info, s);
             var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct);
@@ -209,11 +247,14 @@ public sealed class BackupChecker(
             {
                 presentGroups.Add(g);
             }
+            // HEAD 不下载内容：字节记 0，否则会报出一个与实际流量无关的"速度"。
+            tracker?.Advance(0);
         }
+        tracker?.Complete();
 
         if (options.Cloud >= CloudCheckLevel.Content)
         {
-            var corrupted = await DeepVerifyAsync(cc, presentGroups, options, password, downloadConcurrency, ct);
+            var corrupted = await DeepVerifyAsync(cc, presentGroups, options, password, downloadConcurrency, onProgress, ct);
             foreach (var p in corrupted)
                 bad.Add(p);
         }
@@ -230,7 +271,7 @@ public sealed class BackupChecker(
     /// Archive 未活化（下载报 archived）不计损坏（无法验证，跳过）。</summary>
     private async Task<IReadOnlyList<string>> DeepVerifyAsync(
         BlobContainerClient cc, List<IGrouping<string, IndexEntry>> presentGroups,
-        CheckOptions options, string? password, int downloadConcurrency, CancellationToken ct)
+        CheckOptions options, string? password, int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         if (compressor is null || hasher is null || string.IsNullOrEmpty(tempRoot))
             throw new InvalidOperationException("Content check requires compressor/hasher/tempRoot.");
@@ -238,26 +279,38 @@ public sealed class BackupChecker(
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
         using var gate = new SemaphoreSlim(Math.Max(1, downloadConcurrency));
+        // 这是整个检查里唯一真正下载数据的阶段，也是唯一可能跑几小时的阶段。
+        var tracker = Track(onProgress, "Verifying", presentGroups.Count);
         try
         {
-            var perGroup = await Task.WhenAll(presentGroups.Select(g =>
-                VerifyGroupAsync(cc, work, g.Key, g.ToList(), options, password, gate, ct)));
+            var perGroup = await Task.WhenAll(presentGroups.Select(async g =>
+            {
+                try { return await VerifyGroupAsync(cc, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
+                finally
+                {
+                    tracker?.Advance(0); // 计数与在途分开：一个组恰好占一个槽位
+                }
+            }));
             return perGroup.SelectMany(x => x).ToList();
         }
         finally
         {
+            tracker?.Complete(); // 不强制产出终态，最后一组的字节会被节流压住再也发不出去
             try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
         }
     }
 
     private async Task<IReadOnlyList<string>> VerifyGroupAsync(
         BlobContainerClient cc, string work, string blobName, List<IndexEntry> members,
-        CheckOptions options, string? password, SemaphoreSlim gate, CancellationToken ct)
+        CheckOptions options, string? password, SemaphoreSlim gate, StageTracker? tracker, CancellationToken ct)
     {
         var corrupted = new List<string>();
         var groupDir = Path.Combine(work, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(groupDir);
         await gate.WaitAsync(ct);
+        // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
+        // await，若在那之前标记，几千个包会一股脑全算"正在校验"（见 RestoreOrchestrator 同处注释）。
+        tracker?.BeginItem(blobName);
         try
         {
             var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
@@ -305,6 +358,10 @@ public sealed class BackupChecker(
         }
         finally
         {
+            // 先摘在途再放闸门：反过来的话，后一个组已经开始校验，界面上却还挂着上一个组。
+            // 字节按成员**解压后**的大小算——这个阶段的时间就花在读解出来的内容算 hash 上，
+            // 用它做速度与剩余时间的基准，和用户看到的进展是同一回事。
+            tracker?.EndItem(blobName, members.Sum(m => m.Length));
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }

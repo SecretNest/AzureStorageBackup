@@ -27,7 +27,7 @@ import {
   type BackupRun,
   type StageProgress,
   type RestoreRun,
-  type CheckReport,
+  type CheckRun,
   type RepairRun,
 } from '../api/backupConfigs'
 import {
@@ -87,6 +87,7 @@ export function BackupConfigsPage() {
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
+  const [checks, setChecks] = useState<Record<number, CheckRun>>({})
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
@@ -195,8 +196,14 @@ export function BackupConfigsPage() {
                     if (!cancelled) setRepairs((r) => ({ ...r, [item.id]: s }))
                   }),
                 )
+              } else if (item.activity === 'Checking') {
+                tasks.push(
+                  backupConfigsApi.checkStatus(item.id).then((s) => {
+                    if (!cancelled) setChecks((r) => ({ ...r, [item.id]: s }))
+                  }),
+                )
               }
-              // Checking 与 CleaningUp 没有状态端点：只显示徽章，不拉进度。
+              // CleaningUp 没有状态端点：只显示徽章，不拉进度。
               await Promise.all(tasks)
             } catch {
               // 单次轮询失败不值得打断整页，下一拍会重试。
@@ -244,6 +251,11 @@ export function BackupConfigsPage() {
             void backupConfigsApi
               .repairStatus(item.id)
               .then((s) => setRepairs((r) => ({ ...r, [item.id]: s })))
+              .catch(() => {})
+          } else if (item.activity === 'Checking') {
+            void backupConfigsApi
+              .checkStatus(item.id)
+              .then((s) => setChecks((r) => ({ ...r, [item.id]: s })))
               .catch(() => {})
           }
         })
@@ -420,6 +432,23 @@ export function BackupConfigsPage() {
     }
   }
 
+  // 停止一个正在跑的操作。在此之前，一次跑了几小时的备份唯一的停法是重启容器——而用户跑在
+  // NAS 上，那会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
+  // 逐操作停而不是一键停光：备份与还原可以并发，误停另一条同样是几小时的损失。
+  const stopOp = async (c: BackupConfig, what: 'backup' | 'restore' | 'repair' | 'check', label: string) => {
+    if (!window.confirm(`Stop the running ${label} for "${c.name}"? Work done so far is kept, but the operation will not finish.`))
+      return
+    setError(null)
+    try {
+      await backupConfigsApi.cancel(c.id, what)
+      // 取消是异步的：信号发出后要等到下一个取消检查点才真的收尾，所以这里不动状态，
+      // 让统一轮询把真实的终态（Canceled）拉回来。
+      load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   // 同上：只写入首个状态，后续进度由统一轮询接手。
   const pollRestore = (id: number, state: RestoreRun) => {
     setRestores((r) => ({ ...r, [id]: state }))
@@ -522,9 +551,10 @@ export function BackupConfigsPage() {
               // 运行状态挪出操作列、单独占一行（见 index.css .ops-row）：操作列是 nowrap 的，
               // 而正在处理的那个路径动辄几百字符，放在那里会把整张表撑到出屏。
               const ops = [
-                runs[c.id] && <RunStatus key="run" run={runs[c.id]} />,
-                restores[c.id] && <RestoreStatus key="restore" run={restores[c.id]} />,
-                repairs[c.id] && <RepairStatus key="repair" run={repairs[c.id]} />,
+                runs[c.id] && <RunStatus key="run" run={runs[c.id]} onStop={() => stopOp(c, 'backup', 'backup')} />,
+                restores[c.id] && <RestoreStatus key="restore" run={restores[c.id]} onStop={() => stopOp(c, 'restore', 'restore')} />,
+                repairs[c.id] && <RepairStatus key="repair" run={repairs[c.id]} onStop={() => stopOp(c, 'repair', 'repair')} />,
+                checks[c.id] && <CheckStatus key="check" run={checks[c.id]} onStop={() => stopOp(c, 'check', 'check')} />,
               ].filter(Boolean)
               return (
               <Fragment key={c.id}>
@@ -1080,12 +1110,28 @@ export function BackupConfigsPage() {
   )
 }
 
-function RunStatus({ run }: { run: BackupRun }) {
+// 停止按钮：只在运行中出现。停止是异步的（信号发出后要等到下一个取消检查点），所以点完
+// 这一行不会立刻变——文案里不作"已停止"的承诺。
+function StopButton({ onStop }: { onStop: () => void }) {
+  return (
+    <>
+      {' '}
+      <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onStop}>
+        Stop
+      </button>
+    </>
+  )
+}
+
+function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 展开状态留在组件内：轮询每秒都在换 props，但 React 保留同一个实例，所以展开不会被刷掉。
   const [showDetail, setShowDetail] = useState(false)
 
   if (run.status === 'Failed')
     return <div className="text-danger">Failed: {run.error}</div>
+  // 停止既不是成功也不是失败：后端不会把它写成该备份的 Error 状态，这里也不用红色。
+  if (run.status === 'Canceled')
+    return <div className="text-warn">Backup stopped — nothing was recorded for this run</div>
   if (run.status === 'Completed')
     return (
       <div className="text-ok">
@@ -1099,7 +1145,7 @@ function RunStatus({ run }: { run: BackupRun }) {
       </div>
     )
   const p = run.progress
-  if (!p) return <div className="text-faint">Starting…</div>
+  if (!p) return <div className="text-faint">Starting…<StopButton onStop={onStop} /></div>
 
   // 顶行的百分比要跟着**当前阶段**走。run.percent 衡量的是上传项的完成比例，在扫描/差分阶段
   // 恒为 0——照搬它就会出现顶上写着 0%、下面细节写着 3% 的自相矛盾。
@@ -1112,6 +1158,7 @@ function RunStatus({ run }: { run: BackupRun }) {
       {backupStageLabels[p.stage]}
       {percent != null && ` ${percent}%`}
       {changed}
+      <StopButton onStop={onStop} />
       {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
           默认只留一行总进度，需要看的时候再展开。 */}
       {p.detail && (
@@ -1141,6 +1188,12 @@ const STAGE_UNITS: Record<string, string> = {
   Diffing: 'files',
   Uploading: 'objects',
   Restoring: 'objects',
+  // 检查的各阶段。Cloud 数的是存储对象（一个 pack 一次 HEAD），Verifying 数的是下载解压
+  // 重算 hash 的包，Local 数的才是索引里的文件条目——三者数量差着数量级，不能共用一个词。
+  Cloud: 'objects',
+  Verifying: 'objects',
+  Local: 'files',
+  Orphans: 'blobs',
 }
 
 function StageDetail({ detail }: { detail: StageProgress }) {
@@ -1197,15 +1250,61 @@ function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () =>
 }
 
 // 与 RunStatus 同形的三态展示；RepairRun 没有 version/progress 字段（见 api/backupConfigs.ts），故没有对应显示。
-function RepairStatus({ run }: { run: RepairRun }) {
+function RepairStatus({ run, onStop }: { run: RepairRun; onStop: () => void }) {
   if (run.status === 'Failed')
     return <div className="text-danger">Repair failed: {run.error}</div>
+  if (run.status === 'Canceled')
+    return <div className="text-warn">Repair stopped — files already repaired are kept</div>
   if (run.status === 'Completed')
     return <div className="text-ok">Repair completed</div>
-  return <div className="text-faint">Repairing…</div>
+  return <div className="text-faint">Repairing…<StopButton onStop={onStop} /></div>
 }
 
-function RestoreStatus({ run }: { run: RestoreRun }) {
+// 检查的运行态。报告本身在 Check/Repair 对话框里看——这一行只回答「还在跑吗、跑到哪了」，
+// 因为一次内容级检查要把整个备份下载重算 hash，可以跑上几小时。
+function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
+  const [showDetail, setShowDetail] = useState(false)
+
+  if (run.status === 'Failed')
+    return <div className="text-danger">Check failed: {run.error}</div>
+  if (run.status === 'Canceled')
+    return <div className="text-warn">Check stopped — no report was produced</div>
+  if (run.status === 'Completed') {
+    const r = run.report
+    if (!r) return <div className="text-ok">Check completed</div>
+    return (
+      <div className={r.ok ? 'text-ok' : 'text-danger'}>
+        {r.ok
+          ? `Check completed — all checked objects OK (version ${r.version})`
+          : `Check completed — ${r.missingRefs.length} problem(s), ${r.repairablePaths.length} repairable (version ${r.version})`}
+      </div>
+    )
+  }
+
+  return (
+    <div className="text-faint">
+      Checking
+      {run.detail?.percent != null && ` ${run.detail.percent}%`}
+      <StopButton onStop={onStop} />
+      {run.detail && (
+        <>
+          {' '}
+          <button
+            type="button"
+            className="btn-ghost"
+            style={{ padding: '0 0.3rem' }}
+            onClick={() => setShowDetail((v) => !v)}
+          >
+            {showDetail ? '▾ details' : '▸ details'}
+          </button>
+          {showDetail && <StageDetail detail={run.detail} />}
+        </>
+      )}
+    </div>
+  )
+}
+
+function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void }) {
   const [showDetail, setShowDetail] = useState(false)
   // 跳过/失败的逐条记录。完成之后才是最该看它的时候——一个数字说不出是哪些文件、为什么。
   const events = run.events ?? []
@@ -1253,9 +1352,19 @@ function RestoreStatus({ run }: { run: RestoreRun }) {
         {detailBlock}
       </div>
     )
+  // 还原是逐文件写出的，没有"回滚"这回事：已经落盘的那些文件停止后仍然留在目标目录里。
+  if (run.status === 'Canceled')
+    return (
+      <div className="text-warn">
+        Restore stopped — files already written are kept
+        {toggle}
+        {detailBlock}
+      </div>
+    )
   return (
     <div className="text-faint">
       {run.phase || 'Restoring…'}
+      <StopButton onStop={onStop} />
       {toggle}
       {detailBlock}
     </div>
@@ -1419,25 +1528,67 @@ function CheckModal({
   const [rehydrate, setRehydrate] = useState<number | null>(null)
   const [listOrphans, setListOrphans] = useState(false)
   const [running, setRunning] = useState(false)
-  const [report, setReport] = useState<CheckReport | null>(null)
+  const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
+  // 轮询要在对话框关掉时停下，否则它会一直往一个已卸载的组件里写状态。
+  const aliveRef = useRef(true)
+  useEffect(() => () => { aliveRef.current = false }, [])
+
+  const report = checkRun?.report ?? null
+
+  // 检查现在是后台 job：POST 只拿到 202，结果与进度都靠轮询。
+  const follow = async (initial: CheckRun) => {
+    setRunning(true)
+    try {
+      let run = initial
+      setCheckRun(run)
+      while (run.status === 'Running') {
+        await delay(1000)
+        if (!aliveRef.current) return null
+        run = await backupConfigsApi.checkStatus(config.id)
+        setCheckRun(run)
+      }
+      if (run.status === 'Failed' && run.error) onError(run.error)
+      return run
+    } finally {
+      if (aliveRef.current) setRunning(false)
+    }
+  }
+
+  // 走 ref 而不是把 follow 放进下面 effect 的依赖：follow 每次渲染都是新函数，
+  // 直接依赖会让这个「打开时读一次」的 effect 每渲染重跑一遍。
+  const followRef = useRef(follow)
+  followRef.current = follow
 
   useEffect(() => {
     backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+    // 服务端保留着最近一次检查的报告：关掉对话框再打开要能看回结果，而一次内容级检查
+    // 要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。404 = 从没查过。
+    // 仍在跑就接着轮询；已跑完则只把报告摆出来——不走 follow，免得把上一次的失败
+    // 当成这次的错误再弹一遍横幅。
+    backupConfigsApi
+      .checkStatus(config.id)
+      .then((s) => { if (s.status === 'Running') void followRef.current(s); else setCheckRun(s) })
+      .catch(() => {})
   }, [config.id])
 
   const rehydrateArg = () => (cloud === CloudCheckLevel.Content ? rehydrate : null)
 
   const runCheck = async () => {
-    setRunning(true)
     setRepairReport(null)
     try {
-      setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
+      await follow(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setRunning(false)
+    }
+  }
+
+  const stopCheck = async () => {
+    try {
+      await backupConfigsApi.cancel(config.id, 'check')
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -1453,7 +1604,7 @@ function CheckModal({
         setRepairReport(run)
       }
       if (run.status === 'Completed')
-        setReport(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
+        await follow(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
       else if (run.error) onError(run.error)
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
@@ -1507,6 +1658,9 @@ function CheckModal({
           <button type="button" className="btn-primary" onClick={runCheck} disabled={running || repairing}>
             {running ? 'Checking…' : 'Run check'}
           </button>
+          {running && (
+            <button type="button" className="btn-danger" onClick={stopCheck}>Stop</button>
+          )}
           {(problems.some((f) => f.repairable) || (report?.orphanBlobs?.length ?? 0) > 0) && (
             <button type="button" onClick={runRepair} disabled={repairing || running}>
               {repairing ? 'Repairing…' : 'Repair from local'}
@@ -1514,6 +1668,25 @@ function CheckModal({
           )}
           <button type="button" onClick={onClose}>Close</button>
         </div>
+
+        {/* 检查在服务端后台跑，不再随请求一起结束：内容级要把整个备份下载重算 hash，
+            可以跑上几小时，所以这里必须给出进度，并明说关掉对话框不会打断它。 */}
+        {running && (
+          <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
+            <div>
+              {checkRun?.detail ? checkRun.detail.stage : 'Starting'}
+              {checkRun?.detail?.percent != null && ` ${checkRun.detail.percent}%`}
+              {' '}— you can close this dialog; the check keeps running.
+            </div>
+            {checkRun?.detail && <StageDetail detail={checkRun.detail} />}
+          </div>
+        )}
+        {checkRun?.status === 'Canceled' && (
+          <div className="text-warn" style={{ marginBottom: '0.6rem' }}>Check stopped — no report was produced.</div>
+        )}
+        {checkRun?.status === 'Failed' && (
+          <div className="text-danger" style={{ marginBottom: '0.6rem' }}>Check failed: {checkRun.error}</div>
+        )}
 
         {repairReport && (
           <div style={{ marginBottom: '0.6rem' }}>

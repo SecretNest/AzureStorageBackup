@@ -5,6 +5,10 @@ public enum RunStatus
     Running,
     Completed,
     Failed,
+
+    /// <summary>用户按了停止。既不算失败也不算成功：**不写 Error 状态**（否则这份备份此后一直
+    /// 挂着一条红色 Error，还要手动 Reset 才消），也不记成一次成功的运行。</summary>
+    Canceled,
 }
 
 /// <summary>一次备份运行的内存状态（前端轮询用）。</summary>
@@ -28,10 +32,15 @@ public sealed class BackupRunState
     internal Exception? Failure { get; set; }
 
     /// <summary>
-    /// 内部机制，不进 HTTP 契约：该次运行到达终态（Completed/Failed）时触发一次。
+    /// 内部机制，不进 HTTP 契约：该次运行到达终态（Completed/Failed/Canceled）时触发一次。
     /// 供 RunTrackedAsync 的短路分支等待，不给前端轮询用。
     /// </summary>
     internal TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。
+    /// 在此之前，一次跑了几小时的备份唯一的停法是重启容器——而用户跑在 NAS 上，
+    /// 那会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路也堵上了。</summary>
+    internal CancellationTokenSource Cancellation { get; } = new();
 }
 
 public sealed record BackupRunResponse(
@@ -103,7 +112,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         {
             try
             {
-                await RunCoreAsync(configId, state, CancellationToken.None);
+                await RunCoreAsync(configId, state, state.Cancellation.Token);
             }
             finally
             {
@@ -153,7 +162,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return state;
         }
 
-        await RunCoreAsync(configId, state, ct);
+        // 调度器的 ct（关机）与本次运行自己的取消源（用户按停止）二选一先到即算取消：
+        // 定时备份同样能在界面上停掉——它跑的是同一条执行体，也一样可能跑上一整夜。
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cancellation.Token);
+        await RunCoreAsync(configId, state, linked.Token);
         return state;
     }
 
@@ -161,6 +173,20 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         lock (_lock)
             return _runs.GetValueOrDefault(configId);
+    }
+
+    /// <summary>停止正在跑的那次备份。返回 false = 当前没有在跑的运行。</summary>
+    public bool Cancel(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running })
+            return false;
+        // Cancel() 会在**当前线程**同步执行已注册的回调；放在 _lock 里的话，任一回调只要回头
+        // 碰到这个 runner 就会自锁。锁只用来取那一条记录。
+        state.Cancellation.Cancel();
+        return true;
     }
 
     /// <summary>两个入口共用的执行体。**不碰忙碌锁**——锁由调用方负责。</summary>
@@ -186,6 +212,13 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.Status = RunStatus.Completed;
 
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());
+            state.Completion.TrySetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            // 用户按了停止（或进程正在关停）：不是失败。既不写 Error 状态，也不写 Normal——
+            // 这一轮什么结论都没有，落库的持久状态保持原样。
+            state.Status = RunStatus.Canceled;
             state.Completion.TrySetResult();
         }
         catch (Exception ex)

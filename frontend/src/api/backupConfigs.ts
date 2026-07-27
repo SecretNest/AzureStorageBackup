@@ -156,8 +156,12 @@ export interface BackupProgress {
   detail: StageProgress | null
 }
 
+// 后台运行的终态。Canceled = 用户按了停止：既不是成功也不是失败，后端因此不会把它写成
+// 该备份的 Error 状态（否则停一次就要手动 Reset 一次）。
+export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled'
+
 export interface BackupRun {
-  status: 'Running' | 'Completed' | 'Failed'
+  status: RunStatus
   progress: BackupProgress | null
   version: number | null
   // 本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来。
@@ -166,7 +170,7 @@ export interface BackupRun {
 }
 
 export interface RestoreRun {
-  status: 'Running' | 'Completed' | 'Failed'
+  status: RunStatus
   version: number | null
   restoredFiles: number | null
   skippedFiles: number | null
@@ -222,11 +226,20 @@ export interface RepairReport {
 }
 
 export interface RepairRun {
-  status: 'Running' | 'Completed' | 'Failed'
+  status: RunStatus
   repaired: string[] | null
   unrecoverable: string[] | null
   deletedOrphans: string[] | null
   error: string | null
+}
+
+// 检查现在是后台 job（202 + 轮询）：内容级要把整个备份下载重算一遍 hash，同步端点时代
+// 请求会先被浏览器/反向代理超时掐断。报告跑完仍留在服务端，关掉对话框再打开还能看回结果。
+export interface CheckRun {
+  status: RunStatus
+  report: CheckReport | null
+  error: string | null
+  detail: StageProgress | null
 }
 
 export interface FileVersionOption {
@@ -318,8 +331,10 @@ export const backupConfigsApi = {
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (listOrphans) p.set('listOrphans', 'true')
-    return api.post<CheckReport>(`/backup-configs/${id}/check?${p.toString()}`, {})
+    // 202：只是把检查跑起来，结果要靠 checkStatus 轮询。
+    return api.post<CheckRun>(`/backup-configs/${id}/check?${p.toString()}`, {})
   },
+  checkStatus: (id: number) => api.get<CheckRun>(`/backup-configs/${id}/check`),
   repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
@@ -329,6 +344,11 @@ export const backupConfigsApi = {
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
+  // 停止正在跑的操作。what 省略＝停掉这个配置上所有在跑的操作。停止是异步的：
+  // 这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾，所以界面上不会立刻变。
+  cancel: (id: number, what?: 'backup' | 'restore' | 'repair' | 'check') =>
+    api.post<{ canceled: string[] }>(
+      `/backup-configs/${id}/cancel${what ? `?what=${what}` : ''}`, {}),
   resetPassword: (id: number, password: string) =>
     api.post<void>(`/backup-configs/${id}/reset-password`, { password }),
 }
