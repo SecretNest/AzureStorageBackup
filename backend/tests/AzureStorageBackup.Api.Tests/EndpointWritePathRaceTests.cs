@@ -265,8 +265,22 @@ public sealed class EndpointWritePathRaceTests
 
         var res = await client.PostAsJsonAsync($"/api/backup-configs/{config!.Id}/check", new { });
 
-        // 取消原样上抛（宿主渲染成 500），不是 200「检查完成」。
-        Assert.NotEqual(HttpStatusCode.OK, res.StatusCode);
+        // 检查改成后台 job 之后，取消不再体现在响应码上（这里拿到的是 202「已受理」），
+        // 而体现在运行态里。所以必须等这次运行真的收尾再看配置行——POST 一返回就读库是在
+        // 和后台任务赛跑：读得快就什么都还没写，测试碰巧绿，掩盖住真正要防的那次写入。
+        Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+
+        CheckRunResponse? run = null;
+        for (var i = 0; i < 200; i++)
+        {
+            run = await (await client.GetAsync($"/api/backup-configs/{config.Id}/check"))
+                .Content.ReadFromJsonAsync<CheckRunResponse>();
+            if (run!.Status != "Running") break;
+            await Task.Delay(25);
+        }
+        // 取消就是取消：既不是「检查完成」，也不是「检查失败」。
+        Assert.Equal("Canceled", run!.Status);
+        Assert.Null(run.Report);
 
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
