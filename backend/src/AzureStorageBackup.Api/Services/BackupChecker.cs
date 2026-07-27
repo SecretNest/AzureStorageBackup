@@ -89,7 +89,7 @@ public sealed class BackupChecker(
                 ? CloudState.NotChecked
                 : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
             var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
-            findings.Add(new FileFinding(e.Path, refName, cloud, local));
+            findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt });
         }
 
         var orphans = options.ListOrphans

@@ -1012,6 +1012,12 @@ function RunStatus({ run }: { run: BackupRun }) {
     return (
       <div className="text-ok">
         Completed — version {run.version}
+        {/* 一次"成功"的备份可能跳过了文件——不写在这里，操作员只能靠可能被淹没的通知发现。 */}
+        {!!run.unreadableFiles && (
+          <span className="text-danger">
+            {' '}— {run.unreadableFiles} file(s) could not be read; earlier content kept
+          </span>
+        )}
       </div>
     )
   const p = run.progress
@@ -1265,6 +1271,8 @@ function CheckModal({
   }
 
   const problems = report ? report.findings.filter((f) => f.cloud === CloudState.MissingOrBad) : []
+  // 内容沿用自更早版本的条目：云端 blob 本身通常没问题，所以不在 problems 里，但同样要报出来。
+  const stale = report ? report.findings.filter((f) => f.unreadableAt) : []
 
   return (
     <div className={overlayStyle} onClick={onClose}>
@@ -1349,13 +1357,33 @@ function CheckModal({
                   : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
               </div>
             )}
+            {/* 沿用条目的云端 blob 通常是好的（cloud=Ok），所以它们不会出现在下面的问题表里——
+                但操作员必须知道这个版本里有内容是旧的，尤其因为它会让本地比对显示为 Changed。 */}
+            {stale.length > 0 && (
+              <div className="text-warn" style={{ margin: '0.4rem 0' }}>
+                {stale.length} file(s) hold content carried forward from an earlier backup — the
+                source could not be read since then, so a local comparison shows them as changed:
+                <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
+                  {stale.slice(0, 20).map((f) => (
+                    <li key={f.path}>
+                      <span className="mono">{f.path}</span>
+                      {' '}— unread since {new Date(f.unreadableAt!).toLocaleString()}
+                    </li>
+                  ))}
+                </ul>
+                {stale.length > 20 && <div>…and {stale.length - 20} more</div>}
+              </div>
+            )}
             {problems.length > 0 && (
               <table className="text-faint">
                 <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
                 <tbody>
                   {problems.map((f) => (
                     <tr key={f.path}>
-                      <td className="mono">{f.path}</td>
+                      <td className="mono">
+                        {f.path}
+                        {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
+                      </td>
                       <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
                       <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
                       <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
