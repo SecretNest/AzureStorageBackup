@@ -3,7 +3,7 @@ import { groupsApi, type Group, type GroupMember } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { Field } from '../components/modal'
 
-export function GroupsPage() {
+export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groups, setGroups] = useState<Group[]>([])
   const [pool, setPool] = useState<DiscoveredBackup[]>([])
   const [poolLoaded, setPoolLoaded] = useState(false)
@@ -74,6 +74,7 @@ export function GroupsPage() {
       else await groupsApi.create(input)
       setShowForm(false)
       loadGroups()
+      onChanged?.()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -84,6 +85,7 @@ export function GroupsPage() {
     try {
       await groupsApi.remove(g.id)
       loadGroups()
+      onChanged?.()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -92,10 +94,11 @@ export function GroupsPage() {
   const poolKeys = new Set(pool.map(backupKey))
   const extraKeys = [...selected].filter((k) => !poolKeys.has(k))
 
+  // 组只被计划任务使用，所以作为 Tasks 页里的一个分区，而不是自成一个顶级标签。
   return (
-    <section>
-      <div className="page-header">
-        <h1>Groups</h1>
+    <>
+      <div className="page-header" style={{ marginTop: '2rem' }}>
+        <h2>Groups</h2>
         <button type="button" onClick={startNew}>
           New Group
         </button>
@@ -185,6 +188,6 @@ export function GroupsPage() {
           </div>
         </div>
       )}
-    </section>
+    </>
   )
 }

@@ -15,6 +15,7 @@ import {
 import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
+import { GroupsSection } from './GroupsPage'
 import { Field } from '../components/modal'
 
 const emptyForm: TaskInput = {
@@ -294,6 +295,7 @@ export function TasksPage() {
           </div>
         </div>
       )}
+      <GroupsSection onChanged={() => groupsApi.list().then(setGroups).catch(() => {})} />
     </section>
   )
 }
