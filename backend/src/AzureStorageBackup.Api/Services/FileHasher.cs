@@ -1,4 +1,6 @@
 using System.IO.Hashing;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace AzureStorageBackup.Api.Services;
 
@@ -65,8 +67,48 @@ public sealed class FileHasher : IFileHasher
         return Format(hash.GetCurrentHash());
     }
 
-    private static FileStream Open(string path) =>
-        new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+    /// <summary>
+    /// 打开待哈希的文件。Unix 上**必须**用 O_NONBLOCK。
+    /// <para>
+    /// 一个 FIFO（命名管道）会让常规的 <c>File.OpenRead</c> **永久阻塞**在 open() 里等待写入端。
+    /// 那是阻塞在系统调用中，<c>CancellationToken</c> 够不着：整轮备份就此挂死、无法取消，
+    /// 忙碌锁被永久占用，该配置此后拒绝一切操作、定时任务全部跳过，界面上只剩一个不动的百分比。
+    /// 而 .NET 在 Unix 上**无法**把它认出来——实测 FIFO 的 <c>FileAttributes</c> 同样是 Normal、
+    /// <c>Length</c> 同样是 0，与普通空文件毫无差别。
+    /// </para>
+    /// <para>
+    /// 所以：非阻塞打开使 FIFO 立即返回而不是挂住，再用 <c>CanSeek</c> 把它与普通文件区分开
+    /// （普通文件——含空文件——恒为 true，FIFO/管道为 false；socket 更早一步，open 直接以 ENXIO 失败）。
+    /// 判为非普通文件就抛 IOException，落进既有的「读不开」处理：不进上传计划，
+    /// 因此 7z 也永远不会去打开它——7z 是独立进程、不带这个标志，一旦碰上会同样挂住。
+    /// O_NONBLOCK 对普通文件的读取语义没有影响（POSIX 保证），所以正常路径分毫不变。
+    /// </para>
+    /// </summary>
+    private static FileStream Open(string path)
+    {
+        if (OperatingSystem.IsWindows())
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+
+        var fd = open(path, O_RDONLY | (OperatingSystem.IsMacOS() ? O_NONBLOCK_BSD : O_NONBLOCK_LINUX));
+        if (fd < 0)
+            throw new IOException(
+                $"Cannot open '{path}' for reading (errno {Marshal.GetLastPInvokeError()}).");
+
+        var stream = new FileStream(new SafeFileHandle(fd, ownsHandle: true), FileAccess.Read, 81920);
+        if (stream.CanSeek)
+            return stream;
+
+        // 管道/FIFO 这类不可定位的东西：它没有「文件内容」可言，读它只会等一个可能永不到来的写入端。
+        stream.Dispose();
+        throw new IOException($"'{path}' is not a regular file (named pipe, device or similar).");
+    }
+
+    private const int O_RDONLY = 0;
+    private const int O_NONBLOCK_LINUX = 0x800;  // Linux: 0o4000
+    private const int O_NONBLOCK_BSD = 0x4;      // macOS/BSD
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    private static extern int open(string pathname, int flags);
 
     private static string Format(byte[] hash) => "xxh128:" + Convert.ToHexString(hash).ToLowerInvariant();
 }
