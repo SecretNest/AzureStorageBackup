@@ -108,6 +108,18 @@ public sealed class BackupProgressDetailTests : IDisposable
             Assert.Null(scanning[^1].Detail!.Percent);
             Assert.Equal(40, scanning[^1].Detail!.Processed);
             Assert.Contains(scanning, r => !string.IsNullOrEmpty(r.Detail!.CurrentItem));
+
+            // 上传阶段：已传字节要累计起来（测速的依据），且收尾必须强制产出终态——
+            // 否则最后一批字节会被压在节流窗口里再也发不出来。
+            // 这里**不**断言"某次快照恰好看到在途项"：那取决于 200ms 节流窗口是否恰好落在
+            // BeginItem 与 EndItem 之间，本地 Azurite 上传太快时不可靠。在途项的机制由
+            // StageProgressTests 的单测确定性地覆盖，集成测试只验证接线与终态。
+            var uploading = progress.Reports.Where(r => r.Stage == BackupStage.Uploading && r.Detail is not null).ToList();
+            Assert.NotEmpty(uploading);
+            Assert.True(uploading[^1].Detail!.Bytes > 0, "uploaded bytes should accumulate for the speed readout");
+
+            // 槽位计数恰好一次：绝不能超过 total（在途项的起止不得参与计数）。
+            Assert.All(uploading, r => Assert.True(r.Detail!.Processed <= r.Detail.Total));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
