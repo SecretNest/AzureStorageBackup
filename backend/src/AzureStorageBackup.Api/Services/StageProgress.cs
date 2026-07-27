@@ -82,12 +82,15 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
 
     public void BeginItem(string item) => _active.TryAdd(item, 0);
 
+    /// <summary>一个在途项结束：移出在途集合并累加字节，**不计数**。
+    /// 计数归 <see cref="Advance"/> 专管——上传的槽位计数有"恰好一次"的精确约束
+    /// （一个 pack 可能因成员变化被重压多次，却始终只占 total 里的一个槽位），
+    /// 在这里顺手加一次就会重复计数，进度条会冲过 100%。</summary>
     public void EndItem(string item, long bytes)
     {
         _active.TryRemove(item, out _);
         lock (_gate)
         {
-            _processed++;
             _bytes += bytes;
             PublishIfDue(force: false);
         }

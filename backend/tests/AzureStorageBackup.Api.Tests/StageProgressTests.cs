@@ -77,6 +77,27 @@ public sealed class StageProgressTests
         tracker.EndItem("packs/p0001.7z", 5000);
         tracker.Complete();
         Assert.Equal(["packs/p0002.7z"], seen[^1].ActiveItems);
+        Assert.Equal(5000, seen[^1].Bytes);
+    }
+
+    /// <summary>在途项的起止**不得**计数。上传的槽位计数有「恰好一次」的约束——一个 pack 因成员
+    /// 变化被重压时会经历多次上传，却始终只占 total 里的一个槽位。让 EndItem 顺手计数，
+    /// 进度条就会冲过 100%（这个仓库在 onItem 上已经踩过一次重复计数）。</summary>
+    [Fact]
+    public void In_Flight_Bookkeeping_Does_Not_Advance_The_Count()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        // 同一个槽位被重压两次：两轮上传，但只该计一次数。
+        tracker.BeginItem("packs/p0001.7z");
+        tracker.EndItem("packs/p0001.7z", 100);
+        tracker.BeginItem("packs/p0001.7z");
+        tracker.EndItem("packs/p0001.7z", 100);
+        tracker.Advance(0); // 槽位完成，只在这里计数
+        tracker.Complete();
+
         Assert.Equal(1, seen[^1].Processed);
+        Assert.Equal(100, seen[^1].Percent); // 恰好 100%，不会超
     }
 }

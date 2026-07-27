@@ -242,9 +242,14 @@ public sealed class BackupOrchestrator(
         // 5. Compress + Upload。压缩仍经单例 StagingArea 全局串行；仅上传按 UploadConcurrency 并行（PRD 3.4）。
         var total = plan.Blobs.Count + plan.Packs.Count;
         var uploaded = 0;
+        // 槽位计数仍归 ReportItem（它有"恰好一次"的既有约束）；tracker 只负责在途项与字节/测速，
+        // 好让界面能说出「正在传哪个包、多快」而不只是一个百分比。
+        var uploadTracker = new StageTracker("Uploading", total, d => progress?.Report(
+            new BackupProgress(BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
         void ReportItem()
         {
             var done = Interlocked.Increment(ref uploaded);
+            uploadTracker.Advance(0);
             progress?.Report(new BackupProgress(
                 BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, done, total));
         }
@@ -253,8 +258,11 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
-        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, ct);
-        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, ct);
+        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+        // 与扫描/差分同理：不强制产出终态，最后一批传完的字节就永远发布不出去——
+        // 节流会把它们压在最后一个窗口里，而那之后不再有任何一次上报。
+        uploadTracker.Complete();
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath, tailByPath, overrides, postDiffUnreadable);
@@ -374,10 +382,10 @@ public sealed class BackupOrchestrator(
         BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
         => await Task.WhenAll(plan.Blobs.Select(blob =>
             HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing, localResolver,
-                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, onItem, ct)));
+                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, onItem, uploadTracker, ct)));
 
     /// <summary>
     /// 处理单文件内容寻址 blob：压缩+上传 data/{hash}，经重校验循环（§9）。
@@ -387,7 +395,7 @@ public sealed class BackupOrchestrator(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -413,6 +421,7 @@ public sealed class BackupOrchestrator(
                 : CompressAsync(request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
             var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
             await uploadGate.WaitAsync(token);
+            uploadTracker.BeginItem(blobRef);
             try
             {
                 var meta = new Dictionary<string, string>(addressing.Metadata(hash, length, head, tail));
@@ -427,6 +436,7 @@ public sealed class BackupOrchestrator(
             finally
             {
                 uploadGate.Release();
+                uploadTracker.EndItem(blobRef, sizes.Sum());
                 staging.Release(staged);
             }
         }
@@ -620,7 +630,7 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
+        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         // 从计划重建每个目录的可分组文件池（顺序不变）；成组/压缩/校验在处理时增量进行。
         var poolByDir = plan.Packs
@@ -632,7 +642,7 @@ public sealed class BackupOrchestrator(
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
         await Task.WhenAll(poolByDir.Select(pool =>
-            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, onItem, ct)));
+            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, onItem, uploadTracker, ct)));
     }
 
     private async Task ProcessDirectoryAsync(
@@ -640,7 +650,7 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, int[] packCounter, Action onItem, CancellationToken ct)
+        SemaphoreSlim uploadGate, int[] packCounter, Action onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
@@ -674,7 +684,7 @@ public sealed class BackupOrchestrator(
                 var kept0 = members.Where(m => !missing0.Contains(m.EntryName)).ToList();
                 if (staged0 is not null && kept0.Count > 0)
                 {
-                    var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
+                    var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, uploadTracker, ct);
                     RecordPack(request, packId, kept0, vols0, info, storageByPath);
                     foreach (var m in kept0) await LogFileAsync(request, m.Path, ct);
                 }
@@ -725,7 +735,7 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadGate, ct);
+                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadGate, uploadTracker, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem();
@@ -740,7 +750,7 @@ public sealed class BackupOrchestrator(
             if (stable.Count > 0)
             {
                 var staged2 = await CompressPackAsync(request, packId, stable, ct);
-                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
+                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, uploadTracker, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
@@ -786,7 +796,7 @@ public sealed class BackupOrchestrator(
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, ct);
+                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, uploadTracker, ct);
                 }
                 else
                 {
@@ -851,19 +861,23 @@ public sealed class BackupOrchestrator(
 
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
-        BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate, CancellationToken ct)
+        BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate,
+        StageTracker uploadTracker, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
+        var blobName = $"packs/{packId}.7z";
         await uploadGate.WaitAsync(ct);
+        uploadTracker.BeginItem(blobName);
         try
         {
             await VolumeBlobIO.UploadAsync(
-                uploader, request.Account, request.Container, $"packs/{packId}.7z", staged.Files,
+                uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct);
         }
         finally
         {
             uploadGate.Release();
+            uploadTracker.EndItem(blobName, sizes.Sum());
             staging.Release(staged);
         }
         return sizes;
