@@ -116,6 +116,20 @@ export interface BackupConfigInput {
   verboseLogging: boolean | null
 }
 
+// 某个阶段正在做什么。上传之外的阶段此前完全没有进度——扫描和 diff 各自只在进入时报一次，
+// 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。
+export interface StageProgress {
+  stage: string
+  processed: number
+  total: number // 0 = 总数未知（扫描还没走完）
+  bytes: number
+  currentItem: string | null
+  activeItems: string[]
+  bytesPerSecond: number
+  percent: number | null
+  estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
+}
+
 export interface BackupProgress {
   stage: number
   changedFiles: number
@@ -123,6 +137,7 @@ export interface BackupProgress {
   uploadedItems: number
   totalItems: number
   percent: number
+  detail: StageProgress | null
 }
 
 export interface BackupRun {

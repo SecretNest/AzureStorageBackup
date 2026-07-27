@@ -73,6 +73,11 @@ public sealed record BackupProgress(
 {
     public int Percent => TotalItems == 0 ? (Stage == BackupStage.Completed ? 100 : 0)
         : (int)Math.Min(100L, 100L * UploadedItems / TotalItems);
+
+    /// <summary>当前阶段在做什么（正在处理哪个文件、已处理多少、多快）。
+    /// 上传之外的阶段此前完全没有进度可言——扫描和 diff 各自只在**进入**时上报一次，
+    /// 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。</summary>
+    public StageProgress? Detail { get; init; }
 }
 
 /// <summary>
@@ -163,7 +168,10 @@ public sealed class BackupOrchestrator(
 
         // 1. Scan
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
-        var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct);
+        var scanTracker = new StageTracker("Scanning", total: 0, d =>   // 扫完才知道总数，故 total=0
+            progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0) { Detail = d }));
+        var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct, scanTracker);
+        scanTracker.Complete();
 
         // 2. 载入上一版本。信息文件优先走本地权威副本（§3.3，避免读云端 Cold 信息文件）；大的版本索引优先走本地缓存。
         var info = (trackedInfo is not null
@@ -199,9 +207,13 @@ public sealed class BackupOrchestrator(
             localResolver = LocalDedupResolver.Build(addressing, indexes);
         }
 
-        // 3. Diff
+        // 3. Diff —— 首次备份时这一步最久（每个文件都要完整读一遍算 hash），
+        // 也正是此前用户盯着一个不动的 0% 完全不知道在干什么的那个阶段。
         progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
-        var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct);
+        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, d =>
+            progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0) { Detail = d }));
+        var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct, diffTracker);
+        diffTracker.Complete();
 
         // 读不开的文件既不算变更也不算删除，索引阶段会静默沿用旧条目——但操作员必须被告知。
         // 放在 Plan 之前、diff 之后：这条路径每一轮都会执行，不依赖"是否有变更文件"这个后续分支，

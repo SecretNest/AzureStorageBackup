@@ -61,7 +61,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
         ScanResult current,
         VersionIndex? previous,
         DiffOptions? options = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        // 首次备份时这一步要把每个文件完整读一遍算 hash，可以跑几小时。没有它，界面上就是
+        // 一个一动不动的 0%，用户无从判断是在干活还是挂死了。
+        StageTracker? tracker = null)
     {
         options ??= new DiffOptions();
         var root = Path.GetFullPath(rootPath);
@@ -76,6 +79,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
         {
             ct.ThrowIfCancellationRequested();
             seen.Add(entry.Path);
+            // 在**处理之前**就把当前路径亮出来：卡住时最需要知道的正是"卡在哪个文件上"。
+            tracker?.Touch(entry.Path);
 
             var full = Path.Combine(root, entry.Path.Replace('/', Path.DirectorySeparatorChar));
             var kind = entry.Kind == EntryKind.File ? "file" : "symlink";
@@ -91,6 +96,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 changedFiles++;
                 changedBytes += entry.Length;
             }
+            // 计入已读字节：只有实际读过内容的分类才算，未变的文件根本没打开过，
+            // 把它们算进去会让速度看起来虚高得离谱。
+            tracker?.Advance(
+                change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly ? entry.Length : 0);
         }
 
         // 扫描阶段就读不出来的路径，必须在"判删除"之前登记进 seen。

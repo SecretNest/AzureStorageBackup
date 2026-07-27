@@ -5,6 +5,7 @@ import { settingsApi, type GlobalSettings } from '../api/settings'
 import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
+import { formatBytes } from '../constants/format'
 import { Field } from '../components/modal'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
 import {
@@ -23,6 +24,7 @@ import {
   type BackupConfig,
   type BackupConfigInput,
   type BackupRun,
+  type StageProgress,
   type RestoreRun,
   type CheckReport,
   type RepairRun,
@@ -1058,6 +1060,41 @@ function RunStatus({ run }: { run: BackupRun }) {
   return (
     <div className="text-faint">
       {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
+      {p?.detail && <StageDetail detail={p.detail} />}
+    </div>
+  )
+}
+
+/// 阶段细节。在此之前，扫描和 diff 各自只在进入时上报一次——首次备份的 diff 要把每个文件
+/// 完整读一遍算 hash，可以跑几小时，界面上却只有一个一动不动的 0%，分不清是在干活还是挂死。
+function StageDetail({ detail }: { detail: StageProgress }) {
+  const counts =
+    detail.total > 0
+      ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()}`
+      : `${detail.processed.toLocaleString()} so far` // 扫描时总数未知——它正是扫描要算出来的
+  const speed = detail.bytesPerSecond > 0 ? ` · ${formatBytes(detail.bytesPerSecond)}/s` : ''
+  // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
+  const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
+
+  return (
+    <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
+      {detail.currentItem && (
+        <div className="mono" style={{ wordBreak: 'break-all' }}>
+          {detail.currentItem}
+        </div>
+      )}
+      {detail.activeItems.length > 0 && (
+        <div className="mono" style={{ wordBreak: 'break-all' }}>
+          {detail.activeItems.slice(0, 3).join(', ')}
+          {detail.activeItems.length > 3 && ` +${detail.activeItems.length - 3} more`}
+        </div>
+      )}
+      <div>
+        {counts}
+        {detail.percent != null && ` · ${detail.percent}%`}
+        {speed}
+        {eta}
+      </div>
     </div>
   )
 }

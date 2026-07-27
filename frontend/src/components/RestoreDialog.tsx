@@ -11,6 +11,7 @@ import {
   type TreeNode,
   type UnreadableEntry,
 } from '../api/backupConfigs'
+import { formatBytes } from '../constants/format'
 import { Field } from './modal'
 import { overlayStyle, panelStyle } from './modalStyles'
 import { PathBrowser } from './PathBrowser'
@@ -18,18 +19,6 @@ import { PathBrowser } from './PathBrowser'
 const rehydratePriorityLabels: Record<number, string> = {
   [RestoreRehydratePriority.Standard]: 'Standard',
   [RestoreRehydratePriority.High]: 'High (faster, more expensive)',
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let v = n / 1024
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(1)} ${units[i]}`
 }
 
 // 还原对话框（§4.1a-d）：选版本 → 懒加载树浏览 + 勾选 → 防抖估算 → 冲突模式/活化优先级 → 目标根路径 → 开始还原。
