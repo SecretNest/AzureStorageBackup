@@ -43,6 +43,9 @@ public class BackupConfig
     public string? DontCompressRules { get; set; }
     public string? DontGroupRules { get; set; }
 
+    /// <summary>命中者允许跨目录装箱；null = 用全局默认。</summary>
+    public string? CrossDirGroupRules { get; set; }
+
     public bool? IncludeSymlinks { get; set; }
 
     // 版本保留（§10）

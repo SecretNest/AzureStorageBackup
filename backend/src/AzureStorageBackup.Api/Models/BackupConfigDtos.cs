@@ -34,7 +34,8 @@ public record BackupConfigResponse(
     DateTimeOffset? LastErrorAt,
     string Activity,
     bool SecretsUnavailable,
-    ResolvedBackupSettings Effective)
+    ResolvedBackupSettings Effective,
+    string? CrossDirGroupRules = null)
 {
     /// <summary>
     /// <paramref name="secretsUnavailable"/> 必须按该配置密文的实际可解性传入
@@ -54,7 +55,7 @@ public record BackupConfigResponse(
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
         c.Status, c.LastError, c.LastErrorAt, activity,
         secretsUnavailable && !string.IsNullOrEmpty(c.PasswordProtected),
-        ResolvedBackupSettings.From(c, settings));
+        ResolvedBackupSettings.From(c, settings), c.CrossDirGroupRules);
 }
 
 /// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。
@@ -78,7 +79,7 @@ public record ImportRequest(int AccountId, string ContainerName, string? Passwor
 public record ResetBackupPasswordRequest(string Password);
 
 /// <summary>创建/更新备份配置请求体。更新时 Password 为空表示保留原值。
-/// 11 个可继承字段为 null 表示「使用默认」——落库即 null，运行时经
+/// 12 个可继承字段为 null 表示「使用默认」——落库即 null，运行时经
 /// <see cref="ResolvedBackupSettings"/> 解析。IndexTier/DataTier 不可继承，保持必填。</summary>
 public record BackupConfigRequest(
     int AccountId,
@@ -99,7 +100,8 @@ public record BackupConfigRequest(
     long? SingleFileThresholdBytes = null,
     long? GroupCapBytes = null,
     long? VolumeBytes = null,
-    bool? VerboseLogging = null)
+    bool? VerboseLogging = null,
+    string? CrossDirGroupRules = null)
 {
     /// <summary>请求体里的 Password 是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。</summary>
     public BackupConfig ToConfig(IEncryptionService encryption) => new()
@@ -117,6 +119,7 @@ public record BackupConfigRequest(
         IgnoreRules = IgnoreRules,
         DontCompressRules = DontCompressRules,
         DontGroupRules = DontGroupRules,
+        CrossDirGroupRules = CrossDirGroupRules,
         IncludeSymlinks = IncludeSymlinks,
         MaxVersions = MaxVersions,
         MaxAgeDays = MaxAgeDays,

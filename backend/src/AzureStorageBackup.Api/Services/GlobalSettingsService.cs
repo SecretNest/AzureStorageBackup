@@ -55,6 +55,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DefaultIgnoreRules = s.DefaultIgnoreRules;
         existing.DefaultDontCompressRules = s.DefaultDontCompressRules;
         existing.DefaultDontGroupRules = s.DefaultDontGroupRules;
+        existing.DefaultCrossDirGroupRules = s.DefaultCrossDirGroupRules;
         existing.UploadConcurrency = s.UploadConcurrency;
         existing.DownloadConcurrency = s.DownloadConcurrency;
         existing.LogEphemeralMaxAgeDays = s.LogEphemeralMaxAgeDays;

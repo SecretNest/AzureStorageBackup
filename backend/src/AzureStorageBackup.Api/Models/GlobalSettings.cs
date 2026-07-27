@@ -41,6 +41,9 @@ public class GlobalSettings
     public string? DefaultDontCompressRules { get; set; }
     public string? DefaultDontGroupRules { get; set; }
 
+    /// <summary>跨路径打包规则的全局默认（gitignore 语法）。空 = 全部按目录打包。</summary>
+    public string? DefaultCrossDirGroupRules { get; set; }
+
     // 全局
     public int UploadConcurrency { get; set; } = 5;
     public int DownloadConcurrency { get; set; } = 5; // 还原/深度检查下载并发（PRD 3.4）

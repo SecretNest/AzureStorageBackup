@@ -29,6 +29,7 @@ public static class BackupRequestMapper
                 Ignore = new IgnoreRuleSet(SplitLines(r.IgnoreRules)),
                 DontCompress = OptionalRules(r.DontCompressRules),
                 DontGroup = OptionalRules(r.DontGroupRules),
+                CrossDirGroup = OptionalRules(r.CrossDirGroupRules),
                 Scan = new ScanOptions { IncludeSymlinks = r.IncludeSymlinks },
                 Plan = new PlanOptions
                 {

@@ -88,6 +88,16 @@ export function SettingsPage() {
       <Field label="Don't group">
         <Rules value={s.defaultDontGroupRules} onChange={(v) => set('defaultDontGroupRules', v)} />
       </Field>
+      <Field label="Pack across directories">
+        <Rules value={s.defaultCrossDirGroupRules} onChange={(v) => set('defaultCrossDirGroupRules', v)} />
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        Small files are normally packed per directory. Paths matching these rules are packed across
+        directory boundaries instead — useful for hash-sharded trees (media metadata, Git objects,
+        caches) where each directory holds only a file or two, which would otherwise produce nearly
+        one archive per file. Empty means everything is packed per directory. "Don't group" wins over
+        this.
+      </p>
 
       <h2>Global</h2>
       <Field label="Upload concurrency">

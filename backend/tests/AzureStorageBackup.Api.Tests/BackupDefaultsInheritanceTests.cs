@@ -31,7 +31,7 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
 
     private async Task<ConfigDto> CreateConfigAsync(int accountId)
     {
-        // 11 个可继承字段全部不传 = 全部继承。
+        // 12 个可继承字段全部不传 = 全部继承。
         var res = await _client.PostAsJsonAsync("/api/backup-configs", new
         {
             AccountId = accountId,

@@ -17,6 +17,7 @@ export interface GlobalSettings {
   defaultIgnoreRules: string | null
   defaultDontCompressRules: string | null
   defaultDontGroupRules: string | null
+  defaultCrossDirGroupRules: string | null
   uploadConcurrency: number
   downloadConcurrency: number
   logEphemeralMaxAgeDays: number

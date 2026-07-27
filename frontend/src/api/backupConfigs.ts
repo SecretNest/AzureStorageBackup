@@ -64,6 +64,8 @@ export interface EffectiveBackupSettings {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  crossDirGroupRules: string | null
   includeSymlinks: boolean
   maxVersions: number
   maxAgeDays: number
@@ -87,6 +89,8 @@ export interface BackupConfig {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  crossDirGroupRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
   maxAgeDays: number | null
@@ -116,6 +120,8 @@ export interface BackupConfigInput {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  crossDirGroupRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
   maxAgeDays: number | null

@@ -53,6 +53,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.IgnoreRules = update.IgnoreRules;
         existing.DontCompressRules = update.DontCompressRules;
         existing.DontGroupRules = update.DontGroupRules;
+        existing.CrossDirGroupRules = update.CrossDirGroupRules;
         existing.IncludeSymlinks = update.IncludeSymlinks;
         existing.MaxVersions = update.MaxVersions;
         existing.MaxAgeDays = update.MaxAgeDays;

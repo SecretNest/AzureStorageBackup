@@ -68,6 +68,7 @@ const emptyForm: BackupConfigInput = {
   ignoreRules: null,
   dontCompressRules: null,
   dontGroupRules: null,
+  crossDirGroupRules: null,
   includeSymlinks: null,
   maxVersions: null,
   maxAgeDays: null,
@@ -314,7 +315,7 @@ export function BackupConfigsPage() {
 
   const startNew = () => {
     setEditing(null)
-    // 11 个可继承字段留 null（= 使用默认，PRD §3）。tier 创建后锁定、不可继承，
+    // 12 个可继承字段留 null（= 使用默认，PRD §3）。tier 创建后锁定、不可继承，
     // 因此仍以全局默认预填，保存即固定。
     setForm({
       ...emptyForm,
@@ -346,6 +347,7 @@ export function BackupConfigsPage() {
       ignoreRules: c.ignoreRules,
       dontCompressRules: c.dontCompressRules,
       dontGroupRules: c.dontGroupRules,
+      crossDirGroupRules: c.crossDirGroupRules,
       includeSymlinks: c.includeSymlinks,
       verboseLogging: c.verboseLogging,
       maxVersions: c.maxVersions,
@@ -814,6 +816,19 @@ export function BackupConfigsPage() {
                 effectiveText={(editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules) || '(none)'}
               >
                 <RuleBox value={form.dontGroupRules} onChange={(v) => set('dontGroupRules', v)} />
+              </DefaultableField>
+              <DefaultableField
+                label="Pack across directories"
+                useDefault={form.crossDirGroupRules === null}
+                onToggle={(useDefault) =>
+                  set(
+                    'crossDirGroupRules',
+                    useDefault ? null : (editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules ?? ''),
+                  )
+                }
+                effectiveText={(editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules) || '(none)'}
+              >
+                <RuleBox value={form.crossDirGroupRules} onChange={(v) => set('crossDirGroupRules', v)} />
               </DefaultableField>
               <DefaultableField
                 label="Include symlinks"
