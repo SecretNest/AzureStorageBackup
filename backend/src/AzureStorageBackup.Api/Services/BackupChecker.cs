@@ -344,17 +344,28 @@ public sealed class BackupChecker(
         if (!File.Exists(local))
             return LocalState.Missing;
 
-        if (level == LocalCheckLevel.Attributes)
+        // 本地文件存在却读不出来（被占用/权限被收回/介质读错误）：一律当 Missing——本地拿不出
+        // 可用副本，既不读它、也不让它成为修复来源，与上面「越界」「文件不在」的处置一致。
+        // 不加这层保护的话，一个读不开的文件会让**整轮检查**崩掉，而"有文件读不开"恰恰是
+        // 最需要跑检查的时候：备份刚跳过了它，操作员正想知道云端那份还在不在。
+        try
         {
-            var permOk = ReadPermissions(local) == e.Permissions;
-            return new FileInfo(local).Length == e.Length && permOk ? LocalState.Ok : LocalState.Changed;
-        }
+            if (level == LocalCheckLevel.Attributes)
+            {
+                var permOk = ReadPermissions(local) == e.Permissions;
+                return new FileInfo(local).Length == e.Length && permOk ? LocalState.Ok : LocalState.Changed;
+            }
 
-        // Content：hash 一致＝可从本地修复。
-        if (hasher is null)
-            return LocalState.NotChecked;
-        var full = await hasher.FullHashAsync(local, ct);
-        return full == e.FullHash ? LocalState.Ok : LocalState.Changed;
+            // Content：hash 一致＝可从本地修复。
+            if (hasher is null)
+                return LocalState.NotChecked;
+            var full = await hasher.FullHashAsync(local, ct);
+            return full == e.FullHash ? LocalState.Ok : LocalState.Changed;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return LocalState.Missing;
+        }
     }
 
     private static string? TryLinkTarget(string path)

@@ -148,4 +148,39 @@ public sealed class LocalFileScannerTests : IDisposable
 
         Assert.Empty(result.EmptyDirs);
     }
+
+    /// <summary>一个列不出内容的目录此前会让整轮备份崩在扫描阶段。它必须被记下来而不是抛出——
+    /// 但**记成空目录是更糟的答案**：还原时会重建出一个空目录，其下的文件全部无声消失。
+    /// 同理也不能什么都不记：diff 会因为"没扫到"把整棵子树判成删除。</summary>
+    [SkippableFact]
+    public async Task An_Unreadable_Directory_Is_Recorded_Instead_Of_Throwing()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+        WriteText("ok/keep.txt", "readable");
+        WriteText("locked/secret.txt", "unreachable");
+        var locked = Path.Combine(_root, "locked");
+        File.SetUnixFileMode(locked, UnixFileMode.None);
+
+        try
+        {
+            var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+
+            var reported = Assert.Single(result.Unreadable);
+            Assert.Equal("locked", reported.Path);
+            Assert.True(reported.IsDirectory);
+            Assert.NotEmpty(reported.Reason); // 原因原文要带上，操作员据此判断是权限还是介质问题
+
+            // 绝不能被当成空目录——那会让还原重建一个空壳，掩盖掉里面的文件。
+            Assert.DoesNotContain("locked", result.EmptyDirs);
+
+            // 其余部分照常扫描，不受牵连。
+            Assert.Contains(result.Entries, e => e.Path == "ok/keep.txt");
+            Assert.DoesNotContain(result.Entries, e => e.Path.StartsWith("locked/", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.SetUnixFileMode(locked,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
 }

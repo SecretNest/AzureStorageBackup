@@ -40,7 +40,16 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             args.Add(archive);
             args.Add(input);
 
-            await RunAsync(args, ct);
+            // 与 SevenZipCompressor 同样的验收：退出码 1 时 7z 可能已经把唯一的条目静默丢掉，
+            // 留下一个有效但空的归档。这里的输入是刚写出的临时文件，撞上的机会极小，
+            // 但索引/信息文件丢内容的后果是整个备份不可读，不值得为省一次列举去赌。
+            var run = await RunAsync(args, ct);
+            if (run.ExitCode == 1
+                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct)).Contains(EntryName))
+            {
+                throw new ArchiveMembersMissingException([EntryName],
+                    "7-Zip left the payload out of the archive.");
+            }
             return await File.ReadAllBytesAsync(archive, ct);
         }
         finally
@@ -80,7 +89,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
         return dir;
     }
 
-    private Task RunAsync(IReadOnlyList<string> args, CancellationToken ct) =>
+    private Task<SevenZipRun> RunAsync(IReadOnlyList<string> args, CancellationToken ct) =>
         SevenZipCli.RunAsync(_exe, args, ct);
 
     private static void TryDelete(string dir)
