@@ -356,4 +356,64 @@ public sealed class BackupRepairerTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// 修复要从本地找一份内容一致的文件当修复源，此前那次读取毫无保护。而外层逐个 blob 的循环
+    /// 也没有兜底，于是一个读不开的本地文件会让**整个修复操作**中途失败——已经修好的 blob 早已
+    /// 上传，但它们的索引改动统一在循环之后才写回，那部分成果一并丢失。
+    /// <para>
+    /// 触发条件一点都不罕见：修复恰恰是在检查报出问题之后跑的。检查器现在会把读不开的本地文件
+    /// 报成 Missing 并跑完全程（上一轮修的），用户看完报告就来点修复——然后修复倒在同一个文件上。
+    /// </para>
+    /// <para>本测试让两个文件的云端 blob 都损坏，其中一个的本地副本读不开：另一个必须照常修好，
+    /// 读不开的那个走既有的「本地取不到 → 标记不可恢复」路径，而不是让整轮修复抛出。</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_Unreadable_Local_File_Does_Not_Abort_The_Whole_Repair()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rep-unread-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        var locked = Path.Combine(_src, "locked.txt");
+
+        try
+        {
+            await File.WriteAllTextAsync(locked, "readable at backup time, locked before the repair");
+            await File.WriteAllTextAsync(Path.Combine(_src, "fine.txt"), "stays readable throughout");
+            await backup.RunAsync(Req(account, name)); // 阈值为 1 → 两个各自成 data blob
+
+            // 两份云端数据都没了；修复要靠本地。
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            File.SetUnixFileMode(locked, UnixFileMode.None); // 备份之后、修复之前变得读不开
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
+
+            // 读得到的那个照常修好——修复前，整轮会在 locked.txt 上抛出，这一条根本走不到。
+            Assert.Contains("fine.txt", report.Repaired);
+
+            var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions.Single().IndexBlob, null);
+            var fineRef = idx.Entries.Single(e => e.Path == "fine.txt").Storage!.Ref;
+            Assert.True(await container.GetBlobClient(fineRef).ExistsAsync()); // 数据真的回到了云端
+
+            // 读不开的那个走既有处置：本地拿不出可用副本 → 标记不可恢复，而不是拿它去覆盖云端。
+            Assert.Contains("locked.txt", report.Unrecoverable);
+            Assert.DoesNotContain("locked.txt", report.Repaired);
+        }
+        finally
+        {
+            try { File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { /* best effort */ }
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }

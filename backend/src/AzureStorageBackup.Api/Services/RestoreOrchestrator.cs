@@ -394,7 +394,18 @@ public sealed class RestoreOrchestrator(
         // OverwriteIfChanged / RenameKeep：本地已是相同内容则跳过；FullHash 缺失无从比较则视为需还原。
         if (entry.FullHash is null)
             return true;
-        return await hasher.FullHashAsync(dest, ct) != entry.FullHash;
+        try
+        {
+            return await hasher.FullHashAsync(dest, ct) != entry.FullHash;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 目标位置那个文件读不开，就无从判断它是否已经是要还原的内容——保守地当作「需要还原」。
+            // 真去写它若同样失败，TryWriteRestoredFile 的逐文件兜底会记一条并继续；
+            // 而在这里抛出会被**整组**的 catch 接住，让同一个包里其它文件也一并还原不了——
+            // 一个文件的权限问题不该有那么大的爆炸半径。
+            return true;
+        }
     }
 
     /// <summary>
