@@ -248,7 +248,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         return written;
     }
 
-    public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+    public async Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
     {
         var args = new List<string> { "x", "-y", "-bso0", "-bsp0" };
         if (!string.IsNullOrEmpty(password))
@@ -256,7 +256,57 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add("-o" + Path.GetFullPath(outputDir));
         args.Add(Path.GetFullPath(firstVolumePath));
 
-        return SevenZipCli.RunAsync(_exe, args, ct);
+        await SevenZipCli.RunAsync(_exe, args, ct);
+        EnsureReadable(Path.GetFullPath(outputDir));
+    }
+
+    /// <summary>
+    /// 把解压产物补成"当前用户读得了"。
+    /// <para>
+    /// 归档里的权限位不一定能用：7-Zip 23.01（以及 Debian 的 p7zip）从 stdin 压缩（<c>-si</c>）时
+    /// 把属性写成 0，解出来的文件就是 <c>----------</c>——我们随后连自己刚解出来的东西都打不开。
+    /// 属性是压缩时写死进归档里的，换个版本解压也救不回来（实测 23.01 建的归档由 26.00 解压
+    /// 依然是 000），所以只能在解压之后补。
+    /// </para>
+    /// <para>
+    /// 只补"当前用户能读、目录能进"，其余位一律不动：解压区的权限本就不代表任何东西——
+    /// 还原写到目标后会按索引里的 Permissions 重设，检查与重打包只是把内容读一遍。
+    /// 符号链接整个跳过：chmod 会跟随到链接目标上去，而归档可以是导入进来的、不可信的。
+    /// </para>
+    /// </summary>
+    private static void EnsureReadable(string dir)
+    {
+        if (OperatingSystem.IsWindows() || !Directory.Exists(dir))
+            return;
+
+        var info = new DirectoryInfo(dir);
+        if (info.LinkTarget is not null)
+            return;
+
+        Grant(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        // 先把本级目录补好再枚举：没有 x 位的目录连列都列不出来。
+        foreach (var sub in info.EnumerateDirectories())
+            EnsureReadable(sub.FullName);
+        foreach (var file in info.EnumerateFiles())
+        {
+            if (file.LinkTarget is null)
+                Grant(file.FullName, UnixFileMode.UserRead);
+        }
+    }
+
+    private static void Grant(string path, UnixFileMode wanted)
+    {
+        try
+        {
+            var mode = File.GetUnixFileMode(path);
+            if ((mode & wanted) != wanted)
+                File.SetUnixFileMode(path, mode | wanted);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 补不上就让后续的读失败去报错：那条路径上的错误信息带着文件名，比这里更有用。
+        }
     }
 
     /// <summary>

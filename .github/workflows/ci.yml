@@ -18,17 +18,17 @@ jobs:
           dotnet-version: "10.0.x"
 
       - name: Install 7-Zip
+        # 官方最新正式版，和 Dockerfile 装进镜像的是同一个东西。发行版打包的 7zip/p7zip
+        # 从 stdin 压缩时把条目属性写成 0（解出来是 ----------），跑出来的结果代表不了生产。
+        # 老归档那条路由 Fixtures/zero-attr-si.7z 覆盖，不靠这里装什么版本。
         run: |
-          sudo apt-get update
-          sudo apt-get install -y 7zip || sudo apt-get install -y p7zip-full
-          echo "--- resolved 7-Zip binaries ---"
-          for b in 7zz 7z 7za; do
-            if command -v "$b" >/dev/null; then
-              echo "$b -> $(command -v "$b")"; "$b" 2>/dev/null | head -2
-            else
-              echo "$b: absent"
-            fi
-          done
+          set -eux
+          ver="$(curl -fsSL https://www.7-zip.org/download.html \
+                 | grep -oE '7z[0-9]{4}-linux-x64\.tar\.xz' | grep -oE '[0-9]{4}' | sort -rn | head -1)"
+          test -n "$ver"
+          curl -fsSL -o /tmp/7z.tar.xz "https://www.7-zip.org/a/7z${ver}-linux-x64.tar.xz"
+          sudo tar -xJf /tmp/7z.tar.xz -C /usr/local/bin 7zz
+          7zz | head -2
 
       - name: Start Azurite
         run: |
