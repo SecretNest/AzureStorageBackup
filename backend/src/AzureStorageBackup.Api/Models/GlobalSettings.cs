@@ -67,4 +67,11 @@ public class GlobalSettings
 
     /// <summary>处理后重校验（<see cref="Services.ProcessingVerifier"/>）反复重处理上限（PRD §5.1，M4 §9，默认 5）。</summary>
     public int ProcessingMaxAttempts { get; set; } = 5;
+
+    /// <summary>
+    /// 备份时差分与「压缩+上传」是否重叠跑（默认开）。开着时网络不必等哈希全部跑完；
+    /// 代价是差分的读与压缩的读同时压在一块盘上。机械盘的 NAS 上两股读可能互相拖慢到得不偿失，
+    /// 那种情况下关掉它，回到"先全部判完再传"。
+    /// </summary>
+    public bool OverlapDiffAndUpload { get; set; } = true;
 }

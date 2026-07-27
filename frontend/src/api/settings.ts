@@ -27,6 +27,7 @@ export interface GlobalSettings {
   deadWeightThresholdPercent: number
   stagedLimitBytes: number
   processingMaxAttempts: number
+  overlapDiffAndUpload: boolean
 }
 
 export const settingsApi = {

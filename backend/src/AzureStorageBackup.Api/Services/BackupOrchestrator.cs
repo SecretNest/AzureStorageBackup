@@ -39,6 +39,13 @@ public sealed record BackupEngineOptions
 
     /// <summary>处理后重校验（<see cref="ProcessingVerifier"/>）反复重处理上限（PRD §5.1，默认 5）。</summary>
     public int ProcessingMaxAttempts { get; init; } = 5;
+
+    /// <summary>
+    /// 差分与「压缩+上传」是否重叠跑（默认开）。开着时判定一出来就开始传，网络不必等到哈希全部
+    /// 跑完；代价是差分的读与压缩的读会同时压在同一块盘上。机械盘的 NAS 上两股读可能互相拖慢到
+    /// 净收益为负——那种情况下关掉它，回到"先全部判完再传"的老行为。
+    /// </summary>
+    public bool OverlapDiffAndUpload { get; init; } = true;
 }
 
 /// <summary>一次备份执行请求。</summary>
@@ -77,10 +84,18 @@ public sealed record BackupProgress(
     public int Percent => TotalItems == 0 ? (Stage == BackupStage.Completed ? 100 : 0)
         : (int)Math.Min(100L, 100L * UploadedItems / TotalItems);
 
-    /// <summary>当前阶段在做什么（正在处理哪个文件、已处理多少、多快）。
-    /// 上传之外的阶段此前完全没有进度可言——扫描和 diff 各自只在**进入**时上报一次，
-    /// 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。</summary>
-    public StageProgress? Detail { get; init; }
+    /// <summary>当前正在跑的各阶段各自在做什么（正在处理哪个文件、已处理多少、多快）。
+    /// 流水线化之后 Diffing 与 Uploading 是**同时**在跑的，所以这里是一个列表而不是单值：
+    /// 只报其中一条，界面上就会看不见另一条在动。</summary>
+    public IReadOnlyList<StageProgress> Details { get; init; } = [];
+
+    /// <summary>头条明细。串行阶段（扫描、写索引…）只有一条，就是它。
+    /// 保留这个单值字段是为了让"只看一条"的调用方（既有前端与测试）不必先判断有没有第二条。</summary>
+    public StageProgress? Detail
+    {
+        get => Details.Count > 0 ? Details[0] : null;
+        init => Details = value is null ? [] : [value];
+    }
 }
 
 /// <summary>
@@ -106,6 +121,68 @@ public sealed class BackupOrchestrator(
     TrackedInfoStore? trackedInfo = null,
     VerboseFileLog? verboseLog = null)
 {
+    /// <summary>流水线上的一件活：一个单文件 blob，或一箱已封好的 pack 成员。</summary>
+    private readonly record struct WorkItem(PlannedFile? Single, IReadOnlyList<PlannedFile>? Pack);
+
+    /// <summary>
+    /// diff 最多可以领先压缩上传侧多少件活。这个数只是内存的护栏，不是节流阀：
+    /// 每件活不过是几个已经在内存里的路径，所以给得足够宽，正常情况下 diff 从不会被它挡住。
+    /// </summary>
+    private const int WorkQueueCapacity = 4096;
+
+    /// <summary>
+    /// 流水线的进度汇总。Diffing 与 Uploading 是**同时**在跑的，任何一侧更新都要连另一侧的
+    /// 最新快照一起发出去——只发自己那条，界面上两行会互相把对方擦掉。
+    /// </summary>
+    private sealed class PipelineReporter(IProgress<BackupProgress>? sink)
+    {
+        private readonly Lock _gate = new();
+        private StageProgress? _diff;
+        private StageProgress? _upload;
+        private BackupStage _stage = BackupStage.Diffing;
+        private int _changedFiles;
+        private long _changedBytes;
+        private int _uploaded;
+        private int _total;
+
+        public void ReportDiff(StageProgress d) { lock (_gate) { _diff = d; Publish(); } }
+        public void ReportUpload(StageProgress u) { lock (_gate) { _upload = u; Publish(); } }
+
+        public void SetChanged(int files, long bytes)
+        {
+            lock (_gate) { _changedFiles = files; _changedBytes = bytes; }
+        }
+
+        public void SetUploaded(int done) { lock (_gate) { _uploaded = done; Publish(); } }
+
+        /// <summary>两条流都跑完了：收起 diff 那条明细，总数这时才是确定的。</summary>
+        public void Settle(int total)
+        {
+            lock (_gate) { _diff = null; _stage = BackupStage.Uploading; _total = total; Publish(); }
+        }
+
+        private void Publish() => sink?.Report(
+            new BackupProgress(_stage, _changedFiles, _changedBytes, _uploaded, _total)
+            {
+                Details = (_diff, _upload) switch
+                {
+                    (null, null) => [],
+                    (null, { } u) => [u],
+                    ({ } d, null) => [d],
+                    var (d, u) => [d!, u!],
+                },
+            });
+    }
+
+    /// <summary>等两条流都停下来，吞掉它们的异常——调用方手上已经有要抛的那个了。</summary>
+    private static async Task SettleAsync(IEnumerable<Task> consumers)
+    {
+        try { await Task.WhenAll(consumers); }
+        catch { /* 先出的那个错才是根因，这里只负责"等干净" */ }
+    }
+
+    private static PlannedFile ToPlannedFile(PackEntry m) => new(m.Path, m.Length, m.FullHash);
+
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
     {
@@ -210,30 +287,12 @@ public sealed class BackupOrchestrator(
             localResolver = LocalDedupResolver.Build(addressing, indexes);
         }
 
-        // 3. Diff —— 首次备份时这一步最久（每个文件都要完整读一遍算 hash），
-        // 也正是此前用户盯着一个不动的 0% 完全不知道在干什么的那个阶段。
-        progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
-        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, d =>
-            progress?.Report(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0) { Detail = d }));
-        var diff = await differ.DiffAsync(request.LocalRoot, scan, previous, opts.Diff, ct, diffTracker);
-        diffTracker.Complete();
-
-        // 读不开的文件既不算变更也不算删除，索引阶段会静默沿用旧条目——但操作员必须被告知。
-        // 放在 Plan 之前、diff 之后：这条路径每一轮都会执行，不依赖"是否有变更文件"这个后续分支，
-        // 否则一次全程读不开的备份会一条告警都不产生（信号最弱的最坏情形）。
-        await RecordUnreadableWarningsAsync(request, scan, diff, ct);
-
-        // 4. Plan（对 Added/Modified 决定 blob/pack）
-        var changed = diff.Changes
-            .Where(c => c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null)
-            .Select(c => new PlannedFile(c.Path, c.Current!.Length, c.FullHash!))
-            .ToList();
-        var plan = planner.Plan(changed, opts.Plan with
-        {
-            DontGroup = opts.DontGroup,
-            CrossDirGroup = opts.CrossDirGroup,
-            FirstPackNumber = NextPackNumber(info.Packs),
-        });
+        // 3./4./5. Diff 与「装箱 + 压缩 + 上传」流水线化。
+        // 从前这三段严格串行：Diffing 全部跑完 → Plan → Uploading。首次备份的 diff 要把每个文件
+        // 完整读一遍算 hash，那几小时里网络一个字节都没在传。而 Plan 其实不必当这道全局屏障——
+        // 归类只看路径与长度（见 GroupingPlanner.Classify），扫描一结束就已经定局。
+        var packOptions = opts.Plan with { DontGroup = opts.DontGroup, CrossDirGroup = opts.CrossDirGroup };
+        var classification = planner.Classify(scan.Entries, packOptions);
 
         var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
         var tailByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal); // 单文件 blob 的尾部 hash → 索引条目
@@ -243,30 +302,197 @@ public sealed class BackupOrchestrator(
         // 不产生 blob、索引沿用旧条目、计入 UnreadableFiles，绝不能让整轮备份因此崩溃（M4 设计 §3 遗漏点）。
         var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-        // 5. Compress + Upload。压缩仍经单例 StagingArea 全局串行；仅上传按 UploadConcurrency 并行（PRD 3.4）。
-        var total = plan.Blobs.Count + plan.Packs.Count;
-        var uploaded = 0;
-        // 槽位计数仍归 ReportItem（它有"恰好一次"的既有约束）；tracker 只负责在途项与字节/测速，
-        // 好让界面能说出「正在传哪个包、多快」而不只是一个百分比。
-        var uploadTracker = new StageTracker("Uploading", total, d => progress?.Report(
-            new BackupProgress(BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
+        var reporter = new PipelineReporter(progress);
+        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff);
+        // 上传的总数是**边跑边长出来的**（diff 还在往队列里塞活），先报 0＝未知：
+        // 用一个还在涨的分母算百分比，会先冲到 100 再掉回去。
+        var uploadTracker = new StageTracker("Uploading", total: 0, reporter.ReportUpload);
+
+        var totalItems = 0;
+        var uploadedItems = 0;
         void ReportItem()
         {
-            var done = Interlocked.Increment(ref uploaded);
+            // 槽位计数归这里（它有"恰好一次"的既有约束）；tracker 只负责在途项与字节/测速。
+            reporter.SetUploaded(Interlocked.Increment(ref uploadedItems));
             uploadTracker.Advance(0);
-            progress?.Report(new BackupProgress(
-                BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, done, total));
         }
-        progress?.Report(new BackupProgress(BackupStage.Uploading, diff.ChangedFiles, diff.ChangedBytes, 0, total));
 
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
+        // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
+        var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
 
-        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
-        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+        // 有界队列把两条流解耦：staged 满时挡住的只是压缩侧，diff 该读盘照样读盘——
+        // 反压一路顶回 diff，磁盘就跟着停了，这次改造也就白做了。
+        // 关掉重叠时用无界队列：那条路上根本没人在消费，容量限制只会把 diff 卡死。
+        var overlap = opts.OverlapDiffAndUpload;
+        var work = overlap
+            ? System.Threading.Channels.Channel.CreateBounded<WorkItem>(
+                new System.Threading.Channels.BoundedChannelOptions(WorkQueueCapacity) { SingleWriter = true })
+            : System.Threading.Channels.Channel.CreateUnbounded<WorkItem>(
+                new System.Threading.Channels.UnboundedChannelOptions { SingleWriter = true });
+
+        // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
+        // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
+        using var stopProducing = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        async Task ConsumeAsync()
+        {
+            try
+            {
+                await foreach (var item in work.Reader.ReadAllAsync(ct))
+                {
+                    if (item.Single is { } single)
+                        await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
+                            overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+                    else
+                        await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
+                            tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, ReportItem,
+                            uploadTracker, ct);
+                }
+            }
+            catch
+            {
+                await stopProducing.CancelAsync(); // 别再让 diff 白读盘
+                throw;
+            }
+        }
+
+        var workers = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+        List<Task> consumers = [];
+        void StartConsumers() => consumers = [.. Enumerable.Range(0, workers).Select(_ => Task.Run(ConsumeAsync, ct))];
+
+        if (overlap)
+            StartConsumers();
+
+        // 装箱的在途状态。diff 单线程按扫描顺序推进，所以这些都不需要加锁。
+        var cap = packOptions.GroupCapBytes;
+        var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
+        var dirRemaining = new Dictionary<string, int>(classification.DirectoryCandidates, StringComparer.Ordinal);
+        var crossPending = new List<PlannedFile>();
+        long crossBytes = 0;
+        var changedFiles = 0;
+        long changedBytes = 0;
+
+        async Task EnqueueAsync(WorkItem item, CancellationToken token)
+        {
+            Interlocked.Increment(ref totalItems);
+            await work.Writer.WriteAsync(item, token);
+        }
+
+        async Task OnChangeAsync(FileChange c, CancellationToken token)
+        {
+            var changed = c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null;
+            if (changed)
+            {
+                changedFiles++;
+                changedBytes += c.Current!.Length;
+                reporter.SetChanged(changedFiles, changedBytes);
+            }
+
+            if (!classification.ByPath.TryGetValue(c.Path, out var klass))
+                return;
+
+            var file = changed ? new PlannedFile(c.Path, c.Current!.Length, c.FullHash!) : null;
+
+            switch (klass.Category)
+            {
+                case FileCategory.SingleFile:
+                    // 单文件：判定一出来立刻走流式压缩上传，不等任何人。
+                    if (file is not null)
+                        await EnqueueAsync(new WorkItem(file, null), token);
+                    return;
+
+                case FileCategory.CrossDirectoryGroup:
+                    // 扫描结果按 ordinal 路径序排好，与跨目录装箱用的是同一个序，因此"边 diff 边填、
+                    // 填满即封"得到的包，与"等全部 diff 完再一次装箱"逐字节相同。
+                    if (file is not null)
+                    {
+                        if (crossPending.Count > 0 && crossBytes + file.Length > cap)
+                        {
+                            await EnqueueAsync(new WorkItem(null, crossPending), token);
+                            crossPending = [];
+                            crossBytes = 0;
+                        }
+                        crossPending.Add(file);
+                        crossBytes += file.Length;
+                    }
+                    return;
+
+                default:
+                    // 按目录：必须等**整个目录**都判完才能封箱——未变的、读不开的、以及 hash 算完
+                    // 发现内容其实没变的（MetadataOnly），都不该进包，而这些要 diff 过才知道。
+                    var dir = klass.GroupKey!;
+                    if (file is not null)
+                    {
+                        if (!dirPending.TryGetValue(dir, out var pending))
+                            dirPending[dir] = pending = [];
+                        pending.Add(file);
+                    }
+                    if (--dirRemaining[dir] == 0 && dirPending.Remove(dir, out var members))
+                    {
+                        // 装箱仍由规划器那个纯函数负责，输入换成"这一组里确实变更的文件"。
+                        foreach (var pack in planner.Plan(members, packOptions).Packs)
+                            await EnqueueAsync(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)]), token);
+                    }
+                    return;
+            }
+        }
+
+        DiffResult diff;
+        try
+        {
+            try
+            {
+                diff = await differ.DiffAsync(
+                    request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync);
+
+                // 收尾：把还没填满的箱子封掉。跨目录的那一箱肯定有剩；按目录的理论上都已在
+                // 计数归零时封过，这里只是不留活口。
+                if (crossPending.Count > 0)
+                    await EnqueueAsync(new WorkItem(null, crossPending), stopProducing.Token);
+                foreach (var leftover in dirPending.Values.Where(m => m.Count > 0))
+                    await EnqueueAsync(new WorkItem(null, leftover), stopProducing.Token);
+            }
+            finally
+            {
+                diffTracker.Complete();
+                work.Writer.TryComplete(); // 无论如何都要让消费者知道"没有更多活了"，否则它们永远等下去
+            }
+        }
+        catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            // diff 是被上传侧的失败叫停的：真正的原因在消费者那边，等它们把它抛出来。
+            await Task.WhenAll(consumers);
+            throw; // 消费者居然没抛：那就把这个取消交上去，绝不静默当成功
+        }
+        catch
+        {
+            // 忙碌锁要等 RunAsync 返回才释放，早一步返回就等于把一堆压缩/上传丢在锁外面继续跑。
+            await SettleAsync(consumers);
+            throw;
+        }
+
+        // 关掉重叠：活全部攒好了才开工，回到"先全部判完再传"的老行为。
+        if (!overlap)
+            StartConsumers();
+
+        // diff 收工，队列里再不会多出活来 → 上传的分母到此才是确定的，界面上的百分比这时才有意义。
+        uploadTracker.SetTotal(totalItems);
+        reporter.Settle(totalItems);
+
+        // 读不开的文件既不算变更也不算删除，索引阶段会静默沿用旧条目——但操作员必须被告知。
+        // 排在等待上传之前：这条路径每一轮都要执行，压到最后就等于让一次上传失败顺手把
+        // 这些告警也吞掉，而"有文件读不开"恰恰是最需要告诉操作员的时候。
+        await RecordUnreadableWarningsAsync(request, scan, diff, ct);
+
+        await Task.WhenAll(consumers);
         // 与扫描/差分同理：不强制产出终态，最后一批传完的字节就永远发布不出去——
         // 节流会把它们压在最后一个窗口里，而那之后不再有任何一次上报。
         uploadTracker.Complete();
+
+        var total = totalItems;
+        var uploaded = uploadedItems;
 
         // 6. 构建新版本第二级索引
         var entries = BuildEntries(diff, storageByPath, tailByPath, overrides, postDiffUnreadable);
@@ -381,15 +607,6 @@ public sealed class BackupOrchestrator(
     private async Task RecordPostDiffUnreadableAsync(BackupRequest request, string path, string reason, CancellationToken ct) =>
         await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
             $"File unreadable, skipped: {path}", reason, ct);
-
-    private async Task UploadBlobsAsync(
-        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
-        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
-        => await Task.WhenAll(plan.Blobs.Select(blob =>
-            HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing, localResolver,
-                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, onItem, uploadTracker, ct)));
 
     /// <summary>一遍读得到的内容身份：三段 hash + 长度 + 读完时的 mtime，外加它是否以原始字节存储。</summary>
     private sealed record BlobContent(
@@ -750,35 +967,17 @@ public sealed class BackupOrchestrator(
     }
 
     /// <summary>
-    /// 处理可分组小文件（§6/§9）：按目录**增量成组**——每次从目录池取总长≤上限的一组压缩+校验，
-    /// 压缩中变化的成员以稳定后的新 hash **重新入队**（自然进入下一组），而非移出为单文件；
-    /// 仅当变大到超阈值、或反复变化达阈值时才降级为单文件（后者报警）。各目录并发，目录内顺序。
+    /// 处理**一箱**已封好的可分组小文件（§6/§9）：压缩 + 压缩后校验，压缩中变化的成员以稳定后的
+    /// 新 hash 重新入队（自然进入下一箱），而非移出为单文件；仅当变大到超阈值、或反复变化达阈值
+    /// 时才降级为单文件（后者报警）。
+    /// <para>
+    /// 封箱时机移到了 diff 那一侧（见 <see cref="GroupingPlanner.Classify"/> 与流水线）：从前这里
+    /// 拿到的是"一个目录的全部可分组文件"，自己边取边装箱；现在拿到的就是装好的一箱，
+    /// 因此箱与箱之间可以并发，而不必等同目录的上一箱传完。
+    /// </para>
     /// </summary>
-    private async Task UploadGroupablesAsync(
-        BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
-        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
-        ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
-    {
-        // 从计划重建每个目录的可分组文件池（顺序不变）；成组/压缩/校验在处理时增量进行。
-        // 按规划器给出的分组键建池，而不是在这里重新按目录切一遍——否则跨路径打包的成员
-        // 会被这一步重新按目录打散，规划器那边的决定就白做了。
-        // 按目录打包时键就是目录（与历史行为一致）；跨路径打包时每个 pack 自成一池。
-        var poolByDir = plan.Packs
-            .GroupBy(p => p.GroupKey, StringComparer.Ordinal)
-            .Select(g => g.SelectMany(p => p.Members)
-                .Select(m => new PlannedFile(m.Path, m.Length, m.FullHash)).ToList())
-            .ToList();
-
-        // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
-        var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
-        await Task.WhenAll(poolByDir.Select(pool =>
-            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, onItem, uploadTracker, ct)));
-    }
-
-    private async Task ProcessDirectoryAsync(
-        BackupRequest request, List<PlannedFile> pool, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+    private async Task ProcessPackAsync(
+        BackupRequest request, IReadOnlyList<PlannedFile> pool, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,

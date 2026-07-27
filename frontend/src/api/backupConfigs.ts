@@ -153,6 +153,9 @@ export interface BackupProgress {
   uploadedItems: number
   totalItems: number
   percent: number
+  // 流水线化之后 Diffing 与 Uploading 是同时在跑的，所以明细是一个列表。
+  details: StageProgress[]
+  // 头条明细（= details[0]）。串行阶段只有一条，就是它。
   detail: StageProgress | null
 }
 

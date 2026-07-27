@@ -94,6 +94,30 @@ public sealed class UnreadableDuringUploadTests : IDisposable
         }
     }
 
+    /// <summary>diff 读完某个文件之后，立刻删掉**另一个**文件——用来构造"待打包的成员在被装箱之前
+    /// 就已经消失"。触发点挂在 diff 上而不是上传上：流水线化之后单文件与分组是并发跑的，
+    /// "第一个单文件传完了"不再意味着分组还没开始，靠它定时序就成了掷骰子。</summary>
+    private sealed class DeleteAfterHashHasher(IFileHasher inner, string triggerRelPath, string victimFullPath)
+        : IFileHasher
+    {
+        private int _fired;
+
+        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
+            inner.HeadHashAsync(path, headBytes, ct);
+
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
+            inner.TailHashAsync(path, tailBytes, ct);
+
+        public async Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        {
+            var hash = await inner.FullHashAsync(path, ct);
+            if (path.EndsWith(triggerRelPath.Replace('/', Path.DirectorySeparatorChar), StringComparison.Ordinal)
+                && Interlocked.Exchange(ref _fired, 1) == 0)
+                File.Delete(victimFullPath);
+            return hash;
+        }
+    }
+
     /// <summary>把一组文件（分组打包成员）压缩一次之后立刻整批锁住——模拟"整个目录忽然读不开"：
     /// 分组重校验会发现每个成员的权限位都变了，逐一重算 hash 全部失败，"已排除成员"处理必须
     /// 在第一个成员就吞下失败、继续处理其余成员，而不是抛出未接住的异常让整轮备份崩溃。</summary>
@@ -220,39 +244,6 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null) =>
             throw new IOException("Unable to write data to the transport connection: Network is unreachable.");
-    }
-
-    /// <summary>第一次上传成功之后立刻删掉指定的源文件——复现真实时序：所有单文件 blob 传完才轮到
-    /// 分组上传，两者之间对一次大备份可能隔了几小时，一个构建产物在这段窗口里被删掉再正常不过。
-    /// 故障同样注在上传接缝处，而不是靠替身在源读取路径上假抛异常。</summary>
-    private sealed class DeleteAfterFirstUploadUploader(IBlobUploader inner, string victimFullPath) : IBlobUploader
-    {
-        private int _fired;
-
-        public async Task<bool> UploadIfMissingAsync(
-            Account account, string container, string blobName, string filePath,
-            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-            IReadOnlyDictionary<string, string>? metadata = null)
-        {
-            var uploaded = await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
-            Fire();
-            return uploaded;
-        }
-
-        public async Task UploadOverwriteAsync(
-            Account account, string container, string blobName, string filePath,
-            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-            IReadOnlyDictionary<string, string>? metadata = null)
-        {
-            await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
-            Fire();
-        }
-
-        private void Fire()
-        {
-            if (Interlocked.Exchange(ref _fired, 1) == 0)
-                File.Delete(victimFullPath);
-        }
     }
 
     /// <summary>捕获 NotifyAsync 调用，供断言"读不开的文件推送了通知"。</summary>
@@ -583,10 +574,10 @@ public sealed class UnreadableDuringUploadTests : IDisposable
     }
 
     /// <summary>终审 Important 2：分组重校验前的 <c>before</c> 元数据快照落在所有 try 之外，而它对一个
-    /// 已经消失的成员会抛 FileNotFoundException。单文件 blob 全部上传完才轮到分组上传，两者之间
-    /// 对一次大备份可能隔了几小时——一个被删掉的构建产物就足以让整轮备份倒在与本分支所修完全
-    /// 相同的形状上。本测试把故障注在上传接缝处：第一个单文件 blob 上传成功之后立刻删除某个
-    /// 待打包成员，断言备份照常完工、该成员按"读不开"降级、同组的兄弟文件不受牵连。</summary>
+    /// 已经消失的成员会抛 FileNotFoundException。diff 判完一个文件、到它所在的那一箱被压缩，
+    /// 对一次大备份中间可能隔了很久——一个被删掉的构建产物就足以让整轮备份倒在与本分支所修
+    /// 完全相同的形状上。本测试在 diff 读完同目录最后一个文件的那一刻删掉某个待打包成员
+    /// （封箱正是这一刻定的），断言备份照常完工、该成员按"读不开"降级、同组的兄弟不受牵连。</summary>
     [SkippableFact]
     public async Task A_Pack_Member_Deleted_Before_The_Metadata_Snapshot_Does_Not_Abort_The_Run()
     {
@@ -612,12 +603,14 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             WriteText("d/x.txt", "xxxx");
             WriteText("d/y.txt", "yyyy");
 
+            // 扫描按 ordinal 路径序推进 → d/y.txt 是这个目录最后一个被 diff 的成员，
+            // 它一判完这一箱就封箱。在那一刻删掉 d/x.txt，快照必然撞上一个已经不在的文件。
             var victim = Path.Combine(_root, "d", "x.txt");
-            var uploader = new DeleteAfterFirstUploadUploader(new BlobUploader(factory), victim);
+            var differ = new BackupDiffer(new DeleteAfterHashHasher(new FileHasher(), "d/y.txt", victim));
 
             var orchestrator = new BackupOrchestrator(
-                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-                new SevenZipCompressor(), uploader, factory, store, staging,
+                new LocalFileScanner(), differ, new GroupingPlanner(),
+                new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
                 notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
 

@@ -134,6 +134,17 @@ export function SettingsPage() {
       <Field label="Processing re-verify max attempts">
         <Num value={s.processingMaxAttempts} onChange={(v) => set('processingMaxAttempts', v)} />
       </Field>
+      <Field label="Overlap diffing and uploading">
+        <input type="checkbox" checked={s.overlapDiffAndUpload}
+          onChange={(e) => set('overlapDiffAndUpload', e.target.checked)} />
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        On by default: a changed file starts uploading as soon as the diff decides it changed,
+        instead of waiting for every file to be hashed first. On a first backup that keeps the
+        network busy for hours that would otherwise be idle. Turn it off if your disks are slow
+        enough that reading for the diff and reading for compression at the same time makes the
+        whole run take longer.
+      </p>
 
       <div className="row" style={{ marginTop: '1rem' }}>
         <button type="button" className="btn-primary" onClick={save}>Save</button>
