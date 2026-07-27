@@ -50,7 +50,22 @@ internal static class SevenZipCli
 
         var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-        await proc.WaitForExitAsync(ct);
+        try
+        {
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // 取消 WaitForExitAsync 只是「不再等」——7z 不会因此停下，Process.Dispose 也不杀它。
+            // 用户在界面上按了 Stop，压缩进程却还在 NAS 上啃着几十 GB、继续往临时目录写分卷：
+            // CPU/IO 一直被占，而调用方紧接着要删的正是那个目录，会撞上一个仍在被写的文件。
+            // 所以取消时显式把整棵进程树杀掉——7z 会 fork 出子进程，只杀父进程留得下孤儿。
+            KillTree(proc);
+            // 不带 ct 地等它真收尾：带上就又被立刻取消，清理还是会撞上活着的进程。
+            await proc.WaitForExitAsync(CancellationToken.None);
+            await ObserveAsync(stdoutTask, stderrTask);
+            throw;
+        }
         var stderr = await stderrTask;
         var stdout = await stdoutTask;
 
@@ -59,6 +74,33 @@ internal static class SevenZipCli
             throw new InvalidOperationException($"7-Zip failed (exit {proc.ExitCode}): {stderr.Trim()}");
 
         return new SevenZipRun(proc.ExitCode, stdout, stderr);
+    }
+
+    /// <summary>杀掉进程及其子进程。已经退出（竞态）或杀不动都不算错——取消本身已经在往外抛了，
+    /// 不能让收尾动作再盖一个不相干的异常上去。</summary>
+    private static void KillTree(Process proc)
+    {
+        try
+        {
+            proc.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException) { } // 在 Kill 之前它自己退出了
+        catch (System.ComponentModel.Win32Exception) { } // 系统拒绝（权限/已回收）：只能作罢
+    }
+
+    /// <summary>观察掉两个读取任务的结局。进程被杀后它们要么随 ct 取消，要么因管道关闭而报错；
+    /// 不 await 就成了未观察的任务异常。这里只吞这两种预期结局，别的照抛。</summary>
+    private static async Task ObserveAsync(params Task[] tasks)
+    {
+        foreach (var t in tasks)
+        {
+            try
+            {
+                await t;
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+        }
     }
 
     /// <summary>列出归档内的条目名（`l -slt`），分隔符归一化为 '/'。
