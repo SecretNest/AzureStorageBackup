@@ -99,6 +99,10 @@ public sealed record IndexEntry
     /// <summary>symlink 目标（仅 kind=symlink）。</summary>
     public string? Target { get; init; }
 
+    /// <summary>本轮未能重读该文件（被占用/无权限/读错误），条目内容沿用上一版本。
+    /// null = 本版本正常读取。值为发生时刻，便于操作员判断这份旧内容有多旧。</summary>
+    public DateTimeOffset? UnreadableAt { get; init; }
+
     public StorageRef? Storage { get; init; }
 }
 

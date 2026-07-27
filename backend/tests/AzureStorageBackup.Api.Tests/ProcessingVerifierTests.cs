@@ -129,6 +129,66 @@ public sealed class ProcessingVerifierTests : IDisposable
         Assert.Equal(changed, result.FullHash);
     }
 
+    /// <summary>指定路径的 FullHashAsync 抛给定异常，其余路径照常委托给真实 hasher。</summary>
+    private sealed class ThrowingHasher(IFileHasher inner, Exception toThrow) : IFileHasher
+    {
+        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
+            inner.HeadHashAsync(path, headBytes, ct);
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
+            inner.TailHashAsync(path, tailBytes, ct);
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default) => throw toThrow;
+    }
+
+    [Fact]
+    public async Task Unreadable_File_During_Reverify_Ends_Alarmed_Instead_Of_Throwing()
+    {
+        var path = Write("a.txt", "content");
+        var expected = await Hash(path);
+        var verifier = new ProcessingVerifier(new ThrowingHasher(Hasher, new IOException("locked")));
+
+        // 处理期间元数据变化（触发重算 hash），但此刻文件读不开：不能判断内容是否稳定，
+        // 重试也无从谈起——应直接以 Alarmed 收场，而不是让异常上抛终止整轮备份。
+        var result = await verifier.RunAsync(path, expected, (_, _) =>
+        {
+            File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(10));
+            return Task.CompletedTask;
+        });
+
+        Assert.Equal(ProcessingOutcome.Alarmed, result.Outcome);
+        Assert.Equal(1, result.Attempts);
+    }
+
+    [Fact]
+    public async Task UnauthorizedAccess_During_Reverify_Also_Ends_Alarmed()
+    {
+        var path = Write("a.txt", "content");
+        var expected = await Hash(path);
+        var verifier = new ProcessingVerifier(new ThrowingHasher(Hasher, new UnauthorizedAccessException("denied")));
+
+        var result = await verifier.RunAsync(path, expected, (_, _) =>
+        {
+            File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(10));
+            return Task.CompletedTask;
+        });
+
+        Assert.Equal(ProcessingOutcome.Alarmed, result.Outcome);
+    }
+
+    [Fact]
+    public async Task Cancellation_During_Reverify_Still_Aborts()
+    {
+        // 护栏：取消不能被当成"读不开"吞掉——catch 必须精确到 IOException/UnauthorizedAccessException。
+        var path = Write("a.txt", "content");
+        var expected = await Hash(path);
+        var verifier = new ProcessingVerifier(new ThrowingHasher(Hasher, new OperationCanceledException("cancelled")));
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => verifier.RunAsync(path, expected, (_, _) =>
+        {
+            File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(10));
+            return Task.CompletedTask;
+        }));
+    }
+
     [Fact]
     public async Task Alarm_Processes_Final_Content_Under_Its_Own_Hash()
     {

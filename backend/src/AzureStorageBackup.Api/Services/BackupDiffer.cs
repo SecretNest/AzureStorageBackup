@@ -14,6 +14,10 @@ public enum ChangeKind
     /// <summary>内容不变，仅 mtime/权限变 → 只更新索引元数据，不重传。</summary>
     MetadataOnly,
 
+    /// <summary>本轮读不开（被占用/无权限/读错误）。既不是变更也不是删除：
+    /// 索引沿用上一版本条目并打 UnreadableAt，绝不能被当成删除。</summary>
+    Unreadable,
+
     /// <summary>完全未变（length+mtime+权限一致，未哈希）。</summary>
     Unchanged,
 
@@ -29,7 +33,9 @@ public sealed record FileChange(
     IndexEntry? Previous,
     string? HeadHash,
     string? FullHash,
-    StorageRef? CarriedStorage);
+    StorageRef? CarriedStorage,
+    /// <summary>读失败原因（ex.Message）。仅 Kind == Unreadable 时非空。</summary>
+    string? UnreadableReason = null);
 
 public sealed record DiffOptions
 {
@@ -117,17 +123,20 @@ public sealed class BackupDiffer(IFileHasher hasher)
             return Unchanged(entry, prev);
 
         // length 同、mtime 或权限变 → 两级哈希。
-        var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-        if (head != prev.HeadHash)
+        return await TryReadAsync(async () =>
         {
-            var changedFull = await hasher.FullHashAsync(full, ct);
-            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, changedFull, null);
-        }
+            var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
+            if (head != prev.HeadHash)
+            {
+                var changedFull = await hasher.FullHashAsync(full, ct);
+                return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, changedFull, null);
+            }
 
-        var fullHash = await hasher.FullHashAsync(full, ct);
-        return fullHash == prev.FullHash
-            ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage)
-            : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+            var fullHash = await hasher.FullHashAsync(full, ct);
+            return fullHash == prev.FullHash
+                ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage)
+                : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+        }, entry, prev);
     }
 
     private async Task<FileChange> AddedAsync(ScannedEntry entry, string full, DiffOptions options, CancellationToken ct)
@@ -135,9 +144,12 @@ public sealed class BackupDiffer(IFileHasher hasher)
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Added, entry, null, null, null, null);
 
-        var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-        var fullHash = await hasher.FullHashAsync(full, ct);
-        return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null);
+        return await TryReadAsync(async () =>
+        {
+            var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
+            var fullHash = await hasher.FullHashAsync(full, ct);
+            return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null);
+        }, entry, null);
     }
 
     private async Task<FileChange> ModifiedAsync(ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, CancellationToken ct)
@@ -146,11 +158,32 @@ public sealed class BackupDiffer(IFileHasher hasher)
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
         // 记录完整的 headHash + fullHash（索引条目须含原文件哈希/尺寸/权限，供后续 diff 与还原比对）。
-        var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-        var fullHash = await hasher.FullHashAsync(full, ct);
-        return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+        return await TryReadAsync(async () =>
+        {
+            var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
+            var fullHash = await hasher.FullHashAsync(full, ct);
+            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+        }, entry, prev);
     }
 
     private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>
         new(entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage);
+
+    /// <summary>
+    /// 读失败（被占用/无权限/读到一半设备错误）不该终止整轮备份。
+    /// 精确捕获这两类，**不要**写成 catch(Exception)：OperationCanceledException 不派生自它们，
+    /// 写宽了会把取消也变成「跳过一个文件」，备份看起来成功、实际没跑完。
+    /// </summary>
+    private static async Task<FileChange> TryReadAsync(
+        Func<Task<FileChange>> build, ScannedEntry entry, IndexEntry? prev)
+    {
+        try
+        {
+            return await build();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new FileChange(entry.Path, ChangeKind.Unreadable, entry, prev, null, null, null, ex.Message);
+        }
+    }
 }

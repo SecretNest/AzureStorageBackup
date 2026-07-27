@@ -53,7 +53,16 @@ public sealed class ProcessingVerifier(IFileHasher hasher)
                 return new ProcessingResult(ProcessingOutcome.Stable, attempts, expected);
 
             // 元数据变了 → 重算 hash 判断内容是否真的变。
-            var current = await hasher.FullHashAsync(path, ct);
+            string current;
+            try
+            {
+                current = await hasher.FullHashAsync(path, ct);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 读不开就无法确认内容是否稳定，继续重试没有意义：直接报警收场。
+                return new ProcessingResult(ProcessingOutcome.Alarmed, attempts, expected);
+            }
             if (current == expected)
                 return new ProcessingResult(ProcessingOutcome.Stable, attempts, expected);
 
