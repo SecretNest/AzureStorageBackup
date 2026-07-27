@@ -6,7 +6,7 @@ A single-user application that backs up local files to an Azure Storage account 
 
 - **Backend**: .NET 10 Minimal API + EF Core (SQLite) + Azure.Storage.Blobs
 - **Frontend**: Vite + React + TypeScript
-- **Packaging**: a single multi-arch Docker image (`linux/amd64` + `linux/arm64`) in which the backend serves both the API and the built frontend. Compression uses 7-Zip (`p7zip-full`) bundled in the image.
+- **Packaging**: a single multi-arch Docker image (`linux/amd64` + `linux/arm64`) in which the backend serves both the API and the built frontend. Compression uses the official 7-Zip binary (`7zz`), downloaded at image build time for the target architecture.
 
 ## Repository layout
 
