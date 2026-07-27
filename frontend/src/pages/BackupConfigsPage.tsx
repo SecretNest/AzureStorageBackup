@@ -91,6 +91,8 @@ export function BackupConfigsPage() {
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
+  // 独立于 form：它只用来比对，绝不能跟着 form 一起被 POST 出去。
+  const [passwordConfirm, setPasswordConfirm] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [postCreate, setPostCreate] = useState<BackupConfig | null>(null)
@@ -320,6 +322,7 @@ export function BackupConfigsPage() {
       }),
     })
     setStep(1)
+    setPasswordConfirm('')
     setError(null)
     // 此标志位独立于 form，重置表单时不会自动清除；陈旧的 true 会导致容器选择器误开自由文本输入模式
     setNewContainer(false)
@@ -350,12 +353,18 @@ export function BackupConfigsPage() {
       volumeBytes: c.volumeBytes,
     })
     setStep(1)
+    setPasswordConfirm('')
     setError(null)
     setNewContainer(false)
     setShowForm(true)
   }
 
+  // 编辑时密码字段是锁死的，不参与比对。空密码（不加密）要求确认框同样为空，
+  // 这样「本想设密码却只填了一个框」也会被拦下。
+  const passwordMismatch = !editing && (form.password ?? '') !== passwordConfirm
+
   const save = async () => {
+    if (passwordMismatch) return
     setBusy(true)
     setError(null)
     try {
@@ -702,6 +711,31 @@ export function BackupConfigsPage() {
                   onChange={(e) => set('password', e.target.value)}
                 />
               </Field>
+              {/* 只有新建才要二次输入。导入与密钥环恢复时输入的密码会被**验证**（错了当场失败），
+                  唯独这里是「设定」——没有任何东西能判断它对不对，而它此后不可更改、丢失无解。
+                  一个看不见的字符打错，要等到真正需要还原的那天才会发现。 */}
+              {!editing && (
+                <Field label="Confirm password">
+                  <input
+                    type="password"
+                    placeholder={form.password ? 'Re-enter the same password' : 'Leave empty for no encryption'}
+                    value={passwordConfirm}
+                    onChange={(e) => setPasswordConfirm(e.target.value)}
+                  />
+                </Field>
+              )}
+              {passwordMismatch && (
+                <div className="text-danger" style={{ marginBottom: '0.4rem' }}>
+                  Passwords do not match.
+                </div>
+              )}
+              {!editing && !!form.password && !passwordMismatch && (
+                <div className="text-warn" style={{ marginBottom: '0.4rem' }}>
+                  This password cannot be changed or recovered after the backup is created. If it is
+                  lost, nothing encrypted with it can be restored — the only way out is to delete the
+                  configuration and start over.
+                </div>
+              )}
               <Field label={editing ? 'Index Tier (locked)' : 'Index Tier'}>
                 <TierSelect
                   value={form.indexTier}
@@ -934,7 +968,7 @@ export function BackupConfigsPage() {
                 <button type="button" onClick={() => setStep(1)}>
                   Back
                 </button>
-                <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim()}>
+                <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim() || passwordMismatch}>
                   {editing ? 'Save' : 'Create'}
                 </button>
                 <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
