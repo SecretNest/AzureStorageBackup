@@ -391,9 +391,27 @@ public sealed class BackupOrchestrator(
             HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing, localResolver,
                 storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, onItem, uploadTracker, ct)));
 
+    /// <summary>一遍读得到的内容身份：三段 hash + 长度 + 读完时的 mtime，外加它是否以原始字节存储。</summary>
+    private sealed record BlobContent(
+        string FullHash, string HeadHash, string TailHash, long Length, DateTimeOffset Mtime, bool Raw);
+
+    /// <summary>单文件 blob 的最终落位：存储引用 + 实际存下去的内容身份。</summary>
+    private sealed record BlobPlacement(
+        string Ref, bool Collision, int Volumes, IReadOnlyList<long> VolumeSizes, BlobContent Content);
+
     /// <summary>
-    /// 处理单文件内容寻址 blob：压缩+上传 data/{hash}，经重校验循环（§9）。
-    /// 内容在处理中变化时，用稳定后的新 hash 决定 blob 名并回写索引覆盖，避免存储名与内容不符（PRD 特别说明 D）。
+    /// 处理单文件内容寻址 blob：**一遍读**同时算 hash 并压缩，然后上传 data/{hash}。
+    /// <para>
+    /// 顺序与从前相反。过去是「先算全文 hash → 查去重 → 命中就整个跳过 → 否则再读一遍去压」；
+    /// 现在是「边读边压边算 → 压完才知道名字」。代价是已经存在的内容会被白压一遍，所以前面加了一道
+    /// 只需读文件头的预筛（长度 + head hash）：本地索引里真有候选时才退回老路（读一遍算全文 hash，
+    /// 命中就一个字节都不压）。首次备份没有任何候选，走的全是一遍读的快路径。
+    /// </para>
+    /// <para>
+    /// 顺带消掉一整类竞态：hash 现在算的**就是压进归档的那些字节**，两者不可能对不上，
+    /// 因此这条路径不再需要处理后重校验，也不再需要为写索引覆盖条目而第二次打开源文件
+    /// （那正是"内容变了随后又被锁住"会崩在的地方）。pack 路径仍是先 hash 后压，重校验照旧保留。
+    /// </para>
     /// </summary>
     private async Task HandleBlobAsync(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
@@ -401,117 +419,14 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
     {
-        var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
+        var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
-        var headBytes = request.Options.Diff.HeadHashBytes;
-        var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 内容寻址去重 + hash 碰撞避让：本地权威时纯本地判定（不发云端 HEAD，见 localResolver）；否则回退云端存在性检查。
-        // 不同内容碰撞到同 hash 时改用备用名 …~N 并报警。verifier 内容变化时用新 hash 重调。
-        var uploadedVolumes = 0;
-        IReadOnlyList<long> uploadedSizes = [];   // 本次上传的各分卷尺寸
-        int? dedupVolumes = null;                 // 去重命中时的既有分卷数（免云端 CountVolumes）
-        IReadOnlyList<long>? dedupSizes = null;   // 去重命中时的既有分卷尺寸
-        var chosenRef = addressing.DataAddress(file.FullHash);
-        var collided = false;
-        var wasRaw = false;
-        string? finalTail = null;      // 最终内容的尾部 hash，回填索引条目
-
-        // data/{hash}（或避让后的 …~N）不存在时：压缩/直传并上传，记录卷数/尺寸。
-        async Task UploadNewAsync(string blobRef, string hash, long length, string head, string tail, bool raw, CancellationToken token)
-        {
-            var staged = await staging.StageAsync((compressTemp, t) => raw
-                ? CopyRawAsync(localPath, compressTemp, SafeFileName(hash), t)
-                : CompressAsync(request, compressTemp, SafeFileName(hash), [file.Path], storeOnly, t), token);
-            var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
-            await uploadGate.WaitAsync(token);
-            uploadTracker.BeginItem(blobRef);
-            try
-            {
-                var meta = new Dictionary<string, string>(addressing.Metadata(hash, length, head, tail));
-                if (raw)
-                    meta["raw"] = "1";
-                await VolumeBlobIO.UploadAsync(
-                    uploader, request.Account, request.Container, blobRef, staged.Files,
-                    request.DataTier, request.Options.Upload, token, meta);
-                uploadedVolumes = staged.Files.Count;
-                uploadedSizes = sizes;
-            }
-            finally
-            {
-                uploadGate.Release();
-                uploadTracker.EndItem(blobRef, sizes.Sum());
-                staging.Release(staged);
-            }
-        }
-
-        async Task ProcessAsync(string hash, CancellationToken token)
-        {
-            var length = new FileInfo(localPath).Length;
-            var head = await hasher.HeadHashAsync(localPath, headBytes, token);
-            var tail = await hasher.TailHashAsync(localPath, headBytes, token);
-            finalTail = tail;
-            // 原始直传（PRD 3.3.2）：不压缩(store-only) + 未加密 + 无需分卷(≤分卷大小) → 直接拷原文件，省一次 7z 封装。
-            var raw = storeOnly && string.IsNullOrEmpty(request.Password)
-                && (request.Options.VolumeBytes is not { } vb || length <= vb);
-
-            if (localResolver is not null)
-            {
-                // 纯本地判定：跨版本查映射、同批经预约协调（同内容共享 ref/raw/卷数，不同内容避让）。不读云端。
-                var res = await localResolver.ResolveAsync(hash, length, head, tail);
-                chosenRef = res.Ref;
-                collided = res.Collision;
-                if (res.Exists)
-                {
-                    wasRaw = res.Existing!.Raw;   // 以既有 blob 的实际 raw 为准（同批同内容也一致）
-                    dedupVolumes = res.Existing.Volumes;
-                    dedupSizes = res.Existing.VolumeSizes;
-                    return;
-                }
-                try
-                {
-                    await UploadNewAsync(res.Ref, hash, length, head, tail, raw, token);
-                    wasRaw = raw;
-                    res.Complete(raw, uploadedVolumes, uploadedSizes); // 唤醒同批同内容的后到者，给它们相同存储信息
-                }
-                catch (Exception ex)
-                {
-                    res.Fail(ex);                        // 令等待者一并失败，绝不去重到未成功上传的 blob
-                    throw;
-                }
-                return;
-            }
-
-            // 回退：导入未同步的备份走云端存在性检查 + 元数据比对。
-            var (blobRef, exists, collision, existingRaw) = await ResolveDataRefAsync(cc, addressing, hash, length, head, tail, token);
-            chosenRef = blobRef;
-            collided = collision;
-            if (exists)
-            {
-                wasRaw = existingRaw;
-                return;
-            }
-            await UploadNewAsync(blobRef, hash, length, head, tail, raw, token);
-            wasRaw = raw;
-        }
-
-        var finalHash = file.FullHash;
-        ProcessingOutcome? verifyOutcome = null;
-        var verifyAttempts = 0;
+        BlobPlacement placement;
         try
         {
-            if (verifier is not null)
-            {
-                var verificationOptions = new VerificationOptions { MaxAttempts = request.Options.ProcessingMaxAttempts };
-                var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
-                finalHash = vr.FullHash;
-                verifyOutcome = vr.Outcome;
-                verifyAttempts = vr.Attempts;
-            }
-            else
-            {
-                await ProcessAsync(file.FullHash, ct);
-            }
+            placement = await PlaceBlobAsync(
+                request, file, localPath, storeOnly, addressing, localResolver, uploadGate, uploadTracker, ct);
         }
         // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
         // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
@@ -519,68 +434,278 @@ public sealed class BackupOrchestrator(
         // 若干个"文件不可读、沿用旧条目"，整轮备份照常报告成功——操作员看到的是"Backup succeeded,
         // 0 changed files"，而实际上什么都没传上去。因此 filter 里再探一次源文件：真读不开才降级，
         // 读得开就让异常照常向上抛，让整轮备份响亮地失败。
-        // ArchiveMembersMissingException 是例外，不需要探测：它只在 7z 把这个文件丢出归档时抛出，
-        // 已经是"本轮没能把这个文件存下来"的确证，而且抛在上传之前，云端不会留下空归档。
+        // ArchiveMembersMissingException 是例外，不需要探测：它只在 7z 没把这个文件完整放进归档时
+        // 抛出，已经是"本轮没能把这个文件存下来"的确证，而且抛在上传之前，云端不会留下空归档。
         catch (Exception ex) when (ex is ArchiveMembersMissingException
             || ((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
         {
-            // diff 时可读、随后（压缩打包/原样直传重新打开源文件时）才读不开：与 diff 阶段读不开同等
-            // 处置——不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
+            // diff 时可读、随后（压缩/直传重新打开源文件时）才读不开：与 diff 阶段读不开同等处置——
+            // 不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
             // 只记一条复用既有通道的告警，绝不能让这一个文件拖垮整轮备份。
             await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
             onItem();
             return;
         }
 
-        // "反复变化"告警是内容已成功处理/上传之后的事后上报，不再触碰源文件——绝不能留在上面的
-        // try 里：否则这条通知（或其内部日志写入）失败会被误判成"文件读不开"，导致已经成功上传
-        // 的内容在索引里被沿用旧条目或整条丢弃，而云端其实已经有这份数据（本次修复 Finding 1）。
-        if (verifyOutcome == ProcessingOutcome.Alarmed)
-            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                $"File kept changing during backup: {file.Path}",
-                $"Saved with current content after {verifyAttempts} attempts", ct);
-
-        if (collided)
+        // 碰撞告警是内容已成功处理/上传之后的事后上报，不再触碰源文件——绝不能留在上面的 try 里：
+        // 否则这条通知（或其内部日志写入）失败会被误判成"文件读不开"，导致已经成功上传的内容
+        // 在索引里被沿用旧条目或整条丢弃，而云端其实已经有这份数据。
+        if (placement.Collision)
             await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                 $"Hash collision avoided: {file.Path}",
-                $"Different content shares hash {finalHash}; stored at {chosenRef}", ct);
+                $"Different content shares hash {placement.Content.FullHash}; stored at {placement.Ref}", ct);
 
-        // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
-        // 这一步要**再读一次源文件**（长度/mtime/头部 hash），因此和分组路径上的同一动作一样需要保护；
-        // 之所以提到写 storageByPath 之前：读不开时该文件按"本轮没能存下来"降级，此时不该留下任何
-        // 半条存储引用——一条 fullHash 指向新内容、长度/头部 hash 却还是旧内容的索引记录，
-        // 比整条缺席更糟，检查与还原都会据此得出错误结论。
-        if (finalHash != file.FullHash)
-        {
-            try
-            {
-                overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
-                onItem();
-                return;
-            }
-        }
+        // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
+        // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
+        var content = placement.Content;
+        if (content.FullHash != file.FullHash)
+            overrides[file.Path] = new EntryOverride(
+                content.FullHash, content.HeadHash, content.Length, content.Mtime);
 
-        // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；去重时用本地已知卷数（dedupVolumes），
-        // 仅云端回退路径且无从得知时才 CountVolumes（本地权威路径不读云端）。
-        var volumes = uploadedVolumes > 0
-            ? uploadedVolumes
-            : dedupVolumes ?? await VolumeBlobIO.CountVolumesAsync(cc, chosenRef, ct);
-        // 分卷尺寸：本次上传取实测；去重取既有；云端回退路径无从得知则留空（尺寸检查降级为仅验存在）。
-        var volumeSizes = uploadedVolumes > 0 ? uploadedSizes : dedupSizes ?? [];
         storageByPath[file.Path] = new StorageRef
         {
-            Kind = "blob", Ref = chosenRef, Volumes = Math.Max(1, volumes), Raw = wasRaw,
-            VolumeSizes = [.. volumeSizes],
+            Kind = "blob", Ref = placement.Ref, Volumes = Math.Max(1, placement.Volumes), Raw = content.Raw,
+            VolumeSizes = [.. placement.VolumeSizes],
         };
-        if (finalTail is not null)
-            tailByPath[file.Path] = finalTail;
+        tailByPath[file.Path] = content.TailHash;
 
         await LogFileAsync(request, file.Path, ct);
         onItem();
+    }
+
+    /// <summary>决定这份内容最终落在哪个 blob 上：先预筛探一次（命中去重就完全不压），
+    /// 否则一遍读完成 hash + 压缩，再按算出来的 hash 判去重/碰撞避让并上传。</summary>
+    private async Task<BlobPlacement> PlaceBlobAsync(
+        BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
+        BlobAddressScheme addressing, LocalDedupResolver? localResolver,
+        SemaphoreSlim uploadGate, StageTracker uploadTracker, CancellationToken ct)
+    {
+        var headBytes = request.Options.Diff.HeadHashBytes;
+        var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+
+        // 1. 预筛 + 探测。命中既有 blob 就到此为止：一个字节都不用压、不用传。
+        BlobContent? probed = null;
+        (string Ref, bool Collision)? probedPlacement = null;
+        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, ct) is { } p)
+        {
+            probed = p;
+            if (localResolver is not null)
+            {
+                if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+                    return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
+            }
+            else
+            {
+                // 回退：导入未同步的备份没有本地权威索引，只能发云端 HEAD 比对元数据。
+                var (refName, exists, collision, existingRaw) = await ResolveDataRefAsync(
+                    cc, addressing, p.FullHash, p.Length, p.HeadHash, p.TailHash, ct);
+                if (exists)
+                    return new BlobPlacement(
+                        refName, collision, await VolumeBlobIO.CountVolumesAsync(cc, refName, ct), [],
+                        p with { Raw = existingRaw });
+                probedPlacement = (refName, collision); // 空位已经问出来了，内容没变就别再问一遍
+            }
+        }
+
+        // 2. 一遍读：边读边算三段 hash，边把字节喂进 7z（或直接拷成 raw 临时文件）。
+        var (content, staged) = await StreamAndStageAsync(request, localPath, file.Path, storeOnly, headBytes, ct);
+        try
+        {
+            // 3. 压完才知道名字，此时才判去重与碰撞避让。
+            if (localResolver is not null)
+            {
+                // 纯本地判定：跨版本查映射、同批经预约协调（同内容共享 ref/raw/卷数，不同内容避让）。不读云端。
+                var res = await localResolver.ResolveAsync(
+                    content.FullHash, content.Length, content.HeadHash, content.TailHash);
+                if (res.Exists)
+                {
+                    var prior = res.Existing!;
+                    return new BlobPlacement(res.Ref, res.Collision, prior.Volumes, prior.VolumeSizes,
+                        content with { Raw = prior.Raw }); // 以既有 blob 的实际 raw 为准
+                }
+                try
+                {
+                    var (volumes, sizes) = await UploadStagedBlobAsync(
+                        request, res.Ref, staged, content, addressing, uploadGate, uploadTracker, ct);
+                    res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
+                    return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
+                }
+                catch (Exception ex)
+                {
+                    res.Fail(ex);   // 令等待者一并失败，绝不去重到未成功上传的 blob
+                    throw;
+                }
+            }
+
+            // 云端回退路径：探测时已经问出过一个空位。读到的内容与探测时一致（绝大多数情况）
+            // 就直接用它——重复的 HEAD 除了在压缩与上传之间插进一段等待之外没有任何作用。
+            string blobRef;
+            bool cloudCollision;
+            if (probedPlacement is { } known && probed is { } q && SameContent(q, content))
+            {
+                (blobRef, cloudCollision) = known;
+            }
+            else
+            {
+                var resolved = await ResolveDataRefAsync(
+                    cc, addressing, content.FullHash, content.Length, content.HeadHash, content.TailHash, ct);
+                if (resolved.Exists)
+                    return new BlobPlacement(resolved.Ref, resolved.Collision,
+                        await VolumeBlobIO.CountVolumesAsync(cc, resolved.Ref, ct), [],
+                        content with { Raw = resolved.ExistingRaw });
+                (blobRef, cloudCollision) = (resolved.Ref, resolved.Collision);
+            }
+
+            var (uploadedVolumes, uploadedSizes) = await UploadStagedBlobAsync(
+                request, blobRef, staged, content, addressing, uploadGate, uploadTracker, ct);
+            return new BlobPlacement(blobRef, cloudCollision, uploadedVolumes, uploadedSizes, content);
+        }
+        finally
+        {
+            // 去重命中时这份归档白压了，一样要立刻还给暂存区——它占着背压额度。
+            staging.Release(staged);
+        }
+    }
+
+    /// <summary>两次读到的是不是同一份内容（四项内容身份全等，与去重判定用的是同一个标准）。</summary>
+    private static bool SameContent(BlobContent a, BlobContent b) =>
+        a.FullHash == b.FullHash && a.Length == b.Length
+        && a.HeadHash == b.HeadHash && a.TailHash == b.TailHash;
+
+    /// <summary>
+    /// 去重预筛：先只读文件头算 head hash，本地索引里连（长度 + head）都对不上就返回 null，
+    /// 让调用方直接走一遍读的流式快路径；有候选才把整个文件读一遍算出完整内容身份。
+    /// </summary>
+    private async Task<BlobContent?> ProbeForDedupAsync(
+        PlannedFile file, string localPath, int headBytes, LocalDedupResolver? localResolver, CancellationToken ct)
+    {
+        // 云端回退（导入未同步的备份）：没有本地索引可预筛，判去重只能发 HEAD，而 HEAD 要一个
+        // 完整的内容身份。全文 hash 直接沿用 diff 已经算好的那个——为了预筛把文件再整个读一遍，
+        // 会把这条路径上本来两遍的读变成三遍。内容若真在此期间变了，压完之后的比对会发现并重判。
+        if (localResolver is null)
+        {
+            var stat = new FileInfo(localPath);
+            return new BlobContent(
+                file.FullHash,
+                await hasher.HeadHashAsync(localPath, headBytes, ct),
+                await hasher.TailHashAsync(localPath, headBytes, ct),
+                stat.Length, new DateTimeOffset(stat.LastWriteTimeUtc), Raw: false);
+        }
+
+        var length = new FileInfo(localPath).Length;
+        var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
+        var may = localResolver.MayDeduplicate(length, head);
+        localResolver.NoteInFlight(length, head);
+        return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
+    }
+
+    /// <summary>把文件完整读一遍，一次算出 head/full/tail 三段 hash 与长度
+    /// （分三次各读一遍是白付两趟 IO）。</summary>
+    private static async Task<BlobContent> ReadContentIdentityAsync(
+        string localPath, int segmentBytes, CancellationToken ct)
+    {
+        var mtime = new FileInfo(localPath).LastWriteTimeUtc;
+        var streaming = new StreamingHasher(segmentBytes, segmentBytes);
+        await using (var source = FileHasher.OpenRead(localPath))
+        {
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await source.ReadAsync(buffer, ct)) > 0)
+                streaming.Append(buffer.AsSpan(0, read));
+        }
+        return Identity(streaming, mtime, raw: false);
+    }
+
+    /// <summary>一遍读：源文件的字节同时流进 hasher 与归档（或 raw 临时文件）。
+    /// 于是"算 hash 的字节"与"存下去的字节"按构造就是同一批。</summary>
+    private async Task<(BlobContent Content, StagedItem Staged)> StreamAndStageAsync(
+        BackupRequest request, string localPath, string entryName, bool storeOnly, int segmentBytes,
+        CancellationToken ct)
+    {
+        // 开读之前先取一次元数据。长度用于判 raw；mtime 要**取读之前的那个**：文件若在读的过程中
+        // 又被改写，记下更早的 mtime 会让下一轮 diff 认为它变过而重新检查（安全方向），
+        // 记下更晚的则会让那份更新的内容此后再也不被备份（危险方向）。
+        var before = new FileInfo(localPath);
+        var mtime = before.LastWriteTimeUtc;
+
+        // 原始直传（PRD 3.3.2）：不压缩(store-only) + 未加密 + 无需分卷 → 直接拷原文件，省一次 7z 封装。
+        var raw = storeOnly && string.IsNullOrEmpty(request.Password)
+            && (request.Options.VolumeBytes is not { } vb || before.Length <= vb);
+
+        var streaming = new StreamingHasher(segmentBytes, segmentBytes);
+        var name = StagedName(entryName);
+        var staged = await staging.StageAsync(async (compressTemp, token) => raw
+            ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
+            : await CompressStreamingAsync(
+                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token),
+            ct);
+
+        return (Identity(streaming, mtime, raw), staged);
+    }
+
+    private static BlobContent Identity(StreamingHasher streaming, DateTime mtimeUtc, bool raw) => new(
+        streaming.FullHash, streaming.HeadHash, streaming.TailHash, streaming.Length,
+        new DateTimeOffset(mtimeUtc), raw);
+
+    /// <summary>压缩临时区里的文件名。流式之前用的是内容 hash，而现在压完才知道 hash——
+    /// 这个名字只在临时区里活几秒，唯一要求是同一时刻不重名（压缩全局串行，产出移出后才放锁）。</summary>
+    private static string StagedName(string entryPath) =>
+        "b" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(entryPath))).ToLowerInvariant()[..16];
+
+    private static async Task<string> CopyRawStreamingAsync(
+        string localPath, string compressTemp, string name, StreamingHasher streaming, CancellationToken ct)
+    {
+        var dest = Path.Combine(compressTemp, name);
+        await using var source = FileHasher.OpenRead(localPath);
+        await using var file = File.Create(dest);
+        await using var sink = new HashingStream(streaming, file);
+        await source.CopyToAsync(sink, ct);
+        return dest;
+    }
+
+    private async Task<IReadOnlyList<string>> CompressStreamingAsync(
+        BackupRequest request, string compressTemp, string archiveName, string entryName, string localPath,
+        bool storeOnly, long expectedBytes, StreamingHasher streaming, CancellationToken ct)
+    {
+        var output = Path.Combine(compressTemp, archiveName + ".7z");
+        var result = await compressor.CompressStreamAsync(
+            new StreamCompressionRequest(entryName, output, request.Password,
+                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedBytes),
+            async (stdin, token) =>
+            {
+                await using var source = FileHasher.OpenRead(localPath);
+                await using var sink = new HashingStream(streaming, stdin);
+                await source.CopyToAsync(sink, token);
+                return streaming.Length;
+            }, ct);
+        return result.VolumeFiles;
+    }
+
+    /// <returns>该 blob 的分卷数与各卷字节尺寸。</returns>
+    private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
+        BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
+        BlobAddressScheme addressing, SemaphoreSlim uploadGate, StageTracker uploadTracker, CancellationToken ct)
+    {
+        var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
+        await uploadGate.WaitAsync(ct);
+        uploadTracker.BeginItem(blobRef);
+        try
+        {
+            var meta = new Dictionary<string, string>(
+                addressing.Metadata(content.FullHash, content.Length, content.HeadHash, content.TailHash));
+            if (content.Raw)
+                meta["raw"] = "1";
+            await VolumeBlobIO.UploadAsync(
+                uploader, request.Account, request.Container, blobRef, staged.Files,
+                request.DataTier, request.Options.Upload, ct, meta);
+            return (staged.Files.Count, sizes);
+        }
+        finally
+        {
+            uploadGate.Release();
+            uploadTracker.EndItem(blobRef, sizes.Sum());
+        }
     }
 
     /// <summary>
@@ -662,7 +787,7 @@ public sealed class BackupOrchestrator(
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
         var headBytes = request.Options.Diff.HeadHashBytes;
-        const int maxAttempts = 5;
+        var maxAttempts = Math.Max(1, request.Options.ProcessingMaxAttempts);
         var attempts = new Dictionary<string, int>(StringComparer.Ordinal);
         var queue = new List<PlannedFile>(pool);
 
@@ -959,17 +1084,6 @@ public sealed class BackupOrchestrator(
         }
     }
 
-    /// <summary>原始直传：直接把原文件拷到压缩临时区（单卷），不走 7z 封装（PRD 3.3.2）。</summary>
-    private static async Task<IReadOnlyList<string>> CopyRawAsync(
-        string localPath, string compressTemp, string name, CancellationToken ct)
-    {
-        var dest = Path.Combine(compressTemp, name);
-        await using var src = File.OpenRead(localPath);
-        await using var dst = File.Create(dest);
-        await src.CopyToAsync(dst, ct);
-        return [dest];
-    }
-
     private async Task<IReadOnlyList<string>> CompressAsync(
         BackupRequest request, string compressTemp, string archiveName,
         IReadOnlyList<string> entries, bool storeOnly, CancellationToken ct)
@@ -1062,5 +1176,4 @@ public sealed class BackupOrchestrator(
         return max + 1;
     }
 
-    private static string SafeFileName(string fullHash) => fullHash.Replace(':', '_');
 }

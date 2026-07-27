@@ -42,6 +42,52 @@ public sealed class SevenZipCliTests : IDisposable
         Assert.False(File.Exists(marker), "the child process outlived the cancellation");
     }
 
+    /// <summary>流式压缩把源文件的字节一路喂进 7z 的 stdin，取消因此发生在**写的中途**。
+    /// 这条路径同样要杀整棵进程树：写入侧一被打断就撒手不管，留下的进程会继续往即将被清理的
+    /// 临时目录里写分卷。</summary>
+    [SkippableFact]
+    public async Task Canceling_While_Feeding_Stdin_Kills_The_Whole_Process_Tree()
+    {
+        Skip.IfNot(File.Exists("/bin/sh"), "POSIX shell not available.");
+        var marker = Path.Combine(_dir, "stdin-still-running.txt");
+
+        using var cts = new CancellationTokenSource();
+        var run = SevenZipCli.RunStreamingAsync(
+            "/bin/sh", ["-c", $"( sleep 2; echo alive > '{marker}' ) & cat > /dev/null; wait"], cts.Token,
+            writeStdin: async (stdin, token) =>
+            {
+                var chunk = new byte[64 * 1024];
+                while (true) // 一直喂，直到取消把它打断
+                {
+                    await stdin.WriteAsync(chunk, token);
+                    await Task.Delay(10, token);
+                }
+            });
+
+        await Task.Delay(300); // 让进程树真的起来
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+        await Task.Delay(2500); // 越过它本该写出标记的时刻
+        Assert.False(File.Exists(marker), "the child process outlived the cancellation");
+    }
+
+    /// <summary>喂 stdin 时源读取失败必须原样传出。吞掉它，一次只写进去半个文件的压缩
+    /// 就会被当成成功——产出是一个完全合法的 7z 归档，光看退出码分辨不出来。</summary>
+    [SkippableFact]
+    public async Task A_Failure_While_Feeding_Stdin_Is_Not_Swallowed()
+    {
+        Skip.IfNot(File.Exists("/bin/sh"), "POSIX shell not available.");
+
+        await Assert.ThrowsAsync<IOException>(() => SevenZipCli.RunStreamingAsync(
+            "/bin/sh", ["-c", "cat > /dev/null"], CancellationToken.None,
+            writeStdin: async (stdin, token) =>
+            {
+                await stdin.WriteAsync(new byte[1024], token);
+                throw new IOException("the source went away mid-read");
+            }));
+    }
+
     /// <summary>取消要在进程真正收尾之后才返回：调用方紧接着就要删掉工作目录，
     /// 若进程还活着，删除会撞上一个正在被写的文件（或删完又被写回来）。</summary>
     [SkippableFact]

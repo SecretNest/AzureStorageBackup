@@ -124,6 +124,89 @@ public sealed class StreamingExtractionTests : IDisposable
         Assert.Equal(0, hasher.Length);
     }
 
+    [SkippableTheory]
+    [InlineData(null, null, false)]      // 纯压缩
+    [InlineData("pw", null, false)]      // 加密 + 头加密
+    [InlineData("pw", 64 * 1024L, false)] // 加密 + 分卷
+    [InlineData(null, null, true)]       // store-only（不压缩，仍走 7z 封装）
+    public async Task Streamed_Archive_Holds_Exactly_The_Bytes_That_Were_Fed(
+        string? password, long? volumeBytes, bool storeOnly)
+    {
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var source = await WriteFileAsync("a/b/payload.bin", 250_000);
+        var compressor = new SevenZipCompressor();
+        var archive = Path.Combine(_dir, $"s{password}{volumeBytes}{storeOnly}.7z");
+
+        var fed = new StreamingHasher(4096, 4096);
+        var result = await compressor.CompressStreamAsync(
+            new StreamCompressionRequest("a/b/payload.bin", archive, password, volumeBytes, storeOnly,
+                ExpectedBytes: new FileInfo(source).Length),
+            async (stdin, token) =>
+            {
+                await using var input = FileHasher.OpenRead(source);
+                await using var sink = new HashingStream(fed, stdin);
+                await input.CopyToAsync(sink, token);
+                return fed.Length;
+            });
+
+        // 条目名保留完整相对路径——还原与检查定位成员的逻辑因此不必区分归档是怎么产出来的。
+        var entry = Assert.Single(
+            await compressor.ListEntriesAsync(result.VolumeFiles[0], password), e => !e.IsDirectory);
+        Assert.Equal("a/b/payload.bin", entry.Name);
+
+        var back = new StreamingHasher(4096, 4096);
+        await using (var sink = new HashingStream(back))
+            await compressor.ExtractToStreamAsync(result.VolumeFiles[0], "a/b/payload.bin", password, sink);
+
+        var file = new FileHasher();
+        Assert.Equal(await file.FullHashAsync(source), back.FullHash);
+        Assert.Equal(await file.HeadHashAsync(source, 4096), fed.HeadHash);
+        Assert.Equal(await file.TailHashAsync(source, 4096), fed.TailHash);
+        Assert.Equal(new FileInfo(source).Length, back.Length);
+    }
+
+    [SkippableFact]
+    public async Task Canceling_A_Streaming_Compression_Leaves_No_Half_Written_Archive()
+    {
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        using var cts = new CancellationTokenSource();
+        var archive = Path.Combine(_dir, "half.7z");
+        var task = new SevenZipCompressor().CompressStreamAsync(
+            new StreamCompressionRequest("x.bin", archive),
+            async (stdin, token) =>
+            {
+                await stdin.WriteAsync(new byte[64 * 1024], token);
+                await Task.Delay(Timeout.Infinite, token); // 停在这里等取消打断
+                return 0L;
+            }, cts.Token);
+
+        await Task.Delay(300);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+        // 半截的归档是合法的 7z 文件，留下来就会被暂存区当成产物收走并上传。
+        Assert.Empty(Directory.EnumerateFiles(_dir, "half.7z*"));
+    }
+
+    [SkippableFact]
+    public async Task A_Source_Failure_While_Feeding_Is_Not_Swallowed()
+    {
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var archive = Path.Combine(_dir, "failed.7z");
+        await Assert.ThrowsAsync<IOException>(() => new SevenZipCompressor().CompressStreamAsync(
+            new StreamCompressionRequest("x.bin", archive),
+            async (stdin, token) =>
+            {
+                await stdin.WriteAsync(new byte[64 * 1024], token);
+                throw new IOException("the source went away mid-read");
+            }));
+
+        Assert.Empty(Directory.EnumerateFiles(_dir, "failed.7z*"));
+    }
+
     [SkippableFact]
     public async Task Listing_Reports_Sizes_And_Directories()
     {
