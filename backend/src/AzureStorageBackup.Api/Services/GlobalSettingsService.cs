@@ -68,6 +68,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DeadWeightThresholdPercent = s.DeadWeightThresholdPercent;
         existing.StagedLimitBytes = s.StagedLimitBytes;
         existing.ProcessingMaxAttempts = s.ProcessingMaxAttempts;
+        existing.OverlapDiffAndUpload = s.OverlapDiffAndUpload;
         await db.SaveChangesAsync(ct);
         return existing;
     }

@@ -64,7 +64,12 @@ public sealed class BackupDiffer(IFileHasher hasher)
         CancellationToken ct = default,
         // 首次备份时这一步要把每个文件完整读一遍算 hash，可以跑几小时。没有它，界面上就是
         // 一个一动不动的 0%，用户无从判断是在干活还是挂死了。
-        StageTracker? tracker = null)
+        StageTracker? tracker = null,
+        // 每判完一个**扫描到的**条目就回调一次，按扫描顺序（= ordinal 路径序）。
+        // 编排器据此边 diff 边把已定局的活推给压缩上传侧，不必等整轮 diff 跑完——首次备份的
+        // diff 要几小时，那几小时里网络本来一个字节都没在传。
+        // 尾部补出来的 Unreadable/Deleted 条目不回调：它们不产生任何要上传的东西。
+        Func<FileChange, CancellationToken, Task>? onChange = null)
     {
         options ??= new DiffOptions();
         var root = Path.GetFullPath(rootPath);
@@ -100,6 +105,9 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // 把它们算进去会让速度看起来虚高得离谱。
             tracker?.Advance(
                 change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly ? entry.Length : 0);
+
+            if (onChange is not null)
+                await onChange(change, ct);
         }
 
         // 扫描阶段就读不出来的路径，必须在"判删除"之前登记进 seen。

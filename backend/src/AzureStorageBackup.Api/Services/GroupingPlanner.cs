@@ -43,6 +43,30 @@ public sealed record PlannedPack(string PackId, IReadOnlyList<PackEntry> Members
 
 public sealed record BackupPlan(IReadOnlyList<BlobEntry> Blobs, IReadOnlyList<PlannedPack> Packs);
 
+/// <summary>一个条目该走哪条路。</summary>
+public enum FileCategory
+{
+    /// <summary>单文件 blob：超尺寸或命中不分组列表。变更判定一出来就能立刻压缩上传，不等任何人。</summary>
+    SingleFile,
+
+    /// <summary>按目录合并：要等**整个目录**都 diff 完才能封箱（未变的、读不开的、内容其实没变的都不进包）。</summary>
+    DirectoryGroup,
+
+    /// <summary>跨目录合并：按扫描顺序边 diff 边填包、填满即封。</summary>
+    CrossDirectoryGroup,
+}
+
+/// <summary>一个条目的归类结果。<see cref="GroupKey"/> 仅按目录合并时有值（= 直接父目录）。</summary>
+public sealed record FileClass(FileCategory Category, string? GroupKey);
+
+/// <summary>
+/// 全部扫描条目的归类。<see cref="DirectoryCandidates"/> 给出每个目录组有多少个候选成员——
+/// 流水线据此知道"这个目录还差几个没 diff 完"，从而确定封箱时机。
+/// </summary>
+public sealed record Classification(
+    IReadOnlyDictionary<string, FileClass> ByPath,
+    IReadOnlyDictionary<string, int> DirectoryCandidates);
+
 /// <summary>
 /// 分组规划（M4 设计 §6）：决定变更文件走单文件 blob 还是分组 pack。
 /// 超尺寸/命中不分组列表 → 单文件；其余同一目录（不含子目录）小文件合并成 pack，
@@ -50,6 +74,44 @@ public sealed record BackupPlan(IReadOnlyList<BlobEntry> Blobs, IReadOnlyList<Pl
 /// </summary>
 public sealed class GroupingPlanner
 {
+    /// <summary>
+    /// 扫描一结束就能定下的归类。三条判定只看 <c>Path</c> 与 <c>Length</c>——**不需要**任何哈希，
+    /// 因此不必等 diff：<see cref="PlannedFile.FullHash"/> 只用来生成 <c>data/{hash}</c> 这个内容地址，
+    /// 与"走单文件还是走分组"无关。这正是流水线化的前提。
+    /// <para>
+    /// 判定顺序与 <see cref="Plan"/> 逐字一致（不分组 &gt; 跨路径 &gt; 按目录），否则同一个文件会
+    /// 在归类和装箱两处被分到不同的路上。
+    /// </para>
+    /// </summary>
+    public Classification Classify(IReadOnlyList<ScannedEntry> entries, PlanOptions? options = null)
+    {
+        options ??= new PlanOptions();
+
+        var byPath = new Dictionary<string, FileClass>(entries.Count, StringComparer.Ordinal);
+        var dirCandidates = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var entry in entries)
+        {
+            if (entry.Length >= options.SingleFileThresholdBytes
+                || (options.DontGroup?.MatchesFileOrAncestorDir(entry.Path) ?? false))
+            {
+                byPath[entry.Path] = new FileClass(FileCategory.SingleFile, null);
+            }
+            else if (options.CrossDirGroup?.MatchesFileOrAncestorDir(entry.Path) ?? false)
+            {
+                byPath[entry.Path] = new FileClass(FileCategory.CrossDirectoryGroup, null);
+            }
+            else
+            {
+                var dir = Directory(entry.Path);
+                byPath[entry.Path] = new FileClass(FileCategory.DirectoryGroup, dir);
+                dirCandidates[dir] = dirCandidates.GetValueOrDefault(dir) + 1;
+            }
+        }
+
+        return new Classification(byPath, dirCandidates);
+    }
+
     public BackupPlan Plan(IReadOnlyList<PlannedFile> files, PlanOptions? options = null)
     {
         options ??= new PlanOptions();

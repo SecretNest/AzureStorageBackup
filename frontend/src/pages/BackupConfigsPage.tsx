@@ -1147,9 +1147,13 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   const p = run.progress
   if (!p) return <div className="text-faint">Starting…<StopButton onStop={onStop} /></div>
 
+  // 流水线化之后 Diffing 与 Uploading 会同时在跑，明细因此可能有两条。老后端只发 detail，
+  // 所以两边都要认。
+  const details = p.details?.length ? p.details : p.detail ? [p.detail] : []
   // 顶行的百分比要跟着**当前阶段**走。run.percent 衡量的是上传项的完成比例，在扫描/差分阶段
   // 恒为 0——照搬它就会出现顶上写着 0%、下面细节写着 3% 的自相矛盾。
-  const percent = p.detail?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
+  // 两条并行时以第一条（Diffing）为准：它才是决定整轮还要多久的那条。
+  const percent = details[0]?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
   // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
   const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
 
@@ -1161,7 +1165,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
       <StopButton onStop={onStop} />
       {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
           默认只留一行总进度，需要看的时候再展开。 */}
-      {p.detail && (
+      {details.length > 0 && (
         <>
           {' '}
           <button
@@ -1172,7 +1176,9 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
           >
             {showDetail ? '▾ details' : '▸ details'}
           </button>
-          {showDetail && <StageDetail detail={p.detail} />}
+          {/* 两条并行的明细上下叠放，不横着摊开——用户提过 details 会把表格撑宽，
+              多一条更要小心。 */}
+          {showDetail && details.map((d) => <StageDetail key={d.stage} detail={d} />)}
         </>
       )}
     </div>
@@ -1220,6 +1226,8 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         </div>
       )}
       <div>
+        {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
+        <span className="text-faint">{detail.stage}: </span>
         {counts}
         {detail.percent != null && ` · ${detail.percent}%`}
         {speed}

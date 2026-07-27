@@ -54,9 +54,21 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     private readonly Lock _gate = new();
 
     private int _processed;
+    private int _total = total;
     private long _bytes;
     private string? _current;
     private long _lastPublishMs = -ThrottleMs;
+
+    /// <summary>把总数定下来。流水线化之后上传阶段的总数是**边跑边长出来的**（diff 还在往队列里
+    /// 塞活），在它定下来之前只能报 0＝未知——报一个还在涨的分母，百分比会先冲到 100 再掉回去。</summary>
+    public void SetTotal(int value)
+    {
+        lock (_gate)
+        {
+            _total = value;
+            PublishIfDue(force: true);
+        }
+    }
 
     /// <summary>处理完一项：计数 +1 并累加已读字节。**不动**当前项——当前项由 <see cref="Touch"/>
     /// 维护，让它一直停留在最后进入的那个路径上，卡住时才看得到究竟卡在哪。</summary>
@@ -126,6 +138,6 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
                 speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
         }
 
-        publish(new StageProgress(stage, _processed, total, _bytes, _current, [.. _active.Keys], speed));
+        publish(new StageProgress(stage, _processed, _total, _bytes, _current, [.. _active.Keys], speed));
     }
 }

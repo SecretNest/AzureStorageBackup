@@ -52,7 +52,7 @@ Integration tests that talk to Azure use [Azurite](https://github.com/Azure/Azur
 
 ## How a backup runs
 
-A backup goes through three stages, strictly one after another. The **Details** panel on the Backups page names the stage it is in, what it is working on right now, and a speed — but the speed means something different in each stage, so it is worth knowing what you are looking at.
+A backup goes through three stages. The **Details** panel on the Backups page names the stage it is in, what it is working on right now, and a speed — but the speed means something different in each stage, so it is worth knowing what you are looking at.
 
 | Stage | What it does | Writes to disk? |
 | --- | --- | --- |
@@ -60,7 +60,7 @@ A backup goes through three stages, strictly one after another. The **Details** 
 | **Diffing** | Decides which files changed since the last backup, hashing content where needed. | No |
 | **Uploading** | Compresses changed files into 7-Zip archives and uploads them. | Yes — see *Working space* below |
 
-Grouping happens between Diffing and Uploading and needs the complete list of changed files before it can pack anything, so **nothing is uploaded until Diffing has finished**. On a first backup that means the network sits idle for as long as the hashing takes.
+Scanning finishes before anything else starts, but **Diffing and Uploading overlap**: whether a file is packed with its neighbours or stored on its own depends only on its path and size, both known as soon as the scan ends. A large file therefore starts uploading the moment the diff decides it changed, and the Details panel shows two lines while both are running. Files that get packed together still wait for their whole directory to be diffed — until then it is not known which of them actually changed.
 
 ### Why the first backup is slow, and later ones are not
 
@@ -84,10 +84,10 @@ A first backup has no previous index to compare against, so every file takes the
 **During Uploading it is end-to-end throughput, not network speed.** Three differences matter:
 
 - The bytes counted are **compressed and encrypted** bytes, not the original file sizes, so the number is normally well below what the source data would suggest.
-- The elapsed time **includes compression**, which runs serially ahead of each upload. A slow compressor drags this number down even on a fast link.
+- The elapsed time **includes compression**, which is still one-at-a-time across the whole run. A slow compressor drags this number down even on a fast link.
 - Bytes are credited **when an object finishes uploading**, not continuously. Large packs therefore make the figure jump: flat for a while, then a spike.
 
-So a low Uploading figure does not by itself mean the network is the bottleneck. Comparing it against the Diffing figure from the same run gives a rough hint, but the two are not separated today.
+So a low Uploading figure does not by itself mean the network is the bottleneck. While both stages are running you can read the two figures side by side in the Details panel — Diffing is disk, Uploading is compression plus network — which is usually enough to tell which one is holding things up.
 
 ### Working space
 

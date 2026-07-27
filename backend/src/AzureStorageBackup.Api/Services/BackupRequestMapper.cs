@@ -45,6 +45,7 @@ public static class BackupRequestMapper
                 AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
                 VerboseLogging = r.VerboseLogging,
                 ProcessingMaxAttempts = settings is { ProcessingMaxAttempts: > 0 } ? settings.ProcessingMaxAttempts : 5,
+                OverlapDiffAndUpload = settings?.OverlapDiffAndUpload ?? true,
             },
         };
     }
