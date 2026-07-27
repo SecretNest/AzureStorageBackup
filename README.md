@@ -100,6 +100,8 @@ Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 
 Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
 
+A restore downloads each archive under `restore/` before writing files out. Single-file blobs — anything above the *single-file threshold* — are decompressed straight into the destination file, so they cost only the downloaded archive; the file's own bytes are never written twice. Packs are still extracted to disk first, so their peak is the downloaded pack plus its uncompressed contents, times the download concurrency.
+
 ## Docker
 
 The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.

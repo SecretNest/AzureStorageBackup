@@ -352,21 +352,25 @@ public sealed class RestoreOrchestrator(
             if (storage.Kind == "blob")
             {
                 // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
-                // 内容寻址去重时同一 blob 可被多个路径引用 → 复制给每个引用条目。
-                string content;
-                if (storage.Raw)
-                {
-                    content = firstVolume;
-                }
-                else
-                {
-                    var extractDir = Path.Combine(groupDir, "x");
-                    await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
-                    content = Directory.EnumerateFiles(extractDir, "*", SearchOption.AllDirectories).First();
-                }
+                // 内容寻址去重时同一 blob 可被多个路径引用 → 第一条写好之后，其余从它复制。
+                // 非 raw 的那条直接从归档流到目标：先解压到临时目录再复制，等于把同样的字节
+                // 写两遍盘（一个 20 GB 的 blob 就是 40 GB 的写入 + 20 GB 的临时空间）。
+                string? content = storage.Raw ? firstVolume : null;
                 foreach (var e in needed)
                 {
-                    if (TryWriteRestoredFile(request, realRoot, e, content, phase))
+                    if (content is null)
+                    {
+                        var streamed = await TryStreamRestoredFileAsync(request, realRoot, e, firstVolume, phase, ct);
+                        if (streamed is null)
+                        {
+                            failedEntries++;
+                            continue;
+                        }
+                        // 后续引用从这一份复制。它在目标根内、内容已按长度和 hash 核对过。
+                        content = streamed;
+                        restored++;
+                    }
+                    else if (TryWriteRestoredFile(request, realRoot, e, content, phase))
                         restored++;
                     else
                         failedEntries++;
@@ -452,6 +456,81 @@ public sealed class RestoreOrchestrator(
             phase?.Report($"Failed to restore '{entry.Path}': {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// 把单文件 blob 从归档直接流到目标，不经过临时解压目录。成功返回写好的目标路径，失败返回 null
+    /// （错误已上报，只圈在这一条上，与 <see cref="TryWriteRestoredFile"/> 同样的容错语义）。
+    /// </summary>
+    private async Task<string?> TryStreamRestoredFileAsync(
+        RestoreRequest request, string? realRoot, IndexEntry entry, string firstVolume,
+        IProgress<string>? phase, CancellationToken ct)
+    {
+        var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
+        // 越界判定必须在**任何**写动作之前：临时件也是写，也会跟随链接落到根外。
+        if (!WriteStaysInsideRoot(realRoot, dest))
+        {
+            phase?.Report(UnsafeRestorePathException.MessageFor(entry.Path));
+            return null;
+        }
+
+        // 先写同目录的临时件、核对无误再顶上去：直接往 dest 写的话，一次中途失败
+        // （网络断、归档坏、取消）留下的就是一个半截的、覆盖掉用户原文件的东西。
+        var part = dest + ".asb-part";
+        // 临时件同样要过边界判定：索引（可能来自 /import 的任意容器）里放一条
+        // `<某文件>.asb-part -> /etc/cron.d/x` 的 symlink 条目，软链先于文件条目还原，
+        // 之后 FileStream 会跟随它把归档内容写到根外——只查 dest 挡不住这一条。
+        if (!WriteStaysInsideRoot(realRoot, part))
+        {
+            phase?.Report(UnsafeRestorePathException.MessageFor(entry.Path));
+            return null;
+        }
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+
+            var hasher = new StreamingHasher(0, 0);
+            long written;
+            await using (var file = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None))
+            await using (var sink = new HashingStream(hasher, file))
+            {
+                // 不带成员名：去重之后归档里的条目名来自**最先上传这份内容**的那个路径，
+                // 未必等于当前索引条目的 Path；单文件归档只有一个成员，整个输出就是它的内容。
+                written = await compressor.ExtractToStreamAsync(firstVolume, entryName: null, request.Password, sink, ct);
+            }
+
+            // `7z x -so` 取不到成员时输出为空却**退出码 0**，所以退出码不能作为通过依据——
+            // 长度和 hash 才是。归档里若不止一个条目，内容会首尾相接，长度这一关同样拦得住。
+            if (written != entry.Length)
+            {
+                throw new IOException(
+                    $"archive yielded {written} byte(s) for '{entry.Path}' but the index says {entry.Length}");
+            }
+            if (entry.FullHash is not null && hasher.FullHash != entry.FullHash)
+                throw new IOException($"archive content for '{entry.Path}' does not match the hash in the index");
+
+            if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
+                RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
+            File.Move(part, dest, overwrite: true);
+            ApplyMetadata(dest, entry);
+            return dest;
+        }
+        catch (OperationCanceledException)
+        {
+            TryDeleteFile(part);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            TryDeleteFile(part);
+            phase?.Report($"Failed to restore '{entry.Path}': {ex.Message}");
+            return null;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try { File.Delete(path); } catch { /* best effort */ }
     }
 
     /// <summary>把还原内容写到目标路径。RenameKeep 且目标已存在（能进到这一步即内容不同或无法比较）→
