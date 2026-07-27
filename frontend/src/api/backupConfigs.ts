@@ -24,14 +24,24 @@ export const retentionModeLabels: Record<number, string> = {
 }
 
 // 备份管线阶段
+export const BackupStage = {
+  Scanning: 0,
+  Diffing: 1,
+  Uploading: 2,
+  WritingIndex: 3,
+  Finalizing: 4,
+  CleaningUp: 5,
+  Completed: 6,
+} as const
+
 export const backupStageLabels: Record<number, string> = {
-  0: 'Scanning',
-  1: 'Diffing',
-  2: 'Uploading',
-  3: 'Writing index',
-  4: 'Finalizing',
-  5: 'Cleaning up',
-  6: 'Completed',
+  [BackupStage.Scanning]: 'Scanning',
+  [BackupStage.Diffing]: 'Diffing',
+  [BackupStage.Uploading]: 'Uploading',
+  [BackupStage.WritingIndex]: 'Writing index',
+  [BackupStage.Finalizing]: 'Finalizing',
+  [BackupStage.CleaningUp]: 'Cleaning up',
+  [BackupStage.Completed]: 'Completed',
 }
 
 // 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态见 BackupActivity（派生，不落库）。
