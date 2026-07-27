@@ -219,6 +219,9 @@ public sealed class BackupOrchestrator(
         var tailByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal); // 单文件 blob 的尾部 hash → 索引条目
         // 处理中内容变化的文件：以稳定后的新 hash/元数据覆盖 diff 时的索引条目（§9、PRD 特别说明 D）。
         var overrides = new ConcurrentDictionary<string, EntryOverride>(StringComparer.Ordinal);
+        // diff 之后才读不开（压缩/上传阶段重新打开源文件时撞上）：与 diff 时就读不开的文件同等对待——
+        // 不产生 blob、索引沿用旧条目、计入 UnreadableFiles，绝不能让整轮备份因此崩溃（M4 设计 §3 遗漏点）。
+        var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
         // 5. Compress + Upload。压缩仍经单例 StagingArea 全局串行；仅上传按 UploadConcurrency 并行（PRD 3.4）。
         var total = plan.Blobs.Count + plan.Packs.Count;
@@ -234,11 +237,11 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(
             Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
 
-        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, uploadGate, ReportItem, ct);
-        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, uploadGate, ReportItem, ct);
+        await UploadBlobsAsync(request, plan, addressing, localResolver, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, ct);
+        await UploadGroupablesAsync(request, plan, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, ReportItem, ct);
 
         // 6. 构建新版本第二级索引
-        var entries = BuildEntries(diff, storageByPath, tailByPath, overrides);
+        var entries = BuildEntries(diff, storageByPath, tailByPath, overrides, postDiffUnreadable);
         var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
         var index = new VersionIndex
         {
@@ -284,7 +287,7 @@ public sealed class BackupOrchestrator(
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes,
-            diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable));
+            diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable) + postDiffUnreadable.Count);
     }
 
     /// <summary>每个读不开的文件各走一次 Record：源头一致沿用备份来源，消息保留系统给出的原因原文
@@ -300,14 +303,21 @@ public sealed class BackupOrchestrator(
                 $"File unreadable, skipped: {c.Path}", c.UnreadableReason ?? "", ct);
     }
 
+    /// <summary>diff 之后（压缩/上传阶段重新打开源文件时）才发现读不开：与 diff 时读不开复用完全相同的
+    /// 通知通道、相同的 UnrecoverableError 事件、相同的消息格式——操作员不需要区分这个文件是在哪个
+    /// 阶段读不开的，只需要知道"这个文件本轮没能读到"。</summary>
+    private async Task RecordPostDiffUnreadableAsync(BackupRequest request, string path, string reason, CancellationToken ct) =>
+        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+            $"File unreadable, skipped: {path}", reason, ct);
+
     private async Task UploadBlobsAsync(
         BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
         => await Task.WhenAll(plan.Blobs.Select(blob =>
             HandleBlobAsync(request, new PlannedFile(blob.Path, 0, blob.FullHash), addressing, localResolver,
-                storageByPath, tailByPath, overrides, uploadGate, onItem, ct)));
+                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, onItem, ct)));
 
     /// <summary>
     /// 处理单文件内容寻址 blob：压缩+上传 data/{hash}，经重校验循环（§9）。
@@ -316,8 +326,8 @@ public sealed class BackupOrchestrator(
     private async Task HandleBlobAsync(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
     {
         var localPath = Path.Combine(request.LocalRoot, file.Path.Replace('/', Path.DirectorySeparatorChar));
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -412,19 +422,32 @@ public sealed class BackupOrchestrator(
         }
 
         var finalHash = file.FullHash;
-        if (verifier is not null)
+        try
         {
-            var verificationOptions = new VerificationOptions { MaxAttempts = request.Options.ProcessingMaxAttempts };
-            var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
-            finalHash = vr.FullHash;
-            if (vr.Outcome == ProcessingOutcome.Alarmed)
-                await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                    $"File kept changing during backup: {file.Path}",
-                    $"Saved with current content after {vr.Attempts} attempts", ct);
+            if (verifier is not null)
+            {
+                var verificationOptions = new VerificationOptions { MaxAttempts = request.Options.ProcessingMaxAttempts };
+                var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
+                finalHash = vr.FullHash;
+                if (vr.Outcome == ProcessingOutcome.Alarmed)
+                    await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                        $"File kept changing during backup: {file.Path}",
+                        $"Saved with current content after {vr.Attempts} attempts", ct);
+            }
+            else
+            {
+                await ProcessAsync(file.FullHash, ct);
+            }
         }
-        else
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            await ProcessAsync(file.FullHash, ct);
+            // diff 时可读、随后（压缩打包/原样直传重新打开源文件时）才读不开：与 diff 阶段读不开同等
+            // 处置——不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
+            // 只记一条复用既有通道的告警，绝不能让这一个文件拖垮整轮备份。
+            postDiffUnreadable[file.Path] = ex.Message;
+            await RecordPostDiffUnreadableAsync(request, file.Path, ex.Message, ct);
+            onItem();
+            return;
         }
 
         if (collided)
@@ -504,8 +527,8 @@ public sealed class BackupOrchestrator(
         BackupRequest request, BackupPlan plan, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
-        Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        SemaphoreSlim uploadGate, Action onItem, CancellationToken ct)
     {
         // 从计划重建每个目录的可分组文件池（顺序不变）；成组/压缩/校验在处理时增量进行。
         var poolByDir = plan.Packs
@@ -517,15 +540,15 @@ public sealed class BackupOrchestrator(
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
         await Task.WhenAll(poolByDir.Select(pool =>
-            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, uploadGate, packCounter, onItem, ct)));
+            ProcessDirectoryAsync(request, pool, addressing, localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, onItem, ct)));
     }
 
     private async Task ProcessDirectoryAsync(
         BackupRequest request, List<PlannedFile> pool, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, SemaphoreSlim uploadGate,
-        int[] packCounter, Action onItem, CancellationToken ct)
+        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        SemaphoreSlim uploadGate, int[] packCounter, Action onItem, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
@@ -608,25 +631,37 @@ public sealed class BackupOrchestrator(
             foreach (var m in changed)
             {
                 var local = Local(request, m.Path);
-                var newHash = await hasher.FullHashAsync(local, ct);
-                var newLen = new FileInfo(local).Length;
-                // 内容已变（≠ diff 时 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
-                overrides[m.Path] = await BuildOverrideAsync(local, newHash, headBytes, ct);
+                try
+                {
+                    var newHash = await hasher.FullHashAsync(local, ct);
+                    var newLen = new FileInfo(local).Length;
+                    // 内容已变（≠ diff 时 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
+                    overrides[m.Path] = await BuildOverrideAsync(local, newHash, headBytes, ct);
 
-                var n = attempts[m.Path] = attempts.GetValueOrDefault(m.Path) + 1;
-                if (newLen >= threshold || n >= maxAttempts)
-                {
-                    // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
-                    if (n >= maxAttempts)
-                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                            $"File kept changing during grouping: {m.Path}",
-                            $"Stored as single file after {n} attempts", ct);
-                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                        storageByPath, tailByPath, overrides, uploadGate, static () => { }, ct);
+                    var n = attempts[m.Path] = attempts.GetValueOrDefault(m.Path) + 1;
+                    if (newLen >= threshold || n >= maxAttempts)
+                    {
+                        // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
+                        if (n >= maxAttempts)
+                            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                                $"File kept changing during grouping: {m.Path}",
+                                $"Stored as single file after {n} attempts", ct);
+                        await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                            storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, ct);
+                    }
+                    else
+                    {
+                        queue.Add(new PlannedFile(m.Path, newLen, newHash)); // 自然进入下一组
+                    }
                 }
-                else
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    queue.Add(new PlannedFile(m.Path, newLen, newHash)); // 自然进入下一组
+                    // 上面已排除该成员出本次归档（内容变了 or 读不开，处置相同）；这里第二次尝试确认新内容时
+                    // 若仍然读不开（并非瞬时抖动，而是真被锁住/权限收回），就不再假装能重新入队处理——
+                    // 就地按"读不开"降级：不产生任何 blob、不进入任何 pack，索引沿用旧条目或整条缺席。
+                    // 全目录一起读不开时，这一步保证第一个撞上的成员不会让同目录其余成员失去被处理的机会。
+                    postDiffUnreadable[m.Path] = ex.Message;
+                    await RecordPostDiffUnreadableAsync(request, m.Path, ex.Message, ct);
                 }
             }
         }
@@ -725,7 +760,8 @@ public sealed class BackupOrchestrator(
     private static List<IndexEntry> BuildEntries(
         DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
         IReadOnlyDictionary<string, string> tailByPath,
-        IReadOnlyDictionary<string, EntryOverride> overrides)
+        IReadOnlyDictionary<string, EntryOverride> overrides,
+        IReadOnlyDictionary<string, string> postDiffUnreadable)
     {
         var entries = new List<IndexEntry>();
         foreach (var c in diff.Changes)
@@ -735,7 +771,9 @@ public sealed class BackupOrchestrator(
 
             // 读不开：沿用上一版本条目（含 Storage，因此不重传任何内容、不影响去重），
             // 仅追加 UnreadableAt。上一版本没有该文件时整条跳过——没有内容可指向。
-            if (c.Kind == ChangeKind.Unreadable)
+            // diff 时读得开、但压缩/上传阶段重新打开时才读不开（postDiffUnreadable）走完全相同的处置：
+            // 对索引而言，"这一轮没能把内容存下来"是同一件事，不该另起一套判断。
+            if (c.Kind == ChangeKind.Unreadable || postDiffUnreadable.ContainsKey(c.Path))
             {
                 if (c.Previous is not null)
                     entries.Add(c.Previous with { UnreadableAt = DateTimeOffset.UtcNow });
