@@ -49,7 +49,10 @@ public sealed class LocalFileScanner
         string rootPath,
         IgnoreRuleSet ignore,
         ScanOptions? options = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        // 扫描一棵大目录树本身就要几分钟，期间界面上同样什么都看不到。
+        // 这里没有"总数"可言——总数正是扫描要算出来的——所以只报已扫条目数与当前目录。
+        StageTracker? tracker = null)
     {
         options ??= new ScanOptions();
         var root = Path.GetFullPath(rootPath);
@@ -58,7 +61,7 @@ public sealed class LocalFileScanner
         var emptyDirs = new List<string>();
         var unreadable = new List<UnreadablePath>();
 
-        ScanDirectory(root, root, ignore, options, entries, emptyDirs, unreadable, ct);
+        ScanDirectory(root, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
 
         entries.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
         emptyDirs.Sort(StringComparer.Ordinal);
@@ -74,9 +77,11 @@ public sealed class LocalFileScanner
         List<ScannedEntry> entries,
         List<string> emptyDirs,
         List<UnreadablePath> unreadable,
-        CancellationToken ct)
+        CancellationToken ct,
+        StageTracker? tracker)
     {
         var keptChildren = 0;
+        tracker?.Touch(RelativePath(root, dir));
 
         // 目录读不出来有**两个**失败点，都要接住，但都不能把循环体也圈进去（那就成了"catch 范围
         // 圈住整个工作单元"，会把处理条目时的失败误判成"目录列不出来"）：
@@ -131,7 +136,7 @@ public sealed class LocalFileScanner
             if (isDirectory && !isSymlink)
             {
                 keptChildren++;
-                ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct);
+                ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
                 continue;
             }
 
@@ -150,6 +155,7 @@ public sealed class LocalFileScanner
                         new DateTimeOffset(info.LastWriteTimeUtc),
                         ReadPermissions(info.FullName),
                         Target: info.LinkTarget));
+                    tracker?.Advance(0); // 扫描只读元数据，不读内容，故字节为 0
                     continue;
                 }
 
@@ -159,6 +165,7 @@ public sealed class LocalFileScanner
                     relative, EntryKind.File, file.Length,
                     new DateTimeOffset(file.LastWriteTimeUtc),
                     ReadPermissions(file.FullName)));
+                tracker?.Advance(0);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
