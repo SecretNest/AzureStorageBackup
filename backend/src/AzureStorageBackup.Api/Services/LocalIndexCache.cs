@@ -26,21 +26,37 @@ public interface ILocalIndexCache
     Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default);
 }
 
-public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : ILocalIndexCache
+public sealed class LocalIndexCache(
+    AppDbContext db, IBackupInfoStore store, VersionIndexMemoryCache? memory = null) : ILocalIndexCache
 {
+    // 省略即禁用进程内那一层：单测关注的是 SQLite 这一层，不该被跨请求缓存干扰。
+    // 生产由 DI 注入按 Backup__IndexCacheSize 配好的实例。
+    private readonly VersionIndexMemoryCache _memory = memory ?? new VersionIndexMemoryCache(0);
+
     public async Task<VersionIndex> ReadAsync(
         Account account, string container, int version, long identityTicks,
         string indexBlob, string? password, CancellationToken ct = default)
     {
+        // 行里存的是**序列化字节**，所以 SQLite 命中也仍要把整份索引重建成对象（50 万条目实测
+        // 约 0.9 s / 350 MB 分配）。还原对话框每展开一个目录都要走一遍，因此在其上再加一层
+        // 进程内对象缓存；容量为 0 时这一层整体旁路，行为与加它之前一致（VersionIndexMemoryCache）。
+        if (_memory.TryGet(account.Id, container, version, identityTicks, out var cached))
+            return cached;
+
         var row = await db.CachedVersionIndexes
             .FirstOrDefaultAsync(x => x.AccountId == account.Id && x.Container == container && x.Version == version, ct);
 
         if (row is not null && row.IdentityTicks == identityTicks)
-            return IndexSerializer.DeserializeIndex(row.Bytes);
+        {
+            var fromRow = IndexSerializer.DeserializeIndex(row.Bytes);
+            _memory.Set(account.Id, container, version, identityTicks, fromRow);
+            return fromRow;
+        }
 
         // 未命中或 container 已重建（身份不符）→ 下载云端并回填。
         var index = await store.ReadIndexAsync(account, container, indexBlob, password, ct);
         await UpsertAsync(row, account.Id, container, version, identityTicks, index, ct);
+        _memory.Set(account.Id, container, version, identityTicks, index);
         return index;
     }
 
@@ -50,6 +66,10 @@ public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : I
         var row = await db.CachedVersionIndexes
             .FirstOrDefaultAsync(x => x.AccountId == accountId && x.Container == container && x.Version == version, ct);
         await UpsertAsync(row, accountId, container, version, identityTicks, index, ct);
+        // 存字节、**不**把调用方的对象放进内存缓存：索引对象是可变的（BackupRepairer 就会往
+        // UnrecoverablePaths 里加东西），共享一个还在被调用方持有的实例迟早出事。失效的代价
+        // 只是下次读少一次命中。
+        _memory.Invalidate(accountId, container, version);
     }
 
     public async Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
@@ -61,6 +81,7 @@ public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : I
             db.CachedVersionIndexes.Remove(row);
             await db.SaveChangesAsync(ct);
         }
+        _memory.Invalidate(accountId, container, version);
     }
 
     public async Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
@@ -68,6 +89,7 @@ public sealed class LocalIndexCache(AppDbContext db, IBackupInfoStore store) : I
         await db.CachedVersionIndexes
             .Where(x => x.AccountId == accountId && x.Container == container)
             .ExecuteDeleteAsync(ct);
+        _memory.InvalidateContainer(accountId, container);
     }
 
     private async Task UpsertAsync(

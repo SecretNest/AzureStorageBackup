@@ -40,6 +40,13 @@ builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
 builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
 builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
+// 反序列化后的版本索引缓存（单例，跨请求）。默认 2 项＝偏响应速度：还原对话框的树浏览与
+// 版本对比都命中同一份索引，免去每次点击都重建整份索引（50 万条目实测约 0.9 s / 350 MB）。
+// 代价是常驻内存（约 190 MB/份 @ 50 万条目），小内存机器设 Backup__IndexCacheSize=0 完全关闭。
+builder.Services.AddSingleton(new VersionIndexMemoryCache(
+    int.TryParse(builder.Configuration["Backup:IndexCacheSize"], out var indexCacheSize) && indexCacheSize >= 0
+        ? indexCacheSize
+        : 2));
 builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();
 builder.Services.AddScoped<TrackedInfoStore>();
 
