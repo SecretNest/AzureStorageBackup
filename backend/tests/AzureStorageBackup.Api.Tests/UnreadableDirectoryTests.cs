@@ -175,6 +175,55 @@ public sealed class UnreadableDirectoryTests : IDisposable
         }
     }
 
+    /// <summary>UnreadableAt 要回答的是"这份内容从什么时候起就没能再更新"。此前每轮都把它刷成
+    /// UtcNow，等于每轮把答案抹掉、只剩一句"刚才也没读到"——操作员再也问不出"这文件多久没备份上了"。
+    /// 连跑三轮：第三轮索引里的时间戳必须还是第二轮那一刻的。</summary>
+    [SkippableFact]
+    public async Task The_Unreadable_Timestamp_Records_When_It_First_Went_Unread()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreadstamp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        var lockedDir = Path.Combine(_root, "vault");
+
+        try
+        {
+            WriteText("vault/a.txt", "content");
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v1：可读
+
+            File.SetUnixFileMode(lockedDir, UnixFileMode.None);
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v2：首次读不开
+
+            var info2 = await store.ReadInfoAsync(account, name, null);
+            var idx2 = await store.ReadIndexAsync(account, name, info2!.Versions[1].IndexBlob, null);
+            var firstSeen = idx2.Entries.Single(e => e.Path == "vault/a.txt").UnreadableAt;
+            Assert.NotNull(firstSeen);
+
+            await Task.Delay(1100); // 时间戳有秒级分辨率，确保"若被刷新"会是一个可分辨的新值
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v3：仍读不开
+
+            var info3 = await store.ReadInfoAsync(account, name, null);
+            var idx3 = await store.ReadIndexAsync(account, name, info3!.Versions[2].IndexBlob, null);
+            var stillFirstSeen = idx3.Entries.Single(e => e.Path == "vault/a.txt").UnreadableAt;
+
+            Assert.Equal(firstSeen, stillFirstSeen); // 记的是"何时起"，不是"刚才"
+        }
+        finally
+        {
+            try { File.SetUnixFileMode(lockedDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute); }
+            catch { /* best effort */ }
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
     /// <summary>读不开的目录里若有上一版本记录的空目录，也要一并带过来：直接用本轮扫描结果的话，
     /// 这些空目录会从新版本消失，还原出来的目录结构就少了一块。</summary>
     [SkippableFact]

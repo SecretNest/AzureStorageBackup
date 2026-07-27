@@ -513,7 +513,13 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         var unrec = await _client.GetFromJsonAsync<List<string>>($"/api/backup-configs/{created.Id}/unrecoverable");
         Assert.Empty(unrec!);
+
+        // /unreadable 与 /unrecoverable 同构：无版本时同样短路成 200 空数组，不触碰云端。
+        var unread = await _client.GetFromJsonAsync<List<UnreadableRow>>($"/api/backup-configs/{created.Id}/unreadable");
+        Assert.Empty(unread!);
     }
+
+    private sealed record UnreadableRow(string path, DateTimeOffset unreadableAt);
 
     [Fact]
     public async Task Check_Endpoint_Returns_Conflict_When_Backup_Busy()
@@ -543,6 +549,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/versions")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/file-versions?path=a.txt")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/unrecoverable")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/unreadable")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{missingId}/tree")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.PostAsync($"/api/backup-configs/{missingId}/check", null)).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.PostAsync($"/api/backup-configs/{missingId}/repair", null)).StatusCode);

@@ -970,7 +970,10 @@ public sealed class BackupOrchestrator(
             if (c.Kind == ChangeKind.Unreadable || postDiffUnreadable.ContainsKey(c.Path))
             {
                 if (c.Previous is not null)
-                    entries.Add(c.Previous with { UnreadableAt = DateTimeOffset.UtcNow });
+                    // 已经带着 UnreadableAt 的条目保留原值：这个字段要回答的是"这份内容从什么时候起
+                    // 就没能再更新"，每轮刷成 UtcNow 等于每轮把答案抹掉，只剩一句"刚才也没读到"。
+                    // 一旦某轮重新读到，条目会正常重建，字段自然回到 null。
+                    entries.Add(c.Previous with { UnreadableAt = c.Previous.UnreadableAt ?? DateTimeOffset.UtcNow });
                 continue;
             }
 

@@ -58,6 +58,11 @@ public sealed record FileFinding(string Path, string? Ref, CloudState Cloud, Loc
 {
     /// <summary>云端已坏且本地内容一致 → 可从本地修复。</summary>
     public bool Repairable => Cloud == CloudState.MissingOrBad && Local == LocalState.Ok;
+
+    /// <summary>非空＝云端这份内容是从更早的版本沿用来的（备份一直没能读到源文件），值为自何时起。
+    /// 没有这条信息时，<see cref="LocalState.Changed"/> 会被读成"本地文件被改了"，
+    /// 而真实原因是"备份从未成功更新过云端这一份"——两者的处置完全不同。</summary>
+    public DateTimeOffset? UnreadableAt { get; init; }
 }
 
 /// <summary>检查报告：按文件结论 + 可选元数据漂移说明。</summary>

@@ -9,6 +9,7 @@ import {
   type RestoreEstimate,
   type RestoreRun,
   type TreeNode,
+  type UnreadableEntry,
 } from '../api/backupConfigs'
 import { Field } from './modal'
 import { overlayStyle, panelStyle } from './modalStyles'
@@ -43,6 +44,8 @@ export function RestoreDialog({
 
   // 不可恢复文件的按版本替代（沿用既有能力）
   const [unrecoverable, setUnrecoverable] = useState<string[]>([])
+  // 内容沿用自更早版本的文件：不需要"替代"（内容是有效的，只是旧），但还原前必须知道。
+  const [stale, setStale] = useState<UnreadableEntry[]>([])
   const [options, setOptions] = useState<Record<string, FileVersionOption[]>>({})
   const [choices, setChoices] = useState<Record<string, number>>({})
   const [subsLoading, setSubsLoading] = useState(false)
@@ -73,6 +76,8 @@ export function RestoreDialog({
         const paths = await backupConfigsApi.unrecoverablePaths(config.id, version)
         if (cancelled) return
         setUnrecoverable(paths)
+        setStale(await backupConfigsApi.unreadableEntries(config.id, version))
+        if (cancelled) return
         const opts: Record<string, FileVersionOption[]> = {}
         const ch: Record<string, number> = {}
         for (const p of paths) {
@@ -244,6 +249,8 @@ export function RestoreDialog({
   // 与选中集的交集：选择性还原时，替代表只对"实际会被还原"的不可恢复路径有意义
   // （后端按 SelectedPaths 过滤生效集，替代路径若未被勾选则替代是空操作）。未选中任何项 = 还原整版本，全部展示。
   const relevantUnrecoverable = selected.size === 0 ? unrecoverable : unrecoverable.filter((p) => selected.has(p))
+  // 同理：选择性还原时，只提示实际会被还原的那些沿用条目。
+  const relevantStale = selected.size === 0 ? stale : stale.filter((e) => selected.has(e.path))
 
   const setAllNearest = () => {
     const ch: Record<string, number> = {}
@@ -296,6 +303,23 @@ export function RestoreDialog({
         </Field>
 
         {subsLoading && <div className="text-faint">Loading…</div>}
+        {/* 沿用的内容是**有效**数据，就是这个版本能给出的最好结果——所以不提供"按版本替代"，
+            那会暗示存在更好的选项。但操作员必须知道：还原这个版本，这些文件拿到的是更早的内容。 */}
+        {!subsLoading && relevantStale.length > 0 && (
+          <div className="text-warn" style={{ margin: '0.6rem 0' }}>
+            {relevantStale.length} file(s) in this version hold content from an earlier backup —
+            the source could not be read since then, so restoring gives you that older content:
+            <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
+              {relevantStale.slice(0, 10).map((e) => (
+                <li key={e.path}>
+                  <span className="mono">{e.path}</span>
+                  {' '}— unread since {new Date(e.unreadableAt).toLocaleString()}
+                </li>
+              ))}
+            </ul>
+            {relevantStale.length > 10 && <div>…and {relevantStale.length - 10} more</div>}
+          </div>
+        )}
         {!subsLoading && relevantUnrecoverable.length > 0 && (
           <div className="text-faint" style={{ margin: '0.6rem 0' }}>
             <div style={{ marginBottom: '0.3rem' }}>
@@ -455,6 +479,12 @@ function TreeBrowser({
                   <input type="checkbox" checked={selected.has(node.path)} onChange={() => onToggleFile(node.path)} />
                   <span>{node.name}</span>
                   {node.length != null && <span className="text-muted" style={{ marginLeft: 6 }}>{formatBytes(node.length)}</span>}
+                  {/* 选择还原内容的这一刻，正是最需要知道"这份内容不是这个版本时刻的"的时候。 */}
+                  {node.unreadableAt && (
+                    <span className="text-warn" style={{ marginLeft: 6 }}>
+                      older content (unread since {new Date(node.unreadableAt).toLocaleDateString()})
+                    </span>
+                  )}
                 </>
               )}
             </div>

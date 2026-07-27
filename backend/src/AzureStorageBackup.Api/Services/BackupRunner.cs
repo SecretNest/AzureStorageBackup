@@ -13,6 +13,11 @@ public sealed class BackupRunState
     public RunStatus Status { get; set; } = RunStatus.Running;
     public BackupProgress? Progress { get; set; }
     public int? Version { get; set; }
+
+    /// <summary>本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来，
+    /// 界面上不显示这个数字，操作员就只能靠通知——而通知会被别的消息淹没。</summary>
+    public int? UnreadableFiles { get; set; }
+
     public string? Error { get; set; }
 
     /// <summary>
@@ -29,10 +34,11 @@ public sealed class BackupRunState
     internal TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 }
 
-public sealed record BackupRunResponse(string Status, BackupProgress? Progress, int? Version, string? Error)
+public sealed record BackupRunResponse(
+    string Status, BackupProgress? Progress, int? Version, int? UnreadableFiles, string? Error)
 {
     public static BackupRunResponse From(BackupRunState s) =>
-        new(s.Status.ToString(), s.Progress, s.Version, s.Error);
+        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error);
 }
 
 /// <summary>
@@ -176,6 +182,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings), new StateProgress(state), ct);
             state.Version = result.Version;
+            state.UnreadableFiles = result.UnreadableFiles;
             state.Status = RunStatus.Completed;
 
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());

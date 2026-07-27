@@ -33,4 +33,29 @@ public class VersionTreeServiceTests
         Assert.True(a.Single(n => n.Name == "empty").IsDir);           // 空目录也作可展开节点
         Assert.False(a.Single(n => n.Name == "d.txt").IsDir);
     }
+
+    /// <summary>还原树必须带出"这条记录沿用自更早版本"。选择还原内容的那一刻，是操作员最需要
+    /// 知道"还原这个版本拿到的不是这个版本时刻的内容"的时候——此前这个信息在索引里却到不了界面。</summary>
+    [Fact]
+    public void Children_Carries_The_Unreadable_Marker_To_File_Nodes()
+    {
+        var since = new DateTimeOffset(2026, 7, 20, 8, 30, 0, TimeSpan.Zero);
+        var index = new VersionIndex
+        {
+            Version = 3,
+            Entries =
+            [
+                new IndexEntry { Path = "vault/stale.txt", Kind = "file", Length = 10, Permissions = "0644",
+                    UnreadableAt = since,
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/s", VolumeSizes = [20] } },
+                new IndexEntry { Path = "vault/fresh.txt", Kind = "file", Length = 20, Permissions = "0644",
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/f", VolumeSizes = [30] } },
+            ],
+        };
+
+        var vault = VersionTreeService.Children(index, "vault");
+
+        Assert.Equal(since, vault.Single(n => n.Name == "stale.txt").UnreadableAt);
+        Assert.Null(vault.Single(n => n.Name == "fresh.txt").UnreadableAt); // 正常条目不能被误标
+    }
 }

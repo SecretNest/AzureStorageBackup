@@ -129,6 +129,8 @@ export interface BackupRun {
   status: 'Running' | 'Completed' | 'Failed'
   progress: BackupProgress | null
   version: number | null
+  // 本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来。
+  unreadableFiles: number | null
   error: string | null
 }
 
@@ -162,6 +164,9 @@ export interface FileFinding {
   cloud: number // CloudState
   local: number // LocalState
   repairable: boolean
+  // 非空＝云端这份是从更早版本沿用来的（备份一直读不到源文件）。没有它，local=Changed
+  // 会被读成"本地被改了"，而真实原因是备份从未成功更新过云端这一份。
+  unreadableAt: string | null
 }
 
 export interface CheckReport {
@@ -205,6 +210,15 @@ export interface TreeNode {
   mtime: string | null
   storageKind: string | null
   storageRef: string | null
+  // 非空＝这条记录沿用自更早的版本，值为自何时起没能再更新。还原选择时必须看得到：
+  // 还原这个版本，拿到的不是这个版本时刻的内容。
+  unreadableAt: string | null
+}
+
+// 某版本里内容为沿用的文件（备份那几轮读不开源文件）。与 unrecoverable 不同：内容有效，只是旧。
+export interface UnreadableEntry {
+  path: string
+  unreadableAt: string
 }
 
 // 还原量估算（§4.1b）：本地纯算下载量/解压量/文件数，再对去重存储对象 HEAD 查活化状态。
@@ -260,6 +274,8 @@ export const backupConfigsApi = {
     api.get<FileVersionOption[]>(`/backup-configs/${id}/file-versions?path=${encodeURIComponent(path)}`),
   unrecoverablePaths: (id: number, version: number | null) =>
     api.get<string[]>(`/backup-configs/${id}/unrecoverable${version != null ? `?version=${version}` : ''}`),
+  unreadableEntries: (id: number, version: number | null) =>
+    api.get<UnreadableEntry[]>(`/backup-configs/${id}/unreadable${version != null ? `?version=${version}` : ''}`),
   check: (id: number, cloud: number, local: number, version: number | null = null, rehydrate: number | null = null, listOrphans = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))

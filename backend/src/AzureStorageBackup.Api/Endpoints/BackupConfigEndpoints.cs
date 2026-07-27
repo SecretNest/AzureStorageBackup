@@ -286,6 +286,34 @@ public static class BackupConfigEndpoints
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
+        // 某版本里内容为**沿用**的文件：备份那几轮读不开源文件，索引沿用了更早版本的条目。
+        // 与 /unrecoverable 对称，但语义不同：那边是数据已损坏、无内容可给；这边内容有效，只是旧。
+        // 还原前需要知道这件事——否则还原了这个版本，却拿到更早时刻的内容而毫不知情。
+        group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = secrets.RevealBackupPassword(config);
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            if (info is null || info.Versions.Count == 0)
+                return Results.Ok(Array.Empty<object>());
+            var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
+            if (ver is null)
+                return Results.Ok(Array.Empty<object>());
+            var idx = await store.ReadIndexAsync(account, config.ContainerName, ver.IndexBlob, password, ct);
+            return Results.Ok(idx.Entries
+                .Where(e => e.UnreadableAt is not null)
+                .Select(e => new { path = e.Path, unreadableAt = e.UnreadableAt })
+                .ToList());
+        });
+
         // 还原懒加载目录树（§4.1a，决策 1）：返回 path 目录的直接子节点（子目录+文件），供前端逐层展开，
         // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,

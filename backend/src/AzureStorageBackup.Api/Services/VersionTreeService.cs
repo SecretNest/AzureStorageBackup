@@ -11,7 +11,11 @@ public sealed record TreeNode(
     long? Length,
     DateTimeOffset? Mtime,
     string? StorageKind,
-    string? StorageRef);
+    string? StorageRef,
+    /// <summary>非空＝这条记录是从更早的版本沿用来的（此后一直没能读到源文件），
+    /// 值为"自何时起没能再更新"。选择还原内容的那一刻，操作员最需要知道这件事：
+    /// 还原这个版本拿到的不是这个版本时刻的内容。</summary>
+    DateTimeOffset? UnreadableAt = null);
 
 /// <summary>
 /// 从版本索引懒加载目录树（M4 §4.1a，决策 1）：给定目录路径，返回其直接子节点（子目录 + 文件），
@@ -36,7 +40,7 @@ public static class VersionTreeService
                 // 直接子项是文件本身
                 var childPath = prefix.Length == 0 ? entry.Path : $"{prefix}/{rest}";
                 nodes[rest] = new TreeNode(rest, childPath, IsDir: false, HasChildren: false,
-                    entry.Length, entry.Mtime, entry.Storage?.Kind, entry.Storage?.Ref);
+                    entry.Length, entry.Mtime, entry.Storage?.Kind, entry.Storage?.Ref, entry.UnreadableAt);
             }
             else
             {
