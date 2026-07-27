@@ -12,6 +12,7 @@ namespace AzureStorageBackup.Api.Tests;
 public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
     private readonly HttpClient _client = factory.CreateClient();
+    private readonly IServiceProvider _services = factory.Services;
 
     // AccountId 默认 0：不是一个真实账户，调用方必须显式传入 CreateAccountAsync 建出的账户 id
     // （否则从 P2T7 起会被「Account not found.」拦下）。仅当测试确实要断言这条拒绝时才保留 0/999999。
@@ -141,6 +142,38 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created!.Id}")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+    }
+
+    /// <summary>删配置不会停掉后台那次运行。放行的话，它会继续跑、继续占着
+    /// (account, container) 的忙碌锁，而进度状态是按 config id 存的——配置一删就再也查不到，
+    /// 于是同一 container 上新建的备份被"busy"拒掉，状态却显示 BackingUp 且没有任何细节。
+    /// 用户真踩到了这个（还顺带勾了「同时删除 container」，那次运行就一直在往一个已不存在的
+    /// container 上传）。所以正在忙时必须直接拒掉删除。</summary>
+    [Fact]
+    public async Task Delete_Is_Refused_While_An_Operation_Is_Running()
+    {
+        var accountId = await CreateAccountAsync("del-busy");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("del-busy", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var busy = _services.GetRequiredService<BackupBusyTracker>();
+        Assert.True(busy.TryAcquire(accountId, created!.ContainerName, "BackingUp"));
+        try
+        {
+            var refused = await _client.DeleteAsync($"/api/backup-configs/{created.Id}");
+            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+            var body = await refused.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+            Assert.Contains("backing up", body!["error"]);
+            // 配置必须还在：拒绝要是"半拒绝"，比不拒还糟。
+            Assert.Equal(HttpStatusCode.OK, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+        }
+        finally
+        {
+            busy.Release(accountId, created.ContainerName);
+        }
+
+        Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created.Id}")).StatusCode);
     }
 
     // Azurite 的 well-known 账户与密钥（与其它集成测试一致，见 BackupRunEndpointsTests）。

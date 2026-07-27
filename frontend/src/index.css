@@ -272,6 +272,22 @@ tbody tr:hover {
   background: var(--bg-hover);
 }
 
+/* 运行状态（备份/还原/修复）自占一整行，横跨所有列。
+   放在操作列里时，那一列是 white-space: nowrap 的（按钮不许折行），而 white-space 会继承——
+   于是一条几百字符的路径撑成一行，把整张表挤到出屏。这里给它整个表宽去折行。
+   与上一行之间不划线：它讲的是同一个备份的事。 */
+tbody tr.has-ops > td {
+  border-bottom: none;
+}
+tbody tr.ops-row > td {
+  padding-top: 0;
+}
+tbody tr.has-ops:hover,
+tbody tr.has-ops:hover + tr.ops-row,
+tbody tr.ops-row:hover {
+  background: var(--bg-hover);
+}
+
 /* ── Shell ────────────────────────────────────────────────────────────────── */
 .app-shell {
   display: grid;

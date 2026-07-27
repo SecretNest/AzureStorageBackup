@@ -171,6 +171,10 @@ export interface RestoreRun {
   restoredFiles: number | null
   skippedFiles: number | null
   failedFiles: number | null
+  detail: StageProgress | null
+  // 跳过/失败的逐条记录。此前只有 phase 一个单值字段，后一条覆盖前一条，
+  // 跑完只剩最后一条，其余仅体现为 failedFiles 那个数字。
+  events: string[] | null
   error: string | null
   phase: string | null
 }

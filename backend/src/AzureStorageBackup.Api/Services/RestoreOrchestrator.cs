@@ -61,13 +61,17 @@ public sealed class RestoreOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null)
 {
-    public async Task<RestoreResult> RunAsync(RestoreRequest request, CancellationToken ct = default, IProgress<string>? phase = null)
+    /// <param name="onProgress">阶段进度（正在还原哪个包、完成多少组、多快）。此前只有 phase 那条
+    /// 自由文本，且它承载的其实是错误流，说不出"还剩多少"。</param>
+    public async Task<RestoreResult> RunAsync(
+        RestoreRequest request, CancellationToken ct = default, IProgress<string>? phase = null,
+        Action<StageProgress>? onProgress = null)
     {
         var source = $"restore:{request.Account.Id}/{request.Container}";
         await Record(NotificationEvents.RestoreStart, source, $"Restore started: {request.Container}", request.TargetRoot, ct);
         try
         {
-            var result = await RunCoreAsync(request, phase, ct);
+            var result = await RunCoreAsync(request, phase, onProgress, ct);
             await Record(NotificationEvents.RestoreSuccess, source, $"Restore succeeded: {request.Container}",
                 $"Restored {result.RestoredFiles} file(s) to {request.TargetRoot} (version {result.Version})", ct);
             return result;
@@ -87,7 +91,8 @@ public sealed class RestoreOrchestrator(
             await notifier.NotifyAsync(evt, title, body, ct);
     }
 
-    private async Task<RestoreResult> RunCoreAsync(RestoreRequest request, IProgress<string>? phase, CancellationToken ct)
+    private async Task<RestoreResult> RunCoreAsync(
+        RestoreRequest request, IProgress<string>? phase, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         var info = await store.ReadInfoAsync(request.Account, request.Container, request.Password, ct)
             ?? throw new InvalidOperationException("No backup found in container.");
@@ -248,17 +253,24 @@ public sealed class RestoreOrchestrator(
         try
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
+            // 总数只有在分完组之后才知道（同一个 pack 只下一次），所以 tracker 在这里才建得起来。
+            var tracker = onProgress is null ? null : new StageTracker("Restoring", groups.Count, onProgress);
             var tasks = groups.Select(async g =>
             {
-                try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, ct); }
+                try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker, ct); }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
                     phase?.Report($"Group failed ({g.Key}): {ex.Message}");
                     return (Restored: 0, Skipped: 0, Failed: g.Count());
                 }
+                finally
+                {
+                    tracker?.Advance(0); // 计数与在途分开：一个组恰好占一个槽位
+                }
             });
             var counts = await Task.WhenAll(tasks);
+            tracker?.Complete(); // 不强制产出终态，最后一组的字节会被节流压住再也发不出去
             restored += counts.Sum(c => c.Restored);
             skipped += counts.Sum(c => c.Skipped);
             failed += counts.Sum(c => c.Failed);
@@ -282,7 +294,7 @@ public sealed class RestoreOrchestrator(
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
         BlobContainerClient container, RestoreRequest request, string? realRoot, string work,
         List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
-        IProgress<string>? phase, CancellationToken ct)
+        IProgress<string>? phase, StageTracker? tracker, CancellationToken ct)
     {
         var skipped = 0;
         var failedEntries = 0;
@@ -318,6 +330,10 @@ public sealed class RestoreOrchestrator(
         Directory.CreateDirectory(groupDir);
         var restored = 0;
         await gate.WaitAsync(ct);
+        // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
+        // await，若在那之前标记，几千个包会一股脑全算"正在还原"——既与事实不符
+        // （同时只跑 DownloadConcurrency 个），每次快照还要复制一份几千项的数组。
+        tracker?.BeginItem(blobName);
         try
         {
             string firstVolume;
@@ -374,6 +390,8 @@ public sealed class RestoreOrchestrator(
         }
         finally
         {
+            // 先摘在途再放闸门：反过来的话，后一个组已经开始还原，界面上却还挂着上一个组。
+            tracker?.EndItem(blobName, needed.Sum(e => e.Length));
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }

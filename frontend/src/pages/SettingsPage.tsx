@@ -68,7 +68,7 @@ export function SettingsPage() {
       <Field label="Volume size (MB, 0=off)">
         <Num value={s.defaultVolumeBytes ? Math.round(s.defaultVolumeBytes / MB) : 0} onChange={(v) => set('defaultVolumeBytes', v > 0 ? v * MB : null)} />
       </Field>
-      <Field label="Repack: download by tier">
+      <Field label="Repack: download by tier" multi>
         <span className="row" style={{ flexWrap: 'wrap' }}>
           <label><input type="checkbox" checked={s.repackDownloadHot} onChange={(e) => set('repackDownloadHot', e.target.checked)} /> Hot</label>
           <label><input type="checkbox" checked={s.repackDownloadCool} onChange={(e) => set('repackDownloadCool', e.target.checked)} /> Cool</label>
@@ -79,6 +79,12 @@ export function SettingsPage() {
       <Field label="Include symlinks">
         <input type="checkbox" checked={s.defaultIncludeSymlinks} onChange={(e) => set('defaultIncludeSymlinks', e.target.checked)} />
       </Field>
+      {/* 与新建备份表单同一句提示：规则的路径基准是各备份的 Local Root，不是主机上的完整路径。 */}
+      <p className="text-muted">
+        The rule lists below use gitignore syntax and match paths <strong>relative to each backup's local
+        root</strong> — write <span className="mono">/Backup/</span>, not the full host path. A trailing{' '}
+        <span className="mono">/</span> means "this directory and everything under it".
+      </p>
       <Field label="Ignore rules">
         <Rules value={s.defaultIgnoreRules} onChange={(v) => set('defaultIgnoreRules', v)} />
       </Field>

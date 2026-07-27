@@ -7,16 +7,24 @@ public sealed class RestoreRunState
     public RestoreResult? Result { get; set; }
     public string? Error { get; set; }
 
-    /// <summary>当前阶段说明（如「等待活化…」），供前端显示长等待原因。</summary>
+    /// <summary>当前阶段说明（如「等待活化…」），供前端显示长等待原因。最近一条。</summary>
     public string? Phase { get; set; }
+
+    /// <summary>最近若干条事件。Phase 是单值，后一条覆盖前一条——跳过/失败了几十个文件时，
+    /// 跑完只剩最后一条，其余只体现为一个计数。这里把它们留住。</summary>
+    public RecentEvents Events { get; } = new();
+
+    /// <summary>当前阶段在做什么（正在还原哪个包、已完成多少组、多快）。</summary>
+    public StageProgress? Detail { get; set; }
 }
 
 public sealed record RestoreRunResponse(
-    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, int? FailedFiles, string? Error, string? Phase)
+    string Status, int? Version, int? RestoredFiles, int? SkippedFiles, int? FailedFiles, string? Error, string? Phase,
+    StageProgress? Detail = null, IReadOnlyList<string>? Events = null)
 {
     public static RestoreRunResponse From(RestoreRunState s) => new(
         s.Status.ToString(), s.Result?.Version, s.Result?.RestoredFiles, s.Result?.SkippedFiles,
-        s.Result?.FailedFiles, s.Error, s.Phase);
+        s.Result?.FailedFiles, s.Error, s.Phase, s.Detail, s.Events.Snapshot());
 }
 
 /// <summary>
@@ -74,7 +82,13 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
             var settings = await settingsSvc.GetAsync();
 
             // 不占忙碌锁：还原与备份可并行。遇 Archive 自动发起活化并轮询（可长等），完成后重新归档。
-            var progress = new Progress<string>(p => state.Phase = p);
+            // Phase 保留「最近一条」供一行摘要用；同一条同时进环形缓冲，这样跳过/失败的条目
+            // 不会被后一条冲掉——它们恰恰是还原之后最需要逐条看的东西。
+            var progress = new Progress<string>(p =>
+            {
+                state.Phase = p;
+                state.Events.Add(p);
+            });
             state.Result = await orchestrator.RunAsync(new RestoreRequest
             {
                 Account = account,
@@ -87,7 +101,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 SelectedPaths = selectedPaths,
                 Conflict = conflict,
                 RehydratePriority = rehydratePriority,
-            }, ct: default, phase: progress);
+            }, ct: default, phase: progress, onProgress: d => state.Detail = d);
             state.Phase = null;
             state.Status = RunStatus.Completed;
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<RestoreRunner>>());

@@ -155,11 +155,23 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
+
+            // 正在跑操作时不许删。删配置**不会**停掉后台那次运行：它会继续跑完，继续占着
+            // BackupBusyTracker 里 (account, container) 那把锁，而 _runs 是按 config id 存的，
+            // 配置一删，界面就再也找不到它的进度——于是同一个 container 上新建的备份被拒（busy），
+            // 状态却显示 BackingUp 且没有任何细节，像是凭空卡死。若同时勾了「删除 container」，
+            // 那次运行还会继续往一个已经不存在的 container 上传。这些都是用户实际踩到的。
+            var activity = DeriveActivity(config, backupRunner, restoreRunner, repairRunner, busy);
+            if (activity != "Idle")
+                return Results.Conflict(new
+                {
+                    error = $"This backup is currently {Humanize(activity)}. Wait for it to finish before deleting it.",
+                });
 
             // 先于删配置行捕获 account/container：本地缓存/状态按 (accountId, container) 归属，配置行删完就拿不到了。
             var accountId = config.AccountId;
@@ -196,6 +208,16 @@ public static class BackupConfigEndpoints
                 // 删掉的可能正是唯一一条待重设的解不开的密文（备份密码）：不收尾就翻不回 Healthy，
                 // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
                 await recovery.TryCompleteAsync(ct);
+
+                // 审计行写在清理**之后**：DeleteForContainerAsync 会把该 (account, container) 的日志
+                // 全部删掉，写在前面等于自己把自己删了。删除是这里唯一会抹掉历史的操作，
+                // 它本身却不留痕，日志页就会莫名其妙地整个变空——用户报过这个现象。
+                await BestEffort(logger, "record deletion", () => log.AppendAsync(
+                    OperationLogLevel.Warning, $"backup:{container}",
+                    (deleteContainer ?? false)
+                        ? $"Backup config '{config.Name}' deleted, along with its cloud container."
+                        : $"Backup config '{config.Name}' deleted; the cloud container was kept.",
+                    ct, durable: true));
             }
             return ok ? Results.NoContent() : Results.NotFound();
         });
@@ -625,6 +647,10 @@ public static class BackupConfigEndpoints
         // 避免把计划备份/清理一律误标为 Checking。
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
+
+    /// <summary>把 DeriveActivity 的驼峰标签写成一句话里读得通的样子（BackingUp → backing up）。</summary>
+    private static string Humanize(string activity) =>
+        string.Concat(activity.Select((ch, i) => i > 0 && char.IsUpper(ch) ? " " + char.ToLowerInvariant(ch) : $"{char.ToLowerInvariant(ch)}"));
 
     /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。
     /// 取消除外——那不是「这一步失败了」，而是整条请求该停下（与 a3ac967 的孤儿清理同一约定）；
