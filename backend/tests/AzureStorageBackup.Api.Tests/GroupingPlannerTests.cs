@@ -77,4 +77,94 @@ public sealed class GroupingPlannerTests
         Assert.Equal("dir/a.txt", member.EntryName);
         Assert.Equal("p0001", plan.Packs[0].PackId);
     }
+
+    // ---- 跨路径打包（散列分片目录）----
+    //
+    // 用户实测发现的问题：Emby 元数据是 .../library/09/<guid>/poster.jpg 这种结构——目录极多、
+    // 每个目录一两个文件。按目录切分时包数逼近文件数，46,624 个文件产生上万个包，
+    // 每个包一次 7z 进程加一次计费的上传请求，分组打包（合并小文件、减少 blob 数）完全落空。
+
+    /// <summary>命中跨路径规则的文件无视目录边界装箱：四个分处不同目录的小文件应当只成一个包。</summary>
+    [Fact]
+    public void Cross_Dir_Rule_Packs_Across_Directory_Boundaries()
+    {
+        var options = new PlanOptions
+        {
+            CrossDirGroup = new IgnoreRuleSet(["meta/**"]),
+            GroupCapBytes = 10_000,
+        };
+
+        var plan = Plan(
+        [
+            F("meta/09/aaa/poster.jpg", 100),
+            F("meta/09/bbb/poster.jpg", 100),
+            F("meta/1a/ccc/poster.jpg", 100),
+            F("meta/1a/ddd/poster.jpg", 100),
+        ], options);
+
+        var pack = Assert.Single(plan.Packs);
+        Assert.Equal(4, pack.Members.Count);
+        Assert.Empty(plan.Blobs);
+    }
+
+    /// <summary>默认（规则为空）必须与历史行为逐字节一致：仍按目录切分，一个目录一个包。</summary>
+    [Fact]
+    public void Without_The_Rule_Each_Directory_Still_Gets_Its_Own_Pack()
+    {
+        var plan = Plan(
+        [
+            F("meta/09/aaa/poster.jpg", 100),
+            F("meta/09/bbb/poster.jpg", 100),
+        ], new PlanOptions { GroupCapBytes = 10_000 });
+
+        Assert.Equal(2, plan.Packs.Count); // 不同目录 → 两个包，正是要解决的那个形态
+    }
+
+    /// <summary>优先级：不分组 > 跨路径打包。「不分组」说的是"根本不该和别人合并"，
+    /// 不该被跨路径规则翻案。</summary>
+    [Fact]
+    public void Dont_Group_Outranks_Cross_Dir_Grouping()
+    {
+        var options = new PlanOptions
+        {
+            CrossDirGroup = new IgnoreRuleSet(["meta/**"]),
+            DontGroup = new IgnoreRuleSet(["*.iso"]),
+        };
+
+        var plan = Plan([F("meta/a/x.iso", 100), F("meta/b/y.jpg", 100)], options);
+
+        Assert.Equal("meta/a/x.iso", Assert.Single(plan.Blobs).Path); // 不分组胜出
+        Assert.Equal("meta/b/y.jpg", Assert.Single(Assert.Single(plan.Packs).Members).Path);
+    }
+
+    /// <summary>跨路径的包各自带独立的 GroupKey：编排器按它建池，池间并发。
+    /// 若都用同一个键，成千上万个跨目录文件会被塞进同一个串行池里。</summary>
+    [Fact]
+    public void Cross_Dir_Packs_Get_Distinct_Group_Keys_So_They_Stay_Parallel()
+    {
+        var options = new PlanOptions
+        {
+            CrossDirGroup = new IgnoreRuleSet(["meta/**"]),
+            GroupCapBytes = 150, // 每包最多一个文件
+        };
+
+        var plan = Plan([F("meta/a/1.jpg", 100), F("meta/b/2.jpg", 100), F("meta/c/3.jpg", 100)], options);
+
+        Assert.Equal(3, plan.Packs.Count);
+        Assert.Equal(3, plan.Packs.Select(p => p.GroupKey).Distinct().Count());
+    }
+
+    /// <summary>按目录打包时 GroupKey 就是目录，编排器据此把同目录的包归入一个池（历史行为）。</summary>
+    [Fact]
+    public void By_Directory_Packs_Use_The_Directory_As_Group_Key()
+    {
+        var plan = Plan(
+        [
+            F("d/1.txt", 100),
+            F("d/2.txt", 100),
+        ], new PlanOptions { GroupCapBytes = 150 }); // 拆成两个包，但同属一个目录池
+
+        Assert.Equal(2, plan.Packs.Count);
+        Assert.Equal(["d"], plan.Packs.Select(p => p.GroupKey).Distinct());
+    }
 }

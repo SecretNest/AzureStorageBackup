@@ -11,6 +11,9 @@ public sealed record BackupEngineOptions
     public IgnoreRuleSet Ignore { get; init; } = new([]);
     public IgnoreRuleSet? DontCompress { get; init; }
     public IgnoreRuleSet? DontGroup { get; init; }
+
+    /// <summary>命中者允许跨目录装箱（散列分片目录用；空 = 全部按目录打包）。</summary>
+    public IgnoreRuleSet? CrossDirGroup { get; init; }
     public ScanOptions Scan { get; init; } = new();
     public DiffOptions Diff { get; init; } = new();
     public PlanOptions Plan { get; init; } = new();
@@ -228,6 +231,7 @@ public sealed class BackupOrchestrator(
         var plan = planner.Plan(changed, opts.Plan with
         {
             DontGroup = opts.DontGroup,
+            CrossDirGroup = opts.CrossDirGroup,
             FirstPackNumber = NextPackNumber(info.Packs),
         });
 
@@ -633,8 +637,11 @@ public sealed class BackupOrchestrator(
         SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         // 从计划重建每个目录的可分组文件池（顺序不变）；成组/压缩/校验在处理时增量进行。
+        // 按规划器给出的分组键建池，而不是在这里重新按目录切一遍——否则跨路径打包的成员
+        // 会被这一步重新按目录打散，规划器那边的决定就白做了。
+        // 按目录打包时键就是目录（与历史行为一致）；跨路径打包时每个 pack 自成一池。
         var poolByDir = plan.Packs
-            .GroupBy(p => DirectoryOf(p.Members[0].Path), StringComparer.Ordinal)
+            .GroupBy(p => p.GroupKey, StringComparer.Ordinal)
             .Select(g => g.SelectMany(p => p.Members)
                 .Select(m => new PlannedFile(m.Path, m.Length, m.FullHash)).ToList())
             .ToList();
