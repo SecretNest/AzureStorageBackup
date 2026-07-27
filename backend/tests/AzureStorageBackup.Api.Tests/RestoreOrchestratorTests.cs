@@ -1117,4 +1117,57 @@ public sealed class RestoreOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// 覆盖判定要先读一遍目标位置已有的文件，看它是不是已经等于要还原的内容。此前那次读取没有保护，
+    /// 而它抛出后会被**整组**的 catch 接住——同一个 pack 里的其它文件因此一个都还原不了。
+    /// 一个文件的权限问题不该有这么大的爆炸半径：它自己失败即可，同伴照常落地。
+    /// <para>三个小文件同目录 → 同一个 pack。目标位置预先放一个读不开的 b.txt（权限位清零，
+    /// 不是替身抛的假异常）。修复前：整组失败，a 和 c 根本不会出现在目标目录里。</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_Unreadable_Target_File_Does_Not_Sink_Its_Whole_Restore_Group()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rst-unread-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        var blocked = Path.Combine(_dst, "d", "b.txt");
+
+        try
+        {
+            WriteSrc("d/a.txt", "alpha");
+            WriteSrc("d/b.txt", "bravo");
+            WriteSrc("d/c.txt", "charlie");
+            await backup.RunAsync(BackupReq(account, name)); // 默认阈值 5MB → 三个小文件同成一个 pack
+
+            // 目标位置已有一个同名文件，且读不开——覆盖判定第一步就撞上它。
+            Directory.CreateDirectory(Path.GetDirectoryName(blocked)!);
+            await File.WriteAllTextAsync(blocked, "pre-existing and unreadable");
+            File.SetUnixFileMode(blocked, UnixFileMode.None);
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+
+            // 同伴照常落地——修复前这两个文件连碰都碰不到。
+            Assert.Equal("alpha", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "a.txt")));
+            Assert.Equal("charlie", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "c.txt")));
+            Assert.Equal(2, result.RestoredFiles);
+
+            // 读不开的那个自己失败，恰好一个——不是整组三个。
+            Assert.Equal(1, result.FailedFiles);
+        }
+        finally
+        {
+            try { File.SetUnixFileMode(blocked, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { /* best effort */ }
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }

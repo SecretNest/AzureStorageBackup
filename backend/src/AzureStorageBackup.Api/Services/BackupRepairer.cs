@@ -183,7 +183,7 @@ public sealed class BackupRepairer(
             // 合法引用仍可继续尝试；一条都不可用时照常走「标记不可恢复」。
             if (!PathBoundary.IsWithin(localRoot, local))
                 continue;
-            if (File.Exists(local) && fullHash is not null && await hasher.FullHashAsync(local, ct) == fullHash)
+            if (await LocalMatchesAsync(local, fullHash, ct))
             {
                 localSource = local;
                 sourcePath = e.Path;
@@ -281,7 +281,7 @@ public sealed class BackupRepairer(
                         MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
                     continue;
                 }
-                if (File.Exists(local) && m.Hash is not null && await hasher.FullHashAsync(local, ct) == m.Hash)
+                if (await LocalMatchesAsync(local, m.Hash, ct))
                 {
                     var dest = Path.Combine(composeDir, entryName.Replace('/', Path.DirectorySeparatorChar));
                     Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
@@ -360,6 +360,32 @@ public sealed class BackupRepairer(
         finally
         {
             try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    /// <summary>
+    /// 本地这份文件能不能当修复源：存在、且内容 hash 与云端记录一致。
+    /// <para>
+    /// 读不开（被占用/权限收回/介质读错误）一律当作**不能**——拿不到内容就不能拿它去覆盖云端。
+    /// 这层保护不能省：修复恰恰是在检查报出问题之后跑的，本地有文件读不开的概率本就不低
+    /// （检查器现在会把这类文件报成 Missing，用户看完报告就来点修复）。而且外层逐个 blob 的循环
+    /// 没有兜底，一处抛出就让**整个修复操作**中途失败——此时已修好的 blob 早已上传，
+    /// 但它们的索引改动统一在循环之后才写回，于是那部分成果一并丢失。
+    /// </para>
+    /// 返回 false 时调用方走既有的两条路：单文件路径继续试同内容的其它引用，
+    /// 分组路径直接把该成员标记为不可恢复——与"本地没有这个文件"完全同一处置。
+    /// </summary>
+    private async Task<bool> LocalMatchesAsync(string local, string? expectedHash, CancellationToken ct)
+    {
+        if (expectedHash is null || !File.Exists(local))
+            return false;
+        try
+        {
+            return await hasher.FullHashAsync(local, ct) == expectedHash;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
         }
     }
 
