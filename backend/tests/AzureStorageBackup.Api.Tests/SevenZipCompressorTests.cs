@@ -98,4 +98,78 @@ public sealed class SevenZipCompressorTests : IDisposable
         var bad = Path.Combine(_dir, "bad");
         await Assert.ThrowsAnyAsync<Exception>(() => compressor.ExtractAsync(result.VolumeFiles[0], bad, password: null));
     }
+
+    /// <summary>7z 对读不了的成员只报**警告**：退出码 1、把成员静默丢掉、仍产出一个完全有效的归档。
+    /// 只看退出码（此前只有 >= 2 才算失败）就会让一个缺成员的包被当成正常产物上传，而索引声称该成员
+    /// 在里面——只有还原或深度检查时才暴露。压缩器必须自己验收归档的实际内容。</summary>
+    [SkippableFact]
+    public async Task Reports_A_Member_The_Archiver_Silently_Dropped()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+        var compressor = Compressor();
+        var src = SourceDir();
+        WriteInto(src, "readable.txt", Encoding.UTF8.GetBytes("fine"));
+        var locked = WriteInto(src, "locked.txt", Encoding.UTF8.GetBytes("cannot be read"));
+        WriteInto(src, "other.txt", Encoding.UTF8.GetBytes("also fine"));
+        File.SetUnixFileMode(locked, UnixFileMode.None); // 真实权限拒绝，不是替身抛的假异常
+
+        try
+        {
+            var archive = Path.Combine(_dir, "dropped.7z");
+            var ex = await Assert.ThrowsAsync<ArchiveMembersMissingException>(() =>
+                compressor.CompressAsync(new CompressionRequest(
+                    src, ["readable.txt", "locked.txt", "other.txt"], archive)));
+
+            // 只报真正缺席的那一个：读得到的成员不能被牵连（否则整组都会被无谓地重压/降级）。
+            Assert.Equal(["locked.txt"], ex.MissingEntries);
+
+            // 那个残缺归档不该留在磁盘上：它不可用，留着只会占空间并可能被误当成产物。
+            Assert.False(File.Exists(archive));
+        }
+        finally { File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
+    }
+
+    /// <summary>最坏情形，同样由真实探针确认：**所有**成员都读不了时 7z 依旧退出 1，
+    /// 并产出一个有效的空归档。没有验收的话，上传的就是一个"看起来正常"的空包。</summary>
+    [SkippableFact]
+    public async Task Reports_Every_Member_When_The_Archive_Comes_Out_Empty()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+        var compressor = Compressor();
+        var src = SourceDir();
+        var a = WriteInto(src, "a.txt", Encoding.UTF8.GetBytes("aaa"));
+        var b = WriteInto(src, "b.txt", Encoding.UTF8.GetBytes("bbb"));
+        File.SetUnixFileMode(a, UnixFileMode.None);
+        File.SetUnixFileMode(b, UnixFileMode.None);
+
+        try
+        {
+            var ex = await Assert.ThrowsAsync<ArchiveMembersMissingException>(() =>
+                compressor.CompressAsync(new CompressionRequest(src, ["a.txt", "b.txt"], Path.Combine(_dir, "empty.7z"))));
+
+            Assert.Equal(["a.txt", "b.txt"], ex.MissingEntries.OrderBy(m => m, StringComparer.Ordinal));
+        }
+        finally
+        {
+            File.SetUnixFileMode(a, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            File.SetUnixFileMode(b, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    /// <summary>加密备份用 -mhe=on（连头都加密），不给密码连条目名都列不出来。验收逻辑必须把密码
+    /// 一并传给 `l`，否则加密备份要么永远验收失败、要么在 7z 等待密码输入时卡住。</summary>
+    [SkippableFact]
+    public async Task Accepts_A_Complete_Encrypted_Archive_Without_False_Alarm()
+    {
+        var compressor = Compressor();
+        var src = SourceDir();
+        WriteInto(src, "s1.txt", Encoding.UTF8.GetBytes("one"));
+        WriteInto(src, "s2.txt", Encoding.UTF8.GetBytes("two"));
+
+        var archive = Path.Combine(_dir, "enc-ok.7z");
+        var result = await compressor.CompressAsync(
+            new CompressionRequest(src, ["s1.txt", "s2.txt"], archive, Password: "pw"));
+
+        Assert.Single(result.VolumeFiles); // 齐全的加密归档照常产出，不被误判为缺成员
+    }
 }

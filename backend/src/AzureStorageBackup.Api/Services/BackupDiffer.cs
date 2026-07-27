@@ -93,6 +93,24 @@ public sealed class BackupDiffer(IFileHasher hasher)
             }
         }
 
+        // 扫描阶段就读不出来的路径，必须在"判删除"之前登记进 seen。
+        // 一个列不出内容的目录，其下**整棵子树**都没能被扫到——若不登记，接下来那段循环会把
+        // 这些既有条目一个不剩地判成删除，等于因为一次权限故障就把整棵子树从索引里抹掉，
+        // 直到还原时才发现文件没了。读不开 ≠ 删除，这里是这条原则最要紧的一处。
+        foreach (var u in current.Unreadable)
+        {
+            foreach (var prev in PreviousEntriesUnder(prevByPath, u))
+            {
+                if (seen.Add(prev.Path))
+                    changes.Add(new FileChange(prev.Path, ChangeKind.Unreadable, null, prev, null, null, null, u.Reason));
+            }
+
+            // 读不开的**文件**即使上一版本没有（全新且从头就读不开），也要记一条：
+            // 没有内容可指向、索引里不会有它，但操作员必须知道它本轮没被备份。
+            if (!u.IsDirectory && !prevByPath.ContainsKey(u.Path) && seen.Add(u.Path))
+                changes.Add(new FileChange(u.Path, ChangeKind.Unreadable, null, null, null, null, null, u.Reason));
+        }
+
         foreach (var prev in prevByPath.Values)
         {
             if (!seen.Contains(prev.Path))
@@ -100,6 +118,21 @@ public sealed class BackupDiffer(IFileHasher hasher)
         }
 
         return new DiffResult(changes, changedFiles, changedBytes);
+    }
+
+    /// <summary>某个读不出来的路径覆盖到的上一版本条目：目录取其整棵子树，文件取它自己。</summary>
+    private static IEnumerable<IndexEntry> PreviousEntriesUnder(
+        Dictionary<string, IndexEntry> prevByPath, UnreadablePath unreadable)
+    {
+        if (!unreadable.IsDirectory)
+            return prevByPath.TryGetValue(unreadable.Path, out var one) ? [one] : [];
+
+        // 根自身读不开时 Path 为 "."（GetRelativePath 对根给出的结果），此时整份索引都在其下。
+        if (unreadable.Path is "" or ".")
+            return prevByPath.Values;
+
+        var prefix = unreadable.Path + "/";
+        return prevByPath.Values.Where(e => e.Path.StartsWith(prefix, StringComparison.Ordinal));
     }
 
     private async Task<FileChange> CompareAsync(

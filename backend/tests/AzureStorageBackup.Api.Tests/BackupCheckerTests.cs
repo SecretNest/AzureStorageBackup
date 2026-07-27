@@ -161,6 +161,52 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>本地文件存在却读不出来时，整轮检查此前会崩掉——而"有文件读不开"恰恰是最需要跑检查
+    /// 的时候：备份刚跳过了它，操作员正想知道云端那份还在不在。读不开一律当 Missing（本地拿不出
+    /// 可用副本，也不能当修复来源），与"越界""文件不在"的既有处置一致，且检查必须跑完。</summary>
+    [SkippableFact]
+    public async Task An_Unreadable_Local_File_Is_Missing_Rather_Than_Failing_The_Check()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkunread-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        var locked = Path.Combine(_src, "locked.txt");
+
+        try
+        {
+            await File.WriteAllTextAsync(locked, "readable at backup time");
+            await File.WriteAllTextAsync(Path.Combine(_src, "plain.txt"), "stays readable");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            File.SetUnixFileMode(locked, UnixFileMode.None); // 备份之后才读不开
+
+            var report = await checker.CheckAsync(
+                account, name, null, null,
+                new CheckOptions { Cloud = CloudCheckLevel.None, Local = LocalCheckLevel.Content }, _src);
+
+            var f = report.Findings.Single(x => x.Path == "locked.txt");
+            Assert.Equal(LocalState.Missing, f.Local); // 读不开 == 本地拿不出可用副本
+            Assert.False(f.Repairable);                 // 更不能拿它去"修复"云端
+
+            // 关键：检查跑完了，同一轮里其余文件照常得到结论。
+            Assert.Equal(LocalState.Ok, report.Findings.Single(x => x.Path == "plain.txt").Local);
+        }
+        finally
+        {
+            try { File.SetUnixFileMode(locked, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { /* best effort */ }
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
     [SkippableFact]
     public async Task Repair_From_Local_Fixes_Broken_Blob()
     {

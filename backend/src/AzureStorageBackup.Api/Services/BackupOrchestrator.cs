@@ -206,7 +206,7 @@ public sealed class BackupOrchestrator(
         // 读不开的文件既不算变更也不算删除，索引阶段会静默沿用旧条目——但操作员必须被告知。
         // 放在 Plan 之前、diff 之后：这条路径每一轮都会执行，不依赖"是否有变更文件"这个后续分支，
         // 否则一次全程读不开的备份会一条告警都不产生（信号最弱的最坏情形）。
-        await RecordUnreadableWarningsAsync(request, diff, ct);
+        await RecordUnreadableWarningsAsync(request, scan, diff, ct);
 
         // 4. Plan（对 Added/Modified 决定 blob/pack）
         var changed = diff.Changes
@@ -251,7 +251,7 @@ public sealed class BackupOrchestrator(
         {
             Version = version,
             Entries = entries,
-            EmptyDirs = scan.EmptyDirs.ToList(),
+            EmptyDirs = CarryEmptyDirs(scan, previous),
         };
 
         // 7. WriteIndex（先上传第二级索引）
@@ -298,13 +298,57 @@ public sealed class BackupOrchestrator(
     /// （被占用/权限不足/设备读错误需要不同处理，压成一句「无法读取」等于让操作员无从下手）。
     /// 复用 UnrecoverableError 事件——与"处理中反复变化"共用同一条推送通道（唯一 push 通道是通知 webhook，
     /// 操作日志是 pull-only，单用户无人值守场景下不推送等于没人知道），落地日志级别随之变为 Error（决策：可接受）。
-    /// 同一文件连续多轮仍读不开时，每轮都要再报一次——静默会让操作员误以为问题自己好了（决策 8）。</summary>
-    private async Task RecordUnreadableWarningsAsync(BackupRequest request, DiffResult diff, CancellationToken ct)
+    /// 同一文件连续多轮仍读不开时，每轮都要再报一次——静默会让操作员误以为问题自己好了（决策 8）。
+    /// <para>
+    /// 读不开的**目录**只推一条汇总：其下每个条目都推一条的话，一个五千文件的目录就是五千条 webhook，
+    /// 既是通知风暴，也会让备份卡在推送上（每条都要过 _recordGate 并等一次 HTTP）。
+    /// 操作员需要知道的是"这个目录整个读不到，影响了 N 个文件"，而不是五千条一模一样的原因。
+    /// </para></summary>
+    private async Task RecordUnreadableWarningsAsync(
+        BackupRequest request, ScanResult scan, DiffResult diff, CancellationToken ct)
     {
         var source = $"backup:{request.Account.Id}/{request.Container}";
+        var unreadableDirs = scan.Unreadable.Where(u => u.IsDirectory).ToList();
+
+        foreach (var dir in unreadableDirs)
+        {
+            var affected = diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable && IsUnder(dir.Path, c.Path));
+            await Record(NotificationEvents.UnrecoverableError, source,
+                $"Directory unreadable, skipped: {dir.Path}",
+                $"{affected} entr{(affected == 1 ? "y" : "ies")} carried forward from the previous version. {dir.Reason}", ct);
+        }
+
         foreach (var c in diff.Changes.Where(c => c.Kind == ChangeKind.Unreadable))
+        {
+            if (unreadableDirs.Any(d => IsUnder(d.Path, c.Path)))
+                continue; // 已被上面的目录汇总覆盖
             await Record(NotificationEvents.UnrecoverableError, source,
                 $"File unreadable, skipped: {c.Path}", c.UnreadableReason ?? "", ct);
+        }
+    }
+
+    /// <summary>path 是否位于 dir 之下。dir 为根（"" 或 "."）时覆盖全部。</summary>
+    private static bool IsUnder(string dir, string path) =>
+        dir is "" or "." || path.StartsWith(dir + "/", StringComparison.Ordinal);
+
+    /// <summary>新版本的空目录列表。读不开的目录本轮列不出内容，它自己和它下面的空目录都不会出现在
+    /// 本次扫描里——直接用扫描结果会让这些目录在还原后凭空消失，所以要把上一版本里位于
+    /// 读不开目录之下的项原样带过来。</summary>
+    private static List<string> CarryEmptyDirs(ScanResult scan, VersionIndex? previous)
+    {
+        var dirs = new List<string>(scan.EmptyDirs);
+        var unreadableDirs = scan.Unreadable.Where(u => u.IsDirectory).ToList();
+        if (unreadableDirs.Count == 0 || previous is null)
+            return dirs;
+
+        var known = new HashSet<string>(dirs, StringComparer.Ordinal);
+        foreach (var d in previous.EmptyDirs)
+        {
+            if (unreadableDirs.Any(u => IsUnder(u.Path, d)) && known.Add(d))
+                dirs.Add(d);
+        }
+        dirs.Sort(StringComparer.Ordinal);
+        return dirs;
     }
 
     /// <summary>diff 之后（压缩/上传阶段重新打开源文件时）才发现读不开：与 diff 时读不开复用完全相同的
@@ -449,13 +493,15 @@ public sealed class BackupOrchestrator(
         // 若干个"文件不可读、沿用旧条目"，整轮备份照常报告成功——操作员看到的是"Backup succeeded,
         // 0 changed files"，而实际上什么都没传上去。因此 filter 里再探一次源文件：真读不开才降级，
         // 读得开就让异常照常向上抛，让整轮备份响亮地失败。
-        catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath))
+        // ArchiveMembersMissingException 是例外，不需要探测：它只在 7z 把这个文件丢出归档时抛出，
+        // 已经是"本轮没能把这个文件存下来"的确证，而且抛在上传之前，云端不会留下空归档。
+        catch (Exception ex) when (ex is ArchiveMembersMissingException
+            || ((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
         {
             // diff 时可读、随后（压缩打包/原样直传重新打开源文件时）才读不开：与 diff 阶段读不开同等
             // 处置——不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
             // 只记一条复用既有通道的告警，绝不能让这一个文件拖垮整轮备份。
-            postDiffUnreadable[file.Path] = ex.Message;
-            await RecordPostDiffUnreadableAsync(request, file.Path, ex.Message, ct);
+            await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
             onItem();
             return;
         }
@@ -486,8 +532,7 @@ public sealed class BackupOrchestrator(
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                postDiffUnreadable[file.Path] = ex.Message;
-                await RecordPostDiffUnreadableAsync(request, file.Path, ex.Message, ct);
+                await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
                 onItem();
                 return;
             }
@@ -609,13 +654,24 @@ public sealed class BackupOrchestrator(
             var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash, f.Length)).ToList();
 
-            // 无 verifier：直接压缩上传，不做成员重校验。
+            // 无 verifier：直接压缩上传，不做成员重校验。7z 丢成员的验收仍然要做——
+            // 没有重校验兜底时，这条路径是唯一能发现"包里少了人"的地方。
             if (verifier is null)
             {
-                var staged0 = await CompressPackAsync(request, packId, members, ct);
-                var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
-                RecordPack(request, packId, members, vols0, info, storageByPath);
-                foreach (var m in members) await LogFileAsync(request, m.Path, ct);
+                var (staged0, missing0) = await CompressPackTolerantAsync(request, packId, members, ct);
+                var kept0 = members.Where(m => !missing0.Contains(m.EntryName)).ToList();
+                if (staged0 is not null && kept0.Count > 0)
+                {
+                    var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, ct);
+                    RecordPack(request, packId, kept0, vols0, info, storageByPath);
+                    foreach (var m in kept0) await LogFileAsync(request, m.Path, ct);
+                }
+                else if (staged0 is not null)
+                {
+                    staging.Release(staged0);
+                }
+                foreach (var m in members.Where(m => missing0.Contains(m.EntryName)))
+                    await MarkPostDiffUnreadableAsync(request, m.Path, ArchiverDroppedReason, postDiffUnreadable, ct);
                 onItem();
                 continue;
             }
@@ -625,12 +681,19 @@ public sealed class BackupOrchestrator(
             // 所修完全相同的形状上。不另起机制：读不到就把快照记成 null，交给下面既有的"排除成员"
             // 路径处理（与"内容在压缩期间变了"同一条路：排除出归档 → 重取新内容 → 仍读不开则降级）。
             var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-            var staged = await CompressPackAsync(request, packId, members, ct);
+            var (staged, missing) = await CompressPackTolerantAsync(request, packId, members, ct);
+
+            // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
+            // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
+            // 于是一个缺成员的 pack 就被原样上传，索引却声称它在里面。
+            var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
 
             // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
-            var changed = new List<PackEntry>();
             foreach (var m in members)
             {
+                if (missing.Contains(m.EntryName))
+                    continue;
+
                 var local = Local(request, m.Path);
                 bool exclude;
                 try
@@ -650,7 +713,7 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                var vols = await UploadStagedPackAsync(request, packId, staged, uploadGate, ct);
+                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadGate, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem();
@@ -658,7 +721,9 @@ public sealed class BackupOrchestrator(
             }
 
             // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
-            staging.Release(staged);
+            // staged 为 null 只可能是整组成员都被 7z 丢掉（连空归档都没留下），此时无物可释放。
+            if (staged is not null)
+                staging.Release(staged);
             var stable = members.Where(m => !changed.Contains(m)).ToList();
             if (stable.Count > 0)
             {
@@ -693,8 +758,7 @@ public sealed class BackupOrchestrator(
                     // 就地按"读不开"降级：不产生任何 blob、不进入任何 pack，索引沿用旧条目或整条缺席。
                     // 全目录一起读不开时，这一步保证第一个撞上的成员不会让同目录其余成员失去被处理的机会。
                     // 不在此处调用 onItem()：这一组的槽位已经在上面统一上报过一次，这里再报会双计。
-                    postDiffUnreadable[m.Path] = ex.Message;
-                    await RecordPostDiffUnreadableAsync(request, m.Path, ex.Message, ct);
+                    await MarkPostDiffUnreadableAsync(request, m.Path, ex.Message, postDiffUnreadable, ct);
                     continue;
                 }
 
@@ -718,6 +782,51 @@ public sealed class BackupOrchestrator(
                 }
             }
         }
+    }
+
+    /// <summary>操作员看到的原因：7z 对读不了的成员只报警告并把它丢掉，没有给出任何系统级消息，
+    /// 所以这里只能给出我们自己的判定。</summary>
+    private const string ArchiverDroppedReason =
+        "The archiver could not read this file, so it was left out of the archive.";
+
+    /// <summary>
+    /// 压缩一组成员，容忍 7z 静默丢弃读不了的成员：把被丢掉的剔除后重压，直到归档与成员集一致
+    /// 或成员耗尽。返回归档（整组都读不了时为 null）与被丢掉的条目名。
+    /// 不让 <see cref="ArchiveMembersMissingException"/> 直接冒出去——在本模块的既定语义里，
+    /// 一个读不了的成员是"排除该成员"，不是"整轮备份失败"。
+    /// </summary>
+    private async Task<(StagedItem? Staged, IReadOnlySet<string> Missing)> CompressPackTolerantAsync(
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, CancellationToken ct)
+    {
+        var remaining = members.ToList();
+        var missing = new HashSet<string>(StringComparer.Ordinal);
+
+        while (remaining.Count > 0)
+        {
+            try
+            {
+                return (await CompressPackAsync(request, packId, remaining, ct), missing);
+            }
+            catch (ArchiveMembersMissingException ex)
+            {
+                var dropped = new HashSet<string>(ex.MissingEntries, StringComparer.Ordinal);
+                // 一个成员都剔不掉，说明报回来的名字与成员名对不上（不该发生）。继续循环就是死循环，
+                // 与其无声打转，不如让它响亮地失败。
+                if (remaining.RemoveAll(m => dropped.Contains(m.EntryName)) == 0)
+                    throw;
+                missing.UnionWith(dropped);
+            }
+        }
+        return (null, missing);
+    }
+
+    /// <summary>按"本轮没能把这个文件存下来"降级：索引据此沿用旧条目或整条缺席，并推一条告警。</summary>
+    private async Task MarkPostDiffUnreadableAsync(
+        BackupRequest request, string path, string reason,
+        ConcurrentDictionary<string, string> postDiffUnreadable, CancellationToken ct)
+    {
+        postDiffUnreadable[path] = reason;
+        await RecordPostDiffUnreadableAsync(request, path, reason, ct);
     }
 
     private Task<StagedItem> CompressPackAsync(
@@ -851,19 +960,22 @@ public sealed class BackupOrchestrator(
         var entries = new List<IndexEntry>();
         foreach (var c in diff.Changes)
         {
-            if (c.Kind == ChangeKind.Deleted || c.Current is null)
-                continue;
-
             // 读不开：沿用上一版本条目（含 Storage，因此不重传任何内容、不影响去重），
             // 仅追加 UnreadableAt。上一版本没有该文件时整条跳过——没有内容可指向。
             // diff 时读得开、但压缩/上传阶段重新打开时才读不开（postDiffUnreadable）走完全相同的处置：
             // 对索引而言，"这一轮没能把内容存下来"是同一件事，不该另起一套判断。
+            // 这一段必须排在 Current is null 之前：目录读不开时派生出来的条目**没有** Current
+            // （整棵子树压根没被扫到），排在后面就会被当作"无当前状态"直接跳过，
+            // 于是那些条目从新索引里消失——正是本轮要修的静默数据丢失。
             if (c.Kind == ChangeKind.Unreadable || postDiffUnreadable.ContainsKey(c.Path))
             {
                 if (c.Previous is not null)
                     entries.Add(c.Previous with { UnreadableAt = DateTimeOffset.UtcNow });
                 continue;
             }
+
+            if (c.Kind == ChangeKind.Deleted || c.Current is null)
+                continue;
 
             var ov = overrides.GetValueOrDefault(c.Path);
             entries.Add(new IndexEntry

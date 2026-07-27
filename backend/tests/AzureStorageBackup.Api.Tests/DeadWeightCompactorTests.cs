@@ -298,6 +298,63 @@ public sealed class DeadWeightCompactorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>压缩那一瞬锁住 compose 目录里的某个成员：7z 读不到它、静默丢掉、仍产出有效归档。</summary>
+    private sealed class LockMemberDuringCompressCompressor(IFileCompressor inner, string entryName) : IFileCompressor
+    {
+        public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var full = Path.Combine(request.SourceDirectory, entryName);
+            var lockIt = File.Exists(full);
+            if (lockIt)
+                File.SetUnixFileMode(full, UnixFileMode.None);
+            try
+            {
+                return await inner.CompressAsync(request, ct);
+            }
+            finally
+            {
+                if (lockIt)
+                    File.SetUnixFileMode(full, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+    }
+
+    /// <summary>重打包是**覆盖式**的（ReplaceAsync 直接改写 packs/p0001.7z），所以 7z 在这条路径上
+    /// 丢掉一个成员的后果比备份时严重得多：那个成员仍被有效版本引用，旧 pack 一旦被缺它的新 pack
+    /// 覆盖，数据就永久没了，而索引照旧声称它在里面。压缩器验收归档内容之后，这一轮压实会失败并
+    /// 被逐 pack 的兜底接住——宁可放弃一次空间优化，也不能覆盖出一个缺成员的包。</summary>
+    [SkippableFact]
+    public async Task Recompact_Never_Overwrites_A_Good_Pack_With_One_Missing_A_Member()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        Skip.If(OperatingSystem.IsWindows(), "Relies on Unix permission bits.");
+
+        var name = RandomName("dwc-dropped-");
+        var (info, live, container, account) = await SetupAsync(name);
+        try
+        {
+            Write(_local, "b.txt", new string('b', 2000));
+            Write(_local, "c.txt", new string('c', 2000));
+
+            var compactor = new DeadWeightCompactor(
+                new BlobUploader(new BlobClientFactory(TestSecrets.Reader)),
+                new LockMemberDuringCompressCompressor(new SevenZipCompressor(), "b.txt"),
+                new FileHasher(), Path.Combine(_temp, "compact-dropped"));
+
+            await compactor.CompactAsync(account, container, null, info, live,
+                AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
+
+            // 旧 pack 原封不动：修复前这里会变成只剩 c.txt——b.txt 仍被引用却已从云端消失。
+            Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container));
+            Assert.Equal(3, info.Packs["p0001"].Members.Count); // 本次压实放弃，成员表不变
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     // ReplaceAsync：覆盖上传新卷（倒序，.001 最后作提交标记）+ 删除残留旧卷（新卷数 < 旧卷数的尾部）。
     [SkippableFact]
     public async Task ReplaceAsync_Overwrites_New_Deletes_Residual_And_Uploads_First_Volume_Last()
