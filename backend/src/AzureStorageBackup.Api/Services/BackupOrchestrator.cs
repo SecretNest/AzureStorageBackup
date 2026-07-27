@@ -287,17 +287,17 @@ public sealed class BackupOrchestrator(
             diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable));
     }
 
-    /// <summary>每个读不开的文件各记一条 Warning：源头一致沿用备份来源，消息保留系统给出的原因原文
+    /// <summary>每个读不开的文件各走一次 Record：源头一致沿用备份来源，消息保留系统给出的原因原文
     /// （被占用/权限不足/设备读错误需要不同处理，压成一句「无法读取」等于让操作员无从下手）。
+    /// 复用 UnrecoverableError 事件——与"处理中反复变化"共用同一条推送通道（唯一 push 通道是通知 webhook，
+    /// 操作日志是 pull-only，单用户无人值守场景下不推送等于没人知道），落地日志级别随之变为 Error（决策：可接受）。
     /// 同一文件连续多轮仍读不开时，每轮都要再报一次——静默会让操作员误以为问题自己好了（决策 8）。</summary>
     private async Task RecordUnreadableWarningsAsync(BackupRequest request, DiffResult diff, CancellationToken ct)
     {
-        if (opLog is null)
-            return;
         var source = $"backup:{request.Account.Id}/{request.Container}";
         foreach (var c in diff.Changes.Where(c => c.Kind == ChangeKind.Unreadable))
-            await opLog.AppendAsync(OperationLogLevel.Warning, source,
-                $"File unreadable, skipped: {c.Path} — {c.UnreadableReason}", ct, durable: true);
+            await Record(NotificationEvents.UnrecoverableError, source,
+                $"File unreadable, skipped: {c.Path}", c.UnreadableReason ?? "", ct);
     }
 
     private async Task UploadBlobsAsync(

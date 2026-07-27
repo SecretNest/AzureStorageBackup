@@ -6,8 +6,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 一个文件读不开不该悄无声息——操作员必须在操作日志里看到警告，且知道系统给出的原因原文
+/// 一个文件读不开不该悄无声息——操作员必须在操作日志里看到记录，且知道系统给出的原因原文
 /// （"被占用"「权限不足」「设备读错误」各自需要不同处理，压成一句「无法读取」等于没告诉操作员任何事）。
+/// 操作日志是 pull-only，单用户无人值守部署下没人会主动去看；因此还须复用 UnrecoverableError 通知事件
+/// 推送出去——这是本文件要覆盖的实际修复点，日志级别也随该事件映射为 Error（不再是 Warning）。
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadableWarningTests : IDisposable
@@ -91,9 +93,20 @@ public sealed class UnreadableWarningTests : IDisposable
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
+    /// <summary>捕获 NotifyAsync 调用（事件/标题/正文），供断言"读不开的文件推送了通知"。</summary>
+    private sealed class CapturingNotifier : INotifier
+    {
+        public List<(NotificationEvents Event, string Title, string Body)> Notifications { get; } = [];
+        public Task NotifyAsync(NotificationEvents evt, string title, string body, CancellationToken ct = default)
+        {
+            lock (Notifications) Notifications.Add((evt, title, body));
+            return Task.CompletedTask;
+        }
+    }
+
     /// <summary>构造一个可运行的编排器；differ 缺省时用真实 hasher，传入自定义 differ 可模拟某文件读不开。</summary>
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
-        BackupDiffer? differ = null, IOperationLog? opLog = null)
+        BackupDiffer? differ = null, IOperationLog? opLog = null, INotifier? notifier = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -103,7 +116,8 @@ public sealed class UnreadableWarningTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), differ ?? new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: opLog);
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+            notifier: notifier, opLog: opLog);
         return (orchestrator, store, factory);
     }
 
@@ -118,7 +132,7 @@ public sealed class UnreadableWarningTests : IDisposable
     };
 
     [SkippableFact]
-    public async Task Each_Unreadable_File_Produces_One_Warning_Carrying_The_System_Reason()
+    public async Task Each_Unreadable_File_Produces_One_Log_Entry_Carrying_The_System_Reason()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -140,10 +154,43 @@ public sealed class UnreadableWarningTests : IDisposable
             await orchestrator.RunAsync(Request(account, name));
 
             var expectedSource = $"backup:{account.Id}/{name}";
-            var warning = Assert.Single(log.Entries, e => e.Level == OperationLogLevel.Warning);
-            Assert.Equal(expectedSource, warning.Source);
-            Assert.Contains("locked.mdf", warning.Message);
-            Assert.Contains(reason, warning.Message); // 原因原文必须原样保留，不能被压成一句「无法读取」
+            // 复用 UnrecoverableError 事件后，日志级别随事件映射变为 Error（不再是 Warning）——这是有意的
+            // 结果：读不开的文件现在与"处理中反复变化"同级上报。
+            var entry = Assert.Single(log.Entries, e => e.Level == OperationLogLevel.Error);
+            Assert.Equal(expectedSource, entry.Source);
+            Assert.Contains("locked.mdf", entry.Message);
+            Assert.Contains(reason, entry.Message); // 原因原文必须原样保留，不能被压成一句「无法读取」
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>本次修复的核心断言：读不开的文件不再只落进 pull-only 的操作日志，还须走通知 webhook 推送出去
+    /// （复用既有 UnrecoverableError 事件，无需新增开关）——否则无人值守部署下永远没人知道。</summary>
+    [SkippableFact]
+    public async Task Each_Unreadable_File_Raises_An_UnrecoverableError_Notification()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var notifier = new CapturingNotifier();
+        const string reason = "The process cannot access the file 'locked.mdf' because it is being used by another process.";
+        var differ = new BackupDiffer(new ThrowingHasher("locked.mdf", new IOException(reason)));
+        var (orchestrator, _, factory) = Build(differ, notifier: notifier);
+        var account = AzuriteAccount();
+        var name = RandomName("unreadnotify-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("locked.mdf", "database content");
+            WriteText("plain.txt", "ordinary file");
+
+            await orchestrator.RunAsync(Request(account, name));
+
+            var notification = Assert.Single(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError);
+            Assert.Contains("locked.mdf", notification.Title);
+            Assert.Contains(reason, notification.Body); // 原因原文必须一并推送，不能被压平
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -178,7 +225,7 @@ public sealed class UnreadableWarningTests : IDisposable
     /// <summary>决策 8：长期被占用的文件每轮都告警。这是有意的——它确实没被备起来。
     /// 若第二轮静默，操作员会以为问题自己好了。</summary>
     [SkippableFact]
-    public async Task Two_Consecutive_Runs_Each_Warn_About_The_Same_File()
+    public async Task Two_Consecutive_Runs_Each_Report_About_The_Same_File()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -204,7 +251,7 @@ public sealed class UnreadableWarningTests : IDisposable
             Assert.Equal(1, r1.UnreadableFiles);
             Assert.Equal(1, r2.UnreadableFiles);
 
-            var warnings = log.Entries.Where(e => e.Level == OperationLogLevel.Warning && e.Message.Contains("locked.mdf")).ToList();
+            var warnings = log.Entries.Where(e => e.Level == OperationLogLevel.Error && e.Message.Contains("locked.mdf")).ToList();
             Assert.Equal(2, warnings.Count); // 两轮各一条，长期占用不能只报一次就沉默
         }
         finally { await container.DeleteIfExistsAsync(); }
