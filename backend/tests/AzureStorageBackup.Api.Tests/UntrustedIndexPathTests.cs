@@ -68,6 +68,15 @@ public sealed class UntrustedIndexPathTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => throw new InvalidOperationException("extraction must not be reached in these tests");
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => throw new InvalidOperationException("listing must not be reached in these tests");
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException("extraction must not be reached in these tests");
     }
 
     private sealed class StubCodec : IArchiveCodec

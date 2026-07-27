@@ -315,36 +315,9 @@ public sealed class BackupChecker(
         {
             var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
 
-            if (members[0].Storage!.Kind == "blob")
-            {
-                string content;
-                if (members[0].Storage!.Raw)
-                {
-                    content = firstVolume;
-                }
-                else
-                {
-                    var extractDir = Path.Combine(groupDir, "x");
-                    await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
-                    content = Directory.EnumerateFiles(extractDir, "*", SearchOption.AllDirectories).First();
-                }
-                var actual = await hasher!.FullHashAsync(content, ct);
-                foreach (var e in members)
-                    if (e.FullHash is not null && actual != e.FullHash)
-                        corrupted.Add(e.Path);
-            }
-            else
-            {
-                var extractDir = Path.Combine(groupDir, "x");
-                await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
-
-                foreach (var e in members)
-                {
-                    var path = Path.Combine(extractDir, e.Path.Replace('/', Path.DirectorySeparatorChar));
-                    if (!File.Exists(path) || (e.FullHash is not null && await hasher!.FullHashAsync(path, ct) != e.FullHash))
-                        corrupted.Add(e.Path);
-                }
-            }
+            corrupted.AddRange(members[0].Storage!.Kind == "blob"
+                ? await VerifyBlobAsync(firstVolume, members, password, ct)
+                : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
         }
         catch (RequestFailedException ex) when (IsArchived(ex))
         {
@@ -364,6 +337,113 @@ public sealed class BackupChecker(
             tracker?.EndItem(blobName, members.Sum(m => m.Length));
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+        }
+        return corrupted;
+    }
+
+    /// <summary>
+    /// 单文件 blob 的内容校验，**不落盘**：raw 直传的 blob 就是文件本身；否则整个归档只有一个成员，
+    /// `x -so` 不带成员名的输出正是它的内容——因此不必先知道条目名。这一点很关键：去重之后，
+    /// 归档里的条目名来自**最先上传这份内容**的那个路径，未必等于当前索引条目的 Path。
+    /// <para>
+    /// 长度与 hash 都要核对。`x -so` 取不到内容时输出为空却退出码 0，光看"没抛异常"会把
+    /// 一个空归档判成通过——这正是本项目已经踩过一次的坑（7z 丢成员时退出 1 却静默通过）。
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<string>> VerifyBlobAsync(
+        string firstVolume, List<IndexEntry> members, string? password, CancellationToken ct)
+    {
+        string actualHash;
+        long actualLength;
+        if (members[0].Storage!.Raw)
+        {
+            actualHash = await hasher!.FullHashAsync(firstVolume, ct);
+            actualLength = new FileInfo(firstVolume).Length;
+        }
+        else
+        {
+            var streamHasher = new StreamingHasher(0, 0);
+            await using var sink = new HashingStream(streamHasher);
+            await compressor!.ExtractToStreamAsync(firstVolume, entryName: null, password, sink, ct);
+            actualHash = streamHasher.FullHash;
+            actualLength = streamHasher.Length;
+        }
+
+        return [.. members
+            .Where(e => actualLength != e.Length || (e.FullHash is not null && actualHash != e.FullHash))
+            .Select(e => e.Path)];
+    }
+
+    /// <summary>
+    /// pack 的内容校验，**不落盘**：一次 `x -so`（不带成员名）把整包流出来，按 `l -slt` 给出的
+    /// 成员顺序与尺寸切段，逐段算 hash。逐成员各调一次 7z 是不行的——归档是固实的，
+    /// 取第 k 个成员要连带把前面 k-1 个也解一遍，一个上千成员的包会退化成 O(N²)。
+    /// <para>
+    /// 切段依赖"输出顺序 = 列举顺序"这条 7z 行为。它是对的（有测试钉住），但一旦哪个版本上不成立，
+    /// 后果是把好包报成坏包，而修复流程会据此重传。所以只要有一段对不上，就退回整包落盘解压
+    /// 逐个复核，由**它**给出最终结论：快路径只在正常情况下省事，绝不制造假警报。
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<string>> VerifyPackAsync(
+        string firstVolume, string groupDir, List<IndexEntry> members, string? password, CancellationToken ct)
+    {
+        var listing = await compressor!.ListEntriesAsync(firstVolume, password, ct);
+        var files = listing.Where(e => !e.IsDirectory).Select(e => (e.Name, e.Size)).ToList();
+
+        var actual = new Dictionary<string, (long Length, string Hash)>(StringComparer.Ordinal);
+        var splitter = new SegmentHashingStream(files, (name, len, hash) => actual.TryAdd(name, (len, hash)));
+        await using (splitter)
+        {
+            await compressor.ExtractToStreamAsync(firstVolume, entryName: null, password, splitter, ct);
+            splitter.Finish();
+        }
+
+        // 归档吐出的字节比列举出来的多，或有成员没填满 → 切段的前提不成立，别信这一轮的结果。
+        var splitTrustworthy = splitter.ExtraBytes == 0 && splitter.CompletedSegments == files.Count;
+
+        var suspect = new List<IndexEntry>();
+        var corrupted = new List<string>();
+        foreach (var e in members)
+        {
+            var entryName = SevenZipCli.NormalizeEntryName(e.Storage!.EntryName ?? e.Path);
+            if (!actual.TryGetValue(entryName, out var got))
+            {
+                // 索引说这个成员在包里，包里却根本没有它 —— 确凿的损坏，不必再验内容。
+                // （列举里没有 ≠ 快路径不可信：这是内容本身的问题，落盘重解也一样。）
+                if (splitTrustworthy && !listing.Any(l => l.Name == entryName))
+                    corrupted.Add(e.Path);
+                else
+                    suspect.Add(e);
+                continue;
+            }
+            if (got.Length != e.Length || (e.FullHash is not null && got.Hash != e.FullHash))
+                suspect.Add(e);
+        }
+
+        if (suspect.Count > 0)
+            corrupted.AddRange(await VerifyPackOnDiskAsync(firstVolume, groupDir, suspect, password, ct));
+        return corrupted;
+    }
+
+    /// <summary>慢路径：把整包解到磁盘逐个复核。只在流式切段报出问题时才走，用来给出最终结论。</summary>
+    private async Task<IReadOnlyList<string>> VerifyPackOnDiskAsync(
+        string firstVolume, string groupDir, IReadOnlyList<IndexEntry> members, string? password, CancellationToken ct)
+    {
+        var extractDir = Path.Combine(groupDir, "x");
+        await compressor!.ExtractAsync(firstVolume, extractDir, password, ct);
+
+        var corrupted = new List<string>();
+        foreach (var e in members)
+        {
+            var entryName = e.Storage!.EntryName ?? e.Path;
+            var path = Path.Combine(extractDir, entryName.Replace('/', Path.DirectorySeparatorChar));
+            // 条目名来自云端索引，/import 之后即攻击者可控（设计 §5）：`..` 能把探测点甩到解压目录
+            // 之外，变成一个"某个文件的内容是否等于某个 hash"的确认预言机。越界一律判损坏。
+            if (!PathBoundary.IsWithin(extractDir, path)
+                || !File.Exists(path)
+                || new FileInfo(path).Length != e.Length
+                || (e.FullHash is not null && await hasher!.FullHashAsync(path, ct) != e.FullHash))
+                corrupted.Add(e.Path);
         }
         return corrupted;
     }

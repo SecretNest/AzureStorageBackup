@@ -27,11 +27,31 @@ public sealed class ArchiveMembersMissingException(IReadOnlyList<string> missing
     public IReadOnlyList<string> MissingEntries { get; } = missingEntries;
 }
 
+/// <summary>归档内的一个条目。Size 为**解压后**的字节数；Name 分隔符已归一化为 '/'。</summary>
+public sealed record ArchiveEntry(string Name, long Size, bool IsDirectory);
+
 /// <summary>把文件压缩成 7z 归档（可加密/分卷）及解压。用于数据 blob 与分组 pack（M4 §6、§13.1）。</summary>
 public interface IFileCompressor
 {
     Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default);
     Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default);
+
+    /// <summary>列出归档成员，保持归档内顺序并带尺寸（见 <see cref="SevenZipCli.ListEntryDetailsAsync"/>）。</summary>
+    Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+        string firstVolumePath, string? password, CancellationToken ct = default);
+
+    /// <summary>
+    /// 流式解压到 <paramref name="destination"/>，不落磁盘。<paramref name="entryName"/> 为 null 时
+    /// 取出**全部**成员（按归档内顺序首尾相接）。返回写出的字节数。
+    /// <para>
+    /// 警告：成员不存在时 7z 输出为空且**退出码 0**，这里也照样返回 0 而不报错——
+    /// 与项目已经踩过的「丢成员却退出 1 静默通过」是同一类坑。调用方**必须**自行核对
+    /// 字节数与 hash，不得以"没抛异常"作为通过依据。
+    /// </para>
+    /// </summary>
+    Task<long> ExtractToStreamAsync(
+        string firstVolumePath, string? entryName, string? password, Stream destination,
+        CancellationToken ct = default);
 }
 
 public sealed class SevenZipCompressor : IFileCompressor
@@ -93,6 +113,36 @@ public sealed class SevenZipCompressor : IFileCompressor
 
         var present = await SevenZipCli.ListEntriesAsync(_exe, volumes[0], request.Password, ct);
         return [.. request.Entries.Where(e => !present.Contains(SevenZipCli.NormalizeEntryName(e)))];
+    }
+
+    public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+        string firstVolumePath, string? password, CancellationToken ct = default)
+        => SevenZipCli.ListEntryDetailsAsync(_exe, firstVolumePath, password, ct);
+
+    public async Task<long> ExtractToStreamAsync(
+        string firstVolumePath, string? entryName, string? password, Stream destination,
+        CancellationToken ct = default)
+    {
+        // -so 把成员内容送到 stdout，7z 的消息随之自动改走 stderr；-bso0/-bsp0 再压掉进度噪音。
+        var args = new List<string> { "x", "-so", "-y", "-bso0", "-bsp0" };
+        if (!string.IsNullOrEmpty(password))
+            args.Add("-p" + password);
+        args.Add(Path.GetFullPath(firstVolumePath));
+        if (entryName is not null)
+            args.Add(entryName);
+
+        long written = 0;
+        await SevenZipCli.RunStreamingAsync(_exe, args, async (stdout, token) =>
+        {
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await stdout.ReadAsync(buffer, token)) > 0)
+            {
+                await destination.WriteAsync(buffer.AsMemory(0, read), token);
+                written += read;
+            }
+        }, ct);
+        return written;
     }
 
     public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)

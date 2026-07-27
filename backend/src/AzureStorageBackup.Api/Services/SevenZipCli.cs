@@ -76,6 +76,64 @@ internal static class SevenZipCli
         return new SevenZipRun(proc.ExitCode, stdout, stderr);
     }
 
+    /// <summary>
+    /// 运行 7z，把 stdout **原样**交给调用方处理，不缓冲成字符串。
+    /// <para>
+    /// <see cref="RunAsync"/> 用 <c>ReadToEndAsync</c> 收 stdout，对 `x -so` 是灾难：那条流上跑的
+    /// 是成员内容本身，一个几十 GB 的单文件 blob 会被整个读进内存——比先落盘再读还糟。
+    /// </para>
+    /// <para>
+    /// 调用方读完（或提前不读了）之后剩下的字节由这里负责排空：不排空的话 7z 会一直阻塞在写管道上，
+    /// <c>WaitForExitAsync</c> 永远等不到它退出。stderr 照旧整读（消息量小，且不读同样会把管道写满）。
+    /// </para>
+    /// </summary>
+    public static async Task<SevenZipRun> RunStreamingAsync(
+        string exe, IReadOnlyList<string> args, Func<Stream, CancellationToken, Task> readStdout,
+        CancellationToken ct, string? workingDirectory = null)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = exe,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        if (workingDirectory is not null)
+            psi.WorkingDirectory = workingDirectory;
+        foreach (var a in args)
+            psi.ArgumentList.Add(a);
+
+        using var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
+
+        proc.StandardInput.Close(); // 与 RunAsync 同理：缺密码时给它 EOF 使其失败而非挂起
+        var stderrTask = proc.StandardError.ReadToEndAsync(ct);
+        try
+        {
+            await readStdout(proc.StandardOutput.BaseStream, ct);
+            await proc.StandardOutput.BaseStream.CopyToAsync(Stream.Null, ct);
+            await proc.WaitForExitAsync(ct);
+        }
+        catch
+        {
+            // 取消、读取失败、调用方自己抛——结局都一样：这个 7z 进程还在啃磁盘，而调用方
+            // 紧接着要删的正是它在写/读的临时目录。整棵树杀掉再让异常继续往上走（同 RunAsync）。
+            KillTree(proc);
+            await proc.WaitForExitAsync(CancellationToken.None);
+            await ObserveAsync(stderrTask);
+            throw;
+        }
+
+        var stderr = await stderrTask;
+        if (proc.ExitCode >= 2)
+            throw new InvalidOperationException($"7-Zip failed (exit {proc.ExitCode}): {stderr.Trim()}");
+
+        // stdout 已经交给调用方，这里没有可回填的内容。
+        return new SevenZipRun(proc.ExitCode, "", stderr);
+    }
+
     /// <summary>杀掉进程及其子进程。已经退出（竞态）或杀不动都不算错——取消本身已经在往外抛了，
     /// 不能让收尾动作再盖一个不相干的异常上去。</summary>
     private static void KillTree(Process proc)
@@ -108,6 +166,15 @@ internal static class SevenZipCli
     /// 分卷归档传首卷（.001），7z 自行找齐后续卷。</summary>
     public static async Task<HashSet<string>> ListEntriesAsync(
         string exe, string firstVolumePath, string? password, CancellationToken ct)
+        => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct)).Select(e => e.Name)];
+
+    /// <summary>
+    /// 列出归档成员，**保持归档内顺序**并带上尺寸与目录标记。
+    /// 顺序是承重的：`x -so` 不带成员名时，各成员的内容正是按这个顺序首尾相接输出的，
+    /// 按尺寸切段才能还原出每个成员。注意这个顺序未必等于当初压缩时给出的参数顺序。
+    /// </summary>
+    public static async Task<IReadOnlyList<ArchiveEntry>> ListEntryDetailsAsync(
+        string exe, string firstVolumePath, string? password, CancellationToken ct)
     {
         var args = new List<string> { "l", "-slt", "-y" };
         if (!string.IsNullOrEmpty(password))
@@ -115,17 +182,33 @@ internal static class SevenZipCli
         args.Add(Path.GetFullPath(firstVolumePath));
 
         var run = await RunAsync(exe, args, ct);
-        return ParseEntryPaths(run.StdOut);
+        return ParseEntryDetails(run.StdOut);
     }
 
-    /// <summary>解析 `l -slt` 的输出。归档**自身**的信息块也有一行 "Path = <归档文件名>"，
+    /// <summary>解析 `l -slt` 的输出。归档**自身**的信息块也有一行 "Path = &lt;归档文件名&gt;"，
     /// 成员块则统一排在第一道 "----------" 分隔线之后——所以必须先跳到那道线，
-    /// 否则归档文件名会被当成一个成员混进来。</summary>
-    private static HashSet<string> ParseEntryPaths(string listing)
+    /// 否则归档文件名会被当成一个成员混进来。每遇到一行 "Path = " 就开一个新成员块。</summary>
+    private static IReadOnlyList<ArchiveEntry> ParseEntryDetails(string listing)
     {
         const string pathPrefix = "Path = ";
-        var paths = new HashSet<string>(StringComparer.Ordinal);
+        const string sizePrefix = "Size = ";
+        const string attrPrefix = "Attributes = ";
+        const string folderPrefix = "Folder = ";
+
+        var entries = new List<ArchiveEntry>();
         var inEntries = false;
+        string? name = null;
+        long size = 0;
+        var isDir = false;
+
+        void FlushPending()
+        {
+            if (name is not null)
+                entries.Add(new ArchiveEntry(name, size, isDir));
+            name = null;
+            size = 0;
+            isDir = false;
+        }
 
         foreach (var raw in listing.Split('\n'))
         {
@@ -136,10 +219,29 @@ internal static class SevenZipCli
                     inEntries = true;
                 continue;
             }
+
             if (line.StartsWith(pathPrefix, StringComparison.Ordinal))
-                paths.Add(NormalizeEntryName(line[pathPrefix.Length..]));
+            {
+                FlushPending();
+                name = NormalizeEntryName(line[pathPrefix.Length..]);
+            }
+            else if (line.StartsWith(sizePrefix, StringComparison.Ordinal))
+            {
+                _ = long.TryParse(line[sizePrefix.Length..].Trim(), out size);
+            }
+            else if (line.StartsWith(attrPrefix, StringComparison.Ordinal))
+            {
+                // 目录的属性串以 'D' 打头（Unix: "D drwxr-xr-x"，Windows: "D...."）。
+                var attr = line[attrPrefix.Length..].Trim();
+                isDir |= attr.StartsWith('D');
+            }
+            else if (line.StartsWith(folderPrefix, StringComparison.Ordinal))
+            {
+                isDir |= line[folderPrefix.Length..].Trim() == "+"; // 部分 7z 版本用这个字段
+            }
         }
-        return paths;
+        FlushPending();
+        return entries;
     }
 
     /// <summary>Windows 上 7z 用 '\' 列出条目名，而调用方给的条目名用 '/'。</summary>
