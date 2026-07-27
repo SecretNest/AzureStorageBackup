@@ -320,6 +320,15 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>重打包是**覆盖式**的（ReplaceAsync 直接改写 packs/p0001.7z），所以 7z 在这条路径上

@@ -94,6 +94,15 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>统计 ReadIndexAsync 调用次数的 store 装饰器（验证本地缓存命中）。</summary>

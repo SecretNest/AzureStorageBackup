@@ -118,6 +118,15 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>压缩一次之后立刻改写其中一个成员的内容——模拟"分组重校验发现内容在压缩期间变了"
@@ -141,6 +150,15 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>第一次压缩后改写内容（触发处理中重校验判定"内容变了"，从而让最终 hash ≠ diff 时的
@@ -164,6 +182,15 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>上传接缝处注入网络故障：所有 data/pack blob 上传都以 IOException 失败——这正是

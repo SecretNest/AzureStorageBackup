@@ -83,6 +83,15 @@ public sealed class UnreadablePackMemberTests : IDisposable
         }
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>指定路径的 <c>FullHashAsync</c> 只在第一次调用时抛出（模拟压缩后重校验瞬间读不开），
@@ -221,6 +230,15 @@ public sealed class UnreadablePackMemberTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     /// <summary>核心不变量：**索引声称在包里的成员，必须真的在那个包里**。
