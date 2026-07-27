@@ -570,7 +570,17 @@ public sealed class BackupOrchestrator(
             foreach (var m in members)
             {
                 var local = Local(request, m.Path);
-                if (Stat(local) != before[m.Path] && await hasher.FullHashAsync(local, ct) != m.FullHash)
+                bool exclude;
+                try
+                {
+                    // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
+                    exclude = Stat(local) != before[m.Path] && await hasher.FullHashAsync(local, ct) != m.FullHash;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    exclude = true;
+                }
+                if (exclude)
                     changed.Add(m);
             }
 
