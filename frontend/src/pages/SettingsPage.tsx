@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
 import { Field } from '../components/modal'
+import { NotificationsSection } from './NotificationsPage'
 
 const MB = 1024 * 1024
 
@@ -122,6 +123,8 @@ export function SettingsPage() {
         <button type="button" className="btn-primary" onClick={save}>Save</button>
         {saved && <span className="text-ok">Saved.</span>}
       </div>
+
+      <NotificationsSection />
     </section>
   )
 }

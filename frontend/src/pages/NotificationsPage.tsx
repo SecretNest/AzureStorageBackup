@@ -18,7 +18,7 @@ const emptyCfg: NotificationConfig = {
   proxyUrl: '',
 }
 
-export function NotificationsPage() {
+export function NotificationsSection() {
   const [cfg, setCfg] = useState<NotificationConfig>(emptyCfg)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -64,11 +64,10 @@ export function NotificationsPage() {
     }
   }
 
+  // 通知配置本质就是一项全局设置，所以作为 Settings 页里的一个分区，而不是自成一个顶级标签。
   return (
-    <section>
-      <div className="page-header">
-        <h1>Notifications</h1>
-      </div>
+    <>
+      <h2 style={{ marginTop: '2rem' }}>Notifications</h2>
       {error && <p className="text-danger">{error}</p>}
 
       <Field label="Enabled">
@@ -146,6 +145,6 @@ export function NotificationsPage() {
           {test.success ? 'Test notification sent.' : `Test failed: ${test.error}`}
         </p>
       )}
-    </section>
+    </>
   )
 }
