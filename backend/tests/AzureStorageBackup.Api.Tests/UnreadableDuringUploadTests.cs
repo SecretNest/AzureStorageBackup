@@ -1,5 +1,5 @@
 using System.Net.Sockets;
-using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 
@@ -141,6 +141,81 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+    }
+
+    /// <summary>第一次压缩后改写内容（触发处理中重校验判定"内容变了"，从而让最终 hash ≠ diff 时的
+    /// hash，也就是需要写索引覆盖条目的那条路径），第二次压缩后再锁住文件——于是内容早已成功上传，
+    /// 而随后为覆盖条目重读源文件（长度/头部 hash）的那一步会撞上真实的权限拒绝。</summary>
+    private sealed class MutateThenLockCompressor(
+        IFileCompressor inner, string fullPath, string newContent) : IFileCompressor
+    {
+        private int _count;
+
+        public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var result = await inner.CompressAsync(request, ct);
+            switch (Interlocked.Increment(ref _count))
+            {
+                case 1: File.WriteAllText(fullPath, newContent); break;
+                case 2: File.SetUnixFileMode(fullPath, UnixFileMode.None); break;
+            }
+            return result;
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+    }
+
+    /// <summary>上传接缝处注入网络故障：所有 data/pack blob 上传都以 IOException 失败——这正是
+    /// 真实 NAS/网络中断在重试预算耗尽之后逃出 <see cref="BlobUploader"/> 时的形状（IsTransient 把
+    /// IOException 列为可重试的网络错误，重试用尽后原样抛出）。故障注在**上传**上，源文件自始至终
+    /// 完全可读，因此把它归类为"文件不可读"一定是误判。</summary>
+    private sealed class NetworkFailingUploader : IBlobUploader
+    {
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null) =>
+            throw new IOException("Unable to write data to the transport connection: Network is unreachable.");
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null) =>
+            throw new IOException("Unable to write data to the transport connection: Network is unreachable.");
+    }
+
+    /// <summary>第一次上传成功之后立刻删掉指定的源文件——复现真实时序：所有单文件 blob 传完才轮到
+    /// 分组上传，两者之间对一次大备份可能隔了几小时，一个构建产物在这段窗口里被删掉再正常不过。
+    /// 故障同样注在上传接缝处，而不是靠替身在源读取路径上假抛异常。</summary>
+    private sealed class DeleteAfterFirstUploadUploader(IBlobUploader inner, string victimFullPath) : IBlobUploader
+    {
+        private int _fired;
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            var uploaded = await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+            Fire();
+            return uploaded;
+        }
+
+        public async Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+            Fire();
+        }
+
+        private void Fire()
+        {
+            if (Interlocked.Exchange(ref _fired, 1) == 0)
+                File.Delete(victimFullPath);
+        }
     }
 
     /// <summary>捕获 NotifyAsync 调用，供断言"读不开的文件推送了通知"。</summary>
@@ -414,6 +489,181 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             // 修复前的错误处置会先写一条"读不开"告警再吞掉异常；修复后异常真实向外传播，
             // 不会有任何文件被误判成"读不开"进而通知。
             Assert.DoesNotContain(notifier.Notifications, n => n.Title.Contains("d/x.txt"));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>终审 Important 1：HandleBlobAsync 的 catch 圈住的不只是源文件读取，还有压缩、暂存
+    /// 和上传。BlobUploader.IsTransient 把 IOException 列为可重试的网络错误，重试预算耗尽后它原样
+    /// 抛出——形状与"文件读不开"完全一致。仅凭异常类型收下它，网络中断就会被逐个文件记成
+    /// "unreadable，沿用旧条目"，整轮备份照常提交新版本并报告成功：NAS 断网一小时，操作员收到的是
+    /// "Backup succeeded, 0 changed files"，是比崩溃糟糕得多的静默失败。
+    /// 本测试把故障注在上传接缝处（源文件全程可读），断言这个 IOException 如实向外传播、
+    /// 没有任何文件被误判为不可读、也没有产生任何"成功"的版本。</summary>
+    [SkippableFact]
+    public async Task An_Upload_Network_Failure_Is_Not_Misreported_As_An_Unreadable_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var notifier = new CapturingNotifier();
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreadnet-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 阈值压到 1 → 走单文件路径（HandleBlobAsync/ProcessAsync），也就是那个过宽 catch 所在处。
+            WriteText("reachable.bin", "this file is perfectly readable the whole time");
+
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                new SevenZipCompressor(), new NetworkFailingUploader(), factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+
+            // 上传失败必须让整轮备份失败，而不是被当成"这个文件读不开"悄悄跳过。
+            await Assert.ThrowsAnyAsync<IOException>(() =>
+                orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1)));
+
+            // 源文件全程可读，任何一条"unreadable"告警都是误判。
+            Assert.DoesNotContain(notifier.Notifications, n => n.Title.Contains("unreadable"));
+            // 失败要走失败通道，不能混进成功通知里。
+            Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.BackupFailure);
+            Assert.DoesNotContain(notifier.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
+
+            // 也不能留下一个"成功"的版本：修复前会以旧条目提交 v1 并把它当作正常备份。
+            var info = await store.ReadInfoAsync(account, name, null);
+            Assert.True(info is null || info.Versions.Count == 0);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>终审 Important 2：分组重校验前的 <c>before</c> 元数据快照落在所有 try 之外，而它对一个
+    /// 已经消失的成员会抛 FileNotFoundException。单文件 blob 全部上传完才轮到分组上传，两者之间
+    /// 对一次大备份可能隔了几小时——一个被删掉的构建产物就足以让整轮备份倒在与本分支所修完全
+    /// 相同的形状上。本测试把故障注在上传接缝处：第一个单文件 blob 上传成功之后立刻删除某个
+    /// 待打包成员，断言备份照常完工、该成员按"读不开"降级、同组的兄弟文件不受牵连。</summary>
+    [SkippableFact]
+    public async Task A_Pack_Member_Deleted_Before_The_Metadata_Snapshot_Does_Not_Abort_The_Run()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var notifier = new CapturingNotifier();
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreadsnap-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // big.bin 超过阈值 → 单文件 blob，先上传；d/ 下两个小文件 → 同一个 pack，后处理。
+            // 这个先后顺序正是缺口存在的原因，所以测试必须同时有这两类文件。
+            WriteText("big.bin", new string('b', 400));
+            WriteText("d/x.txt", "xxxx");
+            WriteText("d/y.txt", "yyyy");
+
+            var victim = Path.Combine(_root, "d", "x.txt");
+            var uploader = new DeleteAfterFirstUploadUploader(new BlobUploader(factory), victim);
+
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                new SevenZipCompressor(), uploader, factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+
+            var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 100));
+
+            Assert.Equal(1, result.Version);         // 完工——没有倒在快照那一行
+            Assert.Equal(1, result.UnreadableFiles); // 消失的成员计入既有计数
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+
+            // 全新文件、从未成功备份过 → 没有旧条目可沿用，整条缺席。
+            Assert.DoesNotContain(idx.Entries, e => e.Path == "d/x.txt");
+
+            // 同组的兄弟不受牵连：照常打包上传，pack blob 真的在云端。
+            var sibling = Assert.Single(idx.Entries, e => e.Path == "d/y.txt");
+            Assert.Equal("pack", sibling.Storage!.Kind);
+            Assert.True(await container.GetBlobClient($"packs/{sibling.Storage.Ref}.7z").ExistsAsync());
+
+            // 先行上传的单文件同样不受影响。
+            var big = Assert.Single(idx.Entries, e => e.Path == "big.bin");
+            Assert.Equal("blob", big.Storage!.Kind);
+            Assert.True(await container.GetBlobClient(big.Storage.Ref).ExistsAsync());
+
+            // 消失的成员走既有告警通道，操作员会知道它本轮没被存下来。
+            Assert.Contains(notifier.Notifications,
+                n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/x.txt"));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>终审 Minor：单文件路径上 BuildOverrideAsync 的源读取没有保护，而分组路径上完全对应的
+    /// 那次重读（foreach(changed) 里的 hasher/BuildOverrideAsync）有——同一个动作两条路径处置不一致，
+    /// 于是"内容在处理中变化、随后又被锁住"这一种组合只在单文件路径上会让整轮备份崩溃。
+    /// 本测试构造正是那个组合：第一次压缩后改写内容（最终 hash ≠ diff 时的 hash，必须写覆盖条目），
+    /// 第二次压缩后锁住文件（覆盖条目再也读不出来）。断言两条路径现在一致——按"读不开"降级，
+    /// 备份照常完工，而不是抛出未接住的异常。</summary>
+    [SkippableFact]
+    public async Task A_File_Locked_Before_Its_Override_Is_Built_Does_Not_Abort_The_Run()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var notifier = new CapturingNotifier();
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreadoverride-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("churn.bin", "content as seen by the diff");
+
+            var compressor = new MutateThenLockCompressor(
+                new SevenZipCompressor(), Path.Combine(_root, "churn.bin"),
+                "content rewritten while the backup was compressing it");
+
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                compressor, new BlobUploader(factory), factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+
+            // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是保护缺失的那一条。
+            var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
+
+            Assert.Equal(1, result.Version);         // 完工——没有倒在无保护的重读上
+            Assert.Equal(1, result.UnreadableFiles); // 按"读不开"降级并计数
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+
+            // 描述不了内容就整条缺席：绝不能留下 fullHash 指向新内容、长度/头部 hash 还是旧内容的记录。
+            Assert.DoesNotContain(idx.Entries, e => e.Path == "churn.bin");
+
+            Assert.Contains(notifier.Notifications,
+                n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("unreadable")
+                     && n.Title.Contains("churn.bin"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

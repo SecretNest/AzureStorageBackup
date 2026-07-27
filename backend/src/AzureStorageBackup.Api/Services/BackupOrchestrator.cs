@@ -106,8 +106,12 @@ public sealed class BackupOrchestrator(
         try
         {
             var result = await RunCoreAsync(request, progress, ct);
-            await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}",
-                $"Version {result.Version}, {result.ChangedFiles} changed file(s)", ct);
+            // 有文件被跳过时必须写进成功通知的摘要里：每个读不开的文件都单独推过一条告警，但那些
+            // 告警可能淹没在别的消息里，而"备份成功"这一条是操作员一定会看的。只字不提跳过，
+            // 等于让一次"成功"的备份掩盖掉本轮根本没存下来的文件。为零时不提，避免噪音。
+            var summary = $"Version {result.Version}, {result.ChangedFiles} changed file(s)"
+                + (result.UnreadableFiles > 0 ? $", {result.UnreadableFiles} unreadable file(s) skipped" : "");
+            await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}", summary, ct);
             return result;
         }
         catch (Exception ex)
@@ -439,7 +443,13 @@ public sealed class BackupOrchestrator(
                 await ProcessAsync(file.FullHash, ct);
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
+        // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
+        // 重试预算耗尽后它会原样抛出来，落进这里。仅凭类型收下它，一次 NAS 断网就会被记成
+        // 若干个"文件不可读、沿用旧条目"，整轮备份照常报告成功——操作员看到的是"Backup succeeded,
+        // 0 changed files"，而实际上什么都没传上去。因此 filter 里再探一次源文件：真读不开才降级，
+        // 读得开就让异常照常向上抛，让整轮备份响亮地失败。
+        catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath))
         {
             // diff 时可读、随后（压缩打包/原样直传重新打开源文件时）才读不开：与 diff 阶段读不开同等
             // 处置——不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
@@ -463,6 +473,26 @@ public sealed class BackupOrchestrator(
                 $"Hash collision avoided: {file.Path}",
                 $"Different content shares hash {finalHash}; stored at {chosenRef}", ct);
 
+        // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
+        // 这一步要**再读一次源文件**（长度/mtime/头部 hash），因此和分组路径上的同一动作一样需要保护；
+        // 之所以提到写 storageByPath 之前：读不开时该文件按"本轮没能存下来"降级，此时不该留下任何
+        // 半条存储引用——一条 fullHash 指向新内容、长度/头部 hash 却还是旧内容的索引记录，
+        // 比整条缺席更糟，检查与还原都会据此得出错误结论。
+        if (finalHash != file.FullHash)
+        {
+            try
+            {
+                overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                postDiffUnreadable[file.Path] = ex.Message;
+                await RecordPostDiffUnreadableAsync(request, file.Path, ex.Message, ct);
+                onItem();
+                return;
+            }
+        }
+
         // 记录分卷数（供检查核验全部分卷）：本次上传的卷数；去重时用本地已知卷数（dedupVolumes），
         // 仅云端回退路径且无从得知时才 CountVolumes（本地权威路径不读云端）。
         var volumes = uploadedVolumes > 0
@@ -477,9 +507,6 @@ public sealed class BackupOrchestrator(
         };
         if (finalTail is not null)
             tailByPath[file.Path] = finalTail;
-        // 内容在处理中变化：以稳定后的新 hash/元数据覆盖索引条目，保证 data/{hash} 内容与名一致。
-        if (finalHash != file.FullHash)
-            overrides[file.Path] = await BuildOverrideAsync(localPath, finalHash, request.Options.Diff.HeadHashBytes, ct);
 
         await LogFileAsync(request, file.Path, ct);
         onItem();
@@ -593,7 +620,11 @@ public sealed class BackupOrchestrator(
                 continue;
             }
 
-            var before = members.ToDictionary(m => m.Path, m => Stat(Local(request, m.Path)));
+            // 这份快照离 diff 可能已隔了几小时——所有单文件 blob 传完才轮到分组上传——期间一个成员
+            // 完全可能被删掉（构建产物）或被收回权限，而 Stat 会就此抛出，让整轮备份倒在与本分支
+            // 所修完全相同的形状上。不另起机制：读不到就把快照记成 null，交给下面既有的"排除成员"
+            // 路径处理（与"内容在压缩期间变了"同一条路：排除出归档 → 重取新内容 → 仍读不开则降级）。
+            var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
             var staged = await CompressPackAsync(request, packId, members, ct);
 
             // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
@@ -605,7 +636,9 @@ public sealed class BackupOrchestrator(
                 try
                 {
                     // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
-                    exclude = Stat(local) != before[m.Path] && await hasher.FullHashAsync(local, ct) != m.FullHash;
+                    // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
+                    exclude = before[m.Path] is not { } snapshot
+                        || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -750,6 +783,38 @@ public sealed class BackupOrchestrator(
         var info = new FileInfo(path);
         var mode = OperatingSystem.IsWindows() ? 0 : (int)File.GetUnixFileMode(path);
         return (info.LastWriteTimeUtc.Ticks, info.Length, mode);
+    }
+
+    /// <summary>取不到元数据（文件已消失、权限被收回）时返回 null，由调用方按"该成员必须排除"处理。</summary>
+    private static (long Mtime, long Length, int Mode)? TryStat(string path)
+    {
+        try
+        {
+            return Stat(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>源文件此刻是否真的读不开。用于把"文件读不开"与压缩/暂存/上传栈里同样以 IOException
+    /// 现身的故障区分开——尤其是网络：BlobUploader 把 IOException 当可重试的网络错误，重试预算耗尽后
+    /// 原样抛出，形状与"文件读不开"一模一样。打开成功还要真读一个字节：权限/介质错误可能到第一次
+    /// 实际读才暴露。FileShare 放到最宽，只判"我们能不能读"，不去替别的写者判断它该不该写。</summary>
+    private static bool SourceUnreadable(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            stream.ReadByte();
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 
     /// <summary>原始直传：直接把原文件拷到压缩临时区（单卷），不走 7z 封装（PRD 3.3.2）。</summary>

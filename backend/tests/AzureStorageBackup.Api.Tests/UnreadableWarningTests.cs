@@ -195,6 +195,55 @@ public sealed class UnreadableWarningTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>终审 Minor：UnreadableFiles 此前是只写字段，没有任何消费者。每个读不开的文件确实各推了
+    /// 一条告警，但那些告警会淹没在别的消息里，而"备份成功"这一条是操作员一定会看的——它却只字不提
+    /// 有文件被跳过，于是一次"成功"的备份可以完全掩盖掉本轮根本没存下来的文件。非零时必须写进摘要；
+    /// 为零时不得添噪，否则每一次正常备份都多带一句无意义的 "0 unreadable"。</summary>
+    [SkippableFact]
+    public async Task The_Success_Notification_Reports_Skipped_Files_Only_When_There_Are_Any()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var account = AzuriteAccount();
+
+        // 其一：有文件读不开 → 成功通知的摘要必须带上计数。
+        var withUnreadable = new CapturingNotifier();
+        var differ = new BackupDiffer(new ThrowingHasher("locked.mdf",
+            new IOException("The process cannot access the file because it is being used by another process.")));
+        var (orchestrator, _, factory) = Build(differ, notifier: withUnreadable);
+        var name = RandomName("unreadsummary-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("locked.mdf", "database content");
+            WriteText("plain.txt", "ordinary file");
+
+            await orchestrator.RunAsync(Request(account, name));
+
+            var success = Assert.Single(withUnreadable.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
+            Assert.Contains("1 unreadable file(s) skipped", success.Body);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+
+        // 其二：全部可读 → 摘要不得出现 unreadable 字样。这个反向断言防的是矫枉过正：
+        // 给每一次正常备份都挂上一句 "0 unreadable file(s) skipped" 会让这条信号迅速变成背景噪音。
+        var allReadable = new CapturingNotifier();
+        var (clean, _, factory2) = Build(notifier: allReadable);
+        var name2 = RandomName("readsummary-");
+        var container2 = factory2.CreateServiceClient(account).GetBlobContainerClient(name2);
+        await container2.CreateIfNotExistsAsync();
+        try
+        {
+            await clean.RunAsync(Request(account, name2));
+
+            var success = Assert.Single(allReadable.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
+            Assert.DoesNotContain("unreadable", success.Body, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { await container2.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task The_Run_Result_Counts_Unreadable_Files()
     {
