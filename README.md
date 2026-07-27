@@ -50,6 +50,56 @@ cd backend && dotnet test
 
 Integration tests that talk to Azure use [Azurite](https://github.com/Azure/Azurite); they are skipped automatically when Azurite is not reachable on `127.0.0.1:10000`.
 
+## How a backup runs
+
+A backup goes through three stages, strictly one after another. The **Details** panel on the Backups page names the stage it is in, what it is working on right now, and a speed — but the speed means something different in each stage, so it is worth knowing what you are looking at.
+
+| Stage | What it does | Writes to disk? |
+| --- | --- | --- |
+| **Scanning** | Walks the local root and lists every file (path, size, modified time, permissions). | No |
+| **Diffing** | Decides which files changed since the last backup, hashing content where needed. | No |
+| **Uploading** | Compresses changed files into 7-Zip archives and uploads them. | Yes — see *Working space* below |
+
+Grouping happens between Diffing and Uploading and needs the complete list of changed files before it can pack anything, so **nothing is uploaded until Diffing has finished**. On a first backup that means the network sits idle for as long as the hashing takes.
+
+### Why the first backup is slow, and later ones are not
+
+Diffing compares each file against the previous backup's index:
+
+- **Same size, same modified time, same permissions → unchanged.** The file is not opened at all. This is the case for almost every file in a routine incremental backup, which is why Diffing then finishes in a fraction of the time.
+- **Different size → changed.** The content is read and hashed.
+- **Same size but the modified time or permissions changed →** the content is read and hashed to find out whether it really changed. If the hash turns out to be identical, only the index entry is updated and **nothing is re-uploaded**.
+
+A first backup has no previous index to compare against, so every file takes the slow path. That is the one run where Diffing reads every byte you own.
+
+> Two consequences worth planning around:
+>
+> - Anything that rewrites modified times without changing content — `touch`, some sync tools, restoring files from another backup, copying across filesystems — makes the next backup re-read and re-hash those files. It will not re-upload them, so no bandwidth is wasted, but the disk work comes back.
+> - A file whose content changes while its size **and** modified time stay the same is not detected. This is the inherent trade-off of size+timestamp comparison and applies to every incremental backup tool. Run a **content-level Check** periodically if you need to catch it; that mode re-reads and re-hashes everything.
+
+### What the speed number means
+
+**During Diffing it is local disk throughput** — bytes read and hashed per second. It has nothing to do with the network. Files that were skipped as unchanged count zero bytes, so on an incremental run the file counter races ahead while the speed stays low; that is the expected shape, not a stall.
+
+**During Uploading it is end-to-end throughput, not network speed.** Three differences matter:
+
+- The bytes counted are **compressed and encrypted** bytes, not the original file sizes, so the number is normally well below what the source data would suggest.
+- The elapsed time **includes compression**, which runs serially ahead of each upload. A slow compressor drags this number down even on a fast link.
+- Bytes are credited **when an object finishes uploading**, not continuously. Large packs therefore make the figure jump: flat for a while, then a spike.
+
+So a low Uploading figure does not by itself mean the network is the bottleneck. Comparing it against the Diffing figure from the same run gives a rough hint, but the two are not separated today.
+
+### Working space
+
+Diffing produces no files — it only reads. Its cost is memory: the file list and the previous index are held in RAM (roughly 190 MB per 500,000 files, proportional to the file count).
+
+Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
+
+- `compress/` — the archive currently being produced. Compression is global and serial: one archive at a time, across all backups.
+- `staged/` — finished archives waiting to be uploaded. This directory is what the **staging-area limit** on the Settings page (default **2 GB**) applies to: once it is full, the next compression waits until an upload frees space. A single archive is allowed to exceed the limit if it started below it, so the peak can be somewhat higher than the configured value — size the volume with that in mind.
+
+Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
+
 ## Docker
 
 The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.
