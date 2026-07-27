@@ -120,6 +120,29 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
     }
 
+    /// <summary>压缩一次之后立刻改写其中一个成员的内容——模拟"分组重校验发现内容在压缩期间变了"
+    /// （而非读不开）：该成员会被排除出本次归档、以新内容重新处理，走 foreach(changed) 里"内容变化"
+    /// 而非"读不开"的分支，为 Finding 1 的回归测试构造"源读取已经全部成功"的前提。</summary>
+    private sealed class MutateAfterFirstCompressCompressor(
+        IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
+    {
+        private int _fired;
+
+        public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var result = await inner.CompressAsync(request, ct);
+            if (Interlocked.Exchange(ref _fired, 1) == 0)
+            {
+                var full = Path.Combine(rootPath, relPath.Replace('/', Path.DirectorySeparatorChar));
+                File.WriteAllText(full, newContent);
+            }
+            return result;
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+    }
+
     /// <summary>捕获 NotifyAsync 调用，供断言"读不开的文件推送了通知"。</summary>
     private sealed class CapturingNotifier : INotifier
     {
@@ -129,6 +152,13 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             lock (Notifications) Notifications.Add((evt, title, body));
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>捕获每次 progress?.Report 调用，供断言"完工时进度确实到了 100%"（Finding 2）。</summary>
+    private sealed class CapturingProgress : IProgress<BackupProgress>
+    {
+        public List<BackupProgress> Reports { get; } = [];
+        public void Report(BackupProgress value) { lock (Reports) Reports.Add(value); }
     }
 
     private BackupRequest Request(Account account, string container, long singleFileThresholdBytes) => new()
@@ -250,6 +280,140 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             // 两个各有一条告警，都复用既有通知通道。
             Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/x.txt"));
             Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/y.txt"));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Finding 2：一整个 pack 的成员全部在 diff 之后读不开时（stable.Count == 0），
+    /// 此前 HandleBlobAsync 的 catch 会 onItem()，但 ProcessDirectoryAsync 里 foreach(changed) 的
+    /// 姊妹 catch 不会——而 stable.Count == 0 时 "if (stable.Count > 0)" 这唯一的另一个 onItem()
+    /// 调用点也被跳过，于是这个在 total 里占了一个槽位的 pack，整轮下来 onItem() 被调用零次。
+    /// uploaded 从此永远比 total 少 1，完工时进度报告也到不了 100%——即使备份其实已经跑完。
+    /// 本测试直接盯着 progress 上报：备份完工后最后一次上报必须是 Stage=Completed 且 Percent=100。</summary>
+    [SkippableFact]
+    public async Task A_Whole_Pack_Unreadable_After_The_Diff_Still_Reports_Full_Progress()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var notifier = new CapturingNotifier();
+        var progress = new CapturingProgress();
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreadprog-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 同目录两个小文件 → 规划成同一个 pack，占 total 里的一个槽位。
+            WriteText("d/x.txt", "xxxx");
+            WriteText("d/y.txt", "yyyy");
+
+            var compressor = new LockAllAfterFirstCompressCompressor(
+                new SevenZipCompressor(), _root, ["d/x.txt", "d/y.txt"]);
+
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                compressor, new BlobUploader(factory), factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+
+            var result = await orchestrator.RunAsync(
+                Request(account, name, singleFileThresholdBytes: 5_000_000), progress); // 走分组打包
+
+            Assert.Equal(1, result.Version);
+            Assert.Equal(2, result.UnreadableFiles); // 两个成员都读不开——这个 pack 整包失败
+
+            var completed = Assert.Single(progress.Reports, p => p.Stage == BackupStage.Completed);
+            Assert.Equal(completed.TotalItems, completed.UploadedItems); // uploaded 追上了 total
+            Assert.Equal(100, completed.Percent); // 完工必须显示 100%，不能永远差一
+
+            // 反过来也要确认没有矫枉过正到重复计数：整个运行过程中任何一次上报都不该超过 total。
+            Assert.All(progress.Reports, p => Assert.True(p.UploadedItems <= p.TotalItems));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Finding 1 回归测试：修复前，ProcessDirectoryAsync 的 foreach(changed) 用一个 try
+    /// 圈住了整个 HandleBlobAsync(...) 调用——而该方法自己的处理早已成功把内容上传到云端之后，
+    /// 还会做与源读取无关的下游工作（这里用 verbose logging 真实触发磁盘 IOException 来还原：
+    /// 令 VerboseFileLog 的日志根目录路径中有一段是文件而非目录，Directory.CreateDirectory 在这种
+    /// 路径下必然抛 IOException——不是靠假抛异常的替身模拟，是真实的文件系统调用失败）。
+    /// 修复前，这个下游失败会被那层过宽的 try 接住，文件被误判成"读不开"、已经成功上传的
+    /// blob 在索引里凭空消失，备份本身却"成功"收尾——这才是最坏的情形：数据丢失但无人报警。
+    /// 修复后，foreach(changed) 的 try 只圈住了 hasher/BuildOverrideAsync 这段真正的源读取；
+    /// HandleBlobAsync 自己也没有再把这段下游工作纳入它自己的 catch。于是这个下游失败必须
+    /// 如实地从 RunAsync 抛出来——响亮地失败，而不是悄悄把一个已经传成功的文件当作读不开。</summary>
+    [SkippableFact]
+    public async Task A_Downstream_Failure_After_Successful_Upload_Is_Not_Misreported_As_Unreadable()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var notifier = new CapturingNotifier();
+
+        // verbose 日志根目录里有一段路径其实是个普通文件——Directory.CreateDirectory 在这种路径下
+        // 必然报 ENOTDIR（IOException），这是货真价实的文件系统失败，不是替身抛的假异常。
+        var logBlockerFile = Path.Combine(_temp, "log-root-blocker");
+        await File.WriteAllTextAsync(logBlockerFile, "not a directory");
+        var verboseLog = new VerboseFileLog(Path.Combine(logBlockerFile, "logs"));
+
+        var account = AzuriteAccount();
+        var name = RandomName("unreaddownstream-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 目录 d 下只有这一个小文件（长度 22 字节 < 30 字节阈值）→ 规划阶段单独成一个只有
+            // 1 个成员的 pack（GroupingPlanner 按目录分组，目录内哪怕只有一个可分组文件也会
+            // 成一个 pack）。故意只放一个文件：如果还有其它"稳定"成员，它们会先被
+            // ProcessDirectoryAsync 里 "if (stable.Count > 0)" 分支的 LogFileAsync 撞上同一个坏
+            // 日志目录，抢先失败，测试就测不到 foreach(changed) 这条路径了。
+            // x.txt 会在首次压缩后被改写成一段超过阈值长度的新内容（模拟"处理中变化"，而非
+            // 读不开)。分组重校验发现它变化后排除出归档（此时 stable.Count == 0，不产生任何
+            // LogFileAsync 调用），foreach(changed) 见其新长度 ≥ 阈值 → 走"超阈值→单文件"分支，
+            // 递归调用 HandleBlobAsync 走单文件上传路径——这正是 Finding 1 命中的那条调用路径
+            // （调用方 try 曾经圈住这整个调用，包括调用内部成功上传之后的 LogFileAsync）。
+            WriteText("d/x.txt", "original content of x"); // 22 字节，< 30，规划时入 pack
+
+            var compressor = new MutateAfterFirstCompressCompressor(
+                new SevenZipCompressor(), _root, "d/x.txt",
+                "mutated content of x, now much longer than the 30-byte threshold"); // > 30 字节
+
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                compressor, new BlobUploader(factory), factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()), verboseLog: verboseLog);
+
+            var request = Request(account, name, singleFileThresholdBytes: 30) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 30 },
+                    VerboseLogging = true,
+                },
+            };
+
+            // 内容已经成功压缩、上传到云端之后，verbose 日志写入才失败——这个失败必须如实抛出来，
+            // 绝不能被悄悄吞掉、把 x.txt 误判成"读不开"（那样的话数据在云端却在索引里凭空消失，
+            // 而且备份还会"成功"收尾，是比崩溃更糟的静默数据丢失）。DirectoryNotFoundException
+            // 是 IOException 的子类，用 ThrowsAnyAsync 兼容 .NET 对 ENOTDIR 的具体映射类型。
+            await Assert.ThrowsAnyAsync<IOException>(() => orchestrator.RunAsync(request));
+
+            // 修复前的错误处置会先写一条"读不开"告警再吞掉异常；修复后异常真实向外传播，
+            // 不会有任何文件被误判成"读不开"进而通知。
+            Assert.DoesNotContain(notifier.Notifications, n => n.Title.Contains("d/x.txt"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

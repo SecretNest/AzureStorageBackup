@@ -422,6 +422,8 @@ public sealed class BackupOrchestrator(
         }
 
         var finalHash = file.FullHash;
+        ProcessingOutcome? verifyOutcome = null;
+        var verifyAttempts = 0;
         try
         {
             if (verifier is not null)
@@ -429,10 +431,8 @@ public sealed class BackupOrchestrator(
                 var verificationOptions = new VerificationOptions { MaxAttempts = request.Options.ProcessingMaxAttempts };
                 var vr = await verifier.RunAsync(localPath, file.FullHash, ProcessAsync, verificationOptions, ct);
                 finalHash = vr.FullHash;
-                if (vr.Outcome == ProcessingOutcome.Alarmed)
-                    await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                        $"File kept changing during backup: {file.Path}",
-                        $"Saved with current content after {vr.Attempts} attempts", ct);
+                verifyOutcome = vr.Outcome;
+                verifyAttempts = vr.Attempts;
             }
             else
             {
@@ -449,6 +449,14 @@ public sealed class BackupOrchestrator(
             onItem();
             return;
         }
+
+        // "反复变化"告警是内容已成功处理/上传之后的事后上报，不再触碰源文件——绝不能留在上面的
+        // try 里：否则这条通知（或其内部日志写入）失败会被误判成"文件读不开"，导致已经成功上传
+        // 的内容在索引里被沿用旧条目或整条丢弃，而云端其实已经有这份数据（本次修复 Finding 1）。
+        if (verifyOutcome == ProcessingOutcome.Alarmed)
+            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                $"File kept changing during backup: {file.Path}",
+                $"Saved with current content after {verifyAttempts} attempts", ct);
 
         if (collided)
             await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
@@ -625,34 +633,25 @@ public sealed class BackupOrchestrator(
                 var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
-                onItem();
             }
+            // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
+            // total 里预留的一个槽位，必须**恰好上报一次**——即便 stable.Count == 0（整组成员一起
+            // 读不开，Finding 2 命中的最坏情形），否则 uploaded 永远追不上 total，完工也显示不了 100%。
+            // 反过来，onItem() 放在这里而不是 foreach(changed) 内部的每个成员上，也避免了同一组里
+            // 多个成员一起失败时被重复计数（该组只占一个槽位，不是每个成员各占一个）。
+            onItem();
 
             foreach (var m in changed)
             {
                 var local = Local(request, m.Path);
+                string newHash;
+                long newLen;
                 try
                 {
-                    var newHash = await hasher.FullHashAsync(local, ct);
-                    var newLen = new FileInfo(local).Length;
+                    newHash = await hasher.FullHashAsync(local, ct);
+                    newLen = new FileInfo(local).Length;
                     // 内容已变（≠ diff 时 fullHash）：写索引覆盖，使 fullHash/名字/元数据与新内容一致。
                     overrides[m.Path] = await BuildOverrideAsync(local, newHash, headBytes, ct);
-
-                    var n = attempts[m.Path] = attempts.GetValueOrDefault(m.Path) + 1;
-                    if (newLen >= threshold || n >= maxAttempts)
-                    {
-                        // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
-                        if (n >= maxAttempts)
-                            await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                                $"File kept changing during grouping: {m.Path}",
-                                $"Stored as single file after {n} attempts", ct);
-                        await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                            storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, ct);
-                    }
-                    else
-                    {
-                        queue.Add(new PlannedFile(m.Path, newLen, newHash)); // 自然进入下一组
-                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -660,8 +659,29 @@ public sealed class BackupOrchestrator(
                     // 若仍然读不开（并非瞬时抖动，而是真被锁住/权限收回），就不再假装能重新入队处理——
                     // 就地按"读不开"降级：不产生任何 blob、不进入任何 pack，索引沿用旧条目或整条缺席。
                     // 全目录一起读不开时，这一步保证第一个撞上的成员不会让同目录其余成员失去被处理的机会。
+                    // 不在此处调用 onItem()：这一组的槽位已经在上面统一上报过一次，这里再报会双计。
                     postDiffUnreadable[m.Path] = ex.Message;
                     await RecordPostDiffUnreadableAsync(request, m.Path, ex.Message, ct);
+                    continue;
+                }
+
+                var n = attempts[m.Path] = attempts.GetValueOrDefault(m.Path) + 1;
+                if (newLen >= threshold || n >= maxAttempts)
+                {
+                    // 变大到超阈值、或反复变化达阈值 → 单文件（后者报警）。
+                    if (n >= maxAttempts)
+                        await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                            $"File kept changing during grouping: {m.Path}",
+                            $"Stored as single file after {n} attempts", ct);
+                    // 不重新用 try 包住整个调用：HandleBlobAsync 自己对源读取/处理/上传有正确范围的
+                    // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
+                    // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
+                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, ct);
+                }
+                else
+                {
+                    queue.Add(new PlannedFile(m.Path, newLen, newHash)); // 自然进入下一组
                 }
             }
         }
