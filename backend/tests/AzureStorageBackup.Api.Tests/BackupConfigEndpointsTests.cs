@@ -498,6 +498,91 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Empty((await missingVer.Content.ReadFromJsonAsync<List<TreeNode>>())!);
     }
 
+    /// <summary>
+    /// 读版本索引的端点必须走**本地权威缓存**，不能在运行期读云端（设计核心原则：本地索引权威、
+    /// 运行期零云读）。/tree 一直是对的，而 /unrecoverable、/file-versions、/unreadable 三个
+    /// 直接调 IBackupInfoStore.ReadIndexAsync ——还原对话框一打开就至少两次云端索引下载，
+    /// /file-versions 更是**每个版本各一次**：延迟之外还是实打实的 Azure 出站流量费，
+    /// 而本地就躺着权威副本。
+    /// <para>
+    /// 判据很干净：本测试的 container 在 Azurite 上**根本不存在**，本地缓存里却有完整索引。
+    /// 走本地则三个端点都能返回正确内容；走云端则必然失败。修复前 /unrecoverable 与 /unreadable
+    /// 返回 500，/file-versions 返回空。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Index_Reading_Endpoints_Use_The_Local_Cache_Not_The_Cloud()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-nocloud") with { AccountId = account.Id, ContainerName = "ep-nocloud-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var identityTicks = SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion
+            {
+                Version = 1, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = "v1.index",
+                Stats = new VersionStats(2, 10, 2, 10),
+            },
+        ]);
+
+        var stale = new DateTimeOffset(2026, 7, 20, 8, 30, 0, TimeSpan.Zero);
+        var index = new VersionIndex
+        {
+            Version = 1,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    Path = "carried.txt", Kind = "file", Length = 5, Mtime = DateTimeOffset.UtcNow,
+                    Permissions = "644", UnreadableAt = stale,
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/abc" },
+                },
+                new IndexEntry
+                {
+                    Path = "broken.txt", Kind = "file", Length = 5, Mtime = DateTimeOffset.UtcNow,
+                    Permissions = "644", Storage = new StorageRef { Kind = "blob", Ref = "data/def" },
+                },
+            ],
+            UnrecoverablePaths = ["broken.txt"],
+        };
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.CachedVersionIndexes.Add(new CachedVersionIndex
+            {
+                AccountId = account.Id, Container = created.ContainerName, Version = 1,
+                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+            });
+            await db.SaveChangesAsync();
+        }
+
+        // /unreadable —— 云端没有这个 container，能返回内容就证明读的是本地缓存。
+        var unread = await _client.GetAsync($"/api/backup-configs/{created.Id}/unreadable?version=1");
+        Assert.Equal(HttpStatusCode.OK, unread.StatusCode);
+        var unreadRow = Assert.Single((await unread.Content.ReadFromJsonAsync<List<UnreadableRow>>())!);
+        Assert.Equal("carried.txt", unreadRow.path);
+        Assert.Equal(stale, unreadRow.unreadableAt);
+
+        // /unrecoverable
+        var unrec = await _client.GetAsync($"/api/backup-configs/{created.Id}/unrecoverable?version=1");
+        Assert.Equal(HttpStatusCode.OK, unrec.StatusCode);
+        Assert.Equal(["broken.txt"], (await unrec.Content.ReadFromJsonAsync<List<string>>())!);
+
+        // /file-versions —— 循环里每个版本各读一次索引，最该走本地。
+        var fv = await _client.GetAsync(
+            $"/api/backup-configs/{created.Id}/file-versions?path={Uri.EscapeDataString("carried.txt")}");
+        Assert.Equal(HttpStatusCode.OK, fv.StatusCode);
+        var candidate = Assert.Single((await fv.Content.ReadFromJsonAsync<List<FileVersionCandidate>>())!);
+        Assert.Equal(1, candidate.version);
+
+        // 标记为不可恢复的路径不得出现在替代候选里（本地读没有把这条既有语义读丢）。
+        var fvBroken = await _client.GetAsync(
+            $"/api/backup-configs/{created.Id}/file-versions?path={Uri.EscapeDataString("broken.txt")}");
+        Assert.Empty((await fvBroken.Content.ReadFromJsonAsync<List<FileVersionCandidate>>())!);
+    }
+
     [Fact]
     public async Task File_Versions_And_Unrecoverable_Return_Empty_Array_When_No_Versions_Exist()
     {

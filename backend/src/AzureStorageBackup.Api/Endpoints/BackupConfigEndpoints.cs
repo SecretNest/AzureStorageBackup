@@ -237,7 +237,7 @@ public static class BackupConfigEndpoints
         });
 
         // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
-        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -251,9 +251,13 @@ public static class BackupConfigEndpoints
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var candidates = new List<object>();
+            // 本地权威缓存优先（与 /tree 一致）。这里尤其要紧：循环里**每个版本各读一次索引**，
+            // 直接读云端就是每次点击「选择替代版本」下载 N 个索引 blob——延迟之外还是实打实的
+            // Azure 出站流量费，而本地就有权威副本。
+            var fvIdentity = info?.Backup.CreatedAt.UtcTicks ?? 0;
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
             {
-                var idx = await store.ReadIndexAsync(account, config.ContainerName, v.IndexBlob, password, ct);
+                var idx = await indexCache.ReadAsync(account, config.ContainerName, v.Version, fvIdentity, v.IndexBlob, password, ct);
                 if (idx.UnrecoverablePaths.Contains(path))
                     continue;
                 var e = idx.Entries.FirstOrDefault(x => x.Path == path && x.Storage is not null);
@@ -264,7 +268,7 @@ public static class BackupConfigEndpoints
         });
 
         // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
-        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -282,14 +286,15 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<string>());
-            var idx = await store.ReadIndexAsync(account, config.ContainerName, ver.IndexBlob, password, ct);
+            var idx = await indexCache.ReadAsync(
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ct);
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
         // 某版本里内容为**沿用**的文件：备份那几轮读不开源文件，索引沿用了更早版本的条目。
         // 与 /unrecoverable 对称，但语义不同：那边是数据已损坏、无内容可给；这边内容有效，只是旧。
         // 还原前需要知道这件事——否则还原了这个版本，却拿到更早时刻的内容而毫不知情。
-        group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IBackupInfoStore store, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -307,7 +312,8 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<object>());
-            var idx = await store.ReadIndexAsync(account, config.ContainerName, ver.IndexBlob, password, ct);
+            var idx = await indexCache.ReadAsync(
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ct);
             return Results.Ok(idx.Entries
                 .Where(e => e.UnreadableAt is not null)
                 .Select(e => new { path = e.Path, unreadableAt = e.UnreadableAt })
