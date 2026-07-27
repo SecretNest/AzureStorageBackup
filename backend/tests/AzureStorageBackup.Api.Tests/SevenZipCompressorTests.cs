@@ -172,4 +172,51 @@ public sealed class SevenZipCompressorTests : IDisposable
 
         Assert.Single(result.VolumeFiles); // 齐全的加密归档照常产出，不被误判为缺成员
     }
+    /// <summary>压缩方法参数可调（Backup__SevenZipMethodArgs）：NAS 上内存和 CPU 都紧张，
+    /// 换算法、缩字典、限线程都是实际诉求。归档自描述，改了不影响已有版本还原。</summary>
+    [SkippableFact]
+    public async Task Method_Args_From_Configuration_Are_Passed_To_7z()
+    {
+        Skip.If(Exe is null, "7z executable not found on PATH.");
+        var src = SourceDir();
+        // 高度可压的内容：-mx9 与 -mx0 的产物大小必然拉开差距。
+        WriteInto(src, "z.bin", new byte[200_000]);
+
+        var packed = await new SevenZipCompressor(Exe).CompressAsync(
+            new CompressionRequest(src, ["z.bin"], Path.Combine(_dir, "default.7z")));
+        var stored = await new SevenZipCompressor(Exe, "-mx0").CompressAsync(
+            new CompressionRequest(src, ["z.bin"], Path.Combine(_dir, "stored.7z")));
+
+        Assert.True(new FileInfo(stored.VolumeFiles[0]).Length > new FileInfo(packed.VolumeFiles[0]).Length,
+            "-mx0 should not have compressed the input");
+    }
+
+    /// <summary>只收 -m 开头的参数。其余开关决定的是我们怎么和 7z 对话（-y/-bso0/-si/-t7z），
+    /// 一次手滑就能毁掉输出解析或产出还原不了的归档——所以在构造时就拦，启动即失败。</summary>
+    [Theory]
+    [InlineData("-o/tmp/evil")]
+    [InlineData("-mx9 -y")]
+    [InlineData("-m")]
+    public void Non_Method_Arguments_Are_Rejected_Up_Front(string args)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => new SevenZipCompressor(Exe ?? "/bin/true", args));
+        Assert.Contains("-m", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>配置里显式给了 -md 就照配置来：自动推算的词典只是"没人管时的默认"，
+    /// 不该盖掉运维按自己机器内存定下的值。</summary>
+    [SkippableFact]
+    public async Task Explicit_Dictionary_Size_Survives_Streaming_Compression()
+    {
+        Skip.If(Exe is null, "7z executable not found on PATH.");
+        var compressor = new SevenZipCompressor(Exe, "-mx9 -md=1m");
+        var payload = new byte[300_000];
+
+        var result = await compressor.CompressStreamAsync(
+            new StreamCompressionRequest("s.bin", Path.Combine(_dir, "stream-md.7z"), ExpectedBytes: payload.Length),
+            async (stdin, ct) => { await stdin.WriteAsync(payload, ct); return payload.Length; });
+
+        var entries = await compressor.ListEntriesAsync(result.VolumeFiles[0], null);
+        Assert.Equal(payload.Length, Assert.Single(entries).Size);
+    }
 }

@@ -82,7 +82,14 @@ builder.Services.AddSingleton(sp => new DeadWeightCompactor(
     Path.Combine(tempPath, "compact"),
     sp.GetService<ILogger<DeadWeightCompactor>>()));
 builder.Services.AddScoped<RetentionCleaner>();
-builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor());
+// 压缩方法参数可调（Backup__SevenZipMethodArgs，例如 "-mx7 -md=32m -mmt=2"）：默认 -mx9 最省空间，
+// 但 NAS 上 CPU 和内存都是稀缺资源，换算法/缩字典/限线程是很实际的诉求。只收 -m 开头的参数——
+// 其余开关决定的是我们怎么和 7z 对话，可配等于让一次手滑毁掉输出解析。
+// 归档自描述，改了不影响已有版本的还原。
+// 在这里先验一次：DI 工厂是懒的，不验的话一个写错的值要等到第一次备份跑起来才炸。
+var sevenZipMethodArgs = builder.Configuration["Backup:SevenZipMethodArgs"];
+SevenZipCompressor.ValidateMethodArgs(sevenZipMethodArgs);
+builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor(methodArgs: sevenZipMethodArgs));
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddSingleton<ProcessingVerifier>();
 builder.Services.AddScoped<BackupOrchestrator>();
