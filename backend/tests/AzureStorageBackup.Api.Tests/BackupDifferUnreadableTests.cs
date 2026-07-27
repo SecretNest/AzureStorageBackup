@@ -124,6 +124,30 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     }
 
     [Fact]
+    public async Task An_Unreadable_File_With_Unchanged_Length_But_Changed_Mtime_Is_Classified_Unreadable()
+    {
+        // 期望：length 不变但 mtime 变 → 走"两级哈希"分支（先 headHash 再视情况 fullHash）。
+        // 这条分支此前只在正常路径下被覆盖，读失败时从未有测试真正跑到这里。
+        var path = Write("locked.mdf", "hello");
+        var previous = await SnapshotAsync();
+
+        // 不改内容（length 不变），只改 mtime，确保落入 length 同、mtime 不同的分支。
+        File.SetLastWriteTimeUtc(path, previous.Entries.Single(e => e.Path == "locked.mdf").Mtime.UtcDateTime.AddHours(1));
+
+        var hasher = new ThrowingHasher("locked.mdf",
+            new IOException("The process cannot access the file because it is being used by another process."));
+
+        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous);
+
+        var c = Change(diff, "locked.mdf");
+        Assert.Equal(ChangeKind.Unreadable, c.Kind);
+        Assert.Same(previous.Entries.Single(e => e.Path == "locked.mdf"), c.Previous);
+        Assert.Null(c.HeadHash);
+        Assert.Null(c.FullHash);
+        Assert.Null(c.CarriedStorage);
+    }
+
+    [Fact]
     public async Task UnauthorizedAccess_Is_Treated_The_Same_As_IOException()
     {
         // 期望：与上一条同样分类为 Unreadable。
