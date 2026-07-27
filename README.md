@@ -100,6 +100,8 @@ Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 
 Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
 
+A restore downloads each archive under `restore/` before writing files out. Single-file blobs — anything above the *single-file threshold* — are decompressed straight into the destination file, so they cost only the downloaded archive; the file's own bytes are never written twice. Packs are still extracted to disk first, so their peak is the downloaded pack plus its uncompressed contents, times the download concurrency.
+
 ## Docker
 
 The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.
@@ -129,6 +131,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
 | `Backup__IndexCacheSize` | How many deserialised version indexes to keep in memory. Trades RAM for responsiveness when browsing large backups — see below. `0` disables it. | `2` |
+| `Backup__SevenZipMethodArgs` | Compression method switches handed to `7zz` — see below. Only `-m…` switches are accepted. | `-mx9` |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
 | `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
 | `Auth__Password` | Password required to open the UI. Unset or empty = no authentication (the app logs a warning at startup). There is no username. | *(unset)* |
@@ -158,6 +161,21 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > | Small-memory host, or only ever browsing one version at a time | `1` | Most of the speed-up for half the memory. |
 >
 > Only browsing and reporting are affected. Backup, restore and check themselves read each index once and do not depend on this setting, so `0` never makes a backup slower — and it never changes what gets backed up or restored.
+
+> `Backup__SevenZipMethodArgs` replaces the compression settings the app passes to `7zz`, which are `-mx9` (maximum LZMA2 compression) by default. Anything 7-Zip accepts as a method switch works, so you can trade ratio for speed or memory:
+>
+> | Value | Effect |
+> | --- | --- |
+> | `-mx9` (default) | Smallest archives, slowest, ~700 MB of RAM per compression at the default dictionary size. |
+> | `-mx5` | Roughly half the time for a few percent more size. A good default on a NAS. |
+> | `-mx1` | Fastest real compression; useful when the upload link, not the CPU, is the bottleneck. |
+> | `-mx9 -md=256m` | Better ratio on large files, at ~2.5 GB of RAM per compression. Do not use on a small-memory host. |
+> | `-mx9 -mmt=2` | Caps compression at two threads. Lower peak RAM and leaves CPU for everything else on the box. |
+> | `-mx9 -m0=PPMd` | Better ratio than LZMA2 on text-heavy data, worse on everything else. |
+>
+> **Only method switches (`-m…`) are accepted**, and a bad value stops the app at startup rather than halfway through a backup. Everything else about the command line — file names, encryption, volume splitting, and the switches that govern how the app reads 7-Zip's output — stays under the app's control, because changing those would break how archives are located and verified. Files matched by a *don't compress* rule are still stored uncompressed (`-mx0`) regardless of this setting.
+>
+> The setting affects only archives written from then on. Existing backups keep whatever they were compressed with — 7-Zip records that in the archive — so changing it is safe and never invalidates anything already uploaded.
 
 > Setting `Auth__Password` puts a single password in front of the whole UI — there is no username, and changing the password means changing the variable and restarting. The session cookie is signed with the Data Protection key ring in `/keys`, so losing that directory signs you out and you will have to log in again; the password itself is read straight from the environment, so a lost key ring never locks you out.
 >

@@ -1210,4 +1210,74 @@ public sealed class RestoreOrchestratorTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// 单文件 blob 直接从归档流到目标，不再落一份临时解压件——于是"写出来的东西对不对"
+    /// 必须自己核对：<c>7z x -so</c> 取不到内容时输出为空却**退出码 0**（本项目已经踩过一次），
+    /// 光靠"没抛异常"会把一个空文件或别人的内容当成还原成功盖到用户文件上。
+    /// 这里把 data blob 换成另一个**合法**归档（内容与长度都不同）：解压这一步会成功，
+    /// 只有长度/hash 这道关能拦住它。
+    /// </summary>
+    [SkippableFact]
+    public async Task Streamed_Blob_Whose_Content_Does_Not_Match_The_Index_Fails_That_Entry_And_Leaves_No_Debris()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var good = RandomName("rst-mismatch-");
+        var other = RandomName("rst-other-");
+        var goodContainer = factory.CreateServiceClient(account).GetBlobContainerClient(good);
+        var otherContainer = factory.CreateServiceClient(account).GetBlobContainerClient(other);
+        await goodContainer.CreateIfNotExistsAsync();
+        await otherContainer.CreateIfNotExistsAsync();
+
+        try
+        {
+            var blobOnly = BackupReq(account, good) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            };
+
+            WriteSrc("victim.txt", "the content the index describes");
+            await backup.RunAsync(blobOnly);
+
+            // 另一次备份产出一个内容不同的合法 7z 单文件归档，拿它顶掉上面那条的 data blob。
+            File.Delete(Path.Combine(_src, "victim.txt"));
+            WriteSrc("decoy.txt", "a different payload of a different length entirely");
+            await backup.RunAsync(blobOnly with { Container = other });
+
+            var decoy = await FirstDataBlobAsync(otherContainer);
+            var victim = await FirstDataBlobAsync(goodContainer);
+            var bytes = (await otherContainer.GetBlobClient(decoy).DownloadContentAsync()).Value.Content;
+            await goodContainer.GetBlobClient(victim).UploadAsync(bytes, overwrite: true);
+
+            var phase = new SyncProgress();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = good, TargetRoot = _dst },
+                phase: phase);
+
+            Assert.Equal(0, result.RestoredFiles);
+            Assert.Equal(1, result.FailedFiles);
+            Assert.Contains(phase.Messages, m => m.Contains("victim.txt", StringComparison.Ordinal));
+
+            // 内容对不上就一个字节都不该落到目标上——半截件、临时件都不留。
+            Assert.False(File.Exists(Path.Combine(_dst, "victim.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "victim.txt.asb-part")));
+        }
+        finally
+        {
+            await goodContainer.DeleteIfExistsAsync();
+            await otherContainer.DeleteIfExistsAsync();
+        }
+    }
+
+    private static async Task<string> FirstDataBlobAsync(Azure.Storage.Blobs.BlobContainerClient container)
+    {
+        await foreach (var b in container.GetBlobsAsync(
+            Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+            return b.Name;
+        throw new InvalidOperationException("no data blob was produced by the backup");
+    }
 }

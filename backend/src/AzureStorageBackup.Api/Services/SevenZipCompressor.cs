@@ -82,18 +82,63 @@ public interface IFileCompressor
 public sealed class SevenZipCompressor : IFileCompressor
 {
     private readonly string _exe;
+    private readonly IReadOnlyList<string> _methodArgs;
 
-    public SevenZipCompressor(string? executable = null)
-        => _exe = executable ?? SevenZipCli.TryResolveExecutable()
+    /// <param name="methodArgs">
+    /// 覆盖压缩方法参数（<c>-m…</c>），默认 <c>-mx9</c>（PRD 3.3.2.1 要求最大压缩）。
+    /// 换算法、调字典、限线程都从这里走，例如 <c>-mx7 -m0=lzma2 -md=32m -mmt=2</c>。
+    /// <para>
+    /// 只收 <c>-m</c> 开头的参数：其余开关决定的是我们怎么和 7z 对话（<c>-y</c> 自动应答、
+    /// <c>-bso0/-bsp0</c> 静音、<c>-si</c> 走 stdin、<c>-t7z</c> 归档格式），让它们可配等于
+    /// 让一次手滑毁掉输出解析或产出还原不了的归档。加密（<c>-p</c>/<c>-mhe=on</c>）与分卷
+    /// （<c>-v</c>）按备份配置走，同样不从这里来。
+    /// </para>
+    /// <para>写错了在构造时就抛——启动即失败，好过备份跑到一半才炸。</para>
+    /// </param>
+    public SevenZipCompressor(string? executable = null, string? methodArgs = null)
+    {
+        _exe = executable ?? SevenZipCli.TryResolveExecutable()
             ?? throw new InvalidOperationException("No 7-Zip executable found on PATH.");
+        _methodArgs = ParseMethodArgs(methodArgs);
+    }
+
+    /// <summary>本实例实际会用的 <c>-m…</c> 参数（StoreOnly 除外，见 <see cref="MethodArgs"/>）。
+    /// 用于断言配置确实绑到了这里——真正会坏的是配置绑定那一环，键名写错的话类本身再正确也没用。</summary>
+    public IReadOnlyList<string> ConfiguredMethodArgs => _methodArgs;
+
+    /// <summary>
+    /// 校验一串方法参数，配置写错就抛。给启动期用：DI 工厂是懒的，不在这里先验一次的话，
+    /// 一个写错的 <c>Backup__SevenZipMethodArgs</c> 要等到第一次备份跑起来才炸——
+    /// 那时用户已经以为一切正常了。<paramref name="methodArgs"/> 为空＝用默认值，合法。
+    /// </summary>
+    public static void ValidateMethodArgs(string? methodArgs) => ParseMethodArgs(methodArgs);
+
+    private static IReadOnlyList<string> ParseMethodArgs(string? methodArgs)
+    {
+        if (string.IsNullOrWhiteSpace(methodArgs))
+            return ["-mx9"];
+
+        var parsed = methodArgs.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var a in parsed)
+        {
+            if (!a.StartsWith("-m", StringComparison.Ordinal) || a.Length <= 2)
+                throw new ArgumentException(
+                    $"7-Zip compression arguments may only be method switches (-m…); got '{a}'.", nameof(methodArgs));
+        }
+        return parsed;
+    }
+
+    /// <summary>本次压缩实际要用的 <c>-m…</c> 参数。StoreOnly（不压缩列表）恒为 <c>-mx0</c>：
+    /// 那是"这类文件压了也白压"的判断结果，不是可调的偏好。</summary>
+    private IEnumerable<string> MethodArgs(bool storeOnly) => storeOnly ? ["-mx0"] : _methodArgs;
 
     public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
     {
         var outDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputArchivePath))!;
         Directory.CreateDirectory(outDir);
 
-        // 压缩级别默认最大（PRD 3.3.2.1）；不压缩列表用 -mx0（仅封装）。
-        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", request.StoreOnly ? "-mx0" : "-mx9" };
+        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
+        args.AddRange(MethodArgs(request.StoreOnly));
         if (!string.IsNullOrEmpty(request.Password))
         {
             args.Add("-p" + request.Password);
@@ -148,17 +193,20 @@ public sealed class SevenZipCompressor : IFileCompressor
         Directory.CreateDirectory(outDir);
 
         // -si{name} 让 7z 从 stdin 读内容、以 name 作为归档内的条目名。加密/头加密/分卷与它完全兼容。
-        var args = new List<string>
-        {
-            "a", "-t7z", "-y", "-bso0", "-bsp0", request.StoreOnly ? "-mx0" : "-mx9",
-            "-si" + request.EntryName,
-        };
+        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
+        var method = MethodArgs(request.StoreOnly).ToList();
+        args.AddRange(method);
+        args.Add("-si" + request.EntryName);
         // 词典大小必须自己给。压缩一个**文件**时 7z 会把词典缩到输入大小；从 stdin 读它不知道会来多少，
         // 于是每次都照 -mx9 的 64 MB 分配——一个 6 MB 的文件因此凭空多付近一秒（实测 0.10s → 0.30s），
         // 而这条路径上跑的正是成千上万个刚过 5 MB 阈值的文件。按压之前 stat 到的长度取 2 的幂并封顶
         // 64 MB，与 7z 自己对同尺寸文件的选择一致：产出逐字节相同，只是不再白等那次分配。
-        if (!request.StoreOnly && request.ExpectedBytes is { } expected)
+        // 配置里显式给了 -md 就照配置来：那是运维按自己机器的内存定的，比这里的自动推算权威。
+        if (!request.StoreOnly && request.ExpectedBytes is { } expected
+            && !method.Any(a => a.StartsWith("-md", StringComparison.Ordinal)))
+        {
             args.Add($"-md={DictionaryBytes(expected)}b");
+        }
         if (!string.IsNullOrEmpty(request.Password))
         {
             args.Add("-p" + request.Password);
