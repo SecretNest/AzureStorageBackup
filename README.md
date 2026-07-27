@@ -78,6 +78,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
+| `Backup__IndexCacheSize` | How many deserialised version indexes to keep in memory. Trades RAM for responsiveness when browsing large backups — see below. `0` disables it. | `2` |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
 | `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
 | `Auth__Password` | Password required to open the UI. Unset or empty = no authentication (the app logs a warning at startup). There is no username. | *(unset)* |
@@ -90,6 +91,20 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](docs/keyring-loss-recovery-design.md).
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
+
+> `Backup__IndexCacheSize` trades memory for responsiveness, and which way you want it depends entirely on how much RAM the machine has.
+>
+> A version index lists every file in a backup. It is stored compactly on local disk, so reading one means rebuilding the whole list in memory — and the restore dialog does that every time you expand a folder, as do the check and version screens. On a 500,000-file backup one expansion measured **~0.9 s and ~350 MB of allocation** just to return the handful of entries in that folder. Keeping the rebuilt index around makes every later read of the same version nearly instant.
+>
+> The cost is resident memory: roughly **190 MB per cached index at 500,000 files**, proportional to the file count (a 50,000-file backup is nearer 19 MB). The default of `2` keeps the version you are browsing plus one more, so comparing two versions stays fast.
+>
+> | Situation | Suggested value | Effect |
+> | --- | --- | --- |
+> | Normal machine (default) | `2` | Browsing and version comparison stay fast. |
+> | Small-memory host (e.g. 1 GB NAS / Raspberry Pi) with a large backup | `0` | No index is held in memory. Every folder expansion rebuilds the index, so the restore dialog gets slower, but peak memory stays low. |
+> | Small-memory host, or only ever browsing one version at a time | `1` | Most of the speed-up for half the memory. |
+>
+> Only browsing and reporting are affected. Backup, restore and check themselves read each index once and do not depend on this setting, so `0` never makes a backup slower — and it never changes what gets backed up or restored.
 
 > Setting `Auth__Password` puts a single password in front of the whole UI — there is no username, and changing the password means changing the variable and restarting. The session cookie is signed with the Data Protection key ring in `/keys`, so losing that directory signs you out and you will have to log in again; the password itself is read straight from the environment, so a lost key ring never locks you out.
 >
