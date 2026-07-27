@@ -14,21 +14,21 @@ public static class BackupConfigEndpoints
     {
         var group = app.MapGroup("/api/backup-configs").WithTags("BackupConfigs");
 
-        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapGet("/", async (IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
             var settings = await settingsSvc.GetAsync(ct);
             return Results.Ok(list.Select(c =>
-                BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c))));
+                BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c))));
         });
 
-        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
             var c = await svc.GetAsync(id, ct);
             if (c is null)
                 return Results.NotFound();
             var settings = await settingsSvc.GetAsync(ct);
-            return Results.Ok(BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, busy), Pending(keyring, encryption, c)));
+            return Results.Ok(BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c)));
         })
         .WithName("GetBackupConfig");
 
@@ -155,7 +155,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -166,7 +166,7 @@ public static class BackupConfigEndpoints
             // 配置一删，界面就再也找不到它的进度——于是同一个 container 上新建的备份被拒（busy），
             // 状态却显示 BackingUp 且没有任何细节，像是凭空卡死。若同时勾了「删除 container」，
             // 那次运行还会继续往一个已经不存在的 container 上传。这些都是用户实际踩到的。
-            var activity = DeriveActivity(config, backupRunner, restoreRunner, repairRunner, busy);
+            var activity = DeriveActivity(config, backupRunner, restoreRunner, repairRunner, checkRunner, busy);
             if (activity != "Idle")
                 return Results.Conflict(new
                 {
@@ -499,8 +499,10 @@ public static class BackupConfigEndpoints
             return Results.Ok(versions);
         });
 
-        // 完整性检查（deep=true 时下载解压重算 hash 深度校验）
-        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, IAccountService accounts, BackupChecker checker, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, ISecretReader secrets, IKeyringHealth keyring, ILoggerFactory loggerFactory, PathBoundary boundary, CancellationToken ct) =>
+        // 完整性检查（Content 级下载解压重算 hash 深度校验）。**后台 job**：
+        // 内容级检查要把整个备份下载一遍，几百 GB 就是几小时——同步端点时代请求会先被浏览器
+        // 或反向代理超时掐断，检查白跑，而且全程没有任何进度可看。现在返回 202，用 GET 轮询。
+        group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, CheckRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -508,45 +510,52 @@ public static class BackupConfigEndpoints
             if (config is null)
                 return Results.NotFound();
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
-            var account = await accounts.GetAsync(config.AccountId, ct);
-            if (account is null)
-                return Results.BadRequest(new { error = "Account not found." });
 
-            // 检查也是对该备份的操作 → 纳入忙碌；备份正忙则拒绝，检查期间也标记忙碌使计划任务跳过。
-            if (!busy.TryAcquire(account.Id, config.ContainerName))
-                return Results.Conflict(new { error = "Backup is busy with another operation." });
-            try
+            var options = new CheckOptions
             {
-                var password = secrets.RevealBackupPassword(config);
-                var settings = await settingsSvc.GetAsync(ct);
-                var options = new CheckOptions
-                {
-                    Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
-                    Local = local ?? LocalCheckLevel.Content,
-                    // 显式转为 AccessTier?：AccessTier 有 string 隐式转换构造函数，三元表达式与裸 null 混用时
-                    // 编译器会走「null→string→AccessTier(string)」这条隐式转换路径而非「AccessTier→AccessTier?」，
-                    // 导致 rehydrate 为空时对 AccessTier(string) 传 null 触发 ArgumentNullException（真实生产 bug）。
-                    RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
-                    ListOrphans = listOrphans ?? false,
-                };
-                var result = await checker.CheckAsync(account, config.ContainerName, password, version, options, config.LocalRoot, ct,
-                    downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5);
-                // Check 完成（无论是否发现问题）算成功；只有异常才置 Error（决策 2）。
-                // best-effort：状态回写失败不应把已成功的检查结果变成 500。
-                await svc.WriteStatusAsync(id, error: null, loggerFactory.CreateLogger("BackupStatus"), ct);
-                return Results.Ok(result);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // 取消不是检查失败：不能把「客户端断开 / 进程关停」写成该备份的 Error 状态
-                // （与 a3ac967 同一约定）。异常本就原样上抛，busy 锁在 finally 里照常释放。
-                await svc.WriteStatusAsync(id, ex.Message, loggerFactory.CreateLogger("BackupStatus"), ct);
-                throw;
-            }
-            finally
-            {
-                busy.Release(account.Id, config.ContainerName);
-            }
+                Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
+                Local = local ?? LocalCheckLevel.Content,
+                // 显式转为 AccessTier?：AccessTier 有 string 隐式转换构造函数，三元表达式与裸 null 混用时
+                // 编译器会走「null→string→AccessTier(string)」这条隐式转换路径而非「AccessTier→AccessTier?」，
+                // 导致 rehydrate 为空时对 AccessTier(string) 传 null 触发 ArgumentNullException（真实生产 bug）。
+                RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
+                ListOrphans = listOrphans ?? false,
+            };
+            var state = runner.Start(id, version, options);
+            return Results.Accepted($"/api/backup-configs/{id}/check", CheckRunResponse.From(state));
+        });
+
+        // 最近一次检查的状态与报告。跑完之后**报告仍然留着**：关掉对话框再打开要能看回结果。
+        group.MapGet("/{id:int}/check", (int id, CheckRunner runner) =>
+        {
+            var state = runner.Get(id);
+            return state is null ? Results.NotFound() : Results.Ok(CheckRunResponse.From(state));
+        });
+
+        // 停止该备份上正在跑的操作。what 省略＝全部停；否则只停指定的一种
+        // （一个配置可能同时在备份和还原——还原刻意不占忙碌锁，见 RestoreRunner 顶部注释）。
+        //
+        // 在此之前根本没有"停"这个动作：一次跑错了的备份只能等它跑完，或者重启整个容器——
+        // 而用户跑在 NAS 上，重启会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
+        group.MapPost("/{id:int}/cancel", async (int id, string? what, IBackupConfigService svc,
+            BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner,
+            CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+
+            var canceled = new List<string>();
+            if (Wanted(what, "backup") && backupRunner.Cancel(id)) canceled.Add("backup");
+            if (Wanted(what, "restore") && restoreRunner.Cancel(id)) canceled.Add("restore");
+            if (Wanted(what, "repair") && repairRunner.Cancel(id)) canceled.Add("repair");
+            if (Wanted(what, "check") && checkRunner.Cancel(id)) canceled.Add("check");
+
+            // 停止是异步的：这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾。
+            // 界面据此把按钮改成「Stopping…」，而不是立刻当成已经停了。
+            return canceled.Count == 0
+                ? Results.Conflict(new { error = "Nothing is running for this backup." })
+                : Results.Ok(new { canceled });
         });
 
         // 备份密码重设（设计 §3.4）。验证依据：加密备份的信息文件本身就是用该密码加密的 7z，
@@ -630,12 +639,13 @@ public static class BackupConfigEndpoints
 
     /// <summary>
     /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态
-    /// （BackupRunner/RestoreRunner/RepairRunner 已各自暴露 <c>Get(id)</c>，无需新增 accessor）；
+    /// （各 Runner 已各自暴露 <c>Get(id)</c>，无需新增 accessor）；
     /// 都没有但 BackupBusyTracker 显示忙碌，则取其记录的操作标签（BackingUp/Checking/CleaningUp）——
-    /// 检查端点 (/check) 与计划任务的备份/检查/清理都同步持锁运行，不经过任何 Runner。
+    /// 计划任务的备份/检查/清理都同步持锁运行，不经过任何 Runner。
     /// </summary>
     private static string DeriveActivity(
-        BackupConfig c, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, BackupBusyTracker busy)
+        BackupConfig c, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner,
+        CheckRunner checkRunner, BackupBusyTracker busy)
     {
         if (backupRunner.Get(c.Id)?.Status == RunStatus.Running)
             return "BackingUp";
@@ -643,10 +653,16 @@ public static class BackupConfigEndpoints
             return "Restoring";
         if (repairRunner.Get(c.Id)?.Status == RunStatus.Running)
             return "Repairing";
-        // 非 Runner 的持锁操作（手动 /check、计划 备份/检查/清理）：读忙碌跟踪记录的实际操作标签，
+        if (checkRunner.Get(c.Id)?.Status == RunStatus.Running)
+            return "Checking";
+        // 非 Runner 的持锁操作（计划任务的备份/检查/清理）：读忙碌跟踪记录的实际操作标签，
         // 避免把计划备份/清理一律误标为 Checking。
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
+
+    /// <summary>/cancel 的 what 过滤：省略即全选。</summary>
+    private static bool Wanted(string? what, string kind) =>
+        string.IsNullOrWhiteSpace(what) || string.Equals(what, kind, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>把 DeriveActivity 的驼峰标签写成一句话里读得通的样子（BackingUp → backing up）。</summary>
     private static string Humanize(string activity) =>

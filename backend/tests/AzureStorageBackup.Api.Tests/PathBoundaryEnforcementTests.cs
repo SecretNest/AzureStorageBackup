@@ -390,8 +390,9 @@ public class PathBoundaryEnforcementTests
 
         var res = await client.PostAsync($"/api/backup-configs/{configId}/check", null);
 
-        // 闸门就在账户查找之前：拿到 400（账户不存在）就证明这一步已经走过去了。
-        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        // 检查改成后台 job 之后与 /repair 同形：越界会在闸门处拿到 400/409，拿到 202
+        // 就证明这一步已经走过去了（账户不存在的失败此后体现在运行态里，不在响应码上）。
+        Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
     }
 
     /// <summary>

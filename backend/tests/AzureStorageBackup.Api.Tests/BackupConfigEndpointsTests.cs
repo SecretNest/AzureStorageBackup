@@ -300,7 +300,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs", req))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        // 模拟 /check 端点持有的忙碌锁（无专属 runner，靠 BackupBusyTracker 兜底判定 Checking）。
+        // 模拟检查持有的忙碌锁，且 CheckRunner 里没有对应记录（例如检查由计划任务发起）：
+        // DeriveActivity 必须靠 BackupBusyTracker 兜底判出 Checking。
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
         Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName));
         try
@@ -639,8 +640,10 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
     private sealed record UnreadableRow(string path, DateTimeOffset unreadableAt);
 
+    /// <summary>检查改成后台 job 之后，忙碌不再是同步的 409：POST 只负责把运行起起来，
+    /// 冲突要在**运行态**里体现（与 /repair 同一约定）。</summary>
     [Fact]
-    public async Task Check_Endpoint_Returns_Conflict_When_Backup_Busy()
+    public async Task Check_Endpoint_Reports_Busy_Through_The_Run_State()
     {
         var account = await CreateAzuriteAccountAsync();
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
@@ -652,13 +655,104 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         try
         {
             var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/check", null);
-            Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+            Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+
+            CheckRunResponse? run = null;
+            for (var i = 0; i < 200; i++)
+            {
+                run = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+                    .Content.ReadFromJsonAsync<CheckRunResponse>();
+                if (run!.Status != "Running") break;
+                await Task.Delay(25);
+            }
+            Assert.Equal("Failed", run!.Status);
+            Assert.Contains("busy", run.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Null(run.Report);
         }
         finally
         {
             busy.Release(created.AccountId, created.ContainerName);
         }
     }
+
+    [Fact]
+    public async Task Check_Status_Endpoint_Is_404_Until_A_Check_Has_Been_Started()
+    {
+        var accountId = await CreateAccountAsync("check-never-run");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-never-run", accountId) with { ContainerName = "check-never-run-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await _client.GetAsync($"/api/backup-configs/{created!.Id}/check")).StatusCode);
+    }
+
+    /// <summary>停止：在此之前，一次跑了几小时的备份唯一的停法是重启容器。逐操作停而不是
+    /// 一键停光——备份与还原可以并发，误停另一条同样是几小时的损失。</summary>
+    [Fact]
+    public async Task Cancel_Endpoint_Signals_Only_The_Requested_Operation()
+    {
+        var accountId = await CreateAccountAsync("cancel-dispatch");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("cancel-dispatch", accountId) with { ContainerName = "cancel-dispatch-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        // 没有任何运行 → 409：与「停了什么都没停到」区分开，界面才好如实说明。
+        var idle = await _client.PostAsync($"/api/backup-configs/{created!.Id}/cancel", null);
+        Assert.Equal(HttpStatusCode.Conflict, idle.StatusCode);
+
+        // 直接往两个 runner 的私有字典里塞一条 Running 记录（同 Activity_Strings 测试的手法）：
+        // 为了触发取消分发而去真跑一次备份/还原，会把这个测试绑死在 Azurite 的时序上。
+        var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
+        var restoreRunner = factory.Services.GetRequiredService<RestoreRunner>();
+        var backupState = new BackupRunState { Status = RunStatus.Running };
+        var restoreState = new RestoreRunState { Status = RunStatus.Running };
+        InjectRun(backupRunner, created.Id, backupState);
+        InjectRun(restoreRunner, created.Id, restoreState);
+        try
+        {
+            var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/cancel?what=backup", null);
+            Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+            var body = await res.Content.ReadFromJsonAsync<CanceledBody>();
+            Assert.Equal(["backup"], body!.canceled);
+
+            Assert.True(backupState.Cancellation.IsCancellationRequested);
+            // 并发的还原不能被顺手一起停掉。
+            Assert.False(restoreState.Cancellation.IsCancellationRequested);
+
+            // 不带 what → 停掉该配置上所有在跑的操作。
+            var all = await _client.PostAsync($"/api/backup-configs/{created.Id}/cancel", null);
+            Assert.Equal(HttpStatusCode.OK, all.StatusCode);
+            Assert.True(restoreState.Cancellation.IsCancellationRequested);
+        }
+        finally
+        {
+            RemoveRun(backupRunner, created.Id);
+            RemoveRun(restoreRunner, created.Id);
+        }
+    }
+
+    [Fact]
+    public async Task Cancel_On_Missing_Config_Returns_404()
+    {
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await _client.PostAsync("/api/backup-configs/999999/cancel", null)).StatusCode);
+    }
+
+    private sealed record CanceledBody(List<string> canceled);
+
+    private static Dictionary<int, TState> RunsOf<TRunner, TState>(TRunner runner) where TRunner : notnull =>
+        (Dictionary<int, TState>)typeof(TRunner)
+            .GetField("_runs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(runner)!;
+
+    private static void InjectRun<TRunner, TState>(TRunner runner, int configId, TState state) where TRunner : notnull =>
+        RunsOf<TRunner, TState>(runner)[configId] = state;
+
+    private static void RemoveRun<TRunner>(TRunner runner, int configId) where TRunner : notnull =>
+        ((System.Collections.IDictionary)typeof(TRunner)
+            .GetField("_runs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(runner)!).Remove(configId);
 
     [Fact]
     public async Task Read_And_Action_Endpoints_On_Missing_Config_Return_404()
@@ -709,10 +803,20 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             }
             Assert.Equal("Completed", backup!.Status);
 
-            // /check：健康备份 → ok=true，单文件在案
-            var checkRes = await _client.PostAsync($"/api/backup-configs/{config.Id}/check", null);
-            Assert.Equal(HttpStatusCode.OK, checkRes.StatusCode);
-            var checkReport = await checkRes.Content.ReadFromJsonAsync<CheckReport>();
+            // /check：健康备份 → ok=true，单文件在案。检查是后台 job（202 + 轮询）：
+            // 内容级检查要把整个备份下载重算一遍 hash，同步端点会先被浏览器/反代超时掐断。
+            var checkStart = await _client.PostAsync($"/api/backup-configs/{config.Id}/check", null);
+            Assert.Equal(HttpStatusCode.Accepted, checkStart.StatusCode);
+            CheckRunResponse? check = null;
+            for (var i = 0; i < 600; i++)
+            {
+                check = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/check"))
+                    .Content.ReadFromJsonAsync<CheckRunResponse>();
+                if (check!.Status != "Running") break;
+                await Task.Delay(200);
+            }
+            Assert.Equal("Completed", check!.Status);
+            var checkReport = check.Report;
             Assert.True(checkReport!.Ok);
             Assert.Single(checkReport.Findings);
 

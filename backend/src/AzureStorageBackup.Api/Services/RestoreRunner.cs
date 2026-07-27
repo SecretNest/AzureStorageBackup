@@ -16,6 +16,10 @@ public sealed class RestoreRunState
 
     /// <summary>当前阶段在做什么（正在还原哪个包、已完成多少组、多快）。</summary>
     public StageProgress? Detail { get; set; }
+
+    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。
+    /// 还原尤其需要它——等 Archive 活化可以等上几小时，中途改主意只能干等着。</summary>
+    internal CancellationTokenSource Cancellation { get; } = new();
 }
 
 public sealed record RestoreRunResponse(
@@ -61,6 +65,19 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
             return _runs.GetValueOrDefault(configId);
     }
 
+    /// <summary>停止正在跑的那次还原。返回 false = 当前没有在跑的还原。
+    /// Cancel() 在当前线程同步跑回调，故取记录用锁、取消不用（见 BackupRunner.Cancel 同处注释）。</summary>
+    public bool Cancel(int configId)
+    {
+        RestoreRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running })
+            return false;
+        state.Cancellation.Cancel();
+        return true;
+    }
+
     private async Task RunAsync(int configId, string targetRoot, int? version,
         IReadOnlyDictionary<string, int>? substitutions,
         IReadOnlyList<string>? selectedPaths, RestoreConflictMode conflict, RestoreRehydratePriority rehydratePriority,
@@ -101,10 +118,17 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 SelectedPaths = selectedPaths,
                 Conflict = conflict,
                 RehydratePriority = rehydratePriority,
-            }, ct: default, phase: progress, onProgress: d => state.Detail = d);
+            }, ct: state.Cancellation.Token, phase: progress, onProgress: d => state.Detail = d);
             state.Phase = null;
             state.Status = RunStatus.Completed;
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<RestoreRunner>>());
+        }
+        catch (OperationCanceledException)
+        {
+            // 用户按了停止：不是失败，不写 Error 状态（与 BackupRunner 同一约定）。
+            // 已经落盘的那些文件保留——还原是逐文件写出的，没有"回滚"这回事。
+            state.Phase = null;
+            state.Status = RunStatus.Canceled;
         }
         catch (Exception ex)
         {

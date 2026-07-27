@@ -114,6 +114,11 @@ public sealed class TaskDispatcher(
                     // 开始的空壳堆栈，对无人值守部署这是最后一道诊断线索，不该丢。
                     if (backupState.Status == RunStatus.Failed)
                         throw new InvalidOperationException(backupState.Error ?? "Backup failed.", backupState.Failure);
+                    // 用户在界面上把这次定时备份停掉了（或进程正在关停）：不是失败，也不是一次
+                    // 成功的备份。直接返回，跳过下面那句「成功落库 Normal」——否则一次被叫停的
+                    // 备份会被记成跑成功了，还会把之前真实的 Error 状态一并抹掉。
+                    if (backupState.Status == RunStatus.Canceled)
+                        return;
                     break;
 
                 case ScheduledTaskType.Check:
