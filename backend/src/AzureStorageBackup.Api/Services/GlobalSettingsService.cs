@@ -15,7 +15,10 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
 {
     public async Task<GlobalSettings> GetAsync(CancellationToken ct = default)
     {
-        var s = await db.GlobalSettings.AsNoTracking().FirstOrDefaultAsync(ct);
+        // OrderBy 不是多余的：单例表也得给 First 一个确定的顺序，否则 EF 每次调用都记一条
+        // 10103 警告（"First without OrderBy may lead to unpredictable results"）。
+        // 这个方法几乎每个请求都会走一遍，docker logs 里刷屏的就是它。
+        var s = await db.GlobalSettings.AsNoTracking().OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
         if (s is null)
             return new GlobalSettings();
 
@@ -31,7 +34,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
 
     public async Task<GlobalSettings> UpsertAsync(GlobalSettings s, CancellationToken ct = default)
     {
-        var existing = await db.GlobalSettings.FirstOrDefaultAsync(ct);
+        var existing = await db.GlobalSettings.OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
         if (existing is null)
         {
             db.GlobalSettings.Add(s);

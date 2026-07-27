@@ -22,7 +22,7 @@ export function DefaultableField({
   children: ReactNode
 }) {
   return (
-    <Field label={label}>
+    <Field label={label} multi>
       <span className="defaultable">
         <label className="defaultable-toggle">
           <input

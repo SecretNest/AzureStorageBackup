@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
@@ -518,8 +518,17 @@ export function BackupConfigsPage() {
               </td>
             </tr>
           ) : (
-            configs.map((c) => (
-              <tr key={c.id}>
+            configs.map((c) => {
+              // 运行状态挪出操作列、单独占一行（见 index.css .ops-row）：操作列是 nowrap 的，
+              // 而正在处理的那个路径动辄几百字符，放在那里会把整张表撑到出屏。
+              const ops = [
+                runs[c.id] && <RunStatus key="run" run={runs[c.id]} />,
+                restores[c.id] && <RestoreStatus key="restore" run={restores[c.id]} />,
+                repairs[c.id] && <RepairStatus key="repair" run={repairs[c.id]} />,
+              ].filter(Boolean)
+              return (
+              <Fragment key={c.id}>
+              <tr className={ops.length > 0 ? 'has-ops' : undefined}>
                 <td>
                   {c.name}
                   {c.secretsUnavailable && (
@@ -581,12 +590,16 @@ export function BackupConfigsPage() {
                   <button type="button" className="btn-ghost btn-danger" onClick={() => setDeleteModal(c)}>
                     Delete
                   </button>
-                  {runs[c.id] && <RunStatus run={runs[c.id]} />}
-                  {restores[c.id] && <RestoreStatus run={restores[c.id]} />}
-                  {repairs[c.id] && <RepairStatus run={repairs[c.id]} />}
                 </td>
               </tr>
-            ))
+              {ops.length > 0 && (
+                <tr className="ops-row">
+                  <td colSpan={6}>{ops}</td>
+                </tr>
+              )}
+              </Fragment>
+              )
+            })
           )}
         </tbody>
       </table>
@@ -615,7 +628,7 @@ export function BackupConfigsPage() {
                   ))}
                 </select>
               </Field>
-              <Field label={editing ? 'Container (locked)' : 'Container'}>
+              <Field label={editing ? 'Container (locked)' : 'Container'} multi>
                 {editing || containerListError || containerList === null ? (
                   <>
                     <input
@@ -778,6 +791,16 @@ export function BackupConfigsPage() {
             </>
           ) : (
             <>
+              {/* 路径基准必须写在这里。规则匹配的是**相对于 Local Root** 的路径，不含 Local Root
+                  本身；不说的话很自然会照着自己看到的完整路径去写，写出来的规则一条都不命中，
+                  而且不命中是静默的——用户只能从"包数没变少"这种间接现象去猜。 */}
+              <p className="text-muted" style={{ margin: '0 0 var(--sp-2)' }}>
+                All rule lists below use gitignore syntax and match paths <strong>relative to the local
+                root</strong>{form.localRoot.trim() && <> (<span className="mono">{form.localRoot}</span>)</>} —
+                write <span className="mono">/Backup/</span> to mean{' '}
+                <span className="mono">{(form.localRoot.trim() || '<local root>').replace(/\/+$/, '')}/Backup</span>, not the
+                full path. A trailing <span className="mono">/</span> means "this directory and everything under it".
+              </p>
               <DefaultableField
                 label="Ignore rules"
                 useDefault={form.ignoreRules === null}
@@ -1111,11 +1134,21 @@ function RunStatus({ run }: { run: BackupRun }) {
 
 /// 阶段细节。在此之前，扫描和 diff 各自只在进入时上报一次——首次备份的 diff 要把每个文件
 /// 完整读一遍算 hash，可以跑几小时，界面上却只有一个一动不动的 0%，分不清是在干活还是挂死。
+// 每个阶段数的是**不同的东西**，光一个 "4,995 / 46,624" 会让人以为打包没生效：
+// 差分数的是文件（打包与否都是这个数），上传/还原数的才是包与单文件 blob。
+const STAGE_UNITS: Record<string, string> = {
+  Scanning: 'entries',
+  Diffing: 'files',
+  Uploading: 'objects',
+  Restoring: 'objects',
+}
+
 function StageDetail({ detail }: { detail: StageProgress }) {
+  const unit = STAGE_UNITS[detail.stage] ?? 'items'
   const counts =
     detail.total > 0
-      ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()}`
-      : `${detail.processed.toLocaleString()} so far` // 扫描时总数未知——它正是扫描要算出来的
+      ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()} ${unit}`
+      : `${detail.processed.toLocaleString()} ${unit} so far` // 扫描时总数未知——它正是扫描要算出来的
   const speed = detail.bytesPerSecond > 0 ? ` · ${formatBytes(detail.bytesPerSecond)}/s` : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
@@ -1173,16 +1206,60 @@ function RepairStatus({ run }: { run: RepairRun }) {
 }
 
 function RestoreStatus({ run }: { run: RestoreRun }) {
+  const [showDetail, setShowDetail] = useState(false)
+  // 跳过/失败的逐条记录。完成之后才是最该看它的时候——一个数字说不出是哪些文件、为什么。
+  const events = run.events ?? []
+  const toggle = events.length > 0 || run.detail ? (
+    <>
+      {' '}
+      <button
+        type="button"
+        className="btn-ghost"
+        style={{ padding: '0 0.3rem' }}
+        onClick={() => setShowDetail((v) => !v)}
+      >
+        {showDetail ? '▾ details' : '▸ details'}
+      </button>
+    </>
+  ) : null
+
+  const detailBlock = showDetail && (
+    <>
+      {run.detail && <StageDetail detail={run.detail} />}
+      {events.length > 0 && (
+        <ul className="mono" style={{ margin: '0.2rem 0 0 1.2rem', wordBreak: 'break-all' }}>
+          {events.map((e, i) => (
+            <li key={i}>{e}</li>
+          ))}
+        </ul>
+      )}
+    </>
+  )
+
   if (run.status === 'Failed')
-    return <div className="text-danger">Restore failed: {run.error}</div>
+    return (
+      <div className="text-danger">
+        Restore failed: {run.error}
+        {toggle}
+        {detailBlock}
+      </div>
+    )
   if (run.status === 'Completed')
     return (
       <div className={run.failedFiles ? 'text-warn' : 'text-ok'}>
         Restored {run.restoredFiles} file(s), skipped {run.skippedFiles}
         {run.failedFiles ? `, failed ${run.failedFiles}` : ''} — version {run.version}
+        {toggle}
+        {detailBlock}
       </div>
     )
-  return <div className="text-faint">{run.phase || 'Restoring…'}</div>
+  return (
+    <div className="text-faint">
+      {run.phase || 'Restoring…'}
+      {toggle}
+      {detailBlock}
+    </div>
+  )
 }
 
 function TierSelect({

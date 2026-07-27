@@ -1170,4 +1170,44 @@ public sealed class RestoreOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>还原此前只有一个自由文本的 phase 字段，而它承载的其实是**错误流**
+    /// （Failed to restore…／Skipped unsafe…），且是单值覆盖：说不出"还剩多少组"，
+    /// 逐文件失败也只剩最后一条。这里验证结构化进度确实报出来了。</summary>
+    [SkippableFact]
+    public async Task Restore_Reports_Structured_Progress_For_Each_Group()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rst-progress-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 三个分处不同目录的文件 → 三个 pack → 三组，进度有多步可报。
+            WriteSrc("a/1.txt", "alpha");
+            WriteSrc("b/2.txt", "bravo");
+            WriteSrc("c/3.txt", "charlie");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var snapshots = new List<StageProgress>();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                onProgress: d => { lock (snapshots) snapshots.Add(d); });
+
+            Assert.Equal(3, result.RestoredFiles);
+            Assert.NotEmpty(snapshots);
+
+            // 收尾必须产出终态：所有组都完成，否则进度永远差最后一下。
+            var final = snapshots[^1];
+            Assert.Equal(final.Total, final.Processed);
+            Assert.Equal(100, final.Percent);
+            Assert.True(final.Bytes > 0, "restored bytes should accumulate for the speed readout");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }
