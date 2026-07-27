@@ -27,6 +27,12 @@ public sealed record VerificationOptions
 /// 因此内容在处理中变化时会用新 hash 重处理（重命名 blob），避免存储名与内容不符（§9、PRD 特别说明 D）。
 /// 报警前仍以最终内容的 hash 再处理一次，保证 blob 以正确名字落库、不留悬挂引用。
 /// </para>
+/// <para>
+/// **单文件 blob 不再走这里**：那条路径已改为边读边压，hash 算的就是压进归档的那些字节，
+/// 两者按构造不可能对不上，没有需要追平的差距。分组打包仍是先 hash 后压，重校验照旧必须做——
+/// 编排器把它写在成组循环里（要以"整组"为单位排除成员、重新入队），因此那边用的不是
+/// <see cref="RunAsync"/>，而是把本类的**存在与否**当作"要不要做压缩后重校验"的开关。
+/// </para>
 /// </summary>
 public sealed class ProcessingVerifier(IFileHasher hasher)
 {

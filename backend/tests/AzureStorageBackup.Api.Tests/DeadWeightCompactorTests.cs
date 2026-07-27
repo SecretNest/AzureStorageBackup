@@ -329,6 +329,11 @@ public sealed class DeadWeightCompactorTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
     /// <summary>重打包是**覆盖式**的（ReplaceAsync 直接改写 packs/p0001.7z），所以 7z 在这条路径上

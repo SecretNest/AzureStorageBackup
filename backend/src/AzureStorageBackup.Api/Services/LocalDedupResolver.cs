@@ -22,22 +22,52 @@ public sealed class LocalDedupResolver
     private readonly IReadOnlyDictionary<string, ResolvedBlob> _priorByContent; // 内容身份 → 既有 blob（跨版本）
     private readonly IReadOnlyDictionary<string, string> _priorRefs;            // 已占用 ref → 其内容身份（碰撞避让）
     private readonly ConcurrentDictionary<string, Reservation> _run = new(StringComparer.Ordinal);
+    private readonly IReadOnlySet<string> _priorHeads;                                  // 预筛：既有内容的 "长度\nhead"
+    private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // 预筛：本轮已开工的
 
     private LocalDedupResolver(
         BlobAddressScheme addressing,
         IReadOnlyDictionary<string, ResolvedBlob> priorByContent,
-        IReadOnlyDictionary<string, string> priorRefs)
+        IReadOnlyDictionary<string, string> priorRefs,
+        IReadOnlySet<string> priorHeads)
     {
         _addressing = addressing;
         _priorByContent = priorByContent;
         _priorRefs = priorRefs;
+        _priorHeads = priorHeads;
     }
+
+    /// <summary>
+    /// 本轮**可能**存在同内容的既有 blob 吗？只看长度 + head hash，因此不必读完整个文件就能回答。
+    /// <para>
+    /// 流式压缩要压完才知道全文 hash，"先算全文 hash 再判去重"等于把文件多读一遍。这个预筛让
+    /// 首次备份（一个候选都没有）直接走一遍读的快路径，只有真有候选时才付那一遍。
+    /// 宁可误报也绝不漏报：误报只是多读一遍，漏报会让一份本可以整个跳过的内容被白压一遍。
+    /// </para>
+    /// </summary>
+    public bool MayDeduplicate(long length, string headHash)
+    {
+        var key = HeadKey(length, headHash);
+        return _priorHeads.Contains(key) || _runHeads.ContainsKey(key);
+    }
+
+    /// <summary>登记本轮已开工的内容（长度 + head）：后到的同内容文件据此走预筛慢路径，
+    /// 先查一次而不是白压一遍。</summary>
+    public void NoteInFlight(long length, string headHash) => _runHeads.TryAdd(HeadKey(length, headHash), 0);
+
+    /// <summary>只查跨版本映射，**不**占用 ref、不产生预约。给"先探一次、命中就完全不压"的预筛路径用；
+    /// 真要上传时仍须走 <see cref="ResolveAsync"/> 拿预约。</summary>
+    public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
+        _priorByContent.GetValueOrDefault(ContentKey(fullHash, length, headHash, tailHash));
+
+    private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
     /// <summary>从保留版本的第二级索引构建映射（仅单文件 blob 条目参与内容寻址去重）。</summary>
     public static LocalDedupResolver Build(BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes)
     {
         var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
         var refs = new Dictionary<string, string>(StringComparer.Ordinal);
+        var heads = new HashSet<string>(StringComparer.Ordinal);
         foreach (var index in indexes)
         {
             foreach (var e in index.Entries)
@@ -47,9 +77,13 @@ public sealed class LocalDedupResolver
                 var ck = ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
                 byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
                 refs[s.Ref] = ck;
+                // HeadHash 为 null 的老条目不进预筛集：它们的内容身份里 head 也是 null，
+                // 和任何一个算得出 head 的新文件都对不上，本来就不可能命中去重。
+                if (e.HeadHash is not null)
+                    heads.Add(HeadKey(e.Length, e.HeadHash));
             }
         }
-        return new LocalDedupResolver(addressing, byContent, refs);
+        return new LocalDedupResolver(addressing, byContent, refs, heads);
     }
 
     /// <summary>解析某内容：命中既有 → 去重；否则占一个空 ref 由调用方上传，完成后回填 (raw, 分卷数)。</summary>

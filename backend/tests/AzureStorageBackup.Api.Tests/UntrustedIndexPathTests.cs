@@ -77,6 +77,11 @@ public sealed class UntrustedIndexPathTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => throw new InvalidOperationException("extraction must not be reached in these tests");
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => throw new InvalidOperationException("streaming compression must not be reached in these tests");
     }
 
     private sealed class StubCodec : IArchiveCodec

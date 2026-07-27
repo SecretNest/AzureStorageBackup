@@ -83,7 +83,13 @@ public sealed class FileHasher : IFileHasher
     /// 因此 7z 也永远不会去打开它——7z 是独立进程、不带这个标志，一旦碰上会同样挂住。
     /// O_NONBLOCK 对普通文件的读取语义没有影响（POSIX 保证），所以正常路径分毫不变。
     /// </para>
+    /// <para>
+    /// 公开出去（<see cref="OpenRead"/>）是因为流式备份也要读源文件：一条 FIFO 对它同样是死局，
+    /// 而"读源文件"这件事在项目里必须只有一种打开方式，否则这道保护迟早会被绕过去一次。
+    /// </para>
     /// </summary>
+    public static FileStream OpenRead(string path) => Open(path);
+
     private static FileStream Open(string path)
     {
         if (OperatingSystem.IsWindows())

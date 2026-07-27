@@ -30,11 +30,36 @@ public sealed class ArchiveMembersMissingException(IReadOnlyList<string> missing
 /// <summary>归档内的一个条目。Size 为**解压后**的字节数；Name 分隔符已归一化为 '/'。</summary>
 public sealed record ArchiveEntry(string Name, long Size, bool IsDirectory);
 
+/// <summary>
+/// 一次流式压缩请求：内容由调用方写进 7z 的 stdin，归档里只有 <paramref name="EntryName"/> 一个成员。
+/// 条目名保留完整相对路径（与按文件压缩时一致），因此还原与检查定位成员的逻辑不必区分两种产出。
+/// </summary>
+public sealed record StreamCompressionRequest(
+    string EntryName,
+    string OutputArchivePath,
+    string? Password = null,
+    long? VolumeBytes = null,
+    bool StoreOnly = false,
+    long? ExpectedBytes = null);
+
 /// <summary>把文件压缩成 7z 归档（可加密/分卷）及解压。用于数据 blob 与分组 pack（M4 §6、§13.1）。</summary>
 public interface IFileCompressor
 {
     Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default);
     Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default);
+
+    /// <summary>
+    /// 流式压缩：<paramref name="writeSource"/> 把内容写进给它的流（7z 的 stdin），返回写了多少字节。
+    /// 源文件因此只被读一遍——调用方可以在同一遍里顺便算 hash，不必压完再读一次。
+    /// <para>
+    /// 写入侧的异常（源文件读失败、取消）必须原样传出，绝不能被当成"压完了"：半截的归档
+    /// 是有效的 7z 文件，光看退出码分辨不出来。实现须在失败时删掉已产出的卷。
+    /// </para>
+    /// </summary>
+    /// <returns>产出的卷文件（按名排序）。</returns>
+    Task<CompressionResult> CompressStreamAsync(
+        StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+        CancellationToken ct = default);
 
     /// <summary>列出归档成员，保持归档内顺序并带尺寸（见 <see cref="SevenZipCli.ListEntryDetailsAsync"/>）。</summary>
     Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
@@ -115,6 +140,84 @@ public sealed class SevenZipCompressor : IFileCompressor
         return [.. request.Entries.Where(e => !present.Contains(SevenZipCli.NormalizeEntryName(e)))];
     }
 
+    public async Task<CompressionResult> CompressStreamAsync(
+        StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+        CancellationToken ct = default)
+    {
+        var outDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputArchivePath))!;
+        Directory.CreateDirectory(outDir);
+
+        // -si{name} 让 7z 从 stdin 读内容、以 name 作为归档内的条目名。加密/头加密/分卷与它完全兼容。
+        var args = new List<string>
+        {
+            "a", "-t7z", "-y", "-bso0", "-bsp0", request.StoreOnly ? "-mx0" : "-mx9",
+            "-si" + request.EntryName,
+        };
+        // 词典大小必须自己给。压缩一个**文件**时 7z 会把词典缩到输入大小；从 stdin 读它不知道会来多少，
+        // 于是每次都照 -mx9 的 64 MB 分配——一个 6 MB 的文件因此凭空多付近一秒（实测 0.10s → 0.30s），
+        // 而这条路径上跑的正是成千上万个刚过 5 MB 阈值的文件。按压之前 stat 到的长度取 2 的幂并封顶
+        // 64 MB，与 7z 自己对同尺寸文件的选择一致：产出逐字节相同，只是不再白等那次分配。
+        if (!request.StoreOnly && request.ExpectedBytes is { } expected)
+            args.Add($"-md={DictionaryBytes(expected)}b");
+        if (!string.IsNullOrEmpty(request.Password))
+        {
+            args.Add("-p" + request.Password);
+            args.Add("-mhe=on");
+        }
+        if (request.VolumeBytes is { } size)
+            args.Add($"-v{size}b");
+        args.Add(Path.GetFullPath(request.OutputArchivePath));
+
+        long written = 0;
+        try
+        {
+            await SevenZipCli.RunStreamingAsync(_exe, args, ct,
+                writeStdin: async (stdin, token) => written = await writeSource(stdin, token));
+        }
+        catch
+        {
+            // 半截的归档一个字节都不能留：调用方（StagingArea）会把 compress-temp 里的东西当作产物收走。
+            foreach (var v in CollectVolumes(request.OutputArchivePath))
+            {
+                try { File.Delete(v); } catch { /* best effort */ }
+            }
+            throw;
+        }
+
+        var volumes = CollectVolumes(request.OutputArchivePath);
+
+        // 归档里必须真的有这个条目，且解压后尺寸等于我们喂进去的字节数。喂进去的字节又正是
+        // 算 hash 的那些字节，所以这一条查过之后，"索引记的内容"与"归档里的内容"就再无缝隙。
+        // 一次列举的代价只是读一遍归档头，和压缩本身比可以忽略。
+        var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct))
+            .FirstOrDefault(e => e.Name == SevenZipCli.NormalizeEntryName(request.EntryName));
+        if (volumes.Count == 0 || entry is null || entry.Size != written)
+        {
+            foreach (var v in volumes)
+            {
+                try { File.Delete(v); } catch { /* best effort */ }
+            }
+            throw new ArchiveMembersMissingException([request.EntryName],
+                entry is null
+                    ? $"7-Zip did not put '{request.EntryName}' into the archive."
+                    : $"'{request.EntryName}' is {entry.Size} byte(s) in the archive but {written} byte(s) were fed to it.");
+        }
+
+        return new CompressionResult(volumes);
+    }
+
+    /// <summary>-mx9 的默认词典（64 MB）与最小词典（1 MB）之间，取不小于输入长度的 2 的幂。
+    /// 比输入大的词典只是白占内存与分配时间，比输入小才会损失压缩率——所以只往上取整、只封顶。</summary>
+    private static long DictionaryBytes(long expectedBytes)
+    {
+        const long min = 1L << 20;
+        const long max = 64L << 20;
+        var size = min;
+        while (size < expectedBytes && size < max)
+            size <<= 1;
+        return size;
+    }
+
     public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
         string firstVolumePath, string? password, CancellationToken ct = default)
         => SevenZipCli.ListEntryDetailsAsync(_exe, firstVolumePath, password, ct);
@@ -132,7 +235,7 @@ public sealed class SevenZipCompressor : IFileCompressor
             args.Add(entryName);
 
         long written = 0;
-        await SevenZipCli.RunStreamingAsync(_exe, args, async (stdout, token) =>
+        await SevenZipCli.RunStreamingAsync(_exe, args, ct, readStdout: async (stdout, token) =>
         {
             var buffer = new byte[81920];
             int read;
@@ -141,7 +244,7 @@ public sealed class SevenZipCompressor : IFileCompressor
                 await destination.WriteAsync(buffer.AsMemory(0, read), token);
                 written += read;
             }
-        }, ct);
+        });
         return written;
     }
 

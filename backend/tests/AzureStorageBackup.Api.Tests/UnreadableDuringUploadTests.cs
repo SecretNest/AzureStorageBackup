@@ -127,6 +127,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
     /// <summary>压缩一次之后立刻改写其中一个成员的内容——模拟"分组重校验发现内容在压缩期间变了"
@@ -159,26 +164,31 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>第一次压缩后改写内容（触发处理中重校验判定"内容变了"，从而让最终 hash ≠ diff 时的
-    /// hash，也就是需要写索引覆盖条目的那条路径），第二次压缩后再锁住文件——于是内容早已成功上传，
-    /// 而随后为覆盖条目重读源文件（长度/头部 hash）的那一步会撞上真实的权限拒绝。</summary>
+    /// <summary>7z 开始读之前把内容换掉（于是存下去的 hash ≠ diff 时的 hash，走的正是需要写索引
+    /// 覆盖条目的那条路径），读完之后立刻把文件锁死——单文件路径此后**不该再打开它一次**。
+    /// 流式之前，覆盖条目要重读源文件取长度与头部 hash，正好撞上这里的权限拒绝而让整轮备份崩掉。</summary>
     private sealed class MutateThenLockCompressor(
         IFileCompressor inner, string fullPath, string newContent) : IFileCompressor
     {
-        private int _count;
-
-        public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        public async Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
         {
-            var result = await inner.CompressAsync(request, ct);
-            switch (Interlocked.Increment(ref _count))
-            {
-                case 1: File.WriteAllText(fullPath, newContent); break;
-                case 2: File.SetUnixFileMode(fullPath, UnixFileMode.None); break;
-            }
+            File.WriteAllText(fullPath, newContent);
+            var result = await inner.CompressStreamAsync(request, writeSource, ct);
+            File.SetUnixFileMode(fullPath, UnixFileMode.None);
             return result;
         }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+            => inner.CompressAsync(request, ct);
 
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
             => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
@@ -639,14 +649,12 @@ public sealed class UnreadableDuringUploadTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>终审 Minor：单文件路径上 BuildOverrideAsync 的源读取没有保护，而分组路径上完全对应的
-    /// 那次重读（foreach(changed) 里的 hasher/BuildOverrideAsync）有——同一个动作两条路径处置不一致，
-    /// 于是"内容在处理中变化、随后又被锁住"这一种组合只在单文件路径上会让整轮备份崩溃。
-    /// 本测试构造正是那个组合：第一次压缩后改写内容（最终 hash ≠ diff 时的 hash，必须写覆盖条目），
-    /// 第二次压缩后锁住文件（覆盖条目再也读不出来）。断言两条路径现在一致——按"读不开"降级，
-    /// 备份照常完工，而不是抛出未接住的异常。</summary>
+    /// <summary>"内容在处理中变化、随后又被锁住"这个组合，此前会在单文件路径上崩掉整轮备份：
+    /// 写索引覆盖条目要重读源文件取长度与头部 hash，而那时文件已经读不开了。
+    /// 流式之后这次重读整个消失——长度、头尾 hash 全部来自压缩时的那一遍读。本测试就钉这一点：
+    /// 文件在被读完的下一刻锁死，备份照常完工，条目里记的是**实际存下去**的那份内容。</summary>
     [SkippableFact]
-    public async Task A_File_Locked_Before_Its_Override_Is_Built_Does_Not_Abort_The_Run()
+    public async Task A_File_Locked_Right_After_Being_Read_Still_Records_What_Was_Stored()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -676,21 +684,21 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
                 notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
 
-            // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是保护缺失的那一条。
+            // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是从前保护缺失的那一条。
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
 
-            Assert.Equal(1, result.Version);         // 完工——没有倒在无保护的重读上
-            Assert.Equal(1, result.UnreadableFiles); // 按"读不开"降级并计数
+            Assert.Equal(1, result.Version);
+            Assert.Equal(0, result.UnreadableFiles); // 内容已经完整读到并存下去了，没有任何东西"读不开"
+            Assert.Empty(notifier.Notifications.Where(
+                n => n.Event == NotificationEvents.UnrecoverableError));
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+            var entry = Assert.Single(idx.Entries, e => e.Path == "churn.bin");
 
-            // 描述不了内容就整条缺席：绝不能留下 fullHash 指向新内容、长度/头部 hash 还是旧内容的记录。
-            Assert.DoesNotContain(idx.Entries, e => e.Path == "churn.bin");
-
-            Assert.Contains(notifier.Notifications,
-                n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("unreadable")
-                     && n.Title.Contains("churn.bin"));
+            var rewritten = "content rewritten while the backup was compressing it";
+            Assert.Equal(rewritten.Length, entry.Length);   // 记的是压进去的那份，不是 diff 时看到的那份
+            Assert.True(await VolumeBlobIO.ExistsAsync(container, entry.Storage!.Ref, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

@@ -77,19 +77,36 @@ public sealed class BackupOrchestratorTests : IDisposable
         return (orchestrator, store, factory);
     }
 
-    /// <summary>压缩含目标文件后，篡改其源文件一次，模拟「文件在处理中变化」（§9、PRD 特别说明 D）。</summary>
-    private sealed class MutatingCompressor(IFileCompressor inner, string relPath, string newContent) : IFileCompressor
+    /// <summary>把目标文件篡改一次，模拟「文件在处理中变化」（§9、PRD 特别说明 D）。
+    /// 两条路径的时机不同：分组路径先 hash 后压，所以挂在 <c>CompressAsync</c> 之**后**（重校验据此
+    /// 发现内容变了）；单文件路径边读边压，改写必须发生在 7z 开始读之**前**，才谈得上
+    /// "压进去的和 diff 时看到的不是同一份"。</summary>
+    private sealed class MutatingCompressor(
+        IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
     {
         private int _fired;
+        private int _firedStream;
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+        {
+            if (request.EntryName == relPath && Interlocked.Exchange(ref _firedStream, 1) == 0)
+                Mutate();
+            return inner.CompressStreamAsync(request, writeSource, ct);
+        }
+
+        private void Mutate()
+        {
+            var full = Path.Combine(rootPath, relPath.Replace('/', Path.DirectorySeparatorChar));
+            File.WriteAllText(full, newContent);
+            File.SetLastWriteTimeUtc(full, File.GetLastWriteTimeUtc(full).AddSeconds(7));
+        }
         public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
         {
             var result = await inner.CompressAsync(request, ct);
             if (request.Entries.Contains(relPath) && Interlocked.Exchange(ref _fired, 1) == 0)
-            {
-                var full = Path.Combine(request.SourceDirectory, relPath.Replace('/', Path.DirectorySeparatorChar));
-                File.WriteAllText(full, newContent);
-                File.SetLastWriteTimeUtc(full, File.GetLastWriteTimeUtc(full).AddSeconds(7));
-            }
+                Mutate();
             return result;
         }
         public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
@@ -213,7 +230,10 @@ public sealed class BackupOrchestratorTests : IDisposable
             lock (_l) { _current++; _max = Math.Max(_max, _current); }
             try
             {
-                await Task.Delay(250, ct); // 让上传明显长于压缩，使并发窗口稳定可观测
+                // 让上传明显长于"压缩 + 校验归档内容"，并发窗口才稳定可观测。压缩是全局串行的，
+                // 所以两次上传能不能重叠，取决于一次上传是否比下一次压缩更久——这个延迟太接近
+                // 压缩耗时，测的就成了压缩快慢而不是并发上限。
+                await Task.Delay(800, ct);
                 return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
             }
             finally { lock (_l) _current--; }
@@ -688,15 +708,20 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// 单文件 blob 边读边压之后，hash 算的**就是压进归档的那些字节**——"内容在处理中变化"
+    /// 不再是一个需要重校验去追平的竞态：压进去的是什么，索引记的就是什么。
+    /// 本用例在 7z 开始读之前把文件换掉，然后把 blob 拉回来解出内容重算，断言索引条目、
+    /// blob 名与归档实际内容三者严丝合缝。
+    /// </summary>
     [SkippableFact]
-    public async Task Single_File_Changed_During_Processing_Is_Stored_Under_New_Hash()
+    public async Task Single_File_Changed_Before_It_Is_Read_Is_Stored_As_What_Was_Actually_Read()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var mutating = new MutatingCompressor(new SevenZipCompressor(), "a.txt", "changed-content!!");
-        var (orchestrator, store, factory) = Build(
-            verifier: new ProcessingVerifier(new FileHasher()), compressor: mutating);
+        var mutating = new MutatingCompressor(new SevenZipCompressor(), _root, "a.txt", "changed-content!!");
+        var (orchestrator, store, factory) = Build(compressor: mutating);
         var account = AzuriteAccount();
         var name = RandomName("orchv-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -712,22 +737,39 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             await orchestrator.RunAsync(request);
 
-            var expected = await new FileHasher().FullHashAsync(Path.Combine(_root, "a.txt")); // 稳定后的新内容 hash
+            var expected = await new FileHasher().FullHashAsync(Path.Combine(_root, "a.txt")); // 换上去的新内容
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             var entry = Assert.Single(idx.Entries);
 
-            Assert.Equal(expected, entry.FullHash);                 // 索引 fullHash 用新内容
-            Assert.Equal("data/" + expected, entry.Storage!.Ref);   // blob 名用新 hash
-            Assert.Equal("changed-content!!".Length, entry.Length); // 元数据一并更新
-            Assert.True(await container.GetBlobClient("data/" + expected).ExistsAsync(),
-                "referenced blob must exist under the new hash");
+            Assert.Equal(expected, entry.FullHash);                 // 索引 fullHash = 实际压进去的内容
+            Assert.Equal("data/" + expected, entry.Storage!.Ref);   // blob 名同样由它决定
+            Assert.Equal("changed-content!!".Length, entry.Length); // 长度一并来自那一遍读
             await AssertReferencedBlobsExist(container, idx);
+
+            // 承重断言：归档里躺着的字节确实就是索引描述的那份。
+            var (length, hash) = await HashStoredBlobAsync(container, entry.Storage.Ref, password: null);
+            Assert.Equal(entry.Length, length);
+            Assert.Equal(entry.FullHash, hash);
         }
         finally
         {
             await container.DeleteIfExistsAsync();
         }
+    }
+
+    /// <summary>把单文件 blob 拉回本地、流式解出内容并重算长度与 hash。</summary>
+    private async Task<(long Length, string Hash)> HashStoredBlobAsync(
+        BlobContainerClient container, string blobRef, string? password)
+    {
+        var dir = Path.Combine(_temp, "verify-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var firstVolume = await VolumeBlobIO.DownloadAsync(container, blobRef, dir, CancellationToken.None);
+
+        var hasher = new StreamingHasher(0, 0);
+        await using var sink = new HashingStream(hasher);
+        await new SevenZipCompressor().ExtractToStreamAsync(firstVolume, entryName: null, password, sink);
+        return (hasher.Length, hasher.FullHash);
     }
 
     [SkippableFact]
@@ -736,7 +778,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var mutating = new MutatingCompressor(new SevenZipCompressor(), "d/y.txt", "yyyy-CHANGED");
+        var mutating = new MutatingCompressor(new SevenZipCompressor(), _root, "d/y.txt", "yyyy-CHANGED");
         var (orchestrator, store, factory) = Build(
             verifier: new ProcessingVerifier(new FileHasher()), compressor: mutating);
         var account = AzuriteAccount();

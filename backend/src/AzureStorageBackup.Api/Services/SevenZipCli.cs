@@ -77,19 +77,23 @@ internal static class SevenZipCli
     }
 
     /// <summary>
-    /// 运行 7z，把 stdout **原样**交给调用方处理，不缓冲成字符串。
+    /// 运行 7z，把 stdin/stdout **原样**交给调用方处理，不缓冲成字符串。
     /// <para>
     /// <see cref="RunAsync"/> 用 <c>ReadToEndAsync</c> 收 stdout，对 `x -so` 是灾难：那条流上跑的
     /// 是成员内容本身，一个几十 GB 的单文件 blob 会被整个读进内存——比先落盘再读还糟。
+    /// 反方向的 `a -si` 同理：源文件的字节要一路喂进 stdin，中间不能有一个"先攒起来"的环节。
     /// </para>
     /// <para>
-    /// 调用方读完（或提前不读了）之后剩下的字节由这里负责排空：不排空的话 7z 会一直阻塞在写管道上，
-    /// <c>WaitForExitAsync</c> 永远等不到它退出。stderr 照旧整读（消息量小，且不读同样会把管道写满）。
+    /// 三条管道都必须有人管。stdout 由调用方读，读完（或提前不读了）剩下的由这里排空；
+    /// 排空动作和写 stdin 并发进行——真让 7z 在写 stdout 上把管道塞满而我们正卡在写 stdin，
+    /// 两边就一起死等。stderr 照旧整读（消息量小，不读同样会把管道写满）。
     /// </para>
     /// </summary>
     public static async Task<SevenZipRun> RunStreamingAsync(
-        string exe, IReadOnlyList<string> args, Func<Stream, CancellationToken, Task> readStdout,
-        CancellationToken ct, string? workingDirectory = null)
+        string exe, IReadOnlyList<string> args, CancellationToken ct,
+        Func<Stream, CancellationToken, Task>? writeStdin = null,
+        Func<Stream, CancellationToken, Task>? readStdout = null,
+        string? workingDirectory = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -108,21 +112,32 @@ internal static class SevenZipCli
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
 
-        proc.StandardInput.Close(); // 与 RunAsync 同理：缺密码时给它 EOF 使其失败而非挂起
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
+        var stdoutTask = Task.Run(async () =>
+        {
+            if (readStdout is not null)
+                await readStdout(proc.StandardOutput.BaseStream, ct);
+            await proc.StandardOutput.BaseStream.CopyToAsync(Stream.Null, ct);
+        }, ct);
+
         try
         {
-            await readStdout(proc.StandardOutput.BaseStream, ct);
-            await proc.StandardOutput.BaseStream.CopyToAsync(Stream.Null, ct);
+            // 不喂 stdin 就立刻给 EOF：与 RunAsync 同理，缺密码时让它失败而非挂起等输入。
+            if (writeStdin is not null)
+                await writeStdin(proc.StandardInput.BaseStream, ct);
+            proc.StandardInput.Close();   // 关闭＝告诉 7z"内容到此为止"，必须在写完之后
+            await stdoutTask;
             await proc.WaitForExitAsync(ct);
         }
         catch
         {
-            // 取消、读取失败、调用方自己抛——结局都一样：这个 7z 进程还在啃磁盘，而调用方
+            // 取消、读写失败、调用方自己抛——结局都一样：这个 7z 进程还在啃磁盘，而调用方
             // 紧接着要删的正是它在写/读的临时目录。整棵树杀掉再让异常继续往上走（同 RunAsync）。
+            // 尤其是喂 stdin 时读源文件失败：这里绝不能吞，否则一次半截的压缩会被当成成功。
             KillTree(proc);
             await proc.WaitForExitAsync(CancellationToken.None);
-            await ObserveAsync(stderrTask);
+            try { proc.StandardInput.Close(); } catch { /* 已随进程一起没了 */ }
+            await ObserveAsync(stdoutTask, stderrTask);
             throw;
         }
 

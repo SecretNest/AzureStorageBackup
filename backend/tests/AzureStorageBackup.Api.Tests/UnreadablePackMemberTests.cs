@@ -92,6 +92,11 @@ public sealed class UnreadablePackMemberTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
     /// <summary>指定路径的 <c>FullHashAsync</c> 只在第一次调用时抛出（模拟压缩后重校验瞬间读不开），
@@ -239,6 +244,11 @@ public sealed class UnreadablePackMemberTests : IDisposable
             string firstVolumePath, string? entryName, string? password, Stream destination,
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
     /// <summary>核心不变量：**索引声称在包里的成员，必须真的在那个包里**。
