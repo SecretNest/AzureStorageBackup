@@ -78,26 +78,48 @@ public sealed class LocalFileScanner
     {
         var keptChildren = 0;
 
-        // 枚举是惰性的（异常在 MoveNext 时才抛），所以必须在 try 内强制求值，否则 foreach
-        // 一旦开始迭代，异常就落到 try 外面去了。
-        List<FileSystemInfo> children;
+        // 目录读不出来有**两个**失败点，都要接住，但都不能把循环体也圈进去（那就成了"catch 范围
+        // 圈住整个工作单元"，会把处理条目时的失败误判成"目录列不出来"）：
+        //   1) EnumerateFileSystemInfos() 本身——它在构造时就打开目录句柄，目录没有读/执行权限
+        //      时在这一步抛（不是等到 MoveNext）；
+        //   2) 迭代过程中的 MoveNext——目录在扫描途中被删、介质读错误等。
+        // 也**不能**图省事把整个目录物化成列表：一个目录下几十万个文件（日志/缓存/素材库）很常见，
+        // 那样每个 FileSystemInfo 都要常驻内存，容器里足以 OOM。所以手动驱动迭代器。
+        IEnumerator<FileSystemInfo> found;
         try
         {
-            children = [.. new DirectoryInfo(dir).EnumerateFileSystemInfos()];
+            found = new DirectoryInfo(dir).EnumerateFileSystemInfos().GetEnumerator();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // 列不出内容的目录：整棵子树本轮不可知。**绝不能落进 emptyDirs**——那会让还原
             // 重建出一个空目录，其下的文件全部消失得无声无息；也不能什么都不记，
             // 否则 diff 会因为"没扫到"把这些既有条目一律判成删除。
-            var relativeDir = RelativePath(root, dir);
-            unreadable.Add(new UnreadablePath(relativeDir, IsDirectory: true, ex.Message));
+            unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
             return;
         }
 
-        foreach (var info in children)
+        using var children = found;
+
+        while (true)
         {
             ct.ThrowIfCancellationRequested();
+
+            FileSystemInfo info;
+            try
+            {
+                if (!children.MoveNext())
+                    break;
+                info = children.Current;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 迭代**中途**才失败：此前已扫到的条目照常留在 entries 里——它们是真读到的，
+                // 比沿用旧条目准确。diff 侧按路径登记，已扫到的不会被这条目录标记二次覆盖。
+                unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
+                return;
+            }
+
 
             var relative = RelativePath(root, info.FullName);
             var isSymlink = info.LinkTarget is not null;
