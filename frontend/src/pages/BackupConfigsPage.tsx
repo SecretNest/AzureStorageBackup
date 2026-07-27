@@ -17,6 +17,7 @@ import {
   CloudState,
   LocalState,
   BackupStatus,
+  BackupStage,
   tierLabels,
   retentionModeLabels,
   backupStageLabels,
@@ -1042,6 +1043,9 @@ export function BackupConfigsPage() {
 }
 
 function RunStatus({ run }: { run: BackupRun }) {
+  // 展开状态留在组件内：轮询每秒都在换 props，但 React 保留同一个实例，所以展开不会被刷掉。
+  const [showDetail, setShowDetail] = useState(false)
+
   if (run.status === 'Failed')
     return <div className="text-danger">Failed: {run.error}</div>
   if (run.status === 'Completed')
@@ -1057,10 +1061,35 @@ function RunStatus({ run }: { run: BackupRun }) {
       </div>
     )
   const p = run.progress
+  if (!p) return <div className="text-faint">Starting…</div>
+
+  // 顶行的百分比要跟着**当前阶段**走。run.percent 衡量的是上传项的完成比例，在扫描/差分阶段
+  // 恒为 0——照搬它就会出现顶上写着 0%、下面细节写着 3% 的自相矛盾。
+  const percent = p.detail?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
+  // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
+  const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
+
   return (
     <div className="text-faint">
-      {p ? `${backupStageLabels[p.stage]} ${p.percent}% (${p.changedFiles} changed)` : 'Starting…'}
-      {p?.detail && <StageDetail detail={p.detail} />}
+      {backupStageLabels[p.stage]}
+      {percent != null && ` ${percent}%`}
+      {changed}
+      {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
+          默认只留一行总进度，需要看的时候再展开。 */}
+      {p.detail && (
+        <>
+          {' '}
+          <button
+            type="button"
+            className="btn-ghost"
+            style={{ padding: '0 0.3rem' }}
+            onClick={() => setShowDetail((v) => !v)}
+          >
+            {showDetail ? '▾ details' : '▸ details'}
+          </button>
+          {showDetail && <StageDetail detail={p.detail} />}
+        </>
+      )}
     </div>
   )
 }
