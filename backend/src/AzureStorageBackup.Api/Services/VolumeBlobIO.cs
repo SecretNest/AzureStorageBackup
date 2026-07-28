@@ -6,6 +6,45 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
+/// 每一卷上传时套的外围：向全局闸门要一份**流**的额度、把这一卷登记为在途、给它一个独立的进度回报。
+/// <para>
+/// 额度按**卷**而不是按**件**计。按件计时，一个 100 GB 文件切出来的上千卷整段只占一条流——
+/// 界面上设的「并发 5」在传大文件时形同虚设，实测 4–6 MB/s，正是单条 TCP 到 Azure 的天花板。
+/// 按卷计之后，在途流数恒等于设定值，与队列里躺的是一个大文件还是一万个小文件无关。
+/// </para>
+/// <para>
+/// 有意**不去动** SDK 的 <c>TransferOptions.MaximumConcurrency</c>（blob 内部的块级并发）：
+/// 那一层会与这里的额度相乘，设定的 5 就不再等于任何能解释的数字。而默认卷大小 100 MB 低于
+/// SDK 的 256 MB 单发阈值，一卷就是一个 PUT、一条连接，所以「一卷 = 一条流」是精确的而非近似。
+/// </para>
+/// </summary>
+public sealed class VolumeUploadScope(SemaphoreSlim gate, StageTracker tracker, int maxParallelPerItem)
+{
+    /// <summary>单件活最多同时压几卷上去。不放开成「整族一起排队」是为了公平：
+    /// <see cref="SemaphoreSlim"/> 先到先得，上千个等待者会把后来的小活整段挡在队尾，
+    /// 它们的暂存文件也就一直堆在临时盘上不走。</summary>
+    public int MaxParallelPerItem { get; } = Math.Max(1, maxParallelPerItem);
+
+    public async Task RunAsync(string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct)
+    {
+        await gate.WaitAsync(ct);
+        tracker.BeginItem(blobName);
+        try
+        {
+            // 每卷各要一个 ItemProgress：DeltaProgress 的基线是 per-call 的，多卷并行共用一个实例，
+            // 彼此的累计值会被当成对方的回退。
+            await upload(tracker.ItemProgress());
+        }
+        finally
+        {
+            // 字节在传输过程中已逐笔计过，这里再加一次总量就是双计。
+            tracker.EndItem(blobName, 0);
+            gate.Release();
+        }
+    }
+}
+
+/// <summary>
 /// 单卷/多卷归档在 blob 上的读写（§7）。单卷用基名；多卷用 基名.001/.002...
 /// 供数据 blob 与 pack 共用，还原/检查按同规则重组下载。
 /// </summary>
@@ -13,24 +52,43 @@ public static class VolumeBlobIO
 {
     /// <summary>
     /// 上传压缩产出的卷文件。单卷→baseRef；多卷→baseRef.001、baseRef.002...
-    /// 多卷时**倒序上传**（先 .00N、最后 .001），使首卷 .001 成为「整族齐全」的提交标记——
-    /// 上传中断时 .001 尚未写入，避免部分上传被存在性检查误判为已存在（§7）。
+    /// <para>
+    /// 多卷时 .002…N 并行、**首卷 .001 最后单独传**，使 .001 成为「整族齐全」的提交标记——
+    /// 上传中断时 .001 尚未写入，部分上传不会被存在性检查误判为已存在（§7）。它只是一条便宜的
+    /// 快路径提示而非保证：blob 可以被人从 Azure 侧直接删掉，所以 check 一律按索引记的卷数
+    /// 逐卷核验（<see cref="VerifyVolumesAsync"/>），并不信这个标记。上千卷里多收尾一个往返，
+    /// 代价可以忽略，就顺手留着。
+    /// </para>
     /// </summary>
-    /// <param name="progress">上传过程中的字节回报（每卷各自从 0 开始累计，见
-    /// <see cref="IBlobUploader.UploadIfMissingAsync(Account, string, string, string, AccessTier, RetryOptions?, CancellationToken, IReadOnlyDictionary{string, string}?, IProgress{long}?)"/>）。</param>
+    /// <param name="scope">每卷的并发额度与进度登记（见 <see cref="VolumeUploadScope"/>）。
+    /// 为 null 时退化成老样子：串行、不限流、不报进度——修复/替换那些不在备份主路径上的调用用。</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? metadata = null, IProgress<long>? progress = null)
+        IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null)
     {
+        Task One(string name, string file) =>
+            scope is null
+                ? uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata)
+                : scope.RunAsync(
+                    name,
+                    p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
+                    ct);
+
         if (volumeFiles.Count == 1)
         {
-            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct, metadata, progress);
+            await One(baseRef, volumeFiles[0]);
             return;
         }
-        for (var i = volumeFiles.Count - 1; i >= 0; i--)
-            await uploader.UploadIfMissingAsync(
-                account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct, metadata, progress);
+
+        var batch = scope?.MaxParallelPerItem ?? 1;
+        for (var start = 1; start < volumeFiles.Count; start += batch)
+        {
+            var end = Math.Min(volumeFiles.Count, start + batch);
+            await Task.WhenAll(Enumerable.Range(start, end - start)
+                .Select(i => One(VolumeName(baseRef, i + 1), volumeFiles[i])));
+        }
+        await One(VolumeName(baseRef, 1), volumeFiles[0]);
     }
 
     /// <summary>

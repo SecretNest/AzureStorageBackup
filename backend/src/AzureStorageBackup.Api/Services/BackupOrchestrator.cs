@@ -321,8 +321,11 @@ public sealed class BackupOrchestrator(
             uploadTracker.Advance(0, work);
         }
 
-        using var uploadGate = new SemaphoreSlim(
-            Math.Max(1, opts.UploadConcurrency), Math.Max(1, opts.UploadConcurrency));
+        // 并发额度按**卷**发放，不按件（见 VolumeUploadScope）：一件活可能是一个大文件切出来的
+        // 上千卷，按件发的话它整段只占一条流，设置里那个数字在传大文件时根本不起作用。
+        var streams = Math.Max(1, opts.UploadConcurrency);
+        using var uploadGate = new SemaphoreSlim(streams, streams);
+        var uploadScope = new VolumeUploadScope(uploadGate, uploadTracker, streams);
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
 
@@ -346,17 +349,17 @@ public sealed class BackupOrchestrator(
             {
                 await foreach (var item in work.Reader.ReadAllAsync(ct))
                 {
-                    // 领走一件活。从这里到 BeginItem（拿到 uploadGate、真开始推字节）之间是压缩与暂存，
+                    // 领走一件活。从这里到 BeginUpload（压完、开始抢流的额度）之间是压缩与暂存，
                     // 一箱 100 MB 过 7z 可以几十秒——界面上得看得见这段，否则就是"什么都没在发生"。
                     uploadTracker.BeginWork();
                     try
                     {
                         if (item.Single is { } single)
                             await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                                overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, ct);
                         else
                             await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
-                                tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, ReportItem,
+                                tailByPath, overrides, postDiffUnreadable, uploadScope, packCounter, ReportItem,
                                 uploadTracker, ct);
                     }
                     finally
@@ -659,7 +662,7 @@ public sealed class BackupOrchestrator(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -668,7 +671,7 @@ public sealed class BackupOrchestrator(
         try
         {
             placement = await PlaceBlobAsync(
-                request, file, localPath, storeOnly, addressing, localResolver, uploadGate, uploadTracker, ct);
+                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, ct);
         }
         // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
         // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
@@ -722,7 +725,7 @@ public sealed class BackupOrchestrator(
     private async Task<BlobPlacement> PlaceBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver? localResolver,
-        SemaphoreSlim uploadGate, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, StageTracker uploadTracker, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -770,7 +773,7 @@ public sealed class BackupOrchestrator(
                 try
                 {
                     var (volumes, sizes) = await UploadStagedBlobAsync(
-                        request, res.Ref, staged, content, addressing, uploadGate, uploadTracker, ct);
+                        request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, ct);
                     res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                     return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
                 }
@@ -801,7 +804,7 @@ public sealed class BackupOrchestrator(
             }
 
             var (uploadedVolumes, uploadedSizes) = await UploadStagedBlobAsync(
-                request, blobRef, staged, content, addressing, uploadGate, uploadTracker, ct);
+                request, blobRef, staged, content, addressing, uploadScope, uploadTracker, ct);
             return new BlobPlacement(blobRef, cloudCollision, uploadedVolumes, uploadedSizes, content);
         }
         finally
@@ -935,11 +938,12 @@ public sealed class BackupOrchestrator(
     /// <returns>该 blob 的分卷数与各卷字节尺寸。</returns>
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
-        BlobAddressScheme addressing, SemaphoreSlim uploadGate, StageTracker uploadTracker, CancellationToken ct)
+        BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
-        await uploadGate.WaitAsync(ct);
-        uploadTracker.BeginItem(blobRef);
+        // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
+        // 好把它与还在压缩的那些区分开。
+        uploadTracker.BeginUpload();
         try
         {
             var meta = new Dictionary<string, string>(
@@ -948,14 +952,12 @@ public sealed class BackupOrchestrator(
                 meta["raw"] = "1";
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
-                request.DataTier, request.Options.Upload, ct, meta, uploadTracker.ItemProgress());
+                request.DataTier, request.Options.Upload, ct, meta, uploadScope);
             return (staged.Files.Count, sizes);
         }
         finally
         {
-            uploadGate.Release();
-            // 字节在传输过程中已逐笔计过（ItemProgress），这里再加一次总量就是双计。
-            uploadTracker.EndItem(blobRef, 0);
+            uploadTracker.EndUpload();
         }
     }
 
@@ -1015,7 +1017,7 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, int[] packCounter, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, int[] packCounter, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
@@ -1081,7 +1083,7 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadGate, uploadTracker, ct);
+                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadScope, uploadTracker, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
@@ -1096,7 +1098,7 @@ public sealed class BackupOrchestrator(
             if (stable.Count > 0)
             {
                 var staged2 = await CompressPackAsync(request, packId, stable, ct);
-                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadGate, uploadTracker, ct);
+                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadScope, uploadTracker, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
@@ -1144,7 +1146,7 @@ public sealed class BackupOrchestrator(
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static _ => { }, uploadTracker, ct);
+                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { }, uploadTracker, ct);
                 }
                 else
                 {
@@ -1204,24 +1206,21 @@ public sealed class BackupOrchestrator(
 
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
-        BackupRequest request, string packId, StagedItem staged, SemaphoreSlim uploadGate,
+        BackupRequest request, string packId, StagedItem staged, VolumeUploadScope uploadScope,
         StageTracker uploadTracker, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
-        await uploadGate.WaitAsync(ct);
-        uploadTracker.BeginItem(blobName);
+        uploadTracker.BeginUpload();   // 闸门与在途登记见 VolumeUploadScope，都在每卷那一层
         try
         {
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
-                request.DataTier, request.Options.Upload, ct, progress: uploadTracker.ItemProgress());
+                request.DataTier, request.Options.Upload, ct, scope: uploadScope);
         }
         finally
         {
-            uploadGate.Release();
-            // 字节在传输过程中已逐笔计过（ItemProgress），这里再加一次总量就是双计。
-            uploadTracker.EndItem(blobName, 0);
+            uploadTracker.EndUpload();
             staging.Release(staged);
         }
         return sizes;

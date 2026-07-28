@@ -95,14 +95,61 @@ public sealed class StageProgressTests
             tracker.Enqueue();
         tracker.BeginWork(); // 工作线程领走两件……
         tracker.BeginWork();
-        tracker.BeginItem("packs/p0001.7z"); // ……其中一件已经在推字节，另一件还在压缩
+        tracker.BeginUpload();               // ……其中一件已经压完、进了上传段，另一件还在压缩
+        tracker.BeginItem("packs/p0001.7z"); // 在途登记的是**卷**
         tracker.Complete();
 
         var s = seen[^1];
         Assert.Equal(["packs/p0001.7z"], s.ActiveItems);
-        Assert.Equal(1, s.Preparing); // 手上 2 件 - 在传 1 件
+        Assert.Equal(1, s.Preparing); // 手上 2 件 - 在上传 1 件
         Assert.Equal(3, s.Queued);    // 入队 5 - 完成 0 - 手上 2
         Assert.Equal(0, s.Processed); // 这些记账一律**不**计数
+    }
+
+    /// <summary>
+    /// "在准备"要按**件**算，不能拿在途的**卷**数去减。
+    /// <para>
+    /// 并发额度改成按卷发放之后，一件活可以同时有好几卷在飞（一个大文件切出上千卷，从前它整段
+    /// 只占一个槽位，设置里的「并发 5」在传大文件时形同虚设）。此时若还用 <c>件数 - 在途卷数</c>，
+    /// 相减会把仍在压缩的那些件算没了，界面上"preparing"凭空归零。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Preparing_Counts_Items_Not_The_Volumes_On_The_Wire()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        for (var i = 0; i < 3; i++)
+            tracker.BeginWork();  // 三件活在工作线程手上
+        tracker.BeginUpload();    // 只有一件进了上传段……
+        for (var i = 1; i <= 5; i++)
+            tracker.BeginItem($"data/big.{i:000}"); // ……但它自己就有 5 卷同时在传
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(5, s.ActiveItems.Count); // "N uploading" 回答的是"网线上有几条流"
+        Assert.Equal(2, s.Preparing);         // 手上 3 件 - 在上传 1 件，与卷数无关
+    }
+
+    /// <summary>每卷各要一个 <c>ItemProgress</c>：DeltaProgress 的累计基线是 per-call 的，
+    /// 多卷并行共用一个实例，彼此的累计值会被当成对方的"回退"而重复计入。</summary>
+    [Fact]
+    public void Parallel_Volumes_Each_Get_Their_Own_Progress_Baseline()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        var v1 = tracker.ItemProgress();
+        var v2 = tracker.ItemProgress();
+        // 两卷交错着各自从 0 涨到 100。
+        v1.Report(40);
+        v2.Report(60);
+        v1.Report(100);
+        v2.Report(100);
+        tracker.Complete();
+
+        Assert.Equal(200, seen[^1].Bytes);
     }
 
     /// <summary>队列深度必须能归零。BeginWork/EndWork 不配对（比如失败路径漏了 finally）

@@ -82,6 +82,9 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     private long _lastPublishMs = -ThrottleMs;
     private int _enqueued;
     private int _inWork;
+    // 已经进入"上传"这一段的**件**数。不能拿 _active.Count 代替：那里装的是**卷**，
+    // 一件活可以同时有好几卷在飞，相减会把还在压缩的件算没了（preparing 被压成 0）。
+    private int _inUpload;
     // 剩余时间用的"工作量"。与 _bytes 是两回事：后者是真正过了网线的字节（压缩后、去重命中为 0），
     // 拿它当完成度会让剩余时间随压缩率和去重命中率乱跳。没有阶段申报工作量时（0），
     // 剩余时间退回按件数外推。
@@ -154,6 +157,14 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     /// 槽位计数只归 Advance 管，在这里顺手加一次进度条就会冲过 100%。</summary>
     public void EndWork() => Interlocked.Decrement(ref _inWork);
 
+    /// <summary>一件活压完了、开始往上传（成对调 <see cref="EndUpload"/>）。只用来把"在准备"
+    /// 与"在上传"分开算，同样**不计数**。</summary>
+    public void BeginUpload() => Interlocked.Increment(ref _inUpload);
+
+    public void EndUpload() => Interlocked.Decrement(ref _inUpload);
+
+    /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
+    /// 不是件——界面上那个 "N uploading" 要回答的是"网线上现在有几条流"。</summary>
     public void BeginItem(string item) => _active.TryAdd(item, 0);
 
     /// <summary>
@@ -244,10 +255,9 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
                 speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
         }
 
-        // 三个计数各自独立推进，读到的是错开半拍的快照——不夹到 0 以上，界面上就会闪出负数。
-        var active = _active.Count;
+        // 几个计数各自独立推进，读到的是错开半拍的快照——不夹到 0 以上，界面上就会闪出负数。
         var inWork = Volatile.Read(ref _inWork);
-        var preparing = Math.Max(0, inWork - active);
+        var preparing = Math.Max(0, inWork - Volatile.Read(ref _inUpload));
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
 
         publish(new StageProgress(
