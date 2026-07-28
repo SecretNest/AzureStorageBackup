@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -539,8 +540,10 @@ public sealed class StageProgressTests
     [Fact]
     public async Task Real_Timer_Heartbeat_Publishes_Without_Any_Further_Manual_Event()
     {
-        var seen = new List<StageProgress>();
-        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true);
+        // 与本文件其余测试不同：这里心跳跑在真实的 Timer 线程上，写入 seen 不再和读取它的
+        // 测试线程同线程——List<T> 不是线程安全的，改用 ConcurrentQueue 让写读天然免锁。
+        var seen = new ConcurrentQueue<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Enqueue, speedWhileInFlight: true);
 
         tracker.BeginItem("v1");
         var progress = tracker.ItemProgress();

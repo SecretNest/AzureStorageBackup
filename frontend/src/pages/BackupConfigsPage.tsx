@@ -1234,11 +1234,12 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   ]
     .filter(Boolean)
     .join(' · ')
-  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick），
-  // 若在这里改回 "> 0"，卡死与"还没来得及采样"这两种情况会渲染成同一个"什么都不显示"——
-  // 这正是该看出卡住的地方，别把它"修"回去。
+  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick）。
+  // 但只有 Uploading 是边传边报字节的——Restoring/Verifying 整组字节要等 EndItem 才一次性入账
+  // （见 docs/upload-speed-clock-design.md §3），正常干活时读数本来就长时间是 0，
+  // 对它们显示 0 B/s 就是个假的"卡住"信号。
   const speed =
-    detail.bytesPerSecond > 0 || detail.activeItems.length > 0
+    detail.bytesPerSecond > 0 || (detail.stage === 'Uploading' && detail.activeItems.length > 0)
       ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
       : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
