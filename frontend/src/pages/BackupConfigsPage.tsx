@@ -1217,29 +1217,39 @@ function StageDetail({ detail }: { detail: StageProgress }) {
       ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // 扫描时总数未知——它正是扫描要算出来的
   // 在途分解。光一个"处理了 N 件"看不出是在干活还是卡住了：备份的上传阶段里，一件活要先过
-  // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是。
-  // 三个数各自有值才出现——扫描、差分这些阶段没有队列，全是 0，这一段自然整体消失。
+  // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是；
+  // 还原/校验阶段同理，下载一结束就退出在途窗口，随后的解压/算 hash 那段本地 CPU 工作同样要
+  // 占着 preparing 才不会从界面上消失。三个数各自有值才出现——扫描、差分这些阶段没有队列，
+  // 全是 0，这一段自然整体消失。
   //
-  // preparing 按后端的定义只会是 0 或 1（压缩锁是全局的），排在它后面等锁的活都算在 queued 里。
+  // preparing 现在是**阶段相关**的，不只是数值范围不同、连数的是什么都不同：上传阶段数的是
+  // "拿到全局压缩锁、正在产出卷文件"的活，压缩锁只有一把，永远是 0 或 1，排在它后面等锁的
+  // 活算进 queued；还原/校验阶段数的是"下载完、正在解压/算 hash"的组，那里没有全局锁，
+  // 最多可以有 DownloadConcurrency 个组同时在解，不是 0/1。标签跟着这层含义走。
   //
   // 一个字节都没在传、手上却有活在准备，这种时候**不能**只让 "N uploading" 悄悄消失：
   // 那一刻速度是 0、进度条不动、在途路径一行都没有，界面上看跟卡死一模一样。把原因写出来。
-  // 措辞不提"压缩"：选了不压缩的备份一样要过一遍 7z（加密、打包、分卷），说 compressing 是错的。
+  // 措辞不提"压缩"：选了不压缩的备份一样要过一遍 7z（加密、打包、分卷），说 compressing 是错的；
+  // 还原/校验阶段则确实是在解压/算 hash，直说就行。
+  const preparingLabel = detail.stage === 'Uploading' ? 'preparing' : 'extracting'
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
+  const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   const inFlight = [
-    detail.activeItems.length > 0 && `${detail.activeItems.length} uploading`,
+    detail.activeItems.length > 0 && `${detail.activeItems.length} ${inFlightVerb}`,
     idleOnStaging && 'nothing on the wire yet',
-    detail.preparing > 0 && `${detail.preparing} preparing`,
+    detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
   ]
     .filter(Boolean)
     .join(' · ')
-  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick）。
-  // 但只有 Uploading 是边传边报字节的——Restoring/Verifying 整组字节要等 EndItem 才一次性入账
-  // （见 docs/upload-speed-clock-design.md §3），正常干活时读数本来就长时间是 0，
-  // 对它们显示 0 B/s 就是个假的"卡住"信号。
+  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick），
+  // 这正是要显示出来的信号——真卡住时应该看到 "0 B/s"，而不是这一行整段消失、让人分不清
+  // 是没在传还是卡死了。Uploading/Restoring/Verifying 三个会登记在途项的阶段都是边传边报字节
+  // （下载同样挂了逐卷 progress，见 VolumeBlobIO.DownloadAsync），此前只有 Uploading 是这样，
+  // 现在三者对称，不必再单独把 Uploading 摘出来。其余七个阶段从不调 BeginItem，
+  // activeItems 恒为空，条件退化回原来的 bytesPerSecond > 0，行为不变。
   const speed =
-    detail.bytesPerSecond > 0 || (detail.stage === 'Uploading' && detail.activeItems.length > 0)
+    detail.bytesPerSecond > 0 || detail.activeItems.length > 0
       ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
       : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。

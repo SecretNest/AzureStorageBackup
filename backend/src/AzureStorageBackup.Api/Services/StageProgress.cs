@@ -22,13 +22,16 @@ public sealed record StageProgress(
     /// <summary>正在并发处理的多个（上传/下载阶段）。</summary>
     IReadOnlyList<string> ActiveItems,
     long BytesPerSecond,
-    /// <summary>正在过暂存区的件数（备份上传阶段＝正占着压缩锁在产出卷文件）。
-    /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9），此前它在界面上完全不可见：
-    /// 不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
+    /// <summary>正在做本地 CPU 工作、既不在排队也不产生传输字节的件数。三个阶段各用各的含义：
+    /// 上传＝正占着压缩锁在产出卷文件；还原/校验＝下载已完成、正在解压/算 hash。
+    /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9 是压，解一箱同样大小的包是解），此前它在
+    /// 界面上完全不可见：不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
     /// <para>
-    /// 因为 <c>StagingArea</c> 里那把压缩锁是全局的，这个数只会是 0 或 1。工作线程池比它大得多
-    /// （<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的活各自去占一条上传流，
-    /// 不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
+    /// 三个阶段的界限不一样：上传阶段用的是 <c>StagingArea</c> 里那把全局压缩锁，这个数只会是
+    /// 0 或 1，工作线程池比它大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的
+    /// 活各自去占一条上传流，不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
+    /// 还原/校验阶段复用同一对方法记这一段，但那里没有全局锁，解压/算 hash 各组各干各的，
+    /// 这个数可以到 <c>DownloadConcurrency</c>，不是 0/1。
     /// </para></summary>
     int Preparing = 0,
     /// <summary>还没开工的件数：既包括还在队列里没被领走的，也包括已被领走、正排在压缩锁后面
@@ -209,10 +212,32 @@ public sealed class StageTracker(
     public void EndStaging() => Interlocked.Decrement(ref _inStaging);
 
     /// <summary>拿到压缩锁、真正开始产出卷文件（成对调 <see cref="EndPacking"/>）。
-    /// 界面上的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1。</summary>
-    public void BeginPacking() => Interlocked.Increment(ref _inPacking);
+    /// 界面上上传阶段的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1；还原/校验阶段
+    /// 复用同一对方法标记"下载完、正在解压/算 hash"这一段本地 CPU 工作，那里没有全局锁，
+    /// 同时几个组各自解压，这个数可以大于 1。
+    /// <para>
+    /// 进 <c>_gate</c> 发一次 <see cref="PublishIfDue"/>：这一段的前后手（<c>EndItem</c> 摘掉在途项、
+    /// 随后进入这一段）本身不产生任何字节，若不在这里主动推一次，preparing 从 0 变到 1 这件事
+    /// 只能等下一次别的调用顺带发布才会被界面看到——而下载刚结束、解压/算 hash 期间恰恰没有别的
+    /// 调用在跑，这一拍就会一直卡在旧快照上，界面冻结到这一段结束，正是它要修的那个"冻住"。
+    /// 200ms 节流仍然生效，不是每次调用都真发。</para></summary>
+    public void BeginPacking()
+    {
+        lock (_gate)
+        {
+            Interlocked.Increment(ref _inPacking);
+            PublishIfDue(force: false);
+        }
+    }
 
-    public void EndPacking() => Interlocked.Decrement(ref _inPacking);
+    public void EndPacking()
+    {
+        lock (_gate)
+        {
+            Interlocked.Decrement(ref _inPacking);
+            PublishIfDue(force: false);
+        }
+    }
 
     /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
     /// 不是件——界面上那个 "N uploading" 要回答的是"网线上现在有几条流"。

@@ -316,11 +316,46 @@ public sealed class BackupChecker(
         tracker?.BeginItem(blobName);
         try
         {
-            var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
+            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
+            // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
+            // （上限是前一卷的大小），不是虚高。
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
 
-            corrupted.AddRange(members[0].Storage!.Kind == "blob"
-                ? await VerifyBlobAsync(firstVolume, members, password, ct)
-                : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
+            string firstVolume;
+            try
+            {
+                firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct, itemProgress);
+            }
+            finally
+            {
+                // 下载一结束（成功或抛出）就摘在途标记：字节已经边传边计过了，测速窗口
+                // 不该被随后不占网线的解压、重算 hash 时间继续拖长。这个 finally 只包
+                // 下载本身——它不吞异常，下载失败照样穿透到下面两个 catch，两者看到的
+                // 异常集合与改动前完全一致。
+                tracker?.EndItem(blobName, 0);
+            }
+
+            // 下载已经摘出在途窗口，但解压/重算 hash 这段本地 CPU 工作不能就此从界面上消失——
+            // 内容级检查最慢的一步就是它，没有这一对，界面会冻在下载刚结束那一刻的快照上，
+            // 跟卡死一模一样（同 RestoreOrchestrator.RestoreGroupAsync 同处注释）。
+            try
+            {
+                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
+                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
+                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                tracker?.BeginPacking();
+                // 这段的共同契约是「解压/算 hash 发生在这一件已经退出 ActiveItems 之后」，
+                // 还原侧由 Extraction_Starts_After_Item_Is_Removed_From_ActiveItems 钉住；
+                // 这里没有单独的测试，改这段时对照那个测试守住同一条约束。
+                corrupted.AddRange(members[0].Storage!.Kind == "blob"
+                    ? await VerifyBlobAsync(firstVolume, members, password, ct)
+                    : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
+            }
+            finally
+            {
+                tracker?.EndPacking();
+            }
         }
         catch (RequestFailedException ex) when (IsArchived(ex))
         {
@@ -335,9 +370,12 @@ public sealed class BackupChecker(
         finally
         {
             // 先摘在途再放闸门：反过来的话，后一个组已经开始校验，界面上却还挂着上一个组。
-            // 字节按成员**解压后**的大小算——这个阶段的时间就花在读解出来的内容算 hash 上，
-            // 用它做速度与剩余时间的基准，和用户看到的进展是同一回事。
-            tracker?.EndItem(blobName, members.Sum(m => m.Length));
+            // EndItem(blobName, 0) 是兜底而非正路：正常情况下载完成时已经在上面的 finally
+            // 里摘过一次，字节也已经在下载过程中边传边计完——这里只防 BeginItem 之后、
+            // 进下载 try 之前抛异常的边界情况。EndItem 本身不是幂等的（_bytes += bytes 与
+            // PublishIfDue 都在 TryRemove 之外无条件跑），这句在正常路径下不会把「解压+算 hash」
+            // 的字节再补一次进测速窗口，纯粹是因为它传的字节数是 0，不是因为 EndItem 本身安全重入。
+            tracker?.EndItem(blobName, 0);
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }

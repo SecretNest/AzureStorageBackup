@@ -61,6 +61,12 @@ public sealed class RestoreOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null)
 {
+    /// <summary>测试注入的毫秒时间源，原样转给内部建的 <see cref="StageTracker"/>（见其上同名字段的注释）。
+    /// 生产为 null，走真实墙钟。用来让"下载结束就摘掉在途标记、解压期间不再算在途"这类
+    /// 时序断言摆脱 200ms 节流窗口——注入后每次查询时间都保证前进，节流因此永不生效，
+    /// 每一次状态变化都会被发布出来，断言不必赌真实时钟是否恰好跨过节流窗口。</summary>
+    internal Func<long>? Clock { get; init; }
+
     /// <param name="onProgress">阶段进度（正在还原哪个包、完成多少组、多快）。此前只有 phase 那条
     /// 自由文本，且它承载的其实是错误流，说不出"还剩多少"。</param>
     public async Task<RestoreResult> RunAsync(
@@ -256,7 +262,7 @@ public sealed class RestoreOrchestrator(
             // 总数只有在分完组之后才知道（同一个 pack 只下一次），所以 tracker 在这里才建得起来。
             var tracker = onProgress is null
                 ? null
-                : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true);
+                : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
             var tasks = groups.Select(async g =>
             {
                 try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker, ct); }
@@ -338,66 +344,105 @@ public sealed class RestoreOrchestrator(
         tracker?.BeginItem(blobName);
         try
         {
+            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
+            // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
+            // （上限是前一卷的大小），不是虚高。
+            // tracker 为 null（没人接进度）时整个表达式退化为 null，DownloadAsync 不挂回调。
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
+
             string firstVolume;
             try
             {
-                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+                try
+                {
+                    firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
+                }
+                catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
+                {
+                    // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
+                    await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
+                    rehydrated.Add(blobName);
+                    firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
+                }
             }
-            catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
+            finally
             {
-                // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
-                await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
-                rehydrated.Add(blobName);
-                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+                // 下载一结束（成功，或两次都失败向上抛）就把在途标记摘掉：字节已经在下载过程中
+                // 边传边计过了，测速窗口不该被随后不占网线的解压/写盘时间继续拖长。
+                // 下面外层 finally 里那句兜底 EndItem(blobName, 0) 因此在正常路径下不会二次生效——
+                // EndItem 本身**不是**幂等的（_bytes += bytes 和 PublishIfDue 都在 TryRemove 之外
+                // 无条件跑），兜底调用能安全重复，只是因为它传的是 0 字节；真传了非零字节的第二次
+                // 调用会悄悄把这批字节多计一遍。
+                tracker?.EndItem(blobName, 0);
             }
 
-            if (storage.Kind == "blob")
+            // 下载已经摘出在途窗口，但解压/算 hash/写盘这段本地 CPU 工作不能就此从界面上消失——
+            // 没有它，一个大 pack 解压的几十秒里 ActiveItems 空、preparing/queued 也都是 0，
+            // 界面冻在下载刚结束那一刻的快照上，跟卡死一模一样（b6db78a 已经为压缩段修过同一个
+            // 问题，这里是它在还原/校验侧的对称件）。BeginPacking/EndPacking 不影响测速分母
+            // （那个窗口只认 BeginItem/EndItem），单纯是"正在准备"这个信号的载体。
+            try
             {
-                // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
-                // 内容寻址去重时同一 blob 可被多个路径引用 → 第一条写好之后，其余从它复制。
-                // 非 raw 的那条直接从归档流到目标：先解压到临时目录再复制，等于把同样的字节
-                // 写两遍盘（一个 20 GB 的 blob 就是 40 GB 的写入 + 20 GB 的临时空间）。
-                string? content = storage.Raw ? firstVolume : null;
-                foreach (var e in needed)
+                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
+                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
+                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                tracker?.BeginPacking();
+                if (storage.Kind == "blob")
                 {
-                    if (content is null)
+                    // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
+                    // 内容寻址去重时同一 blob 可被多个路径引用 → 第一条写好之后，其余从它复制。
+                    // 非 raw 的那条直接从归档流到目标：先解压到临时目录再复制，等于把同样的字节
+                    // 写两遍盘（一个 20 GB 的 blob 就是 40 GB 的写入 + 20 GB 的临时空间）。
+                    string? content = storage.Raw ? firstVolume : null;
+                    foreach (var e in needed)
                     {
-                        var streamed = await TryStreamRestoredFileAsync(request, realRoot, e, firstVolume, phase, ct);
-                        if (streamed is null)
+                        if (content is null)
                         {
-                            failedEntries++;
-                            continue;
+                            var streamed = await TryStreamRestoredFileAsync(request, realRoot, e, firstVolume, phase, ct);
+                            if (streamed is null)
+                            {
+                                failedEntries++;
+                                continue;
+                            }
+                            // 后续引用从这一份复制。它在目标根内、内容已按长度和 hash 核对过。
+                            content = streamed;
+                            restored++;
                         }
-                        // 后续引用从这一份复制。它在目标根内、内容已按长度和 hash 核对过。
-                        content = streamed;
-                        restored++;
+                        else if (TryWriteRestoredFile(request, realRoot, e, content, phase))
+                            restored++;
+                        else
+                            failedEntries++;
                     }
-                    else if (TryWriteRestoredFile(request, realRoot, e, content, phase))
-                        restored++;
-                    else
-                        failedEntries++;
+                }
+                else
+                {
+                    // pack：解压后按各成员的归档条目名复制。
+                    var extractDir = Path.Combine(groupDir, "x");
+                    await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
+
+                    foreach (var e in needed)
+                    {
+                        var source = Path.Combine(extractDir, ToLocal(e.Path));
+                        if (TryWriteRestoredFile(request, realRoot, e, source, phase))
+                            restored++;
+                        else
+                            failedEntries++;
+                    }
                 }
             }
-            else
+            finally
             {
-                // pack：解压后按各成员的归档条目名复制。
-                var extractDir = Path.Combine(groupDir, "x");
-                await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
-
-                foreach (var e in needed)
-                {
-                    var source = Path.Combine(extractDir, ToLocal(e.Path));
-                    if (TryWriteRestoredFile(request, realRoot, e, source, phase))
-                        restored++;
-                    else
-                        failedEntries++;
-                }
+                tracker?.EndPacking();
             }
         }
         finally
         {
-            // 先摘在途再放闸门：反过来的话，后一个组已经开始还原，界面上却还挂着上一个组。
-            tracker?.EndItem(blobName, needed.Sum(e => e.Length));
+            // 兜底摘除：正常路径下载结束时已经在上面的 finally 里摘过一次（真正的字节也已经
+            // 边传边计完）。这里传 0 字节纯粹是防御——万一 BeginItem 之后、进下载 try 之前
+            // 抛出异常，在途集合不能漏摘。EndItem 本身不是幂等的（见上面那处同样的说明），
+            // 这句在正常路径下之所以不会二次生效、不会重复计数，纯粹是因为它传的字节数是 0。
+            tracker?.EndItem(blobName, 0);
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }
