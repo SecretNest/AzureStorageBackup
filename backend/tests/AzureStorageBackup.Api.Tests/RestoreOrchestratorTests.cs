@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using System.Text;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 

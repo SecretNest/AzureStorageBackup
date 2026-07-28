@@ -82,6 +82,12 @@ public sealed class StageTracker(
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
     private const int HeartbeatMs = 1_000;
+    // 采样队列的硬上限，防的是虚拟时钟冻结期间"按时间淘汰"这一半条件永远不成立的那种增长：
+    // 冻着的时候每个采样的 Ms 都相同，tick - _samples.Peek().Ms 恒为 0，谁都淘汰不掉。
+    // 200ms 节流下最多 5 个采样/秒，10 秒窗口正常撑满时最多约 50 个——256 是它的 5 倍余量，
+    // 这条子句在正常运行下摸不到，只会在真出现长时间冻结（活跃段内密集发布、但虚拟时钟
+    // 本身不走的那种边角）时把陈年残留顺手清掉，不靠"多久发布一次"这种运气兜底。
+    private const int MaxSamples = 256;
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly ConcurrentDictionary<string, byte> _active = new(StringComparer.Ordinal);
@@ -365,7 +371,22 @@ public sealed class StageTracker(
                 }
                 catch
                 {
-                    // 见上面的注释：故意吞掉，别把定时器线程的异常带到进程头上。
+                    // 见上面的注释：故意吞掉，别把定时器线程的异常带到进程头上。但吞完不能就此
+                    // 当没事发生——如果什么都不做，下一拍还会原样再跑一次 Tick()，publish 大概率
+                    // 还是那个坏掉的 sink，于是异常每秒发生一次、每次都被悄悄吃掉，整条跟踪器
+                    // 剩下的生命周期里全程隐身重试，没有任何痕迹能让人发现进度上报早就废了。
+                    // 两个更极端的做法都想过：什么都不做＝原样重试，就是刚说的隐身循环；
+                    // 往外抛＝顶到 .NET 默认行为直接打掉整个进程，让一条"锦上添花"的旁路
+                    // 拖死正在跑的备份/还原/校验，比吞掉还糟。折中是停表：一个刚失败的 sink
+                    // 大概率还是坏的，重试不会有产出，不如就此认输——只停这一个 tracker 的
+                    // 心跳，不影响其余状态变化路径（Advance/Touch/EndItem 等）照常在调用方
+                    // 线程上跑，异常照常传给能处理它的人，那些地方不该照抄这个 catch。
+                    // Tick() 抛出时锁已经在它自己的 try 块里被释放（lock 语句的 finally 语义），
+                    // 这里重新拿一次 _gate 是安全的，不会自锁。
+                    lock (_gate)
+                    {
+                        StopHeartbeat();
+                    }
                 }
             }, null, Timeout.Infinite, Timeout.Infinite);
             _heartbeat.Change(HeartbeatMs, HeartbeatMs);
@@ -386,9 +407,19 @@ public sealed class StageTracker(
         lock (_gate)
         {
             _current = null;
-            PublishIfDue(force: true);
-            _completed = true;
-            StopHeartbeat();
+            // PublishIfDue 若抛出（比如 publish 回调本身坏了），下面两句收尾动作不能跟着漏掉——
+            // 漏了 _completed=true，Tick() 会把这个"本该已经收尾"的阶段当成还活着继续处理；
+            // 漏了 StopHeartbeat()，定时器留着继续跑，成了没人管的泄漏。两句都只是内存里的
+            // 状态清理，不会自己再抛第二次异常，包一层 finally 就能把它们从"跟着陪葬"里摘出来。
+            try
+            {
+                PublishIfDue(force: true);
+            }
+            finally
+            {
+                _completed = true;
+                StopHeartbeat();
+            }
         }
     }
 
@@ -402,7 +433,9 @@ public sealed class StageTracker(
         // 节流用墙钟（它管的是"多久刷一次界面"），测速用虚拟轴（它管的是"这些字节花了多少传输时间"）。
         var tick = SpeedNow(now);
         _samples.Enqueue((tick, _bytes));
-        while (_samples.Count > 1 && tick - _samples.Peek().Ms > SpeedWindowMs)
+        // 按时间淘汰（正路）之外再加一条按数量硬淘汰：虚拟时钟冻结期间所有采样共享同一个
+        // Ms，第一个条件永远不成立，队列只能靠这条兜住上限（见 MaxSamples 上的注释）。
+        while (_samples.Count > 1 && (tick - _samples.Peek().Ms > SpeedWindowMs || _samples.Count > MaxSamples))
             _samples.Dequeue();
 
         long speed = 0;
