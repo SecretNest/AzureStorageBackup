@@ -338,9 +338,16 @@ public sealed class BackupChecker(
             // 下载已经摘出在途窗口，但解压/重算 hash 这段本地 CPU 工作不能就此从界面上消失——
             // 内容级检查最慢的一步就是它，没有这一对，界面会冻在下载刚结束那一刻的快照上，
             // 跟卡死一模一样（同 RestoreOrchestrator.RestoreGroupAsync 同处注释）。
-            tracker?.BeginPacking();
             try
             {
+                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
+                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
+                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                tracker?.BeginPacking();
+                // 这段的共同契约是「解压/算 hash 发生在这一件已经退出 ActiveItems 之后」，
+                // 还原侧由 Extraction_Starts_After_Item_Is_Removed_From_ActiveItems 钉住；
+                // 这里没有单独的测试，改这段时对照那个测试守住同一条约束。
                 corrupted.AddRange(members[0].Storage!.Kind == "blob"
                     ? await VerifyBlobAsync(firstVolume, members, password, ct)
                     : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));

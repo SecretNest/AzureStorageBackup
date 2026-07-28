@@ -22,13 +22,16 @@ public sealed record StageProgress(
     /// <summary>正在并发处理的多个（上传/下载阶段）。</summary>
     IReadOnlyList<string> ActiveItems,
     long BytesPerSecond,
-    /// <summary>正在过暂存区的件数（备份上传阶段＝正占着压缩锁在产出卷文件）。
-    /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9），此前它在界面上完全不可见：
-    /// 不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
+    /// <summary>正在做本地 CPU 工作、既不在排队也不产生传输字节的件数。三个阶段各用各的含义：
+    /// 上传＝正占着压缩锁在产出卷文件；还原/校验＝下载已完成、正在解压/算 hash。
+    /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9 是压，解一箱同样大小的包是解），此前它在
+    /// 界面上完全不可见：不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
     /// <para>
-    /// 因为 <c>StagingArea</c> 里那把压缩锁是全局的，这个数只会是 0 或 1。工作线程池比它大得多
-    /// （<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的活各自去占一条上传流，
-    /// 不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
+    /// 三个阶段的界限不一样：上传阶段用的是 <c>StagingArea</c> 里那把全局压缩锁，这个数只会是
+    /// 0 或 1，工作线程池比它大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的
+    /// 活各自去占一条上传流，不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
+    /// 还原/校验阶段复用同一对方法记这一段，但那里没有全局锁，解压/算 hash 各组各干各的，
+    /// 这个数可以到 <c>DownloadConcurrency</c>，不是 0/1。
     /// </para></summary>
     int Preparing = 0,
     /// <summary>还没开工的件数：既包括还在队列里没被领走的，也包括已被领走、正排在压缩锁后面

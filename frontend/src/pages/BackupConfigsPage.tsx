@@ -1233,8 +1233,9 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 还原/校验阶段则确实是在解压/算 hash，直说就行。
   const preparingLabel = detail.stage === 'Uploading' ? 'preparing' : 'extracting'
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
+  const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   const inFlight = [
-    detail.activeItems.length > 0 && `${detail.activeItems.length} uploading`,
+    detail.activeItems.length > 0 && `${detail.activeItems.length} ${inFlightVerb}`,
     idleOnStaging && 'nothing on the wire yet',
     detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,

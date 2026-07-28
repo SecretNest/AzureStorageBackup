@@ -45,9 +45,13 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             {
                 // 背压等的是暂存空间，此时锁已在手上、别人一样压不了——算"在准备"是诚实的：
                 // 系统确实正为这一件活等着。每次实时读当前上限（决策 4：Settings 改动立即生效）。
-                tracker?.BeginPacking();
                 try
                 {
+                    // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                    // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
+                    // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
+                    // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                    tracker?.BeginPacking();
                     // 背压：超限时等待上传腾出空间（从上限以下起步则允许本次结果临时超限）。
                     while (Interlocked.Read(ref _stagedBytes) >= stagedLimit())
                         await _releaseSignal.WaitAsync(ct);

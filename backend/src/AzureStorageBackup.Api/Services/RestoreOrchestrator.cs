@@ -381,9 +381,13 @@ public sealed class RestoreOrchestrator(
             // 界面冻在下载刚结束那一刻的快照上，跟卡死一模一样（b6db78a 已经为压缩段修过同一个
             // 问题，这里是它在还原/校验侧的对称件）。BeginPacking/EndPacking 不影响测速分母
             // （那个窗口只认 BeginItem/EndItem），单纯是"正在准备"这个信号的载体。
-            tracker?.BeginPacking();
             try
             {
+                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
+                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
+                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                tracker?.BeginPacking();
                 if (storage.Kind == "blob")
                 {
                     // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
