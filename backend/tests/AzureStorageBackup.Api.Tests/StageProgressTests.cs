@@ -531,10 +531,12 @@ public sealed class StageProgressTests
 
     /// <summary>
     /// 并发上传是生产默认场景：多条卷同时在飞。先结束的那一卷不该把测速时钟叫停——
-    /// 只要还有另一条流没收口，这段时间依然要算进测速窗口。<see cref="EndItem"/> 里的
-    /// <c>_active.IsEmpty</c> 判断正是为了这个：只有"最后一条"收工才停表。
+    /// 只要还有另一条流没收口，这段时间依然要算进测速窗口，直到"最后一条"收工时钟才真正停下。
+    /// <see cref="EndItem"/> 里的 <c>_active.IsEmpty</c> 判断正是为了这个。
     /// 只测严格先后的 Begin/End 对（现有测试都是这样）盖不到这条分支——那种写法即使把
     /// IsEmpty 判断整个删掉，串行场景照样算得对，删掉它才会露馅的正是这里的重叠场景。
+    /// 后半段再验"时钟真的停了"：b 收工之后把注入的时钟拨快 5 秒并手动敲一拍心跳，
+    /// 这 5 秒不能钻进测速窗口——否则就是把 IsEmpty 判断的另一半漏掉了。
     /// </summary>
     [Fact]
     public void An_Overlapping_Upload_Keeps_The_Clock_Running_Until_The_Last_Volume_Ends()
@@ -563,6 +565,14 @@ public sealed class StageProgressTests
 
         // 2 MB 在 2 秒里过了网线 ≈ 1 MB/s。时钟被提前叫停的话，第二拍会撞上第一拍的时间戳，
         // spanMs 算出 0，速度读数变成 0——正是 IsEmpty 判断要防的那种假象。
-        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+        var afterB = seen[^1];
+        Assert.InRange(afterB.BytesPerSecond, 900_000L, 1_150_000L);
+
+        // 时钟已经停了：把墙钟拨快 5 秒（远超测速窗口会淘汰旧采样的量级），手动敲一拍心跳。
+        // 若 EndItem("b") 没能把时钟真正停住，这 5 秒空转会钻进分母，把速度读数摊薄甚至压到 0。
+        now += 5_000;
+        tracker.Tick();
+
+        Assert.Equal(afterB.BytesPerSecond, seen[^1].BytesPerSecond);
     }
 }

@@ -120,6 +120,9 @@ public sealed class StageTracker(
     private long _activeSince = -1;
     // 只在活跃段内跑的定时器。压缩期停着，一个多余的快照都不发。
     private Timer? _heartbeat;
+    // Complete() 之后收到的迟到回调（已经排上线程池、Dispose 也叫不停）必须原地作废——
+    // 见 Tick() 里的用法。
+    private bool _completed;
 
     /// <summary>测试注入的毫秒时间源。10 秒测速窗口不可能靠真等来验，注入之后整个跟踪器
     /// 在时间上完全确定。生产为 null，走内部的 <see cref="Stopwatch"/>。</summary>
@@ -301,7 +304,14 @@ public sealed class StageTracker(
     {
         lock (_gate)
         {
+            // 阶段已经收尾：Complete() 发过的终态快照就是界面该看到的最后一条。
+            // Dispose() 不能撤回一个已经在排队或正在跑的回调，它排到这把锁时 Complete()
+            // 早就放行了——不挡住的话，终态之后还会再冒出一条，把"最后一条是真终态"的承诺破了。
+            if (_completed)
+                return;
             // 一条流都没开：这段时间本就不进分母，也没有新东西可报。
+            // 这条与上面那条是两回事：即便阶段没收尾，虚拟时钟冻着的时候采样也不能进——
+            // 冻着的采样全带同一个时间戳，永远挤不出 _samples 窗口。
             if (speedWhileInFlight && _activeSince < 0)
                 return;
             PublishIfDue(force: false);
@@ -316,7 +326,23 @@ public sealed class StageTracker(
             return;
         if (on)
         {
-            _heartbeat ??= new Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
+            // 心跳跑在线程池定时器线程上，没有调用方能接住它抛出的异常——顶到运行时手里，
+            // .NET 的默认行为是直接打掉整个进程。这条回调经 Task 3 之后会挂在 RestoreOrchestrator/
+            // BackupChecker 传进来的 onProgress 上，那是调用方自己的代码，出故障的概率不为零。
+            // 进度上报只是锦上添花的旁路，宁可丢这一拍也不能把正在跑的备份/还原/校验拖下水一起死，
+            // 所以这里必须吞掉——其余路径（Advance/Touch/EndItem 等）都在调用方线程上跑，
+            // 异常能传回能处理它的人，那些地方**不**该照抄这个 catch。
+            _heartbeat ??= new Timer(_ =>
+            {
+                try
+                {
+                    Tick();
+                }
+                catch
+                {
+                    // 见上面的注释：故意吞掉，别把定时器线程的异常带到进程头上。
+                }
+            }, null, Timeout.Infinite, Timeout.Infinite);
             _heartbeat.Change(HeartbeatMs, HeartbeatMs);
         }
         else
@@ -336,6 +362,7 @@ public sealed class StageTracker(
         {
             _current = null;
             PublishIfDue(force: true);
+            _completed = true;
             StopHeartbeat();
         }
     }
