@@ -21,6 +21,14 @@ public sealed class BackupChecker(
     IOperationLog? opLog = null,
     TrackedInfoStore? trackedInfo = null)
 {
+    /// <summary>测试注入的毫秒时间源，原样转给内部经 <see cref="Track"/> 建的每一个
+    /// <see cref="StageTracker"/>（见其上同名字段的注释；与 <see cref="RestoreOrchestrator.Clock"/>
+    /// 是同一形状的镜像件）。生产为 null，走真实墙钟。用来让"下载结束就摘掉在途标记、
+    /// 解压/算 hash 期间不再算在途"这类时序断言摆脱 200ms 节流窗口——注入后每次查询时间都
+    /// 保证前进，节流因此永不生效，每一次状态变化都会被发布出来，断言不必赌真实时钟是否
+    /// 恰好跨过节流窗口。</summary>
+    internal Func<long>? Clock { get; init; }
+
     /// <param name="onProgress">
     /// 阶段进度回调（可空）。检查此前完全没有进度：内容级要把整个备份下载重算 hash，
     /// 跑几小时是常态，界面上却只有一个转圈——分不清是在查还是挂死了。
@@ -61,9 +69,9 @@ public sealed class BackupChecker(
     /// <summary>阶段跟踪器的构造捷径：没人要进度就一路传 null，不产生任何开销。</summary>
     /// <param name="inFlight">这个阶段会不会登记在途项。只有会的（Verifying）才让测速时钟
     /// 随流启停；不会的（本地/列举/元数据）必须走墙钟，否则虚拟时钟永不前进、速度恒为 0。</param>
-    private static StageTracker? Track(
+    private StageTracker? Track(
         Action<StageProgress>? onProgress, string stage, int total, bool inFlight = false) =>
-        onProgress is null ? null : new StageTracker(stage, total, onProgress, inFlight);
+        onProgress is null ? null : new StageTracker(stage, total, onProgress, inFlight) { Clock = Clock };
 
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
@@ -346,8 +354,9 @@ public sealed class BackupChecker(
                 // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
                 tracker?.BeginPacking();
                 // 这段的共同契约是「解压/算 hash 发生在这一件已经退出 ActiveItems 之后」，
-                // 还原侧由 Extraction_Starts_After_Item_Is_Removed_From_ActiveItems 钉住；
-                // 这里没有单独的测试，改这段时对照那个测试守住同一条约束。
+                // 与 RestoreOrchestrator 同一形状；这里由 BackupCheckerTests 里同名的
+                // Extraction_Starts_After_Item_Is_Removed_From_ActiveItems 钉住（镜像还原侧
+                // 那条测试，但各自独立、互不代替），不再需要借还原侧的测试来兜底。
                 corrupted.AddRange(members[0].Storage!.Kind == "blob"
                     ? await VerifyBlobAsync(firstVolume, members, password, ct)
                     : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
