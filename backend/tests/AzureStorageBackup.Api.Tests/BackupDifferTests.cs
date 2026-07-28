@@ -169,6 +169,99 @@ public sealed class BackupDifferTests : IDisposable
         Assert.Equal(0, diff.ChangedFiles);          // 仅元数据不计入变更
     }
 
+    /// <summary>
+    /// 单文件 blob 的全文 hash 由压缩那一遍读顺手算出，还会覆盖 diff 记的值——diff 再读一遍
+    /// 就是把每个大文件从头到尾读了两遍。用户实测：一个接近 100 GB 的文件，diff 阶段光是为了
+    /// 算这个用不上的 hash 就要读满 100 GB，而那段时间网络上一个字节都没在传。
+    /// </summary>
+    [Fact]
+    public async Task Deferred_Paths_Are_Not_Read_Whole_When_They_Are_New()
+    {
+        Write("big.bin", "pretend this is 100 GB");
+        Write("small.txt", "packed with others");
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous: null, fullHashDeferred: p => p == "big.bin");
+
+        var big = Change(diff, "big.bin");
+        Assert.Equal(ChangeKind.Added, big.Kind);
+        Assert.Null(big.FullHash);      // 延后：压缩那一遍会算出来并写进索引
+        Assert.NotNull(big.HeadHash);   // 4KB 的头照读——顺带把"此刻打得开吗"问清楚了
+
+        // 打包的那些不受影响：它们的 hash 是装箱时就要写进 pack 成员的，没有第二次机会补算。
+        Assert.NotNull(Change(diff, "small.txt").FullHash);
+        Assert.Equal(1, counter.FullCalls);
+        Assert.Equal(2, counter.HeadCalls);
+
+        // 变更统计只看长度，不受影响——界面上的 "N changed" 不能因为这个优化少数几个。
+        Assert.Equal(2, diff.ChangedFiles);
+    }
+
+    [Fact]
+    public async Task Deferred_Paths_Are_Not_Read_Whole_When_Their_Length_Changed()
+    {
+        var path = Write("big.bin", "hello");
+        var previous = await SnapshotAsync();
+
+        File.WriteAllText(path, "hello world!"); // 长度变 → 已经确定内容变了，hash 只剩生成地址一个用途
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+
+        var c = Change(diff, "big.bin");
+        Assert.Equal(ChangeKind.Modified, c.Kind);
+        Assert.Null(c.FullHash);
+        Assert.Equal(0, counter.FullCalls);
+    }
+
+    /// <summary>
+    /// 这一条是整个优化的边界，也是省错了就会静默烧钱的地方：length 没变、只有 mtime 或权限被碰过时，
+    /// fullHash 是区分「只是 touch 了一下」（MetadataOnly，不重传）与「内容真的变了」（Modified）
+    /// 的**唯一**依据。在这条路上也省掉它，就只能一律当成变更——每次 touch 都把文件重传一遍。
+    /// </summary>
+    [Fact]
+    public async Task A_Touched_File_Is_Still_Hashed_In_Full_Even_When_Deferral_Is_On()
+    {
+        var path = Write("big.bin", "same content");
+        var previous = await SnapshotAsync();
+
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30)); // 内容没动
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+
+        var c = Change(diff, "big.bin");
+        Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
+        Assert.Equal(1, counter.FullCalls);
+        Assert.NotNull(c.FullHash);
+        Assert.NotNull(c.CarriedStorage);   // 沿用旧存储 = 一个字节都不重传
+        Assert.Equal(0, diff.ChangedFiles);
+    }
+
+    /// <summary>
+    /// 省掉的读也要从进度里省掉。按整份文件计，一个 100 GB 的延后条目会在一瞬间被记成 100 GB 已读，
+    /// diff 的速度读数冲到几十 GB/s，剩余时间跟着变成一句笑话。
+    /// </summary>
+    [Fact]
+    public async Task Deferred_Files_Do_Not_Inflate_The_Read_Byte_Count()
+    {
+        Write("big.bin", new string('x', 4096));
+        Write("small.txt", new string('y', 100));
+
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 2, seen.Add);
+        await new BackupDiffer(new FileHasher()).DiffAsync(
+            _root, await ScanAsync(_root), previous: null, tracker: tracker,
+            fullHashDeferred: p => p == "big.bin");
+        tracker.Complete();
+
+        Assert.Equal(100, seen[^1].Bytes); // 只有真读全了的那个算数
+        Assert.Equal(2, seen[^1].Processed); // 条目数照常推进，进度条不受影响
+    }
+
     [Fact]
     public async Task Removed_File_Is_Deleted()
     {

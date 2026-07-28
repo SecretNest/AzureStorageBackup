@@ -67,31 +67,37 @@ public sealed class UnreadableDuringUploadTests : IDisposable
     }
 
     /// <summary>
-    /// 模拟"diff 时能读、随后立刻被锁住"：包一层真实 hasher，diff 用它对目标路径算完真实的
-    /// fullHash 之后（也就是 diff 认定该文件可读、可分类为 Added/Modified 的那一刻），
-    /// 立刻把该文件的 Unix 权限位清零。此后 orchestrator 自己的（同样是真实的）hasher/7z
-    /// 再去读它，会撞上真正的操作系统权限拒绝——不是靠假异常模拟，是真的读不开。
+    /// 模拟"diff 时能读、随后立刻被锁住"：包一层真实 hasher，diff 对目标路径算完 hash
+    /// （也就是 diff 认定该文件可读、可分类为 Added/Modified 的那一刻）之后，立刻把该文件的
+    /// Unix 权限位清零。此后 orchestrator 自己的（同样是真实的）hasher/7z 再去读它，
+    /// 会撞上真正的操作系统权限拒绝——不是靠假异常模拟，是真的读不开。
     /// 之所以不用假抛异常的替身：本进程不是 root（chmod 000 在这台机器上真实生效），
     /// 用真权限验证的是"生产环境下的操作系统调用是否真被正确捕获"，比替身更贴近真实故障。
+    /// <para>
+    /// 触发点挂在 <c>HeadHashAsync</c> 上：本测试把单文件阈值压到 1，目标文件因此归类为单文件
+    /// blob，而单文件 blob 的全文 hash 已经延后到压缩那一遍再算——diff 压根不会调
+    /// <c>FullHashAsync</c>，挂在那里的话锁永远不会落下，"diff 之后才读不开"这个场景就凭空消失了。
+    /// 头部 hash 则是无论走哪条路、每个文件都恰好调一次，而且是 diff 对该文件的最后一次读。
+    /// </para>
     /// </summary>
     private sealed class LockAfterDiffHasher(IFileHasher inner, string relPath) : IFileHasher
     {
         private int _locked;
 
-        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
-            inner.HeadHashAsync(path, headBytes, ct);
-
-        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
-            inner.TailHashAsync(path, tailBytes, ct);
-
-        public async Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        public async Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
         {
-            var hash = await inner.FullHashAsync(path, ct);
+            var hash = await inner.HeadHashAsync(path, headBytes, ct);
             if (path.EndsWith(relPath.Replace('/', Path.DirectorySeparatorChar), StringComparison.Ordinal)
                 && Interlocked.Exchange(ref _locked, 1) == 0)
                 File.SetUnixFileMode(path, UnixFileMode.None); // diff 之后立即锁住——模拟"随后被占用/权限收回"
             return hash;
         }
+
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
+            inner.TailHashAsync(path, tailBytes, ct);
+
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default) =>
+            inner.FullHashAsync(path, ct);
     }
 
     /// <summary>diff 读完某个文件之后，立刻删掉**另一个**文件——用来构造"待打包的成员在被装箱之前

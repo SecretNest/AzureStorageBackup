@@ -155,26 +155,28 @@ public sealed class PipelinedBackupTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>diff 每读完一个文件就慢一下，并数一数已经判完几个。
-    /// 首次备份里差分对每个文件恰好调一次 <c>FullHashAsync</c>，所以这个计数就是"判到第几个了"。</summary>
+    /// <summary>diff 每判完一个文件就慢一下，并数一数已经判完几个。
+    /// 数的是 <c>HeadHashAsync</c>：首次备份里差分对每个文件恰好调它一次，无论走哪条路。
+    /// **不能**数 <c>FullHashAsync</c>——归类为单文件 blob 的条目压根不调它（全文 hash 延后到
+    /// 压缩那一遍算），那样计数会永远停在 0，"diff 还在跑吗"这个判据就废了。</summary>
     private sealed class SlowHasher(IFileHasher inner, int delayMs) : IFileHasher
     {
-        private int _hashed;
-        public int Hashed => Volatile.Read(ref _hashed);
+        private int _judged;
+        public int Hashed => Volatile.Read(ref _judged);
 
-        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
-            inner.HeadHashAsync(path, headBytes, ct);
+        public async Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
+        {
+            var hash = await inner.HeadHashAsync(path, headBytes, ct);
+            await Task.Delay(delayMs, ct);
+            Interlocked.Increment(ref _judged);
+            return hash;
+        }
 
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
             inner.TailHashAsync(path, tailBytes, ct);
 
-        public async Task<string> FullHashAsync(string path, CancellationToken ct = default)
-        {
-            var hash = await inner.FullHashAsync(path, ct);
-            await Task.Delay(delayMs, ct);
-            Interlocked.Increment(ref _hashed);
-            return hash;
-        }
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default) =>
+            inner.FullHashAsync(path, ct);
     }
 
     /// <summary>记下每次上传发生时"diff 是否还在跑"。</summary>

@@ -403,7 +403,8 @@ public sealed class BackupOrchestrator(
             if (!classification.ByPath.TryGetValue(c.Path, out var klass))
                 return;
 
-            var file = changed ? new PlannedFile(c.Path, c.Current!.Length, c.FullHash!) : null;
+            // FullHash 可能为空——单文件 blob 的全文 hash 延后到压缩那一遍算（见 DeferFullHash）。
+            var file = changed ? new PlannedFile(c.Path, c.Current!.Length, c.FullHash) : null;
 
             switch (klass.Category)
             {
@@ -449,13 +450,20 @@ public sealed class BackupOrchestrator(
             }
         }
 
+        // 走单文件 blob 的条目，diff 阶段不必把文件整个读一遍算全文 hash：那条路上 hash 是压缩
+        // 那一遍读顺手算出来的（StreamAndStageAsync），算完还会覆盖 diff 记的值。归类只看
+        // 路径与长度，扫描一结束就定了，所以这个判定在 diff 之前就能给出来。
+        bool DeferFullHash(string path) =>
+            classification.ByPath.TryGetValue(path, out var k) && k.Category == FileCategory.SingleFile;
+
         DiffResult diff;
         try
         {
             try
             {
                 diff = await differ.DiffAsync(
-                    request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync);
+                    request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync,
+                    DeferFullHash);
 
                 // 收尾：把还没填满的箱子封掉。跨目录的那一箱肯定有剩；按目录的理论上都已在
                 // 计数归零时封过，这里只是不留活口。
@@ -684,6 +692,8 @@ public sealed class BackupOrchestrator(
 
         // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
         // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
+        // file.FullHash 为空（diff 把全文 hash 延后给了这一遍读）时必然不等，于是照常写覆盖——
+        // 索引里的 hash 因此永远来自"真正压进归档的那些字节"，而不是 diff 时看到的那一份。
         var content = placement.Content;
         if (content.FullHash != file.FullHash)
             overrides[file.Path] = new EntryOverride(
@@ -811,6 +821,12 @@ public sealed class BackupOrchestrator(
         // 会把这条路径上本来两遍的读变成三遍。内容若真在此期间变了，压完之后的比对会发现并重判。
         if (localResolver is null)
         {
+            // diff 把全文 hash 延后了（单文件 blob 的常态）→ 手上没有内容身份，预筛无从谈起。
+            // 返回 null 让调用方直接走一遍读的流式快路径，压完拿到真 hash 再判去重——那正是
+            // 延后想要的效果：为了提前问一次 HEAD 而把 100 GB 再读一遍，比重压一次还亏。
+            if (file.FullHash is null)
+                return null;
+
             var stat = new FileInfo(localPath);
             return new BlobContent(
                 file.FullHash,
@@ -1016,7 +1032,9 @@ public sealed class BackupOrchestrator(
             queue.RemoveRange(0, group.Count);
 
             var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
-            var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash, f.Length)).ToList();
+            // 这些 PlannedFile 全部由 ToPlannedFile(PackEntry) 而来，FullHash 按构造非空——
+            // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
+            var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
 
             // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
             // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
