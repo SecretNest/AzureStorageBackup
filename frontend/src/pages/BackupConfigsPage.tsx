@@ -81,6 +81,14 @@ const emptyForm: BackupConfigInput = {
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+// 从「配置 id → 运行状态」的表里摘掉一条。没有这条时原样返回，免得白白重渲一次。
+function without<T>(map: Record<number, T>, id: number): Record<number, T> {
+  if (!(id in map)) return map
+  const next = { ...map }
+  delete next[id]
+  return next
+}
+
 export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -199,7 +207,7 @@ export function BackupConfigsPage() {
               } else if (item.activity === 'Checking') {
                 tasks.push(
                   backupConfigsApi.checkStatus(item.id).then((s) => {
-                    if (!cancelled) setChecks((r) => ({ ...r, [item.id]: s }))
+                    if (!cancelled && s) setChecks((r) => ({ ...r, [item.id]: s }))
                   }),
                 )
               }
@@ -255,7 +263,7 @@ export function BackupConfigsPage() {
           } else if (item.activity === 'Checking') {
             void backupConfigsApi
               .checkStatus(item.id)
-              .then((s) => setChecks((r) => ({ ...r, [item.id]: s })))
+              .then((s) => { if (s) setChecks((r) => ({ ...r, [item.id]: s })) })
               .catch(() => {})
           }
         })
@@ -426,6 +434,10 @@ export function BackupConfigsPage() {
     try {
       const state = await backupConfigsApi.run(c.id)
       setRuns((r) => ({ ...r, [c.id]: state }))
+      // 上一次检查/修复的结论说的是「云端此刻的内容」，这次备份一上传就作废了：那行绿字
+      // 留在原地只会让人以为它还成立。以前得切到别的页面再回来（组件重挂载）才清得掉。
+      setChecks((m) => without(m, c.id))
+      setRepairs((m) => without(m, c.id))
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1068,14 +1080,14 @@ export function BackupConfigsPage() {
         <CheckModal
           config={checkModal}
           onClose={() => setCheckModal(null)}
-          onError={(e) => setError(e)}
+          onError={setError}
         />
       )}
       {restoreModal && (
         <RestoreDialog
           config={restoreModal}
           onClose={() => setRestoreModal(null)}
-          onError={(e) => setError(e)}
+          onError={setError}
           onStarted={(state) => {
             const id = restoreModal.id
             setRestoreModal(null)
@@ -1599,7 +1611,10 @@ function CheckModal({
       while (run.status === 'Running') {
         await delay(1000)
         if (!aliveRef.current) return null
-        run = await backupConfigsApi.checkStatus(config.id)
+        // 正在跑的检查一定有状态可报；真拿到空就停下轮询，别把 run 打成空值。
+        const next = await backupConfigsApi.checkStatus(config.id)
+        if (!next) break
+        run = next
         setCheckRun(run)
       }
       if (run.status === 'Failed' && run.error) onError(run.error)
@@ -1617,21 +1632,24 @@ function CheckModal({
   useEffect(() => {
     backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
     // 服务端保留着最近一次检查的报告：关掉对话框再打开要能看回结果，而一次内容级检查
-    // 要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。404 = 从没查过。
+    // 要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。空 = 从没查过。
     // 仍在跑就接着轮询；已跑完则只把报告摆出来——不走 follow，免得把上一次的失败
     // 当成这次的错误再弹一遍横幅。
     backupConfigsApi
       .checkStatus(config.id)
-      .then((s) => { if (s.status === 'Running') void followRef.current(s); else setCheckRun(s) })
+      .then((s) => { if (!s) return; if (s.status === 'Running') void followRef.current(s); else setCheckRun(s) })
       .catch(() => {})
   }, [config.id])
 
   const rehydrateArg = () => (cloud === CloudCheckLevel.Content ? rehydrate : null)
 
+  // 检查是后台 job，进度在列表那一行（Checking N% + Details）已经有了，这里再显示一份没有意义：
+  // 启动成功就直接关掉对话框，报告下次打开时从服务端读回来。
   const runCheck = async () => {
     setRepairReport(null)
     try {
-      await follow(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
+      await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans)
+      onClose()
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
     }
@@ -1701,10 +1719,12 @@ function CheckModal({
           </Field>
         )}
         <Field label="Unreferenced blobs">
-          <label>
+          {/* 说明文字与勾选框同在外层 <label class="field"> 里——不再自己套一层 <label>：
+              标签不能嵌套，而且嵌套那层会让勾选框逃出 .field 的居中规则，看上去偏高。 */}
+          <span className="field-check">
             <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
-            {' '}Detect unreferenced blobs (repair deletes them)
-          </label>
+            Detect unreferenced blobs (repair deletes them)
+          </span>
         </Field>
 
         <div className="row" style={{ margin: '0.8rem 0' }}>
@@ -1722,16 +1742,11 @@ function CheckModal({
           <button type="button" onClick={onClose}>Close</button>
         </div>
 
-        {/* 检查在服务端后台跑，不再随请求一起结束：内容级要把整个备份下载重算 hash，
-            可以跑上几小时，所以这里必须给出进度，并明说关掉对话框不会打断它。 */}
+        {/* 进度不在这里重复一遍：检查在服务端后台跑，列表里那一行已经有阶段、百分比和 Details。
+            对话框只说明它正在跑（报告要等它结束才有），并留下 Stop。 */}
         {running && (
           <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
-            <div>
-              {checkRun?.detail ? checkRun.detail.stage : 'Starting'}
-              {checkRun?.detail?.percent != null && ` ${checkRun.detail.percent}%`}
-              {' '}— you can close this dialog; the check keeps running.
-            </div>
-            {checkRun?.detail && <StageDetail detail={checkRun.detail} />}
+            A check is running — progress is shown in the backup list. The report appears here when it finishes.
           </div>
         )}
         {checkRun?.status === 'Canceled' && (

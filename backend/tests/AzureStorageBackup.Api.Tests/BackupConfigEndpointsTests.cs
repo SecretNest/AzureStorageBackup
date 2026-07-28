@@ -675,15 +675,17 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         }
     }
 
+    /// <summary>没跑过检查要答 204 而不是 404：对话框一打开就问一次，404 会在浏览器控制台
+    /// 留下一条红色报错，看着像故障。</summary>
     [Fact]
-    public async Task Check_Status_Endpoint_Is_404_Until_A_Check_Has_Been_Started()
+    public async Task Check_Status_Endpoint_Is_204_Until_A_Check_Has_Been_Started()
     {
         var accountId = await CreateAccountAsync("check-never-run");
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
                 SampleRequest("check-never-run", accountId) with { ContainerName = "check-never-run-container" }))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        Assert.Equal(HttpStatusCode.NotFound,
+        Assert.Equal(HttpStatusCode.NoContent,
             (await _client.GetAsync($"/api/backup-configs/{created!.Id}/check")).StatusCode);
     }
 

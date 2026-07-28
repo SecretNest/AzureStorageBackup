@@ -520,11 +520,20 @@ tbody tr.ops-row:hover {
 /* 值区只有一个光秃秃的勾选框时（Enabled 之类）：它既没有输入框的高度也没有内边距，
    而标题为了跟输入框的文字对齐往下压了 6px，两者于是错开——看上去就是「勾偏上」。
    这一行改为整行居中，标题那 6px 的补偿也一并撤掉。 */
-.field:has(> span > input[type='checkbox']:only-child) {
+.field:has(> span > input[type='checkbox']:only-child),
+.field:has(> span > .field-check) {
   align-items: center;
 }
-.field:has(> span > input[type='checkbox']:only-child) > .field-label {
+.field:has(> span > input[type='checkbox']:only-child) > .field-label,
+.field:has(> span > .field-check) > .field-label {
   padding-top: 0;
+}
+/* 「勾选框 + 一句说明」的值区。勾选框默认坐在文字基线上，看着比说明文字高出一截；
+   按行内 flex 居中，勾与字才在同一条中线上。 */
+.field-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
 }
 
 /* 「Use default」行：勾选框在前，控件或只读生效值在后。 */

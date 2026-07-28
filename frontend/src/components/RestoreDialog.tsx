@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   backupConfigsApi,
   RestoreConflictMode,
@@ -53,6 +53,13 @@ export function RestoreDialog({
   const [rehydratePriority, setRehydratePriority] = useState<number>(RestoreRehydratePriority.Standard)
   const [starting, setStarting] = useState(false)
 
+  // onError 是父组件在渲染里现写的箭头函数，每渲染一次就换一个引用。它一旦进了下面这些
+  // effect 的依赖数组，备份列表每隔几秒的例行刷新就会把 effect 重跑一遍——什么都不点，
+  // 对话框也会自己闪：Loading… 冒出来又消失，替代表和沿用提示跟着重排，看着就像刚切了版本。
+  // 用 ref 拿最新的回调，依赖里只留真正决定要重取什么的 config.id 与 version。
+  const onErrorRef = useRef(onError)
+  onErrorRef.current = onError
+
   useEffect(() => {
     backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
   }, [config.id])
@@ -78,13 +85,13 @@ export function RestoreDialog({
         setOptions(opts)
         setChoices(ch)
       } catch (e) {
-        if (!cancelled) onError(e instanceof Error ? e.message : String(e))
+        if (!cancelled) onErrorRef.current(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) setSubsLoading(false)
       }
     })()
     return () => { cancelled = true }
-  }, [config.id, version, onError])
+  }, [config.id, version])
 
   // 版本切换时重置树浏览状态并加载根目录（本地权威索引读，快，不触云）。
   useEffect(() => {
@@ -99,7 +106,7 @@ export function RestoreDialog({
         const kids = await backupConfigsApi.tree(config.id, version, null)
         if (!cancelled) setTreeCache((c) => ({ ...c, '': kids }))
       } catch (e) {
-        if (!cancelled) onError(e instanceof Error ? e.message : String(e))
+        if (!cancelled) onErrorRef.current(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) {
           setLoadingDirs((s) => {
@@ -111,7 +118,6 @@ export function RestoreDialog({
       }
     })()
     return () => { cancelled = true }
-    // eslint-disable-next-line -- oxlint 未启用 exhaustive-deps；onError 每次渲染新引用，特意不纳入依赖避免树重复抓取
   }, [config.id, version])
 
   // 勾选变化防抖 ~400ms 调 restoreEstimate；未选中任何项时视为"还原整版本"，不展示估算。
@@ -129,7 +135,7 @@ export function RestoreDialog({
           if (!cancelled) setEstimate(est)
         })
         .catch((e) => {
-          if (!cancelled) onError(e instanceof Error ? e.message : String(e))
+          if (!cancelled) onErrorRef.current(e instanceof Error ? e.message : String(e))
         })
         .finally(() => {
           if (!cancelled) setEstimating(false)
@@ -139,7 +145,6 @@ export function RestoreDialog({
       cancelled = true
       clearTimeout(timer)
     }
-    // eslint-disable-next-line -- 同上，onError 不纳入依赖
   }, [config.id, version, selected])
 
   const toggleExpand = async (node: TreeNode) => {

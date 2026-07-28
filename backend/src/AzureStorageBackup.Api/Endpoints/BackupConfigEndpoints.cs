@@ -529,7 +529,9 @@ public static class BackupConfigEndpoints
         group.MapGet("/{id:int}/check", (int id, CheckRunner runner) =>
         {
             var state = runner.Get(id);
-            return state is null ? Results.NotFound() : Results.Ok(CheckRunResponse.From(state));
+            // 「从没查过」不是错误：检查对话框一打开就问一次，而 404 会在浏览器控制台留下一条
+            // 红色报错，看上去像故障（用户就是这么报上来的）。204 = 没有可报告的检查。
+            return state is null ? Results.NoContent() : Results.Ok(CheckRunResponse.From(state));
         });
 
         // 停止该备份上正在跑的操作。what 省略＝全部停；否则只停指定的一种

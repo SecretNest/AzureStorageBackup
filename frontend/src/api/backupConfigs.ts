@@ -340,7 +340,8 @@ export const backupConfigsApi = {
     // 202：只是把检查跑起来，结果要靠 checkStatus 轮询。
     return api.post<CheckRun>(`/backup-configs/${id}/check?${p.toString()}`, {})
   },
-  checkStatus: (id: number) => api.get<CheckRun>(`/backup-configs/${id}/check`),
+  // 从没查过这个备份时后端答 204（不是 404：那会在浏览器控制台留下红色报错），这里拿到的是空。
+  checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
   repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
