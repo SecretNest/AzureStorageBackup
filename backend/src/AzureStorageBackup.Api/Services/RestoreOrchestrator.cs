@@ -366,6 +366,10 @@ public sealed class RestoreOrchestrator(
                     // 摘掉的只是测速窗口的标记，不是进度信号本身：EnsureOnlineAsync 自己会在
                     // 每次轮询时把 "Waiting for rehydration of {baseRef} — N volume(s) still
                     // archived…" 报到 phase 上，操作员看得到组的动向，不会以为它消失了。
+                    // 已知的粗糙之处：phase 的顶行（RestoreRunner 里的 state.Phase）是所有并发组
+                    // 共用的一个槽，多组同跑时这条消息会被别的组顶掉，只在 state.Events 里留底；
+                    // 但轮询每 RehydratePollSeconds 重报一次，它自己会再回来。这是既有的进度模型，
+                    // 不是这里引入的。
                     tracker?.EndItem(blobName, 0);
                     await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
                     rehydrated.Add(blobName);
