@@ -317,7 +317,8 @@ public sealed class BackupChecker(
         try
         {
             // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
-            // 多卷共用一个实例会把后一卷的进度当成前一卷的回退，字节滚雪球式虚高。
+            // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
+            // （上限是前一卷的大小），不是虚高。
             Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
 
             string firstVolume;
@@ -334,9 +335,20 @@ public sealed class BackupChecker(
                 tracker?.EndItem(blobName, 0);
             }
 
-            corrupted.AddRange(members[0].Storage!.Kind == "blob"
-                ? await VerifyBlobAsync(firstVolume, members, password, ct)
-                : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
+            // 下载已经摘出在途窗口，但解压/重算 hash 这段本地 CPU 工作不能就此从界面上消失——
+            // 内容级检查最慢的一步就是它，没有这一对，界面会冻在下载刚结束那一刻的快照上，
+            // 跟卡死一模一样（同 RestoreOrchestrator.RestoreGroupAsync 同处注释）。
+            tracker?.BeginPacking();
+            try
+            {
+                corrupted.AddRange(members[0].Storage!.Kind == "blob"
+                    ? await VerifyBlobAsync(firstVolume, members, password, ct)
+                    : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
+            }
+            finally
+            {
+                tracker?.EndPacking();
+            }
         }
         catch (RequestFailedException ex) when (IsArchived(ex))
         {
@@ -353,8 +365,9 @@ public sealed class BackupChecker(
             // 先摘在途再放闸门：反过来的话，后一个组已经开始校验，界面上却还挂着上一个组。
             // EndItem(blobName, 0) 是兜底而非正路：正常情况下载完成时已经在上面的 finally
             // 里摘过一次，字节也已经在下载过程中边传边计完——这里只防 BeginItem 之后、
-            // 进下载 try 之前抛异常的边界情况。EndItem 幂等（TryRemove 找不到就什么都不做），
-            // 正常路径下这行不会二次生效，不会把「解压+算 hash」的字节再补一次进测速窗口。
+            // 进下载 try 之前抛异常的边界情况。EndItem 本身不是幂等的（_bytes += bytes 与
+            // PublishIfDue 都在 TryRemove 之外无条件跑），这句在正常路径下不会把「解压+算 hash」
+            // 的字节再补一次进测速窗口，纯粹是因为它传的字节数是 0，不是因为 EndItem 本身安全重入。
             tracker?.EndItem(blobName, 0);
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }

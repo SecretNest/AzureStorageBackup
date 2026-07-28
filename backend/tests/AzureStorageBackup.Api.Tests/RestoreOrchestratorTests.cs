@@ -62,7 +62,13 @@ public sealed class RestoreOrchestratorTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    private (BackupOrchestrator Backup, RestoreOrchestrator Restore, IBackupInfoStore Store, BlobClientFactory Factory) Build()
+    /// <param name="restoreCompressor">还原侧注入的压缩器，默认 null 时用真的 <see cref="SevenZipCompressor"/>。
+    /// 备份侧固定用真的——这个口子只为了让某些测试在**解压**这一步接一个假的（例如探测
+    /// "解压这一刻在途标记是否已经摘掉"），不影响打包过程本身。</param>
+    /// <param name="restoreClock">还原侧注入给内部 <see cref="StageTracker"/> 的时间源，见
+    /// <see cref="RestoreOrchestrator.Clock"/> 上的注释——只为让节流窗口失效，不影响下载/解压本身。</param>
+    private (BackupOrchestrator Backup, RestoreOrchestrator Restore, IBackupInfoStore Store, BlobClientFactory Factory) Build(
+        IFileCompressor? restoreCompressor = null, Func<long>? restoreClock = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -71,7 +77,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
+            factory, store, restoreCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"))
+        { Clock = restoreClock };
         return (backup, restore, store, factory);
     }
 
@@ -598,6 +605,91 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.False(File.Exists(Path.Combine(_dst, "dir", "c.txt")));
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 钉住 RestoreGroupAsync 里那对内层 try/finally：下载一结束就把 <c>EndItem</c> 摘掉，解压/写盘
+    /// 这段本地 CPU 工作不该继续算"在途"。这不是不痛不痒的细节——测速分母只认在途窗口，
+    /// 解压一个大 pack 能有几十秒，多算进去会把显示的速度腰斩。
+    /// <para>
+    /// 直接读 <c>onProgress</c> 收到的"最近一次发布"靠不住：发布有 200ms 节流，真实时钟下载一个
+    /// 几十字节的测试包全程往往就几十毫秒，下载中 SDK 至少报一次进度（首次调用必发布），
+    /// 随后 EndItem/BeginPacking 各自的发布多半被这同一个节流窗口吞掉——于是无论 fix 还是
+    /// mutant，观察到的"最近一次"都可能还停在"下载中"的快照上，测试测不出任何东西
+    /// （已用 Diagnostic 探针实测验证过这个失效模式）。
+    /// </para>
+    /// <para>
+    /// 用注入的假时钟绕开它：每查一次时间就往前跳一大步，节流条件 <c>now - last &lt; 200ms</c>
+    /// 因此永远不成立，每一次状态变化都会被发布——不是赌真实时钟恰好跨过节流窗口，
+    /// 是让节流窗口对这个测试彻底失效。不涉及 Thread.Sleep/Task.Delay，下载/解压仍是对
+    /// Azurite 的真实调用，只是"现在几点"这一件事被接管了。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Extraction_Starts_After_Item_Is_Removed_From_ActiveItems()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var probe = new ActiveItemsProbeCompressor(new SevenZipCompressor());
+        long fakeNow = 0;
+        var (backup, restore, _, factory) = Build(probe, restoreClock: () => Interlocked.Add(ref fakeNow, 1000));
+        var account = AzuriteAccount();
+        var name = RandomName("rstextract-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 三个小文件同目录 → 单个 pack、单个组：只有一件在途项，断言不必按名字过滤。
+            WriteSrc("dir/a.txt", "alpha");
+            WriteSrc("dir/b.txt", "bravo");
+            WriteSrc("dir/c.txt", "charlie");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                onProgress: d => probe.LatestPublished = d);
+
+            Assert.Equal(3, result.RestoredFiles);
+            Assert.True(probe.ExtractCallCount > 0, "fake compressor's ExtractAsync should have been invoked");
+            // 解压这一刻，假时钟已经保证了下载结束时那次 EndItem 触发的发布没被节流吞掉——
+            // 拿到的就是解压开始那一瞬间真正的在途集合，不是碰运气捞到的一张旧快照。
+            Assert.Empty(probe.ActiveItemsAtExtractCall ?? ["<no snapshot captured>"]);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>包一层真压缩器，只在 <see cref="ExtractAsync"/> 这一步截住，记下调用那一刻
+    /// 最近一次发布的 <see cref="StageProgress.ActiveItems"/>——解压本身仍然照常委托给内层真的
+    /// <see cref="SevenZipCompressor"/> 完成，被测的只是"调用顺序"，不是解压结果。</summary>
+    private sealed class ActiveItemsProbeCompressor(IFileCompressor inner) : IFileCompressor
+    {
+        public StageProgress? LatestPublished { get; set; }
+        public IReadOnlyList<string>? ActiveItemsAtExtractCall { get; private set; }
+        public int ExtractCallCount { get; private set; }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default) =>
+            inner.CompressAsync(request, ct);
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+        {
+            ExtractCallCount++;
+            ActiveItemsAtExtractCall = LatestPublished?.ActiveItems;
+            return inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+        }
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default) => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default) =>
+            inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default) => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
     [SkippableFact]

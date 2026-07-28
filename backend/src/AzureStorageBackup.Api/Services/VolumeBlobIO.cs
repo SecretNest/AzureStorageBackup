@@ -217,9 +217,18 @@ public static class VolumeBlobIO
     /// <param name="progress">每卷的进度回调**工厂**。为什么必须是工厂而不是单个 <see cref="IProgress{T}"/>：
     /// SDK 的 <c>ProgressHandler</c> 报的是本次 <c>DownloadToAsync</c> 调用内的累计字节，
     /// <see cref="StageTracker.ItemProgress"/> 返回的 <c>DeltaProgress</c> 把累计转增量时是按
-    /// **这一个实例自己的基线**算的（回退即视为重新开始，见 <see cref="StageTracker"/> 里的注释）。
-    /// 多卷下载若共用一个实例，卷 2 的累计值从 0 起步、还没追上卷 1 收尾时的基线，会被当成
-    /// "又从头传了一遍"整段重新计入，字节随卷数一路滚雪球式虚高。每卷调一次工厂拿一个全新实例，
+    /// **这一个实例自己的基线** <c>_last</c> 算的，且每次 <c>Report</c> 之后 <c>_last</c> 都**无条件**
+    /// 更新一次（见 <see cref="StageTracker"/> 里 <c>DeltaProgress</c> 的注释）。
+    /// <para>
+    /// 多卷下载若共用一个实例：设上一卷收尾时的基线为 L，卷 k 的首次上报为 c₁。若 c₁ ≥ L，
+    /// 这一下只会被记成 c₁ − L，之后卷 k 自己的增量照常累加，结果是**整卷少计 L 个字节**——
+    /// 是漏记，不是虚高，且漏记的上限就是上一卷的大小。触发条件：一个较小的卷后面紧跟一个
+    /// 较大的卷，大卷的第一个上报块超过了小卷收尾时的基线。（反过来，若 c₁ &lt; L，"当作重新
+    /// 开始"的复位对这一卷而言算对了，不会漏。）真正的虚高只有一种来路：同一串 <c>Report</c>
+    /// 调用里累计值忽然下跌（SDK 重试），那种情况换不换实例表现一致，是设计上刻意允许的
+    /// （见 <c>DeltaProgress</c> 上的注释）。
+    /// </para>
+    /// 每卷调一次工厂拿一个全新实例，就是不让上一卷的基线泄漏进下一卷，
     /// 与 <see cref="VolumeUploadScope.RunAsync"/> 里"每卷各要一个 ItemProgress()"是同一个道理。
     /// 为 null 时不挂进度回调——修复/压实等不在途登记的调用路径用。</param>
     public static async Task<string> DownloadAsync(

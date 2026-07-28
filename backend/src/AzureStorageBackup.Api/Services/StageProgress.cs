@@ -209,10 +209,32 @@ public sealed class StageTracker(
     public void EndStaging() => Interlocked.Decrement(ref _inStaging);
 
     /// <summary>拿到压缩锁、真正开始产出卷文件（成对调 <see cref="EndPacking"/>）。
-    /// 界面上的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1。</summary>
-    public void BeginPacking() => Interlocked.Increment(ref _inPacking);
+    /// 界面上上传阶段的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1；还原/校验阶段
+    /// 复用同一对方法标记"下载完、正在解压/算 hash"这一段本地 CPU 工作，那里没有全局锁，
+    /// 同时几个组各自解压，这个数可以大于 1。
+    /// <para>
+    /// 进 <c>_gate</c> 发一次 <see cref="PublishIfDue"/>：这一段的前后手（<c>EndItem</c> 摘掉在途项、
+    /// 随后进入这一段）本身不产生任何字节，若不在这里主动推一次，preparing 从 0 变到 1 这件事
+    /// 只能等下一次别的调用顺带发布才会被界面看到——而下载刚结束、解压/算 hash 期间恰恰没有别的
+    /// 调用在跑，这一拍就会一直卡在旧快照上，界面冻结到这一段结束，正是它要修的那个"冻住"。
+    /// 200ms 节流仍然生效，不是每次调用都真发。</para></summary>
+    public void BeginPacking()
+    {
+        lock (_gate)
+        {
+            Interlocked.Increment(ref _inPacking);
+            PublishIfDue(force: false);
+        }
+    }
 
-    public void EndPacking() => Interlocked.Decrement(ref _inPacking);
+    public void EndPacking()
+    {
+        lock (_gate)
+        {
+            Interlocked.Decrement(ref _inPacking);
+            PublishIfDue(force: false);
+        }
+    }
 
     /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
     /// 不是件——界面上那个 "N uploading" 要回答的是"网线上现在有几条流"。

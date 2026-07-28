@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
