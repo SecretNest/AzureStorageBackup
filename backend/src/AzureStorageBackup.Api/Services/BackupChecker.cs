@@ -59,8 +59,11 @@ public sealed class BackupChecker(
     }
 
     /// <summary>阶段跟踪器的构造捷径：没人要进度就一路传 null，不产生任何开销。</summary>
-    private static StageTracker? Track(Action<StageProgress>? onProgress, string stage, int total) =>
-        onProgress is null ? null : new StageTracker(stage, total, onProgress);
+    /// <param name="inFlight">这个阶段会不会登记在途项。只有会的（Verifying）才让测速时钟
+    /// 随流启停；不会的（本地/列举/元数据）必须走墙钟，否则虚拟时钟永不前进、速度恒为 0。</param>
+    private static StageTracker? Track(
+        Action<StageProgress>? onProgress, string stage, int total, bool inFlight = false) =>
+        onProgress is null ? null : new StageTracker(stage, total, onProgress, inFlight);
 
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
@@ -280,7 +283,7 @@ public sealed class BackupChecker(
         Directory.CreateDirectory(work);
         using var gate = new SemaphoreSlim(Math.Max(1, downloadConcurrency));
         // 这是整个检查里唯一真正下载数据的阶段，也是唯一可能跑几小时的阶段。
-        var tracker = Track(onProgress, "Verifying", presentGroups.Count);
+        var tracker = Track(onProgress, "Verifying", presentGroups.Count, inFlight: true);
         try
         {
             var perGroup = await Task.WhenAll(presentGroups.Select(async g =>

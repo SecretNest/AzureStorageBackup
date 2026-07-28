@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -414,5 +415,203 @@ public sealed class StageProgressTests
         tracker.Complete();
 
         Assert.Equal(0, seen[^1].Bytes);
+    }
+
+    /// <summary>
+    /// 备份上传的节奏是「压一箱几十秒 → 传几秒」。测速窗口过去按墙钟打时间戳，于是同一条网线
+    /// 量出来的数字随停顿长短而变：停顿短于窗口被稀释，长于窗口则老采样被整批淘汰、当场报 0。
+    /// 速度要回答的是"网线上有多快"，压缩那几十秒就不该进分母。
+    /// </summary>
+    [Fact]
+    public void Compression_Stalls_Do_Not_Dilute_The_Upload_Speed()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        // 第一卷：1 MB 用掉 1 秒。
+        tracker.BeginItem("v1");
+        var first = tracker.ItemProgress();
+        now += 1_000;
+        first.Report(1 << 20);
+        tracker.EndItem("v1", 0);
+
+        // 压缩 30 秒——一条流都没开着。这 30 秒不该进分母。
+        now += 30_000;
+
+        // 第二卷：又是 1 MB 用掉 1 秒。
+        tracker.BeginItem("v2");
+        var second = tracker.ItemProgress();
+        now += 1_000;
+        second.Report(1 << 20);
+        tracker.EndItem("v2", 0);
+
+        // 2 MB / 2 秒在网线上 ≈ 1 MB/s。被 30 秒摊薄的话是 64 KB/s，老采样被淘汰的话是 0。
+        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+    }
+
+    /// <summary>
+    /// 开关默认关：扫描、差分这些阶段从不登记在途项，虚拟时钟对它们会永远停在 0，
+    /// 速度将恒为 0。它们必须原样走墙钟。
+    /// </summary>
+    [Fact]
+    public void Stages_Without_In_Flight_Items_Keep_The_Wall_Clock_Speed()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 2, seen.Add) { Clock = () => now };
+
+        tracker.Advance(1 << 20);
+        now += 1_000;
+        tracker.Advance(1 << 20);
+
+        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+    }
+
+    /// <summary>
+    /// 流开着却一个字节都不动（网络卡死、SDK 没触发重试）时，没有任何事件会触发上报，
+    /// 界面就冻在卡住前的数字上——最该看出问题的时候反而看不出来。
+    /// 活跃段内的心跳负责把测速窗口推下去，让速度自己掉到 0。
+    /// </summary>
+    [Fact]
+    public void A_Stuck_Stream_Drags_The_Speed_Down_Instead_Of_Freezing_It()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginItem("v1");
+        var bytes = tracker.ItemProgress();
+        now += 1_000;
+        bytes.Report(4 << 20);
+        now += 1_000;
+        bytes.Report(8 << 20);   // 累计值：又是 4 MB
+        Assert.True(seen[^1].BytesPerSecond > 0, "流通着的时候要看得见速度");
+
+        // 流还挂着，字节不动。心跳每秒一拍。
+        for (var i = 0; i < 12; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Equal(0, seen[^1].BytesPerSecond);
+    }
+
+    /// <summary>
+    /// 纯压缩期一条流都没开：那段时间不进分母，也就没有任何新东西可报。
+    /// 心跳必须闭嘴，否则几十秒一箱的压缩会刷出一串内容完全相同的快照。
+    /// </summary>
+    [Fact]
+    public void The_Heartbeat_Stays_Silent_While_Nothing_Is_On_The_Wire()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginWork();   // 领了活，但还在压缩：一条流都没开
+        seen.Clear();
+
+        for (var i = 0; i < 5; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Empty(seen);
+    }
+
+    /// <summary>
+    /// 上面几条心跳测试全部注入了假时钟——<c>Heartbeat(bool)</c> 一看到 <c>Clock is not null</c>
+    /// 就直接早退，压根不会去 new 生产用的那个 <see cref="System.Threading.Timer"/>。也就是说，
+    /// 假如有人把 <c>BeginItem</c> 里那句 <c>Heartbeat(on: true)</c> 删掉，上面所有测试照样全绿，
+    /// 产品里的心跳却已经被静音了。这条测试**不注入时钟**，走真实的 <see cref="System.Threading.Timer"/>，
+    /// 才盖得到那一行调用本身。
+    /// </summary>
+    [Fact]
+    public async Task Real_Timer_Heartbeat_Publishes_Without_Any_Further_Manual_Event()
+    {
+        // 与本文件其余测试不同：这里心跳跑在真实的 Timer 线程上，写入 seen 不再和读取它的
+        // 测试线程同线程——List<T> 不是线程安全的，改用 ConcurrentQueue 让写读天然免锁。
+        var seen = new ConcurrentQueue<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Enqueue, speedWhileInFlight: true);
+
+        tracker.BeginItem("v1");
+        var progress = tracker.ItemProgress();
+        progress.Report(1_000_000);
+        await Task.Delay(300); // 跨过 200 ms 节流，确认这次手工上报已经落地
+        var countBeforeHeartbeat = seen.Count;
+
+        // 心跳周期 1 秒。等 2.5 秒——是周期的 2.5 倍，跑不出至少一拍才叫异常；
+        // 这份余量是留给构建机在 CI/NAS 上被抢占调度、GC 暂停之类的抖动的，不是掐着 1 秒边缘赌。
+        // 一个月才炸一次的测试比没有测试更糟，宁可等得久一点。
+        await Task.Delay(2_500);
+
+        // 必须在 Complete() 之前取数：Complete() 自己会强制补发一条终态快照，
+        // 混进来的话，就算心跳一拍都没响，这条断言也会假装通过。
+        var countAfterWaiting = seen.Count;
+
+        tracker.Complete();
+
+        Assert.True(
+            countAfterWaiting > countBeforeHeartbeat,
+            $"expected the real-time heartbeat to publish at least one snapshot with no further manual events, " +
+            $"got {countAfterWaiting - countBeforeHeartbeat} extra reports before Complete()");
+    }
+
+    /// <summary>
+    /// 并发上传是生产默认场景：多条卷同时在飞。先结束的那一卷不该把测速时钟叫停——
+    /// 只要还有另一条流没收口，这段时间依然要算进测速窗口，直到"最后一条"收工时钟才真正停下。
+    /// <see cref="EndItem"/> 里的 <c>_active.IsEmpty</c> 判断正是为了这个。
+    /// 只测严格先后的 Begin/End 对（现有测试都是这样）盖不到这条分支——那种写法即使把
+    /// IsEmpty 判断整个删掉，串行场景照样算得对，删掉它才会露馅的正是这里的重叠场景。
+    /// 后半段再验"时钟真的停了"：b 收工之后把注入的时钟拨快 5 秒并手动敲一拍心跳，
+    /// 这 5 秒不能钻进测速窗口——否则就是把 IsEmpty 判断的另一半漏掉了。
+    /// </summary>
+    [Fact]
+    public void An_Overlapping_Upload_Keeps_The_Clock_Running_Until_The_Last_Volume_Ends()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginItem("a");
+        tracker.BeginItem("b"); // b 开的时候 a 还没收工，两条流重叠在一起
+
+        var aProgress = tracker.ItemProgress();
+        var bProgress = tracker.ItemProgress();
+
+        now += 1_000;
+        aProgress.Report(1 << 20); // a 传了 1 MB，用掉 1 秒
+        tracker.EndItem("a", 0);   // a 收工，但 b 还在飞——时钟不该停
+
+        now += 1_000;
+        bProgress.Report(1 << 20); // b 又传了 1 MB，用掉 1 秒。若时钟被 a 的收工叫停，
+                                    // 这一拍会被记成与上一拍相同的时刻，测出来的速度就是 0。
+        tracker.EndItem("b", 0);   // 最后一条流收工，时钟才真正停下
+
+        // 2 MB 在 2 秒里过了网线 ≈ 1 MB/s。时钟被提前叫停的话，第二拍会撞上第一拍的时间戳，
+        // spanMs 算出 0，速度读数变成 0——正是 IsEmpty 判断要防的那种假象。
+        var afterB = seen[^1];
+        Assert.InRange(afterB.BytesPerSecond, 900_000L, 1_150_000L);
+
+        // 时钟已经停了：把墙钟拨快 5 秒（远超测速窗口会淘汰旧采样的量级），手动敲一拍心跳。
+        // 若 EndItem("b") 没能把时钟真正停住，这 5 秒空转会钻进分母，把速度读数摊薄甚至压到 0。
+        now += 5_000;
+        tracker.Tick();
+
+        Assert.Equal(afterB.BytesPerSecond, seen[^1].BytesPerSecond);
     }
 }

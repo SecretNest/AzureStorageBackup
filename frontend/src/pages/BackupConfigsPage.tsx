@@ -1163,7 +1163,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 流水线化之后 diff 与上传是**同时**在跑的，而后端的 stage 要等 diff 收工才切到 Uploading。
   // 照搬它，顶行就会在整轮里绝大部分时间写着 "Diffing"——首次备份的 diff 要把每个文件读完算
   // hash，可以跑几小时，期间上传其实一直在传，界面上却看不出来。两条明细同时在动时照实说。
-  const label = details.length > 1 ? 'Diffing + uploading' : backupStageLabels[p.stage]
+  const label = details.length > 1 ? 'Diffing + Uploading' : backupStageLabels[p.stage]
 
   return (
     <div className="text-faint">
@@ -1182,7 +1182,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
             style={{ padding: '0 0.3rem' }}
             onClick={() => setShowDetail((v) => !v)}
           >
-            {showDetail ? '▾ details' : '▸ details'}
+            {showDetail ? '▾ Details' : '▸ Details'}
           </button>
           {/* 两条并行的明细上下叠放，不横着摊开——用户提过 details 会把表格撑宽，
               多一条更要小心。 */}
@@ -1234,7 +1234,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   ]
     .filter(Boolean)
     .join(' · ')
-  const speed = detail.bytesPerSecond > 0 ? ` · ${formatBytes(detail.bytesPerSecond)}/s` : ''
+  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick）。
+  // 但只有 Uploading 是边传边报字节的——Restoring/Verifying 整组字节要等 EndItem 才一次性入账
+  // （见 docs/upload-speed-clock-design.md §3），正常干活时读数本来就长时间是 0，
+  // 对它们显示 0 B/s 就是个假的"卡住"信号。
+  const speed =
+    detail.bytesPerSecond > 0 || (detail.stage === 'Uploading' && detail.activeItems.length > 0)
+      ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
+      : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
 
@@ -1330,7 +1337,7 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
             style={{ padding: '0 0.3rem' }}
             onClick={() => setShowDetail((v) => !v)}
           >
-            {showDetail ? '▾ details' : '▸ details'}
+            {showDetail ? '▾ Details' : '▸ Details'}
           </button>
           {showDetail && <StageDetail detail={run.detail} />}
         </>
@@ -1352,7 +1359,7 @@ function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void })
         style={{ padding: '0 0.3rem' }}
         onClick={() => setShowDetail((v) => !v)}
       >
-        {showDetail ? '▾ details' : '▸ details'}
+        {showDetail ? '▾ Details' : '▸ Details'}
       </button>
     </>
   ) : null
