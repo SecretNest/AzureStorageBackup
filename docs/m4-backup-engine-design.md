@@ -115,6 +115,7 @@ Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → F
    - length 不同 → 变更，需处理。
    - length 同、mtime 或权限不同 → 先比 **headHash**（文件头部一小段，默认 4 KB，可配）：不同 → 变更；相同 → 再比 **fullHash**；fullHash 不同 → 变更；相同 → 仅更新索引元数据（不重传）。
    - 上版本有、本次无 → 删除（新版本排除）。
+   - **归类为单文件 blob 的条目跳过 fullHash**（`BackupDiffer` 的 `fullHashDeferred`）：那条路上 hash 是压缩那一遍读顺手算出来的（`StreamAndStageAsync`），算完还会覆盖 diff 记的值，diff 再读一遍等于把每个大文件从头到尾读了两遍。归类只看路径与长度（§6），扫描一结束就定得下来。**仅**对已经确定变更的判定生效（新增、以及长度不同的修改）；「length 同、mtime/权限变」那条两级哈希路径不受影响——那里的 fullHash 正是区分 MetadataOnly 与 Modified 的唯一依据。
 3. **Plan**：对变更文件决定分组/单文件（§6），死重压实检查。
 4. **Compress**：7z 压缩/加密/分卷，经临时区状态机（§7）；处理后重校验（§9）。
 5. **Upload**：并发上传 data/pack blob，设置 Tier（索引=索引 Tier，数据=数据 Tier），重试退避（PRD 4.1）。

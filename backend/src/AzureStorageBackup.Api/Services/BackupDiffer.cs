@@ -69,7 +69,14 @@ public sealed class BackupDiffer(IFileHasher hasher)
         // 编排器据此边 diff 边把已定局的活推给压缩上传侧，不必等整轮 diff 跑完——首次备份的
         // diff 要几小时，那几小时里网络本来一个字节都没在传。
         // 尾部补出来的 Unreadable/Deleted 条目不回调：它们不产生任何要上传的东西。
-        Func<FileChange, CancellationToken, Task>? onChange = null)
+        Func<FileChange, CancellationToken, Task>? onChange = null,
+        // 哪些路径的全文 hash 可以不在这里算（编排器传"归类为单文件 blob 的"）。
+        // 那条路上 hash 是压缩那一遍读顺手算出来的，算完还会覆盖这里记的值——diff 再读一遍
+        // 等于把每个大文件从头到尾读两遍。一个 100 GB 的文件，省掉的就是整整 100 GB 的读。
+        // 只对"已经确定变了"的判定生效（Added、以及 length 变的 Modified）；
+        // "length 同、mtime 变"那条两级哈希路径**不受影响**——那里的 fullHash 正是用来判断
+        // 到底是 MetadataOnly 还是真 Modified 的，省掉它会把没变的文件全部重传一遍。
+        Func<string, bool>? fullHashDeferred = null)
     {
         options ??= new DiffOptions();
         var root = Path.GetFullPath(rootPath);
@@ -91,9 +98,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
             var kind = entry.Kind == EntryKind.File ? "file" : "symlink";
             prevByPath.TryGetValue(entry.Path, out var prev);
 
+            var deferFull = fullHashDeferred?.Invoke(entry.Path) ?? false;
             var change = prev is null
-                ? await AddedAsync(entry, full, options, ct)
-                : await CompareAsync(entry, prev, full, kind, options, ct);
+                ? await AddedAsync(entry, full, options, deferFull, ct)
+                : await CompareAsync(entry, prev, full, kind, options, deferFull, ct);
 
             changes.Add(change);
             if (change.Kind is ChangeKind.Added or ChangeKind.Modified)
@@ -102,9 +110,14 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 changedBytes += entry.Length;
             }
             // 计入已读字节：只有实际读过内容的分类才算，未变的文件根本没打开过，
-            // 把它们算进去会让速度看起来虚高得离谱。
+            // 把它们算进去会让速度看起来虚高得离谱。全文 hash 被延后的（FullHash 为空）同理——
+            // 这里只摸了个文件头，一个 100 GB 的文件若按整份计，速度会瞬间冲到几十 GB/s，
+            // 剩余时间跟着变成一句笑话。FullHash 是否为空恰好就是"读没读全"的准确指示。
             tracker?.Advance(
-                change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly ? entry.Length : 0);
+                change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly
+                && change.FullHash is not null
+                    ? entry.Length
+                    : 0);
 
             if (onChange is not null)
                 await onChange(change, ct);
@@ -153,26 +166,29 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     private async Task<FileChange> CompareAsync(
-        ScannedEntry entry, IndexEntry prev, string full, string kind, DiffOptions options, CancellationToken ct)
+        ScannedEntry entry, IndexEntry prev, string full, string kind, DiffOptions options, bool deferFull,
+        CancellationToken ct)
     {
         // 类型变更（file<->symlink）视为内容变更。
         if (prev.Kind != kind)
-            return await ModifiedAsync(entry, prev, full, options, ct);
+            return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
 
         if (entry.Kind == EntryKind.Symlink)
             return entry.Target == prev.Target
                 ? Unchanged(entry, prev)
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
-        // length 不同 → 直接变更，无需 head 预筛（仍需 fullHash 作去重键）。
+        // length 不同 → 直接变更，无需 head 预筛。
         if (entry.Length != prev.Length)
-            return await ModifiedAsync(entry, prev, full, options, ct);
+            return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
 
         // length 同、mtime 与权限都同 → 未变，完全跳过哈希。
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
             return Unchanged(entry, prev);
 
-        // length 同、mtime 或权限变 → 两级哈希。
+        // length 同、mtime 或权限变 → 两级哈希。这里的 fullHash **不能**延后：它正是用来区分
+        // "只是 mtime 被碰了一下"（MetadataOnly，不重传）和"内容真变了"（Modified）的唯一依据。
+        // 省掉它就只能一律当作变更，等于每次 touch 都把文件重传一遍。
         return await TryReadAsync(async () =>
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
@@ -189,29 +205,36 @@ public sealed class BackupDiffer(IFileHasher hasher)
         }, entry, prev);
     }
 
-    private async Task<FileChange> AddedAsync(ScannedEntry entry, string full, DiffOptions options, CancellationToken ct)
+    private async Task<FileChange> AddedAsync(
+        ScannedEntry entry, string full, DiffOptions options, bool deferFull, CancellationToken ct)
     {
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Added, entry, null, null, null, null);
 
         return await TryReadAsync(async () =>
         {
+            // headHash 照算。它只读 4KB，却顺带把"这个文件此刻打得开吗"问清楚了——
+            // 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = await hasher.FullHashAsync(full, ct);
+            var fullHash = deferFull ? null : await hasher.FullHashAsync(full, ct);
             return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null);
         }, entry, null);
     }
 
-    private async Task<FileChange> ModifiedAsync(ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, CancellationToken ct)
+    private async Task<FileChange> ModifiedAsync(
+        ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, bool deferFull, CancellationToken ct)
     {
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
         // 记录完整的 headHash + fullHash（索引条目须含原文件哈希/尺寸/权限，供后续 diff 与还原比对）。
+        // 走到这里已经**确定**内容变了（类型换了，或 length 对不上），fullHash 在这里只剩两个用途：
+        // 生成 data/{hash} 地址、以及写进索引——而这两件事单文件 blob 那条路都会用压缩那一遍
+        // 算出来的值重做一次。所以延后是无损的。
         return await TryReadAsync(async () =>
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = await hasher.FullHashAsync(full, ct);
+            var fullHash = deferFull ? null : await hasher.FullHashAsync(full, ct);
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
         }, entry, prev);
     }

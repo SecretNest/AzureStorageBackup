@@ -1,7 +1,13 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>参与规划的变更文件（来自 diff 的 Added/Modified）。</summary>
-public sealed record PlannedFile(string Path, long Length, string FullHash);
+/// <param name="FullHash">全文哈希；<c>null</c> = 延后到压缩那一遍再算。
+/// 只有走单文件 blob 的条目允许为空——那条路上 hash 与压缩共用同一遍读（<c>StreamAndStageAsync</c>），
+/// 算出来的值还会**覆盖** diff 记下的那个，所以 diff 阶段再整个读一遍纯属白读；
+/// 而 <c>data/{hash}</c> 这个内容地址没有第二次补算的机会，因此延后的值一旦真走到
+/// <see cref="GroupingPlanner.Plan"/> 的寻址那一支，会被当场拒绝（装箱那一支则容忍空值——
+/// symlink 本来就没有内容 hash）。</param>
+public sealed record PlannedFile(string Path, long Length, string? FullHash);
 
 public sealed record PlanOptions
 {
@@ -126,7 +132,13 @@ public sealed class GroupingPlanner
             // 它说的是"这个文件根本不该和别人合并"，不该被后面的规则翻案。
             if (file.Length >= options.SingleFileThresholdBytes
                 || (options.DontGroup?.MatchesFileOrAncestorDir(file.Path) ?? false))
-                blobs.Add(new BlobEntry(file.Path, file.FullHash));
+                // data/{hash} 是内容地址，没有 hash 就没有地址。单文件 blob 允许把全文 hash 延后到
+                // 压缩那一遍再算（见 PlannedFile.FullHash），但那条路是编排器直接送去压缩的、不经过
+                // 这里。真有延后的值走到这里就是接错了线：与其拼出一个 "data/" 的空地址悄悄传上去
+                // （要到还原那天才会发现指不到 blob），不如当场炸掉。
+                blobs.Add(new BlobEntry(file.Path, file.FullHash
+                    ?? throw new InvalidOperationException(
+                        $"Cannot address '{file.Path}': its full hash has not been computed yet.")));
             else if (options.CrossDirGroup?.MatchesFileOrAncestorDir(file.Path) ?? false)
                 crossDirectory.Add(file);
             else
@@ -172,7 +184,9 @@ public sealed class GroupingPlanner
                     currentBytes = 0;
                 }
 
-                current.Add(new PackEntry(file.Path, file.Path, file.FullHash, file.Length));
+                // 这里不拒空：symlink 本来就没有内容 hash（差分对它一律返回 null），而 symlink 是
+                // 可以被打进包的——7z 存的是链接本身。延后计算则只发生在单文件 blob 上，不经过装箱。
+                current.Add(new PackEntry(file.Path, file.Path, file.FullHash!, file.Length));
                 currentBytes += file.Length;
             }
 

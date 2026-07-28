@@ -167,4 +167,32 @@ public sealed class GroupingPlannerTests
         Assert.Equal(2, plan.Packs.Count);
         Assert.Equal(["d"], plan.Packs.Select(p => p.GroupKey).Distinct());
     }
+
+    /// <summary>
+    /// 单文件 blob 的全文 hash 可以延后到压缩那一遍再算（<see cref="PlannedFile.FullHash"/> 为空），
+    /// 而 <c>data/{hash}</c> 是内容地址——没有 hash 就没有地址。接错线时必须当场炸掉：
+    /// 拼出一个 <c>data/</c> 的空地址传上去，要到还原那天才会被发现指不到 blob。
+    /// </summary>
+    [Fact]
+    public void Addressing_A_File_Whose_Hash_Was_Deferred_Fails_Loudly()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => Plan([new PlannedFile("big.bin", 10_000_000, null)]));
+
+        Assert.Contains("big.bin", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 打包成员则**不**拒空：symlink 本来就没有内容 hash（差分对它一律返回 null），
+    /// 而 symlink 是可以被打进包的——7z 存的是链接本身。把拒空写宽一格，
+    /// 一个指向别处的软链接就能让整轮备份倒掉。
+    /// </summary>
+    [Fact]
+    public void A_Pack_Member_Without_A_Content_Hash_Is_Still_Packed()
+    {
+        var plan = Plan([F("d/1.txt", 100), new PlannedFile("d/link", 0, null)]);
+
+        Assert.Empty(plan.Blobs);
+        Assert.Equal(["d/1.txt", "d/link"], plan.Packs.Single().Members.Select(m => m.Path));
+    }
 }
