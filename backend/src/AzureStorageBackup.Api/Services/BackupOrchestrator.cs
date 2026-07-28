@@ -1006,10 +1006,11 @@ public sealed class BackupOrchestrator(
             var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash, f.Length)).ToList();
 
-            // 这份快照离 diff 可能已隔了几小时——所有单文件 blob 传完才轮到分组上传——期间一个成员
-            // 完全可能被删掉（构建产物）或被收回权限，而 Stat 会就此抛出，让整轮备份倒在与本分支
-            // 所修完全相同的形状上。不另起机制：读不到就把快照记成 null，交给下面既有的"排除成员"
-            // 路径处理（与"内容在压缩期间变了"同一条路：排除出归档 → 重取新内容 → 仍读不开则降级）。
+            // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
+            // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
+            // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
+            // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
+            // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
             var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
             var (staged, missing) = await CompressPackTolerantAsync(request, packId, members, ct);
 
