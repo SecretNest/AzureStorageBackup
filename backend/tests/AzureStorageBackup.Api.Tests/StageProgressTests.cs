@@ -530,6 +530,42 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
+    /// 上面几条心跳测试全部注入了假时钟——<c>Heartbeat(bool)</c> 一看到 <c>Clock is not null</c>
+    /// 就直接早退，压根不会去 new 生产用的那个 <see cref="System.Threading.Timer"/>。也就是说，
+    /// 假如有人把 <c>BeginItem</c> 里那句 <c>Heartbeat(on: true)</c> 删掉，上面所有测试照样全绿，
+    /// 产品里的心跳却已经被静音了。这条测试**不注入时钟**，走真实的 <see cref="System.Threading.Timer"/>，
+    /// 才盖得到那一行调用本身。
+    /// </summary>
+    [Fact]
+    public async Task Real_Timer_Heartbeat_Publishes_Without_Any_Further_Manual_Event()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true);
+
+        tracker.BeginItem("v1");
+        var progress = tracker.ItemProgress();
+        progress.Report(1_000_000);
+        await Task.Delay(300); // 跨过 200 ms 节流，确认这次手工上报已经落地
+        var countBeforeHeartbeat = seen.Count;
+
+        // 心跳周期 1 秒。等 2.5 秒——是周期的 2.5 倍，跑不出至少一拍才叫异常；
+        // 这份余量是留给构建机在 CI/NAS 上被抢占调度、GC 暂停之类的抖动的，不是掐着 1 秒边缘赌。
+        // 一个月才炸一次的测试比没有测试更糟，宁可等得久一点。
+        await Task.Delay(2_500);
+
+        // 必须在 Complete() 之前取数：Complete() 自己会强制补发一条终态快照，
+        // 混进来的话，就算心跳一拍都没响，这条断言也会假装通过。
+        var countAfterWaiting = seen.Count;
+
+        tracker.Complete();
+
+        Assert.True(
+            countAfterWaiting > countBeforeHeartbeat,
+            $"expected the real-time heartbeat to publish at least one snapshot with no further manual events, " +
+            $"got {countAfterWaiting - countBeforeHeartbeat} extra reports before Complete()");
+    }
+
+    /// <summary>
     /// 并发上传是生产默认场景：多条卷同时在飞。先结束的那一卷不该把测速时钟叫停——
     /// 只要还有另一条流没收口，这段时间依然要算进测速窗口，直到"最后一条"收工时钟才真正停下。
     /// <see cref="EndItem"/> 里的 <c>_active.IsEmpty</c> 判断正是为了这个。

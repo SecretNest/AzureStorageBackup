@@ -438,10 +438,18 @@ public sealed class StageTracker(
     }
 
     /// <summary>停掉心跳。阶段收尾时 <see cref="Complete"/> 已经做过一次；异常路径漏掉也不要紧——
-    /// 三处在途登记都在 <c>finally</c> 里成对调 <see cref="EndItem"/>，最后一条流一结束心跳就已停了。</summary>
+    /// 三处在途登记都在 <c>finally</c> 里成对调 <see cref="EndItem"/>，最后一条流一结束心跳就已停了。
+    /// <para>
+    /// 与 <see cref="Complete"/> 一样要先置 <see cref="_completed"/>：单单停表并不能挡住已经排上
+    /// 线程池、Dispose 也叫不停的那一拍回调，留着这条缝就是白留——<see cref="Tick"/> 靠的正是
+    /// 这个标记，不是靠表停没停。
+    /// </para></summary>
     public void Dispose()
     {
         lock (_gate)
+        {
+            _completed = true;
             StopHeartbeat();
+        }
     }
 }

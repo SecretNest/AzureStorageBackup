@@ -57,6 +57,11 @@ speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
 
 卡住时没有事件，虚拟时钟走了也没人去重算。加一个 `System.Threading.Timer`，周期 1 秒，**只在活跃段内跑**：空→非空时 `Change(1s, 1s)`，非空→空时 `Change(Timeout.Infinite, Timeout.Infinite)`。回调只做一件事——`PublishIfDue(force: false)`，200 ms 节流照旧。
 
+实现落地时又加了两层防护，都不是本节最初设想的那"只做一件事"：回调先检查 `_completed`，
+已经收尾的阶段不会被迟到的回调再补一条快照（见下一节）；回调本身包一层 `try/catch` 把异常吞掉——
+它跑在线程池定时器线程上，没有调用方能接住抛出的异常，顶到运行时手里默认行为是打掉整个进程，
+而进度上报只是锦上添花，不该有资格拖累正在跑的备份/还原/校验。
+
 这样纯压缩期一个多余的快照都不发，界面保留停顿前的最后一个速度值（含义是「最近一段上传时的速度」；旁边的 `uploading=0 / preparing=1` 已经说清了当下没在传）。
 
 `StageTracker` 实现 `IDisposable`，`Complete()` 里停表。异常路径下漏掉 `Dispose` 也不会泄漏定时器回调：只要 `EndItem` 是成对调用的（三处都在 `finally` 里），表在最后一条流结束时就已经停了。
@@ -73,6 +78,22 @@ speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
 | Scanning / Diffing / LoadingIndex / Metadata / Local / Orphans / Cloud | — | `false` | 从不 `BeginItem` |
 
 `Cloud` 阶段只做 HEAD 请求后 `Advance`，不登记在途项，因此留在 `false`。
+
+三个开了 `true` 的阶段里，只有 Uploading 名副其实地"边传边报"：字节经 `ItemProgress()` 逐笔进
+`AddBytes`，活跃段内什么时候有字节、有多少，测出来的就是那一刻网线上的真实速度。Restoring 与
+Verifying 不是——它们在下载前 `BeginItem`、解压/重算 hash 之后才 `EndItem`，`VolumeBlobIO.DownloadAsync`
+用的是 `DownloadToAsync`，没有挂进度回调，整组的字节要等到 `EndItem` 才一次性入账。活跃段因此把
+本地 CPU 时间（解压、hash）也算了进去，而字节是一整块地砸在窗口的最后一瞬：心跳每秒定期重算，
+一组超过 10 秒的活如果在窗口边界上被采到，读数会是"锯齿"——`组字节 / 10s` 连续报上十秒，
+随后掉回 0，直到下一组落账，而不是这组真实花掉的时间。例如 30 秒传完解压完的 300 MB，有三分之一
+的时间显示 30 MB/s、其余显示 0，真实吞吐其实是 10 MB/s。
+
+这**不是**这条改动引入的回归：改动之前同样是这一整块字节落账，只是当时时间戳走墙钟，
+一次性入账后旧采样立刻被判定超龄整批淘汰，读数直接是永久的 0——现在的锯齿是从"永远看不到"
+变成"看到的数字有时偏高、有时偏低"，多组活落在同一个窗口内时（并发下载/校验较多的场景）
+心跳反而把它抹平成更接近真实值的样子，是净改善而非倒退。要让 Restoring / Verifying 也做到
+"边传边报"，真正的修法是把 `IProgress<long>` 接进 `VolumeBlobIO.DownloadAsync`，这是与本次改动
+分开的另一块工作，本次不动代码。
 
 ### 4. 可测性
 

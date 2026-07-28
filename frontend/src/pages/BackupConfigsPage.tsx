@@ -1234,7 +1234,13 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   ]
     .filter(Boolean)
     .join(' · ')
-  const speed = detail.bytesPerSecond > 0 ? ` · ${formatBytes(detail.bytesPerSecond)}/s` : ''
+  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick），
+  // 若在这里改回 "> 0"，卡死与"还没来得及采样"这两种情况会渲染成同一个"什么都不显示"——
+  // 这正是该看出卡住的地方，别把它"修"回去。
+  const speed =
+    detail.bytesPerSecond > 0 || detail.activeItems.length > 0
+      ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
+      : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
 
