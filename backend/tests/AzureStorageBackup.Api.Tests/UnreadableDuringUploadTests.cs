@@ -688,8 +688,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
             Assert.Equal(1, result.Version);
             Assert.Equal(0, result.UnreadableFiles); // 内容已经完整读到并存下去了，没有任何东西"读不开"
-            Assert.Empty(notifier.Notifications.Where(
-                n => n.Event == NotificationEvents.UnrecoverableError));
+            Assert.DoesNotContain(
+                notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError);
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
