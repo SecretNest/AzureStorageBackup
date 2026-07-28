@@ -72,9 +72,9 @@ speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
 
 | 阶段 | 位置 | 开关 | 理由 |
 |---|---|---|---|
-| Uploading | `BackupOrchestrator.cs:311` | `true` | 压一箱几十秒、传几秒 |
-| Restoring | `RestoreOrchestrator.cs:257` | `true` | 下载与解压交替 |
-| Verifying | `BackupChecker.cs:283` | `true` | 下载后解压重算 hash |
+| Uploading | `BackupOrchestrator.cs:313` | `true` | 压一箱几十秒、传几秒 |
+| Restoring | `RestoreOrchestrator.cs:259` | `true` | 下载与解压交替 |
+| Verifying | `BackupChecker.cs:286` | `true` | 下载后解压重算 hash |
 | Scanning / Diffing / LoadingIndex / Metadata / Local / Orphans / Cloud | — | `false` | 从不 `BeginItem` |
 
 `Cloud` 阶段只做 HEAD 请求后 `Advance`，不登记在途项，因此留在 `false`。
