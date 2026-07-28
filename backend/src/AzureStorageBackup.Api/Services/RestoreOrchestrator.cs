@@ -254,7 +254,9 @@ public sealed class RestoreOrchestrator(
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
             // 总数只有在分完组之后才知道（同一个 pack 只下一次），所以 tracker 在这里才建得起来。
-            var tracker = onProgress is null ? null : new StageTracker("Restoring", groups.Count, onProgress);
+            var tracker = onProgress is null
+                ? null
+                : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true);
             var tasks = groups.Select(async g =>
             {
                 try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker, ct); }

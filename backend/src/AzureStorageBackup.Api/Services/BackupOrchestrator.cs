@@ -308,7 +308,10 @@ public sealed class BackupOrchestrator(
         var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff);
         // 上传的总数是**边跑边长出来的**（diff 还在往队列里塞活），先报 0＝未知：
         // 用一个还在涨的分母算百分比，会先冲到 100 再掉回去。工作量同理，随 Enqueue 一件件累加。
-        var uploadTracker = new StageTracker("Uploading", total: 0, reporter.ReportUpload);
+        // 速度只算"网线上有流"的那段时间：这个阶段大部分时间花在 7z 上，把压缩算进分母
+        // 量出来的既不是传输速度也不是墙钟吞吐（见 StageTracker.SpeedNow）。
+        var uploadTracker = new StageTracker(
+            "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true);
 
         var totalItems = 0;
         var uploadedItems = 0;

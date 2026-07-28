@@ -42,7 +42,7 @@ speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
 
 活跃时长 = `_activeMs + (_activeSinceMs >= 0 ? now - _activeSinceMs : 0)`。
 
-`_active` 由空变非空（`BeginItem`）时记起点，由非空变空（`EndItem`）时把这一段累进 `_activeMs`。两处都在 `_gate` 锁内完成，并顺手采一个样——段边界上必须切一刀，否则跨越边界的那对采样会把边界两侧的字节混在一个时间差里。
+`_active` 由空变非空（`BeginItem`）时记起点，由非空变空（`EndItem`）时把这一段累进 `_activeMs`。两处都在 `_gate` 锁内完成，`_active` 的增删也一并挪进锁里——"是不是空的"与时钟开关必须在同一个临界区内定下来。段边界不需要额外强制采样：活跃段外没有字节流动，累计值本身就是准的。
 
 采样队列 `(Ms, Bytes)` 的 `Ms` 从墙钟改为这条虚拟时间轴，10 秒窗口也在虚拟轴上度量。
 
