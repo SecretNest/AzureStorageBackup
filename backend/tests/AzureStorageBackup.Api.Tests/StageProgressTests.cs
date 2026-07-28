@@ -201,4 +201,102 @@ public sealed class StageProgressTests
         Assert.Equal(1, seen[^1].Processed);
         Assert.Equal(100, seen[^1].Percent); // 恰好 100%，不会超
     }
+
+    // ---- 剩余时间 ----
+    //
+    // 用户实测反馈：上传速度起伏很大，剩余时间跟着乱跳。根因是它从前拿 10 秒滚动窗口的速度当分母，
+    // 而备份的节奏是「压一箱几十秒 → 传几秒」：压缩期间窗口里一个字节都没有，速度归零，剩余时间
+    // 整段消失；压完又猛地冒出一个很小的数。压缩那几十秒明明也是剩余时间的一部分。
+
+    /// <summary>压缩把网速摁到 0 的那几十秒里，剩余时间不许消失——它恰恰是最需要它的时候。</summary>
+    [Fact]
+    public async Task Remaining_Time_Survives_The_Stretches_Where_Nothing_Is_On_The_Wire()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        for (var i = 0; i < 4; i++) tracker.Enqueue(1_000_000); // 四件活，每件 1 MB 原始字节
+        tracker.SetTotal(4);
+        tracker.BeginWork();
+        await Task.Delay(60);
+        tracker.Advance(0, work: 1_000_000); // 一件完工。字节走 ItemProgress，这里一个都不加
+        await Task.Delay(250);               // 越过节流，逼出一次带最新状态的上报
+        tracker.Advance(0, work: 1_000_000);
+
+        var last = seen[^1];
+        Assert.Equal(0, last.BytesPerSecond);      // 测速窗口里确实一个字节都没有
+        Assert.NotNull(last.EstimatedRemaining);   // 但剩余时间照给
+        Assert.True(last.EstimatedRemaining > TimeSpan.Zero);
+    }
+
+    /// <summary>一件活可能是 100 GB 的单文件，也可能是一箱几百个 5 KB 的小文件。上传阶段按
+    /// **原始字节**外推正是为了别把这两者当成一样重：干完 1 件却已经过掉 90% 的字节时，
+    /// 剩余时间该按字节说话，而不是说"还剩 3/4"。</summary>
+    [Fact]
+    public async Task Upload_Estimates_By_Bytes_Not_By_Item_Count()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        tracker.Enqueue(900);                                  // 一个大件
+        for (var i = 0; i < 3; i++) tracker.Enqueue(100 / 3 + 1); // 三个小件，合计约 100
+        tracker.SetTotal(4);
+        tracker.BeginWork();
+        await Task.Delay(300);
+        tracker.Advance(0, work: 900); // 大件完工：件数才 1/4，字节已经 9/10
+
+        var eta = seen[^1].EstimatedRemaining;
+        Assert.NotNull(eta);
+        // 按字节：剩下约 1/9 的时间。按件数会是 3 倍已用时间，差着一个数量级。
+        Assert.True(eta < TimeSpan.FromMilliseconds(200), $"expected a byte-weighted estimate, got {eta}");
+    }
+
+    /// <summary>没申报工作量的阶段（diff/还原/检查）退回按件数外推——同样是全程平均，
+    /// 同样不看瞬时速度。diff 那边件数才是对的代理：绝大多数条目只 stat 一下就过去了。</summary>
+    [Fact]
+    public async Task Stages_Without_A_Declared_Workload_Fall_Back_To_Counting_Items()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 4, seen.Add);
+
+        await Task.Delay(60);
+        tracker.Advance(0); // 一个没变的文件：一个字节都没读，测速窗口里空空如也
+        await Task.Delay(250);
+        tracker.Advance(0);
+
+        Assert.Equal(0, seen[^1].BytesPerSecond);
+        Assert.NotNull(seen[^1].EstimatedRemaining);
+    }
+
+    /// <summary>全部干完之后必须收成 null：留一个"还剩 0 秒"挂在界面上，比不显示更像卡住了。</summary>
+    [Fact]
+    public void No_Remaining_Time_Once_Everything_Is_Done()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        tracker.Enqueue(1000);
+        tracker.Enqueue(1000);
+        tracker.SetTotal(2);
+        tracker.Advance(0, work: 1000);
+        tracker.Advance(0, work: 1000);
+        tracker.Complete();
+
+        Assert.Null(seen[^1].EstimatedRemaining);
+    }
+
+    /// <summary>工作量只影响剩余时间，不许渗进 <c>Bytes</c>——那个数是"真正过了网线的字节"，
+    /// 界面上的速度和累计流量都指着它。混进原始字节，去重命中就会显示成传了一堆数据。</summary>
+    [Fact]
+    public void Declared_Workload_Never_Leaks_Into_The_Transferred_Byte_Count()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        tracker.Enqueue(5_000_000);
+        tracker.Advance(0, work: 5_000_000); // 去重命中：原始 5 MB，网线上 0 字节
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].Bytes);
+    }
 }

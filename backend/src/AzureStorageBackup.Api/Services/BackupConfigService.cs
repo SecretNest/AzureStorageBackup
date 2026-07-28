@@ -6,8 +6,12 @@ namespace AzureStorageBackup.Api.Services;
 
 public class BackupConfigService(AppDbContext db) : IBackupConfigService
 {
+    /// <summary>按名字排序。<c>COLLATE NOCASE</c> 不是可有可无的润色：SQLite 的默认排序是
+    /// 按字节码点比的，大写字母全部排在小写字母前面（"Zoo" 会跑到 "apple" 前面），
+    /// 在界面上看就是「没按字母排」。</summary>
     public async Task<IReadOnlyList<BackupConfig>> ListAsync(CancellationToken ct = default) =>
-        await db.BackupConfigs.AsNoTracking().OrderBy(c => c.Name).ToListAsync(ct);
+        await db.BackupConfigs.AsNoTracking()
+            .OrderBy(c => EF.Functions.Collate(c.Name, "NOCASE")).ToListAsync(ct);
 
     public async Task<BackupConfig?> GetAsync(int id, CancellationToken ct = default) =>
         await db.BackupConfigs.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id, ct);

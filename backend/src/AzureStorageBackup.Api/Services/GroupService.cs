@@ -10,7 +10,8 @@ public class GroupService(AppDbContext db) : IGroupService
         await db.Groups
             .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
             .AsNoTracking()
-            .OrderBy(g => g.Name).ToListAsync(ct);
+            // NOCASE：SQLite 默认按码点比，大写字母会整体排在小写字母前面（见 BackupConfigService.ListAsync）。
+            .OrderBy(g => EF.Functions.Collate(g.Name, "NOCASE")).ToListAsync(ct);
 
     public async Task<Group?> GetAsync(int id, CancellationToken ct = default) =>
         await db.Groups

@@ -7,7 +7,9 @@ namespace AzureStorageBackup.Api.Services;
 public class AccountService(AppDbContext db) : IAccountService
 {
     public async Task<IReadOnlyList<Account>> ListAsync(CancellationToken ct = default) =>
-        await db.Accounts.AsNoTracking().OrderBy(a => a.Name).ToListAsync(ct);
+        // NOCASE：SQLite 默认按码点比，大写字母会整体排在小写字母前面（见 BackupConfigService.ListAsync）。
+        await db.Accounts.AsNoTracking()
+            .OrderBy(a => EF.Functions.Collate(a.Name, "NOCASE")).ToListAsync(ct);
 
     public async Task<Account?> GetAsync(int id, CancellationToken ct = default) =>
         await db.Accounts.AsNoTracking().FirstOrDefaultAsync(a => a.Id == id, ct);

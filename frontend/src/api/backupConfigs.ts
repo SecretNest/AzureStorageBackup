@@ -145,6 +145,7 @@ export interface StageProgress {
   preparing: number // 已领走、还没开始推字节的（上传阶段＝正在压缩/暂存，可以持续几十秒）
   queued: number // 已排队、还没被领走的
   percent: number | null
+  etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
   estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
 }
 
