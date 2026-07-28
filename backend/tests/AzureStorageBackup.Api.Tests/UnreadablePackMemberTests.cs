@@ -164,8 +164,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             touching, new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), flaky,
-            verifier: new ProcessingVerifier(new FileHasher()));
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), flaky);
 
         var account = AzuriteAccount();
         var name = RandomName("unreadpk-");
@@ -282,8 +281,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                verifier: new ProcessingVerifier(new FileHasher()));
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
 
             await orchestrator.RunAsync(Request(account, name));
 
@@ -331,10 +329,10 @@ public sealed class UnreadablePackMemberTests : IDisposable
         }
     }
 
-    /// <summary>没有 verifier 时根本不做压缩后重校验——这条路径此前对"7z 丢了成员"毫无防备：
-    /// 缺成员的包被直接上传，索引照样认领它。成员在 diff 之后才被锁住，所以它确实进了打包计划。</summary>
+    /// <summary>成员在 diff 之后才被锁住——它确实进了打包计划，然后一直读不开：7z 丢掉它、
+    /// 压缩后的重校验也读不到它。此前这条路径把缺成员的包直接传上去，索引照样认领它。</summary>
     [SkippableFact]
-    public async Task Without_A_Verifier_A_Dropped_Member_Is_Not_Claimed_By_The_Index()
+    public async Task A_Member_Locked_After_Diff_Is_Not_Claimed_By_The_Index()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -359,8 +357,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new LockAfterDiffHasher(new FileHasher(), "d/y.txt")),
                 new GroupingPlanner(), new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                verifier: null); // 关键：这条路径没有压缩后重校验兜底
+                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
 
             var result = await orchestrator.RunAsync(Request(account, name));
 

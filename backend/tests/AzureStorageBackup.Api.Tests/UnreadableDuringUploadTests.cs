@@ -365,7 +365,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+                notifier: notifier);
 
             var result = await orchestrator.RunAsync(
                 Request(account, name, singleFileThresholdBytes: 5_000_000)); // 走分组打包，不走单文件路径
@@ -424,7 +424,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+                notifier: notifier);
 
             var result = await orchestrator.RunAsync(
                 Request(account, name, singleFileThresholdBytes: 5_000_000), progress); // 走分组打包
@@ -497,7 +497,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()), verboseLog: verboseLog);
+                notifier: notifier, verboseLog: verboseLog);
 
             var request = Request(account, name, singleFileThresholdBytes: 30) with
             {
@@ -554,7 +554,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new SevenZipCompressor(), new NetworkFailingUploader(), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+                notifier: notifier);
 
             // 上传失败必须让整轮备份失败，而不是被当成"这个文件读不开"悄悄跳过。
             await Assert.ThrowsAnyAsync<IOException>(() =>
@@ -612,7 +612,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), differ, new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+                notifier: notifier);
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 100));
 
@@ -675,7 +675,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-                notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+                notifier: notifier);
 
             // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是从前保护缺失的那一条。
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));

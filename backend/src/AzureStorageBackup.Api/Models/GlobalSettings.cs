@@ -65,7 +65,7 @@ public class GlobalSettings
     /// <summary>压缩临时区（staged-temp）字节上限，背压阈值（决策 4，可经 Settings 实时改）。默认 2GB。</summary>
     public long StagedLimitBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 
-    /// <summary>处理后重校验（<see cref="Services.ProcessingVerifier"/>）反复重处理上限（PRD §5.1，M4 §9，默认 5）。</summary>
+    /// <summary>压缩后重校验中，同一个成员反复变化时的重处理次数上限（PRD §5.1，M4 §9，默认 5）。</summary>
     public int ProcessingMaxAttempts { get; set; } = 5;
 
     /// <summary>

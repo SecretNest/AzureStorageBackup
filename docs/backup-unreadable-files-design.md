@@ -15,7 +15,7 @@
 
 排查中确认了两件**已经按设计工作**的事，本轮不动它们：
 
-- **处理后重校验**（`ProcessingVerifier`）：处理完比对 mtime/权限/长度，变了就重算 hash，内容确实变了就以新 hash 重处理；反复达 `ProcessingMaxAttempts`（默认 5）则告警并以当前内容保存。
+- **处理后重校验**：处理完比对 mtime/权限/长度，变了就重算 hash，内容确实变了就以新 hash 重处理；反复达 `ProcessingMaxAttempts`（默认 5）则告警并以当前内容保存。（当时由独立的 `ProcessingVerifier` 承担；流水线化之后这段逻辑并入 `BackupOrchestrator`，该类已删。）
 - **分组成员的重校验**（`BackupOrchestrator.UploadGroupablesAsync`）：压缩前给全部成员打 `Stat` 快照，压缩后逐个比对，发现变化就丢弃本次归档、排除变化成员后重压。
 
 关于分组，用户给出的是一条**不变量**而非实现方式：
