@@ -78,6 +78,7 @@ public sealed class StageTracker(
 {
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
+    private const int HeartbeatMs = 1_000;
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly ConcurrentDictionary<string, byte> _active = new(StringComparer.Ordinal);
@@ -117,6 +118,8 @@ public sealed class StageTracker(
     private long _activeMs;
     // 当前活跃段的起点；-1 = 当下一条流都没开。
     private long _activeSince = -1;
+    // 只在活跃段内跑的定时器。压缩期停着，一个多余的快照都不发。
+    private Timer? _heartbeat;
 
     /// <summary>测试注入的毫秒时间源。10 秒测速窗口不可能靠真等来验，注入之后整个跟踪器
     /// 在时间上完全确定。生产为 null，走内部的 <see cref="Stopwatch"/>。</summary>
@@ -221,7 +224,10 @@ public sealed class StageTracker(
             if (!_active.TryAdd(item, 0))
                 return;
             if (speedWhileInFlight && _activeSince < 0)
+            {
                 _activeSince = NowMs();
+                Heartbeat(on: true);
+            }
         }
     }
 
@@ -282,19 +288,55 @@ public sealed class StageTracker(
             {
                 _activeMs += NowMs() - _activeSince;
                 _activeSince = -1;
+                Heartbeat(on: false);
             }
             _bytes += bytes;
             PublishIfDue(force: false);
         }
     }
 
-    /// <summary>阶段收尾：无条件产出一次，把进度落到实处。</summary>
+    /// <summary>心跳的一拍：重算一次测速窗口并上报。卡住的流不产生任何事件，
+    /// 没有它，速度会一直冻在卡住前的数字上。</summary>
+    internal void Tick()
+    {
+        lock (_gate)
+        {
+            // 一条流都没开：这段时间本就不进分母，也没有新东西可报。
+            if (speedWhileInFlight && _activeSince < 0)
+                return;
+            PublishIfDue(force: false);
+        }
+    }
+
+    /// <summary>随活跃段启停心跳。必须在 <c>_gate</c> 内调用。
+    /// 注入了时钟＝单测在手工驱动 <see cref="Tick"/>，此时不叠一个真定时器上去，结果才确定。</summary>
+    private void Heartbeat(bool on)
+    {
+        if (Clock is not null)
+            return;
+        if (on)
+        {
+            _heartbeat ??= new Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
+            _heartbeat.Change(HeartbeatMs, HeartbeatMs);
+        }
+        else
+            _heartbeat?.Change(Timeout.Infinite, Timeout.Infinite);
+    }
+
+    private void StopHeartbeat()
+    {
+        _heartbeat?.Dispose();
+        _heartbeat = null;
+    }
+
+    /// <summary>阶段收尾：无条件产出一次，把进度落到实处，并停掉心跳。</summary>
     public void Complete()
     {
         lock (_gate)
         {
             _current = null;
             PublishIfDue(force: true);
+            StopHeartbeat();
         }
     }
 
@@ -368,6 +410,11 @@ public sealed class StageTracker(
         return (double)elapsedMs * (total - done) / done / 1000;
     }
 
-    /// <summary>停掉心跳定时器（Task 2 起有实际内容）。</summary>
-    public void Dispose() { }
+    /// <summary>停掉心跳。阶段收尾时 <see cref="Complete"/> 已经做过一次；异常路径漏掉也不要紧——
+    /// 三处在途登记都在 <c>finally</c> 里成对调 <see cref="EndItem"/>，最后一条流一结束心跳就已停了。</summary>
+    public void Dispose()
+    {
+        lock (_gate)
+            StopHeartbeat();
+    }
 }

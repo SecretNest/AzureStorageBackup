@@ -469,4 +469,100 @@ public sealed class StageProgressTests
 
         Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
     }
+
+    /// <summary>
+    /// 流开着却一个字节都不动（网络卡死、SDK 没触发重试）时，没有任何事件会触发上报，
+    /// 界面就冻在卡住前的数字上——最该看出问题的时候反而看不出来。
+    /// 活跃段内的心跳负责把测速窗口推下去，让速度自己掉到 0。
+    /// </summary>
+    [Fact]
+    public void A_Stuck_Stream_Drags_The_Speed_Down_Instead_Of_Freezing_It()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginItem("v1");
+        var bytes = tracker.ItemProgress();
+        now += 1_000;
+        bytes.Report(4 << 20);
+        now += 1_000;
+        bytes.Report(8 << 20);   // 累计值：又是 4 MB
+        Assert.True(seen[^1].BytesPerSecond > 0, "流通着的时候要看得见速度");
+
+        // 流还挂着，字节不动。心跳每秒一拍。
+        for (var i = 0; i < 12; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Equal(0, seen[^1].BytesPerSecond);
+    }
+
+    /// <summary>
+    /// 纯压缩期一条流都没开：那段时间不进分母，也就没有任何新东西可报。
+    /// 心跳必须闭嘴，否则几十秒一箱的压缩会刷出一串内容完全相同的快照。
+    /// </summary>
+    [Fact]
+    public void The_Heartbeat_Stays_Silent_While_Nothing_Is_On_The_Wire()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginWork();   // 领了活，但还在压缩：一条流都没开
+        seen.Clear();
+
+        for (var i = 0; i < 5; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Empty(seen);
+    }
+
+    /// <summary>
+    /// 并发上传是生产默认场景：多条卷同时在飞。先结束的那一卷不该把测速时钟叫停——
+    /// 只要还有另一条流没收口，这段时间依然要算进测速窗口。<see cref="EndItem"/> 里的
+    /// <c>_active.IsEmpty</c> 判断正是为了这个：只有"最后一条"收工才停表。
+    /// 只测严格先后的 Begin/End 对（现有测试都是这样）盖不到这条分支——那种写法即使把
+    /// IsEmpty 判断整个删掉，串行场景照样算得对，删掉它才会露馅的正是这里的重叠场景。
+    /// </summary>
+    [Fact]
+    public void An_Overlapping_Upload_Keeps_The_Clock_Running_Until_The_Last_Volume_Ends()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.BeginItem("a");
+        tracker.BeginItem("b"); // b 开的时候 a 还没收工，两条流重叠在一起
+
+        var aProgress = tracker.ItemProgress();
+        var bProgress = tracker.ItemProgress();
+
+        now += 1_000;
+        aProgress.Report(1 << 20); // a 传了 1 MB，用掉 1 秒
+        tracker.EndItem("a", 0);   // a 收工，但 b 还在飞——时钟不该停
+
+        now += 1_000;
+        bProgress.Report(1 << 20); // b 又传了 1 MB，用掉 1 秒。若时钟被 a 的收工叫停，
+                                    // 这一拍会被记成与上一拍相同的时刻，测出来的速度就是 0。
+        tracker.EndItem("b", 0);   // 最后一条流收工，时钟才真正停下
+
+        // 2 MB 在 2 秒里过了网线 ≈ 1 MB/s。时钟被提前叫停的话，第二拍会撞上第一拍的时间戳，
+        // spanMs 算出 0，速度读数变成 0——正是 IsEmpty 判断要防的那种假象。
+        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+    }
 }
