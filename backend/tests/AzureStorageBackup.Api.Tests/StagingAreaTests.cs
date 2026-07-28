@@ -160,6 +160,89 @@ public sealed class StagingAreaTests : IDisposable
         Assert.False(File.Exists(path));
     }
 
+    /// <summary>假压缩：一次产出多卷（v.001..v.00N），每卷 size 字节。</summary>
+    private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> ProduceVolumes(
+        string name, int count, int size)
+        => async (dir, ct) =>
+        {
+            var paths = new List<string>();
+            for (var i = 1; i <= count; i++)
+            {
+                var path = Path.Combine(dir, $"{name}.{i:000}");
+                await File.WriteAllBytesAsync(path, new byte[size], ct);
+                paths.Add(path);
+            }
+            return paths;
+        };
+
+    /// <summary>
+    /// 传完一卷就得删一卷，水位跟着一卷一卷往下走。
+    /// <para>
+    /// 整族传完才删的话，临时盘峰值等于**整个归档**——一个 100 GB 的文件就要 100 GB 临时空间
+    /// （这条已经把一次真实备份撞失败过），而且水位整段贴在上限上，后面的压缩被背压一直堵着。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Volumes_Are_Released_One_By_One_As_They_Go_Up()
+    {
+        using var area = Area(limit: 1_000_000);
+        var item = await area.StageAsync(ProduceVolumes("v", count: 4, size: 25));
+        Assert.Equal(100, area.StagedBytes);
+
+        for (var i = 0; i < item.Files.Count; i++)
+        {
+            area.ReleaseFile(item.Files[i]);
+            Assert.False(File.Exists(item.Files[i]));
+            Assert.Equal(100 - 25 * (i + 1), area.StagedBytes);
+        }
+
+        area.Release(item);                                  // 收尾兜底：只剩删空目录
+        Assert.Equal(0, area.StagedBytes);
+        Assert.Empty(Directory.GetDirectories(_stagedTemp));
+    }
+
+    /// <summary>逐卷释放必须幂等：上传路径逐卷释放过之后，收尾的整族 Release 还会再走一遍。
+    /// 重复扣账会把水位记成负的，此后背压永远挡不住压缩——临时盘就再没有上限了。</summary>
+    [Fact]
+    public async Task Releasing_The_Same_Volume_Twice_Does_Not_Go_Negative()
+    {
+        using var area = Area(limit: 1_000_000);
+        var a = await area.StageAsync(ProduceVolumes("a", count: 2, size: 50));
+        var b = await area.StageAsync(Produce("b", 30));
+
+        area.ReleaseFile(a.Files[0]);
+        area.ReleaseFile(a.Files[0]);   // 重复
+        area.Release(a);                // 整族兜底：另一卷才是真正要删的
+        area.Release(a);                // 再来一次
+
+        Assert.Equal(30, area.StagedBytes);   // 只剩 b
+        area.Release(b);
+        Assert.Equal(0, area.StagedBytes);
+    }
+
+    /// <summary>逐卷释放同样要能解除背压——否则压缩要等到整族传完才动，逐卷删就白删了。</summary>
+    [Fact]
+    public async Task Releasing_A_Single_Volume_Wakes_The_Blocked_Compression()
+    {
+        using var area = Area(limit: 100);
+
+        var first = await area.StageAsync(ProduceVolumes("v", count: 3, size: 50)); // 150 > 100
+        var next = area.StageAsync(Produce("w", 10));
+
+        await Task.Delay(150);
+        Assert.False(next.IsCompleted);          // 背压挡着
+
+        area.ReleaseFile(first.Files[0]);        // 只放掉一卷：150 → 100，还在线上
+        await Task.Delay(150);
+        Assert.False(next.IsCompleted);
+
+        area.ReleaseFile(first.Files[1]);        // 再放一卷：100 → 50，跌破上限
+        var item = await next.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(10, item.Bytes);
+
+        area.Release(first);
+    }
+
     [Fact]
     public async Task Empty_Produce_Leaves_No_Subdir()
     {
