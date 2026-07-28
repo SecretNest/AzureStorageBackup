@@ -62,18 +62,26 @@ public static class VolumeBlobIO
     /// </summary>
     /// <param name="scope">每卷的并发额度与进度登记（见 <see cref="VolumeUploadScope"/>）。
     /// 为 null 时退化成老样子：串行、不限流、不报进度——修复/替换那些不在备份主路径上的调用用。</param>
+    /// <param name="onVolumeUploaded">某一卷传完后立刻调用，参数是它的**本地**文件路径。
+    /// 备份路径把暂存区的逐卷释放挂在这里：整族传完才删的话，临时盘峰值等于整个归档
+    /// （一个 100 GB 的文件就要 100 GB 临时空间），水位还会整段贴在上限上把压缩堵死。</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null)
+        IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
+        Action<string>? onVolumeUploaded = null)
     {
-        Task One(string name, string file) =>
-            scope is null
-                ? uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata)
-                : scope.RunAsync(
+        async Task One(string name, string file)
+        {
+            if (scope is null)
+                await uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata);
+            else
+                await scope.RunAsync(
                     name,
                     p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
                     ct);
+            onVolumeUploaded?.Invoke(file);
+        }
 
         if (volumeFiles.Count == 1)
         {

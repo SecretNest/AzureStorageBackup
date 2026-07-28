@@ -952,7 +952,8 @@ public sealed class BackupOrchestrator(
                 meta["raw"] = "1";
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
-                request.DataTier, request.Options.Upload, ct, meta, uploadScope);
+                request.DataTier, request.Options.Upload, ct, meta, uploadScope,
+                onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
             return (staged.Files.Count, sizes);
         }
         finally
@@ -1216,7 +1217,8 @@ public sealed class BackupOrchestrator(
         {
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
-                request.DataTier, request.Options.Upload, ct, scope: uploadScope);
+                request.DataTier, request.Options.Upload, ct, scope: uploadScope,
+                onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
         }
         finally
         {
