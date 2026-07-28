@@ -415,4 +415,58 @@ public sealed class StageProgressTests
 
         Assert.Equal(0, seen[^1].Bytes);
     }
+
+    /// <summary>
+    /// 备份上传的节奏是「压一箱几十秒 → 传几秒」。测速窗口过去按墙钟打时间戳，于是同一条网线
+    /// 量出来的数字随停顿长短而变：停顿短于窗口被稀释，长于窗口则老采样被整批淘汰、当场报 0。
+    /// 速度要回答的是"网线上有多快"，压缩那几十秒就不该进分母。
+    /// </summary>
+    [Fact]
+    public void Compression_Stalls_Do_Not_Dilute_The_Upload_Speed()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        // 第一卷：1 MB 用掉 1 秒。
+        tracker.BeginItem("v1");
+        var first = tracker.ItemProgress();
+        now += 1_000;
+        first.Report(1 << 20);
+        tracker.EndItem("v1", 0);
+
+        // 压缩 30 秒——一条流都没开着。这 30 秒不该进分母。
+        now += 30_000;
+
+        // 第二卷：又是 1 MB 用掉 1 秒。
+        tracker.BeginItem("v2");
+        var second = tracker.ItemProgress();
+        now += 1_000;
+        second.Report(1 << 20);
+        tracker.EndItem("v2", 0);
+
+        // 2 MB / 2 秒在网线上 ≈ 1 MB/s。被 30 秒摊薄的话是 64 KB/s，老采样被淘汰的话是 0。
+        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+    }
+
+    /// <summary>
+    /// 开关默认关：扫描、差分这些阶段从不登记在途项，虚拟时钟对它们会永远停在 0，
+    /// 速度将恒为 0。它们必须原样走墙钟。
+    /// </summary>
+    [Fact]
+    public void Stages_Without_In_Flight_Items_Keep_The_Wall_Clock_Speed()
+    {
+        long now = 0;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 2, seen.Add) { Clock = () => now };
+
+        tracker.Advance(1 << 20);
+        now += 1_000;
+        tracker.Advance(1 << 20);
+
+        Assert.InRange(seen[^1].BytesPerSecond, 900_000L, 1_150_000L);
+    }
 }
