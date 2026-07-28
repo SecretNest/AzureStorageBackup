@@ -662,7 +662,7 @@ export function BackupConfigsPage() {
                 {editing || containerListError || containerList === null ? (
                   <>
                     <input
-                      className="w-md mono"
+                      className="w-lg mono"
                       value={form.containerName}
                       disabled={!!editing}
                       onChange={(e) => set('containerName', e.target.value)}
@@ -679,7 +679,7 @@ export function BackupConfigsPage() {
                 ) : (
                   <>
                     <select
-                      className="w-md"
+                      className="w-lg"
                       value={newContainer ? ' new' : form.containerName}
                       onChange={(e) => {
                         if (e.target.value === ' new') {
@@ -703,7 +703,7 @@ export function BackupConfigsPage() {
                     {newContainer && (
                       <>
                         <input
-                          className="w-md mono"
+                          className="w-lg mono"
                           placeholder="new-container-name"
                           value={form.containerName}
                           onChange={(e) => set('containerName', e.target.value)}
@@ -736,10 +736,11 @@ export function BackupConfigsPage() {
                 </button>
               </Field>
               <Field label="Name">
-                <input value={form.name} onChange={(e) => set('name', e.target.value)} />
+                <input className="w-lg" value={form.name} onChange={(e) => set('name', e.target.value)} />
               </Field>
               <Field label="Description">
                 <input
+                  className="w-lg"
                   value={form.description ?? ''}
                   onChange={(e) => set('description', e.target.value)}
                 />
@@ -747,6 +748,7 @@ export function BackupConfigsPage() {
               <Field label={editing ? 'Password (locked)' : 'Password'}>
                 <input
                   type="password"
+                  className="w-lg"
                   placeholder={
                     editing
                       ? editing.hasPassword
@@ -766,6 +768,7 @@ export function BackupConfigsPage() {
                 <Field label="Confirm password">
                   <input
                     type="password"
+                    className="w-lg"
                     placeholder={form.password ? 'Re-enter the same password' : 'Leave empty for no encryption'}
                     value={passwordConfirm}
                     onChange={(e) => setPasswordConfirm(e.target.value)}
@@ -1522,6 +1525,7 @@ function ResetPasswordModal({
         <Field label="Password">
           <input
             type="password"
+            className="w-lg"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />

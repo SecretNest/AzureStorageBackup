@@ -302,18 +302,23 @@ public sealed class BackupOrchestrator(
         var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
         var reporter = new PipelineReporter(progress);
+        // diff 不申报字节工作量，剩余时间按**件数**外推（见 StageTracker.Eta）：这个阶段的耗时
+        // 主要摊在"每条至少 stat 一次"上，真要整个读一遍的只是少数变更文件——按字节推的话，
+        // 一个没变的 100 GB 文件秒过，会让剩余时间当场塌掉一大截。
         var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff);
         // 上传的总数是**边跑边长出来的**（diff 还在往队列里塞活），先报 0＝未知：
-        // 用一个还在涨的分母算百分比，会先冲到 100 再掉回去。
+        // 用一个还在涨的分母算百分比，会先冲到 100 再掉回去。工作量同理，随 Enqueue 一件件累加。
         var uploadTracker = new StageTracker("Uploading", total: 0, reporter.ReportUpload);
 
         var totalItems = 0;
         var uploadedItems = 0;
-        void ReportItem()
+        // work = 这一件活对应的**原始**字节。不能用实传字节当完成度：去重命中一个字节都不传，
+        // 压缩率又随文件类型大幅摆动，拿它算剩余时间会随命中率和压缩率乱跳。
+        void ReportItem(long work)
         {
             // 槽位计数归这里（它有"恰好一次"的既有约束）；tracker 只负责在途项与字节/测速。
             reporter.SetUploaded(Interlocked.Increment(ref uploadedItems));
-            uploadTracker.Advance(0);
+            uploadTracker.Advance(0, work);
         }
 
         using var uploadGate = new SemaphoreSlim(
@@ -386,7 +391,9 @@ public sealed class BackupOrchestrator(
         async Task EnqueueAsync(WorkItem item, CancellationToken token)
         {
             Interlocked.Increment(ref totalItems);
-            uploadTracker.Enqueue();
+            // 申报这件活的原始字节，作为剩余时间估算的工作量。完工时 ReportItem 会照同一个量
+            // 销账（单文件按 Length，一箱按成员长度和），两边必须对得上，否则剩余量归不了零。
+            uploadTracker.Enqueue(item.Single?.Length ?? item.Pack!.Sum(f => f.Length));
             await work.Writer.WriteAsync(item, token);
         }
 
@@ -652,7 +659,7 @@ public sealed class BackupOrchestrator(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, Action onItem, StageTracker uploadTracker, CancellationToken ct)
+        SemaphoreSlim uploadGate, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -678,7 +685,7 @@ public sealed class BackupOrchestrator(
             // 不产生 blob、不写 storageByPath/overrides（索引阶段据此沿用旧条目或整条缺席），
             // 只记一条复用既有通道的告警，绝不能让这一个文件拖垮整轮备份。
             await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
-            onItem();
+            onItem(file.Length);
             return;
         }
 
@@ -707,7 +714,7 @@ public sealed class BackupOrchestrator(
         tailByPath[file.Path] = content.TailHash;
 
         await LogFileAsync(request, file.Path, ct);
-        onItem();
+        onItem(file.Length);
     }
 
     /// <summary>决定这份内容最终落在哪个 blob 上：先预筛探一次（命中去重就完全不压），
@@ -1008,7 +1015,7 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        SemaphoreSlim uploadGate, int[] packCounter, Action onItem, StageTracker uploadTracker, CancellationToken ct)
+        SemaphoreSlim uploadGate, int[] packCounter, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
@@ -1077,7 +1084,7 @@ public sealed class BackupOrchestrator(
                 var vols = await UploadStagedPackAsync(request, packId, staged!, uploadGate, uploadTracker, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
-                onItem();
+                onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
                 continue;
             }
 
@@ -1098,7 +1105,9 @@ public sealed class BackupOrchestrator(
             // 读不开，Finding 2 命中的最坏情形），否则 uploaded 永远追不上 total，完工也显示不了 100%。
             // 反过来，onItem() 放在这里而不是 foreach(changed) 内部的每个成员上，也避免了同一组里
             // 多个成员一起失败时被重复计数（该组只占一个槽位，不是每个成员各占一个）。
-            onItem();
+            // 剩余时间的销账同理：整组的原始字节一次记清，哪怕组里没剩下一个稳定成员——
+            // 这一组的活确实做完了，工作量不销就永远悬在那里，剩余时间收不到 0。
+            onItem(bytes);
 
             foreach (var m in changed)
             {
@@ -1135,7 +1144,7 @@ public sealed class BackupOrchestrator(
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static () => { }, uploadTracker, ct);
+                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadGate, static _ => { }, uploadTracker, ct);
                 }
                 else
                 {

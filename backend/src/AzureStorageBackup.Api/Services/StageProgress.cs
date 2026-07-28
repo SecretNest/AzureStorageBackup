@@ -27,16 +27,32 @@ public sealed record StageProgress(
     /// 不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。</summary>
     int Preparing = 0,
     /// <summary>已排进队列、还没被工作线程领走的件数。</summary>
-    int Queued = 0)
+    int Queued = 0,
+    /// <summary>由 <see cref="StageTracker"/> 按「本阶段全程平均进度」算出的剩余秒数；
+    /// 阶段没有申报工作量、或还没干完一件时为 null，此时退回下面那个基于当前速度的粗估。</summary>
+    double? EtaSeconds = null)
 {
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Processed / Total) : null;
 
-    /// <summary>按当前速度估算的剩余时间。速度为 0 或总数未知时为 null——
-    /// 与其给一个瞎猜的数字，不如不显示。</summary>
+    /// <summary>
+    /// 估算的剩余时间。首选 <see cref="EtaSeconds"/>——它按「已用时间 × 剩余工作量 ÷ 已完成工作量」
+    /// 外推，等价于用**全程平均**吞吐，而不是眼下这一瞬的速度。
+    /// <para>
+    /// 为什么不用 <see cref="BytesPerSecond"/> 算：那是 10 秒滚动窗口，量的是"此刻网线上有多快"。
+    /// 备份的实际节奏是「压一箱几十秒 → 传几秒」，压缩期间窗口里一个字节都没有，速度掉到 0，
+    /// 剩余时间就整段消失，压完又猛地冒出一个很小的数——用户看到的就是"很飘"。而压缩那几十秒
+    /// 同样是剩余时间的一部分，全程平均天然把它算了进去。
+    /// </para>
+    /// <para>
+    /// 回退公式（阶段没申报工作量时）仍是老样子：拿"平均每件字节 × 剩余件数 ÷ 当前速度"粗估。
+    /// </para>
+    /// </summary>
     public TimeSpan? EstimatedRemaining =>
-        Total > 0 && Processed > 0 && Processed < Total && BytesPerSecond > 0 && Bytes > 0
-            ? TimeSpan.FromSeconds((double)Bytes / Processed * (Total - Processed) / BytesPerSecond)
-            : null;
+        EtaSeconds is { } s
+            ? TimeSpan.FromSeconds(s)
+            : Total > 0 && Processed > 0 && Processed < Total && BytesPerSecond > 0 && Bytes > 0
+                ? TimeSpan.FromSeconds((double)Bytes / Processed * (Total - Processed) / BytesPerSecond)
+                : null;
 }
 
 /// <summary>
@@ -66,6 +82,15 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     private long _lastPublishMs = -ThrottleMs;
     private int _enqueued;
     private int _inWork;
+    // 剩余时间用的"工作量"。与 _bytes 是两回事：后者是真正过了网线的字节（压缩后、去重命中为 0），
+    // 拿它当完成度会让剩余时间随压缩率和去重命中率乱跳。没有阶段申报工作量时（0），
+    // 剩余时间退回按件数外推。
+    private long _totalWork;
+    private long _doneWork;
+    // 本阶段真正开工的时刻。上传阶段的 tracker 在 diff 刚起步时就建好了，此后可能空等一阵才
+    // 有第一件活；从建对象那一刻起算平均速度，会把这段空转摊进去，ETA 一路偏长。
+    // -1 = 还没开工（没人调 BeginWork 的阶段——如 diff——一律按"建对象即开工"处理，那是对的）。
+    private long _workStartMs = -1;
 
     /// <summary>把总数定下来。流水线化之后上传阶段的总数是**边跑边长出来的**（diff 还在往队列里
     /// 塞活），在它定下来之前只能报 0＝未知——报一个还在涨的分母，百分比会先冲到 100 再掉回去。</summary>
@@ -80,12 +105,17 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
 
     /// <summary>处理完一项：计数 +1 并累加已读字节。**不动**当前项——当前项由 <see cref="Touch"/>
     /// 维护，让它一直停留在最后进入的那个路径上，卡住时才看得到究竟卡在哪。</summary>
-    public void Advance(long bytes)
+    /// <param name="bytes">计入测速与 <c>Bytes</c> 的字节。</param>
+    /// <param name="work">计入剩余时间估算的工作量，默认与 <paramref name="bytes"/> 相同。
+    /// 上传阶段两者不同：字节是压缩后真正传上去的（去重命中时是 0），工作量则是这一件活对应的
+    /// 原始字节——必须与 <see cref="Enqueue"/> 时申报的是同一个量，否则完工时剩余量归不了零。</param>
+    public void Advance(long bytes, long? work = null)
     {
         lock (_gate)
         {
             _processed++;
             _bytes += bytes;
+            _doneWork += work ?? bytes;
             PublishIfDue(force: false);
         }
     }
@@ -102,10 +132,23 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
 
     /// <summary>一件活排进了队列。生产侧（diff）单线程调用，但它与消费侧并发，故用 Interlocked。
     /// **不**用它去动 <c>_total</c>：那个分母在 diff 收工前一直在涨，拿它算百分比会先冲到 100 再掉回来。</summary>
-    public void Enqueue() => Interlocked.Increment(ref _enqueued);
+    /// <param name="work">这件活的工作量（原始字节），累加成本阶段的总工作量。
+    /// 它在 diff 收工前一直在涨，所以 ETA 与百分比一样用 <c>_total &gt; 0</c> 把门——
+    /// 拿一个还在涨的分母外推，剩余时间会先缩到很小再弹回去。</param>
+    public void Enqueue(long work = 0)
+    {
+        Interlocked.Increment(ref _enqueued);
+        if (work > 0)
+            Interlocked.Add(ref _totalWork, work);
+    }
 
     /// <summary>工作线程领走一件活（此后它算"在准备"，直到 <see cref="BeginItem"/> 开始推字节）。</summary>
-    public void BeginWork() => Interlocked.Increment(ref _inWork);
+    public void BeginWork()
+    {
+        Interlocked.Increment(ref _inWork);
+        // 第一件活被领走 = 本阶段真正开工，平均速度从这里开始量。
+        Interlocked.CompareExchange(ref _workStartMs, _clock.ElapsedMilliseconds, -1);
+    }
 
     /// <summary>工作线程干完一件活（成功或失败都要调）。与 <see cref="Advance"/> 一样**不计数**——
     /// 槽位计数只归 Advance 管，在这里顺手加一次进度条就会冲过 100%。</summary>
@@ -208,6 +251,40 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
 
         publish(new StageProgress(
-            stage, _processed, _total, _bytes, _current, [.. _active.Keys], speed, preparing, queued));
+            stage, _processed, _total, _bytes, _current, [.. _active.Keys], speed, preparing, queued,
+            Eta(now)));
+    }
+
+    /// <summary>
+    /// 剩余时间 = 已开工时长 × 剩余量 ÷ 已完成量。也就是拿**本阶段全程的平均进度**外推，
+    /// 而不是拿最近 10 秒的网速——后者在"压一箱几十秒、传几秒"的节奏下会在 0 和峰值之间来回跳，
+    /// 而压缩那几十秒同样是剩余时间的一部分，全程平均天然把它算进去了。
+    /// <para>
+    /// 「量」优先用申报的工作量（上传阶段＝原始字节）；没人申报就退回件数。
+    /// 上传阶段非用字节不可：一件活可能是 100 GB 的单文件，也可能是一箱几百个 5 KB 的小文件，
+    /// 按件数外推等于把它们当成一样重。反过来 diff 阶段件数才对——那里绝大多数条目只 stat 一下就过。
+    /// </para>
+    /// <para>
+    /// 已知的粗糙之处：在途那一件的进度不算数（完工才一次性销账）。只剩一个 100 GB 文件在传时，
+    /// 剩余时间会一路涨到它传完才掉下来。要修得把在途项的部分进度也折算进来，那需要每一项的
+    /// 预期总量（压完才知道），代价比收益大——先让它在"多件活"的常态下准。
+    /// </para>
+    /// </summary>
+    private double? Eta(long now)
+    {
+        if (_total <= 0)   // 总数还没定下来（diff 还在往队列里塞活）——分母都没有，别猜
+            return null;
+
+        var totalWork = Volatile.Read(ref _totalWork);
+        var (total, done) = totalWork > 0 ? (totalWork, _doneWork) : (_total, _processed);
+        if (done <= 0 || done >= total)
+            return null;
+
+        var startMs = Volatile.Read(ref _workStartMs);
+        var elapsedMs = now - (startMs < 0 ? 0 : startMs);
+        if (elapsedMs <= 0)
+            return null;
+
+        return (double)elapsedMs * (total - done) / done / 1000;
     }
 }
