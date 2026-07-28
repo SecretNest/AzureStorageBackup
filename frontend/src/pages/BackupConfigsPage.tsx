@@ -1157,9 +1157,14 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
   const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
 
+  // 流水线化之后 diff 与上传是**同时**在跑的，而后端的 stage 要等 diff 收工才切到 Uploading。
+  // 照搬它，顶行就会在整轮里绝大部分时间写着 "Diffing"——首次备份的 diff 要把每个文件读完算
+  // hash，可以跑几小时，期间上传其实一直在传，界面上却看不出来。两条明细同时在动时照实说。
+  const label = details.length > 1 ? 'Diffing + uploading' : backupStageLabels[p.stage]
+
   return (
     <div className="text-faint">
-      {backupStageLabels[p.stage]}
+      {label}
       {percent != null && ` ${percent}%`}
       {changed}
       <StopButton onStop={onStop} />
@@ -1208,6 +1213,16 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.total > 0
       ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // 扫描时总数未知——它正是扫描要算出来的
+  // 在途分解。光一个"处理了 N 件"看不出是在干活还是卡住了：备份的上传阶段里，一件活要先过
+  // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是。
+  // 三个数各自有值才出现——扫描、差分这些阶段没有队列，全是 0，这一段自然整体消失。
+  const inFlight = [
+    detail.activeItems.length > 0 && `${detail.activeItems.length} uploading`,
+    detail.preparing > 0 && `${detail.preparing} preparing`,
+    detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
   const speed = detail.bytesPerSecond > 0 ? ` · ${formatBytes(detail.bytesPerSecond)}/s` : ''
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
@@ -1230,6 +1245,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         <span className="text-faint">{detail.stage}: </span>
         {counts}
         {detail.percent != null && ` · ${detail.percent}%`}
+        {inFlight && ` · ${inFlight}`}
         {speed}
         {eta}
       </div>

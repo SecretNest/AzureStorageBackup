@@ -80,6 +80,107 @@ public sealed class StageProgressTests
         Assert.Equal(5000, seen[^1].Bytes);
     }
 
+    /// <summary>
+    /// 「多少在传、多少在准备、多少在排队」的分解。用户看到的现象是备份详情里只有一个
+    /// 只增不减的 `N objects so far`：上传阶段的一件活要先过 7z（一箱 100 MB 几十秒起步）
+    /// 才轮到推字节，那几十秒里在途项是空的、字节是 0，界面上完全看不出在干活还是卡死。
+    /// </summary>
+    [Fact]
+    public void Reports_What_Is_Queued_And_What_Is_Being_Prepared()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        for (var i = 0; i < 5; i++)
+            tracker.Enqueue();
+        tracker.BeginWork(); // 工作线程领走两件……
+        tracker.BeginWork();
+        tracker.BeginItem("packs/p0001.7z"); // ……其中一件已经在推字节，另一件还在压缩
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(["packs/p0001.7z"], s.ActiveItems);
+        Assert.Equal(1, s.Preparing); // 手上 2 件 - 在传 1 件
+        Assert.Equal(3, s.Queued);    // 入队 5 - 完成 0 - 手上 2
+        Assert.Equal(0, s.Processed); // 这些记账一律**不**计数
+    }
+
+    /// <summary>队列深度必须能归零。BeginWork/EndWork 不配对（比如失败路径漏了 finally）
+    /// 会让界面永远挂着几件"在准备"，而那时候其实什么都没在跑。</summary>
+    [Fact]
+    public void Queue_Depth_Drains_To_Zero_When_Every_Item_Is_Done()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 3, seen.Add);
+
+        for (var i = 0; i < 3; i++)
+            tracker.Enqueue();
+        for (var i = 0; i < 3; i++)
+        {
+            tracker.BeginWork();
+            tracker.Advance(10);
+            tracker.EndWork();
+        }
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].Queued);
+        Assert.Equal(0, seen[^1].Preparing);
+        Assert.Equal(3, seen[^1].Processed);
+    }
+
+    /// <summary>三个计数各自独立推进，读到的必然是错开半拍的快照——消费者抢在入队记账落地之前
+    /// 领走一件活是完全正常的时序。不夹到 0 以上，界面上就会闪出 "-1 queued"。</summary>
+    [Fact]
+    public void Skewed_Counters_Never_Produce_Negative_Numbers()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        tracker.BeginWork(); // 入队还没落账，活已经被领走了
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].Queued);
+        Assert.Equal(1, seen[^1].Preparing);
+    }
+
+    /// <summary>
+    /// 上传过程中的字节要**边传边计**，而不是等一个 blob 传完才一次性计入：传一个 100 MB 的包
+    /// 要几十秒，那几十秒里测速窗口是空的，速度读数会归零——正是用户报的「看不到速度」。
+    /// </summary>
+    [Fact]
+    public async Task Streaming_Byte_Reports_Produce_A_Live_Speed_Without_Counting_Items()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        var progress = tracker.ItemProgress();
+        progress.Report(1_000_000); // SDK 报的是**累计**值
+        await Task.Delay(250);      // 跨过节流窗口，才会有第二个测速采样点
+        progress.Report(3_000_000);
+        tracker.Complete();
+
+        Assert.True(seen[^1].BytesPerSecond > 0, "in-flight bytes should feed the speed readout");
+        Assert.Equal(3_000_000, seen[^1].Bytes);
+        Assert.Equal(0, seen[^1].Processed); // 字节回报不是槽位完成
+    }
+
+    /// <summary>累计值回退＝重试从头再传（或多卷的下一卷从 0 开始）。重传的字节要**再算一次**：
+    /// 对「当下网速」而言这是对的，那些字节确实又过了一遍网线。</summary>
+    [Fact]
+    public void A_Retry_That_Restarts_The_Byte_Count_Is_Treated_As_Fresh_Traffic()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        var progress = tracker.ItemProgress();
+        progress.Report(100);
+        progress.Report(300); // 同一次调用内继续累计 → +200
+        progress.Report(50);  // 回退：重试从头来 → 这 50 是新流量
+        tracker.Complete();
+
+        Assert.Equal(350, seen[^1].Bytes);
+    }
+
     /// <summary>在途项的起止**不得**计数。上传的槽位计数有「恰好一次」的约束——一个 pack 因成员
     /// 变化被重压时会经历多次上传，却始终只占 total 里的一个槽位。让 EndItem 顺手计数，
     /// 进度条就会冲过 100%（这个仓库在 onItem 上已经踩过一次重复计数）。</summary>

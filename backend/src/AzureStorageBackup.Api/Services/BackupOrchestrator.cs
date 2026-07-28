@@ -341,13 +341,23 @@ public sealed class BackupOrchestrator(
             {
                 await foreach (var item in work.Reader.ReadAllAsync(ct))
                 {
-                    if (item.Single is { } single)
-                        await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                            overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
-                    else
-                        await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
-                            tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, ReportItem,
-                            uploadTracker, ct);
+                    // 领走一件活。从这里到 BeginItem（拿到 uploadGate、真开始推字节）之间是压缩与暂存，
+                    // 一箱 100 MB 过 7z 可以几十秒——界面上得看得见这段，否则就是"什么都没在发生"。
+                    uploadTracker.BeginWork();
+                    try
+                    {
+                        if (item.Single is { } single)
+                            await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
+                                overrides, postDiffUnreadable, uploadGate, ReportItem, uploadTracker, ct);
+                        else
+                            await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
+                                tailByPath, overrides, postDiffUnreadable, uploadGate, packCounter, ReportItem,
+                                uploadTracker, ct);
+                    }
+                    finally
+                    {
+                        uploadTracker.EndWork();
+                    }
                 }
             }
             catch
@@ -376,6 +386,7 @@ public sealed class BackupOrchestrator(
         async Task EnqueueAsync(WorkItem item, CancellationToken token)
         {
             Interlocked.Increment(ref totalItems);
+            uploadTracker.Enqueue();
             await work.Writer.WriteAsync(item, token);
         }
 
@@ -914,13 +925,14 @@ public sealed class BackupOrchestrator(
                 meta["raw"] = "1";
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
-                request.DataTier, request.Options.Upload, ct, meta);
+                request.DataTier, request.Options.Upload, ct, meta, uploadTracker.ItemProgress());
             return (staged.Files.Count, sizes);
         }
         finally
         {
             uploadGate.Release();
-            uploadTracker.EndItem(blobRef, sizes.Sum());
+            // 字节在传输过程中已逐笔计过（ItemProgress），这里再加一次总量就是双计。
+            uploadTracker.EndItem(blobRef, 0);
         }
     }
 
@@ -1176,12 +1188,13 @@ public sealed class BackupOrchestrator(
         {
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
-                request.DataTier, request.Options.Upload, ct);
+                request.DataTier, request.Options.Upload, ct, progress: uploadTracker.ItemProgress());
         }
         finally
         {
             uploadGate.Release();
-            uploadTracker.EndItem(blobName, sizes.Sum());
+            // 字节在传输过程中已逐笔计过（ItemProgress），这里再加一次总量就是双计。
+            uploadTracker.EndItem(blobName, 0);
             staging.Release(staged);
         }
         return sizes;

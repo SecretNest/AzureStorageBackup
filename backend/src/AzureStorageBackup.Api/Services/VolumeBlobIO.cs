@@ -16,18 +16,21 @@ public static class VolumeBlobIO
     /// 多卷时**倒序上传**（先 .00N、最后 .001），使首卷 .001 成为「整族齐全」的提交标记——
     /// 上传中断时 .001 尚未写入，避免部分上传被存在性检查误判为已存在（§7）。
     /// </summary>
+    /// <param name="progress">上传过程中的字节回报（每卷各自从 0 开始累计，见
+    /// <see cref="IBlobUploader.UploadIfMissingAsync(Account, string, string, string, AccessTier, RetryOptions?, CancellationToken, IReadOnlyDictionary{string, string}?, IProgress{long}?)"/>）。</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? metadata = null)
+        IReadOnlyDictionary<string, string>? metadata = null, IProgress<long>? progress = null)
     {
         if (volumeFiles.Count == 1)
         {
-            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct, metadata);
+            await uploader.UploadIfMissingAsync(account, container, baseRef, volumeFiles[0], tier, retry, ct, metadata, progress);
             return;
         }
         for (var i = volumeFiles.Count - 1; i >= 0; i--)
-            await uploader.UploadIfMissingAsync(account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct, metadata);
+            await uploader.UploadIfMissingAsync(
+                account, container, VolumeName(baseRef, i + 1), volumeFiles[i], tier, retry, ct, metadata, progress);
     }
 
     /// <summary>
