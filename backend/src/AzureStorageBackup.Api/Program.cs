@@ -91,7 +91,6 @@ var sevenZipMethodArgs = builder.Configuration["Backup:SevenZipMethodArgs"];
 SevenZipCompressor.ValidateMethodArgs(sevenZipMethodArgs);
 builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor(methodArgs: sevenZipMethodArgs));
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
-builder.Services.AddSingleton<ProcessingVerifier>();
 builder.Services.AddScoped<BackupOrchestrator>();
 builder.Services.AddSingleton<BackupBusyTracker>();
 builder.Services.AddSingleton<BackupRunner>();

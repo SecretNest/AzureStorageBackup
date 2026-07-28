@@ -62,7 +62,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
-        IBlobUploader? uploader = null, ProcessingVerifier? verifier = null, IFileCompressor? compressor = null)
+        IBlobUploader? uploader = null, IFileCompressor? compressor = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -73,7 +73,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), new FileHasher(), verifier: verifier);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), new FileHasher());
         return (orchestrator, store, factory);
     }
 
@@ -779,8 +779,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         Skip.IfNot(SevenZip(), "7z not found");
 
         var mutating = new MutatingCompressor(new SevenZipCompressor(), _root, "d/y.txt", "yyyy-CHANGED");
-        var (orchestrator, store, factory) = Build(
-            verifier: new ProcessingVerifier(new FileHasher()), compressor: mutating);
+        var (orchestrator, store, factory) = Build(compressor: mutating);
         var account = AzuriteAccount();
         var name = RandomName("orchpk-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);

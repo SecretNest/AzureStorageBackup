@@ -86,7 +86,7 @@ public sealed class UnreadableDirectoryTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            notifier: notifier, verifier: new ProcessingVerifier(new FileHasher()));
+            notifier: notifier);
     }
 
     private BackupRequest Request(Account account, string container) => new()

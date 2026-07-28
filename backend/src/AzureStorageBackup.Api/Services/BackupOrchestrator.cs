@@ -37,7 +37,7 @@ public sealed record BackupEngineOptions
     /// <summary>死重重 pack 时本地缺失成员是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
     public bool AllowRepackDownload { get; init; } = true;
 
-    /// <summary>处理后重校验（<see cref="ProcessingVerifier"/>）反复重处理上限（PRD §5.1，默认 5）。</summary>
+    /// <summary>压缩后重校验中，同一个成员反复变化时的重处理次数上限（PRD §5.1，默认 5）。</summary>
     public int ProcessingMaxAttempts { get; init; } = 5;
 
     /// <summary>
@@ -116,7 +116,6 @@ public sealed class BackupOrchestrator(
     IFileHasher hasher,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
-    ProcessingVerifier? verifier = null,
     ILocalIndexCache? indexCache = null,
     TrackedInfoStore? trackedInfo = null,
     VerboseFileLog? verboseLog = null)
@@ -1007,28 +1006,6 @@ public sealed class BackupOrchestrator(
             var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash, f.Length)).ToList();
 
-            // 无 verifier：直接压缩上传，不做成员重校验。7z 丢成员的验收仍然要做——
-            // 没有重校验兜底时，这条路径是唯一能发现"包里少了人"的地方。
-            if (verifier is null)
-            {
-                var (staged0, missing0) = await CompressPackTolerantAsync(request, packId, members, ct);
-                var kept0 = members.Where(m => !missing0.Contains(m.EntryName)).ToList();
-                if (staged0 is not null && kept0.Count > 0)
-                {
-                    var vols0 = await UploadStagedPackAsync(request, packId, staged0, uploadGate, uploadTracker, ct);
-                    RecordPack(request, packId, kept0, vols0, info, storageByPath);
-                    foreach (var m in kept0) await LogFileAsync(request, m.Path, ct);
-                }
-                else if (staged0 is not null)
-                {
-                    staging.Release(staged0);
-                }
-                foreach (var m in members.Where(m => missing0.Contains(m.EntryName)))
-                    await MarkPostDiffUnreadableAsync(request, m.Path, ArchiverDroppedReason, postDiffUnreadable, ct);
-                onItem();
-                continue;
-            }
-
             // 这份快照离 diff 可能已隔了几小时——所有单文件 blob 传完才轮到分组上传——期间一个成员
             // 完全可能被删掉（构建产物）或被收回权限，而 Stat 会就此抛出，让整轮备份倒在与本分支
             // 所修完全相同的形状上。不另起机制：读不到就把快照记成 null，交给下面既有的"排除成员"
@@ -1136,11 +1113,6 @@ public sealed class BackupOrchestrator(
             }
         }
     }
-
-    /// <summary>操作员看到的原因：7z 对读不了的成员只报警告并把它丢掉，没有给出任何系统级消息，
-    /// 所以这里只能给出我们自己的判定。</summary>
-    private const string ArchiverDroppedReason =
-        "The archiver could not read this file, so it was left out of the archive.";
 
     /// <summary>
     /// 压缩一组成员，容忍 7z 静默丢弃读不了的成员：把被丢掉的剔除后重压，直到归档与成员集一致
