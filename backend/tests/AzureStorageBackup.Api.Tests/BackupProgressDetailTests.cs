@@ -116,10 +116,18 @@ public sealed class BackupProgressDetailTests : IDisposable
             // StageProgressTests 的单测确定性地覆盖，集成测试只验证接线与终态。
             var uploading = progress.Reports.Where(r => r.Stage == BackupStage.Uploading && r.Detail is not null).ToList();
             Assert.NotEmpty(uploading);
+            // 字节现在只有一个来源：Azure SDK 的 ProgressHandler 边传边报。这条断言因此顺带守住了
+            // 整条字节级链路（VolumeBlobIO → IBlobUploader → BlobUploadOptions.ProgressHandler）——
+            // 任何一环断了，速度读数就会永远是 0，正是修复前用户看到的现象。
             Assert.True(uploading[^1].Detail!.Bytes > 0, "uploaded bytes should accumulate for the speed readout");
 
             // 槽位计数恰好一次：绝不能超过 total（在途项的起止不得参与计数）。
             Assert.All(uploading, r => Assert.True(r.Detail!.Processed <= r.Detail.Total));
+
+            // 队列必须排空。BeginWork/EndWork 不配对（失败路径漏了 finally）会让界面永远挂着
+            // "N preparing"，而那时其实什么都没在跑；入队计数漏一笔则会挂着 "N queued"。
+            Assert.Equal(0, uploading[^1].Detail!.Preparing);
+            Assert.Equal(0, uploading[^1].Detail!.Queued);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

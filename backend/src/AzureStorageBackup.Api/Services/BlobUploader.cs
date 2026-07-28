@@ -13,6 +13,21 @@ public interface IBlobUploader
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null);
 
+    /// <summary>
+    /// 同上，外加**上传过程中**的字节回报（<paramref name="progress"/> 收到的是本次调用内的累计值）。
+    /// 没有它，界面上的速度只能按「一个 blob 传完」这个粒度跳变：传一个 100 MB 的包要几十秒，
+    /// 那几十秒里测速窗口是空的，读数归零。
+    /// <para>
+    /// 默认实现直接丢掉进度、转发到无进度版本——测试替身不必为此改一行。进度参数放在最后
+    /// **且不给默认值**：8 个实参唯一匹配上面那个重载，9 个唯一匹配这个，不存在歧义。
+    /// </para>
+    /// </summary>
+    Task<bool> UploadIfMissingAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+        => UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
     /// <summary>覆盖上传文件到 blob（带 Tier + 可选元数据），**不做**存在性短路——目标存在也直接覆盖。
     /// 原子替换用：先覆盖上传新卷、再删残留旧卷，使崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可修复）。</summary>
     Task UploadOverwriteAsync(
@@ -29,6 +44,12 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         IReadOnlyDictionary<string, string>? metadata = null)
         => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata);
 
+    public Task<bool> UploadIfMissingAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress);
+
     public async Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -40,7 +61,7 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     private async Task<bool> UploadCoreAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, bool overwrite, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata)
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress = null)
     {
         var blob = factory.CreateServiceClient(account)
             .GetBlobContainerClient(container)
@@ -49,7 +70,7 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         if (!overwrite && (await blob.ExistsAsync(ct)).Value)
             return false;
 
-        var options = new BlobUploadOptions { AccessTier = tier };
+        var options = new BlobUploadOptions { AccessTier = tier, ProgressHandler = progress };
         if (metadata is not null)
             options.Metadata = metadata.ToDictionary(kv => kv.Key, kv => kv.Value);
 
