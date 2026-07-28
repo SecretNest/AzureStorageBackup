@@ -1163,7 +1163,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 流水线化之后 diff 与上传是**同时**在跑的，而后端的 stage 要等 diff 收工才切到 Uploading。
   // 照搬它，顶行就会在整轮里绝大部分时间写着 "Diffing"——首次备份的 diff 要把每个文件读完算
   // hash，可以跑几小时，期间上传其实一直在传，界面上却看不出来。两条明细同时在动时照实说。
-  const label = details.length > 1 ? 'Diffing + uploading' : backupStageLabels[p.stage]
+  const label = details.length > 1 ? 'Diffing + Uploading' : backupStageLabels[p.stage]
 
   return (
     <div className="text-faint">
@@ -1182,7 +1182,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
             style={{ padding: '0 0.3rem' }}
             onClick={() => setShowDetail((v) => !v)}
           >
-            {showDetail ? '▾ details' : '▸ details'}
+            {showDetail ? '▾ Details' : '▸ Details'}
           </button>
           {/* 两条并行的明细上下叠放，不横着摊开——用户提过 details 会把表格撑宽，
               多一条更要小心。 */}
@@ -1330,7 +1330,7 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
             style={{ padding: '0 0.3rem' }}
             onClick={() => setShowDetail((v) => !v)}
           >
-            {showDetail ? '▾ details' : '▸ details'}
+            {showDetail ? '▾ Details' : '▸ Details'}
           </button>
           {showDetail && <StageDetail detail={run.detail} />}
         </>
@@ -1352,7 +1352,7 @@ function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void })
         style={{ padding: '0 0.3rem' }}
         onClick={() => setShowDetail((v) => !v)}
       >
-        {showDetail ? '▾ details' : '▸ details'}
+        {showDetail ? '▾ Details' : '▸ Details'}
       </button>
     </>
   ) : null
