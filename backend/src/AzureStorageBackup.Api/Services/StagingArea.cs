@@ -26,30 +26,53 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 
     public long StagedBytes => Interlocked.Read(ref _stagedBytes);
 
+    /// <param name="tracker">可选的进度记账。<b>只能</b>传本次备份自己的那个：本类是单例、
+    /// 跨备份共享，把全局状态直接算给某一个备份会让并发的两轮互相污染。谁调用谁记账，
+    /// 各自只看得见自己的活。</param>
     public async Task<StagedItem> StageAsync(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        StageTracker? tracker = null)
     {
-        // 全局非并发：同一时刻只有一个压缩。
-        await _compressLock.WaitAsync(ct);
+        // 进了这一段就先算"排队中"：压缩锁是全局的，这里多半要干等一会儿，而干等对用户
+        // 与"还没被领走"没有区别。拿到锁之后才翻成"在准备"。
+        tracker?.BeginStaging();
         try
         {
-            // 背压：超限时等待上传腾出空间（从上限以下起步则允许本次结果临时超限）。
-            // 每次实时读当前上限（决策 4：Settings 改动立即生效）。
-            while (Interlocked.Read(ref _stagedBytes) >= stagedLimit())
-                await _releaseSignal.WaitAsync(ct);
+            // 全局非并发：同一时刻只有一个压缩。
+            await _compressLock.WaitAsync(ct);
+            try
+            {
+                // 背压等的是暂存空间，此时锁已在手上、别人一样压不了——算"在准备"是诚实的：
+                // 系统确实正为这一件活等着。每次实时读当前上限（决策 4：Settings 改动立即生效）。
+                tracker?.BeginPacking();
+                try
+                {
+                    // 背压：超限时等待上传腾出空间（从上限以下起步则允许本次结果临时超限）。
+                    while (Interlocked.Read(ref _stagedBytes) >= stagedLimit())
+                        await _releaseSignal.WaitAsync(ct);
 
-            Directory.CreateDirectory(compressTempDir);
-            Directory.CreateDirectory(stagedTempDir);
+                    Directory.CreateDirectory(compressTempDir);
+                    Directory.CreateDirectory(stagedTempDir);
 
-            var produced = await produce(compressTempDir, ct);
-            var item = MoveToStaged(produced);
-            Interlocked.Add(ref _stagedBytes, item.Bytes);
-            return item;
+                    var produced = await produce(compressTempDir, ct);
+                    var item = MoveToStaged(produced);
+                    Interlocked.Add(ref _stagedBytes, item.Bytes);
+                    return item;
+                }
+                finally
+                {
+                    tracker?.EndPacking();
+                }
+            }
+            finally
+            {
+                _compressLock.Release();
+            }
         }
         finally
         {
-            _compressLock.Release();
+            tracker?.EndStaging();
         }
     }
 

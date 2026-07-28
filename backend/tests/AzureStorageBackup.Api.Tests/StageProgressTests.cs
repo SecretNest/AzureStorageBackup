@@ -95,41 +95,106 @@ public sealed class StageProgressTests
             tracker.Enqueue();
         tracker.BeginWork(); // 工作线程领走两件……
         tracker.BeginWork();
-        tracker.BeginUpload();               // ……其中一件已经压完、进了上传段，另一件还在压缩
+        // ……其中一件已经过完暂存区、进了上传段
+        tracker.BeginStaging();
+        tracker.BeginPacking();
+        tracker.EndPacking();
+        tracker.EndStaging();
+        tracker.BeginUpload();
         tracker.BeginItem("packs/p0001.7z"); // 在途登记的是**卷**
+        // 另一件正占着压缩锁在产出
+        tracker.BeginStaging();
+        tracker.BeginPacking();
         tracker.Complete();
 
         var s = seen[^1];
         Assert.Equal(["packs/p0001.7z"], s.ActiveItems);
-        Assert.Equal(1, s.Preparing); // 手上 2 件 - 在上传 1 件
+        Assert.Equal(1, s.Preparing); // 正占着压缩锁的那一件
         Assert.Equal(3, s.Queued);    // 入队 5 - 完成 0 - 手上 2
         Assert.Equal(0, s.Processed); // 这些记账一律**不**计数
     }
 
     /// <summary>
-    /// "在准备"要按**件**算，不能拿在途的**卷**数去减。
+    /// "在准备"永远不会超过 1：<see cref="StagingArea"/> 里有一把全局压缩锁，同一时刻只有一件活
+    /// 在产出。工作线程池开得比它大（<c>UploadConcurrency + 1</c>）是为了让压完的活各自去占一条
+    /// 上传流，不是为了并行压缩。
     /// <para>
-    /// 并发额度改成按卷发放之后，一件活可以同时有好几卷在飞（一个大文件切出上千卷，从前它整段
-    /// 只占一个槽位，设置里的「并发 5」在传大文件时形同虚设）。此时若还用 <c>件数 - 在途卷数</c>，
-    /// 相减会把仍在压缩的那些件算没了，界面上"preparing"凭空归零。
+    /// 从前这个数是 <c>手上件数 - 在上传件数</c> 反推的，于是把「排在压缩锁后面干等」的线程也算成
+    /// 了"在准备"：默认配置下界面会显示 5 preparing，读起来像五件活在并行推进，实际是一件在压、
+    /// 四个线程闲着。它同时也是**压缩就是瓶颈**这个结论的反面证据——看起来越忙，其实越闲。
     /// </para>
     /// </summary>
     [Fact]
-    public void Preparing_Counts_Items_Not_The_Volumes_On_The_Wire()
+    public void Preparing_Never_Exceeds_The_One_Item_Holding_The_Compress_Lock()
     {
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Uploading", total: 0, seen.Add);
 
         for (var i = 0; i < 3; i++)
             tracker.BeginWork();  // 三件活在工作线程手上
-        tracker.BeginUpload();    // 只有一件进了上传段……
+        // 一件在产出，另两件在排压缩锁
+        tracker.BeginStaging();
+        tracker.BeginPacking();
+        tracker.BeginStaging();
+        tracker.BeginStaging();
+        tracker.BeginUpload();    // 还有一件已经进了上传段……
         for (var i = 1; i <= 5; i++)
-            tracker.BeginItem($"data/big.{i:000}"); // ……但它自己就有 5 卷同时在传
+            tracker.BeginItem($"data/big.{i:000}"); // ……它自己就有 5 卷同时在传
         tracker.Complete();
 
         var s = seen[^1];
         Assert.Equal(5, s.ActiveItems.Count); // "N uploading" 回答的是"网线上有几条流"
-        Assert.Equal(2, s.Preparing);         // 手上 3 件 - 在上传 1 件，与卷数无关
+        Assert.Equal(1, s.Preparing);         // 与在手件数、卷数都无关：压缩是串行的
+    }
+
+    /// <summary>
+    /// 排在压缩锁后面干等的活算 <c>queued</c>。从用户的角度它们和还在队列里没被领走的活没有区别，
+    /// 都是"排着队还没开工"——而把它们算进"在准备"会让界面显示成一堆活在并行推进。
+    /// </summary>
+    [Fact]
+    public void Items_Waiting_For_The_Compress_Lock_Count_As_Queued()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        for (var i = 0; i < 3; i++)
+            tracker.Enqueue();
+        for (var i = 0; i < 3; i++)
+        {
+            tracker.BeginWork();     // 三件全被领走，队列里一件不剩
+            tracker.BeginStaging();
+        }
+        tracker.BeginPacking();      // 只有一件拿到了锁
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.Preparing); // 真正在产出的
+        Assert.Equal(2, s.Queued);    // 另两件在干等锁——队列里虽然空了，它们仍是"没开工"
+    }
+
+    /// <summary>
+    /// 压完到开始上传之间还有一段实打实的活：pack 要逐成员重新 <c>Stat</c>（变了的还得重算 hash），
+    /// 单文件要查去重映射，去重命中的甚至根本不上传。这段活**不能**被算成 queued——
+    /// 把正在干活的报成"排队中"，比原先那个虚高的 preparing 更误导。
+    /// </summary>
+    [Fact]
+    public void Post_Packing_Verification_Is_Not_Reported_As_Queued()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add);
+
+        tracker.Enqueue();
+        tracker.Enqueue();
+        tracker.BeginWork();
+        tracker.BeginStaging();
+        tracker.BeginPacking();
+        tracker.EndPacking();
+        tracker.EndStaging();  // 压完了，正在逐成员校验/查去重，还没进上传段
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(0, s.Preparing); // 压缩锁已经交出去了
+        Assert.Equal(1, s.Queued);    // 只有还在队列里那一件，不是 2
     }
 
     /// <summary>每卷各要一个 <c>ItemProgress</c>：DeltaProgress 的累计基线是 per-call 的，
@@ -152,8 +217,8 @@ public sealed class StageProgressTests
         Assert.Equal(200, seen[^1].Bytes);
     }
 
-    /// <summary>队列深度必须能归零。BeginWork/EndWork 不配对（比如失败路径漏了 finally）
-    /// 会让界面永远挂着几件"在准备"，而那时候其实什么都没在跑。</summary>
+    /// <summary>队列深度必须能归零。这些计数不配对（比如失败路径漏了 finally）
+    /// 会让界面永远挂着几件"在准备"或"在排队"，而那时候其实什么都没在跑。</summary>
     [Fact]
     public void Queue_Depth_Drains_To_Zero_When_Every_Item_Is_Done()
     {
@@ -165,6 +230,10 @@ public sealed class StageProgressTests
         for (var i = 0; i < 3; i++)
         {
             tracker.BeginWork();
+            tracker.BeginStaging();
+            tracker.BeginPacking();
+            tracker.EndPacking();
+            tracker.EndStaging();
             tracker.Advance(10);
             tracker.EndWork();
         }
@@ -175,7 +244,7 @@ public sealed class StageProgressTests
         Assert.Equal(3, seen[^1].Processed);
     }
 
-    /// <summary>三个计数各自独立推进，读到的必然是错开半拍的快照——消费者抢在入队记账落地之前
+    /// <summary>几个计数各自独立推进，读到的必然是错开半拍的快照——消费者抢在入队记账落地之前
     /// 领走一件活是完全正常的时序。不夹到 0 以上，界面上就会闪出 "-1 queued"。</summary>
     [Fact]
     public void Skewed_Counters_Never_Produce_Negative_Numbers()
@@ -186,8 +255,8 @@ public sealed class StageProgressTests
         tracker.BeginWork(); // 入队还没落账，活已经被领走了
         tracker.Complete();
 
-        Assert.Equal(0, seen[^1].Queued);
-        Assert.Equal(1, seen[^1].Preparing);
+        Assert.Equal(0, seen[^1].Queued);    // 入队 0 - 手上 1 是负的，夹到 0
+        Assert.Equal(0, seen[^1].Preparing); // 还没拿到压缩锁
     }
 
     /// <summary>

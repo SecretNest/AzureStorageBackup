@@ -101,6 +101,75 @@ public sealed class StagingAreaTests : IDisposable
         Assert.Equal(1, maxConcurrent);
     }
 
+    /// <summary>
+    /// 进度上的"在准备"只算真正拿到压缩锁的那一件，排在它后面的算"排队中"。
+    /// <para>
+    /// 工作线程池比压缩锁大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的活
+    /// 各自去占一条上传流。从前进度用「手上件数 - 在上传件数」反推"在准备"，把这些干等锁的线程
+    /// 全算了进去：默认配置下界面显示 5 preparing，读起来像五件活在并行推进，实际是一件在压、
+    /// 四个在闲等——恰恰是压缩就是瓶颈的时候，界面看起来最忙。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Progress_Counts_Only_The_Lock_Holder_As_Preparing()
+    {
+        using var area = Area(limit: 1_000_000);
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 3, seen.Add);
+        for (var i = 0; i < 3; i++)
+        {
+            tracker.Enqueue();
+            tracker.BeginWork();   // 三件全被工作线程领走，队列里一件不剩
+        }
+
+        var hold = new TaskCompletionSource();
+        var holding = new TaskCompletionSource();
+        Task<IReadOnlyList<string>> Blocking(string dir, CancellationToken ct) => Task.Run(async () =>
+        {
+            holding.TrySetResult();
+            await hold.Task;
+            var path = Path.Combine(dir, "v1");
+            await File.WriteAllBytesAsync(path, new byte[10], ct);
+            return (IReadOnlyList<string>)[path];
+        }, ct);
+
+        var first = area.StageAsync(Blocking, tracker: tracker);
+        await holding.Task;                                        // 第一件确实拿到了锁、正在产出
+        var second = area.StageAsync(Produce("v2", 10), tracker: tracker);
+        var third = area.StageAsync(Produce("v3", 10), tracker: tracker);
+
+        tracker.Complete();   // 强制越过节流，取一张当下的快照
+        var s = seen[^1];
+        Assert.Equal(1, s.Preparing); // 压缩是串行的，无论后面排了多少
+        Assert.Equal(2, s.Queued);    // 干等锁的两件——队列虽空，它们仍然什么都没在做
+
+        hold.SetResult();
+        await Task.WhenAll(first, second, third);
+        tracker.Complete();
+        Assert.Equal(0, seen[^1].Preparing); // 全部交还，不留悬挂
+        Assert.Equal(0, seen[^1].Queued);
+    }
+
+    /// <summary>产出中途抛异常也必须把两个计数都交还——漏了 finally，界面会永远挂着
+    /// "1 preparing"，而那时候什么都没在跑。</summary>
+    [Fact]
+    public async Task A_Failed_Compression_Still_Gives_Back_Its_Progress_Slots()
+    {
+        using var area = Area(limit: 1_000_000);
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+        tracker.Enqueue();
+        tracker.BeginWork();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => area.StageAsync(
+            (_, _) => Task.FromException<IReadOnlyList<string>>(new IOException("disk full")),
+            tracker: tracker));
+
+        tracker.Complete();
+        Assert.Equal(0, seen[^1].Preparing);
+        Assert.Equal(0, seen[^1].Queued);
+    }
+
     [Fact]
     public async Task Over_Limit_Blocks_Next_Compression_Until_Release()
     {
