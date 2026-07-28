@@ -1219,8 +1219,13 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 在途分解。光一个"处理了 N 件"看不出是在干活还是卡住了：备份的上传阶段里，一件活要先过
   // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是。
   // 三个数各自有值才出现——扫描、差分这些阶段没有队列，全是 0，这一段自然整体消失。
+  //
+  // 一个字节都没在传、手上的活却全在压缩，这种时候**不能**只让 "N uploading" 悄悄消失：
+  // 那一刻速度是 0、进度条不动、在途路径一行都没有，界面上看跟卡死一模一样。把原因写出来。
+  const idleOnCompression = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlight = [
     detail.activeItems.length > 0 && `${detail.activeItems.length} uploading`,
+    idleOnCompression && 'nothing on the wire — still compressing',
     detail.preparing > 0 && `${detail.preparing} preparing`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
   ]
