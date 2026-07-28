@@ -316,7 +316,23 @@ public sealed class BackupChecker(
         tracker?.BeginItem(blobName);
         try
         {
-            var firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct);
+            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
+            // 多卷共用一个实例会把后一卷的进度当成前一卷的回退，字节滚雪球式虚高。
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
+
+            string firstVolume;
+            try
+            {
+                firstVolume = await VolumeBlobIO.DownloadAsync(cc, blobName, groupDir, ct, itemProgress);
+            }
+            finally
+            {
+                // 下载一结束（成功或抛出）就摘在途标记：字节已经边传边计过了，测速窗口
+                // 不该被随后不占网线的解压、重算 hash 时间继续拖长。这个 finally 只包
+                // 下载本身——它不吞异常，下载失败照样穿透到下面两个 catch，两者看到的
+                // 异常集合与改动前完全一致。
+                tracker?.EndItem(blobName, 0);
+            }
 
             corrupted.AddRange(members[0].Storage!.Kind == "blob"
                 ? await VerifyBlobAsync(firstVolume, members, password, ct)
@@ -335,9 +351,11 @@ public sealed class BackupChecker(
         finally
         {
             // 先摘在途再放闸门：反过来的话，后一个组已经开始校验，界面上却还挂着上一个组。
-            // 字节按成员**解压后**的大小算——这个阶段的时间就花在读解出来的内容算 hash 上，
-            // 用它做速度与剩余时间的基准，和用户看到的进展是同一回事。
-            tracker?.EndItem(blobName, members.Sum(m => m.Length));
+            // EndItem(blobName, 0) 是兜底而非正路：正常情况下载完成时已经在上面的 finally
+            // 里摘过一次，字节也已经在下载过程中边传边计完——这里只防 BeginItem 之后、
+            // 进下载 try 之前抛异常的边界情况。EndItem 幂等（TryRemove 找不到就什么都不做），
+            // 正常路径下这行不会二次生效，不会把「解压+算 hash」的字节再补一次进测速窗口。
+            tracker?.EndItem(blobName, 0);
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }

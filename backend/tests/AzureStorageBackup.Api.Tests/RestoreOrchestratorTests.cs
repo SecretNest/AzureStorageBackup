@@ -460,6 +460,73 @@ public sealed class RestoreOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// 端到端兜底：走真实备份/还原全流程产出一个真正的多卷 7z 归档，断言 Restoring 阶段最终
+    /// 累计的字节数与云端归档的真实（压缩后）大小一致。
+    /// <para>
+    /// 这条测不出"工厂被换成共用实例"这个缺陷本身——按 mutation 验证过：本项目 7z 分卷天然是
+    /// "除末卷外各卷等大、末卷最小"的大小序列，<c>DeltaProgress</c> 的回退判定（见
+    /// <see cref="StageTracker"/>）在这种序列下会自我纠正，共享一个实例照样能凑出与本测试相同的
+    /// 正确总数，不会让这条断言变红。真正钉死 Part 1 契约（"每卷各调一次工厂、拿到各不相同的
+    /// 实例"）的是 <c>VolumeBlobIOTests.DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance</c>——
+    /// 那条直接测 <c>DownloadAsync</c> 本身、不经过分卷大小序列这层间接性。这条测试留着是为了兜住
+    /// "整条还原链路的字节账目没被这次改动弄错"这个更朴素的不变量，与 mutation-检测无关。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Multi_Volume_Restore_Sums_Downloaded_Bytes_Without_Compounding()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstb-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 小分卷逼出一个真正的多卷归档（5+ 卷）——只有卷数足够多，"每卷各要一个进度实例"
+            // 与"全程共用一个实例"两条路径的累计结果才会显著分岔。
+            WriteSrc("big.bin", new string('x', 100_000));
+            var req = BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1000 },
+                    DontCompress = new IgnoreRuleSet(["*.bin"]),
+                    VolumeBytes = 20_000,
+                },
+            };
+            await backup.RunAsync(req);
+
+            // 云端归档的真实大小：下载会实打实传过网线的字节数，即改动之后 Restoring 阶段
+            // 应该累计到的数字。
+            long archivedBytes = 0;
+            var volumeCount = 0;
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+            {
+                archivedBytes += b.Properties.ContentLength ?? 0;
+                volumeCount++;
+            }
+            Assert.True(volumeCount >= 4, "fixture should produce several volumes, or this test doesn't exercise the per-volume factory");
+
+            var reports = new List<StageProgress>();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                CancellationToken.None, phase: null, onProgress: p => { lock (reports) reports.Add(p); });
+
+            Assert.Equal(1, result.RestoredFiles);
+
+            var restoring = reports.Where(r => r.Stage == "Restoring").ToList();
+            Assert.NotEmpty(restoring);
+            Assert.Equal(archivedBytes, restoring[^1].Bytes);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task Second_Restore_Skips_Unchanged_Files()
     {

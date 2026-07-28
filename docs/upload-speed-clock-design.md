@@ -79,21 +79,27 @@ speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
 
 `Cloud` 阶段只做 HEAD 请求后 `Advance`，不登记在途项，因此留在 `false`。
 
-三个开了 `true` 的阶段里，只有 Uploading 名副其实地"边传边报"：字节经 `ItemProgress()` 逐笔进
-`AddBytes`，活跃段内什么时候有字节、有多少，测出来的就是那一刻网线上的真实速度。Restoring 与
-Verifying 不是——它们在下载前 `BeginItem`、解压/重算 hash 之后才 `EndItem`，`VolumeBlobIO.DownloadAsync`
-用的是 `DownloadToAsync`，没有挂进度回调，整组的字节要等到 `EndItem` 才一次性入账。活跃段因此把
-本地 CPU 时间（解压、hash）也算了进去，而字节是一整块地砸在窗口的最后一瞬：心跳每秒定期重算，
-一组超过 10 秒的活如果在窗口边界上被采到，读数会是"锯齿"——`组字节 / 10s` 连续报上十秒，
-随后掉回 0，直到下一组落账，而不是这组真实花掉的时间。例如 30 秒传完解压完的 300 MB，有三分之一
-的时间显示 30 MB/s、其余显示 0，真实吞吐其实是 10 MB/s。
+三个开了 `true` 的阶段现在都名副其实地"边传边报"：`VolumeBlobIO.DownloadAsync` 新增一个可选的
+`Func<IProgress<long>>?` 进度回调**工厂**参数，挂到 SDK `DownloadToAsync` 的 `BlobDownloadToOptions.
+ProgressHandler` 上，字节和 Uploading 一样经 `ItemProgress()` 返回的 `DeltaProgress` 逐笔进
+`AddBytes`。Restoring（`RestoreOrchestrator.cs`）与 Verifying（`BackupChecker.cs`）的 `BeginItem`/
+`EndItem` 窗口也相应收窄：`BeginItem` 仍在拿到并发闸门之后打，但 `EndItem(blobName, 0)` 提前到
+下载本身结束（成功或失败）就调用——`0` 是因为字节已经在下载过程中经进度回调计过了，收尾不需要、
+也不能再补一次，否则就是双计。下载之后的解压、重算 hash、写盘不再计入在途窗口，虚拟测速时钟
+量的因此真的是"网线上有多快"，不再把本地 CPU 时间也算进分母。
 
-这**不是**这条改动引入的回归：改动之前同样是这一整块字节落账，只是当时时间戳走墙钟，
-一次性入账后旧采样立刻被判定超龄整批淘汰，读数直接是永久的 0——现在的锯齿是从"永远看不到"
-变成"看到的数字有时偏高、有时偏低"，多组活落在同一个窗口内时（并发下载/校验较多的场景）
-心跳反而把它抹平成更接近真实值的样子，是净改善而非倒退。要让 Restoring / Verifying 也做到
-"边传边报"，真正的修法是把 `IProgress<long>` 接进 `VolumeBlobIO.DownloadAsync`，这是与本次改动
-分开的另一块工作，本次不动代码。
+工厂而不是单个 `IProgress<long>`：SDK 报的是**本次** `DownloadToAsync` 调用内的累计字节，
+`DeltaProgress` 把累计转增量是按"这一个实例自己的基线"算的（回退即视为重新开始）。多卷下载若
+共用一个实例，后一卷从 0 起步的累计有可能被那个基线错误地记账——每卷调一次工厂拿一个全新实例，
+与 `VolumeUploadScope.RunAsync` 里"每卷各要一个 `ItemProgress()`"是同一个道理，`VolumeBlobIO.cs`
+里 `DownloadAsync` 方法头的注释和 `VolumeBlobIOTests.
+DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance` 分别是这条约束的
+文档和 mutation 验证过的回归测试。
+
+此前这一节描述的"锯齿"（一组活的字节整块砸在 `EndItem` 那一瞬、心跳采样跨窗口边界时读数忽高忽低）
+到这里就不再是 Restoring / Verifying 的已知限制——字节随下载进度连续入账，不再有"一整块"这回事。
+`DeadWeightCompactor.cs` 里那个不带 tracker 的调用点（死重压实，不接进度、不登记在途）维持原样，
+`progress` 参数默认 `null` 时 `DownloadAsync` 完全不挂回调，行为与改动前一致。
 
 ### 4. 可测性
 

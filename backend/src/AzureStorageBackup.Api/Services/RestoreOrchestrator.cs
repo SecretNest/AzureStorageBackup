@@ -338,17 +338,33 @@ public sealed class RestoreOrchestrator(
         tracker?.BeginItem(blobName);
         try
         {
+            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
+            // 多卷共用一个实例会把后一卷的进度当成前一卷的回退，字节滚雪球式虚高。
+            // tracker 为 null（没人接进度）时整个表达式退化为 null，DownloadAsync 不挂回调。
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
+
             string firstVolume;
             try
             {
-                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+                try
+                {
+                    firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
+                }
+                catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
+                {
+                    // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
+                    await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
+                    rehydrated.Add(blobName);
+                    firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
+                }
             }
-            catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
+            finally
             {
-                // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
-                await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
-                rehydrated.Add(blobName);
-                firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct);
+                // 下载一结束（成功，或两次都失败向上抛）就把在途标记摘掉：字节已经在下载过程中
+                // 边传边计过了，测速窗口不该被随后不占网线的解压/写盘时间继续拖长。
+                // EndItem 是幂等的（TryRemove 找不到就什么都不做），下面外层 finally 里那句
+                // 兜底 EndItem(blobName, 0) 因此不会在这里之后重复摘一次、也不会重复计字节。
+                tracker?.EndItem(blobName, 0);
             }
 
             if (storage.Kind == "blob")
@@ -396,8 +412,11 @@ public sealed class RestoreOrchestrator(
         }
         finally
         {
-            // 先摘在途再放闸门：反过来的话，后一个组已经开始还原，界面上却还挂着上一个组。
-            tracker?.EndItem(blobName, needed.Sum(e => e.Length));
+            // 兜底摘除：正常路径下载结束时已经在上面的 finally 里摘过一次（真正的字节也已经
+            // 边传边计完）。这里传 0 字节纯粹是防御——万一 BeginItem 之后、进下载 try 之前
+            // 抛出异常，在途集合不能漏摘；EndItem 幂等（TryRemove 找不到就什么都不做），
+            // 正常路径下这行不会二次生效，不会重复计数、也不会把闸门释放的时机提前。
+            tracker?.EndItem(blobName, 0);
             gate.Release();
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }

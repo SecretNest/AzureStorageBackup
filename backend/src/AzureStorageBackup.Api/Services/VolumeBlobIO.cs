@@ -214,14 +214,31 @@ public static class VolumeBlobIO
     }
 
     /// <summary>把归档（单卷或多卷）下载到 workDir，返回供 7z 解压的首卷本地路径。</summary>
+    /// <param name="progress">每卷的进度回调**工厂**。为什么必须是工厂而不是单个 <see cref="IProgress{T}"/>：
+    /// SDK 的 <c>ProgressHandler</c> 报的是本次 <c>DownloadToAsync</c> 调用内的累计字节，
+    /// <see cref="StageTracker.ItemProgress"/> 返回的 <c>DeltaProgress</c> 把累计转增量时是按
+    /// **这一个实例自己的基线**算的（回退即视为重新开始，见 <see cref="StageTracker"/> 里的注释）。
+    /// 多卷下载若共用一个实例，卷 2 的累计值从 0 起步、还没追上卷 1 收尾时的基线，会被当成
+    /// "又从头传了一遍"整段重新计入，字节随卷数一路滚雪球式虚高。每卷调一次工厂拿一个全新实例，
+    /// 与 <see cref="VolumeUploadScope.RunAsync"/> 里"每卷各要一个 ItemProgress()"是同一个道理。
+    /// 为 null 时不挂进度回调——修复/压实等不在途登记的调用路径用。</param>
     public static async Task<string> DownloadAsync(
-        BlobContainerClient cc, string baseRef, string workDir, CancellationToken ct)
+        BlobContainerClient cc, string baseRef, string workDir, CancellationToken ct,
+        Func<IProgress<long>>? progress = null)
     {
+        async Task DownloadOne(BlobClient blob, string path)
+        {
+            if (progress is null)
+                await blob.DownloadToAsync(path, ct);
+            else
+                await blob.DownloadToAsync(path, new BlobDownloadToOptions { ProgressHandler = progress() }, ct);
+        }
+
         var single = cc.GetBlobClient(baseRef);
         if ((await single.ExistsAsync(ct)).Value)
         {
             var path = Path.Combine(workDir, "arc.7z");
-            await single.DownloadToAsync(path, ct);
+            await DownloadOne(single, path);
             return path;
         }
 
@@ -232,7 +249,7 @@ public static class VolumeBlobIO
             if (!(await blob.ExistsAsync(ct)).Value)
                 break;
             var local = Path.Combine(workDir, $"arc.7z.{i:D3}");
-            await blob.DownloadToAsync(local, ct);
+            await DownloadOne(blob, local);
             first ??= local;
         }
 

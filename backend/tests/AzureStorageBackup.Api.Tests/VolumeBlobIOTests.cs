@@ -1,3 +1,5 @@
+using System.Net.Sockets;
+using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -6,6 +8,25 @@ namespace AzureStorageBackup.Api.Tests;
 
 public sealed class VolumeBlobIOTests
 {
+    private const string AzuriteKey =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+    private static Account AzuriteAccount() => new()
+    {
+        Name = "azurite",
+        BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
+        Region = AzureRegion.Global,
+    };
+
+    private static bool AzuriteReachable()
+    {
+        try { using var c = new TcpClient(); c.Connect("127.0.0.1", 10000); return true; }
+        catch { return false; }
+    }
+
+    private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
+
     /// <summary>记录上传顺序的假 uploader。</summary>
     private sealed class RecordingUploader : IBlobUploader
     {
@@ -130,6 +151,76 @@ public sealed class VolumeBlobIOTests
         await VolumeBlobIO.UploadAsync(up, Acc(), "c", "data/h", ["/tmp/a.7z"], AccessTier.Hot);
 
         Assert.Equal(["data/h"], up.Order);
+    }
+
+    /// <summary>记录每次调用返回的实例是否互不相同的假进度回调。</summary>
+    private sealed class SpyProgress : IProgress<long>
+    {
+        public long LastReported { get; private set; } = -1;
+        public void Report(long value) => LastReported = value;
+    }
+
+    /// <summary>
+    /// 用户实际会看到的症状（修复前）：<c>DownloadAsync</c> 若把进度回调只拿一次、多卷共用，
+    /// 后一卷的字节会被 <see cref="StageTracker"/> 里的 <c>DeltaProgress</c> 误判成"前一卷的
+    /// 回退重传"而错记账，还原/校验速度读数因此失真（见 <c>VolumeBlobIO.DownloadAsync</c> 方法头
+    /// 注释）。
+    /// <para>
+    /// 直接钉死 Part 1 的字面契约——"工厂每卷各调一次、拿到的是各不相同的实例"——而不是拐个弯去看
+    /// 下游 <c>StageTracker</c> 累计的总字节数：后者经过 mutation 验证过，对本项目 7z 分卷天然产生
+    /// 的"除末卷外各卷等大、末卷最小"这种大小序列并不敏感（<c>DeltaProgress</c> 的回退判定在这种
+    /// 序列下会自我纠正，共享实例照样能凑出正确的总数，测不出这个缺陷）。工厂调用次数/实例身份
+    /// 是本次改动唯一能保证在 mutation 下必现的信号。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var account = AzuriteAccount();
+        var name = RandomName("vbio-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            const string baseRef = "data/multi";
+            var sizes = new[] { 5_000, 7_000, 3_000, 1_234 };
+            for (var i = 0; i < sizes.Length; i++)
+                await container.GetBlobClient($"{baseRef}.{i + 1:D3}")
+                    .UploadAsync(new BinaryData(new byte[sizes[i]]), overwrite: true);
+
+            var instances = new List<SpyProgress>();
+            Func<IProgress<long>> makeProgress = () =>
+            {
+                var spy = new SpyProgress();
+                instances.Add(spy);
+                return spy;
+            };
+
+            var workDir = Path.Combine(Path.GetTempPath(), "asb-vbio-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(workDir);
+            try
+            {
+                await VolumeBlobIO.DownloadAsync(container, baseRef, workDir, CancellationToken.None, makeProgress);
+            }
+            finally
+            {
+                try { Directory.Delete(workDir, recursive: true); } catch { /* best effort */ }
+            }
+
+            // 工厂调用次数＝卷数：若实现把 progress() 提到循环外只调一次，这里会是 1 而不是 4。
+            Assert.Equal(sizes.Length, instances.Count);
+            // 每个实例互不相同——ReferenceEquals 意义上真的是"各卷各要一个"，不是同一个引用重复入列。
+            Assert.Equal(instances.Count, instances.Distinct().Count());
+            // 每个实例确实收到了对应那一卷的最终累计字节，证明工厂返回值真被接到了那一卷的下载上，
+            // 不是造了个没人用的实例、实际下载另外共享着别的回调。
+            for (var i = 0; i < sizes.Length; i++)
+                Assert.Equal(sizes[i], instances[i].LastReported);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
     }
 
     [Theory]
