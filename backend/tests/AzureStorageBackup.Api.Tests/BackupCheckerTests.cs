@@ -44,7 +44,13 @@ public sealed class BackupCheckerTests : IDisposable
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory) Build()
+    /// <param name="checkCompressor">检查侧注入的压缩器，默认 null 时用真的 <see cref="SevenZipCompressor"/>。
+    /// 这个口子只为了让某些测试在**解压/算 hash**这一步接一个假的（例如探测"这一刻在途标记是否
+    /// 已经摘掉"，见 <see cref="RestoreOrchestratorTests"/> 里同形状的口子），不影响打包过程本身。</param>
+    /// <param name="checkerClock">检查侧注入给内部 <see cref="StageTracker"/> 的时间源，见
+    /// <see cref="BackupChecker.Clock"/> 上的注释——只为让节流窗口失效，不影响下载/解压本身。</param>
+    private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory) Build(
+        IFileCompressor? checkCompressor = null, Func<long>? checkerClock = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -53,7 +59,8 @@ public sealed class BackupCheckerTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            factory, store, checkCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"))
+        { Clock = checkerClock };
         return (backup, checker, factory);
     }
 
@@ -590,5 +597,93 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.Equal(archivedBytes, verifying[^1].Bytes);
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 钉住 VerifyGroupAsync 里那对内层 try/finally：下载一结束就把 <c>EndItem</c> 摘掉，
+    /// 解压/算 hash 这段本地 CPU 工作不该继续算"在途"。与
+    /// <see cref="RestoreOrchestratorTests.Extraction_Starts_After_Item_Is_Removed_From_ActiveItems"/>
+    /// 同一形状的镜像件——两处结构几乎一致（都是"BeginItem 之后拿闸门、下载、EndItem、再解压"），
+    /// 此前只有还原侧有测试守着，检查侧被判定"结构相同、不值得再测一遍"；这条补齐它，
+    /// 检查侧从此有自己的锚，不必再借还原侧的测试当担保。
+    /// <para>
+    /// 直接读 onProgress 收到的"最近一次发布"同样靠不住（原因见还原侧那条测试上的详细说明）：
+    /// 发布有 200ms 节流，真实时钟下载一个几十字节的测试包全程往往就几十毫秒，EndItem 触发的
+    /// 发布多半被同一个节流窗口吞掉，无论 fix 还是 mutant 都可能读到"下载中"的旧快照。
+    /// 用注入的假时钟绕开它：每查一次时间就往前跳一大步，节流条件永远不成立，每一次状态变化
+    /// 都会被发布——不涉及 Thread.Sleep/Task.Delay，下载/解压仍是对 Azurite 的真实调用，
+    /// 只是"现在几点"这一件事被接管了。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Extraction_Starts_After_Item_Is_Removed_From_ActiveItems()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var probe = new ActiveItemsProbeCompressor(new SevenZipCompressor());
+        long fakeNow = 0;
+        var (backup, checker, factory) = Build(probe, checkerClock: () => Interlocked.Add(ref fakeNow, 1000));
+        var account = AzuriteAccount();
+        var name = RandomName("chkextract-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 三个小文件同目录 → 单个 pack、单个组：只有一件在途项，断言不必按名字过滤。
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await File.WriteAllTextAsync(Path.Combine(_src, "b.txt"), "bravo");
+            await File.WriteAllTextAsync(Path.Combine(_src, "c.txt"), "charlie");
+            await backup.RunAsync(Req(account, name));
+
+            var result = await checker.CheckAsync(
+                account, name, null, null,
+                new CheckOptions { Cloud = CloudCheckLevel.Content },
+                onProgress: d => probe.LatestPublished = d);
+
+            Assert.True(result.Ok);
+            Assert.True(probe.ExtractCallCount > 0, "fake compressor's ExtractToStreamAsync should have been invoked");
+            // 解压这一刻，假时钟已经保证了下载结束时那次 EndItem 触发的发布没被节流吞掉——
+            // 拿到的就是解压开始那一瞬间真正的在途集合，不是碰运气捞到的一张旧快照。
+            Assert.Empty(probe.ActiveItemsAtExtractCall ?? ["<no snapshot captured>"]);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>包一层真压缩器，只在 <c>ExtractToStreamAsync</c> 这一步截住，记下调用那一刻
+    /// 最近一次发布的 <see cref="StageProgress.ActiveItems"/>——解压本身仍然照常委托给内层真的
+    /// <see cref="SevenZipCompressor"/> 完成，被测的只是"调用顺序"，不是解压结果。检查侧的深度
+    /// 校验走 <c>ExtractToStreamAsync</c>（不落盘的流式路径），与
+    /// <see cref="RestoreOrchestratorTests.ActiveItemsProbeCompressor"/> 探的 <c>ExtractAsync</c>
+    /// 不是同一个方法——两边各探各自真正会调用的那一个。</summary>
+    private sealed class ActiveItemsProbeCompressor(IFileCompressor inner) : IFileCompressor
+    {
+        public StageProgress? LatestPublished { get; set; }
+        public IReadOnlyList<string>? ActiveItemsAtExtractCall { get; private set; }
+        public int ExtractCallCount { get; private set; }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default) =>
+            inner.CompressAsync(request, ct);
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default) =>
+            inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default) => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default) =>
+            inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+        {
+            ExtractCallCount++;
+            ActiveItemsAtExtractCall = LatestPublished?.ActiveItems;
+            return inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+        }
     }
 }

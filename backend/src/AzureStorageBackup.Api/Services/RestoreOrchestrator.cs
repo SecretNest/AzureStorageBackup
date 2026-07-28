@@ -359,9 +359,22 @@ public sealed class RestoreOrchestrator(
                 }
                 catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
                 {
-                    // Archive 未活化：发起活化并轮询到就绪（可长等，还原 job 不占锁），再下载。
+                    // Archive 未活化：发起活化并轮询到就绪，这一等按 EnsureOnlineAsync 自己的注释
+                    // 是"几小时级"。在途标记的窗口现在是测速时钟的分母——「网线上有几条流」，
+                    // 活化排队和轮询期间网线上什么都没有，标记不摘的话虚拟时钟会照样走上几个
+                    // 小时，心跳把速度硬拖到 0，界面报"卡住"，而备份其实在正确地等 Azure。
+                    // 摘掉的只是测速窗口的标记，不是进度信号本身：EnsureOnlineAsync 自己会在
+                    // 每次轮询时把 "Waiting for rehydration of {baseRef} — N volume(s) still
+                    // archived…" 报到 phase 上，操作员看得到组的动向，不会以为它消失了。
+                    // 已知的粗糙之处：phase 的顶行（RestoreRunner 里的 state.Phase）是所有并发组
+                    // 共用的一个槽，多组同跑时这条消息会被别的组顶掉，只在 state.Events 里留底；
+                    // 但轮询每 RehydratePollSeconds 重报一次，它自己会再回来。这是既有的进度模型，
+                    // 不是这里引入的。
+                    tracker?.EndItem(blobName, 0);
                     await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
                     rehydrated.Add(blobName);
+                    // 活化完成、真正要下载了才重新打开窗口——与最初 BeginItem 同一节奏。
+                    tracker?.BeginItem(blobName);
                     firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
                 }
             }
@@ -369,6 +382,10 @@ public sealed class RestoreOrchestrator(
             {
                 // 下载一结束（成功，或两次都失败向上抛）就把在途标记摘掉：字节已经在下载过程中
                 // 边传边计过了，测速窗口不该被随后不占网线的解压/写盘时间继续拖长。
+                // 走到这里时标记可能已经被上面 catch 块摘过一次（活化路径先摘再重打）——
+                // EndItem 对不在集合里的项是安全的空操作（ConcurrentDictionary.TryRemove 返回
+                // false，后面 _bytes += 0 与 PublishIfDue 照跑，不影响任何计数），这里不需要
+                // 区分是否已经摘过，反正传的是 0 字节，摘第二次没有副作用。
                 // 下面外层 finally 里那句兜底 EndItem(blobName, 0) 因此在正常路径下不会二次生效——
                 // EndItem 本身**不是**幂等的（_bytes += bytes 和 PublishIfDue 都在 TryRemove 之外
                 // 无条件跑），兜底调用能安全重复，只是因为它传的是 0 字节；真传了非零字节的第二次

@@ -609,9 +609,14 @@ public sealed class StageProgressTests
 
         // 时钟已经停了：把墙钟拨快 5 秒（远超测速窗口会淘汰旧采样的量级），手动敲一拍心跳。
         // 若 EndItem("b") 没能把时钟真正停住，这 5 秒空转会钻进分母，把速度读数摊薄甚至压到 0。
+        var countAfterB = seen.Count;
         now += 5_000;
         tracker.Tick();
 
-        Assert.Equal(afterB.BytesPerSecond, seen[^1].BytesPerSecond);
+        // 时钟冻着时 Tick() 该直接早退、什么都不发布——直接断言"没有新快照"，比拿两个
+        // 理应相等的 BytesPerSecond 互相比较更直白：后者只是"没发布"这件事的一个间接推论
+        // （没发布 ⇒ seen[^1] 还是 afterB 本人 ⇒ 两边数值自然相等），读者得反向推理才看得出
+        // 这条断言到底在防什么。
+        Assert.Equal(countAfterB, seen.Count);
     }
 }
