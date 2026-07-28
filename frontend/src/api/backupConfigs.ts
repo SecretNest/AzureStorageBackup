@@ -142,8 +142,8 @@ export interface StageProgress {
   currentItem: string | null
   activeItems: string[]
   bytesPerSecond: number
-  preparing: number // 已领走、还没开始推字节的（上传阶段＝正在压缩/暂存，可以持续几十秒）
-  queued: number // 已排队、还没被领走的
+  preparing: number // 正占着全局压缩锁产出卷文件的（可以持续几十秒）——按锁的定义只会是 0 或 1
+  queued: number // 还没开工的：队列里没被领走的 + 已领走但在排压缩锁干等的
   percent: number | null
   etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
   estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"

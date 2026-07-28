@@ -22,11 +22,17 @@ public sealed record StageProgress(
     /// <summary>正在并发处理的多个（上传/下载阶段）。</summary>
     IReadOnlyList<string> ActiveItems,
     long BytesPerSecond,
-    /// <summary>已被工作线程领走、但还没开始推字节的件数（备份上传阶段＝正在压缩/暂存）。
+    /// <summary>正在过暂存区的件数（备份上传阶段＝正占着压缩锁在产出卷文件）。
     /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9），此前它在界面上完全不可见：
-    /// 不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。</summary>
+    /// 不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
+    /// <para>
+    /// 因为 <c>StagingArea</c> 里那把压缩锁是全局的，这个数只会是 0 或 1。工作线程池比它大得多
+    /// （<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的活各自去占一条上传流，
+    /// 不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
+    /// </para></summary>
     int Preparing = 0,
-    /// <summary>已排进队列、还没被工作线程领走的件数。</summary>
+    /// <summary>还没开工的件数：既包括还在队列里没被领走的，也包括已被领走、正排在压缩锁后面
+    /// 干等的。两者对用户是同一件事——排着队，什么都没在动。</summary>
     int Queued = 0,
     /// <summary>由 <see cref="StageTracker"/> 按「本阶段全程平均进度」算出的剩余秒数；
     /// 阶段没有申报工作量、或还没干完一件时为 null，此时退回下面那个基于当前速度的粗估。</summary>
@@ -85,6 +91,11 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     // 已经进入"上传"这一段的**件**数。不能拿 _active.Count 代替：那里装的是**卷**，
     // 一件活可以同时有好几卷在飞，相减会把还在压缩的件算没了（preparing 被压成 0）。
     private int _inUpload;
+    // 进了暂存区这一段的件数，以及其中真正拿到压缩锁的件数（后者按锁的定义只会是 0 或 1）。
+    // 必须分开记，不能拿"手上件数 - 在上传件数"反推：那样会把排在锁后面干等的线程算成"在准备"，
+    // 默认配置下界面显示 5 preparing，看着像五件活在并行推进，实际是一件在压、四个在闲等。
+    private int _inStaging;
+    private int _inPacking;
     // 剩余时间用的"工作量"。与 _bytes 是两回事：后者是真正过了网线的字节（压缩后、去重命中为 0），
     // 拿它当完成度会让剩余时间随压缩率和去重命中率乱跳。没有阶段申报工作量时（0），
     // 剩余时间退回按件数外推。
@@ -162,6 +173,18 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
     public void BeginUpload() => Interlocked.Increment(ref _inUpload);
 
     public void EndUpload() => Interlocked.Decrement(ref _inUpload);
+
+    /// <summary>一件活进了暂存区这一段——此刻它多半还在排压缩锁，所以算"排队中"
+    /// （成对调 <see cref="EndStaging"/>）。</summary>
+    public void BeginStaging() => Interlocked.Increment(ref _inStaging);
+
+    public void EndStaging() => Interlocked.Decrement(ref _inStaging);
+
+    /// <summary>拿到压缩锁、真正开始产出卷文件（成对调 <see cref="EndPacking"/>）。
+    /// 界面上的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1。</summary>
+    public void BeginPacking() => Interlocked.Increment(ref _inPacking);
+
+    public void EndPacking() => Interlocked.Decrement(ref _inPacking);
 
     /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
     /// 不是件——界面上那个 "N uploading" 要回答的是"网线上现在有几条流"。</summary>
@@ -257,8 +280,13 @@ public sealed class StageTracker(string stage, int total, Action<StageProgress> 
 
         // 几个计数各自独立推进，读到的是错开半拍的快照——不夹到 0 以上，界面上就会闪出负数。
         var inWork = Volatile.Read(ref _inWork);
-        var preparing = Math.Max(0, inWork - Volatile.Read(ref _inUpload));
-        var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
+        var preparing = Math.Max(0, Volatile.Read(ref _inPacking));
+        // 没开工的 = 还在队列里的 + 已领走但在排压缩锁的。
+        // 刻意**不**用「入队 - 完成 - 在压 - 在传」那个减法：压完到开传之间还有一段实打实的活
+        // （pack 逐成员重新 Stat、单文件查去重映射，去重命中的甚至根本不上传），减法会把它们
+        // 全报成"排队中"——把正在干活的说成在排队，比原先那个虚高的 preparing 更误导。
+        var waiting = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
+        var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork) + waiting;
 
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, [.. _active.Keys], speed, preparing, queued,
