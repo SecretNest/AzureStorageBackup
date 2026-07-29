@@ -127,6 +127,25 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(0, seen[^1].WorkPercent); // 字节：几乎没动
     }
 
+    /// <summary>
+    /// 下载侧能事先报出总传输量（索引里记着各卷尺寸），上传侧报不出——压完才知道有多大。
+    /// 分母缺失时必须是 0 而不是一个偏小的数：拿它算百分比会一路虚高，然后卡在 100% 上不动。
+    /// </summary>
+    [Fact]
+    public void Transfer_Total_Is_Only_Reported_When_Declared()
+    {
+        var (tracker, seen) = Rig();
+
+        tracker.Enqueue(work: 1000);                    // 上传侧：只申报源字节
+        tracker.Complete();
+        Assert.Equal(0, seen[^1].TransferTotal);
+
+        tracker.Enqueue(work: 500, transfer: 120);      // 下载侧：两笔都申报
+        tracker.Enqueue(work: 500, transfer: 80);
+        tracker.Complete();
+        Assert.Equal(200, seen[^1].TransferTotal);
+    }
+
     /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>
     [Fact]
     public void Stages_Without_A_Pool_Report_No_Staged_Bytes()

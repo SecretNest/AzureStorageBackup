@@ -172,6 +172,7 @@ export interface StageProgress {
   workRemaining: number
   transferredBytes: number // 已完工的项真正推上网线的字节（压缩后，不含在途）
   stagedBytes: number // 已压好、还没送出去的（压缩后）
+  transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
   workPercent: number | null // 按源字节算的完成度；总量未定时为 null
 }
 

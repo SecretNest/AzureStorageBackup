@@ -4,14 +4,6 @@ using System.Diagnostics;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 某个阶段正在做什么。备份/还原/检查共用一套形状，阶段名各用各的。
-/// <para>
-/// 存在的理由：在此之前，界面上一个阶段只在**进入**时上报一次。首次备份的 Diffing 要把每个文件
-/// 完整读一遍算 hash，1 TB 数据在 100 MB/s 的盘上就是三小时——全程一个不动的 0%，
-/// 分不清是在干活还是挂死了（而 FIFO 那个 bug 恰好会真的挂死）。
-/// </para>
-/// </summary>
-/// <summary>
 /// 一条正在传的流。<paramref name="Label"/> 是给人看的名字——上传阶段是**源文件路径**，
 /// 而不是 blob 名：blob 是内容寻址的（加密时还是 HMAC 后的乱码），
 /// <c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。一箱 pack 装着几百个文件，列不下，
@@ -24,6 +16,14 @@ public sealed record ActiveTransfer(string Label, long Sent, long Total)
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Sent / Total) : null;
 }
 
+/// <summary>
+/// 某个阶段正在做什么。备份/还原/检查共用一套形状，阶段名各用各的。
+/// <para>
+/// 存在的理由：在此之前，界面上一个阶段只在**进入**时上报一次。首次备份的 Diffing 要把每个文件
+/// 完整读一遍算 hash，1 TB 数据在 100 MB/s 的盘上就是三小时——全程一个不动的 0%，
+/// 分不清是在干活还是挂死了（而 FIFO 那个 bug 恰好会真的挂死）。
+/// </para>
+/// </summary>
 public sealed record StageProgress(
     string Stage,
     int Processed,
@@ -70,7 +70,16 @@ public sealed record StageProgress(
     /// 已经送走的只是其中一截。不减的话，同一批字节会在这里和 <see cref="ActiveItems"/> 里各数一遍。
     /// </para>
     /// </summary>
-    long StagedBytes = 0)
+    long StagedBytes = 0,
+    /// <summary>
+    /// 这一阶段一共要过多少网线字节（压缩后）。0 = 未知。
+    /// <para>
+    /// 只有下载侧填得出：要拉哪些对象、各多大，索引里都记着。上传侧给不出——压完才知道有多大，
+    /// 开始传之前这个数不存在。老索引缺卷尺寸时同样报 0：宁可不显示，也不能给一个偏小的分母，
+    /// 那会让百分比一路虚高然后卡在 100% 上不动。
+    /// </para>
+    /// </summary>
+    long TransferTotal = 0)
 {
     /// <summary>还没开始处理的源端字节（压缩前）。</summary>
     public long WorkRemaining => Math.Max(0, WorkTotal - WorkDone);
@@ -184,6 +193,8 @@ public sealed class StageTracker(
     // 已经彻底走完的那些流真正推上网线的字节（压缩后）。与 _bytes 的区别：那个边传边加、
     // 含在途的部分，用来测速；这个只认走完的，用来回答"有多少已经稳稳落在云上"。
     private long _transferred;
+    // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
+    private long _transferTotal;
     // 本阶段真正开工的时刻。上传阶段的 tracker 在 diff 刚起步时就建好了，此后可能空等一阵才
     // 有第一件活；从建对象那一刻起算平均速度，会把这段空转摊进去，ETA 一路偏长。
     // -1 = 还没开工（没人调 BeginWork 的阶段——如 diff——一律按"建对象即开工"处理，那是对的）。
@@ -254,11 +265,16 @@ public sealed class StageTracker(
     /// <param name="work">这件活的工作量（原始字节），累加成本阶段的总工作量。
     /// 它在 diff 收工前一直在涨，所以 ETA 与百分比一样用 <c>_total &gt; 0</c> 把门——
     /// 拿一个还在涨的分母外推，剩余时间会先缩到很小再弹回去。</param>
-    public void Enqueue(long work = 0)
+    /// <param name="work">这一件活的**源端**字节（压缩前）——完成度与剩余时间按它外推。</param>
+    /// <param name="transfer">这一件活要过网线的字节（压缩后）。只有下载侧给得出，见
+    /// <see cref="StageProgress.TransferTotal"/>。</param>
+    public void Enqueue(long work = 0, long transfer = 0)
     {
         Interlocked.Increment(ref _enqueued);
         if (work > 0)
             Interlocked.Add(ref _totalWork, work);
+        if (transfer > 0)
+            Interlocked.Add(ref _transferTotal, transfer);
     }
 
     /// <summary>工作线程领走一件活（此后它算"在准备"，直到 <see cref="BeginItem"/> 开始推字节）。</summary>
@@ -555,7 +571,8 @@ public sealed class StageTracker(
 
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
-            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, staged));
+            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, staged,
+            Volatile.Read(ref _transferTotal)));
     }
 
     /// <summary>

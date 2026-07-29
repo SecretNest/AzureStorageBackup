@@ -277,6 +277,18 @@ public sealed class RestoreOrchestrator(
             var tracker = onProgress is null
                 ? null
                 : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
+
+            // 申报两笔工作量：要写出多少源字节（解压后），以及要拉多少网线字节（压缩后）。
+            // 光按组数报进度是失真的——一组可能是一个 100 GB 的单文件，也可能是一箱几百个小文件。
+            // 下载总量**必须整组都问得出才报**：老索引缺卷尺寸时给一个偏小的分母，
+            // 百分比会一路虚高然后卡在 100% 上不动，比不显示更糟。
+            var groupWork = groups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
+            var downloadSizes = groups.ToDictionary(
+                g => g.Key, g => DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
+            var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
+            foreach (var g in groups)
+                tracker?.Enqueue(groupWork[g.Key], downloadTotalKnown ? downloadSizes[g.Key] : 0);
+
             var tasks = groups.Select(async g =>
             {
                 try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker, ct); }
@@ -288,7 +300,9 @@ public sealed class RestoreOrchestrator(
                 }
                 finally
                 {
-                    tracker?.Advance(0); // 计数与在途分开：一个组恰好占一个槽位
+                    // 计数与在途分开：一个组恰好占一个槽位。工作量同理一次销清——失败的组也要销，
+                    // 否则剩余量永远归不了零，剩余时间就一直挂着。
+                    tracker?.Advance(0, groupWork[g.Key]);
                 }
             });
             var counts = await Task.WhenAll(tasks);
@@ -813,6 +827,20 @@ public sealed class RestoreOrchestrator(
     }
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
+
+    /// <summary>
+    /// 这个存储对象要拉下来多少字节（压缩后，含全部分卷）。索引在备份时就把各卷尺寸记下来了，
+    /// 所以不必先去问云端。
+    /// <para>
+    /// pack 的卷尺寸记在信息文件里而不是条目里——死重压实会重写整个包、改变卷数与尺寸，
+    /// 记在条目上就会随着每次压实全部过期（<c>StorageRef.VolumeSizes</c> 上有同样的说明）。
+    /// </para>
+    /// <para>0 = 问不出来（老索引没有这一项）。调用方据此决定整体报不报总量。</para>
+    /// </summary>
+    private static long DownloadBytesOf(StorageRef s, BackupInfoFile info) =>
+        s.Kind == "pack"
+            ? info.Packs.TryGetValue(s.Ref, out var pack) ? pack.VolumeSizes.Sum() : 0
+            : s.VolumeSizes.Sum();
 
     /// <summary>确保某归档（含全部分卷）已从 Archive 活化为可下载：对未活化的发起活化，轮询到全部就绪。</summary>
     private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>

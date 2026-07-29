@@ -1282,17 +1282,30 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
 
   // 字节明细另起一行：件数那行已经够长了，再塞进去在窄屏上会折得没法读。
-  // 三段刻意互不重叠，加起来才是全貌：
-  //   to compress —— 还没处理的源字节（压缩前）
-  //   staged      —— 已压好、还没送出去的（压缩后）；在途那几条已经传走的部分已扣除
-  //   uploaded    —— 已经稳稳落在云上的（压缩后），配上它对应的源字节，压缩+去重省了多少一眼可见
-  // 每一项为零时整段省略——扫描/差分这些阶段一个都不会有，这一行于是自然消失。
-  const bytesLine = [
-    detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to compress`,
-    detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
-    detail.transferredBytes > 0 &&
-      `${formatBytes(detail.workDone)} → ${formatBytes(detail.transferredBytes)} uploaded`,
-  ]
+  // 各段刻意互不重叠，加起来才是全貌；为零的整段省略，所以扫描/差分这些阶段这一行自然消失。
+  //
+  // 上传与下载是两个方向，措辞不能共用：上传是「压缩 → 送走」，下载是「拉下来 → 写出去」，
+  // 而且下载侧的总量事先就知道（索引里记着各卷尺寸），上传侧压完才知道，只能报已完成的。
+  const downloading = detail.stage === 'Restoring' || detail.stage === 'Verifying'
+  const bytesLine = (
+    downloading
+      ? [
+          // 已下载 / 总下载：分母来自索引；老索引缺卷尺寸时后端报 0，这里就只显示分子。
+          detail.transferredBytes > 0 &&
+            (detail.transferTotal > 0
+              ? `${formatBytes(detail.transferredBytes)} / ${formatBytes(detail.transferTotal)} downloaded`
+              : `${formatBytes(detail.transferredBytes)} downloaded`),
+          // 已恢复 / 待恢复：解压后写出去的源字节。
+          detail.workDone > 0 && `${formatBytes(detail.workDone)} restored`,
+          detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
+        ]
+      : [
+          detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to compress`,
+          detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
+          detail.transferredBytes > 0 &&
+            `${formatBytes(detail.workDone)} → ${formatBytes(detail.transferredBytes)} uploaded`,
+        ]
+  )
     .filter(Boolean)
     .join(' · ')
 
