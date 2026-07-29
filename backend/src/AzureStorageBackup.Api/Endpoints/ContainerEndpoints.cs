@@ -92,13 +92,33 @@ public static class ContainerEndpoints
 
         group.MapDelete("/{name}", async (
             int accountId, string name,
-            IAccountService accounts, IContainerService containers, IKeyringHealth keyring, CancellationToken ct) =>
+            IAccountService accounts, IContainerService containers, IBackupConfigService configs,
+            IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
             var account = await accounts.GetAsync(accountId, ct);
             if (account is null)
                 return Results.NotFound();
+
+            // 这个 container 上还挂着一条备份配置 → 不许从这里删。删掉云端而把配置留在库里，
+            // 备份列表会继续显示一个后面什么都没有的备份，点进去的每个操作都会以各种形状失败。
+            // 删备份那条路（DELETE /api/backups/{id}?deleteContainer=true）才是正道：它连本地
+            // 索引缓存、备份状态与操作日志一并清掉，还挡得住"正在跑操作时删除"。这里只负责把
+            // 绕过它的近路堵上，并把用户指回去。
+            // 判定必须在**触云之前**：先删了再报错，数据已经没了，报什么都晚了。
+            // 按 (account, container) 精确限定——BackupConfig 在这两列上有唯一索引，不同账户下
+            // 可以有同名 container，按名字一刀切会让一个账户的备份挡住另一个账户里同名的空 container。
+            if (await configs.FindAsync(accountId, name, ct) is { } config)
+            {
+                return Results.Conflict(new
+                {
+                    error = $"Container '{name}' holds the backup \"{config.Name}\". Delete that backup "
+                        + "instead — it offers to remove the container along with it, and only that path "
+                        + "also clears the local index cache, backup state and logs. Removing the container "
+                        + "here would leave the backup listed with nothing behind it.",
+                });
+            }
 
             try
             {
