@@ -155,7 +155,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
         var hasher = new RecordingHasher();
         var compressor = new RecordingCompressor();
         var compactor = new DeadWeightCompactor(
-            new ThrowingUploader(), compressor, hasher, Path.Combine(_temp, "compact"));
+            new ThrowingUploader(), compressor, hasher, Path.Combine(_temp, "compact"),
+            new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000));
 
         await compactor.CompactAsync(
             new Account
@@ -270,7 +271,10 @@ public sealed class UntrustedIndexPathTests : IDisposable
             SampleAccount(), SampleContainer(), "data/x",
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
-            new List<string>(), unrecoverable, new HashSet<int>(), CancellationToken.None,
+            new List<string>(), unrecoverable, new HashSet<int>(),
+            // 修复的压缩产出现在经暂存区（全局压缩锁 + 预算），故多一个席位参数。
+            // 这个用例在触碰暂存区之前就该被越界判定挡下，席位只是为了调得通。
+            StagingLease(), CancellationToken.None,
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -321,7 +325,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             SampleAccount(), SampleContainer(), "packs/p0001.7z", info,
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             AccessTier.Hot, null, new List<string>(), unrecoverable,
-            new HashSet<int>(), CancellationToken.None,
+            new HashSet<int>(), StagingLease(), CancellationToken.None,
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -346,7 +350,9 @@ public sealed class UntrustedIndexPathTests : IDisposable
         var factory = new BlobClientFactory(TestSecrets.Reader);
         return (new BackupRepairer(
             factory, new BackupInfoStore(factory, new StubCodec()), compressor, hasher,
-            new ThrowingUploader(), Path.Combine(_temp, "repair")), hasher, compressor);
+            new ThrowingUploader(), Path.Combine(_temp, "repair"),
+            new StagingArea(Path.Combine(_temp, "rc"), Path.Combine(_temp, "rs"), () => 200_000_000)),
+            hasher, compressor);
     }
 
     /// <summary>
@@ -365,6 +371,10 @@ public sealed class UntrustedIndexPathTests : IDisposable
             checker, [entry, _local, LocalCheckLevel.Content, CancellationToken.None])!;
         return await task;
     }
+
+    /// <summary>一次性的暂存席位：这两个用例都在触碰暂存区之前就被越界判定挡下，席位只为调得通签名。</summary>
+    private StagingArea.StagingLease StagingLease() =>
+        new StagingArea(Path.Combine(_temp, "lc"), Path.Combine(_temp, "ls"), () => 200_000_000).AcquireLease();
 
     private static async Task InvokeAsync(object target, string name, object?[] args)
     {

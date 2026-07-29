@@ -69,7 +69,9 @@ public sealed class BackupCheckerTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         return new BackupRepairer(
             factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
-            Path.Combine(_temp, "repair"), checker: checker);
+            Path.Combine(_temp, "repair"),
+            new StagingArea(Path.Combine(_temp, "rc"), Path.Combine(_temp, "rs"), () => 200_000_000),
+            checker: checker);
     }
 
     private BackupRequest Req(Account a, string c) => new()

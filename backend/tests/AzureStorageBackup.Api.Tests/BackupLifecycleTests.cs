@@ -122,7 +122,7 @@ public sealed class BackupLifecycleTests : IDisposable
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
-            _uploader, new SevenZipCompressor(), hasher, Path.Combine(_temp, "compact"));
+            _uploader, new SevenZipCompressor(), hasher, Path.Combine(_temp, "compact"), staging);
         var cleaner = new RetentionCleaner(
             factory, store, new RetentionEvaluator(), compactor, indexCache, tracked);
         var backup = new BackupOrchestrator(
@@ -132,7 +132,7 @@ public sealed class BackupLifecycleTests : IDisposable
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
         var repairer = new BackupRepairer(
-            factory, store, new SevenZipCompressor(), hasher, _uploader, Path.Combine(_temp, "repair"),
+            factory, store, new SevenZipCompressor(), hasher, _uploader, Path.Combine(_temp, "repair"), staging,
             checker: checker, trackedInfo: tracked, indexCache: indexCache);
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "restore"));

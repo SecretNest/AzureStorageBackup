@@ -16,16 +16,27 @@ public sealed record LivePackMember(string EntryName, long Length, string FullHa
 /// 成员内容来源：**优先用本地文件**（内容一致者，须 hash 确认）；本地缺失的成员——若允许下载（按数据 tier 开关）
 /// 则下载云端 pack 解压补齐，否则**放弃该 pack 的重打包**（保留死重）。全部成员本地可得时无需任何下载（Archive 亦可压实）。
 /// </summary>
+/// <param name="staging">
+/// 压实和备份共用同一块物理临时盘，所以它的压缩要走同一把全局锁、临时占用要计进同一份预算。
+/// 从前它有自己的 tempRoot 且完全不受约束：备份被暂存上限挡着的同时，压实可以照样往盘上写，
+/// 两边谁都不知道对方存在。tempRoot 仍然保留——compose/解压那些**输入侧**的中间产物还得有地方放，
+/// 它们经 <see cref="StagingArea.ReserveAsync"/> 记账。
+/// </param>
 public sealed class DeadWeightCompactor(
     IBlobUploader uploader, IFileCompressor compressor, IFileHasher hasher, string tempRoot,
-    ILogger<DeadWeightCompactor>? logger = null)
+    StagingArea staging, ILogger<DeadWeightCompactor>? logger = null)
 {
     /// <param name="liveByPack">packId → (fullHash → 仍有效成员)，由清理器扫描保留版本索引得出。</param>
+    /// <param name="lease">
+    /// 调用方的暂存席位。备份收尾时顺带压实要传**备份自己的**席位——另取一个会让分母虚高，
+    /// 把并行的其它备份额度算小。独立跑的清理任务自己取一个。
+    /// </param>
     public async Task CompactAsync(
         Account account, BlobContainerClient container, string? password, BackupInfoFile info,
         IReadOnlyDictionary<string, Dictionary<string, LivePackMember>> liveByPack,
         AccessTier dataTier, long? volumeBytes, double threshold,
-        string? localRoot, bool allowDownload, CancellationToken ct)
+        string? localRoot, bool allowDownload, CancellationToken ct,
+        StagingArea.StagingLease? lease = null)
     {
         foreach (var packId in info.Packs.Keys.ToList())
         {
@@ -50,7 +61,8 @@ public sealed class DeadWeightCompactor(
             try
             {
                 var newSizes = await RecompactAsync(
-                    account, container, password, packId, live, localRoot, dataTier, allowDownload, volumeBytes, ct);
+                    account, container, password, packId, live, localRoot, dataTier, allowDownload, volumeBytes,
+                    lease, ct);
                 if (newSizes.Count > 0)
                 {
                     info.Packs[packId] = packInfo with
@@ -86,7 +98,7 @@ public sealed class DeadWeightCompactor(
     private async Task<IReadOnlyList<long>> RecompactAsync(
         Account account, BlobContainerClient container, string? password, string packId,
         Dictionary<string, LivePackMember> live, string? localRoot, AccessTier dataTier,
-        bool allowDownload, long? volumeBytes, CancellationToken ct)
+        bool allowDownload, long? volumeBytes, StagingArea.StagingLease? lease, CancellationToken ct)
     {
         var baseRef = $"packs/{packId}.7z";
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
@@ -114,6 +126,10 @@ public sealed class DeadWeightCompactor(
         if (hasAbsentLocal && !allowDownload)
             return [];
 
+        // compose 目录会装下全部存活成员的**原始**内容，这块盘和备份的暂存是同一块。
+        // 先预留再动手：不预留的话，一次压实可以在备份被暂存上限挡着的同时把盘写满。
+        using var composeReservation = await staging.ReserveAsync(live.Values.Sum(m => m.Length), lease, ct);
+
         Directory.CreateDirectory(composeDir);
         try
         {
@@ -129,30 +145,54 @@ public sealed class DeadWeightCompactor(
                     needFromPack.Add(member.EntryName);
             }
 
-            if (needFromPack.Count > 0)
+            IDisposable? downloadReservation = null;
+            try
             {
-                if (!allowDownload)
-                    return [];
+                if (needFromPack.Count > 0)
+                {
+                    if (!allowDownload)
+                        return [];
 
-                // 下载并解压旧 pack，取出本地缺失的成员。
-                var extractDir = Path.Combine(work, "x");
-                var firstVolume = await VolumeBlobIO.DownloadAsync(container, baseRef, work, ct);
-                await compressor.ExtractAsync(firstVolume, extractDir, password, ct);
-                foreach (var entryName in needFromPack)
-                    CopyInto(composeDir, entryName, Path.Combine(extractDir, ToLocal(entryName)));
+                    // 下载的 pack 卷（压缩态）加上解压出来的成员，都落在 work 里。按存活成员总长度
+                    // 再预留一份：解压出来的只是其中缺失的那些，压缩态的卷更小，这个数够覆盖。
+                    downloadReservation = await staging.ReserveAsync(live.Values.Sum(m => m.Length), lease, ct);
+
+                    // 下载并解压旧 pack，取出本地缺失的成员。
+                    var extractDir = Path.Combine(work, "x");
+                    var firstVolume = await VolumeBlobIO.DownloadAsync(container, baseRef, work, ct);
+                    await compressor.ExtractAsync(firstVolume, extractDir, password, ct);
+                    foreach (var entryName in needFromPack)
+                        CopyInto(composeDir, entryName, Path.Combine(extractDir, ToLocal(entryName)));
+                }
+
+                // 用仍有效成员重压成新归档，替换同 packId：先覆盖上传新卷、后删残留旧卷（不再先删空）。
+                // 经 StagingArea：压缩因此与备份共用同一把全局锁（不再两边同时啃 CPU），产出也进同一份
+                // 预算，并且沿用逐卷释放——传完一卷删一卷，峰值只剩还没传完的那几卷。
+                var staged = await staging.StageAsync(
+                    async (compressTemp, token) =>
+                    {
+                        var result = await compressor.CompressAsync(
+                            new CompressionRequest(composeDir, [.. live.Values.Select(m => m.EntryName)],
+                                Path.Combine(compressTemp, packId + ".7z"), password,
+                                VolumeBytes: volumeBytes, StoreOnly: false), token);
+                        return result.VolumeFiles;
+                    }, lease, ct);
+                try
+                {
+                    var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // 释放前先取尺寸
+                    await VolumeBlobIO.ReplaceAsync(
+                        uploader, account, container, baseRef, staged.Files, dataTier, retry: null, ct);
+                    return sizes;
+                }
+                finally
+                {
+                    staging.Release(staged);
+                }
             }
-
-            // 用仍有效成员重压成新归档，替换同 packId：先覆盖上传新卷、后删残留旧卷（不再先删空）。
-            var outDir = Path.Combine(work, "out");
-            Directory.CreateDirectory(outDir);
-            var output = Path.Combine(outDir, packId + ".7z");
-            var result = await compressor.CompressAsync(
-                new CompressionRequest(composeDir, [.. live.Values.Select(m => m.EntryName)], output, password,
-                    VolumeBytes: volumeBytes, StoreOnly: false), ct);
-
-            await VolumeBlobIO.ReplaceAsync(
-                uploader, account, container, baseRef, result.VolumeFiles, dataTier, retry: null, ct);
-            return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
+            finally
+            {
+                downloadReservation?.Dispose();
+            }
         }
         finally
         {

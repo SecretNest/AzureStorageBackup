@@ -80,6 +80,7 @@ builder.Services.AddSingleton(sp => new DeadWeightCompactor(
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "compact"),
+    sp.GetRequiredService<StagingArea>(),
     sp.GetService<ILogger<DeadWeightCompactor>>()));
 builder.Services.AddScoped<RetentionCleaner>();
 // 压缩方法参数可调（Backup__SevenZipMethodArgs，例如 "-mx7 -md=32m -mmt=2"）：默认 -mx9 最省空间，
@@ -121,6 +122,7 @@ builder.Services.AddScoped(sp => new BackupRepairer(
     sp.GetRequiredService<IFileHasher>(),
     sp.GetRequiredService<IBlobUploader>(),
     Path.Combine(tempPath, "repair"),
+    sp.GetRequiredService<StagingArea>(),
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
     sp.GetRequiredService<BackupChecker>(),

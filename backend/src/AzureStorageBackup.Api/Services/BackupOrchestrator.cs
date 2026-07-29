@@ -661,7 +661,8 @@ public sealed class BackupOrchestrator(
             DeadWeightThreshold = request.Options.DeadWeightThreshold,
             LocalRoot = request.LocalRoot,
             AllowRepackDownload = request.Options.AllowRepackDownload,
-        }, info, ct);
+            // 收尾顺带压实用**本轮自己的**席位：另取一个会让均分的分母虚高，把并行的其它备份额度算小。
+        }, info, ct, stagingLease);
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
 

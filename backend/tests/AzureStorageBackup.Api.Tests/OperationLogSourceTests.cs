@@ -118,7 +118,10 @@ public sealed class OperationLogSourceTests
             new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
         var repairer = new BackupRepairer(
             new UnusedBlobClientFactory(), new OneVersionBackupInfoStore(), compressor: null!, hasher: null!,
-            uploader: null!, tempRoot: Path.GetTempPath(), checker: checker);
+            uploader: null!, tempRoot: Path.GetTempPath(),
+            // 这个用例走不到压缩，暂存区只是为了构造得出来。
+            staging: new StagingArea(Path.GetTempPath(), Path.GetTempPath(), () => long.MaxValue),
+            checker: checker);
         var account = new Account { Id = 7, Name = "acct7" };
 
         try { await repairer.RepairAsync(account, "photos", null, "/tmp", null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null); }

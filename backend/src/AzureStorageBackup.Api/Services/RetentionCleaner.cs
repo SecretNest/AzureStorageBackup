@@ -48,20 +48,25 @@ public sealed class RetentionCleaner(
 {
     /// <summary>独立清理：自行读取信息文件（优先本地权威副本）。</summary>
     public async Task<CleanupReport> CleanupAsync(
-        Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default)
+        Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default,
+        StagingArea.StagingLease? lease = null)
     {
         var info = trackedInfo is not null
             ? await trackedInfo.LoadAsync(account, container, password, ct)
             : await store.ReadInfoAsync(account, container, password, ct);
         return info is not null && info.Versions.Count > 0
-            ? await CleanupAsync(account, container, password, options, info, ct)
+            ? await CleanupAsync(account, container, password, options, info, ct, lease)
             : CleanupReport.Empty;
     }
 
     /// <summary>已持有信息文件时清理（编排器备份完成后调用）。</summary>
+    /// <param name="lease">
+    /// 调用方的暂存席位，透传给死重压实。备份收尾顺带清理时要传**备份自己的**席位——
+    /// 另取一个会让均分的分母虚高，把并行的其它备份额度算小。
+    /// </param>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options,
-        BackupInfoFile info, CancellationToken ct = default)
+        BackupInfoFile info, CancellationToken ct = default, StagingArea.StagingLease? lease = null)
     {
         var toDelete = retention.VersionsToDelete(
             info.Versions.Select(v => new VersionRef(v.Version, v.CreatedAt)).ToList(),
@@ -162,7 +167,7 @@ public sealed class RetentionCleaner(
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
-                options.LocalRoot, options.AllowRepackDownload, ct);
+                options.LocalRoot, options.AllowRepackDownload, ct, lease);
 
         if (trackedInfo is not null)
             await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct);

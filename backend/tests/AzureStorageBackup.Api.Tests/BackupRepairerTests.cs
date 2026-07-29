@@ -103,7 +103,8 @@ public sealed class BackupRepairerTests : IDisposable
             trackedInfo: tracked);
         var repairer = new BackupRepairer(
             factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
-            Path.Combine(_temp, "repair"), opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache);
+            Path.Combine(_temp, "repair"), staging,
+            opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache);
         return (backup, checker, repairer, tracked, indexCache, factory);
     }
 

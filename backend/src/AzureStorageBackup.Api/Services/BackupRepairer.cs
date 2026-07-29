@@ -21,6 +21,9 @@ public sealed class BackupRepairer(
     IFileHasher hasher,
     IBlobUploader uploader,
     string tempRoot,
+    // 修复和备份共用同一块物理临时盘：压缩走同一把全局锁，临时占用计进同一份预算。
+    // tempRoot 仍保留——compose 那些输入侧中间产物还得有地方放，它们经 ReserveAsync 记账。
+    StagingArea staging,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     BackupChecker? checker = null,
@@ -37,6 +40,10 @@ public sealed class BackupRepairer(
         CancellationToken ct = default)
     {
         // 本地权威优先读（与编排器/检查器一致）：本地有则零云读，无则读云端并回填；写侧已走 trackedInfo。
+        // 修复期间持一个暂存席位：重压出来的归档与拼装成员的 compose 目录都落在与备份同一块
+        // 物理临时盘上，额度按当前在跑的运行数均分（见 StagingArea）。
+        using var lease = staging.AcquireLease();
+
         var info = (trackedInfo is not null
                 ? await trackedInfo.LoadAsync(account, container, password, ct)
                 : await store.ReadInfoAsync(account, container, password, ct))
@@ -74,10 +81,10 @@ public sealed class BackupRepairer(
             {
                 if (badRef.StartsWith("packs/", StringComparison.Ordinal))
                     await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                        repaired, unrecoverable, changedVersions, ct);
+                        repaired, unrecoverable, changedVersions, lease, ct);
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                        dontCompress, repaired, unrecoverable, changedVersions, ct);
+                        dontCompress, repaired, unrecoverable, changedVersions, lease, ct);
             }
 
             // 持久化被改动的版本索引 + 信息文件（经本地权威状态机，保持 ETag/缓存一致，避免下次备份 412）。
@@ -156,7 +163,8 @@ public sealed class BackupRepairer(
         Account account, BlobContainerClient cc, string blobRef, Dictionary<int, VersionIndex> indexes, string localRoot,
         string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes,
         IgnoreRuleSet? dontCompress, List<string> repaired,
-        List<string> unrecoverable, HashSet<int> changedVersions, CancellationToken ct)
+        List<string> unrecoverable, HashSet<int> changedVersions,
+        StagingArea.StagingLease lease, CancellationToken ct)
     {
         // 全部版本中引用此 blob 的条目（同内容不同路径可有多个）。
         var refs = indexes.SelectMany(kv => kv.Value.Entries
@@ -215,7 +223,7 @@ public sealed class BackupRepairer(
         // 与全新备份同一套推导（BackupOrchestrator.HandleBlobAsync）：命中 DontCompress 的路径只存不压。
         var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
         var newSizes = await ReplaceBlobAsync(
-            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, ct);
+            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct);
 
         // 省略元数据 = 该对象的碰撞防护被削弱（密钥化时改发窄校验值 v1，退化为 fullHash+长度，
         // 而非无防护——head/tail 未知时 Metadata 已改发 v1，见 BlobAddressScheme）。
@@ -246,7 +254,8 @@ public sealed class BackupRepairer(
     private async Task RepairPackAsync(
         Account account, BlobContainerClient cc, string packBlobRef, BackupInfoFile info, Dictionary<int, VersionIndex> indexes,
         string localRoot, string? password, AccessTier dataTier, long? volumeBytes,
-        List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions, CancellationToken ct)
+        List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions,
+        StagingArea.StagingLease lease, CancellationToken ct)
     {
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
@@ -263,6 +272,11 @@ public sealed class BackupRepairer(
 
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         var composeDir = Path.Combine(work, "compose");
+        // compose 目录会装下能从本地取到的全部成员的**原始**内容，这块盘和备份的暂存是同一块。
+        // 上界取这个 pack 记录的原始成员总字节：实际拼进去的只会更少（取不到的成员判为不可恢复）。
+        using var composeReservation = await staging.ReserveAsync(
+            info.Packs.TryGetValue(packId, out var sizeHint) ? sizeHint.OriginalBytes : 0, lease, ct);
+
         Directory.CreateDirectory(composeDir);
         try
         {
@@ -302,13 +316,26 @@ public sealed class BackupRepairer(
             }
 
             // 用可得成员重压，替换同 packId：先覆盖上传新卷、后删残留旧卷（不再先删空）。
-            var outDir = Path.Combine(work, "out");
-            Directory.CreateDirectory(outDir);
-            var output = Path.Combine(outDir, packId + ".7z");
-            var result = await compressor.CompressAsync(
-                new CompressionRequest(composeDir, available, output, password, VolumeBytes: volumeBytes, StoreOnly: false), ct);
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, packBlobRef, result.VolumeFiles, dataTier, retry: null, ct);
-            var newSizes = result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
+            // 经 StagingArea：压缩因此与备份共用同一把全局锁（不再两边同时啃 CPU），产出进同一份预算，
+            // 并沿用逐卷释放——传完一卷删一卷，峰值只剩还没传完的那几卷。
+            var staged = await staging.StageAsync(
+                async (compressTemp, token) =>
+                {
+                    var result = await compressor.CompressAsync(
+                        new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
+                            password, VolumeBytes: volumeBytes, StoreOnly: false), token);
+                    return result.VolumeFiles;
+                }, lease, ct);
+            List<long> newSizes;
+            try
+            {
+                newSizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // 释放前先取尺寸
+                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct);
+            }
+            finally
+            {
+                staging.Release(staged);
+            }
 
             if (info.Packs.TryGetValue(packId, out var pi))
                 info.Packs[packId] = pi with
@@ -331,7 +358,7 @@ public sealed class BackupRepairer(
     private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier,
         long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, bool storeOnly,
-        CancellationToken ct)
+        StagingArea.StagingLease lease, CancellationToken ct)
     {
         if (raw)
         {
@@ -341,10 +368,6 @@ public sealed class BackupRepairer(
             return [new FileInfo(localSource).Length];
         }
 
-        var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(outDir);
-        try
         {
             var srcDir = Path.GetDirectoryName(localSource)!;
             var entry = Path.GetFileName(localSource);
@@ -352,14 +375,26 @@ public sealed class BackupRepairer(
             // StoreOnly 由调用方按配置的 DontCompress 规则逐路径推导（与 BackupOrchestrator.HandleBlobAsync
             // 同一套），修好的归档与全新备份对同一文件写出的压缩方式一致。
             // （pack 那条路径不需要：全新备份的 CompressPackAsync 本来就是 storeOnly: false。）
-            var result = await compressor.CompressAsync(
-                new CompressionRequest(srcDir, [entry], Path.Combine(outDir, "b.7z"), password, VolumeBytes: volumeBytes, StoreOnly: storeOnly), ct);
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, result.VolumeFiles, dataTier, retry: null, ct, metadata);
-            return result.VolumeFiles.Select(f => new FileInfo(f).Length).ToList();
-        }
-        finally
-        {
-            try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
+            // 源文件直接喂给 7z，没有 compose 那类中间产物，所以只有归档产出需要记账——
+            // StageAsync 全包了：全局压缩锁、预算、逐卷释放。
+            var staged = await staging.StageAsync(
+                async (compressTemp, token) =>
+                {
+                    var result = await compressor.CompressAsync(
+                        new CompressionRequest(srcDir, [entry], Path.Combine(compressTemp, "b.7z"), password,
+                            VolumeBytes: volumeBytes, StoreOnly: storeOnly), token);
+                    return result.VolumeFiles;
+                }, lease, ct);
+            try
+            {
+                var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // 释放前先取尺寸
+                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata);
+                return sizes;
+            }
+            finally
+            {
+                staging.Release(staged);
+            }
         }
     }
 

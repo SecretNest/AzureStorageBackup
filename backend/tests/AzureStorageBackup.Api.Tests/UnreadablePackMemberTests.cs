@@ -155,7 +155,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
-            new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"));
+            new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
+            staging);
 
         // d/y.txt 压缩后重校验时读不开一次；orchestrator 自身的 hasher（分组重校验用）被替换成会抛的版本。
         var flaky = new FlakyOnceHasher(new FileHasher(), "d/y.txt", new IOException("The process cannot access the file 'y.txt' because it is being used by another process."));

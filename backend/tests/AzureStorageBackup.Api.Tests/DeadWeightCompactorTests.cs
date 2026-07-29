@@ -108,7 +108,11 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
     private DeadWeightCompactor Compactor() =>
         new(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), new SevenZipCompressor(), new FileHasher(),
-            Path.Combine(_temp, "compact"));
+            Path.Combine(_temp, "compact"), Staging());
+
+    /// <summary>压实的压缩产出现在经暂存区（全局压缩锁 + 预算），所以每处构造都得给一个。</summary>
+    private StagingArea Staging() =>
+        new(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
 
     private async Task<List<string>> PackEntriesAsync(Azure.Storage.Blobs.BlobContainerClient container)
     {
@@ -279,7 +283,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             // 用「上传即抛」的装饰 uploader；CompactAsync 逐 pack 吞掉异常，关键是旧数据须在失败后仍在。
             var compactor = new DeadWeightCompactor(
                 new FailingUploader(),
-                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact-fail"));
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact-fail"), Staging());
 
             await compactor.CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
@@ -357,7 +361,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             var compactor = new DeadWeightCompactor(
                 new BlobUploader(new BlobClientFactory(TestSecrets.Reader)),
                 new LockMemberDuringCompressCompressor(new SevenZipCompressor(), "b.txt"),
-                new FileHasher(), Path.Combine(_temp, "compact-dropped"));
+                new FileHasher(), Path.Combine(_temp, "compact-dropped"), Staging());
 
             await compactor.CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);

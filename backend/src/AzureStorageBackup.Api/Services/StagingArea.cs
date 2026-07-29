@@ -100,6 +100,40 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             _releaseSignal.Release(waiters);
     }
 
+    /// <summary>
+    /// 预留一块额度给**调用方自己管理**的临时空间——修复与死重压实要把成员拼进 compose 目录、
+    /// 有时还要下载并解压整个旧 pack，那些字节同样落在这块物理盘上。
+    /// <para>
+    /// 与 <see cref="StageAsync"/> 的区别：那边是"产出等待上传"，量是压完才知道的精确值，
+    /// 而且能逐卷释放；这边是"输入等待消费"，量只能事先估，且整段持有到操作结束。所以这里
+    /// 只记账与背压，不搬文件——调用方自己保证写入不超过预留值，用完 Dispose 归还。
+    /// </para>
+    /// <para>
+    /// 不抢压缩锁：预留期间调用方多半在下载或拷贝，把压缩锁按在那儿等网络是这次改造刚修掉的病。
+    /// </para>
+    /// </summary>
+    public async Task<IDisposable> ReserveAsync(long bytes, StagingLease? lease = null, CancellationToken ct = default)
+    {
+        await WaitForRoomAsync(lease, ct);
+        Interlocked.Add(ref _stagedBytes, bytes);
+        lease?.Add(bytes);
+        return new Reservation(this, lease, bytes);
+    }
+
+    private sealed class Reservation(StagingArea area, StagingLease? lease, long bytes) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            Interlocked.Add(ref area._stagedBytes, -bytes);
+            lease?.Add(-bytes);
+            area.SignalRelease();
+        }
+    }
+
     /// <summary>等到有空间为止。**不持压缩锁**——这正是要点所在，见类注释。</summary>
     private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct)
     {
