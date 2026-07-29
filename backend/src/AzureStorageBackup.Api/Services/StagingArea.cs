@@ -18,19 +18,116 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 {
     private readonly SemaphoreSlim _compressLock = new(1, 1);
     private readonly SemaphoreSlim _releaseSignal = new(0);
-    // 每个已暂存文件占的字节。按卷释放要能精确扣账，而且必须**幂等**——同一卷会被上传路径
-    // 逐卷释放一次、收尾时再随整族兜底一次，重复扣会把水位记成负的，压缩就再也不会被背压挡住了。
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _staged =
+    // 每个已暂存文件占的字节，连同它记在谁账上。按卷释放要能精确扣账，而且必须**幂等**——
+    // 同一卷会被上传路径逐卷释放一次、收尾时再随整族兜底一次，重复扣会把水位记成负的，
+    // 压缩就再也不会被背压挡住了。
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (StagingLease? Lease, long Bytes)> _staged =
         new(StringComparer.Ordinal);
     private long _stagedBytes;
 
+    /// <summary>当前在跑的运行数（= 配额的分母）。存量的非活动备份不占席位。</summary>
+    private int _leases;
+
+    /// <summary>正等着腾空间的调用方数量。释放时要把它们**全部**唤醒，见 <see cref="SignalRelease"/>。</summary>
+    private int _waiting;
+
     public long StagedBytes => Interlocked.Read(ref _stagedBytes);
+
+    /// <summary>
+    /// 一次运行在暂存区里的席位。暂存盘的额度按**当前持有席位的运行数**均分，所以席位必须随
+    /// 运行开始而取、随运行结束而还——存量的非活动备份不该占份额，否则配了十个备份、只跑一个，
+    /// 那一个也只能用十分之一的盘。
+    /// </summary>
+    public sealed class StagingLease : IDisposable
+    {
+        private readonly StagingArea _area;
+        private long _bytes;
+        private int _disposed;
+
+        internal StagingLease(StagingArea area) => _area = area;
+
+        /// <summary>这次运行当前占着的暂存字节。</summary>
+        public long Bytes => Interlocked.Read(ref _bytes);
+
+        internal void Add(long bytes) => Interlocked.Add(ref _bytes, bytes);
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            Interlocked.Decrement(ref _area._leases);
+            // 席位一走，剩下的运行额度立刻变大——必须叫醒它们，否则它们会一直等在旧配额上，
+            // 直到下一次有卷上传完才偶然被唤醒。
+            _area.SignalRelease();
+        }
+    }
+
+    /// <summary>取一个席位。返回值必须在运行结束时释放（<c>using</c>）。</summary>
+    public StagingLease AcquireLease()
+    {
+        var lease = new StagingLease(this);
+        Interlocked.Increment(ref _leases);
+        return lease;
+    }
+
+    /// <summary>本次调用可用的额度。没有席位的调用方不参与均分，只受全局上限约束。</summary>
+    private long QuotaFor(StagingLease? lease)
+    {
+        var limit = stagedLimit();
+        if (lease is null)
+            return limit;
+        return limit / Math.Max(1, Volatile.Read(ref _leases));
+    }
+
+    /// <summary>
+    /// 现在能不能开压。两道闸都要过：自己的额度（公平），以及全局上限（暂存盘是物理磁盘，
+    /// 写满就是备份直接失败）。判据都是「**当前**占用低于额度就放行」，沿用既有语义——
+    /// 于是从零起步的一件活总能开压，哪怕它的产物注定超出额度，否则比额度大的文件永远压不出来。
+    /// </summary>
+    private bool HasRoom(StagingLease? lease) =>
+        Interlocked.Read(ref _stagedBytes) < stagedLimit()
+        && (lease is null || lease.Bytes < QuotaFor(lease));
+
+    /// <summary>
+    /// 唤醒**所有**等待者，而不是一个。各人等的是各自的额度，只放一个的话，醒来的未必是那个
+    /// 能继续的——信号还会被它消费掉，真正该醒的那个就此错过，一直干等到下一次释放。
+    /// 多放的信号会让后续 WaitAsync 立即返回一次，等待循环重新判条件即可，无害。
+    /// </summary>
+    private void SignalRelease()
+    {
+        var waiters = Volatile.Read(ref _waiting);
+        if (waiters > 0)
+            _releaseSignal.Release(waiters);
+    }
+
+    /// <summary>等到有空间为止。**不持压缩锁**——这正是要点所在，见类注释。</summary>
+    private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct)
+    {
+        while (!HasRoom(lease))
+        {
+            Interlocked.Increment(ref _waiting);
+            try
+            {
+                if (HasRoom(lease))   // 登记为等待者之后再看一眼，避免错过刚刚发生的释放
+                    return;
+                await _releaseSignal.WaitAsync(ct);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _waiting);
+            }
+        }
+    }
 
     /// <param name="tracker">可选的进度记账。<b>只能</b>传本次备份自己的那个：本类是单例、
     /// 跨备份共享，把全局状态直接算给某一个备份会让并发的两轮互相污染。谁调用谁记账，
     /// 各自只看得见自己的活。</param>
+    /// <param name="lease">
+    /// 本次运行的席位（见 <see cref="AcquireLease"/>）。传 null 表示不参与额度均分，只受全局上限约束。
+    /// </param>
     public async Task<StagedItem> StageAsync(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
+        StagingLease? lease = null,
         CancellationToken ct = default,
         StageTracker? tracker = null)
     {
@@ -39,29 +136,38 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         tracker?.BeginStaging();
         try
         {
-            // 全局非并发：同一时刻只有一个压缩。
-            await _compressLock.WaitAsync(ct);
+            // 等空间**不持压缩锁**。从前是先抢锁再等空间，理由是"锁已在手上、别人一样压不了"——
+            // 单个备份跑时确实如此。但多个备份并行时那就成了病根：一个运行被暂存挡住，就抱着
+            // 全局压缩锁干等，别的运行连压缩都开始不了。给谁加配额都救不了，只是换个理由卡死。
+            while (true)
+            {
+                await WaitForRoomAsync(lease, ct);
+
+                await _compressLock.WaitAsync(ct);
+                // 等到空位和拿到锁之间有个窗口，空位可能已经被别人用掉。锁到手了必须再看一眼，
+                // 不然就突破了上限——放锁回去重等，让真正有空间的那个先走。
+                if (HasRoom(lease))
+                    break;
+                _compressLock.Release();
+            }
+
             try
             {
-                // 背压等的是暂存空间，此时锁已在手上、别人一样压不了——算"在准备"是诚实的：
-                // 系统确实正为这一件活等着。每次实时读当前上限（决策 4：Settings 改动立即生效）。
                 try
                 {
-                    // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
+                    // BeginPacking 挪进 try：它会在 _gate 下调用 publish(...)，非心跳路径故意让
                     // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
                     // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
                     // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
                     tracker?.BeginPacking();
-                    // 背压：超限时等待上传腾出空间（从上限以下起步则允许本次结果临时超限）。
-                    while (Interlocked.Read(ref _stagedBytes) >= stagedLimit())
-                        await _releaseSignal.WaitAsync(ct);
 
                     Directory.CreateDirectory(compressTempDir);
                     Directory.CreateDirectory(stagedTempDir);
 
                     var produced = await produce(compressTempDir, ct);
-                    var item = MoveToStaged(produced);
+                    var item = MoveToStaged(produced, lease);
                     Interlocked.Add(ref _stagedBytes, item.Bytes);
+                    lease?.Add(item.Bytes);
                     return item;
                 }
                 finally
@@ -86,11 +192,13 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     /// </summary>
     public void ReleaseFile(string file)
     {
-        if (!_staged.TryRemove(file, out var bytes))
+        if (!_staged.TryRemove(file, out var entry))
             return;
         try { File.Delete(file); } catch { /* best effort */ }
-        Interlocked.Add(ref _stagedBytes, -bytes);
-        _releaseSignal.Release();
+        Interlocked.Add(ref _stagedBytes, -entry.Bytes);
+        // 席位的账也要扣：不扣的话这次运行的占用只增不减，它自己的配额很快就永远满着。
+        entry.Lease?.Add(-entry.Bytes);
+        SignalRelease();
     }
 
     /// <summary>整族收尾：把还没逐卷释放掉的都释放掉（去重命中时一卷都没传，全在这里还），
@@ -106,10 +214,10 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             catch { /* best effort */ }
         }
         // 整族收尾也发一次信号：全部卷都已逐卷释放时上面一次都没发，等在背压里的压缩会漏掉唤醒。
-        _releaseSignal.Release();
+        SignalRelease();
     }
 
-    private StagedItem MoveToStaged(IReadOnlyList<string> producedFiles)
+    private StagedItem MoveToStaged(IReadOnlyList<string> producedFiles, StagingLease? lease)
     {
         if (producedFiles.Count == 0)
             return new StagedItem([], 0); // 无产出：不建子目录，避免留下空 GUID 目录
@@ -127,7 +235,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                 File.Move(src, dest, overwrite: false);
                 var size = new FileInfo(dest).Length;
                 bytes += size;
-                _staged[dest] = size;   // 逐卷释放要按这份账扣，不能事后再 stat（那时文件已经删了）
+                // 逐卷释放要按这份账扣，不能事后再 stat（那时文件已经删了）。
+                // 一并记下这一卷记在谁账上，否则释放时无从知道该给哪个席位退额度。
+                _staged[dest] = (lease, size);
                 staged.Add(dest);
             }
         }

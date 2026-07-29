@@ -150,8 +150,11 @@ public sealed class BackupOrchestrator(
     /// "每轮的账记在这一轮的对象上"这件事应当由签名保证，而不是靠注册方式碰巧成立。
     /// 多个上传消费者并发访问，故计数走 Interlocked、预约表用 ConcurrentDictionary。
     /// </summary>
-    private sealed class RunState
+    private sealed class RunState(StagingArea.StagingLease staging)
     {
+        /// <summary>本次运行在暂存区的席位：暂存盘额度按**当前在跑的运行数**均分，席位随运行来去。</summary>
+        public StagingArea.StagingLease Staging => staging;
+
         private long _uploadedBytes;
         private readonly ConcurrentDictionary<string, TaskCompletionSource<ResolvedBlob>> _cloudUploads =
             new(StringComparer.Ordinal);
@@ -383,7 +386,9 @@ public sealed class BackupOrchestrator(
         // 不产生 blob、索引沿用旧条目、计入 UnreadableFiles，绝不能让整轮备份因此崩溃（M4 设计 §3 遗漏点）。
         var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-        var state = new RunState();
+        // 席位在整轮运行期间持有：暂存盘额度按当前持有席位的运行数均分，跑完即还。
+        using var stagingLease = staging.AcquireLease();
+        var state = new RunState(stagingLease);
         var reporter = new PipelineReporter(progress);
         // diff 不申报字节工作量，剩余时间按**件数**外推（见 StageTracker.Eta）：这个阶段的耗时
         // 主要摊在"每条至少 stat 一次"上，真要整个读一遍的只是少数变更文件——按字节推的话，
@@ -877,7 +882,7 @@ public sealed class BackupOrchestrator(
 
         // 2. 一遍读：边读边算三段 hash，边把字节喂进 7z（或直接拷成 raw 临时文件）。
         var (content, staged) = await StreamAndStageAsync(
-            request, localPath, file.Path, storeOnly, headBytes, uploadTracker, ct);
+            request, localPath, file.Path, storeOnly, headBytes, uploadTracker, state, ct);
         try
         {
             // 3. 压完才知道名字，此时才判去重与碰撞避让。
@@ -1020,7 +1025,7 @@ public sealed class BackupOrchestrator(
     /// 于是"算 hash 的字节"与"存下去的字节"按构造就是同一批。</summary>
     private async Task<(BlobContent Content, StagedItem Staged)> StreamAndStageAsync(
         BackupRequest request, string localPath, string entryName, bool storeOnly, int segmentBytes,
-        StageTracker uploadTracker, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         // 开读之前先取一次元数据。长度用于判 raw；mtime 要**取读之前的那个**：文件若在读的过程中
         // 又被改写，记下更早的 mtime 会让下一轮 diff 认为它变过而重新检查（安全方向），
@@ -1038,7 +1043,7 @@ public sealed class BackupOrchestrator(
             ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
             : await CompressStreamingAsync(
                 request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token),
-            ct, uploadTracker);
+            state.Staging, ct, uploadTracker);
 
         return (Identity(streaming, mtime, raw), staged);
     }
@@ -1204,7 +1209,7 @@ public sealed class BackupOrchestrator(
             // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
             // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
             var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-            var (staged, missing) = await CompressPackTolerantAsync(request, packId, members, uploadTracker, ct);
+            var (staged, missing) = await CompressPackTolerantAsync(request, packId, members, uploadTracker, state, ct);
 
             // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
             // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
@@ -1250,7 +1255,7 @@ public sealed class BackupOrchestrator(
             var stable = members.Where(m => !changed.Contains(m)).ToList();
             if (stable.Count > 0)
             {
-                var staged2 = await CompressPackAsync(request, packId, stable, uploadTracker, ct);
+                var staged2 = await CompressPackAsync(request, packId, stable, uploadTracker, state, ct);
                 var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadScope, uploadTracker, state, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
@@ -1318,7 +1323,7 @@ public sealed class BackupOrchestrator(
     /// </summary>
     private async Task<(StagedItem? Staged, IReadOnlySet<string> Missing)> CompressPackTolerantAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
-        StageTracker uploadTracker, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var remaining = members.ToList();
         var missing = new HashSet<string>(StringComparer.Ordinal);
@@ -1327,7 +1332,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                return (await CompressPackAsync(request, packId, remaining, uploadTracker, ct), missing);
+                return (await CompressPackAsync(request, packId, remaining, uploadTracker, state, ct), missing);
             }
             catch (ArchiveMembersMissingException ex)
             {
@@ -1353,11 +1358,12 @@ public sealed class BackupOrchestrator(
 
     private Task<StagedItem> CompressPackAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
-        StageTracker uploadTracker, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var entries = members.Select(m => m.EntryName).ToList();
         return staging.StageAsync((compressTemp, token) => CompressAsync(
-            request, compressTemp, packId, entries, storeOnly: false, token), ct, uploadTracker);
+            request, compressTemp, packId, entries, storeOnly: false, token),
+            state.Staging, ct, uploadTracker);
     }
 
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
