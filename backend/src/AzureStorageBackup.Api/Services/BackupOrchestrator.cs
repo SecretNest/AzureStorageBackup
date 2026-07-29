@@ -63,7 +63,28 @@ public sealed record BackupRequest
 }
 
 /// <summary>一次备份执行结果。</summary>
-public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes, int UnreadableFiles);
+/// <param name="ChangedFiles">Added + Modified 的件数（与 <see cref="NewFiles"/> + <see cref="ModifiedFiles"/> 恒等）。</param>
+/// <param name="ChangedBytes">上述文件的**源端原始**字节（未压缩、未去重）。</param>
+public sealed record BackupRunResult(int Version, int ChangedFiles, long ChangedBytes, int UnreadableFiles)
+{
+    /// <summary>上一版本没有的文件数。</summary>
+    public int NewFiles { get; init; }
+
+    /// <summary>内容变了的文件数。</summary>
+    public int ModifiedFiles { get; init; }
+
+    /// <summary>上一版本有、本次没有的文件数。</summary>
+    public int DeletedFiles { get; init; }
+
+    /// <summary>
+    /// 本轮真正推上云的字节（压缩/加密**之后**的归档尺寸）。去重命中的内容一个字节都不计——
+    /// 它压根没经过上传那一步。与 <see cref="ChangedBytes"/> 一起看才知道压缩和去重各省下了多少。
+    /// </summary>
+    public long UploadedBytes { get; init; }
+
+    /// <summary>备份收尾时那次保留清理删掉了什么（未触发清理时为 <see cref="CleanupReport.Empty"/>）。</summary>
+    public CleanupReport Cleanup { get; init; } = CleanupReport.Empty;
+}
 
 /// <summary>备份管线阶段。</summary>
 public enum BackupStage
@@ -122,6 +143,21 @@ public sealed class BackupOrchestrator(
 {
     /// <summary>流水线上的一件活：一个单文件 blob，或一箱已封好的 pack 成员。</summary>
     private readonly record struct WorkItem(PlannedFile? Single, IReadOnlyList<PlannedFile>? Pack);
+
+    /// <summary>
+    /// 一次运行边跑边攒的计数。按参数一路传下去而不是做成实例字段：编排器在 DI 里是 scoped，
+    /// 单次请求内不会有第二轮备份共用它，但"每轮的账记在这一轮的对象上"这件事应当由签名保证，
+    /// 而不是靠注册方式碰巧成立。多个上传消费者并发往里加，故一律走 Interlocked。
+    /// </summary>
+    private sealed class RunTally
+    {
+        private long _uploadedBytes;
+
+        /// <summary>本轮真正推上云的字节（压缩后）。去重命中走的是 early-return，根本到不了这里。</summary>
+        public long UploadedBytes => Interlocked.Read(ref _uploadedBytes);
+
+        public void AddUploaded(long bytes) => Interlocked.Add(ref _uploadedBytes, bytes);
+    }
 
     /// <summary>
     /// diff 最多可以领先压缩上传侧多少件活。这个数只是内存的护栏，不是节流阀：
@@ -190,12 +226,10 @@ public sealed class BackupOrchestrator(
         try
         {
             var result = await RunCoreAsync(request, progress, ct);
-            // 有文件被跳过时必须写进成功通知的摘要里：每个读不开的文件都单独推过一条告警，但那些
-            // 告警可能淹没在别的消息里，而"备份成功"这一条是操作员一定会看的。只字不提跳过，
-            // 等于让一次"成功"的备份掩盖掉本轮根本没存下来的文件。为零时不提，避免噪音。
-            var summary = $"Version {result.Version}, {result.ChangedFiles} changed file(s)"
-                + (result.UnreadableFiles > 0 ? $", {result.UnreadableFiles} unreadable file(s) skipped" : "");
-            await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}", summary, ct);
+            // 排版与"零值省略"规则见 BackupSummary：那条消息同时进操作日志和 webhook 通知，
+            // 是操作员一定会看的一条，所以本轮动了什么、云上多了多少、清掉了多少，都得在里面。
+            await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}",
+                BackupSummary.Format(result), ct);
             return result;
         }
         catch (Exception ex)
@@ -301,6 +335,7 @@ public sealed class BackupOrchestrator(
         // 不产生 blob、索引沿用旧条目、计入 UnreadableFiles，绝不能让整轮备份因此崩溃（M4 设计 §3 遗漏点）。
         var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
+        var tally = new RunTally();
         var reporter = new PipelineReporter(progress);
         // diff 不申报字节工作量，剩余时间按**件数**外推（见 StageTracker.Eta）：这个阶段的耗时
         // 主要摊在"每条至少 stat 一次"上，真要整个读一遍的只是少数变更文件——按字节推的话，
@@ -359,11 +394,11 @@ public sealed class BackupOrchestrator(
                     {
                         if (item.Single is { } single)
                             await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, ct);
+                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, tally, ct);
                         else
                             await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
                                 tailByPath, overrides, postDiffUnreadable, uploadScope, packCounter, ReportItem,
-                                uploadTracker, ct);
+                                uploadTracker, tally, ct);
                     }
                     finally
                     {
@@ -560,7 +595,7 @@ public sealed class BackupOrchestrator(
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+        var cleanup = await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
         {
             Retention = request.Options.Retention,
             DataTier = request.DataTier,
@@ -571,8 +606,37 @@ public sealed class BackupOrchestrator(
         }, info, ct);
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+
+        // 各分类各数一遍，折进同一次遍历：50 万条目的索引上，每多走一趟 Count(…) 就是多 50 万次
+        // 委托调用，而这些数字全都在同一个列表里。
+        var newFiles = 0;
+        var modifiedFiles = 0;
+        var deletedFiles = 0;
+        var unreadableFiles = 0;
+        foreach (var c in diff.Changes)
+        {
+            switch (c.Kind)
+            {
+                case ChangeKind.Added: newFiles++; break;
+                case ChangeKind.Modified: modifiedFiles++; break;
+                case ChangeKind.Deleted: deletedFiles++; break;
+                case ChangeKind.Unreadable: unreadableFiles++; break;
+                default: break;   // MetadataOnly / Unchanged：这一轮什么都没动，不进摘要
+            }
+        }
+
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes,
-            diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable) + postDiffUnreadable.Count);
+            unreadableFiles + postDiffUnreadable.Count)
+        {
+            // 刻意**不**从新增/变更里扣除 post-diff 才发现读不开的文件：扣了就会出现
+            // "340 changed" 而 "128 + 209 ≠ 340" 的账，得对着源码才看得懂。读不开的单独成项，
+            // 谁都能自己把账算平（见 BackupSummaryTests）。
+            NewFiles = newFiles,
+            ModifiedFiles = modifiedFiles,
+            DeletedFiles = deletedFiles,
+            UploadedBytes = tally.UploadedBytes,
+            Cleanup = cleanup,
+        };
     }
 
     /// <summary>每个读不开的文件各走一次 Record：源头一致沿用备份来源，消息保留系统给出的原因原文
@@ -665,7 +729,8 @@ public sealed class BackupOrchestrator(
         BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver? localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, RunTally tally,
+        CancellationToken ct)
     {
         var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -674,7 +739,7 @@ public sealed class BackupOrchestrator(
         try
         {
             placement = await PlaceBlobAsync(
-                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, ct);
+                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, tally, ct);
         }
         // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
         // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
@@ -728,7 +793,7 @@ public sealed class BackupOrchestrator(
     private async Task<BlobPlacement> PlaceBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver? localResolver,
-        VolumeUploadScope uploadScope, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, StageTracker uploadTracker, RunTally tally, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
         var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -777,7 +842,7 @@ public sealed class BackupOrchestrator(
                 try
                 {
                     var (volumes, sizes) = await UploadStagedBlobAsync(
-                        request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, ct);
+                        request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, tally, ct);
                     res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                     return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
                 }
@@ -808,7 +873,7 @@ public sealed class BackupOrchestrator(
             }
 
             var (uploadedVolumes, uploadedSizes) = await UploadStagedBlobAsync(
-                request, blobRef, staged, content, addressing, uploadScope, uploadTracker, ct);
+                request, blobRef, staged, content, addressing, uploadScope, uploadTracker, tally, ct);
             return new BlobPlacement(blobRef, cloudCollision, uploadedVolumes, uploadedSizes, content);
         }
         finally
@@ -942,7 +1007,8 @@ public sealed class BackupOrchestrator(
     /// <returns>该 blob 的分卷数与各卷字节尺寸。</returns>
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
-        BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, CancellationToken ct)
+        BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunTally tally,
+        CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
         // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
@@ -958,6 +1024,9 @@ public sealed class BackupOrchestrator(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
                 onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
+            // 记在整件传完之后：中途失败会把整轮备份带失败，那时这个数字根本不会被用到，
+            // 而按卷边传边记会让一次重试把同一批字节记两遍。
+            tally.AddUploaded(sizes.Sum());
             return (staged.Files.Count, sizes);
         }
         finally
@@ -1022,7 +1091,8 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        VolumeUploadScope uploadScope, int[] packCounter, Action<long> onItem, StageTracker uploadTracker, CancellationToken ct)
+        VolumeUploadScope uploadScope, int[] packCounter, Action<long> onItem, StageTracker uploadTracker,
+        RunTally tally, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
         var threshold = request.Options.Plan.SingleFileThresholdBytes;
@@ -1088,7 +1158,7 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadScope, uploadTracker, ct);
+                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadScope, uploadTracker, tally, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
@@ -1103,7 +1173,7 @@ public sealed class BackupOrchestrator(
             if (stable.Count > 0)
             {
                 var staged2 = await CompressPackAsync(request, packId, stable, uploadTracker, ct);
-                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadScope, uploadTracker, ct);
+                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadScope, uploadTracker, tally, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
@@ -1151,7 +1221,8 @@ public sealed class BackupOrchestrator(
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
-                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { }, uploadTracker, ct);
+                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
+                        uploadTracker, tally, ct);
                 }
                 else
                 {
@@ -1214,7 +1285,7 @@ public sealed class BackupOrchestrator(
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, VolumeUploadScope uploadScope,
-        StageTracker uploadTracker, CancellationToken ct)
+        StageTracker uploadTracker, RunTally tally, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
@@ -1225,6 +1296,7 @@ public sealed class BackupOrchestrator(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
                 onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
+            tally.AddUploaded(sizes.Sum());   // 时机同单文件路径：整件传完才记
         }
         finally
         {

@@ -223,7 +223,9 @@ public sealed class UnreadableWarningTests : IDisposable
             await orchestrator.RunAsync(Request(account, name));
 
             var success = Assert.Single(withUnreadable.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
-            Assert.Contains("1 unreadable file(s) skipped", success.Body);
+            // 措辞随摘要改版换过（现在这条消息还带新增/变更/删除与字节数，排版见 BackupSummary），
+            // 但这个测试要钉的从来不是那句话本身，而是"跳过的文件数必须出现在成功摘要里"。
+            Assert.Contains("1 unreadable", success.Body);
         }
         finally { await container.DeleteIfExistsAsync(); }
 
