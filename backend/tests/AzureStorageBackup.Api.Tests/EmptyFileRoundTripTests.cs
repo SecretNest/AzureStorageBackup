@@ -247,6 +247,83 @@ public sealed class EmptyFileRoundTripTests : IDisposable
     }
 
     /// <summary>
+    /// 老备份里的空文件带着 storage 引用（那时它们照常被压缩上传）。这些条目必须在下一次备份时
+    /// **自己变干净**，而不是等用户去动那个文件。
+    /// <para>
+    /// 不修的话它们永远好不了：一个从不变化的空文件（.gitkeep、__init__.py、锁文件……）每轮都被
+    /// 判成 Unchanged，而 Unchanged 会把上一版本的 Storage 原样带进新索引（BackupDiffer.Unchanged
+    /// → CarriedStorage）。要是那条引用当初就记错了 raw 标志，它会一代代传下去，而用户完全没有
+    /// 理由去碰一个从没变过的文件。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Inherited_Storage_Refs_On_Empty_Files_Are_Dropped_On_The_Next_Backup()
+    {
+        Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var (backup, restore) = Build(localAuthoritative: false); // 直接读云端索引，好让篡改生效
+        var account = AzuriteAccount();
+        var name = RandomName("inherit-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteEmpty("packed/zero.txt");
+            File.WriteAllText(Path.Combine(_src, "packed", "other.txt"), new string('o', 2_000));
+            await backup.RunAsync(new BackupRequest
+            {
+                Account = account, Container = name, LocalRoot = _src,
+                Name = "inherit", Options = EngineOptions(),
+            });
+
+            // 把 v1 改成"老备份的样子"：给空文件条目塞一个 storage 引用。
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var donor = index.Entries.Single(e => e.Path == "packed/other.txt").Storage;
+            Assert.NotNull(donor);
+            Assert.Null(index.Entries.Single(e => e.Path == "packed/zero.txt").Storage); // 新代码本就不给
+
+            await store.WriteIndexAsync(account, name, v1.Version, new VersionIndex
+            {
+                Version = index.Version,
+                EmptyDirs = index.EmptyDirs,
+                Entries = [.. index.Entries.Select(e => e.Path == "packed/zero.txt"
+                    ? e with { Storage = donor with { EntryName = "packed/zero.txt" } }
+                    : e)],
+            }, null);
+
+            // 源文件一个字节都不动 → diff 判 Unchanged，正是最容易一路沿用下去的那条路。
+            await backup.RunAsync(new BackupRequest
+            {
+                Account = account, Container = name, LocalRoot = _src,
+                Name = "inherit", Options = EngineOptions(),
+            });
+
+            var info2 = await store.ReadInfoAsync(account, name, null);
+            var v2 = info2!.Versions[^1];
+            Assert.NotEqual(v1.Version, v2.Version);
+            var index2 = await store.ReadIndexAsync(account, name, v2.IndexBlob, null);
+            var healed = index2.Entries.Single(e => e.Path == "packed/zero.txt");
+            Assert.Null(healed.Storage);
+            Assert.Equal(0, healed.Length);
+
+            // 自愈之后照样还原得回来。
+            await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+            var dest = Path.Combine(_dst, "packed", "zero.txt");
+            Assert.True(File.Exists(dest), "自愈后的空文件没有被还原出来");
+            Assert.Empty(await File.ReadAllBytesAsync(dest));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
     /// 同一批里内容相同、却被规则指派成不同存储形态的**非空**文件。store-only 的那份走 raw 直传
     /// （裸字节），另一份压成 7z 归档——两者字节完全不同，可它们 fullHash 相同，于是指向同一个
     /// data/{hash} 地址。没有同批协调时，两个并发任务会各自 HEAD 到同一个空位、各自上传，后写的

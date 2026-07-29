@@ -1497,11 +1497,15 @@ public sealed class BackupOrchestrator(
                 continue;
 
             var ov = overrides.GetValueOrDefault(c.Path);
+            var kind = c.Current.Kind == EntryKind.File ? "file" : "symlink";
+            // 按**最终写进索引的**长度判，而不是 diff 时看到的：内容在处理中缩成空文件时，
+            // 覆盖条目（override）才是这一条的真相。
+            var length = ov?.Length ?? c.Current.Length;
             entries.Add(new IndexEntry
             {
                 Path = c.Path,
-                Kind = c.Current.Kind == EntryKind.File ? "file" : "symlink",
-                Length = ov?.Length ?? c.Current.Length,
+                Kind = kind,
+                Length = length,
                 Mtime = ov?.Mtime ?? c.Current.ModifiedAt,
                 Permissions = c.Current.Permissions,
                 HeadHash = ov?.HeadHash ?? c.HeadHash,
@@ -1509,7 +1513,14 @@ public sealed class BackupOrchestrator(
                 TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.Previous?.TailHash,
                 FullHash = ov?.FullHash ?? c.FullHash,
                 Target = c.Current.Target,
-                Storage = storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,
+                // 零长度的普通文件一律不带存储引用——包括**从上一版本沿用来的**那些。
+                // 老备份里的空文件是照常压缩上传过的，而一个从不变化的空文件（.gitkeep、
+                // __init__.py、锁文件……）每轮都判 Unchanged，CarriedStorage 会把那条老引用
+                // 一代代传下去：若它当初就记错了 raw 标志，用户没有任何理由去碰这个文件，
+                // 它也就永远好不了。在这里断掉，下一次备份即自愈，老 blob 随后由保留清理回收。
+                Storage = kind == "file" && length == 0
+                    ? null
+                    : storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,
             });
         }
         return entries;
