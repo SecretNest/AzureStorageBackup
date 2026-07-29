@@ -79,7 +79,14 @@ public sealed record StageProgress(
     /// 那会让百分比一路虚高然后卡在 100% 上不动。
     /// </para>
     /// </summary>
-    long TransferTotal = 0)
+    long TransferTotal = 0,
+    /// <summary>
+    /// 这一阶段正卡在下游上，不是在干自己的活。差分阶段判得比压缩上传快几个数量级（判一条未变
+    /// 文件只要一次 stat），流水线的有界队列必然被填满，之后每前进一格都要等上传吃掉一件——
+    /// 而 <see cref="CurrentItem"/> 那时亮着的是**刚判完**的那条，界面看上去就是"卡死在这个文件上"。
+    /// 说清楚它其实是在等，比让人盯着一个不动的文件名强。
+    /// </summary>
+    bool WaitingOnDownstream = false)
 {
     /// <summary>还没开始处理的源端字节（压缩前）。</summary>
     public long WorkRemaining => Math.Max(0, WorkTotal - WorkDone);
@@ -195,6 +202,8 @@ public sealed class StageTracker(
     private long _transferred;
     // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
     private long _transferTotal;
+    // 正卡在下游上的调用方数量（差分侧被有界队列挡住时 >0）。
+    private int _blocked;
     // 本阶段真正开工的时刻。上传阶段的 tracker 在 diff 刚起步时就建好了，此后可能空等一阵才
     // 有第一件活；从建对象那一刻起算平均速度，会把这段空转摊进去，ETA 一路偏长。
     // -1 = 还没开工（没人调 BeginWork 的阶段——如 diff——一律按"建对象即开工"处理，那是对的）。
@@ -297,6 +306,23 @@ public sealed class StageTracker(
 
     /// <summary>一件活进了暂存区这一段——此刻它多半还在排压缩锁，所以算"排队中"
     /// （成对调 <see cref="EndStaging"/>）。</summary>
+    /// <summary>开始等下游收活（成对调 <see cref="EndWaitingOnDownstream"/>）。
+    /// 进 <c>_gate</c> 主动发一次：被挡住的那段里本调用方不再产生任何进度，不推的话
+    /// "开始等了"这件事要等到队列松动之后才会被界面看到——而那正是它要说明的那一段。</summary>
+    public void BeginWaitingOnDownstream()
+    {
+        Interlocked.Increment(ref _blocked);
+        lock (_gate)
+            PublishIfDue(force: true);
+    }
+
+    public void EndWaitingOnDownstream()
+    {
+        Interlocked.Decrement(ref _blocked);
+        lock (_gate)
+            PublishIfDue(force: true);
+    }
+
     public void BeginStaging() => Interlocked.Increment(ref _inStaging);
 
     public void EndStaging() => Interlocked.Decrement(ref _inStaging);
@@ -572,7 +598,7 @@ public sealed class StageTracker(
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
             Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, staged,
-            Volatile.Read(ref _transferTotal)));
+            Volatile.Read(ref _transferTotal), Volatile.Read(ref _blocked) > 0));
     }
 
     /// <summary>

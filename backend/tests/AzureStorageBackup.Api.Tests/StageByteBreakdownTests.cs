@@ -146,6 +146,27 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(200, seen[^1].TransferTotal);
     }
 
+    /// <summary>
+    /// 「卡在下游」要能被看见，而且必须**立刻**发布——被挡住的那段里调用方不再产生任何进度，
+    /// 等下一次别的调用顺带发布的话，界面正好在最需要说明的那一段里冻着。
+    /// </summary>
+    [Fact]
+    public void Waiting_On_Downstream_Is_Published_Immediately()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 100, seen.Add);
+
+        tracker.Touch("photos/a.bin");
+        tracker.Advance(0);
+        Assert.False(seen[^1].WaitingOnDownstream);
+
+        tracker.BeginWaitingOnDownstream();
+        Assert.True(seen[^1].WaitingOnDownstream, "开始等下游要立刻发布，不能等节流窗口");
+
+        tracker.EndWaitingOnDownstream();
+        Assert.False(seen[^1].WaitingOnDownstream);
+    }
+
     /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>
     [Fact]
     public void Stages_Without_A_Pool_Report_No_Staged_Bytes()

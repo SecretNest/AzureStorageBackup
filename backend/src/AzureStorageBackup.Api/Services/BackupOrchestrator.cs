@@ -490,7 +490,24 @@ public sealed class BackupOrchestrator(
             // 申报这件活的原始字节，作为剩余时间估算的工作量。完工时 ReportItem 会照同一个量
             // 销账（单文件按 Length，一箱按成员长度和），两边必须对得上，否则剩余量归不了零。
             uploadTracker.Enqueue(item.Single?.Length ?? item.Pack!.Sum(f => f.Length));
-            await work.Writer.WriteAsync(item, token);
+
+            // 队列没满就直接塞进去，一个字节的噪音都不加。
+            if (work.Writer.TryWrite(item))
+                return;
+
+            // 满了。差分判一条未变文件只要一次 stat，上传消化一件活要几秒到几十秒——差着几个
+            // 数量级，所以队列被填满是常态而非异常（首次备份尤其：所有文件都是新增，全部入队）。
+            // 这一等可以是十几秒，而 diff 的 CurrentItem 那时亮着的是**刚判完**的那条，
+            // 界面上看就是"卡死在这个文件上"。标出来，好让它说的是实话：在等上传追上来。
+            diffTracker.BeginWaitingOnDownstream();
+            try
+            {
+                await work.Writer.WriteAsync(item, token);
+            }
+            finally
+            {
+                diffTracker.EndWaitingOnDownstream();
+            }
         }
 
         async Task OnChangeAsync(FileChange c, CancellationToken token)

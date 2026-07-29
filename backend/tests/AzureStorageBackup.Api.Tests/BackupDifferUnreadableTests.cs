@@ -71,7 +71,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
             Task.FromResult("tail-" + Path.GetFileName(path));
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default) =>
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null) =>
             path.EndsWith(lockedPath, StringComparison.Ordinal)
                 ? throw toThrow
                 : Task.FromResult("full-" + Path.GetFileName(path));

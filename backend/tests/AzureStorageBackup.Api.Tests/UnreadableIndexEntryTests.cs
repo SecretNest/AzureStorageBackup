@@ -69,7 +69,7 @@ public sealed class UnreadableIndexEntryTests : IDisposable
                 ? throw toThrow
                 : Task.FromResult("tail-" + Path.GetFileName(path));
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default) =>
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null) =>
             path.EndsWith(lockedPath, StringComparison.Ordinal)
                 ? throw toThrow
                 : Task.FromResult("full-" + Path.GetFileName(path));

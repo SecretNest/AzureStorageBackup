@@ -174,6 +174,9 @@ export interface StageProgress {
   stagedBytes: number // 已压好、还没送出去的（压缩后）
   transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
   workPercent: number | null // 按源字节算的完成度；总量未定时为 null
+  // 差分被流水线的有界队列挡住（判得比上传快几个数量级，填满是常态）。currentItem 那时亮着的是
+  // 刚判完的那条，不标出来界面上就是"卡死在这个文件上"。
+  waitingOnDownstream: boolean
 }
 
 export interface BackupProgress {

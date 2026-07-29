@@ -135,10 +135,18 @@ export function BackupConfigsPage() {
   // 这是无人触发的后台刷新：一次网络抖动不该弹一条错误横幅——它可能盖掉用户正在看的
   // 另一条错误，且用户对这次刷新没有可做的动作。下一拍会自然重试(Fix 7)。
   useEffect(() => {
-    const t = setInterval(() => {
-      backupConfigsApi.list().then(setConfigs).catch(() => {})
-    }, 5000)
-    return () => clearInterval(t)
+    const refresh = () => backupConfigsApi.list().then(setConfigs).catch(() => {})
+    const t = setInterval(refresh, 5000)
+    // 浏览器把后台标签页的定时器节流到分钟级，切回来那一瞬看到的还是上一拍的旧快照，
+    // 要再等一个周期才更新——长任务跑着时，那正是"看起来卡住了"的一半原因。
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void refresh()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(t)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [])
 
   // 有活跃项时，只对活跃的那几份、且只拉该 activity 对应的那一个端点。
@@ -226,9 +234,15 @@ export function BackupConfigsPage() {
 
     const t = setInterval(tick, 1000)
     void tick()
+    // 同上：切回前台立刻补一拍，别让用户盯着一分钟前的快照。
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void tick()
+    }
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
       cancelled = true
       clearInterval(t)
+      document.removeEventListener('visibilitychange', onVisible)
 
       // 这个 1 秒 tick 和上面 5 秒的列表刷新相位互相独立：如果恰好是后者把某配置的 activity
       // 翻成 Idle、配置退出活跃集合，这个 cleanup 会先于下一拍跑到，状态就停在了最后一次
@@ -1261,6 +1275,9 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   const inFlight = [
+    // 差分被流水线的有界队列挡住时，CurrentItem 亮着的是**刚判完**的那条，看上去就是卡死在
+    // 那个文件上。说清楚它在等什么——判得比上传快几个数量级，队列填满是常态。
+    detail.waitingOnDownstream && 'waiting for upload to catch up',
     detail.activeItems.length > 0 && `${detail.activeItems.length} ${inFlightVerb}`,
     idleOnStaging && 'nothing on the wire yet',
     detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,

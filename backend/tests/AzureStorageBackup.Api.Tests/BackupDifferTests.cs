@@ -69,7 +69,7 @@ public sealed class BackupDifferTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default)
             => inner.TailHashAsync(path, tailBytes, ct);
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
             Interlocked.Increment(ref FullCalls);
             return inner.FullHashAsync(path, ct);

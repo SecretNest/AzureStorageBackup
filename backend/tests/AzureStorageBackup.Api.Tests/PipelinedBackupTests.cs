@@ -175,7 +175,7 @@ public sealed class PipelinedBackupTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
             inner.TailHashAsync(path, tailBytes, ct);
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default) =>
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null) =>
             inner.FullHashAsync(path, ct);
     }
 

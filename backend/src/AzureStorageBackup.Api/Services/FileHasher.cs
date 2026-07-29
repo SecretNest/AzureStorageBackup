@@ -17,7 +17,13 @@ public interface IFileHasher
     /// 内容不同却 fullHash+长度+头 全等的残余碰撞，若差异不在文件中段即可被尾部 hash 识破。</summary>
     Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default);
 
-    Task<string> FullHashAsync(string path, CancellationToken ct = default);
+    /// <param name="onRead">
+    /// 已读字节的回报（增量）。算一个大文件的全文 hash 要把它整个读一遍——NAS 上一个 10 GB 的
+    /// 文件就是十几秒，而差异检测**必须**读全（length 相同、mtime 变了时，只有全文 hash 能分辨
+    /// "内容真变了"和"只是被 touch 了一下"）。不报进度的话，界面上就是一个静止的文件名，
+    /// 与挂死一模一样。
+    /// </param>
+    Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null);
 }
 
 public sealed class FileHasher : IFileHasher
@@ -56,14 +62,18 @@ public sealed class FileHasher : IFileHasher
         return Format(XxHash128.Hash(buffer.AsSpan(0, total)));
     }
 
-    public async Task<string> FullHashAsync(string path, CancellationToken ct = default)
+    public async Task<string> FullHashAsync(
+        string path, CancellationToken ct = default, IProgress<long>? onRead = null)
     {
         await using var stream = Open(path);
         var hash = new XxHash128();
         var buffer = new byte[81920];
         int read;
         while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+        {
             hash.Append(buffer.AsSpan(0, read));
+            onRead?.Report(read);   // 增量：调用方按需累加，不必知道从哪一块开始
+        }
         return Format(hash.GetCurrentHash());
     }
 

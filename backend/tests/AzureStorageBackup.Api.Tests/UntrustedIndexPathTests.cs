@@ -45,7 +45,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default)
             => Record(path);
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
             => Record(path);
 
         private Task<string> Record(string path)

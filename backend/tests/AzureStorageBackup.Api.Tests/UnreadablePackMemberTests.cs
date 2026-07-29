@@ -111,7 +111,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
             inner.TailHashAsync(path, tailBytes, ct);
 
-        public Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
             if (path.EndsWith(relPath.Replace('/', Path.DirectorySeparatorChar), StringComparison.Ordinal)
                 && Interlocked.Exchange(ref _thrown, 1) == 0)
@@ -320,7 +320,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
             inner.TailHashAsync(path, tailBytes, ct);
 
-        public async Task<string> FullHashAsync(string path, CancellationToken ct = default)
+        public async Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
             var hash = await inner.FullHashAsync(path, ct);
             if (path.EndsWith(relPath.Replace('/', Path.DirectorySeparatorChar), StringComparison.Ordinal)
