@@ -252,6 +252,20 @@ public sealed class RestoreOrchestrator(
             }
         }
 
+        // 0 字节文件没有存储引用可分组——备份侧压根不给它产生（见 BackupOrchestrator.IsEmptyFile），
+        // 因为它没有任何内容需要存。它的全部信息就是"长度为零"，这里据此直接把文件建出来。
+        // 放在分组之前：下面那句 Where(e => e.Storage is not null) 会把它们滤掉，漏掉这一段的话
+        // 还原出来的树就会**静默地少几个文件**，而所有按内容比对的校验都会照常通过。
+        foreach (var e in fileEntries.Where(IsEmptyFileEntry))
+        {
+            switch (await TryCreateEmptyFileAsync(request, realRoot, e, phase, ct))
+            {
+                case EmptyFileOutcome.Created: restored++; break;
+                case EmptyFileOutcome.Unchanged: skipped++; break;
+                default: failed++; break;
+            }
+        }
+
         // 按存储分组：同一 pack 只下载/解压一次。各组并发下载（PRD 3.4），每组独立临时子目录避免冲突。
         var work = NewTempDir();
         var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // 活化过的 blob 基名，完成后重新归档
@@ -464,6 +478,54 @@ public sealed class RestoreOrchestrator(
             try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
         }
         return (restored, skipped, failedEntries);
+    }
+
+    /// <summary>零长度的普通文件条目：没有存储引用，因此不属于任何下载分组，得单独建出来。
+    /// 只认 <c>Kind == "file"</c>，symlink 的内容是 Target 字段、另有分支。
+    /// <para>刻意**不**兜住 <c>Length &gt; 0</c> 却没有存储引用的条目：那是畸形/损坏的索引，
+    /// 拿一个空文件冒充它等于用静默的数据损坏换掉一次显式的失败。</para></summary>
+    private static bool IsEmptyFileEntry(IndexEntry e) => e.Storage is null && e.Kind == "file" && e.Length == 0;
+
+    private enum EmptyFileOutcome { Created, Unchanged, Failed }
+
+    /// <summary>
+    /// 建一个空文件。走的是与有内容条目**完全相同**的边界检查、冲突模式与元数据恢复——
+    /// 空文件也是文件，少一道检查就是少一道；尤其越界判定必须在任何写动作之前。
+    /// </summary>
+    private async Task<EmptyFileOutcome> TryCreateEmptyFileAsync(
+        RestoreRequest request, string? realRoot, IndexEntry entry, IProgress<string>? phase, CancellationToken ct)
+    {
+        var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
+        if (!WriteStaysInsideRoot(realRoot, dest))
+        {
+            phase?.Report(UnsafeRestorePathException.MessageFor(entry.Path));
+            return EmptyFileOutcome.Failed;
+        }
+
+        try
+        {
+            if (!await NeedsRestoreAsync(dest, entry, request.Conflict, ct))
+                return EmptyFileOutcome.Unchanged;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
+                RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
+            // 没有内容可写，也就没有"中途失败留下半截并覆盖掉用户原文件"的风险——
+            // 不必像有内容的条目那样先落 .asb-part 再顶上去。
+            File.Create(dest).Dispose();
+            ApplyMetadata(dest, entry);
+            return EmptyFileOutcome.Created;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 与其它条目同样的容错语义：把失败圈在这一条上，不让一条脏条目中断整次还原。
+            phase?.Report($"Failed to restore '{entry.Path}': {ex.Message}");
+            return EmptyFileOutcome.Failed;
+        }
     }
 
     /// <summary><paramref name="dest"/> 必须是**已通过边界检查**的目标路径（见 RestoreGroupAsync）：

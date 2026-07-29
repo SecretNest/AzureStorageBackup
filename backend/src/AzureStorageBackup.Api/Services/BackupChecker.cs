@@ -119,9 +119,14 @@ public sealed class BackupChecker(
         {
             localTracker?.Touch(e.Path);
             var refName = e.Storage is { } s ? BlobNameOf(s) : null;
-            var cloud = options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
-                ? CloudState.NotChecked
-                : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
+            // 零长度的普通文件在云端**本就不该有**对应对象（备份侧不给它产生存储引用，
+            // 见 BackupOrchestrator.IsEmptyFile）。报 NotChecked 会让一整列空文件看起来像是
+            // 检查漏掉了它们；它们的云端状态是确定的，就是没问题。
+            var cloud = e.Storage is null && e.Kind == "file" && e.Length == 0
+                ? CloudState.Ok
+                : options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
+                    ? CloudState.NotChecked
+                    : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
             var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
             findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt });
             // 字节只在真的读了文件时才算，否则 Attributes/None 级会报出一个天文数字的"速度"。

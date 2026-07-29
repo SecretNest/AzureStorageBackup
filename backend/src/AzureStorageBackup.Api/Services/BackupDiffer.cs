@@ -216,7 +216,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // headHash 照算。它只读 4KB，却顺带把"这个文件此刻打得开吗"问清楚了——
             // 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = deferFull ? null : await hasher.FullHashAsync(full, ct);
+            var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
             return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null);
         }, entry, null);
     }
@@ -234,10 +234,18 @@ public sealed class BackupDiffer(IFileHasher hasher)
         return await TryReadAsync(async () =>
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = deferFull ? null : await hasher.FullHashAsync(full, ct);
+            var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
         }, entry, prev);
     }
+
+    /// <summary>
+    /// 这一条的全文 hash 能不能真的延后。延后的意义是免掉"为算 hash 把文件再整个读一遍"，
+    /// 而 0 字节那一遍读是免费的——更要紧的是，编排器不会把空文件送进压缩，也就没有人回来
+    /// 补上这个值：延后会在索引里留下一个永远为 null 的 fullHash，下一轮 diff 拿它和新算的
+    /// 值比对必然不等，于是每一轮都把这个空文件重判成变更。
+    /// </summary>
+    private static bool DeferrableFullHash(ScannedEntry entry, bool deferFull) => deferFull && entry.Length > 0;
 
     private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>
         new(entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage);
