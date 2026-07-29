@@ -25,15 +25,20 @@ public sealed class VolumeUploadScope(SemaphoreSlim gate, StageTracker tracker, 
     /// 它们的暂存文件也就一直堆在临时盘上不走。</summary>
     public int MaxParallelPerItem { get; } = Math.Max(1, maxParallelPerItem);
 
-    public async Task RunAsync(string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct)
+    /// <param name="label">界面上显示的名字——**源文件路径**或包的描述，不是 blob 名。
+    /// blob 是内容寻址的（加密时还是 HMAC），<c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。</param>
+    /// <param name="volumeBytes">这一卷多大，供界面显示"传了多少 / 一共多大"。</param>
+    public async Task RunAsync(
+        string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
+        string? label = null, long volumeBytes = 0)
     {
         await gate.WaitAsync(ct);
-        tracker.BeginItem(blobName);
+        tracker.BeginItem(blobName, label, volumeBytes);
         try
         {
             // 每卷各要一个 ItemProgress：DeltaProgress 的基线是 per-call 的，多卷并行共用一个实例，
-            // 彼此的累计值会被当成对方的回退。
-            await upload(tracker.ItemProgress());
+            // 彼此的累计值会被当成对方的回退。带上 key，这一笔字节才落得到对应那条流的账上。
+            await upload(tracker.ItemProgress(blobName));
         }
         finally
         {
@@ -69,9 +74,15 @@ public static class VolumeBlobIO
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
-        Action<string>? onVolumeUploaded = null)
+        Action<string>? onVolumeUploaded = null, string? label = null)
     {
-        async Task One(string name, string file)
+        // 多卷时在标签上标出这是第几卷：一个大文件切成上千卷，光显示路径的话界面上会是同一行
+        // 重复上千次，看不出在推进。
+        string LabelFor(int index) => label is null
+            ? baseRef
+            : volumeFiles.Count > 1 ? $"{label} ({index + 1}/{volumeFiles.Count})" : label;
+
+        async Task One(string name, string file, int index)
         {
             if (scope is null)
                 await uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata);
@@ -79,13 +90,18 @@ public static class VolumeBlobIO
                 await scope.RunAsync(
                     name,
                     p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
-                    ct);
+                    ct, LabelFor(index), SizeOf(file));
             onVolumeUploaded?.Invoke(file);
+        }
+
+        static long SizeOf(string file)
+        {
+            try { return new FileInfo(file).Length; } catch { return 0; }
         }
 
         if (volumeFiles.Count == 1)
         {
-            await One(baseRef, volumeFiles[0]);
+            await One(baseRef, volumeFiles[0], 0);
             return;
         }
 
@@ -94,9 +110,9 @@ public static class VolumeBlobIO
         {
             var end = Math.Min(volumeFiles.Count, start + batch);
             await Task.WhenAll(Enumerable.Range(start, end - start)
-                .Select(i => One(VolumeName(baseRef, i + 1), volumeFiles[i])));
+                .Select(i => One(VolumeName(baseRef, i + 1), volumeFiles[i], i)));
         }
-        await One(VolumeName(baseRef, 1), volumeFiles[0]);
+        await One(VolumeName(baseRef, 1), volumeFiles[0], 0);
     }
 
     /// <summary>

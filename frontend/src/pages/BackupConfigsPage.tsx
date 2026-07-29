@@ -1281,6 +1281,21 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
   const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
 
+  // 字节明细另起一行：件数那行已经够长了，再塞进去在窄屏上会折得没法读。
+  // 三段刻意互不重叠，加起来才是全貌：
+  //   to compress —— 还没处理的源字节（压缩前）
+  //   staged      —— 已压好、还没送出去的（压缩后）；在途那几条已经传走的部分已扣除
+  //   uploaded    —— 已经稳稳落在云上的（压缩后），配上它对应的源字节，压缩+去重省了多少一眼可见
+  // 每一项为零时整段省略——扫描/差分这些阶段一个都不会有，这一行于是自然消失。
+  const bytesLine = [
+    detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to compress`,
+    detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
+    detail.transferredBytes > 0 &&
+      `${formatBytes(detail.workDone)} → ${formatBytes(detail.transferredBytes)} uploaded`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
       {detail.currentItem && (
@@ -1288,21 +1303,37 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           {detail.currentItem}
         </div>
       )}
-      {detail.activeItems.length > 0 && (
-        <div className="mono" style={{ wordBreak: 'break-all' }}>
-          {detail.activeItems.slice(0, 3).join(', ')}
-          {detail.activeItems.length > 3 && ` +${detail.activeItems.length - 3} more`}
+      {/* 在途的每一条各占一行，带上尺寸与进度。从前这里挤的是内容寻址的 blob 名
+          （加密时还是 HMAC），既看不出在传哪个文件，也看不出传了多少。 */}
+      {detail.activeItems.slice(0, 3).map((a) => (
+        <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
+          {a.label}
+          {a.total > 0 && (
+            <span className="text-faint">
+              {' '}
+              — {formatBytes(a.sent)} / {formatBytes(a.total)}
+              {a.percent !== null && ` · ${a.percent}%`}
+            </span>
+          )}
         </div>
+      ))}
+      {detail.activeItems.length > 3 && (
+        <div className="text-faint">+{detail.activeItems.length - 3} more in flight</div>
       )}
       <div>
         {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
         <span className="text-faint">{detail.stage}: </span>
         {counts}
-        {detail.percent != null && ` · ${detail.percent}%`}
+        {/* 完成度优先按**源端字节**算：一件活可能是一个 100 GB 的单文件，也可能是一箱几百个
+            5 KB 的小文件，按件数算等于把它们当成一样重——会先飞快冲到 90%，再在最后一件上
+            卡住半小时。总量还没定下来时 workPercent 为 null，退回件数百分比。 */}
+        {(detail.workPercent ?? detail.percent) != null &&
+          ` · ${detail.workPercent ?? detail.percent}%`}
         {inFlight && ` · ${inFlight}`}
         {speed}
         {eta}
       </div>
+      {bytesLine && <div className="text-faint">{bytesLine}</div>}
     </div>
   )
 }

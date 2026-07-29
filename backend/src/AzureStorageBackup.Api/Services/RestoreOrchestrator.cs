@@ -362,7 +362,7 @@ public sealed class RestoreOrchestrator(
             // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
             // （上限是前一卷的大小），不是虚高。
             // tracker 为 null（没人接进度）时整个表达式退化为 null，DownloadAsync 不挂回调。
-            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : () => tracker.ItemProgress(blobName);
 
             string firstVolume;
             try

@@ -398,8 +398,10 @@ public sealed class BackupOrchestrator(
         // 用一个还在涨的分母算百分比，会先冲到 100 再掉回去。工作量同理，随 Enqueue 一件件累加。
         // 速度只算"网线上有流"的那段时间：这个阶段大部分时间花在 7z 上，把压缩算进分母
         // 量出来的既不是传输速度也不是墙钟吞吐（见 StageTracker.SpeedNow）。
+        // 待传池子的读数接进来：界面上那个"已压好、还没送出去"就是它减掉在途已传的部分。
         var uploadTracker = new StageTracker(
-            "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true);
+            "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true,
+            stagedBytes: () => stagingLease.Bytes);
 
         var totalItems = 0;
         var uploadedItems = 0;
@@ -901,7 +903,8 @@ public sealed class BackupOrchestrator(
                 try
                 {
                     var (volumes, sizes) = await UploadStagedBlobAsync(
-                        request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, state, ct);
+                        request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, state,
+                        file.Path, ct);
                     res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                     return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
                 }
@@ -950,7 +953,8 @@ public sealed class BackupOrchestrator(
                 }
 
                 var (uploadedVolumes, uploadedSizes) = await UploadStagedBlobAsync(
-                    request, blobRef, staged, content, addressing, uploadScope, uploadTracker, state, ct);
+                    request, blobRef, staged, content, addressing, uploadScope, uploadTracker, state,
+                    file.Path, ct);
                 claim.TrySetResult(new ResolvedBlob(blobRef, content.Raw, uploadedVolumes, uploadedSizes));
                 return new BlobPlacement(blobRef, cloudCollision, uploadedVolumes, uploadedSizes, content);
             }
@@ -1092,7 +1096,7 @@ public sealed class BackupOrchestrator(
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
         BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
-        CancellationToken ct)
+        string sourceLabel, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
         // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
@@ -1107,7 +1111,8 @@ public sealed class BackupOrchestrator(
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
-                onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
+                onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
+                label: sourceLabel);                     // 界面上显示源文件路径，不是内容寻址的 blob 名
             // 记在整件传完之后：中途失败会把整轮备份带失败，那时这个数字根本不会被用到，
             // 而按卷边传边记会让一次重试把同一批字节记两遍。
             state.AddUploaded(sizes.Sum());
@@ -1242,7 +1247,8 @@ public sealed class BackupOrchestrator(
 
             if (changed.Count == 0)
             {
-                var vols = await UploadStagedPackAsync(request, packId, staged!, uploadScope, uploadTracker, state, ct);
+                var vols = await UploadStagedPackAsync(
+                    request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
                 RecordPack(request, packId, members, vols, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
@@ -1257,7 +1263,8 @@ public sealed class BackupOrchestrator(
             if (stable.Count > 0)
             {
                 var staged2 = await CompressPackAsync(request, packId, stable, uploadTracker, state, ct);
-                var vols2 = await UploadStagedPackAsync(request, packId, staged2, uploadScope, uploadTracker, state, ct);
+                var vols2 = await UploadStagedPackAsync(
+                    request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
                 RecordPack(request, packId, stable, vols2, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
@@ -1370,7 +1377,7 @@ public sealed class BackupOrchestrator(
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, VolumeUploadScope uploadScope,
-        StageTracker uploadTracker, RunState state, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, int memberCount, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
@@ -1380,7 +1387,9 @@ public sealed class BackupOrchestrator(
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
-                onVolumeUploaded: staging.ReleaseFile);   // 传完一卷就把它从临时盘上撤掉
+                onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
+                // 一箱装着几百个文件，列不下——报包号与成员数。
+                label: $"pack {packId} ({memberCount} files)");
             state.AddUploaded(sizes.Sum());   // 时机同单文件路径：整件传完才记
         }
         finally

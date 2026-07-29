@@ -73,11 +73,11 @@ public sealed class StageProgressTests
         tracker.Complete();
         Assert.Equal(
             ["packs/p0001.7z", "packs/p0002.7z"],
-            seen[^1].ActiveItems.OrderBy(x => x, StringComparer.Ordinal));
+            seen[^1].ActiveItems.Select(a => a.Label).OrderBy(x => x, StringComparer.Ordinal));
 
         tracker.EndItem("packs/p0001.7z", 5000);
         tracker.Complete();
-        Assert.Equal(["packs/p0002.7z"], seen[^1].ActiveItems);
+        Assert.Equal(["packs/p0002.7z"], seen[^1].ActiveItems.Select(a => a.Label));
         Assert.Equal(5000, seen[^1].Bytes);
     }
 
@@ -109,7 +109,7 @@ public sealed class StageProgressTests
         tracker.Complete();
 
         var s = seen[^1];
-        Assert.Equal(["packs/p0001.7z"], s.ActiveItems);
+        Assert.Equal(["packs/p0001.7z"], s.ActiveItems.Select(a => a.Label));
         Assert.Equal(1, s.Preparing); // 正占着压缩锁的那一件
         Assert.Equal(3, s.Queued);    // 入队 5 - 完成 0 - 手上 2
         Assert.Equal(0, s.Processed); // 这些记账一律**不**计数

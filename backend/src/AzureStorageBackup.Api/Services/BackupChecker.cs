@@ -332,7 +332,7 @@ public sealed class BackupChecker(
             // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
             // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
             // （上限是前一卷的大小），不是虚高。
-            Func<IProgress<long>>? itemProgress = tracker is null ? null : tracker.ItemProgress;
+            Func<IProgress<long>>? itemProgress = tracker is null ? null : () => tracker.ItemProgress(blobName);
 
             string firstVolume;
             try

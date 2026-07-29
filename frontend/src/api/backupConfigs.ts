@@ -144,19 +144,35 @@ export interface BackupConfigInput {
 
 // 某个阶段正在做什么。上传之外的阶段此前完全没有进度——扫描和 diff 各自只在进入时报一次，
 // 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。
+/** 一条正在传的流。label 是**源文件路径**（上传）或包的描述，不是内容寻址的 blob 名。 */
+export interface ActiveTransfer {
+  label: string
+  sent: number
+  total: number // 0 = 未知（下载在拿到响应头前不知道）
+  percent: number | null
+}
+
 export interface StageProgress {
   stage: string
   processed: number
   total: number // 0 = 总数未知（扫描还没走完）
-  bytes: number
+  bytes: number // 边传边加，**含在途**——测速用的那个
   currentItem: string | null
-  activeItems: string[]
+  activeItems: ActiveTransfer[]
   bytesPerSecond: number
   preparing: number // 正占着全局压缩锁产出卷文件的（可以持续几十秒）——按锁的定义只会是 0 或 1
   queued: number // 还没开工的：队列里没被领走的 + 已领走但在排压缩锁干等的
   percent: number | null
   etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
   estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
+  // 字节明细。三段互不重叠：workRemaining（还没处理的源字节）、stagedBytes（已压好没送出去的）、
+  // transferredBytes（已经稳稳落在云上的）。workDone/workTotal 是压缩前口径，用于算真实完成度。
+  workTotal: number // 源端字节总量（压缩前）。上传阶段在 diff 判完前还会往上长
+  workDone: number // 其中已彻底完工的（不含在途）
+  workRemaining: number
+  transferredBytes: number // 已完工的项真正推上网线的字节（压缩后，不含在途）
+  stagedBytes: number // 已压好、还没送出去的（压缩后）
+  workPercent: number | null // 按源字节算的完成度；总量未定时为 null
 }
 
 export interface BackupProgress {

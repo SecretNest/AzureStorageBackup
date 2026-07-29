@@ -648,7 +648,9 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.True(probe.ExtractCallCount > 0, "fake compressor's ExtractToStreamAsync should have been invoked");
             // 解压这一刻，假时钟已经保证了下载结束时那次 EndItem 触发的发布没被节流吞掉——
             // 拿到的就是解压开始那一瞬间真正的在途集合，不是碰运气捞到的一张旧快照。
-            Assert.Empty(probe.ActiveItemsAtExtractCall ?? ["<no snapshot captured>"]);
+            // 没抓到快照本身就是失败——原先靠塞一个非空哨兵集合来表达，现在直接断言非空，意思一样但更直白。
+            Assert.NotNull(probe.ActiveItemsAtExtractCall);
+            Assert.Empty(probe.ActiveItemsAtExtractCall);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -662,7 +664,7 @@ public sealed class BackupCheckerTests : IDisposable
     private sealed class ActiveItemsProbeCompressor(IFileCompressor inner) : IFileCompressor
     {
         public StageProgress? LatestPublished { get; set; }
-        public IReadOnlyList<string>? ActiveItemsAtExtractCall { get; private set; }
+        public IReadOnlyList<ActiveTransfer>? ActiveItemsAtExtractCall { get; private set; }
         public int ExtractCallCount { get; private set; }
 
         public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default) =>

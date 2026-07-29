@@ -11,6 +11,19 @@ namespace AzureStorageBackup.Api.Services;
 /// 分不清是在干活还是挂死了（而 FIFO 那个 bug 恰好会真的挂死）。
 /// </para>
 /// </summary>
+/// <summary>
+/// 一条正在传的流。<paramref name="Label"/> 是给人看的名字——上传阶段是**源文件路径**，
+/// 而不是 blob 名：blob 是内容寻址的（加密时还是 HMAC 后的乱码），
+/// <c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。一箱 pack 装着几百个文件，列不下，
+/// 报的是包号与成员数。
+/// </summary>
+/// <param name="Sent">这一条已经过网线的字节。</param>
+/// <param name="Total">这一条一共有多少字节；0 = 未知（下载路径在拿到响应头之前不知道）。</param>
+public sealed record ActiveTransfer(string Label, long Sent, long Total)
+{
+    public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Sent / Total) : null;
+}
+
 public sealed record StageProgress(
     string Stage,
     int Processed,
@@ -20,7 +33,7 @@ public sealed record StageProgress(
     /// <summary>当前正在处理的那一个（串行阶段）。</summary>
     string? CurrentItem,
     /// <summary>正在并发处理的多个（上传/下载阶段）。</summary>
-    IReadOnlyList<string> ActiveItems,
+    IReadOnlyList<ActiveTransfer> ActiveItems,
     long BytesPerSecond,
     /// <summary>正在做本地 CPU 工作、既不在排队也不产生传输字节的件数。三个阶段各用各的含义：
     /// 上传＝正占着压缩锁在产出卷文件；还原/校验＝下载已完成、正在解压/算 hash。
@@ -39,8 +52,42 @@ public sealed record StageProgress(
     int Queued = 0,
     /// <summary>由 <see cref="StageTracker"/> 按「本阶段全程平均进度」算出的剩余秒数；
     /// 阶段没有申报工作量、或还没干完一件时为 null，此时退回下面那个基于当前速度的粗估。</summary>
-    double? EtaSeconds = null)
+    double? EtaSeconds = null,
+    /// <summary>本阶段申报的**源端**字节总量（压缩前）。上传阶段是渐增的——diff 边判边入队，
+    /// 判完之前这个数还会往上长。0 = 该阶段不申报工作量。</summary>
+    long WorkTotal = 0,
+    /// <summary>其中已经彻底完工的源端字节。**不含在途**：一件活整件做完才销账。</summary>
+    long WorkDone = 0,
+    /// <summary>已完工的项真正推上网线的字节（压缩后）。同样**不含在途**——
+    /// 与 <see cref="Bytes"/> 的区别正在这里：那个是边传边加的，用于测速，含正在传的那部分。</summary>
+    long TransferredBytes = 0,
+    /// <summary>
+    /// 待传池子里**还没送出去**的字节（压缩后）：池子里所有文件的总尺寸，减去在途那几条已经
+    /// 传出去的那部分。压缩跑在上传前面时它会涨，上传跟上来就落回去——这个数把「压缩快还是
+    /// 网络快」直接摆在脸上。
+    /// <para>
+    /// 减的是在途的**已传**字节而不是整卷：那几卷确实还整个躺在池子里（逐卷释放，传完才删），
+    /// 已经送走的只是其中一截。不减的话，同一批字节会在这里和 <see cref="ActiveItems"/> 里各数一遍。
+    /// </para>
+    /// </summary>
+    long StagedBytes = 0)
 {
+    /// <summary>还没开始处理的源端字节（压缩前）。</summary>
+    public long WorkRemaining => Math.Max(0, WorkTotal - WorkDone);
+
+    /// <summary>
+    /// 按**源端字节**（压缩前）算的完成度。上传阶段应当优先用它而不是 <see cref="Percent"/>：
+    /// 一件活可能是一个 100 GB 的单文件，也可能是一箱几百个 5 KB 的小文件，按件数算等于把它们
+    /// 当成一样重——界面上会先飞快冲到 90%，再在最后一件上卡住半小时。
+    /// <para>
+    /// 只在总量已经定下来（<see cref="Total"/> &gt; 0）时才给。上传的工作量是 diff 边判边入队的，
+    /// 判完之前分母还在长，这时算出来的百分比会先冲高再掉下去。件数那边用同一个信号。
+    /// </para>
+    /// </summary>
+    public int? WorkPercent => Total > 0 && WorkTotal > 0
+        ? (int)Math.Min(100, 100L * WorkDone / WorkTotal)
+        : null;
+
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Processed / Total) : null;
 
     /// <summary>
@@ -76,8 +123,13 @@ public sealed record StageProgress(
 /// 会登记在途项的阶段（上传/还原/校验）置 true：它们的节奏是「压一箱几十秒 → 传几秒」，
 /// 拿墙钟当分母量出来的既不是传输速度也不是墙钟吞吐。从不调 <see cref="BeginItem"/> 的阶段
 /// （扫描/差分/本地检查）必须保持 false——虚拟时钟对它们永远不走，速度会恒为 0。</param>
+/// <param name="stagedBytes">
+/// 待传池子当前占用（压缩后字节）的读数。上传阶段传本次运行的暂存席位；其余阶段没有池子，省略。
+/// 每次发布时现读——它随压缩与上传此消彼长，缓存下来就永远慢一拍。
+/// </param>
 public sealed class StageTracker(
-    string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false) : IDisposable
+    string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false,
+    Func<long>? stagedBytes = null) : IDisposable
 {
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
@@ -93,7 +145,17 @@ public sealed class StageTracker(
     private const int MaxSamples = 256;
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
-    private readonly ConcurrentDictionary<string, byte> _active = new(StringComparer.Ordinal);
+    /// <summary>在途的流：key 是 blob/卷名（唯一），值带着给人看的标签、已传字节与总字节。</summary>
+    private sealed class InFlight(string label, long total)
+    {
+        public string Label { get; } = label;
+        public long Total { get; } = total;
+        private long _sent;
+        public long Sent => Interlocked.Read(ref _sent);
+        public void Add(long delta) => Interlocked.Add(ref _sent, delta);
+    }
+
+    private readonly ConcurrentDictionary<string, InFlight> _active = new(StringComparer.Ordinal);
     // (毫秒, 累计字节) 采样，用于算最近一段时间的速度。文件大小差异很大时，
     // 全程平均值会长期偏离当下的实际速度，滚动窗口才对得上用户看到的现象。
     private readonly Queue<(long Ms, long Bytes)> _samples = new();
@@ -119,6 +181,9 @@ public sealed class StageTracker(
     // 剩余时间退回按件数外推。
     private long _totalWork;
     private long _doneWork;
+    // 已经彻底走完的那些流真正推上网线的字节（压缩后）。与 _bytes 的区别：那个边传边加、
+    // 含在途的部分，用来测速；这个只认走完的，用来回答"有多少已经稳稳落在云上"。
+    private long _transferred;
     // 本阶段真正开工的时刻。上传阶段的 tracker 在 diff 刚起步时就建好了，此后可能空等一阵才
     // 有第一件活；从建对象那一刻起算平均速度，会把这段空转摊进去，ETA 一路偏长。
     // -1 = 还没开工（没人调 BeginWork 的阶段——如 diff——一律按"建对象即开工"处理，那是对的）。
@@ -254,11 +319,14 @@ public sealed class StageTracker(
     /// 空→非空这一下同时开启测速时钟：在此之前的压缩与排队不算进速度的分母。
     /// 集合的增删挪进锁里，是为了让"是不是空的"与时钟开关在同一个临界区内定下来。
     /// </para></summary>
-    public void BeginItem(string item)
+    /// <param name="label">给人看的名字（上传阶段传**源文件路径**，不是内容寻址的 blob 名）。
+    /// 省略时退回用 key 本身，与从前的行为一致。</param>
+    /// <param name="totalBytes">这一条一共多少字节；0 = 未知（下载在拿到响应头前不知道）。</param>
+    public void BeginItem(string item, string? label = null, long totalBytes = 0)
     {
         lock (_gate)
         {
-            if (!_active.TryAdd(item, 0))
+            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes)))
                 return;
             if (speedWhileInFlight && _activeSince < 0)
             {
@@ -276,14 +344,19 @@ public sealed class StageTracker(
     /// 收尾再加一次总量就是双计。
     /// </para>
     /// </summary>
-    public IProgress<long> ItemProgress() => new DeltaProgress(AddBytes);
+    /// <param name="item">对应 <see cref="BeginItem"/> 的 key：这一笔字节要记到那一条流的账上，
+    /// 界面才显示得出「这一条传了多少 / 一共多大」。省略则只累加阶段总字节，不落到具体某条流上。</param>
+    public IProgress<long> ItemProgress(string? item = null) =>
+        new DeltaProgress(delta => AddBytes(item, delta));
 
-    /// <summary>只累加字节，不计数、不动在途集合。</summary>
-    private void AddBytes(long delta)
+    /// <summary>累加字节：既进阶段总量（测速用），也进这一条流自己的账（界面显示用）。</summary>
+    private void AddBytes(string? item, long delta)
     {
         lock (_gate)
         {
             _bytes += delta;
+            if (item is not null && _active.TryGetValue(item, out var flow))
+                flow.Add(delta);
             PublishIfDue(force: false);
         }
     }
@@ -321,11 +394,17 @@ public sealed class StageTracker(
     {
         lock (_gate)
         {
-            if (_active.TryRemove(item, out _) && speedWhileInFlight && _active.IsEmpty && _activeSince >= 0)
+            if (_active.TryRemove(item, out var flow))
             {
-                _activeMs += NowMs() - _activeSince;
-                _activeSince = -1;
-                Heartbeat(on: false);
+                // 这一条走完了：把它的字节从"在途"挪进"已传"。界面上那个"已传"要能回答
+                // "有多少已经**稳稳落在云上**"，所以在途的部分一律不算进去，走完才认。
+                _transferred += flow.Sent + bytes;
+                if (speedWhileInFlight && _active.IsEmpty && _activeSince >= 0)
+                {
+                    _activeMs += NowMs() - _activeSince;
+                    _activeSince = -1;
+                    Heartbeat(on: false);
+                }
             }
             _bytes += bytes;
             PublishIfDue(force: false);
@@ -463,9 +542,20 @@ public sealed class StageTracker(
         var waiting = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork) + waiting;
 
+        // 在途快照。各条流的已传字节是并发更新的，这里取的是同一瞬的读数，
+        // 下面那个减法也用同一批值——分两次读会让"待传"偶尔算出个负数再被夹回 0，界面上就是跳。
+        var inFlight = _active.Values
+            .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total))
+            .ToList();
+        // 待传池子里还没送出去的：池子占用 - 在途那几条已经传走的部分（它们还整个躺在池子里，
+        // 逐卷释放要传完才删）。不减就会在这里和 ActiveItems 里把同一批字节数两遍。
+        var staged = stagedBytes is null
+            ? 0
+            : Math.Max(0, stagedBytes() - inFlight.Sum(f => f.Sent));
+
         publish(new StageProgress(
-            stage, _processed, _total, _bytes, _current, [.. _active.Keys], speed, preparing, queued,
-            Eta(now)));
+            stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
+            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, staged));
     }
 
     /// <summary>
