@@ -59,6 +59,16 @@ export const restoreConflictModeLabels: Record<number, string> = {
 export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
 export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing' | 'CleaningUp'
 
+/** 读得通的形式，用在句子里（"Currently backing up — …"）。后端 Humanize 的对应物。 */
+export const activityLabels: Record<BackupActivity, string> = {
+  Idle: 'idle',
+  BackingUp: 'backing up',
+  Restoring: 'restoring',
+  Checking: 'checking',
+  Repairing: 'repairing',
+  CleaningUp: 'cleaning up',
+}
+
 /** 后端解析后的生效值（null 字段已用全局设置填充）。只读，仅供显示。 */
 export interface EffectiveBackupSettings {
   ignoreRules: string | null

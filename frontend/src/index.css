@@ -539,13 +539,24 @@ tbody tr.ops-row:hover {
 /* 「Use default」行：勾选框在前，控件或只读生效值在后。 */
 .defaultable {
   display: flex;
-  align-items: center;
+  /* 顶部对齐而非居中：值区是多行控件（规则用的 textarea）时，居中会把「Use default」拖到
+     文本框的半腰上，而左边的标题还在顶上。勾与字的对齐由 .defaultable-toggle 自己管，
+     所以这里改成 flex-start 不会让它们错开。 */
+  align-items: flex-start;
   gap: var(--sp-3);
   flex-wrap: wrap;
 }
-.defaultable-toggle {
+/* 勾选行与只读生效值都撑到一个控件的高度，并在其中居中。
+   标题那 6px 的 padding-top 是为了跟 32px 输入框里的文字对齐的；值区只有一行文字时没有
+   对应的高度，标题就被那 6px 压得比右边低了一截——Step 2 整页都是这种字段，于是整列都歪。
+   撑到同样的高度，两边的文字就落在同一条中线上。 */
+.defaultable-toggle,
+.defaultable-effective {
   display: inline-flex;
   align-items: center;
+  min-height: var(--control-h);
+}
+.defaultable-toggle {
   gap: var(--sp-1);
   color: var(--text-muted);
   white-space: nowrap;

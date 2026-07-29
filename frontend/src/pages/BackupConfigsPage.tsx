@@ -9,6 +9,7 @@ import { formatBytes } from '../constants/format'
 import { Field } from '../components/modal'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
 import {
+  activityLabels,
   backupConfigsApi,
   StorageTier,
   RetentionMode,
@@ -409,14 +410,13 @@ export function BackupConfigsPage() {
     }
   }
 
+  // 失败**不**在这里吞掉：错误要显示在删除弹窗内部（见 DeleteModal）。写进页面那条全局错误的话，
+  // 弹窗正盖在它上面，用户看到的就是"点了 Delete，什么都没发生"——后端拒绝删除正在运行的配置时
+  // （409）每次都是这个现象。
   const remove = async (c: BackupConfig, deleteContainer: boolean) => {
-    try {
-      await backupConfigsApi.remove(c.id, deleteContainer)
-      setDeleteModal(null)
-      load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
+    await backupConfigsApi.remove(c.id, deleteContainer)
+    setDeleteModal(null)
+    load()
   }
 
   const resetStatus = async (c: BackupConfig) => {
@@ -629,7 +629,21 @@ export function BackupConfigsPage() {
                   <button type="button" className="btn-ghost" onClick={() => startEdit(c)}>
                     Edit
                   </button>{' '}
-                  <button type="button" className="btn-ghost btn-danger" onClick={() => setDeleteModal(c)}>
+                  {/* 后端本就拒绝删除正在运行的配置（409，见 BackupConfigEndpoints 的 DeriveActivity）。
+                      按钮从前不跟着灰，于是用户点了 Delete、确认、然后什么都没发生——错误被弹窗盖住了。
+                      这里只是把按钮与那条既有护栏对齐；真正的保证仍在后端，因为 activity 每 5 秒才刷一次，
+                      刚开跑的那几秒里按钮还是亮的（那时错误会显示在弹窗里，见 DeleteModal）。 */}
+                  <button
+                    type="button"
+                    className="btn-ghost btn-danger"
+                    onClick={() => setDeleteModal(c)}
+                    disabled={c.activity !== 'Idle'}
+                    title={
+                      c.activity === 'Idle'
+                        ? undefined
+                        : `Currently ${activityLabels[c.activity]} — stop it or wait for it to finish before deleting.`
+                    }
+                  >
                     Delete
                   </button>
                 </td>
@@ -1472,10 +1486,19 @@ function RuleBox({ value, onChange }: { value: string | null; onChange: (v: stri
 // window.confirm 强调不可逆，避免误删整个 container。
 function DeleteModal({
   config, onClose, onConfirm,
-}: { config: BackupConfig; onClose: () => void; onConfirm: (deleteContainer: boolean) => void }) {
+}: {
+  config: BackupConfig
+  onClose: () => void
+  /** 抛出即视为失败，错误显示在本弹窗内。成功由调用方关闭弹窗。 */
+  onConfirm: (deleteContainer: boolean) => Promise<void>
+}) {
   const [deleteContainer, setDeleteContainer] = useState(false)
+  // 失败原因必须显示在**弹窗内部**。从前是写到页面上那条全局错误里，而弹窗正盖在它上面——
+  // 后端拒绝删除正在运行的配置时（409），用户看到的就是"点了 Delete，什么都没发生"。
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
-  const confirm = () => {
+  const confirm = async () => {
     if (deleteContainer) {
       const sure = window.confirm(
         `This will PERMANENTLY delete the Azure container "${config.containerName}" and ALL backup data in it. ` +
@@ -1483,7 +1506,15 @@ function DeleteModal({
       )
       if (!sure) return
     }
-    onConfirm(deleteContainer)
+    setError(null)
+    setBusy(true)
+    try {
+      await onConfirm(deleteContainer)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
@@ -1501,9 +1532,14 @@ function DeleteModal({
             Also delete cloud container (irreversible — erases all backup data)
           </span>
         </label>
+        {error && (
+          <div className="text-danger" style={{ margin: '0.8rem 0' }}>
+            {error}
+          </div>
+        )}
         <div className="row" style={{ marginTop: '1rem' }}>
-          <button type="button" className="btn-danger" onClick={confirm}>
-            Delete
+          <button type="button" className="btn-danger" onClick={confirm} disabled={busy}>
+            {busy ? 'Deleting…' : 'Delete'}
           </button>
           <button type="button" onClick={onClose}>
             Cancel

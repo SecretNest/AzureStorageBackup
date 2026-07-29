@@ -32,7 +32,8 @@ export function DefaultableField({
           />
           Use default
         </label>
-        {useDefault ? <span className="text-muted">{effectiveText}</span> : children}
+        {/* defaultable-effective：与勾选行同高，好让这一行文字跟左边的标题落在同一条中线上。 */}
+        {useDefault ? <span className="defaultable-effective text-muted">{effectiveText}</span> : children}
       </span>
     </Field>
   )
