@@ -47,7 +47,12 @@ public static class BackupSummary
         return sb.ToString();
     }
 
-    private static string FormatRetention(CleanupReport c)
+    /// <summary>
+    /// 保留清理那一句。公开是因为定时清理任务（TaskDispatcher）单独跑时也要报同样的数字——
+    /// 同一件事在两个地方各写一遍措辞，迟早会漂成两种说法，而操作员得同时读这两条日志。
+    /// 调用方须自行跳过 <see cref="CleanupReport.IsEmpty"/>：什么都没清掉时这句不该出现。
+    /// </summary>
+    public static string FormatRetention(CleanupReport c)
     {
         var parts = new List<string>(3);
         if (c.RetiredVersions > 0)

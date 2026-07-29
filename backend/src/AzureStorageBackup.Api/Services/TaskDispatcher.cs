@@ -140,8 +140,17 @@ public sealed class TaskDispatcher(
 
                 case ScheduledTaskType.Cleanup:
                     var cleanupSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                    await sp.GetRequiredService<RetentionCleaner>()
+                    var cleanup = await sp.GetRequiredService<RetentionCleaner>()
                         .CleanupAsync(account, container, password, BackupRequestMapper.CleanupOf(config, cleanupSettings), ct);
+                    // 备份收尾那次清理会把删掉的东西写进成功摘要；独立跑的这一次没有理由更沉默——
+                    // 无人值守部署下，操作日志是回头查"保留策略到底腾出了多少空间"的唯一地方。
+                    // 长存：这条记的是数据被删除，属于审计内容，不该随短存日志 14 天后消失。
+                    // 什么都没清掉时一个字都不写：每晚一条 "retired 0 version(s)" 会让这条信号变成
+                    // 背景噪音，而"任务确实跑过了"另有任务运行记录可查。
+                    if (!cleanup.IsEmpty)
+                        await sp.GetRequiredService<IOperationLog>().AppendAsync(
+                            OperationLogLevel.Info, $"schedule:{accountId}/{container}",
+                            BackupSummary.FormatRetention(cleanup), ct, durable: true);
                     break;
             }
         }
