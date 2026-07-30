@@ -1317,10 +1317,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
         ]
       : [
-          detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to compress`,
+          // 已上传 / 总量。两边都是**源端**字节（压缩前）——分数只有同口径才有意义。
+          // 拿实传字节当分子是不行的：分母（压缩后的总量）在开始传之前根本不存在，压完才知道，
+          // 而且压缩率随文件类型大幅摆动，跨口径的比例读不出任何东西。
+          detail.workTotal > 0 &&
+            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} uploaded`,
+          // 云上实际占了多少（压缩后）。与上面那个分数并列而不是塞进它，两个口径就不会被混读。
+          detail.transferredBytes > 0 && `${formatBytes(detail.transferredBytes)} stored`,
           detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
-          detail.transferredBytes > 0 &&
-            `${formatBytes(detail.workDone)} → ${formatBytes(detail.transferredBytes)} uploaded`,
         ]
   )
     .filter(Boolean)

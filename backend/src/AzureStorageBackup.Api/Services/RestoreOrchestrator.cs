@@ -468,7 +468,14 @@ public sealed class RestoreOrchestrator(
 
                     foreach (var e in needed)
                     {
-                        var source = Path.Combine(extractDir, ToLocal(e.Path));
+                        // 归档里的成员名是 EntryName，**不是**条目自己的 Path。两者从前恒等
+                        // （RecordPack 拿 f.Path 填 EntryName），所以按 Path 取一直是对的；
+                        // 打包成员开始跨版本去重之后就不再恒等了——同一份内容被另一个路径引用时，
+                        // 归档里只有最初那个成员名。按 Path 取会在解压目录里找不到文件，
+                        // 于是这一条被记成失败、内容悄悄地没还原出来。
+                        // 检查器那边（BackupChecker）一直用的就是 EntryName ?? Path，这里补齐；
+                        // 对已有备份逐字节等价，因为那些条目的 EntryName 就等于 Path。
+                        var source = Path.Combine(extractDir, ToLocal(e.Storage?.EntryName ?? e.Path));
                         if (TryWriteRestoredFile(request, realRoot, e, source, phase))
                             restored++;
                         else

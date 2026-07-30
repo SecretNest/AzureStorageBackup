@@ -7,6 +7,16 @@ namespace AzureStorageBackup.Api.Services;
 public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
 
 /// <summary>
+/// 某个既有 pack 里的一个成员。新条目指向它即完成去重——不压、不传、不装箱。
+/// <para>
+/// <paramref name="EntryName"/> 是**最初存进去时**那个路径（归档内的成员名），与现在引用它的
+/// 路径可以不同：内容一样、路径不同，正是要去重的那种情形。还原按这个名字从归档里取成员，
+/// 写到索引条目自己的 Path 上。
+/// </para>
+/// </summary>
+public sealed record PackMemberRef(string PackId, string EntryName);
+
+/// <summary>
 /// 纯本地的单文件 blob 去重/碰撞解析（不读云端）。自建备份的本地缓存索引已含每个 blob 的
 /// 内容身份（fullHash+长度+head+tail）与存储信息，故去重、碰撞避让、分卷数、raw 均可从本地判定。
 /// <para>
@@ -24,17 +34,21 @@ public sealed class LocalDedupResolver
     private readonly ConcurrentDictionary<string, Reservation> _run = new(StringComparer.Ordinal);
     private readonly IReadOnlySet<string> _priorHeads;                                  // 预筛：既有内容的 "长度\nhead"
     private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // 预筛：本轮已开工的
+    // 打包成员的内容身份（三项）→ 它躺在哪个包的哪个成员上。见 TryFindPackMember 上的说明。
+    private readonly IReadOnlyDictionary<string, PackMemberRef> _packMembers;
 
     private LocalDedupResolver(
         BlobAddressScheme addressing,
         IReadOnlyDictionary<string, ResolvedBlob> priorByContent,
         IReadOnlyDictionary<string, string> priorRefs,
-        IReadOnlySet<string> priorHeads)
+        IReadOnlySet<string> priorHeads,
+        IReadOnlyDictionary<string, PackMemberRef> packMembers)
     {
         _addressing = addressing;
         _priorByContent = priorByContent;
         _priorRefs = priorRefs;
         _priorHeads = priorHeads;
+        _packMembers = packMembers;
     }
 
     /// <summary>
@@ -62,17 +76,35 @@ public sealed class LocalDedupResolver
 
     private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
-    /// <summary>从保留版本的第二级索引构建映射（仅单文件 blob 条目参与内容寻址去重）。</summary>
+    /// <summary>从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。</summary>
     public static LocalDedupResolver Build(BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes)
     {
         var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
         var refs = new Dictionary<string, string>(StringComparer.Ordinal);
         var heads = new HashSet<string>(StringComparer.Ordinal);
+        var packMembers = new Dictionary<string, PackMemberRef>(StringComparer.Ordinal);
         foreach (var index in indexes)
         {
             foreach (var e in index.Entries)
             {
-                if (e.Storage is not { Kind: "blob" } s || e.FullHash is null)
+                if (e.FullHash is null)
+                    continue;
+
+                // 打包成员：内容已经躺在某个既有 pack 里，新文件同内容时直接指过去，不必再装一箱。
+                // 同一箱内的重复本来就被 7z 的 solid 归档消掉了（字典跨成员匹配），真正省下来的是
+                // **跨箱、跨版本**那部分——不同箱之间压缩不共享字典，同一份内容会实打实地存两遍。
+                if (e.Storage is { Kind: "pack" } p)
+                {
+                    if (e.HeadHash is not null)
+                        // TryAdd：多个保留版本可能各有一条同内容成员，取最先遇到的（版本从旧到新传入）。
+                        // 偏向老 pack 是有意的：引用聚到老包上，它就更不容易在死重压实里被重写。
+                        packMembers.TryAdd(
+                            PackMemberKey(e.FullHash, e.Length, e.HeadHash),
+                            new PackMemberRef(p.Ref, p.EntryName ?? e.Path));
+                    continue;
+                }
+
+                if (e.Storage is not { Kind: "blob" } s)
                     continue;
                 var ck = ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
                 byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
@@ -83,8 +115,28 @@ public sealed class LocalDedupResolver
                     heads.Add(HeadKey(e.Length, e.HeadHash));
             }
         }
-        return new LocalDedupResolver(addressing, byContent, refs, heads);
+        return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers);
     }
+
+    /// <summary>
+    /// 这份内容是不是已经在某个既有 pack 里。命中即可让新条目直接指过去——不压、不传、不装箱。
+    /// <para>
+    /// 身份只用三项（fullHash + 长度 + head），比单文件 blob 那条路少一个尾部 hash：打包成员的
+    /// 索引条目里**从来没有** tail（<c>BuildEntries</c> 只给单文件 blob 填它），要求四项等于把
+    /// 存量小文件全部排除在去重之外，而那恰恰是收益所在。
+    /// </para>
+    /// <para>
+    /// 三项对这条路是够的：fullHash 是整份内容的 xxh128（128 位），再叠长度与头 4KB 的 xxh128，
+    /// 而打包成员按定义都是小文件（超过单文件阈值的走 blob 那条路），head 覆盖的比例本就高。
+    /// 单文件 blob 之所以还要 tail，是因为那条路上可能是一个 100 GB 的文件，头尾各 4KB 覆盖率极低——
+    /// 两条路的取舍不同，不是这里漏了一项。
+    /// </para>
+    /// </summary>
+    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash) =>
+        _packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash));
+
+    private static string PackMemberKey(string fullHash, long length, string head) =>
+        $"{fullHash}\n{length}\n{head}";
 
     /// <summary>解析某内容：命中既有 → 去重；否则占一个空 ref 由调用方上传，完成后回填 (raw, 分卷数)。</summary>
     public async Task<Resolution> ResolveAsync(string fullHash, long length, string headHash, string tailHash)

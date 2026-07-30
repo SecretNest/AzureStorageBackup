@@ -531,6 +531,31 @@ public sealed class BackupOrchestrator(
                 ? new PlannedFile(c.Path, c.Current!.Length, c.FullHash)
                 : null;
 
+            // 打包成员的文件级去重：这份内容已经躺在某个既有 pack 里 → 直接指过去，不装箱、不压、不传。
+            // 只对要成组的条目做（单文件 blob 那条路自己有内容寻址去重）。
+            //
+            // 同一箱内的重复本来就被 7z 的 solid 归档消掉了（字典跨成员匹配），这里省下的是**跨箱、
+            // 跨版本**那部分：不同箱之间压缩不共享字典，同一份内容会实打实地存两遍。
+            //
+            // 对已有备份是**只读**的：老索引一个字节都不改，只是多了一种命中可能。命中之后写下的
+            // 引用形状（Kind=pack + Ref + EntryName）与从前逐字节相同，所以保留清理按 Ref 收集引用、
+            // 死重压实按 EntryName 归组存活成员、还原按 EntryName 从归档里取成员——三处都不必改
+            // （RetentionCleaner 那句"同内容不同路径去重成同 fullHash 但仍是两个成员"的注释早已
+            // 预见了这一天）。
+            if (file is not null && klass.Category != FileCategory.SingleFile
+                && localResolver is not null
+                && file.FullHash is { } packHash && c.HeadHash is { } packHead
+                && localResolver.TryFindPackMember(packHash, file.Length, packHead) is { } priorMember)
+            {
+                storageByPath[c.Path] = new StorageRef
+                {
+                    Kind = "pack", Ref = priorMember.PackId, EntryName = priorMember.EntryName,
+                };
+                // 之后走的是与"这一条没有变更内容"完全相同的既有路径：目录计数照常递减、封箱时机
+                // 不受影响、不占上传槽位也不必销账。
+                file = null;
+            }
+
             switch (klass.Category)
             {
                 case FileCategory.SingleFile:
