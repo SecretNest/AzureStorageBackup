@@ -41,7 +41,13 @@ public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateSt
                 account, container, info, password, tier, ifMatch: local?.ETag, ct);
             await state.PutAsync(account.Id, container, IndexSerializer.SerializeInfoFile(info), newEtag, ct);
         }
-        catch (RequestFailedException ex) when (ex.Status is 412 or 409)
+        // 412 = ETag 对不上，409 BlobAlreadyExists = 我们以为没有、它却已经在了。两者都确实是
+        // "信息文件被别处改过"。
+        //
+        // 但**不能**把 409 一律收下：BlobArchived 也是 409，它说的是"这个 blob 已归档、动不了"，
+        // 与"被别处改了"毫无关系。混在一起会给出一条彻底误导的错误，还顺手把本地权威状态清掉——
+        // 而那份状态正是下一次备份免于读云端的依据，清了就得重新回填。
+        catch (RequestFailedException ex) when (ex.Status == 412 || ex.ErrorCode == "BlobAlreadyExists")
         {
             await state.RemoveAsync(account.Id, container, ct);
             throw new InvalidOperationException(
