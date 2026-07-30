@@ -1406,7 +1406,10 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           {detail.activeItems.length} parallel {inFlightVerb}:
         </div>
       )}
-      {detail.activeItems.slice(0, 3).map((a) => (
+      {/* 全部列出，不再截到 3 条。在途条数有上界——它就是设置里的上传/下载并发数（默认 5），
+          闸门按**卷**发额度，所以不会因为队列长或文件大而涨。把其中几条折成 "+2 more" 反而
+          藏掉了最有用的东西：卡住的那条通常就在被折起来的那几条里。 */}
+      {detail.activeItems.map((a) => (
         <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
           {a.label}
           {a.total > 0 && (
@@ -1418,9 +1421,6 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           )}
         </div>
       ))}
-      {detail.activeItems.length > 3 && (
-        <div className="text-faint">+{detail.activeItems.length - 3} more in flight</div>
-      )}
       <div>
         {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
         <span className="text-faint">{detail.stage}: </span>
