@@ -106,6 +106,31 @@ public sealed class BackupDifferTests : IDisposable
     private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
 
     /// <summary>
+    /// 完全未变的文件**一趟 IO 都不付**，缺尾部也不补。曾经在这里补过一次让旧备份自愈，
+    /// 撤掉了：未变文件本来不读盘，为这一项去读就是凭空多出来的随机读（NAS 机械盘上
+    /// 50 万小文件接近一小时），而换来的加固边际价值极小。
+    /// 这条断言是**故意**的：谁要加回自愈，得先在这里解释那笔 IO 为什么值得。
+    /// </summary>
+    [Fact]
+    public async Task An_Unchanged_File_Costs_No_IO_Even_If_Its_Tail_Is_Missing()
+    {
+        Write("a.txt", "unchanged");
+        var previous = await SnapshotAsync();   // SnapshotAsync 不记 tail —— 正是老索引的样子
+        Assert.Null(previous.Entries.Single(e => e.Path == "a.txt").TailHash);
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
+
+        var c = Change(diff, "a.txt");
+        Assert.Equal(ChangeKind.Unchanged, c.Kind);
+        Assert.Null(c.TailHash);
+        Assert.Equal(0, counter.TailCalls);
+        Assert.Equal(0, counter.HeadCalls);
+        Assert.Equal(0, counter.FullCalls);
+        Assert.Equal(0, counter.IdentityCalls);
+    }
+
+    /// <summary>
     /// 长度没变、mtime 变了的大文件（全文可延后）：尾部对不上就该当场定案，**不读全文**。
     /// 这是最贵的一趟——100 GB 的文件就是 100 GB 的读——而"内容变了"在读完 4KB 尾巴时
     /// 已经成立。数据库文件、虚拟磁盘、被覆写的日志都是长度不变而尾部先动的典型。
@@ -149,7 +174,9 @@ public sealed class BackupDifferTests : IDisposable
             _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
 
         Assert.Equal(ChangeKind.MetadataOnly, Change(diff, "big.bin").Kind);
-        Assert.Equal(1, counter.FullCalls);
+        // 一遍读——既然反正要读全文，三段一起拿到，尾部是顺路捡的。
+        Assert.Equal(1, counter.IdentityCalls);
+        Assert.Equal(0, counter.FullCalls);
     }
 
     /// <summary>
@@ -302,8 +329,10 @@ public sealed class BackupDifferTests : IDisposable
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
-        Assert.Equal(1, counter.HeadCalls);
-        Assert.Equal(1, counter.FullCalls);
+        Assert.Equal(1, counter.HeadCalls);   // 头先问，一样才往下走
+        // 头一样之后就得读全文才能分清"真变了"和"被 touch 了"——一遍读，三段一起拿到。
+        Assert.Equal(1, counter.IdentityCalls);
+        Assert.Equal(0, counter.FullCalls);
         Assert.Equal(previous.Entries.Single(e => e.Path == "a.txt").FullHash, c.FullHash);
         Assert.NotNull(c.CarriedStorage);            // 复用旧存储，不重传
         Assert.Equal(0, diff.ChangedFiles);          // 仅元数据不计入变更
@@ -378,7 +407,9 @@ public sealed class BackupDifferTests : IDisposable
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
-        Assert.Equal(1, counter.FullCalls);
+        // 延后只免掉"已确定变更"那一支的全文读；这一支要判的正是变没变，全文非读不可。
+        Assert.Equal(1, counter.IdentityCalls);
+        Assert.Equal(0, counter.FullCalls);
         Assert.NotNull(c.FullHash);
         Assert.NotNull(c.CarriedStorage);   // 沿用旧存储 = 一个字节都不重传
         Assert.Equal(0, diff.ChangedFiles);

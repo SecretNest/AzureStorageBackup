@@ -232,12 +232,16 @@ public sealed class PackMemberDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 打包成员的索引条目要带上尾部 hash——判据与单文件 blob 那条路一致（四项），
-    /// 不能两条路各有一套标准。而**未变**的文件也要补上：老索引里一项都没有，
-    /// 而未变文件永远走不到会重算 hash 的分支，不补就永远缺。补一次就自愈。
+    /// 新写的打包成员条目要带上尾部 hash——判据与单文件 blob 那条路一致（四项），
+    /// 不能两条路各有一套标准。
+    /// <para>
+    /// 但**未变文件不补**：它本来一趟 IO 都不付，专程去读就是凭空多出来的随机读
+    /// （NAS 机械盘上 50 万小文件接近一小时），换来的加固边际价值极小。老条目因此保持缺失，
+    /// 去重那边按"缺失即不参与判定"处理。
+    /// </para>
     /// </summary>
     [SkippableFact]
-    public async Task Packed_Members_Carry_A_Tail_Hash_And_Missing_Ones_Heal()
+    public async Task New_Packed_Members_Carry_A_Tail_But_Unchanged_Ones_Are_Not_Backfilled()
     {
         Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
 
@@ -259,21 +263,17 @@ public sealed class PackMemberDedupTests : IDisposable
             Assert.Equal("pack", packed.Storage!.Kind);
             Assert.NotNull(packed.TailHash);   // 新写的条目就该有
 
-            // 把它抹掉，做出"老索引"的样子，再跑一轮——文件一个字节都没动（未变路径）。
-            await store.WriteIndexAsync(account, name, v1.Version, new VersionIndex
-            {
-                Version = v1.Version,
-                EmptyDirs = v1.EmptyDirs,
-                Entries = [.. v1.Entries.Select(e => e with { TailHash = null })],
-            }, null);
-
+            // 文件被改动后，新条目照样带着它。
+            Write("docs/a.txt", new string('b', 400));
             await backup.RunAsync(Request(account, name));
-
             var info2 = await store.ReadInfoAsync(account, name, null);
             var v2 = await store.ReadIndexAsync(account, name, info2!.Versions[^1].IndexBlob, null);
-            var healed = v2.Entries.Single(e => e.Path == "docs/a.txt");
-            Assert.NotNull(healed.TailHash);   // 未变文件也补上了
-            Assert.Equal(packed.TailHash, healed.TailHash);
+            var changed = v2.Entries.Single(e => e.Path == "docs/a.txt");
+            Assert.NotNull(changed.TailHash);
+            Assert.NotEqual(packed.TailHash, changed.TailHash);   // 内容变了，尾部也该变
+
+            // 「未变文件不补尾部」在 BackupDifferTests 那一层测——这里隔着本地索引缓存，
+            // 改云端的索引 blob 影响不到下一轮读到的 previous。
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }

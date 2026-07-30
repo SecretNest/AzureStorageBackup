@@ -44,8 +44,9 @@ public sealed record FileChange(
     /// 这里也该是四项，不该两条路各有一套标准。
     /// </para>
     /// <para>
-    /// 未变文件也会补算（见 <c>UnchangedAsync</c>）：老索引里的打包成员条目全都缺这一项，
-    /// 不补就永远缺——未变文件本来一个字节都不读。补一次之后写进新索引，旧备份就此自愈。
+    /// **未变文件不补**：它本来一趟 IO 都不付，为这一项去读就是凭空多出来的随机读（NAS 的
+    /// 机械盘上 50 万小文件接近一小时），而换来的加固边际价值极小。老索引的打包成员因此会
+    /// 一直缺它，去重那边按"缺失即不参与判定"处理。
     /// </para>
     /// </summary>
     string? TailHash = null);
@@ -188,7 +189,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         if (entry.Kind == EntryKind.Symlink)
             return entry.Target == prev.Target
-                ? await UnchangedAsync(entry, prev, options, full, ct)
+                ? Unchanged(entry, prev)
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
         // length 不同 → 直接变更，无需 head 预筛。
@@ -197,7 +198,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         // length 同、mtime 与权限都同 → 未变，完全跳过哈希。
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
-            return await UnchangedAsync(entry, prev, options, full, ct);
+            return Unchanged(entry, prev);
 
         // length 同、mtime 或权限变 → 由便宜到昂贵地问：头 4KB → 尾 4KB → 全文。
         // 全文那一趟是这里唯一昂贵的动作（100 GB 的文件就是 100 GB 的读），而只要头或尾对不上，
@@ -223,13 +224,15 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // 头尾都一样：只有读全文才能分清"内容真变了"和"只是被 touch 了一下"。
             // 这一趟**不能**因为 deferFull 而省——省掉就只能一律当作变更，等于每次 touch
             // 都把文件重传一遍。
-            var fullHash = await hasher.FullHashAsync(full, ct);
-            return fullHash == prev.FullHash
-                ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage,
-                    // 这一条内容没变、不重传，head/full 刚算过，只补一个尾部：
-                    // 单独 seek 读 4KB，比为它把整个文件再读一遍便宜得多。
-                    TailHash: prev.TailHash ?? await hasher.TailHashAsync(full, options.HeadHashBytes, ct))
-                : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+            //
+            // 既然反正要读全文，就一遍拿全三段：尾部因此是顺路捡的，不额外付 IO。
+            // 缺尾部的老条目走到这一支时也就顺带补齐了——但这是免费的，不是专程去补。
+            var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+            return id.FullHash == prev.FullHash
+                ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, id.HeadHash, id.FullHash,
+                    prev.Storage, TailHash: id.TailHash)
+                : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, id.HeadHash, id.FullHash, null,
+                    TailHash: id.TailHash);
         }, entry, prev);
     }
 
@@ -298,33 +301,23 @@ public sealed class BackupDiffer(IFileHasher hasher)
     private static bool DeferrableFullHash(ScannedEntry entry, bool deferFull) => deferFull && entry.Length > 0;
 
     /// <summary>
-    /// 这一条完全没变。照理不该碰盘，但**缺尾部 hash 时补算一次**：老索引里的打包成员条目
-    /// 一项都没有（那时只有单文件 blob 存 tail），而未变文件永远走不到会重算 hash 的分支，
-    /// 不补就永远缺。补一次写进新索引，旧备份就此自愈，此后再不会读。
+    /// 这一条完全没变——**一个字节都不读**，全部沿用上一版本的条目。
     /// <para>
-    /// 代价是首次跑新版本时，每个缺这一项的未变文件各读 4KB。之后为零。
-    /// 读不开就算了——未变文件的 tail 是锦上添花，不值得为它把一条好端端的条目判成读不开。
+    /// 曾经在这里给缺尾部 hash 的老条目补算过一次，让旧备份自愈。撤掉了：未变文件本来一趟 IO
+    /// 都不付，补它就是凭空多出来的随机读——实测 SSD 上 0.033 ms/文件，而 NAS 的机械盘上一次
+    /// 随机 IO 是 5–10 ms，50 万个小文件就是接近一小时。换来的只是把打包成员的去重判据从三项
+    /// 补到四项，而真正的防线一直是 fullHash（xxh128 覆盖全文），那 4KB 的边际价值极小。
+    /// 这笔账不划算。
+    /// </para>
+    /// <para>
+    /// 于是老索引的打包成员会一直缺这一项，去重那边按"缺失即不参与判定"处理（见
+    /// <see cref="LocalDedupResolver.TryFindPackMember"/>）。新写的条目都带着它，
+    /// 文件一旦被改动就自然补齐。
     /// </para>
     /// </summary>
-    private async Task<FileChange> UnchangedAsync(
-        ScannedEntry entry, IndexEntry prev, DiffOptions options, string full, CancellationToken ct)
-    {
-        var tail = prev.TailHash;
-        if (tail is null && entry.Kind == EntryKind.File && entry.Length > 0)
-        {
-            try
-            {
-                tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // 补不上就维持缺失。去重那边按"缺失即不参与判定"处理，不会因此误判。
-            }
-        }
-        return new FileChange(
-            entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage,
-            TailHash: tail);
-    }
+    private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>
+        new(entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage,
+            TailHash: prev.TailHash);
 
     /// <summary>
     /// 已确定变更的这一条要算哪些 hash。

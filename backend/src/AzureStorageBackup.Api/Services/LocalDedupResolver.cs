@@ -96,11 +96,15 @@ public sealed class LocalDedupResolver
                 if (e.Storage is { Kind: "pack" } p)
                 {
                     if (e.HeadHash is not null)
-                        // TryAdd：多个保留版本可能各有一条同内容成员，取最先遇到的（版本从旧到新传入）。
-                        // 偏向老 pack 是有意的：引用聚到老包上，它就更不容易在死重压实里被重写。
+                    {
+                        // 多个保留版本可能各有一条同内容成员。**指向**取最先遇到的（版本从旧到新
+                        // 传入）：引用聚到老包上，它就更不容易在死重压实里被重写。
+                        // 取最先遇到的（版本从旧到新传入）：引用聚到老包上，它就更不容易在
+                        // 死重压实里被重写。同内容的更新版本条目指向的是同一份内容，谁都行。
                         packMembers.TryAdd(
                             PackMemberKey(e.FullHash, e.Length, e.HeadHash),
                             new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));
+                    }
                     continue;
                 }
 
@@ -126,21 +130,17 @@ public sealed class LocalDedupResolver
     /// 还原时出来错误数据。
     /// </para>
     /// <para>
-    /// 尾部 hash 按「缺失即不参与判定」处理（与 <see cref="BlobAddressScheme.MetadataMatches"/>
-    /// 同一约定）：老索引里的打包成员条目一项都没有，要求它必须存在等于把存量小文件全部排除在
-    /// 去重之外。diff 现在会给未变文件补算并写进新索引（见 <c>BackupDiffer.UnchangedAsync</c>），
-    /// 所以旧备份跑一轮就补齐了，此后自然走满四项。
+    /// 四项**严格**相等，缺失也算不等。曾经放宽成"两边都有才比"，为的是让老索引里那些没有尾部
+    /// 的打包成员也能参与去重；那个放宽已经撤掉——判据要么是四项要么不是，为兼容开个口子，
+    /// 等于在最不该含糊的地方（"这份内容是不是同一份"）留了一档说不清的语义。
+    /// 新写的条目都带着尾部，老条目不参与去重而已，代价只是它们那份内容会被再存一次。
     /// </para>
     /// </summary>
-    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash)
-    {
-        if (_packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash)) is not { } member)
-            return null;
-        // 两边都有才比。任一侧缺失时退回三项——那是补齐之前的过渡态，不是放弃判定。
-        return tailHash is not null && member.TailHash is not null && member.TailHash != tailHash
-            ? null
-            : member;
-    }
+    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
+        _packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash)) is { } member
+        && member.TailHash == tailHash
+            ? member
+            : null;
 
     private static string PackMemberKey(string fullHash, long length, string head) =>
         $"{fullHash}\n{length}\n{head}";
