@@ -270,7 +270,7 @@ public sealed class BackupChecker(
 
         if (options.Cloud >= CloudCheckLevel.Content)
         {
-            var corrupted = await DeepVerifyAsync(cc, presentGroups, options, password, downloadConcurrency, onProgress, ct);
+            var corrupted = await DeepVerifyAsync(cc, info, presentGroups, options, password, downloadConcurrency, onProgress, ct);
             foreach (var p in corrupted)
                 bad.Add(p);
         }
@@ -285,8 +285,10 @@ public sealed class BackupChecker(
 
     /// <summary>深度校验：并发下载解压、重算 fullHash 与索引比对。仅内容不符计入损坏；
     /// Archive 未活化（下载报 archived）不计损坏（无法验证，跳过）。</summary>
+    /// <param name="info">只为算出每个对象要拉多少字节（pack 的卷尺寸记在信息文件里，
+    /// 不在条目上——压实会改写它）。界面据此显示"传了多少 / 一共多大"。</param>
     private async Task<IReadOnlyList<string>> DeepVerifyAsync(
-        BlobContainerClient cc, List<IGrouping<string, IndexEntry>> presentGroups,
+        BlobContainerClient cc, BackupInfoFile info, List<IGrouping<string, IndexEntry>> presentGroups,
         CheckOptions options, string? password, int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         if (compressor is null || hasher is null || string.IsNullOrEmpty(tempRoot))
@@ -301,7 +303,7 @@ public sealed class BackupChecker(
         {
             var perGroup = await Task.WhenAll(presentGroups.Select(async g =>
             {
-                try { return await VerifyGroupAsync(cc, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
+                try { return await VerifyGroupAsync(cc, info, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
                 finally
                 {
                     tracker?.Advance(0); // 计数与在途分开：一个组恰好占一个槽位
@@ -317,7 +319,7 @@ public sealed class BackupChecker(
     }
 
     private async Task<IReadOnlyList<string>> VerifyGroupAsync(
-        BlobContainerClient cc, string work, string blobName, List<IndexEntry> members,
+        BlobContainerClient cc, BackupInfoFile info, string work, string blobName, List<IndexEntry> members,
         CheckOptions options, string? password, SemaphoreSlim gate, StageTracker? tracker, CancellationToken ct)
     {
         var corrupted = new List<string>();
@@ -326,7 +328,11 @@ public sealed class BackupChecker(
         await gate.WaitAsync(ct);
         // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
         // await，若在那之前标记，几千个包会一股脑全算"正在校验"（见 RestoreOrchestrator 同处注释）。
-        tracker?.BeginItem(blobName);
+        // 名字用**源文件路径**（pack 用包号+成员数），不是内容寻址的 blob 名——与上传/还原侧同一形状。
+        tracker?.BeginItem(
+            blobName,
+            TransferLabel.For(members[0].Storage!, members),
+            TransferLabel.DownloadBytesOf(members[0].Storage!, info));
         try
         {
             // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——

@@ -284,14 +284,19 @@ public sealed class RestoreOrchestrator(
             // 百分比会一路虚高然后卡在 100% 上不动，比不显示更糟。
             var groupWork = groups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
             var downloadSizes = groups.ToDictionary(
-                g => g.Key, g => DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
+                g => g.Key, g => TransferLabel.DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
             var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
             foreach (var g in groups)
                 tracker?.Enqueue(groupWork[g.Key], downloadTotalKnown ? downloadSizes[g.Key] : 0);
 
             var tasks = groups.Select(async g =>
             {
-                try { return await RestoreGroupAsync(container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker, ct); }
+                try
+                {
+                    return await RestoreGroupAsync(
+                        container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker,
+                        downloadSizes[g.Key], ct);
+                }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
@@ -330,7 +335,7 @@ public sealed class RestoreOrchestrator(
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
         BlobContainerClient container, RestoreRequest request, string? realRoot, string work,
         List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
-        IProgress<string>? phase, StageTracker? tracker, CancellationToken ct)
+        IProgress<string>? phase, StageTracker? tracker, long downloadBytes, CancellationToken ct)
     {
         var skipped = 0;
         var failedEntries = 0;
@@ -369,7 +374,9 @@ public sealed class RestoreOrchestrator(
         // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
         // await，若在那之前标记，几千个包会一股脑全算"正在还原"——既与事实不符
         // （同时只跑 DownloadConcurrency 个），每次快照还要复制一份几千项的数组。
-        tracker?.BeginItem(blobName);
+        // 名字用**源文件路径**（pack 用包号+成员数），不是内容寻址的 blob 名——与上传侧同一形状。
+        // 用 needed 而不是 group：跳过的那些（本地已是相同内容）本来就不在这次传输里。
+        tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
         try
         {
             // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
@@ -402,7 +409,7 @@ public sealed class RestoreOrchestrator(
                     await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
                     rehydrated.Add(blobName);
                     // 活化完成、真正要下载了才重新打开窗口——与最初 BeginItem 同一节奏。
-                    tracker?.BeginItem(blobName);
+                    tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
                     firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
                 }
             }
@@ -835,19 +842,7 @@ public sealed class RestoreOrchestrator(
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
 
-    /// <summary>
-    /// 这个存储对象要拉下来多少字节（压缩后，含全部分卷）。索引在备份时就把各卷尺寸记下来了，
-    /// 所以不必先去问云端。
-    /// <para>
-    /// pack 的卷尺寸记在信息文件里而不是条目里——死重压实会重写整个包、改变卷数与尺寸，
-    /// 记在条目上就会随着每次压实全部过期（<c>StorageRef.VolumeSizes</c> 上有同样的说明）。
-    /// </para>
-    /// <para>0 = 问不出来（老索引没有这一项）。调用方据此决定整体报不报总量。</para>
-    /// </summary>
-    private static long DownloadBytesOf(StorageRef s, BackupInfoFile info) =>
-        s.Kind == "pack"
-            ? info.Packs.TryGetValue(s.Ref, out var pack) ? pack.VolumeSizes.Sum() : 0
-            : s.VolumeSizes.Sum();
+
 
     /// <summary>确保某归档（含全部分卷）已从 Archive 活化为可下载：对未活化的发起活化，轮询到全部就绪。</summary>
     private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>
