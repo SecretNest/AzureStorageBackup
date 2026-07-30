@@ -1213,7 +1213,14 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   //
   // 所以标明那个百分比是 diff 的，再并上上传**已完成的绝对量**——没有可靠分母时，绝对量比一个
   // 会回落的假百分比诚实。
-  const singlePercent = details[0]?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
+  // 完成度按**源端字节**算，不按件数。上传阶段件数百分比几乎没有意义：一件活可能是一个 6.8 GB
+  // 的单文件，也可能是一箱几百个 5 KB 的小文件，按件数等于把它们当成一样重——实测件数报 75% 时
+  // 源字节才 31%，顶行一路虚高，最后几件大的再把它按在 99% 上很久。"还剩多少件"由明细行那个
+  // 分数（2,003 / 2,661 objects）直说，比折成百分比清楚。
+  // 拿不到时（扫描/差分不申报字节工作量，上传阶段 diff 判完前分母还在长）才退回件数。
+  const singlePercent =
+    (details[0]?.workPercent ?? details[0]?.percent) ??
+    (p.stage >= BackupStage.Uploading ? p.percent : null)
   const headline =
     diffing && uploading
       ? [
@@ -1280,9 +1287,13 @@ const STAGE_UNITS: Record<string, string> = {
 
 function StageDetail({ detail }: { detail: StageProgress }) {
   const unit = STAGE_UNITS[detail.stage] ?? 'items'
+  // 用 "of" 而不是 "/"：斜杠是分数记号，摆在那儿就是在邀人约一个百分比出来，而件数百分比在
+  // 上传阶段恰恰没什么意义（一件可能是 6.8 GB 的单文件，也可能是一箱几百个 5 KB 的小文件）。
+  // 真正的完成度按字节算，在下一行那个 "60.6 GB / 191.0 GB original (31%)" 上——那里用斜杠，
+  // 因为它的百分比就跟在后面，约得出来也约得对。
   const counts =
     detail.total > 0
-      ? `${detail.processed.toLocaleString()} / ${detail.total.toLocaleString()} ${unit}`
+      ? `${detail.processed.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // 扫描时总数未知——它正是扫描要算出来的
   // 在途分解。光一个"处理了 N 件"看不出是在干活还是卡住了：备份的上传阶段里，一件活要先过
   // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是；
@@ -1355,8 +1366,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           // 措辞用 original / compressed 这一对，跟压缩工具里 Original Size / Compressed Size
           // 的惯例一致。原先叫 "uploaded" 是错的：它让人以为这是传上去的量，而这两个数说的是
           // **原始文件有多大**——压不动的内容两个数几乎相等，那个词就把口径彻底藏起来了。
+          //
+          // 完成度百分比就跟在这个分数后面——它算的正是这两个数，摆在一起谁都不会认错。
+          // 从件数那行挪过来的：搁在 "2,003 of 2,661 objects" 旁边，读起来是那个分数的完成度，
+          // 而件数 75% 时字节可能才 31%。
           detail.workTotal > 0 &&
-            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} original`,
+            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} original${
+              detail.workPercent != null ? ` (${detail.workPercent}%)` : ''
+            }`,
           // 这一轮真正传出去的字节，后面跟上它占原始尺寸的比例。
           //
           // 措辞换了四轮，每一轮都指出同一件事——这个数的**口径**看不出来：
@@ -1435,11 +1452,12 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
         <span className="text-faint">{detail.stage}: </span>
         {counts}
-        {/* 完成度优先按**源端字节**算：一件活可能是一个 100 GB 的单文件，也可能是一箱几百个
-            5 KB 的小文件，按件数算等于把它们当成一样重——会先飞快冲到 90%，再在最后一件上
-            卡住半小时。总量还没定下来时 workPercent 为 null，退回件数百分比。 */}
-        {(detail.workPercent ?? detail.percent) != null &&
-          ` · ${detail.workPercent ?? detail.percent}%`}
+        {/* 按字节的完成度**不放这里**——它紧跟在 "2,003 of 2,661 objects" 后面，会被读成那个数
+            的完成度，而两者差得很远（实测件数 75% 时字节才 31%）。它挪去下一行，紧跟自己的那个
+            分数（"60.6 GB / 191.0 GB original (31%)"），谁的百分比一眼可见，也就不必再加口径标注。
+            这里只留件数百分比，且只在按字节算不出来时（扫描/差分不申报字节工作量）才出现——
+            那时它和旁边的分数本来就是同一个口径。 */}
+        {detail.workPercent == null && detail.percent != null && ` · ${detail.percent}%`}
         {inFlight && ` · ${inFlight}`}
         {speed}
         {eta}
