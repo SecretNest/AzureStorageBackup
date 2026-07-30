@@ -22,8 +22,10 @@ export function KeyringBanner({ onGoToAccounts }: { onGoToAccounts: () => void }
         <>
           {' '}
           Start with{' '}
+          {/* 点了会跳到 Settings——Accounts 现在是那一页最上面的一个区域，所以按钮得把
+              "在 Settings 里"说出来，否则点完会有一瞬"我点的是 Accounts 怎么到 Settings 了"。 */}
           <button type="button" className="btn-ghost" onClick={onGoToAccounts}>
-            Accounts
+            Accounts in Settings
           </button>
           {' '}({status.accountsPending} pending), then re-enter backup passwords
           ({status.backupConfigsPending} pending).

@@ -100,6 +100,7 @@ export function BackupConfigsPage() {
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
+  const [errorModal, setErrorModal] = useState<BackupConfig | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [browsing, setBrowsing] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
@@ -607,7 +608,11 @@ export function BackupConfigsPage() {
                 <td className="mono text-faint">{c.localRoot}</td>
                 <td>{c.hasPassword ? 'Yes' : 'No'}</td>
                 <td>
-                  <StatusBadge config={c} onReset={() => resetStatus(c)} />
+                  <StatusBadge
+                    config={c}
+                    onReset={() => resetStatus(c)}
+                    onShowError={() => setErrorModal(c)}
+                  />
                 </td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button
@@ -1123,6 +1128,7 @@ export function BackupConfigsPage() {
           }}
         />
       )}
+      {errorModal && <ErrorModal config={errorModal} onClose={() => setErrorModal(null)} />}
       {deleteModal && (
         <DeleteModal
           config={deleteModal}
@@ -1193,10 +1199,32 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 流水线化之后 Diffing 与 Uploading 会同时在跑，明细因此可能有两条。老后端只发 detail，
   // 所以两边都要认。
   const details = p.details?.length ? p.details : p.detail ? [p.detail] : []
-  // 顶行的百分比要跟着**当前阶段**走。run.percent 衡量的是上传项的完成比例，在扫描/差分阶段
-  // 恒为 0——照搬它就会出现顶上写着 0%、下面细节写着 3% 的自相矛盾。
-  // 两条并行时以第一条（Diffing）为准：它才是决定整轮还要多久的那条。
-  const percent = details[0]?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
+  const diffing = details.find((d) => d.stage === 'Diffing')
+  const uploading = details.find((d) => d.stage === 'Uploading')
+
+  // 顶行的进度。单条阶段用它自己的百分比：run.percent 衡量的是上传项完成比例，在扫描/差分阶段
+  // 恒为 0——照搬会出现顶上写 0%、下面细节写 3% 的自相矛盾。
+  //
+  // 两条并行时**不能只给一个数**。百分比只有 Diffing 拿得出（它的分母是扫描到的条目数，一开始
+  // 就定了）；上传的分母还随 diff 边判边入队在涨，给不出可靠的百分比。原先顶行直接摆 Diffing
+  // 那个数，理由写的是"它才是决定整轮还要多久的那条"——而这恰恰在最要紧的时候反过来：diff 判得
+  // 比压缩上传快几个数量级，被有界队列挡住（waiting for upload to catch up）之后它就停在原地，
+  // 而上传其实一直在推进，顶行却看着像卡死了。
+  //
+  // 所以标明那个百分比是 diff 的，再并上上传**已完成的绝对量**——没有可靠分母时，绝对量比一个
+  // 会回落的假百分比诚实。
+  const singlePercent = details[0]?.percent ?? (p.stage >= BackupStage.Uploading ? p.percent : null)
+  const headline =
+    diffing && uploading
+      ? [
+          diffing.percent != null && `${diffing.percent}% diffed`,
+          uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : singlePercent != null
+        ? `${singlePercent}%`
+        : ''
   // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
   const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
 
@@ -1208,7 +1236,7 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   return (
     <div className="text-faint">
       {label}
-      {percent != null && ` ${percent}%`}
+      {headline && ` ${headline}`}
       {changed}
       <StopButton onStop={onStop} />
       {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
@@ -1371,6 +1399,13 @@ function StageDetail({ detail }: { detail: StageProgress }) {
       )}
       {/* 在途的每一条各占一行，带上尺寸与进度。从前这里挤的是内容寻址的 blob 名
           （加密时还是 HMAC），既看不出在传哪个文件，也看不出传了多少。 */}
+      {/* 标题里点明"并发的传输流"：同时列出 2-3 个文件名会让人以为在并发压缩，
+          而压缩是全局串行的（一把锁，就是上面那个 N preparing），并发的是上传/下载。 */}
+      {detail.activeItems.length > 0 && (
+        <div className="text-faint">
+          {detail.activeItems.length} parallel {inFlightVerb}:
+        </div>
+      )}
       {detail.activeItems.slice(0, 3).map((a) => (
         <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
           {a.label}
@@ -1405,16 +1440,21 @@ function StageDetail({ detail }: { detail: StageProgress }) {
 }
 
 // 状态徽标（§4.2 决策 2）：进行中（蓝，派生 activity）优先于持久 Error（红，tooltip + Reset）；否则不显示。
-function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () => void }) {
+function StatusBadge({
+  config, onReset, onShowError,
+}: { config: BackupConfig; onReset: () => void; onShowError: () => void }) {
   if (config.activity !== 'Idle') {
     return <span className="badge badge-info">{config.activity}</span>
   }
   if (config.status === BackupStatus.Error) {
     return (
       <span className="row-inline">
-        <span title={config.lastError ?? 'Unknown error'} className="badge badge-danger">
+        {/* 徽章可点开看正文。从前错误只塞在 title（tooltip）里：那一大坨 Azure 异常在 tooltip
+            里根本读不了，而且没人想到去悬停——刷新界面之后就"只能在日志里找错误"了。
+            正文一直是持久化的（BackupConfig.LastError），缺的只是给它一个能读的地方。 */}
+        <button type="button" className="badge badge-danger" onClick={onShowError}>
           Error
-        </span>
+        </button>
         <button type="button" className="btn-ghost" onClick={onReset}>
           Reset
         </button>
@@ -1422,6 +1462,52 @@ function StatusBadge({ config, onReset }: { config: BackupConfig; onReset: () =>
     )
   }
   return <span className="text-faint">—</span>
+}
+
+/// 备份最近一次失败的完整正文。Azure 的异常又长又带 XML，必须给足空间、可滚动、可复制。
+function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => void }) {
+  const [copied, setCopied] = useState(false)
+  const text = config.lastError ?? 'No error detail was recorded.'
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+    } catch {
+      // 剪贴板被浏览器策略挡住（非 https、无权限）——正文就在下面，用户还能自己选中复制。
+    }
+  }
+
+  return (
+    <div className={overlayStyle} onClick={onClose}>
+      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ marginTop: 0 }}>Last error — {config.name}</h3>
+        {config.lastErrorAt && (
+          <p className="text-faint" style={{ marginTop: 0 }}>
+            {new Date(config.lastErrorAt).toLocaleString()}
+          </p>
+        )}
+        <pre
+          className="mono"
+          style={{
+            maxHeight: '50vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+            background: 'var(--bg-raised)', border: '1px solid var(--border)',
+            borderRadius: 'var(--r-md)', padding: 'var(--sp-3)', margin: 0,
+          }}
+        >
+          {text}
+        </pre>
+        <div className="row" style={{ marginTop: '1rem' }}>
+          <button type="button" onClick={copy}>
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+          <button type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // 与 RunStatus 同形的三态展示；RepairRun 没有 version/progress 字段（见 api/backupConfigs.ts），故没有对应显示。

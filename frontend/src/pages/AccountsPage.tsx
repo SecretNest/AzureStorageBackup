@@ -27,7 +27,10 @@ const emptyForm: AccountInput = {
   proxyPassword: '',
 }
 
-export function AccountsPage() {
+/// Accounts 现在是 Settings 里的一个区域（<see cref="SettingsPage"/>），不再是独立页面：
+/// 账户是"配一次就不再碰"的东西，常驻一个顶级导航项名不副实。展开某个账户看 container 时
+/// 仍然整片替换成 ContainersPage——那是一段有返回的下钻，嵌在区域里照旧成立。
+export function AccountsSection() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [editing, setEditing] = useState<Account | null>(null)
   const [form, setForm] = useState<AccountInput>(emptyForm)
@@ -163,7 +166,7 @@ export function AccountsPage() {
   return (
     <section>
       <div className="page-header">
-        <h1>Accounts</h1>
+        <h2 style={{ margin: 0 }}>Accounts</h2>
         <button type="button" className="btn-primary" onClick={startNew}>
           New Account
         </button>

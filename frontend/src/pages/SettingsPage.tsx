@@ -2,11 +2,28 @@ import { useEffect, useState } from 'react'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
 import { Field } from '../components/modal'
+import { AccountsSection } from './AccountsPage'
 import { NotificationsSection } from './NotificationsPage'
 
 const MB = 1024 * 1024
 
+/// Settings 是几个区域的外壳。Accounts 排在**最前面**并且**不等全局设置加载完**：
+/// 没有配过账户时用户会被直接带到这一页（见 App.tsx 里挑默认标签那段），第一眼就该看到它——
+/// 让它排在下面、或者压在 "Loading…" 后面，挡住的恰恰是新用户唯一能做的那件事。
 export function SettingsPage() {
+  return (
+    <section>
+      <div className="page-header">
+        <h1>Settings</h1>
+      </div>
+      <AccountsSection />
+      <BackupDefaults />
+      <NotificationsSection />
+    </section>
+  )
+}
+
+function BackupDefaults() {
   const [s, setS] = useState<GlobalSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -15,7 +32,7 @@ export function SettingsPage() {
     settingsApi.get().then(setS).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  if (!s) return <section><h1>Settings</h1><p>Loading…</p></section>
+  if (!s) return <><h2 style={{ marginTop: '2rem' }}>Backup defaults</h2><p>Loading…</p></>
 
   const set = <K extends keyof GlobalSettings>(k: K, v: GlobalSettings[K]) =>
     setS((cur) => (cur ? { ...cur, [k]: v } : cur))
@@ -32,10 +49,8 @@ export function SettingsPage() {
   }
 
   return (
-    <section>
-      <div className="page-header">
-        <h1>Settings</h1>
-      </div>
+    <>
+      <h2 style={{ marginTop: '2rem' }}>Backup defaults</h2>
       <p className="text-muted">Defaults for new backups, and for any existing backup field set to Use default.</p>
       {error && <p className="text-danger">{error}</p>}
 
@@ -150,9 +165,7 @@ export function SettingsPage() {
         <button type="button" className="btn-primary" onClick={save}>Save</button>
         {saved && <span className="text-ok">Saved.</span>}
       </div>
-
-      <NotificationsSection />
-    </section>
+    </>
   )
 }
 
