@@ -1344,7 +1344,11 @@ function StageDetail({ detail }: { detail: StageProgress }) {
                 ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}%)`
                 : ''
             }`,
-          detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
+          // "ready to upload" 而不是 "staged"：后者是内部术语（暂存区），对着屏幕的人没理由知道，
+          // 而且同一行里还有个 "N preparing"——那个是**正在压**的件数，这个是**已经压完**、
+          // 躺在临时盘上等上传的字节，两者被混问过。
+          // 这个数还顺带说明压缩与网络谁跑在前面：它涨＝压缩快过上传，落＝上传追上来了。
+          detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} ready to upload`,
         ]
   )
     .filter(Boolean)
