@@ -105,13 +105,31 @@ public static class VolumeBlobIO
             return;
         }
 
-        var batch = scope?.MaxParallelPerItem ?? 1;
-        for (var start = 1; start < volumeFiles.Count; start += batch)
+        // 滑动窗口：完成一卷就补一卷。分批 Task.WhenAll 的话，一批里最慢的那一卷会让其余几条流
+        // 全程空转等它——卷与卷的耗时本来就不齐（重试、分块并行度、服务端限流各不相同），
+        // 界面上的表现是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
+        // 窗口宽度仍卡在 MaxParallelPerItem 上：不能把上千卷一次性全塞进全局闸门的等待队列，
+        // SemaphoreSlim 先到先得，那样后来的小活会被整段挡在队尾（见 VolumeUploadScope）。
+        var window = scope?.MaxParallelPerItem ?? 1;
+        var started = new List<Task>(volumeFiles.Count - 1);
+        var running = new List<Task>(window);
+        for (var i = 1; i < volumeFiles.Count; i++)
         {
-            var end = Math.Min(volumeFiles.Count, start + batch);
-            await Task.WhenAll(Enumerable.Range(start, end - start)
-                .Select(i => One(VolumeName(baseRef, i + 1), volumeFiles[i], i)));
+            if (running.Count >= window)
+            {
+                var done = await Task.WhenAny(running);
+                running.Remove(done);
+                // 有卷倒了就不再起新的。已经起飞的仍在下面等完——半路撒手会留下没人观察的
+                // 孤儿任务，它们还占着闸门额度和临时盘。异常本身留给 WhenAll 抛，与原先分批时
+                // 的语义一致：全部落定之后再抛，抛的是第一个。
+                if (done.IsFaulted || done.IsCanceled)
+                    break;
+            }
+            var one = One(VolumeName(baseRef, i + 1), volumeFiles[i], i);
+            started.Add(one);
+            running.Add(one);
         }
+        await Task.WhenAll(started);
         await One(VolumeName(baseRef, 1), volumeFiles[0], 0);
     }
 

@@ -222,6 +222,118 @@ public sealed class VolumeBlobIOTests
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>一卷挂住不动，其余卷照常放行；记下谁传完了。</summary>
+    private sealed class OneStuckVolume(string stuck, int expectOthers) : IBlobUploader
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _others = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _done;
+
+        public Task OthersFinished => _others.Task;
+        public void Release() => _release.TrySetResult();
+        public List<string> Order { get; } = [];
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            if (blobName == stuck)
+                await _release.Task.WaitAsync(ct);
+            lock (Order) Order.Add(blobName);
+            if (blobName != stuck && Interlocked.Increment(ref _done) >= expectOthers)
+                _others.TrySetResult();
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// 卷的并发额度是**滑动窗口**：完成一卷立刻补一卷，不等同批的其它卷。
+    /// <para>
+    /// 从前是一批一批来（<c>Task.WhenAll</c> 每 N 卷一个栅栏），一批里最慢的那一卷会让其余几条流
+    /// 全程空转等它。卷与卷的耗时本来就不齐——重试、分块并行度、服务端限流各不相同——所以界面上
+    /// 看到的是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
+    /// </para>
+    /// <para>
+    /// 这条测试专挑那个故障：窗口 3、共 10 卷，第二卷挂死不动。补位生效的话，剩下 8 卷照样能全部
+    /// 传完（慢卷只占住一个位子）；换回分批实现，第一批就整批卡在慢卷上，最多传完 2 卷，
+    /// 下面这个等待会超时。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_Slow_Volume_Does_Not_Stall_The_Others()
+    {
+        // .001 是最后单独传的提交标记，不进窗口；窗口里是 .002…010 共 9 卷，卡住的是 .002。
+        var up = new OneStuckVolume("data/h.002", expectOthers: 8);
+        using var gate = new SemaphoreSlim(3, 3);
+        var files = Enumerable.Range(1, 10).Select(i => $"/tmp/a.{i:D3}").ToList();
+
+        var upload = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3));
+
+        await up.OthersFinished.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(upload.IsCompleted, "慢卷还挂着，整件不该已经收工");
+
+        up.Release();
+        await upload.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("data/h.001", up.Order[^1]);   // 提交标记仍旧最后落地
+    }
+
+    /// <summary>某一卷倒了。</summary>
+    private sealed class FailingVolume(string bad) : IBlobUploader
+    {
+        public List<string> Order { get; } = [];
+        public int Finished;
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            await Task.Yield();
+            lock (Order) Order.Add(blobName);
+            if (blobName == bad)
+                throw new IOException("volume died");
+            Interlocked.Increment(ref Finished);
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// 有卷倒了时：**首卷绝不能写上去**。它是「整族齐全」的提交标记，残缺的归档挂上这个标记，
+    /// 存在性检查就会把它当成完整的（§7）。
+    /// <para>
+    /// 另一半同样要紧：抛出之前要把已经起飞的卷等完。半路撒手会留下没人观察的孤儿任务，
+    /// 它们还占着闸门额度、还在读临时盘上的卷文件——而上层收到异常后就要去释放暂存区了。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_Dead_Volume_Keeps_The_Commit_Marker_Off_And_Leaves_Nothing_Running()
+    {
+        var up = new FailingVolume("data/h.004");
+        using var gate = new SemaphoreSlim(3, 3);
+        var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
+
+        await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
+
+        Assert.DoesNotContain("data/h.001", up.Order);
+        // 闸门额度全数归还＝没有卷还攥在手里。抛出时仍在跑的话，这里会少。
+        Assert.Equal(3, gate.CurrentCount);
+    }
+
     [Theory]
     // 自身卷：基名、卷后缀（含 >3 位数）
     [InlineData("data/abc", "data/abc", true)]
