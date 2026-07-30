@@ -418,6 +418,9 @@ public sealed class BackupOrchestrator(
         var uploadTracker = new StageTracker(
             "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true,
             stagedBytes: () => stagingLease.Bytes);
+        // 「已传字节」走件级权威读数（RunState.UploadedBytes），不用按卷累加——它要和按件销账的
+        // 原始字节摆在一起读，口径必须一致。这一句在第一件活完成前就宣告接管，原委见 SetTransferred。
+        uploadTracker.SetTransferred(0);
 
         var totalItems = 0;
         var uploadedItems = 0;
@@ -428,6 +431,10 @@ public sealed class BackupOrchestrator(
             // 槽位计数归这里（它有"恰好一次"的既有约束）；tracker 只负责在途项与字节/测速。
             reporter.SetUploaded(Interlocked.Increment(ref uploadedItems));
             uploadTracker.Advance(0, work);
+            // 已传字节与工作量在**同一时刻、同一件活**上落账，界面上那个百分比才读得成话。
+            // 两条路径都在调到这里之前就 AddUploaded 过了（单文件在 return 前，一箱在
+            // UploadStagedPackAsync 里），所以这个快照已经含上刚完成的这一件。
+            uploadTracker.SetTransferred(state.UploadedBytes);
         }
 
         // 并发额度按**卷**发放，不按件（见 VolumeUploadScope）：一件活可能是一个大文件切出来的

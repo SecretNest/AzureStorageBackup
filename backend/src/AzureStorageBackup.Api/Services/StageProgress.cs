@@ -197,9 +197,11 @@ public sealed class StageTracker(
     // 剩余时间退回按件数外推。
     private long _totalWork;
     private long _doneWork;
-    // 已经彻底走完的那些流真正推上网线的字节（压缩后）。与 _bytes 的区别：那个边传边加、
-    // 含在途的部分，用来测速；这个只认走完的，用来回答"有多少已经稳稳落在云上"。
+    // 已经稳稳落在云上/盘上的字节（压缩后）。与 _bytes 的区别：那个边传边加、含在途的部分，
+    // 用来测速；这个只认走完的。上传侧由 SetTransferred 按**件**给出权威读数，下载侧按卷累加。
     private long _transferred;
+    // 上述权威读数是否已接管。见 SetTransferred。
+    private bool _transferredByItem;
     // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
     private long _transferTotal;
     // 正卡在下游上的调用方数量（差分侧被有界队列挡住时 >0）。
@@ -255,6 +257,32 @@ public sealed class StageTracker(
             _processed++;
             _bytes += bytes;
             _doneWork += work ?? bytes;
+            PublishIfDue(force: false);
+        }
+    }
+
+    /// <summary>
+    /// 「已传字节」改由调用方按**件**给出权威读数（绝对值，不是增量），此后 <see cref="EndItem"/>
+    /// 的按卷累加让位。调用一次即接管，之后每件活销账时刷新。
+    /// <para>
+    /// 上传侧非用它不可，因为这个数字要和<b>按件</b>销账的原始字节摆在一起读（界面上的
+    /// "X uploaded (N% of original)"）。按卷累加的话，一件大活边压边传的那几十分钟里分子一路涨、
+    /// 分母纹丝不动——它要等整件完成才跳——百分比于是结构性地冲过 100%（实测 112%，那件活
+    /// 完成后落回 99%）。文件越大差得越远，和压缩率毫无关系。
+    /// </para>
+    /// <para>
+    /// 顺带修掉两处按卷累加固有的偏差：重传的字节不再重复计（<see cref="DeltaProgress"/> 把回退
+    /// 按"重新开始"处理，对测速是对的，但云上还是那一份），去重命中也不再被当成传过
+    /// （if-missing 撞上已存在的 blob 时一个字节都没上网线）。件级读数天生没有这两个问题，
+    /// 而且与完工日志里那个"本次上传量"同源，界面和日志从此对得上。
+    /// </para>
+    /// </summary>
+    public void SetTransferred(long total)
+    {
+        lock (_gate)
+        {
+            _transferredByItem = true;
+            _transferred = total;
             PublishIfDue(force: false);
         }
     }
@@ -440,7 +468,10 @@ public sealed class StageTracker(
             {
                 // 这一条走完了：把它的字节从"在途"挪进"已传"。界面上那个"已传"要能回答
                 // "有多少已经**稳稳落在云上**"，所以在途的部分一律不算进去，走完才认。
-                _transferred += flow.Sent + bytes;
+                // 有件级权威读数时（SetTransferred）这里让位——**按卷**累加与按件销账的
+                // 工作量不同步，两个数字摆在一起就读不成话，原委见 SetTransferred。
+                if (!_transferredByItem)
+                    _transferred += flow.Sent + bytes;
                 if (speedWhileInFlight && _active.IsEmpty && _activeSince >= 0)
                 {
                     _activeMs += NowMs() - _activeSince;

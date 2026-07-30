@@ -167,6 +167,73 @@ public sealed class StageByteBreakdownTests
         Assert.False(seen[^1].WaitingOnDownstream);
     }
 
+    /// <summary>
+    /// 上传侧的「已传」按**件**记，不按卷——因为它要和按件销账的原始字节摆在一起读。
+    /// 一件大活分成许多卷，前几卷传完时那些字节**确实已经在云上**（按卷累加没有虚报），
+    /// 但原始字节要等整件完成才跳，于是分子按卷、分母按件，两个真实的数字凑不出能读的比值：
+    /// 界面上那个 "X uploaded (N% of original)" 会结构性地冲过 100%（实测 112%，那件活完成后
+    /// 落回 99%），文件越大差得越远，和压缩率毫无关系。
+    /// </summary>
+    [Fact]
+    public void Uploaded_Never_Runs_Ahead_Of_The_Original_Bytes_It_Is_Compared_With()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);   // 上传侧宣告：已传字节由件级读数接管
+
+        // 一件 10 GB 的活切成 4 卷，压缩后共 8 GB。前 3 卷传完了。
+        tracker.Enqueue(10_000);
+        foreach (var (vol, size) in new[] { ("d.001", 2_000L), ("d.002", 2_000L), ("d.003", 2_000L) })
+        {
+            tracker.BeginItem(vol, "photos/big.bin", size);
+            tracker.ItemProgress(vol).Report(size);
+            tracker.EndItem(vol, 0);
+        }
+        tracker.Complete();
+
+        // 那 6 GB 确实在云上了，但这件活还没销账（WorkDone 仍是 0）。此刻报出去就是
+        // 分子有、分母无——正是 112% 的来源。
+        Assert.Equal(0, seen[^1].WorkDone);
+        Assert.Equal(0, seen[^1].TransferredBytes);
+
+        // 末卷传完，整件销账：两个数字同一时刻落地，比值这才第一次有意义。
+        tracker.BeginItem("d.004", "photos/big.bin", 2_000);
+        tracker.ItemProgress("d.004").Report(2_000);
+        tracker.EndItem("d.004", 0);
+        tracker.Advance(0, 10_000);
+        tracker.SetTransferred(8_000);
+        tracker.Complete();
+
+        Assert.Equal(10_000, seen[^1].WorkDone);
+        Assert.Equal(8_000, seen[^1].TransferredBytes);
+        Assert.True(seen[^1].TransferredBytes <= seen[^1].WorkDone, "已传不该跑在它被拿来比的原始字节前面");
+    }
+
+    /// <summary>
+    /// 件级读数是**绝对值**，不是增量：它取自运行期那本"整件传完才记"的账
+    /// （<c>RunState.UploadedBytes</c>），与完工日志里那个"本次上传量"同源，界面和日志因此对得上。
+    /// 顺带免疫两处按卷累加固有的偏差——重传的字节（DeltaProgress 把回退按"重新开始"处理，
+    /// 对测速是对的，但云上还是那一份）和 if-missing 命中已存在 blob（一个字节都没上网线）。
+    /// </summary>
+    [Fact]
+    public void The_Item_Level_Reading_Overrides_Per_Volume_Accumulation()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        // 同一卷传到一半断了、重来一遍：网线上过了 1500 字节，云上只落了 1000。
+        tracker.BeginItem("d.001", "a.bin", 1000);
+        tracker.ItemProgress("d.001").Report(500);
+        tracker.ItemProgress("d.001").Report(1000);   // 累计回退＝重传，DeltaProgress 按重新开始处理
+        tracker.EndItem("d.001", 0);
+        tracker.Advance(0, 4000);
+        tracker.SetTransferred(1000);                 // 件级账只认真正落云的那一份
+        tracker.Complete();
+
+        Assert.Equal(1000, seen[^1].TransferredBytes);
+        // 测速那本账**照旧**含重传——那些字节确实又过了一遍网线，当下网速要的正是这个。
+        Assert.Equal(1500, seen[^1].Bytes);
+    }
+
     /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>
     [Fact]
     public void Stages_Without_A_Pool_Report_No_Staged_Bytes()
