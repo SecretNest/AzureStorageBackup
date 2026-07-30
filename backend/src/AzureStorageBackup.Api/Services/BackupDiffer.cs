@@ -35,7 +35,20 @@ public sealed record FileChange(
     string? FullHash,
     StorageRef? CarriedStorage,
     /// <summary>读失败原因（ex.Message）。仅 Kind == Unreadable 时非空。</summary>
-    string? UnreadableReason = null);
+    string? UnreadableReason = null,
+    /// <summary>
+    /// 尾部 hash。内容身份的第四项，与 fullHash + 长度 + head 一起用于去重与碰撞判定。
+    /// <para>
+    /// 单文件 blob 那条路上它由压缩那一遍顺手算出（见编排器的 tailByPath），所以这里主要是为
+    /// **打包成员**准备的——它们从前一项都没有，于是只能按三项去重。既然判据在别处是四项，
+    /// 这里也该是四项，不该两条路各有一套标准。
+    /// </para>
+    /// <para>
+    /// 未变文件也会补算（见 <c>UnchangedAsync</c>）：老索引里的打包成员条目全都缺这一项，
+    /// 不补就永远缺——未变文件本来一个字节都不读。补一次之后写进新索引，旧备份就此自愈。
+    /// </para>
+    /// </summary>
+    string? TailHash = null);
 
 public sealed record DiffOptions
 {
@@ -175,7 +188,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         if (entry.Kind == EntryKind.Symlink)
             return entry.Target == prev.Target
-                ? Unchanged(entry, prev)
+                ? await UnchangedAsync(entry, prev, options, full, ct)
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
         // length 不同 → 直接变更，无需 head 预筛。
@@ -184,7 +197,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         // length 同、mtime 与权限都同 → 未变，完全跳过哈希。
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
-            return Unchanged(entry, prev);
+            return await UnchangedAsync(entry, prev, options, full, ct);
 
         // length 同、mtime 或权限变 → 两级哈希。这里的 fullHash **不能**延后：它正是用来区分
         // "只是 mtime 被碰了一下"（MetadataOnly，不重传）和"内容真变了"（Modified）的唯一依据。
@@ -200,7 +213,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
             var fullHash = await hasher.FullHashAsync(full, ct);
             return fullHash == prev.FullHash
-                ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage)
+                ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage,
+                    TailHash: await TailAsync(entry, full, options, ct))
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
         }, entry, prev);
     }
@@ -217,7 +231,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
             var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
-            return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null);
+            var tail = await TailAsync(entry, full, options, ct);
+            return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null, TailHash: tail);
         }, entry, null);
     }
 
@@ -235,7 +250,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
             var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
-            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
+            var tail = await TailAsync(entry, full, options, ct);
+            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null, TailHash: tail);
         }, entry, prev);
     }
 
@@ -247,8 +263,44 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// </summary>
     private static bool DeferrableFullHash(ScannedEntry entry, bool deferFull) => deferFull && entry.Length > 0;
 
-    private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>
-        new(entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage);
+    /// <summary>
+    /// 这一条完全没变。照理不该碰盘，但**缺尾部 hash 时补算一次**：老索引里的打包成员条目
+    /// 一项都没有（那时只有单文件 blob 存 tail），而未变文件永远走不到会重算 hash 的分支，
+    /// 不补就永远缺。补一次写进新索引，旧备份就此自愈，此后再不会读。
+    /// <para>
+    /// 代价是首次跑新版本时，每个缺这一项的未变文件各读 4KB。之后为零。
+    /// 读不开就算了——未变文件的 tail 是锦上添花，不值得为它把一条好端端的条目判成读不开。
+    /// </para>
+    /// </summary>
+    private async Task<FileChange> UnchangedAsync(
+        ScannedEntry entry, IndexEntry prev, DiffOptions options, string full, CancellationToken ct)
+    {
+        var tail = prev.TailHash;
+        if (tail is null && entry.Kind == EntryKind.File && entry.Length > 0)
+        {
+            try
+            {
+                tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 补不上就维持缺失。去重那边按"缺失即不参与判定"处理，不会因此误判。
+            }
+        }
+        return new FileChange(
+            entry.Path, ChangeKind.Unchanged, entry, prev, prev.HeadHash, prev.FullHash, prev.Storage,
+            TailHash: tail);
+    }
+
+    /// <summary>
+    /// 尾部 hash。内容身份的第四项——单文件 blob 那条路由压缩那一遍算出来并覆盖此处的值，
+    /// 打包成员则只有这里能算。多读 4KB，而这个文件刚刚才被完整读过一遍算 fullHash，还热着。
+    /// </summary>
+    private async Task<string?> TailAsync(
+        ScannedEntry entry, string full, DiffOptions options, CancellationToken ct) =>
+        entry.Kind == EntryKind.File && entry.Length > 0
+            ? await hasher.TailHashAsync(full, options.HeadHashBytes, ct)
+            : null;
 
     /// <summary>
     /// 读失败（被占用/无权限/读到一半设备错误）不该终止整轮备份。

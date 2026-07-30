@@ -232,6 +232,53 @@ public sealed class PackMemberDedupTests : IDisposable
     }
 
     /// <summary>
+    /// 打包成员的索引条目要带上尾部 hash——判据与单文件 blob 那条路一致（四项），
+    /// 不能两条路各有一套标准。而**未变**的文件也要补上：老索引里一项都没有，
+    /// 而未变文件永远走不到会重算 hash 的分支，不补就永远缺。补一次就自愈。
+    /// </summary>
+    [SkippableFact]
+    public async Task Packed_Members_Carry_A_Tail_Hash_And_Missing_Ones_Heal()
+    {
+        Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
+
+        var (backup, _, store) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("packtail-");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await cc.CreateIfNotExistsAsync();
+
+        try
+        {
+            Write("docs/a.txt", new string('a', 400));
+            await backup.RunAsync(Request(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            var packed = v1.Entries.Single(e => e.Path == "docs/a.txt");
+            Assert.Equal("pack", packed.Storage!.Kind);
+            Assert.NotNull(packed.TailHash);   // 新写的条目就该有
+
+            // 把它抹掉，做出"老索引"的样子，再跑一轮——文件一个字节都没动（未变路径）。
+            await store.WriteIndexAsync(account, name, v1.Version, new VersionIndex
+            {
+                Version = v1.Version,
+                EmptyDirs = v1.EmptyDirs,
+                Entries = [.. v1.Entries.Select(e => e with { TailHash = null })],
+            }, null);
+
+            await backup.RunAsync(Request(account, name));
+
+            var info2 = await store.ReadInfoAsync(account, name, null);
+            var v2 = await store.ReadIndexAsync(account, name, info2!.Versions[^1].IndexBlob, null);
+            var healed = v2.Entries.Single(e => e.Path == "docs/a.txt");
+            Assert.NotNull(healed.TailHash);   // 未变文件也补上了
+            Assert.Equal(packed.TailHash, healed.TailHash);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
     /// 内容**不同**的文件绝不能被误判成同一个成员。这条守的是去重键本身：
     /// 三项（fullHash + 长度 + head）里任何一项不同就必须各存一份。
     /// </summary>

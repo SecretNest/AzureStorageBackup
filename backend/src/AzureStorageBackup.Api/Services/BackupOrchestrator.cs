@@ -561,7 +561,7 @@ public sealed class BackupOrchestrator(
             if (file is not null && klass.Category != FileCategory.SingleFile
                 && localResolver is not null
                 && file.FullHash is { } packHash && c.HeadHash is { } packHead
-                && localResolver.TryFindPackMember(packHash, file.Length, packHead) is { } priorMember)
+                && localResolver.TryFindPackMember(packHash, file.Length, packHead, c.TailHash) is { } priorMember)
             {
                 storageByPath[c.Path] = new StorageRef
                 {
@@ -1583,8 +1583,12 @@ public sealed class BackupOrchestrator(
                 Mtime = ov?.Mtime ?? c.Current.ModifiedAt,
                 Permissions = c.Current.Permissions,
                 HeadHash = ov?.HeadHash ?? c.HeadHash,
-                // 尾部 hash：本次上传的单文件 blob 用其算得值；未变/打包文件继承上一版本条目（打包成员为 null，不参与 blob 去重）。
-                TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.Previous?.TailHash,
+                // 尾部 hash 的优先级：本次上传的单文件 blob 用压缩那一遍算得的值（最权威——那是
+                // 真正压进归档的字节）；否则用 diff 算出来的；再否则继承上一版本条目。
+                // 中间这一档是新加的：打包成员从前一项都没有，于是只能按三项去重，与单文件 blob
+                // 那条路的四项判据不一致。diff 现在给未变文件也补算（见 BackupDiffer.UnchangedAsync），
+                // 所以老备份跑一轮就把这一项补齐了。
+                TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.TailHash ?? c.Previous?.TailHash,
                 FullHash = ov?.FullHash ?? c.FullHash,
                 Target = c.Current.Target,
                 // 零长度的普通文件一律不带存储引用——包括**从上一版本沿用来的**那些。

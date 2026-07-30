@@ -14,7 +14,7 @@ public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyLi
 /// 写到索引条目自己的 Path 上。
 /// </para>
 /// </summary>
-public sealed record PackMemberRef(string PackId, string EntryName);
+public sealed record PackMemberRef(string PackId, string EntryName, string? TailHash);
 
 /// <summary>
 /// 纯本地的单文件 blob 去重/碰撞解析（不读云端）。自建备份的本地缓存索引已含每个 blob 的
@@ -100,7 +100,7 @@ public sealed class LocalDedupResolver
                         // 偏向老 pack 是有意的：引用聚到老包上，它就更不容易在死重压实里被重写。
                         packMembers.TryAdd(
                             PackMemberKey(e.FullHash, e.Length, e.HeadHash),
-                            new PackMemberRef(p.Ref, p.EntryName ?? e.Path));
+                            new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));
                     continue;
                 }
 
@@ -121,19 +121,26 @@ public sealed class LocalDedupResolver
     /// <summary>
     /// 这份内容是不是已经在某个既有 pack 里。命中即可让新条目直接指过去——不压、不传、不装箱。
     /// <para>
-    /// 身份只用三项（fullHash + 长度 + head），比单文件 blob 那条路少一个尾部 hash：打包成员的
-    /// 索引条目里**从来没有** tail（<c>BuildEntries</c> 只给单文件 blob 填它），要求四项等于把
-    /// 存量小文件全部排除在去重之外，而那恰恰是收益所在。
+    /// 判据与单文件 blob 那条路**一致**：fullHash + 长度 + head + tail 四项全等。两条路各有一套
+    /// 标准是说不通的——同样是"这份内容已经有了"的判断，同样是判错就让索引指向别人的内容、
+    /// 还原时出来错误数据。
     /// </para>
     /// <para>
-    /// 三项对这条路是够的：fullHash 是整份内容的 xxh128（128 位），再叠长度与头 4KB 的 xxh128，
-    /// 而打包成员按定义都是小文件（超过单文件阈值的走 blob 那条路），head 覆盖的比例本就高。
-    /// 单文件 blob 之所以还要 tail，是因为那条路上可能是一个 100 GB 的文件，头尾各 4KB 覆盖率极低——
-    /// 两条路的取舍不同，不是这里漏了一项。
+    /// 尾部 hash 按「缺失即不参与判定」处理（与 <see cref="BlobAddressScheme.MetadataMatches"/>
+    /// 同一约定）：老索引里的打包成员条目一项都没有，要求它必须存在等于把存量小文件全部排除在
+    /// 去重之外。diff 现在会给未变文件补算并写进新索引（见 <c>BackupDiffer.UnchangedAsync</c>），
+    /// 所以旧备份跑一轮就补齐了，此后自然走满四项。
     /// </para>
     /// </summary>
-    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash) =>
-        _packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash));
+    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash)
+    {
+        if (_packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash)) is not { } member)
+            return null;
+        // 两边都有才比。任一侧缺失时退回三项——那是补齐之前的过渡态，不是放弃判定。
+        return tailHash is not null && member.TailHash is not null && member.TailHash != tailHash
+            ? null
+            : member;
+    }
 
     private static string PackMemberKey(string fullHash, long length, string head) =>
         $"{fullHash}\n{length}\n{head}";
