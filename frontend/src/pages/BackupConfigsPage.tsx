@@ -1346,7 +1346,10 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           detail.transferredBytes > 0 &&
             `${formatBytes(detail.transferredBytes)} uploaded${
               detail.workDone > 0
-                ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}%)`
+                // 括号里必须带上"of original"。光一个 (95%) 会被读成"上传进度 95%"——
+                // 而上一行**就有**一个真正的进度百分比，两个挨着，混读几乎是必然的。
+                // 重复一次 original 换来零歧义，值得。
+                ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}% of original)`
                 : ''
             }`,
           // "ready to upload" 而不是 "staged"：后者是内部术语（暂存区），对着屏幕的人没理由知道，
