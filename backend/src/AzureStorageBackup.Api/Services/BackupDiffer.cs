@@ -199,26 +199,62 @@ public sealed class BackupDiffer(IFileHasher hasher)
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
             return await UnchangedAsync(entry, prev, options, full, ct);
 
-        // length 同、mtime 或权限变 → 两级哈希。这里的 fullHash **不能**延后：它正是用来区分
-        // "只是 mtime 被碰了一下"（MetadataOnly，不重传）和"内容真变了"（Modified）的唯一依据。
-        // 省掉它就只能一律当作变更，等于每次 touch 都把文件重传一遍。
+        // length 同、mtime 或权限变 → 由便宜到昂贵地问：头 4KB → 尾 4KB → 全文。
+        // 全文那一趟是这里唯一昂贵的动作（100 GB 的文件就是 100 GB 的读），而只要头或尾对不上，
+        // "内容变了"就已经成立，那一趟根本不必付。
         return await TryReadAsync(async () =>
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
             if (head != prev.HeadHash)
+                return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, null, ct);
+
+            // 头一样，再问尾巴。只在**全文可以延后**时才问：那条路上的文件按定义超过单文件阈值
+            // （几 MB 到上百 GB），4KB 换掉的可能是整整一遍全文读，稳赚。
+            // 打包成员反过来——它们小，而且判成 Modified 之后 fullHash 仍要算了写进索引，
+            // 早退一步也省不下什么，白付一次 open + seek。
+            // prev.TailHash 为空是老索引的过渡态（见 UnchangedAsync 的补算），此时跳过这一问。
+            if (deferFull && prev.TailHash is not null)
             {
-                var changedFull = await hasher.FullHashAsync(full, ct);
-                return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, changedFull, null);
+                var tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);
+                if (tail != prev.TailHash)
+                    return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, tail, ct);
             }
 
+            // 头尾都一样：只有读全文才能分清"内容真变了"和"只是被 touch 了一下"。
+            // 这一趟**不能**因为 deferFull 而省——省掉就只能一律当作变更，等于每次 touch
+            // 都把文件重传一遍。
             var fullHash = await hasher.FullHashAsync(full, ct);
             return fullHash == prev.FullHash
                 ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage,
-                    // 这一条内容没变、不重传，head/full 刚在上面算过了，只补一个尾部：
+                    // 这一条内容没变、不重传，head/full 刚算过，只补一个尾部：
                     // 单独 seek 读 4KB，比为它把整个文件再读一遍便宜得多。
                     TailHash: prev.TailHash ?? await hasher.TailHashAsync(full, options.HeadHashBytes, ct))
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
         }, entry, prev);
+    }
+
+    /// <summary>
+    /// 头或尾已经证明内容变了，接下来只是把条目填完整。
+    /// <para>
+    /// 全文 hash 可延后时（单文件 blob）就**不算**——它由压缩那一遍顺手算出并覆盖，而"是不是
+    /// 变了"这个问题已经有答案了，不需要它来回答。这正是早退省下的那一趟：一个 100 GB 的文件
+    /// 头部或尾部动过，读 4KB 就定了案，从前要整整读一遍。
+    /// </para>
+    /// <para>
+    /// 不能延后时（打包成员）仍要算——索引条目需要它，下一轮 diff 也靠它比对。既然要读全文，
+    /// 就一遍读把三段一起拿到。
+    /// </para>
+    /// </summary>
+    private async Task<FileChange> DecidedChangedAsync(
+        ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, bool deferFull,
+        string head, string? tail, CancellationToken ct)
+    {
+        if (DeferrableFullHash(entry, deferFull))
+            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, null, null, TailHash: tail);
+
+        var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+        return new FileChange(
+            entry.Path, ChangeKind.Modified, entry, prev, id.HeadHash, id.FullHash, null, TailHash: id.TailHash);
     }
 
     private async Task<FileChange> AddedAsync(

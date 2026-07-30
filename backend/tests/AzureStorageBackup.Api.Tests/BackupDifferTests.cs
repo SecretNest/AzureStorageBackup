@@ -55,6 +55,20 @@ public sealed class BackupDifferTests : IDisposable
         return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = scan.EmptyDirs.ToList() };
     }
 
+    /// <summary>同 SnapshotAsync，但把尾部 hash 也记进条目——尾部早退要拿它当比对基准。</summary>
+    private async Task<VersionIndex> SnapshotWithTailAsync()
+    {
+        var snapshot = await SnapshotAsync();
+        var hasher = new FileHasher();
+        var withTail = new List<IndexEntry>(snapshot.Entries.Count);
+        foreach (var e in snapshot.Entries)
+            withTail.Add(e with
+            {
+                TailHash = await hasher.TailHashAsync(Path.Combine(_root, e.Path), 4096),
+            });
+        return snapshot with { Entries = withTail };
+    }
+
     private sealed class CountingHasher(IFileHasher inner) : IFileHasher
     {
         public int HeadCalls;
@@ -74,8 +88,13 @@ public sealed class BackupDifferTests : IDisposable
             return inner.HeadHashAsync(path, headBytes, ct);
         }
 
+        public int TailCalls;
+
         public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default)
-            => inner.TailHashAsync(path, tailBytes, ct);
+        {
+            Interlocked.Increment(ref TailCalls);
+            return inner.TailHashAsync(path, tailBytes, ct);
+        }
 
         public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
@@ -85,6 +104,75 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
+
+    /// <summary>
+    /// 长度没变、mtime 变了的大文件（全文可延后）：尾部对不上就该当场定案，**不读全文**。
+    /// 这是最贵的一趟——100 GB 的文件就是 100 GB 的读——而"内容变了"在读完 4KB 尾巴时
+    /// 已经成立。数据库文件、虚拟磁盘、被覆写的日志都是长度不变而尾部先动的典型。
+    /// </summary>
+    [Fact]
+    public async Task A_Differing_Tail_Settles_It_Without_Reading_The_Whole_File()
+    {
+        var path = Write("big.bin", new string('a', 8192) + "TAIL-ONE");
+        var previous = await SnapshotWithTailAsync();
+
+        // 等长改写，只动尾巴。mtime 也要推进，否则走的是"完全未变"那条路。
+        File.WriteAllText(path, new string('a', 8192) + "TAIL-TWO");
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+
+        var c = Change(diff, "big.bin");
+        Assert.Equal(ChangeKind.Modified, c.Kind);
+        Assert.Equal(0, counter.FullCalls);      // 要害：全文那一趟没付
+        Assert.Equal(0, counter.IdentityCalls);
+        Assert.Equal(1, counter.HeadCalls);
+        Assert.Equal(1, counter.TailCalls);
+    }
+
+    /// <summary>
+    /// 头尾都一样时仍必须读全文——那是分清"内容真变了"和"只是被 touch 了一下"的唯一依据。
+    /// 省掉它就只能一律当作变更，等于每次 touch 都把文件重传一遍。
+    /// </summary>
+    [Fact]
+    public async Task Matching_Head_And_Tail_Still_Costs_The_Full_Read()
+    {
+        var path = Write("big.bin", new string('a', 8192) + "SAME-TAIL");
+        var previous = await SnapshotWithTailAsync();
+
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1)); // 只碰 mtime
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+
+        Assert.Equal(ChangeKind.MetadataOnly, Change(diff, "big.bin").Kind);
+        Assert.Equal(1, counter.FullCalls);
+    }
+
+    /// <summary>
+    /// 打包成员不做尾部早退：它们小，而且判成 Modified 之后 fullHash 仍要算了写进索引——
+    /// 早退一步省不下什么，白付一次 open + seek。
+    /// </summary>
+    [Fact]
+    public async Task A_Packed_Member_Skips_The_Tail_Probe()
+    {
+        var path = Write("small.txt", "0123456789");
+        var previous = await SnapshotWithTailAsync();
+
+        File.WriteAllText(path, "0123456ABC"); // 等长、尾部不同
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
+
+        var counter = new CountingHasher(new FileHasher());
+        var diff = await new BackupDiffer(counter).DiffAsync(
+            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => false);
+
+        Assert.Equal(ChangeKind.Modified, Change(diff, "small.txt").Kind);
+        Assert.Equal(0, counter.TailCalls);     // 没有多问那一次
+        Assert.Equal(1, counter.IdentityCalls); // 一遍读拿全三段
+    }
 
     /// <summary>
     /// 一个确定变更的文件只读**一遍**。三段 hash 从前是分三次各开一次文件算的，而全文那一趟
