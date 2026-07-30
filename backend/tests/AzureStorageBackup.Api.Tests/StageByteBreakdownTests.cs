@@ -234,6 +234,90 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(1500, seen[^1].Bytes);
     }
 
+    /// <summary>
+    /// 按件记账把"传完的卷"挤出了 uploaded，但那些字节**确实已经在云上**，不能就此从界面上消失。
+    /// 它们落在单独一栏里，整件完成时并入 uploaded 并归零。
+    /// </summary>
+    [Fact]
+    public void Volumes_Already_On_The_Cloud_Are_Shown_While_Their_Item_Is_Unfinished()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        // 一件活切成两卷，压缩后共 8000。第一卷传完了。
+        tracker.BeginItem("d.001", "photos/big.bin", 5_000);
+        tracker.ItemProgress("d.001").Report(5_000);
+        tracker.EndItem("d.001", 0);
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].TransferredBytes);          // 件没完成，进不了这本账
+        Assert.Equal(5_000, seen[^1].UnfinishedItemBytes);   // 但它已经在云上了，得看得见
+
+        tracker.BeginItem("d.002", "photos/big.bin", 3_000);
+        tracker.ItemProgress("d.002").Report(3_000);
+        tracker.EndItem("d.002", 0);
+        tracker.Advance(0, 10_000);
+        tracker.SetTransferred(8_000);
+        tracker.Complete();
+
+        Assert.Equal(8_000, seen[^1].TransferredBytes);
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // 并入之后归零，界面上整段消失
+    }
+
+    /// <summary>
+    /// 多件同时在传时，一件完成**不能**把这一栏清零——那会连别的活已经传上去的卷一起抹掉。
+    /// 记的是笔总量守恒的账：卷传完就加，件销账时按 uploaded 的增量减，那个增量恰好是刚归档
+    /// 那件的全部卷，因此不必知道哪一卷属于哪一件。
+    /// </summary>
+    [Fact]
+    public void One_Item_Finishing_Does_Not_Wipe_Another_Items_Uploaded_Volumes()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        void Volume(string name, string label, long size)
+        {
+            tracker.BeginItem(name, label, size);
+            tracker.ItemProgress(name).Report(size);
+            tracker.EndItem(name, 0);
+        }
+
+        Volume("a.001", "a.bin", 500);    // A 的前半
+        Volume("b.001", "b.bin", 1_000);  // B 的前半（并发）
+        Volume("a.002", "a.bin", 500);    // A 齐了
+        tracker.Advance(0, 900);
+        tracker.SetTransferred(1_000);    // A 销账：1000 = A 的两卷
+        tracker.Complete();
+
+        Assert.Equal(1_000, seen[^1].TransferredBytes);
+        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);  // 剩下的正是 B 已传的那一卷，没被误伤
+
+        Volume("b.002", "b.bin", 1_000);
+        tracker.Advance(0, 2_500);
+        tracker.SetTransferred(3_000);
+        tracker.Complete();
+
+        Assert.Equal(3_000, seen[^1].TransferredBytes);
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);
+    }
+
+    /// <summary>
+    /// if-missing 撞上已存在的 blob 时一个字节都没上网线，件级账也不会计它——这一栏同样不能加，
+    /// 否则它永远减不回 0，界面上会挂着一笔根本不存在的"已上传"。中断重跑时这种命中成片发生。
+    /// </summary>
+    [Fact]
+    public void A_Skipped_Blob_Never_Enters_The_Unfinished_Column()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        tracker.BeginItem("d.001", "a.bin", 5_000);   // 申报了 5000，但一个字节也没传
+        tracker.EndItem("d.001", 0);
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);
+    }
+
     /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>
     [Fact]
     public void Stages_Without_A_Pool_Report_No_Staged_Bytes()

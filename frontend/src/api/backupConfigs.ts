@@ -165,12 +165,17 @@ export interface StageProgress {
   percent: number | null
   etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
   estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
-  // 字节明细。三段互不重叠：workRemaining（还没处理的源字节）、stagedBytes（已压好没送出去的）、
-  // transferredBytes（已经稳稳落在云上的）。workDone/workTotal 是压缩前口径，用于算真实完成度。
+  // 字节明细。各段互不重叠：workRemaining（还没处理的源字节）、stagedBytes（已压好没送出去的）、
+  // transferredBytes（已落云且整件已完成的）、unfinishedItemBytes（已落云但整件还没完成的）。
+  // workDone/workTotal 是压缩前口径，用于算真实完成度。
   workTotal: number // 源端字节总量（压缩前）。上传阶段在 diff 判完前还会往上长
   workDone: number // 其中已彻底完工的（不含在途）
   workRemaining: number
   transferredBytes: number // 已完工的项真正推上网线的字节（压缩后，不含在途）
+  // 已落云、但所属那件活还没完成的字节（压缩后）。一件大活切成许多卷，前几卷传完时那些字节
+  // 确实到了云上，可整件没完成，既进不了 transferredBytes（那本账按件记，才对得上按件销账的
+  // workDone），也已不在 stagedBytes 里（池子逐卷释放）。整件完成时并入前者并归零。
+  unfinishedItemBytes: number
   stagedBytes: number // 已压好、还没送出去的（压缩后）
   transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
   workPercent: number | null // 按源字节算的完成度；总量未定时为 null

@@ -1380,6 +1380,16 @@ function StageDetail({ detail }: { detail: StageProgress }) {
                 ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}% of original)`
                 : ''
             }`,
+          // 已经落在云上、但所属那件活还没完成的字节。左边那个 uploaded 按**件**记（才对得上
+          // 同样按件销账的原始字节），所以一件大活分卷上传的几十分钟里，传完的卷进不了那个数——
+          // 而它们确实已经在云上了，也早已不在 "ready to upload" 里（池子逐卷释放）。没有这一项，
+          // 这批字节就在界面上凭空消失，看着像什么都没发生。整件完成时并入左边，这里归零消失。
+          //
+          // 措辞：`+` 表示它是左边那个数之外的追加量；复用 "uploaded" 是因为口径确实相同
+          // （都是已落云的压缩后字节），换个词反而像是另一种东西；单位跟着上一行的 "objects"
+          // 走，不另起 "items"——同一屏里两个词指同一件事，读起来就得先猜它们是不是一回事。
+          detail.unfinishedItemBytes > 0 &&
+            `+${formatBytes(detail.unfinishedItemBytes)} uploaded in unfinished objects`,
           // "ready to upload" 而不是 "staged"：后者是内部术语（暂存区），对着屏幕的人没理由知道，
           // 而且同一行里还有个 "N preparing"——那个是**正在压**的件数，这个是**已经压完**、
           // 躺在临时盘上等上传的字节，两者被混问过。

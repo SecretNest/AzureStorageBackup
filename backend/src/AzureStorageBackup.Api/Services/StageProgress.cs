@@ -62,6 +62,15 @@ public sealed record StageProgress(
     /// 与 <see cref="Bytes"/> 的区别正在这里：那个是边传边加的，用于测速，含正在传的那部分。</summary>
     long TransferredBytes = 0,
     /// <summary>
+    /// 已经**稳稳落在云上、但所属的那件活还没销账**的字节（压缩后）。一件大活切成许多卷，
+    /// 前几卷传完时那些字节确实已经到了云上，可整件还没完成，于是既进不了
+    /// <see cref="TransferredBytes"/>（那本账按件记，才对得上按件销账的
+    /// <see cref="WorkDone"/>），也早已不在 <see cref="StagedBytes"/> 里（池子逐卷释放）。
+    /// 没有这一项，这批字节在界面上就凭空消失了，大文件上传的几十分钟里看着像什么都没发生。
+    /// <para>整件完成时它并入 TransferredBytes 并归零；0 = 没有这种半完成的活，界面上整段不显示。</para>
+    /// </summary>
+    long UnfinishedItemBytes = 0,
+    /// <summary>
     /// 待传池子里**还没送出去**的字节（压缩后）：池子里所有文件的总尺寸，减去在途那几条已经
     /// 传出去的那部分。压缩跑在上传前面时它会涨，上传跟上来就落回去——这个数把「压缩快还是
     /// 网络快」直接摆在脸上。
@@ -202,6 +211,9 @@ public sealed class StageTracker(
     private long _transferred;
     // 上述权威读数是否已接管。见 SetTransferred。
     private bool _transferredByItem;
+    // 已落云、但所属那件活还没销账的字节。卷传完时加，件销账时按 _transferred 的增量减——
+    // 那个增量恰好是刚归档那件的全部卷。多件并发也对：这是笔总量守恒的账，不认哪一卷属于哪一件。
+    private long _unfinishedItemBytes;
     // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
     private long _transferTotal;
     // 正卡在下游上的调用方数量（差分侧被有界队列挡住时 >0）。
@@ -282,6 +294,10 @@ public sealed class StageTracker(
         lock (_gate)
         {
             _transferredByItem = true;
+            // 刚归档那件的全部卷从"未销账"里划走：增量就是它的量，不必知道哪一卷属于哪一件。
+            // 夹到 0 是防守——重传/失败重压等情形下卷侧可能加得比件侧少，宁可这一栏早一步归零，
+            // 也不能让它显示成负数。
+            _unfinishedItemBytes = Math.Max(0, _unfinishedItemBytes - (total - _transferred));
             _transferred = total;
             PublishIfDue(force: false);
         }
@@ -470,7 +486,13 @@ public sealed class StageTracker(
                 // "有多少已经**稳稳落在云上**"，所以在途的部分一律不算进去，走完才认。
                 // 有件级权威读数时（SetTransferred）这里让位——**按卷**累加与按件销账的
                 // 工作量不同步，两个数字摆在一起就读不成话，原委见 SetTransferred。
-                if (!_transferredByItem)
+                // 让位不等于把这批字节丢掉：它们确实已经在云上了，先记进"所属活未销账"那一栏，
+                // 等整件完成时并入。记标称大小（Total）才能和件级账的增量精确抵消——Sent 含重传，
+                // 抵不平会留下正向漂移。Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的
+                // blob），件级账也不会计它，所以这里同样不加。
+                if (_transferredByItem)
+                    _unfinishedItemBytes += flow.Sent > 0 ? (flow.Total > 0 ? flow.Total : flow.Sent) : 0;
+                else
                     _transferred += flow.Sent + bytes;
                 if (speedWhileInFlight && _active.IsEmpty && _activeSince >= 0)
                 {
@@ -628,7 +650,7 @@ public sealed class StageTracker(
 
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
-            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, staged,
+            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, _unfinishedItemBytes, staged,
             Volatile.Read(ref _transferTotal), Volatile.Read(ref _blocked) > 0));
     }
 
