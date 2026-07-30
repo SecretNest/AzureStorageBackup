@@ -1329,17 +1329,22 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           // **原始文件有多大**——压不动的内容两个数几乎相等，那个词就把口径彻底藏起来了。
           detail.workTotal > 0 &&
             `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} original`,
-          // 这一轮压缩后真正传出去的字节，后面跟上它占源端的比例。
+          // 这一轮真正传出去的字节，后面跟上它占原始尺寸的比例。
           //
-          // 措辞被问了三轮，每一轮都指出同一件事——这个数的**口径**看不出来：
+          // 措辞换了四轮，每一轮都指出同一件事——这个数的**口径**看不出来：
           // · 叫 "stored" 被读成"云上一共存了多少"（它和整条明细一样只说本次运行）；
-          // · 与前面那个分数"有什么不同"同样看不出来，两个数都以 GB 结尾，口径却一个压缩前
-          //   一个压缩后，而压不动的内容（媒体、已压缩文件）两者几乎相等，光摆着像重复了一遍；
+          // · 与前面那个分数"有什么不同"同样看不出来，两个数都以 GB 结尾，口径却一个是原始尺寸
+          //   一个是实传，而压不动的内容（媒体、已压缩文件）两者几乎相等，光摆着像重复了一遍；
           // · 叫 "on the wire" 更糟——上面那句 "nothing on the wire right now" 正用着同一个词，
-          //   一处说没有、一处说 2 GB。
-          // 所以直接说"压缩后"，再把比例摆出来让关系自明：100% 附近＝压不动，20% ＝压得很好。
+          //   一处说没有、一处说 2 GB；
+          // · 叫 "compressed" 会自相矛盾：不压缩(store-only)又加了密时，7z 封装加 AES 让产物
+          //   **比原文件大**，小文件的归档头开销同样如此，于是出现 "compressed (105%)"。
+          //
+          // 落回 "uploaded"——分数改叫 original 之后这个词就空出来了，而它本来就是最准的：
+          // 传出去多少就是多少，不预设变大还是变小。超过 100% 照样读得通（上传了原始尺寸的
+          // 105%），而且那正是要告诉用户的事：这样配下来云上反而更占地方。
           detail.transferredBytes > 0 &&
-            `${formatBytes(detail.transferredBytes)} compressed${
+            `${formatBytes(detail.transferredBytes)} uploaded${
               detail.workDone > 0
                 ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}%)`
                 : ''
