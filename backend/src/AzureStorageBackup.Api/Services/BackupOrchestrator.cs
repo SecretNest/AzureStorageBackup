@@ -158,6 +158,22 @@ public sealed class BackupOrchestrator(
         private long _uploadedBytes;
         private readonly ConcurrentDictionary<string, TaskCompletionSource<ResolvedBlob>> _cloudUploads =
             new(StringComparer.Ordinal);
+        private readonly string _packTag = Guid.NewGuid().ToString("N")[..8];
+        private int _packSeq;
+
+        /// <summary>
+        /// 发一个新的 pack 号。必须**跨运行**唯一：pack 不像 data blob 那样内容寻址——名字里没有
+        /// 内容的影子，光靠"接着信息文件里的最大号往下发"在上一次运行失败时就会重号。那一次
+        /// 已经把 packs/p0001.7z 传上去了、却没能写成信息文件，于是下一次又从 p0001 发起，
+        /// 而这个同号包装的是**另一批成员**。上传走 if-missing，撞上同名就跳过，索引却声称它含
+        /// 这一次的成员——还原时从那个包里根本取不到，静默地少一批文件。Archive 数据层上更藏不住：
+        /// 跳过的理由从"已存在"变成 BlobArchived，同样是跳过。
+        /// <para>
+        /// 每轮一个随机前缀就够了。pack 号的唯一要求本来就只是"不重"，没有任何地方依赖它连续或
+        /// 有序：PackIdOf 只做前缀切分，死重压实按同名重写，索引里记的是全名。
+        /// </para>
+        /// </summary>
+        public string NextPackId() => $"p{_packTag}{Interlocked.Increment(ref _packSeq):D4}";
 
         /// <summary>本轮真正推上云的字节（压缩后）。去重命中走的是 early-return，根本到不了这里。</summary>
         public long UploadedBytes => Interlocked.Read(ref _uploadedBytes);
@@ -420,7 +436,7 @@ public sealed class BackupOrchestrator(
         using var uploadGate = new SemaphoreSlim(streams, streams);
         var uploadScope = new VolumeUploadScope(uploadGate, uploadTracker, streams);
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
-        var packCounter = new[] { NextPackNumber(info.Packs) - 1 };
+        // pack 号的分配收在 RunState 里（见 NextPackId）：它必须跨运行唯一。
 
         // 有界队列把两条流解耦：staged 满时挡住的只是压缩侧，diff 该读盘照样读盘——
         // 反压一路顶回 diff，磁盘就跟着停了，这次改造也就白做了。
@@ -452,7 +468,7 @@ public sealed class BackupOrchestrator(
                                 overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, ct);
                         else
                             await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
-                                tailByPath, overrides, postDiffUnreadable, uploadScope, packCounter, ReportItem,
+                                tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
                                 uploadTracker, state, ct);
                     }
                     finally
@@ -1222,7 +1238,7 @@ public sealed class BackupOrchestrator(
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
-        VolumeUploadScope uploadScope, int[] packCounter, Action<long> onItem, StageTracker uploadTracker,
+        VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
         RunState state, CancellationToken ct)
     {
         var cap = request.Options.Plan.GroupCapBytes;
@@ -1246,7 +1262,7 @@ public sealed class BackupOrchestrator(
             }
             queue.RemoveRange(0, group.Count);
 
-            var packId = "p" + Interlocked.Increment(ref packCounter[0]).ToString("D4");
+            var packId = state.NextPackId();
             // 这些 PlannedFile 全部由 ToPlannedFile(PackEntry) 而来，FullHash 按构造非空——
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
@@ -1601,17 +1617,6 @@ public sealed class BackupOrchestrator(
                 KdfSalt = encrypted ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(16) : null,
             },
         };
-    }
-
-    private static int NextPackNumber(IReadOnlyDictionary<string, PackInfo> packs)
-    {
-        var max = 0;
-        foreach (var id in packs.Keys)
-        {
-            if (id.StartsWith('p') && int.TryParse(id.AsSpan(1), out var n) && n > max)
-                max = n;
-        }
-        return max + 1;
     }
 
 }

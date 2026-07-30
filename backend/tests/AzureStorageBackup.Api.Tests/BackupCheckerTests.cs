@@ -74,6 +74,17 @@ public sealed class BackupCheckerTests : IDisposable
             checker: checker);
     }
 
+    /// <summary>从最新版本索引里读出唯一那个 pack 的号。pack 号带每轮随机前缀（跨运行唯一，
+    /// 见 <c>RunState.NextPackId</c>），所以测试不能写死 "p0001"。</summary>
+    private static async Task<string> OnlyPackIdAsync(BlobClientFactory factory, Account account, string container)
+    {
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var info = await store.ReadInfoAsync(account, container, null);
+        var index = await store.ReadIndexAsync(account, container, info!.Versions[^1].IndexBlob, null);
+        return index.Entries.Where(e => e.Storage?.Kind == "pack")
+            .Select(e => e.Storage!.Ref).Distinct(StringComparer.Ordinal).Single();
+    }
+
     private BackupRequest Req(Account a, string c) => new()
     {
         Account = a, Container = c, LocalRoot = _src, Name = "photos",
@@ -310,13 +321,15 @@ public sealed class BackupCheckerTests : IDisposable
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
             await backup.RunAsync(Req(account, name));
 
-            // 删除引用的 pack（小文件 a.txt 进 p0001）
-            await container.GetBlobClient("packs/p0001.7z").DeleteIfExistsAsync();
+            // 删除被引用的那个 pack（小文件 a.txt 进了它）。包名从索引里读，不写死——
+            // pack 号带每轮随机前缀（跨运行唯一，见 RunState.NextPackId），没有固定值可猜。
+            var packBlob = $"packs/{await OnlyPackIdAsync(factory, account, name)}.7z";
+            await container.GetBlobClient(packBlob).DeleteIfExistsAsync();
 
             var result = await checker.CheckAsync(account, name, null, null, new CheckOptions());
 
             Assert.False(result.Ok);
-            Assert.Contains("packs/p0001.7z", result.MissingRefs);
+            Assert.Contains(packBlob, result.MissingRefs);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -393,17 +406,21 @@ public sealed class BackupCheckerTests : IDisposable
 
             var hash = await new FileHasher().FullHashAsync(Path.Combine(_src, "big.bin"));
 
+            // 包名从索引里读，不写死（pack 号带每轮随机前缀，见 RunState.NextPackId）。
+            var packId = await OnlyPackIdAsync(factory, account, name);
+            var stalePackVolume = $"packs/{packId}.7z.099";
+
             // 手动往 container 塞真孤儿 + 残余旧卷（模拟非原子替换/失败上传遗留）。
             await container.GetBlobClient("data/ZZZ").UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
-            await container.GetBlobClient("packs/p0001.7z.099").UploadAsync(BinaryData.FromString("stale pack volume"), overwrite: true);
+            await container.GetBlobClient(stalePackVolume).UploadAsync(BinaryData.FromString("stale pack volume"), overwrite: true);
             await container.GetBlobClient($"data/{hash}.099").UploadAsync(BinaryData.FromString("stale data volume"), overwrite: true);
 
             // 列表检查：报告恰好这些孤儿；被引用/信息/索引不在孤儿中。
             var check = await checker.CheckAsync(account, name, null, null, new CheckOptions { ListOrphans = true }, _src);
             Assert.Contains("data/ZZZ", check.OrphanBlobs);
-            Assert.Contains("packs/p0001.7z.099", check.OrphanBlobs);
+            Assert.Contains(stalePackVolume, check.OrphanBlobs);
             Assert.Contains($"data/{hash}.099", check.OrphanBlobs);
-            Assert.DoesNotContain("packs/p0001.7z", check.OrphanBlobs);
+            Assert.DoesNotContain($"packs/{packId}.7z", check.OrphanBlobs);
             Assert.DoesNotContain($"data/{hash}.001", check.OrphanBlobs);
             Assert.DoesNotContain(BackupDiscovery.IndexBlobName, check.OrphanBlobs);
             Assert.True(check.Ok); // 孤儿不影响 Ok
@@ -415,15 +432,15 @@ public sealed class BackupCheckerTests : IDisposable
                 dontCompress: null);
 
             Assert.Contains("data/ZZZ", report.DeletedOrphans);
-            Assert.Contains("packs/p0001.7z.099", report.DeletedOrphans);
+            Assert.Contains(stalePackVolume, report.DeletedOrphans);
             Assert.Contains($"data/{hash}.099", report.DeletedOrphans);
 
             // 孤儿已删。
             Assert.False((await container.GetBlobClient("data/ZZZ").ExistsAsync()).Value);
-            Assert.False((await container.GetBlobClient("packs/p0001.7z.099").ExistsAsync()).Value);
+            Assert.False((await container.GetBlobClient(stalePackVolume).ExistsAsync()).Value);
             Assert.False((await container.GetBlobClient($"data/{hash}.099").ExistsAsync()).Value);
             // 被引用 blob + 信息文件仍在。
-            Assert.True((await container.GetBlobClient("packs/p0001.7z").ExistsAsync()).Value);
+            Assert.True((await container.GetBlobClient($"packs/{packId}.7z").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient($"data/{hash}.001").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync()).Value);
 
@@ -476,7 +493,8 @@ public sealed class BackupCheckerTests : IDisposable
             await backup.RunAsync(Req(account, name));
 
             // 用垃圾覆盖 pack blob（存在但解不开）→ 深度校验报损坏
-            await container.GetBlobClient("packs/p0001.7z").UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
+            await container.GetBlobClient($"packs/{await OnlyPackIdAsync(factory, account, name)}.7z")
+                .UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
 
             var result = await checker.CheckAsync(account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
 

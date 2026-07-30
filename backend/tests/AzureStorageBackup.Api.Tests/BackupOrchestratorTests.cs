@@ -511,16 +511,20 @@ public sealed class BackupOrchestratorTests : IDisposable
             WriteText("f.txt", "v1"); await orchestrator.RunAsync(Req());
             var info1 = await store.ReadInfoAsync(account, name, null);
             var v1IndexBlob = info1!.Versions[0].IndexBlob;
+            // 包名从索引里读，不写死：pack 号带每轮随机前缀（跨运行唯一，见 RunState.NextPackId）。
+            var v1Pack = await OnlyPackIdAsync(store, account, name);
 
             WriteText("f.txt", "v2"); await orchestrator.RunAsync(Req());
             WriteText("f.txt", "v3"); await orchestrator.RunAsync(Req());
 
             var info = await store.ReadInfoAsync(account, name, null);
             Assert.Equal([2, 3], info!.Versions.Select(v => v.Version)); // v1 retired
-            Assert.DoesNotContain("p0001", info.Packs.Keys);              // v1's exclusive pack removed from info
+            var v3Pack = await OnlyPackIdAsync(store, account, name);
+            Assert.NotEqual(v1Pack, v3Pack);
+            Assert.DoesNotContain(v1Pack, info.Packs.Keys);              // v1's exclusive pack removed from info
             Assert.False(await container.GetBlobClient(v1IndexBlob).ExistsAsync()); // v1 index blob deleted
-            Assert.False(await container.GetBlobClient("packs/p0001.7z").ExistsAsync()); // v1 pack blob deleted
-            Assert.True(await container.GetBlobClient("packs/p0002.7z").ExistsAsync());  // still referenced
+            Assert.False(await container.GetBlobClient($"packs/{v1Pack}.7z").ExistsAsync()); // v1 pack blob deleted
+            Assert.True(await container.GetBlobClient($"packs/{v3Pack}.7z").ExistsAsync());  // still referenced
         }
         finally
         {
@@ -603,12 +607,14 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            await orchestrator.RunAsync(Req());        // v1: p0001{a,b,c}
+            await orchestrator.RunAsync(Req());        // v1: 一个包装着 {a,b,c}
+            // 包名从索引里读，不写死（pack 号带每轮随机前缀，见 RunState.NextPackId）。
+            var v1Pack = await OnlyPackIdAsync(store, account, name);
             WriteText("d/a.txt", new string('A', 2000)); // 改 a（等长不同内容）
-            await orchestrator.RunAsync(Req());        // v2: a→p0002；退役 v1 → p0001 中 a_old 死重(1/3>30%)→压实
+            await orchestrator.RunAsync(Req());        // v2: a 进新包；退役 v1 → 老包里 a_old 死重(1/3>30%)→压实
 
             var info = await store.ReadInfoAsync(account, name, null);
-            var p1 = info!.Packs["p0001"];
+            var p1 = info!.Packs[v1Pack];
             Assert.Equal(2, p1.Members.Count); // a_old 被丢弃，仅保留 b、c
             Assert.Equal(0, p1.DeadBytes);
 
@@ -620,6 +626,16 @@ public sealed class BackupOrchestratorTests : IDisposable
         {
             await container.DeleteIfExistsAsync();
         }
+    }
+
+    /// <summary>从最新版本索引里读出唯一那个 pack 的号。pack 号带每轮随机前缀（跨运行唯一，
+    /// 见 <c>RunState.NextPackId</c>），所以测试不能写死 "p0001"。</summary>
+    private static async Task<string> OnlyPackIdAsync(IBackupInfoStore store, Account account, string container)
+    {
+        var info = await store.ReadInfoAsync(account, container, null);
+        var index = await store.ReadIndexAsync(account, container, info!.Versions[^1].IndexBlob, null);
+        return index.Entries.Where(e => e.Storage?.Kind == "pack")
+            .Select(e => e.Storage!.Ref).Distinct(StringComparer.Ordinal).Single();
     }
 
     private sealed class SyncProgress(List<BackupProgress> sink) : IProgress<BackupProgress>

@@ -105,13 +105,18 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     /// 条件上传被"已经存在"挡下了。412 是 If-None-Match 不满足的正路；409 BlobAlreadyExists
     /// 也一并收下——重试碰上自己刚写成功的那一份时，服务端两种都可能给。
     /// <para>
-    /// 刻意**不**收 409 BlobArchived：那说的是"目标已归档、动不了"。在 if-missing 语义下它同样
-    /// 意味着内容已经在云上（本就无需重传），但把它和"已存在"混为一谈会顺手掩盖掉真正的归档
-    /// 覆盖企图——那种情况该响亮地失败，而不是静默当成功。条件请求已经让这条路走不到了。
+    /// **BlobArchived 也算**。条件请求救不了归档 blob：对已归档对象的写操作，服务端在判条件
+    /// **之前**就拒绝，于是拿不到 412，拿到的是 409 BlobArchived。而在 if-missing 语义下这条
+    /// 错误的含义是确定的——目标已经在那儿了，正是"不必再传"。Archive 数据层上跑备份时，
+    /// 每一个已经存过的对象都会走到这里。
+    /// </para>
+    /// <para>
+    /// 只在 if-missing 那一侧收。<c>overwrite: true</c>（修复、死重压实）撞上 BlobArchived 是
+    /// 真的要覆盖归档数据，那种情况必须响亮地失败，不能静默当成功。
     /// </para>
     /// </summary>
     private static bool IsAlreadyThere(RequestFailedException ex) =>
-        ex.Status == 412 || ex.ErrorCode == "BlobAlreadyExists";
+        ex.Status == 412 || ex.ErrorCode is "BlobAlreadyExists" or "BlobArchived";
 
     /// <summary>可重试的瞬时错误：服务端 5xx、超时(408)、限流(429)、网络 IO。</summary>
     private static bool IsTransient(Exception ex) => ex switch
