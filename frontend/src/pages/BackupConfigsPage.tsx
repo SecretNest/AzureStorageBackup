@@ -1279,7 +1279,10 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 那个文件上。说清楚它在等什么——判得比上传快几个数量级，队列填满是常态。
     detail.waitingOnDownstream && 'waiting for upload to catch up',
     detail.activeItems.length > 0 && `${detail.activeItems.length} ${inFlightVerb}`,
-    idleOnStaging && 'nothing on the wire yet',
+    // "right now" 而不是 "yet"：这一条说的是**这一瞬**没有流在传（手上那件正占着压缩锁），
+    // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
+    // 用户正是拿这两句对着问的。
+    idleOnStaging && 'nothing on the wire right now',
     detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
   ]
@@ -1317,13 +1320,30 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
         ]
       : [
-          // 已上传 / 总量。两边都是**源端**字节（压缩前）——分数只有同口径才有意义。
-          // 拿实传字节当分子是不行的：分母（压缩后的总量）在开始传之前根本不存在，压完才知道，
+          // 已完成 / 总量，两边都是**源端**字节（压缩前）。分数只有同口径才有意义——拿实传
+          // 字节当分子是不行的：分母（压缩后的总量）在开始传之前根本不存在，压完才知道，
           // 而且压缩率随文件类型大幅摆动，跨口径的比例读不出任何东西。
+          //
+          // 措辞用 original / compressed 这一对，跟压缩工具里 Original Size / Compressed Size
+          // 的惯例一致。原先叫 "uploaded" 是错的：它让人以为这是传上去的量，而这两个数说的是
+          // **原始文件有多大**——压不动的内容两个数几乎相等，那个词就把口径彻底藏起来了。
           detail.workTotal > 0 &&
-            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} uploaded`,
-          // 云上实际占了多少（压缩后）。与上面那个分数并列而不是塞进它，两个口径就不会被混读。
-          detail.transferredBytes > 0 && `${formatBytes(detail.transferredBytes)} stored`,
+            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} original`,
+          // 这一轮压缩后真正传出去的字节，后面跟上它占源端的比例。
+          //
+          // 措辞被问了三轮，每一轮都指出同一件事——这个数的**口径**看不出来：
+          // · 叫 "stored" 被读成"云上一共存了多少"（它和整条明细一样只说本次运行）；
+          // · 与前面那个分数"有什么不同"同样看不出来，两个数都以 GB 结尾，口径却一个压缩前
+          //   一个压缩后，而压不动的内容（媒体、已压缩文件）两者几乎相等，光摆着像重复了一遍；
+          // · 叫 "on the wire" 更糟——上面那句 "nothing on the wire right now" 正用着同一个词，
+          //   一处说没有、一处说 2 GB。
+          // 所以直接说"压缩后"，再把比例摆出来让关系自明：100% 附近＝压不动，20% ＝压得很好。
+          detail.transferredBytes > 0 &&
+            `${formatBytes(detail.transferredBytes)} compressed${
+              detail.workDone > 0
+                ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}%)`
+                : ''
+            }`,
           detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} staged`,
         ]
   )
