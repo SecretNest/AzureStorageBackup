@@ -59,6 +59,14 @@ public sealed class BackupDifferTests : IDisposable
     {
         public int HeadCalls;
         public int FullCalls;
+        public int IdentityCalls;
+
+        public Task<ContentIdentity> ContentIdentityAsync(
+            string path, int segmentBytes, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref IdentityCalls);
+            return inner.ContentIdentityAsync(path, segmentBytes, ct);
+        }
 
         public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
         {
@@ -77,6 +85,48 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
+
+    /// <summary>
+    /// 一个确定变更的文件只读**一遍**。三段 hash 从前是分三次各开一次文件算的，而全文那一趟
+    /// 本来就路过头和尾——首次备份几十万个小文件，那就是几十万次多余的 open + seek。
+    /// </summary>
+    [Fact]
+    public async Task A_Changed_File_Is_Read_Once_Not_Three_Times()
+    {
+        Write("a.txt", "aaa");
+        var hasher = new CountingHasher(new FileHasher());
+
+        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous: null);
+
+        Assert.Equal(1, hasher.IdentityCalls);
+        Assert.Equal(0, hasher.HeadCalls);
+        Assert.Equal(0, hasher.FullCalls);
+        var c = Change(diff, "a.txt");
+        Assert.NotNull(c.HeadHash);
+        Assert.NotNull(c.FullHash);
+        Assert.NotNull(c.TailHash);
+    }
+
+    /// <summary>
+    /// 全文 hash 被延后时（单文件 blob）只读头 4KB。**尾部一趟都不必付**——那条路的三段
+    /// 都由压缩那一遍顺手算出并覆盖，在这里算等于白读一次。
+    /// </summary>
+    [Fact]
+    public async Task A_Deferred_Full_Hash_Costs_Only_The_Head_Read()
+    {
+        Write("big.bin", new string('x', 8192));
+        var hasher = new CountingHasher(new FileHasher());
+
+        var diff = await new BackupDiffer(hasher).DiffAsync(
+            _root, await ScanAsync(_root), previous: null, fullHashDeferred: _ => true);
+
+        Assert.Equal(1, hasher.HeadCalls);
+        Assert.Equal(0, hasher.FullCalls);
+        Assert.Equal(0, hasher.IdentityCalls);
+        var c = Change(diff, "big.bin");
+        Assert.Null(c.FullHash);
+        Assert.Null(c.TailHash);
+    }
 
     [Fact]
     public async Task First_Backup_Marks_Everything_Added()
@@ -144,8 +194,10 @@ public sealed class BackupDifferTests : IDisposable
         // 索引条目须含完整哈希：headHash + fullHash 都记录
         Assert.NotNull(c.HeadHash);
         Assert.NotNull(c.FullHash);
-        Assert.Equal(1, counter.HeadCalls);
-        Assert.Equal(1, counter.FullCalls);
+        // 两个 hash 都在，但只读了**一遍**：它们连同尾部一起来自同一趟读，不再各开一次文件。
+        Assert.Equal(1, counter.IdentityCalls);
+        Assert.Equal(0, counter.HeadCalls);
+        Assert.Equal(0, counter.FullCalls);
     }
 
     [Fact]
@@ -191,8 +243,11 @@ public sealed class BackupDifferTests : IDisposable
 
         // 打包的那些不受影响：它们的 hash 是装箱时就要写进 pack 成员的，没有第二次机会补算。
         Assert.NotNull(Change(diff, "small.txt").FullHash);
-        Assert.Equal(1, counter.FullCalls);
-        Assert.Equal(2, counter.HeadCalls);
+        // 延后的那个只付了一趟 4KB 的头读——尾部也不算（压缩那一遍会连三段一起给出来）。
+        Assert.Equal(1, counter.HeadCalls);
+        Assert.Equal(0, counter.FullCalls);
+        // 要算全文的那个走一遍读，三段一起拿到。
+        Assert.Equal(1, counter.IdentityCalls);
 
         // 变更统计只看长度，不受影响——界面上的 "N changed" 不能因为这个优化少数几个。
         Assert.Equal(2, diff.ChangedFiles);

@@ -214,7 +214,9 @@ public sealed class BackupDiffer(IFileHasher hasher)
             var fullHash = await hasher.FullHashAsync(full, ct);
             return fullHash == prev.FullHash
                 ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, head, fullHash, prev.Storage,
-                    TailHash: await TailAsync(entry, full, options, ct))
+                    // 这一条内容没变、不重传，head/full 刚在上面算过了，只补一个尾部：
+                    // 单独 seek 读 4KB，比为它把整个文件再读一遍便宜得多。
+                    TailHash: prev.TailHash ?? await hasher.TailHashAsync(full, options.HeadHashBytes, ct))
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null);
         }, entry, prev);
     }
@@ -227,12 +229,9 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         return await TryReadAsync(async () =>
         {
-            // headHash 照算。它只读 4KB，却顺带把"这个文件此刻打得开吗"问清楚了——
-            // 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
-            var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
-            var tail = await TailAsync(entry, full, options, ct);
-            return new FileChange(entry.Path, ChangeKind.Added, entry, null, head, fullHash, null, TailHash: tail);
+            var id = await IdentityAsync(entry, full, options, deferFull, ct);
+            return new FileChange(
+                entry.Path, ChangeKind.Added, entry, null, id.Head, id.Full, null, TailHash: id.Tail);
         }, entry, null);
     }
 
@@ -248,10 +247,9 @@ public sealed class BackupDiffer(IFileHasher hasher)
         // 算出来的值重做一次。所以延后是无损的。
         return await TryReadAsync(async () =>
         {
-            var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
-            var fullHash = DeferrableFullHash(entry, deferFull) ? null : await hasher.FullHashAsync(full, ct);
-            var tail = await TailAsync(entry, full, options, ct);
-            return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, fullHash, null, TailHash: tail);
+            var id = await IdentityAsync(entry, full, options, deferFull, ct);
+            return new FileChange(
+                entry.Path, ChangeKind.Modified, entry, prev, id.Head, id.Full, null, TailHash: id.Tail);
         }, entry, prev);
     }
 
@@ -293,14 +291,32 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     /// <summary>
-    /// 尾部 hash。内容身份的第四项——单文件 blob 那条路由压缩那一遍算出来并覆盖此处的值，
-    /// 打包成员则只有这里能算。多读 4KB，而这个文件刚刚才被完整读过一遍算 fullHash，还热着。
+    /// 已确定变更的这一条要算哪些 hash。
+    /// <para>
+    /// 要算全文时（打包成员）**一遍读拿全三段**：全文那一趟本来就路过头和尾，分别调三个方法
+    /// 等于把同一个文件打开三次。首次备份几十万个小文件，省下的就是几十万次多余的 open + seek。
+    /// </para>
+    /// <para>
+    /// 全文被延后时（单文件 blob）只算 head——**尾部这里不算**：那条路的三段 hash 都由压缩
+    /// 那一遍顺手算出并覆盖此处的值（见编排器的 tailByPath 与 StreamAndStageAsync），
+    /// 在这里算等于白读一次。head 仍要算，它顺带回答了"这个文件此刻打得开吗"，
+    /// 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
+    /// </para>
     /// </summary>
-    private async Task<string?> TailAsync(
-        ScannedEntry entry, string full, DiffOptions options, CancellationToken ct) =>
-        entry.Kind == EntryKind.File && entry.Length > 0
-            ? await hasher.TailHashAsync(full, options.HeadHashBytes, ct)
-            : null;
+    private async Task<(string? Head, string? Full, string? Tail)> IdentityAsync(
+        ScannedEntry entry, string full, DiffOptions options, bool deferFull, CancellationToken ct)
+    {
+        if (DeferrableFullHash(entry, deferFull))
+            return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct), null, null);
+
+        // 符号链接与空文件没有内容可读，一趟都不必付。
+        if (entry.Kind != EntryKind.File || entry.Length == 0)
+            return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct),
+                await hasher.FullHashAsync(full, ct), null);
+
+        var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+        return (id.HeadHash, id.FullHash, id.TailHash);
+    }
 
     /// <summary>
     /// 读失败（被占用/无权限/读到一半设备错误）不该终止整轮备份。

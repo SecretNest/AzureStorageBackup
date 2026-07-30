@@ -24,7 +24,29 @@ public interface IFileHasher
     /// 与挂死一模一样。
     /// </param>
     Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null);
+
+    /// <summary>
+    /// 一遍读算出完整的内容身份（三段 hash + 长度）。
+    /// <para>
+    /// 分三次各读一遍是白付两趟 IO：全文那一遍本来就路过了头和尾。差分阶段判一个变更文件
+    /// 从前要打开同一个文件三次，首次备份几十万个小文件就是几十万次多余的 open + seek——
+    /// 在机械盘的 NAS 上这不是小数。
+    /// </para>
+    /// <para>
+    /// 默认实现照旧分三次调，好让测试里的假 hasher 不必各自重写一遍（它们靠拦截这三个方法
+    /// 来模拟"读不开"，语义必须原样保留）。真实现（<see cref="FileHasher"/>）覆写成一遍读。
+    /// </para>
+    /// </summary>
+    async Task<ContentIdentity> ContentIdentityAsync(
+        string path, int segmentBytes, CancellationToken ct = default) =>
+        new(await FullHashAsync(path, ct),
+            await HeadHashAsync(path, segmentBytes, ct),
+            await TailHashAsync(path, segmentBytes, ct),
+            new FileInfo(path).Length);
 }
+
+/// <summary>一遍读得到的内容身份：三段 hash + 长度。去重与碰撞判定的四项依据。</summary>
+public sealed record ContentIdentity(string FullHash, string HeadHash, string TailHash, long Length);
 
 public sealed class FileHasher : IFileHasher
 {
@@ -75,6 +97,19 @@ public sealed class FileHasher : IFileHasher
             onRead?.Report(read);   // 增量：调用方按需累加，不必知道从哪一块开始
         }
         return Format(hash.GetCurrentHash());
+    }
+
+    /// <summary>一遍读：字节同时喂进三段 hasher，头和尾都是这一趟顺路取的。</summary>
+    public async Task<ContentIdentity> ContentIdentityAsync(
+        string path, int segmentBytes, CancellationToken ct = default)
+    {
+        var streaming = new StreamingHasher(segmentBytes, segmentBytes);
+        await using var stream = Open(path);
+        var buffer = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+            streaming.Append(buffer.AsSpan(0, read));
+        return new ContentIdentity(streaming.FullHash, streaming.HeadHash, streaming.TailHash, streaming.Length);
     }
 
     /// <summary>
