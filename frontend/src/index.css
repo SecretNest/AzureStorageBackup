@@ -850,10 +850,13 @@ tbody tr.ops-row:hover {
     padding: var(--sp-2) var(--sp-3);
     background: var(--bg-raised);
   }
-  /* 触屏层在文件末尾有一条 tbody tr:hover { background: transparent }，与上面那条
-     specificity 打平、靠源码顺序赢——手机上点一下卡片里的按钮，整张卡的底色就没了
-     （浅色看不出来，深色是从 --bg-raised 塌到 --bg）。多一个 tbody 压回去。 */
-  table.cards tbody tr {
+  /* 触屏层（文件末尾）有一组四个选择器的 hover 抑制，其中三个带 class，specificity 比
+     table.cards tbody tr 高——光压住第一个不够。正在跑备份的那张卡（has-ops + ops-row
+     合并而成）会在点击后塌掉底色，而那正是手机上盯着看的那张。 */
+  table.cards tbody tr,
+  table.cards tbody tr.has-ops,
+  table.cards tbody tr.ops-row,
+  table.cards tbody tr.has-ops:hover + tr.ops-row {
     background: var(--bg-raised);
   }
   table.cards td {
