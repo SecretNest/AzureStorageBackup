@@ -29,6 +29,14 @@ function App() {
   const refreshAuth = () => {
     authApi.status().then(setAuth).catch(() => setAuth({ required: true, authenticated: false }))
   }
+
+  // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
+  // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
+  const logout = () => {
+    const signedOut = () => setAuth({ required: true, authenticated: false })
+    authApi.logout().then(signedOut, signedOut)
+  }
+
   useEffect(() => {
     setUnauthorizedHandler(() => setAuth({ required: true, authenticated: false }))
     refreshAuth()
@@ -69,21 +77,6 @@ function App() {
             </button>
           ))}
         </nav>
-        {auth.required && (
-          <div className="sidebar-footer">
-            <button
-              type="button"
-              // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
-              // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
-              onClick={() => {
-                const signedOut = () => setAuth({ required: true, authenticated: false })
-                authApi.logout().then(signedOut, signedOut)
-              }}
-            >
-              Log out
-            </button>
-          </div>
-        )}
       </aside>
 
       <main className="app-main">
@@ -92,7 +85,7 @@ function App() {
         {tab === 'backups' && <BackupConfigsPage />}
         {tab === 'tasks' && <TasksPage />}
         {tab === 'logs' && <LogsPage />}
-        {tab === 'settings' && <SettingsPage />}
+        {tab === 'settings' && <SettingsPage authRequired={auth.required} onLogout={logout} />}
       </main>
     </div>
   )

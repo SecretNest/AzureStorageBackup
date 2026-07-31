@@ -9,8 +9,8 @@ import {
   type ConnectionResult,
 } from '../api/accounts'
 import { refreshKeyringStatus } from '../api/keyring'
-import { overlayStyle, panelStyle } from '../components/modalStyles'
-import { Field } from '../components/modal'
+import { Modal } from '../components/Modal'
+import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
 const emptyForm: AccountInput = {
@@ -174,56 +174,58 @@ export function AccountsSection() {
 
       {error && <p className="text-danger">{error}</p>}
 
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Endpoint</th>
-            <th>Region</th>
-            <th>Proxy</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {accounts.length === 0 ? (
+      <div className="table-scroll" tabIndex={0}>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={5} className="empty-state">
-                No accounts yet.
-              </td>
+              <th>Name</th>
+              <th>Endpoint</th>
+              <th>Region</th>
+              <th>Proxy</th>
+              <th></th>
             </tr>
-          ) : (
-            accounts.map((a) => (
-              <tr key={a.id}>
-                <td>
-                  {a.name}
-                  {a.secretsUnavailable && (
-                    <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
-                      <span className="badge badge-warn">Credential required</span>
-                      <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
-                        Re-enter
-                      </button>
-                    </span>
-                  )}
-                </td>
-                <td>{a.blobEndpoint}</td>
-                <td>{regionLabels[a.region]}</td>
-                <td>{a.useProxy ? 'Yes' : 'No'}</td>
-                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                  <button type="button" className="btn-ghost" onClick={() => setViewing(a)}>
-                    Containers
-                  </button>{' '}
-                  <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
-                    Edit
-                  </button>{' '}
-                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
-                    Delete
-                  </button>
+          </thead>
+          <tbody>
+            {accounts.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="empty-state">
+                  No accounts yet.
                 </td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              accounts.map((a) => (
+                <tr key={a.id}>
+                  <td>
+                    {a.name}
+                    {a.secretsUnavailable && (
+                      <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
+                        <span className="badge badge-warn">Credential required</span>
+                        <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
+                          Re-enter
+                        </button>
+                      </span>
+                    )}
+                  </td>
+                  <td>{a.blobEndpoint}</td>
+                  <td>{regionLabels[a.region]}</td>
+                  <td>{a.useProxy ? 'Yes' : 'No'}</td>
+                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <button type="button" className="btn-ghost" onClick={() => setViewing(a)}>
+                      Containers
+                    </button>{' '}
+                    <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
+                      Edit
+                    </button>{' '}
+                    <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {showForm && (
         <div className="panel">
@@ -379,37 +381,11 @@ function ResetSecretsModal({
   const [proxyPassword, setProxyPassword] = useState('')
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3>Re-enter Credentials — {account.name}</h3>
-        <p>
-          The data protection keys used to store this account's credentials were lost.
-          Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
-          it will be verified against the live storage account before being saved.
-        </p>
-
-        <Field label="Account Key">
-          <input
-            className="w-lg"
-            type="password"
-            value={accountKey}
-            onChange={(e) => setAccountKey(e.target.value)}
-          />
-        </Field>
-        {account.useProxy && (
-          <Field label="Proxy Password">
-            <input
-              className="w-lg"
-              type="password"
-              value={proxyPassword}
-              onChange={(e) => setProxyPassword(e.target.value)}
-            />
-          </Field>
-        )}
-
-        {error && <p className="text-danger">{error}</p>}
-
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Re-enter Credentials — ${account.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button
             type="button"
             className="btn-primary"
@@ -421,8 +397,35 @@ function ResetSecretsModal({
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <p>
+        The data protection keys used to store this account's credentials were lost.
+        Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
+        it will be verified against the live storage account before being saved.
+      </p>
+
+      <Field label="Account Key">
+        <input
+          className="w-lg"
+          type="password"
+          value={accountKey}
+          onChange={(e) => setAccountKey(e.target.value)}
+        />
+      </Field>
+      {account.useProxy && (
+        <Field label="Proxy Password">
+          <input
+            className="w-lg"
+            type="password"
+            value={proxyPassword}
+            onChange={(e) => setProxyPassword(e.target.value)}
+          />
+        </Field>
+      )}
+
+      {error && <p className="text-danger">{error}</p>}
+    </Modal>
   )
 }

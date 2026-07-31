@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Field } from './modal'
+import { Field } from './Field'
 
 /**
  * 可继承字段的一行（PRD §3「使用默认」）。勾选 = 该字段存 null，运行时读全局设置；

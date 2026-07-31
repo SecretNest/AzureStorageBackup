@@ -12,8 +12,8 @@ import {
   type UnreadableEntry,
 } from '../api/backupConfigs'
 import { formatBytes } from '../constants/format'
-import { Field } from './modal'
-import { overlayStyle, panelStyle } from './modalStyles'
+import { Field } from './Field'
+import { Modal } from './Modal'
 import { PathBrowser } from './PathBrowser'
 
 const rehydratePriorityLabels: Record<number, string> = {
@@ -270,56 +270,66 @@ export function RestoreDialog({
   }
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Restore — {config.name}</h3>
-        <Field label="Restore to">
-          <input className="mono" value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: 340 }} />
-          <button type="button" onClick={() => setBrowsing(true)}>
-            Browse
+    <Modal
+      title={`Restore — ${config.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="btn-primary" onClick={start} disabled={subsLoading || starting}>
+            {starting ? 'Starting…' : 'Start restore'}
           </button>
-        </Field>
-        {browsing && (
-          <PathBrowser
-            initialPath={target || undefined}
-            onPick={(p) => {
-              setTarget(p)
-              setBrowsing(false)
-            }}
-            onClose={() => setBrowsing(false)}
-          />
-        )}
-        <Field label="Version">
-          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
-            <option value="">Latest</option>
-            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
-          </select>
-        </Field>
+          <button type="button" onClick={onClose}>Cancel</button>
+        </>
+      }
+    >
+      <Field label="Restore to">
+        <input className="mono w-lg" value={target} onChange={(e) => setTarget(e.target.value)} />
+        <button type="button" onClick={() => setBrowsing(true)}>
+          Browse
+        </button>
+      </Field>
+      {browsing && (
+        <PathBrowser
+          initialPath={target || undefined}
+          onPick={(p) => {
+            setTarget(p)
+            setBrowsing(false)
+          }}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
+      <Field label="Version">
+        <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
+          <option value="">Latest</option>
+          {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+        </select>
+      </Field>
 
-        {subsLoading && <div className="text-faint">Loading…</div>}
-        {/* 沿用的内容是**有效**数据，就是这个版本能给出的最好结果——所以不提供"按版本替代"，
-            那会暗示存在更好的选项。但操作员必须知道：还原这个版本，这些文件拿到的是更早的内容。 */}
-        {!subsLoading && relevantStale.length > 0 && (
-          <div className="text-warn" style={{ margin: '0.6rem 0' }}>
-            {relevantStale.length} file(s) in this version hold content from an earlier backup —
-            the source could not be read since then, so restoring gives you that older content:
-            <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
-              {relevantStale.slice(0, 10).map((e) => (
-                <li key={e.path}>
-                  <span className="mono">{e.path}</span>
-                  {' '}— unread since {new Date(e.unreadableAt).toLocaleString()}
-                </li>
-              ))}
-            </ul>
-            {relevantStale.length > 10 && <div>…and {relevantStale.length - 10} more</div>}
+      {subsLoading && <div className="text-faint">Loading…</div>}
+      {/* 沿用的内容是**有效**数据，就是这个版本能给出的最好结果——所以不提供"按版本替代"，
+          那会暗示存在更好的选项。但操作员必须知道：还原这个版本，这些文件拿到的是更早的内容。 */}
+      {!subsLoading && relevantStale.length > 0 && (
+        <div className="text-warn" style={{ margin: '0.6rem 0' }}>
+          {relevantStale.length} file(s) in this version hold content from an earlier backup —
+          the source could not be read since then, so restoring gives you that older content:
+          <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
+            {relevantStale.slice(0, 10).map((e) => (
+              <li key={e.path}>
+                <span className="mono">{e.path}</span>
+                {' '}— unread since {new Date(e.unreadableAt).toLocaleString()}
+              </li>
+            ))}
+          </ul>
+          {relevantStale.length > 10 && <div>…and {relevantStale.length - 10} more</div>}
+        </div>
+      )}
+      {!subsLoading && relevantUnrecoverable.length > 0 && (
+        <div className="text-faint" style={{ margin: '0.6rem 0' }}>
+          <div style={{ marginBottom: '0.3rem' }}>
+            {relevantUnrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
+            {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
           </div>
-        )}
-        {!subsLoading && relevantUnrecoverable.length > 0 && (
-          <div className="text-faint" style={{ margin: '0.6rem 0' }}>
-            <div style={{ marginBottom: '0.3rem' }}>
-              {relevantUnrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
-              {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
-            </div>
+          <div className="table-scroll" tabIndex={0}>
             <table>
               <thead><tr><th>File</th><th>Substitute from</th></tr></thead>
               <tbody>
@@ -337,83 +347,77 @@ export function RestoreDialog({
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      <div style={{ margin: '0.8rem 0 0.3rem' }}>
+        <strong>Select files/folders (optional)</strong>
+      </div>
+      <div className="text-faint" style={{ marginBottom: '0.4rem' }}>
+        Leave nothing selected to restore the entire version. Checking a folder selects its whole subtree
+        (fetched recursively — may take a moment for large folders).
+      </div>
+      <div className="mono" style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--border)', padding: '0.4rem' }}>
+        {loadingDirs.has('') ? (
+          <div className="text-faint">Loading…</div>
+        ) : (
+          <TreeBrowser
+            dirPath=""
+            depth={0}
+            tree={treeCache}
+            expanded={expanded}
+            loadingDirs={loadingDirs}
+            cascading={cascading}
+            selected={selected}
+            folderState={folderState}
+            onToggleExpand={toggleExpand}
+            onToggleFolder={toggleFolder}
+            onToggleFile={toggleFile}
+          />
         )}
-
-        <div style={{ margin: '0.8rem 0 0.3rem' }}>
-          <strong>Select files/folders (optional)</strong>
-        </div>
-        <div className="text-faint" style={{ marginBottom: '0.4rem' }}>
-          Leave nothing selected to restore the entire version. Checking a folder selects its whole subtree
-          (fetched recursively — may take a moment for large folders).
-        </div>
-        <div className="mono" style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--border)', padding: '0.4rem' }}>
-          {loadingDirs.has('') ? (
-            <div className="text-faint">Loading…</div>
-          ) : (
-            <TreeBrowser
-              dirPath=""
-              depth={0}
-              tree={treeCache}
-              expanded={expanded}
-              loadingDirs={loadingDirs}
-              cascading={cascading}
-              selected={selected}
-              folderState={folderState}
-              onToggleExpand={toggleExpand}
-              onToggleFolder={toggleFolder}
-              onToggleFile={toggleFile}
-            />
-          )}
-        </div>
-        <div className="text-faint" style={{ margin: '0.3rem 0 0.8rem' }}>
-          {selected.size} file(s) selected
-          {selected.size > 0 && (
-            <>{' '}<button type="button" onClick={() => setSelected(new Set())}>Clear selection</button></>
-          )}
-        </div>
-
+      </div>
+      <div className="text-faint" style={{ margin: '0.3rem 0 0.8rem' }}>
+        {selected.size} file(s) selected
         {selected.size > 0 && (
-          <div style={{ margin: '0.4rem 0 0.8rem', padding: '0.6rem', border: '1px solid var(--border)' }}>
-            {estimating && <div className="text-muted">Estimating…</div>}
-            {!estimating && estimate && (
-              <>
-                <div>
-                  Download: {formatBytes(estimate.downloadBytes)} — Uncompressed: {formatBytes(estimate.uncompressedBytes)}
-                  {' '}— {estimate.fileCount} file(s)
+          <>{' '}<button type="button" onClick={() => setSelected(new Set())}>Clear selection</button></>
+        )}
+      </div>
+
+      {selected.size > 0 && (
+        <div style={{ margin: '0.4rem 0 0.8rem', padding: '0.6rem', border: '1px solid var(--border)' }}>
+          {estimating && <div className="text-muted">Estimating…</div>}
+          {!estimating && estimate && (
+            <>
+              <div>
+                Download: {formatBytes(estimate.downloadBytes)} — Uncompressed: {formatBytes(estimate.uncompressedBytes)}
+                {' '}— {estimate.fileCount} file(s)
+              </div>
+              {estimate.archivedObjects > 0 && (
+                <div className="text-warn" style={{ marginTop: '0.4rem' }}>
+                  {estimate.archivedObjects} archived object(s) need rehydration before download
+                  (typically several hours){estimate.rehydratePending > 0 && ` — ${estimate.rehydratePending} already rehydrating`}.
                 </div>
-                {estimate.archivedObjects > 0 && (
-                  <div className="text-warn" style={{ marginTop: '0.4rem' }}>
-                    {estimate.archivedObjects} archived object(s) need rehydration before download
-                    (typically several hours){estimate.rehydratePending > 0 && ` — ${estimate.rehydratePending} already rehydrating`}.
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
+              )}
+            </>
+          )}
+        </div>
+      )}
 
-        {selected.size > 0 && estimate && estimate.archivedObjects > 0 && (
-          <Field label="Rehydrate priority">
-            <select value={rehydratePriority} onChange={(e) => setRehydratePriority(Number(e.target.value))}>
-              {Object.entries(rehydratePriorityLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-            </select>
-          </Field>
-        )}
-
-        <Field label="On conflict">
-          <select value={conflict} onChange={(e) => setConflict(Number(e.target.value))}>
-            {Object.entries(restoreConflictModeLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      {selected.size > 0 && estimate && estimate.archivedObjects > 0 && (
+        <Field label="Rehydrate priority">
+          <select value={rehydratePriority} onChange={(e) => setRehydratePriority(Number(e.target.value))}>
+            {Object.entries(rehydratePriorityLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </select>
         </Field>
+      )}
 
-        <div className="row" style={{ marginTop: '0.8rem' }}>
-          <button type="button" className="btn-primary" onClick={start} disabled={subsLoading || starting}>
-            {starting ? 'Starting…' : 'Start restore'}
-          </button>
-          <button type="button" onClick={onClose}>Cancel</button>
-        </div>
-      </div>
-    </div>
+      <Field label="On conflict">
+        <select value={conflict} onChange={(e) => setConflict(Number(e.target.value))}>
+          {Object.entries(restoreConflictModeLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </Field>
+
+    </Modal>
   )
 }
 
@@ -448,7 +452,7 @@ function TreeBrowser({
                 <>
                   <button
                     type="button"
-                    className="icon-btn"
+                    className="icon-btn hit-target"
                     onClick={() => onToggleExpand(node)}
                     disabled={!node.hasChildren}
                     style={{ width: 18, cursor: node.hasChildren ? 'pointer' : 'default' }}

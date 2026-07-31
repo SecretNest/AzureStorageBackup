@@ -288,6 +288,22 @@ tbody tr.ops-row:hover {
   background: var(--bg-hover);
 }
 
+/* 窄屏上装不下的表包一层它。表格本身不变形——日志这类扫读型的表，
+   横滚比拆成卡片好用：卡片化后一屏看不了几条。 */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* 容器可聚焦（用法处加 tabIndex），键盘用户才能滚动溢出的内容（WCAG 2.1.1）。
+   但它不是控件，获焦时的 outline 会画出一个没有意义的大方框。 */
+.table-scroll:focus {
+  outline: none;
+}
+.table-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ── Shell ────────────────────────────────────────────────────────────────── */
 .app-shell {
   display: grid;
@@ -321,11 +337,6 @@ tbody tr.ops-row:hover {
   gap: 2px;
   padding: 0 var(--sp-2);
   overflow-y: auto;
-}
-
-.sidebar-footer {
-  margin-top: auto;
-  padding: var(--sp-4) var(--sp-3) 0;
 }
 
 /* 导航项是 <button>，所以要把按钮的默认外观整个抹掉再重画。 */
@@ -401,11 +412,6 @@ tbody tr.ops-row:hover {
     border-radius: var(--r-md);
     border-left: none;
     border-bottom-color: var(--accent);
-  }
-  .sidebar-footer {
-    margin-top: 0;
-    margin-left: auto;
-    padding: 0 var(--sp-2);
   }
   .app-main {
     padding: var(--sp-4);
@@ -606,6 +612,44 @@ tbody tr.ops-row:hover {
   gap: var(--sp-2);
 }
 
+/* 目录选择器的一行。原先是个 .btn-ghost，高 32px、左右各 8px 内边距，
+   手机上要瞄准才点得中；整行可点就没有瞄准这回事了。 */
+.browse-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: var(--control-h);
+  height: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+  word-break: break-all;
+}
+.browse-row:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.browse-row::after {
+  content: '›';
+  color: var(--text-muted);
+  flex: none;
+}
+.browse-row:disabled::after {
+  content: none;
+}
+
+/* 事件多选项：桌面上排成 200px 的多列，窄屏上自然掉成单列。 */
+.notify-event {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 260px;
+}
+
 /* ── Alerts & badges ──────────────────────────────────────────────────────── */
 .alert {
   border: 1px solid var(--border);
@@ -661,19 +705,347 @@ tbody tr.ops-row:hover {
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-overlay);
-  padding: var(--sp-5);
   min-width: 620px;
   max-width: 90vw;
   max-height: 88vh;
   overflow: auto;
 }
-.modal-panel > h3:first-child {
-  margin-bottom: var(--sp-3);
+
+/* 内容区自己滚，标题栏与动作栏不动。桌面上 max-height 由 .modal-panel 限制，
+   手机上（见下）改成占满视口。 */
+.modal-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 0;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+.modal-body {
+  padding: var(--sp-4) var(--sp-5);
+  overflow-y: auto;
+}
+.modal-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--border);
+}
+.modal-close {
+  font-size: 16px;
+  line-height: 1;
+}
+/* 二级弹窗（叠在另一个弹窗之上的 PathBrowser）。原先两层同为 z-index 50，
+   靠 DOM 顺序侥幸生效；手机上两层都是全屏，顺序不对就是"点了没反应"。 */
+.modal-overlay-secondary {
+  z-index: 60;
 }
 
 @media (max-width: 900px) {
   .modal-panel {
     min-width: 0;
     width: 100%;
+  }
+}
+
+/* ── Mobile (≤640px) ────────────────────────────────────────────────────────
+   手机层。平板层（≤900px）已经处理了侧栏塌陷与 .field 单列，这里只加手机独有的东西。 */
+@media (max-width: 640px) {
+  /* 16px 是硬门槛，不是观感问题：低于 16px 时 iOS Safari 会在聚焦输入框的瞬间
+     放大整个页面，并且失焦后不缩回——用户此后看到的是一个需要手动双指缩小的界面。
+     只有表单控件会触发这个行为，正文其余部分保持 14px。 */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  /* .mono 的 font-size: 0.9em 是 (0,1,0)，比上面那条 (0,0,1) 高，不管源码顺序都赢——
+     于是等宽字体的那几个框（Local Root、Restore to、cron 表达式…）实际是 12.6px，
+     照样会触发 iOS 的聚焦缩放。这一条 (0,1,1) 才压得住。 */
+  input.mono,
+  select.mono,
+  textarea.mono {
+    font-size: 16px;
+  }
+
+  /* 长输入框占满可用宽度：480px 在任何手机上都溢出，280px 在 320px 屏上也贴边。 */
+  .w-md,
+  .w-lg {
+    width: 100%;
+  }
+
+  /* 底部固定 tab 栏：拇指够得着，且不随页面滚走。
+     结构不变（仍是 .sidebar），只是换个位置和方向。 */
+  .app-shell {
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .sidebar {
+    order: 2;
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 40; /* 低于 .modal-overlay 的 50：全屏弹窗必须盖住导航栏 */
+    flex-direction: row;
+    border-top: 1px solid var(--border);
+    border-bottom: none;
+    padding: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+    overflow: visible;
+  }
+  /* 品牌名在手机上是纯装饰：页面自己有 <h1>，这条只是在抢高度。 */
+  .sidebar-brand {
+    display: none;
+  }
+  .sidebar-nav {
+    flex: 1;
+    gap: 0;
+  }
+  .nav-item {
+    flex: 1;
+    min-height: 52px;
+    justify-content: center;
+    text-align: center;
+    border-bottom: none;
+    border-top: 2px solid transparent;
+    border-radius: 0;
+  }
+  .nav-item-active {
+    border-radius: 0;
+    border-bottom: none;
+    border-top-color: var(--accent);
+  }
+  /* 底部栏是 fixed 的，脱离了文档流：不给内容留出等高的下边距，
+     最后一行内容会被永久盖住，而且没有任何办法滚出来。 */
+  .app-main {
+    padding-bottom: calc(52px + var(--sp-4) + env(safe-area-inset-bottom));
+  }
+
+  /* 卡片化的表。只有显式标了 .cards 的表才变形——日志那类表要留在 Task 3 的横滚里。 */
+  table.cards,
+  table.cards tbody,
+  table.cards tr,
+  table.cards td {
+    display: block;
+    width: auto;
+  }
+  /* 列名改由每个 td 自己用 ::before 显示，表头就没用了。
+     用 position:absolute 而不是 display:none：后者会让屏幕阅读器也读不到。 */
+  table.cards thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  table.cards tr {
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    margin-bottom: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--bg-raised);
+  }
+  /* 触屏层（文件末尾）有一组四个选择器的 hover 抑制，其中三个带 class，specificity 比
+     table.cards tbody tr 高——光压住第一个不够。正在跑备份的那张卡（has-ops + ops-row
+     合并而成）会在点击后塌掉底色，而那正是手机上盯着看的那张。 */
+  table.cards tbody tr,
+  table.cards tbody tr.has-ops,
+  table.cards tbody tr.ops-row,
+  table.cards tbody tr.has-ops:hover + tr.ops-row {
+    background: var(--bg-raised);
+  }
+  table.cards td {
+    border-bottom: none;
+    padding: var(--sp-1) 0;
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr);
+    gap: var(--sp-3);
+    align-items: start;
+  }
+  table.cards td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  /* 首列是这张卡片的标题——给它标签反而是噪音。 */
+  table.cards td.card-title {
+    display: block;
+    font-weight: 600;
+    font-size: 15px;
+    padding-bottom: var(--sp-2);
+  }
+  table.cards td.card-title::before {
+    content: none;
+  }
+  /* 操作列：按钮横排在卡片底部，上面划一条线与字段区分开。
+     它的 data-label 是空的，所以不占标签列。 */
+  table.cards td.card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border);
+    text-align: left;
+  }
+  table.cards td.card-actions::before {
+    content: none;
+  }
+  /* 空表提示不是卡片，别给它画边框。 */
+  table.cards td.empty-state {
+    display: block;
+  }
+  table.cards td.empty-state::before {
+    content: none;
+  }
+  /* tr 才是画卡片的那一层，上面两条只管住了 td——不撤掉这一层，
+     "No backups yet." 就会被裱进一个空卡片里。 */
+  table.cards tr:has(td.empty-state) {
+    border: none;
+    border-radius: 0;
+    background: none;
+    padding: 0;
+    margin-bottom: 0;
+  }
+
+  /* 运行状态行在桌面上是跨全列的独立一行，卡片化后要和上面那张卡合成一张。 */
+  table.cards tr.has-ops {
+    margin-bottom: 0;
+    border-bottom: none;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  table.cards tr.ops-row {
+    border-top: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    padding-top: 0;
+  }
+  table.cards tr.ops-row td {
+    display: block;
+    padding-top: 0;
+  }
+  table.cards tr.ops-row td::before {
+    content: none;
+  }
+
+  /* 全屏面板：长表单的动作按钮必须常驻可见，这是"手机上完整可操作"的关键一处。 */
+  .modal-overlay {
+    padding: 0;
+  }
+  .modal-panel {
+    width: 100vw;
+    height: 100dvh; /* 不用 vh：地址栏收缩会改变它的解析值，动作栏会跟着跳 */
+    min-width: 0;
+    max-width: none;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .modal-header,
+  .modal-body,
+  .modal-footer {
+    padding-left: var(--sp-4);
+    padding-right: var(--sp-4);
+  }
+  .modal-footer {
+    padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
+  }
+  /* 动作按钮在手机上占满一行更好点，主按钮排在最前面。 */
+  .modal-footer > button {
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
+
+  /* 内联表单（新建备份向导）的动作栏。它不是弹窗，拿不到 .modal-footer 的固定位置，
+     用 sticky 达到同样效果：按钮始终贴在视口底部，而不是躺在表单末尾等人滚过去。 */
+  .form-actions {
+    position: sticky;
+    /* 让开底部导航栏，否则两条栏叠在一起。52px 与 .nav-item 的 min-height 一致。 */
+    bottom: calc(52px + env(safe-area-inset-bottom));
+    z-index: 30; /* 低于 .sidebar 的 40 */
+    margin: var(--sp-4) calc(-1 * var(--sp-4)) 0;
+    padding: var(--sp-3) var(--sp-4);
+    /* 背景与上边框不能省：sticky 元素下面的表单内容会从它背后透上来。 */
+    background: var(--bg-raised);
+    border-top: 1px solid var(--border);
+  }
+  .form-actions > button {
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
+}
+
+/* ── Touch ──────────────────────────────────────────────────────────────────
+   与屏幕宽度无关，只看指针精度：1000px 宽的触屏平板同样需要大命中区，
+   而桌面用户把窗口拖窄不该让按钮突然变粗。
+   这个块必须排在文件最后：@media 不增加 specificity，同 specificity 时源码顺序
+   靠后者胜出，放前面会被下面无条件的 tbody tr:hover 等规则盖掉，在触屏设备上失效。 */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+  }
+
+  /* 触屏上 :hover 会在点击后粘住不消失，表格会留下一片高亮，看着像"选中了"。
+     四个选择器要写全：.has-ops / .ops-row 那组带 class，specificity 比裸的
+     tbody tr:hover 高，只覆盖后者的话运行状态行仍然会粘住。 */
+  tbody tr:hover,
+  tbody tr.has-ops:hover,
+  tbody tr.has-ops:hover + tr.ops-row,
+  tbody tr.ops-row:hover {
+    background: transparent;
+  }
+
+  /* 系统默认的蓝色点击方块会盖住下面这些自定义的按下反馈。 */
+  button,
+  a,
+  label,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 没有 hover 就必须有 active，否则触屏上点下去毫无反馈。 */
+  button:active:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn-primary:active:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  .btn-danger:active:not(:disabled) {
+    background: var(--danger-bg);
+  }
+  .nav-item:active:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  /* 视觉尺寸保持不变——放大会破坏紧凑控制台的观感——只把命中区撑到 44px。
+     用伪元素实现：它不参与布局，因此不会推开周围内容。 */
+  .icon-btn,
+  .hit-target {
+    position: relative; /* 伪元素的定位基准；缺了它命中区会落到更外层的定位祖先上 */
+  }
+  .icon-btn::after,
+  .hit-target::after {
+    content: '';
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+
+  /* 还原树的行只有约 18px 高（.text-sm 的 12px × 1.5），44px 的方形命中盒会和上下两行
+     重叠 26px——点这一行的三角，展开的是下一行；而 disabled 的三角还会变成一块吞掉
+     邻居的死区。密集列表不适用通用的方形命中盒：横向仍扩到 44px（手指的宽度方向），
+     纵向老实跟着行高走。 */
+  .row.text-sm .icon-btn::after,
+  .row.text-sm .hit-target::after {
+    height: 100%;
   }
 }

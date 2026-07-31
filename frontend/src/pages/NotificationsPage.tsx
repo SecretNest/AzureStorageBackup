@@ -6,7 +6,7 @@ import {
   type NotificationConfig,
   type TestResult,
 } from '../api/notifications'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 
 const emptyCfg: NotificationConfig = {
   enabled: false,
@@ -118,7 +118,7 @@ export function NotificationsSection() {
         <legend>Notify on events</legend>
         <div className="row" style={{ flexWrap: 'wrap' }}>
           {eventList.map((e) => (
-            <label key={e.bit} className="row" style={{ width: 200 }}>
+            <label key={e.bit} className="row notify-event">
               <input
                 type="checkbox"
                 checked={(cfg.events & e.bit) !== 0}

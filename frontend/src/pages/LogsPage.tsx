@@ -100,45 +100,47 @@ export function LogsPage() {
         </button>
       </div>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Level</th>
-            <th>Source</th>
-            <th>Message</th>
-          </tr>
-        </thead>
-        <tbody>
-          {logs.length === 0 ? (
+      <div className="table-scroll" tabIndex={0}>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={4} className="empty-state">
-                No log entries.
-              </td>
+              <th>Time</th>
+              <th>Level</th>
+              <th>Source</th>
+              <th>Message</th>
             </tr>
-          ) : (
-            logs.map((l) => (
-              <tr key={l.id}>
-                <td className="text-faint" style={{ whiteSpace: 'nowrap' }}>
-                  {new Date(l.timestamp).toLocaleString()}
+          </thead>
+          <tbody>
+            {logs.length === 0 ? (
+              <tr>
+                <td colSpan={4} className="empty-state">
+                  No log entries.
                 </td>
-                <td>
-                  {/* 严重程度顺序须与 OperationLogLevel 一致：之前的映射有偏移，Error 会被渲染成和 Debug 一样的纯灰徽标。 */}
-                  <span className={
-                    l.level === OperationLogLevel.Error ? 'badge badge-danger'
-                    : l.level === OperationLogLevel.Warning ? 'badge badge-warn'
-                    : 'badge'
-                  }>
-                    {levelLabels[l.level]}
-                  </span>
-                </td>
-                <td className="mono text-faint">{l.source}</td>
-                <td>{l.message}</td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              logs.map((l) => (
+                <tr key={l.id}>
+                  <td className="text-faint" style={{ whiteSpace: 'nowrap' }}>
+                    {new Date(l.timestamp).toLocaleString()}
+                  </td>
+                  <td>
+                    {/* 严重程度顺序须与 OperationLogLevel 一致：之前的映射有偏移，Error 会被渲染成和 Debug 一样的纯灰徽标。 */}
+                    <span className={
+                      l.level === OperationLogLevel.Error ? 'badge badge-danger'
+                      : l.level === OperationLogLevel.Warning ? 'badge badge-warn'
+                      : 'badge'
+                    }>
+                      {levelLabels[l.level]}
+                    </span>
+                  </td>
+                  <td className="mono text-faint">{l.source}</td>
+                  <td>{l.message}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
 
       <h2>System</h2>
       <p className="text-muted">Version: {version || '…'}</p>

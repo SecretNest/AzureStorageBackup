@@ -42,7 +42,7 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
 
   if (advanced) {
     return (
-      <div className="row">
+      <div className="row" style={{ flexWrap: 'wrap' }}>
         <input
           value={value}
           onChange={(e) => onChange(e.target.value)}

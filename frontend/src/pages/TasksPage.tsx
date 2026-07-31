@@ -16,7 +16,7 @@ import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
 import { GroupsSection } from './GroupsPage'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 
 const emptyForm: TaskInput = {
   targetKind: TaskTargetKind.Backup,
@@ -150,35 +150,39 @@ export function TasksPage() {
 
       {error && <p className="text-danger">{error}</p>}
 
-      <table>
+      <table className="cards">
         <thead>
           <tr>
             <th>Target</th>
             <th>Type</th>
             <th>Schedule</th>
             <th>Enabled</th>
+            <th>Last run</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
           {tasks.length === 0 ? (
             <tr>
-              <td colSpan={5} className="empty-state">
+              <td colSpan={6} className="empty-state">
                 No tasks yet.
               </td>
             </tr>
           ) : (
             tasks.map((t) => (
               <tr key={t.id}>
-                <td>
+                <td className="card-title">
                   {targetKindLabels[t.targetKind]}: {describeTarget(t)}
                 </td>
-                <td>{taskTypeLabels[t.taskType]}</td>
-                <td>
+                <td data-label="Type">{taskTypeLabels[t.taskType]}</td>
+                <td data-label="Schedule">
                   <code>{t.cronExpression}</code>
                 </td>
-                <td>{t.enabled ? 'Yes' : 'No'}</td>
-                <td style={{ textAlign: 'right' }}>
+                <td data-label="Enabled">{t.enabled ? 'Yes' : 'No'}</td>
+                <td data-label="Last run" className="text-faint">
+                  {t.lastRunAt ? new Date(t.lastRunAt).toLocaleString() : 'never'}
+                </td>
+                <td className="card-actions" style={{ textAlign: 'right' }}>
                   <button type="button" className="btn-ghost" onClick={() => runNow(t)} disabled={running === t.id}>
                     {running === t.id ? 'Running…' : 'Run now'}
                   </button>{' '}
@@ -188,9 +192,6 @@ export function TasksPage() {
                   <button type="button" className="btn-ghost btn-danger" onClick={() => remove(t)}>
                     Delete
                   </button>
-                  <div className="text-faint">
-                    Last run: {t.lastRunAt ? new Date(t.lastRunAt).toLocaleString() : 'never'}
-                  </div>
                 </td>
               </tr>
             ))
