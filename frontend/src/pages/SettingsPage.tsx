@@ -10,7 +10,13 @@ const MB = 1024 * 1024
 /// Settings 是几个区域的外壳。Accounts 排在**最前面**并且**不等全局设置加载完**：
 /// 没有配过账户时用户会被直接带到这一页（见 App.tsx 里挑默认标签那段），第一眼就该看到它——
 /// 让它排在下面、或者压在 "Loading…" 后面，挡住的恰恰是新用户唯一能做的那件事。
-export function SettingsPage() {
+export function SettingsPage({
+  authRequired,
+  onLogout,
+}: {
+  authRequired?: boolean
+  onLogout?: () => void
+}) {
   return (
     <section>
       <div className="page-header">
@@ -19,6 +25,16 @@ export function SettingsPage() {
       <AccountsSection />
       <BackupDefaults />
       <NotificationsSection />
+      {/* 登出从侧栏搬到这里：手机上底部栏只有四格，塞不下第五个入口。
+          桌面端也一并搬过来——同一个功能摆两个位置，是后续最容易忘记同步的那种东西。 */}
+      {authRequired && onLogout && (
+        <>
+          <h2>Session</h2>
+          <button type="button" onClick={onLogout}>
+            Log out
+          </button>
+        </>
+      )}
     </section>
   )
 }
