@@ -174,56 +174,58 @@ export function AccountsSection() {
 
       {error && <p className="text-danger">{error}</p>}
 
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Endpoint</th>
-            <th>Region</th>
-            <th>Proxy</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {accounts.length === 0 ? (
+      <div className="table-scroll" tabIndex={0}>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={5} className="empty-state">
-                No accounts yet.
-              </td>
+              <th>Name</th>
+              <th>Endpoint</th>
+              <th>Region</th>
+              <th>Proxy</th>
+              <th></th>
             </tr>
-          ) : (
-            accounts.map((a) => (
-              <tr key={a.id}>
-                <td>
-                  {a.name}
-                  {a.secretsUnavailable && (
-                    <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
-                      <span className="badge badge-warn">Credential required</span>
-                      <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
-                        Re-enter
-                      </button>
-                    </span>
-                  )}
-                </td>
-                <td>{a.blobEndpoint}</td>
-                <td>{regionLabels[a.region]}</td>
-                <td>{a.useProxy ? 'Yes' : 'No'}</td>
-                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                  <button type="button" className="btn-ghost" onClick={() => setViewing(a)}>
-                    Containers
-                  </button>{' '}
-                  <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
-                    Edit
-                  </button>{' '}
-                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
-                    Delete
-                  </button>
+          </thead>
+          <tbody>
+            {accounts.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="empty-state">
+                  No accounts yet.
                 </td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              accounts.map((a) => (
+                <tr key={a.id}>
+                  <td>
+                    {a.name}
+                    {a.secretsUnavailable && (
+                      <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
+                        <span className="badge badge-warn">Credential required</span>
+                        <button type="button" className="btn-ghost" onClick={() => startReset(a)}>
+                          Re-enter
+                        </button>
+                      </span>
+                    )}
+                  </td>
+                  <td>{a.blobEndpoint}</td>
+                  <td>{regionLabels[a.region]}</td>
+                  <td>{a.useProxy ? 'Yes' : 'No'}</td>
+                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <button type="button" className="btn-ghost" onClick={() => setViewing(a)}>
+                      Containers
+                    </button>{' '}
+                    <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
+                      Edit
+                    </button>{' '}
+                    <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {showForm && (
         <div className="panel">

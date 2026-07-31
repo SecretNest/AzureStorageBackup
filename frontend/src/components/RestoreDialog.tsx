@@ -320,22 +320,24 @@ export function RestoreDialog({
               {relevantUnrecoverable.length} unrecoverable file(s) in this version — choose a version to substitute (or skip):
               {' '}<button type="button" onClick={setAllNearest}>Set all to nearest</button>
             </div>
-            <table>
-              <thead><tr><th>File</th><th>Substitute from</th></tr></thead>
-              <tbody>
-                {relevantUnrecoverable.map((p) => (
-                  <tr key={p}>
-                    <td className="mono">{p}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
-                        <option value={0}>Skip (don't restore)</option>
-                        {(options[p] ?? []).map((o) => <option key={o.version} value={o.version}>Version {o.version}</option>)}
-                      </select>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="table-scroll" tabIndex={0}>
+              <table>
+                <thead><tr><th>File</th><th>Substitute from</th></tr></thead>
+                <tbody>
+                  {relevantUnrecoverable.map((p) => (
+                    <tr key={p}>
+                      <td className="mono">{p}</td>
+                      <td style={{ textAlign: 'center' }}>
+                        <select value={choices[p] ?? 0} onChange={(e) => setChoices((c) => ({ ...c, [p]: Number(e.target.value) }))}>
+                          <option value={0}>Skip (don't restore)</option>
+                          {(options[p] ?? []).map((o) => <option key={o.version} value={o.version}>Version {o.version}</option>)}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
 

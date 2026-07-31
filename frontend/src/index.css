@@ -288,6 +288,22 @@ tbody tr.ops-row:hover {
   background: var(--bg-hover);
 }
 
+/* 窄屏上装不下的表包一层它。表格本身不变形——日志这类扫读型的表，
+   横滚比拆成卡片好用：卡片化后一屏看不了几条。 */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* 容器可聚焦（用法处加 tabIndex），键盘用户才能滚动溢出的内容（WCAG 2.1.1）。
+   但它不是控件，获焦时的 outline 会画出一个没有意义的大方框。 */
+.table-scroll:focus {
+  outline: none;
+}
+.table-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ── Shell ────────────────────────────────────────────────────────────────── */
 .app-shell {
   display: grid;

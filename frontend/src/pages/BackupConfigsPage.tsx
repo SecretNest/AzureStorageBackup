@@ -2097,22 +2097,24 @@ function CheckModal({
               </div>
             )}
             {problems.length > 0 && (
-              <table className="text-faint">
-                <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
-                <tbody>
-                  {problems.map((f) => (
-                    <tr key={f.path}>
-                      <td className="mono">
-                        {f.path}
-                        {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
-                      </td>
-                      <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
-                      <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
-                      <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="table-scroll" tabIndex={0}>
+                <table className="text-faint">
+                  <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
+                  <tbody>
+                    {problems.map((f) => (
+                      <tr key={f.path}>
+                        <td className="mono">
+                          {f.path}
+                          {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
+                        </td>
+                        <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
+                        <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
+                        <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         )}

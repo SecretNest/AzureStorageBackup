@@ -91,37 +91,39 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
       ) : containers.length === 0 ? (
         <p className="empty-state">No containers yet. We suggest creating one to start a backup.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Status</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {containers.map((c) => (
-              <tr key={c.name}>
-                <td>{c.name}</td>
-                <td>
-                  {infoFileName(c.backup) ? (
-                    <span className="row-inline">
-                      <span>{containerStatusLabel(c)}</span>
-                      <span className="text-faint">({infoFileName(c.backup)})</span>
-                    </span>
-                  ) : (
-                    containerStatusLabel(c)
-                  )}
-                </td>
-                <td style={{ textAlign: 'right' }}>
-                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(c.name)}>
-                    Delete
-                  </button>
-                </td>
+        <div className="table-scroll" tabIndex={0}>
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Status</th>
+                <th></th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {containers.map((c) => (
+                <tr key={c.name}>
+                  <td>{c.name}</td>
+                  <td>
+                    {infoFileName(c.backup) ? (
+                      <span className="row-inline">
+                        <span>{containerStatusLabel(c)}</span>
+                        <span className="text-faint">({infoFileName(c.backup)})</span>
+                      </span>
+                    ) : (
+                      containerStatusLabel(c)
+                    )}
+                  </td>
+                  <td style={{ textAlign: 'right' }}>
+                    <button type="button" className="btn-ghost btn-danger" onClick={() => remove(c.name)}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </section>
   )

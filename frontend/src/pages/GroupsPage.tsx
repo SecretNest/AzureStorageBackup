@@ -106,39 +106,41 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
 
       {error && <p className="text-danger">{error}</p>}
 
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Backups</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {groups.length === 0 ? (
+      <div className="table-scroll" tabIndex={0}>
+        <table>
+          <thead>
             <tr>
-              <td colSpan={3} className="empty-state">
-                No groups yet.
-              </td>
+              <th>Name</th>
+              <th>Backups</th>
+              <th></th>
             </tr>
-          ) : (
-            groups.map((g) => (
-              <tr key={g.id}>
-                <td>{g.name}</td>
-                <td>{g.members.length}</td>
-                <td style={{ textAlign: 'right' }}>
-                  <button type="button" className="btn-ghost" onClick={() => startEdit(g)}>
-                    Edit
-                  </button>{' '}
-                  <button type="button" className="btn-ghost btn-danger" onClick={() => remove(g)}>
-                    Delete
-                  </button>
+          </thead>
+          <tbody>
+            {groups.length === 0 ? (
+              <tr>
+                <td colSpan={3} className="empty-state">
+                  No groups yet.
                 </td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              groups.map((g) => (
+                <tr key={g.id}>
+                  <td>{g.name}</td>
+                  <td>{g.members.length}</td>
+                  <td style={{ textAlign: 'right' }}>
+                    <button type="button" className="btn-ghost" onClick={() => startEdit(g)}>
+                      Edit
+                    </button>{' '}
+                    <button type="button" className="btn-ghost btn-danger" onClick={() => remove(g)}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {showForm && (
         <div className="panel">
