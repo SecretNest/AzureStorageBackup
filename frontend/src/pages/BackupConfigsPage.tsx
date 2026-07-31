@@ -557,7 +557,7 @@ export function BackupConfigsPage() {
           被服务端拒掉的保存会把原因显示在离按钮几屏远的地方，看着就是"点了没反应"。 */}
       {!showForm && error && <p className="text-danger">{error}</p>}
 
-      <table>
+      <table className="cards">
         <thead>
           <tr>
             <th>Name</th>
@@ -588,7 +588,7 @@ export function BackupConfigsPage() {
               return (
               <Fragment key={c.id}>
               <tr className={ops.length > 0 ? 'has-ops' : undefined}>
-                <td>
+                <td className="card-title">
                   {c.name}
                   {c.secretsUnavailable && (
                     <span className="row-inline" style={{ marginLeft: '0.5rem' }}>
@@ -604,19 +604,19 @@ export function BackupConfigsPage() {
                     </span>
                   )}
                 </td>
-                <td>
+                <td data-label="Account / Container">
                   {accountName(c.accountId)} / {c.containerName}
                 </td>
-                <td className="mono text-faint">{c.localRoot}</td>
-                <td>{c.hasPassword ? 'Yes' : 'No'}</td>
-                <td>
+                <td className="mono text-faint" data-label="Local Root">{c.localRoot}</td>
+                <td data-label="Encrypted">{c.hasPassword ? 'Yes' : 'No'}</td>
+                <td data-label="Status">
                   <StatusBadge
                     config={c}
                     onReset={() => resetStatus(c)}
                     onShowError={() => setErrorModal(c)}
                   />
                 </td>
-                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                <td className="card-actions" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <button
                     type="button"
                     className="btn-ghost"

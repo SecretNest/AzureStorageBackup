@@ -746,6 +746,96 @@ tbody tr.ops-row:hover {
   .app-main {
     padding-bottom: calc(52px + var(--sp-4) + env(safe-area-inset-bottom));
   }
+
+  /* 卡片化的表。只有显式标了 .cards 的表才变形——日志那类表要留在 Task 3 的横滚里。 */
+  table.cards,
+  table.cards tbody,
+  table.cards tr,
+  table.cards td {
+    display: block;
+    width: auto;
+  }
+  /* 列名改由每个 td 自己用 ::before 显示，表头就没用了。
+     用 position:absolute 而不是 display:none：后者会让屏幕阅读器也读不到。 */
+  table.cards thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  table.cards tr {
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    margin-bottom: var(--sp-3);
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--bg-raised);
+  }
+  table.cards td {
+    border-bottom: none;
+    padding: var(--sp-1) 0;
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr);
+    gap: var(--sp-3);
+    align-items: start;
+  }
+  table.cards td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  /* 首列是这张卡片的标题——给它标签反而是噪音。 */
+  table.cards td.card-title {
+    display: block;
+    font-weight: 600;
+    font-size: 15px;
+    padding-bottom: var(--sp-2);
+  }
+  table.cards td.card-title::before {
+    content: none;
+  }
+  /* 操作列：按钮横排在卡片底部，上面划一条线与字段区分开。
+     它的 data-label 是空的，所以不占标签列。 */
+  table.cards td.card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border);
+    text-align: left;
+  }
+  table.cards td.card-actions::before {
+    content: none;
+  }
+  /* 空表提示不是卡片，别给它画边框。 */
+  table.cards td.empty-state {
+    display: block;
+  }
+  table.cards td.empty-state::before {
+    content: none;
+  }
+
+  /* 运行状态行在桌面上是跨全列的独立一行，卡片化后要和上面那张卡合成一张。 */
+  table.cards tr.has-ops {
+    margin-bottom: 0;
+    border-bottom: none;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  table.cards tr.ops-row {
+    border-top: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    padding-top: 0;
+  }
+  table.cards tr.ops-row td {
+    display: block;
+    padding-top: 0;
+  }
+  table.cards tr.ops-row td::before {
+    content: none;
+  }
 }
 
 /* ── Touch ──────────────────────────────────────────────────────────────────
