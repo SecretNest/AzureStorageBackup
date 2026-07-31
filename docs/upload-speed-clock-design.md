@@ -118,3 +118,43 @@ DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance` 分�
 - 前端。`BackupConfigsPage` 照旧渲染 `bytesPerSecond`，含义变了但形状没变。
 - `Eta()` 与 `EstimatedRemaining`。
 - `preparing` / `queued` / `ActiveItems` 的口径。
+
+## 2026-07-31 追加：压完到开传之间那一段
+
+上面那三个口径确实一个都没动，但它们**加起来不等于总数**——这一轮补的就是差额。
+
+现场是这样一屏，而且一连几分钟纹丝不动：
+
+```
+Uploading: 5,345 of 6,378 objects · nothing on the wire right now · 1 preparing · 1,031 queued
+195.3 GB / 331.6 GB original (58%) · +4.2 GB uploaded in unfinished objects · 100.0 MB ready to upload
+```
+
+`5,345 + 1 + 1,031 = 6,377`。少的那一件正是卡住的那个：它压完了（`100.0 MB ready to upload` 就是它，`_stagedBytes` 只在整件压完移入暂存区后才增加），卷已经部分落云（`+4.2 GB`），可它既不在 `preparing`（那只数拿到压缩锁的）、不在 `queued`（那只数还没被领走或在排压缩锁的）、也不在 `ActiveItems`（那数的是在途的**卷**）。屏幕上没有任何一栏在说它，只能靠把几屏截图排在一起做减法才发现得了它存在。
+
+### 恒等式
+
+```
+processed + preparing + queued + uploading ≡ total
+```
+
+`uploading` 取 `inWork - _inStaging`——手上的件减去还在暂存段的件。**不用** `_inUpload`（`BeginUpload`/`EndUpload` 那一对）：它从 `UploadStagedBlobAsync` 才开始算，而压完到那里之间还隔着预约协调与云端 HEAD，一件活能在那儿卡上几分钟却不在它里面。用它当口径，账在最需要对得上的时候恰好对不上，而账对不上正是这一栏存在的理由。这个减法把那段空隙一并算了进来，恒等式于是不依赖任何调用位置。
+
+### 卡在哪一段要分开说
+
+`UploadWait` 三档，因为三段的处置完全不同：
+
+| | 等什么 | 单位 | 标记处 |
+|---|---|---|---|
+| `Peer` | 同批同内容的首个上传者传完**整件** | 件 | `LocalDedupResolver.ResolveAsync`、`RunState.ClaimCloudUpload` 的等待侧 |
+| `Slot` | 全局上传闸门的额度 | **卷**（闸门按卷排队） | `VolumeUploadScope.RunAsync` |
+| `Cloud` | 云端存在性/元数据 HEAD | 件 | `ResolveDataRefAsync` |
+
+两处要点：
+
+- **`BeginWait`/`EndWait` 强制发布，不受 200ms 节流约束。** 等待期间本调用方不再产生任何事件，而心跳只在有流在传时才跑（`Tick()` 里那条虚拟时钟短路）。零流在传时被节流吞掉的那一次发布没有任何后续补偿，界面就冻在旧快照上直到等待结束——那正是这一栏要说明的那几分钟。
+- **闸门那一路先试 `gate.Wait(0)`。** 闸门空着时随手就拿到，标记它等于给每一卷平白加一次强制发布，一件大活上千卷就是上千次。只有真排上队才报。补 `ct.ThrowIfCancellationRequested()`：`Wait(0)` 不看取消令牌，而它替下来的 `WaitAsync(ct)` 是看的。
+
+### 这一轮没做
+
+`ActiveItems.length` 在界面上仍显示为 `N uploading`，单位是**卷**却和件数摆在同一行，加起来会超过总数（实测 `5,346 + 5 + 1,031 = 6,382 > 6,378`）。`X uploaded (N% of original)` 的分母是 `workDone` 而不是那一行左边的 `workTotal`，`of original` 这个标签指错了数。两处都已确认，本轮按要求未动。

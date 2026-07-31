@@ -182,6 +182,14 @@ export interface StageProgress {
   // 差分被流水线的有界队列挡住（判得比上传快几个数量级，填满是常态）。currentItem 那时亮着的是
   // 刚判完的那条，不标出来界面上就是"卡死在这个文件上"。
   waitingOnDownstream: boolean
+  // 已经离开压缩/暂存段的**件**数：压缩早已完成，此后要么有卷在飞，要么正卡在下面那三段之一。
+  // 与 activeItems 是两个口径——那里装的是**卷**，一件活可以同时有好几卷在飞，也可以一卷都没有。
+  // processed + preparing + queued + uploading ≡ total 是个恒等式，屏幕上的数必须凑得出它：
+  // 从前凑不出，一件卡在这一段的活谁也不算，只能靠把几屏截图排在一起做减法才发现得了。
+  uploading: number
+  waitingOnPeer: number // 其中在等同批同内容的首个上传者传完的件数
+  waitingOnSlot: number // 其中在排全局上传闸门的**卷**数（闸门按卷排队，单位与另外两个不同）
+  waitingOnCloud: number // 其中在等云端应答（存在性/元数据 HEAD）的件数
 }
 
 export interface BackupProgress {

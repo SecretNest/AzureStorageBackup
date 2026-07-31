@@ -32,7 +32,24 @@ public sealed class VolumeUploadScope(SemaphoreSlim gate, StageTracker tracker, 
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
         string? label = null, long volumeBytes = 0)
     {
-        await gate.WaitAsync(ct);
+        // 先试一次非阻塞获取：闸门空着时随手就拿到，那种情况下标记「在等额度」等于给每一卷平白
+        // 加一次强制发布——一件大活上千卷就是上千次。只有真的要排队才报，而真排上队的时候，
+        // 屏幕上一个字节都没在动，那一栏正是唯一说得出「在等什么」的东西。
+        // Wait(0) 不看取消令牌，而它替下来的 WaitAsync(ct) 是看的：不补这一句，已经取消的运行
+        // 在闸门空着时会照常传完这一卷才发现自己该停了。
+        ct.ThrowIfCancellationRequested();
+        if (!gate.Wait(0))
+        {
+            tracker.BeginWait(UploadWait.Slot);
+            try
+            {
+                await gate.WaitAsync(ct);
+            }
+            finally
+            {
+                tracker.EndWait(UploadWait.Slot);
+            }
+        }
         tracker.BeginItem(blobName, label, volumeBytes);
         try
         {

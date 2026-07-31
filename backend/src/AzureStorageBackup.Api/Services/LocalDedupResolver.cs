@@ -146,7 +146,11 @@ public sealed class LocalDedupResolver
         $"{fullHash}\n{length}\n{head}";
 
     /// <summary>解析某内容：命中既有 → 去重；否则占一个空 ref 由调用方上传，完成后回填 (raw, 分卷数)。</summary>
-    public async Task<Resolution> ResolveAsync(string fullHash, long length, string headHash, string tailHash)
+    /// <param name="tracker">可选的进度记账。同批同内容时后到者要等首个上传者**整件**传完——
+    /// 那可能是几分钟，而这段等待发生在压缩之后、上传之前，屏幕上既没有流在传也没有件在压。
+    /// 不标出来的话，界面上就是一片纹丝不动，连"在等谁"都无从说起。</param>
+    public async Task<Resolution> ResolveAsync(
+        string fullHash, long length, string headHash, string tailHash, StageTracker? tracker = null)
     {
         var ck = ContentKey(fullHash, length, headHash, tailHash);
         if (_priorByContent.TryGetValue(ck, out var prior))
@@ -172,7 +176,18 @@ public sealed class LocalDedupResolver
 
             var held = _run[refName];
             if (held.ContentKey == ck)
-                return Resolution.ForExisting(await held.Completion, collision); // 同批同内容 → 等首个上传者
+            {
+                // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
+                tracker?.BeginWait(UploadWait.Peer);
+                try
+                {
+                    return Resolution.ForExisting(await held.Completion, collision);
+                }
+                finally
+                {
+                    tracker?.EndWait(UploadWait.Peer);
+                }
+            }
             // 同批不同内容占此址 → 避让到下一个
         }
     }

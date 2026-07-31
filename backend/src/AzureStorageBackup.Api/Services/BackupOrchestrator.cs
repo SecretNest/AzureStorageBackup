@@ -939,7 +939,7 @@ public sealed class BackupOrchestrator(
             {
                 // 回退：导入未同步的备份没有本地权威索引，只能发云端 HEAD 比对元数据。
                 var (refName, exists, collision, existingRaw) = await ResolveDataRefAsync(
-                    cc, addressing, p.FullHash, p.Length, p.HeadHash, p.TailHash, ct);
+                    cc, addressing, p.FullHash, p.Length, p.HeadHash, p.TailHash, ct, uploadTracker);
                 if (exists)
                     return new BlobPlacement(
                         refName, collision, await VolumeBlobIO.CountVolumesAsync(cc, refName, ct), [],
@@ -958,7 +958,7 @@ public sealed class BackupOrchestrator(
             {
                 // 纯本地判定：跨版本查映射、同批经预约协调（同内容共享 ref/raw/卷数，不同内容避让）。不读云端。
                 var res = await localResolver.ResolveAsync(
-                    content.FullHash, content.Length, content.HeadHash, content.TailHash);
+                    content.FullHash, content.Length, content.HeadHash, content.TailHash, uploadTracker);
                 if (res.Exists)
                 {
                     var prior = res.Existing!;
@@ -986,7 +986,17 @@ public sealed class BackupOrchestrator(
             var claim = state.ClaimCloudUpload(CloudContentKey(content), out var inFlight);
             if (claim is null)
             {
-                var first = await inFlight;
+                // 与本地解析器那条路同一回事：等的是首个上传者整件传完，期间既无流在传也无件在压。
+                uploadTracker.BeginWait(UploadWait.Peer);
+                ResolvedBlob first;
+                try
+                {
+                    first = await inFlight;
+                }
+                finally
+                {
+                    uploadTracker.EndWait(UploadWait.Peer);
+                }
                 // collision 不再报一次：同一份内容的碰撞避让首个上传者已经报过，重复推送只是噪音。
                 return new BlobPlacement(first.Ref, false, first.Volumes, first.VolumeSizes,
                     content with { Raw = first.Raw });
@@ -1005,7 +1015,8 @@ public sealed class BackupOrchestrator(
                 else
                 {
                     var resolved = await ResolveDataRefAsync(
-                        cc, addressing, content.FullHash, content.Length, content.HeadHash, content.TailHash, ct);
+                        cc, addressing, content.FullHash, content.Length, content.HeadHash, content.TailHash, ct,
+                        uploadTracker);
                     if (resolved.Exists)
                     {
                         var existing = new ResolvedBlob(resolved.Ref, resolved.ExistingRaw,
@@ -1193,19 +1204,30 @@ public sealed class BackupOrchestrator(
     /// 定位 data blob 的实际存储名并判断是否可去重。基名由寻址方案给出（加密备份为密钥化地址）；
     /// 元数据确认同内容才去重，内容不同却 hash 相同（碰撞）时顺延到备用名 …~1、~2…。
     /// </summary>
+    /// <param name="tracker">可选的进度记账。这里每一轮都是一到两次云端 HEAD，碰撞避让还会一轮轮
+    /// 往下试；网络一慢，压缩与上传之间就插进一段几十秒的空白，而那段时间屏幕上什么都不动。</param>
     private static async Task<(string Ref, bool Exists, bool Collision, bool ExistingRaw)> ResolveDataRefAsync(
-        BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, string tailHash, CancellationToken ct)
+        BlobContainerClient cc, BlobAddressScheme addressing, string hash, long length, string headHash, string tailHash,
+        CancellationToken ct, StageTracker? tracker = null)
     {
-        var baseAddr = addressing.DataAddress(hash);
-        for (var n = 0; ; n++)
+        tracker?.BeginWait(UploadWait.Cloud);
+        try
         {
-            var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
-            var meta = await ReadBlobMetaAsync(cc, refName, ct);
-            if (meta is null)
-                return (refName, false, n > 0, false);                            // 空位 → 在此上传（n>0=已避让碰撞）
-            if (addressing.MetadataMatches(meta, hash, length, headHash, tailHash))
-                return (refName, true, n > 0, meta.TryGetValue("raw", out var r) && r == "1"); // 同内容 → 去重，带既有 raw 属性
-            // 元数据不符 → 碰撞，试下一个备用名。
+            var baseAddr = addressing.DataAddress(hash);
+            for (var n = 0; ; n++)
+            {
+                var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
+                var meta = await ReadBlobMetaAsync(cc, refName, ct);
+                if (meta is null)
+                    return (refName, false, n > 0, false);                            // 空位 → 在此上传（n>0=已避让碰撞）
+                if (addressing.MetadataMatches(meta, hash, length, headHash, tailHash))
+                    return (refName, true, n > 0, meta.TryGetValue("raw", out var r) && r == "1"); // 同内容 → 去重，带既有 raw 属性
+                // 元数据不符 → 碰撞，试下一个备用名。
+            }
+        }
+        finally
+        {
+            tracker?.EndWait(UploadWait.Cloud);
         }
     }
 

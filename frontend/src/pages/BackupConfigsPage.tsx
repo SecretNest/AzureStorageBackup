@@ -1322,6 +1322,19 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 措辞不提"压缩"：选了不压缩的备份一样要过一遍 7z（加密、打包、分卷），说 compressing 是错的；
   // 还原/校验阶段则确实是在解压/算 hash，直说就行。
   const preparingLabel = detail.stage === 'Uploading' ? 'preparing' : 'extracting'
+  // 压完了、字节却还没上网线的件卡在哪一段。三段的处置完全不同，所以分开说：
+  // · peer  —— 同一份内容正由别人上传，只能等它整件传完（几分钟起步）
+  // · slot  —— 全局上传闸门排满了（这一项数的是**卷**，闸门按卷排队）
+  // · cloud —— 在等云端应答（存在性/元数据 HEAD），网络一慢就是几十秒
+  // 不分开的话，屏幕上就只剩"什么都没在传"这一句，而这正是查不下去的地方。
+  //
+  // 件数口径：peer 与 cloud 数的是**件**，slot 数的是**卷**。所以只有前两项参与件数加法，
+  // slot 单独说，措辞里点明单位。
+  //
+  // 剩下的那些（uploading 减掉 peer 与 cloud）是已进上传段、但字节还没上路的件——正在做压完到
+  // 开传之间那段本地活（pack 逐成员重新 Stat、单文件查去重映射）。只在**一条流都没在传**时才报：
+  // 有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人分不清哪个数是哪个。
+  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.waitingOnCloud)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   const inFlight = [
@@ -1334,6 +1347,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 用户正是拿这两句对着问的。
     idleOnStaging && 'nothing on the wire right now',
     detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
+    // 压完了、字节却还没上路的件卡在哪一段。这几档存在的理由就是那个"几分钟纹丝不动"：
+    // 从前这些件不属于任何一栏，屏幕上 processed + preparing + queued 比总数少，而少掉的
+    // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
+    detail.waitingOnPeer > 0 && `${detail.waitingOnPeer} waiting on the same content elsewhere`,
+    detail.waitingOnCloud > 0 && `${detail.waitingOnCloud} waiting on the cloud`,
+    // 单位是**卷**不是件（闸门按卷排队），所以措辞里必须点明，否则又是一个加不平的数。
+    detail.waitingOnSlot > 0 && `${detail.waitingOnSlot} volumes waiting for an upload slot`,
+    detail.activeItems.length === 0 && stalled > 0 && `${stalled} starting upload`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
   ]
     .filter(Boolean)

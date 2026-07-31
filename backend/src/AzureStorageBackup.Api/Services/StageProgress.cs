@@ -17,6 +17,24 @@ public sealed record ActiveTransfer(string Label, long Sent, long Total)
 }
 
 /// <summary>
+/// 一件活压完之后、字节真正上网线之前，可能停在哪一段。三段的处置完全不同，所以必须分开报：
+/// 一句笼统的「在等」等于把三种病症合成一个症状。
+/// </summary>
+public enum UploadWait
+{
+    /// <summary>等同批同内容的首个上传者（预约协调）。同一份内容只能由一个上传者定调，
+    /// 后到者挂在它的完成信号上——等的时长就是那一件的整个上传时长。</summary>
+    Peer,
+
+    /// <summary>等全局上传闸门的额度。额度被别的卷占满时才会出现；闸门空着时随手就拿到，不报。</summary>
+    Slot,
+
+    /// <summary>等云端应答（存在性/元数据 HEAD、卷数清点）。只有没有本地权威索引的备份会走到，
+    /// 网络一慢，这里就是几十秒起步。</summary>
+    Cloud,
+}
+
+/// <summary>
 /// 某个阶段正在做什么。备份/还原/检查共用一套形状，阶段名各用各的。
 /// <para>
 /// 存在的理由：在此之前，界面上一个阶段只在**进入**时上报一次。首次备份的 Diffing 要把每个文件
@@ -95,8 +113,35 @@ public sealed record StageProgress(
     /// 而 <see cref="CurrentItem"/> 那时亮着的是**刚判完**的那条，界面看上去就是"卡死在这个文件上"。
     /// 说清楚它其实是在等，比让人盯着一个不动的文件名强。
     /// </summary>
-    bool WaitingOnDownstream = false)
+    bool WaitingOnDownstream = false,
+    /// <summary>
+    /// 已经进了上传段的**件**数：压缩早已完成、暂存文件就绪，此后要么有卷在飞，要么正卡在
+    /// <see cref="UploadWait"/> 说的那三段之一上。
+    /// <para>
+    /// 与 <see cref="ActiveItems"/> 是两个口径，不能互相代替：那里装的是**卷**，一件活可以同时有
+    /// 好几卷在飞，也可以一卷都没有（正卡着）。没有这一栏，「压完了但一个字节都没在传」的活
+    /// 在屏幕上不属于任何一栏——<c>processed + preparing + queued</c> 加起来比总数少，而少掉的
+    /// 恰恰就是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
+    /// </para>
+    /// </summary>
+    int Uploading = 0,
+    /// <summary>其中正卡在同批预约上的件数（<see cref="UploadWait.Peer"/>）。</summary>
+    int WaitingOnPeer = 0,
+    /// <summary>其中正卡在全局上传闸门上的**卷**数（<see cref="UploadWait.Slot"/>）。
+    /// 闸门是按卷排队的，所以这一个数的单位与另外两个不同。</summary>
+    int WaitingOnSlot = 0,
+    /// <summary>其中正卡在云端应答上的件数（<see cref="UploadWait.Cloud"/>）。</summary>
+    int WaitingOnCloud = 0)
 {
+    /// <summary>某一种等待此刻卡着几个。</summary>
+    public int Waiting(UploadWait kind) => kind switch
+    {
+        UploadWait.Peer => WaitingOnPeer,
+        UploadWait.Slot => WaitingOnSlot,
+        UploadWait.Cloud => WaitingOnCloud,
+        _ => 0,
+    };
+
     /// <summary>还没开始处理的源端字节（压缩前）。</summary>
     public long WorkRemaining => Math.Max(0, WorkTotal - WorkDone);
 
@@ -201,6 +246,9 @@ public sealed class StageTracker(
     // 默认配置下界面显示 5 preparing，看着像五件活在并行推进，实际是一件在压、四个在闲等。
     private int _inStaging;
     private int _inPacking;
+    // 各段等待的当前人数，按 UploadWait 的序号索引。数组而不是三个字段：调用方按枚举取用，
+    // 加一段等待只需在枚举里多一项，发布那一头不必再各加一条。
+    private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
     // 剩余时间用的"工作量"。与 _bytes 是两回事：后者是真正过了网线的字节（压缩后、去重命中为 0），
     // 拿它当完成度会让剩余时间随压缩率和去重命中率乱跳。没有阶段申报工作量时（0），
     // 剩余时间退回按件数外推。
@@ -347,6 +395,29 @@ public sealed class StageTracker(
     public void BeginUpload() => Interlocked.Increment(ref _inUpload);
 
     public void EndUpload() => Interlocked.Decrement(ref _inUpload);
+
+    /// <summary>
+    /// 开始等某一段（成对调 <see cref="EndWait"/>）。
+    /// <para>
+    /// 进 <c>_gate</c> 强制发一次，**不**受 200ms 节流约束：等待期间本调用方不再产生任何事件，
+    /// 而心跳只在有流在传时才跑（见 <see cref="Tick"/> 里那条虚拟时钟的短路）。零流在传的时候
+    /// 被节流吞掉的这一次发布没有任何后续补偿，界面就冻在旧快照上直到等待结束——那正是这一栏
+    /// 要说明的那几分钟。等待事件本身不密集（闸门那一路还先试过非阻塞获取），代价可以忽略。
+    /// </para>
+    /// </summary>
+    public void BeginWait(UploadWait kind)
+    {
+        Interlocked.Increment(ref _waits[(int)kind]);
+        lock (_gate)
+            PublishIfDue(force: true);
+    }
+
+    public void EndWait(UploadWait kind)
+    {
+        Interlocked.Decrement(ref _waits[(int)kind]);
+        lock (_gate)
+            PublishIfDue(force: true);
+    }
 
     /// <summary>一件活进了暂存区这一段——此刻它多半还在排压缩锁，所以算"排队中"
     /// （成对调 <see cref="EndStaging"/>）。</summary>
@@ -651,7 +722,18 @@ public sealed class StageTracker(
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
             Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, _unfinishedItemBytes, staged,
-            Volatile.Read(ref _transferTotal), Volatile.Read(ref _blocked) > 0));
+            Volatile.Read(ref _transferTotal), Volatile.Read(ref _blocked) > 0,
+            // 已经离开压缩/暂存段的件数 = 手上的件 - 还在暂存段的件。
+            //
+            // 刻意**不**用 _inUpload（BeginUpload/EndUpload 那一对）：它从 UploadStagedBlobAsync
+            // 才开始算，而压完之后到那里之间还隔着预约协调与云端 HEAD——一件活能在那儿卡上几分钟，
+            // 却不在 _inUpload 里。用它当口径，件数账在最需要对得上的时候恰好对不上，
+            // 而账对不上正是这一栏存在的理由。这个减法把那段空隙一并算了进来，于是
+            // processed + preparing + queued + uploading ≡ total 是个恒等式，不依赖任何调用位置。
+            Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
+            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
+            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
+            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Cloud]))));
     }
 
     /// <summary>
