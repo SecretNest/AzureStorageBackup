@@ -859,7 +859,7 @@ export function BackupConfigsPage() {
                 />
               </Field>
 
-              <div className="row" style={{ marginTop: '1rem' }}>
+              <div className="row form-actions" style={{ marginTop: '1rem' }}>
                 <button
                   type="button"
                   onClick={() => setStep(2)}
@@ -1094,7 +1094,7 @@ export function BackupConfigsPage() {
               </DefaultableField>
 
               {error && <p className="text-danger">{error}</p>}
-              <div className="row" style={{ marginTop: '1rem' }}>
+              <div className="row form-actions" style={{ marginTop: '1rem' }}>
                 <button type="button" onClick={() => setStep(1)}>
                   Back
                 </button>

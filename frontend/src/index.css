@@ -906,6 +906,24 @@ tbody tr.ops-row:hover {
     flex: 1 1 auto;
     min-width: 120px;
   }
+
+  /* 内联表单（新建备份向导）的动作栏。它不是弹窗，拿不到 .modal-footer 的固定位置，
+     用 sticky 达到同样效果：按钮始终贴在视口底部，而不是躺在表单末尾等人滚过去。 */
+  .form-actions {
+    position: sticky;
+    /* 让开底部导航栏，否则两条栏叠在一起。52px 与 .nav-item 的 min-height 一致。 */
+    bottom: calc(52px + env(safe-area-inset-bottom));
+    z-index: 30; /* 低于 .sidebar 的 40 */
+    margin: var(--sp-4) calc(-1 * var(--sp-4)) 0;
+    padding: var(--sp-3) var(--sp-4);
+    /* 背景与上边框不能省：sticky 元素下面的表单内容会从它背后透上来。 */
+    background: var(--bg-raised);
+    border-top: 1px solid var(--border);
+  }
+  .form-actions > button {
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
 }
 
 /* ── Touch ──────────────────────────────────────────────────────────────────
