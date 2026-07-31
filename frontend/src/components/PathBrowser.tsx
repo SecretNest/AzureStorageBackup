@@ -56,20 +56,20 @@ export function PathBrowser({
 
       {error && <p className="text-danger">{error}</p>}
 
-      <div style={{ overflowY: 'auto', border: '1px solid var(--border)', padding: 'var(--sp-2)' }}>
+      <div style={{ border: '1px solid var(--border)', padding: 'var(--sp-2)' }}>
         {data?.parent && (
           <div>
-            <button type="button" className="btn-ghost" onClick={() => setPath(data.parent!)}>
+            <button type="button" className="browse-row" onClick={() => setPath(data.parent!)}>
               .. (up)
             </button>
           </div>
         )}
         {data?.entries.map((e) => (
-          <div key={e.fullPath} style={{ padding: '0.15rem 0' }}>
+          <div key={e.fullPath}>
             {e.isDirectory ? (
               <button
                 type="button"
-                className="btn-ghost"
+                className="browse-row"
                 disabled={e.outsideRoot}
                 title={e.outsideRoot ? 'Outside the configured root' : undefined}
                 onClick={() => setPath(e.fullPath)}

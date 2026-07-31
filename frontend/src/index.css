@@ -612,6 +612,44 @@ tbody tr.ops-row:hover {
   gap: var(--sp-2);
 }
 
+/* 目录选择器的一行。原先是个 .btn-ghost，高 32px、左右各 8px 内边距，
+   手机上要瞄准才点得中；整行可点就没有瞄准这回事了。 */
+.browse-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: var(--control-h);
+  height: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+  word-break: break-all;
+}
+.browse-row:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.browse-row::after {
+  content: '›';
+  color: var(--text-muted);
+  flex: none;
+}
+.browse-row:disabled::after {
+  content: none;
+}
+
+/* 事件多选项：桌面上排成 200px 的多列，窄屏上自然掉成单列。 */
+.notify-event {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 260px;
+}
+
 /* ── Alerts & badges ──────────────────────────────────────────────────────── */
 .alert {
   border: 1px solid var(--border);

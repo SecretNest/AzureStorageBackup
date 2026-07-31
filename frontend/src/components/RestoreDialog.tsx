@@ -452,7 +452,7 @@ function TreeBrowser({
                 <>
                   <button
                     type="button"
-                    className="icon-btn"
+                    className="icon-btn hit-target"
                     onClick={() => onToggleExpand(node)}
                     disabled={!node.hasChildren}
                     style={{ width: 18, cursor: node.hasChildren ? 'pointer' : 'default' }}
