@@ -91,7 +91,11 @@
 
 ### 3.6 固定宽度
 
-`.w-sm/.w-md/.w-lg`（`index.css:491-493`）在手机层一律变 `width: 100%`。三处内联固定宽度同样处理：`NotificationsPage.tsx:121`（`width: 200`）、`RestoreDialog.tsx:277`（`width: 340`）。
+`.w-md`（280px）与 `.w-lg`（480px）在手机层变 `width: 100%`。
+
+`.w-sm`（160px）**不动**：这一档全是数字框——代理端口、版本数、保留天数，以及计划编辑器里 `at [__] h`、`min [__]` 这些夹在文字中间的输入框（`CronEditor.tsx:87/101/115`）。让它们占满一行既难看，又会把那两个标签挤散。160px 在最窄的 320px 屏上也放得下。
+
+三处内联固定宽度另行处理：`NotificationsPage.tsx:121`（`width: 200`）、`RestoreDialog.tsx:277`（`width: 340`）、PathBrowser 目录列表的 `maxHeight: 320`（后者在弹窗改用 `.modal-body` 滚动后会造成嵌套滚动条，一并删掉）。
 
 ## 4. 主导航：手机层底部 tab 栏
 
@@ -181,23 +185,36 @@ Logs 不卡片化的理由："时间/级别/来源/消息"是扫读型日志流�
 
 ### 6.3 嵌套弹窗的层级
 
-向导与还原对话框都会在自身之上再开 PathBrowser。`.modal-overlay` 现在是固定的 `z-index: 50`（`index.css:650`），两层叠在一起时靠 DOM 顺序侥幸生效——桌面端因为两个面板尺寸不同、能看见下面那层的边缘，问题不明显；手机层两层都是全屏，一旦顺序不对就是"点了 Browse 什么也没发生"。
+还原对话框会在自身之上再开 PathBrowser（`RestoreDialog.tsx:282`）。`.modal-overlay` 现在是固定的 `z-index: 50`（`index.css:650`），两层叠在一起时靠 DOM 顺序侥幸生效——桌面端因为两个面板尺寸不同、能看见下面那层的边缘，问题不明显；手机层两层都是全屏，一旦顺序不对就是"点了 Browse 什么也没发生"。
 
 改为让嵌套层显式提升：PathBrowser 作为二级弹窗使用 `z-index: 60`。同时保留其 `onClick={onClose}` 的遮罩点击关闭行为——手机全屏下遮罩不可见，关闭要靠标题栏的 `✕`，这正是 §6.2 三段结构里 header 关闭按钮的必要性所在。
 
 ### 6.4 需要改造的弹窗
 
-目前动作按钮都是散在内容末尾的 `.row`，要包进 `.modal-footer`：
+全部 8 处弹窗共用 `.modal-overlay` / `.modal-panel`。目前动作按钮都是散在内容末尾的 `.row`，要包进 `.modal-footer`：
 
-| 弹窗 | 位置 | 说明 |
+| # | 弹窗 | 位置 |
 |---|---|---|
-| 新建/编辑备份向导 | `BackupConfigsPage.tsx:687` 起 | Step 1/2，最长的表单，全屏化收益最大 |
-| 还原对话框 | `RestoreDialog.tsx` | 含目录树 + 版本表 |
-| 目录选择器 | `PathBrowser.tsx:37` 起 | |
-| 通用确认框 | `modal.tsx` | |
-| 删除确认 | `BackupConfigsPage.tsx` / 各页 | 复用通用确认框的走 `modal.tsx` |
+| 1 | 目录选择器 PathBrowser | `PathBrowser.tsx:38` |
+| 2 | 账户表单 | `AccountsPage.tsx:382` |
+| 3 | 还原对话框 | `RestoreDialog.tsx:273` |
+| 4 | 末次错误 ErrorModal | `BackupConfigsPage.tsx:1552` |
+| 5 | 删除备份确认 | `BackupConfigsPage.tsx:1774` |
+| 6 | 创建完成 PostCreateModal | `BackupConfigsPage.tsx:1812` |
+| 7 | 重输密码 ResetPasswordModal | `BackupConfigsPage.tsx:1843` |
+| 8 | 检查/修复 | `BackupConfigsPage.tsx:1981` |
 
-向导的 Step 1/2 切换按钮（`BackupConfigsPage.tsx:865`、`1098`）进 footer 后固定可见——这是"完整可操作"目标里最关键的一处：现在手机上要滚过整个表单才能摸到"下一步"。
+`components/modal.tsx` **不是**弹窗组件——它导出的是表单字段行 `Field`，不在本节范围内。
+
+### 6.4.1 新建/编辑备份向导：不是弹窗
+
+向导是内联面板 `<div className="panel">`（`BackupConfigsPage.tsx:684`），展开在表格下方，随页面一起滚动。它拿不到 §6.2 的全屏三段结构。
+
+但它恰恰是"完整可操作"目标里最关键的一处：Step 1 的表单很长，手机上要滚过整屏才能摸到底部的"下一步"（`:865`）和"上一步 / 保存"（`:1098`）。
+
+处理方式：把这两组按钮包进 `.form-actions`，手机层 `position: sticky; bottom: 0` 钉在视口底部，加背景色与上边框以免内容透上来。`bottom` 值要让开底部导航栏的高度（§4），否则两条栏会叠在一起。
+
+选 sticky 而不是把向导改成弹窗：后者要动状态管理与 `showForm` 的渲染位置，风险远大于收益，而按钮常驻可见的效果是一样的。
 
 ### 6.5 背景滚动锁定
 
@@ -205,7 +222,7 @@ Logs 不卡片化的理由："时间/级别/来源/消息"是扫读型日志流�
 
 实现：在 `modalStyles.ts` 旁新增一个 `useModalScrollLock()` hook——挂载时给 `body` 加 `overflow: hidden` 并记录当前滚动位置，卸载时恢复两者。每个弹窗组件调用一次这个 hook，锁定逻辑只写一份。
 
-**hook 必须带引用计数**：弹窗会嵌套——向导里点 Browse 会在向导之上再开 PathBrowser（`BackupConfigsPage.tsx:1113`），还原对话框同样（`RestoreDialog.tsx:282`）。没有计数的话，内层 PathBrowser 关闭时会把 `body` 的 `overflow` 恢复掉，而外层向导还开着，背景又能滚了。用模块级计数器：归零时才恢复。
+**hook 必须带引用计数**：还原对话框会在自身之上再开 PathBrowser（`RestoreDialog.tsx:282`）。没有计数的话，内层 PathBrowser 关闭时会把 `body` 的 `overflow` 恢复掉，而外层还原对话框还开着，背景又能滚了。用模块级计数器：归零时才恢复。
 
 ## 7. 逐页触屏细节
 
@@ -213,7 +230,7 @@ Logs 不卡片化的理由："时间/级别/来源/消息"是扫读型日志流�
 
 **RestoreDialog**：树形展开三角（`:454`）命中区扩到 44px；`:277` 的 `width: 340` 输入框改响应式；版本表包横滚。
 
-**CronEditor**（`CronEditor.tsx`）：多个并排的窄输入框，手机层改为纵向堆叠。
+**CronEditor**（`CronEditor.tsx`）：不需要纵向堆叠。简单模式的容器（`:60`）本来就带 `flexWrap: 'wrap'`，三个数字框保持 160px 后会自然折行；只有高级模式的容器（`:45`）缺 `flexWrap`——那里的 `.w-md` 输入框占满宽度后会把 Simple 按钮挤出去，补上折行即可。
 
 **NotificationsPage**（`:121`）：`width: 200` 的事件多选行改为响应式栅格，手机层单列。
 
