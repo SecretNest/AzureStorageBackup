@@ -94,6 +94,58 @@
   }
 }
 
+/* ── Touch ──────────────────────────────────────────────────────────────────
+   与屏幕宽度无关，只看指针精度：1000px 宽的触屏平板同样需要大命中区，
+   而桌面用户把窗口拖窄不该让按钮突然变粗。 */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+  }
+
+  /* 触屏上 :hover 会在点击后粘住不消失，表格会留下一片高亮，看着像"选中了"。 */
+  tbody tr:hover {
+    background: transparent;
+  }
+
+  /* 系统默认的蓝色点击方块会盖住下面这些自定义的按下反馈。 */
+  button,
+  a,
+  label,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 没有 hover 就必须有 active，否则触屏上点下去毫无反馈。 */
+  button:active:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn-primary:active:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  .btn-danger:active:not(:disabled) {
+    background: var(--danger-bg);
+  }
+  .nav-item:active:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  /* 视觉尺寸保持不变——放大会破坏紧凑控制台的观感——只把命中区撑到 44px。
+     用伪元素实现：它不参与布局，因此不会推开周围内容。 */
+  .icon-btn,
+  .hit-target {
+    position: relative; /* 伪元素的定位基准；缺了它命中区会落到更外层的定位祖先上 */
+  }
+  .icon-btn::after,
+  .hit-target::after {
+    content: '';
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+}
+
 /* ── Base ─────────────────────────────────────────────────────────────────── */
 *,
 *::before,
@@ -674,6 +726,25 @@ tbody tr.ops-row:hover {
 @media (max-width: 900px) {
   .modal-panel {
     min-width: 0;
+    width: 100%;
+  }
+}
+
+/* ── Mobile (≤640px) ────────────────────────────────────────────────────────
+   手机层。平板层（≤900px）已经处理了侧栏塌陷与 .field 单列，这里只加手机独有的东西。 */
+@media (max-width: 640px) {
+  /* 16px 是硬门槛，不是观感问题：低于 16px 时 iOS Safari 会在聚焦输入框的瞬间
+     放大整个页面，并且失焦后不缩回——用户此后看到的是一个需要手动双指缩小的界面。
+     只有表单控件会触发这个行为，正文其余部分保持 14px。 */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  /* 长输入框占满可用宽度：480px 在任何手机上都溢出，280px 在 320px 屏上也贴边。 */
+  .w-md,
+  .w-lg {
     width: 100%;
   }
 }
