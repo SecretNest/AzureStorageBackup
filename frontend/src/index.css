@@ -667,14 +667,46 @@ tbody tr.ops-row:hover {
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-overlay);
-  padding: var(--sp-5);
   min-width: 620px;
   max-width: 90vw;
   max-height: 88vh;
   overflow: auto;
 }
-.modal-panel > h3:first-child {
-  margin-bottom: var(--sp-3);
+
+/* 内容区自己滚，标题栏与动作栏不动。桌面上 max-height 由 .modal-panel 限制，
+   手机上（见下）改成占满视口。 */
+.modal-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 0;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+.modal-body {
+  padding: var(--sp-4) var(--sp-5);
+  overflow-y: auto;
+}
+.modal-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--border);
+}
+.modal-close {
+  font-size: 16px;
+  line-height: 1;
+}
+/* 二级弹窗（叠在另一个弹窗之上的 PathBrowser）。原先两层同为 z-index 50，
+   靠 DOM 顺序侥幸生效；手机上两层都是全屏，顺序不对就是"点了没反应"。 */
+.modal-overlay-secondary {
+  z-index: 60;
 }
 
 @media (max-width: 900px) {
@@ -844,6 +876,35 @@ tbody tr.ops-row:hover {
   }
   table.cards tr.ops-row td::before {
     content: none;
+  }
+
+  /* 全屏面板：长表单的动作按钮必须常驻可见，这是"手机上完整可操作"的关键一处。 */
+  .modal-overlay {
+    padding: 0;
+  }
+  .modal-panel {
+    width: 100vw;
+    height: 100dvh; /* 不用 vh：地址栏收缩会改变它的解析值，动作栏会跟着跳 */
+    min-width: 0;
+    max-width: none;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .modal-header,
+  .modal-body,
+  .modal-footer {
+    padding-left: var(--sp-4);
+    padding-right: var(--sp-4);
+  }
+  .modal-footer {
+    padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
+  }
+  /* 动作按钮在手机上占满一行更好点，主按钮排在最前面。 */
+  .modal-footer > button {
+    flex: 1 1 auto;
+    min-width: 120px;
   }
 }
 
