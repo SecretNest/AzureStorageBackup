@@ -44,7 +44,8 @@ public static class ContainerEndpoints
         // 列/建/删 container 都要连云（设计 §3.1 明列「列容器」为需要凭据的动作），
         // 密钥环丢失时必须在入口 409，而不是让 SecretReader 在深处抛异常。
         group.MapGet("/", async (
-            int accountId, IAccountService accounts, IContainerService containers, IKeyringHealth keyring, CancellationToken ct) =>
+            int accountId, IAccountService accounts, IContainerService containers, IBackupConfigService configs,
+            IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -55,7 +56,19 @@ public static class ContainerEndpoints
             try
             {
                 var list = await containers.ListContainersAsync(account, ct);
-                return Results.Ok(list);
+
+                // 云端那个 presence 只说得出「信息文件在不在」，而它是备份最后一步才写的：首次备份
+                // 跑到一半的 container 里已经躺着这一轮上传的数据，云端却还什么标记都没有，列表于是
+                // 把它报成空容器——用户照着这份列表把同一个 container 又配给了第二条备份，两边各写
+                // 各的索引互相覆盖。占用的权威在本地：库里那条配置从创建的那一刻起就在，不必等云端。
+                var held = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var c in await configs.ListAsync(ct))
+                    if (c.AccountId == accountId)
+                        held.TryAdd(c.ContainerName, c.Name);
+
+                return Results.Ok(list
+                    .Select(c => held.TryGetValue(c.Name, out var owner) ? c with { InUseBy = owner } : c)
+                    .ToList());
             }
             catch (RequestFailedException ex)
             {

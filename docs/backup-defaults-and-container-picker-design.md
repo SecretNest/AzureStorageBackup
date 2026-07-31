@@ -20,7 +20,7 @@
 | 6 | 解析时机 | **使用时解析，不在读取时填充**。见 §3.2——填充会让功能自我作废 |
 | 7 | 现有配置的迁移 | **一律保持覆盖**，11 个字段全部保留当前具体值，不静默改成继承 |
 | 8 | `IndexTier` / `DataTier` | **不可继承**。`BackupConfigService.cs:40-45` 在创建后拒绝变更这两个字段，而继承的含义正是「随全局设置变化」——即一次创建后的变更。改为新建时以全局默认预填，保存即固定 |
-| 9 | 已有备份的容器 | 在下拉里**标记但不禁用**。本地库对 `(accountId, container)` 无唯一约束，禁用等于替用户定一条产品规则，超出本轮范围 |
+| 9 | 已有备份的容器 | 在下拉里**标记但不禁用**。本地库对 `(accountId, container)` 无唯一约束，禁用等于替用户定一条产品规则，超出本轮范围。**已于 2026-07-31 部分推翻**——见下方「2026-07-31 修订」 |
 
 ## 2. Container 选择器
 
@@ -29,6 +29,7 @@
 选定 account 后拉取 `GET /api/accounts/{accountId}/containers`（现有接口，`ContainersPage` 已在用），下拉呈现结果，末项固定为 `+ New container…`。选中末项才显示输入框，用 `validateContainerName`（`frontend/src/api/containers.ts`）即时校验。
 
 - **标记已有备份**：该接口返回 `BackupPresence`，据此在选项后附 `● has backup`。指向已有备份的容器通常是误操作，那种场景应走 Import 流程；但仅提示，不阻止（决策 8）。
+- **标记本地已占用**（2026-07-31 追加）：该接口另返回 `inUseBy`，本地已有备份配置占着这个 container 时是那条备份的名字。这一项**禁用**该选项，文案为 `● in use by "<名字>"`。
 - **切换 account 清空已选容器**：否则会残留属于上一个账户的名字，而后端不校验存在性。
 - **列举失败可继续**：列举需连云。失败时下拉降级为纯输入框，并显示失败原因——不能因为列不出来就无法新建备份。
 
@@ -37,6 +38,19 @@
 ### 2.2 不做
 
 不改后端。不为 `POST /api/backup-configs` 增加容器存在性校验——`BackupOrchestrator.cs:158` 会在首次备份时 `CreateIfNotExistsAsync`，指定尚不存在的容器是受支持的正常流程。
+
+### 2.3 2026-07-31 修订：占用改由本地判定，重复直接拒绝
+
+决策 9 当初的理由是「本地库对 `(accountId, container)` 无唯一约束」。那条约束现在有了，理由随之失效。
+
+推翻它的是一次真实事故：**首次备份跑到一半时，同一个 container 在下拉里显示为空容器**。`BackupPresence` 只看云端信息文件在不在，而那个文件是 `BackupOrchestrator` 最后一步才写的——容器里已经躺着这一轮上传的数据，云端却还什么标记都没有。用户照着这份列表把它又配给了第二条备份，两条各写各的版本历史互相覆盖，各自的数据 blob 在对方的保留清理里被当成孤儿删掉。
+
+- **占用的权威在本地**：库里那条 `BackupConfig` 从创建的那一刻就在，不必等任何云端产物。`GET /api/accounts/{id}/containers` 由 `ContainerEndpoints` 合入 `inUseBy`；备份进行中、备份失败留下半成品、云端一时读不到，三种情况一并覆盖。
+- **服务端硬拒绝**：`POST /api/backup-configs` 与 `POST /api/backup-configs/import` 在写库之前查 `FindAsync(accountId, container)`，已占用返回 409（import 的判定排在读云之前——本地能回答的问题不该先花一趟网络，也不该为一次注定被拒的导入把云端信息文件种进 `TrackedInfoStore`）。
+- **库上兜底**：`BackupConfigs` 加 `(AccountId, ContainerName)` 唯一索引，堵住绕过端点的写入与挤进「查—写」窗口的并发。
+- **迁移不删数据**：`EnforceOneBackupPerContainer` 先把已有重复挪开——保留每组 `Id` 最小的那条，其余的 `ContainerName` 改成带点的名字（Azure 一概不收，于是再也碰不到任何真实 container）、标 `Error` 并写明原因，一条都不删。重复配置指着真实的云端数据，删掉本地记录只会让用户再也看不见它。
+
+§2.2「不改后端」同样只对当初那一轮成立：这次改了后端，但仍**不**校验容器在云端是否存在——`CreateIfNotExistsAsync` 那条理由依然有效。
 
 ## 3. 「使用默认」继承
 

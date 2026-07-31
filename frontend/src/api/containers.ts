@@ -20,7 +20,20 @@ export const infoFileName = (presence: number): string | null =>
 export interface ContainerInfo {
   name: string
   backup: number
+  /**
+   * 本地已有一条备份配置占着这个 container 时，是那条备份的名字。
+   *
+   * `backup` 只说得出「云端信息文件在不在」，而那个文件是备份的最后一步才写的：首次备份跑到
+   * 一半的 container 里已经躺着这一轮的数据，云端却还什么标记都没有。占用的权威在本地。
+   */
+  inUseBy?: string | null
 }
+
+/** container 在列表里那一格状态文案。占用优先于云端 presence——它更早、也更确定。 */
+export const containerStatusLabel = (c: ContainerInfo): string =>
+  c.inUseBy
+    ? `In use by "${c.inUseBy}"`
+    : (backupPresenceLabels[c.backup] ?? 'Unknown')
 
 export const containersApi = {
   list: (accountId: number) => api.get<ContainerInfo[]>(`/accounts/${accountId}/containers`),

@@ -47,6 +47,10 @@ public static class BackupConfigEndpoints
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
+            // 排在读云之前：本地就能回答的问题不该先花一趟网络，何况那趟网络还会把云端信息文件
+            // 种进 TrackedInfoStore——为一次注定要被拒绝的导入改动本地权威状态，是白留一份脏数据。
+            if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
+                return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
             (BackupInfoFile Info, string ETag)? seeded;
             try
@@ -120,6 +124,8 @@ public static class BackupConfigEndpoints
             if (PathBoundaryGuard.Blocked(boundary, req.LocalRoot) is { } outside) return outside;
             if (await accounts.GetAsync(req.AccountId, ct) is null)
                 return Results.BadRequest(new { error = "Account not found." });
+            if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
+                return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
             var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
             var settings = await settingsSvc.GetAsync(ct);
@@ -631,6 +637,19 @@ public static class BackupConfigEndpoints
 
         return app;
     }
+
+    /// <summary>
+    /// 一个 container 只能挂一条备份配置。两条配置指到同一个 (账户, container) 上，就是两套互不
+    /// 知情的版本号与索引写在同一个地方：后跑的那条读到的云端信息文件要么还没写出来、要么是别人的，
+    /// 于是从 version 1 重新开始，把对方的 index.json 覆盖掉，对方的数据 blob 变成孤儿，
+    /// 下一轮保留清理就把它们删了。<see cref="AppDbContext"/> 里的唯一索引兜住绕过端点的写入；
+    /// 这里负责在写库之前就说清楚是谁占着它。
+    /// </summary>
+    private static string ContainerTaken(string container, string holder) =>
+        $"Container '{container}' already holds the backup \"{holder}\". A container can only hold one "
+        + "backup — pointing a second one at it would make both write their own version history to the "
+        + "same place, and each would delete the other's data as it cleans up old versions. Pick another "
+        + "container, or delete that backup first.";
 
     /// <summary>
     /// 该备份配置是否仍待重设密码。Healthy 时短路，列表端点不触发任何解密（设计 §3.1 的核心性质）；

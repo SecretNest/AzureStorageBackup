@@ -59,6 +59,10 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(x => x.ContainerName).IsRequired();
             e.Property(x => x.LocalRoot).IsRequired();
             e.Property(x => x.PasswordProtected).HasColumnName("Password"); // 密文落库，列名不变
+            // 一个 container 只能挂一条备份。两条配置写同一个地方，就是两套互不知情的版本号
+            // 与索引互相覆盖，各自的数据 blob 在对方的保留清理里被当成孤儿删掉。端点会先查一次
+            // 并给出说得清的 409；这条索引兜住绕过端点的写入与并发挤进那个窗口的第二条。
+            e.HasIndex(x => new { x.AccountId, x.ContainerName }).IsUnique();
         });
 
         modelBuilder.Entity<NotificationConfig>(e => e.HasKey(x => x.Id));

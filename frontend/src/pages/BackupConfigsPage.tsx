@@ -553,7 +553,9 @@ export function BackupConfigsPage() {
         </div>
       )}
       {accounts.length === 0 && <p className="text-muted">Add an account first.</p>}
-      {error && <p className="text-danger">{error}</p>}
+      {/* 表单开着的时候这条挪到表单里去（见下）：表单在表格下方，而这里是表格上方，
+          被服务端拒掉的保存会把原因显示在离按钮几屏远的地方，看着就是"点了没反应"。 */}
+      {!showForm && error && <p className="text-danger">{error}</p>}
 
       <table>
         <thead>
@@ -738,9 +740,17 @@ export function BackupConfigsPage() {
                     >
                       <option value="">— select —</option>
                       {containerList.map((c) => (
-                        <option key={c.name} value={c.name}>
+                        // 已经被一条备份占着的 container 不给选：选了也会被服务端 409 挡下，
+                        // 而两条备份写同一个 container 会互相覆盖版本历史，各自的数据在对方的
+                        // 保留清理里被当成孤儿删掉。占用来自本地配置，备份跑到一半时同样成立
+                        // ——云端那个信息文件要等最后一步才写出来。
+                        <option key={c.name} value={c.name} disabled={!!c.inUseBy}>
                           {c.name}
-                          {c.backup !== BackupPresence.None ? '  ● has backup' : ''}
+                          {c.inUseBy
+                            ? `  ● in use by "${c.inUseBy}"`
+                            : c.backup !== BackupPresence.None
+                              ? '  ● has backup'
+                              : ''}
                         </option>
                       ))}
                       <option value={' new'}>+ New container…</option>
@@ -1083,6 +1093,7 @@ export function BackupConfigsPage() {
                 />
               </DefaultableField>
 
+              {error && <p className="text-danger">{error}</p>}
               <div className="row" style={{ marginTop: '1rem' }}>
                 <button type="button" onClick={() => setStep(1)}>
                   Back

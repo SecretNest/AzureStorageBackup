@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   containersApi,
-  backupPresenceLabels,
+  containerStatusLabel,
   infoFileName,
   validateContainerName,
   containerNameRule,
@@ -106,11 +106,11 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
                 <td>
                   {infoFileName(c.backup) ? (
                     <span className="row-inline">
-                      <span>{backupPresenceLabels[c.backup] ?? 'Unknown'}</span>
+                      <span>{containerStatusLabel(c)}</span>
                       <span className="text-faint">({infoFileName(c.backup)})</span>
                     </span>
                   ) : (
-                    backupPresenceLabels[c.backup] ?? 'Unknown'
+                    containerStatusLabel(c)
                   )}
                 </td>
                 <td style={{ textAlign: 'right' }}>

@@ -30,10 +30,12 @@ public sealed class BackupConfigServiceTests : IDisposable
         _connection.Dispose();
     }
 
-    private static BackupConfig Sample(string name = "photos") => new()
+    // 一个 container 只挂得住一条备份（AppDbContext 上的唯一索引），所以要两条并存的用例
+    // 必须各给各的 container——从前它们共用 "photos"，靠的正是这次修掉的那个漏洞。
+    private static BackupConfig Sample(string name = "photos", string container = "photos") => new()
     {
         AccountId = 1,
-        ContainerName = "photos",
+        ContainerName = container,
         Name = name,
         LocalRoot = "/data/photos",
         PasswordProtected = TestSecrets.Protect("s3cret"),
@@ -81,8 +83,8 @@ public sealed class BackupConfigServiceTests : IDisposable
     [Fact]
     public async Task List_Returns_All()
     {
-        await _sut.CreateAsync(Sample("a"));
-        await _sut.CreateAsync(Sample("b"));
+        await _sut.CreateAsync(Sample("a", "container-a"));
+        await _sut.CreateAsync(Sample("b", "container-b"));
 
         Assert.Equal(2, (await _sut.ListAsync()).Count);
     }
