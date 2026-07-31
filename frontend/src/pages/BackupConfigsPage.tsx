@@ -1337,11 +1337,21 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.waitingOnCloud)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
+  // 在途那个数的单位**两侧不一样**，所以只有上传侧要点明：
+  // · 上传：VolumeBlobIO 每一卷各登记一条，一件大活自己就能占满全部并发额度（默认 5）；
+  // · 下载：RestoreOrchestrator / BackupChecker 按整个对象（或整组）登记一条，多卷共用它。
+  // 不点明的后果是实打实的：同一行里 processed 与 queued 数的是**件**，把卷数加进去就超过
+  // 总数——实测 5,346 + 5 + 1,031 = 6,382 > 6,378，多出的 4 正是「5 卷 − 1 件」。
+  // 下载侧本来就与件数同口径，加"objects"反而是多余的噪音，维持原样。
+  const inFlightUnit =
+    detail.stage === 'Uploading' ? (detail.activeItems.length === 1 ? 'volume ' : 'volumes ') : ''
+  // "5 volumes uploading" / "1 volume uploading" / "3 downloading"
+  const inFlightPhrase = `${detail.activeItems.length} ${inFlightUnit}${inFlightVerb}`
   const inFlight = [
     // 差分被流水线的有界队列挡住时，CurrentItem 亮着的是**刚判完**的那条，看上去就是卡死在
     // 那个文件上。说清楚它在等什么——判得比上传快几个数量级，队列填满是常态。
     detail.waitingOnDownstream && 'waiting for upload to catch up',
-    detail.activeItems.length > 0 && `${detail.activeItems.length} ${inFlightVerb}`,
+    detail.activeItems.length > 0 && inFlightPhrase,
     // "right now" 而不是 "yet"：这一条说的是**这一瞬**没有流在传（手上那件正占着压缩锁），
     // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
     // 用户正是拿这两句对着问的。
@@ -1462,7 +1472,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           而压缩是全局串行的（一把锁，就是上面那个 N preparing），并发的是上传/下载。 */}
       {detail.activeItems.length > 0 && (
         <div className="text-faint">
-          {detail.activeItems.length} parallel {inFlightVerb}:
+          {`${detail.activeItems.length} parallel ${inFlightUnit}${inFlightVerb}:`}
         </div>
       )}
       {/* 全部列出，不再截到 3 条。在途条数有上界——它就是设置里的上传/下载并发数（默认 5），
