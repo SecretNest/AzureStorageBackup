@@ -16,7 +16,7 @@ import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
 import { GroupsSection } from './GroupsPage'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 
 const emptyForm: TaskInput = {
   targetKind: TaskTargetKind.Backup,

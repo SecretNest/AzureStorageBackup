@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { groupsApi, type Group, type GroupMember } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 
 export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groups, setGroups] = useState<Group[]>([])

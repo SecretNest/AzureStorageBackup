@@ -10,7 +10,7 @@ import {
 } from '../api/accounts'
 import { refreshKeyringStatus } from '../api/keyring'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
 const emptyForm: AccountInput = {

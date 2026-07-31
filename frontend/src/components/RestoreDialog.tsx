@@ -12,7 +12,7 @@ import {
   type UnreadableEntry,
 } from '../api/backupConfigs'
 import { formatBytes } from '../constants/format'
-import { Field } from './modal'
+import { Field } from './Field'
 import { overlayStyle, panelStyle } from './modalStyles'
 import { PathBrowser } from './PathBrowser'
 

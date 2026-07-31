@@ -6,7 +6,7 @@ import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { formatBytes } from '../constants/format'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 import { overlayStyle, panelStyle } from '../components/modalStyles'
 import {
   activityLabels,

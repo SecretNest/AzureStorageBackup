@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 import { AccountsSection } from './AccountsPage'
 import { NotificationsSection } from './NotificationsPage'
 

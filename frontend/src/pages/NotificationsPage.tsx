@@ -6,7 +6,7 @@ import {
   type NotificationConfig,
   type TestResult,
 } from '../api/notifications'
-import { Field } from '../components/modal'
+import { Field } from '../components/Field'
 
 const emptyCfg: NotificationConfig = {
   enabled: false,
