@@ -815,6 +815,15 @@ tbody tr.ops-row:hover {
   table.cards td.empty-state::before {
     content: none;
   }
+  /* tr 才是画卡片的那一层，上面两条只管住了 td——不撤掉这一层，
+     "No backups yet." 就会被裱进一个空卡片里。 */
+  table.cards tr:has(td.empty-state) {
+    border: none;
+    border-radius: 0;
+    background: none;
+    padding: 0;
+    margin-bottom: 0;
+  }
 
   /* 运行状态行在桌面上是跨全列的独立一行，卡片化后要和上面那张卡合成一张。 */
   table.cards tr.has-ops {
