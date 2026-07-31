@@ -15,9 +15,6 @@ function useModalLayering(id: symbol, onClose: () => void) {
   // 谁负责保存原始 overflow 再锁定；谁把栈从非空清空到空，谁负责恢复。
   // cleanup 时不假设自己一定在栈顶——卸载顺序可能与打开顺序不一致，
   // 所以用 indexOf 定位再 splice，而不是直接 pop。
-  // id 在整个挂载期间不变（来自调用方的 idRef），特意保持依赖为空数组，
-  // 只在挂载/卸载各跑一次——这正是滚动锁定需要的语义。
-  /* oxlint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (modalStack.length === 0) {
       restoreOverflow = document.body.style.overflow
@@ -29,20 +26,16 @@ function useModalLayering(id: symbol, onClose: () => void) {
       if (idx !== -1) modalStack.splice(idx, 1)
       if (modalStack.length === 0) document.body.style.overflow = restoreOverflow
     }
-  }, [])
-  /* oxlint-enable react-hooks/exhaustive-deps */
+  }, [id])
 
   // Esc 关闭。只有栈顶（最上面那层）才响应，避免嵌套弹窗时一次 Esc 关掉两层。
-  // id 同样在挂载期间不变，依赖数组只跟随 onClose 变化。
-  /* oxlint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && modalStack[modalStack.length - 1] === id) onClose()
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
-  /* oxlint-enable react-hooks/exhaustive-deps */
+  }, [onClose, id])
 }
 
 /**
