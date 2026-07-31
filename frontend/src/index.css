@@ -766,6 +766,15 @@ tbody tr.ops-row:hover {
     font-size: 16px;
   }
 
+  /* .mono 的 font-size: 0.9em 是 (0,1,0)，比上面那条 (0,0,1) 高，不管源码顺序都赢——
+     于是等宽字体的那几个框（Local Root、Restore to、cron 表达式…）实际是 12.6px，
+     照样会触发 iOS 的聚焦缩放。这一条 (0,1,1) 才压得住。 */
+  input.mono,
+  select.mono,
+  textarea.mono {
+    font-size: 16px;
+  }
+
   /* 长输入框占满可用宽度：480px 在任何手机上都溢出，280px 在 320px 屏上也贴边。 */
   .w-md,
   .w-lg {
@@ -839,6 +848,12 @@ tbody tr.ops-row:hover {
     border-radius: var(--r-lg);
     margin-bottom: var(--sp-3);
     padding: var(--sp-2) var(--sp-3);
+    background: var(--bg-raised);
+  }
+  /* 触屏层在文件末尾有一条 tbody tr:hover { background: transparent }，与上面那条
+     specificity 打平、靠源码顺序赢——手机上点一下卡片里的按钮，整张卡的底色就没了
+     （浅色看不出来，深色是从 --bg-raised 塌到 --bg）。多一个 tbody 压回去。 */
+  table.cards tbody tr {
     background: var(--bg-raised);
   }
   table.cards td {
@@ -1020,5 +1035,14 @@ tbody tr.ops-row:hover {
     width: 44px;
     height: 44px;
     transform: translate(-50%, -50%);
+  }
+
+  /* 还原树的行只有约 18px 高（.text-sm 的 12px × 1.5），44px 的方形命中盒会和上下两行
+     重叠 26px——点这一行的三角，展开的是下一行；而 disabled 的三角还会变成一块吞掉
+     邻居的死区。密集列表不适用通用的方形命中盒：横向仍扩到 44px（手指的宽度方向），
+     纵向老实跟着行高走。 */
+  .row.text-sm .icon-btn::after,
+  .row.text-sm .hit-target::after {
+    height: 100%;
   }
 }
