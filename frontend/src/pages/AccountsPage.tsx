@@ -9,7 +9,7 @@ import {
   type ConnectionResult,
 } from '../api/accounts'
 import { refreshKeyringStatus } from '../api/keyring'
-import { overlayStyle, panelStyle } from '../components/modalStyles'
+import { Modal } from '../components/Modal'
 import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
@@ -381,37 +381,11 @@ function ResetSecretsModal({
   const [proxyPassword, setProxyPassword] = useState('')
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3>Re-enter Credentials — {account.name}</h3>
-        <p>
-          The data protection keys used to store this account's credentials were lost.
-          Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
-          it will be verified against the live storage account before being saved.
-        </p>
-
-        <Field label="Account Key">
-          <input
-            className="w-lg"
-            type="password"
-            value={accountKey}
-            onChange={(e) => setAccountKey(e.target.value)}
-          />
-        </Field>
-        {account.useProxy && (
-          <Field label="Proxy Password">
-            <input
-              className="w-lg"
-              type="password"
-              value={proxyPassword}
-              onChange={(e) => setProxyPassword(e.target.value)}
-            />
-          </Field>
-        )}
-
-        {error && <p className="text-danger">{error}</p>}
-
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Re-enter Credentials — ${account.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button
             type="button"
             className="btn-primary"
@@ -423,8 +397,35 @@ function ResetSecretsModal({
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <p>
+        The data protection keys used to store this account's credentials were lost.
+        Re-enter the account key{account.useProxy ? ' and proxy password' : ''} to restore access;
+        it will be verified against the live storage account before being saved.
+      </p>
+
+      <Field label="Account Key">
+        <input
+          className="w-lg"
+          type="password"
+          value={accountKey}
+          onChange={(e) => setAccountKey(e.target.value)}
+        />
+      </Field>
+      {account.useProxy && (
+        <Field label="Proxy Password">
+          <input
+            className="w-lg"
+            type="password"
+            value={proxyPassword}
+            onChange={(e) => setProxyPassword(e.target.value)}
+          />
+        </Field>
+      )}
+
+      {error && <p className="text-danger">{error}</p>}
+    </Modal>
   )
 }

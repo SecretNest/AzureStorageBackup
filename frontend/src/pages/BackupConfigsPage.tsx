@@ -7,7 +7,7 @@ import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { formatBytes } from '../constants/format'
 import { Field } from '../components/Field'
-import { overlayStyle, panelStyle } from '../components/modalStyles'
+import { Modal } from '../components/Modal'
 import {
   activityLabels,
   backupConfigsApi,
@@ -1549,34 +1549,36 @@ function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => 
   }
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Last error — {config.name}</h3>
-        {config.lastErrorAt && (
-          <p className="text-faint" style={{ marginTop: 0 }}>
-            {new Date(config.lastErrorAt).toLocaleString()}
-          </p>
-        )}
-        <pre
-          className="mono"
-          style={{
-            maxHeight: '50vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-            background: 'var(--bg-raised)', border: '1px solid var(--border)',
-            borderRadius: 'var(--r-md)', padding: 'var(--sp-3)', margin: 0,
-          }}
-        >
-          {text}
-        </pre>
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Last error — ${config.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button type="button" onClick={copy}>
             {copied ? 'Copied' : 'Copy'}
           </button>
           <button type="button" onClick={onClose}>
             Close
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      {config.lastErrorAt && (
+        <p className="text-faint" style={{ marginTop: 0 }}>
+          {new Date(config.lastErrorAt).toLocaleString()}
+        </p>
+      )}
+      <pre
+        className="mono"
+        style={{
+          maxHeight: '50vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+          background: 'var(--bg-raised)', border: '1px solid var(--border)',
+          borderRadius: 'var(--r-md)', padding: 'var(--sp-3)', margin: 0,
+        }}
+      >
+        {text}
+      </pre>
+    </Modal>
   )
 }
 
@@ -1771,35 +1773,37 @@ function DeleteModal({
   }
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Delete Backup — {config.name}</h3>
-        <p>This removes the local backup configuration, cached index, and logs.</p>
-        <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.8rem 0' }}>
-          <input
-            type="checkbox"
-            checked={deleteContainer}
-            onChange={(e) => setDeleteContainer(e.target.checked)}
-          />
-          <span className={deleteContainer ? 'text-danger' : undefined}>
-            Also delete cloud container (irreversible — erases all backup data)
-          </span>
-        </label>
-        {error && (
-          <div className="text-danger" style={{ margin: '0.8rem 0' }}>
-            {error}
-          </div>
-        )}
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Delete Backup — ${config.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button type="button" className="btn-danger" onClick={confirm} disabled={busy}>
             {busy ? 'Deleting…' : 'Delete'}
           </button>
           <button type="button" onClick={onClose}>
             Cancel
           </button>
+        </>
+      }
+    >
+      <p>This removes the local backup configuration, cached index, and logs.</p>
+      <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', margin: '0.8rem 0' }}>
+        <input
+          type="checkbox"
+          checked={deleteContainer}
+          onChange={(e) => setDeleteContainer(e.target.checked)}
+        />
+        <span className={deleteContainer ? 'text-danger' : undefined}>
+          Also delete cloud container (irreversible — erases all backup data)
+        </span>
+      </label>
+      {error && (
+        <div className="text-danger" style={{ margin: '0.8rem 0' }}>
+          {error}
         </div>
-      </div>
-    </div>
+      )}
+    </Modal>
   )
 }
 
@@ -1809,20 +1813,22 @@ function PostCreateModal({
   config, onRunNow, onNotNow,
 }: { config: BackupConfig; onRunNow: () => void; onNotNow: () => void }) {
   return (
-    <div className={overlayStyle} onClick={onNotNow}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Backup Created — {config.name}</h3>
-        <p>Run the first backup now?</p>
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Backup Created — ${config.name}`}
+      onClose={onNotNow}
+      footer={
+        <>
           <button type="button" className="btn-primary" onClick={onRunNow}>
             Run first backup now
           </button>
           <button type="button" onClick={onNotNow}>
             Not now
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <p>Run the first backup now?</p>
+    </Modal>
   )
 }
 
@@ -1840,35 +1846,36 @@ function ResetPasswordModal({
   const [password, setPassword] = useState('')
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Re-enter Password — {config.name}</h3>
-        <p>
-          Enter the original password used to encrypt this backup. It cannot be changed — a
-          different password will fail verification.
-        </p>
-
-        <Field label="Password">
-          <input
-            type="password"
-            className="w-lg"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
-
-        {error && <p className="text-danger">{error}</p>}
-
-        <div className="row" style={{ marginTop: '1rem' }}>
+    <Modal
+      title={`Re-enter Password — ${config.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button type="button" className="btn-primary" onClick={() => onSubmit(password)} disabled={busy || !password}>
             Submit
           </button>
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      <p>
+        Enter the original password used to encrypt this backup. It cannot be changed — a
+        different password will fail verification.
+      </p>
+
+      <Field label="Password">
+        <input
+          type="password"
+          className="w-lg"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+      </Field>
+
+      {error && <p className="text-danger">{error}</p>}
+    </Modal>
   )
 }
 
@@ -1978,45 +1985,11 @@ function CheckModal({
   const stale = report ? report.findings.filter((f) => f.unreadableAt) : []
 
   return (
-    <div className={overlayStyle} onClick={onClose}>
-      <div className={panelStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ marginTop: 0 }}>Check / Repair — {config.name}</h3>
-
-        <Field label="Version">
-          <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
-            <option value="">Latest</option>
-            {versions.map((v) => <option key={v} value={v}>{v}</option>)}
-          </select>
-        </Field>
-        <Field label="Cloud check">
-          <select value={cloud} onChange={(e) => setCloud(Number(e.target.value))}>
-            {Object.entries(cloudLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-          </select>
-        </Field>
-        <Field label="Local check">
-          <select value={local} onChange={(e) => setLocal(Number(e.target.value))}>
-            {Object.entries(localLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-          </select>
-        </Field>
-        {cloud === CloudCheckLevel.Content && (
-          <Field label="Rehydrate Archive to">
-            <select value={rehydrate ?? ''} onChange={(e) => setRehydrate(e.target.value === '' ? null : Number(e.target.value))}>
-              <option value="">Don't rehydrate</option>
-              <option value={StorageTier.Hot}>Hot</option>
-              <option value={StorageTier.Cool}>Cool</option>
-            </select>
-          </Field>
-        )}
-        <Field label="Unreferenced blobs">
-          {/* 说明文字与勾选框同在外层 <label class="field"> 里——不再自己套一层 <label>：
-              标签不能嵌套，而且嵌套那层会让勾选框逃出 .field 的居中规则，看上去偏高。 */}
-          <span className="field-check">
-            <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
-            Detect unreferenced blobs (repair deletes them)
-          </span>
-        </Field>
-
-        <div className="row" style={{ margin: '0.8rem 0' }}>
+    <Modal
+      title={`Check / Repair — ${config.name}`}
+      onClose={onClose}
+      footer={
+        <>
           <button type="button" className="btn-primary" onClick={runCheck} disabled={running || repairing}>
             {running ? 'Checking…' : 'Run check'}
           </button>
@@ -2029,96 +2002,130 @@ function CheckModal({
             </button>
           )}
           <button type="button" onClick={onClose}>Close</button>
+        </>
+      }
+    >
+      <Field label="Version">
+        <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
+          <option value="">Latest</option>
+          {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+        </select>
+      </Field>
+      <Field label="Cloud check">
+        <select value={cloud} onChange={(e) => setCloud(Number(e.target.value))}>
+          {Object.entries(cloudLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </Field>
+      <Field label="Local check">
+        <select value={local} onChange={(e) => setLocal(Number(e.target.value))}>
+          {Object.entries(localLevelLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </Field>
+      {cloud === CloudCheckLevel.Content && (
+        <Field label="Rehydrate Archive to">
+          <select value={rehydrate ?? ''} onChange={(e) => setRehydrate(e.target.value === '' ? null : Number(e.target.value))}>
+            <option value="">Don't rehydrate</option>
+            <option value={StorageTier.Hot}>Hot</option>
+            <option value={StorageTier.Cool}>Cool</option>
+          </select>
+        </Field>
+      )}
+      <Field label="Unreferenced blobs">
+        {/* 说明文字与勾选框同在外层 <label class="field"> 里——不再自己套一层 <label>：
+            标签不能嵌套，而且嵌套那层会让勾选框逃出 .field 的居中规则，看上去偏高。 */}
+        <span className="field-check">
+          <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
+          Detect unreferenced blobs (repair deletes them)
+        </span>
+      </Field>
+
+      {/* 进度不在这里重复一遍：检查在服务端后台跑，列表里那一行已经有阶段、百分比和 Details。
+          对话框只说明它正在跑（报告要等它结束才有），并留下 Stop。 */}
+      {running && (
+        <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
+          A check is running — progress is shown in the backup list. The report appears here when it finishes.
         </div>
+      )}
+      {checkRun?.status === 'Canceled' && (
+        <div className="text-warn" style={{ marginBottom: '0.6rem' }}>Check stopped — no report was produced.</div>
+      )}
+      {checkRun?.status === 'Failed' && (
+        <div className="text-danger" style={{ marginBottom: '0.6rem' }}>Check failed: {checkRun.error}</div>
+      )}
 
-        {/* 进度不在这里重复一遍：检查在服务端后台跑，列表里那一行已经有阶段、百分比和 Details。
-            对话框只说明它正在跑（报告要等它结束才有），并留下 Stop。 */}
-        {running && (
-          <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
-            A check is running — progress is shown in the backup list. The report appears here when it finishes.
+      {repairReport && (
+        <div style={{ marginBottom: '0.6rem' }}>
+          {repairReport.status === 'Running' && 'Repairing (backup is locked until done)…'}
+          {repairReport.status === 'Failed' && <span className="text-danger">Repair failed: {repairReport.error}</span>}
+          {repairReport.status === 'Completed' && (
+            <>
+              Repaired {repairReport.repaired?.length ?? 0} file(s);{' '}
+              <span className={repairReport.unrecoverable?.length ? 'text-danger' : undefined}>
+                {repairReport.unrecoverable?.length ?? 0} unrecoverable
+              </span>
+              {(repairReport.unrecoverable?.length ?? 0) > 0 && `: ${repairReport.unrecoverable!.join(', ')}`}
+              {(repairReport.deletedOrphans?.length ?? 0) > 0 &&
+                `; deleted ${repairReport.deletedOrphans!.length} unreferenced blob(s)`}
+            </>
+          )}
+        </div>
+      )}
+
+      {report && (
+        <div>
+          {report.metadataIssue && (
+            <div className="text-danger">Metadata drift: {report.metadataIssue}</div>
+          )}
+          <div className={report.ok ? 'text-ok' : 'text-danger'} style={{ margin: '0.4rem 0' }}>
+            {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
+            {' '}(version {report.version})
           </div>
-        )}
-        {checkRun?.status === 'Canceled' && (
-          <div className="text-warn" style={{ marginBottom: '0.6rem' }}>Check stopped — no report was produced.</div>
-        )}
-        {checkRun?.status === 'Failed' && (
-          <div className="text-danger" style={{ marginBottom: '0.6rem' }}>Check failed: {checkRun.error}</div>
-        )}
-
-        {repairReport && (
-          <div style={{ marginBottom: '0.6rem' }}>
-            {repairReport.status === 'Running' && 'Repairing (backup is locked until done)…'}
-            {repairReport.status === 'Failed' && <span className="text-danger">Repair failed: {repairReport.error}</span>}
-            {repairReport.status === 'Completed' && (
-              <>
-                Repaired {repairReport.repaired?.length ?? 0} file(s);{' '}
-                <span className={repairReport.unrecoverable?.length ? 'text-danger' : undefined}>
-                  {repairReport.unrecoverable?.length ?? 0} unrecoverable
-                </span>
-                {(repairReport.unrecoverable?.length ?? 0) > 0 && `: ${repairReport.unrecoverable!.join(', ')}`}
-                {(repairReport.deletedOrphans?.length ?? 0) > 0 &&
-                  `; deleted ${repairReport.deletedOrphans!.length} unreferenced blob(s)`}
-              </>
-            )}
-          </div>
-        )}
-
-        {report && (
-          <div>
-            {report.metadataIssue && (
-              <div className="text-danger">Metadata drift: {report.metadataIssue}</div>
-            )}
-            <div className={report.ok ? 'text-ok' : 'text-danger'} style={{ margin: '0.4rem 0' }}>
-              {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
-              {' '}(version {report.version})
+          {listOrphans && (
+            <div className={report.orphanBlobs.length ? 'text-warn' : 'text-ok'} style={{ margin: '0.4rem 0' }}>
+              {report.orphanBlobs.length === 0
+                ? 'No unreferenced blobs found'
+                : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
             </div>
-            {listOrphans && (
-              <div className={report.orphanBlobs.length ? 'text-warn' : 'text-ok'} style={{ margin: '0.4rem 0' }}>
-                {report.orphanBlobs.length === 0
-                  ? 'No unreferenced blobs found'
-                  : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
-              </div>
-            )}
-            {/* 沿用条目的云端 blob 通常是好的（cloud=Ok），所以它们不会出现在下面的问题表里——
-                但操作员必须知道这个版本里有内容是旧的，尤其因为它会让本地比对显示为 Changed。 */}
-            {stale.length > 0 && (
-              <div className="text-warn" style={{ margin: '0.4rem 0' }}>
-                {stale.length} file(s) hold content carried forward from an earlier backup — the
-                source could not be read since then, so a local comparison shows them as changed:
-                <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
-                  {stale.slice(0, 20).map((f) => (
-                    <li key={f.path}>
-                      <span className="mono">{f.path}</span>
-                      {' '}— unread since {new Date(f.unreadableAt!).toLocaleString()}
-                    </li>
+          )}
+          {/* 沿用条目的云端 blob 通常是好的（cloud=Ok），所以它们不会出现在下面的问题表里——
+              但操作员必须知道这个版本里有内容是旧的，尤其因为它会让本地比对显示为 Changed。 */}
+          {stale.length > 0 && (
+            <div className="text-warn" style={{ margin: '0.4rem 0' }}>
+              {stale.length} file(s) hold content carried forward from an earlier backup — the
+              source could not be read since then, so a local comparison shows them as changed:
+              <ul style={{ margin: '0.2rem 0 0 1.2rem' }}>
+                {stale.slice(0, 20).map((f) => (
+                  <li key={f.path}>
+                    <span className="mono">{f.path}</span>
+                    {' '}— unread since {new Date(f.unreadableAt!).toLocaleString()}
+                  </li>
+                ))}
+              </ul>
+              {stale.length > 20 && <div>…and {stale.length - 20} more</div>}
+            </div>
+          )}
+          {problems.length > 0 && (
+            <div className="table-scroll" tabIndex={0}>
+              <table className="text-faint">
+                <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
+                <tbody>
+                  {problems.map((f) => (
+                    <tr key={f.path}>
+                      <td className="mono">
+                        {f.path}
+                        {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
+                      </td>
+                      <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
+                      <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
+                      <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
+                    </tr>
                   ))}
-                </ul>
-                {stale.length > 20 && <div>…and {stale.length - 20} more</div>}
-              </div>
-            )}
-            {problems.length > 0 && (
-              <div className="table-scroll" tabIndex={0}>
-                <table className="text-faint">
-                  <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
-                  <tbody>
-                    {problems.map((f) => (
-                      <tr key={f.path}>
-                        <td className="mono">
-                          {f.path}
-                          {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
-                        </td>
-                        <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
-                        <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
-                        <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
   )
 }
