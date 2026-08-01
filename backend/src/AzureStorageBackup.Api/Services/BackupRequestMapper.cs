@@ -3,6 +3,19 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
+/// <summary>
+/// 装箱那两条**按机器**（而不是按备份）定的界，由环境变量给：<c>Backup__MaxPackMembers</c> 与
+/// <c>Backup__MaxPackPathBytes</c>。第三条 <c>GroupCapBytes</c> 是每个备份自己的设置，不在这里。
+/// <para>
+/// 之所以按机器给：这两条约束的是**这台机器上 7z 进程的内存与 argv 上限**，
+/// 与"这份备份想把包切多大"无关。同一份配置搬到另一台机器上，合适的值可能完全不同。
+/// </para>
+/// </summary>
+public sealed record PackLimits(int MaxPackMembers = 20_000, long MaxPackPathBytes = 1_000_000)
+{
+    public static readonly PackLimits Default = new();
+}
+
 /// <summary>把持久化的 BackupConfig 映射为引擎的 BackupRequest（BackupRunner 与调度器共用）。</summary>
 public static class BackupRequestMapper
 {
@@ -11,9 +24,11 @@ public static class BackupRequestMapper
     /// （设计 §3.1：解密只在咽喉处；映射器是静态的，拿不到 ISecretReader）。
     /// </summary>
     public static BackupRequest From(
-        BackupConfig config, Account account, string? password, GlobalSettings? settings = null)
+        BackupConfig config, Account account, string? password, GlobalSettings? settings = null,
+        PackLimits? packLimits = null)
     {
         var r = ResolvedBackupSettings.From(config, settings);
+        var limits = packLimits ?? PackLimits.Default;
         return new BackupRequest
         {
             Account = account,
@@ -35,6 +50,8 @@ public static class BackupRequestMapper
                 {
                     SingleFileThresholdBytes = r.SingleFileThresholdBytes,
                     GroupCapBytes = r.GroupCapBytes,
+                    MaxPackMembers = limits.MaxPackMembers,
+                    MaxPackPathBytes = limits.MaxPackPathBytes,
                 },
                 VolumeBytes = r.VolumeBytes is > 0 ? r.VolumeBytes : null,
                 Retention = RetentionOf(config, settings),

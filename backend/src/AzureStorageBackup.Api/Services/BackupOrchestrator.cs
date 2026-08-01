@@ -500,11 +500,11 @@ public sealed class BackupOrchestrator(
             StartConsumers();
 
         // 装箱的在途状态。diff 单线程按扫描顺序推进，所以这些都不需要加锁。
-        var cap = packOptions.GroupCapBytes;
         var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
         var dirRemaining = new Dictionary<string, int>(classification.DirectoryCandidates, StringComparer.Ordinal);
         var crossPending = new List<PlannedFile>();
         long crossBytes = 0;
+        long crossPathBytes = 0;
         var changedFiles = 0;
         long changedBytes = 0;
 
@@ -590,14 +590,20 @@ public sealed class BackupOrchestrator(
                     // 填满即封"得到的包，与"等全部 diff 完再一次装箱"逐字节相同。
                     if (file is not null)
                     {
-                        if (crossPending.Count > 0 && crossBytes + file.Length > cap)
+                        // 三条界共用 GroupingPlanner.GroupIsFull：这一处与规划器那个纯函数、
+                        // 以及压缩前的重新切分必须口径完全一致，否则"实际产出与规划器一致"那条
+                        // 不变量就破了（PipelinedBackupTests 正是拿纯函数当基准在守它）。
+                        if (crossPending.Count > 0
+                            && GroupingPlanner.GroupIsFull(crossPending.Count, crossBytes, crossPathBytes, file, packOptions))
                         {
                             Enqueue(new WorkItem(null, crossPending));
                             crossPending = [];
                             crossBytes = 0;
+                            crossPathBytes = 0;
                         }
                         crossPending.Add(file);
                         crossBytes += file.Length;
+                        crossPathBytes += GroupingPlanner.EntryArgBytes(file.Path);
                     }
                     return;
 
@@ -1268,8 +1274,8 @@ public sealed class BackupOrchestrator(
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
         RunState state, CancellationToken ct)
     {
-        var cap = request.Options.Plan.GroupCapBytes;
-        var threshold = request.Options.Plan.SingleFileThresholdBytes;
+        var plan = request.Options.Plan;
+        var threshold = plan.SingleFileThresholdBytes;
         var headBytes = request.Options.Diff.HeadHashBytes;
         var maxAttempts = Math.Max(1, request.Options.ProcessingMaxAttempts);
         var attempts = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -1277,15 +1283,17 @@ public sealed class BackupOrchestrator(
 
         while (queue.Count > 0)
         {
-            // 取出目录中未处理、总长≤上限的一组（至少一个）。
+            // 取出目录中未处理、不越界的一组（至少一个）。三条界共用 GroupIsFull——这是交给 7z
+            // 之前的最后一道，其中 MaxPackPathBytes 那条直接决定 argv 会不会撑爆（E2BIG）。
             var group = new List<PlannedFile>();
             long bytes = 0;
+            long pathBytes = 0;
             var take = 0;
             while (take < queue.Count)
             {
                 var f = queue[take];
-                if (group.Count > 0 && bytes + f.Length > cap) break;
-                group.Add(f); bytes += f.Length; take++;
+                if (group.Count > 0 && GroupingPlanner.GroupIsFull(group.Count, bytes, pathBytes, f, plan)) break;
+                group.Add(f); bytes += f.Length; pathBytes += GroupingPlanner.EntryArgBytes(f.Path); take++;
             }
             queue.RemoveRange(0, group.Count);
 

@@ -132,6 +132,10 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
 | `Backup__IndexCacheSize` | How many deserialised version indexes to keep in memory. Trades RAM for responsiveness when browsing large backups — see below. `0` disables it. | `2` |
 | `Backup__SevenZipMethodArgs` | Compression method switches handed to `7zz` — see below. Only `-m…` switches are accepted. | `-mx9` |
+| `Backup__MaxPackMembers` | Largest number of files the app will put into one pack archive — see below. Caps how much memory `7zz` needs for member metadata. | `20000` |
+| `Backup__MaxPackPathBytes` | Largest total size, in bytes, of the member paths handed to `7zz` on one command line — see below. Guards against the kernel's argument-list limit. | `1000000` |
+| `Backup__DiffQueueMaxItems` | How many pending work items the diff→upload queue keeps in memory before buffering to disk — see below. | `2000` |
+| `Backup__DiffQueueMemoryBytes` | Memory budget, in bytes, for that queue. Whichever of the two limits is reached first wins. | `67108864` |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
 | `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
 | `Auth__Password` | Password required to open the UI. Unset or empty = no authentication (the app logs a warning at startup). There is no username. | *(unset)* |
@@ -176,6 +180,25 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > **Only method switches (`-m…`) are accepted**, and a bad value stops the app at startup rather than halfway through a backup. Everything else about the command line — file names, encryption, volume splitting, and the switches that govern how the app reads 7-Zip's output — stays under the app's control, because changing those would break how archives are located and verified. Files matched by a *don't compress* rule are still stored uncompressed (`-mx0`) regardless of this setting.
 >
 > The setting affects only archives written from then on. Existing backups keep whatever they were compressed with — 7-Zip records that in the archive — so changing it is safe and never invalidates anything already uploaded.
+
+> `Backup__MaxPackMembers` and `Backup__MaxPackPathBytes` bound how many files end up in a single pack archive. **On a normal set of files neither one ever fires** — the per-backup *group cap* (100 MB by default, on the backup's own settings page) is reached long first. They exist for one situation: a folder holding an enormous number of very small files.
+>
+> The group cap is a size, so the smaller the files, the more of them fit. At 5 KB each a 100 MB pack holds about 20,000; at 1 KB, 100,000; at one byte, a hundred million. The whole member list of a pack is held in memory at once — compression needs it, the post-compression re-verification needs it, and a retry needs it again — so an unbounded member count is an unbounded amount of memory.
+>
+> | Limit | What it guards | Measured basis |
+> | --- | --- | --- |
+> | `Backup__MaxPackMembers` (`20000`) | Memory. `7zz` needs roughly **1.3 KB per member** for archive metadata, independent of compression level, plus about 0.4 KB on the app's side. 20,000 members ≈ 51 MB per pack. | `7zz` peak RSS measured at 1k/5k/10k/20k/34k members: 17 / 18 / 28 / 43 / 56 MB. |
+> | `Backup__MaxPackPathBytes` (`1000000`) | A hard failure. Member paths are passed to `7zz` as individual command-line arguments, and exceeding the kernel's limit fails the compression outright with `E2BIG`. | A single `exec` accepted **1.73 MB** of arguments (`ARG_MAX` 2 MB, 8 MB stack): 34,218 members of 52-character paths passed, 34,375 failed. The default leaves ~40% headroom. |
+>
+> The second limit is counted in **bytes, not files**, because the wall moves with path length: the same 1.73 MB holds thirty-odd thousand 52-character paths but only about twelve thousand 150-character ones. A fixed file count would still hit it on deep directory trees.
+>
+> Raising either is safe as long as the machine has the memory; lowering them produces more, smaller archives. Neither changes anything already uploaded — they only affect how future packs are split, and packs are self-describing.
+
+> `Backup__DiffQueueMaxItems` and `Backup__DiffQueueMemoryBytes` size the queue between the diff stage and the compress/upload stage. Diff decides what changed far faster than compression and upload can consume it, so it runs ahead; work it has queued but that has not been picked up yet is held in memory, and anything over these limits is buffered to a temp file under `Backup__TempPath` and read back as space frees up.
+>
+> Diff is never blocked by the queue. That matters for more than throughput: the upload stage cannot show a time estimate until diff has finished — that is when the total becomes known — so a queue that stalls the diff also delays the estimate until the very end of the run. Buffering to disk instead lets diff finish early and the estimate appear early.
+>
+> Both limits apply, whichever is reached first, for the same reason as the pack limits above: one work item is either a single large file or a whole pack, and a pack of small files can hold tens of thousands of entries. A count alone does not bound memory. The defaults (2,000 items / 64 MB) are enough that a backup of a few hundred thousand files typically never touches the disk buffer; if the progress line reports items *buffered to disk*, that is the signal to raise `Backup__DiffQueueMaxItems`.
 
 > Setting `Auth__Password` puts a single password in front of the whole UI — there is no username, and changing the password means changing the variable and restarting. The session cookie is signed with the Data Protection key ring in `/keys`, so losing that directory signs you out and you will have to log in again; the password itself is read straight from the environment, so a lost key ring never locks you out.
 >

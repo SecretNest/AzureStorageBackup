@@ -195,4 +195,96 @@ public sealed class GroupingPlannerTests
         Assert.Empty(plan.Blobs);
         Assert.Equal(["d/1.txt", "d/link"], plan.Packs.Single().Members.Select(m => m.Path));
     }
+
+    /// <summary>
+    /// 字节上限管不住成员数：文件越小，同样的字节额度装进去的成员越多。
+    /// 那一箱的成员表是**整件**拿在手上的（压缩要、重校验要、失败重试也要），
+    /// 实测 7z 光成员元数据就是约 1.3 KB/个。
+    /// </summary>
+    [Fact]
+    public void A_Pack_Is_Sealed_When_It_Hits_The_Member_Limit()
+    {
+        // 10 个 1 字节的文件，字节上限给到天上——只有成员数这条界能把它切开。
+        var plan = Plan(
+            Enumerable.Range(0, 10).Select(i => F($"d/{i}.txt", 1)),
+            new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackMembers = 4 });
+
+        Assert.Equal([4, 4, 2], plan.Packs.Select(p => p.Members.Count));
+        // 切开归切开，一个成员都不能丢。
+        Assert.Equal(10, plan.Packs.Sum(p => p.Members.Count));
+    }
+
+    /// <summary>
+    /// 路径字节这条界治的是硬故障：成员路径逐个作为 argv 传给 7z，超了内核直接 E2BIG。
+    /// 必须按**字节**设界而不是按成员数——墙的位置随路径长度缩水，实测 1.73 MB 的 argv 额度
+    /// 在 52 字符的路径下能放三万多个，500 字符的只剩三千多。
+    /// </summary>
+    [Fact]
+    public void A_Pack_Is_Sealed_When_It_Hits_The_Path_Byte_Limit()
+    {
+        // 每条路径 "d/xx.txt" = 8 字节 + NUL = 9；额度 30 → 每箱 3 条。
+        var plan = Plan(
+            Enumerable.Range(0, 7).Select(i => F($"d/{i:D2}.txt", 1)),
+            new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackMembers = int.MaxValue, MaxPackPathBytes = 30 });
+
+        Assert.Equal([3, 3, 1], plan.Packs.Select(p => p.Members.Count));
+    }
+
+    /// <summary>
+    /// 路径按 UTF-8 字节算，不按字符数。中日韩路径一个字符最多三字节，按字符数记会低估两倍多，
+    /// 而低估的后果不是包变大，是 <c>E2BIG</c>：压缩当场失败。
+    /// </summary>
+    [Fact]
+    public void Path_Bytes_Are_Counted_As_Utf8_Not_Characters()
+    {
+        // "照片/01.jpg"：中文 2 字 ×3 + "/01.jpg" 7 = 13 字节 + NUL = 14。按字符数记只有 10。
+        Assert.Equal(14, GroupingPlanner.EntryArgBytes("照片/01.jpg"));
+
+        // 额度 28 = 正好两条。按字符数记的话会以为塞得下第三条（33 > 28 才封箱）。
+        var plan = Plan(
+            Enumerable.Range(0, 5).Select(i => F($"照片/{i:D2}.jpg", 1)),
+            new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackPathBytes = 28 });
+
+        Assert.Equal([2, 2, 1], plan.Packs.Select(p => p.Members.Count));
+    }
+
+    /// <summary>
+    /// 两条新界对常规备份必须是**空操作**。默认下平均 ≥ 5 KB 的文件永远先撞 100 MB 那条，
+    /// 所以既有备份的装箱结果一个字节都不变——这是加这两条界的前提，不是附带效果。
+    /// </summary>
+    [Fact]
+    public void The_New_Limits_Do_Not_Change_Grouping_For_Ordinary_Files()
+    {
+        // 1000 个 200 KB 的文件（共 200 MB）＝ 默认下按 100 MB 切成两箱，各 500 个成员。
+        var files = Enumerable.Range(0, 1000).Select(i => F($"d/{i:D4}.bin", 200 * 1024)).ToList();
+
+        var withLimits = Plan(files);                                    // 默认：2 万成员 / 1 MB 路径
+        var withoutLimits = Plan(files, new PlanOptions
+        {
+            MaxPackMembers = int.MaxValue,
+            MaxPackPathBytes = long.MaxValue,
+        });
+
+        Assert.Equal(
+            withoutLimits.Packs.Select(p => p.Members.Select(m => m.Path).ToList()),
+            withLimits.Packs.Select(p => p.Members.Select(m => m.Path).ToList()));
+        Assert.Equal(2, withLimits.Packs.Count);
+    }
+
+    /// <summary>
+    /// 单个成员本身就超过某条界时不能死循环、也不能把它丢掉：一件装不下也要单独成箱。
+    /// （字节那条界早有这个行为，新加的两条必须一致。）
+    /// </summary>
+    [Fact]
+    public void An_Item_That_Alone_Exceeds_A_Limit_Still_Gets_Its_Own_Pack()
+    {
+        var longPath = "d/" + new string('x', 200) + ".txt";
+        var plan = Plan(
+            [F("d/a.txt", 1), F(longPath, 1), F("d/b.txt", 1)],
+            new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackPathBytes = 50 });
+
+        // 排序后是 a、b、超长路径：前两条凑一箱，超长那条自己撑爆额度 → 单独成箱。
+        Assert.Equal(3, plan.Packs.Sum(p => p.Members.Count));
+        Assert.Contains(plan.Packs, p => p.Members.Count == 1 && p.Members[0].Path == longPath);
+    }
 }

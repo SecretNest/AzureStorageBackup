@@ -503,6 +503,75 @@ public sealed class PipelinedBackupTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// 成员数与路径字节这两条界必须在**三处**装箱点上口径一致：规划器那个纯函数、编排器里边 diff
+    /// 边填的跨目录累加、以及压缩前 <c>ProcessPackAsync</c> 的重新切分。任何一处漏掉，实际产出就与
+    /// 规划器分道扬镳，而最先出事的是按成员分组认包的去重与保留清理。
+    /// 这里仍然拿纯函数当基准——它是唯一一份"应该长什么样"的定义。
+    /// </summary>
+    [SkippableFact]
+    public async Task Member_And_Path_Limits_Apply_At_Every_Packing_Site()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("pipelim-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 全是小文件：字节上限永远撞不到，只有成员数那条界能把箱子切开。
+            foreach (var dir in new[] { "docs", "notes" })
+                for (var i = 0; i < 25; i++)
+                    WriteFile($"{dir}/f{i:D2}.txt", 40);
+            for (var i = 0; i < 30; i++)
+                WriteFile($"shard/{i:D2}/blob.dat", 40);
+
+            var options = new BackupEngineOptions
+            {
+                CrossDirGroup = new IgnoreRuleSet(["shard/"]),
+                Plan = new PlanOptions
+                {
+                    SingleFileThresholdBytes = 10_000,
+                    GroupCapBytes = 100 * 1024 * 1024, // 故意给足：不让字节那条界参与
+                    MaxPackMembers = 7,                // 只有这条能切
+                },
+            };
+            await Build(factory, store).RunAsync(Request(account, name, options));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
+
+            var expected = new GroupingPlanner().Plan(
+                [.. idx.Entries
+                    .OrderBy(e => e.Path, StringComparer.Ordinal)
+                    .Select(e => new PlannedFile(e.Path, e.Length, e.FullHash!))],
+                options.Plan with { CrossDirGroup = options.CrossDirGroup });
+
+            // 先确认这批数据真的被成员数那条界切开了，否则下面的相等断言可能只是"两边都一箱"。
+            Assert.True(expected.Packs.Count >= 12, $"expected many small packs, got {expected.Packs.Count}");
+            Assert.All(expected.Packs, p => Assert.True(p.Members.Count <= 7, $"planner 自己就超界了：{p.Members.Count}"));
+
+            static IEnumerable<string> Signature(IEnumerable<IEnumerable<string>> packs) =>
+                packs.Select(m => string.Join('\n', m.OrderBy(p => p, StringComparer.Ordinal)))
+                    .OrderBy(s => s, StringComparer.Ordinal);
+
+            var actualPacks = idx.Entries.Where(e => e.Storage!.Kind == "pack")
+                .GroupBy(e => e.Storage!.Ref, StringComparer.Ordinal)
+                .Select(g => g.Select(e => e.Path))
+                .ToList();
+
+            // 实际产出的每一箱都不超界——这一条直接守住 7z 那边的内存与 argv。
+            Assert.All(actualPacks, m => Assert.True(m.Count() <= 7, $"实际产出超界：{m.Count()}"));
+            Assert.Equal(Signature(expected.Packs.Select(p => p.Members.Select(m => m.Path))), Signature(actualPacks));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     private static async Task<VersionIndex> ReadOnlyIndexAsync(
         IBackupInfoStore store, Account account, string container)
     {

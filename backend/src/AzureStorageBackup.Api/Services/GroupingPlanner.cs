@@ -17,6 +17,42 @@ public sealed record PlanOptions
     /// <summary>单组上限（压缩前，默认 100M）。</summary>
     public long GroupCapBytes { get; init; } = 100 * 1024 * 1024;
 
+    /// <summary>
+    /// 单组成员数上限（默认 2 万）。<see cref="GroupCapBytes"/> 管不住这一头：文件越小，
+    /// 同样 100 MB 装进去的成员越多——1 字节的文件能装进上亿个，而那一箱的成员表是**整件**
+    /// 拿在手上的（压缩要它、重校验要它、失败重试也要它）。
+    /// <para>
+    /// 定在 2 万的依据是实测的 7z 内存：成员元数据约 <b>1.3 KB/个</b>（与压缩级别无关，
+    /// -mx1 与 -mx9 同曲线），加上我们自己的 <see cref="PlannedFile"/> 约 0.4 KB，
+    /// 合计约 1.7 KB/成员。2 万 ≈ 51 MB/箱。
+    /// </para>
+    /// <para>
+    /// 对平均 ≥ 5 KB 的文件这条界是**空操作**（100 MB 的字节上限先到），所以它不改变常规备份的
+    /// 装箱结果——只在它存在的理由真出现时才生效。
+    /// </para>
+    /// </summary>
+    public int MaxPackMembers { get; init; } = 20_000;
+
+    /// <summary>
+    /// 单组成员路径在 7z 命令行上占的字节上限（默认 1 MB）。
+    /// <para>
+    /// 这一条治的是**硬故障**，不是内存：成员路径是逐个作为 argv 传给 7z 的
+    /// （见 <c>SevenZipCompressor.CompressAsync</c>），超了内核直接 <c>E2BIG</c>，压缩当场失败。
+    /// 实测这台机器上单次 exec 的 argv 上限是 <b>1.73 MB</b>（ARG_MAX 2 MB / stack 8 MB），
+    /// 52 字符的相对路径下 34,218 个成员通过、34,375 个失败。
+    /// </para>
+    /// <para>
+    /// 必须按**字节**而不是按成员数设界：墙的位置随路径长度缩水。同样 1.73 MB，52 字符的路径
+    /// 能放三万多个，150 字符的只剩一万二，500 字符的只剩三千多。固定成员数在长路径下照样撞。
+    /// 默认留了约 40% 余量给环境变量与其它参数。
+    /// </para>
+    /// <para>
+    /// 不改用 <c>@listfile</c> 绕开：列表文件按行分隔，而 Linux 路径里可以有换行——切错的表现是
+    /// 备份少传文件、还不报错。也不能分批追加：本项目用 <c>-v</c> 分卷，7z 拒绝更新多卷归档。
+    /// </para>
+    /// </summary>
+    public long MaxPackPathBytes { get; init; } = 1_000_000;
+
     /// <summary>跨路径打包列表（gitignore 语法）：命中者允许**跨目录**装箱，而不是按目录切分。
     /// 为散列分片目录（Emby/Jellyfin 元数据、Git objects、各类缓存——目录极多、每个目录没几个文件）
     /// 而设：那种结构下按目录切分会让包数逼近文件数，分组打包的意义（合并小文件、减少 blob 数）归零，
@@ -80,6 +116,27 @@ public sealed record Classification(
 /// </summary>
 public sealed class GroupingPlanner
 {
+    /// <summary>一个成员在 7z 命令行上占的字节：路径的 UTF-8 长度 + 结尾的 NUL。
+    /// 按 UTF-8 而不是字符数——中日韩路径一个字符最多三字节，按字符数记会低估两倍，
+    /// 而低估的后果是 <c>E2BIG</c>：压缩当场失败。</summary>
+    public static long EntryArgBytes(string path) =>
+        System.Text.Encoding.UTF8.GetByteCount(path) + 1;
+
+    /// <summary>
+    /// 已经攒了这些的一组，再收下 <paramref name="next"/> 会不会越界。
+    /// <para>
+    /// 三条界谁先到算谁，**装箱的每一处都必须用这一个判断**：规划器那个纯函数、编排器里边 diff
+    /// 边填的跨目录累加、以及压缩前 <c>ProcessPackAsync</c> 的重新切分。三处但凡有一处口径不同，
+    /// 「实际产出与规划器一致」那条不变量就破了，而破了之后最先出事的是去重与保留清理
+    /// （它们按成员分组认包）。
+    /// </para>
+    /// </summary>
+    public static bool GroupIsFull(
+        int members, long bytes, long pathBytes, PlannedFile next, PlanOptions options) =>
+        bytes + next.Length > options.GroupCapBytes
+        || members + 1 > options.MaxPackMembers
+        || pathBytes + EntryArgBytes(next.Path) > options.MaxPackPathBytes;
+
     /// <summary>
     /// 扫描一结束就能定下的归类。三条判定只看 <c>Path</c> 与 <c>Length</c>——**不需要**任何哈希，
     /// 因此不必等 diff：<see cref="PlannedFile.FullHash"/> 只用来生成 <c>data/{hash}</c> 这个内容地址，
@@ -173,21 +230,24 @@ public sealed class GroupingPlanner
         {
             var current = new List<PackEntry>();
             long currentBytes = 0;
+            long currentPathBytes = 0;
 
             foreach (var file in ordered)
             {
-                // 累加超过单组上限 → 封存当前 pack，另起一个。
-                if (current.Count > 0 && currentBytes + file.Length > options.GroupCapBytes)
+                // 撞到三条界中的任意一条 → 封存当前 pack，另起一个（见 GroupIsFull）。
+                if (current.Count > 0 && GroupIsFull(current.Count, currentBytes, currentPathBytes, file, options))
                 {
                     Seal(current, groupKey);
                     current = [];
                     currentBytes = 0;
+                    currentPathBytes = 0;
                 }
 
                 // 这里不拒空：symlink 本来就没有内容 hash（差分对它一律返回 null），而 symlink 是
                 // 可以被打进包的——7z 存的是链接本身。延后计算则只发生在单文件 blob 上，不经过装箱。
                 current.Add(new PackEntry(file.Path, file.Path, file.FullHash!, file.Length));
                 currentBytes += file.Length;
+                currentPathBytes += EntryArgBytes(file.Path);
             }
 
             if (current.Count > 0)

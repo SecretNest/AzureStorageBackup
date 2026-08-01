@@ -77,6 +77,20 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
 // 按运行清会把别人正在写的文件删掉。正常收尾各删各的（DiffWorkQueue.Dispose）。
 DiffWorkQueue.ClearStale(spillDir);
+// 装箱的两条**按机器**定的界。GroupCapBytes 是每个备份自己的设置，不在这里——
+// 这两条约束的是这台机器上 7z 进程的内存与 argv 上限，换台机器合适的值就不一样。
+builder.Services.AddSingleton(new PackLimits(
+    // 每箱成员数。实测 7z 的成员元数据约 1.3 KB/个（与压缩级别无关），加上我们自己的
+    // PlannedFile 约 0.4 KB，2 万 ≈ 51 MB/箱。平均 ≥ 5 KB 的文件用不到这条（100 MB 先到）。
+    int.TryParse(builder.Configuration["Backup:MaxPackMembers"], out var packMembers) && packMembers > 0
+        ? packMembers
+        : 20_000,
+    // 每箱成员路径在 7z 命令行上的字节数。成员是逐个作为 argv 传的，超了内核直接 E2BIG。
+    // 实测单次 exec 的 argv 上限 1.73 MB（ARG_MAX 2 MB / stack 8 MB），这里留了约 40% 余量。
+    long.TryParse(builder.Configuration["Backup:MaxPackPathBytes"], out var packPathBytes) && packPathBytes > 0
+        ? packPathBytes
+        : 1_000_000));
+
 int DiffQueueInt(string key, int fallback) =>
     int.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
 long DiffQueueLong(string key, long fallback) =>

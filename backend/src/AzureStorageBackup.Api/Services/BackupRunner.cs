@@ -206,7 +206,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config);
 
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
-                BackupRequestMapper.From(config, account, password, settings), new StateProgress(state), ct);
+                BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
+                new StateProgress(state), ct);
             state.Version = result.Version;
             state.UnreadableFiles = result.UnreadableFiles;
             state.Status = RunStatus.Completed;
