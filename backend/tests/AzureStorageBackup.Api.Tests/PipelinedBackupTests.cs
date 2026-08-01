@@ -456,8 +456,11 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions { SingleFileThresholdBytes = 10_000, GroupCapBytes = 9_000 },
             };
 
-            // memberLimit=1：内存里只要还有一件，下一件就得落盘——除了头一件，全部走磁盘。
-            var tiny = new DiffWorkQueueFactory(spillDir, memberLimit: 1, refillBatchItems: 2);
+            // r 段只装一件、w 段攒够一件就刷盘：除了头一件，全部真的过一遍磁盘。
+            var tiny = new DiffWorkQueueFactory(spillDir, new DiffQueueLimits(
+                MaxCachedItems: 1, MaxCachedBytes: long.MaxValue,
+                WriteBatchItems: 1, WriteBatchBytes: long.MaxValue,
+                RefillBatchItems: 2));
             var reports = new List<BackupProgress>();
             await Build(factory, store, spill: tiny)
                 .RunAsync(Request(account, spilledName, options), new CollectingProgress(reports));

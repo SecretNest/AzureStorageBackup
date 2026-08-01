@@ -209,10 +209,11 @@ public sealed class BackupOrchestrator(
         $"{c.FullHash}\n{c.Length}\n{c.HeadHash}\n{c.TailHash}";
 
     /// <summary>
-    /// 没有配溢出目录时（单元测试、没给临时盘）内存里最多攒多少个成员。
-    /// 配了溢出目录就用 <see cref="DiffWorkQueueFactory"/> 里那个值，这个常量不参与。
+    /// 没有配溢出目录时（单元测试、没给临时盘）的退路：纯内存、不设界。
+    /// 配了溢出目录就用 <see cref="DiffWorkQueueFactory"/> 里那套额度，这个不参与。
     /// </summary>
-    private const int InMemoryOnlyMemberLimit = int.MaxValue;
+    private static readonly DiffQueueLimits InMemoryOnlyLimits =
+        new(MaxCachedItems: int.MaxValue, MaxCachedBytes: long.MaxValue);
 
     /// <summary>
     /// 流水线的进度汇总。Diffing 与 Uploading 是**同时**在跑的，任何一侧更新都要连另一侧的
@@ -453,7 +454,7 @@ public sealed class BackupOrchestrator(
         //
         // 关掉重叠那条路更需要落盘：那时根本没人在消费，所有活会一路攒到 diff 结束。
         var overlap = opts.OverlapDiffAndUpload;
-        using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyMemberLimit, 1);
+        using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
 
         // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
         // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。

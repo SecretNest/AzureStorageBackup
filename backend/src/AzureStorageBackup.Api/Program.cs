@@ -77,19 +77,25 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
 // 按运行清会把别人正在写的文件删掉。正常收尾各删各的（DiffWorkQueue.Dispose）。
 DiffWorkQueue.ClearStale(spillDir);
-builder.Services.AddSingleton(new DiffWorkQueueFactory(
-    spillDir,
-    // 内存里最多攒多少个 PlannedFile。一个约 400 字节（路径 + 长度 + 64 字符 hash，
-    // 且路径字符串与扫描结果共享实例，实际增量更接近 200），20 万 ≈ 40~80 MB。
-    // 20 万条目规模的备份全部工作项也就在这个量级，实测下多半一件都不落盘。
-    int.TryParse(builder.Configuration["Backup:DiffQueueMemberLimit"], out var diffMembers) && diffMembers > 0
-        ? diffMembers
-        : 200_000,
-    // 一次从盘上捞多少件。成批捞是有意的：回读发生在消费侧的关键路径上，
-    // 一件一件捞的话每件都要过一次锁和一次 Flush。
-    int.TryParse(builder.Configuration["Backup:DiffQueueRefillBatch"], out var diffBatch) && diffBatch > 0
-        ? diffBatch
-        : 1_000));
+int DiffQueueInt(string key, int fallback) =>
+    int.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
+long DiffQueueLong(string key, long fallback) =>
+    long.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
+
+builder.Services.AddSingleton(new DiffWorkQueueFactory(spillDir, new DiffQueueLimits(
+    // r 段（内存里等着被领走的）：件数是主旋钮，字节是兜底，谁先到算谁。
+    // 2000 件——20~50 万文件的备份打包后总件数就在几千，多数情况下只落一点点盘。
+    // 64 MB——小文件那一格的保险：一箱 100 MB 装 5 KB 的文件就是两万个成员，
+    // 光按件数记，2000 件能到几十 GB。
+    MaxCachedItems: DiffQueueInt("MaxItems", 2_000),
+    MaxCachedBytes: DiffQueueLong("MemoryBytes", 64L * 1024 * 1024),
+    // w 段（等着成批写盘的）：r 段的 1/8。它同样在内存里，不给它设界就等于给 r 段的额度开后门。
+    WriteBatchItems: DiffQueueInt("WriteBatchItems", 200),
+    WriteBatchBytes: DiffQueueLong("WriteBatchBytes", 8L * 1024 * 1024),
+    // 一次从盘上捞多少件。回读在消费侧的关键路径上，成批捞是为了摊平锁与 Flush。
+    RefillBatchItems: DiffQueueInt("RefillBatch", 1_000),
+    // 临时文件的流缓冲。写侧真正的批量化主要发生在这里。
+    FileBufferBytes: DiffQueueInt("FileBufferBytes", 256 * 1024))));
 
 builder.Services.AddSingleton<LocalFileScanner>();
 builder.Services.AddSingleton<IFileHasher, FileHasher>();
