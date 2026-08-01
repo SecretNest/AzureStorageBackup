@@ -211,10 +211,34 @@ public sealed class BackupOrchestrator(
         $"{c.FullHash}\n{c.Length}\n{c.HeadHash}\n{c.TailHash}";
 
     /// <summary>
-    /// diff 最多可以领先压缩上传侧多少件活。这个数只是内存的护栏，不是节流阀：
-    /// 每件活不过是几个已经在内存里的路径，所以给得足够宽，正常情况下 diff 从不会被它挡住。
+    /// diff 最多可以领先压缩上传侧多少**件活**（不是多少个文件：一件活可能是一个单文件 blob，
+    /// 也可能是一箱上万个小文件，见 <see cref="WorkItem"/>）。这个数是内存的护栏，不是节流阀。
+    /// <para>
+    /// 500 不是"给得宽"，是刻意给小的。消费侧的真正瓶颈是 <c>StagingArea</c> 里那把**全局压缩锁**：
+    /// 同一时刻只有一件活在过 7z，多出来的工作线程只是让压完的活各自去占一条上传流（见
+    /// <see cref="StageProgress.Preparing"/> 那段注释）。队列只需保证"锁一空就有下一件等着"，
+    /// 深度 6 就够，500 已是八十倍余量——再往上加一个字节的吞吐量都换不来，只是把内存和
+    /// 「判定→真正读盘」的时间窗一起拉长：
+    /// </para>
+    /// <list type="bullet">
+    /// <item>内存：一箱 5 KB 小文件有上万个成员，每件活的 <see cref="PlannedFile"/> 列表就是几 MB。</item>
+    /// <item>时间窗：打包候选的全文 hash 是 diff 当场读出来的（只有单文件 blob 走 DeferFullHash
+    /// 延后），判完到 <c>ProcessPackAsync</c> 真去读盘之间隔着整个队列的排空时间。窗口越长，
+    /// 源文件在这中间被改被删、只能靠逐成员重新 Stat 兜底的机会越多。</item>
+    /// </list>
+    /// <para>
+    /// 界面上那个"排队中"的数会比这里**大几个**，不是 bug：队列之外还有正卡在 WriteAsync 里的
+    /// 那一件，以及被 <c>UploadConcurrency + 1</c> 个工作线程领走、正排在压缩锁后面干等的几件
+    /// （见 <c>StageTracker</c> 里 queued 的口径）。所以容量 500 时屏幕上是 501~506 之间摆动。
+    /// </para>
+    /// <para>
+    /// 别指望调大它能让 diff 不停：diff 判一条未变文件只要一次 stat，上传消化一件活要几秒到
+    /// 几十秒——差着几个数量级，任何有限容量都会被填满。而 diff 停住**没有代价**，它领先与否
+    /// 不改变备份完成时间，瓶颈自始至终是那把压缩锁。停顿会在界面上如实标出
+    /// （<c>BeginWaitingOnDownstream</c>），那是为了让 CurrentItem 别看上去像卡死。
+    /// </para>
     /// </summary>
-    private const int WorkQueueCapacity = 4096;
+    private const int WorkQueueCapacity = 500;
 
     /// <summary>
     /// 流水线的进度汇总。Diffing 与 Uploading 是**同时**在跑的，任何一侧更新都要连另一侧的
