@@ -432,6 +432,12 @@ export function BackupConfigsPage() {
   const remove = async (c: BackupConfig, deleteContainer: boolean) => {
     await backupConfigsApi.remove(c.id, deleteContainer)
     setDeleteModal(null)
+    // 删除是从这份配置的编辑表单里发起的：留着表单开着，用户面对的是一份已经不存在的配置，
+    // 再点一次 Save 只会撞上 404。
+    if (editing?.id === c.id) {
+      setShowForm(false)
+      setEditing(null)
+    }
     load()
   }
 
@@ -502,6 +508,32 @@ export function BackupConfigsPage() {
   }
 
   const accountName = (id: number) => accounts.find((a) => a.id === id)?.name ?? `#${id}`
+
+  // editing 是点 Edit 那一刻的快照，而表单可能开着好几分钟——activity 得从每 5 秒刷新的
+  // configs 里取当下的值，否则删除按钮的禁用状态停在打开表单时的那一拍。
+  const editingLive = editing ? (configs.find((c) => c.id === editing.id) ?? editing) : null
+
+  // 两个步骤的操作栏共用一个：删除跟当前停在第几步无关，不该逼用户先 Back 回第 1 步。
+  // 后端本就拒绝删除正在运行的配置（409，见 BackupConfigEndpoints 的 DeriveActivity）；
+  // 这里跟着灰只是把按钮与那条既有护栏对齐——真正的保证仍在后端，因为 activity 每 5 秒才刷
+  // 一次，刚开跑的那几秒里按钮还是亮的（那时错误会显示在弹窗里，见 DeleteModal）。
+  const deleteButton = editingLive && (
+    <button
+      type="button"
+      className="btn-danger"
+      // 推到操作栏另一端：不可逆的操作不该紧挨着 Save/Cancel 让人误点。
+      style={{ marginLeft: 'auto' }}
+      onClick={() => setDeleteModal(editingLive)}
+      disabled={busy || editingLive.activity !== 'Idle'}
+      title={
+        editingLive.activity === 'Idle'
+          ? undefined
+          : `Currently ${activityLabels[editingLive.activity]} — stop it or wait for it to finish before deleting.`
+      }
+    >
+      Delete…
+    </button>
+  )
 
   return (
     <section>
@@ -648,25 +680,11 @@ export function BackupConfigsPage() {
                   >
                     Check / Repair…
                   </button>{' '}
+                  {/* Delete 不在这一行：它藏在 Edit 里（见下方表单的 form-actions）。
+                      一行五个按钮时，不可逆的那个正好紧挨着最常用的 Backup/Restore，窄屏换行后
+                      位置还会漂；走一趟编辑表单既拉开了距离，也保证删之前先看清删的是哪一份。 */}
                   <button type="button" className="btn-ghost" onClick={() => startEdit(c)}>
                     Edit
-                  </button>{' '}
-                  {/* 后端本就拒绝删除正在运行的配置（409，见 BackupConfigEndpoints 的 DeriveActivity）。
-                      按钮从前不跟着灰，于是用户点了 Delete、确认、然后什么都没发生——错误被弹窗盖住了。
-                      这里只是把按钮与那条既有护栏对齐；真正的保证仍在后端，因为 activity 每 5 秒才刷一次，
-                      刚开跑的那几秒里按钮还是亮的（那时错误会显示在弹窗里，见 DeleteModal）。 */}
-                  <button
-                    type="button"
-                    className="btn-ghost btn-danger"
-                    onClick={() => setDeleteModal(c)}
-                    disabled={c.activity !== 'Idle'}
-                    title={
-                      c.activity === 'Idle'
-                        ? undefined
-                        : `Currently ${activityLabels[c.activity]} — stop it or wait for it to finish before deleting.`
-                    }
-                  >
-                    Delete
                   </button>
                 </td>
               </tr>
@@ -876,6 +894,7 @@ export function BackupConfigsPage() {
                 <button type="button" onClick={() => setShowForm(false)}>
                   Cancel
                 </button>
+                {deleteButton}
               </div>
             </>
           ) : (
@@ -1105,6 +1124,7 @@ export function BackupConfigsPage() {
                 <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
                   Cancel
                 </button>
+                {deleteButton}
               </div>
             </>
           )}
