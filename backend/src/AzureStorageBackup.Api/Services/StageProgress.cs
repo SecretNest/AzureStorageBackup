@@ -225,7 +225,11 @@ public sealed class StageTracker(
         public long Total { get; } = total;
         private long _sent;
         public long Sent => Interlocked.Read(ref _sent);
-        public void Add(long delta) => Interlocked.Add(ref _sent, delta);
+
+        /// <summary>本次尝试推到哪儿了。是**赋值**不是累加——重试整卷重来时它跟着退回去，
+        /// 这一条才和自己的 <see cref="Total"/> 同口径。累加的话重传会让分子越过分母：
+        /// 实测出现过 <c>200.0 MB / 100.0 MB</c>（一次重试），而那一卷随后正常传完了。</summary>
+        public void Set(long attemptCumulative) => Interlocked.Exchange(ref _sent, attemptCumulative);
     }
 
     private readonly ConcurrentDictionary<string, InFlight> _active = new(StringComparer.Ordinal);
@@ -502,41 +506,58 @@ public sealed class StageTracker(
     /// <param name="item">对应 <see cref="BeginItem"/> 的 key：这一笔字节要记到那一条流的账上，
     /// 界面才显示得出「这一条传了多少 / 一共多大」。省略则只累加阶段总字节，不落到具体某条流上。</param>
     public IProgress<long> ItemProgress(string? item = null) =>
-        new DeltaProgress(delta => AddBytes(item, delta));
+        new DeltaProgress((delta, attemptCumulative) => AddBytes(item, delta, attemptCumulative));
 
-    /// <summary>累加字节：既进阶段总量（测速用），也进这一条流自己的账（界面显示用）。</summary>
-    private void AddBytes(string? item, long delta)
+    /// <summary>
+    /// 记一笔字节。**两个口径，两个数**，刻意不共用：
+    /// <list type="bullet">
+    /// <item>阶段总量按**增量**累加——它是测速的分子，重传的字节要再算一次，那些字节确实又过了
+    /// 一遍网线，当下的网速就是这么快。</item>
+    /// <item>这一条流自己的读数按**本次尝试的累计值**赋值——它是界面上「传了多少 / 一共多大」的
+    /// 分子，跟分母（这一卷的标称大小）同口径。重试整卷重来时它跟着退回去。</item>
+    /// </list>
+    /// 从前两处共用同一个增量，于是重传会把分子推过分母：实测出现过
+    /// <c>DJI_0032.MP4 (30/36) — 200.0 MB / 100.0 MB · 100%</c>（百分比被夹在 100 上，
+    /// 两个字节数却明摆着矛盾），而那一卷随后正常传完了。
+    /// </summary>
+    private void AddBytes(string? item, long delta, long attemptCumulative)
     {
         lock (_gate)
         {
             _bytes += delta;
             if (item is not null && _active.TryGetValue(item, out var flow))
-                flow.Add(delta);
+                flow.Set(attemptCumulative);
             PublishIfDue(force: false);
         }
     }
 
     /// <summary>
-    /// 累计值 → 增量。SDK 报的是本次上传调用内的累计，而我们的 <see cref="RetryPolicy"/> 重试
-    /// 会让它从 0 重来（多卷上传同理，每卷各自从 0 开始）。回退一律按「重新开始」处理：
-    /// 重传的字节会再算一次——对「当下网速」而言这是对的，那些字节确实又过了一遍网线。
-    /// <para>分块并行上传时 <see cref="Report"/> 会被并发调用，所以要上锁。</para>
+    /// SDK 报的是本次上传调用内的累计值，而我们的 <see cref="RetryPolicy"/> 重试会让它从 0 重来
+    /// （多卷上传同理，每卷各自从 0 开始）。回退一律按「重新开始」处理，两个数一起交出去：
+    /// 增量（重传的算新流量）与本次尝试的累计值（重传的退回去），用途见 <see cref="AddBytes"/>。
+    /// <para>
+    /// 分块并行上传时 <see cref="Report"/> 会被并发调用，所以要上锁；回调也在锁内发，
+    /// 「算」与「落账」得是同一笔——放到锁外的话两笔回调可能乱序到达，后到的那个旧累计值
+    /// 会把新的盖回去，界面上就是往回跳。
+    /// </para>
     /// </summary>
-    private sealed class DeltaProgress(Action<long> onDelta) : IProgress<long>
+    private sealed class DeltaProgress(Action<long, long> onProgress) : IProgress<long>
     {
         private readonly Lock _gate = new();
         private long _last;
 
         public void Report(long cumulative)
         {
-            long delta;
             lock (_gate)
             {
-                delta = cumulative >= _last ? cumulative - _last : cumulative;
+                var delta = cumulative >= _last ? cumulative - _last : cumulative;
+                var restarted = cumulative < _last;
                 _last = cumulative;
+                // delta == 0 时也要放行**回退**：重试从 0 重来的那一下增量正好是 0，
+                // 而这一条流的读数恰恰要在那一刻退回去，吞掉它界面就停在旧数字上。
+                if (delta > 0 || restarted)
+                    onProgress(delta, cumulative);
             }
-            if (delta > 0)
-                onDelta(delta);
         }
     }
 
@@ -556,8 +577,9 @@ public sealed class StageTracker(
                 // 有件级权威读数时（SetTransferred）这里让位——**按卷**累加与按件销账的
                 // 工作量不同步，两个数字摆在一起就读不成话，原委见 SetTransferred。
                 // 让位不等于把这批字节丢掉：它们确实已经在云上了，先记进"所属活未销账"那一栏，
-                // 等整件完成时并入。记标称大小（Total）才能和件级账的增量精确抵消——Sent 含重传，
-                // 抵不平会留下正向漂移。Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的
+                // 等整件完成时并入。记标称大小（Total）才能和件级账的增量精确抵消——Sent 是
+                // **最后一次尝试**推到的位置，正常收尾时它就等于 Total，但失败/取消路径上
+                // 停在半截，抵不平会留下漂移。Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的
                 // blob），件级账也不会计它，所以这里同样不加。
                 if (_transferredByItem)
                     _unfinishedItemBytes += flow.Sent > 0 ? (flow.Total > 0 ? flow.Total : flow.Sent) : 0;

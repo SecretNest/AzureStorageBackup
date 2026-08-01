@@ -298,6 +298,35 @@ public sealed class StageProgressTests
         Assert.Equal(350, seen[^1].Bytes);
     }
 
+    /// <summary>
+    /// 同一件事的两个口径不能共用一个数：重传的字节对**测速**是新流量（确实又过了一遍网线），
+    /// 对**这一条流传了多少 / 一共多大**那个分数却不是——分子会越过分母。
+    /// <para>
+    /// 实测现象：一卷 100 MB 传到一半断了、重试整卷重来，界面上显示
+    /// <c>DJI_0032.MP4 (30/36) — 200.0 MB / 100.0 MB · 100%</c>，随后正常完成。
+    /// 百分比被夹在 100 上，两个字节数却明摆着自相矛盾。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void A_Retry_Restarts_The_Per_Stream_Reading_Instead_Of_Overshooting_Its_Size()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        tracker.BeginItem("data/abc.030", "DJI_0032.MP4 (30/36)", totalBytes: 100);
+        var progress = tracker.ItemProgress("data/abc.030");
+        progress.Report(100); // 整卷推完了，收尾时断线
+        progress.Report(30);  // 重试：SDK 的累计值从 0 重来
+        tracker.Complete();
+
+        var flow = Assert.Single(seen[^1].ActiveItems);
+        Assert.Equal(100, flow.Total);
+        Assert.Equal(30, flow.Sent); // 这一条**当下**传到哪儿，不是历次尝试的总和
+        Assert.Equal(30, flow.Percent);
+        // 测速那一头照旧含重传：那 130 字节确实都过了网线。
+        Assert.Equal(130, seen[^1].Bytes);
+    }
+
     /// <summary>在途项的起止**不得**计数。上传的槽位计数有「恰好一次」的约束——一个 pack 因成员
     /// 变化被重压时会经历多次上传，却始终只占 total 里的一个槽位。让 EndItem 顺手计数，
     /// 进度条就会冲过 100%（这个仓库在 onItem 上已经踩过一次重复计数）。</summary>
