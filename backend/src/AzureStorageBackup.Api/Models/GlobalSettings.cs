@@ -1,6 +1,40 @@
+using System.Diagnostics;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Models;
+
+/// <summary>
+/// 7z 进程的 CPU 优先级档位。
+/// <para>
+/// <b>Lowest 必须是 0。</b>加列时 EF 给既有行填的就是 0，这样老库升级后天然落在"最低"上，
+/// 与新库的默认值一致。反面教材是 StagedLimitBytes / ProcessingMaxAttempts：它们的合法默认
+/// 不是 0，于是 <see cref="Services.GlobalSettingsService"/> 里至今留着一段"读到 0 就换回默认值"
+/// 的补丁。把 Lowest 定成 0 就不必再欠这笔账。
+/// </para>
+/// <para>不提供"高于正常"：Linux 上提升优先级要特权，而让压缩抢在 Web 界面前面，
+/// 对一个背景备份程序来说只有坏处。</para>
+/// </summary>
+public enum SevenZipCpuPriority
+{
+    /// <summary>Linux nice 19。只吃别人不要的那部分 CPU。</summary>
+    Lowest = 0,
+    /// <summary>Linux nice 10。</summary>
+    BelowNormal = 1,
+    /// <summary>Linux nice 0，与其它进程平等争抢。</summary>
+    Normal = 2,
+}
+
+public static class SevenZipCpuPriorityExtensions
+{
+    /// <summary>映射到进程优先级。落到 default 的（数据库里存了个不认识的值）一律按最低走：
+    /// 认不出来时压慢一点是小事，把机器卡住不是。</summary>
+    public static ProcessPriorityClass ToProcessPriorityClass(this SevenZipCpuPriority priority) => priority switch
+    {
+        SevenZipCpuPriority.Normal => ProcessPriorityClass.Normal,
+        SevenZipCpuPriority.BelowNormal => ProcessPriorityClass.BelowNormal,
+        _ => ProcessPriorityClass.Idle,
+    };
+}
 
 /// <summary>
 /// 全局设置（单例，Id=1）。新建备份的默认值（PRD §11「使用默认」）+ 全局项（日志保留、并发）。
@@ -74,4 +108,14 @@ public class GlobalSettings
     /// 那种情况下关掉它，回到"先全部判完再传"。
     /// </summary>
     public bool OverlapDiffAndUpload { get; set; } = true;
+
+    /// <summary>
+    /// 7z 进程的 CPU 优先级，默认最低。压缩与解压是这个程序唯一会把 CPU 吃满的动作，
+    /// 而它跑在一台还有别的东西在跑的机器上——备份慢一点没人会注意，机器卡住会。
+    /// <para>
+    /// 与 <c>Backup__SevenZipMethodArgs</c> 里的 <c>-mmt=N</c> 是两件事：限线程降的是并行度，
+    /// 这里降的是争抢时的排队权重。单线程满载一样能让界面卡顿，那种情况只有优先级救得了。
+    /// </para>
+    /// </summary>
+    public SevenZipCpuPriority SevenZipPriority { get; set; } = SevenZipCpuPriority.Lowest;
 }

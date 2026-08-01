@@ -1,5 +1,14 @@
 import { api } from './client'
 
+// 7z 进程的 CPU 优先级。Lowest 是 0——后端枚举照着"加列时既有行填 0 就该落在最低档"排的。
+export const SevenZipCpuPriority = { Lowest: 0, BelowNormal: 1, Normal: 2 } as const
+
+export const sevenZipPriorityLabels: Record<number, string> = {
+  0: 'Lowest (default)',
+  1: 'Below normal',
+  2: 'Normal',
+}
+
 export interface GlobalSettings {
   defaultIndexTier: number
   defaultDataTier: number
@@ -28,6 +37,7 @@ export interface GlobalSettings {
   stagedLimitBytes: number
   processingMaxAttempts: number
   overlapDiffAndUpload: boolean
+  sevenZipPriority: number
 }
 
 export const settingsApi = {

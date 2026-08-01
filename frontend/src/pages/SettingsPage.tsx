@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { settingsApi, type GlobalSettings } from '../api/settings'
+import { settingsApi, sevenZipPriorityLabels, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
 import { Field } from '../components/Field'
 import { AccountsSection } from './AccountsPage'
@@ -175,6 +175,19 @@ function BackupDefaults() {
         network busy for hours that would otherwise be idle. Turn it off if your disks are slow
         enough that reading for the diff and reading for compression at the same time makes the
         whole run take longer.
+      </p>
+      <Field label="7-Zip CPU priority">
+        <select value={s.sevenZipPriority} onChange={(e) => set('sevenZipPriority', Number(e.target.value))}>
+          {Object.entries(sevenZipPriorityLabels).map(([v, label]) => (
+            <option key={v} value={v}>{label}</option>
+          ))}
+        </select>
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        Compression and extraction are the most CPU-hungry things this app does. Lowest keeps them
+        out of the way of everything else on the machine — they only get the CPU nobody else wants,
+        so a backup running in the background stays invisible. Raise it if backups are the reason
+        you bought the machine. Applies to every 7-Zip process: backup, restore, check, and repair.
       </p>
 
       <div className="row" style={{ marginTop: '1rem' }}>

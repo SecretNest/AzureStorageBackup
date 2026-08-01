@@ -180,6 +180,8 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > **Only method switches (`-m…`) are accepted**, and a bad value stops the app at startup rather than halfway through a backup. Everything else about the command line — file names, encryption, volume splitting, and the switches that govern how the app reads 7-Zip's output — stays under the app's control, because changing those would break how archives are located and verified. Files matched by a *don't compress* rule are still stored uncompressed (`-mx0`) regardless of this setting.
 >
 > The setting affects only archives written from then on. Existing backups keep whatever they were compressed with — 7-Zip records that in the archive — so changing it is safe and never invalidates anything already uploaded.
+>
+> If your goal is simply to keep compression from crowding out everything else on the machine, reach for **7-Zip CPU priority** on the Settings page first. It is set to *Lowest* out of the box, needs no restart, and applies to every `7zz` process — backup, restore, check and repair. `-mmt=N` caps how many cores compression uses; the priority setting decides who wins when they are all busy, which is what actually makes a NAS feel slow.
 
 > `Backup__MaxPackMembers` and `Backup__MaxPackPathBytes` bound how many files end up in a single pack archive. **On a normal set of files neither one ever fires** — the per-backup *group cap* (100 MB by default, on the backup's own settings page) is reached long first. They exist for one situation: a folder holding an enormous number of very small files.
 >

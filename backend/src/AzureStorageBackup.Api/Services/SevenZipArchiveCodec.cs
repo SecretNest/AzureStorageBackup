@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
@@ -11,12 +13,17 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
 
     private readonly string _exe;
     private readonly string _tempRoot;
+    private readonly Func<ProcessPriorityClass>? _priority;
 
-    public SevenZipArchiveCodec(string? executable = null, string? tempRoot = null)
+    /// <param name="priority">每个 7z 进程的 CPU 优先级，取委托以便设置改完立即生效
+    /// （见 <see cref="SevenZipCompressor"/> 的同名参数）。null＝不动优先级。</param>
+    public SevenZipArchiveCodec(
+        string? executable = null, string? tempRoot = null, Func<ProcessPriorityClass>? priority = null)
     {
         _exe = executable ?? TryResolveExecutable()
             ?? throw new InvalidOperationException("No 7-Zip executable found on PATH.");
         _tempRoot = tempRoot ?? Path.Combine(Path.GetTempPath(), "asb-7z");
+        _priority = priority;
     }
 
     /// <summary>在 PATH 上探测 7-Zip 可执行文件（7zz→7z→7za），找不到返回 null。</summary>
@@ -45,7 +52,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             // 但索引/信息文件丢内容的后果是整个备份不可读，不值得为省一次列举去赌。
             var run = await RunAsync(args, ct);
             if (run.ExitCode == 1
-                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct)).Contains(EntryName))
+                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))
             {
                 throw new ArchiveMembersMissingException([EntryName],
                     "7-Zip left the payload out of the archive.");
@@ -90,7 +97,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
     }
 
     private Task<SevenZipRun> RunAsync(IReadOnlyList<string> args, CancellationToken ct) =>
-        SevenZipCli.RunAsync(_exe, args, ct);
+        SevenZipCli.RunAsync(_exe, args, ct, priority: _priority);
 
     private static void TryDelete(string dir)
     {

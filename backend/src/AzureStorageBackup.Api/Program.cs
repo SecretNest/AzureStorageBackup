@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Endpoints;
+using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
@@ -36,8 +38,26 @@ builder.Services.AddScoped<IScheduledTaskService, ScheduledTaskService>();
 builder.Services.AddScoped<IBackupInventoryService, BackupInventoryService>();
 builder.Services.AddScoped<IBackupConfigService, BackupConfigService>();
 
+// 每个 7z 进程的 CPU 优先级，实时从 GlobalSettings 读（带 scope，短读一次），与下面 StagingArea
+// 的上限同款：界面上改完保存，下一个 7z 进程就按新档跑，不必重启容器。
+// 读设置失败绝不能把压缩带下水——这只是个性能偏好，读不到就按默认的"最低"走。
+static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
+{
+    try
+    {
+        using var scope = sp.GetRequiredService<IServiceScopeFactory>().CreateScope();
+        var settings = scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>()
+            .GetAsync().GetAwaiter().GetResult();
+        return settings.SevenZipPriority.ToProcessPriorityClass();
+    }
+    catch
+    {
+        return SevenZipCpuPriority.Lowest.ToProcessPriorityClass();
+    }
+};
+
 // 备份引擎（M4）：7z 编解码 + 信息文件/索引读写。codec 按需构造（首次解析时探测 7z）。
-builder.Services.AddSingleton<IArchiveCodec>(_ => new SevenZipArchiveCodec());
+builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
 builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
 builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
 // 反序列化后的版本索引缓存（单例，跨请求）。默认 2 项＝偏响应速度：还原对话框的树浏览与
@@ -131,7 +151,8 @@ builder.Services.AddScoped<RetentionCleaner>();
 // 在这里先验一次：DI 工厂是懒的，不验的话一个写错的值要等到第一次备份跑起来才炸。
 var sevenZipMethodArgs = builder.Configuration["Backup:SevenZipMethodArgs"];
 SevenZipCompressor.ValidateMethodArgs(sevenZipMethodArgs);
-builder.Services.AddSingleton<IFileCompressor>(_ => new SevenZipCompressor(methodArgs: sevenZipMethodArgs));
+builder.Services.AddSingleton<IFileCompressor>(sp =>
+    new SevenZipCompressor(methodArgs: sevenZipMethodArgs, priority: SevenZipPriority(sp)));
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddScoped<BackupOrchestrator>();
 builder.Services.AddSingleton<BackupBusyTracker>();

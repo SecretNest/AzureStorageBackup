@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>一次压缩请求。Entries 为相对 SourceDirectory 的条目名（决定归档内的条目名）。</summary>
@@ -83,6 +85,7 @@ public sealed class SevenZipCompressor : IFileCompressor
 {
     private readonly string _exe;
     private readonly IReadOnlyList<string> _methodArgs;
+    private readonly Func<ProcessPriorityClass>? _priority;
 
     /// <param name="methodArgs">
     /// 覆盖压缩方法参数（<c>-m…</c>），默认 <c>-mx9</c>（PRD 3.3.2.1 要求最大压缩）。
@@ -95,11 +98,17 @@ public sealed class SevenZipCompressor : IFileCompressor
     /// </para>
     /// <para>写错了在构造时就抛——启动即失败，好过备份跑到一半才炸。</para>
     /// </param>
-    public SevenZipCompressor(string? executable = null, string? methodArgs = null)
+    /// <param name="priority">
+    /// 每个 7z 进程的 CPU 优先级。传委托而非值：全局设置在界面上改完保存后，下一个进程就该按新档跑，
+    /// 不该等重启容器（与 <see cref="StagingArea"/> 的上限同一个道理）。null＝不动优先级。
+    /// </param>
+    public SevenZipCompressor(
+        string? executable = null, string? methodArgs = null, Func<ProcessPriorityClass>? priority = null)
     {
         _exe = executable ?? SevenZipCli.TryResolveExecutable()
             ?? throw new InvalidOperationException("No 7-Zip executable found on PATH.");
         _methodArgs = ParseMethodArgs(methodArgs);
+        _priority = priority;
     }
 
     /// <summary>本实例实际会用的 <c>-m…</c> 参数（StoreOnly 除外，见 <see cref="MethodArgs"/>）。
@@ -149,7 +158,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add(Path.GetFullPath(request.OutputArchivePath));
         args.AddRange(request.Entries);
 
-        var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory);
+        var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
         var volumes = CollectVolumes(request.OutputArchivePath);
 
         // 退出码 0 的归档必然齐全，所以这次额外的列举只在 1 时付出——而 1 恰恰是 7z 丢掉
@@ -181,7 +190,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         if (volumes.Count == 0)
             return [.. request.Entries];
 
-        var present = await SevenZipCli.ListEntriesAsync(_exe, volumes[0], request.Password, ct);
+        var present = await SevenZipCli.ListEntriesAsync(_exe, volumes[0], request.Password, ct, _priority);
         return [.. request.Entries.Where(e => !present.Contains(SevenZipCli.NormalizeEntryName(e)))];
     }
 
@@ -220,7 +229,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         try
         {
             await SevenZipCli.RunStreamingAsync(_exe, args, ct,
-                writeStdin: async (stdin, token) => written = await writeSource(stdin, token));
+                writeStdin: async (stdin, token) => written = await writeSource(stdin, token),
+                priority: _priority);
         }
         catch
         {
@@ -237,7 +247,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         // 归档里必须真的有这个条目，且解压后尺寸等于我们喂进去的字节数。喂进去的字节又正是
         // 算 hash 的那些字节，所以这一条查过之后，"索引记的内容"与"归档里的内容"就再无缝隙。
         // 一次列举的代价只是读一遍归档头，和压缩本身比可以忽略。
-        var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct))
+        var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct, _priority))
             .FirstOrDefault(e => e.Name == SevenZipCli.NormalizeEntryName(request.EntryName));
         if (volumes.Count == 0 || entry is null || entry.Size != written)
         {
@@ -268,7 +278,7 @@ public sealed class SevenZipCompressor : IFileCompressor
 
     public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
         string firstVolumePath, string? password, CancellationToken ct = default)
-        => SevenZipCli.ListEntryDetailsAsync(_exe, firstVolumePath, password, ct);
+        => SevenZipCli.ListEntryDetailsAsync(_exe, firstVolumePath, password, ct, _priority);
 
     public async Task<long> ExtractToStreamAsync(
         string firstVolumePath, string? entryName, string? password, Stream destination,
@@ -283,7 +293,7 @@ public sealed class SevenZipCompressor : IFileCompressor
             args.Add(entryName);
 
         long written = 0;
-        await SevenZipCli.RunStreamingAsync(_exe, args, ct, readStdout: async (stdout, token) =>
+        await SevenZipCli.RunStreamingAsync(_exe, args, ct, priority: _priority, readStdout: async (stdout, token) =>
         {
             var buffer = new byte[81920];
             int read;
@@ -304,7 +314,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add("-o" + Path.GetFullPath(outputDir));
         args.Add(Path.GetFullPath(firstVolumePath));
 
-        await SevenZipCli.RunAsync(_exe, args, ct);
+        await SevenZipCli.RunAsync(_exe, args, ct, priority: _priority);
         EnsureReadable(Path.GetFullPath(outputDir));
     }
 

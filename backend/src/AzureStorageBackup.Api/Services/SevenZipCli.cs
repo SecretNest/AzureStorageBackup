@@ -26,7 +26,8 @@ internal static class SevenZipCli
     /// 返回退出码供调用方自行验收：**1 不是"没事"**——7z 用它表示警告，而"读不了的成员被静默丢掉、
     /// 归档照样有效产出"正是这个退出码，只有比对归档实际内容才能发现。</summary>
     public static async Task<SevenZipRun> RunAsync(
-        string exe, IReadOnlyList<string> args, CancellationToken ct, string? workingDirectory = null)
+        string exe, IReadOnlyList<string> args, CancellationToken ct, string? workingDirectory = null,
+        Func<ProcessPriorityClass>? priority = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -44,6 +45,7 @@ internal static class SevenZipCli
 
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
+        ApplyPriority(proc, priority);
 
         // 关闭 stdin：若归档加密而未提供密码，7z 会等待输入 —— 给它 EOF 使其失败而非挂起。
         proc.StandardInput.Close();
@@ -93,7 +95,8 @@ internal static class SevenZipCli
         string exe, IReadOnlyList<string> args, CancellationToken ct,
         Func<Stream, CancellationToken, Task>? writeStdin = null,
         Func<Stream, CancellationToken, Task>? readStdout = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        Func<ProcessPriorityClass>? priority = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -111,6 +114,7 @@ internal static class SevenZipCli
 
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
+        ApplyPriority(proc, priority);
 
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
         var stdoutTask = Task.Run(async () =>
@@ -149,6 +153,46 @@ internal static class SevenZipCli
         return new SevenZipRun(proc.ExitCode, "", stderr);
     }
 
+    /// <summary>
+    /// 把优先级设到刚起来的 7z 进程上。<paramref name="priority"/> 为 null＝不动（保持继承自本进程的值）。
+    /// <para>
+    /// <b>失败一律吞掉。</b>进程可能在这几微秒里就已经退出（<see cref="InvalidOperationException"/>），
+    /// 系统也可能拒绝（<see cref="System.ComponentModel.Win32Exception"/>）。优先级调不动不是压缩失败——
+    /// 让一次备份因为一个性能偏好设置炸掉，比它跑得快一点糟得多。
+    /// </para>
+    /// <para>
+    /// <b>Linux 上 nice 是每线程属性。</b><c>setpriority(PRIO_PROCESS, pid)</c> 只落在主线程上，
+    /// 7z 的 LZMA 工作线程继承的是**创建它们的那个线程**当时的 nice 值。这里紧贴 Process.Start 设置，
+    /// 那一刻 7z 还在动态链接、解析参数，工作线程尚未创建，所以实践上全部继承得到。
+    /// 最坏情况（输掉这个竞态）也只是有几个线程没降下来：效果打折，不影响正确性。
+    /// </para>
+    /// </summary>
+    private static void ApplyPriority(Process proc, Func<ProcessPriorityClass>? priority)
+    {
+        if (priority is null)
+            return;
+
+        ProcessPriorityClass wanted;
+        try
+        {
+            wanted = priority();
+        }
+        catch
+        {
+            // 取值失败＝读设置失败（数据库不可用之类）。那与这次压缩没有一点关系，
+            // 不该由它决定这次备份的成败——保持继承来的优先级接着跑。
+            return;
+        }
+
+        try
+        {
+            proc.PriorityClass = wanted;
+        }
+        catch (InvalidOperationException) { }                    // 设之前它自己退出了
+        catch (System.ComponentModel.Win32Exception) { }         // 系统拒绝（权限/已回收）
+        catch (PlatformNotSupportedException) { }                // 该平台不支持调优先级
+    }
+
     /// <summary>杀掉进程及其子进程。已经退出（竞态）或杀不动都不算错——取消本身已经在往外抛了，
     /// 不能让收尾动作再盖一个不相干的异常上去。</summary>
     private static void KillTree(Process proc)
@@ -180,8 +224,9 @@ internal static class SevenZipCli
     /// 加密备份用 -mhe=on（头也加密），不给密码连条目名都列不出来，所以密码必须一并传入。
     /// 分卷归档传首卷（.001），7z 自行找齐后续卷。</summary>
     public static async Task<HashSet<string>> ListEntriesAsync(
-        string exe, string firstVolumePath, string? password, CancellationToken ct)
-        => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct)).Select(e => e.Name)];
+        string exe, string firstVolumePath, string? password, CancellationToken ct,
+        Func<ProcessPriorityClass>? priority = null)
+        => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct, priority)).Select(e => e.Name)];
 
     /// <summary>
     /// 列出归档成员，**保持归档内顺序**并带上尺寸与目录标记。
@@ -189,14 +234,15 @@ internal static class SevenZipCli
     /// 按尺寸切段才能还原出每个成员。注意这个顺序未必等于当初压缩时给出的参数顺序。
     /// </summary>
     public static async Task<IReadOnlyList<ArchiveEntry>> ListEntryDetailsAsync(
-        string exe, string firstVolumePath, string? password, CancellationToken ct)
+        string exe, string firstVolumePath, string? password, CancellationToken ct,
+        Func<ProcessPriorityClass>? priority = null)
     {
         var args = new List<string> { "l", "-slt", "-y" };
         if (!string.IsNullOrEmpty(password))
             args.Add("-p" + password);
         args.Add(Path.GetFullPath(firstVolumePath));
 
-        var run = await RunAsync(exe, args, ct);
+        var run = await RunAsync(exe, args, ct, priority: priority);
         return ParseEntryDetails(run.StdOut);
     }
 

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using AzureStorageBackup.Api.Services;
 
@@ -218,5 +219,51 @@ public sealed class SevenZipCompressorTests : IDisposable
 
         var entries = await compressor.ListEntriesAsync(result.VolumeFiles[0], null);
         Assert.Equal(payload.Length, Assert.Single(entries).Size);
+    }
+
+    /// <summary>
+    /// 降优先级不能把正常路径搞坏——压缩、列举、解压三条都得照常。
+    /// <para>
+    /// 不回读 <c>PriorityClass</c> 做断言：那是竞态（进程可能已经退出），而且 nice 值本身
+    /// 在容器/CI 里未必调得动。这里守的是另一件事：多出来的那个 setpriority 调用，以及它
+    /// 周围的 try/catch，不会让任何一条 7z 路径失败。设不上时它必须**静默**，因为一个
+    /// 性能偏好绝不该炸掉一次备份。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Priority_Setting_Does_Not_Disturb_Any_Path()
+    {
+        Skip.If(Exe is null, "7z executable not found on PATH.");
+        var compressor = new SevenZipCompressor(Exe, priority: () => ProcessPriorityClass.Idle);
+        var src = SourceDir();
+        WriteInto(src, "a.txt", Encoding.UTF8.GetBytes("alpha"));
+
+        var archive = Path.Combine(_dir, "prio.7z");
+        var result = await compressor.CompressAsync(new CompressionRequest(src, ["a.txt"], archive));
+
+        var entries = await compressor.ListEntriesAsync(result.VolumeFiles[0], null);
+        Assert.Equal("a.txt", Assert.Single(entries).Name);
+
+        var outDir = Path.Combine(_dir, "out");
+        await compressor.ExtractAsync(result.VolumeFiles[0], outDir, null);
+        Assert.Equal("alpha", await File.ReadAllTextAsync(Path.Combine(outDir, "a.txt")));
+    }
+
+    /// <summary>优先级委托抛出来时也不能影响压缩：这条路上的异常来自读设置（数据库），
+    /// 和归档内容没有一点关系。</summary>
+    [SkippableFact]
+    public async Task Throwing_Priority_Provider_Does_Not_Fail_Compression()
+    {
+        Skip.If(Exe is null, "7z executable not found on PATH.");
+        var compressor = new SevenZipCompressor(
+            Exe, priority: () => throw new TimeoutException("settings unavailable"));
+        var src = SourceDir();
+        WriteInto(src, "a.txt", Encoding.UTF8.GetBytes("alpha"));
+
+        var result = await compressor.CompressAsync(
+            new CompressionRequest(src, ["a.txt"], Path.Combine(_dir, "prio-throw.7z")));
+
+        var entries = await compressor.ListEntriesAsync(result.VolumeFiles[0], null);
+        Assert.Equal("a.txt", Assert.Single(entries).Name);
     }
 }
