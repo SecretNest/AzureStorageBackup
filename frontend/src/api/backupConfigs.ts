@@ -69,6 +69,20 @@ export const activityLabels: Record<BackupActivity, string> = {
   CleaningUp: 'cleaning up',
 }
 
+/**
+ * 徽标里单独站着的形式。不能复用 activityLabels：那一组是为句子中间准备的小写形式，
+ * 摆进徽标就成了半截句子；也不能直接打 activity 本身——那是后端的 enum 名，
+ * "BackingUp" / "CleaningUp" 这种驼峰直接糊到屏幕上是漏出来的实现细节，不是文案。
+ */
+export const activityBadgeLabels: Record<BackupActivity, string> = {
+  Idle: 'Idle',
+  BackingUp: 'Backing Up',
+  Restoring: 'Restoring',
+  Checking: 'Checking',
+  Repairing: 'Repairing',
+  CleaningUp: 'Cleaning Up',
+}
+
 /** 后端解析后的生效值（null 字段已用全局设置填充）。只读，仅供显示。 */
 export interface EffectiveBackupSettings {
   ignoreRules: string | null
@@ -179,9 +193,10 @@ export interface StageProgress {
   stagedBytes: number // 已压好、还没送出去的（压缩后）
   transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
   workPercent: number | null // 按源字节算的完成度；总量未定时为 null
-  // 差分被流水线的有界队列挡住（判得比上传快几个数量级，填满是常态）。currentItem 那时亮着的是
-  // 刚判完的那条，不标出来界面上就是"卡死在这个文件上"。
-  waitingOnDownstream: boolean
+  // 差分判得比压缩上传快几个数量级，必然跑到上传前面去；多出来的活攒到磁盘上（累计件数，只增）。
+  // 从前这里是一个 boolean「被队列挡住了」——写侧现在不再阻塞，diff 一路跑到底，
+  // 上传的剩余时间才有分母（总数只有 diff 收工才确定）。这个数是那件事的量化读数。
+  spilledItems: number
   // 已经离开压缩/暂存段的**件**数：压缩早已完成，此后要么有卷在飞，要么正卡在下面那三段之一。
   // 与 activeItems 是两个口径——那里装的是**卷**，一件活可以同时有好几卷在飞，也可以一卷都没有。
   // processed + preparing + queued + uploading ≡ total 是个恒等式，屏幕上的数必须凑得出它：

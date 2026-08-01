@@ -62,14 +62,16 @@ public sealed class PipelinedBackupTests : IDisposable
 
     private BackupOrchestrator Build(
         BlobClientFactory factory, IBackupInfoStore store,
-        IFileHasher? hasher = null, IBlobUploader? uploader = null)
+        IFileHasher? hasher = null, IBlobUploader? uploader = null,
+        DiffWorkQueueFactory? spill = null)
     {
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         return new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher ?? new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+            spillFactory: spill);
     }
 
     private BackupRequest Request(Account account, string container, BackupEngineOptions options) => new()
@@ -412,6 +414,97 @@ public sealed class PipelinedBackupTests : IDisposable
             }
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 内存界卡到最小、逼着几乎每一件活都过一遍磁盘，产出必须与全程走内存那一轮**逐条相同**。
+    /// 这是溢出落盘唯一需要证明的事：它是一条运输通道，不是一条会改写内容的通道。
+    /// 顺带盯两件收尾：落盘这件事要在界面上报得出来，临时文件要在运行结束后消失。
+    /// </summary>
+    [SkippableFact]
+    public async Task Spilling_The_Work_Queue_To_Disk_Produces_An_Identical_Backup()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var spilledName = RandomName("pipesp-");
+        var memoryName = RandomName("pipemem-");
+        var spilled = factory.CreateServiceClient(account).GetBlobContainerClient(spilledName);
+        var memory = factory.CreateServiceClient(account).GetBlobContainerClient(memoryName);
+        await spilled.CreateIfNotExistsAsync();
+        await memory.CreateIfNotExistsAsync();
+
+        var spillDir = Path.Combine(_temp, "diff-spill");
+
+        try
+        {
+            // 三条路都要走到：单文件 blob、按目录成箱、跨目录成箱。
+            WriteFile("big.bin", 40_000);
+            WriteFile("also/big2.bin", 40_000);
+            foreach (var dir in new[] { "docs", "docs/deep", "notes" })
+                for (var i = 0; i < 6; i++)
+                    WriteFile($"{dir}/f{i}.txt", 3_000);
+            for (var i = 0; i < 12; i++)
+                WriteFile($"shard/{i:D2}/blob.dat", 2_500);
+
+            var options = new BackupEngineOptions
+            {
+                CrossDirGroup = new IgnoreRuleSet(["shard/"]),
+                Plan = new PlanOptions { SingleFileThresholdBytes = 10_000, GroupCapBytes = 9_000 },
+            };
+
+            // memberLimit=1：内存里只要还有一件，下一件就得落盘——除了头一件，全部走磁盘。
+            var tiny = new DiffWorkQueueFactory(spillDir, memberLimit: 1, refillBatchItems: 2);
+            var reports = new List<BackupProgress>();
+            await Build(factory, store, spill: tiny)
+                .RunAsync(Request(account, spilledName, options), new CollectingProgress(reports));
+
+            await Build(factory, store).RunAsync(Request(account, memoryName, options));
+
+            var spilledIndex = await ReadOnlyIndexAsync(store, account, spilledName);
+            var memoryIndex = await ReadOnlyIndexAsync(store, account, memoryName);
+
+            // 逐条相同：路径、长度、全文 hash。落盘只是搬运，一个字节都不该变。
+            Assert.Equal(
+                memoryIndex.Entries.OrderBy(e => e.Path, StringComparer.Ordinal)
+                    .Select(e => (e.Path, e.Length, e.FullHash)),
+                spilledIndex.Entries.OrderBy(e => e.Path, StringComparer.Ordinal)
+                    .Select(e => (e.Path, e.Length, e.FullHash)));
+
+            // 装箱分组也必须一致（pack 编号可以不同，成员怎么分不行）。
+            static IEnumerable<string> PackSignature(VersionIndex idx) =>
+                idx.Entries.Where(e => e.Storage!.Kind == "pack")
+                    .GroupBy(e => e.Storage!.Ref, StringComparer.Ordinal)
+                    .Select(g => string.Join('\n', g.Select(e => e.Path).OrderBy(p => p, StringComparer.Ordinal)))
+                    .OrderBy(s => s, StringComparer.Ordinal);
+            Assert.Equal(PackSignature(memoryIndex), PackSignature(spilledIndex));
+
+            // 这一轮真的落过盘——否则上面那些相等断言只是"两轮都走了内存"。
+            lock (reports)
+            {
+                Assert.Contains(reports, r => r.Details.Any(d => d.Stage == "Diffing" && d.SpilledItems > 0));
+            }
+
+            // 运行结束后不留垃圾：正常收尾各删各的溢出文件（非正常退出那一路由 ClearStale 兜底）。
+            Assert.True(
+                !Directory.Exists(spillDir) || Directory.GetFiles(spillDir, "*.spill").Length == 0,
+                "运行结束后不该还留着溢出文件");
+        }
+        finally
+        {
+            await spilled.DeleteIfExistsAsync();
+            await memory.DeleteIfExistsAsync();
+        }
+    }
+
+    private static async Task<VersionIndex> ReadOnlyIndexAsync(
+        IBackupInfoStore store, Account account, string container)
+    {
+        var info = await store.ReadInfoAsync(account, container, null);
+        return await store.ReadIndexAsync(account, container, info!.Versions[0].IndexBlob, null);
     }
 
     private sealed class CollectingProgress(List<BackupProgress> sink) : IProgress<BackupProgress>

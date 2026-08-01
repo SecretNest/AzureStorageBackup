@@ -70,6 +70,27 @@ builder.Services.AddSingleton(sp =>
 // verbose 逐文件 debug 日志的文件后端（按备份+按日期文本文件，PRD 3.6）。
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
+// diff→上传那条队列的溢出区。写侧永不阻塞：内存装不下就落到这里，diff 因此能一路跑到底——
+// 这是上传阶段能显示剩余时间的前提（分母 SetTotal 只有 diff 收工才确定，见 StageProgress.Eta）。
+var spillDir = Path.Combine(tempPath, "diff-spill");
+// 上一次非正常退出（容器被 kill、断电）留下的溢出文件在这里清掉。
+// 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
+// 按运行清会把别人正在写的文件删掉。正常收尾各删各的（DiffWorkQueue.Dispose）。
+DiffWorkQueue.ClearStale(spillDir);
+builder.Services.AddSingleton(new DiffWorkQueueFactory(
+    spillDir,
+    // 内存里最多攒多少个 PlannedFile。一个约 400 字节（路径 + 长度 + 64 字符 hash，
+    // 且路径字符串与扫描结果共享实例，实际增量更接近 200），20 万 ≈ 40~80 MB。
+    // 20 万条目规模的备份全部工作项也就在这个量级，实测下多半一件都不落盘。
+    int.TryParse(builder.Configuration["Backup:DiffQueueMemberLimit"], out var diffMembers) && diffMembers > 0
+        ? diffMembers
+        : 200_000,
+    // 一次从盘上捞多少件。成批捞是有意的：回读发生在消费侧的关键路径上，
+    // 一件一件捞的话每件都要过一次锁和一次 Flush。
+    int.TryParse(builder.Configuration["Backup:DiffQueueRefillBatch"], out var diffBatch) && diffBatch > 0
+        ? diffBatch
+        : 1_000));
+
 builder.Services.AddSingleton<LocalFileScanner>();
 builder.Services.AddSingleton<IFileHasher, FileHasher>();
 builder.Services.AddSingleton<BackupDiffer>();

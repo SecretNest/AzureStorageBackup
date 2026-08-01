@@ -139,11 +139,9 @@ public sealed class BackupOrchestrator(
     IOperationLog? opLog = null,
     ILocalIndexCache? indexCache = null,
     TrackedInfoStore? trackedInfo = null,
-    VerboseFileLog? verboseLog = null)
+    VerboseFileLog? verboseLog = null,
+    DiffWorkQueueFactory? spillFactory = null)
 {
-    /// <summary>流水线上的一件活：一个单文件 blob，或一箱已封好的 pack 成员。</summary>
-    private readonly record struct WorkItem(PlannedFile? Single, IReadOnlyList<PlannedFile>? Pack);
-
     /// <summary>
     /// 一次运行的可变状态：边跑边攒的计数，以及云端回退路径的同批上传协调。按参数一路传下去
     /// 而不是做成实例字段：编排器在 DI 里是 scoped，单次请求内不会有第二轮备份共用它，但
@@ -211,34 +209,10 @@ public sealed class BackupOrchestrator(
         $"{c.FullHash}\n{c.Length}\n{c.HeadHash}\n{c.TailHash}";
 
     /// <summary>
-    /// diff 最多可以领先压缩上传侧多少**件活**（不是多少个文件：一件活可能是一个单文件 blob，
-    /// 也可能是一箱上万个小文件，见 <see cref="WorkItem"/>）。这个数是内存的护栏，不是节流阀。
-    /// <para>
-    /// 500 不是"给得宽"，是刻意给小的。消费侧的真正瓶颈是 <c>StagingArea</c> 里那把**全局压缩锁**：
-    /// 同一时刻只有一件活在过 7z，多出来的工作线程只是让压完的活各自去占一条上传流（见
-    /// <see cref="StageProgress.Preparing"/> 那段注释）。队列只需保证"锁一空就有下一件等着"，
-    /// 深度 6 就够，500 已是八十倍余量——再往上加一个字节的吞吐量都换不来，只是把内存和
-    /// 「判定→真正读盘」的时间窗一起拉长：
-    /// </para>
-    /// <list type="bullet">
-    /// <item>内存：一箱 5 KB 小文件有上万个成员，每件活的 <see cref="PlannedFile"/> 列表就是几 MB。</item>
-    /// <item>时间窗：打包候选的全文 hash 是 diff 当场读出来的（只有单文件 blob 走 DeferFullHash
-    /// 延后），判完到 <c>ProcessPackAsync</c> 真去读盘之间隔着整个队列的排空时间。窗口越长，
-    /// 源文件在这中间被改被删、只能靠逐成员重新 Stat 兜底的机会越多。</item>
-    /// </list>
-    /// <para>
-    /// 界面上那个"排队中"的数会比这里**大几个**，不是 bug：队列之外还有正卡在 WriteAsync 里的
-    /// 那一件，以及被 <c>UploadConcurrency + 1</c> 个工作线程领走、正排在压缩锁后面干等的几件
-    /// （见 <c>StageTracker</c> 里 queued 的口径）。所以容量 500 时屏幕上是 501~506 之间摆动。
-    /// </para>
-    /// <para>
-    /// 别指望调大它能让 diff 不停：diff 判一条未变文件只要一次 stat，上传消化一件活要几秒到
-    /// 几十秒——差着几个数量级，任何有限容量都会被填满。而 diff 停住**没有代价**，它领先与否
-    /// 不改变备份完成时间，瓶颈自始至终是那把压缩锁。停顿会在界面上如实标出
-    /// （<c>BeginWaitingOnDownstream</c>），那是为了让 CurrentItem 别看上去像卡死。
-    /// </para>
+    /// 没有配溢出目录时（单元测试、没给临时盘）内存里最多攒多少个成员。
+    /// 配了溢出目录就用 <see cref="DiffWorkQueueFactory"/> 里那个值，这个常量不参与。
     /// </summary>
-    private const int WorkQueueCapacity = 500;
+    private const int InMemoryOnlyMemberLimit = int.MaxValue;
 
     /// <summary>
     /// 流水线的进度汇总。Diffing 与 Uploading 是**同时**在跑的，任何一侧更新都要连另一侧的
@@ -469,15 +443,17 @@ public sealed class BackupOrchestrator(
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         // pack 号的分配收在 RunState 里（见 NextPackId）：它必须跨运行唯一。
 
-        // 有界队列把两条流解耦：staged 满时挡住的只是压缩侧，diff 该读盘照样读盘——
+        // 队列把两条流解耦：staged 满时挡住的只是压缩侧，diff 该读盘照样读盘——
         // 反压一路顶回 diff，磁盘就跟着停了，这次改造也就白做了。
-        // 关掉重叠时用无界队列：那条路上根本没人在消费，容量限制只会把 diff 卡死。
+        //
+        // 写侧**永不阻塞**：内存装不下就落盘（见 DiffWorkQueue）。这一条是剩余时间能不能显示的
+        // 前提——上传阶段的 ETA 要等 SetTotal 才算得出来，而那个总数只有 diff 跑完才确定。
+        // 写侧一旦被队列挡住，diff 就只能跟着上传的节奏挪，"diff 收工"＝"只剩一个队列深度没做"，
+        // 剩余时间要到整轮备份的尾巴上才肯出现。
+        //
+        // 关掉重叠那条路更需要落盘：那时根本没人在消费，所有活会一路攒到 diff 结束。
         var overlap = opts.OverlapDiffAndUpload;
-        var work = overlap
-            ? System.Threading.Channels.Channel.CreateBounded<WorkItem>(
-                new System.Threading.Channels.BoundedChannelOptions(WorkQueueCapacity) { SingleWriter = true })
-            : System.Threading.Channels.Channel.CreateUnbounded<WorkItem>(
-                new System.Threading.Channels.UnboundedChannelOptions { SingleWriter = true });
+        using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyMemberLimit, 1);
 
         // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
         // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
@@ -487,7 +463,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                await foreach (var item in work.Reader.ReadAllAsync(ct))
+                while (await work.DequeueAsync(ct) is { } item)
                 {
                     // 领走一件活。从这里到 BeginUpload（压完、开始抢流的额度）之间是压缩与暂存，
                     // 一箱 100 MB 过 7z 可以几十秒——界面上得看得见这段，否则就是"什么都没在发生"。
@@ -531,29 +507,26 @@ public sealed class BackupOrchestrator(
         var changedFiles = 0;
         long changedBytes = 0;
 
-        async Task EnqueueAsync(WorkItem item, CancellationToken token)
+        var reportedSpill = 0L;
+        void Enqueue(WorkItem item)
         {
             Interlocked.Increment(ref totalItems);
             // 申报这件活的原始字节，作为剩余时间估算的工作量。完工时 ReportItem 会照同一个量
             // 销账（单文件按 Length，一箱按成员长度和），两边必须对得上，否则剩余量归不了零。
             uploadTracker.Enqueue(item.Single?.Length ?? item.Pack!.Sum(f => f.Length));
 
-            // 队列没满就直接塞进去，一个字节的噪音都不加。
-            if (work.Writer.TryWrite(item))
-                return;
+            // 永不阻塞：内存装不下就落盘。diff 因此能一路跑到底，SetTotal 才有机会早早落定。
+            work.Enqueue(item);
 
-            // 满了。差分判一条未变文件只要一次 stat，上传消化一件活要几秒到几十秒——差着几个
-            // 数量级，所以队列被填满是常态而非异常（首次备份尤其：所有文件都是新增，全部入队）。
-            // 这一等可以是十几秒，而 diff 的 CurrentItem 那时亮着的是**刚判完**的那条，
-            // 界面上看就是"卡死在这个文件上"。标出来，好让它说的是实话：在等上传追上来。
-            diffTracker.BeginWaitingOnDownstream();
-            try
+            // 落了多少盘要说出来——它就是"diff 领先上传多少"的直接读数，而这一段
+            // 从前是靠 CurrentItem 卡住不动来间接体现的。
+            // 只在数变了才报：SetSpilled 要进发布锁，而正常规模下一件都不落盘，
+            // 那样等于给 diff 的热路径上每件活都加一把没有用处的锁。
+            var spilled = work.SpilledItems;
+            if (spilled != reportedSpill)
             {
-                await work.Writer.WriteAsync(item, token);
-            }
-            finally
-            {
-                diffTracker.EndWaitingOnDownstream();
+                reportedSpill = spilled;
+                diffTracker.SetSpilled(spilled);
             }
         }
 
@@ -608,7 +581,7 @@ public sealed class BackupOrchestrator(
                 case FileCategory.SingleFile:
                     // 单文件：判定一出来立刻走流式压缩上传，不等任何人。
                     if (file is not null)
-                        await EnqueueAsync(new WorkItem(file, null), token);
+                        Enqueue(new WorkItem(file, null));
                     return;
 
                 case FileCategory.CrossDirectoryGroup:
@@ -618,7 +591,7 @@ public sealed class BackupOrchestrator(
                     {
                         if (crossPending.Count > 0 && crossBytes + file.Length > cap)
                         {
-                            await EnqueueAsync(new WorkItem(null, crossPending), token);
+                            Enqueue(new WorkItem(null, crossPending));
                             crossPending = [];
                             crossBytes = 0;
                         }
@@ -641,7 +614,7 @@ public sealed class BackupOrchestrator(
                     {
                         // 装箱仍由规划器那个纯函数负责，输入换成"这一组里确实变更的文件"。
                         foreach (var pack in planner.Plan(members, packOptions).Packs)
-                            await EnqueueAsync(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)]), token);
+                            Enqueue(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)]));
                     }
                     return;
             }
@@ -665,14 +638,14 @@ public sealed class BackupOrchestrator(
                 // 收尾：把还没填满的箱子封掉。跨目录的那一箱肯定有剩；按目录的理论上都已在
                 // 计数归零时封过，这里只是不留活口。
                 if (crossPending.Count > 0)
-                    await EnqueueAsync(new WorkItem(null, crossPending), stopProducing.Token);
+                    Enqueue(new WorkItem(null, crossPending));
                 foreach (var leftover in dirPending.Values.Where(m => m.Count > 0))
-                    await EnqueueAsync(new WorkItem(null, leftover), stopProducing.Token);
+                    Enqueue(new WorkItem(null, leftover));
             }
             finally
             {
                 diffTracker.Complete();
-                work.Writer.TryComplete(); // 无论如何都要让消费者知道"没有更多活了"，否则它们永远等下去
+                work.CompleteAdding(); // 无论如何都要让消费者知道"没有更多活了"，否则它们永远等下去
             }
         }
         catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)

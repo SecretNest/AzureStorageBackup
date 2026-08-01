@@ -147,24 +147,29 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// 「卡在下游」要能被看见，而且必须**立刻**发布——被挡住的那段里调用方不再产生任何进度，
-    /// 等下一次别的调用顺带发布的话，界面正好在最需要说明的那一段里冻着。
+    /// 「diff 已经跑到上传前面、开始往盘上攒活」要能被看见，而且**头一件**必须立刻发布——
+    /// 那一刻正是这段说明存在的理由，压进节流窗口的话界面会先安静一段再突然蹦出个大数。
+    /// 之后的更新照常走节流：它只是同一个数在长，没有一次值得单独打断。
     /// </summary>
     [Fact]
-    public void Waiting_On_Downstream_Is_Published_Immediately()
+    public void First_Spilled_Item_Is_Published_Immediately()
     {
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Diffing", total: 100, seen.Add);
 
         tracker.Touch("photos/a.bin");
         tracker.Advance(0);
-        Assert.False(seen[^1].WaitingOnDownstream);
+        Assert.Equal(0, seen[^1].SpilledItems);
 
-        tracker.BeginWaitingOnDownstream();
-        Assert.True(seen[^1].WaitingOnDownstream, "开始等下游要立刻发布，不能等节流窗口");
+        tracker.SetSpilled(1);
+        Assert.Equal(1, seen[^1].SpilledItems);
 
-        tracker.EndWaitingOnDownstream();
-        Assert.False(seen[^1].WaitingOnDownstream);
+        // 0 → 非 0 已经发生过了，之后只是同一个数在长，没有哪一次值得单独打断节流。
+        // 这里不去断言"下一拍还没发出来"——那要赌节流窗口的长短。要守的是另一件事：
+        // 一旦有人强制发布（阶段收尾就是），带出来的必须是最新的值，而不是停在 1。
+        tracker.SetSpilled(4096);
+        tracker.Complete();
+        Assert.Equal(4096, seen[^1].SpilledItems);
     }
 
     /// <summary>

@@ -9,6 +9,7 @@ import { formatBytes } from '../constants/format'
 import { Field } from '../components/Field'
 import { Modal } from '../components/Modal'
 import {
+  activityBadgeLabels,
   activityLabels,
   backupConfigsApi,
   StorageTier,
@@ -1348,9 +1349,10 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // "5 volumes uploading" / "1 volume uploading" / "3 downloading"
   const inFlightPhrase = `${detail.activeItems.length} ${inFlightUnit}${inFlightVerb}`
   const inFlight = [
-    // 差分被流水线的有界队列挡住时，CurrentItem 亮着的是**刚判完**的那条，看上去就是卡死在
-    // 那个文件上。说清楚它在等什么——判得比上传快几个数量级，队列填满是常态。
-    detail.waitingOnDownstream && 'waiting for upload to catch up',
+    // 差分判得比压缩上传快几个数量级，跑到前面去是常态；多出来的活攒在磁盘上等下游消化。
+    // 这一行取代了从前那句 "waiting for upload to catch up"——写侧不再阻塞了，所以要说的
+    // 不再是"卡住了"，而是"领先了多少"。措辞里点明 buffered，别让人以为这是失败重试。
+    detail.spilledItems > 0 && `${detail.spilledItems.toLocaleString()} buffered to disk`,
     detail.activeItems.length > 0 && inFlightPhrase,
     // "right now" 而不是 "yet"：这一条说的是**这一瞬**没有流在传（手上那件正占着压缩锁），
     // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
@@ -1514,7 +1516,7 @@ function StatusBadge({
   config, onReset, onShowError,
 }: { config: BackupConfig; onReset: () => void; onShowError: () => void }) {
   if (config.activity !== 'Idle') {
-    return <span className="badge badge-info">{config.activity}</span>
+    return <span className="badge badge-info">{activityBadgeLabels[config.activity]}</span>
   }
   if (config.status === BackupStatus.Error) {
     return (

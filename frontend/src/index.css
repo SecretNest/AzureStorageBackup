@@ -872,6 +872,17 @@ tbody tr.ops-row:hover {
     color: var(--text-muted);
     font-size: 12px;
   }
+  /* 卡片化之后 td 是 grid，格子里的东西默认被拉满整列：grid item 会被 blockify，
+     .badge / .row-inline 的 inline-flex 一律变成 flex，再被 justify-self 的初始值
+     stretch 撑到列宽——于是一个本该裹着文字的胶囊横贯整屏。
+     不能改在 td 上加 justify-items：纯文本单元格是**匿名 grid item**，一起收缩会改掉
+     长路径（Local Root）的换行位置。只按住这两个自成一体的行内块。
+     specificity：这条 (0,2,2) 压得住 .badge 的 (0,1,0) 与 .row-inline 的 (0,1,0)，
+     与源码顺序无关——本文件的覆盖规则在这一点上已经栽过三次。 */
+  table.cards td > .badge,
+  table.cards td > .row-inline {
+    justify-self: start;
+  }
   /* 首列是这张卡片的标题——给它标签反而是噪音。 */
   table.cards td.card-title {
     display: block;
