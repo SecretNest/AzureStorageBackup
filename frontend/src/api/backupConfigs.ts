@@ -231,6 +231,10 @@ export interface BackupRun {
   // 本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来。
   unreadableFiles: number | null
   error: string | null
+  // 本次备份的起止时刻（UTC），取自版本记录——与 /versions 给还原对话框的是同一组数字。
+  // 运行中、以及未带这两个字段的老后端，为 null。
+  startedAt: string | null
+  completedAt: string | null
 }
 
 export interface RestoreRun {
@@ -249,7 +253,10 @@ export interface RestoreRun {
 
 export interface BackupVersionInfo {
   version: number
+  /** 版本提交时刻（备份结束）。UTC，显示时转本地时区。 */
   createdAt: string
+  /** 备份开始跑的时刻。UTC。此字段问世前写下的版本为 null。 */
+  startedAt: string | null
   files: number
   bytes: number
   changedFiles: number

@@ -1,3 +1,18 @@
+/**
+ * 一个版本的起止时刻。时间以 UTC 存储，这里按浏览器所在时区渲染。
+ *
+ * 同一个**本地**日期只写一次日期（判断也必须按本地时区做——按 UTC 判断的话，本地明明同一天
+ * 的备份会因为跨了 UTC 零点被写成两个日期）；跨日则两侧都写全。升级前写下的版本没有开始
+ * 时刻，写「—」，不拿别的时间冒充。
+ */
+export function formatVersionSpan(startedAt: string | null, completedAt: string): string {
+  const end = new Date(completedAt)
+  if (!startedAt) return `— → ${end.toLocaleString()}`
+  const start = new Date(startedAt)
+  const sameDay = start.toLocaleDateString() === end.toLocaleDateString()
+  return `${start.toLocaleString()} → ${sameDay ? end.toLocaleTimeString() : end.toLocaleString()}`
+}
+
 /** 字节数的人类可读形式。备份界面到处都要用（尺寸、速度），集中一处避免各写一份走样。 */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
