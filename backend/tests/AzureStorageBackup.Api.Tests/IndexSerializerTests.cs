@@ -223,4 +223,86 @@ public sealed class IndexSerializerTests
 
         Assert.Throws<NotSupportedException>(() => IndexSerializer.DeserializeInfoFile(future));
     }
+
+    [Fact]
+    public void Version_StartedAt_RoundTrips()
+    {
+        var info = SampleInfo();
+        var started = new DateTimeOffset(2026, 7, 16, 11, 40, 0, TimeSpan.Zero);
+        info.Versions[0] = info.Versions[0] with { StartedAt = started };
+
+        var back = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
+
+        Assert.Equal(started, Assert.Single(back.Versions).StartedAt);
+    }
+
+    /// <summary>
+    /// 升级前写下的信息文件（format 2）版本条目里没有开始时刻。读出来必须是 null——而且
+    /// 不能错位：版本条目后面紧跟的是 pack 表，少读/多读一个字节，后面全是垃圾。
+    /// </summary>
+    [Fact]
+    public void Legacy_Format2_Info_Reads_StartedAt_As_Null()
+    {
+        var back = IndexSerializer.DeserializeInfoFile(LegacyFormat2Info());
+
+        var v = Assert.Single(back.Versions);
+        Assert.Null(v.StartedAt);
+        Assert.Equal(new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero), v.CreatedAt);
+        Assert.Equal("indexes/v1.bin.enc", v.IndexBlob);
+        Assert.Equal(1200, v.Stats.Files);
+        Assert.Equal("packs/p0001.7z", back.Packs["p0001"].Blob);  // pack 表没被读错位
+        Assert.Equal(900_000, back.Packs["p0001"].OriginalBytes);
+    }
+
+    // InfoFormat 2 的字节布局（版本条目止于 stats，没有 StartedAt）。手写而非调用序列化器：
+    // 序列化器只会写当前格式，验不了向后兼容。
+    private static byte[] LegacyFormat2Info()
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+
+        w.Write((byte)2);               // InfoFormat
+        w.Write(1);                     // SchemaVersion
+        w.Write("photos");
+        WriteLegacyNullableString(w, "family photos");
+        WriteLegacyNullableString(w, "/data/photos");
+        w.Write(true);                  // Encrypted
+        WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 0, 0, TimeSpan.Zero));
+        WriteLegacyNullableString(w, null);  // Settings
+        w.Write(false);                 // KdfSalt = null
+
+        w.Write(1);                     // 版本数
+        w.Write(1);                     // Version
+        WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero));  // CreatedAt
+        w.Write("indexes/v1.bin.enc");
+        w.Write(1200L);                 // Stats.Files
+        w.Write(3_400_000_000L);        // Stats.Bytes
+        w.Write(12L);                   // Stats.ChangedFiles
+        w.Write(50_000_000L);           // Stats.ChangedBytes
+
+        w.Write(1);                     // pack 数
+        w.Write("p0001");
+        w.Write("packs/p0001.7z");
+        w.Write(0);                     // 成员数
+        w.Write(900_000L);              // OriginalBytes
+        w.Write(0L);                    // DeadBytes
+        w.Write(1);                     // Volumes
+        w.Write(0);                     // VolumeSizes 数（info format 2）
+
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    private static void WriteLegacyNullableString(BinaryWriter w, string? value)
+    {
+        w.Write(value is not null);
+        if (value is not null)
+            w.Write(value);
+    }
+
+    private static void WriteLegacyDto(BinaryWriter w, DateTimeOffset value)
+    {
+        w.Write(value.UtcTicks);
+        w.Write((short)value.Offset.TotalMinutes);
+    }
 }

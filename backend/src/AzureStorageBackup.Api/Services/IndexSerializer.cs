@@ -13,7 +13,7 @@ public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
     // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
-    private const byte InfoFormat = 2;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）
+    private const byte InfoFormat = 3;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）；format 3: BackupVersion.StartedAt
     private const byte IndexFormat = 4;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths；format 4: IndexEntry.UnreadableAt
 
     // ---- 信息记录文件 ----
@@ -40,6 +40,7 @@ public static class IndexSerializer
         {
             w.Write(v.Version);
             WriteDto(w, v.CreatedAt);
+            WriteNullableDto(w, v.StartedAt); // info format 3
             w.Write(v.IndexBlob);
             w.Write(v.Stats.Files);
             w.Write(v.Stats.Bytes);
@@ -96,8 +97,10 @@ public static class IndexSerializer
         {
             versions.Add(new BackupVersion
             {
+                // 初始化器按书写顺序求值 = 流里的字段顺序，与写侧一一对应，别重排。
                 Version = r.ReadInt32(),
                 CreatedAt = ReadDto(r),
+                StartedAt = format >= 3 ? ReadNullableDto(r) : null, // format 3+
                 IndexBlob = r.ReadString(),
                 Stats = new VersionStats(r.ReadInt64(), r.ReadInt64(), r.ReadInt64(), r.ReadInt64()),
             });

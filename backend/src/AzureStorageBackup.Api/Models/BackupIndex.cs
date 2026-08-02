@@ -39,7 +39,14 @@ public sealed record BackupMeta
 public sealed record BackupVersion
 {
     public int Version { get; init; }
+
+    /// <summary>版本提交时刻（备份结束）。收尾清理在此之后还要跑一阵，不计入。</summary>
     public DateTimeOffset CreatedAt { get; init; }
+
+    /// <summary>本次备份开始跑的时刻。info format 3 之前写下的版本没有这个信息 → null，
+    /// 无法回填（猜出来的数字比空着更坏）。</summary>
+    public DateTimeOffset? StartedAt { get; init; }
+
     public required string IndexBlob { get; init; }
     public required VersionStats Stats { get; init; }
 }
