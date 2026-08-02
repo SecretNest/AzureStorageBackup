@@ -83,16 +83,26 @@ export function ScopeTree({
   }, [localRoot])
 
   const toggleExpand = (relative: string) => {
+    // 是否要发起加载，从本次渲染已有的 children 现算，不放进 setExpanded 的
+    // 更新函数里判断——StrictMode 下更新函数会被调用两次（一次探测一次生效），
+    // 若在里面调 load 会在开发环境里并发打两次同一个目录的 GET。
+    const isExpanding = !expanded.has(relative)
+    // 没有 children[relative]，或者上次加载失败（entry.error 非空且从未成功过），
+    // 都算「还没有可用数据」，都要发起加载——否则一次失败就把这个目录锁死，
+    // 用户再也点不动它（失败也会写入 children，之前的判断把它当成"已加载"）。
+    const needsLoad = isExpanding && (!children[relative] || children[relative].error !== null)
+
     setExpanded((prev) => {
       const next = new Set(prev)
       if (next.has(relative)) {
         next.delete(relative)
       } else {
         next.add(relative)
-        if (!children[relative]) void load(relative, 0)
       }
       return next
     })
+
+    if (needsLoad) void load(relative, 0)
   }
 
   return (
@@ -155,7 +165,10 @@ function Level({
   if (state.error) {
     return (
       <div className="text-warn text-sm" style={pad}>
-        Could not be read — {state.error}
+        Could not be read — {state.error}{' '}
+        <button type="button" className="text-sm" onClick={() => onLoadMore(relative, 0)}>
+          Retry
+        </button>
       </div>
     )
   }
