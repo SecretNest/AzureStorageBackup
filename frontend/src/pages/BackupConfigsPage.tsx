@@ -27,6 +27,7 @@ import {
   type BackupConfig,
   type BackupConfigInput,
   type BackupRun,
+  type BackupVersionInfo,
   type StageProgress,
   type RestoreRun,
   type CheckRun,
@@ -1914,7 +1915,8 @@ function ResetPasswordModal({
 function CheckModal({
   config, onClose, onError,
 }: { config: BackupConfig; onClose: () => void; onError: (e: string) => void }) {
-  const [versions, setVersions] = useState<number[]>([])
+  // 与还原对话框同理：编号认不出"上周四那次"，整条留着以便显示起止时刻。
+  const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [cloud, setCloud] = useState<number>(CloudCheckLevel.ExistenceSize)
   const [local, setLocal] = useState<number>(LocalCheckLevel.Content)
@@ -1958,7 +1960,7 @@ function CheckModal({
   followRef.current = follow
 
   useEffect(() => {
-    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+    backupConfigsApi.versions(config.id).then(setVersions).catch(() => {})
     // 服务端保留着最近一次检查的报告：关掉对话框再打开要能看回结果，而一次内容级检查
     // 要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。空 = 从没查过。
     // 仍在跑就接着轮询；已跑完则只把报告摆出来——不走 follow，免得把上一次的失败
@@ -2040,7 +2042,11 @@ function CheckModal({
       <Field label="Version">
         <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
           <option value="">Latest</option>
-          {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+          {versions.map((v) => (
+            <option key={v.version} value={v.version}>
+              Version {v.version} — {formatVersionSpan(v.startedAt, v.createdAt)}
+            </option>
+          ))}
         </select>
       </Field>
       <Field label="Cloud check">
