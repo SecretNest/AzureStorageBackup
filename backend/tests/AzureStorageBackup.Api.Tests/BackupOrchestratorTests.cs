@@ -1099,4 +1099,42 @@ public sealed class BackupOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// 版本要同时记下开始与结束时刻，且结果里报出来的是**版本记录里的那两个**——不是运行器
+    /// 自己的时钟。收尾清理在版本提交之后还要跑一阵，各取各的时钟就会出现完成提示与还原
+    /// 下拉对同一次备份写出两个不同时间。
+    /// </summary>
+    [SkippableFact]
+    public async Task Version_Records_Start_And_Finish_And_Result_Reports_The_Same_Pair()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchts-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("a.txt", "alpha");
+            var before = DateTimeOffset.UtcNow;
+
+            var result = await orchestrator.RunAsync(Request(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v = Assert.Single(info!.Versions);
+            Assert.NotNull(v.StartedAt);
+            Assert.True(v.StartedAt >= before, $"started {v.StartedAt} should be >= {before}");
+            Assert.True(v.StartedAt <= v.CreatedAt, $"started {v.StartedAt} should be <= finished {v.CreatedAt}");
+            Assert.Equal(v.StartedAt, result.StartedAt);
+            Assert.Equal(v.CreatedAt, result.CompletedAt);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }

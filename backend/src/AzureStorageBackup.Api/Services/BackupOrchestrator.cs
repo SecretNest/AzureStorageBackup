@@ -84,6 +84,14 @@ public sealed record BackupRunResult(int Version, int ChangedFiles, long Changed
 
     /// <summary>备份收尾时那次保留清理删掉了什么（未触发清理时为 <see cref="CleanupReport.Empty"/>）。</summary>
     public CleanupReport Cleanup { get; init; } = CleanupReport.Empty;
+
+    /// <summary>本次备份开始跑的时刻，与写进版本记录的 <see cref="BackupVersion.StartedAt"/> 同一个值。</summary>
+    public DateTimeOffset StartedAt { get; init; }
+
+    /// <summary>版本提交时刻，与写进版本记录的 <see cref="BackupVersion.CreatedAt"/> 同一个值。
+    /// **不是**本次运行结束的时刻：提交之后还有保留清理要跑。界面上完成提示与还原下拉都读这个值，
+    /// 各取各的时钟就会对同一次备份写出两个不同时间。</summary>
+    public DateTimeOffset CompletedAt { get; init; }
 }
 
 /// <summary>备份管线阶段。</summary>
@@ -287,11 +295,13 @@ public sealed class BackupOrchestrator(
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
     {
+        // 开始时刻在任何 I/O 之前取：这是操作员心里"这次备份几点开跑"的那一刻。
+        var startedAt = DateTimeOffset.UtcNow;
         var source = $"backup:{request.Account.Id}/{request.Container}";
         await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
         try
         {
-            var result = await RunCoreAsync(request, progress, ct);
+            var result = await RunCoreAsync(request, startedAt, progress, ct);
             // 排版与"零值省略"规则见 BackupSummary：那条消息同时进操作日志和 webhook 通知，
             // 是操作员一定会看的一条，所以本轮动了什么、云上多了多少、清掉了多少，都得在里面。
             await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}",
@@ -335,7 +345,7 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task<BackupRunResult> RunCoreAsync(
-        BackupRequest request, IProgress<BackupProgress>? progress, CancellationToken ct)
+        BackupRequest request, DateTimeOffset startedAt, IProgress<BackupProgress>? progress, CancellationToken ct)
     {
         var opts = request.Options;
         var password = request.Password;
@@ -706,10 +716,12 @@ public sealed class BackupOrchestrator(
 
         // 8/9. Finalize（原子更新信息文件）
         progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+        var completedAt = DateTimeOffset.UtcNow;
         info.Versions.Add(new BackupVersion
         {
             Version = version,
-            CreatedAt = DateTimeOffset.UtcNow,
+            CreatedAt = completedAt,
+            StartedAt = startedAt,
             IndexBlob = indexBlob,
             Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
         });
@@ -766,6 +778,8 @@ public sealed class BackupOrchestrator(
             DeletedFiles = deletedFiles,
             UploadedBytes = state.UploadedBytes,
             Cleanup = cleanup,
+            StartedAt = startedAt,
+            CompletedAt = completedAt,
         };
     }
 
