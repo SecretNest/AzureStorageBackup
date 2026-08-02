@@ -228,6 +228,24 @@ public sealed class LocalFileScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_Directory_That_Ends_With_Zero_Kept_Children_And_Is_Itself_Out_Of_Scope_Is_Not_Recorded_As_Empty()
+    {
+        // docs 下只有一个被排除的文件，没有 docs/2026——所以下降到 docs 之后，keptChildren
+        // 真的会停在 0（不像"路过"那个用例，那边靠 docs/2026/q1.pdf 撑住了 keptChildren）。
+        // 但 docs 仍然必须被下降，因为它下面挂着 `+ docs/2026` 规则（MayContainIncluded 为真）。
+        // 这才是真正走到 `if (keptChildren == 0 && !IsInScope(self))` 这一分支的场景：
+        // 删掉守卫两行也不会让上面那个用例失败，但会让这个用例失败。
+        WriteText("docs/other.txt", "x");
+
+        var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.DoesNotContain("docs", result.EmptyDirs);
+        Assert.Empty(result.Entries);
+    }
+
+    [Fact]
     public async Task An_In_Scope_Empty_Directory_Is_Still_Recorded()
     {
         Directory.CreateDirectory(Path.Combine(_root, "photos", "empty"));
