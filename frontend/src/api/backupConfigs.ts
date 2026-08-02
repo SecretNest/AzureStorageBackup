@@ -115,6 +115,8 @@ export interface BackupConfig {
   dontGroupRules: string | null
   // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
   crossDirGroupRules: string | null
+  /** 备份范围。null = 根下全部内容。不可继承，因此不出现在 EffectiveBackupSettings 里。 */
+  scopeRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
   maxAgeDays: number | null
@@ -146,6 +148,8 @@ export interface BackupConfigInput {
   dontGroupRules: string | null
   // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
   crossDirGroupRules: string | null
+  /** 备份范围。null = 根下全部内容。不可继承，因此不出现在 EffectiveBackupSettings 里。 */
+  scopeRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
   maxAgeDays: number | null

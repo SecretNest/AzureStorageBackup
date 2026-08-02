@@ -1,12 +1,14 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
+import { ScopeTree } from '../components/ScopeTree'
 import { formatBytes, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { Modal } from '../components/Modal'
 import {
   activityBadgeLabels,
@@ -72,6 +74,7 @@ const emptyForm: BackupConfigInput = {
   dontCompressRules: null,
   dontGroupRules: null,
   crossDirGroupRules: null,
+  scopeRules: null,
   includeSymlinks: null,
   maxVersions: null,
   maxAgeDays: null,
@@ -368,6 +371,7 @@ export function BackupConfigsPage() {
     setError(null)
     // 此标志位独立于 form，重置表单时不会自动清除；陈旧的 true 会导致容器选择器误开自由文本输入模式
     setNewContainer(false)
+    setPickingScope(false)
     setShowForm(true)
   }
 
@@ -386,6 +390,7 @@ export function BackupConfigsPage() {
       dontCompressRules: c.dontCompressRules,
       dontGroupRules: c.dontGroupRules,
       crossDirGroupRules: c.crossDirGroupRules,
+      scopeRules: c.scopeRules,
       includeSymlinks: c.includeSymlinks,
       verboseLogging: c.verboseLogging,
       maxVersions: c.maxVersions,
@@ -399,15 +404,41 @@ export function BackupConfigsPage() {
     setPasswordConfirm('')
     setError(null)
     setNewContainer(false)
+    setPickingScope(!!c.scopeRules)
     setShowForm(true)
   }
 
   // 编辑时密码字段是锁死的，不参与比对。空密码（不加密）要求确认框同样为空，
   // 这样「本想设密码却只填了一个框」也会被拦下。
   const passwordMismatch = !editing && (form.password ?? '') !== passwordConfirm
+  // 树要的是规则集，表单存的是文本。现算，不另存一份状态。
+  const scope = useMemo(() => parseScope(form.scopeRules), [form.scopeRules])
+  // 「全部」与「空规则集」在文本上都是 null，界面上却要分开：勾着复选框是前者，
+  // 取消勾选后从全选起步是后者。所以这个开关必须独立于 form。
+  const [pickingScope, setPickingScope] = useState(false)
 
   const save = async () => {
     if (passwordMismatch) return
+    // 范围收窄的警告。移出范围的文件在下次备份时会被当作删除处理——新版本不再包含它们
+    // （旧版本仍可还原，直到保留策略把旧版本清掉）。与改忽略规则的行为一致，但用户在树上
+    // 点几下就能收窄一大片，所以这里必须说出来。
+    if (editing) {
+      const before = parseScope(editing.scopeRules)
+      const after = parseScope(form.scopeRules)
+      // 判断依据是新旧规则集的差异，不扫文件系统：只要两边任一条规则所指的路径从「在范围内」
+      // 变成了「不在」，就算收窄。规则所指的路径正是范围发生变化的那些边界点，因此够用。
+      const boundaries = new Set<string>([...before.keys(), ...after.keys()])
+      const narrowed = [...boundaries].some((p) => isInScope(before, p) && !isInScope(after, p))
+      if (
+        narrowed
+        && !window.confirm(
+          'This narrows the backup scope. Files that are no longer in scope will be treated as '
+            + 'deleted on the next backup: new versions will not include them. Older versions keep '
+            + 'them until your retention policy removes those versions. Continue?',
+        )
+      )
+        return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -810,6 +841,37 @@ export function BackupConfigsPage() {
                   Browse
                 </button>
               </Field>
+              <Field label="Scope">
+                <label className="row" style={{ gap: 'var(--sp-1)' }}>
+                  <input
+                    type="checkbox"
+                    checked={!pickingScope}
+                    disabled={!form.localRoot.trim()}
+                    onChange={(e) => {
+                      setPickingScope(!e.target.checked)
+                      // 两个方向都回到「全部」：勾回去是清空范围，取消勾选是从全选起步、
+                      // 由用户往下剔除（设计 §10）。
+                      set('scopeRules', null)
+                    }}
+                  />
+                  <span>Back up everything in this folder</span>
+                </label>
+              </Field>
+              {pickingScope && !!form.localRoot.trim() && (
+                <>
+                  <p className="text-muted text-sm" style={{ margin: '0 0 var(--sp-2)' }}>
+                    Checking a folder backs up everything inside it, including files added later.
+                    Hidden files and files matched by the ignore rules are listed here too — ignore
+                    rules are applied separately and still leave those out of the backup.
+                  </p>
+                  <ScopeTree
+                    localRoot={form.localRoot}
+                    rules={scope}
+                    onChange={(next) => set('scopeRules', scopeToText(next) || null)}
+                    ignoreRules={form.ignoreRules ?? editing?.effective.ignoreRules ?? ''}
+                  />
+                </>
+              )}
               <Field label="Name">
                 <input className="w-lg" value={form.name} onChange={(e) => set('name', e.target.value)} />
               </Field>
