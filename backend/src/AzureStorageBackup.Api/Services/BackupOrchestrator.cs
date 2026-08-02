@@ -362,6 +362,15 @@ public sealed class BackupOrchestrator(
         var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct, scanTracker);
         scanTracker.Complete();
 
+        // 范围把所有文件都剔光了：diff 会把上一版本的一切判成删除，写出一个空版本。
+        // 旧版本还在，不是数据丢失，但这一定是误操作（比如勾错了一层目录），不能安静地发生。
+        // 没配范围时的空根是正常情况，不在此列。
+        if (scan.Entries.Count == 0 && scan.EmptyDirs.Count == 0 && !opts.Scan.Scope.IsAll)
+            throw new InvalidOperationException(
+                "The configured scope selects no files under the local root. "
+                + "Nothing would be backed up, so this run was stopped. "
+                + "Check the scope selection on this backup.");
+
         // 2. 载入上一版本。信息文件优先走本地权威副本（§3.3，避免读云端 Cold 信息文件）；大的版本索引优先走本地缓存。
         var info = (trackedInfo is not null
             ? await trackedInfo.LoadAsync(request.Account, request.Container, password, ct)

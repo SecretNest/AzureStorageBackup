@@ -1137,4 +1137,66 @@ public sealed class BackupOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    [SkippableFact]
+    public async Task Backup_Fails_Loudly_When_The_Scope_Leaves_Nothing()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("scope-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("photos/a.jpg", "x");
+
+            var request = Request(account, name) with
+            {
+                // 全部排除，一个文件都不剩。
+                Options = new BackupEngineOptions
+                {
+                    Scan = new ScanOptions { Scope = ScopeRuleSet.Parse("-") },
+                },
+            };
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => orchestrator.RunAsync(request));
+
+            Assert.Contains("scope", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task An_Empty_Root_Without_A_Scope_Is_Still_Allowed()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("scope-empty-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 没配范围时的空根是正常情况（比如刚建好还没往里放东西），不该被这条兜底拦下。
+            // _root 此刻是空的——这条用例刻意什么都不写进去。
+            var result = await orchestrator.RunAsync(Request(account, name));
+
+            Assert.Equal(1, result.Version);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }
