@@ -116,7 +116,11 @@ public sealed class ScopeRuleSet
 ```
 
 内部结构 `SortedDictionary<string, bool>`（Ordinal）。`IsInScope` 逐级切分路径查表，
-O(depth)；`MayContainIncluded` / `IsPartial` 用有序键做前缀区间扫描，不遍历全集。
+O(depth)。`MayContainIncluded` / `IsPartial` 线性扫描规则集找前缀——规则是用户一次次点
+出来的边界，几十条封顶，线性扫描比二分查找更简单也更快；这里刻意不做区间索引。
+
+Ordinal 序下祖先必排在后代之前（严格前缀在字符串比较中恒小于其扩展），规范化时因此可以
+一遍顺序遍历就把冗余规则清干净。
 
 ### 4. `LocalFileScanner` 集成
 
