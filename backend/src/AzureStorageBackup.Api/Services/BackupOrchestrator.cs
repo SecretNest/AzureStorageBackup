@@ -365,7 +365,12 @@ public sealed class BackupOrchestrator(
         // 范围把所有文件都剔光了：diff 会把上一版本的一切判成删除，写出一个空版本。
         // 旧版本还在，不是数据丢失，但这一定是误操作（比如勾错了一层目录），不能安静地发生。
         // 没配范围时的空根是正常情况，不在此列。
-        if (scan.Entries.Count == 0 && scan.EmptyDirs.Count == 0 && !opts.Scan.Scope.IsAll)
+        // 有读不出来的路径时也不在此列：一个掉线的 SMB/NFS 挂载点会让整棵子树进 Unreadable
+        // 而不是 Entries/EmptyDirs（"读不开 ≠ 删除"），此时 Entries/EmptyDirs 皆空只说明
+        // 挂载点没答应，与范围选得对不对无关——真把这种情况当成范围误配置报出来，
+        // 会误导用户去改一个本来就对的范围，而真正的问题（挂载点没起来）反而被掩盖了。
+        if (scan.Entries.Count == 0 && scan.EmptyDirs.Count == 0 && scan.Unreadable.Count == 0
+            && !opts.Scan.Scope.IsAll)
             throw new InvalidOperationException(
                 "The configured scope selects no files under the local root. "
                 + "Nothing would be backed up, so this run was stopped. "

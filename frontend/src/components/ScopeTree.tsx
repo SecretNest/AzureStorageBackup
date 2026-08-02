@@ -7,6 +7,15 @@ const PAGE_SIZE = 500
 interface Loaded {
   entries: BrowseEntry[]
   total: number
+  // 服务端在 stat 之前的全量列表上分页，不是在 entries 上分页：一页里可能有几项因读不出
+  // 属性而被跳过（不进 entries，但仍消耗一个位置）。下一页的 offset 必须算上它们，
+  // 否则会把被跳过的那几项重新请求一遍——重复的行、重复的 React key，Load more 也会
+  // 因为「以为只吃了 entries.length 项」而多按了几次才消失。
+  consumed: number
+  // 累计有多少项因读不出属性而未列出（例如目录 mode 为 r--：可 readdir、不可 stat 子项）。
+  // 少给了东西必须说出来（同 PathBrowser 的 skipped 提示），否则这些项从列表里凭空消失，
+  // 用户会把「读不出来」误当成「本来就没有」。
+  skipped: number
   loading: boolean
   error: string | null
 }
@@ -43,26 +52,43 @@ export function ScopeTree({
   const load = async (relative: string, offset: number) => {
     setChildren((c) => ({
       ...c,
-      [relative]: { entries: c[relative]?.entries ?? [], total: c[relative]?.total ?? 0, loading: true, error: null },
+      [relative]: {
+        entries: c[relative]?.entries ?? [],
+        total: c[relative]?.total ?? 0,
+        consumed: c[relative]?.consumed ?? 0,
+        skipped: c[relative]?.skipped ?? 0,
+        loading: true,
+        error: null,
+      },
     }))
     try {
       const page = await browseApi.list(absolute(relative), undefined, { offset, limit: PAGE_SIZE })
-      setChildren((c) => ({
-        ...c,
-        [relative]: {
-          // 追加而不是替换：Load more 不能把已经看到的项抖掉。
-          entries: offset === 0 ? page.entries : [...(c[relative]?.entries ?? []), ...page.entries],
-          total: page.total,
-          loading: false,
-          error: null,
-        },
-      }))
+      setChildren((c) => {
+        // offset === 0 是一次替换性的（首次加载或 Retry）：连累计的 consumed/skipped 也要
+        // 跟着重新起算，否则 Retry 之后这两个数会把上一次失败前的旧值也算进去。
+        const prevConsumed = offset === 0 ? 0 : (c[relative]?.consumed ?? 0)
+        const prevSkipped = offset === 0 ? 0 : (c[relative]?.skipped ?? 0)
+        return {
+          ...c,
+          [relative]: {
+            // 追加而不是替换：Load more 不能把已经看到的项抖掉。
+            entries: offset === 0 ? page.entries : [...(c[relative]?.entries ?? []), ...page.entries],
+            total: page.total,
+            consumed: prevConsumed + page.entries.length + page.skipped,
+            skipped: prevSkipped + page.skipped,
+            loading: false,
+            error: null,
+          },
+        }
+      })
     } catch (e) {
       setChildren((c) => ({
         ...c,
         [relative]: {
           entries: c[relative]?.entries ?? [],
           total: c[relative]?.total ?? 0,
+          consumed: c[relative]?.consumed ?? 0,
+          skipped: c[relative]?.skipped ?? 0,
           loading: false,
           error: e instanceof Error ? e.message : String(e),
         },
@@ -172,14 +198,17 @@ function Level({
       </div>
     )
   }
-  if (state.loading && state.entries.length === 0) {
+  if (state.loading && state.entries.length === 0 && state.skipped === 0) {
     return (
       <div className="text-faint text-sm" style={pad}>
         Loading…
       </div>
     )
   }
-  if (state.entries.length === 0) {
+  // total 是服务端 stat 之前的全量子项数：真空目录时它恒为 0（skipped 也必然是 0，
+  // 无项可跳过）。一页恰好把能读的都跳过、下一页还有更多要拉的情形，靠这个条件
+  // 与"Empty"分开——那种情况下面的分支会照常渲染 skipped 提示与 Load more。
+  if (!state.loading && state.total === 0) {
     return (
       <div className="text-faint text-sm" style={pad}>
         Empty
@@ -222,13 +251,22 @@ function Level({
           </div>
         )
       })}
-      {state.entries.length < state.total && (
+      {/* 少给了东西必须说出来（同 PathBrowser 的 skipped 提示）：这些子项因属性读不出来
+          而没有出现在上面的列表里，不代表它们不存在。 */}
+      {state.skipped > 0 && (
+        <div className="text-warn text-sm" style={pad}>
+          {state.skipped} item(s) could not be read and are not listed.
+        </div>
+      )}
+      {state.consumed < state.total && (
         <div style={pad}>
           <button
             type="button"
             className="text-sm"
             disabled={state.loading}
-            onClick={() => onLoadMore(relative, state.entries.length)}
+            // 服务端在 stat 之前的全量列表上分页：下一页要从"这一页真正消耗掉的位置"续，
+            // 那包含被跳过的项，不只是成功 stat 出来的 entries.length。
+            onClick={() => onLoadMore(relative, state.consumed)}
           >
             {state.loading
               ? 'Loading…'

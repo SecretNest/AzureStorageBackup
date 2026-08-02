@@ -868,7 +868,7 @@ export function BackupConfigsPage() {
                     localRoot={form.localRoot}
                     rules={scope}
                     onChange={(next) => set('scopeRules', scopeToText(next) || null)}
-                    ignoreRules={form.ignoreRules ?? editing?.effective.ignoreRules ?? ''}
+                    ignoreRules={form.ignoreRules ?? editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''}
                   />
                 </>
               )}
