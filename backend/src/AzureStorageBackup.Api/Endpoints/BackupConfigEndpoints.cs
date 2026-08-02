@@ -498,6 +498,7 @@ public static class BackupConfigEndpoints
             {
                 v.Version,
                 v.CreatedAt,
+                v.StartedAt,   // 升级前写下的版本没有 → null，界面写「—」
                 files = v.Stats.Files,
                 bytes = v.Stats.Bytes,
                 changedFiles = v.Stats.ChangedFiles,

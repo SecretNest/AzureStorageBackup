@@ -449,6 +449,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     }
 
     private sealed record VersionSummary(int version, DateTimeOffset createdAt, long files, long bytes, long changedFiles);
+    private sealed record VersionSpanRow(int version, DateTimeOffset createdAt, DateTimeOffset? startedAt);
     private sealed record FileVersionCandidate(int version, DateTimeOffset createdAt, long length);
     private sealed record RestoreEstimateResult(long downloadBytes, long uncompressedBytes, int fileCount, int archivedObjects, int rehydratePending);
 
@@ -476,6 +477,40 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(1, row.version);
         Assert.Equal(2, row.files);
         Assert.Equal(100, row.bytes);
+    }
+
+    /// <summary>还原对话框靠这两个时刻认版本。升级前写下的版本没有开始时刻，端点如实给 null，
+    /// 界面写「—」——不拿上一版本的结束时刻冒充。</summary>
+    [Fact]
+    public async Task Versions_Endpoint_Exposes_Start_Time_And_Null_For_Legacy_Versions()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-vspan") with { AccountId = account.Id, ContainerName = "ep-vspan-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var started = new DateTimeOffset(2026, 8, 2, 14, 3, 0, TimeSpan.Zero);
+        var finished = new DateTimeOffset(2026, 8, 2, 14, 47, 0, TimeSpan.Zero);
+        SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion
+            {
+                Version = 1, CreatedAt = finished.AddDays(-1), IndexBlob = "v1.index",  // 升级前写下的：无 StartedAt
+                Stats = new VersionStats(1, 10, 1, 10),
+            },
+            new BackupVersion
+            {
+                Version = 2, CreatedAt = finished, StartedAt = started, IndexBlob = "v2.index",
+                Stats = new VersionStats(2, 20, 1, 10),
+            },
+        ]);
+
+        var rows = await _client.GetFromJsonAsync<List<VersionSpanRow>>(
+            $"/api/backup-configs/{created.Id}/versions");
+
+        Assert.Null(rows!.Single(r => r.version == 1).startedAt);
+        Assert.Equal(started, rows.Single(r => r.version == 2).startedAt);
+        Assert.Equal(finished, rows.Single(r => r.version == 2).createdAt);
     }
 
     [Fact]

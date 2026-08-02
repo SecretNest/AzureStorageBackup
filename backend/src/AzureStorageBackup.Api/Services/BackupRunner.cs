@@ -24,6 +24,11 @@ public sealed class BackupRunState
 
     public string? Error { get; set; }
 
+    /// <summary>本次备份的起止时刻，取自版本记录（见 <see cref="BackupRunResult.CompletedAt"/>）。
+    /// 完成前为 null。</summary>
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+
     /// <summary>
     /// 内部机制，不进 HTTP 契约：失败时的原始异常。RunCoreAsync 的 catch 里连 Error 一起设置，
     /// 供 TaskDispatcher 在向上抛出时挂作 InnerException——容器日志因此保留 Azure 异常自带的
@@ -44,10 +49,11 @@ public sealed class BackupRunState
 }
 
 public sealed record BackupRunResponse(
-    string Status, BackupProgress? Progress, int? Version, int? UnreadableFiles, string? Error)
+    string Status, BackupProgress? Progress, int? Version, int? UnreadableFiles, string? Error,
+    DateTimeOffset? StartedAt = null, DateTimeOffset? CompletedAt = null)
 {
     public static BackupRunResponse From(BackupRunState s) =>
-        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error);
+        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt);
 }
 
 /// <summary>
@@ -210,6 +216,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 new StateProgress(state), ct);
             state.Version = result.Version;
             state.UnreadableFiles = result.UnreadableFiles;
+            state.StartedAt = result.StartedAt;
+            state.CompletedAt = result.CompletedAt;
             state.Status = RunStatus.Completed;
 
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());

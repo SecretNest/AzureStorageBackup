@@ -81,6 +81,16 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
             Assert.Equal(1, status.Version);
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 
+            // 完成提示要显示起止时刻，而且必须与还原对话框读的 /versions 是同一组数字。
+            Assert.NotNull(status.StartedAt);
+            Assert.NotNull(status.CompletedAt);
+            Assert.True(status.StartedAt <= status.CompletedAt);
+            var versions = await _client.GetFromJsonAsync<List<VersionSpanRow>>(
+                $"/api/backup-configs/{config.Id}/versions");
+            var v = Assert.Single(versions!);
+            Assert.Equal(v.startedAt, status.StartedAt);
+            Assert.Equal(v.createdAt, status.CompletedAt);
+
             // 操作日志已记录本次备份（M8 接线验证）
             var logs = await _client.GetFromJsonAsync<LogRow[]>($"/api/logs?source=backup:{account.Id}/{containerName}");
             Assert.Contains(logs!, l => l.message.Contains("Backup succeeded"));
@@ -92,4 +102,5 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
     }
 
     private sealed record LogRow(int id, string source, string message);
+    private sealed record VersionSpanRow(int version, DateTimeOffset createdAt, DateTimeOffset? startedAt);
 }
