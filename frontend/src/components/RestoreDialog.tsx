@@ -5,13 +5,14 @@ import {
   restoreConflictModeLabels,
   RestoreRehydratePriority,
   type BackupConfig,
+  type BackupVersionInfo,
   type FileVersionOption,
   type RestoreEstimate,
   type RestoreRun,
   type TreeNode,
   type UnreadableEntry,
 } from '../api/backupConfigs'
-import { formatBytes } from '../constants/format'
+import { formatBytes, formatVersionSpan } from '../constants/format'
 import { Field } from './Field'
 import { Modal } from './Modal'
 import { PathBrowser } from './PathBrowser'
@@ -26,7 +27,8 @@ const rehydratePriorityLabels: Record<number, string> = {
 export function RestoreDialog({
   config, onClose, onError, onStarted,
 }: { config: BackupConfig; onClose: () => void; onError: (e: string) => void; onStarted: (s: RestoreRun) => void }) {
-  const [versions, setVersions] = useState<number[]>([])
+  // 光有编号选不出"上周四那次"——起止时刻才是操作员认版本的依据，整条留着。
+  const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [target, setTarget] = useState(config.localRoot)
   const [browsing, setBrowsing] = useState(false)
@@ -61,7 +63,7 @@ export function RestoreDialog({
   onErrorRef.current = onError
 
   useEffect(() => {
-    backupConfigsApi.versions(config.id).then((vs) => setVersions(vs.map((v) => v.version))).catch(() => {})
+    backupConfigsApi.versions(config.id).then(setVersions).catch(() => {})
   }, [config.id])
 
   useEffect(() => {
@@ -301,7 +303,11 @@ export function RestoreDialog({
       <Field label="Version">
         <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
           <option value="">Latest</option>
-          {versions.map((v) => <option key={v} value={v}>{v}</option>)}
+          {versions.map((v) => (
+            <option key={v.version} value={v.version}>
+              Version {v.version} — {formatVersionSpan(v.startedAt, v.createdAt)}
+            </option>
+          ))}
         </select>
       </Field>
 

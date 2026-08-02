@@ -5,7 +5,7 @@ import { settingsApi, type GlobalSettings } from '../api/settings'
 import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
-import { formatBytes } from '../constants/format'
+import { formatBytes, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
 import { Modal } from '../components/Modal'
 import {
@@ -1217,6 +1217,8 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
     return (
       <div className="text-ok">
         Completed — version {run.version}
+        {/* 起止时刻取自版本记录，与还原对话框读的是同一组数字。老后端不发这两个字段 → 只显示编号。 */}
+        {run.completedAt && ` (${formatVersionSpan(run.startedAt, run.completedAt)})`}
         {/* 一次"成功"的备份可能跳过了文件——不写在这里，操作员只能靠可能被淹没的通知发现。 */}
         {!!run.unreadableFiles && (
           <span className="text-danger">
