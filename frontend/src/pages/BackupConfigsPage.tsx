@@ -1368,6 +1368,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.stage === 'Uploading' ? (detail.activeItems.length === 1 ? 'volume ' : 'volumes ') : ''
   // "5 volumes uploading" / "1 volume uploading" / "3 downloading"
   const inFlightPhrase = `${detail.activeItems.length} ${inFlightUnit}${inFlightVerb}`
+  // 排列按**逆时间轴**：越接近"字节已经上了网线"的排越前，越早的阶段排越后，末尾落到 queued。
+  // 一件活的正序是 queued → preparing（占锁压）→ starting upload（压完到开传之间的本地活）→
+  // waiting on peer/cloud/slot（等资源）→ uploading（在传），这一行倒着念就是它。
+  // preparing 从前排在 waiting 与 starting upload 的**前面**，读起来像"先压、再准备、再等"，
+  // 而它其实比那两段都早——屏幕上最常见的组合恰好是 waiting 三档全 0，于是错位就直接暴露成
+  // "preparing · starting upload"这种倒着的相邻两项。
+  // buffered to disk 与 nothing on the wire 不在这条时间轴上：前者是 diff 领先量，后者是一句
+  // 总述（解释为什么没有 "N volumes uploading"），都留在队首。
   const inFlight = [
     // 差分判得比压缩上传快几个数量级，跑到前面去是常态；多出来的活攒在磁盘上等下游消化。
     // 这一行取代了从前那句 "waiting for upload to catch up"——写侧不再阻塞了，所以要说的
@@ -1378,7 +1386,6 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
     // 用户正是拿这两句对着问的。
     idleOnStaging && 'nothing on the wire right now',
-    detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
     // 压完了、字节却还没上路的件卡在哪一段。这几档存在的理由就是那个"几分钟纹丝不动"：
     // 从前这些件不属于任何一栏，屏幕上 processed + preparing + queued 比总数少，而少掉的
     // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
@@ -1387,6 +1394,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 单位是**卷**不是件（闸门按卷排队），所以措辞里必须点明，否则又是一个加不平的数。
     detail.waitingOnSlot > 0 && `${detail.waitingOnSlot} volumes waiting for an upload slot`,
     detail.activeItems.length === 0 && stalled > 0 && `${stalled} starting upload`,
+    detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
     detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
   ]
     .filter(Boolean)
