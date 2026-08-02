@@ -89,6 +89,78 @@ A first backup has no previous index to compare against, so every file takes the
 
 So a low Uploading figure does not by itself mean the network is the bottleneck. While both stages are running you can read the two figures side by side in the Details panel — Diffing is disk, Uploading is compression plus network — which is usually enough to tell which one is holding things up.
 
+### Reading the Details panel
+
+Every number on a running row belongs to exactly one of four groups, and the groups do **not** share units. Mixing them up is the single most common way to misread a run that is perfectly healthy, so they are listed here in the order they appear on screen.
+
+#### The collapsed line
+
+```
+Diffing + Uploading 45% diffed · 60.6 GB uploaded (1,234 changed)
+```
+
+- A single stage shows **one percentage**, computed from **source bytes** (pre-compression), not from the object count. Object counts are meaningless as a completion measure during Uploading — one item can be a 6.8 GB single file or a pack of several hundred 5 KB files — and in practice the count reads 75% while the bytes are at 31%. When the byte total is not yet known (Scanning and Diffing do not report byte workloads) it falls back to the count.
+- While **Diffing and Uploading overlap**, no single percentage is honest: Diffing has a fixed denominator (entries found by the scan), Uploading does not (the diff is still enqueueing work). So the line names whose percentage it is and puts Uploading's **absolute** completed volume beside it.
+- `(N changed)` appears only once the run has reached Uploading — before the diff finishes, the number does not yet exist.
+
+#### Counts — `Stage: N of M …`
+
+The unit word is chosen per stage because each stage counts a **different kind of thing**. A backup that packs 46,624 files into 4,995 archives is not losing anything; the two stages simply do not count the same objects.
+
+| Stage | Unit | What one unit is |
+| --- | --- | --- |
+| Scanning | `entries` | A filesystem entry found by the walk. The total is unknown until the scan ends, so the line reads `N entries so far`. |
+| Diffing | `files` | A source file, whether or not it later gets packed. |
+| Uploading / Restoring | `objects` | A stored object: one pack archive, or one single-file blob. |
+| Cloud (check) | `objects` | A stored object — one `HEAD` per pack, not per file. |
+| Verifying (check) | `objects` | A pack that gets downloaded, extracted and re-hashed. |
+| Local (check) | `files` | An index entry, i.e. a source file. |
+| Orphans (cleanup) | `blobs` | A blob in the container. |
+
+The speed figure and `~hh:mm:ss left` follow on the same line. The speed is shown whenever bytes are moving **or** a transfer is in flight — a stalled transfer is deliberately displayed as `0 B/s` rather than disappearing, because a missing line cannot be told apart from a finished one.
+
+#### The in-flight breakdown
+
+The middle segment splits the items that are neither finished nor untouched. It exists because `N objects processed` alone cannot distinguish work from a hang: during Uploading an item first goes through 7-Zip (tens of seconds for a 100 MB pack) before a single byte is pushed, and during that window nothing is on the network.
+
+The identity **`processed + preparing + queued + uploading ≡ total`** always holds, in **items**. Two entries are counted in **volumes** instead and say so in their wording, because the upload gate hands out slots per volume, not per item:
+
+| What you see | Unit | Meaning |
+| --- | --- | --- |
+| `N buffered to disk` | items | Diff ran ahead and its surplus work was spilled to a temp file. Cumulative for the run — it only ever grows. See `Backup__DiffQueueMaxItems` below. |
+| `N volumes uploading` / `N downloading` | volumes / items | Transfers actually moving bytes. Upload registers one entry **per volume**, so a single large item can occupy the whole concurrency allowance on its own; download registers one per object. |
+| `nothing on the wire right now` | — | This instant has no transfer in flight while an item is being prepared. It says *right now*, not *not yet*: several GB may already have gone up earlier in the run. |
+| `N waiting on the same content elsewhere` | items | The identical content is already being uploaded by another item in this run; this one waits for that upload to finish rather than sending the bytes twice. Can take minutes. |
+| `N waiting on the cloud` | items | Waiting for an Azure response (existence / metadata `HEAD`). Tens of seconds on a slow link. |
+| `N volumes waiting for an upload slot` | **volumes** | The global upload gate is saturated. |
+| `N starting upload` | items | Compression is done and the bytes have not left yet, for none of the reasons above — the item is doing the local work between the two: re-`stat`ing each pack member, looking up the dedup map (a dedup hit never uploads at all). Shown **only when no transfer is in flight**; an item that gets a slot immediately simply appears under `volumes uploading` instead. |
+| `N preparing` (Uploading) | items | Holding the **global compression lock** and producing volume files. There is exactly one lock, so this is always `0` or `1`; everything queuing behind it counts as `queued`. |
+| `N extracting` (Restoring / Verifying) | items | Downloaded and now extracting / re-hashing. No global lock here, so this can go up to the download concurrency. |
+| `N queued` | items | Not started: still in the queue, plus items already picked up but waiting for the compression lock. |
+
+The entries are ordered **backwards along the timeline** — closest to "bytes are on the wire" first, earliest last. An item's forward order is `queued → preparing → starting upload → waiting on peer/cloud/slot → uploading`, so reading the line right to left follows one item through the run. (`buffered to disk` and `nothing on the wire right now` are not stages and stay at the head.)
+
+> The wording deliberately avoids "compressing" for `preparing`: a backup configured **not** to compress still goes through 7-Zip for packing, encryption and volume splitting, so it is preparing either way.
+
+#### The byte line
+
+Bytes get their own line, and the segments never overlap — each byte is in at most one of them. Zero segments are omitted, which is why Scanning and Diffing have no byte line at all.
+
+During **Uploading**:
+
+| Segment | Meaning |
+| --- | --- |
+| `X / Y original (Z%)` | Completed and total **source** bytes, pre-compression. Both sides are the same unit, which is the only way the fraction means anything — the compressed total does not exist until compression has run. `Z%` is the real completion figure for the run. `Y` keeps growing until the diff finishes. |
+| `X uploaded (N% of original)` | Bytes this run actually pushed to Azure, post-compression and post-encryption. `N%` can exceed 100: store-only plus encryption (AES wrapping, archive headers) makes the result larger than the input, and that is worth knowing — it means this configuration costs *more* in the cloud than the source. |
+| `+X uploaded in unfinished objects` | Bytes already in the cloud that belong to an item which has not finished. `uploaded` is credited per item so that it reconciles with the per-item source-byte accounting; a large item split into many volumes would otherwise make those bytes vanish from the screen for the tens of minutes it takes. Folded into `uploaded` when the item completes. |
+| `X ready to upload` | Compressed archives sitting in `staged/` waiting for their turn. Rising means compression is outrunning the network; falling means the uploads have caught up. This is the number the **staging-area limit** applies to. |
+
+During **Restoring / Verifying** the direction reverses, and the download total *is* known up front (volume sizes are recorded in the index): `X / Y downloaded · X restored · X to go`. Old indexes that predate recorded volume sizes show only the numerator.
+
+#### The in-flight transfer list
+
+Each concurrent transfer is listed on its own line with its own progress — `path — 41.2 MB / 220.0 MB · 18%`. The header says *parallel* explicitly because seeing two or three names at once suggests parallel compression, which never happens: compression is globally serialised behind one lock (that is the `N preparing` above), and only transfers run in parallel. The list is never truncated — its length is bounded by the upload/download concurrency setting — since the stuck transfer is usually the one that would have been folded away.
+
 ### Working space
 
 Diffing produces no files — it only reads. Its cost is memory: the file list and the previous index are held in RAM (roughly 190 MB per 500,000 files, proportional to the file count).
