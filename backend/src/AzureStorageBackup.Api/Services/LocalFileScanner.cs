@@ -37,6 +37,9 @@ public sealed record ScanOptions
 {
     /// <summary>是否包含符号链接（默认跳过，M4 决策）。</summary>
     public bool IncludeSymlinks { get; init; } = false;
+
+    /// <summary>备份范围（设计 docs/backup-scope-selection-design.md）。默认全部包含。</summary>
+    public ScopeRuleSet Scope { get; init; } = ScopeRuleSet.All;
 }
 
 /// <summary>
@@ -61,7 +64,7 @@ public sealed class LocalFileScanner
         var emptyDirs = new List<string>();
         var unreadable = new List<UnreadablePath>();
 
-        ScanDirectory(root, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
+        _ = ScanDirectory(root, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
 
         entries.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
         emptyDirs.Sort(StringComparer.Ordinal);
@@ -69,7 +72,10 @@ public sealed class LocalFileScanner
         return await Task.FromResult(new ScanResult(entries, emptyDirs, unreadable));
     }
 
-    private void ScanDirectory(
+    /// <returns>这棵子树是否真的留下了东西（条目 / 空目录 / 读不出来的路径）。
+    /// 父目录据此决定要不要把自己算作「有保留的子项」——一个只是为了下降到深处某个
+    /// 重新包含的目录而被路过的目录，自身并没有留下任何东西，绝不能进 EmptyDirs。</returns>
+    private bool ScanDirectory(
         string dir,
         string root,
         IgnoreRuleSet ignore,
@@ -101,7 +107,7 @@ public sealed class LocalFileScanner
             // 重建出一个空目录，其下的文件全部消失得无声无息；也不能什么都不记，
             // 否则 diff 会因为"没扫到"把这些既有条目一律判成删除。
             unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
-            return;
+            return true;
         }
 
         using var children = found;
@@ -122,7 +128,7 @@ public sealed class LocalFileScanner
                 // 迭代**中途**才失败：此前已扫到的条目照常留在 entries 里——它们是真读到的，
                 // 比沿用旧条目准确。diff 侧按路径登记，已扫到的不会被这条目录标记二次覆盖。
                 unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
-                return;
+                return true;
             }
 
 
@@ -135,10 +141,20 @@ public sealed class LocalFileScanner
 
             if (isDirectory && !isSymlink)
             {
-                keptChildren++;
-                ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
+                // 目录被排除、且子树里也没有任何重新包含的规则 → 整棵剪掉，不下降。
+                // 只判 IsInScope 是不够的：被排除的目录下面可能还有 + 规则（设计 §2）。
+                if (!options.Scope.MayContainIncluded(relative))
+                    continue;
+
+                // keptChildren 只在子树**真的**留下了东西时才 ++。路过的目录不算——
+                // 否则 `- docs` + `+ docs/2026` 会让 docs 被写成空目录，还原时凭空重建出来。
+                if (ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker))
+                    keptChildren++;
                 continue;
             }
+
+            if (!options.Scope.IsInScope(relative))
+                continue;
 
             // 单个条目的元数据也可能读不出来（枚举之后被删掉、权限被收回）。同样不能默默跳过：
             // 跳过等于让 diff 判它删除。记一条，让 diff 沿用上一版本的条目。
@@ -173,9 +189,17 @@ public sealed class LocalFileScanner
             }
         }
 
-        // 空文件夹：应用忽略后既无保留文件也无保留子目录（根自身不记录）。
-        if (keptChildren == 0 && !string.IsNullOrEmpty(RelativePath(root, dir)))
-            emptyDirs.Add(RelativePath(root, dir));
+        // 空文件夹：应用忽略与范围后既无保留文件也无保留子目录（根自身不记录）。
+        var self = RelativePath(root, dir);
+        if (keptChildren == 0 && !string.IsNullOrEmpty(self))
+        {
+            // 自身不在范围内的目录（只是被路过）不算空目录，也不算「留下了东西」。
+            if (!options.Scope.IsInScope(self))
+                return false;
+            emptyDirs.Add(self);
+        }
+
+        return true;
     }
 
     private static string RelativePath(string root, string full) =>

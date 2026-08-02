@@ -1,0 +1,108 @@
+{
+  "comment": "Shared cases for ScopeRuleSet (C#) and scopeRules.ts. Both sides must agree.",
+  "queries": [
+    {
+      "name": "empty rule set includes everything",
+      "rules": [],
+      "inScope": ["", "a", "a/b/c.txt"],
+      "outOfScope": [],
+      "partial": [],
+      "notPartial": ["", "a"],
+      "mayContain": ["", "a", "a/b"],
+      "mayNotContain": []
+    },
+    {
+      "name": "root excluded with two included subtrees",
+      "rules": ["-", "+ photos", "+ docs/2026"],
+      "inScope": ["photos", "photos/a.jpg", "photos/x/y.jpg", "docs/2026", "docs/2026/q1.pdf"],
+      "outOfScope": ["", "music", "docs", "docs/2025", "docs/2025/old.pdf"],
+      "partial": ["", "docs"],
+      "notPartial": ["photos", "docs/2026", "music"],
+      "mayContain": ["", "docs", "photos", "docs/2026"],
+      "mayNotContain": ["music", "docs/2025"]
+    },
+    {
+      "name": "alternating include and exclude down one branch",
+      "rules": ["- docs", "+ docs/2026", "- docs/2026/tmp"],
+      "inScope": ["", "music", "docs/2026", "docs/2026/q1.pdf"],
+      "outOfScope": ["docs", "docs/2025", "docs/2026/tmp", "docs/2026/tmp/a.log"],
+      "partial": ["docs", "docs/2026"],
+      "notPartial": ["docs/2026/tmp", "music", "docs/2025"],
+      "mayContain": ["", "docs", "docs/2026"],
+      "mayNotContain": ["docs/2026/tmp", "docs/2025"]
+    },
+    {
+      "name": "paths are normalized on the way in",
+      "rules": ["+ /photos/", "- docs//2026"],
+      "inScope": ["photos/a.jpg"],
+      "outOfScope": ["docs/2026/q1.pdf"],
+      "partial": ["docs"],
+      "notPartial": ["photos"],
+      "mayContain": ["photos"],
+      "mayNotContain": ["docs/2026"]
+    },
+    {
+      "name": "malformed lines are skipped, not fatal",
+      "rules": ["nonsense", "", "   ", "+ photos", "- ../escape", "# comment"],
+      "inScope": ["photos/a.jpg", "music"],
+      "outOfScope": [],
+      "partial": [],
+      "notPartial": ["photos"],
+      "mayContain": ["photos", "music"],
+      "mayNotContain": []
+    }
+  ],
+  "writes": [
+    {
+      "name": "unchecking the root stores a single minus",
+      "start": [],
+      "ops": [{ "path": "", "included": false }],
+      "expect": ["-"]
+    },
+    {
+      "name": "checking the root is redundant and stores nothing",
+      "start": [],
+      "ops": [{ "path": "", "included": true }],
+      "expect": []
+    },
+    {
+      "name": "re-including a subtree under an excluded root",
+      "start": [],
+      "ops": [
+        { "path": "", "included": false },
+        { "path": "photos", "included": true }
+      ],
+      "expect": ["-", "+ photos"]
+    },
+    {
+      "name": "writing a rule clears the deeper rules it covers",
+      "start": ["- docs", "+ docs/2026", "- docs/2026/tmp"],
+      "ops": [{ "path": "docs", "included": true }],
+      "expect": []
+    },
+    {
+      "name": "a rule agreeing with its nearest ancestor is not stored",
+      "start": ["-"],
+      "ops": [{ "path": "music", "included": false }],
+      "expect": ["-"]
+    },
+    {
+      "name": "unchecking then re-checking a folder returns to the original set",
+      "start": [],
+      "ops": [
+        { "path": "photos", "included": false },
+        { "path": "photos", "included": true }
+      ],
+      "expect": []
+    },
+    {
+      "name": "excluding every child does not collapse into the parent",
+      "start": [],
+      "ops": [
+        { "path": "docs/a", "included": false },
+        { "path": "docs/b", "included": false }
+      ],
+      "expect": ["- docs/a", "- docs/b"]
+    }
+  ]
+}

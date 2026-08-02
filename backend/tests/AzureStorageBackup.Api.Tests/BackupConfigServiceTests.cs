@@ -134,6 +134,7 @@ public sealed class BackupConfigServiceTests : IDisposable
         GroupCapBytes = c.GroupCapBytes,
         VolumeBytes = c.VolumeBytes,
         VerboseLogging = c.VerboseLogging,
+        ScopeRules = c.ScopeRules,
         CreatedAt = c.CreatedAt,
         Status = c.Status,
         LastError = c.LastError,
@@ -205,6 +206,20 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Equal("renamed", result!.Name);
         var fetched = await _sut.GetAsync(created.Id);
         Assert.Equal("s3cret", TestSecrets.Reader.RevealBackupPassword(fetched!));
+    }
+
+    [Fact]
+    public async Task Update_Can_Change_Scope_Rules()
+    {
+        var created = await _sut.CreateAsync(Sample());
+
+        var update = Clone(created);
+        update.ScopeRules = "-\n+ photos";
+
+        var result = await _sut.UpdateAsync(created.Id, update);
+
+        Assert.Equal("-\n+ photos", result!.ScopeRules);
+        Assert.Equal("-\n+ photos", (await _sut.GetAsync(created.Id))!.ScopeRules);
     }
 
     [Fact]

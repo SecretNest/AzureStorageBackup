@@ -14,6 +14,9 @@ public static class SystemEndpoints
     /// <summary>单次浏览返回的条目上限。超出即截断并在响应里标明，不静默少给。</summary>
     private const int MaxBrowseEntries = 2000;
 
+    private const int DefaultPageSize = 500;
+    private const int MaxPageSize = 2000;
+
     public static IEndpointRouteBuilder MapSystemEndpoints(this IEndpointRouteBuilder app)
     {
         app.MapGet("/api/system/paths", (IConfiguration config) =>
@@ -82,7 +85,7 @@ public static class SystemEndpoints
         .WithTags("System");
 
         // 本地目录浏览（设计 §6）。懒加载，只返回直接子项。
-        app.MapGet("/api/system/browse", (string? path, PathBoundary boundary) =>
+        app.MapGet("/api/system/browse", (string? path, int? offset, int? limit, PathBoundary boundary) =>
         {
             var start = string.IsNullOrWhiteSpace(path) ? DefaultBrowseStart(boundary) : path!;
 
@@ -92,101 +95,75 @@ public static class SystemEndpoints
             if (!Directory.Exists(start))
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
 
-            var entries = new List<BrowseEntry>();
-            var truncated = false;
-            var skipped = 0;
+            // 分页请求（传了 offset 或 limit）与老的一次性请求走同一段代码，区别只在切片。
+            // 老调用方（PathBrowser）不传这两个参数，行为与从前完全一致：最多 MaxBrowseEntries 项，
+            // 超出则 Truncated。
+            var paged = offset is not null || limit is not null;
+            var skip = Math.Max(0, offset ?? 0);
+            var take = paged ? Math.Clamp(limit ?? DefaultPageSize, 1, MaxPageSize) : MaxBrowseEntries;
 
-            // Directory.Exists 为 true 不代表目录可读：实测在这台机器上，UnauthorizedAccessException
-            // 在拿到迭代器的那一刻（GetEnumerator，底层已经在开 fd）就抛出，比 foreach 文档里说的
-            // 「第一次 MoveNext」更早；后续某一项读到一半失败（例如挂载点掉线）则会在 MoveNext
-            // 上抛出。两处都落在原来那层只包住单项处理的 try 之外，UnauthorizedAccessException/
-            // IOException 会直接冲出 handler，变成裸 500。这里手动驱动迭代器，把「目录本身读不了」
-            // 和「某一项读不了」分开处理，前者不能让请求裸奔成 500。
-            IEnumerator<string> iterator;
+            // 目录与文件分开枚举：isDir 因此免费得到，不必对每一项 stat。名字先全部收上来
+            // （20 万个字符串是可以接受的），排完序再只对**当前页**取属性——原先那版先收集
+            // 再排序，截断发生在收集阶段，于是截断之后的顺序是随机的，也就没法分页。
+            List<string> dirs;
+            List<string> files;
             try
             {
-                iterator = Directory.EnumerateFileSystemEntries(start).GetEnumerator();
+                dirs = Directory.EnumerateDirectories(start).ToList();
+                files = Directory.EnumerateFiles(start).ToList();
             }
-            // B3：DirectoryNotFoundException 派生自 IOException，必须先于下面那个更宽的
-            // IOException 分支单独捕获——否则 Directory.Exists 检查和这里取迭代器之间的
-            // TOCTOU 窗口里目录被删掉，会报成「读不了」(403) 而不是「不存在」(404)，
-            // 状态码对不上真实原因。窗口本身天然存在、无法消除，这里只保证报对状态码。
+            // DirectoryNotFoundException 派生自 IOException，必须先于更宽的分支单独捕获，
+            // 否则 Directory.Exists 与这里之间的 TOCTOU 窗口里目录被删会报成 403 而不是 404。
             catch (DirectoryNotFoundException)
             {
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
             {
+                // 目录不可读（权限不足）或读取失败（挂载点掉线）：docker 卷挂载场景下是常态，
+                // 给一个干净的 403 而不是裸 500。
                 return Results.Json(
                     new { error = $"Directory '{start}' could not be read." },
                     statusCode: StatusCodes.Status403Forbidden);
             }
 
-            using var _ = iterator;
-            while (true)
+            dirs.Sort((a, b) => string.Compare(Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase));
+            files.Sort((a, b) => string.Compare(Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase));
+
+            var total = dirs.Count + files.Count;
+            var ordered = dirs.Select(d => (Full: d, IsDir: true))
+                .Concat(files.Select(f => (Full: f, IsDir: false)))
+                .Skip(skip)
+                .Take(take)
+                .ToList();
+
+            var truncated = !paged && total > MaxBrowseEntries;
+            var entries = new List<BrowseEntry>(ordered.Count);
+            var skipped = 0;
+
+            foreach (var (full, isDir) in ordered)
             {
-                string item;
                 try
                 {
-                    if (!iterator.MoveNext())
-                        break;
-                    item = iterator.Current;
-                }
-                // 同上：目录在迭代中途被整个删掉（而不是权限问题/挂载点掉线）也要报 404。
-                catch (DirectoryNotFoundException)
-                {
-                    return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
-                }
-                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-                {
-                    // 目录本身不可读（权限不足）或中途读取失败（如挂载点掉线）：
-                    // 用户点进了自己没有权限、或另一个 uid 拥有的目录——docker 卷挂载
-                    // 场景下是常态，不是异常情况，给一个干净的 403 而不是裸 500。
-                    return Results.Json(
-                        new { error = $"Directory '{start}' could not be read." },
-                        statusCode: StatusCodes.Status403Forbidden);
-                }
-
-                if (entries.Count >= MaxBrowseEntries)
-                {
-                    truncated = true;
-                    break;
-                }
-
-                try
-                {
-                    var info = new FileInfo(item);
-                    var isDir = (info.Attributes & FileAttributes.Directory) != 0;
-                    var name = Path.GetFileName(item);
+                    var info = new FileInfo(full);
                     entries.Add(new BrowseEntry(
-                        name,
-                        // 绝对路径，原样可作为下一次 `?path=` 或 localRoot 送回（picker 就是这么
-                        // 用的）。ConfiguredRoot 恒为绝对路径，所以 start 也一定是绝对的。
-                        item,
+                        Path.GetFileName(full),
+                        // 绝对路径，原样可作为下一次 `?path=` 或 localRoot 送回。
+                        full,
                         isDir,
-                        // 软链的 Length 是 lstat 值（链接自身的字节数，通常几十字节），
-                        // 不是目标文件的大小——不会把目标内容的大小泄漏出去，但前端picker
-                        // 展示这个字段时不能当成目标文件真实大小来用。
+                        // 软链的 Length 是 lstat 值（链接自身的字节数），不是目标文件的大小。
                         isDir ? null : info.Length,
                         info.LastWriteTimeUtc,
-                        // 软链可能指向根外：返回但标记，前端灰显不可点
-                        !boundary.IsInside(item)));
+                        // 软链可能指向根外：返回但标记，前端灰显不可点。
+                        !boundary.IsInside(full)));
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
                 {
-                    // 单项读取失败跳过该项，不让整个请求失败。真实成因是「目录可读但不可执行」
-                    // （mode `r--`）：readdir 拿得到名字，对子项 stat 却被拒，FileInfo.Attributes
-                    // 在这种目录下会**抛** UnauthorizedAccessException，而不是返回 -1 哨兵值。
-                    // 跳过是对的（少给一项好过整个列表 403），但静默跳过会让这种目录渲染成
-                    // 「空目录」，用户完全看不出差别——所以计数并随响应返回，与 Truncated 同理。
+                    // 单项 stat 失败（目录 mode 为 r--：可 readdir、不可 stat 子项）跳过该项，
+                    // 但要计数并随响应返回——静默跳过会让这种目录渲染成「空目录」，用户看不出差别。
                     skipped++;
                 }
             }
-
-            // 目录在前，各自按名称排序
-            entries.Sort((a, b) => a.IsDirectory != b.IsDirectory
-                ? (a.IsDirectory ? -1 : 1)
-                : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
 
             // 上级到根为止。不能用 Path.GetFullPath 词法折叠 `..`——PathBoundary 也刻意
             // 避开这一点（见 PathBoundary.ResolveReal 的文档）：若 start 途经符号链接，
@@ -203,7 +180,7 @@ public static class SystemEndpoints
                 ? boundary.ToDisplayPath(realParent)
                 : null;
 
-            return Results.Ok(new BrowseResponse(start, parent, truncated, skipped, entries));
+            return Results.Ok(new BrowseResponse(start, parent, truncated, skipped, total, skip, entries));
         })
         .WithTags("System");
 
@@ -237,11 +214,13 @@ public static class SystemEndpoints
 /// <summary>
 /// 浏览结果。Parent 为 null 表示已在根（或边界）处，不能再往上。
 /// <para><c>Skipped</c>：读不出属性因而未列出的子项数（典型成因是目录 mode 为 <c>r--</c>——
-/// 可 readdir、不可 stat 子项）。与 <c>Truncated</c> 同一用途：少给了东西必须说出来，
-/// 否则这种目录看起来就是个普通空目录。</para>
+/// 可 readdir、不可 stat 子项）。与 <c>Truncated</c> 同一用途：少给了东西必须说出来。</para>
+/// <para><c>Total</c>：该目录的子项总数（不受分页影响）；<c>Offset</c>：本页起始位置。
+/// 分页请求恒不置 <c>Truncated</c>——它的意思是「还有东西但拿不到了」，而分页拿得到。</para>
 /// </summary>
 public record BrowseResponse(
-    string Path, string? Parent, bool Truncated, int Skipped, IReadOnlyList<BrowseEntry> Entries);
+    string Path, string? Parent, bool Truncated, int Skipped, int Total, int Offset,
+    IReadOnlyList<BrowseEntry> Entries);
 
 /// <summary>
 /// OutsideRoot=true 表示该项（通常是指向根外的软链）不可选，但仍列出以免用户困惑。

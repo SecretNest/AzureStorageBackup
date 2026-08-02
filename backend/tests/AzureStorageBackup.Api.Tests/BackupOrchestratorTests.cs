@@ -1137,4 +1137,125 @@ public sealed class BackupOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    [SkippableFact]
+    public async Task Backup_Fails_Loudly_When_The_Scope_Leaves_Nothing()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("scope-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteText("photos/a.jpg", "x");
+
+            var request = Request(account, name) with
+            {
+                // 全部排除，一个文件都不剩。
+                Options = new BackupEngineOptions
+                {
+                    Scan = new ScanOptions { Scope = ScopeRuleSet.Parse("-") },
+                },
+            };
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => orchestrator.RunAsync(request));
+
+            Assert.Contains("scope", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    [SkippableFact]
+    public async Task An_Empty_Root_Without_A_Scope_Is_Still_Allowed()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("scope-empty-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 没配范围时的空根是正常情况（比如刚建好还没往里放东西），不该被这条兜底拦下。
+            // _root 此刻是空的——这条用例刻意什么都不写进去。
+            var result = await orchestrator.RunAsync(Request(account, name));
+
+            Assert.Equal(1, result.Version);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    // 复现终审 Important：范围是 "-" + "+ photos"，而 photos 是个掉线的 SMB/NFS 挂载点——
+    // 这在出货的 NAS 上是常态，不是误操作。ScanDirectory 把它记进 Unreadable 并返回
+    // true，于是 Entries 和 EmptyDirs 都是空的，但那不是"范围选空了"，是"这棵子树本轮读不到"。
+    // 之前的守卫只看 Entries/EmptyDirs，会把这个误诊成范围配错，抛异常拦下整次备份；
+    // 更糟的是，若这不是首次备份，diff 引擎本该按"读不开 ≠ 删除"沿用上一版本的条目，
+    // 守卫却抢在 diff 之前就把整次运行连本地这条正确行为一起拦掉了。
+    [SkippableFact]
+    public async Task An_Unreadable_Mount_Does_Not_Trigger_The_Empty_Scope_Guard()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var photosDir = Path.Combine(_root, "photos");
+        Directory.CreateDirectory(photosDir);
+        WriteText("photos/a.jpg", "x"); // 挂载点掉线前留在里面的东西——目录本身不是空的
+
+        // 收走读权限（保留 execute），模拟掉线的挂载点：opendir/readdir 拿不到内容。
+        File.SetUnixFileMode(photosDir, UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        // root（以及任何有 CAP_DAC_OVERRIDE 的用户）不受目录权限位约束，chmod 在那种环境下
+        // 不是屏障——枚举照样成功，Unreadable 永远不会非空，断言会为错误的原因通过。
+        // 与其赌运行环境，不如实测一下这道 chmod 是否真的挡住了枚举，挡不住就如实 Skip。
+        var reallyUnreadable = false;
+        try { new DirectoryInfo(photosDir).EnumerateFileSystemInfos().GetEnumerator().MoveNext(); }
+        catch (UnauthorizedAccessException) { reallyUnreadable = true; }
+        Skip.IfNot(reallyUnreadable,
+            "running as a user that bypasses directory permission checks (e.g. root); chmod is not a barrier here");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("scope-unread-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            var request = Request(account, name) with
+            {
+                // 排除一切，只重新包含 photos——与描述里的场景一致。
+                Options = new BackupEngineOptions
+                {
+                    Scan = new ScanOptions { Scope = ScopeRuleSet.Parse("-\n+ photos") },
+                },
+            };
+
+            // 不该抛"检查范围选择"的异常：范围本身没问题，是 photos 这棵子树读不到。
+            var result = await orchestrator.RunAsync(request);
+
+            Assert.Equal(1, result.Version);
+        }
+        finally
+        {
+            // 恢复权限，否则 Dispose() 里对 _root 的递归删除会在这个目录上失败。
+            File.SetUnixFileMode(photosDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }

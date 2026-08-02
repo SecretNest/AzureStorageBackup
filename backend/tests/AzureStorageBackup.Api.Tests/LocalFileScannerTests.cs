@@ -183,4 +183,92 @@ public sealed class LocalFileScannerTests : IDisposable
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
     }
+
+    [Fact]
+    public async Task Scope_Prunes_Whole_Subtrees()
+    {
+        WriteText("photos/a.jpg", "x");
+        WriteText("music/b.mp3", "y");
+
+        var scope = ScopeRuleSet.Parse("-\n+ photos");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.Equal(["photos/a.jpg"], result.Entries.Select(e => e.Path));
+    }
+
+    [Fact]
+    public async Task Scope_Descends_Into_An_Excluded_Directory_To_Reach_A_Re_Included_One()
+    {
+        WriteText("docs/2025/old.pdf", "x");
+        WriteText("docs/2026/q1.pdf", "y");
+
+        // 只判 IsInScope 会在 docs 处就把整棵剪掉，2026 永远到不了。
+        var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.Equal(["docs/2026/q1.pdf"], result.Entries.Select(e => e.Path));
+    }
+
+    [Fact]
+    public async Task A_Directory_Only_Passed_Through_Is_Not_Recorded_As_Empty()
+    {
+        WriteText("docs/2026/q1.pdf", "y");
+        Directory.CreateDirectory(Path.Combine(_root, "docs", "scratch"));
+
+        // docs 自身被排除，只是为了下降到 docs/2026 才走进去。它绝不能进 EmptyDirs——
+        // 那会让还原凭空重建出一个用户明确排除掉的目录。docs/scratch 同理。
+        var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.DoesNotContain("docs", result.EmptyDirs);
+        Assert.DoesNotContain("docs/scratch", result.EmptyDirs);
+    }
+
+    [Fact]
+    public async Task A_Directory_That_Ends_With_Zero_Kept_Children_And_Is_Itself_Out_Of_Scope_Is_Not_Recorded_As_Empty()
+    {
+        // docs 下只有一个被排除的文件，没有 docs/2026——所以下降到 docs 之后，keptChildren
+        // 真的会停在 0（不像"路过"那个用例，那边靠 docs/2026/q1.pdf 撑住了 keptChildren）。
+        // 但 docs 仍然必须被下降，因为它下面挂着 `+ docs/2026` 规则（MayContainIncluded 为真）。
+        // 这才是真正走到 `if (keptChildren == 0 && !IsInScope(self))` 这一分支的场景：
+        // 删掉守卫两行也不会让上面那个用例失败，但会让这个用例失败。
+        WriteText("docs/other.txt", "x");
+
+        var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.DoesNotContain("docs", result.EmptyDirs);
+        Assert.Empty(result.Entries);
+    }
+
+    [Fact]
+    public async Task An_In_Scope_Empty_Directory_Is_Still_Recorded()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "photos", "empty"));
+
+        var scope = ScopeRuleSet.Parse("-\n+ photos");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+
+        Assert.Contains("photos/empty", result.EmptyDirs);
+    }
+
+    [Fact]
+    public async Task Scope_And_Ignore_Apply_Independently()
+    {
+        WriteText("photos/a.jpg", "x");
+        WriteText("photos/debug.log", "y");
+        WriteText("music/c.mp3", "z");
+
+        var scope = ScopeRuleSet.Parse("-\n+ photos");
+        var result = await Scanner().ScanAsync(
+            _root, new IgnoreRuleSet(["*.log"]), new ScanOptions { Scope = scope });
+
+        // 范围留下 photos，忽略规则再从中剔掉 .log —— 两层串联，互不干扰。
+        Assert.Equal(["photos/a.jpg"], result.Entries.Select(e => e.Path));
+    }
 }

@@ -27,7 +27,8 @@ public class BrowseEndpointTests : IDisposable
         DateTimeOffset ModifiedAt, bool OutsideRoot);
 
     private sealed record BrowseDto(
-        string Path, string? Parent, bool Truncated, int Skipped, List<BrowseEntryDto> Entries);
+        string Path, string? Parent, bool Truncated, int Skipped,
+        int Total, int Offset, List<BrowseEntryDto> Entries);
 
     private sealed class RootedFactory(string root) : TestWebAppFactory
     {
@@ -406,5 +407,57 @@ public class BrowseEndpointTests : IDisposable
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 #pragma warning restore CA1416
+    }
+
+    [Fact]
+    public async Task Pages_Through_A_Directory_With_A_Stable_Order()
+    {
+        for (var i = 0; i < 12; i++)
+            File.WriteAllText(Path.Combine(_root, $"f{i:D2}.txt"), "x");
+
+        using var factory = new RootedFactory(_root);
+        var client = factory.CreateClient();
+
+        var first = await client.GetFromJsonAsync<BrowseDto>(
+            $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=0&limit=5");
+        var second = await client.GetFromJsonAsync<BrowseDto>(
+            $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=5&limit=5");
+
+        // 2 个目录（photos/docs，来自构造函数）+ 13 个文件（readme.txt + f00..f11）
+        Assert.Equal(15, first!.Total);
+        Assert.Equal(5, first.Entries.Count);
+        Assert.Equal(0, first.Offset);
+        Assert.Equal(5, second!.Offset);
+
+        // 目录在前，之后按名称排序；两页不重叠、不漏项。
+        Assert.Equal(["docs", "photos"], first.Entries.Take(2).Select(e => e.Name));
+        Assert.Empty(first.Entries.Select(e => e.Name).Intersect(second.Entries.Select(e => e.Name)));
+    }
+
+    [Fact]
+    public async Task Paged_Requests_Are_Not_Marked_Truncated()
+    {
+        using var factory = new RootedFactory(_root);
+        var client = factory.CreateClient();
+
+        var body = await client.GetFromJsonAsync<BrowseDto>(
+            $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=0&limit=1");
+
+        // Truncated 的意思是「还有东西但拿不到了」。分页请求拿得到，Total 已经说明了全貌。
+        Assert.False(body!.Truncated);
+        Assert.Equal(3, body.Total);
+    }
+
+    [Fact]
+    public async Task Offset_Past_The_End_Returns_An_Empty_Page_Not_An_Error()
+    {
+        using var factory = new RootedFactory(_root);
+        var client = factory.CreateClient();
+
+        var body = await client.GetFromJsonAsync<BrowseDto>(
+            $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=999&limit=10");
+
+        Assert.Empty(body!.Entries);
+        Assert.Equal(3, body.Total);
     }
 }
