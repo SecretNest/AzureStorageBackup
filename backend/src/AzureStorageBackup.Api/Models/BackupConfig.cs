@@ -46,6 +46,17 @@ public class BackupConfig
     /// <summary>命中者允许跨目录装箱；null = 用全局默认。</summary>
     public string? CrossDirGroupRules { get; set; }
 
+    /// <summary>
+    /// 备份范围（设计 docs/backup-scope-selection-design.md）：每行一条 `+ path` / `- path`，
+    /// 判定取最长前缀匹配。null/空 = 根下**全部内容**。
+    /// <para>
+    /// 注意它与上面几个规则字段的 null 含义**不同**：那些是「继承全局默认」，这个是
+    /// 「全部包含」。范围是这个备份自己的事，全局默认没有意义，因此它不进
+    /// <see cref="ResolvedBackupSettings"/>。
+    /// </para>
+    /// </summary>
+    public string? ScopeRules { get; set; }
+
     public bool? IncludeSymlinks { get; set; }
 
     // 版本保留（§10）

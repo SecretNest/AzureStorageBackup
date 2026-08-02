@@ -45,7 +45,12 @@ public static class BackupRequestMapper
                 DontCompress = OptionalRules(r.DontCompressRules),
                 DontGroup = OptionalRules(r.DontGroupRules),
                 CrossDirGroup = OptionalRules(r.CrossDirGroupRules),
-                Scan = new ScanOptions { IncludeSymlinks = r.IncludeSymlinks },
+                // ScopeRules 不可继承，直接从 config 取而不是从 r（ResolvedBackupSettings）。
+                Scan = new ScanOptions
+                {
+                    IncludeSymlinks = r.IncludeSymlinks,
+                    Scope = ScopeRuleSet.Parse(config.ScopeRules),
+                },
                 Plan = new PlanOptions
                 {
                     SingleFileThresholdBytes = r.SingleFileThresholdBytes,

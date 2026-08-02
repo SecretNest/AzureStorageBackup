@@ -58,4 +58,31 @@ public sealed class BackupRequestMapperTests
         // 空序列 → 计数模式（Backoff 为空），DelaySchedule 产出 MaxAttempts-1 项。
         Assert.Null(request.Options.Upload.Backoff);
     }
+
+    [Fact]
+    public void Maps_Scope_Rules_Into_Scan_Options()
+    {
+        var config = Config();
+        config.ScopeRules = "-\n+ photos";
+
+        var request = BackupRequestMapper.From(config, Account(), password: null);
+
+        Assert.True(request.Options.Scan.Scope.IsInScope("photos/a.jpg"));
+        Assert.False(request.Options.Scan.Scope.IsInScope("music/b.mp3"));
+    }
+
+    [Fact]
+    public void Scope_Rules_Are_Not_Inheritable_So_Null_Means_Everything()
+    {
+        // 其它规则字段的 null = 「继承全局默认」，这个字段的 null = 「全部包含」。
+        // 这处不同是故意的（设计 §1），别顺手把它塞进 ResolvedBackupSettings。
+        var config = Config();
+        config.ScopeRules = null;
+
+        var request = BackupRequestMapper.From(
+            config, Account(), password: null,
+            settings: new GlobalSettings { DefaultIgnoreRules = "*.tmp" });
+
+        Assert.True(request.Options.Scan.Scope.IsAll);
+    }
 }

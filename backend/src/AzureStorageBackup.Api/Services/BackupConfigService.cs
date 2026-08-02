@@ -58,6 +58,8 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.DontCompressRules = update.DontCompressRules;
         existing.DontGroupRules = update.DontGroupRules;
         existing.CrossDirGroupRules = update.CrossDirGroupRules;
+        // 范围可改（不属于锁定的基础字段），改后下次备份生效。
+        existing.ScopeRules = update.ScopeRules;
         existing.IncludeSymlinks = update.IncludeSymlinks;
         existing.MaxVersions = update.MaxVersions;
         existing.MaxAgeDays = update.MaxAgeDays;
