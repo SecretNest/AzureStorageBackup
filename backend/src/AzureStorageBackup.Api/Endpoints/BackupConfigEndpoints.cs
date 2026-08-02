@@ -494,7 +494,8 @@ public static class BackupConfigEndpoints
 
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
-            var versions = (info?.Versions ?? []).Select(v => new
+            // 从新到旧：界面上 "Latest" 紧跟着的就该是次新的一版，与 /file-versions 的就近排序一致。
+            var versions = (info?.Versions ?? []).OrderByDescending(v => v.Version).Select(v => new
             {
                 v.Version,
                 v.CreatedAt,

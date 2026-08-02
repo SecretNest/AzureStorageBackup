@@ -513,6 +513,29 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(finished, rows.Single(r => r.version == 2).createdAt);
     }
 
+    /// <summary>还原/检查的版本下拉里，"Latest" 之后必须是从新到旧——最可能被选的就在最近处。
+    /// 端点按版本号降序给，与 /file-versions 的"就近排序"一致。</summary>
+    [Fact]
+    public async Task Versions_Endpoint_Returns_Newest_First()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-vorder") with { AccountId = account.Id, ContainerName = "ep-vorder-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-3), IndexBlob = "v1.index", Stats = new VersionStats(1, 10, 1, 10) },
+            new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow.AddDays(-2), IndexBlob = "v2.index", Stats = new VersionStats(2, 20, 1, 10) },
+            new BackupVersion { Version = 3, CreatedAt = DateTimeOffset.UtcNow.AddDays(-1), IndexBlob = "v3.index", Stats = new VersionStats(3, 30, 1, 10) },
+        ]);
+
+        var rows = await _client.GetFromJsonAsync<List<VersionSummary>>(
+            $"/api/backup-configs/{created.Id}/versions");
+
+        Assert.Equal([3, 2, 1], rows!.Select(r => r.version));
+    }
+
     [Fact]
     public async Task Tree_Endpoint_Returns_Root_Children()
     {

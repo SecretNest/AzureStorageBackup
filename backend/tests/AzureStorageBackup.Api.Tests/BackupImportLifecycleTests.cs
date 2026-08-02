@@ -223,13 +223,13 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             // 本地权威状态与全部版本索引都已回填（之后备份/还原平时不再下载云端索引）。
             await AssertLocalStateSeededAsync(account.Id, container, expectedVersions: 2);
 
-            // ─── 列出全部版本 ───
+            // ─── 列出全部版本（从新到旧，与还原/检查下拉里 Latest 之后的排列一致）───
             var versions = await _client.GetFromJsonAsync<List<VersionRow>>(
                 $"/api/backup-configs/{imported.Id}/versions");
             Assert.NotNull(versions);
-            Assert.Equal([1, 2], versions!.Select(v => v.version));
-            Assert.Equal(snap1.Count, versions[0].files);
-            Assert.Equal(snap2!.Count, versions[1].files);
+            Assert.Equal([2, 1], versions!.Select(v => v.version));
+            Assert.Equal(snap2!.Count, versions[0].files);
+            Assert.Equal(snap1.Count, versions[1].files);
 
             // ─── 从导入的备份还原（两个版本都要逐字节正确）───
             await RestoreAndAssertAsync(imported.Id, version: 1, snap1, "v1");
