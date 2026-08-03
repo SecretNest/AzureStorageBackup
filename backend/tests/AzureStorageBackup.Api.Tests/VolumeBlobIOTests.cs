@@ -91,17 +91,19 @@ public sealed class VolumeBlobIOTests
     private static VolumeUploadScope Scope(SemaphoreSlim gate, int perItem) =>
         new(gate, new StageTracker("Uploading", 0, static _ => { }), perItem);
 
+    /// <summary>
+    /// 每一卷都传上去了，顺序不作要求。首卷曾经是最后单独传的「整族齐全」提交标记，那个语义
+    /// 已经随云端存在性去重一并删掉——它换来的是 2–5 卷的文件上传耗时翻倍（收尾那一趟只有一条流
+    /// 在动），而去重现在只看本地权威索引，根本不问云端有什么。
+    /// </summary>
     [Fact]
-    public async Task Multi_Volume_Uploads_First_Volume_Last_As_Commit_Marker()
+    public async Task Every_Volume_Goes_Up_Regardless_Of_Order()
     {
         var up = new RecordingUploader();
 
         await VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002", "/tmp/a.003"], AccessTier.Hot);
 
-        // 只有「.001 最后」这一条是不变式（首卷＝「整族齐全」的提交标记）；.002…N 之间的先后
-        // 无所谓，并行之后本来也定不下来。
-        Assert.Equal("data/h.001", up.Order[^1]);
         Assert.Equal(["data/h.001", "data/h.002", "data/h.003"], [.. up.Order.Order(StringComparer.Ordinal)]);
     }
 
@@ -126,8 +128,29 @@ public sealed class VolumeBlobIOTests
 
         Assert.Equal(2, up.Max);              // 既确实并行了（>1），又没越过闸门（≤2）
         Assert.Equal(7, up.Order.Count);
-        Assert.Equal("data/h.001", up.Order[^1]);
         Assert.Equal(2, gate.CurrentCount);   // 额度全数归还
+    }
+
+    /// <summary>
+    /// 两卷也要真并发——这正是首卷单独收尾最贵的地方。
+    /// <para>
+    /// 默认卷 100 MB、并发 5，一个 100–500 MB 的文件切成 2–5 卷。首卷留到最后单传的话，这样的
+    /// 文件永远是"其余几卷并行一轮，再单独一轮传首卷"，整件耗时翻倍，而这个尺寸段在真实备份里
+    /// 是大头。探针要等到 2 卷同时在传才放行：旧实现下峰值只会是 1，这条会卡到超时后失败。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Two_Volumes_Go_Up_At_The_Same_Time()
+    {
+        var up = new ConcurrencyProbe(expectPeak: 2);
+        using var gate = new SemaphoreSlim(5, 5);
+
+        await VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002"], AccessTier.Hot,
+            scope: Scope(gate, perItem: 5));
+
+        Assert.Equal(2, up.Max);
+        Assert.Equal(5, gate.CurrentCount);
     }
 
     /// <summary>没给 scope 的调用（修复/替换等非备份主路径）保持老样子：串行、一次一卷。</summary>
@@ -261,7 +284,7 @@ public sealed class VolumeBlobIOTests
     /// 看到的是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
     /// </para>
     /// <para>
-    /// 这条测试专挑那个故障：窗口 3、共 10 卷，第二卷挂死不动。补位生效的话，剩下 8 卷照样能全部
+    /// 这条测试专挑那个故障：窗口 3、共 10 卷，第二卷挂死不动。补位生效的话，剩下 9 卷照样能全部
     /// 传完（慢卷只占住一个位子）；换回分批实现，第一批就整批卡在慢卷上，最多传完 2 卷，
     /// 下面这个等待会超时。
     /// </para>
@@ -269,8 +292,8 @@ public sealed class VolumeBlobIOTests
     [Fact]
     public async Task A_Slow_Volume_Does_Not_Stall_The_Others()
     {
-        // .001 是最后单独传的提交标记，不进窗口；窗口里是 .002…010 共 9 卷，卡住的是 .002。
-        var up = new OneStuckVolume("data/h.002", expectOthers: 8);
+        // 十卷全进窗口（首卷不再是最后单独传的提交标记），卡住的是 .002，其余 9 卷该照跑。
+        var up = new OneStuckVolume("data/h.002", expectOthers: 9);
         using var gate = new SemaphoreSlim(3, 3);
         var files = Enumerable.Range(1, 10).Select(i => $"/tmp/a.{i:D3}").ToList();
 
@@ -282,7 +305,7 @@ public sealed class VolumeBlobIOTests
 
         up.Release();
         await upload.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal("data/h.001", up.Order[^1]);   // 提交标记仍旧最后落地
+        Assert.Equal(10, up.Order.Count);
     }
 
     /// <summary>某一卷倒了。</summary>
@@ -312,15 +335,11 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 有卷倒了时：**首卷绝不能写上去**。它是「整族齐全」的提交标记，残缺的归档挂上这个标记，
-    /// 存在性检查就会把它当成完整的（§7）。
-    /// <para>
-    /// 另一半同样要紧：抛出之前要把已经起飞的卷等完。半路撒手会留下没人观察的孤儿任务，
-    /// 它们还占着闸门额度、还在读临时盘上的卷文件——而上层收到异常后就要去释放暂存区了。
-    /// </para>
+    /// 有卷倒了时：不再往上起新的卷，而且抛出之前要把已经起飞的等完。半路撒手会留下没人观察的
+    /// 孤儿任务，它们还占着闸门额度、还在读临时盘上的卷文件——而上层收到异常后就要去释放暂存区了。
     /// </summary>
     [Fact]
-    public async Task A_Dead_Volume_Keeps_The_Commit_Marker_Off_And_Leaves_Nothing_Running()
+    public async Task A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running()
     {
         var up = new FailingVolume("data/h.004");
         using var gate = new SemaphoreSlim(3, 3);
@@ -329,7 +348,8 @@ public sealed class VolumeBlobIOTests
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
 
-        Assert.DoesNotContain("data/h.001", up.Order);
+        // 倒在第 4 卷，后面几卷就不该再起飞了——8 卷不可能都跑过一遍。
+        Assert.True(up.Order.Count < files.Count, $"倒了之后还在起新卷：{up.Order.Count} 卷都跑了");
         // 闸门额度全数归还＝没有卷还攥在手里。抛出时仍在跑的话，这里会少。
         Assert.Equal(3, gate.CurrentCount);
     }

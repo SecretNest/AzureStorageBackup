@@ -428,10 +428,12 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         foreach (var e in index.Entries)
         {
-            // 用 VolumeBlobIO.ExistsAsync：单卷查基名，多卷查首卷 .001。
+            // 按索引记的卷数**逐卷**查。只查首卷是不够的：各卷是并发上传的，谁先落地不作要求，
+            // 首卷在并不能说明整族齐全。
             var baseRef = e.Storage!.Kind == "pack" ? $"packs/{e.Storage.Ref}.7z" : e.Storage.Ref;
-            Assert.True(await VolumeBlobIO.ExistsAsync(container, baseRef, CancellationToken.None),
-                $"missing blob {baseRef} for {e.Path}");
+            var (present, _) = await VolumeBlobIO.VerifyVolumesAsync(
+                container, baseRef, Math.Max(1, e.Storage.Volumes), [], CancellationToken.None);
+            Assert.True(present, $"missing blob {baseRef} for {e.Path}");
         }
     }
 
