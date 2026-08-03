@@ -42,7 +42,7 @@ public static class BackupConfigEndpoints
         });
 
         // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -101,13 +101,58 @@ public static class BackupConfigEndpoints
                     ct);
             }
 
-            // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：之后备份/清理平时不再下载云端索引。
+            // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：备份/清理/还原此后
+            // 一律读本地这一份，云端不再问——导入之后就没有"没有本地权威"这种状态了。
+            //
+            // 某个版本的索引读不出来**不中断整次导入**：坏的只是那一个版本，其余版本连同这条配置
+            // 都还是好的，而配置建起来了用户才有地方去查、去修。把它写进操作日志，下面那次自动
+            // 检查也会把牵连到的东西一并列出来。
             var identity = info.Backup.CreatedAt.UtcTicks;
+            var unreadable = new List<int>();
             foreach (var v in info.Versions)
-                await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
+            {
+                try
+                {
+                    await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    unreadable.Add(v.Version);
+                    await log.AppendAsync(
+                        OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
+                        $"Could not read the file list of version {v.Version} ({v.IndexBlob}): {ex.Message}. "
+                        + "That version cannot be restored or checked; the rest of this backup is unaffected.",
+                        ct);
+                }
+            }
+            if (unreadable.Count > 0)
+            {
+                await log.AppendAsync(
+                    OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
+                    $"Imported '{config.Name}' with {unreadable.Count} unreadable version file(s): "
+                    + string.Join(", ", unreadable.Select(v => $"v{v}")) + ".",
+                    ct);
+            }
+
+            // 账本抓全了，接着核一次账：云端那些 data blob 和分卷是不是都还在、尺寸对不对。
+            // 只发 HEAD，不下载。**不查本地**——导入这一刻 LocalRoot 多半还是空的（信息文件里
+            // 没有 SourceRootHint 时就是如此），拿它比对只会满屏报"本地缺失"。
+            // 走内部调用而不是打自己的 /check 端点，正是为了绕开那上面的 LocalRoot 边界闸门。
+            var checkStarted = req.CheckAfterImport ?? true;
+            if (checkStarted)
+            {
+                checkRunner.Start(created.Id, version: null, new CheckOptions
+                {
+                    Cloud = CloudCheckLevel.ExistenceSize,
+                    Local = LocalCheckLevel.None,
+                });
+            }
 
             var importSettings = await settingsSvc.GetAsync(ct);
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, importSettings, secretsUnavailable: Pending(keyring, encryption, created)));
+            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, new ImportResponse(
+                BackupConfigResponse.From(created, importSettings, secretsUnavailable: Pending(keyring, encryption, created)),
+                checkStarted,
+                unreadable));
         });
 
         group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IAccountService accounts, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, CancellationToken ct) =>

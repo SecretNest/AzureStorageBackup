@@ -6,7 +6,7 @@ import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { ScopeTree } from '../components/ScopeTree'
-import { formatBytes, formatVersionSpan } from '../constants/format'
+import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { Modal } from '../components/Modal'
@@ -522,18 +522,33 @@ export function BackupConfigsPage() {
   }
 
   const [importing, setImporting] = useState(false)
-  const [importForm, setImportForm] = useState({ accountId: 0, containerName: '', password: '' })
+  const [importForm, setImportForm] = useState({
+    accountId: 0,
+    containerName: '',
+    password: '',
+    checkAfterImport: true,
+  })
   const doImport = async () => {
     setError(null)
     try {
-      await backupConfigsApi.import(
+      const result = await backupConfigsApi.import(
         importForm.accountId || accounts[0]?.id || 0,
         importForm.containerName,
         importForm.password || null,
+        importForm.checkAfterImport,
       )
       setImporting(false)
-      setImportForm({ accountId: 0, containerName: '', password: '' })
+      setImportForm({ accountId: 0, containerName: '', password: '', checkAfterImport: true })
       load()
+      if (result.unreadableVersions.length > 0) {
+        setError(
+          `Imported, but the file list of ${result.unreadableVersions
+            .map((v) => `v${v}`)
+            .join(', ')} could not be read. Those versions cannot be restored or checked.`,
+        )
+      }
+      // 检查已经在后台跑了，直接把面板端到用户面前——让他自己再去找一遍那个按钮没有道理。
+      if (result.checkStarted) setCheckModal(result.config)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -615,6 +630,17 @@ export function BackupConfigsPage() {
               Import
             </button>
           </div>
+          <label className="row" style={{ gap: 'var(--sp-1)', marginTop: 'var(--sp-2)' }}>
+            <input
+              type="checkbox"
+              checked={importForm.checkAfterImport}
+              onChange={(e) =>
+                setImportForm((f) => ({ ...f, checkAfterImport: e.target.checked }))
+              }
+            />
+            {/* 导入抓的是账本；账本上写的东西还在不在，得问过云端才知道。只发 HEAD，不下载。 */}
+            Check cloud data once the import finishes
+          </label>
         </div>
       )}
       {accounts.length === 0 && <p className="text-muted">Add an account first.</p>}
@@ -1433,7 +1459,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 剩下的那些（uploading 减掉 peer 与 cloud）是已进上传段、但字节还没上路的件——正在做压完到
   // 开传之间那段本地活（pack 逐成员重新 Stat、单文件查去重映射）。只在**一条流都没在传**时才报：
   // 有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人分不清哪个数是哪个。
-  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.waitingOnCloud)
+  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // 在途那个数的单位**两侧不一样**：
@@ -1469,7 +1495,6 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    detail.waitingOnCloud > 0 && `${withUnit(detail.waitingOnCloud, unit)} waiting on the cloud`,
     // 单位是**卷**不是件（闸门按卷排队），与相邻各项刻意不同。
     detail.waitingOnSlot > 0 &&
       `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
@@ -1489,8 +1514,8 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.bytesPerSecond > 0 || detail.activeItems.length > 0
       ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
       : ''
-  // .NET 把 TimeSpan 序列化成 "hh:mm:ss.fffffff"；截到秒即可。
-  const eta = detail.estimatedRemaining ? ` · ~${detail.estimatedRemaining.split('.')[0]} left` : ''
+  // 从秒数算，不去切 estimatedRemaining 那个字符串——理由见 formatDuration。
+  const eta = detail.etaSeconds !== null ? ` · ~${formatDuration(detail.etaSeconds)} left` : ''
 
   // 字节明细另起一行：件数那行已经够长了，再塞进去在窄屏上会折得没法读。
   // 各段刻意互不重叠，加起来才是全貌；为零的整段省略，所以扫描/差分这些阶段这一行自然消失。

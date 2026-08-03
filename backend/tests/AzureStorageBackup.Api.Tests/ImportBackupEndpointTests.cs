@@ -72,11 +72,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
 
             // 导入：从信息文件恢复配置
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account.Id, containerName, null));
+                new ImportRequest(account.Id, containerName, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.Equal("family-photos", imported!.Name);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.Equal("family-photos", imported.Name);
             Assert.Equal(containerName, imported.ContainerName);
             Assert.Equal(_root, imported.LocalRoot); // sourceRootHint
         }
@@ -127,11 +127,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
 
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account.Id, containerName, "pw"));
+                new ImportRequest(account.Id, containerName, "pw", CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.True(imported!.HasPassword);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.True(imported.HasPassword);
 
             var versions = await _client.GetAsync($"/api/backup-configs/{imported.Id}/versions");
             Assert.Equal(HttpStatusCode.OK, versions.StatusCode);
@@ -161,7 +161,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         try
         {
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account!.Id, empty, null));
+                new ImportRequest(account!.Id, empty, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -204,11 +204,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             }, password: null);
 
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account!.Id, containerName, null));
+                new ImportRequest(account!.Id, containerName, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.Equal(string.Empty, imported!.LocalRoot);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.Equal(string.Empty, imported.LocalRoot);
 
             using var scope = factory.Services.CreateScope();
             var log = scope.ServiceProvider.GetRequiredService<IOperationLog>();

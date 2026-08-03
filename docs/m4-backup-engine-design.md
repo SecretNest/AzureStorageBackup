@@ -14,7 +14,7 @@
 > - hash 用 **XxHash128**（`xxh128:` 前缀），本文档 §2/§3.2 中出现的 `sha256:` 示例均按 §13.2 读作 `xxh128:`。
 > - 信息文件与第二级索引为**紧凑二进制序列化**（§13.4，`IndexSerializer` BinaryWriter），blob 名仍字面保留 `.json[.enc]` 后缀；§3.1/§3.2 的 JSON 示例仅描述**逻辑结构**，非磁盘字节格式。
 > - data blob 与 pack 均可**分卷**：多卷时实际 blob 名为 `data/{hash}.001/.002…`、`packs/{id}.7z.001/.002…`（单卷用基名），读写/清理经 `VolumeBlobIO` 按分卷族处理。
-> - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失；多卷**倒序上传**（.001 最后写）作为「整族齐全」提交标记。
+> - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失。多卷各卷**并发上传、先后不论**；.001 曾作为「整族齐全」提交标记最后单独写，随云端存在性去重一并取消（那个标记让 2–5 卷的文件上传耗时翻倍，而去重已不问云端）。
 > - **hash 碰撞避让**：data blob 元数据存原始长度 + headHash；去重时须元数据一致才跳过，否则判为碰撞、改用备用名 `data/{hash}~1/~2…` 并报 UnrecoverableError。索引 `StorageRef.Ref` 记实际名，还原/检查/清理据此。（残余「同 hash+同长度+同 headHash」碰撞概率可忽略，不再下载内容比对。）
 > - **加密备份密钥化寻址（防指纹识别）**：加密备份的 data blob 名改为 `data/{HMAC(key, fullHash)[:16]}`（key = HKDF(password, `BackupMeta.KdfSalt`)），碰撞元数据改为不透明 `v = HMAC(key, fullHash|len|head)`，不泄露长度/头部。未授权者即使能列 container 也无法用公开 hash 反推「是否备份过某文件」。去重照常（同内容→同地址）。非加密备份仍明文寻址。仅编排器创建 blob 时用密钥；还原/检查/清理用索引里记录的实际地址。残余泄露：blob 数量与大小。见 `BlobAddressScheme`。
 > - **原始文件直传（PRD 3.3.2，`StorageRef.Raw`）**：单文件 data blob 若**命中不压缩列表(store-only) + 无密码 + 单卷内(≤VolumeBytes)**，则直接把原文件拷到待上传区、上传**原始字节**（不走 7z 封装），`StorageRef.Raw=true`；raw 属性同时记入 blob 元数据(`raw=1`)，去重时以既有 blob 为准（同内容不同 don't-compress 状态也正确）。还原直接写回、深度检查直接重算 hash，均不解压。因单文件 blob 内容寻址去重可被多路径引用，还原/检查对同一 blob 复制/校验给**每个**引用条目。加密（keyed）备份永不 raw。见 `BackupOrchestrator.CopyRawAsync`。
@@ -28,7 +28,7 @@
 > - **单文件 blob 去重纯本地化（自建备份零云端读，`LocalDedupResolver`）**：自建备份的本地缓存已含每个 blob 的内容身份（fullHash+长度+头+尾）与存储信息（ref/raw/分卷数），故备份时**不发云端 HEAD**判断去重/碰撞：
 >   - 跨版本：从保留版本索引建「内容身份 → 既有 blob」映射直接命中。
 >   - 同一次备份内：运行内预约表（每 ref 一个 `TaskCompletionSource`）协调——同内容后到者等首个上传者完成，拿到相同 (ref, raw, 分卷数)（顺带修一个潜在竞态：同内容但不压缩设置不同的两文件曾各写各的 raw 标志、还原时损坏）；不同内容撞同址避让到 …~N；上传失败则令等待者一并失败，绝不去重到未成功写入的 blob。
->   - **权威判定**：本地有状态（`TrackedInfoStore.HasLocalAsync`）或全新无版本时启用本地解析；**导入未同步**的备份回退到云端存在性检查（`ResolveDataRefAsync`）。
+>   - **权威判定**：一律本地解析，没有云端回退。导入时就把信息文件与每个版本的索引全部拉进本地（`/import` 端点），此后不存在「没有本地权威」这种状态。没有本地权威时信任云端本身就是危险的——不知道那些 blob 是谁写的、用的什么密码、内容还对不对，而一次误判的「已存在」就是把一份从没传上去的文件静默记成备份完成。
 >   - **行为取舍**（与「尽量不读云端」一致）：备份信任本地索引＝云端真相，不再自动重传被外部误删的 blob——该漂移交由**检查(Check)**发现。
 
 ## 2. 存储布局（container 内 blob 组织）

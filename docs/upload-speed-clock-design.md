@@ -146,9 +146,8 @@ processed + preparing + queued + uploading ≡ total
 
 | | 等什么 | 单位 | 标记处 |
 |---|---|---|---|
-| `Peer` | 同批同内容的首个上传者传完**整件** | 件 | `LocalDedupResolver.ResolveAsync`、`RunState.ClaimCloudUpload` 的等待侧 |
+| `Peer` | 同批同内容的首个上传者传完**整件** | 件 | `LocalDedupResolver.ResolveAsync` 的等待侧 |
 | `Slot` | 全局上传闸门的额度 | **卷**（闸门按卷排队） | `VolumeUploadScope.RunAsync` |
-| `Cloud` | 云端存在性/元数据 HEAD | 件 | `ResolveDataRefAsync` |
 
 两处要点：
 

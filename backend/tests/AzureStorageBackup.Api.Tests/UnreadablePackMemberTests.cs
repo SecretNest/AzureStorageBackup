@@ -162,10 +162,11 @@ public sealed class UnreadablePackMemberTests : IDisposable
         var flaky = new FlakyOnceHasher(new FileHasher(), "d/y.txt", new IOException("The process cannot access the file 'y.txt' because it is being used by another process."));
         var touching = new TouchAfterCompressCompressor(new SevenZipCompressor(), "d/y.txt");
 
+        var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             touching, new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), flaky);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), flaky, authority.IndexCache, authority.Tracked);
 
         var account = AzuriteAccount();
         var name = RandomName("unreadpk-");
@@ -279,10 +280,11 @@ public sealed class UnreadablePackMemberTests : IDisposable
             WriteText("d/z.txt", "zzzz");
 
             var compressor = new LockDuringCompressCompressor(new SevenZipCompressor(), _root, "d/y.txt");
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
 
             await orchestrator.RunAsync(Request(account, name));
 
@@ -355,10 +357,11 @@ public sealed class UnreadablePackMemberTests : IDisposable
             WriteText("d/x.txt", "xxxx");
             WriteText("d/y.txt", "yyyy");
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new LockAfterDiffHasher(new FileHasher(), "d/y.txt")),
                 new GroupingPlanner(), new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
 
             var result = await orchestrator.RunAsync(Request(account, name));
 

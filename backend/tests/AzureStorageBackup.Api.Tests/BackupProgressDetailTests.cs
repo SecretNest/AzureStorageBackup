@@ -80,10 +80,11 @@ public sealed class BackupProgressDetailTests : IDisposable
                 await File.WriteAllTextAsync(Path.Combine(dir, $"f{i:D3}.txt"), new string('x', 500 + i));
             }
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
 
             await orchestrator.RunAsync(new BackupRequest
             {

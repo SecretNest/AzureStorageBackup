@@ -25,7 +25,7 @@
 - **还原替代判据**：改为「是否真解析成功」而非「用户意图」——替代版本被清理时回落跳过、不再整体失败；`Task.WhenAll` 改逐组容错（`RestoreResult.FailedFiles`）。
 - **修复走本地权威状态机**：`BackupRepairer` 注入 `TrackedInfoStore`+`LocalIndexCache`，信息/索引写经本地权威（消除修复后下次备份误 412）。
 - **ETag 冲突不留幽灵版本**：版本索引本地缓存 `Put` 移到信息文件提交**成功之后**（冲突时不污染缓存）。
-- **原子替换**：`IBlobUploader.UploadOverwriteAsync` + `VolumeBlobIO.ReplaceAsync`——先覆盖上传新卷（保持 .001 末位提交标记）、后删残留旧卷；崩溃窗口从「整 blob 丢失」降为「可恢复的新旧卷混合」。压实（`DeadWeightCompactor`）与修复共用。
+- **原子替换**：`IBlobUploader.UploadOverwriteAsync` + `VolumeBlobIO.ReplaceAsync`——先覆盖上传新卷、后删残留旧卷；崩溃窗口从「整 blob 丢失」降为「可恢复的新旧卷混合」。压实（`DeadWeightCompactor`）与修复共用。
 - **多卷 Archive 全卷活化**：抽 `BlobRehydration.BeginAsync`（按前缀枚举全部分卷），修复检查器只活化首卷的缺陷；还原保持 fail-fast 不复用（避免吞异常挂起占锁）。
 
 ### 🟡 需求缺口

@@ -74,7 +74,18 @@ public record RestoreRequestBody(
 public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
 
 /// <summary>导入已有备份请求：读 container 的信息文件恢复配置（roadmap，PRD 1.5）。加密备份需提供密码。</summary>
-public record ImportRequest(int AccountId, string ContainerName, string? Password);
+/// <param name="CheckAfterImport">导入完成后顺手核验一次云端数据（存在 + 尺寸，不下载）。
+/// 省略视为 true：导入只保证把云端记着的**账本**抓全了，账本上写的东西是不是还都在，
+/// 得问过云端才知道，而这件事没有理由要用户自己再去点一次。</param>
+public record ImportRequest(int AccountId, string ContainerName, string? Password, bool? CheckAfterImport = null);
+
+/// <summary>导入的结果：建好的配置，外加这次导入自己发现的两件事。</summary>
+/// <param name="CheckStarted">云端核验已经在后台跑了，前端可以直接把检查面板打开，
+/// 不必让用户再去找那个按钮。</param>
+/// <param name="UnreadableVersions">文件列表读不出来的版本号。这些版本还原不了也检查不了，
+/// 其余版本不受影响；详情在操作日志里。</param>
+public record ImportResponse(
+    BackupConfigResponse Config, bool CheckStarted, IReadOnlyList<int> UnreadableVersions);
 
 /// <summary>备份密码重设请求。必须是当初加密云端包的那个密码——不支持更改密码（设计决策 6、8）。</summary>
 public record ResetBackupPasswordRequest(string Password);

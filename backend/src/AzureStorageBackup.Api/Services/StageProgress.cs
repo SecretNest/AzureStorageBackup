@@ -29,9 +29,6 @@ public enum UploadWait
     /// <summary>等全局上传闸门的额度。额度被别的卷占满时才会出现；闸门空着时随手就拿到，不报。</summary>
     Slot,
 
-    /// <summary>等云端应答（存在性/元数据 HEAD、卷数清点）。只有没有本地权威索引的备份会走到，
-    /// 网络一慢，这里就是几十秒起步。</summary>
-    Cloud,
 }
 
 /// <summary>
@@ -132,16 +129,13 @@ public sealed record StageProgress(
     int WaitingOnPeer = 0,
     /// <summary>其中正卡在全局上传闸门上的**卷**数（<see cref="UploadWait.Slot"/>）。
     /// 闸门是按卷排队的，所以这一个数的单位与另外两个不同。</summary>
-    int WaitingOnSlot = 0,
-    /// <summary>其中正卡在云端应答上的件数（<see cref="UploadWait.Cloud"/>）。</summary>
-    int WaitingOnCloud = 0)
+    int WaitingOnSlot = 0)
 {
     /// <summary>某一种等待此刻卡着几个。</summary>
     public int Waiting(UploadWait kind) => kind switch
     {
         UploadWait.Peer => WaitingOnPeer,
         UploadWait.Slot => WaitingOnSlot,
-        UploadWait.Cloud => WaitingOnCloud,
         _ => 0,
     };
 
@@ -746,14 +740,13 @@ public sealed class StageTracker(
             // 已经离开压缩/暂存段的件数 = 手上的件 - 还在暂存段的件。
             //
             // 刻意**不**用 _inUpload（BeginUpload/EndUpload 那一对）：它从 UploadStagedBlobAsync
-            // 才开始算，而压完之后到那里之间还隔着预约协调与云端 HEAD——一件活能在那儿卡上几分钟，
+            // 才开始算，而压完之后到那里之间还隔着预约协调——一件活能在那儿卡上几分钟，
             // 却不在 _inUpload 里。用它当口径，件数账在最需要对得上的时候恰好对不上，
             // 而账对不上正是这一栏存在的理由。这个减法把那段空隙一并算了进来，于是
             // processed + preparing + queued + uploading ≡ total 是个恒等式，不依赖任何调用位置。
             Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
-            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
-            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Cloud]))));
+            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot]))));
     }
 
     /// <summary>

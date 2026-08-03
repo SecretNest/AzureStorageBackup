@@ -73,10 +73,11 @@ public sealed class PackIdUniquenessTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var authority = new TestLocalAuthority(store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
         return (backup, restore, store);
@@ -128,11 +129,17 @@ public sealed class PackIdUniquenessTests : IDisposable
                 await cc.GetBlobClient(b.Name).DeleteIfExistsAsync();
             await cc.GetBlobClient(BackupDiscovery.IndexBlobName).DeleteIfExistsAsync();
 
-            // 第二轮：**另一批**文件。信息文件不在，所以这是一次"全新"备份。
+            // 第二轮换一个编排器，因为"那一轮没能收尾"在本地也留不下任何东西：写本地状态是
+            // 收尾动作的一部分，运行倒在半路时它压根没执行。沿用上一个编排器的话，本地状态里
+            // 还记着第一轮写成的信息文件和它的 ETag——那不是"运行失败"的形状，而是"云端被
+            // 别人动过"，写回时会撞 412 并清本地状态要求重跑（见 TrackedInfoStore.WriteAsync）。
+            var (backup2, _, _) = Build();
+
+            // **另一批**文件。本地与云端都没有信息文件，所以这是一次"全新"备份。
             Directory.Delete(Path.Combine(_src, "first"), recursive: true);
             Write("second/c.txt", new string('c', 400));
             Write("second/d.txt", new string('d', 400));
-            await backup.RunAsync(Request(account, name));
+            await backup2.RunAsync(Request(account, name));
 
             var info = await store.ReadInfoAsync(account, name, null);
             var index = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);

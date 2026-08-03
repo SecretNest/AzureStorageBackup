@@ -309,10 +309,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             // differ 用会在读完之后锁文件的 hasher；orchestrator 自身用真实 hasher/真实 7z——
             // 它们撞上的是货真价实的操作系统权限拒绝，不是替身抛出的假异常。
             var differ = new BackupDiffer(new LockAfterDiffHasher(new FileHasher(), "locked.bin"));
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), differ, new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
@@ -367,10 +368,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var compressor = new LockAllAfterFirstCompressCompressor(
                 new SevenZipCompressor(), _root, ["d/x.txt", "d/y.txt"]);
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
@@ -426,10 +428,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var compressor = new LockAllAfterFirstCompressCompressor(
                 new SevenZipCompressor(), _root, ["d/x.txt", "d/y.txt"]);
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
@@ -499,10 +502,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new SevenZipCompressor(), _root, "d/x.txt",
                 "mutated content of x, now much longer than the 30-byte threshold"); // > 30 字节
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier, verboseLog: verboseLog);
 
             var request = Request(account, name, singleFileThresholdBytes: 30) with
@@ -556,10 +560,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             // 阈值压到 1 → 走单文件路径（HandleBlobAsync/ProcessAsync），也就是那个过宽 catch 所在处。
             WriteText("reachable.bin", "this file is perfectly readable the whole time");
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new SevenZipCompressor(), new NetworkFailingUploader(), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             // 上传失败必须让整轮备份失败，而不是被当成"这个文件读不开"悄悄跳过。
@@ -614,10 +619,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var victim = Path.Combine(_root, "d", "x.txt");
             var differ = new BackupDiffer(new DeleteAfterHashHasher(new FileHasher(), "d/y.txt", victim));
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), differ, new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 100));
@@ -677,10 +683,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new SevenZipCompressor(), Path.Combine(_root, "churn.bin"),
                 "content rewritten while the backup was compressing it");
 
+            var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
             // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是从前保护缺失的那一条。

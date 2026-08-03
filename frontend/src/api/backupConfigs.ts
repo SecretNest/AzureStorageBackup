@@ -208,7 +208,6 @@ export interface StageProgress {
   uploading: number
   waitingOnPeer: number // 其中在等同批同内容的首个上传者传完的件数
   waitingOnSlot: number // 其中在排全局上传闸门的**卷**数（闸门按卷排队，单位与另外两个不同）
-  waitingOnCloud: number // 其中在等云端应答（存在性/元数据 HEAD）的件数
 }
 
 export interface BackupProgress {
@@ -353,12 +352,31 @@ export interface RestoreEstimate {
   rehydratePending: number
 }
 
+/** 一次导入的结果：建好的配置，加上导入自己发现的两件事。 */
+export interface ImportResult {
+  config: BackupConfig
+  /** 云端核验已经在后台跑起来了——直接把检查面板打开，别让用户再去找那个按钮。 */
+  checkStarted: boolean
+  /** 文件列表读不出来的版本号。这些版本还原不了也检查不了，其余版本不受影响。 */
+  unreadableVersions: number[]
+}
+
 export const backupConfigsApi = {
   list: () => api.get<BackupConfig[]>('/backup-configs'),
   get: (id: number) => api.get<BackupConfig>(`/backup-configs/${id}`),
   create: (input: BackupConfigInput) => api.post<BackupConfig>('/backup-configs', input),
-  import: (accountId: number, containerName: string, password: string | null) =>
-    api.post<BackupConfig>('/backup-configs/import', { accountId, containerName, password }),
+  import: (
+    accountId: number,
+    containerName: string,
+    password: string | null,
+    checkAfterImport: boolean,
+  ) =>
+    api.post<ImportResult>('/backup-configs/import', {
+      accountId,
+      containerName,
+      password,
+      checkAfterImport,
+    }),
   update: (id: number, input: BackupConfigInput) =>
     api.put<BackupConfig>(`/backup-configs/${id}`, input),
   remove: (id: number, deleteContainer = false) =>

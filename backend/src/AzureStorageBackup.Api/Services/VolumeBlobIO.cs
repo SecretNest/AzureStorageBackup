@@ -75,11 +75,15 @@ public static class VolumeBlobIO
     /// <summary>
     /// 上传压缩产出的卷文件。单卷→baseRef；多卷→baseRef.001、baseRef.002...
     /// <para>
-    /// 多卷时 .002…N 并行、**首卷 .001 最后单独传**，使 .001 成为「整族齐全」的提交标记——
-    /// 上传中断时 .001 尚未写入，部分上传不会被存在性检查误判为已存在（§7）。它只是一条便宜的
-    /// 快路径提示而非保证：blob 可以被人从 Azure 侧直接删掉，所以 check 一律按索引记的卷数
-    /// 逐卷核验（<see cref="VerifyVolumesAsync"/>），并不信这个标记。上千卷里多收尾一个往返，
-    /// 代价可以忽略，就顺手留着。
+    /// 每一卷都进滑动窗口，**先后不论**——按文件顺序进队，谁先落地不作要求。
+    /// </para>
+    /// <para>
+    /// 从前 .001 是最后单独传的，用作「整族齐全」的提交标记，好让部分上传不被去重的存在性检查
+    /// 误判成已存在。那条检查（云端 HEAD 比对）已经删了——去重一律走本地权威索引，不问云端。
+    /// 而这个标记的代价从来不像注释里算的那样便宜：按上千卷算确实可以忽略，可默认卷 100 MB、
+    /// 并发 5，一个 100–500 MB 的文件正好切成 2–5 卷，收尾那一趟单卷串行就把整件的上传时间
+    /// 翻了一倍——而那个尺寸段在真实备份里是大头。中断残留由别处兜着：逐卷 if-missing 会把缺的
+    /// 补齐，加密多卷则在上传前先清（见 BackupOrchestrator.ClearLeftoverVolumesAsync）。
     /// </para>
     /// </summary>
     /// <param name="scope">每卷的并发额度与进度登记（见 <see cref="VolumeUploadScope"/>）。
@@ -128,9 +132,9 @@ public static class VolumeBlobIO
         // 窗口宽度仍卡在 MaxParallelPerItem 上：不能把上千卷一次性全塞进全局闸门的等待队列，
         // SemaphoreSlim 先到先得，那样后来的小活会被整段挡在队尾（见 VolumeUploadScope）。
         var window = scope?.MaxParallelPerItem ?? 1;
-        var started = new List<Task>(volumeFiles.Count - 1);
+        var started = new List<Task>(volumeFiles.Count);
         var running = new List<Task>(window);
-        for (var i = 1; i < volumeFiles.Count; i++)
+        for (var i = 0; i < volumeFiles.Count; i++)
         {
             if (running.Count >= window)
             {
@@ -147,15 +151,12 @@ public static class VolumeBlobIO
             running.Add(one);
         }
         await Task.WhenAll(started);
-        await One(VolumeName(baseRef, 1), volumeFiles[0], 0);
     }
 
     /// <summary>
     /// 替换某归档全部分卷：以**覆盖**方式上传新卷（单卷→baseRef；多卷→baseRef.001..M），
     /// 全部成功后再删除残留旧卷（尾部 .M+1..N，或旧单卷/新多卷时的旧基名等不属于新卷集者）。
     /// **先传后删**——崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可经检查/修复恢复）。
-    /// 与 <see cref="UploadAsync"/> 同命名，并沿用**倒序上传**（.001 最后写）——首卷 .001 仍是「整族齐全」提交标记，
-    /// 使部分上传不被存在性检查误判为已完成（§7）。
     /// </summary>
     public static async Task ReplaceAsync(
         IBlobUploader uploader, Account account, BlobContainerClient container, string baseRef,
@@ -164,8 +165,8 @@ public static class VolumeBlobIO
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
-        // 1) 覆盖上传新卷。倒序（.00M 先、.001 最后）保持提交标记语义。单卷时循环仅一次写 baseRef。
-        for (var i = volumeFiles.Count - 1; i >= 0; i--)
+        // 1) 覆盖上传新卷。单卷时循环仅一次写 baseRef。
+        for (var i = 0; i < volumeFiles.Count; i++)
             await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
 
         // 2) 删除不属于新卷集的残留旧卷（如旧卷数 > 新卷数的尾部，或单卷↔多卷切换后的旧命名）。
@@ -200,24 +201,16 @@ public static class VolumeBlobIO
             ? [baseRef]
             : Enumerable.Range(1, count).Select(i => VolumeName(baseRef, i)).ToList();
 
-    /// <summary>归档是否存在（单卷或多卷首卷）。多卷上传倒序，故 .001 在即代表整族齐全。</summary>
+    /// <summary>
+    /// 这个归档**沾到边**没有：单卷的基名在，或多卷的首卷在。
+    /// <para>
+    /// 说不了「整族齐全」——各卷并发上传，谁先落地不作要求，首卷在只代表有人往这个地址写过。
+    /// 要核验齐全用 <see cref="VerifyVolumesAsync"/>，它按索引记的卷数逐卷查。
+    /// </para>
+    /// </summary>
     public static async Task<bool> ExistsAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
         => (await cc.GetBlobClient(baseRef).ExistsAsync(ct)).Value
            || (await cc.GetBlobClient(VolumeName(baseRef, 1)).ExistsAsync(ct)).Value;
-
-    /// <summary>核验归档的全部分卷都存在（按版本索引记录的分卷数，§7）。expectedVolumes≤1 时退化为存在性检查。</summary>
-    public static async Task<bool> AllVolumesExistAsync(
-        BlobContainerClient cc, string baseRef, int expectedVolumes, CancellationToken ct)
-    {
-        if (expectedVolumes <= 1)
-            return await ExistsAsync(cc, baseRef, ct);
-        for (var i = 1; i <= expectedVolumes; i++)
-        {
-            if (!(await cc.GetBlobClient(VolumeName(baseRef, i)).ExistsAsync(ct)).Value)
-                return false;
-        }
-        return true;
-    }
 
     /// <summary>
     /// 「存在 + 尺寸」检查：核验全部分卷存在，且当 <paramref name="expectedSizes"/> 非空时每卷尺寸匹配。
@@ -251,17 +244,6 @@ public static class VolumeBlobIO
     {
         try { return (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.ContentLength; }
         catch (RequestFailedException e) when (e.Status == 404) { return null; }
-    }
-
-    /// <summary>统计归档实际存在的分卷数（单卷=1；多卷=连续 .001..N 的 N；都不在=0）。dedup 记录分卷数用。</summary>
-    public static async Task<int> CountVolumesAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
-    {
-        if ((await cc.GetBlobClient(baseRef).ExistsAsync(ct)).Value)
-            return 1;
-        var n = 0;
-        while ((await cc.GetBlobClient(VolumeName(baseRef, n + 1)).ExistsAsync(ct)).Value)
-            n++;
-        return n;
     }
 
     /// <summary>把归档（单卷或多卷）下载到 workDir，返回供 7z 解压的首卷本地路径。</summary>

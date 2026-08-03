@@ -79,7 +79,6 @@ public sealed class UploadWaitVisibilityTests
     [Theory]
     [InlineData(UploadWait.Peer)]
     [InlineData(UploadWait.Slot)]
-    [InlineData(UploadWait.Cloud)]
     public void The_Reason_An_Item_Is_Waiting_Reaches_The_Snapshot(UploadWait kind)
     {
         var seen = new List<StageProgress>();

@@ -373,9 +373,9 @@ public sealed class DeadWeightCompactorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    // ReplaceAsync：覆盖上传新卷（倒序，.001 最后作提交标记）+ 删除残留旧卷（新卷数 < 旧卷数的尾部）。
+    // ReplaceAsync：覆盖上传新卷 + 删除残留旧卷（新卷数 < 旧卷数的尾部）。
     [SkippableFact]
-    public async Task ReplaceAsync_Overwrites_New_Deletes_Residual_And_Uploads_First_Volume_Last()
+    public async Task ReplaceAsync_Overwrites_New_And_Deletes_Residual_Volumes()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
 
@@ -399,8 +399,9 @@ public sealed class DeadWeightCompactorTests : IDisposable
             var rec = new RecordingUploader(new BlobUploader(factory));
             await VolumeBlobIO.ReplaceAsync(rec, account, cc, baseRef, [f1, f2], AccessTier.Hot, retry: null, CancellationToken.None);
 
-            // 倒序上传：.002 先、.001 最后（提交标记）。
-            Assert.Equal([baseRef + ".002", baseRef + ".001"], rec.OverwriteOrder);
+            // 每一卷都写了。顺序不再有讲究——首卷曾是「整族齐全」的提交标记，那个语义已随
+            // 云端存在性去重一并删除。
+            Assert.Equal([baseRef + ".001", baseRef + ".002"], rec.OverwriteOrder);
             // 新内容覆盖旧卷。
             Assert.Equal("NEW1", (await cc.GetBlobClient(baseRef + ".001").DownloadContentAsync()).Value.Content.ToString());
             Assert.Equal("NEW2", (await cc.GetBlobClient(baseRef + ".002").DownloadContentAsync()).Value.Content.ToString());
