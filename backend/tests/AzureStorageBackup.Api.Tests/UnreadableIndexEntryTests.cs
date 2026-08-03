@@ -83,10 +83,11 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         var tag = Guid.NewGuid().ToString("N");
         var staging = new StagingArea(
             Path.Combine(_temp, "compress-" + tag), Path.Combine(_temp, "staged-" + tag), () => 200_000_000);
+        var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), differ ?? new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         return (orchestrator, store, factory);
     }
 

@@ -82,10 +82,11 @@ public sealed class UnreadableDirectoryTests : IDisposable
         var staging = new StagingArea(
             Path.Combine(_temp, "compress-" + Guid.NewGuid().ToString("N")),
             Path.Combine(_temp, "staged-" + Guid.NewGuid().ToString("N")), () => 200_000_000);
+        var authority = new TestLocalAuthority(store);
         return new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
             notifier: notifier);
     }
 

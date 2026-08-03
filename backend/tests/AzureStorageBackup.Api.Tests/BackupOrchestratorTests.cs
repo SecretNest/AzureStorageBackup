@@ -71,10 +71,11 @@ public sealed class BackupOrchestratorTests : IDisposable
         var compactor = new DeadWeightCompactor(
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
             staging);
+        var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         return (orchestrator, store, factory);
     }
 
@@ -154,12 +155,13 @@ public sealed class BackupOrchestratorTests : IDisposable
             .UseSqlite(conn).Options;
         using var db = new AzureStorageBackup.Api.Data.AppDbContext(opts);
         db.Database.EnsureCreated();
-        var cache = new LocalIndexCache(db, counting);
+        var authority = new TestLocalAuthority(db, counting);
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
-            new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(), indexCache: cache);
+            new RetentionCleaner(factory, counting, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(),
+            authority.IndexCache, authority.Tracked);
 
         var account = AzuriteAccount();
         var name = RandomName("orchlc-");
@@ -876,10 +878,11 @@ public sealed class BackupOrchestratorTests : IDisposable
         var log = new CapturingLog();
         var vlogRoot = Path.Combine(_temp, "vlog");
         var verboseLog = new VerboseFileLog(vlogRoot);
+        var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked, opLog: log,
             verboseLog: verboseLog);
 
         var account = AzuriteAccount();
@@ -916,10 +919,11 @@ public sealed class BackupOrchestratorTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var log = new ConcurrencyProbeLog();
+        var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(), opLog: log);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked, opLog: log);
 
         var account = AzuriteAccount();
         var name = RandomName("orchrec-");
@@ -955,47 +959,133 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// 上一次运行传了几卷就倒了，留下一批既不在索引、也不在本地状态里的卷。重跑同一个加密文件时
+    /// 这些残卷必须先被抹掉，不能靠 if-missing 跳过它们。
+    /// <para>
+    /// 加密下 AES 每次换随机 salt/IV，同一个文件两次压出来的密文不同，而 blob 名是从**明文**内容
+    /// hash 派生的——两次跑落在同一个地址上。跳过残卷的话，.001 是上次的密文、后面几卷是这次的，
+    /// 拼起来解不开，那个文件就此还原不了。明文没有这个问题（压缩输出逐字节确定），所以清理只
+    /// 针对加密的多卷归档，见 BackupOrchestrator.ClearLeftoverVolumesAsync。
+    /// </para>
+    /// </summary>
     [SkippableFact]
-    public async Task Hash_Collision_Falls_Back_To_Alternate_Name()
+    public async Task Leftover_Volumes_From_A_Failed_Run_Are_Cleared_Before_Re_Uploading()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (orchestrator, store, factory) = Build();
+        const string password = "pw-leftover";
+        var breaker = new FailAfterNVolumesUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), 3);
+        var (orchestrator, store, factory) = Build(uploader: breaker);
         var account = AzuriteAccount();
-        var name = RandomName("orchhc-");
+        var name = RandomName("orchleft-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
 
         try
         {
-            WriteText("x.txt", "hello");
-            var hash = await new FileHasher().FullHashAsync(Path.Combine(_root, "x.txt"));
-
-            // 预置一个 data/{hash}，其元数据代表「不同内容」——模拟 hash 碰撞。
-            await container.GetBlobClient($"data/{hash}").UploadAsync(
-                BinaryData.FromString("other content"),
-                new BlobUploadOptions
-                {
-                    Metadata = new Dictionary<string, string> { ["len"] = "999999", ["head"] = "xxh128:00" },
-                });
-
             var request = Request(account, name) with
             {
-                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+                Password = password,
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },  // 强制走单文件 blob 路径
+                    VolumeBytes = 64 * 1024,
+                },
             };
+
+            // v1：先立住信息文件。加密备份的 blob 地址是用 password + 信息文件里的 KdfSalt 派生的
+            // HMAC，盐一换地址就全变——所以"中断后重跑撞上自己的残卷"这件事只在信息文件还在时
+            // 才谈得上，而那正是真实的形状：写索引、写信息文件都是最后才做的收尾动作。
+            WriteText("small.txt", "seed");
             await orchestrator.RunAsync(request);
 
-            var info = await store.ReadInfoAsync(account, name, null);
-            var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
-            var e = Assert.Single(idx.Entries);
+            // v2：一个压不动的大文件（随机字节），按 64 KB 切成好几卷。传到第 4 卷时把它打断。
+            var payload = new byte[400_000];
+            Random.Shared.NextBytes(payload);
+            await File.WriteAllBytesAsync(Path.Combine(_root, "big.bin"), payload);
+            breaker.Arm();
+            await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(request));
 
-            Assert.Equal($"data/{hash}~1", e.Storage!.Ref);   // 避让到备用名，不覆盖既有 blob
-            Assert.Equal(hash, e.FullHash);                   // 索引仍记内容 hash
-            Assert.True(await container.GetBlobClient($"data/{hash}~1").ExistsAsync());
+            var leftovers = await ListAsync(container, "data/");
+            Assert.True(leftovers.Count > 1, $"这一轮该留下好几卷才对，实际 {leftovers.Count} 个 data blob");
+            var leftoverBytes = new Dictionary<string, byte[]>();
+            foreach (var b in leftovers)
+                leftoverBytes[b] = await ReadAllAsync(container, b);
+
+            // v2 重跑：同一个编排器（本地状态仍停在 v1——那一轮没能收尾，什么都没记下）。
+            breaker.Disarm();
+            await orchestrator.RunAsync(request);
+
+            var info = await store.ReadInfoAsync(account, name, password);
+            var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, password);
+            var big = idx.Entries.Single(e => e.Path == "big.bin").Storage!;
+            Assert.True(big.Volumes > 1, $"这个用例需要多卷，实际只有 {big.Volumes} 卷");
+
+            // 要害：那些残卷没有一个被原样留下来。留下任何一个都意味着这一族里混着上一轮的密文
+            // （AES 每次换随机 salt/IV，同一个文件两次压出来的字节必然不同），整族就解不开了。
+            foreach (var name2 in VolumeBlobIO.VolumeNames(big.Ref, big.Volumes))
+            {
+                if (leftoverBytes.TryGetValue(name2, out var old))
+                    Assert.NotEqual(old, await ReadAllAsync(container, name2));
+            }
+
             await AssertReferencedBlobsExist(container, idx);
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>传满 N 卷之后就开始抛——模拟一次传到半路倒掉的运行。Arm 之前原样转发。</summary>
+    private sealed class FailAfterNVolumesUploader(IBlobUploader inner, int allowed) : IBlobUploader
+    {
+        private int _armed;
+        private int _uploaded;
+
+        public void Arm() => Interlocked.Exchange(ref _armed, 1);
+        public void Disarm() => Interlocked.Exchange(ref _armed, 0);
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, null);
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+        {
+            if (Volatile.Read(ref _armed) == 1
+                && blobName.StartsWith("data/", StringComparison.Ordinal)
+                && Interlocked.Increment(ref _uploaded) > allowed)
+            {
+                // 不可重试的错误，好让这一轮当场倒掉而不是退避重试到成功。
+                throw new IOException("simulated failure partway through a multi-volume upload");
+            }
+            return inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+    }
+
+    private static async Task<List<string>> ListAsync(BlobContainerClient container, string prefix)
+    {
+        var names = new List<string>();
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, prefix, CancellationToken.None))
+            names.Add(b.Name);
+        return names;
+    }
+
+    private static async Task<byte[]> ReadAllAsync(BlobContainerClient container, string blobName)
+    {
+        using var ms = new MemoryStream();
+        await container.GetBlobClient(blobName).DownloadToAsync(ms);
+        return ms.ToArray();
     }
 
     [SkippableFact]

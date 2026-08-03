@@ -19,9 +19,9 @@ namespace AzureStorageBackup.Api.Tests;
 /// 空文件不是"没有内容"，它是"内容长度为零的文件"——两者在还原后的差别是文件存不存在。
 /// 空目录同理，它走的是索引里独立的 EmptyDirs 名单而非内容存储，也必须一并还原出来。
 /// <para>
-/// 两种接线都要测。生产主路径有本地权威索引，去重走 <see cref="LocalDedupResolver"/>，它对
-/// 同批同内容有预约协调；导入未同步的备份没有本地索引，退回发云端 HEAD 判存在性，那条路上
-/// 没有任何同批协调。两条路对"同内容却存成不同形态"的处置不同，只测一条会漏掉另一条。
+/// 去重一律走 <see cref="LocalDedupResolver"/>（本地权威，不发云端 HEAD），同批同内容由它的
+/// 预约表协调。曾经还有一条"没有本地索引就问云端"的回退接线，本文件也曾两条都测，现已随那条
+/// 路径一并删除。
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -83,26 +83,22 @@ public sealed class EmptyFileRoundTripTests : IDisposable
         File.WriteAllBytes(full, []);
     }
 
-    /// <param name="localAuthoritative">
-    /// true = 生产主路径（本地权威索引 → LocalDedupResolver）；
-    /// false = 导入未同步的备份（无本地索引 → 云端 HEAD 回退）。
-    /// </param>
-    private (BackupOrchestrator Backup, RestoreOrchestrator Restore) Build(bool localAuthoritative)
+    private (BackupOrchestrator Backup, RestoreOrchestrator Restore, TestLocalAuthority Authority) Build()
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
-        var indexCache = localAuthoritative ? new LocalIndexCache(_db, store) : null;
-        var tracked = localAuthoritative ? new TrackedInfoStore(store, new LocalBackupStateStore(_db)) : null;
+        var authority = new TestLocalAuthority(_db, store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: indexCache, trackedInfo: tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(),
+                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.IndexCache, authority.Tracked);
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
-        return (backup, restore);
+        return (backup, restore, authority);
     }
 
     /// <summary>
@@ -116,16 +112,13 @@ public sealed class EmptyFileRoundTripTests : IDisposable
     };
 
     [SkippableTheory]
-    [InlineData(null, true)]       // 生产主路径，明文（raw 直传只有无密码时才走得到）
-    [InlineData(null, false)]      // 导入未同步的备份，明文
-    [InlineData("pw-123", true)]   // 生产主路径，加密
-    [InlineData("pw-123", false)]  // 导入未同步的备份，加密
-    public async Task Zero_Byte_Files_And_Empty_Dirs_Survive_Every_Storage_Path(
-        string? password, bool localAuthoritative)
+    [InlineData(null)]       // 明文（raw 直传只有无密码时才走得到）
+    [InlineData("pw-123")]   // 加密
+    public async Task Zero_Byte_Files_And_Empty_Dirs_Survive_Every_Storage_Path(string? password)
     {
         Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
 
-        var (backup, restore) = Build(localAuthoritative);
+        var (backup, restore, _) = Build();
         var account = AzuriteAccount();
         var name = RandomName("empty-");
         var container = new BlobClientFactory(TestSecrets.Reader)
@@ -197,7 +190,7 @@ public sealed class EmptyFileRoundTripTests : IDisposable
     {
         Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
 
-        var (backup, restore) = Build(localAuthoritative: true);
+        var (backup, restore, _) = Build();
         var account = AzuriteAccount();
         var name = RandomName("emptycost-");
         var container = new BlobClientFactory(TestSecrets.Reader)
@@ -263,7 +256,7 @@ public sealed class EmptyFileRoundTripTests : IDisposable
 
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
-        var (backup, restore) = Build(localAuthoritative: false); // 直接读云端索引，好让篡改生效
+        var (backup, restore, authority) = Build();
         var account = AzuriteAccount();
         var name = RandomName("inherit-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -287,14 +280,19 @@ public sealed class EmptyFileRoundTripTests : IDisposable
             Assert.NotNull(donor);
             Assert.Null(index.Entries.Single(e => e.Path == "packed/zero.txt").Storage); // 新代码本就不给
 
-            await store.WriteIndexAsync(account, name, v1.Version, new VersionIndex
+            var tampered = new VersionIndex
             {
                 Version = index.Version,
                 EmptyDirs = index.EmptyDirs,
                 Entries = [.. index.Entries.Select(e => e.Path == "packed/zero.txt"
                     ? e with { Storage = donor with { EntryName = "packed/zero.txt" } }
                     : e)],
-            }, null);
+            };
+            await store.WriteIndexAsync(account, name, v1.Version, tampered, null);
+            // 本地缓存也得改：备份读上一版本索引只认本地那一份，光改云端的等于没改。
+            // 而这正是"老备份"的真实形状——那条带 storage 的条目当年就是这么写进本地缓存的。
+            await authority.IndexCache.PutAsync(
+                account.Id, name, v1.Version, info.Backup.CreatedAt.UtcTicks, tampered);
 
             // 源文件一个字节都不动 → diff 判 Unchanged，正是最容易一路沿用下去的那条路。
             await backup.RunAsync(new BackupRequest
@@ -326,15 +324,16 @@ public sealed class EmptyFileRoundTripTests : IDisposable
     /// <summary>
     /// 同一批里内容相同、却被规则指派成不同存储形态的**非空**文件。store-only 的那份走 raw 直传
     /// （裸字节），另一份压成 7z 归档——两者字节完全不同，可它们 fullHash 相同，于是指向同一个
-    /// data/{hash} 地址。没有同批协调时，两个并发任务会各自 HEAD 到同一个空位、各自上传，后写的
+    /// data/{hash} 地址。没有同批协调时，两个并发任务会各自认领同一个空位、各自上传，后写的
     /// 被 UploadIfMissing 跳过，而两条索引条目各记各的 raw 标志：其中一条必然与 blob 里真正躺着的
     /// 字节对不上，还原时把归档本身当成文件内容写出来。
     /// <para>
-    /// 只测云端回退接线：本地权威那条路由 LocalDedupResolver 的预约表保护着，本来就不会撞。
+    /// 协调由 LocalDedupResolver 的预约表做（同内容的后到者等首个上传者，继承它的 ref/raw/分卷）。
+    /// 这条用例守的就是那张表在"同内容不同形态"下也管用。
     /// </para>
     /// <para>
     /// 老实说：这个用例**没能**在加同批协调之前复现出错误（撤掉修复跑 6 轮全绿）。原因想清楚了——
-    /// raw 是拷贝、7z 是压缩，非空内容下拷贝总是先落地，压缩那个再去 HEAD 时已经看得见 blob，
+    /// raw 是拷贝、7z 是压缩，非空内容下拷贝总是先落地，压缩那个再去解析时已经看得见它，
     /// 于是去重命中并继承 raw=true，两条条目自然一致。也就是说这里的正确性一直靠"拷贝比压缩快"
     /// 这个时序差撑着，而不是靠设计——分卷会让 store-only 退回 7z、高压缩比的小文件会让压缩变得
     /// 和拷贝一样快（空文件就是极端情形，见上一个用例），假设随时可能不成立。
@@ -347,7 +346,7 @@ public sealed class EmptyFileRoundTripTests : IDisposable
     {
         Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
 
-        var (backup, restore) = Build(localAuthoritative: false);
+        var (backup, restore, _) = Build();
         var account = AzuriteAccount();
         var name = RandomName("shapes-");
         var container = new BlobClientFactory(TestSecrets.Reader)

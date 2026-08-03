@@ -69,10 +69,11 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var authority = new TestLocalAuthority(store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
 
@@ -146,10 +147,11 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress2"), Path.Combine(_temp, "staged2"), () => 200_000_000);
+        var authority = new TestLocalAuthority(store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher());
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check2"));
 
