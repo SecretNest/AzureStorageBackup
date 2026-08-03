@@ -1382,6 +1382,19 @@ const STAGE_UNITS: Record<string, string> = {
   Orphans: 'blobs',
 }
 
+/**
+ * 给一个数配上它自己的单位词，单复数跟着数走。
+ *
+ * 在途那一行里同时躺着两种口径的数——上传按**卷**登记（VolumeBlobIO 每卷一条，上传闸门也按卷
+ * 排队），其余按**件**。从前只给卷那两项写了单位，件那几项光秃秃地摆着，一行读下来像是
+ * 「1 volume uploading · 1 preparing」这样时有时无，反而更像笔误而不是刻意区分。现在每个数
+ * 一律自报单位：读的人不必记住哪一项是哪种口径，也不会再拿这一行的数去凑总数。
+ */
+function withUnit(n: number, plural: string): string {
+  const singular = plural === 'entries' ? 'entry' : plural.replace(/s$/, '')
+  return `${n.toLocaleString()} ${n === 1 ? singular : plural}`
+}
+
 function StageDetail({ detail }: { detail: StageProgress }) {
   const unit = STAGE_UNITS[detail.stage] ?? 'items'
   // 用 "of" 而不是 "/"：斜杠是分数记号，摆在那儿就是在邀人约一个百分比出来，而件数百分比在
@@ -1423,16 +1436,16 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.waitingOnCloud)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
-  // 在途那个数的单位**两侧不一样**，所以只有上传侧要点明：
+  // 在途那个数的单位**两侧不一样**：
   // · 上传：VolumeBlobIO 每一卷各登记一条，一件大活自己就能占满全部并发额度（默认 5）；
   // · 下载：RestoreOrchestrator / BackupChecker 按整个对象（或整组）登记一条，多卷共用它。
-  // 不点明的后果是实打实的：同一行里 processed 与 queued 数的是**件**，把卷数加进去就超过
+  // 点明单位的后果是实打实的：同一行里 processed 与 queued 数的是**件**，把卷数加进去就超过
   // 总数——实测 5,346 + 5 + 1,031 = 6,382 > 6,378，多出的 4 正是「5 卷 − 1 件」。
-  // 下载侧本来就与件数同口径，加"objects"反而是多余的噪音，维持原样。
-  const inFlightUnit =
-    detail.stage === 'Uploading' ? (detail.activeItems.length === 1 ? 'volume ' : 'volumes ') : ''
-  // "5 volumes uploading" / "1 volume uploading" / "3 downloading"
-  const inFlightPhrase = `${detail.activeItems.length} ${inFlightUnit}${inFlightVerb}`
+  // "5 volumes uploading" / "1 volume uploading" / "3 objects downloading"
+  const inFlightPhrase = `${withUnit(
+    detail.activeItems.length,
+    detail.stage === 'Uploading' ? 'volumes' : unit,
+  )} ${inFlightVerb}`
   // 排列按**逆时间轴**：越接近"字节已经上了网线"的排越前，越早的阶段排越后，末尾落到 queued。
   // 一件活的正序是 queued → preparing（占锁压）→ starting upload（压完到开传之间的本地活）→
   // waiting on peer/cloud/slot（等资源）→ uploading（在传），这一行倒着念就是它。
@@ -1445,7 +1458,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 差分判得比压缩上传快几个数量级，跑到前面去是常态；多出来的活攒在磁盘上等下游消化。
     // 这一行取代了从前那句 "waiting for upload to catch up"——写侧不再阻塞了，所以要说的
     // 不再是"卡住了"，而是"领先了多少"。措辞里点明 buffered，别让人以为这是失败重试。
-    detail.spilledItems > 0 && `${detail.spilledItems.toLocaleString()} buffered to disk`,
+    detail.spilledItems > 0 && `${withUnit(detail.spilledItems, unit)} buffered to disk`,
     detail.activeItems.length > 0 && inFlightPhrase,
     // "right now" 而不是 "yet"：这一条说的是**这一瞬**没有流在传（手上那件正占着压缩锁），
     // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
@@ -1454,13 +1467,15 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 压完了、字节却还没上路的件卡在哪一段。这几档存在的理由就是那个"几分钟纹丝不动"：
     // 从前这些件不属于任何一栏，屏幕上 processed + preparing + queued 比总数少，而少掉的
     // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
-    detail.waitingOnPeer > 0 && `${detail.waitingOnPeer} waiting on the same content elsewhere`,
-    detail.waitingOnCloud > 0 && `${detail.waitingOnCloud} waiting on the cloud`,
-    // 单位是**卷**不是件（闸门按卷排队），所以措辞里必须点明，否则又是一个加不平的数。
-    detail.waitingOnSlot > 0 && `${detail.waitingOnSlot} volumes waiting for an upload slot`,
-    detail.activeItems.length === 0 && stalled > 0 && `${stalled} starting upload`,
-    detail.preparing > 0 && `${detail.preparing} ${preparingLabel}`,
-    detail.queued > 0 && `${detail.queued.toLocaleString()} queued`,
+    detail.waitingOnPeer > 0 &&
+      `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
+    detail.waitingOnCloud > 0 && `${withUnit(detail.waitingOnCloud, unit)} waiting on the cloud`,
+    // 单位是**卷**不是件（闸门按卷排队），与相邻各项刻意不同。
+    detail.waitingOnSlot > 0 &&
+      `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
+    detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
+    detail.preparing > 0 && `${withUnit(detail.preparing, unit)} ${preparingLabel}`,
+    detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
   ]
     .filter(Boolean)
     .join(' · ')
@@ -1567,7 +1582,10 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           而压缩是全局串行的（一把锁，就是上面那个 N preparing），并发的是上传/下载。 */}
       {detail.activeItems.length > 0 && (
         <div className="text-faint">
-          {`${detail.activeItems.length} parallel ${inFlightUnit}${inFlightVerb}:`}
+          {`${withUnit(
+            detail.activeItems.length,
+            detail.stage === 'Uploading' ? 'volumes' : unit,
+          )} ${inFlightVerb} in parallel:`}
         </div>
       )}
       {/* 全部列出，不再截到 3 条。在途条数有上界——它就是设置里的上传/下载并发数（默认 5），
