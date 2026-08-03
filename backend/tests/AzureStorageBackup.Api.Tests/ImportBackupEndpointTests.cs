@@ -72,7 +72,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
 
             // 导入：从信息文件恢复配置
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account.Id, containerName, null));
+                new ImportRequest(account.Id, containerName, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
             var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
@@ -127,7 +127,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
 
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account.Id, containerName, "pw"));
+                new ImportRequest(account.Id, containerName, "pw", CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
             var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
@@ -161,7 +161,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         try
         {
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account!.Id, empty, null));
+                new ImportRequest(account!.Id, empty, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -204,7 +204,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
             }, password: null);
 
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
-                new ImportRequest(account!.Id, containerName, null));
+                new ImportRequest(account!.Id, containerName, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
             var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;

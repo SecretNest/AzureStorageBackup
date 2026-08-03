@@ -73,7 +73,14 @@ public sealed class BlobAddressScheme
             : new Dictionary<string, string> { ["v"] = Verifier(fullHash, length, headHash, tailHash) };
     }
 
-    /// <summary>去重时判断既有 blob 的元数据是否代表同内容（老 blob 缺某项 → 该项不参与判定，向后兼容）。</summary>
+    /// <summary>
+    /// 判断某个 blob 的元数据是否代表这份内容（老 blob 缺某项 → 该项不参与判定，向后兼容）。
+    /// <para>
+    /// **备份路径上没有调用者**，去重不看云端元数据。留着它是因为那些键是真真切切写在云上的
+    /// 持久数据，删掉读取端会让写入端（<see cref="Metadata"/>）那一套「省略而非空串」的讲究
+    /// 失去解释的落点；人工排查、以及将来任何要从云端反推内容身份的活，判据都在这里。
+    /// </para>
+    /// </summary>
     public bool MetadataMatches(IDictionary<string, string> meta, string fullHash, long length, string headHash, string tailHash)
     {
         if (_key is null)
@@ -89,13 +96,11 @@ public sealed class BlobAddressScheme
             // · tail 缺失只可能来自 format 1 的索引（IndexSerializer 里 tail 是 `format >= 2` 才读的后加项）——
             //   而 format 1 **未投产**，现网不会遇到；
             // · head 缺失不再只是人为构造/损坏索引才会出现——修复(BackupRepairer)对 HeadHash 为 null 的
-            //   老条目也会发布不带 head 键的对象。但爆炸半径仍窄：MetadataMatches 只在云端回退导入路径
-            //   （localResolver 为 null，见 BackupOrchestrator.ResolveDataRefAsync）才会被调用；正常去重走
-            //   本地权威的 LocalDedupResolver.ResolveAsync，按 ContentKey（fullHash+len+head+tail 精确字符串
-            //   比对）判定，缺字段的条目在那里天然配不上任何键，根本走不到这条放宽的分支——而且并非只是
-            //   「绕过了检查」：该老条目的 ContentKey 形如 `hash\nlen\n\n`（LocalDedupResolver.ContentKey），
-            //   仍会占住 _priorRefs 里的基址，把同内容的新引用挤到 …~1 并标 collision:true（ResolveAsync
-            //   本就有的避让逻辑），本地路径其实另有一套与本改动无关的既有兜底，并非依赖这里的放宽。
+            //   老条目也会发布不带 head 键的对象。但爆炸半径已经窄到没有了：去重**不再读云端元数据**，
+            //   一律走本地权威的 LocalDedupResolver.ResolveAsync，按 ContentKey（fullHash+len+head+tail
+            //   精确字符串比对）判定。缺字段的条目在那里天然配不上任何键，而且并非只是「绕过了检查」：
+            //   该老条目的 ContentKey 形如 `hash\nlen\n\n`（LocalDedupResolver.ContentKey），仍会占住
+            //   _priorRefs 里的基址，把同内容的新引用挤到 …~1 并标 collision:true。
             if (meta.TryGetValue("head", out var h) && h != headHash)
                 return false;
             return !meta.TryGetValue("tail", out var t) || t == tailHash;

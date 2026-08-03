@@ -208,7 +208,6 @@ export interface StageProgress {
   uploading: number
   waitingOnPeer: number // 其中在等同批同内容的首个上传者传完的件数
   waitingOnSlot: number // 其中在排全局上传闸门的**卷**数（闸门按卷排队，单位与另外两个不同）
-  waitingOnCloud: number // 其中在等云端应答（存在性/元数据 HEAD）的件数
 }
 
 export interface BackupProgress {

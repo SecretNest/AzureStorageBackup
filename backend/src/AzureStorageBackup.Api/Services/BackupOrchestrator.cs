@@ -150,10 +150,10 @@ public sealed class BackupOrchestrator(
     DiffWorkQueueFactory? spillFactory = null)
 {
     /// <summary>
-    /// 一次运行的可变状态：边跑边攒的计数，以及云端回退路径的同批上传协调。按参数一路传下去
+    /// 一次运行的可变状态：边跑边攒的计数，以及本轮的 pack 号发号器。按参数一路传下去
     /// 而不是做成实例字段：编排器在 DI 里是 scoped，单次请求内不会有第二轮备份共用它，但
     /// "每轮的账记在这一轮的对象上"这件事应当由签名保证，而不是靠注册方式碰巧成立。
-    /// 多个上传消费者并发访问，故计数走 Interlocked、预约表用 ConcurrentDictionary。
+    /// 多个上传消费者并发访问，故计数与发号都走 Interlocked。
     /// </summary>
     private sealed class RunState(StagingArea.StagingLease staging)
     {

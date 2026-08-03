@@ -1459,7 +1459,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 剩下的那些（uploading 减掉 peer 与 cloud）是已进上传段、但字节还没上路的件——正在做压完到
   // 开传之间那段本地活（pack 逐成员重新 Stat、单文件查去重映射）。只在**一条流都没在传**时才报：
   // 有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人分不清哪个数是哪个。
-  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.waitingOnCloud)
+  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // 在途那个数的单位**两侧不一样**：
@@ -1495,7 +1495,6 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    detail.waitingOnCloud > 0 && `${withUnit(detail.waitingOnCloud, unit)} waiting on the cloud`,
     // 单位是**卷**不是件（闸门按卷排队），与相邻各项刻意不同。
     detail.waitingOnSlot > 0 &&
       `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,

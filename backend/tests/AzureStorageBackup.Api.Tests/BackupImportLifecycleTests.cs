@@ -230,8 +230,11 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             var check = await PollUntilDoneAsync<CheckRunResponse>(
                 $"/api/backup-configs/{imported.Id}/check", c => c.Status is not "Running");
             Assert.NotNull(check);
-            Assert.Equal("Completed", check!.Status);
-            Assert.True(check.Report?.Ok, "导入后的自动检查报告不健康");
+            // 带上 Error 一起断言：这条曾在满负载的全量跑里偶发失败过一次，而当时屏幕上只有
+            // "Completed != something"，看不出检查自己抱怨了什么。下次再挂，原因就在消息里。
+            Assert.True(check!.Status is "Completed", $"检查以 {check.Status} 收场：{check.Error}");
+            Assert.True(check.Report?.Ok,
+                $"导入后的自动检查报告不健康：{string.Join(", ", check.Report?.CorruptedPaths ?? [])}");
 
             // ─── 列出全部版本（从新到旧，与还原/检查下拉里 Latest 之后的排列一致）───
             var versions = await _client.GetFromJsonAsync<List<VersionRow>>(

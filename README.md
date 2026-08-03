@@ -131,14 +131,13 @@ The identity **`processed + preparing + queued + uploading ≡ total`** always h
 | `N volumes uploading` / `N downloading` | volumes / items | Transfers actually moving bytes. Upload registers one entry **per volume**, so a single large item can occupy the whole concurrency allowance on its own; download registers one per object. |
 | `nothing on the wire right now` | — | This instant has no transfer in flight while an item is being prepared. It says *right now*, not *not yet*: several GB may already have gone up earlier in the run. |
 | `N waiting on the same content elsewhere` | items | The identical content is already being uploaded by another item in this run; this one waits for that upload to finish rather than sending the bytes twice. Can take minutes. |
-| `N waiting on the cloud` | items | Waiting for an Azure response (existence / metadata `HEAD`). Tens of seconds on a slow link. |
 | `N volumes waiting for an upload slot` | **volumes** | The global upload gate is saturated. |
 | `N starting upload` | items | Compression is done and the bytes have not left yet, for none of the reasons above — the item is doing the local work between the two: re-`stat`ing each pack member, looking up the dedup map (a dedup hit never uploads at all). Shown **only when no transfer is in flight**; an item that gets a slot immediately simply appears under `volumes uploading` instead. |
 | `N preparing` (Uploading) | items | Holding the **global compression lock** and producing volume files. There is exactly one lock, so this is always `0` or `1`; everything queuing behind it counts as `queued`. |
 | `N extracting` (Restoring / Verifying) | items | Downloaded and now extracting / re-hashing. No global lock here, so this can go up to the download concurrency. |
 | `N queued` | items | Not started: still in the queue, plus items already picked up but waiting for the compression lock. |
 
-The entries are ordered **backwards along the timeline** — closest to "bytes are on the wire" first, earliest last. An item's forward order is `queued → preparing → starting upload → waiting on peer/cloud/slot → uploading`, so reading the line right to left follows one item through the run. (`buffered to disk` and `nothing on the wire right now` are not stages and stay at the head.)
+The entries are ordered **backwards along the timeline** — closest to "bytes are on the wire" first, earliest last. An item's forward order is `queued → preparing → starting upload → waiting on peer/slot → uploading`, so reading the line right to left follows one item through the run. (`buffered to disk` and `nothing on the wire right now` are not stages and stay at the head.)
 
 > The wording deliberately avoids "compressing" for `preparing`: a backup configured **not** to compress still goes through 7-Zip for packing, encryption and volume splitting, so it is preparing either way.
 

@@ -246,17 +246,6 @@ public static class VolumeBlobIO
         catch (RequestFailedException e) when (e.Status == 404) { return null; }
     }
 
-    /// <summary>统计归档实际存在的分卷数（单卷=1；多卷=连续 .001..N 的 N；都不在=0）。dedup 记录分卷数用。</summary>
-    public static async Task<int> CountVolumesAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
-    {
-        if ((await cc.GetBlobClient(baseRef).ExistsAsync(ct)).Value)
-            return 1;
-        var n = 0;
-        while ((await cc.GetBlobClient(VolumeName(baseRef, n + 1)).ExistsAsync(ct)).Value)
-            n++;
-        return n;
-    }
-
     /// <summary>把归档（单卷或多卷）下载到 workDir，返回供 7z 解压的首卷本地路径。</summary>
     /// <param name="progress">每卷的进度回调**工厂**。为什么必须是工厂而不是单个 <see cref="IProgress{T}"/>：
     /// SDK 的 <c>ProgressHandler</c> 报的是本次 <c>DownloadToAsync</c> 调用内的累计字节，
