@@ -75,8 +75,8 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
                 new ImportRequest(account.Id, containerName, null));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.Equal("family-photos", imported!.Name);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.Equal("family-photos", imported.Name);
             Assert.Equal(containerName, imported.ContainerName);
             Assert.Equal(_root, imported.LocalRoot); // sourceRootHint
         }
@@ -130,8 +130,8 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
                 new ImportRequest(account.Id, containerName, "pw"));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.True(imported!.HasPassword);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.True(imported.HasPassword);
 
             var versions = await _client.GetAsync($"/api/backup-configs/{imported.Id}/versions");
             Assert.Equal(HttpStatusCode.OK, versions.StatusCode);
@@ -207,8 +207,8 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
                 new ImportRequest(account!.Id, containerName, null));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
 
-            var imported = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.Equal(string.Empty, imported!.LocalRoot);
+            var imported = (await res.Content.ReadFromJsonAsync<ImportResponse>())!.Config;
+            Assert.Equal(string.Empty, imported.LocalRoot);
 
             using var scope = factory.Services.CreateScope();
             var log = scope.ServiceProvider.GetRequiredService<IOperationLog>();

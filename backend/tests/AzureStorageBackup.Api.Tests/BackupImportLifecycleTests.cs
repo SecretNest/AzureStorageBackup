@@ -212,16 +212,26 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
                 new ImportRequest(account.Id, container, password));
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
-            var imported = await response.Content.ReadFromJsonAsync<BackupConfigResponse>();
-            Assert.NotNull(imported);
-            Assert.Equal("imported-fixture", imported!.Name);          // 配置从信息文件恢复
+            var result = await response.Content.ReadFromJsonAsync<ImportResponse>();
+            Assert.NotNull(result);
+            var imported = result!.Config;
+            Assert.Equal("imported-fixture", imported.Name);          // 配置从信息文件恢复
             Assert.Equal("created on another machine", imported.Description);
             Assert.Equal(container, imported.ContainerName);
             Assert.Equal(_src, imported.LocalRoot);                     // sourceRootHint
             Assert.Equal(password is not null, imported.HasPassword);
+            Assert.Empty(result.UnreadableVersions);                    // 两个版本的文件列表都读得出来
 
             // 本地权威状态与全部版本索引都已回填（之后备份/还原平时不再下载云端索引）。
             await AssertLocalStateSeededAsync(account.Id, container, expectedVersions: 2);
+
+            // 云端核验自动跑起来了，用户不必自己再去点一次检查；跑完该是健康的。
+            Assert.True(result.CheckStarted);
+            var check = await PollUntilDoneAsync<CheckRunResponse>(
+                $"/api/backup-configs/{imported.Id}/check", c => c.Status is not "Running");
+            Assert.NotNull(check);
+            Assert.Equal("Completed", check!.Status);
+            Assert.True(check.Report?.Ok, "导入后的自动检查报告不健康");
 
             // ─── 列出全部版本（从新到旧，与还原/检查下拉里 Latest 之后的排列一致）───
             var versions = await _client.GetFromJsonAsync<List<VersionRow>>(

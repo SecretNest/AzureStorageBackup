@@ -13,6 +13,27 @@ export function formatVersionSpan(startedAt: string | null, completedAt: string)
   return `${start.toLocaleString()} → ${sameDay ? end.toLocaleTimeString() : end.toLocaleString()}`
 }
 
+/**
+ * 剩余时长的人类可读形式，每一段都带单位。
+ *
+ * 别去切 .NET 那个 TimeSpan 字符串：它序列化成 `[d.]hh:mm:ss[.fffffff]`，天数后面那个点
+ * 和小数秒前面那个点长得一模一样。曾经用 `split('.')[0]` 想砍掉小数秒，结果一超过一天就
+ * 只剩下天数那个数字——3 天 5 小时显示成孤零零一个「~3 left」，没单位，也说不清是天是时。
+ * 秒数是后端直接给的（etaSeconds），从它算起就没有这种歧义。
+ *
+ * 只显示两级：「3d 5h」比「3d 5h 20m 11s」好读，而剩三天的时候那 11 秒也没人在乎。
+ */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds))
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (d > 0) return h > 0 ? `${d}d ${h}h` : `${d}d`
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`
+  if (m > 0) return `${m}m ${s % 60}s`
+  return `${s}s`
+}
+
 /** 字节数的人类可读形式。备份界面到处都要用（尺寸、速度），集中一处避免各写一份走样。 */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
