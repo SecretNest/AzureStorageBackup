@@ -41,27 +41,52 @@ public sealed class VolumeUploadScope(SemaphoreSlim gate, StageTracker tracker, 
         if (!gate.Wait(0))
         {
             tracker.BeginWait(UploadWait.Slot);
+            var acquired = false;
             try
             {
                 await gate.WaitAsync(ct);
+                acquired = true;
             }
             finally
             {
-                tracker.EndWait(UploadWait.Slot);
+                // EndWait 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
+                // 而且这条路上的异常是**故意**往外传的（见 StageProgress）。抛出的那一刻额度已经
+                // 到手了，就这么让它走，那一份额度再也回不来——泄漏的形状见下面 Release 处的说明。
+                try
+                {
+                    tracker.EndWait(UploadWait.Slot);
+                }
+                catch
+                {
+                    if (acquired)
+                        gate.Release();
+                    throw;
+                }
             }
         }
-        tracker.BeginItem(blobName, label, volumeBytes);
         try
         {
+            tracker.BeginItem(blobName, label, volumeBytes);
             // 每卷各要一个 ItemProgress：DeltaProgress 的基线是 per-call 的，多卷并行共用一个实例，
             // 彼此的累计值会被当成对方的回退。带上 key，这一笔字节才落得到对应那条流的账上。
             await upload(tracker.ItemProgress(blobName));
         }
         finally
         {
-            // 字节在传输过程中已逐笔计过，这里再加一次总量就是双计。
-            tracker.EndItem(blobName, 0);
-            gate.Release();
+            // Release 必须自己有一层 finally，不能跟 EndItem 排在同一句之后：EndItem 同样会调
+            // publish，它一抛就把后面那句整个跳过去。而这种泄漏还不响——异常往上撞到「文件读不开」
+            // 那条兜底就被吞了（MarkPostDiffUnreadableAsync 收 IOException），备份照跑，只是少一条流；
+            // 攒够设定的并发数，全部上传就永远停在闸门上，界面上是「什么都没在传、暂存池却压着一堆」，
+            // 而且不会自愈。BeginItem 一并挪进 try：它抛出时 EndItem 找不到这条流会直接短路，无害。
+            try
+            {
+                // 字节在传输过程中已逐笔计过，这里再加一次总量就是双计。
+                tracker.EndItem(blobName, 0);
+            }
+            finally
+            {
+                gate.Release();
+            }
         }
     }
 }

@@ -395,9 +395,21 @@ public sealed class BackupChecker(
             // 进下载 try 之前抛异常的边界情况。EndItem 本身不是幂等的（_bytes += bytes 与
             // PublishIfDue 都在 TryRemove 之外无条件跑），这句在正常路径下不会把「解压+算 hash」
             // 的字节再补一次进测速窗口，纯粹是因为它传的字节数是 0，不是因为 EndItem 本身安全重入。
-            tracker?.EndItem(blobName, 0);
-            gate.Release();
-            try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+            //
+            // 放闸门与删临时目录要各自躲在 EndItem 后面的 finally 里：EndItem 会调到调用方给的
+            // publish（写库、推 SSE 之类的外部代码），它可以抛，而这条路上的异常是**故意**往外传的。
+            // 三句排排站的写法下，第一句一抛就把后两句整个跳过——额度一去不回，下一个组永远等在
+            // 闸门上，整个检查再也回不来，界面上是一个转不完的圈。同一形状见 VolumeUploadScope.RunAsync
+            // 与 RestoreOrchestrator.RestoreGroupAsync。
+            try
+            {
+                tracker?.EndItem(blobName, 0);
+            }
+            finally
+            {
+                gate.Release();
+                try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+            }
         }
         return corrupted;
     }

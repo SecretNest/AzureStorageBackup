@@ -674,6 +674,61 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// 进度回调坏掉时，内容级检查不能就此挂死。
+    /// <para>
+    /// <c>EndItem</c> 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
+    /// 而且这条路上的异常是**故意**往外传的。从前 <c>gate.Release()</c> 跟它排在同一个
+    /// <c>finally</c> 里的后一句，前一句抛出就把它整个跳过去——下载额度一去不回。这里只有
+    /// 一份额度，第一组吞掉它，第二组就永远等在闸门上，整个检查再也回不来（界面上是一个
+    /// 转不完的圈，跟卡死无从分辨）。所以**超时本身就是失败**，抛什么异常出来倒无所谓。
+    /// </para>
+    /// <para>
+    /// 假时钟让每次发布都越过 200ms 的节流窗口：否则第二次 <c>EndItem</c>（finally 里那次兜底）
+    /// 会不会真的发布得看下载耗时的脸色，这条测试就成了看运气。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        long fakeNow = 0;
+        var (backup, checker, factory) = Build(checkerClock: () => Interlocked.Add(ref fakeNow, 1000));
+        var account = AzuriteAccount();
+        var name = RandomName("chksink-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 两个目录各一个文件 → 两个 pack，就是两个校验组。闸门只发一份额度（并发 1），
+            // 它们必须一个接一个地来——第一组把额度吞了，第二组就再也开不了工。
+            Directory.CreateDirectory(Path.Combine(_src, "d1"));
+            Directory.CreateDirectory(Path.Combine(_src, "d2"));
+            await File.WriteAllTextAsync(Path.Combine(_src, "d1", "a.txt"), "alpha");
+            await File.WriteAllTextAsync(Path.Combine(_src, "d2", "b.txt"), "bravo");
+            await backup.RunAsync(Req(account, name));
+
+            var check = checker.CheckAsync(
+                account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src,
+                CancellationToken.None, downloadConcurrency: 1,
+                // 只坏在下载校验这一段。整条 sink 都坏的话，检查在前面的列举/元数据阶段就炸了，
+                // 根本走不到闸门那儿——那测的是别的东西。
+                onProgress: d =>
+                {
+                    if (d.Stage == "Verifying")
+                        throw new IOException("progress sink broke");
+                });
+
+            var ex = await Xunit.Record.ExceptionAsync(() => check.WaitAsync(TimeSpan.FromSeconds(20)));
+
+            Assert.IsNotType<TimeoutException>(ex); // 挂住了＝额度被吞了
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>包一层真压缩器，只在 <c>ExtractToStreamAsync</c> 这一步截住，记下调用那一刻
     /// 最近一次发布的 <see cref="StageProgress.ActiveItems"/>——解压本身仍然照常委托给内层真的
     /// <see cref="SevenZipCompressor"/> 完成，被测的只是"调用顺序"，不是解压结果。检查侧的深度

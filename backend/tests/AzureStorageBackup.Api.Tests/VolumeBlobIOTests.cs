@@ -354,6 +354,63 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(3, gate.CurrentCount);
     }
 
+    /// <summary>
+    /// 进度回调坏掉时，那一份上传额度必须还回闸门。
+    /// <para>
+    /// 进度上报不是旁路——<c>EndItem</c>/<c>EndWait</c> 都会直接调用方给的 publish，而那是外部代码
+    /// （写库、推 SSE），抛异常的概率不为零，<c>StageProgress</c> 也明说非心跳路径故意让它往外传。
+    /// 从前 <c>gate.Release()</c> 跟 <c>EndItem</c> 排在同一个 <c>finally</c> 里的后一句，前一句抛出
+    /// 就把它整个跳过去了：额度一去不回。这种泄漏还不响——异常往上撞到"文件读不开"那条兜底
+    /// （<c>MarkPostDiffUnreadableAsync</c> 收 IOException）就被吞了，备份照跑，只是少一条流。
+    /// 攒够设定的并发数，全部上传就永远停在闸门上：界面上是「什么都没在传，暂存池却压着一堆」，
+    /// 而且不会自愈。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_Broken_Progress_Sink_Does_Not_Swallow_The_Upload_Slot()
+    {
+        using var gate = new SemaphoreSlim(1, 1);
+        var tracker = new StageTracker("Uploading", 0, static _ => throw new IOException("progress sink broke"))
+        {
+            Clock = () => 0,
+        };
+        var scope = new VolumeUploadScope(gate, tracker, 1);
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            scope.RunAsync("data/h.001", _ => Task.CompletedTask, CancellationToken.None));
+
+        Assert.Equal(1, gate.CurrentCount);
+    }
+
+    /// <summary>
+    /// 同上，但坏在**刚排到队**那一下：额度已经到手、<c>EndWait</c> 才抛。
+    /// 这一段在另一个 <c>finally</c> 里，与上面那处是两条独立的路。
+    /// </summary>
+    [Fact]
+    public async Task A_Broken_Progress_Sink_Does_Not_Swallow_The_Slot_It_Just_Waited_For()
+    {
+        using var gate = new SemaphoreSlim(1, 1);
+        var publishes = 0;
+        // 头一次是 BeginWait——那时额度还没到手，抛出去不带走任何东西，放过它。
+        // 第二次是 EndWait，闸门已经放行，那一份额度正攥在手里。
+        var tracker = new StageTracker("Uploading", 0, _ =>
+        {
+            if (Interlocked.Increment(ref publishes) >= 2)
+                throw new IOException("progress sink broke");
+        })
+        {
+            Clock = () => 0,
+        };
+        var scope = new VolumeUploadScope(gate, tracker, 1);
+
+        await gate.WaitAsync();  // 把唯一那份额度占住，逼它去排队
+        var run = scope.RunAsync("data/h.001", _ => Task.CompletedTask, CancellationToken.None);
+        gate.Release();          // 放行：等待者醒来，随即撞上坏掉的 sink
+
+        await Assert.ThrowsAsync<IOException>(() => run);
+        Assert.Equal(1, gate.CurrentCount);
+    }
+
     [Theory]
     // 自身卷：基名、卷后缀（含 >3 位数）
     [InlineData("data/abc", "data/abc", true)]

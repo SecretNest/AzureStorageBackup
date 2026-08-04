@@ -596,6 +596,20 @@ public sealed class BackupOrchestrator(
                         crossPending.Add(file);
                         crossBytes += file.Length;
                         crossPathBytes += GroupingPlanner.EntryArgBytes(file.Path);
+
+                        // 装满即封，不等下一个文件来推。上面那个判断问的是"再收下它会不会越界"，
+                        // 非有下一个文件不可；而成员数与路径字节两条与下一个是谁无关（见
+                        // GroupTakesNoMore），箱子在这一刻就已经定局。等下去的代价按扫描顺序算：
+                        // 后面若长期没有跨目录候选（比如接下来全是走单文件的大文件），这一箱要
+                        // 一路挂到 diff 收尾才被兜底封上，白等整个差分。分箱结果不受影响——
+                        // 这条成立时，下一个文件必然也会让 GroupIsFull 成立。
+                        if (GroupingPlanner.GroupTakesNoMore(crossPending.Count, crossPathBytes, packOptions))
+                        {
+                            Enqueue(new WorkItem(null, crossPending));
+                            crossPending = [];
+                            crossBytes = 0;
+                            crossPathBytes = 0;
+                        }
                     }
                     return;
 

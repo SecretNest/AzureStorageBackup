@@ -1441,4 +1441,55 @@ public sealed class RestoreOrchestratorTests : IDisposable
             return b.Name;
         throw new InvalidOperationException("no data blob was produced by the backup");
     }
+
+    /// <summary>
+    /// 进度回调坏掉时，还原不能就此挂死。检查侧同形状那条是
+    /// <c>BackupCheckerTests.A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check</c>——
+    /// 两处各自独立，谁也不替谁兜底。
+    /// <para>
+    /// <c>EndItem</c> 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
+    /// 而这条路上的异常是**故意**往外传的。从前 <c>gate.Release()</c> 跟它排在同一个 <c>finally</c>
+    /// 里的后一句，前一句抛出就把它整个跳过——下载额度一去不回。这里只有一份额度，第一组吞掉它，
+    /// 第二组就永远等在闸门上。所以**超时本身就是失败**，抛什么异常出来倒无所谓。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Broken_Progress_Sink_Does_Not_Wedge_The_Restore()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        // 假时钟让每次发布都越过 200ms 的节流窗口，否则这条测试成了看下载耗时的运气。
+        long fakeNow = 0;
+        var (backup, restore, _, factory) = Build(restoreClock: () => Interlocked.Add(ref fakeNow, 1000));
+        var account = AzuriteAccount();
+        var name = RandomName("rsink-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 两个目录各一个文件 → 两个 pack，就是两个还原组；闸门只发一份额度。
+            WriteSrc("d1/a.txt", "alpha");
+            WriteSrc("d2/b.txt", "bravo");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var run = restore.RunAsync(
+                new RestoreRequest
+                {
+                    Account = account, Container = name, TargetRoot = _dst, DownloadConcurrency = 1,
+                },
+                // 只坏在下载还原这一段：整条 sink 都坏的话，还原在前面的阶段就炸了，走不到闸门那儿。
+                onProgress: d =>
+                {
+                    if (d.Stage == "Restoring")
+                        throw new IOException("progress sink broke");
+                });
+
+            var ex = await Xunit.Record.ExceptionAsync(() => run.WaitAsync(TimeSpan.FromSeconds(20)));
+
+            Assert.IsNotType<TimeoutException>(ex); // 挂住了＝额度被吞了
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

@@ -138,6 +138,29 @@ public sealed class GroupingPlanner
         || pathBytes + EntryArgBytes(next.Path) > options.MaxPackPathBytes;
 
     /// <summary>
+    /// 这一组**已经**装不下任何后来者了——不必看下一个是谁。
+    /// <para>
+    /// <see cref="GroupIsFull"/> 问的是"再收下这一个会不会越界"，所以它非有下一个文件不可。
+    /// 而三条界里有两条与下一个是谁无关：成员数那条按定义就无关；路径字节那条则因为
+    /// <see cref="EntryArgBytes"/> 恒 ≥ 1（路径非空，还要算结尾那个 NUL），撞上上限之后
+    /// 任何一个后来者都会越界。这两条一旦成立，这一箱在**装满的那一刻**就已经定局。
+    /// </para>
+    /// <para>
+    /// 字节那条界**故意不在这里**：符号链接的长度可以是 0（差分对它不算内容 hash，
+    /// 而 0 字节的普通文件早被挡在装箱之外），<c>bytes + 0 &gt; GroupCapBytes</c> 在
+    /// 恰好装到上限时为假。把它算进来，边 diff 边填那一路就会比规划器那个纯函数早封一箱，
+    /// 「实际产出与规划器一致」当场就破了。宁可让字节这条界照旧等下一个文件。
+    /// </para>
+    /// <para>
+    /// 这个判断只影响**何时**封箱，不影响**怎么**分箱：它成立时下一个文件必然也会让
+    /// <see cref="GroupIsFull"/> 成立，两条路封出来的是同一箱。
+    /// </para>
+    /// </summary>
+    public static bool GroupTakesNoMore(int members, long pathBytes, PlanOptions options) =>
+        members >= options.MaxPackMembers
+        || pathBytes >= options.MaxPackPathBytes;
+
+    /// <summary>
     /// 扫描一结束就能定下的归类。三条判定只看 <c>Path</c> 与 <c>Length</c>——**不需要**任何哈希，
     /// 因此不必等 diff：<see cref="PlannedFile.FullHash"/> 只用来生成 <c>data/{hash}</c> 这个内容地址，
     /// 与"走单文件还是走分组"无关。这正是流水线化的前提。

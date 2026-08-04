@@ -573,6 +573,91 @@ public sealed class PipelinedBackupTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>记下 pack 的上传发生时 diff 还在不在跑。只认 <c>packs/</c> 前缀——
+    /// 这一轮里其余条目全是单文件 blob（<c>data/</c>），认前缀就够把那一箱挑出来。</summary>
+    private sealed class PackUploadWatcher(IBlobUploader inner, Func<bool> diffRunning) : IBlobUploader
+    {
+        private int _whileDiffing;
+        public int PackUploadsWhileDiffing => Volatile.Read(ref _whileDiffing);
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            if (blobName.StartsWith("packs/", StringComparison.Ordinal) && diffRunning())
+                Interlocked.Increment(ref _whileDiffing);
+            return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+    }
+
+    /// <summary>
+    /// 跨目录的一箱装满了就该进队列，不该挂在那儿等**下一个**跨目录文件来把它推出去。
+    /// <para>
+    /// 封箱判据 <see cref="GroupingPlanner.GroupIsFull"/> 问的是"再加这一个会不会超"，所以它要有
+    /// 下一个文件才答得出来。可其中成员数与路径字节两条与下一个文件无关——箱子在装满的那一刻
+    /// 就已经定局。等下去的代价按扫描顺序算：后面若长期没有跨目录候选（这里之后全是走单文件的
+    /// 大文件），这一箱就一路挂到 diff 收尾才被兜底封上，白等整个差分。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Full_Cross_Directory_Pack_Goes_Out_Without_Waiting_For_The_Next_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("pipexd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 跨目录的三个小文件正好把一箱装满（MaxPackMembers = 3），此后再没有第四个跨目录候选。
+            for (var i = 0; i < 3; i++)
+                WriteFile($"a-shard/{i:D2}/blob.dat", 2_500);
+            // 之后这一批全是超阈值的单文件，只用来把 diff 拖住：它们一个都进不了那口箱子。
+            // 名字排在后面（ordinal 序），扫描顺序保证三个 shard 先判完。
+            for (var i = 0; i < 8; i++)
+                WriteFile($"z-big/f{i:D2}.bin", 20_000);
+
+            const int files = 11;
+            var hasher = new SlowHasher(new FileHasher(), delayMs: 120);
+            var uploader = new PackUploadWatcher(new BlobUploader(factory), () => hasher.Hashed < files);
+
+            var options = new BackupEngineOptions
+            {
+                CrossDirGroup = new IgnoreRuleSet(["a-shard/"]),
+                Plan = new PlanOptions
+                {
+                    SingleFileThresholdBytes = 10_000,
+                    GroupCapBytes = 100 * 1024 * 1024, // 字节那条界够不着
+                    MaxPackMembers = 3,                // 只有成员数这条能封箱
+                },
+            };
+            await Build(factory, store, hasher, uploader).RunAsync(Request(account, name, options));
+
+            Assert.True(uploader.PackUploadsWhileDiffing > 0,
+                "装满的那一箱一直挂到 diff 收尾才封 —— 它在等下一个跨目录文件");
+
+            // 提前封箱**不改变装箱结果**：三个成员仍旧同在一箱里。
+            var idx = await ReadOnlyIndexAsync(store, account, name);
+            var packed = idx.Entries.Where(e => e.Storage!.Kind == "pack").ToList();
+            Assert.Equal(3, packed.Count);
+            Assert.Single(packed.Select(e => e.Storage!.Ref).Distinct(StringComparer.Ordinal));
+            Assert.Equal(8, idx.Entries.Count(e => e.Storage!.Kind == "blob"));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     private static async Task<VersionIndex> ReadOnlyIndexAsync(
         IBackupInfoStore store, Account account, string container)
     {

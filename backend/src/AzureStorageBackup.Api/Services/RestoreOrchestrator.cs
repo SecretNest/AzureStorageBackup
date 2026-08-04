@@ -501,9 +501,21 @@ public sealed class RestoreOrchestrator(
             // 边传边计完）。这里传 0 字节纯粹是防御——万一 BeginItem 之后、进下载 try 之前
             // 抛出异常，在途集合不能漏摘。EndItem 本身不是幂等的（见上面那处同样的说明），
             // 这句在正常路径下之所以不会二次生效、不会重复计数，纯粹是因为它传的字节数是 0。
-            tracker?.EndItem(blobName, 0);
-            gate.Release();
-            try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+            //
+            // 放闸门与删临时目录要各自躲在 EndItem 后面的 finally 里：EndItem 会调到调用方给的
+            // publish（写库、推 SSE 之类的外部代码），它可以抛，而这条路上的异常是**故意**往外传的。
+            // 三句排排站的写法下，第一句一抛就把后两句整个跳过——额度一去不回，下一个组永远等在
+            // 闸门上，整个还原再也回不来。同一形状见 VolumeUploadScope.RunAsync 与
+            // BackupChecker.VerifyGroupAsync（那一处由 A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check 钉住）。
+            try
+            {
+                tracker?.EndItem(blobName, 0);
+            }
+            finally
+            {
+                gate.Release();
+                try { Directory.Delete(groupDir, recursive: true); } catch { /* best effort */ }
+            }
         }
         return (restored, skipped, failedEntries);
     }
