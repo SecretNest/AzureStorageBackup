@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Text.Json;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
@@ -39,6 +40,14 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
     private const string AzuriteEndpoint = "http://127.0.0.1:10000/devstoreaccount1";
+
+    // 与全仓其余 Azurite 测试一致：起不来就跳过，而不是把整个套件染红（CI 里 Azurite 是
+    // 起着的，见 .github/workflows/ci.yml，所以跳过只发生在本地）。
+    private static bool AzuriteReachable()
+    {
+        try { using var c = new TcpClient(); c.Connect("127.0.0.1", 10000); return true; }
+        catch { return false; }
+    }
 
     /// <summary>凡是会真正走到 LoadBaselineAsync 的「确实没有基线」测试，都必须用这个而不是
     /// CreateAccountAsync：那个用的是个解析不到的假域名，TrackedInfoStore.LoadAsync 在没有本地状态时
@@ -257,9 +266,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Preview_Reports_NoBaseline_When_The_Backup_Has_No_Versions()
     {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
@@ -291,9 +302,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Equal(_dir, config!.LocalRoot);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Apply_Moves_The_Root_When_There_Is_No_Baseline()
     {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
@@ -307,10 +320,15 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Equal(target, body!.LocalRoot);
     }
 
-    /// <summary>导入时没拿到 SourceRootHint 的配置，根是空串——它必须能被补上。</summary>
-    [Fact]
+    /// <summary>导入时没拿到 SourceRootHint 的配置，根是空串——它必须能被补上。
+    /// 这条走的是「云端还没有任何版本」那条路（`NoBaseline`），因此它真正守住的是
+    /// <c>oldRoot == ""</c> 时写审计行不会炸（渲染成 <c>(none)</c>）；空根**有**基线可比的
+    /// 那条路由 <c>An_Imported_Backup_With_No_Root_Is_Still_Checked_Against_Its_Index</c> 覆盖。</summary>
+    [SkippableFact]
     public async Task Apply_Fills_In_An_Empty_Root_Left_Behind_By_Import()
     {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
         Directory.CreateDirectory(_dir);
         var id = await CreateConfigAsync(await CreateAzuriteAccountAsync(), localRoot: "");
 
@@ -476,9 +494,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     /// 顺带钉住无基线时的措辞：一条都没抽样，就不能渲染成 "0/0 sampled entries matched"
     /// ——那读起来像"全都对不上"，恰恰是相反的意思。
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task Apply_Logs_An_Audit_Entry_Under_This_Backups_Source_Key()
     {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
@@ -495,6 +515,9 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Contains(target, entry.Message);
         Assert.Contains(nameof(LocalRootVerdict.NoBaseline), entry.Message);
         Assert.DoesNotContain("sampled", entry.Message);
+        // 没抽样时，位置让给 reason —— BaselineUnreadable 那档的 reason 是底层异常原文，
+        // 也是 NAS 上那位用户唯一的诊断，不能只活在他随手关掉的那个响应里。
+        Assert.Contains("no version index", entry.Message);
     }
 
     /// <summary>真抽过样的那条路径，样本计数照旧要写进日志；强制过的也要留痕。</summary>
