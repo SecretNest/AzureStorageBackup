@@ -231,4 +231,56 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Null(await _sut.GetAsync(created.Id));
         Assert.False(await _sut.DeleteAsync(created.Id));
     }
+
+    [Fact]
+    public async Task ChangeLocalRoot_Moves_The_Root_And_Leaves_Everything_Else_Alone()
+    {
+        var created = await _sut.CreateAsync(Sample());
+        // 范围规则是相对根的坐标，换根后必须原文保留、一字不改。
+        created.ScopeRules = "+ albums\n- albums/tmp";
+        created.PasswordProtected = null; // 更新请求不带密码（创建后不可更改，见决策 8）
+        await _sut.UpdateAsync(created.Id, created);
+        var before = await _sut.GetAsync(created.Id);
+
+        var moved = await _sut.ChangeLocalRootAsync(created.Id, "/mnt/photos");
+
+        Assert.NotNull(moved);
+        Assert.Equal("/mnt/photos", moved!.LocalRoot);
+
+        var after = await _sut.GetAsync(created.Id);
+        Assert.Equal("/mnt/photos", after!.LocalRoot);
+        Assert.Equal(before!.ScopeRules, after.ScopeRules);
+        Assert.Equal(before.AccountId, after.AccountId);
+        Assert.Equal(before.ContainerName, after.ContainerName);
+        Assert.Equal(before.Name, after.Name);
+        Assert.Equal(before.Description, after.Description);
+        Assert.Equal(before.PasswordProtected, after.PasswordProtected);
+        Assert.Equal(before.IndexTier, after.IndexTier);
+        Assert.Equal(before.DataTier, after.DataTier);
+        Assert.Equal(before.IgnoreRules, after.IgnoreRules);
+        Assert.Equal(before.MaxVersions, after.MaxVersions);
+        Assert.Equal(before.RetentionMode, after.RetentionMode);
+        Assert.Equal(before.CreatedAt, after.CreatedAt);
+    }
+
+    [Fact]
+    public async Task ChangeLocalRoot_Returns_Null_For_An_Unknown_Config()
+    {
+        Assert.Null(await _sut.ChangeLocalRootAsync(999999, "/mnt/photos"));
+    }
+
+    /// <summary>
+    /// 新通道是另开的一道门，不是把旧锁撬开：常规更新路径必须**依然**拒绝改根，
+    /// 否则日后一次顺手的编辑就能悄悄换掉根路径。
+    /// </summary>
+    [Fact]
+    public async Task Update_Still_Refuses_To_Change_The_Local_Root()
+    {
+        var created = await _sut.CreateAsync(Sample());
+        var update = await _sut.GetAsync(created.Id);
+        update!.LocalRoot = "/mnt/photos";
+        update.PasswordProtected = null;   // 空 = 保留原值，避免撞上密码那条拒绝
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, update));
+    }
 }

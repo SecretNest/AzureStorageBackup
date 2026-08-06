@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { LocalRootPreview } from '../lib/localRootVerdict'
 
 // 与后端 enum 对应（System.Text.Json 默认序列化为数字）
 export const StorageTier = { Hot: 0, Cool: 1, Cold: 2, Archive: 3 } as const
@@ -159,6 +160,10 @@ export interface BackupConfigInput {
   volumeBytes: number | null
   verboseLogging: boolean | null
 }
+
+// 迁移本地根路径的校验报告（后端 LocalRootPreviewResponse）。
+// 形状定义在 lib/localRootVerdict.ts，与判定逻辑放一起，这里只做转出。
+export type { LocalRootPreview } from '../lib/localRootVerdict'
 
 // 某个阶段正在做什么。上传之外的阶段此前完全没有进度——扫描和 diff 各自只在进入时报一次，
 // 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。
@@ -382,6 +387,11 @@ export const backupConfigsApi = {
   remove: (id: number, deleteContainer = false) =>
     api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`),
   resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
+  // 迁移本地根路径。preview 是纯查询，可反复试；changeLocalRoot 才真的改。
+  previewLocalRoot: (id: number, newRoot: string) =>
+    api.post<LocalRootPreview>(`/backup-configs/${id}/local-root/preview`, { newRoot }),
+  changeLocalRoot: (id: number, newRoot: string, force: boolean) =>
+    api.post<BackupConfig>(`/backup-configs/${id}/local-root`, { newRoot, force }),
   run: (id: number) => api.post<BackupRun>(`/backup-configs/${id}/run`, {}),
   runStatus: (id: number) => api.get<BackupRun>(`/backup-configs/${id}/run`),
   versions: (id: number) => api.get<BackupVersionInfo[]>(`/backup-configs/${id}/versions`),

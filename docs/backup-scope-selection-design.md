@@ -27,8 +27,11 @@
   （`LocalFileScanner.cs:133`）。目录命中忽略时直接 `continue`，**不再下降**。
 - `/api/system/browse` 是现成的本地目录懒加载列举，隐藏文件本来就一并返回，
   受 `PathBoundary` 约束，指向根外的软链标 `OutsideRoot`。每目录硬上限 2000 项后截断。
-- `BackupConfig.LocalRoot` 创建后锁定（`BackupConfigService.cs:46`），因此范围规则的
-  相对路径基准永远稳定，不需要额外防护。
+- `BackupConfig.LocalRoot` 在常规编辑路径上仍然锁定（`BackupConfigService.cs:46`），但另有一条
+  带校验的专用迁移通道（`docs/change-local-root-design.md`，挂载点搬家用）。范围规则的相对
+  基准因此**不是绝对稳定**的：换根后规则原文保留、不做改写，新根下是同一份数据时继续正确；
+  用户强行迁到结构不同的目录树时，规则可能命中变空或部分失效，后果与手工改窄范围一致
+  （见本文语义 4），不损坏数据。
 - `RestoreDialog.tsx` 已有一棵懒加载树 + 三态勾选，但数据源是**云端版本索引**
   （有限已知全集，三态靠数已加载的后代文件算）。
 

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
+import { ChangeLocalRootDialog } from '../components/ChangeLocalRootDialog'
 import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
@@ -108,6 +109,7 @@ export function BackupConfigsPage() {
   const [errorModal, setErrorModal] = useState<BackupConfig | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [browsing, setBrowsing] = useState(false)
+  const [changingRoot, setChangingRoot] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
@@ -863,9 +865,16 @@ export function BackupConfigsPage() {
                   disabled={!!editing}
                   onChange={(e) => set('localRoot', e.target.value)}
                 />
-                <button type="button" onClick={() => setBrowsing(true)} disabled={!!editing}>
-                  Browse
-                </button>
+                {editing ? (
+                  // 常规编辑里根仍然锁着；换根走带校验的专用通道（挂载点搬家用）。
+                  <button type="button" onClick={() => setChangingRoot(true)}>
+                    Change…
+                  </button>
+                ) : (
+                  <button type="button" onClick={() => setBrowsing(true)}>
+                    Browse
+                  </button>
+                )}
               </Field>
               <Field label="Scope">
                 <label className="row" style={{ gap: 'var(--sp-1)' }}>
@@ -1228,6 +1237,21 @@ export function BackupConfigsPage() {
             setBrowsing(false)
           }}
           onClose={() => setBrowsing(false)}
+        />
+      )}
+      {changingRoot && editing && (
+        <ChangeLocalRootDialog
+          configId={editing.id}
+          currentRoot={form.localRoot}
+          onClose={() => setChangingRoot(false)}
+          onDone={(newRoot) => {
+            setChangingRoot(false)
+            // load() 只刷新列表，不会碰这个正开着的编辑表单——不补上这两行，
+            // "Local Root (locked)" 会一直显示旧路径，直到用户关掉表单重开。
+            setEditing((e) => (e ? { ...e, localRoot: newRoot } : e))
+            set('localRoot', newRoot)
+            load()
+          }}
         />
       )}
       {checkModal && (
