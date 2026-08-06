@@ -263,8 +263,13 @@ public static class BackupConfigEndpoints
                 // 审计行写在清理**之后**：DeleteForContainerAsync 会把该 (account, container) 的日志
                 // 全部删掉，写在前面等于自己把自己删了。删除是这里唯一会抹掉历史的操作，
                 // 它本身却不留痕，日志页就会莫名其妙地整个变空——用户报过这个现象。
+                //
+                // 来源键带 accountId：这条曾是改版前的旧格式 "backup:{container}"，漏改了。少了
+                // account 维度，两个账户下的同名 container 写出的是一模一样的行，谁也说不清是哪个；
+                // 日志页按来源精确相等过滤，于是它哪个备份的视图里都不出现。写在清理之后这一点
+                // 不受影响——那次清理早已跑完，它删不到自己。
                 await BestEffort(logger, "record deletion", () => log.AppendAsync(
-                    OperationLogLevel.Warning, $"backup:{container}",
+                    OperationLogLevel.Warning, $"backup:{accountId}/{container}",
                     (deleteContainer ?? false)
                         ? $"Backup config '{config.Name}' deleted, along with its cloud container."
                         : $"Backup config '{config.Name}' deleted; the cloud container was kept.",

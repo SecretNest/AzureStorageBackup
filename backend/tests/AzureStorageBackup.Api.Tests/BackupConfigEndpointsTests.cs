@@ -144,6 +144,30 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
     }
 
+    /// <summary>删除留下的那条审计行，来源键必须带 accountId。它一度是改版前的旧格式
+    /// "backup:{container}"：少了 account 维度，两个账户下的同名 container 写出的行完全一样，
+    /// 而日志页按来源精确相等过滤，于是这条最该留痕的记录哪个备份的视图里都翻不到。
+    /// 顺带钉住它写在清理**之后**——写在前面会被 DeleteForContainerAsync 连自己一起删掉。</summary>
+    [Fact]
+    public async Task Delete_Records_The_Audit_Line_Under_The_Backups_Own_Source_Key()
+    {
+        var accountId = await CreateAccountAsync("del-audit");
+        var container = "delaudit" + Guid.NewGuid().ToString("N")[..8];
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("del-audit", accountId) with { ContainerName = container }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created!.Id}")).StatusCode);
+
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var entry = Assert.Single(db.LogEntries.Where(e => e.Source == $"backup:{accountId}/{container}"));
+        Assert.Equal(OperationLogLevel.Warning, entry.Level);
+        Assert.False(entry.Ephemeral);          // 审计：长存
+        Assert.Contains("deleted", entry.Message);
+    }
+
     /// <summary>删配置不会停掉后台那次运行。放行的话，它会继续跑、继续占着
     /// (account, container) 的忙碌锁，而进度状态是按 config id 存的——配置一删就再也查不到，
     /// 于是同一 container 上新建的备份被"busy"拒掉，状态却显示 BackingUp 且没有任何细节。
@@ -508,7 +532,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var rows = await _client.GetFromJsonAsync<List<VersionSpanRow>>(
             $"/api/backup-configs/{created.Id}/versions");
 
-        Assert.Null(rows!.Single(r => r.version == 1).startedAt);
+        Assert.NotNull(rows);
+        Assert.Null(rows.Single(r => r.version == 1).startedAt);
         Assert.Equal(started, rows.Single(r => r.version == 2).startedAt);
         Assert.Equal(finished, rows.Single(r => r.version == 2).createdAt);
     }
