@@ -382,7 +382,14 @@ public sealed class BackupOrchestrator(
         // 从前这三段严格串行：Diffing 全部跑完 → Plan → Uploading。首次备份的 diff 要把每个文件
         // 完整读一遍算 hash，那几小时里网络一个字节都没在传。而 Plan 其实不必当这道全局屏障——
         // 归类只看路径与长度（见 GroupingPlanner.Classify），扫描一结束就已经定局。
-        var packOptions = opts.Plan with { DontGroup = opts.DontGroup, CrossDirGroup = opts.CrossDirGroup };
+        var packOptions = opts.Plan with
+        {
+            DontGroup = opts.DontGroup,
+            CrossDirGroup = opts.CrossDirGroup,
+            // 装箱要用它把每个目录切成压缩箱/不压箱两组——不接这一句，规则就只对单文件 blob 生效，
+            // 被打包的小文件照旧整箱压（这正是本功能之前的缺陷）。
+            DontCompress = opts.DontCompress,
+        };
         var classification = planner.Classify(scan.Entries, packOptions);
 
         var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
@@ -467,8 +474,8 @@ public sealed class BackupOrchestrator(
                             await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
                                 overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, ct);
                         else
-                            await ProcessPackAsync(request, item.Pack!, addressing, localResolver, info, storageByPath,
-                                tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
+                            await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
+                                info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
                                 uploadTracker, state, ct);
                     }
                     finally
@@ -494,9 +501,11 @@ public sealed class BackupOrchestrator(
         // 装箱的在途状态。diff 单线程按扫描顺序推进，所以这些都不需要加锁。
         var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
         var dirRemaining = new Dictionary<string, int>(classification.DirectoryCandidates, StringComparer.Ordinal);
-        var crossPending = new List<PlannedFile>();
-        long crossBytes = 0;
-        long crossPathBytes = 0;
+        // 跨目录那一路按可压缩性拆成两条独立的流水线（下标 0＝压缩箱，1＝不压箱）：一箱只能有
+        // 一种压法，所以这一刀必须在装箱之前落。两条各自计数、各自封箱，互不影响对方的三条界。
+        var crossPending = new List<PlannedFile>[] { [], [] };
+        var crossBytes = new long[2];
+        var crossPathBytes = new long[2];
         var changedFiles = 0;
         long changedBytes = 0;
 
@@ -582,20 +591,27 @@ public sealed class BackupOrchestrator(
                     // 填满即封"得到的包，与"等全部 diff 完再一次装箱"逐字节相同。
                     if (file is not null)
                     {
+                        // 先分流再装箱。分流之后每一条内部**仍是 ordinal 路径序**（扫描序过滤不改相对
+                        // 顺序），恰好等于规划器 SplitByCompressibility「先分两组、组内按路径排序」的
+                        // 结果——这正是两边能对上的理由，动其中任何一侧的排序都会破掉它。
+                        var storeOnly = packOptions.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
+                        var side = storeOnly ? 1 : 0;
+
                         // 三条界共用 GroupingPlanner.GroupIsFull：这一处与规划器那个纯函数、
                         // 以及压缩前的重新切分必须口径完全一致，否则"实际产出与规划器一致"那条
                         // 不变量就破了（PipelinedBackupTests 正是拿纯函数当基准在守它）。
-                        if (crossPending.Count > 0
-                            && GroupingPlanner.GroupIsFull(crossPending.Count, crossBytes, crossPathBytes, file, packOptions))
+                        if (crossPending[side].Count > 0
+                            && GroupingPlanner.GroupIsFull(
+                                crossPending[side].Count, crossBytes[side], crossPathBytes[side], file, packOptions))
                         {
-                            Enqueue(new WorkItem(null, crossPending));
-                            crossPending = [];
-                            crossBytes = 0;
-                            crossPathBytes = 0;
+                            Enqueue(new WorkItem(null, crossPending[side], storeOnly));
+                            crossPending[side] = [];
+                            crossBytes[side] = 0;
+                            crossPathBytes[side] = 0;
                         }
-                        crossPending.Add(file);
-                        crossBytes += file.Length;
-                        crossPathBytes += GroupingPlanner.EntryArgBytes(file.Path);
+                        crossPending[side].Add(file);
+                        crossBytes[side] += file.Length;
+                        crossPathBytes[side] += GroupingPlanner.EntryArgBytes(file.Path);
 
                         // 装满即封，不等下一个文件来推。上面那个判断问的是"再收下它会不会越界"，
                         // 非有下一个文件不可；而成员数与路径字节两条与下一个是谁无关（见
@@ -603,12 +619,12 @@ public sealed class BackupOrchestrator(
                         // 后面若长期没有跨目录候选（比如接下来全是走单文件的大文件），这一箱要
                         // 一路挂到 diff 收尾才被兜底封上，白等整个差分。分箱结果不受影响——
                         // 这条成立时，下一个文件必然也会让 GroupIsFull 成立。
-                        if (GroupingPlanner.GroupTakesNoMore(crossPending.Count, crossPathBytes, packOptions))
+                        if (GroupingPlanner.GroupTakesNoMore(crossPending[side].Count, crossPathBytes[side], packOptions))
                         {
-                            Enqueue(new WorkItem(null, crossPending));
-                            crossPending = [];
-                            crossBytes = 0;
-                            crossPathBytes = 0;
+                            Enqueue(new WorkItem(null, crossPending[side], storeOnly));
+                            crossPending[side] = [];
+                            crossBytes[side] = 0;
+                            crossPathBytes[side] = 0;
                         }
                     }
                     return;
@@ -626,8 +642,9 @@ public sealed class BackupOrchestrator(
                     if (--dirRemaining[dir] == 0 && dirPending.Remove(dir, out var members))
                     {
                         // 装箱仍由规划器那个纯函数负责，输入换成"这一组里确实变更的文件"。
+                        // 按可压缩性分箱也在它里面完成，所以这个目录可能一次封出两箱（各一种压法）。
                         foreach (var pack in planner.Plan(members, packOptions).Packs)
-                            Enqueue(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)]));
+                            Enqueue(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)], pack.StoreOnly));
                     }
                     return;
             }
@@ -648,12 +665,17 @@ public sealed class BackupOrchestrator(
                     request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync,
                     DeferFullHash);
 
-                // 收尾：把还没填满的箱子封掉。跨目录的那一箱肯定有剩；按目录的理论上都已在
+                // 收尾：把还没填满的箱子封掉。跨目录那两条各自可能有剩；按目录的理论上都已在
                 // 计数归零时封过，这里只是不留活口。
-                if (crossPending.Count > 0)
-                    Enqueue(new WorkItem(null, crossPending));
+                for (var side = 0; side < crossPending.Length; side++)
+                    if (crossPending[side].Count > 0)
+                        Enqueue(new WorkItem(null, crossPending[side], StoreOnly: side == 1));
+                // 兜底这一支也过规划器：它攒的是**未经装箱**的原始列表，直接封成一箱既会混进两种
+                // 压法，也不受三条界约束（成员数/路径字节撑爆 argv 就是 E2BIG）。走 Plan 才与
+                // 正常路径同一个口径。
                 foreach (var leftover in dirPending.Values.Where(m => m.Count > 0))
-                    Enqueue(new WorkItem(null, leftover));
+                    foreach (var pack in planner.Plan(leftover, packOptions).Packs)
+                        Enqueue(new WorkItem(null, [.. pack.Members.Select(ToPlannedFile)], pack.StoreOnly));
             }
             finally
             {
@@ -1165,8 +1187,12 @@ public sealed class BackupOrchestrator(
     /// 因此箱与箱之间可以并发，而不必等同目录的上一箱传完。
     /// </para>
     /// </summary>
+    /// <param name="storeOnly">这一箱的压法，装箱时按可压缩性定死并随箱传到这里（见 <see cref="WorkItem"/>）。
+    /// 这里**不重新推导**：规则按路径匹配，而进来的一箱按定义已经是同质的，重推一遍只会多一处
+    /// 可能与规划器走岔的判断。切分产生的每一小组、以及成员变化后重压的那一组，都沿用同一个值。</param>
     private async Task ProcessPackAsync(
-        BackupRequest request, IReadOnlyList<PlannedFile> pool, BlobAddressScheme addressing, LocalDedupResolver localResolver,
+        BackupRequest request, IReadOnlyList<PlannedFile> pool, bool storeOnly,
+        BlobAddressScheme addressing, LocalDedupResolver localResolver,
         BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
@@ -1207,7 +1233,8 @@ public sealed class BackupOrchestrator(
             // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
             // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
             var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-            var (staged, missing) = await CompressPackTolerantAsync(request, packId, members, uploadTracker, state, ct);
+            var (staged, missing) = await CompressPackTolerantAsync(
+                request, packId, members, storeOnly, uploadTracker, state, ct);
 
             // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
             // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
@@ -1241,7 +1268,7 @@ public sealed class BackupOrchestrator(
             {
                 var vols = await UploadStagedPackAsync(
                     request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
-                RecordPack(request, packId, members, vols, info, storageByPath);
+                RecordPack(request, packId, members, vols, storeOnly, info, storageByPath);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
                 continue;
@@ -1254,10 +1281,10 @@ public sealed class BackupOrchestrator(
             var stable = members.Where(m => !changed.Contains(m)).ToList();
             if (stable.Count > 0)
             {
-                var staged2 = await CompressPackAsync(request, packId, stable, uploadTracker, state, ct);
+                var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
                 var vols2 = await UploadStagedPackAsync(
                     request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
-                RecordPack(request, packId, stable, vols2, info, storageByPath);
+                RecordPack(request, packId, stable, vols2, storeOnly, info, storageByPath);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
             // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
@@ -1322,7 +1349,7 @@ public sealed class BackupOrchestrator(
     /// 一个读不了的成员是"排除该成员"，不是"整轮备份失败"。
     /// </summary>
     private async Task<(StagedItem? Staged, IReadOnlySet<string> Missing)> CompressPackTolerantAsync(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var remaining = members.ToList();
@@ -1332,7 +1359,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                return (await CompressPackAsync(request, packId, remaining, uploadTracker, state, ct), missing);
+                return (await CompressPackAsync(request, packId, remaining, storeOnly, uploadTracker, state, ct), missing);
             }
             catch (ArchiveMembersMissingException ex)
             {
@@ -1357,12 +1384,12 @@ public sealed class BackupOrchestrator(
     }
 
     private Task<StagedItem> CompressPackAsync(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var entries = members.Select(m => m.EntryName).ToList();
         return staging.StageAsync((compressTemp, token) => CompressAsync(
-            request, compressTemp, packId, entries, storeOnly: false, token),
+            request, compressTemp, packId, entries, storeOnly, token),
             state.Staging, ct, uploadTracker);
     }
 
@@ -1392,9 +1419,12 @@ public sealed class BackupOrchestrator(
         return sizes;
     }
 
+    /// <param name="storeOnly">这一箱的压法，记进 <see cref="PackInfo.StoreOnly"/>。死重压实与修复重压会
+    /// 重写同一个 packId 的归档，那时手上只有存活成员和一个包号、没有当初那份规则——不记在包上，
+    /// 一个 store-only 包挨过一次版本退役就被重压成默认压法了，而且没有任何征兆。</param>
     private static void RecordPack(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members, IReadOnlyList<long> volumeSizes,
-        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
+        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
     {
         foreach (var m in members)
             storageByPath[m.Path] = new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName };
@@ -1407,6 +1437,7 @@ public sealed class BackupOrchestrator(
             DeadBytes = 0,
             Volumes = Math.Max(1, volumeSizes.Count),
             VolumeSizes = [.. volumeSizes],
+            StoreOnly = storeOnly,
         };
         lock (info.Packs)
             info.Packs[packId] = packInfo;

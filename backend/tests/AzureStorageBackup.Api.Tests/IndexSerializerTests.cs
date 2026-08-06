@@ -305,4 +305,89 @@ public sealed class IndexSerializerTests
         w.Write(value.UtcTicks);
         w.Write((short)value.Offset.TotalMinutes);
     }
+
+    [Fact]
+    public void Pack_StoreOnly_RoundTrips()
+    {
+        var info = SampleInfo();
+        info.Packs["p0002"] = info.Packs["p0001"] with { Blob = "packs/p0002.7z", StoreOnly = true };
+
+        var back = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
+
+        Assert.False(back.Packs["p0001"].StoreOnly);
+        Assert.True(back.Packs["p0002"].StoreOnly);
+        // 紧跟其后的还有一个 pack 条目——错位的话它就读不出来了。
+        Assert.Equal("packs/p0002.7z", back.Packs["p0002"].Blob);
+        Assert.Equal(900_000, back.Packs["p0002"].OriginalBytes);
+    }
+
+    /// <summary>
+    /// 升级前写下的信息文件（format 3）里，pack 条目止于 VolumeSizes，没有压法。读出来必须是
+    /// false——那恰好等于历史行为（那时候所有包都是压过的）。format 3 是**上一个生产格式**，
+    /// 用户手上的备份就是它，所以这一条比 format 2 那条更要紧。
+    /// </summary>
+    [Fact]
+    public void Legacy_Format3_Info_Reads_Pack_StoreOnly_As_False()
+    {
+        var back = IndexSerializer.DeserializeInfoFile(LegacyFormat3Info());
+
+        var v = Assert.Single(back.Versions);
+        Assert.Equal(new DateTimeOffset(2026, 7, 16, 12, 30, 0, TimeSpan.Zero), v.StartedAt);
+
+        // 两个 pack：第一个读完不错位，第二个才读得出来。
+        Assert.False(back.Packs["p0001"].StoreOnly);
+        Assert.False(back.Packs["p0002"].StoreOnly);
+        Assert.Equal("packs/p0002.7z", back.Packs["p0002"].Blob);
+        Assert.Equal([1_000L, 2_000L], back.Packs["p0001"].VolumeSizes);
+        Assert.Equal(900_000, back.Packs["p0002"].OriginalBytes);
+    }
+
+    // InfoFormat 3 的字节布局（pack 条目止于 VolumeSizes，没有 StoreOnly）。手写而非调用序列化器：
+    // 序列化器只会写当前格式，验不了向后兼容。
+    private static byte[] LegacyFormat3Info()
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+
+        w.Write((byte)3);               // InfoFormat
+        w.Write(1);                     // SchemaVersion
+        w.Write("photos");
+        WriteLegacyNullableString(w, "family photos");
+        WriteLegacyNullableString(w, "/data/photos");
+        w.Write(true);                  // Encrypted
+        WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 0, 0, TimeSpan.Zero));
+        WriteLegacyNullableString(w, null);  // Settings
+        w.Write(false);                 // KdfSalt = null
+
+        w.Write(1);                     // 版本数
+        w.Write(1);                     // Version
+        WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero));   // CreatedAt
+        w.Write(true);                                                                 // StartedAt 非空（format 3）
+        WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 30, 0, TimeSpan.Zero));  // StartedAt
+        w.Write("indexes/v1.bin.enc");
+        w.Write(1200L);                 // Stats.Files
+        w.Write(3_400_000_000L);        // Stats.Bytes
+        w.Write(12L);                   // Stats.ChangedFiles
+        w.Write(50_000_000L);           // Stats.ChangedBytes
+
+        w.Write(2);                     // pack 数
+        WriteLegacyFormat3Pack(w, "p0001", volumeSizes: [1_000L, 2_000L]);
+        WriteLegacyFormat3Pack(w, "p0002", volumeSizes: []);
+
+        w.Flush();
+        return ms.ToArray();
+    }
+
+    private static void WriteLegacyFormat3Pack(BinaryWriter w, string id, long[] volumeSizes)
+    {
+        w.Write(id);
+        w.Write($"packs/{id}.7z");
+        w.Write(0);                     // 成员数
+        w.Write(900_000L);              // OriginalBytes
+        w.Write(0L);                    // DeadBytes
+        w.Write(Math.Max(1, volumeSizes.Length));  // Volumes
+        w.Write(volumeSizes.Length);    // VolumeSizes 数（info format 2+）
+        foreach (var size in volumeSizes)
+            w.Write(size);
+    }
 }

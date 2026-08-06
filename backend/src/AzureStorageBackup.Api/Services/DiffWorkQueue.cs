@@ -4,7 +4,11 @@ using System.Threading.Channels;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>流水线上的一件活：一个单文件 blob，或一箱已封好的 pack 成员。</summary>
-internal readonly record struct WorkItem(PlannedFile? Single, IReadOnlyList<PlannedFile>? Pack)
+/// <param name="StoreOnly">这一箱只存不压（<c>-mx0</c>）。装箱时就已按可压缩性切开，压法随箱走到压缩那一步，
+/// 消费侧不再自己推导——它拿到的是成员表，而规则是按路径匹配的，重推一遍等于把同一个判断写两遍。
+/// 单文件那条路不看这个值：<c>HandleBlobAsync</c> 自己按路径推导（同一套规则、同一个方法）。</param>
+internal readonly record struct WorkItem(
+    PlannedFile? Single, IReadOnlyList<PlannedFile>? Pack, bool StoreOnly = false)
 {
     /// <summary>这件活带着几个 <see cref="PlannedFile"/>。</summary>
     public int Members => Single is not null ? 1 : Pack?.Count ?? 0;
@@ -364,6 +368,7 @@ internal sealed class DiffWorkQueue : IDisposable
         // 每件是一条完整记录，读的时候要么整件出来要么不动，不存在"读了半个 pack"。
         var members = item.AsMembers;
         _writer!.Write(item.Single is not null);
+        _writer.Write(item.StoreOnly);
         _writer.Write(members.Count);
         foreach (var m in members)
         {
@@ -378,6 +383,7 @@ internal sealed class DiffWorkQueue : IDisposable
     private WorkItem ReadSpill()
     {
         var single = _reader!.ReadBoolean();
+        var storeOnly = _reader.ReadBoolean();
         var count = _reader.ReadInt32();
         var members = new List<PlannedFile>(count);
         for (var i = 0; i < count; i++)
@@ -387,7 +393,7 @@ internal sealed class DiffWorkQueue : IDisposable
             var hash = _reader.ReadBoolean() ? _reader.ReadString() : null;
             members.Add(new PlannedFile(path, length, hash));
         }
-        return single ? new WorkItem(members[0], null) : new WorkItem(null, members);
+        return single ? new WorkItem(members[0], null, storeOnly) : new WorkItem(null, members, storeOnly);
     }
 
     public void Dispose()
