@@ -322,6 +322,68 @@ public class PathBoundaryEnforcementTests
         Assert.Equal("path_outside_root", body!.code);
     }
 
+    /// <summary>
+    /// 迁移设计文档（docs/change-local-root-design.md「测试」）列的「越界路径 → 409 +
+    /// code: path_outside_root」在 preview 端点这一行此前没有任何测试兜住——闸门就在
+    /// PrepareLocalRootAsync 里（BackupConfigEndpoints.cs :844），删掉那一行不会让任何
+    /// 测试变红。目标根越不越界，跟被迁移配置自己的 LocalRoot 在界内界外是两件事：
+    /// 这里用 CreateInRootConfigAsync 造一条干净的界内配置，只让「新根越界」单独触发闸门，
+    /// 不与配置自身越界的闸门（上面几条 F2 用例测的是那个）混在一起。
+    /// </summary>
+    [Fact]
+    public async Task LocalRoot_Preview_Endpoint_Rejects_A_New_Root_Outside_The_Root()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+        var acct = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount()))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var configId = await CreateInRootConfigAsync(
+            factory, acct!.Id, "local-root-preview-guard-test-container", "in-root-for-preview-guard", root);
+
+        var res = await client.PostAsJsonAsync(
+            $"/api/backup-configs/{configId}/local-root/preview",
+            new LocalRootPreviewRequest("/definitely/outside/the/root"));
+
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<PathOutsideRootError>();
+        Assert.Equal("path_outside_root", body!.code);
+    }
+
+    /// <summary>
+    /// 与上面对称：apply 端点（/local-root，不带 /preview）复用同一个 PrepareLocalRootAsync，
+    /// 闸门必须先于「落库」执行。目标根越界时，除了断言 409 + path_outside_root 之外，还要
+    /// 断言配置在库里的 LocalRoot 原封不动——闸门若被绕过或摆错了位置（例如摆到
+    /// ChangeLocalRootAsync 之后），最先暴露出来的就是「越界请求居然真的写进了库」。
+    /// </summary>
+    [Fact]
+    public async Task LocalRoot_Apply_Endpoint_Rejects_A_New_Root_Outside_The_Root_And_Does_Not_Write()
+    {
+        var root = TempRoot();
+        using var factory = new RootedFactory(root);
+        var client = factory.CreateClient();
+        var acct = await (await client.PostAsJsonAsync("/api/accounts", SampleAccount()))
+            .Content.ReadFromJsonAsync<AccountResponse>();
+
+        var originalRoot = Path.Combine(root, "photos");
+        var configId = await CreateInRootConfigAsync(
+            factory, acct!.Id, "local-root-apply-guard-test-container", "in-root-for-apply-guard", root);
+
+        var res = await client.PostAsJsonAsync(
+            $"/api/backup-configs/{configId}/local-root",
+            new LocalRootChangeRequest("/definitely/outside/the/root"));
+
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<PathOutsideRootError>();
+        Assert.Equal("path_outside_root", body!.code);
+
+        using var scope = factory.Services.CreateScope();
+        var configs = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
+        var reloaded = await configs.GetAsync(configId, CancellationToken.None);
+        Assert.Equal(originalRoot, reloaded!.LocalRoot);
+    }
+
     // ---- F3（终审）：四个闸门的**放行**方向 ----
     // 上面五条只钉住拒绝方向。少了放行方向，任何一个闸门把参数传错——例如
     // `PathBoundaryGuard.Blocked(boundary, config.ContainerName)`——全部 510 条测试仍会绿：
