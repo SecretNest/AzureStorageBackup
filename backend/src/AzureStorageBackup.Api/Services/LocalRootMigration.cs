@@ -17,6 +17,101 @@ public static class LocalRootMigration
     private const long SmallCeiling = 1L * 1024 * 1024;          // <1MB
     private const long MediumCeiling = 100L * 1024 * 1024;       // 1–100MB
 
+    /// <summary>报告里最多列几条不匹配的样例路径。</summary>
+    public const int MaxExamples = 10;
+
+    private const double OkThreshold = 0.95;
+    private const double RejectThreshold = 0.05;
+
+    /// <summary>
+    /// 比对新根与基线索引，给出判定。**纯查询**：只读文件系统，不改任何东西，可安全重入
+    /// ——apply 正是靠再跑一遍它来兜住 preview 与 apply 之间的竞态。
+    ///
+    /// 调用方负责在此之前做完路径校验（存在/是目录/边界内）与忙检查。
+    /// </summary>
+    /// <param name="currentRoot">配置当前的根。为空表示导入时没拿到 SourceRootHint，无基线可比。</param>
+    /// <param name="baseline">最新版本的索引；取不到（无版本/缓存缺失）时传 null。</param>
+    public static LocalRootPreviewResponse Inspect(string? currentRoot, string newRoot, VersionIndex? baseline)
+    {
+        if (string.IsNullOrWhiteSpace(currentRoot))
+            return NoBaseline("This backup has no local root recorded yet, so there is nothing to compare against.");
+        if (baseline is null)
+            return NoBaseline("This backup has no version index available to compare against.");
+
+        var sample = Sample(baseline.Entries);
+        if (sample.Count == 0)
+            return NoBaseline("The latest version index has no comparable entries.");
+
+        var matched = 0;
+        var missing = 0;
+        var sizeMismatch = 0;
+        var mtimeDiffers = 0;
+        var examples = new List<string>();
+
+        foreach (var entry in sample)
+        {
+            var full = Path.Combine(newRoot, entry.Path.Replace('/', Path.DirectorySeparatorChar));
+            var outcome = Compare(entry, full, ref mtimeDiffers);
+            switch (outcome)
+            {
+                case Outcome.Matched:
+                    matched++;
+                    break;
+                case Outcome.Missing:
+                    missing++;
+                    if (examples.Count < MaxExamples) examples.Add(entry.Path);
+                    break;
+                case Outcome.SizeMismatch:
+                    sizeMismatch++;
+                    if (examples.Count < MaxExamples) examples.Add(entry.Path);
+                    break;
+            }
+        }
+
+        var rate = (double)matched / sample.Count;
+        // 区间左闭右开，边界值归入更宽松的一档。
+        var verdict = rate >= OkThreshold
+            ? LocalRootVerdict.Ok
+            : rate >= RejectThreshold
+                ? LocalRootVerdict.NeedsConfirm
+                : LocalRootVerdict.Rejected;
+
+        return new LocalRootPreviewResponse(
+            verdict.ToString(), sample.Count, matched, missing, sizeMismatch, mtimeDiffers,
+            rate, Reason: null, examples);
+    }
+
+    private enum Outcome { Matched, Missing, SizeMismatch }
+
+    /// <summary>
+    /// 单条比对。判定只看「存在 + size」；mtime 单独计数但**不影响结果**
+    /// ——跨文件系统搬迁时它经常整体偏移，让它参与判定会把一次完全正确的迁移判成失败。
+    /// </summary>
+    private static Outcome Compare(IndexEntry entry, string fullPath, ref int mtimeDiffers)
+    {
+        // symlink 的 IndexEntry.Length 恒为 0（LocalFileScanner.cs:170），比 size 毫无意义，
+        // 只确认它还在、且仍是个链接。
+        if (string.Equals(entry.Kind, "symlink", StringComparison.Ordinal))
+        {
+            var link = new FileInfo(fullPath);
+            return link.Exists && link.LinkTarget is not null ? Outcome.Matched : Outcome.Missing;
+        }
+
+        var info = new FileInfo(fullPath);
+        if (!info.Exists)
+            return Outcome.Missing;
+
+        // mtime 只在文件确实存在时才有得比；秒级容差吸收文件系统的时间戳粒度差异。
+        if (Math.Abs((info.LastWriteTimeUtc - entry.Mtime.UtcDateTime).TotalSeconds) > 1)
+            mtimeDiffers++;
+
+        return info.Length == entry.Length ? Outcome.Matched : Outcome.SizeMismatch;
+    }
+
+    private static LocalRootPreviewResponse NoBaseline(string reason) => new(
+        nameof(LocalRootVerdict.NoBaseline), Sampled: 0, Matched: 0, Missing: 0,
+        SizeMismatch: 0, MtimeDiffers: 0, MatchRate: 0, Reason: reason, Examples: []);
+
     /// <summary>
     /// 从索引条目里分层抽样。按 Length 分四档（0 / &lt;1MB / 1–100MB / &gt;100MB），
     /// 每档按档内条目数占比分名额，**档内等距取样**而非取头部——索引顺序近似目录序，
