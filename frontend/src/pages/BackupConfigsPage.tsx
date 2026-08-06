@@ -1368,17 +1368,17 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   const singlePercent =
     (details[0]?.workPercent ?? details[0]?.percent) ??
     (p.stage >= BackupStage.Uploading ? p.percent : null)
-  const headline =
+  const headline = [
     diffing && uploading
-      ? [
-          diffing.percent != null && `${diffing.percent}% diffed`,
-          uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
-        ]
-          .filter(Boolean)
-          .join(' · ')
-      : singlePercent != null
-        ? `${singlePercent}%`
-        : ''
+      ? diffing.percent != null && `${diffing.percent}% diffed`
+      : singlePercent != null && `${singlePercent}%`,
+    // 上传的绝对量在**两种**排布下都要出现。从前它只挂在并行那一支上，于是 diff 一收工、明细从
+    // 两条变回一条的那一瞬，已经传上去的十几个 GB 就从顶行消失了——只剩一个按源字节算的百分比，
+    // 而那个数在大备份的前期常年是 0%，看着就像整轮归零重来。绝对量是这里唯一不会回退的数。
+    uploading && uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
   // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
   const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
 
