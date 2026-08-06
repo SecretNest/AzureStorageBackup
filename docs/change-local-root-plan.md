@@ -10,6 +10,11 @@
 
 设计文档：`docs/change-local-root-design.md`（本计划的每条判定都可回溯到它）。
 
+> **本计划已实施完毕，此后按历史存档读。** 实施期评审推翻了其中两处，代码与设计文档才是现状：
+> `Inspect` 不再收 `currentRoot` 参数（下文各处仍是三参数的旧签名，连同「`LocalRoot` 为空直接
+> `NoBaseline`」的短路体——那正是被移除的反模式，见设计 §2 第 3 步）；另外多出一档
+> `BaselineUnreadable`（见设计 §5）。
+
 ## Global Constraints
 
 - 界面文案一律英文（既有约定）。代码注释用中文，与仓库现有风格一致。

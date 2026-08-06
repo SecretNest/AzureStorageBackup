@@ -85,7 +85,10 @@ POST /api/backup-configs/{id}/local-root           { newRoot, force }
    - 该备份尚无任何版本 → verdict `NoBaseline`，跳过抽样，允许直接改。
    - 否则经 `TrackedInfoStore` 取最新版本号 → `ILocalIndexCache` 取该版本索引
      （与 `file-versions`、`tree` 端点同一套依赖，不新造取索引的路子）。
-     索引取不到（缓存缺失/读不出）→ verdict `NoBaseline`，理由写进 `reason` 字段。
+     索引读不出来（信息文件损坏/密码解不开/索引 blob 读取失败）→ verdict `BaselineUnreadable`，
+     底层异常原文写进 `reason` 字段，**需 `force`**（见 §5）。注意这里没有「取不到就当没有」
+     的余地：`ILocalIndexCache.ReadAsync` 返回非空 `VersionIndex`，缓存缺失同样是抛异常，
+     所以 `baseline` 为 null 只可能是「没账户 / 没信息文件 / 没版本」。
 4. **抽样比对** — 从索引条目中分层抽最多 200 个，逐个在新根下拼出绝对路径检查。
 5. **分档裁决** — 见下。
 
@@ -140,7 +143,7 @@ mtime **不参与判定**，只单独统计并在报告里附带显示（"其中
 
 ```csharp
 public record LocalRootPreviewResponse(
-    string Verdict,            // "Ok" | "NeedsConfirm" | "Rejected" | "NoBaseline"
+    string Verdict,            // "Ok" | "NeedsConfirm" | "Rejected" | "NoBaseline" | "BaselineUnreadable"
     int Sampled,
     int Matched,
     int Missing,
