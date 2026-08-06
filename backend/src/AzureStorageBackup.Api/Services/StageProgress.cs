@@ -62,8 +62,8 @@ public sealed record StageProgress(
     /// 这个数可以到 <c>DownloadConcurrency</c>，不是 0/1。
     /// </para></summary>
     int Preparing = 0,
-    /// <summary>还没开工的件数：既包括还在队列里没被领走的，也包括已被领走、正排在压缩锁后面
-    /// 干等的。两者对用户是同一件事——排着队，什么都没在动。</summary>
+    /// <summary>还没被领走的件数——只数队列里的。已领走、正排在归档锁后面干等的**不**在这里，
+    /// 它们有自己的一栏（<see cref="WaitingOnArchive"/>），原委见那里。</summary>
     int Queued = 0,
     /// <summary>由 <see cref="StageTracker"/> 按「本阶段全程平均进度」算出的剩余秒数；
     /// 阶段没有申报工作量、或还没干完一件时为 null，此时退回下面那个基于当前速度的粗估。</summary>
@@ -145,7 +145,26 @@ public sealed record StageProgress(
     /// 既没在 starting，也没在 upload。
     /// </para>
     /// </summary>
-    int Checking = 0)
+    int Checking = 0,
+    /// <summary>
+    /// 已经被工作线程领走、正排在**归档锁**后面干等的件数：拿到锁才轮到它产出自己的卷文件
+    /// （压、或者 store-only 时只打包、或者 raw 时只拷贝——三条路占的是同一把锁）。
+    /// <para>
+    /// 这把锁是全局的：<see cref="StagingArea"/> 是单例，产出跨备份也不并发。于是一个备份的线程
+    /// 可以整段排在**另一个备份**手里的锁后面，而 <see cref="Preparing"/> 只数拿到锁的自己人——
+    /// 那时它是 0。合进 <see cref="Queued"/> 的话（从前就是），屏幕上只剩一万条 "queued"，
+    /// 没有任何一栏说得出"这个备份被别的运行挡着"。
+    /// </para>
+    /// <para>
+    /// 拆开之后判别是免费的，不必再去暴露锁的持有者：<c>preparing=1</c> + 有人在等 = 锁在自己
+    /// 手里，正常排队；<c>preparing=0</c> + 有人在等 = 锁在别的运行手里。
+    /// </para>
+    /// <para>
+    /// 件数恒等式因此多一项：
+    /// <c>Processed + Preparing + Queued + WaitingOnArchive + Uploading ≡ Total</c>。
+    /// </para>
+    /// </summary>
+    int WaitingOnArchive = 0)
 {
     /// <summary>某一种等待此刻卡着几个。</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -760,14 +779,17 @@ public sealed class StageTracker(
         // 几个计数各自独立推进，读到的是错开半拍的快照——不夹到 0 以上，界面上就会闪出负数。
         var inWork = Volatile.Read(ref _inWork);
         var preparing = Math.Max(0, Volatile.Read(ref _inPacking));
-        // 没开工的 = 还在队列里的 + 已领走但在排压缩锁的。
+        // 没开工的 = 还在队列里、没被任何线程领走的。已领走但在排归档锁的那些从这里分了出去
+        // （waitingOnArchive），理由见 StageProgress.WaitingOnArchive。
         // 刻意**不**用「入队 - 完成 - 在压 - 在传」那个减法：压完到开传之间还有一段实打实的活
         // （pack 逐成员重新 Stat、单文件查去重映射，去重命中的甚至根本不上传），减法会把它们
         // 全报成"排队中"——把正在干活的说成在排队，比原先那个虚高的 preparing 更误导。
         // 那段活里最耗时的几处如今各自登记成 _inChecking，在界面上单列一栏（见 StageProgress.Checking）；
         // 这里的算法不变——它们照样属于 uploading，checking 只是它的细分。
-        var waiting = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
-        var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork) + waiting;
+        // 在暂存段里、又没拿到锁的那些：全排在归档锁后面。单列一栏，**不**并进 queued——
+        // 并发跑两个备份时那把锁可能整段在别人手里，而 queued 说不出这件事（见 WaitingOnArchive）。
+        var waitingOnArchive = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
+        var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
 
         // 在途快照。各条流的已传字节是并发更新的，这里取的是同一瞬的读数，
         // 下面那个减法也用同一批值——分两次读会让"待传"偶尔算出个负数再被夹回 0，界面上就是跳。
@@ -790,11 +812,13 @@ public sealed class StageTracker(
             // 才开始算，而压完之后到那里之间还隔着预约协调——一件活能在那儿卡上几分钟，
             // 却不在 _inUpload 里。用它当口径，件数账在最需要对得上的时候恰好对不上，
             // 而账对不上正是这一栏存在的理由。这个减法把那段空隙一并算了进来，于是
-            // processed + preparing + queued + uploading ≡ total 是个恒等式，不依赖任何调用位置。
+            // processed + preparing + queued + waitingOnArchive + uploading ≡ total 是个恒等式，
+            // 不依赖任何调用位置。
             Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
-            Math.Max(0, Volatile.Read(ref _inChecking))));
+            Math.Max(0, Volatile.Read(ref _inChecking)),
+            waitingOnArchive));
     }
 
     /// <summary>

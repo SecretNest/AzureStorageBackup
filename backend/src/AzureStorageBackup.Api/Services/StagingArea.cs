@@ -235,6 +235,32 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         SignalRelease();
     }
 
+    /// <summary>
+    /// 把一份归档的所有权系在一个作用域上：块结束就还，无论是正常走完、<c>continue</c>、还是抛出。
+    /// <para>
+    /// 存在的理由是**抛出**那一条：这份账记在单例上，是进程内内存计数，漏一次就永远挂在那里
+    /// （只有重启才清），而它同时是产出的背压闸门——虚高到上限，所有运行的压缩/打包都会被卡在
+    /// <see cref="WaitForRoomAsync"/> 上，整条流水线退化成"一件传完才放行下一件"。
+    /// 界面上还看不出来：那一栏显示的是本次运行席位的占用，不是全局账。
+    /// </para>
+    /// <para>
+    /// 与"用完立刻还"并存而不是取代它：调用方仍该在用完的那一刻 <see cref="Release(StagedItem)"/>
+    /// 腾出额度（早还一秒，别人就早一秒开得了工），这里只兜异常路径。两次释放是安全的——
+    /// <see cref="ReleaseFile"/> 按路径 <c>TryRemove</c>，第二次直接短路。
+    /// </para>
+    /// <param name="item">可以为 null（整组成员都被 7z 丢掉时连空归档都没有），那时什么都不做。</param>
+    /// </summary>
+    public IDisposable Hold(StagedItem? item) => new Holder(this, item);
+
+    private sealed class Holder(StagingArea area, StagedItem? item) : IDisposable
+    {
+        public void Dispose()
+        {
+            if (item is not null)
+                area.Release(item);
+        }
+    }
+
     /// <summary>整族收尾：把还没逐卷释放掉的都释放掉（去重命中时一卷都没传，全在这里还），
     /// 再删空的 GUID 子目录。逐卷释放过的部分在 <see cref="ReleaseFile"/> 里已经幂等短路。</summary>
     public void Release(StagedItem item)

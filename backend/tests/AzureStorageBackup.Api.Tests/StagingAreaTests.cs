@@ -102,12 +102,18 @@ public sealed class StagingAreaTests : IDisposable
     }
 
     /// <summary>
-    /// 进度上的"在准备"只算真正拿到压缩锁的那一件，排在它后面的算"排队中"。
+    /// 进度上的"在准备"只算真正拿到归档锁的那一件；排在它后面的既不算"在准备"，也不算"排队中"，
+    /// 而是单列一栏（<see cref="StageProgress.WaitingOnArchive"/>）。
     /// <para>
-    /// 工作线程池比压缩锁大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的活
+    /// 工作线程池比归档锁大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让产出完的活
     /// 各自去占一条上传流。从前进度用「手上件数 - 在上传件数」反推"在准备"，把这些干等锁的线程
-    /// 全算了进去：默认配置下界面显示 5 preparing，读起来像五件活在并行推进，实际是一件在压、
-    /// 四个在闲等——恰恰是压缩就是瓶颈的时候，界面看起来最忙。
+    /// 全算了进去：默认配置下界面显示 5 preparing，读起来像五件活在并行推进，实际是一件在产出、
+    /// 四个在闲等——恰恰是产出就是瓶颈的时候，界面看起来最忙。
+    /// </para>
+    /// <para>
+    /// 后来它们被并进了 <c>queued</c>，那同样不对：这把锁是全局的，并发跑两个备份时可以整段
+    /// 落在**另一个备份**手里，此时本备份 <c>preparing</c> 是 0，屏幕上只剩一堆 "queued"，
+    /// 说不出"被别人挡着"。所以现在它们自己一栏——见 <c>StageProgressTests</c> 里那两条。
     /// </para>
     /// </summary>
     [Fact]
@@ -140,13 +146,15 @@ public sealed class StagingAreaTests : IDisposable
 
         tracker.Complete();   // 强制越过节流，取一张当下的快照
         var s = seen[^1];
-        Assert.Equal(1, s.Preparing); // 压缩是串行的，无论后面排了多少
-        Assert.Equal(2, s.Queued);    // 干等锁的两件——队列虽空，它们仍然什么都没在做
+        Assert.Equal(1, s.Preparing);        // 产出是串行的，无论后面排了多少
+        Assert.Equal(2, s.WaitingOnArchive); // 干等锁的两件
+        Assert.Equal(0, s.Queued);           // 队列里确实一件不剩——它们不再被混报成"排队中"
 
         hold.SetResult();
         await Task.WhenAll(first, second, third);
         tracker.Complete();
         Assert.Equal(0, seen[^1].Preparing); // 全部交还，不留悬挂
+        Assert.Equal(0, seen[^1].WaitingOnArchive);
         Assert.Equal(0, seen[^1].Queued);
     }
 

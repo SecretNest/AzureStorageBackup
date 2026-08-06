@@ -1501,8 +1501,9 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.stage === 'Uploading' ? 'volumes' : unit,
   )} ${inFlightVerb}`
   // 排列按**逆时间轴**：越接近"字节已经上了网线"的排越前，越早的阶段排越后，末尾落到 queued。
-  // 一件活的正序是 queued → preparing（占锁压）→ starting upload（压完到开传之间的本地活）→
-  // waiting on peer/cloud/slot（等资源）→ uploading（在传），这一行倒着念就是它。
+  // 一件活的正序是 queued → waiting for the archive slot（排全局产出锁）→ preparing（占锁产出）
+  // → checking / starting upload（产出完到开传之间）→ waiting on peer/slot（等资源）→ uploading
+  // （在传），这一行倒着念就是它。
   // preparing 从前排在 waiting 与 starting upload 的**前面**，读起来像"先压、再准备、再等"，
   // 而它其实比那两段都早——屏幕上最常见的组合恰好是 waiting 三档全 0，于是错位就直接暴露成
   // "preparing · starting upload"这种倒着的相邻两项。
@@ -1536,6 +1537,19 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     // downloading、waiting for an upload slot、preparing），插一个介词进来就成了整行唯一的异类。
     detail.checking > 0 && `${withUnit(detail.checking, unit)} checking files`,
     detail.preparing > 0 && `${withUnit(detail.preparing, unit)} ${preparingLabel}`,
+    // 排在那把全局归档锁后面干等的。措辞刻意**不**说 compressing/compressor：这把锁保护的是
+    // "产出这件活的卷文件"，而 store-only 只打包不压、raw 直传连 7z 都不过，三条路占的是同一把锁。
+    // "archive slot" 与上面的 "waiting for an upload slot" 对仗——两者都是全局闸门，一个管产出、
+    // 一个管上传，而屏幕上同时出现这两句时，那正是这条流水线的两个瓶颈各卡了多少。
+    //
+    // 这一栏是从 queued 里拆出来的，屏幕上的恒等式因此多一项：
+    // processed + preparing + queued + waitingOnArchive + uploading ≡ total。
+    // 拆开的理由是并发跑两个备份：那把锁可以整段在**另一个备份**手里，此时本备份 preparing=0，
+    // 合报成 queued 的话，屏幕上就只剩一万条 "queued"，看不出自己是被别人挡着的。
+    // 判别方法免费送：preparing=1 + 这一栏非 0 = 锁在自己手里，正常排队；
+    // preparing=0 + 这一栏非 0 = 锁在别的运行手里，可以去把那个停掉。
+    detail.waitingOnArchive > 0 &&
+      `${withUnit(detail.waitingOnArchive, unit)} waiting for the archive slot`,
     detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
   ]
     .filter(Boolean)
