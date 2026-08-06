@@ -90,11 +90,17 @@ public static class LocalRootMigration
     private static Outcome Compare(IndexEntry entry, string fullPath, ref int mtimeDiffers)
     {
         // symlink 的 IndexEntry.Length 恒为 0（LocalFileScanner.cs:170），比 size 毫无意义，
-        // 只确认它还在、且仍是个链接。
+        // 只确认这个位置上还是个链接。
+        //
+        // **不许再加 Exists**：FileInfo.Exists 对**指向目录**的链接答 false（它问的是"这是不是个
+        // 文件"，而链接解析过去是目录），可扫描侧登记 symlink 只看 LinkTarget 非空
+        // （LocalFileScanner.cs:136），目录链接一样在索引里。加上这一项，每一个完好的目录链接
+        // 都被判 Missing，把一次完全正确的迁移的匹配率生生压下去、逼进 force 那条路。
+        // LinkTarget 非空本身已经说明"这儿确实躺着一个符号链接"，路径不存在时它是 null。
         if (string.Equals(entry.Kind, "symlink", StringComparison.Ordinal))
         {
             var link = new FileInfo(fullPath);
-            return link.Exists && link.LinkTarget is not null ? Outcome.Matched : Outcome.Missing;
+            return link.LinkTarget is not null ? Outcome.Matched : Outcome.Missing;
         }
 
         var info = new FileInfo(fullPath);

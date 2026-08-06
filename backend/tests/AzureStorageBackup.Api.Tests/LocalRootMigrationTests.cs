@@ -230,6 +230,48 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         Assert.Equal(2, r.Matched);
     }
 
+    /// <summary>
+    /// 指向目录的符号链接同样是 symlink 条目（LocalFileScanner 只看 LinkTarget 非空，
+    /// 不区分链到文件还是链到目录），而 FileInfo.Exists 对这种链接答 false。曾经的
+    /// `link.Exists && ...` 于是把每一个完好的目录链接判成 Missing，把一次完全正确的
+    /// 迁移的匹配率生生压下去、逼进 force 那条路。这条用例把那个坑钉住。
+    /// </summary>
+    [Fact]
+    public void A_Symlink_Pointing_At_A_Directory_Is_Matched()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "d", "target"));
+        Directory.CreateSymbolicLink(Path.Combine(_root, "d", "link"), Path.Combine(_root, "d", "target"));
+
+        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+
+        Assert.Equal(1, r.Matched);
+        Assert.Equal(0, r.Missing);
+        Assert.Equal(nameof(LocalRootVerdict.Ok), r.Verdict);
+    }
+
+    /// <summary>索引说是链接、磁盘上却是个普通文件：LinkTarget 为 null，算不匹配。</summary>
+    [Fact]
+    public void A_Plain_File_Where_The_Index_Says_Symlink_Is_Missing()
+    {
+        WriteFile("d/link", 10);
+
+        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+
+        Assert.Equal(0, r.Matched);
+        Assert.Equal(1, r.Missing);
+        Assert.Contains("d/link", r.Examples);
+    }
+
+    /// <summary>链接压根不在新根下：同样是 Missing，不能因为"不比 size"就一律放行。</summary>
+    [Fact]
+    public void A_Symlink_That_Is_Not_There_At_All_Is_Missing()
+    {
+        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+
+        Assert.Equal(0, r.Matched);
+        Assert.Equal(1, r.Missing);
+    }
+
     [Fact]
     public void An_Empty_Current_Root_Has_No_Baseline_To_Compare()
     {
