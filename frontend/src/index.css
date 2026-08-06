@@ -158,6 +158,11 @@ hr {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+  /* outline 画在盒子外面且不占布局，紧跟其后的兄弟元素（典型是输入框后面的 Browse 按钮）
+     会连自己的背景一起盖掉那一段描边。抬一层让获焦元素画在最上面；relative 不带偏移，
+     不影响任何布局。 */
+  position: relative;
+  z-index: 1;
 }
 
 /* ── Controls ─────────────────────────────────────────────────────────────── */

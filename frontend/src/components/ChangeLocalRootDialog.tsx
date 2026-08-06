@@ -69,7 +69,13 @@ export function ChangeLocalRootDialog({
             <button type="button" onClick={onClose}>
               Cancel
             </button>
-            <button type="button" className="btn-primary" disabled={!canApply} onClick={() => void apply()}>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!canApply}
+              title={canApply ? undefined : decision.needsForce ? 'Tick the confirmation above first.' : decision.headline}
+              onClick={() => void apply()}
+            >
               Apply
             </button>
           </>
@@ -81,10 +87,14 @@ export function ChangeLocalRootDialog({
             <div className="mono">{currentRoot || '(none)'}</div>
           </div>
 
-          <div className="row" style={{ gap: 'var(--sp-1)' }}>
+          {/* 用 .row 默认的 8px 间距，不再压到 4px：输入框获焦时的 outline 向外扩 4px
+              （2px 描边 + 2px offset），间距只有 4px 时紧邻的 Browse 按钮正好把它盖掉。 */}
+          <div className="row">
             <input
               className="w-lg mono"
-              placeholder="/mnt/photos"
+              // 占位符用原值：换根多半是「同一堆文件挪了个地方」，原路径是最有用的起草模板，
+              // 一个凭空的 /mnt/photos 只会让人以为那是当前设置。
+              placeholder={currentRoot || '/mnt/photos'}
               value={newRoot}
               onChange={(e) => {
                 setNewRoot(e.target.value)
@@ -101,6 +111,10 @@ export function ChangeLocalRootDialog({
           </div>
 
           {error && <div className="text-danger">{error}</div>}
+
+          {/* 还没 Check 过时 Apply 恒为灰色。不写这一句，用户改完路径只看见一个点不动的
+              按钮，无从知道是自己少做了一步还是界面坏了。 */}
+          {!preview && <div className="text-info">{decision.headline}</div>}
 
           {preview && (
             <div className="col" style={{ gap: 'var(--sp-2)' }}>
