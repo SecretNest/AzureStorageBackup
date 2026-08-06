@@ -1244,8 +1244,12 @@ export function BackupConfigsPage() {
           configId={editing.id}
           currentRoot={form.localRoot}
           onClose={() => setChangingRoot(false)}
-          onDone={() => {
+          onDone={(newRoot) => {
             setChangingRoot(false)
+            // load() 只刷新列表，不会碰这个正开着的编辑表单——不补上这两行，
+            // "Local Root (locked)" 会一直显示旧路径，直到用户关掉表单重开。
+            setEditing((e) => (e ? { ...e, localRoot: newRoot } : e))
+            set('localRoot', newRoot)
             load()
           }}
         />

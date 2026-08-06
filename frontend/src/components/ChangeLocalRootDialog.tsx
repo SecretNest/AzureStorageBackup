@@ -17,7 +17,8 @@ export function ChangeLocalRootDialog({
 }: {
   configId: number
   currentRoot: string
-  onDone: () => void
+  /** newRoot 是刚生效的路径——调用方要用它去更新自己手上的那份配置快照，不能只 reload 列表。 */
+  onDone: (newRoot: string) => void
   onClose: () => void
 }) {
   const [newRoot, setNewRoot] = useState('')
@@ -48,8 +49,9 @@ export function ChangeLocalRootDialog({
     setBusy(true)
     setError(null)
     try {
-      await backupConfigsApi.changeLocalRoot(configId, newRoot.trim(), decision.needsForce)
-      onDone()
+      const applied = newRoot.trim()
+      await backupConfigsApi.changeLocalRoot(configId, applied, decision.needsForce)
+      onDone(applied)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -102,7 +104,7 @@ export function ChangeLocalRootDialog({
 
           {preview && (
             <div className="col" style={{ gap: 'var(--sp-2)' }}>
-              <div className={decision.tone === 'ok' ? 'text-ok' : `text-${decision.tone}`}>
+              <div className={`text-${decision.tone}`}>
                 {decision.headline}
               </div>
 
@@ -133,11 +135,7 @@ export function ChangeLocalRootDialog({
                     checked={acknowledged}
                     onChange={(e) => setAcknowledged(e.target.checked)}
                   />
-                  <span>
-                    I understand — change it anyway. The next backup will record every file that no longer
-                    matches as deleted and upload the new ones. Scope rules are kept as they are and may no
-                    longer match if this directory is laid out differently.
-                  </span>
+                  <span>{decision.confirmBody}</span>
                 </label>
               )}
             </div>
