@@ -682,6 +682,63 @@ public static class BackupConfigEndpoints
             return Results.NoContent();
         });
 
+        // 迁移本地根路径（设计 docs/change-local-root-design.md）。
+        // preview 与 apply 分开：preview 是纯查询、幂等、可反复重试（换个路径再试一次不留痕迹），
+        // apply 的确认语义在日志里独立可辨。同形先例是 restore-estimate 与 restore。
+        group.MapPost("/{id:int}/local-root/preview", async (
+            int id, LocalRootPreviewRequest req, IBackupConfigService svc, IAccountService accounts,
+            ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+            IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct) =>
+        {
+            var prepared = await PrepareLocalRootAsync(
+                id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct);
+            return prepared.Failure ?? Results.Ok(prepared.Preview);
+        });
+
+        group.MapPost("/{id:int}/local-root", async (
+            int id, LocalRootChangeRequest req, IBackupConfigService svc, IAccountService accounts,
+            ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+            IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, IOperationLog log,
+            IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        {
+            // 不信任前端传来的 preview 结果，自己重跑一遍完整校验——这正是 Inspect
+            // 必须是纯查询、可安全重入的原因。preview 之后新根被拔掉、或备份在两次调用之间
+            // 开跑，都由这一遍兜住。
+            var prepared = await PrepareLocalRootAsync(
+                id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct);
+            if (prepared.Failure is { } failure)
+                return failure;
+
+            var preview = prepared.Preview!;
+            var needsForce = preview.Verdict is nameof(LocalRootVerdict.NeedsConfirm)
+                or nameof(LocalRootVerdict.Rejected);
+            if (needsForce && !req.Force)
+                return Results.Json(
+                    new
+                    {
+                        error = "The new root does not match this backup's latest version index.",
+                        code = "local_root_mismatch",
+                        preview,
+                    },
+                    statusCode: StatusCodes.Status400BadRequest);
+
+            var oldRoot = prepared.Config!.LocalRoot;
+            var moved = await svc.ChangeLocalRootAsync(id, prepared.ResolvedRoot!, ct);
+            if (moved is null)
+                return Results.NotFound();
+
+            await log.AppendAsync(
+                OperationLogLevel.Warning, "backup",
+                $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
+                $"to '{moved.LocalRoot}' (verdict {preview.Verdict}, " +
+                $"{preview.Matched}/{preview.Sampled} sampled entries matched" +
+                $"{(req.Force && needsForce ? ", forced" : "")}).",
+                ct);
+
+            var settings = await settingsSvc.GetAsync(ct);
+            return Results.Ok(BackupConfigResponse.From(moved, settings));
+        });
+
         return app;
     }
 
@@ -745,6 +802,94 @@ public static class BackupConfigEndpoints
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "Backup config delete: failed to {What}", what);
+        }
+    }
+
+    private readonly record struct PreparedLocalRoot(
+        IResult? Failure, BackupConfig? Config, string? ResolvedRoot, LocalRootPreviewResponse? Preview);
+
+    /// <summary>
+    /// preview 与 apply 共用的前置：取配置 → 忙检查 → 路径校验 → 取基线索引 → Inspect。
+    /// 顺序短路，任一步失败就带着对应的 IResult 回去。
+    /// </summary>
+    private static async Task<PreparedLocalRoot> PrepareLocalRootAsync(
+        int id, string newRoot, IBackupConfigService svc, IAccountService accounts,
+        ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+        IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct)
+    {
+        if (KeyringGuard.Blocked(keyring) is { } blocked)
+            return new PreparedLocalRoot(blocked, null, null, null);
+
+        var config = await svc.GetAsync(id, ct);
+        if (config is null)
+            return new PreparedLocalRoot(Results.NotFound(), null, null, null);
+
+        // 忙检查在最前面：正在备份/还原/检查时换根，是在给一个正在读的目录抽地毯。
+        if (busy.IsBusy(config.AccountId, config.ContainerName))
+            return new PreparedLocalRoot(
+                Results.Json(
+                    new { error = "This backup is busy; try again once the current operation finishes.", code = "backup_busy" },
+                    statusCode: StatusCodes.Status409Conflict),
+                null, null, null);
+
+        if (string.IsNullOrWhiteSpace(newRoot))
+            return new PreparedLocalRoot(
+                Results.BadRequest(new { error = "A new local root is required." }), null, null, null);
+        if (!Path.IsPathRooted(newRoot))
+            return new PreparedLocalRoot(
+                Results.BadRequest(new { error = "The new local root must be an absolute path." }), null, null, null);
+
+        // 越界走全仓统一的 409 + path_outside_root，不为本功能另立一套。
+        if (PathBoundaryGuard.Blocked(boundary, newRoot) is { } outside)
+            return new PreparedLocalRoot(outside, null, null, null);
+
+        if (!Directory.Exists(newRoot))
+            return new PreparedLocalRoot(
+                Results.BadRequest(new { error = $"'{newRoot}' does not exist or is not a directory." }),
+                null, null, null);
+        try
+        {
+            _ = Directory.EnumerateFileSystemEntries(newRoot).Any();
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+        {
+            return new PreparedLocalRoot(
+                Results.BadRequest(new { error = $"'{newRoot}' cannot be listed: {ex.Message}" }), null, null, null);
+        }
+
+        var baseline = await LoadBaselineAsync(config, accounts, indexCache, trackedInfo, secrets, ct);
+        var preview = LocalRootMigration.Inspect(config.LocalRoot, newRoot, baseline);
+        return new PreparedLocalRoot(null, config, newRoot, preview);
+    }
+
+    /// <summary>
+    /// 取最新版本的索引作为比对基线。走本地权威缓存（与 /tree、/file-versions 同一套依赖），
+    /// 取不到就返回 null —— 判定会因此落到 NoBaseline，而不是伪装成 0% 匹配。
+    /// 任何异常都吞成"没有基线"：拿不到基线不该让用户连根都改不了。
+    /// </summary>
+    private static async Task<VersionIndex?> LoadBaselineAsync(
+        BackupConfig config, IAccountService accounts, ILocalIndexCache indexCache,
+        TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct)
+    {
+        try
+        {
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return null;
+
+            var password = secrets.RevealBackupPassword(config);
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            var latest = info?.Versions.OrderByDescending(v => v.Version).FirstOrDefault();
+            if (info is null || latest is null)
+                return null;
+
+            return await indexCache.ReadAsync(
+                account, config.ContainerName, latest.Version,
+                info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
         }
     }
 }
