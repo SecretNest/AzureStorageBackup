@@ -115,8 +115,8 @@ public sealed record StageProgress(
     /// </summary>
     long SpilledItems = 0,
     /// <summary>
-    /// 已经进了上传段的**件**数：压缩早已完成、暂存文件就绪，此后要么有卷在飞，要么正卡在
-    /// <see cref="UploadWait"/> 说的那三段之一上。
+    /// 已经进了上传段的**件**数：出了暂存段之后的一切。此后要么有卷在飞，要么正卡在
+    /// <see cref="UploadWait"/> 说的那几段之一上，要么在读盘核对（<see cref="Checking"/>）。
     /// <para>
     /// 与 <see cref="ActiveItems"/> 是两个口径，不能互相代替：那里装的是**卷**，一件活可以同时有
     /// 好几卷在飞，也可以一卷都没有（正卡着）。没有这一栏，「压完了但一个字节都没在传」的活
@@ -764,6 +764,8 @@ public sealed class StageTracker(
         // 刻意**不**用「入队 - 完成 - 在压 - 在传」那个减法：压完到开传之间还有一段实打实的活
         // （pack 逐成员重新 Stat、单文件查去重映射，去重命中的甚至根本不上传），减法会把它们
         // 全报成"排队中"——把正在干活的说成在排队，比原先那个虚高的 preparing 更误导。
+        // 那段活里最耗时的几处如今各自登记成 _inChecking，在界面上单列一栏（见 StageProgress.Checking）；
+        // 这里的算法不变——它们照样属于 uploading，checking 只是它的细分。
         var waiting = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork) + waiting;
 
