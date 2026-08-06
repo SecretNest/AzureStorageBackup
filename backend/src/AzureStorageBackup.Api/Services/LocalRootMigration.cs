@@ -28,13 +28,15 @@ public static class LocalRootMigration
     /// ——apply 正是靠再跑一遍它来兜住 preview 与 apply 之间的竞态。
     ///
     /// 调用方负责在此之前做完路径校验（存在/是目录/边界内）与忙检查。
+    ///
+    /// 能不能比对，**只看基线在不在**，与配置当前的根是什么、是不是空的一概无关：导入时没拿到
+    /// SourceRootHint 的配置根是空串，可它的版本索引在导入当下就整批落进了本地缓存
+    /// （BackupConfigEndpoints.cs:110-127）——而这恰恰是用户最可能在猜挂载点的场合，
+    /// 最不该被"没记过旧根"这个理由免检放行。
     /// </summary>
-    /// <param name="currentRoot">配置当前的根。为空表示导入时没拿到 SourceRootHint，无基线可比。</param>
     /// <param name="baseline">最新版本的索引；取不到（无版本/缓存缺失）时传 null。</param>
-    public static LocalRootPreviewResponse Inspect(string? currentRoot, string newRoot, VersionIndex? baseline)
+    public static LocalRootPreviewResponse Inspect(string newRoot, VersionIndex? baseline)
     {
-        if (string.IsNullOrWhiteSpace(currentRoot))
-            return NoBaseline("This backup has no local root recorded yet, so there is nothing to compare against.");
         if (baseline is null)
             return NoBaseline("This backup has no version index available to compare against.");
 

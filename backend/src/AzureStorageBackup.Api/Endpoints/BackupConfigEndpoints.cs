@@ -880,7 +880,7 @@ public static class BackupConfigEndpoints
             return new PreparedLocalRoot(null, config, newRoot, unreadable);
         }
 
-        var preview = LocalRootMigration.Inspect(config.LocalRoot, newRoot, baseline.Index);
+        var preview = LocalRootMigration.Inspect(newRoot, baseline.Index);
         return new PreparedLocalRoot(null, config, newRoot, preview);
     }
 

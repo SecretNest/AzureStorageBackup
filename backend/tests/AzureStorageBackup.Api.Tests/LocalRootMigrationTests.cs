@@ -146,7 +146,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         for (var i = 0; i < 20; i++) WriteFile($"d/f{i}", 10);
         var index = Index([.. Enumerable.Range(0, 20).Select(i => Entry($"d/f{i}", 10))]);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(nameof(LocalRootVerdict.Ok), r.Verdict);
         Assert.Equal(20, r.Sampled);
@@ -161,7 +161,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         for (var i = 0; i < 10; i++) WriteFile($"d/f{i}", 10);
         var index = Index([.. Enumerable.Range(0, 20).Select(i => Entry($"d/f{i}", 10))]);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(nameof(LocalRootVerdict.NeedsConfirm), r.Verdict);
         Assert.Equal(10, r.Matched);
@@ -175,7 +175,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
     {
         var index = Index([.. Enumerable.Range(0, 20).Select(i => Entry($"d/f{i}", 10))]);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(nameof(LocalRootVerdict.Rejected), r.Verdict);
         Assert.Equal(0, r.Matched);
@@ -189,7 +189,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         for (var i = 0; i < 20; i++) WriteFile($"d/f{i}", 99);
         var index = Index([.. Enumerable.Range(0, 20).Select(i => Entry($"d/f{i}", 10))]);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(20, r.SizeMismatch);
         Assert.Equal(0, r.Matched);
@@ -207,7 +207,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         // 索引里的 mtime 是 2026-01-01，磁盘上的是"刚刚"，20 条全都对不上。
         var index = Index([.. Enumerable.Range(0, 20).Select(i => Entry($"d/f{i}", 10))]);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(20, r.MtimeDiffers);
         Assert.Equal(nameof(LocalRootVerdict.Ok), r.Verdict);
@@ -224,7 +224,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
 
         var index = Index(Entry("d/link", 0, kind: "symlink"), Entry("d/target", 123));
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, index);
+        var r = LocalRootMigration.Inspect(_root, index);
 
         Assert.Equal(nameof(LocalRootVerdict.Ok), r.Verdict);
         Assert.Equal(2, r.Matched);
@@ -242,7 +242,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         Directory.CreateDirectory(Path.Combine(_root, "d", "target"));
         Directory.CreateSymbolicLink(Path.Combine(_root, "d", "link"), Path.Combine(_root, "d", "target"));
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+        var r = LocalRootMigration.Inspect(_root, Index(Entry("d/link", 0, kind: "symlink")));
 
         Assert.Equal(1, r.Matched);
         Assert.Equal(0, r.Missing);
@@ -255,7 +255,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
     {
         WriteFile("d/link", 10);
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+        var r = LocalRootMigration.Inspect(_root, Index(Entry("d/link", 0, kind: "symlink")));
 
         Assert.Equal(0, r.Matched);
         Assert.Equal(1, r.Missing);
@@ -266,28 +266,31 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
     [Fact]
     public void A_Symlink_That_Is_Not_There_At_All_Is_Missing()
     {
-        var r = LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/link", 0, kind: "symlink")));
+        var r = LocalRootMigration.Inspect(_root, Index(Entry("d/link", 0, kind: "symlink")));
 
         Assert.Equal(0, r.Matched);
         Assert.Equal(1, r.Missing);
     }
 
+    /// <summary>
+    /// 有基线就一定比对。这条曾经被"配置当前的根为空"整段短路成 NoBaseline 免检放行——
+    /// 而根为空正是导入缺 SourceRootHint 的那种配置，用户对着它猜挂载点的可能性最大。
+    /// Inspect 现在压根不知道当前根是什么，这条用例守住"判据只剩基线"这一点。
+    /// </summary>
     [Fact]
-    public void An_Empty_Current_Root_Has_No_Baseline_To_Compare()
+    public void A_Usable_Baseline_Is_Always_Compared()
     {
-        var index = Index(Entry("d/f", 10));
+        var r = LocalRootMigration.Inspect(_root, Index(Entry("d/f", 10)));
 
-        var r = LocalRootMigration.Inspect(currentRoot: "", _root, index);
-
-        Assert.Equal(nameof(LocalRootVerdict.NoBaseline), r.Verdict);
-        Assert.NotNull(r.Reason);
-        Assert.Equal(0, r.Sampled);
+        Assert.Equal(nameof(LocalRootVerdict.Rejected), r.Verdict);
+        Assert.Equal(1, r.Sampled);
+        Assert.Null(r.Reason);
     }
 
     [Fact]
     public void A_Null_Baseline_Has_Nothing_To_Compare()
     {
-        var r = LocalRootMigration.Inspect("/old/root", _root, baseline: null);
+        var r = LocalRootMigration.Inspect(_root, baseline: null);
 
         Assert.Equal(nameof(LocalRootVerdict.NoBaseline), r.Verdict);
         Assert.NotNull(r.Reason);
@@ -304,7 +307,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
             UnreadableAt = DateTimeOffset.UtcNow,
         };
 
-        var r = LocalRootMigration.Inspect("/old/root", _root, Index(stale));
+        var r = LocalRootMigration.Inspect(_root, Index(stale));
 
         Assert.Equal(nameof(LocalRootVerdict.NoBaseline), r.Verdict);
     }
@@ -315,7 +318,7 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         WriteFile("d/f", 10);
         var before = Directory.GetFileSystemEntries(_root, "*", SearchOption.AllDirectories).OrderBy(x => x).ToList();
 
-        LocalRootMigration.Inspect("/old/root", _root, Index(Entry("d/f", 10)));
+        LocalRootMigration.Inspect(_root, Index(Entry("d/f", 10)));
 
         var after = Directory.GetFileSystemEntries(_root, "*", SearchOption.AllDirectories).OrderBy(x => x).ToList();
         Assert.Equal(before, after);

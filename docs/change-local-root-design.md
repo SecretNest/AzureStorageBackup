@@ -77,9 +77,12 @@ POST /api/backup-configs/{id}/local-root           { newRoot, force }
 2. **路径校验** — 非空、绝对路径、`PathBoundaryGuard` 边界内、存在、是目录、可列出。
    越界 → 409 + `code: "path_outside_root"`（`PathBoundaryGuard.Blocked` 的既有约定，
    全仓一致，不为本功能另立一套）；其余非法输入 → 400。
-3. **历史判定** — 是否有可比的基线？
-   - `LocalRoot` 当前为空（导入缺 `SourceRootHint`），**或**该备份尚无任何版本
-     → verdict `NoBaseline`，跳过抽样，允许直接改。
+3. **历史判定** — 是否有可比的基线？只问这一件事，**与当前 `LocalRoot` 是什么、是不是空的无关**。
+   （初稿曾规定"`LocalRoot` 当前为空则直接 `NoBaseline`"，实施期评审推翻了它：导入缺
+   `SourceRootHint` 的配置根确实是空串，但它的全部版本索引在导入当下就落进了
+   `ILocalIndexCache`（`BackupConfigEndpoints.cs:110-127`），基线是现成的；而这恰恰是用户
+   最可能在猜挂载点的场合，最不该被"没记过旧根"这个理由免检放行。）
+   - 该备份尚无任何版本 → verdict `NoBaseline`，跳过抽样，允许直接改。
    - 否则经 `TrackedInfoStore` 取最新版本号 → `ILocalIndexCache` 取该版本索引
      （与 `file-versions`、`tree` 端点同一套依赖，不新造取索引的路子）。
      索引取不到（缓存缺失/读不出）→ verdict `NoBaseline`，理由写进 `reason` 字段。
@@ -118,7 +121,7 @@ mtime **不参与判定**，只单独统计并在报告里附带显示（"其中
 | `[95%, 100%]` | `Ok` | 直接允许 apply |
 | `[5%, 95%)` | `NeedsConfirm` | 需 `force: true` |
 | `[0, 5%)`（含新目录一个都找不到） | `Rejected` | 需 `force: true` |
-| 无基线 | `NoBaseline` | 直接允许 apply |
+| 无基线（该备份还没有任何版本） | `NoBaseline` | 直接允许 apply |
 | 基线读不出来 | `BaselineUnreadable` | 需 `force: true` |
 
 `BaselineUnreadable` 是实施期评审补上的一档，它修正了本设计初稿的一个错误：初稿把
@@ -168,7 +171,7 @@ apply **不信任前端传来的 preview 结果**，自己重跑一遍完整校�
 
 | 文件 | 改动 |
 |---|---|
-| `Services/LocalRootMigration.cs` | **新增**。唯一的领域逻辑，**静态类、无依赖注入**：`static LocalRootPreview Inspect(string? currentRoot, string newRoot, VersionIndex? baseline)`。只读文件系统，不碰数据库、不连云、不解密——取索引所需的账户/密码/云端信息由端点备好后把 `baseline` 传进来。因而可脱离 HTTP、EF 与 Azure 单测。内部拆出分层抽样（纯函数）与文件系统比对两部分。 |
+| `Services/LocalRootMigration.cs` | **新增**。唯一的领域逻辑，**静态类、无依赖注入**：`static LocalRootPreviewResponse Inspect(string newRoot, VersionIndex? baseline)`。只读文件系统，不碰数据库、不连云、不解密——取索引所需的账户/密码/云端信息由端点备好后把 `baseline` 传进来。因而可脱离 HTTP、EF 与 Azure 单测。内部拆出分层抽样（纯函数）与文件系统比对两部分。 |
 | `Models/BackupConfigDtos.cs` | 加 `LocalRootChangeRequest(string NewRoot, bool Force = false)` 与 `LocalRootPreviewResponse`。 |
 | `Endpoints/BackupConfigEndpoints.cs` | 两个 `MapPost`，紧挨现有 `reset-password`（同属"创建后受限字段的专用变更通道"）。端点只做编排：取配置 → 忙检查 → `InspectAsync` → 按 verdict 与 `force` 裁决 → 落库 + 写日志。 |
 | `Services/BackupConfigService.cs` | 加 `ChangeLocalRootAsync(int id, string newRoot, ct)`。**不动** `UpdateAsync` 的锁定检查，只更新其文档注释说明 `LocalRoot` 现有专用通道。 |
@@ -196,7 +199,8 @@ apply **不信任前端传来的 preview 结果**，自己重跑一遍完整校�
 - `UnreadableAt` 条目被排除出抽样池。
 - symlink 条目只比存在性，不因 size 判不匹配。
 - 全匹配 → `Ok`；部分匹配 → `NeedsConfirm`；空目录 → `Rejected`。
-- `LocalRoot` 为空 → `NoBaseline`；无任何版本 → `NoBaseline`；索引取不到 → `NoBaseline` 且 `Reason` 非空。
+- 无任何版本 → `NoBaseline`；索引取不到 → `BaselineUnreadable` 且 `Reason` 非空。
+- **`LocalRoot` 为空但基线可用 → 照样抽样**（导入缺 `SourceRootHint` 的配置不能免检放行）。
 - 越界路径 → 409 + `code: "path_outside_root"`；空路径 / 相对路径 / 指向文件而非目录 / 不存在 → 400。
 - 忙时 → 409，且**未落库**。
 - `NeedsConfirm` / `Rejected` 无 `force` → 不落库；带 `force` → 落库。

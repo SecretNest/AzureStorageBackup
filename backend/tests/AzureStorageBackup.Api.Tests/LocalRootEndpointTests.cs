@@ -155,14 +155,16 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     }
 
     /// <summary>建一条「基线与新根完全对不上」的配置：新根是个空目录，基线索引里唯一的文件在那儿
-    /// 一个都找不到，抽样匹配率 0% → Rejected，需要 force 才能写。供 force 闸门测试复用。</summary>
-    private async Task<(int Id, string Target)> SeedMismatchingBaselineAsync()
+    /// 一个都找不到，抽样匹配率 0% → Rejected，需要 force 才能写。供 force 闸门测试复用。
+    /// <paramref name="localRoot"/> 传 null 表示用 _dir 当当前根；传 "" 则模拟导入时没拿到
+    /// SourceRootHint 的那种配置。</summary>
+    private async Task<(int Id, string Target)> SeedMismatchingBaselineAsync(string? localRoot = null)
     {
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
         var accountId = await CreateAccountAsync();
-        var id = await CreateConfigAsync(accountId, _dir);
+        var id = await CreateConfigAsync(accountId, localRoot ?? _dir);
         var container = await ContainerOfAsync(id);
 
         var identityTicks = SeedLocalInfo(accountId, container,
@@ -389,6 +391,29 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         var body = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
         Assert.Equal(target, body!.LocalRoot);
         Assert.Equal(target, await LocalRootOfAsync(id));
+    }
+
+    /// <summary>
+    /// 导入时没拿到 SourceRootHint 的配置根是空串，可它的版本索引在导入当下就整批落进了
+    /// 本地缓存（BackupConfigEndpoints.cs:110-127）。从前"当前根为空"会把整段比对短路成
+    /// NoBaseline 免检放行——偏偏这正是用户最可能在猜挂载点的场合，最不该免检。
+    /// 现在能不能比对只看基线在不在：填错目录照样要被拦下。
+    /// </summary>
+    [Fact]
+    public async Task An_Imported_Backup_With_No_Root_Is_Still_Checked_Against_Its_Index()
+    {
+        var (id, target) = await SeedMismatchingBaselineAsync(localRoot: "");
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = false });
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        Assert.Equal(
+            nameof(LocalRootVerdict.Rejected),
+            doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
+
+        Assert.Equal("", await LocalRootOfAsync(id));   // 未落库
     }
 
     /// <summary>索引读不出来（Finding 1）：preview 必须报 BaselineUnreadable，而不是伪装成
