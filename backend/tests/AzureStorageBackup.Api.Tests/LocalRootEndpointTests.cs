@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 using Microsoft.Extensions.DependencyInjection;
@@ -33,6 +35,28 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return account!.Id;
     }
 
+    // Azurite 的 well-known 账户与密钥（与 BackupConfigEndpointsTests 一致）。
+    private const string AzuriteKey =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    private const string AzuriteEndpoint = "http://127.0.0.1:10000/devstoreaccount1";
+
+    /// <summary>凡是会真正走到 LoadBaselineAsync 的「确实没有基线」测试，都必须用这个而不是
+    /// CreateAccountAsync：那个用的是个解析不到的假域名，TrackedInfoStore.LoadAsync 在没有本地状态时
+    /// 会落到云端回填，假域名下这一步是真的网络异常（几十秒超时），会被新代码识别成
+    /// BaselineUnreadable 而不是 NoBaseline —— 这不是本次要测的东西。Azurite 上 container
+    /// 确实不存在时，ExistsAsync 干净地返回 false，无本地状态、无云端信息文件，是真正的「没有」。</summary>
+    private async Task<int> CreateAzuriteAccountAsync()
+    {
+        var req = new AccountRequest(
+            Name: "azurite-" + Guid.NewGuid().ToString("N")[..6], Description: null,
+            BlobEndpoint: AzuriteEndpoint, Region: AzureRegion.Global, AccountKey: AzuriteKey,
+            UseProxy: false, ProxyMode: ProxyMode.Independent,
+            ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null);
+        var res = await _client.PostAsJsonAsync("/api/accounts", req);
+        var account = await res.Content.ReadFromJsonAsync<AccountResponse>();
+        return account!.Id;
+    }
+
     /// <summary>建一条配置，直接落库（绕开创建端点对本地根存在性的校验）。</summary>
     private async Task<int> CreateConfigAsync(int accountId, string localRoot)
     {
@@ -48,6 +72,119 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
             DataTier = StorageTier.Cool,
         });
         return created.Id;
+    }
+
+    private async Task<string> ContainerOfAsync(int configId)
+    {
+        using var scope = _services.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
+        return (await svc.GetAsync(configId))!.ContainerName;
+    }
+
+    private async Task<string> LocalRootOfAsync(int configId)
+    {
+        using var scope = _services.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
+        return (await svc.GetAsync(configId))!.LocalRoot;
+    }
+
+    /// <summary>直接写本地权威信息文件（TrackedInfoStore.LoadAsync 命中本地则不读云端），
+    /// 与 BackupConfigEndpointsTests.SeedLocalInfo 同一条路数。返回 identityTicks，供 SeedIndex 用。</summary>
+    private long SeedLocalInfo(int accountId, string container, List<BackupVersion> versions)
+    {
+        var createdAt = DateTimeOffset.UtcNow;
+        var info = new BackupInfoFile
+        {
+            Backup = new BackupMeta { Name = "seed", CreatedAt = createdAt, Encrypted = false },
+            Versions = versions,
+        };
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.LocalBackupStates.Add(new LocalBackupState
+        {
+            AccountId = accountId, Container = container,
+            InfoBytes = IndexSerializer.SerializeInfoFile(info), ETag = "seed-etag",
+        });
+        db.SaveChanges();
+        return createdAt.UtcTicks;
+    }
+
+    /// <summary>本地信息文件写成一段合法性检不过的字节——format 字节 99 大于当前支持的最新 format，
+    /// IndexSerializer.DeserializeInfoFile 会在读完第一个字节后立刻抛 NotSupportedException。
+    /// 用来在测试里稳定复现「有历史但索引读不出来」（BaselineUnreadable），不依赖加密/云端失败这些
+    /// 更难摆布的失败面。</summary>
+    private void SeedCorruptLocalInfo(int accountId, string container)
+    {
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.LocalBackupStates.Add(new LocalBackupState
+        {
+            AccountId = accountId, Container = container,
+            InfoBytes = [99], ETag = "seed-etag",
+        });
+        db.SaveChanges();
+    }
+
+    private void SeedIndex(int accountId, string container, int version, long identityTicks, VersionIndex index)
+    {
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = accountId, Container = container, Version = version,
+            IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+        });
+        db.SaveChanges();
+    }
+
+    /// <summary>建一条「基线与新根完全对不上」的配置：新根是个空目录，基线索引里唯一的文件在那儿
+    /// 一个都找不到，抽样匹配率 0% → Rejected，需要 force 才能写。供 force 闸门测试复用。</summary>
+    private async Task<(int Id, string Target)> SeedMismatchingBaselineAsync()
+    {
+        Directory.CreateDirectory(_dir);
+        var target = Path.Combine(_dir, "target");
+        Directory.CreateDirectory(target);
+        var accountId = await CreateAccountAsync();
+        var id = await CreateConfigAsync(accountId, _dir);
+        var container = await ContainerOfAsync(id);
+
+        var identityTicks = SeedLocalInfo(accountId, container,
+        [
+            new BackupVersion
+            {
+                Version = 1, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = "v1.index",
+                Stats = new VersionStats(1, 5, 1, 5),
+            },
+        ]);
+        SeedIndex(accountId, container, 1, identityTicks, new VersionIndex
+        {
+            Version = 1,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    Path = "a.txt", Kind = "file", Length = 5, Mtime = DateTimeOffset.UtcNow, Permissions = "644",
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/abc" },
+                },
+            ],
+        });
+
+        return (id, target);
+    }
+
+    /// <summary>建一条「有历史但索引读不出来」的配置（见 SeedCorruptLocalInfo）。</summary>
+    private async Task<(int Id, string Target)> SeedUnreadableBaselineAsync()
+    {
+        Directory.CreateDirectory(_dir);
+        var target = Path.Combine(_dir, "target");
+        Directory.CreateDirectory(target);
+        var accountId = await CreateAccountAsync();
+        var id = await CreateConfigAsync(accountId, _dir);
+        var container = await ContainerOfAsync(id);
+
+        SeedCorruptLocalInfo(accountId, container);
+
+        return (id, target);
     }
 
     [Fact]
@@ -107,7 +244,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
-        var id = await CreateConfigAsync(await CreateAccountAsync(), _dir);
+        var id = await CreateConfigAsync(await CreateAzuriteAccountAsync(), _dir);
 
         var res = await _client.PostAsJsonAsync(
             $"/api/backup-configs/{id}/local-root/preview", new { newRoot = target });
@@ -141,7 +278,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Directory.CreateDirectory(_dir);
         var target = Path.Combine(_dir, "target");
         Directory.CreateDirectory(target);
-        var id = await CreateConfigAsync(await CreateAccountAsync(), _dir);
+        var id = await CreateConfigAsync(await CreateAzuriteAccountAsync(), _dir);
 
         var res = await _client.PostAsJsonAsync(
             $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = false });
@@ -156,7 +293,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     public async Task Apply_Fills_In_An_Empty_Root_Left_Behind_By_Import()
     {
         Directory.CreateDirectory(_dir);
-        var id = await CreateConfigAsync(await CreateAccountAsync(), localRoot: "");
+        var id = await CreateConfigAsync(await CreateAzuriteAccountAsync(), localRoot: "");
 
         var res = await _client.PostAsJsonAsync(
             $"/api/backup-configs/{id}/local-root", new { newRoot = _dir, force = false });
@@ -199,6 +336,93 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         {
             busy.Release(accountId, container);
         }
+    }
+
+    /// <summary>force 闸门是这整个功能的安全依据：NeedsConfirm/Rejected 不带 force 必须被拒、
+    /// 库里的 LocalRoot 必须一字未动。之前 10 个测试全走 NoBaseline 分支（needsForce 恒为 false），
+    /// 这条闸门从未被真正执行过——写反一个布尔值也会全绿。</summary>
+    [Fact]
+    public async Task Apply_Refuses_A_Mismatching_Baseline_Without_Force()
+    {
+        var (id, target) = await SeedMismatchingBaselineAsync();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = false });
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        Assert.Equal("local_root_mismatch", doc.RootElement.GetProperty("code").GetString());
+        Assert.Equal(
+            nameof(LocalRootVerdict.Rejected),
+            doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
+
+        Assert.Equal(_dir, await LocalRootOfAsync(id));   // 未落库
+    }
+
+    /// <summary>同一个不匹配的基线，这次带 force:true —— 必须真的写进去，闸门的另一半。</summary>
+    [Fact]
+    public async Task Apply_Writes_A_Mismatching_Baseline_When_Forced()
+    {
+        var (id, target) = await SeedMismatchingBaselineAsync();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = true });
+
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal(target, body!.LocalRoot);
+        Assert.Equal(target, await LocalRootOfAsync(id));
+    }
+
+    /// <summary>索引读不出来（Finding 1）：preview 必须报 BaselineUnreadable，而不是伪装成
+    /// NoBaseline 直接放行——Reason 里要能看到底层异常消息，NAS 用户没有命令行，这是唯一的诊断。</summary>
+    [Fact]
+    public async Task Preview_Reports_BaselineUnreadable_When_The_Local_Index_Is_Corrupt()
+    {
+        var (id, target) = await SeedUnreadableBaselineAsync();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root/preview", new { newRoot = target });
+
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<LocalRootPreviewResponse>();
+        Assert.Equal(nameof(LocalRootVerdict.BaselineUnreadable), body!.Verdict);
+        Assert.Contains("could not be read", body.Reason);
+        Assert.Contains("newer than supported", body.Reason);   // 底层异常消息确实透传出来了
+    }
+
+    /// <summary>BaselineUnreadable 也走 force 闸门：不带 force 必须被拒、库里未落地。</summary>
+    [Fact]
+    public async Task Apply_Refuses_An_Unreadable_Baseline_Without_Force()
+    {
+        var (id, target) = await SeedUnreadableBaselineAsync();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = false });
+
+        Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        Assert.Equal("local_root_mismatch", doc.RootElement.GetProperty("code").GetString());
+        Assert.Equal(
+            nameof(LocalRootVerdict.BaselineUnreadable),
+            doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
+
+        Assert.Equal(_dir, await LocalRootOfAsync(id));   // 未落库
+    }
+
+    /// <summary>...带 force:true 则必须真的写进去。</summary>
+    [Fact]
+    public async Task Apply_Writes_Through_An_Unreadable_Baseline_When_Forced()
+    {
+        var (id, target) = await SeedUnreadableBaselineAsync();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = true });
+
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
+        Assert.Equal(target, body!.LocalRoot);
+        Assert.Equal(target, await LocalRootOfAsync(id));
     }
 
     [Fact]

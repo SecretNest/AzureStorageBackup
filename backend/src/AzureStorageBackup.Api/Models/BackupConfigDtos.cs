@@ -155,8 +155,12 @@ public enum LocalRootVerdict
     /// <summary>匹配率 &lt;5%（含一个都找不到），默认拒绝，仍可 Force 越过。</summary>
     Rejected = 2,
 
-    /// <summary>没有可比对的基线（当前根为空、无任何版本、或索引读不出来），只校验了路径本身。</summary>
+    /// <summary>没有可比对的基线（当前根为空、无任何版本），只校验了路径本身。</summary>
     NoBaseline = 3,
+
+    /// <summary>这个备份确实有历史版本，但它的索引读不出来（信息文件损坏、解密失败、索引 blob 读取失败等），
+    /// 没能做成比对——这恰恰是最该多看一眼的情形，因此按需要确认处理，而不是像 NoBaseline 那样直接放行。</summary>
+    BaselineUnreadable = 4,
 }
 
 /// <summary>

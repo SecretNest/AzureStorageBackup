@@ -711,7 +711,8 @@ public static class BackupConfigEndpoints
 
             var preview = prepared.Preview!;
             var needsForce = preview.Verdict is nameof(LocalRootVerdict.NeedsConfirm)
-                or nameof(LocalRootVerdict.Rejected);
+                or nameof(LocalRootVerdict.Rejected)
+                or nameof(LocalRootVerdict.BaselineUnreadable);
             if (needsForce && !req.Force)
                 return Results.Json(
                     new
@@ -732,7 +733,7 @@ public static class BackupConfigEndpoints
                 $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
                 $"to '{moved.LocalRoot}' (verdict {preview.Verdict}, " +
                 $"{preview.Matched}/{preview.Sampled} sampled entries matched" +
-                $"{(req.Force && needsForce ? ", forced" : "")}).",
+                $"{(needsForce ? ", forced" : "")}).",
                 ct);
 
             var settings = await settingsSvc.GetAsync(ct);
@@ -858,16 +859,37 @@ public static class BackupConfigEndpoints
         }
 
         var baseline = await LoadBaselineAsync(config, accounts, indexCache, trackedInfo, secrets, ct);
-        var preview = LocalRootMigration.Inspect(config.LocalRoot, newRoot, baseline);
+        if (baseline.Error is { } error)
+        {
+            // 这个备份确实有历史，只是这一份索引读不出来——不能落到 Inspect(null) 那条 NoBaseline
+            // 分支，那条分支是给「压根没有历史」用的，会被直接放行。用户在 NAS 上没有命令行，
+            // 这条 Reason 里的异常消息是他们能看到的唯一诊断。
+            var unreadable = new LocalRootPreviewResponse(
+                nameof(LocalRootVerdict.BaselineUnreadable), Sampled: 0, Matched: 0, Missing: 0,
+                SizeMismatch: 0, MtimeDiffers: 0, MatchRate: 0,
+                Reason: $"The latest version index could not be read: {error}", Examples: []);
+            return new PreparedLocalRoot(null, config, newRoot, unreadable);
+        }
+
+        var preview = LocalRootMigration.Inspect(config.LocalRoot, newRoot, baseline.Index);
         return new PreparedLocalRoot(null, config, newRoot, preview);
     }
 
     /// <summary>
-    /// 取最新版本的索引作为比对基线。走本地权威缓存（与 /tree、/file-versions 同一套依赖），
-    /// 取不到就返回 null —— 判定会因此落到 NoBaseline，而不是伪装成 0% 匹配。
-    /// 任何异常都吞成"没有基线"：拿不到基线不该让用户连根都改不了。
+    /// 取最新版本索引作为比对基线的三种结果：<c>Index</c> 非空 = 取到了；两者皆空 = 确实没有基线
+    /// （没账户/没信息文件/没版本，走 Inspect 判成 NoBaseline）；<c>Error</c> 非空 = 有历史但读取本身
+    /// 失败——这三者必须分开，第三种绝不能被当成第二种直接放行（见下方 LoadBaselineAsync 的注释）。
     /// </summary>
-    private static async Task<VersionIndex?> LoadBaselineAsync(
+    private readonly record struct BaselineLoad(VersionIndex? Index, string? Error);
+
+    /// <summary>
+    /// 取最新版本的索引作为比对基线。走本地权威缓存（与 /tree、/file-versions 同一套依赖）。
+    /// 没有账户/没有信息文件/没有任何版本 —— 这是「真的没有基线」，交给 Inspect 判成 NoBaseline。
+    /// 但信息文件损坏、密码解不开、索引 blob 读取失败 —— 这是「有基线但读不出来」，**不能**
+    /// 也归进 NoBaseline：那条分支会被直接放行，而这恰恰是最该让用户多看一眼、需要 force 的情形
+    /// （详见 Finding 1）。
+    /// </summary>
+    private static async Task<BaselineLoad> LoadBaselineAsync(
         BackupConfig config, IAccountService accounts, ILocalIndexCache indexCache,
         TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct)
     {
@@ -875,21 +897,23 @@ public static class BackupConfigEndpoints
         {
             var account = await accounts.GetAsync(config.AccountId, ct);
             if (account is null)
-                return null;
+                return default;
 
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var latest = info?.Versions.OrderByDescending(v => v.Version).FirstOrDefault();
             if (info is null || latest is null)
-                return null;
+                return default;
 
-            return await indexCache.ReadAsync(
+            var index = await indexCache.ReadAsync(
                 account, config.ContainerName, latest.Version,
                 info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, ct);
+            return new BaselineLoad(index, null);
         }
+        // 取消不是「失败」，是整条请求该停下——照旧不拦。
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return null;
+            return new BaselineLoad(null, ex.Message);
         }
     }
 }
