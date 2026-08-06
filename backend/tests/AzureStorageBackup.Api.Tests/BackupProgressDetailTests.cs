@@ -132,4 +132,78 @@ public sealed class BackupProgressDetailTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// 读盘核对那几段要真的接上线。用户遭遇：屏幕上半分钟纹丝不动的
+    /// <c>686 of 11,004 objects · 1 object starting upload · 10,317 objects queued</c>——
+    /// 那一件活当时在逐成员 <c>Stat</c>／整读算 hash，既没在 starting 也没在 upload，
+    /// 而这几段一个进度事件都不发，心跳又只在有流在传时才跑，于是界面冻在旧快照上。
+    /// <para>
+    /// 这里断言的是**接线**（四处调用点确实登记了、且配对没漏）；计数语义与发布时机由
+    /// <c>UploadWaitVisibilityTests</c> 确定性地覆盖。能这么断言正是因为 <c>BeginChecking</c>
+    /// 强制发布——若它跟着 200ms 节流走，这条断言就得看运气，而那也正说明界面看不看得见得看运气。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Local_Checking_Work_Shows_Up_In_The_Upload_Stage()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var progress = new CapturingProgress();
+
+        var account = new Account
+        {
+            Name = "azurite",
+            BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
+            AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
+            Region = AzureRegion.Global,
+        };
+        var name = "checking-" + Guid.NewGuid().ToString("N")[..8];
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 小文件成箱（装箱前 stat + 压缩后逐成员重校验），大文件走单文件路径（去重预筛整读算
+            // 三段 hash）——四处登记里的三处都在这一趟里，第四处（加密多卷清残留）另有其测。
+            Directory.CreateDirectory(Path.Combine(_root, "pack"));
+            for (var i = 0; i < 8; i++)
+                await File.WriteAllTextAsync(Path.Combine(_root, "pack", $"s{i:D2}.txt"), new string('x', 200 + i));
+            await File.WriteAllTextAsync(Path.Combine(_root, "big.bin"), new string('y', 8_000));
+
+            var authority = new TestLocalAuthority(store);
+            var orchestrator = new BackupOrchestrator(
+                new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+                new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+
+            await orchestrator.RunAsync(new BackupRequest
+            {
+                Account = account, Container = name, LocalRoot = _root, Name = "checking-test",
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1_000 } },
+            }, progress);
+
+            var uploading = progress.Reports
+                .Where(r => r.Stage == BackupStage.Uploading && r.Detail is not null)
+                .Select(r => r.Detail!)
+                .ToList();
+
+            Assert.NotEmpty(uploading);
+            // 接线：这一段至少被看见过一次。看不见就是回到了"屏幕上一动不动的 starting upload"。
+            Assert.Contains(uploading, d => d.Checking > 0);
+            // 细分关系：checking 是从 uploading 里拆出来的，越不过它——越过了说明有一段登记跑到
+            // 暂存段里去了，那条件数恒等式就破了，界面上会算出负数的 "starting upload"。
+            Assert.All(uploading, d => Assert.True(
+                d.Checking <= d.Uploading, $"checking ({d.Checking}) must stay within uploading ({d.Uploading})"));
+            // 配对：终态必须归零。漏一次 EndChecking，这一栏就在余下的运行里卡在虚高的数字上——
+            // preparing 在这个项目里正是这么栽过一次。
+            Assert.Equal(0, uploading[^1].Checking);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

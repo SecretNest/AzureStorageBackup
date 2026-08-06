@@ -1483,7 +1483,9 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 剩下的那些（uploading 减掉 peer 与 cloud）是已进上传段、但字节还没上路的件——正在做压完到
   // 开传之间那段本地活（pack 逐成员重新 Stat、单文件查去重映射）。只在**一条流都没在传**时才报：
   // 有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人分不清哪个数是哪个。
-  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer)
+  // checking 也要减掉：它同样是从 uploading 里拆出来的一档（读盘核对那几段），下面自己有一栏。
+  // 不减就是同一件活报两遍，屏幕上的数再也凑不出 processed + preparing + queued + uploading。
+  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // 在途那个数的单位**两侧不一样**：
@@ -1523,6 +1525,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.waitingOnSlot > 0 &&
       `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
+    // 读盘核对那几段（去重预筛整读、pack 逐成员 stat、云端清残留卷）。**不**跟着上面那一栏加
+    // "一条流都没在传时才报"的条件：那个条件是因为 starting upload 说不清自己在干什么，有流在传
+    // 时再加一档只会让人分不清哪个数是哪个；这一栏说得清，而且它回答的正是"另外那件活为什么不动"。
+    // 位置按逆时间轴排在 preparing 之前——单文件的预筛其实早于压缩，pack 的重校验晚于压缩，
+    // 一栏横跨两头，只能取一个位置，取的是"离网线更近"的那一端。
+    // 措辞不写成 "in checking files"：整行每一项都是 `N objects <现在分词>`（starting upload、
+    // downloading、waiting for an upload slot、preparing），插一个介词进来就成了整行唯一的异类。
+    detail.checking > 0 && `${withUnit(detail.checking, unit)} checking files`,
     detail.preparing > 0 && `${withUnit(detail.preparing, unit)} ${preparingLabel}`,
     detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
   ]

@@ -40,7 +40,9 @@ Uploading: 686 of 11,004 objects · 1 object starting upload · 10,317 objects q
 
 `StageProgress` record 末尾追加 `int Checking = 0`（追加在末尾，不动现有位置参数的次序）。
 
-`StageTracker` 加 `_inChecking`，配 `BeginChecking()` / `EndChecking()`，形状照抄 `BeginPacking`：进 `_gate`、`Interlocked` 增减、`PublishIfDue(force: false)`。200ms 节流照旧生效。
+`StageTracker` 加 `_inChecking`，配 `BeginChecking()` / `EndChecking()`。
+
+**强制发布**（`PublishIfDue(force: true)`），跟 `BeginWait` 走而不是跟 `BeginPacking` 走——设计初稿写的是照抄 `BeginPacking` 的 `force: false`，那是错的：核对期间本调用方一个事件都不产生，心跳又只在有流在传时才跑，被 200ms 节流吞掉的那次发布没有任何后续补偿，界面会一直冻在旧快照上直到这一段结束。吞掉它，整个改动就白做了。代价可以忽略——登记按**件**发生（一件单文件一次、一箱 pack 前后各一次），不像在途登记那样按卷算。
 
 **不开心跳**：这几段期间没有任何新读数，每秒推一条一模一样的快照没有意义。进出各推一次就够——界面从 "1 object starting upload" 变成 "1 object checking files" 再变回去，卡在哪一段就说得出来了。
 
@@ -72,9 +74,10 @@ Uploading: 686 of 11,004 objects · 1 object starting upload · 10,317 objects q
 
 ## 测试
 
-- `StageProgressTests`：计数增减、发布时机、异常路径不泄漏（`finally` 配对）
-- `BackupProgressDetailTests`：字段透出到 detail
-- 前端：`checking > 0` 时渲染出这一栏，且 `starting upload` 相应减掉
+- `UploadWaitVisibilityTests`：计数是 `uploading` 的细分而非新增一段、进出都不被节流吞掉、多还一次也不显示成负数
+- `BackupProgressDetailTests`：跑一次真备份验证四处调用点确实接了线（至少被看见过一次、始终 `checking ≤ uploading`、终态归零）
+
+**前端没有自动化覆盖**：这段拼装内嵌在 `BackupConfigsPage` 组件里，而项目只装了 vitest、没有 testing-library/jsdom，测不了组件渲染。把它抽成 `src/lib/` 下的纯函数是能测，但那是 ~80 行的搬迁，与这次三行的改动不成比例。前端这三行（类型字段、`stalled` 的减法、文案行）靠 `tsc` 与人工核对。
 
 ## 不做
 

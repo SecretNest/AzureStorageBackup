@@ -129,7 +129,23 @@ public sealed record StageProgress(
     int WaitingOnPeer = 0,
     /// <summary>其中正卡在全局上传闸门上的**卷**数（<see cref="UploadWait.Slot"/>）。
     /// 闸门是按卷排队的，所以这一个数的单位与另外两个不同。</summary>
-    int WaitingOnSlot = 0)
+    int WaitingOnSlot = 0,
+    /// <summary>
+    /// 其中正在**读盘核对**、既不推字节也不在等任何东西的件数：单文件的去重预筛要把整个文件读
+    /// 一遍算三段 hash，一箱 pack 压缩前后各要逐成员 <c>Stat</c>（变了的还得整读重算 hash），
+    /// 加密多卷上传前还要列一遍云端清残留卷。这几段在 NAS 上都能跑几十秒。
+    /// <para>
+    /// 是 <see cref="Uploading"/> 的**细分**而不是新的一段：它们全发生在出了暂存段、还没登记
+    /// 在途卷的时候，所以 <c>Checking ≤ Uploading</c>，那条件数恒等式一个字都不用改。界面上
+    /// 要把它从 "starting upload" 里减出去——同一件活报两栏，账就多出来了。
+    /// </para>
+    /// <para>
+    /// 单独列一栏的理由和当初加 <see cref="Uploading"/> 是同一个：这几段一个进度事件都不发，
+    /// 而心跳只在有流在传时才跑，于是屏幕上是几十秒纹丝不动的 "1 object starting upload"——
+    /// 既没在 starting，也没在 upload。
+    /// </para>
+    /// </summary>
+    int Checking = 0)
 {
     /// <summary>某一种等待此刻卡着几个。</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -247,6 +263,7 @@ public sealed class StageTracker(
     // 默认配置下界面显示 5 preparing，看着像五件活在并行推进，实际是一件在压、四个在闲等。
     private int _inStaging;
     private int _inPacking;
+    private int _inChecking;
     // 各段等待的当前人数，按 UploadWait 的序号索引。数组而不是三个字段：调用方按枚举取用，
     // 加一段等待只需在枚举里多一项，发布那一头不必再各加一条。
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
@@ -464,6 +481,34 @@ public sealed class StageTracker(
             Interlocked.Decrement(ref _inPacking);
             PublishIfDue(force: false);
         }
+    }
+
+    /// <summary>
+    /// 开始一段读盘核对（成对调 <see cref="EndChecking"/>）：去重预筛整读算 hash、pack 逐成员
+    /// <c>Stat</c>、加密多卷上传前列举云端残留卷。含义见 <see cref="StageProgress.Checking"/>。
+    /// <para>
+    /// <b>强制发布</b>，与 <see cref="BeginWait"/> 同理而与 <see cref="BeginPacking"/> 不同：
+    /// 核对期间本调用方一个事件都不产生，而心跳只在有流在传时才跑（见 <see cref="Tick"/> 里那条
+    /// 虚拟时钟的短路）。零流在传的时候被节流吞掉的这一次发布没有任何后续补偿，界面会冻在旧快照上
+    /// 直到这一段结束——而那正是这一栏要说明的那几十秒，吞掉它等于白加。
+    /// </para>
+    /// <para>
+    /// 代价可以忽略：登记按**件**发生（一件单文件一次、一箱 pack 前后各一次），不像在途登记那样
+    /// 按卷算——一件大活上千卷，那才是不能强制发布的量级。
+    /// </para>
+    /// </summary>
+    public void BeginChecking()
+    {
+        Interlocked.Increment(ref _inChecking);
+        lock (_gate)
+            PublishIfDue(force: true);
+    }
+
+    public void EndChecking()
+    {
+        Interlocked.Decrement(ref _inChecking);
+        lock (_gate)
+            PublishIfDue(force: true);
     }
 
     /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
@@ -746,7 +791,8 @@ public sealed class StageTracker(
             // processed + preparing + queued + uploading ≡ total 是个恒等式，不依赖任何调用位置。
             Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
-            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot]))));
+            Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
+            Math.Max(0, Volatile.Read(ref _inChecking))));
     }
 
     /// <summary>

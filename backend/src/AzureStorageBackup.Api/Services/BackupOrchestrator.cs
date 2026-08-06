@@ -960,7 +960,7 @@ public sealed class BackupOrchestrator(
         var headBytes = request.Options.Diff.HeadHashBytes;
 
         // 1. 预筛 + 探测。命中既有 blob 就到此为止：一个字节都不用压、不用传。
-        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, ct) is { } p
+        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, uploadTracker, ct) is { } p
             && localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
         {
             return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
@@ -1006,14 +1006,30 @@ public sealed class BackupOrchestrator(
     /// 去重预筛：先只读文件头算 head hash，本地索引里连（长度 + head）都对不上就返回 null，
     /// 让调用方直接走一遍读的流式快路径；有候选才把整个文件读一遍算出完整内容身份。
     /// </summary>
+    /// <remarks>
+    /// 整段登记为「读盘核对」（<see cref="StageProgress.Checking"/>）：命中候选时这里要把整个文件
+    /// 读一遍，一个几 GB 的文件在 NAS 上就是几十秒，期间既不推字节也不等任何东西——不报出来的话
+    /// 屏幕上是一动不动的 "1 object starting upload"，而它连压缩都还没开始。
+    /// </remarks>
     private async Task<BlobContent?> ProbeForDedupAsync(
-        PlannedFile file, string localPath, int headBytes, LocalDedupResolver localResolver, CancellationToken ct)
+        PlannedFile file, string localPath, int headBytes, LocalDedupResolver localResolver,
+        StageTracker uploadTracker, CancellationToken ct)
     {
-        var length = new FileInfo(localPath).Length;
-        var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
-        var may = localResolver.MayDeduplicate(length, head);
-        localResolver.NoteInFlight(length, head);
-        return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
+        uploadTracker.BeginChecking();
+        try
+        {
+            var length = new FileInfo(localPath).Length;
+            var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
+            var may = localResolver.MayDeduplicate(length, head);
+            localResolver.NoteInFlight(length, head);
+            return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
+        }
+        finally
+        {
+            // 必须是 finally：这一路会抛（文件读不开、被取消），漏掉一次配对，这一栏就在余下的
+            // 运行里卡在虚高的数字上——preparing 在这个项目里正是这么栽过一次（见 StagingArea）。
+            uploadTracker.EndChecking();
+        }
     }
 
     /// <summary>把文件完整读一遍，一次算出 head/full/tail 三段 hash 与长度
@@ -1115,7 +1131,7 @@ public sealed class BackupOrchestrator(
                 addressing.Metadata(content.FullHash, content.Length, content.HeadHash, content.TailHash));
             if (content.Raw)
                 meta["raw"] = "1";
-            await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, ct);
+            await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, uploadTracker, ct);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
@@ -1154,18 +1170,29 @@ public sealed class BackupOrchestrator(
     /// </para>
     /// </summary>
     private async Task ClearLeftoverVolumesAsync(
-        BackupRequest request, string blobRef, int volumeCount, CancellationToken ct)
+        BackupRequest request, string blobRef, int volumeCount, StageTracker uploadTracker, CancellationToken ct)
     {
         if (volumeCount <= 1 || string.IsNullOrEmpty(request.Password))
             return;
 
-        var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
-        await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, blobRef, ct))
+        // 登记在早退之后：不加密或单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
+        // 严格说这一段查的是云上的卷而不是本地文件，仍归进「核对」那一栏——单给它一栏不值当，
+        // 要说的就一件事：这件活正在核对，不在传。
+        uploadTracker.BeginChecking();
+        try
         {
-            // 按前缀列举会连带捞到碰撞避让的兄弟（data/{hash}~1 及其分卷），那是**另一份内容**、
-            // 由别的索引条目引用着，误删就是真丢数据。IsVolumeOf 只认这个归档自己的卷。
-            if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
-                await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+            var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+            await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, blobRef, ct))
+            {
+                // 按前缀列举会连带捞到碰撞避让的兄弟（data/{hash}~1 及其分卷），那是**另一份内容**、
+                // 由别的索引条目引用着，误删就是真丢数据。IsVolumeOf 只认这个归档自己的卷。
+                if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
+                    await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+            }
+        }
+        finally
+        {
+            uploadTracker.EndChecking();
         }
     }
 
@@ -1232,7 +1259,17 @@ public sealed class BackupOrchestrator(
             // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
             // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
             // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
-            var before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
+            // 逐成员 stat：一箱几百个成员，在 NAS 上不是白干的。与压缩后那一遍同报「读盘核对」。
+            uploadTracker.BeginChecking();
+            Dictionary<string, (long Mtime, long Length, int Mode)?> before;
+            try
+            {
+                before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
+            }
+            finally
+            {
+                uploadTracker.EndChecking();
+            }
             var (staged, missing) = await CompressPackTolerantAsync(
                 request, packId, members, storeOnly, uploadTracker, state, ct);
 
@@ -1242,26 +1279,38 @@ public sealed class BackupOrchestrator(
             var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
 
             // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
-            foreach (var m in members)
+            //
+            // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
+            // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
+            // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
+            uploadTracker.BeginChecking();
+            try
             {
-                if (missing.Contains(m.EntryName))
-                    continue;
+                foreach (var m in members)
+                {
+                    if (missing.Contains(m.EntryName))
+                        continue;
 
-                var local = Local(request, m.Path);
-                bool exclude;
-                try
-                {
-                    // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
-                    // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
-                    exclude = before[m.Path] is not { } snapshot
-                        || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
+                    var local = Local(request, m.Path);
+                    bool exclude;
+                    try
+                    {
+                        // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
+                        // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
+                        exclude = before[m.Path] is not { } snapshot
+                            || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        exclude = true;
+                    }
+                    if (exclude)
+                        changed.Add(m);
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    exclude = true;
-                }
-                if (exclude)
-                    changed.Add(m);
+            }
+            finally
+            {
+                uploadTracker.EndChecking();
             }
 
             if (changed.Count == 0)

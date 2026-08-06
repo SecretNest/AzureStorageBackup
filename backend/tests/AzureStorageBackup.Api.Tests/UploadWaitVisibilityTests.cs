@@ -117,6 +117,88 @@ public sealed class UploadWaitVisibilityTests
     }
 
     /// <summary>
+    /// 「已进上传段」里有一部分根本不在等着开传，而是在读盘核对：单文件的去重预筛要把整个文件
+    /// 读一遍算三段 hash，一箱 pack 压缩前后各要逐成员 <c>Stat</c>（变了的还得整读重算 hash），
+    /// 加密多卷上传前还要列一遍云端清残留卷。这几段在 NAS 上都能跑几十秒。
+    /// <para>
+    /// 拆出来的是**显示**不是账：这几段都发生在出了暂存段、还没登记在途卷的时候，所以
+    /// <c>checking ⊆ uploading</c>，那条件数恒等式一个字都不用改。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Local_Checking_Work_Is_Told_Apart_From_Items_About_To_Upload()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true);
+
+        tracker.Enqueue();
+        tracker.Enqueue();
+
+        // 第一件：压完出了暂存段，正在逐成员重新 Stat——不推字节，也不在等任何东西。
+        tracker.BeginWork();
+        tracker.BeginStaging();
+        tracker.EndStaging();
+        tracker.BeginChecking();
+
+        // 第二件：同样进了上传段，它才是真的在往开传上走。
+        tracker.BeginWork();
+        tracker.BeginStaging();
+        tracker.EndStaging();
+        tracker.BeginUpload();
+
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.Checking);
+        Assert.Equal(2, s.Uploading);   // 两件都在上传段，checking 是其中一件的细分
+        Assert.Equal(2, s.Processed + s.Preparing + s.Queued + s.Uploading);
+    }
+
+    /// <summary>
+    /// 进出这一段都必须**当场**发出去，理由与
+    /// <see cref="Entering_A_Wait_Is_Published_Immediately_Even_Inside_The_Throttle_Window"/> 逐字相同：
+    /// 核对期间本调用方一个事件都不产生，而心跳只在有流在传时才跑。被 200ms 节流吞掉的那一次
+    /// 发布没有任何后续补偿，界面就冻在旧快照上——那正是这一栏要说明的那几十秒，吞掉它等于白加。
+    /// </summary>
+    [Fact]
+    public void Entering_And_Leaving_Checking_Is_Published_Immediately_Even_Inside_The_Throttle_Window()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true);
+
+        tracker.Advance(1);            // 刚发布过一次，节流窗口正开着
+        var beforeBegin = seen.Count;
+
+        tracker.BeginChecking();
+        Assert.True(seen.Count > beforeBegin, "entering local checking must publish immediately");
+        Assert.Equal(1, seen[^1].Checking);
+
+        var beforeEnd = seen.Count;
+        tracker.EndChecking();
+        Assert.True(seen.Count > beforeEnd, "leaving local checking must publish immediately");
+        Assert.Equal(0, seen[^1].Checking);
+    }
+
+    /// <summary>
+    /// 四处登记全在 <c>finally</c> 里配对，但抛出的那一路仍要保证这一栏归得了零——
+    /// <c>BeginPacking</c> 在这个项目里正是栽在这上面（加了没配对，<c>preparing</c> 在余下的运行里
+    /// 卡在虚高的数字上），配对写法的由来见 <see cref="StagingArea"/>。
+    /// </summary>
+    [Fact]
+    public void Checking_Never_Goes_Negative_Or_Sticks_High()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true);
+
+        tracker.BeginChecking();
+        tracker.EndChecking();
+        tracker.EndChecking();   // 多还一次（不该发生，但夹住它总比让界面显示负数强）
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].Checking);
+    }
+
+    /// <summary>
     /// 闸门满了才算「在等额度」。正常情况下额度随手就拿到，标记它等于给每一卷平白加一次
     /// 强制发布——一件大活上千卷，那是上千次。
     /// </summary>
