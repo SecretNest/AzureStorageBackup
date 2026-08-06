@@ -213,6 +213,13 @@ export interface StageProgress {
   uploading: number
   waitingOnPeer: number // 其中在等同批同内容的首个上传者传完的件数
   waitingOnSlot: number // 其中在排全局上传闸门的**卷**数（闸门按卷排队，单位与另外两个不同）
+  // 其中正在读盘核对、既不推字节也不在等任何东西的件数：单文件去重预筛整读算三段 hash、
+  // 一箱 pack 压缩前后各逐成员 stat（变了的还要整读重算 hash）、加密多卷上传前列举云端残留卷。
+  // 这几段在 NAS 上都能跑几十秒，而且一个进度事件都不发——从前屏幕上是一动不动的
+  // "1 object starting upload"，既没在 starting 也没在 upload。
+  // 它是 uploading 的**细分**（都发生在出了暂存段、还没登记在途卷的时候），所以算 starting upload
+  // 时必须把它减掉，否则同一件活会被报两栏，屏幕上的数就凑不出那条恒等式了。
+  checking: number
 }
 
 export interface BackupProgress {

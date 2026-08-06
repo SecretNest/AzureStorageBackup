@@ -1480,10 +1480,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
   // 件数口径：peer 与 cloud 数的是**件**，slot 数的是**卷**。所以只有前两项参与件数加法，
   // slot 单独说，措辞里点明单位。
   //
-  // 剩下的那些（uploading 减掉 peer 与 cloud）是已进上传段、但字节还没上路的件——正在做压完到
-  // 开传之间那段本地活（pack 逐成员重新 Stat、单文件查去重映射）。只在**一条流都没在传**时才报：
-  // 有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人分不清哪个数是哪个。
-  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer)
+  // 剩下的那些（uploading 减掉 peer 与 checking）是已进上传段、但字节还没上路、又说不出在等什么
+  // 的件：登记完"进上传段"到第一卷起飞之间、卷与卷之间的空档、查去重映射时没排上队的那一段。
+  // 读盘核对那几段（预筛整读、pack 逐成员 Stat、云端清残留）已经拆进 checking 自己那一栏，
+  // 必须从这里减掉——不减就是同一件活报两遍，屏幕上的数再也凑不出
+  // processed + preparing + queued + uploading 那条恒等式。
+  // 只在**一条流都没在传**时才报：有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人
+  // 分不清哪个数是哪个。这个理由对 checking 不成立（那一栏说得清自己在干什么），所以它不设这个门。
+  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // 在途那个数的单位**两侧不一样**：
@@ -1523,6 +1527,14 @@ function StageDetail({ detail }: { detail: StageProgress }) {
     detail.waitingOnSlot > 0 &&
       `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
+    // 读盘核对那几段（去重预筛整读、pack 逐成员 stat、云端清残留卷）。**不**跟着上面那一栏加
+    // "一条流都没在传时才报"的条件：那个条件是因为 starting upload 说不清自己在干什么，有流在传
+    // 时再加一档只会让人分不清哪个数是哪个；这一栏说得清，而且它回答的正是"另外那件活为什么不动"。
+    // 位置按逆时间轴排在 preparing 之前——单文件的预筛其实早于压缩，pack 的重校验晚于压缩，
+    // 一栏横跨两头，只能取一个位置，取的是"离网线更近"的那一端。
+    // 措辞不写成 "in checking files"：整行每一项都是 `N objects <现在分词>`（starting upload、
+    // downloading、waiting for an upload slot、preparing），插一个介词进来就成了整行唯一的异类。
+    detail.checking > 0 && `${withUnit(detail.checking, unit)} checking files`,
     detail.preparing > 0 && `${withUnit(detail.preparing, unit)} ${preparingLabel}`,
     detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
   ]
