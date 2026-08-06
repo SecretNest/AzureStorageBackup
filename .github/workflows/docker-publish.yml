@@ -16,6 +16,8 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # 构建本身十分钟内必完；卡住的话是缓存后端而不是构建，别让它挂满默认的 6 小时。
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -62,5 +64,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 缓存放 GHCR，不放 GitHub Actions Cache。type=gha 的导出跑在镜像推送**之后**，
+          # 一次双架构 mode=max 就把它压垮了：2026-08-06 那次镜像早已推完，导出却原地停了
+          # 十一分钟，只能手动取消——而那时该发布的东西其实全都发布好了。
+          # ignore-error 是第二道保险：缓存写不进去不该让一次成功的发布报红。
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
