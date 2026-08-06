@@ -1293,6 +1293,21 @@ describe('localRootDecision', () => {
     expect(d.tone).toBe('danger')
   })
 
+  it('BaselineUnreadable — needs the checkbox, and surfaces the underlying reason', () => {
+    const d = localRootDecision({
+      ...base,
+      verdict: 'BaselineUnreadable',
+      sampled: 0,
+      matched: 0,
+      matchRate: 0,
+      reason: 'The latest version index could not be read: bad decrypt',
+    })
+    expect(d.canApply).toBe(false)
+    expect(d.needsForce).toBe(true)
+    // 「有历史但读不出来」绝不能被当成「没有历史」放行。
+    expect(d.headline).toContain('bad decrypt')
+  })
+
   it('an unknown verdict never silently allows the change', () => {
     const d = localRootDecision({ ...base, verdict: 'SomethingNew' })
     expect(d.canApply).toBe(false)
@@ -1314,7 +1329,7 @@ Expected: FAIL —— `Failed to resolve import "./localRootVerdict"`
 // 抽成纯函数是为了能测：仓库没有组件渲染测试的基建，对话框只负责把这里的输出画出来。
 
 export interface LocalRootPreview {
-  verdict: string // 'Ok' | 'NeedsConfirm' | 'Rejected' | 'NoBaseline'
+  verdict: string // 'Ok' | 'NeedsConfirm' | 'Rejected' | 'NoBaseline' | 'BaselineUnreadable'
   sampled: number
   matched: number
   missing: number
@@ -1367,6 +1382,15 @@ export function localRootDecision(preview: LocalRootPreview | null): LocalRootDe
         needsForce: true,
         tone: 'danger',
         headline: `${preview.matched} of ${preview.sampled} sampled entries match — this looks like the wrong directory.`,
+      }
+    case 'BaselineUnreadable':
+      // 有历史却读不出来，和「压根没有历史」是两回事：后者放行，前者必须问一句。
+      // reason 里带着底层异常原文——用户在 NAS 上没有命令行，那是他唯一的诊断线索。
+      return {
+        canApply: false,
+        needsForce: true,
+        tone: 'danger',
+        headline: preview.reason ?? 'This backup has history, but its latest version index could not be read.',
       }
     default:
       // 后端加了新 verdict 而前端还没跟上时，宁可卡住也不放行。

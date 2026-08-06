@@ -119,6 +119,13 @@ mtime **不参与判定**，只单独统计并在报告里附带显示（"其中
 | `[5%, 95%)` | `NeedsConfirm` | 需 `force: true` |
 | `[0, 5%)`（含新目录一个都找不到） | `Rejected` | 需 `force: true` |
 | 无基线 | `NoBaseline` | 直接允许 apply |
+| 基线读不出来 | `BaselineUnreadable` | 需 `force: true` |
+
+`BaselineUnreadable` 是实施期评审补上的一档，它修正了本设计初稿的一个错误：初稿把
+「索引取不到」也归进 `NoBaseline`，而 `NoBaseline` 恰恰是免确认直接放行的一档。于是一个
+**云端有历史、但索引读不出来**的备份——最该被多问一句的那种——会被当成「这备份还没跑过」
+一路放行。现在两者分开：确实没有历史照旧放行；有历史却读不出来，把底层异常原文放进
+`Reason` 并要求 `force`。
 
 区间左闭右开，边界值归入更宽松的一档（恰好 95% 判 `Ok`，恰好 5% 判 `NeedsConfirm`）。
 
