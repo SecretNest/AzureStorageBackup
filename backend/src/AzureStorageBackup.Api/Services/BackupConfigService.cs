@@ -34,6 +34,12 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
     /// 更新配置。基础字段（AccountId/ContainerName/LocalRoot/IndexTier/DataTier）与密码创建后锁定
     /// （§4.5）：本地权威状态（TrackedInfoStore/LocalIndexCache）按 账户+container 键控，改这些字段会与云端/本地
     /// 索引失步。检测到变更时抛 <see cref="InvalidOperationException"/>，端点映射为 400。
+    ///
+    /// <para>
+    /// LocalRoot 另有一条带校验的专用通道 <see cref="ChangeLocalRootAsync"/>（挂载点搬家用）。
+    /// **这里的检查不因此放松**：常规编辑路径继续拒绝改根，否则一次顺手的改名保存就能悄悄换掉根，
+    /// 绕开那条通道的全部防呆。
+    /// </para>
     /// </summary>
     public async Task<BackupConfig?> UpdateAsync(int id, BackupConfig update, CancellationToken ct = default)
     {
@@ -69,6 +75,20 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.VolumeBytes = update.VolumeBytes;
         existing.VerboseLogging = update.VerboseLogging;
 
+        await db.SaveChangesAsync(ct);
+        return existing;
+    }
+
+    /// <inheritdoc />
+    public async Task<BackupConfig?> ChangeLocalRootAsync(int id, string newRoot, CancellationToken ct = default)
+    {
+        var existing = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
+        if (existing is null)
+            return null;
+
+        // 只动这一个字段。ScopeRules 尤其不能顺手改写：它是相对根的坐标，
+        // 新根下是同一份数据时，规则原样继续正确命中。
+        existing.LocalRoot = newRoot;
         await db.SaveChangesAsync(ct);
         return existing;
     }
