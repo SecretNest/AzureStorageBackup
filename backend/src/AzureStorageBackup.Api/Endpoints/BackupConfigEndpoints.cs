@@ -735,9 +735,12 @@ public static class BackupConfigEndpoints
             //
             // NoBaseline / BaselineUnreadable 这两档一条都没抽样，样本计数得整句省掉
             // ——"0/0 sampled entries matched" 读起来像"全都对不上"，与实情正相反。
+            // 换成 reason：BaselineUnreadable 的 reason 里是底层异常原文，而设计 §5 把它算作
+            // NAS 上那位拿不到命令行的用户唯一的诊断。只写进 HTTP 响应等于随手一关就没了，
+            // 得落在这条长存的审计行里。
             var compared = preview.Sampled > 0
                 ? $", {preview.Matched}/{preview.Sampled} sampled entries matched"
-                : "";
+                : string.IsNullOrEmpty(preview.Reason) ? "" : $", {preview.Reason}";
             await log.AppendAsync(
                 OperationLogLevel.Warning, $"backup:{moved.AccountId}/{moved.ContainerName}",
                 $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
