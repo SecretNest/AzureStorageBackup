@@ -287,4 +287,105 @@ public sealed class GroupingPlannerTests
         Assert.Equal(3, plan.Packs.Sum(p => p.Members.Count));
         Assert.Contains(plan.Packs, p => p.Members.Count == 1 && p.Members[0].Path == longPath);
     }
+
+    /// <summary>
+    /// 一箱只能有一种压法，所以同一目录里可压与不可压的文件必须分开装。混装的话规则对被打包的
+    /// 文件就等于不存在——那正是这个功能之前的缺陷（整箱一律按配置的 -m… 压）。
+    /// </summary>
+    [Fact]
+    public void Same_Dir_Splits_Into_A_Compressed_Pack_And_A_Store_Only_Pack()
+    {
+        var options = new PlanOptions { DontCompress = new IgnoreRuleSet(["*.jpg"]) };
+
+        var plan = Plan(
+            [F("d/a.jpg", 100), F("d/b.txt", 100), F("d/c.jpg", 100), F("d/e.txt", 100)],
+            options);
+
+        Assert.Equal(2, plan.Packs.Count);
+
+        var compressed = Assert.Single(plan.Packs, p => !p.StoreOnly);
+        Assert.Equal(["d/b.txt", "d/e.txt"], compressed.Members.Select(m => m.Path));
+
+        var stored = Assert.Single(plan.Packs, p => p.StoreOnly);
+        Assert.Equal(["d/a.jpg", "d/c.jpg"], stored.Members.Select(m => m.Path));
+
+        // 两箱同属一个目录，处理池的归属不该因为压法而分家。
+        Assert.All(plan.Packs, p => Assert.Equal("d", p.GroupKey));
+    }
+
+    /// <summary>「不分组」仍然是最强的意思表示：命中者走单文件 blob，压法由那条路自己按同一套规则推导，
+    /// 根本不参与分箱。</summary>
+    [Fact]
+    public void Dont_Group_Outranks_Dont_Compress()
+    {
+        var options = new PlanOptions
+        {
+            DontGroup = new IgnoreRuleSet(["*.iso"]),
+            DontCompress = new IgnoreRuleSet(["*.iso", "*.jpg"]),
+        };
+
+        var plan = Plan([F("d/x.iso", 100), F("d/y.jpg", 100)], options);
+
+        Assert.Equal("d/x.iso", Assert.Single(plan.Blobs).Path);
+        var pack = Assert.Single(plan.Packs);
+        Assert.True(pack.StoreOnly);
+        Assert.Equal("d/y.jpg", Assert.Single(pack.Members).Path);
+    }
+
+    /// <summary>跨路径打包同样要切：它无视的是目录边界，不是压法。</summary>
+    [Fact]
+    public void Cross_Dir_Grouping_Also_Splits_By_Compressibility()
+    {
+        var options = new PlanOptions
+        {
+            CrossDirGroup = new IgnoreRuleSet(["meta/**"]),
+            DontCompress = new IgnoreRuleSet(["*.jpg"]),
+        };
+
+        var plan = Plan(
+            [F("meta/a/1.jpg", 100), F("meta/b/2.txt", 100), F("meta/c/3.jpg", 100)],
+            options);
+
+        Assert.Equal(2, plan.Packs.Count);
+        Assert.Equal(["meta/b/2.txt"], Assert.Single(plan.Packs, p => !p.StoreOnly).Members.Select(m => m.Path));
+        // 跨目录合并照旧发生在同一侧内部：两个 jpg 分属不同目录，仍进同一箱。
+        Assert.Equal(
+            ["meta/a/1.jpg", "meta/c/3.jpg"],
+            Assert.Single(plan.Packs, p => p.StoreOnly).Members.Select(m => m.Path));
+    }
+
+    /// <summary>
+    /// 严格分箱，**不设最小成员数兜底**：哪怕某一侧只有一个成员也照样独立成箱。
+    /// 增量备份里一个目录本轮可能就变了两个文件，「两个各含一个成员的包」是接受的常态——
+    /// 这条把那个取舍钉死，免得日后有人顺手加一条"太小就并回去"的例外。
+    /// </summary>
+    [Fact]
+    public void A_Lone_Odd_File_Still_Gets_Its_Own_Pack()
+    {
+        var options = new PlanOptions { DontCompress = new IgnoreRuleSet(["*.jpg"]) };
+
+        var plan = Plan([F("d/a.jpg", 100), F("d/b.txt", 100)], options);
+
+        Assert.Equal(2, plan.Packs.Count);
+        Assert.All(plan.Packs, p => Assert.Single(p.Members));
+    }
+
+    /// <summary>
+    /// 规则**没命中任何文件**时，装箱结果必须与这条规则存在之前逐字节相同——尤其不能凭空多出
+    /// 一个空的第二箱。这是加分箱的前提，不是附带效果（同 The_New_Limits_… 那条的用意）。
+    /// </summary>
+    [Fact]
+    public void Dont_Compress_That_Matches_Nothing_Leaves_Grouping_Unchanged()
+    {
+        var files = new[] { F("d/a.txt", 100), F("d/b.txt", 100), F("e/c.txt", 100) };
+
+        var withRule = Plan(files, new PlanOptions { DontCompress = new IgnoreRuleSet(["*.nomatch"]) });
+        var withoutRule = Plan(files);
+
+        Assert.Equal(
+            withoutRule.Packs.Select(p => p.Members.Select(m => m.Path).ToList()),
+            withRule.Packs.Select(p => p.Members.Select(m => m.Path).ToList()));
+        Assert.Equal(withoutRule.Packs.Select(p => p.PackId), withRule.Packs.Select(p => p.PackId));
+        Assert.All(withRule.Packs, p => Assert.False(p.StoreOnly));
+    }
 }

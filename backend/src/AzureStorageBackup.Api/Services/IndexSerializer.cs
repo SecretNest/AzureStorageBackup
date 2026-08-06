@@ -13,7 +13,7 @@ public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
     // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
-    private const byte InfoFormat = 3;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）；format 3: BackupVersion.StartedAt
+    private const byte InfoFormat = 4;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）；format 3: BackupVersion.StartedAt；format 4: PackInfo.StoreOnly
     private const byte IndexFormat = 4;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths；format 4: IndexEntry.UnreadableAt
 
     // ---- 信息记录文件 ----
@@ -60,6 +60,7 @@ public static class IndexSerializer
             w.Write(pack.DeadBytes);
             w.Write(pack.Volumes);
             WriteLongs(w, pack.VolumeSizes); // info format 2
+            w.Write(pack.StoreOnly); // info format 4
         }
 
         w.Flush();
@@ -126,6 +127,8 @@ public static class IndexSerializer
                 DeadBytes = deadBytes,
                 Volumes = r.ReadInt32(),
                 VolumeSizes = format >= 2 ? ReadLongs(r) : [],
+                // format 4+。旧信息文件里的包全是压过的，读成 false 恰好等于历史行为。
+                StoreOnly = format >= 4 && r.ReadBoolean(),
             };
         }
 

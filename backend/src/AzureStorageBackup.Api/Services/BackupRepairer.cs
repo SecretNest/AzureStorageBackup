@@ -321,9 +321,12 @@ public sealed class BackupRepairer(
             var staged = await staging.StageAsync(
                 async (compressTemp, token) =>
                 {
+                    // 压法取自包自己记下的那个值（PackInfo.StoreOnly），不重跑一遍不压缩规则：
+                    // 这是原地重写同一个 packId 的归档，修完的包该与当初写下的它一致。
                     var result = await compressor.CompressAsync(
                         new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
-                            password, VolumeBytes: volumeBytes, StoreOnly: false), token);
+                            password, VolumeBytes: volumeBytes,
+                            StoreOnly: info.Packs.TryGetValue(packId, out var packInfo) && packInfo.StoreOnly), token);
                     return result.VolumeFiles;
                 }, lease, ct);
             List<long> newSizes;
@@ -374,7 +377,8 @@ public sealed class BackupRepairer(
             // 必须带上原密码重压，否则加密备份的对象会被静默改写成明文 7z（机密性缺陷）。
             // StoreOnly 由调用方按配置的 DontCompress 规则逐路径推导（与 BackupOrchestrator.HandleBlobAsync
             // 同一套），修好的归档与全新备份对同一文件写出的压缩方式一致。
-            // （pack 那条路径不需要：全新备份的 CompressPackAsync 本来就是 storeOnly: false。）
+            // （pack 那条路径不这么做：一箱的压法在装箱时就定死并记进了 PackInfo.StoreOnly，
+            // 见 RepairPackAsync——那里读包上记的值，不重跑规则。）
             // 源文件直接喂给 7z，没有 compose 那类中间产物，所以只有归档产出需要记账——
             // StageAsync 全包了：全局压缩锁、预算、逐卷释放。
             var staged = await staging.StageAsync(

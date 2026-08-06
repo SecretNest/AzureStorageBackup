@@ -417,4 +417,73 @@ public sealed class BackupRepairerTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// 修复 pack 是**原地重写**同一个 packId 的归档，压法必须从 <see cref="PackInfo.StoreOnly"/> 取回来。
+    /// <para>
+    /// 与单文件那条路刻意不同：那里逐路径重跑不压缩规则（<c>dontCompress</c> 参数），而一箱的压法
+    /// 在装箱时就已经定死并记进了包——这里连规则都不传（<c>dontCompress: null</c>），修出来的包
+    /// 照样得是只存不压的。
+    /// </para>
+    /// <para>修复前（硬编码 <c>StoreOnly: false</c>）：修好的包被重压成 -mx9 的小归档，尺寸断言失败。</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Repair_Keeps_A_Store_Only_Pack_Store_Only()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        // 高度可压：只存 ≈ 40 万字节，-mx9 只剩一两 KB，尺寸断言不会卡在边界上。
+        const int filler = 200_000;
+        var (backup, _, repairer, _, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("rep-pack-store-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // 两个成员内容不同：同内容会被成员去重合成一份，那样这一箱就只剩一个成员了。
+            Directory.CreateDirectory(Path.Combine(_src, "logs"));
+            await File.WriteAllTextAsync(Path.Combine(_src, "logs", "one.log"), new string('a', filler));
+            await File.WriteAllTextAsync(Path.Combine(_src, "logs", "two.log"), new string('b', filler));
+
+            await backup.RunAsync(new BackupRequest
+            {
+                Account = account,
+                Container = name,
+                LocalRoot = _src,
+                Name = "photos",
+                Options = new BackupEngineOptions
+                {
+                    // 阈值抬高，让这两个文件走分组打包而不是单文件 blob。
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    DontCompress = new IgnoreRuleSet(["*.log"]),
+                },
+            });
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var pack = Assert.Single(info!.Packs);
+            Assert.True(pack.Value.StoreOnly, "the fresh pack should have been recorded as store-only");
+
+            async Task<long> SizeOfPackAsync() =>
+                (await container.GetBlobClient(pack.Value.Blob).GetPropertiesAsync()).Value.ContentLength;
+
+            var fresh = await SizeOfPackAsync();
+            Assert.True(fresh > filler * 1.8, $"the fresh pack should be uncompressed, was {fresh}");
+
+            // 抹掉整个包 = 云端损坏。两个成员在本地都还在，修复应当从本地重建它。
+            await container.GetBlobClient(pack.Value.Blob).DeleteIfExistsAsync();
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
+            Assert.Contains("logs/one.log", report.Repaired);
+
+            var repaired = await SizeOfPackAsync();
+            Assert.True(repaired > filler * 1.8,
+                $"the repaired pack must still be store-only, was {repaired} (compressed would be about 1 KB)");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

@@ -62,7 +62,7 @@ public sealed class DeadWeightCompactor(
             {
                 var newSizes = await RecompactAsync(
                     account, container, password, packId, live, localRoot, dataTier, allowDownload, volumeBytes,
-                    lease, ct);
+                    packInfo.StoreOnly, lease, ct);
                 if (newSizes.Count > 0)
                 {
                     info.Packs[packId] = packInfo with
@@ -95,10 +95,14 @@ public sealed class DeadWeightCompactor(
 
     /// <returns>非空=已重压（新各分卷尺寸）；空=放弃重压（本地缺失成员且不允许下载，
     /// 或索引里的成员名越出 compose 目录）。</returns>
+    /// <param name="storeOnly">这个包当初的压法（<see cref="PackInfo.StoreOnly"/>）。压实是**原地重写**
+    /// 同一个 packId 的归档，不带上它，一个只存不压的包压实完就变成默认压法了——而压实是版本退役后
+    /// 自动跑的，没有任何人会看见这次改变。也不在这里重跑一遍不压缩规则：规则改过之后，那样会让
+    /// 旧包在下次压实时悄悄换压法，而记在包上的这个值是稳定的。</param>
     private async Task<IReadOnlyList<long>> RecompactAsync(
         Account account, BlobContainerClient container, string? password, string packId,
         Dictionary<string, LivePackMember> live, string? localRoot, AccessTier dataTier,
-        bool allowDownload, long? volumeBytes, StagingArea.StagingLease? lease, CancellationToken ct)
+        bool allowDownload, long? volumeBytes, bool storeOnly, StagingArea.StagingLease? lease, CancellationToken ct)
     {
         var baseRef = $"packs/{packId}.7z";
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
@@ -174,7 +178,7 @@ public sealed class DeadWeightCompactor(
                         var result = await compressor.CompressAsync(
                             new CompressionRequest(composeDir, [.. live.Values.Select(m => m.EntryName)],
                                 Path.Combine(compressTemp, packId + ".7z"), password,
-                                VolumeBytes: volumeBytes, StoreOnly: false), token);
+                                VolumeBytes: volumeBytes, StoreOnly: storeOnly), token);
                         return result.VolumeFiles;
                     }, lease, ct);
                 try

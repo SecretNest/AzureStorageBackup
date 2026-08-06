@@ -62,6 +62,19 @@ public sealed record PlanOptions
     /// <summary>不分组列表（gitignore 语法）：命中者单文件处理。</summary>
     public IgnoreRuleSet? DontGroup { get; init; }
 
+    /// <summary>不压缩列表（gitignore 语法）：命中者只存不压（<c>-mx0</c>）。
+    /// 装箱时按它把同一目录切成「压缩箱」与「不压箱」两组分别装——一箱只有一种压法，
+    /// 混装的话规则对被打包的文件就等于不存在（历史行为：整箱一律 <c>-mx9</c>）。
+    /// <para>
+    /// 两侧都非空就各成一箱，**不设最小成员数兜底**：增量备份里一个目录本轮可能就变了两个文件，
+    /// 「两个各含一个成员的包」是可接受的常态，不值得为它引入一条会让分箱结果变得难以预测的例外。
+    /// </para>
+    /// <para>
+    /// 与单文件 blob 那条路（<c>BackupOrchestrator.HandleBlobAsync</c>）共用同一个判定方法，
+    /// 口径必须一致：同一个文件因为大小跨过阈值而换了条路时，压法不该跟着变。
+    /// </para></summary>
+    public IgnoreRuleSet? DontCompress { get; init; }
+
     /// <summary>pack 编号起点（编排器传"现有最大 pack 号 + 1"以避免冲突）。</summary>
     public int FirstPackNumber { get; init; } = 1;
 }
@@ -78,7 +91,10 @@ public sealed record PackEntry(string Path, string EntryName, string FullHash, l
 /// <param name="GroupKey">编排器据此把 pack 归入同一个处理池（池内可增量重组、池间并发）。
 /// 按目录打包时是目录路径；跨路径打包时每个 pack 自成一池，既保持并发又不必把成千上万个
 /// 跨目录文件塞进同一个串行池里。</param>
-public sealed record PlannedPack(string PackId, IReadOnlyList<PackEntry> Members, string GroupKey)
+/// <param name="StoreOnly">这一箱只存不压（<c>-mx0</c>）：全体成员都命中了 <see cref="PlanOptions.DontCompress"/>。
+/// 压法由规划器一次定死并随包走到底——下游（压缩、死重压实、修复重压）都不再自己推导，
+/// 否则规则一改，旧包会在下次重写归档时悄悄换一种压法。</param>
+public sealed record PlannedPack(string PackId, IReadOnlyList<PackEntry> Members, string GroupKey, bool StoreOnly = false)
 {
     public long OriginalBytes => Members.Sum(m => m.Length);
 }
@@ -240,16 +256,19 @@ public sealed class GroupingPlanner
             .GroupBy(f => Directory(f.Path), StringComparer.Ordinal)
             .OrderBy(g => g.Key, StringComparer.Ordinal);
 
+        // 每个目录先切压缩性、再各自装箱：一箱只能有一种压法，所以这一刀必须在装箱之前落。
         foreach (var dir in byDir)
-            Fill(dir.OrderBy(f => f.Path, StringComparer.Ordinal), groupKey: dir.Key);
+            foreach (var (storeOnly, files) in SplitByCompressibility(dir, options))
+                Fill(files, groupKey: dir.Key, storeOnly);
 
         // 跨路径：无视目录边界，按完整路径排序后顺序装箱。路径排序天然让同目录的文件相邻，
         // 所以局部性并没有丢——还原一个目录仍然只碰少数几个包——只是包不再因为目录换了就被迫封存。
-        Fill(crossDirectory.OrderBy(f => f.Path, StringComparer.Ordinal), groupKey: null);
+        foreach (var (storeOnly, files) in SplitByCompressibility(crossDirectory, options))
+            Fill(files, groupKey: null, storeOnly);
 
         return packs;
 
-        void Fill(IEnumerable<PlannedFile> ordered, string? groupKey)
+        void Fill(IEnumerable<PlannedFile> ordered, string? groupKey, bool storeOnly)
         {
             var current = new List<PackEntry>();
             long currentBytes = 0;
@@ -260,7 +279,7 @@ public sealed class GroupingPlanner
                 // 撞到三条界中的任意一条 → 封存当前 pack，另起一个（见 GroupIsFull）。
                 if (current.Count > 0 && GroupIsFull(current.Count, currentBytes, currentPathBytes, file, options))
                 {
-                    Seal(current, groupKey);
+                    Seal(current, groupKey, storeOnly);
                     current = [];
                     currentBytes = 0;
                     currentPathBytes = 0;
@@ -274,15 +293,36 @@ public sealed class GroupingPlanner
             }
 
             if (current.Count > 0)
-                Seal(current, groupKey);
+                Seal(current, groupKey, storeOnly);
         }
 
-        void Seal(List<PackEntry> members, string? groupKey)
+        void Seal(List<PackEntry> members, string? groupKey, bool storeOnly)
         {
             var id = PackId(packNumber++);
             // 跨路径的包各自成池：池间是并发的，把成千上万个跨目录文件塞进同一个池会让它们退化成串行。
-            packs.Add(new PlannedPack(id, members, groupKey ?? id));
+            packs.Add(new PlannedPack(id, members, groupKey ?? id, storeOnly));
         }
+    }
+
+    /// <summary>
+    /// 按可压缩性把一组文件切成两路：压缩箱在前、不压箱在后，每一路内部按路径排序。
+    /// <para>
+    /// 空的那一路不产出，所以 <see cref="PlanOptions.DontCompress"/> 为空时只剩「压缩箱」一路，
+    /// 装箱结果与这条规则存在之前**逐字节相同**——常规备份不受影响。
+    /// </para>
+    /// <para>
+    /// 「分两路、路内按路径排序」这个形状，是编排器那条边 diff 边填的跨目录路径能与本纯函数对齐的
+    /// 前提：扫描结果本就是 ordinal 路径序，按压缩性分流到两个累加器之后，每一路内部仍然保持路径序，
+    /// 恰好等于这里先分组再排序的结果。动这里的排序就等于破「实际产出与规划器一致」那条不变量。
+    /// </para>
+    /// </summary>
+    private static IEnumerable<(bool StoreOnly, IEnumerable<PlannedFile> Files)> SplitByCompressibility(
+        IEnumerable<PlannedFile> files, PlanOptions options)
+    {
+        var sides = files.ToLookup(f => options.DontCompress?.MatchesFileOrAncestorDir(f.Path) ?? false);
+        foreach (var storeOnly in (bool[])[false, true])
+            if (sides[storeOnly].Any())
+                yield return (storeOnly, sides[storeOnly].OrderBy(f => f.Path, StringComparer.Ordinal));
     }
 
     private static string Directory(string path)
