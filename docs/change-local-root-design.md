@@ -75,7 +75,8 @@ POST /api/backup-configs/{id}/local-root           { newRoot, force }
 
 1. **忙检查** — `BackupBusyTracker.IsBusy(accountId, container)` 为真 → 409，不做后续。
 2. **路径校验** — 非空、绝对路径、`PathBoundaryGuard` 边界内、存在、是目录、可列出。
-   失败 → 400（非法输入）。
+   越界 → 409 + `code: "path_outside_root"`（`PathBoundaryGuard.Blocked` 的既有约定，
+   全仓一致，不为本功能另立一套）；其余非法输入 → 400。
 3. **历史判定** — 是否有可比的基线？
    - `LocalRoot` 当前为空（导入缺 `SourceRootHint`），**或**该备份尚无任何版本
      → verdict `NoBaseline`，跳过抽样，允许直接改。
@@ -160,7 +161,7 @@ apply **不信任前端传来的 preview 结果**，自己重跑一遍完整校�
 
 | 文件 | 改动 |
 |---|---|
-| `Services/LocalRootMigration.cs` | **新增**。唯一的领域逻辑，对外一个方法 `Task<LocalRootPreview> InspectAsync(BackupConfig, string newRoot, ct)`。不改任何状态、不碰数据库，因而可脱离 HTTP 与 EF 单测。内部拆出分层抽样（纯函数）与文件系统比对两部分。 |
+| `Services/LocalRootMigration.cs` | **新增**。唯一的领域逻辑，**静态类、无依赖注入**：`static LocalRootPreview Inspect(string? currentRoot, string newRoot, VersionIndex? baseline)`。只读文件系统，不碰数据库、不连云、不解密——取索引所需的账户/密码/云端信息由端点备好后把 `baseline` 传进来。因而可脱离 HTTP、EF 与 Azure 单测。内部拆出分层抽样（纯函数）与文件系统比对两部分。 |
 | `Models/BackupConfigDtos.cs` | 加 `LocalRootChangeRequest(string NewRoot, bool Force = false)` 与 `LocalRootPreviewResponse`。 |
 | `Endpoints/BackupConfigEndpoints.cs` | 两个 `MapPost`，紧挨现有 `reset-password`（同属"创建后受限字段的专用变更通道"）。端点只做编排：取配置 → 忙检查 → `InspectAsync` → 按 verdict 与 `force` 裁决 → 落库 + 写日志。 |
 | `Services/BackupConfigService.cs` | 加 `ChangeLocalRootAsync(int id, string newRoot, ct)`。**不动** `UpdateAsync` 的锁定检查，只更新其文档注释说明 `LocalRoot` 现有专用通道。 |
@@ -189,14 +190,17 @@ apply **不信任前端传来的 preview 结果**，自己重跑一遍完整校�
 - symlink 条目只比存在性，不因 size 判不匹配。
 - 全匹配 → `Ok`；部分匹配 → `NeedsConfirm`；空目录 → `Rejected`。
 - `LocalRoot` 为空 → `NoBaseline`；无任何版本 → `NoBaseline`；索引取不到 → `NoBaseline` 且 `Reason` 非空。
-- 越界路径 / 空路径 / 指向文件而非目录 → 400。
+- 越界路径 → 409 + `code: "path_outside_root"`；空路径 / 相对路径 / 指向文件而非目录 / 不存在 → 400。
 - 忙时 → 409，且**未落库**。
 - `NeedsConfirm` / `Rejected` 无 `force` → 不落库；带 `force` → 落库。
 - 落库后逐字段断言：只有 `LocalRoot` 变了，其余（含 `ScopeRules`）一字未动。
 - **`UpdateAsync` 仍然拒绝改 `LocalRoot`** —— 防止新通道顺手把旧防线弄松。
 - preview 调用前后数据库状态完全一致（纯查询性质的回归保护）。
 
-前端（沿用现有 `.test.ts` 风格）：verdict → UI 状态映射；force 复选框未勾时 Apply 禁用。
+前端：仓库现有前端测试只覆盖纯逻辑（`lib/scopeRules.test.ts`、`constants/format.test.ts`），
+没有组件渲染测试的基建，本功能不为此单独引入。因此把 verdict → UI 决策抽成纯函数
+`lib/localRootVerdict.ts`（输出：能否 Apply、是否需要勾 force、提示文案键），用 vitest 测它；
+对话框组件只负责把这个纯函数的输出画出来。
 
 ## 明确不做
 
