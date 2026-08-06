@@ -1272,6 +1272,11 @@ public sealed class BackupOrchestrator(
             }
             var (staged, missing) = await CompressPackTolerantAsync(
                 request, packId, members, storeOnly, uploadTracker, state, ct);
+            // 这一箱的归档由本次迭代持有：本轮怎么结束都还回去。下面从这里到用完之间有一整段
+            // 会抛的代码（压缩后重校验里那次重算 hash，取消时抛的 OperationCanceledException 不在
+            // 那层 catch 的收集范围里），从前一穿出去这份账就永远挂在单例上了——而它是产出的背压
+            // 闸门，攒够就把所有运行的压缩一起卡住。用完仍会立刻显式 Release，这里只兜异常路径。
+            using var held = staging.Hold(staged);
 
             // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
             // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，

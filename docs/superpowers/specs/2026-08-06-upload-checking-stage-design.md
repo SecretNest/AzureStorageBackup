@@ -84,3 +84,51 @@ Uploading: 686 of 11,004 objects · 1 object starting upload · 10,317 objects q
 - 不给 checking 期间开心跳（没有新读数可报）
 - 不在 checking 期间调 `Touch` 报当前文件名：上传阶段是多线程的，`_current` 只有一个，几条线程会互相覆盖
 - 不覆盖上传后的 `RecordPack` + `LogFileAsync`
+
+---
+
+# 后续：那一屏的真正根因（2026-08-07）
+
+上面这一栏是对的，但它**不是**那一屏的原因。继续追下去，问出两条关键信息：那个容器起来之后一次都没取消过备份；**同时跑着两个备份**。
+
+## 根因：两个备份在抢同一把全局归档锁
+
+`_compressLock` 在 `StagingArea` 上，而 `StagingArea` 是 DI 单例——产出（压缩 / store-only 打包 / raw 拷贝）**跨备份也不并发**。而 `preparing` 是每个备份各记各的（`StagingArea.StageAsync` 的 `tracker` 参数注释：「谁调用谁记账，各自只看得见自己的活」）。于是：
+
+- 另一个备份占着锁 → 它的屏幕上是 `1 preparing`
+- 这个备份的 5 个线程全排在 `_compressLock.WaitAsync` 后面 → 记进本备份的 `_inStaging`，从前**并进 `queued`**，而本备份的 `preparing = 0`
+- 干等不产生任何事件，心跳又停着 → 界面冻半分钟
+- 唯一那件已经过了暂存段的活 = `uploading: 1`
+
+屏幕上于是只剩一万条 `queued`，没有任何一栏说得出"这个备份被另一个运行挡着"。不是 bug，是全局串行的设计使然——但可见性是缺陷。
+
+## 改动一：`waitingOnArchive` 单列一栏
+
+从 `queued` 里拆出来，恒等式多一项：
+
+```
+processed + preparing + queued + waitingOnArchive + uploading ≡ total
+```
+
+判别因此是免费的，不必去暴露锁的持有者：
+
+| preparing | waitingOnArchive | 含义 |
+|---|---|---|
+| 1 | >0 | 锁在自己手里，正常排队 |
+| **0** | **>0** | **锁在别的运行手里** ← 就是这一屏 |
+
+措辞 `waiting for the archive slot`，与同一行的 `waiting for an upload slot` 对仗（两个全局闸门，一个管产出一个管上传）。刻意不用 compress/compressor：store-only 只打包不压，raw 直传连 7z 都不过，三条路占的是同一把锁。
+
+这推翻了两条既有测试及其注释（`Items_Waiting_For_The_Compress_Lock_Count_As_Queued`、`Progress_Counts_Only_The_Lock_Holder_As_Preparing`），当初是有意把两者合并的。改的理由是新的：并发跑时"排队"和"被另一个备份挡着"对用户不是同一件事，后者可操作。
+
+## 改动二：pack 路径的暂存账泄漏
+
+顺带查出来的真缺陷，与这次的现象无关（用户一次都没取消过）：
+
+`ProcessPackAsync` 里从 `CompressPackTolerantAsync` 拿到 `staged`，到用完它之间那一整段（压缩后逐成员重校验）没有 `finally` 兜着。那里的 `catch` 只收 `IOException` / `UnauthorizedAccessException`，**取消时抛的 `OperationCanceledException` 一穿出去，这一箱的字节和临时文件就都留下了**。单文件路径一直有保护（`HandleBlobAsync` 的 `finally`），只有 pack 漏。
+
+后果不是"少一点临时空间"：这份账记在单例上，是进程内内存计数，漏一次就永远挂着（只有重启才清），而它同时是产出的背压闸门（`HasRoom`）。攒到上限，**所有运行**的压缩都会被卡在 `WaitForRoomAsync` 上——那也是一个不登记任何等待、不发任何事件的阻塞点。
+
+修法是 `using var held = staging.Hold(staged)`：把所有权系在循环体这个作用域上，本轮怎么结束都还回去。不用 `try/finally` 缩进整段，因为 `Release` 本来就是幂等的（按路径 `TryRemove`），所以"用完立刻还"（尽早腾额度）和"出块兜底还"可以并存。
+
+测试是确定性的：包装 `IFileCompressor` 在压完一箱后把某个成员的 mtime 往后拨，包装 `IFileHasher` 在那之后对该文件的全文 hash 抛非 IO 异常，断言 `staging.StagedBytes == 0`。验证过它在去掉 `Hold` 时确实变红。

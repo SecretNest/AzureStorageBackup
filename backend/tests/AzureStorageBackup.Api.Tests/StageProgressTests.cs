@@ -149,11 +149,22 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
-    /// 排在压缩锁后面干等的活算 <c>queued</c>。从用户的角度它们和还在队列里没被领走的活没有区别，
-    /// 都是"排着队还没开工"——而把它们算进"在准备"会让界面显示成一堆活在并行推进。
+    /// 排在归档锁后面干等的活单列一栏，**不**并进 <c>queued</c>。
+    /// <para>
+    /// 从前是并进去的，理由是"从用户的角度它们和还在队列里没被领走的活没有区别，都是排着队"。
+    /// 并发跑两个备份时这条就不成立了：那把锁是全局的（<see cref="StagingArea"/> 是单例，压缩/打包
+    /// 全局非并发），一个备份的线程可以整段排在**另一个备份**手里的锁后面。那时这个备份的
+    /// <c>preparing</c> 是 0——锁不在它手里——屏幕上于是只剩一万条 queued，没有任何一栏说得出
+    /// "它被别人挡着"。用户实际遭遇：3 TB 那个备份的六个线程全在排另一个备份的锁，界面上是
+    /// <c>686 of 11,004 objects · 1 object starting upload · 10,317 objects queued</c> 半分钟纹丝不动。
+    /// </para>
+    /// <para>
+    /// 拆开之后这个判别是免费的：<c>preparing=1</c> + 有人在等 = 锁在自己手里，正常排队；
+    /// <c>preparing=0</c> + 有人在等 = 锁在别的运行手里，可以去停掉那一个。
+    /// </para>
     /// </summary>
     [Fact]
-    public void Items_Waiting_For_The_Compress_Lock_Count_As_Queued()
+    public void Items_Waiting_For_The_Archive_Lock_Are_Told_Apart_From_Queued()
     {
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Uploading", total: 0, seen.Add);
@@ -169,8 +180,39 @@ public sealed class StageProgressTests
         tracker.Complete();
 
         var s = seen[^1];
-        Assert.Equal(1, s.Preparing); // 真正在产出的
-        Assert.Equal(2, s.Queued);    // 另两件在干等锁——队列里虽然空了，它们仍是"没开工"
+        Assert.Equal(1, s.Preparing);          // 真正在产出的
+        Assert.Equal(2, s.WaitingOnArchive);   // 另两件在干等锁
+        Assert.Equal(0, s.Queued);             // 队列里确实一件不剩——不再混报成"排队中"
+    }
+
+    /// <summary>
+    /// 锁在**别的运行**手里时的形状：自己一件都没在产出，却有一堆在等。这一屏是这次改动的由来，
+    /// 拆开之前它和"队列里还有一万件没轮到"在界面上一模一样。
+    /// </summary>
+    [Fact]
+    public void Waiting_On_An_Archive_Lock_Held_By_Another_Run_Shows_Zero_Preparing()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 8, seen.Add);
+
+        for (var i = 0; i < 8; i++)
+            tracker.Enqueue();
+        for (var i = 0; i < 5; i++)   // 五个线程领了活，全排在锁后面——锁不在这个运行手里
+        {
+            tracker.BeginWork();
+            tracker.BeginStaging();
+        }
+        tracker.BeginWork();          // 第六个：早先压完的那一件，已进上传段
+        tracker.BeginStaging();
+        tracker.EndStaging();
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(0, s.Preparing);         // ← 这个 0 从前是唯一的线索，而它什么也说明不了
+        Assert.Equal(5, s.WaitingOnArchive);
+        Assert.Equal(1, s.Uploading);
+        Assert.Equal(2, s.Queued);            // 还没被领走的
+        Assert.Equal(8, s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive + s.Uploading);
     }
 
     /// <summary>

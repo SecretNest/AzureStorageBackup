@@ -183,8 +183,13 @@ export interface StageProgress {
   currentItem: string | null
   activeItems: ActiveTransfer[]
   bytesPerSecond: number
-  preparing: number // 正占着全局压缩锁产出卷文件的（可以持续几十秒）——按锁的定义只会是 0 或 1
-  queued: number // 还没开工的：队列里没被领走的 + 已领走但在排压缩锁干等的
+  preparing: number // 正占着全局归档锁产出卷文件的（可以持续几十秒）——按锁的定义只会是 0 或 1
+  queued: number // 还没被领走的——只数队列里的（排归档锁的见 waitingOnArchive）
+  // 已领走、正排在**归档锁**后面干等的件数。那把锁是全局的（StagingArea 是单例，产出跨备份也不
+  // 并发），所以一个备份的线程可以整段排在**另一个备份**手里的锁后面——那时本备份 preparing=0，
+  // 合进 queued 的话屏幕上就只剩一万条 "queued"，说不出"它被别人挡着"。
+  // 拆开之后判别是免费的：preparing=1 + 有人在等 = 锁在自己手里；preparing=0 + 有人在等 = 在别人手里。
+  waitingOnArchive: number
   percent: number | null
   etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
   estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
