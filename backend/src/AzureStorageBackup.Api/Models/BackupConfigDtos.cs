@@ -142,3 +142,43 @@ public record BackupConfigRequest(
         GroupCapBytes = GroupCapBytes,
     };
 }
+
+/// <summary>迁移本地根路径的判定结论（设计 docs/change-local-root-design.md §5）。</summary>
+public enum LocalRootVerdict
+{
+    /// <summary>抽样匹配率 ≥95%，直接放行。</summary>
+    Ok = 0,
+
+    /// <summary>匹配率落在 [5%, 95%)，需要用户确认（Force）。</summary>
+    NeedsConfirm = 1,
+
+    /// <summary>匹配率 &lt;5%（含一个都找不到），默认拒绝，仍可 Force 越过。</summary>
+    Rejected = 2,
+
+    /// <summary>没有可比对的基线（当前根为空、无任何版本、或索引读不出来），只校验了路径本身。</summary>
+    NoBaseline = 3,
+}
+
+/// <summary>
+/// 迁移本地根路径的校验报告。<c>MtimeDiffers</c> 仅供参考、**不参与判定**——跨文件系统搬迁时
+/// mtime 的精度与保留情况经常不一致，拿它当判据会大面积误伤，而它对不上的真实后果只是
+/// 下次备份重传这些文件。
+/// </summary>
+/// <param name="Examples">最多 10 条不匹配的相对路径。这不是装饰：用户在 NAS 上拿不到命令行，
+/// 界面必须把「到底哪些文件对不上」直接摆出来，否则一个 68% 的匹配率无从判断该不该强制。</param>
+public record LocalRootPreviewResponse(
+    string Verdict,
+    int Sampled,
+    int Matched,
+    int Missing,
+    int SizeMismatch,
+    int MtimeDiffers,
+    double MatchRate,
+    string? Reason,
+    IReadOnlyList<string> Examples);
+
+/// <summary>迁移本地根路径请求。<c>Force</c> 用于越过 NeedsConfirm / Rejected。</summary>
+public record LocalRootChangeRequest(string NewRoot, bool Force = false);
+
+/// <summary>preview 端点请求体。</summary>
+public record LocalRootPreviewRequest(string NewRoot);
