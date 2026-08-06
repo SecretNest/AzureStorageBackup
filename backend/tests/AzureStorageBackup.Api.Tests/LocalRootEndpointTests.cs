@@ -81,6 +81,23 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return (await svc.GetAsync(configId))!.ContainerName;
     }
 
+    /// <summary>这条备份在操作日志里的来源键。全仓形如 "{op}:{accountId}/{container}"
+    /// （OperationLogService.cs:91-96）——测试自己也照这个形状拼，才能盯住端点没写成别的。</summary>
+    private async Task<string> SourceKeyOfAsync(int configId)
+    {
+        using var scope = _services.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
+        var config = (await svc.GetAsync(configId))!;
+        return $"backup:{config.AccountId}/{config.ContainerName}";
+    }
+
+    private List<LogEntry> LogsOf(string source)
+    {
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return [.. db.LogEntries.Where(e => e.Source == source)];
+    }
+
     private async Task<string> LocalRootOfAsync(int configId)
     {
         using var scope = _services.CreateScope();
@@ -423,6 +440,52 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         var body = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
         Assert.Equal(target, body!.LocalRoot);
         Assert.Equal(target, await LocalRootOfAsync(id));
+    }
+
+    /// <summary>
+    /// 审计日志必须挂在 "backup:{accountId}/{container}" 这个来源上。写成裸 "backup" 的后果有两条，
+    /// 都不会有人当场发现：DeleteForContainerAsync 按 ":{accountId}/{container}" 后缀清理，
+    /// 于是这条 Warning 级（长存）记录在备份被删之后仍然赖在库里；QueryAsync 按来源精确相等过滤，
+    /// 于是"这个备份都发生过什么"的日志视图里，换根这件大事根本看不见。
+    ///
+    /// 顺带钉住无基线时的措辞：一条都没抽样，就不能渲染成 "0/0 sampled entries matched"
+    /// ——那读起来像"全都对不上"，恰恰是相反的意思。
+    /// </summary>
+    [Fact]
+    public async Task Apply_Logs_An_Audit_Entry_Under_This_Backups_Source_Key()
+    {
+        Directory.CreateDirectory(_dir);
+        var target = Path.Combine(_dir, "target");
+        Directory.CreateDirectory(target);
+        var id = await CreateConfigAsync(await CreateAzuriteAccountAsync(), _dir);
+        var source = await SourceKeyOfAsync(id);
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = false });
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var entry = Assert.Single(LogsOf(source));
+        Assert.Equal(OperationLogLevel.Warning, entry.Level);
+        Assert.False(entry.Ephemeral);              // 审计：长存，保留至删除备份
+        Assert.Contains(target, entry.Message);
+        Assert.Contains(nameof(LocalRootVerdict.NoBaseline), entry.Message);
+        Assert.DoesNotContain("sampled", entry.Message);
+    }
+
+    /// <summary>真抽过样的那条路径，样本计数照旧要写进日志；强制过的也要留痕。</summary>
+    [Fact]
+    public async Task Apply_Logs_The_Sample_Counts_When_A_Comparison_Actually_Ran()
+    {
+        var (id, target) = await SeedMismatchingBaselineAsync();
+        var source = await SourceKeyOfAsync(id);
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/backup-configs/{id}/local-root", new { newRoot = target, force = true });
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var entry = Assert.Single(LogsOf(source));
+        Assert.Contains("0/1 sampled entries matched", entry.Message);
+        Assert.Contains("forced", entry.Message);
     }
 
     [Fact]

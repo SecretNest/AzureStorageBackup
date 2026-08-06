@@ -728,11 +728,20 @@ public static class BackupConfigEndpoints
             if (moved is null)
                 return Results.NotFound();
 
+            // 来源键必须是全仓统一的 "{op}:{accountId}/{container}"（OperationLogService.cs:91-96）。
+            // 写成裸 "backup" 会同时破两处：DeleteForContainerAsync 按 ":{accountId}/{container}"
+            // 后缀清理，这条 Warning 级（长存）审计就再也删不掉；QueryAsync 按来源精确相等过滤，
+            // 于是按备份看日志时，换根这件最该留痕的事反而看不见。
+            //
+            // NoBaseline / BaselineUnreadable 这两档一条都没抽样，样本计数得整句省掉
+            // ——"0/0 sampled entries matched" 读起来像"全都对不上"，与实情正相反。
+            var compared = preview.Sampled > 0
+                ? $", {preview.Matched}/{preview.Sampled} sampled entries matched"
+                : "";
             await log.AppendAsync(
-                OperationLogLevel.Warning, "backup",
+                OperationLogLevel.Warning, $"backup:{moved.AccountId}/{moved.ContainerName}",
                 $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
-                $"to '{moved.LocalRoot}' (verdict {preview.Verdict}, " +
-                $"{preview.Matched}/{preview.Sampled} sampled entries matched" +
+                $"to '{moved.LocalRoot}' (verdict {preview.Verdict}{compared}" +
                 $"{(needsForce ? ", forced" : "")}).",
                 ct);
 
