@@ -606,7 +606,9 @@ tbody tr.ops-row:hover {
   align-items: center;
 }
 
-.stack {
+/* .col 是 .stack 的别名——迁移根路径对话框（ChangeLocalRootDialog）沿用 .row 的命名对称性
+   叫它 .col，两者规则完全一致，合并成一条选择器以免以后各改各的、悄悄分叉出两份行为。 */
+.stack, .col {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
@@ -686,6 +688,9 @@ tbody tr.ops-row:hover {
 .text-danger { color: var(--danger); }
 .text-ok { color: var(--ok); }
 .text-warn { color: var(--warn); }
+/* ChangeLocalRootDialog 的 NoBaseline 判定用 tone: 'info'（badge-info 同色，--accent）；
+   brief 的 Step 2 核对清单没列这个类，是核对时另外发现的缺口。 */
+.text-info { color: var(--accent); }
 
 /* ── Modal ────────────────────────────────────────────────────────────────── */
 .modal-overlay {
