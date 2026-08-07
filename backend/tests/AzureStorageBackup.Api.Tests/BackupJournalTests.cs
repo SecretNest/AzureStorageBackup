@@ -98,7 +98,14 @@ public class BackupJournalTests : IDisposable
         Assert.Single(content!.Records);
     }
 
-    // 清理器读的是同一个文件。追加不立刻刷出去，它就会把刚传上去的块当孤儿删掉。
+    // 每追加一条就刷到 OS，为的是**进程死掉**：被 kill、OOM、容器停机时，进程缓冲里的字节
+    // 随进程一起没了，页缓存里的不会。而"云上有、索引里还没有"的块正是这么来的——进程没能走到
+    // 提交索引那一步。少刷这一下，下一轮读到的就是一卷少了最后几行的 journal：那几行记的块
+    // 没人认领，于是重传一遍，而清理判据（认 journal）也不会再保它们。
+    //
+    // 不是为了防"清理器正读着、备份正写着"：BackupBusyTracker.TryAcquire 已经把同一个
+    // (account, container) 上的备份与清理串起来了（TaskDispatcher / BackupRunner），
+    // 而那两处是 CleanupAsync 仅有的生产调用方。
     [Fact]
     public async Task Append_is_visible_to_another_reader_without_an_explicit_flush()
     {
