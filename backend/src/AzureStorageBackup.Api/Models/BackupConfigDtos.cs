@@ -186,3 +186,15 @@ public record LocalRootChangeRequest(string NewRoot, bool Force = false);
 
 /// <summary>preview 端点请求体。</summary>
 public record LocalRootPreviewRequest(string NewRoot);
+
+/// <summary>
+/// 一次中途停下的运行，供界面列出来等用户决定。
+/// </summary>
+/// <param name="Blocks">journal 里已确认在云上的块数。接着跑能省下的，大致就是这么多。</param>
+/// <param name="Resumable">
+/// 便宜的那几项前置校验的预览：configId 与本地根对不对得上。
+/// **不是承诺**——基线版本与加密身份要读索引和密码才能核，那要等真正开卷时才做（Task 10）。
+/// 这里为 true 而开卷时仍被判作废是可能的，界面别把它说成"一定能接上"。
+/// </param>
+public sealed record InterruptedRunResponse(
+    string RunId, DateTimeOffset StartedAt, int Blocks, long JournalBytes, bool Resumable);

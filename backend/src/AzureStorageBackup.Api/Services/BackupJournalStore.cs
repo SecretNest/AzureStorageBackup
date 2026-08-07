@@ -1,4 +1,14 @@
+using System.Text;
+using System.Text.Json;
+
 namespace AzureStorageBackup.Api.Services;
+
+/// <summary>
+/// 一卷 journal 的概览。<b>不解析记录体</b>：只反序列化头一行，剩下的只数行数。
+/// 界面列"有哪些中途停下的运行"会反复调它，而一卷 journal 可能有几十万行——
+/// 逐行 JSON 反序列化只为显示一个数字，代价不值。
+/// </summary>
+public sealed record JournalSummary(string RunId, JournalHeader Header, int Records, long SizeBytes);
 
 /// <summary>
 /// 某个容器上所有**活动** journal 引用到的 blob 基名与 packId。
@@ -68,6 +78,43 @@ public sealed class BackupJournalStore(string rootDir)
             var content = await BackupJournal.ReadAsync(file, ct);
             if (content is not null)
                 result.Add((Path.GetFileNameWithoutExtension(file), content));
+        }
+        return result;
+    }
+
+    /// <summary>列出该容器上每卷 journal 的概览。头读不通的直接跳过（= 这卷作废）。</summary>
+    public async Task<IReadOnlyList<JournalSummary>> PeekAsync(int accountId, string container, CancellationToken ct)
+    {
+        var dir = DirFor(accountId, container);
+        if (!Directory.Exists(dir))
+            return [];
+
+        var result = new List<JournalSummary>();
+        foreach (var file in Directory.EnumerateFiles(dir, "*.jsonl").OrderBy(f => f, StringComparer.Ordinal))
+        {
+            JournalHeader? header;
+            var lines = 0;
+            try
+            {
+                using var reader = new StreamReader(
+                    new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite), Encoding.UTF8);
+                var first = await reader.ReadLineAsync(ct);
+                if (first is null)
+                    continue;
+                try { header = JsonSerializer.Deserialize<JournalHeader>(first, JournalJson.Options); }
+                catch (JsonException) { continue; }
+                if (header is null)
+                    continue;
+                while (await reader.ReadLineAsync(ct) is { } line)
+                    if (line.Length > 0)
+                        lines++;
+            }
+            catch (IOException)
+            {
+                continue;   // 正在被写的那一卷偶尔读不开；下次轮询再说
+            }
+            result.Add(new JournalSummary(
+                Path.GetFileNameWithoutExtension(file), header, lines, new FileInfo(file).Length));
         }
         return result;
     }

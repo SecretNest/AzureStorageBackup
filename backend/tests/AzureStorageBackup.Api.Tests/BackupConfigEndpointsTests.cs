@@ -963,4 +963,80 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         // 配置没了就再没人会来采纳这卷 journal；留着它只会永远保住那批块不被清理。
         Assert.Empty(await journals.ListAsync(accountId, "photos", default));
     }
+
+    [Fact]
+    public async Task Suspend_without_a_running_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("suspend-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("s", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/suspend", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Retry_now_without_a_paused_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("retry-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("r", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/retry-now", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Interrupted_runs_are_listed_with_their_block_count()
+    {
+        var accountId = await CreateAccountAsync("interrupted-list");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("i", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var journals = _services.GetRequiredService<BackupJournalStore>();
+        await using (var j = await journals.CreateAsync(accountId, "photos", "run-1", new JournalHeader
+        {
+            RunId = "run-1", ConfigId = created!.Id, StartedAt = DateTimeOffset.UnixEpoch,
+            BaselineVersion = 0, LocalRoot = "/data/photos", EncryptionIdentity = "plain",
+        }, default))
+        {
+            await j.AppendAsync(
+                new JournalRecord { Kind = "blob", Ref = "data/aaa", Path = "a.bin", FullHash = "aaa" }, default);
+            await j.AppendAsync(
+                new JournalRecord { Kind = "blob", Ref = "data/bbb", Path = "b.bin", FullHash = "bbb" }, default);
+        }
+
+        var listed = await _client.GetFromJsonAsync<List<InterruptedRunResponse>>(
+            $"/api/backup-configs/{created.Id}/interrupted");
+
+        Assert.Single(listed!);
+        Assert.Equal("run-1", listed![0].RunId);
+        Assert.Equal(2, listed[0].Blocks);          // 头一行不算进去
+        Assert.True(listed[0].JournalBytes > 0);
+        Assert.True(listed[0].Resumable);
+    }
+
+    [Fact]
+    public async Task Interrupted_run_from_another_local_root_is_listed_but_not_resumable()
+    {
+        var accountId = await CreateAccountAsync("interrupted-moved");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("m", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var journals = _services.GetRequiredService<BackupJournalStore>();
+        await using (var j = await journals.CreateAsync(accountId, "photos", "run-2", new JournalHeader
+        {
+            RunId = "run-2", ConfigId = created!.Id, StartedAt = DateTimeOffset.UnixEpoch,
+            BaselineVersion = 0, LocalRoot = "/somewhere/else", EncryptionIdentity = "plain",
+        }, default)) { }
+
+        var listed = await _client.GetFromJsonAsync<List<InterruptedRunResponse>>(
+            $"/api/backup-configs/{created.Id}/interrupted");
+        Assert.False(listed![0].Resumable);
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created.Id}/interrupted")).StatusCode);
+        Assert.Empty(await _client.GetFromJsonAsync<List<InterruptedRunResponse>>(
+            $"/api/backup-configs/{created.Id}/interrupted") ?? []);
+    }
 }

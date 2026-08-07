@@ -3,6 +3,13 @@ using System.Text.Json;
 
 namespace AzureStorageBackup.Api.Services;
 
+/// <summary>journal 读写共用的序列化设置。读端不止 <see cref="BackupJournal"/> 一个（还有目录的概览），
+/// 两边设置必须是同一份，否则同一行字节在两处解出不同结果。</summary>
+internal static class JournalJson
+{
+    public static readonly JsonSerializerOptions Options = new() { WriteIndented = false };
+}
+
 /// <summary>journal 的头一行：恢复前置校验要用的一切都在这。</summary>
 public sealed record JournalHeader
 {
@@ -66,8 +73,6 @@ public sealed record JournalContent(JournalHeader Header, IReadOnlyList<JournalR
 /// </summary>
 public sealed class BackupJournal : IAsyncDisposable
 {
-    private static readonly JsonSerializerOptions Json = new() { WriteIndented = false };
-
     private readonly FileStream _stream;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
@@ -81,7 +86,7 @@ public sealed class BackupJournal : IAsyncDisposable
             Directory.CreateDirectory(dir);
         var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
         var journal = new BackupJournal(stream);
-        await journal.WriteLineAsync(JsonSerializer.Serialize(header, Json), ct);
+        await journal.WriteLineAsync(JsonSerializer.Serialize(header, JournalJson.Options), ct);
         await journal.FlushAsync(fsync: true, ct);   // 头写不下去，后面全是白搭，这一次同步值得
         return journal;
     }
@@ -109,7 +114,7 @@ public sealed class BackupJournal : IAsyncDisposable
 
     /// <summary>追加一条。调用点必须在**上传确认返回之后**。</summary>
     public async Task AppendAsync(JournalRecord record, CancellationToken ct)
-        => await WriteLineAsync(JsonSerializer.Serialize(record, Json), ct);
+        => await WriteLineAsync(JsonSerializer.Serialize(record, JournalJson.Options), ct);
 
     /// <param name="fsync">true 时连同操作系统缓冲一起刷到盘上（主动挂起收尾用）。</param>
     public async Task FlushAsync(bool fsync, CancellationToken ct)
@@ -162,7 +167,7 @@ public sealed class BackupJournal : IAsyncDisposable
                 continue;
             if (header is null)
             {
-                try { header = JsonSerializer.Deserialize<JournalHeader>(line, Json); }
+                try { header = JsonSerializer.Deserialize<JournalHeader>(line, JournalJson.Options); }
                 catch (JsonException) { return null; }   // 头坏了，整卷作废
                 if (header is null)
                     return null;
@@ -170,7 +175,7 @@ public sealed class BackupJournal : IAsyncDisposable
             }
             try
             {
-                if (JsonSerializer.Deserialize<JournalRecord>(line, Json) is { } record)
+                if (JsonSerializer.Deserialize<JournalRecord>(line, JournalJson.Options) is { } record)
                     records.Add(record);
             }
             catch (JsonException)
