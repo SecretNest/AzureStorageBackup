@@ -259,8 +259,14 @@ public static class BackupConfigEndpoints
                 // 配置没了就再没人会来采纳这个容器上的 journal，留着它只会永远保住那批块不被清理
                 // （清理判据认 journal，不认 configId）。**只删 journal 文件，不去删它引用的 blob**：
                 // journal 记的既包括真上传，也包括 if-missing 命中，后者完全可能同时被一个已提交的
-                // 版本索引引用着，删了就是把保留下来的版本挖穿。失去保护之后，等这个容器上再有配置时，
-                // 第一次清理会用完整判据（读得到索引、认得出引用）把真孤儿扫掉。
+                // 版本索引引用着，删了就是把保留下来的版本挖穿。
+                //
+                // 失去保护之后由谁来收：等这个容器上再有配置时，**那个配置的第一轮备份**收尾会做
+                // 一次孤儿扫描，用完整判据（读得到索引、认得出引用）把真孤儿扫掉。这条路成立靠的是
+                // 紧挨着的上一步——localState.RemoveAsync 把本地权威状态清了，重建的配置因此认得出
+                // 自己是第一轮（见 BackupOrchestrator 的 firstRun 与 BackupRunControl.SweepNeeded）。
+                // 那两步的先后不重要（都是 best-effort，互不依赖），但少了那一步，这里就只剩
+                // "用户恰好配了 Cleanup 计划任务"这一条指望，而那是配不配全凭他的。
                 await BestEffort(logger, "discard backup journals",
                     () => { journals.DeleteAll(accountId, container); return Task.CompletedTask; });
 

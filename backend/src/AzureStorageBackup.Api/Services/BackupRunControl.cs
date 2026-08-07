@@ -34,7 +34,8 @@ public sealed class BackupRunControl(
     /// <summary>上一轮（或上几轮）已经确认传上去的东西。没有可采纳的卷时是空表。</summary>
     public JournalResume Resume { get; private set; } = JournalResume.Empty;
 
-    /// <summary>开卷时采纳过或作废过旧卷 → 容器里多半躺着孤儿块，收尾清理该做一次扫描（Task 11）。</summary>
+    /// <summary>开卷时采纳过或作废过旧卷、或这是这个配置在这个容器上的第一轮 → 容器里多半躺着
+    /// 孤儿块，收尾清理该做一次扫描（Task 11）。</summary>
     public bool SweepNeeded { get; private set; }
 
     /// <summary>瞬时错误的挂起闸门。默认 30s/1m/5m/每 5m 自愈，10 分钟不见好就降级。</summary>
@@ -108,9 +109,13 @@ public sealed class BackupRunControl(
     /// 开卷。必须等编排器算出基线版本与寻址身份之后再调——这两样是恢复的前置条件，
     /// 写不进头里，这卷 journal 就没法安全复用。
     /// </summary>
+    /// <param name="firstRun">
+    /// 本地权威状态还没建立 = 这是这个配置在这个容器上的第一轮（新建，或**删了配置又重建**）。
+    /// 它同样要触发一次孤儿扫描，原委见下方 <see cref="SweepNeeded"/> 的赋值处。
+    /// </param>
     public async Task OpenJournalAsync(
         int accountId, string container, int baselineVersion, string localRoot, string encryptionIdentity,
-        DateTimeOffset startedAt, CancellationToken ct)
+        DateTimeOffset startedAt, CancellationToken ct, bool firstRun = false)
     {
         _accountId = accountId;
         _container = container;
@@ -156,7 +161,17 @@ public sealed class BackupRunControl(
         }
         // 采纳过、或作废过 → 这个容器里多半躺着"云上有、索引里没有"的块。
         // 收尾清理据此决定要不要做一次孤儿扫描（见 Task 11）。
-        SweepNeeded = voided || adopted.Count > 0;
+        //
+        // 第一轮也扫，而且这一条不是顺手加的：删配置（保留容器）会把这个容器的 journal 全部丢掉，
+        // 那批块从此失去保护，而删配置端点承诺的正是"等这个容器上再有配置时，第一次清理会把真孤儿
+        // 扫掉"。少了这一条，那句承诺是空的——重建配置后的第一次清理是**备份收尾**那次，而那时
+        // journal 目录刚被删空，既没采纳也没作废，上面两项全是 false；只有独立跑的 Cleanup 计划任务
+        // 才会扫，而用户完全可能一个清理计划都没配。
+        //
+        // 代价可控：这是每个配置在每个容器上**只发生一次**的两趟 LIST（data/ 与 packs/），
+        // 而新建备份的容器本来就是空的；真正大的那种容器恰恰是"删了配置又重建"的情形，
+        // 也正是非扫不可的那一种。
+        SweepNeeded = voided || adopted.Count > 0 || firstRun;
         // 采纳是**只读**的：本轮仍新开自己那一卷，旧卷原样留着。这样就不必把复用来的记录再抄一遍，
         // 也不会出现"抄到一半又崩了"的半截状态。旧卷等本轮成功提交索引时一起删。
         Resume = adopted.Count == 0

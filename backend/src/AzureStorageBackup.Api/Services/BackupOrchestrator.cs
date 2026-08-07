@@ -444,6 +444,13 @@ public sealed class BackupOrchestrator(
                 + "Nothing would be backed up, so this run was stopped. "
                 + "Check the scope selection on this backup.");
 
+        // 本地权威状态还没建立 = 这是这个配置在这个容器上的**第一轮**：要么是新建的备份，要么是
+        // 「删了配置、留着容器、又在同一个容器上重建」——删配置时 localState.RemoveAsync 把它清掉了。
+        // 后者正是 journal 被整批丢弃、那批块失去保护的情形，收尾清理必须做一次孤儿扫描才能兑现
+        // 删配置端点写下的承诺。必须问在 LoadAsync **之前**：它会顺手用云端信息文件把本地状态回填上。
+        var firstRun = trackedInfo is not null
+            && !await trackedInfo.HasLocalAsync(request.Account, request.Container, ct);
+
         // 2. 载入上一版本。信息文件优先走本地权威副本（§3.3，避免读云端 Cold 信息文件）；大的版本索引优先走本地缓存。
         var info = (trackedInfo is not null
             ? await trackedInfo.LoadAsync(request.Account, request.Container, password, ct)
@@ -481,7 +488,7 @@ public sealed class BackupOrchestrator(
         if (control is not null)
             await control.OpenJournalAsync(
                 request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
-                startedAt, ct);
+                startedAt, ct, firstRun);
 
         // 去重表在开卷**之后**才建：采纳来的那些块（云上有、索引里还没有）要和索引里的块一起进表，
         // 否则一个同内容不同路径的文件会把它们删了重传一遍。原委见 Build 的 confirmed 参数。

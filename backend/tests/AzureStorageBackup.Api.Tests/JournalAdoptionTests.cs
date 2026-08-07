@@ -62,11 +62,11 @@ public sealed class JournalAdoptionTests : IDisposable
     }
 
     /// <summary>开一轮新运行并走完开卷。四个判据一律用"对得上"的那份值。</summary>
-    private async Task<BackupRunControl> OpenAsync(string runId = "run-new")
+    private async Task<BackupRunControl> OpenAsync(string runId = "run-new", bool firstRun = false)
     {
         var control = new BackupRunControl(_store, ConfigId, runId);
         await control.OpenJournalAsync(
-            AccountId, Container, Baseline, LocalRoot, Identity, DateTimeOffset.UtcNow, default);
+            AccountId, Container, Baseline, LocalRoot, Identity, DateTimeOffset.UtcNow, default, firstRun);
         return control;
     }
 
@@ -77,6 +77,23 @@ public sealed class JournalAdoptionTests : IDisposable
 
         Assert.True(control.Resume.IsEmpty);
         Assert.False(control.SweepNeeded);
+    }
+
+    /// <summary>
+    /// 第一轮：盘上一卷 journal 都没有（既没采纳也没作废），仍然要扫一遍。
+    /// <para>
+    /// 这一条撑着的是删配置端点那句承诺——删配置会把这个容器的 journal 全丢掉，那批"云上有、
+    /// 索引里没有"的块从此无人保护，而重建配置后的第一次清理正是**备份收尾**那次：
+    /// 判据的另外两项此刻必然为 false。没有这一条，那批块只能等一个用户未必配过的 Cleanup 计划。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_first_run_sweeps_even_with_no_journal_in_sight()
+    {
+        await using var control = await OpenAsync(firstRun: true);
+
+        Assert.True(control.Resume.IsEmpty);
+        Assert.True(control.SweepNeeded);
     }
 
     [Fact]
