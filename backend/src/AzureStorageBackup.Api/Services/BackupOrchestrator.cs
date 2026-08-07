@@ -1468,12 +1468,13 @@ public sealed class BackupOrchestrator(
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
 
-            // 「压这一组 + 传上去 + 记下来」是重试的单位：抖一下就把这一组从头做一遍，前面几组
-            // 不受牵连。整段可重入——包号不变，所以重压的产出盖回同一族卷（传之前先清残留，
-            // 见 UploadStagedPackAsync）；info.Packs 与 storageByPath 都按键覆盖；journal 允许重复行
-            // （恢复按内容对号，重复只是多命中一次）。变化成员的重新入队留在外面：那会动 queue
-            // 和 attempts，重来一遍就会把同一个成员排两次队、把重试次数记重。
-            async Task<List<PackEntry>> AttemptAsync()
+            // 「压这一组 + 传上去」是重试的单位：抖一下就把这一组从头做一遍，前面几组不受牵连。
+            // 整段可重入——包号不变，所以重压的产出盖回同一族卷（传之前先清残留，见
+            // UploadStagedPackAsync）。journal append 与 oplog 写**不**在重试单位之内（见下方调用处的
+            // 注释）：它们发生在云端已确认之后，重来一遍只会把上传字节和索引成员表算重/算错，而不是
+            // 让"这一组"重新可重入。变化成员的重新入队也留在外面：那会动 queue 和 attempts，
+            // 重来一遍就会把同一个成员排两次队、把重试次数记重。
+            async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
             {
                 // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
                 // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
@@ -1543,9 +1544,7 @@ public sealed class BackupOrchestrator(
                 {
                     var vols = await UploadStagedPackAsync(
                         request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
-                    await RecordPackAsync(request, packId, members, vols, storeOnly, info, storageByPath, control, ct);
-                    foreach (var m in members) await LogFileAsync(request, m.Path, ct);
-                    return changed;   // 空表：这一组干干净净地成了一个 pack
+                    return (changed, members, vols);   // 空表：这一组干干净净地成了一个 pack
                 }
 
                 // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
@@ -1558,14 +1557,30 @@ public sealed class BackupOrchestrator(
                     var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
                     var vols2 = await UploadStagedPackAsync(
                         request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
-                    await RecordPackAsync(request, packId, stable, vols2, storeOnly, info, storageByPath, control, ct);
-                    foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
+                    return (changed, stable, vols2);
                 }
-                return changed;
+                return (changed, [], []);   // 整组成员都被判为变化/读不开：没有稳定成员可记
             }
 
             List<PackEntry> changedMembers = [];
-            await WithPauseAsync(control, async () => changedMembers = await AttemptAsync(), ct);
+            IReadOnlyList<PackEntry> recordedMembers = [];
+            IReadOnlyList<long> recordedVolumes = [];
+            await WithPauseAsync(control, async () =>
+                (changedMembers, recordedMembers, recordedVolumes) = await AttemptAsync(), ct);
+
+            // journal append 与 oplog 写挪到这里、退出重试单位之后：上面 AttemptAsync 一旦成功返回，
+            // 云端已经确认了这次上传，闸门不会再让这一组重来——RecordPackAsync/LogFileAsync 因而
+            // 只会跑这一次，不会像挪进去之前那样，因为它们自己抛出瞬时错误（比如本地盘 IOException）
+            // 而触发整组重压：重压会把已传的字节在 state.AddUploaded 里算第二遍（速度/ETA 失真），
+            // 单卷 pack 还会被 UploadIfMissing 当"已存在"跳过，导致这次重压出的新 Members/VolumeSizes
+            // 记进索引，而容器里躺着的还是上一次的归档——两者从此对不上，只有 check/repair 才会发现。
+            // 整组成员都读不开、没有任何东西可记（recordedMembers 为空）时自然跳过，不必特判。
+            if (recordedMembers.Count > 0)
+            {
+                await RecordPackAsync(
+                    request, packId, recordedMembers, recordedVolumes, storeOnly, info, storageByPath, control, ct);
+                foreach (var m in recordedMembers) await LogFileAsync(request, m.Path, ct);
+            }
 
             // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
             // total 里预留的一个槽位，必须**恰好上报一次**——即便 stable.Count == 0（整组成员一起

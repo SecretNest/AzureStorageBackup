@@ -215,6 +215,41 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             });
     }
 
+    /// <summary>只记下每次压缩用的包号,不改动内容、不改动行为——用来数"这一组被压了几次"。</summary>
+    private sealed class CountingCompressor(IFileCompressor inner) : IFileCompressor
+    {
+        private readonly List<string> _compressed = [];
+
+        public IReadOnlyList<string> Compressed
+        {
+            get { lock (_compressed) return [.. _compressed]; }
+        }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var packId = Path.GetFileNameWithoutExtension(request.OutputArchivePath);
+            lock (_compressed) _compressed.Add(packId);
+            return inner.CompressAsync(request, ct);
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+    }
+
     /// <summary>取消令牌一按就抛 OperationCanceledException 的上传器：用来验证取消没有被闸门吞掉。</summary>
     private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
     {
@@ -250,7 +285,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     }
 
     private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, IBackupInfoStore Store) Build(
-        IBlobUploader uploader, IFileCompressor compressor)
+        IBlobUploader uploader, IFileCompressor compressor, VerboseFileLog? verboseLog = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -265,7 +300,8 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             compressor, uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            new FileHasher(), authority.IndexCache, authority.Tracked,
+            verboseLog: verboseLog);
         return (orchestrator, factory, store);
     }
 
@@ -427,6 +463,75 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
             Assert.Equal(referenced, inContainer);
             Assert.Equal(2, referenced.Count);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 上传已确认之后才撞上的瞬时错误（journal append / oplog 那一步）不再拖着整组重来一遍。
+    /// <para>
+    /// 用一把独占文件锁常驻卡住当天的 verbose 日志文件：<c>LogFileAsync</c> 一写就撞
+    /// <see cref="IOException"/>（真实的共享冲突，<see cref="TransientErrors"/> 判它为瞬时）。锁全程
+    /// 不放，逼出"重不重试"的差异——重试的话每次撞锁都会先把整组重新压缩、重新上传一遍，压缩
+    /// 次数会跟着撞锁次数一起涨；不重试的话，压缩只可能发生在成功上传的那一次，之后这一步
+    /// 自己撞上的错误原样往外抛，压缩次数永远停在 1。
+    /// </para>
+    /// <para>
+    /// 压缩次数正是「上传字节」的账本：<c>state.AddUploaded</c> 与每一次成功的
+    /// <c>UploadStagedPackAsync</c> 一一对应，而后者又与每一次压缩一一对应。压缩只跑一次，
+    /// 上传字节就只可能记一次——这正是本组要守住的"不双计"。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_failure_after_upload_confirm_does_not_retry_the_group()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new CountingCompressor(new SevenZipCompressor());
+        var verboseRoot = Path.Combine(_temp, "verbose");
+        var verboseLog = new VerboseFileLog(verboseRoot);
+        var (orchestrator, factory, _) = Build(
+            new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), compressor, verboseLog);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();   // 一个池、一组（见类注释）
+
+            // 提前把今天这份 verbose 日志文件锁死：独占打开之后，AppendAsync 内部的
+            // File.AppendAllTextAsync 一开就撞共享冲突，抛出裸 IOException。锁在 using 里，
+            // 直到这个测试方法结束才放开——不给重试留任何"这次就成了"的窗口。
+            var logDir = Path.Combine(verboseRoot, name);
+            Directory.CreateDirectory(logDir);
+            var logFile = Path.Combine(logDir, DateTimeOffset.UtcNow.ToString("yyyyMMdd") + ".log");
+            File.WriteAllText(logFile, "");
+            using var block = new FileStream(logFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    VerboseLogging = true,
+                },
+            };
+
+            await using var control = new BackupRunControl(_journals, 5, "run-record", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(2)));
+
+            // 记账阶段的失败现在原样往外抛：不再经过挂起闸门那套"等一等再来"。
+            await Assert.ThrowsAnyAsync<IOException>(
+                () => orchestrator.RunAsync(request, null, default, control));
+
+            // 压缩只跑了一次——上传已经确认过的那一组没有被重新压、重新传。大于 1 就说明记账阶段
+            // 的失败仍然拖着整组重试，state.AddUploaded 会跟着多算一遍（本组要守的双计 bug）。
+            Assert.Single(compressor.Compressed);
+            // 记账阶段的失败不该经过闸门：它已经在重试范围之外了，闸门连一次连败都不该记到。
+            Assert.False(control.Gate.IsDowngraded, "记账阶段的失败被闸门当成了瞬时抖动去等。");
+            Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
