@@ -499,6 +499,8 @@ public sealed class BackupOrchestrator(
             StartConsumers();
 
         // 装箱的在途状态。diff 单线程按扫描顺序推进，所以这些都不需要加锁。
+        // 本轮内跨箱的打包成员去重：同内容的后到者不入箱，只挂在首个之下，收尾统一回填。
+        var aliasTable = new PackAliasTable();
         var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
         var dirRemaining = new Dictionary<string, int>(classification.DirectoryCandidates, StringComparer.Ordinal);
         // 跨目录那一路按可压缩性拆成两条独立的流水线（下标 0＝压缩箱，1＝不压箱）：一箱只能有
@@ -575,6 +577,36 @@ public sealed class BackupOrchestrator(
                 };
                 // 之后走的是与"这一条没有变更内容"完全相同的既有路径：目录计数照常递减、封箱时机
                 // 不受影响、不占上传槽位也不必销账。
+                file = null;
+            }
+
+            // 本轮内、跨箱的成员去重。上面那一档查的是**既有版本**的包（_packMembers 只从历史索引
+            // 构建），本轮新封的箱不在其中——于是首次备份、或一次新增大量重复小文件时，同内容一旦
+            // 被分进不同的箱就实打实地各存一份（不同箱之间压缩不共享字典，省不下来）。
+            //
+            // 后到者不入箱，只挂在首个之下；它最终指向哪个包要等消费者收工才知道（leader 可能在
+            // 压缩窗口里被改写、可能读不开、可能变大到改走单文件 blob），所以回填放在收尾统一做。
+            // 判断只看最终态，这里因此一个并发原语都不需要。
+            //
+            // 顺序上不会与上面那一档打架：leader 若命中既有包，后来的同内容文件用同一张表、同一套
+            // 四项判据也会命中，根本走不到这里。所以进这张表的 leader 一定是"本轮新装箱的"。
+            //
+            // 这是**路径说明，不是安全约束**——两档对调也产不出错数据（那时先到者成了本轮 leader，
+            // 但它随后仍会命中跨版本档拿到既有包的 StorageRef，收尾回填原样复制给别名，两种顺序
+            // 得到的索引逐字节相同）。写在这里是免得有人以为对调会出错而不敢动，也免得有人以为
+            // 这个顺序是安全所必需的。当前这个顺序的理由只是少一层间接。
+            //
+            // 沉默的例外：别名不入箱，意味着它的源文件本轮不会被第二次打开——"每个打包成员在
+            // 压缩后都会被重校验"这条既有不变量，对别名不成立。它在压缩窗口里被改写或删除，
+            // 本轮都察觉不到。索引依然自洽：存的是 leader 在 diff 时刻的内容 = 别名在 diff 时刻
+            // 的内容，条目写的也是 diff 时刻的 hash/mtime——不是丢数据，下一轮 mtime 一变自然
+            // 重备，但这个沉默的例外必须写出来。
+            if (file is not null && klass.Category != FileCategory.SingleFile
+                && file.FullHash is { } aliasHash && c.HeadHash is { } aliasHead && c.TailHash is { } aliasTail
+                && aliasTable.TryClaim(aliasHash, file.Length, aliasHead, aliasTail, c.Path))
+            {
+                // 与上面那一档收场完全相同：走"这一条没有变更"的既有路径。
+                // storageByPath 留到收尾回填——现在还不知道 leader 会落在哪个包上。
                 file = null;
             }
 
@@ -710,6 +742,85 @@ public sealed class BackupOrchestrator(
         await RecordUnreadableWarningsAsync(request, scan, diff, ct);
 
         await Task.WhenAll(consumers);
+
+        // 本轮内跨箱去重的收尾：把挂在各 leader 身上的别名回填成与 leader 相同的 StorageRef。
+        // 放在这里而不是命中当时，是因为判断只看**最终态**——leader 会不会在压缩窗口里被改写、
+        // 会不会读不开、会不会变大到改走单文件 blob，只有消费者全部收工才知道。于是装箱侧
+        // 一个并发原语都不需要，也不存在"diff 刚挂上一个别名、消费者已经把 leader 判死"的竞态。
+        var orphanAliases = new List<PlannedFile>();
+        foreach (var (leaderPath, aliases) in aliasTable.AliasesByLeader)
+        {
+            // 两条真实路径 + 一条冗余保险，对应 leader 走岔的所有情形：
+            //   overrides 有它            → 内容在压缩窗口里变过，写下的是新 hash；
+            //   storage 不是 pack 或缺失  → 变大到超阈值改走了单文件 blob，或整组一起读不开。
+            //   postDiffUnreadable 有它   → 今天**不可达**：leader 被 MarkPostDiffUnreadableAsync
+            //     标记时必然已经被排除出稳定 pack，RecordPack 从没为它写过 storageByPath，
+            //     上面那条"storage 缺失"已经完全覆盖这个情形。留着是零成本的冗余保险——
+            //     防将来这两件事被解耦（比如 postDiffUnreadable 独立出一条不经过 storageByPath
+            //     的路径）之后，这里悄悄失守。
+            // 任一命中，别名的内容就已经**不等于** leader 最终存下去的那份了——绝不能指过去，
+            // 那会让索引指向别人的内容，还原出来是错数据。
+            //
+            // 这三条判据的前提是 overrides / postDiffUnreadable / storageByPath 三张表在本轮内
+            // **全程只增不删**（现状确实如此——代码里没有任何一处对它们 Remove/TryRemove）。
+            // 一旦将来有人加一次删除（比如"重试成功后把失败标记清掉"），一个走岔的 leader 在
+            // 收尾时会看起来完好，别名照样指过去，还原出来是别人的内容——而且不会有任何测试
+            // 变红，因为现有测试钉的是"三张表当前的状态"，不钉"它们会不会被删过东西"。改这
+            // 三张表的写入方式之前，先想清楚这里的假设还成不成立。
+            var leaderStorage = storageByPath.GetValueOrDefault(leaderPath);
+            if (leaderStorage is { Kind: "pack" }
+                && !overrides.ContainsKey(leaderPath)
+                && !postDiffUnreadable.ContainsKey(leaderPath))
+            {
+                // 整个 StorageRef 原样复制：Ref 与 EntryName 都是 leader 的，形状与 RecordPack
+                // 从前写的逐字节相同，保留清理/死重压实/还原/检查因此都不必改。
+                foreach (var a in aliases)
+                    storageByPath[a.Path] = leaderStorage;
+            }
+            else
+            {
+                orphanAliases.AddRange(aliases.Select(a => new PlannedFile(a.Path, a.Length, a.FullHash)));
+            }
+        }
+
+        // 悬空别名：leader 走岔了，但它们自己好好的，不该被连累。重新跑一遍，第一个自然成为新
+        // leader。它们之间不再互相去重——这条路要求 leader 恰好在压缩窗口内被改写或读不开。
+        //
+        // "本来就罕见"这个前提要打个折扣：NAS 上一个共享中途掉线，那棵子树里的 leader 会**成批**
+        // 变成 postDiffUnreadable，挂在它们身上、分布在别处、活得好好的别名会**成批**悬空，
+        // 然后在下面这个循环里被**串行**重跑——不一定是一小段，可能是一整棵子树。
+        //
+        // 进度取舍比"界面停在 100%"更狠：uploadTracker.BeginWork()/EndWork() 没有包住这段重跑
+        // （那两个只在上面 ConsumeAsync 里配对出现），onItem 传的是下面这个空操作，ReportItem
+        // 不会跑，SetTransferred 也就不会被调用——重跑上传的字节，在读数上直到下面
+        // uploadTracker.Complete() 之前**完全不可见**，在途件数也一直是 0。界面停在 100% 静默
+        // 跑很久，对这个用户群（多在 NAS 上、拿不到命令行）是最容易被误判成"卡死"的形状。
+        //
+        // 这段故意不包 try：包了并 catch 掉，BuildEntries 会给这些别名产出 Length > 0 且
+        // Storage == null 的条目（Added 的 CarriedStorage 是 null，storageByPath 又没有它）——
+        // 那才是真正的静默丢数据形状。让它抛是对的：一轮备份失败、不写索引，孤儿 pack 交给
+        // 保留清理回收，下轮重来。不写下来，将来一定有人"顺手加个 try"。
+        //
+        // onItem 传 static _ => { }：Enqueue 是"一个 WorkItem 一次"，而 ProcessPackAsync 内部按
+        // GroupIsFull 拆出几组是它自己决定的，外部无法预先申报对应的次数，手动补分母只会算错。
+        // 零进零出，配对天然平衡。先例见上面 changed 成员改走单文件 blob 那一处。
+        //
+        // storeOnly 按**别名自己的路径**算，与装箱时同一个写法：规则按路径匹配，别名和 leader
+        // 分属不同目录时压法完全可能不同，而一箱只能有一种压法。
+        foreach (var side in orphanAliases.ToLookup(
+                     f => packOptions.DontCompress?.MatchesFileOrAncestorDir(f.Path) ?? false))
+        {
+            // 按 ordinal 路径序排一下，与文件那条路的排序纪律保持一致（见 crossPending 附近的
+            // 注释）：悬空重跑是独立的一次 ProcessPackAsync 调用，不受"组内仍是 ordinal 路径序"
+            // 那条不变量约束（AliasesByLeader 的枚举序是"leader 首次出现序"，别名在其内按插入序，
+            // 整体是交错的），这里排纯粹是为了与文件那条路的纪律一致——影响的是 solid 压缩率和
+            // 分组切点，不是正确性。
+            var pool = side.OrderBy(f => f.Path, StringComparer.Ordinal).ToList();
+            await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
+                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
+                uploadTracker, state, ct);
+        }
+
         // 与扫描/差分同理：不强制产出终态，最后一批传完的字节就永远发布不出去——
         // 节流会把它们压在最后一个窗口里，而那之后不再有任何一次上报。
         uploadTracker.Complete();

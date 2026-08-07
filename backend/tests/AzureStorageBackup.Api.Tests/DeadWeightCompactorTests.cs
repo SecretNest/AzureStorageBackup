@@ -229,6 +229,120 @@ public sealed class DeadWeightCompactorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// T5 的真正防线：<see cref="RetentionCleaner"/> 扫描保留版本索引、按 EntryName 给每个 pack 归组
+    /// 存活成员（liveByPack），DeadWeightCompactor 只是消费这张表决定重压后留下哪些成员。
+    /// 上面 <see cref="Keeps_Both_Members_That_Share_Identical_Content"/> 只验证了 DeadWeightCompactor
+    /// 拿到"正确"liveByPack 之后的行为——那条用例的 liveByPack 是测试手工拼好直接喂给 CompactAsync 的，
+    /// 从没真正跑过 RetentionCleaner 里的归组代码，所以哪怕归组代码本身写错了它也测不出来。
+    /// 如果归组改成按 fullHash 作 key（RetentionCleaner.cs 那行注释明确写着"不可用 hash 作 key"，
+    /// 正说明它曾经/可能被改错），两个不同 EntryName、同 fullHash 的存活成员会在这张表里合并成一条，
+    /// 重压后归档就少一个成员，而版本索引仍声称它在——静默丢数据，且这条链路上此前没有任何测试
+    /// 能抓住。这里让 CleanupAsync 真正跑一遍（真实 DeadWeightCompactor，不传 null），钉住的是
+    /// 归组代码本身，而不是绕过它。
+    /// </summary>
+    [SkippableFact]
+    public async Task Retention_Cleanup_Preserves_Two_Live_Members_That_Share_A_Hash()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var account = AzuriteAccount();
+        var name = RandomName("dwc-cleaner-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // pack 含 a(将随 v1 退役变成死重) + b、d 两个内容相同(同 fullHash)但 EntryName 不同的成员——
+            // 这是本特性上线前就已存在的历史包形状(同内容不同路径,7z 不跨成员共享字典)。
+            Write(_packSrc, "a.txt", new string('a', 2000));
+            Write(_packSrc, "b.txt", new string('s', 2000));
+            Write(_packSrc, "d.txt", new string('s', 2000));
+
+            var hasher = new FileHasher();
+            var hashA = await hasher.FullHashAsync(Path.Combine(_packSrc, "a.txt"));
+            var hashDup = await hasher.FullHashAsync(Path.Combine(_packSrc, "b.txt"));
+            Assert.Equal(hashDup, await hasher.FullHashAsync(Path.Combine(_packSrc, "d.txt")));
+
+            var output = Path.Combine(_temp, "p0001.7z");
+            var result = await new SevenZipCompressor().CompressAsync(
+                new CompressionRequest(_packSrc, ["a.txt", "b.txt", "d.txt"], output, null));
+            await new BlobUploader(factory).UploadIfMissingAsync(
+                account, name, "packs/p0001.7z", result.VolumeFiles[0], AccessTier.Hot);
+
+            var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+
+            // v1:唯一目的是退役腾出"死重"——它的索引内容与本用例的判据无关,留空即可。
+            var v1Blob = await store.WriteIndexAsync(account, name, 1, new VersionIndex { Version = 1 }, null);
+
+            // v2(保留的那个版本):两条条目指向同一个 pack、同 fullHash、不同 EntryName。
+            var v2Index = new VersionIndex
+            {
+                Version = 2,
+                Entries =
+                [
+                    new IndexEntry
+                    {
+                        Path = "x/b.txt", Kind = "file", Length = 2000, Mtime = DateTimeOffset.UtcNow,
+                        Permissions = "644", FullHash = hashDup,
+                        Storage = new StorageRef { Kind = "pack", Ref = "p0001", EntryName = "b.txt" },
+                    },
+                    new IndexEntry
+                    {
+                        Path = "y/d.txt", Kind = "file", Length = 2000, Mtime = DateTimeOffset.UtcNow,
+                        Permissions = "644", FullHash = hashDup,
+                        Storage = new StorageRef { Kind = "pack", Ref = "p0001", EntryName = "d.txt" },
+                    },
+                ],
+            };
+            var v2Blob = await store.WriteIndexAsync(account, name, 2, v2Index, null);
+
+            var info = new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },
+                Versions =
+                {
+                    new BackupVersion
+                    {
+                        Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10), IndexBlob = v1Blob,
+                        Stats = new VersionStats(1, 2000, 1, 2000),
+                    },
+                    new BackupVersion
+                    {
+                        Version = 2, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = v2Blob,
+                        Stats = new VersionStats(2, 4000, 2, 4000),
+                    },
+                },
+                Packs = { ["p0001"] = new PackInfo { Blob = "packs/p0001.7z", Members = [hashA, hashDup, hashDup], OriginalBytes = 6000 } },
+            };
+
+            Write(_local, "b.txt", new string('s', 2000));
+            Write(_local, "d.txt", new string('s', 2000));
+
+            // 真实 compactor(非 null):CleanupAsync 内部真正跑一遍归组代码,而不是像上面那条用例
+            // 一样把 liveByPack 手工拼好直接喂给 CompactAsync。
+            var cleaner = new RetentionCleaner(factory, store, new RetentionEvaluator(), Compactor());
+            var options = new CleanupOptions
+            {
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
+                DataTier = AccessTier.Hot,
+                DeadWeightThreshold = 0.30,
+                LocalRoot = _local,
+                AllowRepackDownload = false,
+            };
+
+            var report = await cleaner.CleanupAsync(account, name, null, options, info, CancellationToken.None);
+
+            Assert.Equal(1, report.RetiredVersions); // v1 退役,死重才因此出现(30%阈值否则不会触发重压)
+            // 关键:两个同 fullHash、不同 EntryName 的存活成员必须都留在归档里;按 hash 归组会把它们
+            // 合并成一条,重压后归档就只剩一个,v2 索引里另一条却仍声称它在——数据丢失且无迹可寻。
+            Assert.Equal(["b.txt", "d.txt"], await PackEntriesAsync(container));
+            Assert.Equal(2, info.Packs["p0001"].Members.Count);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>装饰 uploader：上传（if-missing 与 overwrite 皆然）一律抛异常，模拟"传新阶段"崩溃。</summary>
     private sealed class FailingUploader : IBlobUploader
     {

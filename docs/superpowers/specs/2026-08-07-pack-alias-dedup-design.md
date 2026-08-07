@@ -185,6 +185,16 @@ T3 和 T6 是这个特性的两根支柱——一根管"别名不会被错删"�
 
 Azurite 必须起，否则这批集成测试会静默跳过（`npx azurite --skipApiVersionCheck`）。
 
+## 已知取舍
+
+**别名让"可从本地修复"退化了。** `BackupRepairer.RepairPackAsync`（`BackupRepairer.cs:284-308`）修复一个成员时，只按 `entryName` 去 `localRoot` 找**一个**修复源——而 `entryName` 就是 leader 那个路径。leader 路径上的本地文件一旦没了或变了，`LocalMatchesAsync` 判不过，这个成员就修不了，于是 `m.Refs` 里引用它的**所有**路径（leader 自己 + 全部别名）一起被 `MarkUnrecoverable`——哪怕某个别名路径上正躺着逐字节相同的文件，本可以拿来当修复源。`DeadWeightCompactor.cs:129`（`hasAbsentLocal`）与 `:144`（逐成员 hash 比对）同理：都只探 `member.EntryName` 这一个路径，探不到就退化成"必须允许下载否则放弃压实/标记不可恢复"，完全没有去看还有没有别的路径引用同一个成员。
+
+这不是新类别——跨版本去重（`TryFindPackMember`）早就有这个性质：本地修复本来就只认 `entryName` 那一条路径，不管这个成员被多少条索引引用。但本特性把它从**偶发**变成**常态**：跨版本去重命中率取决于文件有没有跨版本改名/搬家，通常不高；本轮内跨箱去重只要"同一次备份里有重复内容的小文件"就命中，规模大得多，"leader 路径本地不在了、但某个别名路径还在"这种局面会常态化出现。
+
+修法便宜且安全：`m.Refs`（或 `live` 的等价结构）里除了 `entryName` 还有引用这个成员的全部路径，把它们依次当候选本地源试一遍（`LocalMatchesAsync` 本来就做 hash 校验，试错的唯一代价是多几次 `File.Exists`/hash 计算），零风险。但这个改动会同时碰 `BackupRepairer` 和 `DeadWeightCompactor` 两处的本地探测逻辑，不在这个修复波次里做——先记成明确的已知取舍，将来单独一个分支修。
+
+**`PackInfo.Members` 的语义变窄了。** 它是这个包里各成员的 `fullHash` 列表。以前"这个包里有没有某份内容"可以直接查它、"这个包被引用了多少次"也约等于它的长度；现在同一份内容在包内只登记一次（别名指向同一个 `EntryName`、不产生新成员），`Members` 既不等于引用这个包的索引条目数，也不能用来判断"某份内容是否在这个包里出现过第二次"。今天没有任何消费方这么用（都是按 `EntryName` 或 `Ref` 走），但这是个容易踩的假设——将来谁想用 `Members.Count` 估算"这个包省了多少去重"，得到的数字会偏低。
+
 ## 不做
 
 - 不追溯合并历史版本里已有的重复。

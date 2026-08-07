@@ -192,7 +192,10 @@ public sealed class LocalDedupResolver
         }
     }
 
-    private static string ContentKey(string fullHash, long length, string? head, string? tail) =>
+    /// <summary>内容身份的拼法：fullHash + 长度 + head + tail 四项。
+    /// 公开是为了让本轮内的打包成员去重（<see cref="PackAliasTable"/>）用**同一个**拼法——
+    /// 两条路各拼各的，迟早会在某一次改动里悄悄走岔，而走岔的后果是索引指向别人的内容。</summary>
+    public static string ContentKey(string fullHash, long length, string? head, string? tail) =>
         $"{fullHash}\n{length}\n{head}\n{tail}";
 
     /// <summary>运行内某 ref 的预约：内容身份 + 上传完成信号。</summary>
