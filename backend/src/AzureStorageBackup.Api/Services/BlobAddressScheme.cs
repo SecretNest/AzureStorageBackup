@@ -30,6 +30,16 @@ public sealed class BlobAddressScheme
     /// <summary>是否密钥化（加密备份且有 salt）。</summary>
     public bool Keyed => _key is not null;
 
+    /// <summary>
+    /// 这套寻址方案的身份指纹，用来在恢复时判定"journal 是不是同一把钥匙写的"。
+    /// 换了密码 / 换了 KDF 盐，地址空间就变了，旧 journal 里的引用全都对不上，必须整卷作废。
+    /// 从已派生的密钥再 HMAC 一次，泄露的信息不比现有寻址方案更多。
+    /// </summary>
+    public string Identity => _key is null
+        ? "plain"
+        : Convert.ToHexString(HMACSHA256.HashData(
+            _key, "asb-journal-identity"u8.ToArray()))[..16].ToLowerInvariant();
+
     /// <summary>data blob 基名（不含 ~N 碰撞后缀 / 分卷后缀）。</summary>
     public string DataAddress(string fullHash) => _key is null
         ? "data/" + fullHash
