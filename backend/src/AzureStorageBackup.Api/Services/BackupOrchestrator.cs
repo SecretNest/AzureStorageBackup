@@ -1329,33 +1329,42 @@ public sealed class BackupOrchestrator(
     }
 
     /// <summary>
-    /// 加密的多卷归档上传前，先抹掉这个地址上可能残留的旧卷。
+    /// 多卷归档上传前，先抹掉这个地址上可能残留的旧卷。
     /// <para>
-    /// 走到这里意味着本地权威判定"这个 ref 上不该有东西"。云端却仍可能有——上一次运行传到一半
-    /// 倒了，而收尾（写索引、写信息文件、写本地状态）是最后才做的，那批已经落地的卷于是既不在
-    /// 任何索引里，也不在本地状态里。下一次跑到同一个文件会重新压、重新传，但上传是 if-missing 的
-    /// （<see cref="IBlobUploader.UploadIfMissingAsync"/> 用 If-None-Match 交给服务端判），
-    /// 已经在的卷会被跳过。
+    /// 走到这里意味着本地权威判定"这个 ref 上不该有东西"。云端却仍可能有：上一次运行传到一半
+    /// 倒了（收尾的写索引/写信息文件是最后才做的，那批已落地的卷因此既不在任何索引里也不在本地
+    /// 状态里），或者**本轮**这一件活撞上瞬时错误、在挂起闸门前等过一轮又重来了一次。
+    /// 上传是 if-missing 的（<see cref="IBlobUploader.UploadIfMissingAsync"/> 用 If-None-Match
+    /// 交给服务端判），已经在的卷会被跳过——于是云上那一族卷成了**两次压缩的混合体**。
     /// </para>
     /// <para>
-    /// 明文下这不要紧：同样的输入配同样的参数，7z 压出来的卷逐字节相同（实测确认），跳过旧卷
-    /// 与传一遍新卷结果一致，还省了流量。**加密则不然**——AES 每次生成新的随机 salt/IV，同一个
-    /// 文件两次压出来的密文必然不同。于是 .001 是上一次的密文、.003 是这一次的，拼起来解不开，
-    /// 那个文件就此还原不了，而 blob 名是从明文内容 hash 派生的，两次跑拿到的又恰恰是同一个名字。
+    /// 从前这里对不加密的备份直接早退，依据是"同样的输入配同样的参数，7z 压出来的卷逐字节相同"。
+    /// 这条依据对单文件 blob 那条路**不成立**，实测（7-Zip 26.00）：
     /// </para>
     /// <para>
-    /// 只对多卷做。单卷即使跳过了旧密文也无妨：它是一份完整、自洽的归档，解出来还是同一个文件。
-    /// 多卷才有"半旧半新"这种拼不起来的形状。而多卷都是大文件，一次列举加几次删除相对于要传的
-    /// 字节数可以忽略——反过来，对每个新 blob 都先列一遍，首次备份就是几十万次白问。
+    /// 单文件走的是 <c>-si</c> 从 stdin 读（<see cref="CompressStreamingAsync"/>），而我们喂给它的
+    /// stdin 是一根**管道**。7z 拿不到源文件的 mtime，就把归档成员的 kMTime 属性写成**压缩那一刻**
+    /// 的时间。两次压缩因此差在：末卷里的 8 字节 FILETIME，以及首卷 32 字节签名头里那两个覆盖
+    /// 尾部头的 CRC。压缩数据本身逐字节相同——可正因为首卷的 CRC 校验的是末卷的头，把第一次的
+    /// 首卷和第二次的末卷拼在一起，7z 直接 <c>Headers Error / Can't open as archive</c>。
+    /// 索引却声称这个 blob 好好的：静默的数据损坏，而不是少传一次。
+    /// （对照组：pack 那条路按**文件名**压，mtime 取自磁盘上的文件，两次产出确实逐字节相同——
+    /// 见 SevenZipDeterminismTests。加密则两条路都不确定：AES 每次换随机 salt/IV。）
+    /// </para>
+    /// <para>
+    /// 所以判据只剩"是不是多卷"，不再问加不加密。单卷不必清：它是一份完整、自洽的归档，
+    /// 跳过它与传一遍新的结果一致。多卷才有"半旧半新"这种拼不起来的形状，而多卷都是大文件，
+    /// 一次列举加几次删除相对于要传的字节数可以忽略——反过来，对每个新 blob 都先列一遍，
+    /// 首次备份就是几十万次白问。
     /// </para>
     /// </summary>
     private async Task ClearLeftoverVolumesAsync(
         BackupRequest request, string blobRef, int volumeCount, StageTracker uploadTracker, CancellationToken ct)
     {
-        if (volumeCount <= 1 || string.IsNullOrEmpty(request.Password))
+        if (volumeCount <= 1)
             return;
 
-        // 登记在早退之后：不加密或单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
+        // 登记在早退之后：单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
         // 严格说这一段查的是云上的卷而不是本地文件，仍归进「核对」那一栏——单给它一栏不值当，
         // 要说的就一件事：这件活正在核对，不在传。
         uploadTracker.BeginChecking();
@@ -1637,6 +1646,12 @@ public sealed class BackupOrchestrator(
         uploadTracker.BeginUpload();   // 闸门与在途登记见 VolumeUploadScope，都在每卷那一层
         try
         {
+            // 与单文件 blob 同一条纪律（见 ClearLeftoverVolumesAsync）：多卷才做，做的是不让
+            // 这一族卷混进上一次尝试的产物。pack 号本轮唯一，所以残留只可能来自**本轮自己的**
+            // 重试——而重试正是挂起闸门每次放行都要走的那条路。包的成员按文件名压，两次产出
+            // 通常逐字节相同，但"通常"不是能拿来赌数据的东西：成员的 mtime 在两次尝试之间变过
+            // （内容没变，因此重校验不会把它排除）就足以让归档头不同，拼起来一样打不开。
+            await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, uploadTracker, ct);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
