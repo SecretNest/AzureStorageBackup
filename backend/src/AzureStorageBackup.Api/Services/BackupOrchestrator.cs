@@ -745,12 +745,23 @@ public sealed class BackupOrchestrator(
         var orphanAliases = new List<PlannedFile>();
         foreach (var (leaderPath, aliases) in aliasTable.AliasesByLeader)
         {
-            // 三个否决条件对应 leader 走岔的三条真实路径：
+            // 两条真实路径 + 一条冗余保险，对应 leader 走岔的所有情形：
             //   overrides 有它            → 内容在压缩窗口里变过，写下的是新 hash；
-            //   postDiffUnreadable 有它   → 第二次也读不开，就地降级、不产生任何 blob；
             //   storage 不是 pack 或缺失  → 变大到超阈值改走了单文件 blob，或整组一起读不开。
+            //   postDiffUnreadable 有它   → 今天**不可达**：leader 被 MarkPostDiffUnreadableAsync
+            //     标记时必然已经被排除出稳定 pack，RecordPack 从没为它写过 storageByPath，
+            //     上面那条"storage 缺失"已经完全覆盖这个情形。留着是零成本的冗余保险——
+            //     防将来这两件事被解耦（比如 postDiffUnreadable 独立出一条不经过 storageByPath
+            //     的路径）之后，这里悄悄失守。
             // 任一命中，别名的内容就已经**不等于** leader 最终存下去的那份了——绝不能指过去，
             // 那会让索引指向别人的内容，还原出来是错数据。
+            //
+            // 这三条判据的前提是 overrides / postDiffUnreadable / storageByPath 三张表在本轮内
+            // **全程只增不删**（现状确实如此——代码里没有任何一处对它们 Remove/TryRemove）。
+            // 一旦将来有人加一次删除（比如"重试成功后把失败标记清掉"），一个走岔的 leader 在
+            // 收尾时会看起来完好，别名照样指过去，还原出来是别人的内容——而且不会有任何测试
+            // 变红，因为现有测试钉的是"三张表当前的状态"，不钉"它们会不会被删过东西"。改这
+            // 三张表的写入方式之前，先想清楚这里的假设还成不成立。
             var leaderStorage = storageByPath.GetValueOrDefault(leaderPath);
             if (leaderStorage is { Kind: "pack" }
                 && !overrides.ContainsKey(leaderPath)
@@ -768,8 +779,22 @@ public sealed class BackupOrchestrator(
         }
 
         // 悬空别名：leader 走岔了，但它们自己好好的，不该被连累。重新跑一遍，第一个自然成为新
-        // leader。它们之间不再互相去重——这条路要求 leader 恰好在压缩窗口内被改写或读不开，本来
-        // 就罕见，罕见路径上多存几份，换收尾逻辑保持线性。
+        // leader。它们之间不再互相去重——这条路要求 leader 恰好在压缩窗口内被改写或读不开。
+        //
+        // "本来就罕见"这个前提要打个折扣：NAS 上一个共享中途掉线，那棵子树里的 leader 会**成批**
+        // 变成 postDiffUnreadable，挂在它们身上、分布在别处、活得好好的别名会**成批**悬空，
+        // 然后在下面这个循环里被**串行**重跑——不一定是一小段，可能是一整棵子树。
+        //
+        // 进度取舍比"界面停在 100%"更狠：uploadTracker.BeginWork()/EndWork() 没有包住这段重跑
+        // （那两个只在上面 ConsumeAsync 里配对出现），onItem 传的是下面这个空操作，ReportItem
+        // 不会跑，SetTransferred 也就不会被调用——重跑上传的字节，在读数上直到下面
+        // uploadTracker.Complete() 之前**完全不可见**，在途件数也一直是 0。界面停在 100% 静默
+        // 跑很久，对这个用户群（多在 NAS 上、拿不到命令行）是最容易被误判成"卡死"的形状。
+        //
+        // 这段故意不包 try：包了并 catch 掉，BuildEntries 会给这些别名产出 Length > 0 且
+        // Storage == null 的条目（Added 的 CarriedStorage 是 null，storageByPath 又没有它）——
+        // 那才是真正的静默丢数据形状。让它抛是对的：一轮备份失败、不写索引，孤儿 pack 交给
+        // 保留清理回收，下轮重来。不写下来，将来一定有人"顺手加个 try"。
         //
         // onItem 传 static _ => { }：Enqueue 是"一个 WorkItem 一次"，而 ProcessPackAsync 内部按
         // GroupIsFull 拆出几组是它自己决定的，外部无法预先申报对应的次数，手动补分母只会算错。
@@ -780,7 +805,13 @@ public sealed class BackupOrchestrator(
         foreach (var side in orphanAliases.ToLookup(
                      f => packOptions.DontCompress?.MatchesFileOrAncestorDir(f.Path) ?? false))
         {
-            await ProcessPackAsync(request, [.. side], side.Key, addressing, localResolver, info,
+            // 按 ordinal 路径序排一下，与文件那条路的排序纪律保持一致（见 crossPending 附近的
+            // 注释）：悬空重跑是独立的一次 ProcessPackAsync 调用，不受"组内仍是 ordinal 路径序"
+            // 那条不变量约束（AliasesByLeader 的枚举序是"leader 首次出现序"，别名在其内按插入序，
+            // 整体是交错的），这里排纯粹是为了与文件那条路的纪律一致——影响的是 solid 压缩率和
+            // 分组切点，不是正确性。
+            var pool = side.OrderBy(f => f.Path, StringComparer.Ordinal).ToList();
+            await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
                 storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
                 uploadTracker, state, ct);
         }
