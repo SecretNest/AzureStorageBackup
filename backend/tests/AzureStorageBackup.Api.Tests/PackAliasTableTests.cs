@@ -8,15 +8,13 @@ namespace AzureStorageBackup.Api.Tests;
 /// </summary>
 public sealed class PackAliasTableTests
 {
-    private static PlannedAlias Alias(string path) => new(path, 100, "xxh128:aa", "xxh128:hh", "xxh128:tt");
-
     [Fact]
     public void First_Occurrence_Becomes_Leader_And_Is_Not_An_Alias()
     {
         var table = new PackAliasTable();
 
         // 第一份内容：调用方照旧入箱。
-        Assert.False(table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("a/x.txt")));
+        Assert.False(table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt"));
         Assert.Empty(table.AliasesByLeader);
     }
 
@@ -24,9 +22,9 @@ public sealed class PackAliasTableTests
     public void Second_Occurrence_Of_Same_Content_Becomes_An_Alias_Of_The_First()
     {
         var table = new PackAliasTable();
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("a/x.txt"));
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt");
 
-        Assert.True(table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("c/z.txt")));
+        Assert.True(table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "c/z.txt"));
 
         var (leader, aliases) = Assert.Single(table.AliasesByLeader);
         Assert.Equal("a/x.txt", leader);
@@ -37,9 +35,9 @@ public sealed class PackAliasTableTests
     public void Many_Aliases_All_Hang_On_The_Same_Leader()
     {
         var table = new PackAliasTable();
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("a/x.txt"));
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("b/y.txt"));
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("c/z.txt"));
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt");
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "b/y.txt");
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "c/z.txt");
 
         var (leader, aliases) = Assert.Single(table.AliasesByLeader);
         Assert.Equal("a/x.txt", leader);
@@ -56,9 +54,9 @@ public sealed class PackAliasTableTests
         string full, long length, string head, string tail)
     {
         var table = new PackAliasTable();
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("a/x.txt"));
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt");
 
-        Assert.False(table.TryClaim(full, length, head, tail, Alias("c/z.txt")));
+        Assert.False(table.TryClaim(full, length, head, tail, "c/z.txt"));
         Assert.Empty(table.AliasesByLeader);
     }
 
@@ -73,9 +71,9 @@ public sealed class PackAliasTableTests
         var table = new PackAliasTable();
 
         // 既不登记为 leader……
-        Assert.False(table.TryClaim(full, 100, head, tail, Alias("a/x.txt")));
+        Assert.False(table.TryClaim(full, 100, head, tail, "a/x.txt"));
         // ……第二次同样缺项的也不会认出它来。
-        Assert.False(table.TryClaim(full, 100, head, tail, Alias("c/z.txt")));
+        Assert.False(table.TryClaim(full, 100, head, tail, "c/z.txt"));
         Assert.Empty(table.AliasesByLeader);
     }
 
@@ -83,9 +81,9 @@ public sealed class PackAliasTableTests
     public void A_Leader_Without_Aliases_Does_Not_Occupy_A_List()
     {
         var table = new PackAliasTable();
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("a/x.txt"));
-        table.TryClaim("xxh128:bb", 100, "xxh128:hh", "xxh128:tt", Alias("b/y.txt"));
-        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", Alias("c/z.txt"));
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt");
+        table.TryClaim("xxh128:bb", 100, "xxh128:hh", "xxh128:tt", "b/y.txt");
+        table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "c/z.txt");
 
         // 只有真有别名的 leader 才进这张表：一次首备有几十万个 leader，
         // 给每个都建一个空 List 是白占几十 MB。

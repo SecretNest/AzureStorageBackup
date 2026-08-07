@@ -590,10 +590,15 @@ public sealed class BackupOrchestrator(
             //
             // 顺序上不会与上面那一档打架：leader 若命中既有包，后来的同内容文件用同一张表、同一套
             // 四项判据也会命中，根本走不到这里。所以进这张表的 leader 一定是"本轮新装箱的"。
+            //
+            // 沉默的例外：别名不入箱，意味着它的源文件本轮不会被第二次打开——"每个打包成员在
+            // 压缩后都会被重校验"这条既有不变量，对别名不成立。它在压缩窗口里被改写或删除，
+            // 本轮都察觉不到。索引依然自洽：存的是 leader 在 diff 时刻的内容 = 别名在 diff 时刻
+            // 的内容，条目写的也是 diff 时刻的 hash/mtime——不是丢数据，下一轮 mtime 一变自然
+            // 重备，但这个沉默的例外必须写出来。
             if (file is not null && klass.Category != FileCategory.SingleFile
                 && file.FullHash is { } aliasHash && c.HeadHash is { } aliasHead && c.TailHash is { } aliasTail
-                && aliasTable.TryClaim(aliasHash, file.Length, aliasHead, aliasTail,
-                    new PlannedAlias(c.Path, file.Length, aliasHash, aliasHead, aliasTail)))
+                && aliasTable.TryClaim(aliasHash, file.Length, aliasHead, aliasTail, c.Path))
             {
                 // 与上面那一档收场完全相同：走"这一条没有变更"的既有路径。
                 // storageByPath 留到收尾回填——现在还不知道 leader 会落在哪个包上。

@@ -29,8 +29,14 @@ public sealed record PlannedAlias(
 /// </summary>
 public sealed class PackAliasTable
 {
-    // 四项内容身份 → 第一个见到这份内容的路径。首次备份时每个变更小文件各占一条
-    // （约 150 字节），20 万个约 30 MB——与装箱本身的在途状态同一个量级，可以接受。
+    // 四项内容身份 → 第一个见到这份内容的路径。首次备份时每个变更小文件各占一条。
+    //
+    // 估算口径（按对象布局推算，非实测——本项目的规矩是先跑实测再下判断，这里只是给个数量级）：
+    // key 是 ContentKey 拼出来的字符串，形如 "xxh128:<32 hex>\n<length>\n xxh128:<32 hex>\n xxh128:<32 hex>"，
+    // 约 124 字符 → string 实例约 272 B；加上 Dictionary 条目本身约 40 B（value 是 leader 路径的
+    // 引用，diff.Changes 本来就持有同一份，不重复计），合计约 312 B/条。20 万条约 62 MB，
+    // 50 万条约 155 MB——diff.Changes 本来就是每个扫描条目一个 FileChange，这张表和那份既有
+    // 基线是**同一个量级**，不是新增一个数量级。
     private readonly Dictionary<string, string> _leaderByContent = new(StringComparer.Ordinal);
 
     // leader 路径 → 挂在它身上的别名。**只有真有别名的 leader 才建列表**：
@@ -43,7 +49,7 @@ public sealed class PackAliasTable
     /// <summary>
     /// 本轮这份内容是不是已经有 leader 了。
     /// <para>
-    /// 返回 <c>true</c>：已有，<paramref name="candidate"/> 已登记为那个 leader 的别名，
+    /// 返回 <c>true</c>：已有，<paramref name="path"/> 已登记为那个 leader 的别名，
     /// 调用方**不要**入箱。返回 <c>false</c>：这是第一份（或四项不全，不参与去重），照旧入箱。
     /// </para>
     /// <para>
@@ -51,13 +57,23 @@ public sealed class PackAliasTable
     /// 同一套判据。同样是"这份内容是不是已经有了"的判断，两条路各有一套标准是说不通的：
     /// 判错就让索引指向别人的内容、还原时出来错误数据。
     /// </para>
+    /// <para>
+    /// 四项与 <paramref name="path"/> 一起在这里内部拼成 <see cref="PlannedAlias"/>，不让调用方
+    /// 各拼一份传进来——用来判定"是不是同一份内容"的那组值，和最终记进 <see cref="PlannedAlias"/>
+    /// 的那组值，只可能是同一组，不给"两条路各拼各的、迟早走岔"留口子（同样的教训见
+    /// <see cref="LocalDedupResolver.ContentKey"/> 提为 public 时那段注释）。
+    /// </para>
     /// </summary>
-    public bool TryClaim(
-        string? fullHash, long length, string? headHash, string? tailHash, PlannedAlias candidate)
+    public bool TryClaim(string? fullHash, long length, string? headHash, string? tailHash, string path)
     {
+        // 生产路径上调用方已经用模式匹配（file.FullHash is { } / c.HeadHash is { } / c.TailHash is
+        // { }）做完三项非空检查，传进来的必是非空值——这条分支今天只有单测在跑（见
+        // PackAliasTableTests.A_Missing_Component_Never_Participates）。留着不是为了防生产调用，
+        // 是防将来有人从别处、不带那层检查地调用这个公共方法。
         if (fullHash is null || headHash is null || tailHash is null)
             return false;
 
+        var candidate = new PlannedAlias(path, length, fullHash, headHash, tailHash);
         var key = LocalDedupResolver.ContentKey(fullHash, length, headHash, tailHash);
         if (_leaderByContent.TryGetValue(key, out var leader))
         {
