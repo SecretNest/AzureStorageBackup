@@ -1046,19 +1046,34 @@ public sealed class BackupOrchestrator(
             return;
         }
 
+        // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
+        // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
+        // file.FullHash 为空（diff 把全文 hash 延后给了这一遍读）时必然不等，于是照常写覆盖——
+        // 索引里的 hash 因此永远来自"真正压进归档的那些字节"，而不是 diff 时看到的那一份。
+        var content = placement.Content;
+
+        // journal：上传（或 if-missing 命中）已经确认返回，这块内容此刻确实在云上了，现在才敢记。
+        // 顺序不能动——先记后传就会记下一块并不存在的内容，下次恢复直接跳过它，那是数据丢失。
+        // 放在下面的碰撞告警**之前**：告警要打数据库和 webhook，是一次与这条记录无关的 I/O，
+        // 失败了不该连累 journal——journal 追加只是几十字节的本地写，成本比告警低得多，
+        // 而且是下一次运行真正要靠它判断"这块内容要不要重传"的东西，不能因为无关的失败而丢失。
+        // 传的是 CancellationToken.None，不是这次运行的 ct：Task 9 会取消同一个 ct 来挂起/取消
+        // 运行，而这一刻上传早已确认，云上已经有这块内容了——取消这个写入不会撤销任何东西，
+        // 只会让下次恢复以为这块没传过、白白重传一次。半截写的风险也一样：write 被取消可能截断
+        // 这一行，下次拼接进新 journal 时把它连同下一条一起解析坏掉。
+        if (control is not null)
+            await control.RecordBlobAsync(
+                file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
+                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
+
         // 碰撞告警是内容已成功处理/上传之后的事后上报，不再触碰源文件——绝不能留在上面的 try 里：
         // 否则这条通知（或其内部日志写入）失败会被误判成"文件读不开"，导致已经成功上传的内容
         // 在索引里被沿用旧条目或整条丢弃，而云端其实已经有这份数据。
         if (placement.Collision)
             await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                 $"Hash collision avoided: {file.Path}",
-                $"Different content shares hash {placement.Content.FullHash}; stored at {placement.Ref}", ct);
+                $"Different content shares hash {content.FullHash}; stored at {placement.Ref}", ct);
 
-        // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
-        // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
-        // file.FullHash 为空（diff 把全文 hash 延后给了这一遍读）时必然不等，于是照常写覆盖——
-        // 索引里的 hash 因此永远来自"真正压进归档的那些字节"，而不是 diff 时看到的那一份。
-        var content = placement.Content;
         if (content.FullHash != file.FullHash)
             overrides[file.Path] = new EntryOverride(
                 content.FullHash, content.HeadHash, content.Length, content.Mtime);
@@ -1069,13 +1084,6 @@ public sealed class BackupOrchestrator(
             VolumeSizes = [.. placement.VolumeSizes],
         };
         tailByPath[file.Path] = content.TailHash;
-
-        // journal：上传（或 if-missing 命中）已经确认返回，这块内容此刻确实在云上了，现在才敢记。
-        // 顺序不能动——先记后传就会记下一块并不存在的内容，下次恢复直接跳过它，那是数据丢失。
-        if (control is not null)
-            await control.RecordBlobAsync(
-                file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
-                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], ct);
 
         await LogFileAsync(request, file.Path, ct);
         onItem(file.Length);
@@ -1630,11 +1638,14 @@ public sealed class BackupOrchestrator(
 
         // journal：pack 已经传完确认。成员表要记全，恢复时得靠它重建 PackInfo——
         // 信息文件是最后才提交的，崩溃时它里面根本没有这个包。
+        // 同样传 CancellationToken.None：这次运行的 ct 是 Task 9 挂起/取消要取消的那一个，
+        // 而此刻整箱已经在云上确认了，取消这个写入救不回任何东西，只会让下次恢复以为
+        // 这箱没传过、白白重传一次；写到一半被取消还可能留下半截行，拖累下一条记录。
         if (control is not null)
             await control.RecordPackAsync(
                 packId,
                 [.. members.Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length))],
-                volumeSizes, storeOnly, ct);
+                volumeSizes, storeOnly, CancellationToken.None);
     }
 
     private static string Local(BackupRequest request, string relPath) =>
