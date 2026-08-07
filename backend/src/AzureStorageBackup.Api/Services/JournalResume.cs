@@ -59,7 +59,20 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     private static string PrescreenKey(string path, long length, string headHash)
         => $"{path}\0{length}\0{headHash}";
 
-    /// <summary>成员集合的规范化键：按序拼 路径 + 全文 hash + 长度。顺序也算数——entryName 的编号跟着它走。</summary>
+    /// <summary>
+    /// 成员集合的规范化键：按序拼 路径 + 全文 hash + 长度。
+    /// <para>
+    /// **故意不含 <see cref="JournalMember.EntryName"/>**。在本仓库里它恒等于成员自己的路径
+    /// （<c>new PackEntry(f.Path, f.Path, …)</c>，见 <c>BackupOrchestrator.ProcessPackAsync</c>；
+    /// <c>RestoreOrchestrator</c> 里那段"按 EntryName 而不是 Path 取"说的是**跨版本去重**时
+    /// 一个新路径指向老包里的老成员名，不是装箱时会另起一套编号），因此把它拼进键里除了让
+    /// 同一份内容多算一遍路径之外没有任何区分力。
+    /// </para>
+    /// <para>
+    /// 顺序也算数：<c>PackInfo.Members</c> 是一串按序排下来的成员 hash，键不认顺序就会让
+    /// 同一组成员的两种排法互相命中，而记进信息文件的那串顺序与归档里的实际内容对不上。
+    /// </para>
+    /// </summary>
     private static string MemberKey(IReadOnlyList<JournalMember> members)
         => string.Join('\n', members.Select(m => $"{m.Path}\0{m.FullHash}\0{m.Length}"));
 
@@ -82,8 +95,19 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
             : null;
 
     /// <summary>
-    /// 精确匹配一箱 pack。成员集合必须逐一相同，宽松不得：
-    /// entryName 的编号是跟着分组走的，成员对不上就会让索引指向箱里根本不存在的条目。
+    /// 精确匹配一箱 pack。成员集合必须逐一相同，宽松不得。
+    /// <para>
+    /// 理由不在名字上（归档里的成员名就是成员自己的路径，见 <see cref="MemberKey"/>），
+    /// 而在**记账与归档必须严丝合缝**：命中之后走的 <c>RecordPackAsync</c> 会拿**本轮这一组**
+    /// 的成员表去写 <c>PackInfo.Members</c> / <c>OriginalBytes</c>，并给每个成员写一条指向
+    /// 这个包的索引条目。允许部分匹配（本轮这组是上一轮那箱的超集）就等于宣称归档里有一些
+    /// 它根本没有的成员：还原时解不出文件、检查时报缺失，而索引一口咬定它在。
+    /// 子集同样不行——<c>OriginalBytes</c> 会算少，死重压实据此判断这箱还剩多少活肉。
+    /// </para>
+    /// <para>
+    /// 分组本身是确定性的（同样的基线、同样的源、同样的界），所以严格相等在实际中命中率并不低；
+    /// 对不上就重压——一箱都是小文件，重压很便宜。
+    /// </para>
     /// </summary>
     public JournalRecord? FindPack(IReadOnlyList<JournalMember> members)
         => members.Count > 0 && _packs.TryGetValue(MemberKey(members), out var r) ? r : null;

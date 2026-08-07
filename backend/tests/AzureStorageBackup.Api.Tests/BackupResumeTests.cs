@@ -145,7 +145,9 @@ public sealed class BackupResumeTests : IDisposable
         Password = password,
         Options = new BackupEngineOptions
         {
-            // 上传额度 1＝任一时刻只有一卷在传，"第 1 次上传之后叫停"才说得准。
+            // 上传额度 1＝任一时刻只有一卷在传，所以"第 1 次上传之后叫停"这个**下达时刻**是准的。
+            // 但它并不保证停下来时只做完了一件：编排器起的是 Math.Max(2, UploadConcurrency + 1) 个
+            // 工作者，第二件完全可能已经在半路上（详见下面用例里那段说明）。
             UploadConcurrency = 1,
             Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
         },

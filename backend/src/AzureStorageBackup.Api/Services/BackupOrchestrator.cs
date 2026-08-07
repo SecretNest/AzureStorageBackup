@@ -1643,8 +1643,11 @@ public sealed class BackupOrchestrator(
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
 
-            // 恢复：这一整箱上一轮已经确认传上去了。成员集合必须逐一对得上——
-            // entryName 的编号跟着分组走，成员对不上，索引就会指到箱里根本不存在的条目。
+            // 恢复：这一整箱上一轮已经确认传上去了。成员集合必须逐一对得上——下面的
+            // RecordPackAsync 会拿**本轮这一组**的成员表去写 PackInfo.Members/OriginalBytes，
+            // 并给每个成员写一条指向这个包的索引条目。超集就是宣称归档里有一些它根本没有的成员
+            // （还原解不出、检查报缺失，索引却一口咬定它在），子集则让 OriginalBytes 算少、
+            // 死重压实据此误判这箱还剩多少活肉。
             //
             // 仍然要走 RecordPackAsync（只是不上传）：本轮内跨箱去重的收尾靠 storageByPath[leaderPath]
             // 判 leader 有没有走岔，在这里直接 continue 掉，挂在这个 leader 身上的别名会全部悬空重跑。
