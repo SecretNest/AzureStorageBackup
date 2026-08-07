@@ -464,22 +464,32 @@ public sealed class BackupCancelModesTests : IDisposable
             WriteIncompressible("big.bin", 6_000_000, seed: 20260808);
             await using var c = new BackupRunControl(_journals, 8, "run-gentle-" + (int)kind);
             var run = orchestrator.RunAsync(Request(account, name, volumeBytes: 1_000_000), null, default, c);
+            try
+            {
+                await uploader.Blocked.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                c.RequestStop(kind);                 // 第 2 卷正挂在半空中
+                uploader.Release.TrySetResult();
 
-            await uploader.Blocked.Task.WaitAsync(TimeSpan.FromSeconds(120));
-            c.RequestStop(kind);                 // 第 2 卷正挂在半空中
-            uploader.Release.TrySetResult();
+                await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(30)), kind);
 
-            await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(120)), kind);
+                // 这件活整个做完了：journal 里有它，卷数与它自报的一致。
+                var journal = Assert.Single(await _journals.ListAsync(account.Id, name, default));
+                var record = Assert.Single(journal.Content.Records);
+                Assert.True(record.Volumes >= 3, $"expected a multi-volume item, got {record.Volumes}");
 
-            // 这件活整个做完了：journal 里有它，卷数与它自报的一致。
-            var journal = Assert.Single(await _journals.ListAsync(account.Id, name, default));
-            var record = Assert.Single(journal.Content.Records);
-            Assert.True(record.Volumes >= 3, $"expected a multi-volume item, got {record.Volumes}");
-
-            // 云上一卷不少——这才是"含它的全部分卷"那半句话的实际含义。
-            var expected = VolumeBlobIO.VolumeNames(record.Ref, record.Volumes).Order(StringComparer.Ordinal);
-            Assert.Equal(expected, (await DataBlobsAsync(container)).Order(StringComparer.Ordinal));
-            Assert.Equal(record.Volumes, uploader.Uploaded.Count);
+                // 云上一卷不少——这才是"含它的全部分卷"那半句话的实际含义。
+                var expected = VolumeBlobIO.VolumeNames(record.Ref, record.Volumes).Order(StringComparer.Ordinal);
+                Assert.Equal(expected, (await DataBlobsAsync(container)).Order(StringComparer.Ordinal));
+                Assert.Equal(record.Volumes, uploader.Uploaded.Count);
+            }
+            finally
+            {
+                // Blocked 信号没等到（正是回归会长成的样子）时，run 还在后台挂在 Release 上：
+                // 这里放行、等它收尾，不然它会带着一个没人观察的异常在 Dispose() 删掉临时目录之后
+                // 继续跑，白烧 120s 才让用例变红。TrySetResult 幂等，正常路径下重复调用无副作用。
+                uploader.Release.TrySetResult();
+                await run.ContinueWith(_ => { });
+            }
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -579,18 +589,32 @@ public sealed class BackupCancelModesTests : IDisposable
                 real, reuse: authority, wrapIndexCache: inner => blocking = new BlockingIndexCache(inner));
 
             await using var c = new BackupRunControl(_journals, 8, "run-index-" + (int)kind);
-            var run = second.RunAsync(Request(account, name), null, default, c);
+            // 这条用例唯一的"放行"手段就是这个令牌：BlockingIndexCache 挂在 Task.Delay(Infinite, ct)
+            // 上，没有另外的 Release 信号。令牌没等到 Reading，或者停止意愿没能传进这个 ct（正是
+            // 本用例要钉的回归），run 都可能还在后台挂着——finally 里用测试自己的 CTS 兜底取消。
+            using var runCts = new CancellationTokenSource();
+            var run = second.RunAsync(Request(account, name), null, runCts.Token, c);
+            try
+            {
+                await blocking!.Reading.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                c.RequestStop(kind);
 
-            await blocking!.Reading.Task.WaitAsync(TimeSpan.FromSeconds(60));
-            c.RequestStop(kind);
+                // 令牌没接进读索引那一步的话，这一句会一直挂到超时——那正是这条用例要钉的回归。
+                await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(30)), kind);
 
-            // 令牌没接进读索引那一步的话，这一句会一直挂到超时——那正是这条用例要钉的回归。
-            await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(30)), kind);
-
-            // 停在开卷之前，所以盘上不该留下 journal；也不该写出第二个版本。
-            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
-            var info = await authority.Tracked.LoadAsync(account, name, null, default);
-            Assert.Single(info!.Versions);
+                // 停在开卷之前，所以盘上不该留下 journal；也不该写出第二个版本。
+                Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+                var info = await authority.Tracked.LoadAsync(account, name, null, default);
+                Assert.Single(info!.Versions);
+            }
+            finally
+            {
+                // 不管上面成没成功都保证收尾：run 若还挂着，这里直接取消它自己的外部令牌，
+                // 不再依赖被测的那条链路，然后等它真正跑完，不让它带着未观察的异常在
+                // Dispose() 删掉临时目录之后继续跑。
+                runCts.Cancel();
+                await run.ContinueWith(_ => { });
+            }
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
