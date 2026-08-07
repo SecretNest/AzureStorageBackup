@@ -34,6 +34,34 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     public long StagedBytes => Interlocked.Read(ref _stagedBytes);
 
     /// <summary>
+    /// 进程启动时清掉上一个进程留下的压缩/暂存残留。
+    /// <para>
+    /// 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
+    /// 按运行清会把别人正在写的文件删掉。进程刚起来时没有任何运行存活，
+    /// 这里看到的一切都是上次非正常退出（容器被 kill、断电）的垃圾。
+    /// </para>
+    /// <para>
+    /// 恢复时不复用这些暂存文件——重压一遍比校验一堆来路不明的半成品便宜也安全得多。
+    /// </para>
+    /// </summary>
+    public static void ClearStale(string compressTempDir, string stagedTempDir)
+    {
+        foreach (var dir in new[] { compressTempDir, stagedTempDir })
+        {
+            try
+            {
+                if (!Directory.Exists(dir))
+                    continue;
+                foreach (var sub in Directory.EnumerateDirectories(dir))
+                    try { Directory.Delete(sub, recursive: true); } catch { /* 删不掉就算了，下次再说 */ }
+                foreach (var file in Directory.EnumerateFiles(dir))
+                    try { File.Delete(file); } catch { /* 同上 */ }
+            }
+            catch { /* 同上 */ }
+        }
+    }
+
+    /// <summary>
     /// 一次运行在暂存区里的席位。暂存盘的额度按**当前持有席位的运行数**均分，所以席位必须随
     /// 运行开始而取、随运行结束而还——存量的非活动备份不该占份额，否则配了十个备份、只跑一个，
     /// 那一个也只能用十分之一的盘。

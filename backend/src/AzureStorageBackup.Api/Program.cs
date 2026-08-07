@@ -97,6 +97,9 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
 // 按运行清会把别人正在写的文件删掉。正常收尾各删各的（DiffWorkQueue.Dispose）。
 DiffWorkQueue.ClearStale(spillDir);
+// 同理：上次非正常退出留下的压缩中间产物与暂存分卷也在这里清掉。
+// 恢复靠的是 journal（云端已确认的内容），不靠这些本地半成品。
+StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
 // 装箱的两条**按机器**定的界。GroupCapBytes 是每个备份自己的设置，不在这里——
 // 这两条约束的是这台机器上 7z 进程的内存与 argv 上限，换台机器合适的值就不一样。
 builder.Services.AddSingleton(new PackLimits(
