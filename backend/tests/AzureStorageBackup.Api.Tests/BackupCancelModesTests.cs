@@ -55,6 +55,17 @@ public sealed class BackupCancelModesTests : IDisposable
         File.WriteAllBytes(full, new byte[size]);
     }
 
+    /// <summary>写不可压缩的内容（定种子，可复现）。全零的文件 7z 能压到几 KB，
+    /// 设了 VolumeBytes 也切不出几卷来——要多卷就必须让压缩压不动。</summary>
+    private void WriteIncompressible(string rel, int size, int seed)
+    {
+        var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        var bytes = new byte[size];
+        new Random(seed).NextBytes(bytes);
+        File.WriteAllBytes(full, bytes);
+    }
+
     /// <summary>把 AppendAsync 收进列表的 IOperationLog 替身（durable 一并记下：取消绝不能长存）。
     /// 项目里已有的几份都是各自文件私有的嵌套类，这里照同一形状再写一份。</summary>
     private sealed class RecordingOperationLog : IOperationLog
@@ -343,6 +354,132 @@ public sealed class BackupCancelModesTests : IDisposable
             var journal = Assert.Single(await _journals.ListAsync(account.Id, name, default));
             Assert.NotEmpty(journal.Content.Records);
             Assert.NotEmpty(await DataBlobsAsync(container));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>在第一件活的第 2 卷上挂住，等测试放行；放行之后**先问一次递进来的令牌**再真传。
+    /// <para>
+    /// 那一问就是这条用例的全部力气所在：Suspend / Finish current files 之后，递到上传这一层的
+    /// 令牌必须仍然干净。编排器要是把消费者的 working 令牌接到 StopToken 上（而不是 AbortToken），
+    /// 这里当场抛取消，第 2 卷之后一卷都传不成——"做完当前这件，含它的全部分卷"就成了空话。
+    /// </para></summary>
+    private sealed class BlockOnSecondVolume(IBlobUploader inner) : IBlobUploader
+    {
+        private readonly Lock _lock = new();
+        private readonly List<string> _uploaded = [];
+        private string? _first;
+
+        /// <summary>第 2 卷已经进来、正挂着。</summary>
+        public TaskCompletionSource Blocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>测试下达停止之后放行。</summary>
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>真正传上去的 blob 名（按完成顺序）。</summary>
+        public IReadOnlyList<string> Uploaded
+        {
+            get { lock (_lock) return [.. _uploaded]; }
+        }
+
+        /// <summary>去掉 .001 这种卷号后缀，得到这一族的基名。</summary>
+        private static string BaseOf(string name)
+        {
+            var dot = name.LastIndexOf('.');
+            return dot > 0 && name.Length - dot == 4 && name.AsSpan(dot + 1).ToString().All(char.IsAsciiDigit)
+                ? name[..dot]
+                : name;
+        }
+
+        private async Task<T> RunAsync<T>(string blobName, CancellationToken ct, Func<Task<T>> call)
+        {
+            bool hold;
+            lock (_lock)
+            {
+                _first ??= BaseOf(blobName);
+                hold = BaseOf(blobName) == _first && blobName.EndsWith(".002", StringComparison.Ordinal);
+            }
+            if (hold)
+            {
+                Blocked.TrySetResult();
+                await Release.Task;
+            }
+            ct.ThrowIfCancellationRequested();
+            var result = await call();
+            lock (_lock) _uploaded.Add(blobName);
+            return result;
+        }
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => RunAsync(blobName, ct, () => inner.UploadIfMissingAsync(
+                account, container, blobName, filePath, tier, retry, ct, metadata));
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+            => RunAsync(blobName, ct, () => inner.UploadIfMissingAsync(
+                account, container, blobName, filePath, tier, retry, ct, metadata, progress));
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => RunAsync<bool>(blobName, ct, async () =>
+            {
+                await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+                return true;
+            });
+    }
+
+    /// <summary>
+    /// "做完当前这件，含它的全部分卷，再停"——这条承诺整个落在编排器**怎么用**那两个令牌上：
+    /// 消费者的 working 令牌必须接 AbortToken，绝不能接 StopToken。
+    /// <para>
+    /// 上面那几条单元用例钉的是 BackupRunControl 自己，把这两个令牌在编排器里混成一个，
+    /// 它们一条都不会红。这条从外面钉：一个切成好几卷的大文件传到第 2 卷时按下停止，
+    /// 放行之后剩下的卷必须一卷不少地传完，而且这件活要落进 journal——落了 journal 才算"做完"，
+    /// 下一轮才复用得上。
+    /// </para>
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(StopKind.Suspend)]
+    [InlineData(StopKind.FinishCurrentFiles)]
+    public async Task A_gentle_stop_finishes_every_volume_of_the_item_in_flight(StopKind kind)
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        var uploader = new BlockOnSecondVolume(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+        var (orchestrator, factory, _) = Build(uploader);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            // 6 MB 不可压缩 + 1 MB 一卷 = 七卷上下；单文件阈值 5 MB 以下，走的是单文件 blob 那条路。
+            WriteIncompressible("big.bin", 6_000_000, seed: 20260808);
+            await using var c = new BackupRunControl(_journals, 8, "run-gentle-" + (int)kind);
+            var run = orchestrator.RunAsync(Request(account, name, volumeBytes: 1_000_000), null, default, c);
+
+            await uploader.Blocked.Task.WaitAsync(TimeSpan.FromSeconds(120));
+            c.RequestStop(kind);                 // 第 2 卷正挂在半空中
+            uploader.Release.TrySetResult();
+
+            await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(120)), kind);
+
+            // 这件活整个做完了：journal 里有它，卷数与它自报的一致。
+            var journal = Assert.Single(await _journals.ListAsync(account.Id, name, default));
+            var record = Assert.Single(journal.Content.Records);
+            Assert.True(record.Volumes >= 3, $"expected a multi-volume item, got {record.Volumes}");
+
+            // 云上一卷不少——这才是"含它的全部分卷"那半句话的实际含义。
+            var expected = VolumeBlobIO.VolumeNames(record.Ref, record.Volumes).Order(StringComparer.Ordinal);
+            Assert.Equal(expected, (await DataBlobsAsync(container)).Order(StringComparer.Ordinal));
+            Assert.Equal(record.Volumes, uploader.Uploaded.Count);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
