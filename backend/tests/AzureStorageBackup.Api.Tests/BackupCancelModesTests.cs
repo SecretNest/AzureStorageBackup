@@ -534,8 +534,13 @@ public sealed class BackupCancelModesTests : IDisposable
     /// 只在 <c>UploadOverwriteAsync</c> 上拖——<see cref="VolumeBlobIO.ReplaceAsync"/> 用的正是它，
     /// 而这正是压实"传新卷"落地的那一刻。<c>UploadIfMissingAsync</c> 原样放过：压实不走那条路，
     /// 拖它只会拖累无关的东西。
-    /// </para></summary>
-    private sealed class DelayedOverwriteUploader(IBlobUploader inner, TimeSpan delay) : IBlobUploader
+    /// </para>
+    /// <param name="onFirstCall">第一次真的落到这一步时同步触发一次，跑在调用方（压实自己）的
+    /// 线程上。钉"压实进行中途"那条用例专用：从这里面下停止意愿，"压实已经在跑"就是强制出来的
+    /// 时序，不是指望进度回调赶巧排在它前面。</param>
+    /// </summary>
+    private sealed class DelayedOverwriteUploader(IBlobUploader inner, TimeSpan delay, Action? onFirstCall = null)
+        : IBlobUploader
     {
         private int _overwriteCalls;
 
@@ -553,7 +558,8 @@ public sealed class BackupCancelModesTests : IDisposable
             RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
         {
-            Interlocked.Increment(ref _overwriteCalls);
+            if (Interlocked.Increment(ref _overwriteCalls) == 1)
+                onFirstCall?.Invoke();
             // 观察传进来的 ct：修复前这里收到的是运行自己的 ct（永不因用户停止而触发），
             // 拖延期满才会往下走；修复后收到的是 stopProducing.Token，用户一按停止这里就被打断。
             await Task.Delay(delay, ct);
@@ -574,19 +580,48 @@ public sealed class BackupCancelModesTests : IDisposable
         }
     }
 
+    /// <summary>造一份"v1 提交后删掉一个成员、v2 一提交 v1 就该退役"的现场：两条清理尾巴用例共用。
+    /// 三个小文件同目录，按目录装箱进同一个 pack，内容各不相同（不同种子）——全零内容会被本地
+    /// 去重收敛成同一份物理成员，那样删一个不会产生任何死重。返回时 a 已经删掉、request 已经把
+    /// MaxVersions 摁到 1（v2 一提交，v1 立刻该退役），调用方接着跑 v2 即可让死重压实被叫起来。</summary>
+    private async Task<BackupRequest> SeedPackDueForCompactionAsync(BackupOrchestrator orchestrator, Account account, string name)
+    {
+        WriteIncompressible("pack/a.bin", 2000, seed: 1);
+        WriteIncompressible("pack/b.bin", 2000, seed: 2);
+        WriteIncompressible("pack/c.bin", 2000, seed: 3);
+        var baseRequest = Request(account, name);
+        var request = baseRequest with
+        {
+            Options = baseRequest.Options with
+            {
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
+            },
+        };
+        Assert.Equal(1, (await orchestrator.RunAsync(request, null, default, null)).Version);
+
+        // v2：删掉 a——b、c 没变，仍沿用 v1 那个 pack；那个 pack 里 a 那份变成死重
+        // （2000 / 6000 ≈ 33% > 30% 阈值），触发原地重压。
+        File.Delete(Path.Combine(_root, "pack", "a.bin"));
+        return request;
+    }
+
     /// <summary>清理尾巴上的停止意愿，Task 9 交接时漏掉的那一段：版本索引与信息文件都已提交，
     /// 编排器随即径直调 <c>cleaner.CleanupAsync</c>，两个令牌都不接进去——死重压实该下载、
     /// 重压、重传照样跑到底，而 CancelAsync/SuspendAsync 是等到终态才返回的，用户按下按钮的
     /// 那个 HTTP 请求就跟着一起挂那么久。
     /// <para>
-    /// 用一个人为拖延 8 秒的重传替身把"压实真被叫起来、乖乖跑完"和"压实被跳过/被打断"这两种
-    /// 结局的耗时拉开：3 秒的收尾期限，只有后者跨得过去。
+    /// 这条钉的是**跳过**那半——停止意愿在进清理之前就已经落定（<c>BackupOrchestrator.cs:1028</c>），
+    /// <c>cleaner.CleanupAsync</c> 整个没被叫起来。压实进行中途才被打断的那半在
+    /// <see cref="A_stop_requested_mid_compaction_lets_the_run_finish_promptly"/>：那条才用得上
+    /// 会拖住重传的替身，这条用不上——拖也拖不到从未被叫起来的调用上，硬塞一个只会让人误以为
+    /// 这里也测了压实进行中途，所以这里就用一份不拖延的替身，靠 <c>OverwriteCalls</c> 直接钉
+    /// "压实一次都没被叫起来"。
     /// </para></summary>
     [SkippableTheory]
     [InlineData(StopKind.Suspend)]
     [InlineData(StopKind.FinishCurrentFiles)]
     [InlineData(StopKind.StopNow)]
-    public async Task A_stop_requested_in_the_cleanup_tail_lets_the_run_finish_promptly(StopKind kind)
+    public async Task A_stop_pending_before_cleanup_skips_it_and_finishes_promptly(StopKind kind)
     {
         Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
         Skip.IfNot(SevenZip(), "7z executable not available");
@@ -594,32 +629,15 @@ public sealed class BackupCancelModesTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("stop");
         var real = new BlobUploader(new BlobClientFactory(TestSecrets.Reader));
-        var slowCompact = new DelayedOverwriteUploader(real, TimeSpan.FromSeconds(8));
-        var (orchestrator, factory, authority) = Build(real, compactUploader: slowCompact);
+        // 没有拖延——压实压根不该被叫起来，OverwriteCalls 留着只为验证这一点。
+        var compact = new DelayedOverwriteUploader(real, TimeSpan.Zero);
+        var (orchestrator, factory, _) = Build(real, compactUploader: compact);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
-            // v1：三个小文件同目录，按目录装箱进同一个 pack。内容各不相同（不同种子）——
-            // 全零内容会被本地去重收敛成同一份物理成员，那样删一个不会产生任何死重。
-            WriteIncompressible("pack/a.bin", 2000, seed: 1);
-            WriteIncompressible("pack/b.bin", 2000, seed: 2);
-            WriteIncompressible("pack/c.bin", 2000, seed: 3);
-            var baseRequest = Request(account, name);
-            var request = baseRequest with
-            {
-                Options = baseRequest.Options with
-                {
-                    // MaxVersions=1：v2 一提交，v1 立刻该退役——死重压实随之被叫起来。
-                    Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
-                },
-            };
-            Assert.Equal(1, (await orchestrator.RunAsync(request, null, default, null)).Version);
+            var request = await SeedPackDueForCompactionAsync(orchestrator, account, name);
 
-            // v2：删掉 a——b、c 没变，仍沿用 v1 那个 pack；那个 pack 里 a 那份变成死重
-            // （2000 / 6000 ≈ 33% > 30% 阈值），触发原地重压。
-            File.Delete(Path.Combine(_root, "pack", "a.bin"));
-
-            await using var c = new BackupRunControl(_journals, 8, "run-cleanup-" + (int)kind);
+            await using var c = new BackupRunControl(_journals, 8, "run-cleanup-skip-" + (int)kind);
             // 在 CleaningUp 这一帧同步下停止意愿：跑在编排器自己的线程上，严格早于它判断
             // "要不要调 CleanupAsync"的那一步，不留时间窗口。
             var progress = new StopOnStage(BackupStage.CleaningUp, () => c.RequestStop(kind));
@@ -627,17 +645,106 @@ public sealed class BackupCancelModesTests : IDisposable
             var run = orchestrator.RunAsync(request, progress, default, c);
             try
             {
-                // 8 秒的人为拖延摆在那儿：真正"跳过/打断了压实"的收尾用不了这么久。
                 var result = await run.WaitAsync(TimeSpan.FromSeconds(3));
 
                 // 版本已经提交：这仍然是一次成功的备份，不是 Suspended/Canceled——
                 // 清理只是顺手维护，跳过它不改变"这一轮备份成功"这个事实。
                 Assert.Equal(2, result.Version);
+                // 压实一次都没被叫起来——这才是"跳过"这个词的实际含义。
+                Assert.Equal(0, compact.OverwriteCalls);
             }
             finally
             {
                 await run.ContinueWith(_ => { });
             }
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>清理尾巴的另一半，也是危险的那一半：死重压实已经真被叫起来、正在下载/重压/重传
+    /// 半路上，用户这时候才按下停止。<c>BackupOrchestrator.cs:1050</c> 那个
+    /// <c>catch (OperationCanceledException) when (...)</c> 接的正是这一刻的取消——接漏了，
+    /// 一次已经提交的成功备份会被倒扣成 Suspended/Canceled；接错了 guard，会连宿主真关停的
+    /// 取消也一并吞掉（见 <see cref="A_genuine_cancellation_mid_compaction_still_propagates_as_a_failure"/>）。
+    /// <para>
+    /// 停止意愿从 <see cref="DelayedOverwriteUploader"/> 的 <c>onFirstCall</c> 钩子里下达——那正是
+    /// <c>UploadOverwriteAsync</c>（<see cref="VolumeBlobIO.ReplaceAsync"/> 落地重传新卷的那一步）
+    /// 真被叫到的时刻，早已经在 <c>cleaner.CleanupAsync</c> 内部：这样"压实已经在跑"是强制出来的
+    /// 时序，不是指望某个 progress 回调赶巧排在它前面。8 秒的人为拖延摆在那儿：真正被打断的收尾
+    /// 用不了这么久，3 秒的收尾期限只有它跨得过去。
+    /// </para></summary>
+    [SkippableTheory]
+    [InlineData(StopKind.Suspend)]
+    [InlineData(StopKind.FinishCurrentFiles)]
+    [InlineData(StopKind.StopNow)]
+    public async Task A_stop_requested_mid_compaction_lets_the_run_finish_promptly(StopKind kind)
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        var real = new BlobUploader(new BlobClientFactory(TestSecrets.Reader));
+        BackupRunControl? control = null;
+        var slowCompact = new DelayedOverwriteUploader(
+            real, TimeSpan.FromSeconds(8), onFirstCall: () => control!.RequestStop(kind));
+        var (orchestrator, factory, _) = Build(real, compactUploader: slowCompact);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var request = await SeedPackDueForCompactionAsync(orchestrator, account, name);
+
+            await using var c = new BackupRunControl(_journals, 8, "run-cleanup-mid-" + (int)kind);
+            control = c;
+
+            var run = orchestrator.RunAsync(request, null, default, c);
+            try
+            {
+                // 8 秒的人为拖延摆在那儿：真正被打断的收尾用不了这么久。
+                var result = await run.WaitAsync(TimeSpan.FromSeconds(3));
+
+                // 版本已经提交：压实被半路打断不改变"这一轮备份成功"这个事实，不是
+                // Suspended/Canceled——被打断的这份清理留给下一轮 cleaner 补上。
+                Assert.Equal(2, result.Version);
+                // 压实真的被叫起来过一次——不是像跳过路径那样一次都没碰到 UploadOverwriteAsync。
+                Assert.Equal(1, slowCompact.OverwriteCalls);
+            }
+            finally
+            {
+                await run.ContinueWith(_ => { });
+            }
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>压实进行中途取消的却是**调用方自己的令牌**（宿主关停那一路），不是用户点的停止
+    /// 按钮：<c>BackupOrchestrator.cs:1050</c> 那个 guard 里 <c>!ct.IsCancellationRequested</c>
+    /// 半句就是为了不吞下这一种。没有 <see cref="BackupRunControl"/>——这条要钉的正是"没人按停止，
+    /// 是外面把令牌砍了"——这次取消必须原样透出去，被 <c>RunAsync</c> 顶上兜底的
+    /// <c>catch (Exception)</c> 当成一次真实失败记下来，而不是被那个 catch 悄悄咽成
+    /// <c>CleanupReport.Empty</c>、报一次"成功"。</summary>
+    [SkippableFact]
+    public async Task A_genuine_cancellation_mid_compaction_still_propagates_as_a_failure()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        var real = new BlobUploader(new BlobClientFactory(TestSecrets.Reader));
+        using var hostShutdown = new CancellationTokenSource();
+        var slowCompact = new DelayedOverwriteUploader(
+            real, TimeSpan.FromSeconds(8), onFirstCall: () => hostShutdown.Cancel());
+        var (orchestrator, factory, _) = Build(real, compactUploader: slowCompact);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var request = await SeedPackDueForCompactionAsync(orchestrator, account, name);
+
+            // 无 control：v2 本身用的就是这个会被砍掉的令牌，不是某个 BackupRunControl 的 StopToken。
+            var run = orchestrator.RunAsync(request, null, hostShutdown.Token, null);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => run.WaitAsync(TimeSpan.FromSeconds(3)));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
