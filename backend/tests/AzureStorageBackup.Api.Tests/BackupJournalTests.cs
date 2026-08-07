@@ -98,6 +98,18 @@ public class BackupJournalTests : IDisposable
         Assert.Single(content!.Records);
     }
 
+    // 清理器读的是同一个文件。追加不立刻刷出去，它就会把刚传上去的块当孤儿删掉。
+    [Fact]
+    public async Task Append_is_visible_to_another_reader_without_an_explicit_flush()
+    {
+        var file = Path_("f.jsonl");
+        await using var j = await BackupJournal.CreateAsync(file, Header(), default);
+        await j.AppendAsync(new JournalRecord { Kind = "blob", Ref = "data/aaa", Path = "p", FullHash = "aaa" }, default);
+
+        var content = await BackupJournal.ReadAsync(file, default);
+        Assert.Single(content!.Records);
+    }
+
     public void Dispose()
     {
         try { Directory.Delete(_dir, recursive: true); } catch { }

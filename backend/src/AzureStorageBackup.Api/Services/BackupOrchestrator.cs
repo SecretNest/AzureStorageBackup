@@ -1048,7 +1048,7 @@ public sealed class BackupOrchestrator(
                     // ct 传 stopProducing.Token（不是裸 ct）：停止意愿若是在压实*进行中途*才到达，
                     // 这里也要能被打断，而不是只在进入清理前那一次检查里管用——这正是 Task 9 之前
                     // 旧 Cancel() 取消运行自己的 ct 时，压实这一段本来就享有的行为，这里是照旧恢复。
-                }, info, stopProducing.Token, stagingLease);
+                }, info, stopProducing.Token, stagingLease, sweepOrphans: control?.SweepNeeded ?? false);
             }
             catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
             {

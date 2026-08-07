@@ -939,4 +939,28 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             await container.DeleteIfExistsAsync();
         }
     }
+
+    [Fact]
+    public async Task Delete_config_discards_its_journals()
+    {
+        var accountId = await CreateAccountAsync("journal-sweep");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("j", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var journals = _services.GetRequiredService<BackupJournalStore>();
+        await using (var j = await journals.CreateAsync(accountId, "photos", "leftover", new JournalHeader
+        {
+            RunId = "leftover", ConfigId = created!.Id, StartedAt = DateTimeOffset.UtcNow,
+            BaselineVersion = 0, LocalRoot = "/data/photos", EncryptionIdentity = "plain",
+        }, default))
+            await j.AppendAsync(
+                new JournalRecord { Kind = "blob", Ref = "data/aaa", Path = "a.bin", FullHash = "aaa" }, default);
+        Assert.Single(await journals.ListAsync(accountId, "photos", default));
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created.Id}")).StatusCode);
+
+        // 配置没了就再没人会来采纳这卷 journal；留着它只会永远保住那批块不被清理。
+        Assert.Empty(await journals.ListAsync(accountId, "photos", default));
+    }
 }

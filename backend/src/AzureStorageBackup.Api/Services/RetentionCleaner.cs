@@ -44,18 +44,19 @@ public sealed record CleanupReport(int RetiredVersions, int DeletedPacks, int De
 /// </summary>
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
-    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null)
+    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null,
+    BackupJournalStore? journals = null)
 {
     /// <summary>独立清理：自行读取信息文件（优先本地权威副本）。</summary>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default,
-        StagingArea.StagingLease? lease = null)
+        StagingArea.StagingLease? lease = null, bool sweepOrphans = false)
     {
         var info = trackedInfo is not null
             ? await trackedInfo.LoadAsync(account, container, password, ct)
             : await store.ReadInfoAsync(account, container, password, ct);
         return info is not null && info.Versions.Count > 0
-            ? await CleanupAsync(account, container, password, options, info, ct, lease)
+            ? await CleanupAsync(account, container, password, options, info, ct, lease, sweepOrphans)
             : CleanupReport.Empty;
     }
 
@@ -66,12 +67,17 @@ public sealed class RetentionCleaner(
     /// </param>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options,
-        BackupInfoFile info, CancellationToken ct = default, StagingArea.StagingLease? lease = null)
+        BackupInfoFile info, CancellationToken ct = default, StagingArea.StagingLease? lease = null,
+        bool sweepOrphans = false)
     {
         var toDelete = retention.VersionsToDelete(
             info.Versions.Select(v => new VersionRef(v.Version, v.CreatedAt)).ToList(),
             options.Retention, DateTimeOffset.UtcNow);
-        if (toDelete.Count == 0)
+        // 从前这里是「没有版本退役 → 直接返回」。取消和挂起打破了这个前提：容器里会留下
+        // 「云上已有、索引里还没有」的完整块，而那种情形一个版本都不会退役。
+        // 但也不能无条件全扫——孤儿扫描要把 data/ 与 packs/ 两个前缀整个列一遍，
+        // 几十万对象的容器上这不是白干的，而绝大多数备份根本没有孤儿。
+        if (toDelete.Count == 0 && !sweepOrphans)
             return CleanupReport.Empty;
 
         var container_ = factory.CreateServiceClient(account).GetBlobContainerClient(container);
@@ -128,6 +134,12 @@ public sealed class RetentionCleaner(
             }
         }
 
+        // 判据的另一半：活动 journal 引用着的内容。它们云上有、索引里还没有，只有 journal
+        // 记着它们存在——删了就等于让下一轮恢复白跑，用户点 Resume 会发现要从头再传一遍。
+        var active = journals is not null
+            ? await journals.LoadActiveRefsAsync(account.Id, container, ct)
+            : ActiveJournalRefs.Empty;
+
         // 删除不再被任何保留版本引用的 pack（含分卷 packs/{id}.7z.NNN，也清孤儿 pack）。枚举 packs/ 前缀按 packId 归组，
         // 避免仅删基名漏删分卷（§7）；判据用「未被保留版本引用」，与 data blob 侧对称。
         // 计数按基名去重（一个分了卷的包/blob 在容器里是好几个对象），释放字节则按对象逐个累加。
@@ -137,7 +149,7 @@ public sealed class RetentionCleaner(
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "packs/", ct))
         {
             var packId = PackIdOf(blob.Name);
-            if (referencedPacks.Contains(packId))
+            if (referencedPacks.Contains(packId) || active.Packs.Contains(packId))
                 continue;
             if ((await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct)).Value)
             {
@@ -145,7 +157,8 @@ public sealed class RetentionCleaner(
                 freedBytes += blob.Properties.ContentLength ?? 0;
             }
         }
-        foreach (var packId in info.Packs.Keys.Where(id => !referencedPacks.Contains(id)).ToList())
+        foreach (var packId in info.Packs.Keys
+            .Where(id => !referencedPacks.Contains(id) && !active.Packs.Contains(id)).ToList())
             info.Packs.Remove(packId);
 
         // 删除不再被引用的 data blob（枚举 data/ 前缀）。分卷名 data/{hash}.NNN 归一化回基名后再比对，
@@ -153,7 +166,7 @@ public sealed class RetentionCleaner(
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", ct))
         {
             var baseRef = BaseRef(blob.Name);
-            if (referencedBlobs.Contains(baseRef))
+            if (referencedBlobs.Contains(baseRef) || active.Blobs.Contains(baseRef))
                 continue;
             if ((await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct)).Value)
             {
