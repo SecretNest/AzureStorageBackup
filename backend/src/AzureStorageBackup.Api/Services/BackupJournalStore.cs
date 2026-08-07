@@ -20,14 +20,23 @@ public sealed record ActiveJournalRefs(IReadOnlySet<string> Blobs, IReadOnlySet<
 /// </summary>
 public sealed class BackupJournalStore(string rootDir)
 {
-    /// <summary>容器名理论上不含斜杠，但别把这条当保证：拼路径前一律做一次扁平化。</summary>
+    /// <summary>
+    /// 容器名理论上不含斜杠，但别把这条当保证：拼路径前一律做一次扁平化。
+    /// <para>
+    /// 全是点的名字（<c>.</c>、<c>..</c>）也一并换掉。它们不含任何非法字符，却是路径段而不是名字，
+    /// 拼出来会往上跳一层——而 <see cref="DeleteAll"/> 是 <c>Directory.Delete(recursive: true)</c>，
+    /// 跳错一层删掉的就是别的容器的恢复点。今天到不了这里（Azure 容器名根本不许有点，runId 是自己
+    /// 生成的），这一条纯粹是不指望上游永远守规矩。
+    /// </para>
+    /// </summary>
     private static string Safe(string name)
     {
         var chars = name.ToCharArray();
         for (var i = 0; i < chars.Length; i++)
             if (Array.IndexOf(Path.GetInvalidFileNameChars(), chars[i]) >= 0 || chars[i] is '/' or '\\')
                 chars[i] = '_';
-        return new string(chars);
+        var flat = new string(chars);
+        return flat.Length > 0 && flat.All(c => c == '.') ? new string('_', flat.Length) : flat;
     }
 
     private string DirFor(int accountId, string container)
