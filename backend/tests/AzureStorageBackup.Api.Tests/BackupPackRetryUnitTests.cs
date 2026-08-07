@@ -171,6 +171,50 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             });
     }
 
+    /// <summary>每一个**包**的第一次上传各抖一下：两次抖动之间必定夹着一次成功。</summary>
+    private sealed class FlakyOnEveryPackOnce(IBlobUploader inner) : IBlobUploader
+    {
+        private readonly HashSet<string> _packs = new(StringComparer.Ordinal);
+        private int _thrown;
+
+        public int Thrown => _thrown;
+
+        private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
+        {
+            if (blobName.StartsWith("packs/", StringComparison.Ordinal))
+            {
+                bool trip;
+                lock (_packs)
+                    trip = _packs.Add(blobName[..(blobName.IndexOf(".7z", StringComparison.Ordinal) + 3)]);
+                if (trip)
+                {
+                    Interlocked.Increment(ref _thrown);
+                    throw new AggregateException("Retry failed after 6 tries.", new TaskCanceledException("timeout"));
+                }
+            }
+            return call();
+        }
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata));
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry, CancellationToken ct, IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress));
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, async () =>
+            {
+                await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+                return true;
+            });
+    }
+
     /// <summary>取消令牌一按就抛 OperationCanceledException 的上传器：用来验证取消没有被闸门吞掉。</summary>
     private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
     {
@@ -383,6 +427,57 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
             Assert.Equal(referenced, inContainer);
             Assert.Equal(2, referenced.Count);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 干成一段活就把闸门的连败清零。<c>ReportSuccess</c> 从前没有任何测试守着——把那一行删掉，
+    /// 上面几个测试照样全绿。
+    /// <para>
+    /// 它守的是这件事：闸门的耐心是"从第一次不顺算起还没好过"。中间成功过却不清零的话，一天里
+    /// 零星抖几下就会攒够耐心，把一轮从头到尾都在正常传的备份判成自动挂起——而且抖得越久越像
+    /// 网络坏了，其实每一次都当场自愈了。
+    /// </para>
+    /// <para>
+    /// 现场用的是**同一个池里的两组**，不是两件并发的活：一个池由一个消费者顺序处理，所以
+    /// "第 1 组重试成功 → 清零 → 第 2 组才出事"这个次序由程序顺序保证，不靠等待时间去碰运气。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_success_between_two_blips_resets_the_gates_failure_count()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatingCompressor(new SevenZipCompressor(), _root);
+        var flaky = new FlakyOnEveryPackOnce(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+        var (orchestrator, factory, _) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            // 退避 400ms：挂起现场要在闸门上挂足够久，下面 10ms 一次的取样才看得见它的连败数。
+            // 耐心给足，这个测试问的不是"耐心会不会用尽"。
+            await using var control = new BackupRunControl(_journals, 5, "run-reset", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(400)], steady: TimeSpan.FromMilliseconds(400),
+                patience: TimeSpan.FromSeconds(30)));
+
+            var run = orchestrator.RunAsync(Request(account, name), null, default, control);
+            var peak = 0;
+            while (!run.IsCompleted)
+            {
+                if (control.Gate.Current is { } paused) peak = Math.Max(peak, paused.Failures);
+                await Task.Delay(10);
+            }
+            var result = await run;
+
+            Assert.Equal(1, result.Version);
+            Assert.Equal(2, flaky.Thrown);   // 确实抖了两次，中间夹着一次成功
+            // 第 2 次抖动开闸时的连败数：清零了就还是 1，没清零就是 2。
+            Assert.Equal(1, peak);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
