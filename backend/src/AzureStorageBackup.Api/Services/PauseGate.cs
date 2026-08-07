@@ -63,6 +63,10 @@ public sealed class PauseGate : IDisposable
     /// <exception cref="OperationCanceledException">用户取消了运行。取消永远赢。</exception>
     public async Task<bool> WaitAsync(Exception cause, CancellationToken ct)
     {
+        // 取消检查必须在最前面：正在离场的工作者不该开闸、也不该加入别人的等待——
+        // 哪怕只是短暂地把幻影般的暂停现场发布给 UI 和其它工作者看。
+        ct.ThrowIfCancellationRequested();
+
         Task<bool> release;
         lock (_lock)
         {
