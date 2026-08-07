@@ -9,6 +9,17 @@ public enum RunStatus
     /// <summary>用户按了停止。既不算失败也不算成功：**不写 Error 状态**（否则这份备份此后一直
     /// 挂着一条红色 Error，还要手动 Reset 才消），也不记成一次成功的运行。</summary>
     Canceled,
+
+    /// <summary>
+    /// 现场保住了，活没干完。与 Failed 的区别很实在：journal 还在盘上，下一轮（用户点 Resume
+    /// 或下次计划任务）会把已经传上去的内容原样认下来，不重传。
+    /// <para>
+    /// 注意这**只**用于运行真的退出了的时刻。瞬时错误等待重试期间状态仍是 Running（见
+    /// <see cref="BackupRunState.Pause"/>）——那时 Task 还活着、席位还占着，报成终态会让调度器
+    /// 以为这轮完了，再起一轮把它顶掉。
+    /// </para>
+    /// </summary>
+    Suspended,
 }
 
 /// <summary>一次备份运行的内存状态（前端轮询用）。</summary>
@@ -30,7 +41,19 @@ public sealed class BackupRunState
     public DateTimeOffset? CompletedAt { get; set; }
 
     /// <summary>这一次运行的标识。journal 文件名就是它，恢复时按它对上号。</summary>
-    public string RunId { get; } = Guid.NewGuid().ToString("N")[..12];
+    public string RunId { get; init; } = Guid.NewGuid().ToString("N")[..12];
+
+    /// <summary>挂起（Suspended）的缘由；没挂起就是 null。</summary>
+    public SuspendReason? SuspendReason { get; set; }
+
+    /// <summary>内部机制，不进 HTTP 契约：这次运行的把手，Suspend / Retry now 要靠它够到闸门。</summary>
+    internal BackupRunControl? Control { get; set; }
+
+    /// <summary>
+    /// 眼下是不是卡在瞬时错误上等重试。**这不是一个状态值**：Status 仍是 Running，
+    /// 因为 Task 还活着、席位还占着，报成终态会让调度器再起一轮把它顶掉。
+    /// </summary>
+    public PauseInfo? Pause => Control?.Gate.Current;
 
     /// <summary>
     /// 内部机制，不进 HTTP 契约：失败时的原始异常。RunCoreAsync 的 catch 里连 Error 一起设置，
@@ -53,10 +76,12 @@ public sealed class BackupRunState
 
 public sealed record BackupRunResponse(
     string Status, BackupProgress? Progress, int? Version, int? UnreadableFiles, string? Error,
-    DateTimeOffset? StartedAt = null, DateTimeOffset? CompletedAt = null)
+    DateTimeOffset? StartedAt = null, DateTimeOffset? CompletedAt = null,
+    string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null)
 {
     public static BackupRunResponse From(BackupRunState s) =>
-        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt);
+        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
+            s.RunId, s.Pause, s.SuspendReason?.ToString());
 }
 
 /// <summary>
@@ -198,6 +223,18 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
+    /// <summary>用户点了 <c>Retry now</c>：不等自愈计时器，立刻放行重试。</summary>
+    public bool RetryNow(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running } || state.Pause is null)
+            return false;
+        state.Control!.Gate.ReleaseNow();
+        return true;
+    }
+
     /// <summary>两个入口共用的执行体。**不碰忙碌锁**——锁由调用方负责。</summary>
     private async Task RunCoreAsync(int configId, BackupRunState state, CancellationToken ct)
     {
@@ -216,6 +253,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             await using var control = new BackupRunControl(
                 sp.GetRequiredService<BackupJournalStore>(), configId, state.RunId);
+            state.Control = control;
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
                 new StateProgress(state), ct, control);
@@ -226,6 +264,15 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.Status = RunStatus.Completed;
 
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<BackupRunner>>());
+            state.Completion.TrySetResult();
+        }
+        catch (BackupSuspendedException ex)
+        {
+            // 不是失败：journal 还在盘上，Error 也不写（否则这份备份此后一直挂着红字，
+            // 还要手动 Reset 才消），下一轮会把已传的内容原样认下来。
+            state.Status = RunStatus.Suspended;
+            state.SuspendReason = ex.Reason;
+            // 和其它三个终态分支一样要放行等待者，否则 RunTrackedAsync 会一直挂在 Completion 上。
             state.Completion.TrySetResult();
         }
         catch (OperationCanceledException)

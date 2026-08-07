@@ -119,6 +119,10 @@ public sealed class TaskDispatcher(
                     // 备份会被记成跑成功了，还会把之前真实的 Error 状态一并抹掉。
                     if (backupState.Status == RunStatus.Canceled)
                         return;
+                    // 挂起不是失败：抛异常会给这次计划任务记一笔红色错误，而现场其实好端端保着，
+                    // 下一轮会接着跑。与 Canceled 同等处置：安静收场。
+                    if (backupState.Status == RunStatus.Suspended)
+                        return;
                     break;
 
                 case ScheduledTaskType.Check:
