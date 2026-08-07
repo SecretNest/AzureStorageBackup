@@ -90,6 +90,16 @@ builder.Services.AddSingleton(sp =>
 // verbose 逐文件 debug 日志的文件后端（按备份+按日期文本文件，PRD 3.6）。
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
+// journal 放在**库文件旁边**，不放 tempPath 下：后者没配 Backup:TempPath 时是 /tmp，容器重建
+// 就没了——而 journal 存在的全部理由正是"容器重建之后还认得出上一轮传到哪了"。跟着库走，
+// 它自然落在同一个持久卷上，用户不必为了让崩溃恢复生效而额外配一个环境变量。
+// 另注意**不能**在启动时清它：它记的正是"云上已有、索引还没有"的内容，清了等于让恢复白跑。
+var journalRoot = Path.Combine(
+    Path.GetDirectoryName(Path.GetFullPath(
+        new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource)) ?? ".",
+    "journal");
+builder.Services.AddSingleton(new BackupJournalStore(journalRoot));
+
 // diff→上传那条队列的溢出区。写侧永不阻塞：内存装不下就落到这里，diff 因此能一路跑到底——
 // 这是上传阶段能显示剩余时间的前提（分母 SetTotal 只有 diff 收工才确定，见 StageProgress.Eta）。
 var spillDir = Path.Combine(tempPath, "diff-spill");
