@@ -53,14 +53,42 @@ public sealed class BackupRunControl(
     public void ClearInFlight(string blobRef) => _inFlight.TryRemove(blobRef, out _);
     public IReadOnlyCollection<string> InFlight => _inFlight.Keys.ToList();
 
-    /// <summary>下达停止意愿。重复下达只认第一次（用户点了 Stop now 之后再点 Suspend 没有意义）。</summary>
+    /// <summary>
+    /// 下达停止意愿。**只升不降**：更强的停法覆盖更弱的，更弱或相同的一律忽略。
+    /// <para>
+    /// 两个方向不对称，所以不能写成"只认第一次"。Stop now 之后再点 Suspend 确实没有意义——
+    /// 已经打断、已经删掉的残留卷不可能因为一次更温和的下达而复活。但反过来是用户在**升级**：
+    /// 他点了 Suspend，发现卡在一个几十 GB 的多卷文件后面动不了，于是改点 Stop now。
+    /// 首次优先会把这次升级静静丢掉，而 <see cref="BackupRunner.CancelAsync"/> 等到终态之后
+    /// 照样返回 true——API 报告成功，实际生效的却是另一种停法。
+    /// </para>
+    /// <para>
+    /// 升级只会**收紧**，因此不可能让已经放弃的活复活：<see cref="StopKind"/> 的成员按强度排序，
+    /// 判定就是比大小；CAS 循环保证并发下达时留下的是最强的那一个，而点火由**赢下 CAS 的那个
+    /// 线程**负责，所以升级到 Stop now 时 <see cref="AbortToken"/> 一定会被点着——哪怕
+    /// <see cref="StopToken"/> 早就为上一次较弱的下达点过了（<c>Cancel()</c> 幂等，重复调用无副作用）。
+    /// </para>
+    /// </summary>
     public void RequestStop(StopKind kind)
     {
         if (kind == StopKind.None)
             return;
-        if (Interlocked.CompareExchange(ref _stopKind, (int)kind, (int)StopKind.None) != (int)StopKind.None)
-            return;
+        while (true)
+        {
+            var current = Volatile.Read(ref _stopKind);
+            if ((int)kind <= current)
+                return;     // 更弱或相同：忽略
+            if (Interlocked.CompareExchange(ref _stopKind, (int)kind, current) == current)
+                break;
+        }
         // 正卡在闸门上等重试的工作者要被叫醒，否则它们会一直等到下一次自愈计时器到点。
+        //
+        // 这一句对 Suspend / Finish current files 同样会触发，于是一件**正卡在闸门上等自愈**的活
+        // 会就此被放弃，而不是"做完当前这件"。这是有意的取舍：不叫醒它，用户按下的停止最长要等
+        // 5 分钟（自愈计时器的最后一档）才有反应，而那件活本来就正卡在一个还没好的瞬时错误上，
+        // 等下去多半也是白等。最终抛出的异常仍由编排器的 SettleStopAsync 按停法纠正，
+        // 所以对外的行为（Suspended / Canceled、journal 落盘、残留清理）都是对的——
+        // 不成立的只是"做完当前这件"这句话对闸门上那件活的字面含义。
         Gate.Downgrade();
         _stop.Cancel();
         if (kind == StopKind.StopNow)

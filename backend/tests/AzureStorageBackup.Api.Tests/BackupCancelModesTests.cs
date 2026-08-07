@@ -183,19 +183,91 @@ public sealed class BackupCancelModesTests : IDisposable
     }
 
     [Fact]
-    public async Task The_first_stop_kind_wins_and_None_is_a_no_op()
+    public async Task None_is_a_no_op()
     {
         await using var c = NewControl();
 
         c.RequestStop(StopKind.None);
+
         Assert.Equal(StopKind.None, c.Stop);
         Assert.False(c.StopToken.IsCancellationRequested);
+        Assert.False(c.AbortToken.IsCancellationRequested);
+    }
+
+    /// <summary>用户点了 Suspend、发现卡在一个巨大的多卷文件后面动不了，改点 Stop now：
+    /// 这次升级必须真的生效，否则 API 会为一个从没应用过的停法返回成功。</summary>
+    [Fact]
+    public async Task A_stronger_stop_kind_escalates_and_fires_abort()
+    {
+        await using var c = NewControl();
 
         c.RequestStop(StopKind.Suspend);
-        c.RequestStop(StopKind.StopNow);   // 第二次下达不算数
+        Assert.False(c.AbortToken.IsCancellationRequested);
+
+        c.RequestStop(StopKind.StopNow);
+
+        Assert.Equal(StopKind.StopNow, c.Stop);
+        Assert.True(c.StopToken.IsCancellationRequested);
+        Assert.True(c.AbortToken.IsCancellationRequested);   // 升级的全部意义就在这一句
+    }
+
+    [Fact]
+    public async Task Finish_current_files_escalates_over_suspend()
+    {
+        await using var c = NewControl();
+
+        c.RequestStop(StopKind.Suspend);
+        c.RequestStop(StopKind.FinishCurrentFiles);
+
+        Assert.Equal(StopKind.FinishCurrentFiles, c.Stop);
+        Assert.False(c.AbortToken.IsCancellationRequested);   // 它仍然不许打断在途上传
+    }
+
+    /// <summary>反方向不成立：已经打断、已经删掉的残留卷不会因为一次更温和的下达而复活。</summary>
+    [Theory]
+    [InlineData(StopKind.Suspend)]
+    [InlineData(StopKind.FinishCurrentFiles)]
+    public async Task A_weaker_stop_kind_after_stop_now_is_ignored(StopKind weaker)
+    {
+        await using var c = NewControl();
+
+        c.RequestStop(StopKind.StopNow);
+        c.RequestStop(weaker);
+
+        Assert.Equal(StopKind.StopNow, c.Stop);
+    }
+
+    [Fact]
+    public async Task The_same_stop_kind_twice_is_a_no_op()
+    {
+        await using var c = NewControl();
+
+        c.RequestStop(StopKind.Suspend);
+        c.RequestStop(StopKind.Suspend);
 
         Assert.Equal(StopKind.Suspend, c.Stop);
         Assert.False(c.AbortToken.IsCancellationRequested);
+    }
+
+    /// <summary>并发升级不许把 <c>_abort.Cancel()</c> 丢掉：点火归赢下 CAS 的那个线程，
+    /// 只要 Stop now 赢了一次，AbortToken 就一定被点着。</summary>
+    [Fact]
+    public async Task Concurrent_escalation_never_loses_the_abort()
+    {
+        for (var round = 0; round < 200; round++)
+        {
+            await using var c = NewControl();
+            var start = new ManualResetEventSlim(false);
+            var racers = new[] { StopKind.Suspend, StopKind.StopNow, StopKind.FinishCurrentFiles }
+                .Select(k => Task.Run(() => { start.Wait(); c.RequestStop(k); }))
+                .ToArray();
+
+            start.Set();
+            await Task.WhenAll(racers);
+
+            Assert.Equal(StopKind.StopNow, c.Stop);
+            Assert.True(c.AbortToken.IsCancellationRequested);
+        }
     }
 
     [SkippableFact]
