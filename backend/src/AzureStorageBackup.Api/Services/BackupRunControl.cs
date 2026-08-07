@@ -171,6 +171,11 @@ public sealed class BackupRunControl(
         // 截断之后本轮内存里的 Resume 仍然是全的（上面已经读进来了），所以当轮跑下去不出错；
         // 坏掉的是**盘上**那份担保：再挂起一次，新卷不为那批块作保，下一轮把它们全部重传，
         // 而按 journal 判"这块有没有人认领"的清理/孤儿扫描会直接把它们当垃圾删掉。
+        //
+        // 接着写时头一行**不**重写（见 BackupJournal.OpenForAppendAsync）：判"是我"用的是落到盘上
+        // 那个路径而不是 runId 字符串（上面 mine 的算法），两个不同的 runId 完全可能落在同一个文件
+        // 上——盘上那份头记的因此可能是**更早**那个 runId 和它的 StartedAt。今天没人读这两个字段，
+        // 但往后谁要读 Header.RunId / Header.StartedAt 指望拿到本轮的值，读到的会是陈迹。
         _journal = reopenMine
             ? await store.AppendAsync(accountId, container, runId, ct)
             : await store.CreateAsync(accountId, container, runId, new JournalHeader
