@@ -92,4 +92,27 @@ public sealed class LocalDedupResolverTests
         // 后到者一并失败，绝不去重到未成功上传的 blob。
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await secondTask);
     }
+
+    /// <summary>Task 7 回归：闸门把上传失败的整件活原样重试，重试用的是**同一个**内容身份。
+    /// 首次占位失败后必须把 ref 让出来——不让的话，重试者会撞上那个已经判死的占位，直接等一个
+    /// 永远失败的 Completion、原样重放同一个异常，闸门的"退避后再试一次"就变成了摆设：
+    /// 不管等多久、放行多少次，第二次真正的上传尝试永远不会发生。</summary>
+    [Fact]
+    public async Task Retry_After_Failure_Gets_A_Fresh_Claim_Not_The_Stale_One()
+    {
+        var r = LocalDedupResolver.Build(Plain, []);
+
+        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        Assert.False(first.Exists);
+        first.Fail(new InvalidOperationException("upload boom"));
+
+        // 整件重试：同一个内容身份再来一次，必须拿到一个全新的、未失败过的占位，
+        // 而不是原样重放上一次的异常。
+        var retry = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        Assert.False(retry.Exists);
+        Assert.Equal(first.Ref, retry.Ref);
+
+        // 这一次占位真的能被后续上传完成——证明它不是共享着上一个已判死的 TaskCompletionSource。
+        retry.Complete(raw: false, volumes: 1, volumeSizes: [5]);
+    }
 }

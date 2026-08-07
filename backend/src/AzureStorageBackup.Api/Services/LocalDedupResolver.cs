@@ -170,7 +170,14 @@ public sealed class LocalDedupResolver
                     new ResolvedBlob(refName, false, 1, []), collision);
             }
 
-            var mine = new Reservation(ck);
+            // 占位失败后要能把这个 ref 让出来（见 Reservation.Fail）：Task 7 的闸门会把上传失败的
+            // 整件活原样重试，重试时还是同一个内容身份，会再走到这里——占位若不撤，重试者会撞上
+            // 这个已经失败的占位，`held.ContentKey == ck` 命中后直接等一个永远失败的 Completion，
+            // 原样重放同一个异常，永远等不到真正的第二次上传尝试。
+            Reservation? mine = null;
+            mine = new Reservation(ck, () =>
+                ((ICollection<KeyValuePair<string, Reservation>>)_run)
+                    .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
             if (_run.TryAdd(refName, mine))
                 return Resolution.ForClaim(refName, collision, mine); // 由我上传
 
@@ -199,7 +206,7 @@ public sealed class LocalDedupResolver
         $"{fullHash}\n{length}\n{head}\n{tail}";
 
     /// <summary>运行内某 ref 的预约：内容身份 + 上传完成信号。</summary>
-    internal sealed class Reservation(string contentKey)
+    internal sealed class Reservation(string contentKey, Action release)
     {
         private readonly TaskCompletionSource<ResolvedBlob> _tcs =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -208,7 +215,16 @@ public sealed class LocalDedupResolver
         public Task<ResolvedBlob> Completion => _tcs.Task;
         public void Complete(string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
             _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes, volumeSizes));
-        public void Fail(Exception ex) => _tcs.TrySetException(ex);
+
+        /// <summary>上传失败：先唤醒已经在等的同批同内容后到者（他们绝不该去重到一个没传成功的 blob，
+        /// 这一半行为不变），再把这个 ref 的占位从预约表撤掉——让接下来同内容身份的新一轮
+        /// ResolveAsync（不论是 Task 7 闸门发起的整件重试，还是巧合的下一个同内容文件）能重新
+        /// 占坑、真正再传一次，而不是撞上一个已经判死的占位、原样重放这同一个异常。</summary>
+        public void Fail(Exception ex)
+        {
+            _tcs.TrySetException(ex);
+            release();
+        }
     }
 
     /// <summary>解析结果：去重命中(Exists) 或 需上传的占位(Claim)。</summary>

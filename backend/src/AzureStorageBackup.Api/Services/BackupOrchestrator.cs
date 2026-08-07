@@ -278,6 +278,21 @@ public sealed class BackupOrchestrator(
                 BackupSummary.Format(result), ct);
             return result;
         }
+        // 必须排在下面这个通用 catch (Exception ex) 之前：BackupSuspendedException 也是 Exception，
+        // 匹配顺序反了的话它会先被那条兜底逻辑接住，用户看到的就是一条"Backup failed"——
+        // 而现场其实好端端保着，下次跑就能接上。
+        catch (BackupSuspendedException ex)
+        {
+            // 走 BackupFailure 这个订阅频道，但级别降为 Warning：
+            // 频道选它，是因为订阅"备份没跑完"的人要的正是这条消息，而为此新增一个通知事件位
+            // 意味着所有已有用户默认都收不到——一个只在出事那天才发现的静默默认值。
+            // 级别降下来，是因为这不是错误：Error 会让它长存进审计日志、在界面上顶着红字，
+            // 而它其实是一个可以接着跑的中点。措辞里把"接下来该做什么"直说。
+            await Record(NotificationEvents.BackupFailure, source, $"Backup suspended: {request.Name}",
+                $"{ex.Message} Progress is saved; run this backup again to pick up where it stopped.",
+                ct, OperationLogLevel.Warning);
+            throw;
+        }
         catch (Exception ex)
         {
             await Record(NotificationEvents.BackupFailure, source, $"Backup failed: {request.Name}", ex.Message, ct);
@@ -289,13 +304,15 @@ public sealed class BackupOrchestrator(
     // 故串行化整个上报，避免并发访问 DbContext 击穿备份。
     private readonly SemaphoreSlim _recordGate = new(1, 1);
 
-    private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
+    private async Task Record(
+        NotificationEvents evt, string source, string title, string body, CancellationToken ct,
+        OperationLogLevel? level = null)
     {
         await _recordGate.WaitAsync(ct);
         try
         {
             if (opLog is not null)
-                await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
+                await opLog.AppendAsync(level ?? EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
             if (notifier is not null)
                 await notifier.NotifyAsync(evt, title, body, ct);
         }
@@ -467,6 +484,36 @@ public sealed class BackupOrchestrator(
         // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
         using var stopProducing = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
+        // 一件活撞上瞬时错误就在闸门前等，放行了原样重试。
+        // 重试整件活是安全的：单文件路径每次从头读/压/暂存（PlaceBlobAsync 的 finally 会释放上一次的
+        // 暂存物），pack 路径复用同一个 packId 且分卷逐卷 if-missing，重传只补缺的卷。
+        // journal 因此可能出现重复行——无害，恢复是按内容对号，重复只是多命中一次。
+        async Task WithPauseAsync(WorkItem item, CancellationToken token)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (item.Single is { } single)
+                        await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
+                            overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, token);
+                    else
+                        await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
+                            info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
+                            uploadTracker, state, control, token);
+                    control?.Gate.ReportSuccess();
+                    return;
+                }
+                // 判据带上 token：用户按了取消时 OperationCanceledException 必须原样上抛，
+                // 被闸门当成"网络抖了一下"吞掉的话，取消按钮就静悄悄失效了。
+                catch (Exception ex) when (control is not null && TransientErrors.IsTransient(ex, token))
+                {
+                    if (!await control.Gate.WaitAsync(ex, token))
+                        throw new BackupSuspendedException(SuspendReason.AutoSuspended, ex.Message);
+                }
+            }
+        }
+
         async Task ConsumeAsync()
         {
             try
@@ -478,13 +525,7 @@ public sealed class BackupOrchestrator(
                     uploadTracker.BeginWork();
                     try
                     {
-                        if (item.Single is { } single)
-                            await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, ct);
-                        else
-                            await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
-                                info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
-                                uploadTracker, state, control, ct);
+                        await WithPauseAsync(item, ct);
                     }
                     finally
                     {

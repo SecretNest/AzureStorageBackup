@@ -2,13 +2,17 @@ namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
 /// 一次备份运行的"外部把手"：编排器不认识运行注册表，也不该认识；它只认这一个对象。
-/// 目前只装 journal，后续任务会往里加挂起闸门与停止意图。
+/// 装着 journal 与挂起闸门，后续任务会再往里加停止意图。
 /// </summary>
-public sealed class BackupRunControl(BackupJournalStore store, int configId, string runId) : IAsyncDisposable
+public sealed class BackupRunControl(
+    BackupJournalStore store, int configId, string runId, PauseGate? gate = null) : IAsyncDisposable
 {
     private BackupJournal? _journal;
     private int _accountId;
     private string _container = "";
+
+    /// <summary>瞬时错误的挂起闸门。默认 30s/1m/5m/每 5m 自愈，10 分钟不见好就降级。</summary>
+    public PauseGate Gate { get; } = gate ?? new PauseGate();
 
     public string RunId => runId;
 
@@ -83,6 +87,7 @@ public sealed class BackupRunControl(BackupJournalStore store, int configId, str
 
     public async ValueTask DisposeAsync()
     {
+        Gate.Dispose();
         if (_journal is not null)
             await _journal.DisposeAsync();
         _journal = null;
