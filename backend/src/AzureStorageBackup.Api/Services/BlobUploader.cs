@@ -118,11 +118,6 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     private static bool IsAlreadyThere(RequestFailedException ex) =>
         ex.Status == 412 || ex.ErrorCode is "BlobAlreadyExists" or "BlobArchived";
 
-    /// <summary>可重试的瞬时错误：服务端 5xx、超时(408)、限流(429)、网络 IO。</summary>
-    private static bool IsTransient(Exception ex) => ex switch
-    {
-        RequestFailedException rfe => rfe.Status == 0 || rfe.Status >= 500 || rfe.Status is 408 or 429,
-        IOException => true,
-        _ => false,
-    };
+    /// <summary>可重试的瞬时错误。判据集中在 <see cref="TransientErrors"/>，与挂起闸门同源。</summary>
+    private static bool IsTransient(Exception ex) => TransientErrors.IsTransient(ex);
 }
