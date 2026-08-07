@@ -1161,8 +1161,10 @@ public sealed class BackupOrchestrator(
         string FullHash, string HeadHash, string TailHash, long Length, DateTimeOffset Mtime, bool Raw);
 
     /// <summary>单文件 blob 的最终落位：存储引用 + 实际存下去的内容身份。</summary>
+    /// <param name="Resumed">命中了 journal 里上一轮已经传完的记录。它已经被记过，本轮不必再记。</param>
     private sealed record BlobPlacement(
-        string Ref, bool Collision, int Volumes, IReadOnlyList<long> VolumeSizes, BlobContent Content);
+        string Ref, bool Collision, int Volumes, IReadOnlyList<long> VolumeSizes, BlobContent Content,
+        bool Resumed = false);
 
     /// <summary>
     /// 处理单文件内容寻址 blob：**一遍读**同时算 hash 并压缩，然后上传 data/{hash}。
@@ -1229,7 +1231,8 @@ public sealed class BackupOrchestrator(
         // 运行，而这一刻上传早已确认，云上已经有这块内容了——取消这个写入不会撤销任何东西，
         // 只会让下次恢复以为这块没传过、白白重传一次。半截写的风险也一样：write 被取消可能截断
         // 这一行，下次拼接进新 journal 时把它连同下一条一起解析坏掉。
-        if (control is not null)
+        // Resumed 的那一份是从旧卷复用来的，旧卷本轮成功之前一直留着，不必再抄一遍。
+        if (control is not null && !placement.Resumed)
             await control.RecordBlobAsync(
                 file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
                 Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
@@ -1267,11 +1270,19 @@ public sealed class BackupOrchestrator(
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
-        // 1. 预筛 + 探测。命中既有 blob 就到此为止：一个字节都不用压、不用传。
-        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, uploadTracker, ct) is { } p
-            && localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+        // 1. 预筛 + 探测。命中就到此为止：一个字节都不用压、不用传。
+        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, control, uploadTracker, ct) is { } p)
         {
-            return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
+            // 第一档：上一轮已经确认传上去的这一份。路径 + 内容双对才认——中断之后文件完全
+            // 可能被改过，光凭路径复用就是把旧内容当成新内容写进索引。
+            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done)
+                return new BlobPlacement(
+                    done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
+                    Resumed: true);
+
+            // 第二档：跨版本的既有 blob（原有行为，一字未动）。
+            if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+                return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
         }
 
         // 2. 一遍读：边读边算三段 hash，边把字节喂进 7z（或直接拷成 raw 临时文件）。
@@ -1321,14 +1332,17 @@ public sealed class BackupOrchestrator(
     /// </remarks>
     private async Task<BlobContent?> ProbeForDedupAsync(
         PlannedFile file, string localPath, int headBytes, LocalDedupResolver localResolver,
-        StageTracker uploadTracker, CancellationToken ct)
+        BackupRunControl? control, StageTracker uploadTracker, CancellationToken ct)
     {
         uploadTracker.BeginChecking();
         try
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
-            var may = localResolver.MayDeduplicate(length, head);
+            // journal 也要参与预筛。恢复时上一轮传上去的内容**还没进任何版本索引**，
+            // localResolver 根本认不出它——只问它一个，整轮的活会一件不落地重做一遍。
+            var may = localResolver.MayDeduplicate(length, head)
+                || (control?.Resume.MayResumeBlob(file.Path, length, head) ?? false);
             localResolver.NoteInFlight(length, head);
             return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
         }
@@ -1628,6 +1642,26 @@ public sealed class BackupOrchestrator(
             // 这些 PlannedFile 全部由 ToPlannedFile(PackEntry) 而来，FullHash 按构造非空——
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
+
+            // 恢复：这一整箱上一轮已经确认传上去了。成员集合必须逐一对得上——
+            // entryName 的编号跟着分组走，成员对不上，索引就会指到箱里根本不存在的条目。
+            //
+            // 仍然要走 RecordPackAsync（只是不上传）：本轮内跨箱去重的收尾靠 storageByPath[leaderPath]
+            // 判 leader 有没有走岔，在这里直接 continue 掉，挂在这个 leader 身上的别名会全部悬空重跑。
+            //
+            // control 传 null：这条记录还留在被采纳的那卷 journal 里，本轮成功提交索引之前一直在，
+            // 不必再抄一遍。
+            var journalMembers = members
+                .Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length)).ToList();
+            if (control?.Resume.FindPack(journalMembers) is { } donePack)
+            {
+                await RecordPackAsync(
+                    request, donePack.Ref, members, donePack.VolumeSizes, donePack.StoreOnly, info,
+                    storageByPath, control: null, ct);
+                foreach (var m in members) await LogFileAsync(request, m.Path, ct);
+                onItem(bytes);   // 这一组的槽位与字节照常销账，否则进度永远追不上 total
+                continue;
+            }
 
             // 「压这一组 + 传上去」是重试的单位：抖一下就把这一组从头做一遍，前面几组不受牵连。
             // 整段可重入——包号不变，所以重压的产出盖回同一族卷（传之前先清残留，见

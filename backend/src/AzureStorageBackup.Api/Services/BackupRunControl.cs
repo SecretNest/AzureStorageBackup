@@ -28,6 +28,15 @@ public sealed class BackupRunControl(
     private int _accountId;
     private string _container = "";
 
+    /// <summary>被本轮采纳的旧 journal 的 runId。本轮成功提交索引时，它们和自己那卷一起删。</summary>
+    private readonly List<string> _adopted = [];
+
+    /// <summary>上一轮（或上几轮）已经确认传上去的东西。没有可采纳的卷时是空表。</summary>
+    public JournalResume Resume { get; private set; } = JournalResume.Empty;
+
+    /// <summary>开卷时采纳过或作废过旧卷 → 容器里多半躺着孤儿块，收尾清理该做一次扫描（Task 11）。</summary>
+    public bool SweepNeeded { get; private set; }
+
     /// <summary>瞬时错误的挂起闸门。默认 30s/1m/5m/每 5m 自愈，10 分钟不见好就降级。</summary>
     public PauseGate Gate { get; } = gate ?? new PauseGate();
 
@@ -105,6 +114,42 @@ public sealed class BackupRunControl(
     {
         _accountId = accountId;
         _container = container;
+
+        // 对得上号的采纳，对不上的当场删。
+        //
+        // configId 不同也照删：(AccountId, ContainerName) 在 AppDbContext 里是唯一索引，
+        // 一个容器至多一个配置——所以那只可能是"配置删了又在同一个容器上重建"留下的陈迹。
+        // 留着它会永远保住那批块不被清理（清理判据认 journal，不认 configId）。
+        // 哪天允许多个配置共用一个容器了，这一条必须改回"不是我们的就完全不碰"，
+        // 否则会把别人正挂起着的运行的成果变成孤儿。
+        var voided = false;
+        var adopted = new List<JournalContent>();
+        foreach (var (oldRunId, content) in await store.ListAsync(accountId, container, ct))
+        {
+            var h = content.Header;
+            if (h.ConfigId == configId
+                && h.BaselineVersion == baselineVersion
+                && string.Equals(h.LocalRoot, localRoot, StringComparison.Ordinal)
+                && string.Equals(h.EncryptionIdentity, encryptionIdentity, StringComparison.Ordinal))
+            {
+                adopted.Add(content);
+                _adopted.Add(oldRunId);
+            }
+            else
+            {
+                store.Delete(accountId, container, oldRunId);
+                voided = true;
+            }
+        }
+        // 采纳过、或作废过 → 这个容器里多半躺着"云上有、索引里没有"的块。
+        // 收尾清理据此决定要不要做一次孤儿扫描（见 Task 11）。
+        SweepNeeded = voided || adopted.Count > 0;
+        // 采纳是**只读**的：本轮仍新开自己那一卷，旧卷原样留着。这样就不必把复用来的记录再抄一遍，
+        // 也不会出现"抄到一半又崩了"的半截状态。旧卷等本轮成功提交索引时一起删。
+        Resume = adopted.Count == 0
+            ? JournalResume.Empty
+            : new JournalResume([.. adopted.SelectMany(c => c.Records)]);
+
         _journal = await store.CreateAsync(accountId, container, runId, new JournalHeader
         {
             RunId = runId,
@@ -162,6 +207,10 @@ public sealed class BackupRunControl(
         await _journal.DisposeAsync();
         _journal = null;
         store.Delete(_accountId, _container, runId);
+        // 采纳来的旧卷同样功成身退——它们记的内容此刻已经全在提交好的索引里了。
+        foreach (var old in _adopted)
+            store.Delete(_accountId, _container, old);
+        _adopted.Clear();
     }
 
     public async ValueTask DisposeAsync()
