@@ -85,11 +85,16 @@ public class PauseGateTests
 
         gate.ReportSuccess();
 
+        // 开闸（OpenLocked）是同步做的：调用 WaitAsync 时会在第一个真正把它挂起的
+        // await 之前跑完，这里读 Current 跟调用之间没有任何 await 缝隙——
+        // 10ms 的自愈计时器压根来不及跑到，不用靠拉长退避去赌观测窗口。
         var waiting = gate.WaitAsync(new IOException("blip"), default);
-        for (var i = 0; i < 200 && gate.Current is null; i++)
-            await Task.Delay(1);
-        // 计数清零之后这一次算"第一次出事"
-        Assert.True(gate.Current is null || gate.Current.Failures == 1);
+
+        // 计数清零之后这一次算"第一次出事"——不留 disjunction 逃生口。
+        Assert.NotNull(gate.Current);
+        Assert.Equal(1, gate.Current!.Failures);
+
+        gate.ReleaseNow();
         Assert.True(await waiting);
     }
 
@@ -106,15 +111,35 @@ public class PauseGateTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
     }
 
+    // 走在取消路上的工作者不该顺手开闸，哪怕只是短暂地把幻影现场发给别人看。
+    [Fact]
+    public async Task Already_cancelled_token_throws_without_opening_the_gate()
+    {
+        using var gate = Fast();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => gate.WaitAsync(new IOException("blip"), cts.Token));
+        Assert.Null(gate.Current);
+    }
+
     // 5 分钟的定时器不能比运行活得还久。
     [Fact]
-    public void Dispose_kills_the_pending_timer()
+    public async Task Dispose_kills_the_pending_timer()
     {
         var gate = new PauseGate(
             schedule: [TimeSpan.FromMinutes(5)], steady: TimeSpan.FromMinutes(5),
             patience: TimeSpan.FromHours(1));
-        _ = gate.WaitAsync(new IOException("blip"), default);
+        var waiting = gate.WaitAsync(new IOException("blip"), default);
         gate.Dispose();
+
+        // 只看 IsDowngraded 抓不住"定时器没拆干净"——那个标志位 DowngradeLocked 自己就会置。
+        // 真正能证明 Dispose 把挂着的 5 分钟计时器连锅端掉的，是被晾在那儿的等待者：
+        // 它必须马上收到降级结果，而不是被晾在 5 分钟的 Task.Delay 上等到天荒地老。
+        var completed = await Task.WhenAny(waiting, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(waiting, completed);
+        Assert.False(await waiting);
         Assert.True(gate.IsDowngraded);
     }
 }
