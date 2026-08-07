@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
+import { ApiError } from '../api/client'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { ChangeLocalRootDialog } from '../components/ChangeLocalRootDialog'
@@ -134,15 +135,22 @@ export function BackupConfigsPage() {
   const [resettingPassword, setResettingPassword] = useState<BackupConfig | null>(null)
   const keyring = useKeyringStatus()
 
+  // 按当前配置列表把「中断现场」重新拉一遍。单个配置失败不打断整页：拿不到就当没有，
+  // 下一轮再说。load() 之外，无人触发的 5 秒后台刷新也要走这条路——否则程序在页面开着的时候
+  // 重启，内存里的运行状态没了，interrupted 却只在挂载和用户动作时才更新，中断现场提示
+  // 永远冒不出来，只有整页刷新才能看到。
+  const refreshInterrupted = (list: BackupConfig[]) => {
+    void Promise.all(
+      list.map(async (c) => [c.id, await backupConfigsApi.interrupted(c.id).catch(() => [])] as const),
+    ).then((pairs) => setInterrupted(Object.fromEntries(pairs)))
+  }
+
   const load = () => {
     backupConfigsApi
       .list()
       .then((list) => {
         setConfigs(list)
-        // 中断现场跟着 5 秒的列表刷新走。单个失败不打断整页：拿不到就当没有，下一轮再说。
-        void Promise.all(
-          list.map(async (c) => [c.id, await backupConfigsApi.interrupted(c.id).catch(() => [])] as const),
-        ).then((pairs) => setInterrupted(Object.fromEntries(pairs)))
+        refreshInterrupted(list)
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
@@ -165,7 +173,14 @@ export function BackupConfigsPage() {
   // 这是无人触发的后台刷新：一次网络抖动不该弹一条错误横幅——它可能盖掉用户正在看的
   // 另一条错误，且用户对这次刷新没有可做的动作。下一拍会自然重试(Fix 7)。
   useEffect(() => {
-    const refresh = () => backupConfigsApi.list().then(setConfigs).catch(() => {})
+    const refresh = () =>
+      backupConfigsApi
+        .list()
+        .then((list) => {
+          setConfigs(list)
+          refreshInterrupted(list)
+        })
+        .catch(() => {})
     const t = setInterval(refresh, 5000)
     // 浏览器把后台标签页的定时器节流到分钟级，切回来那一瞬看到的还是上一拍的旧快照，
     // 要再等一个周期才更新——长任务跑着时，那正是"看起来卡住了"的一半原因。
@@ -217,9 +232,22 @@ export function BackupConfigsPage() {
               const tasks: Promise<void>[] = []
               if (item.activity === 'BackingUp') {
                 tasks.push(
-                  backupConfigsApi.runStatus(item.id).then((s) => {
-                    if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
-                  }),
+                  backupConfigsApi
+                    .runStatus(item.id)
+                    .then((s) => {
+                      if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
+                    })
+                    .catch((e) => {
+                      // 404＝后端进程重启后内存里已经没有这个运行了，再显示旧进度就是在撒谎。
+                      // 清掉 runs[id]：下一拍 5 秒刷新会把它从 interrupted 里捞出来，界面自然
+                      // 换成中断现场提示。非 404（网络抖动等瞬时失败）不清，原样往外抛，交给
+                      // 下面按配置的 catch 静默吞掉、下一拍重试——不然一次抖动就会把这一行拍没。
+                      if (e instanceof ApiError && e.status === 404) {
+                        if (!cancelled) setRuns((r) => without(r, item.id))
+                        return
+                      }
+                      throw e
+                    }),
                 )
                 // activity 是单值：并发还原时会被 BackingUp 盖住(见 RestoreRunner.cs 顶部注释——
                 // 还原不占忙碌锁，允许与备份并行)。本地若还记得这个配置的还原仍在跑，就不管
@@ -288,7 +316,12 @@ export function BackupConfigsPage() {
             void backupConfigsApi
               .runStatus(item.id)
               .then((s) => setRuns((r) => ({ ...r, [item.id]: s })))
-              .catch(() => {})
+              .catch((e) => {
+                // 同上：这里的「离场」本身就可能是后端重启造成的（configs 里读到的 activity
+                // 已经变回 Idle）。404 时把陈旧进度一并清掉，别的失败仍旧静默——收尾请求本就是
+                // 尽力而为，不该在这里弹错误打断整页。
+                if (e instanceof ApiError && e.status === 404) setRuns((r) => without(r, item.id))
+              })
             if (restoresRef.current[item.id]?.status === 'Running') {
               void backupConfigsApi
                 .restoreStatus(item.id)
