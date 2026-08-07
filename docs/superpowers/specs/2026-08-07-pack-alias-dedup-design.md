@@ -102,7 +102,8 @@ leader 走岔时，别名文件自己通常好好的，不该被连累。把它�
 // 用不着那条约束，照 OnChangeAsync 的两行分流即可。
 foreach (var (storeOnly, pool) in orphans.ToLookup(
              a => packOptions.DontCompress?.MatchesFileOrAncestorDir(a.Path) ?? false))
-    await ProcessPackAsync(request, pool, storeOnly, /* …原样透传… */);
+    // onItem 传 static _ => { }：见下面「进度计数的配对」。
+    await ProcessPackAsync(request, pool, storeOnly, /* … */ uploadScope, static _ => { }, /* … */);
 ```
 
 `ProcessPackAsync` 自带 `GroupIsFull` 分组（不会撑爆 argv）、自带 `changed` 处理、自带 `queue.Add` 回炉，不需要额外机制。别名文件自己在这期间被改写或读不开，同样由它现成的路径接住。
@@ -115,23 +116,27 @@ foreach (var (storeOnly, pool) in orphans.ToLookup(
 
 ```
   await Task.WhenAll(consumers);
-+ 回填 → 悬空重跑 → 若跑过，重新 uploadTracker.SetTotal(totalItems) + reporter.Settle(totalItems)
++ 回填 → 悬空重跑
   uploadTracker.Complete();      ← 必须留在重跑之后
   var total = totalItems; var uploaded = uploadedItems;
   BuildEntries(...)
 ```
 
-`SetTotal` 可以重复调（`StageProgress.cs:335` 就是赋值加强制发布），所以重跑涨出来的槽位补得进去。
+`uploadTracker.SetTotal` / `reporter.Settle` **不重调**，`totalItems` 也不涨——理由见下一节。
 
 `RecordUnreadableWarningsAsync` 留在原位（consumers join 之前）不动：它的入参是 `scan` 和 `diff`，本来就不含 `postDiffUnreadable`，重跑不影响它。
 
 ### 进度计数的配对
 
-这个项目在"恰好一次"上栽过几次（`onItem` 那一大段注释），单独说清：
+这个项目在"恰好一次"上栽过几次（`onItem` 那一大段注释），单独说清。
 
-- 别名**不** `Enqueue`、**不** `ReportItem`。两边都是零，配对天然平衡——它确实没有对应任何一件活。
-- 悬空重跑走正常配对（`ProcessPackAsync` 内部的 `onItem(bytes)` 保证"每组恰好一次"），只是 total 的分母要在跑完后重新发布一次。
-- 界面表现：无悬空时与今天**完全一致**；有悬空时收尾阶段分母向上跳一次然后走完。比"100% 却还在跑"诚实。
+**别名**不 `Enqueue`、不 `ReportItem`，两边都是零，配对天然平衡——它确实没有对应任何一件活。
+
+**悬空重跑传 `onItem = static _ => { }`**，同样零进零出。不能走正常配对：`Enqueue` 是"一个 WorkItem 一次"，而 `ProcessPackAsync` 内部 `while (queue.Count > 0)` 每轮各调一次 `onItem`——一个 pool 被 `GroupIsFull` 拆成几组是它自己决定的，外部无法预先申报对应的次数。手动 `SetTotal` 只会算错。
+
+这有现成先例：`BackupOrchestrator.cs:1388`，changed 成员改走单文件 blob 时传的就是 `static _ => { }`。
+
+界面表现：无悬空时与今天**完全一致**（这条路径根本不执行）；有悬空时进度条已经走到 100%，收尾阶段静默多跑一会儿。取舍是明确的——宁可让极罕见路径上的一小段不显示，也不要让分母在正常路径上有任何被算错的可能。
 
 ## 对既有备份的只读保证
 
