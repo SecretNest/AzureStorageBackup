@@ -55,6 +55,13 @@ public sealed class RetentionCleaner(
         var info = trackedInfo is not null
             ? await trackedInfo.LoadAsync(account, container, password, ct)
             : await store.ReadInfoAsync(account, container, password, ct);
+        // 一个版本都没提交过的容器（第一轮备份被取消：data/ 里已经有块、还没有任何版本索引）
+        // 在这里直接返回，**即便调用方要求扫描**。判据的一半是"保留版本引用了什么"，而这半边
+        // 此刻根本读不出来：info 为 null 时连信息文件都没有，Versions 为空时无从证明列出来的块
+        // 是孤儿——把整个 data/ 当孤儿删掉，删的是用户真有的东西。
+        // 这批块另有两条正当归宿，都不经过这里：journal 还在时它保着（判据认 journal）；
+        // 而"配置删了又重建"那一支由**第一轮运行必扫**兜住（见 BackupRunControl.OpenJournalAsync），
+        // 那条路走的是下面那个重载——没有这道闸门，且跑在本轮版本提交之后，判据的两半都齐了。
         return info is not null && info.Versions.Count > 0
             ? await CleanupAsync(account, container, password, options, info, ct, lease, sweepOrphans)
             : CleanupReport.Empty;
@@ -102,6 +109,13 @@ public sealed class RetentionCleaner(
         info.Versions.RemoveAll(v => deleted.Contains(v.Version));
 
         // 收集剩余版本仍引用的 data blob、pack，以及每个 pack 仍有效的成员（供死重压实）。
+        //
+        // 这一段**每个保留版本各读一次索引**，孤儿扫描离不开它：不知道保留版本引用了什么，
+        // 就没法判断列出来的对象是不是孤儿。但代价要说实话——读的是本地权威副本
+        // （ILocalIndexCache，零云端流量），可 SQLite 里存的是序列化字节，命中也要把整份索引
+        // 重建成对象：本仓库实测 50 万条目的索引一次约 0.9 s / 350 MB 分配，而它上面那层
+        // 进程内 LRU（VersionIndexMemoryCache）默认只放 2 份。于是一份留着十几个版本的大备份，
+        // 每晚一次「独立清理」就要付十几秒 CPU 加几 GB 的临时分配——这是每晚扫一遍孤儿的真实价钱。
         var referencedBlobs = new HashSet<string>(StringComparer.Ordinal);
         var referencedPacks = new HashSet<string>(StringComparer.Ordinal);
         var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
@@ -157,8 +171,9 @@ public sealed class RetentionCleaner(
                 freedBytes += blob.Properties.ContentLength ?? 0;
             }
         }
-        foreach (var packId in info.Packs.Keys
-            .Where(id => !referencedPacks.Contains(id) && !active.Packs.Contains(id)).ToList())
+        var prunedFromInfo = info.Packs.Keys
+            .Where(id => !referencedPacks.Contains(id) && !active.Packs.Contains(id)).ToList();
+        foreach (var packId in prunedFromInfo)
             info.Packs.Remove(packId);
 
         // 删除不再被引用的 data blob（枚举 data/ 前缀）。分卷名 data/{hash}.NNN 归一化回基名后再比对，
@@ -175,17 +190,30 @@ public sealed class RetentionCleaner(
             }
         }
 
-        // 死重压实（§6）：对仍存活但死重超阈值的 pack 原地重压。仅在版本退役后（死重可能增加）才检查。
-        if (compactor is not null)
+        // 死重压实（§6）：对仍存活但死重超阈值的 pack 原地重压。**仅在真有版本退役时**才检查——
+        // 死重是"某个成员不再被任何保留版本引用"堆出来的，只有退役会让它增加。
+        //
+        // 光是孤儿扫描（sweepOrphans 为真、却一个版本都没退役）绝不能把它带起来：压实失败或放弃时
+        // DeadWeightCompactor 只是把同一个 DeadBytes 写回去（见其 catch 与"本地缺失成员"分支），
+        // 下一轮的判断因此一模一样。挂在每晚一次的定时清理上，就是同一批包每晚下载、重压、重传一遍，
+        // 永远如此——而在此之前，这件事只在一次退役之后发生一次。
+        if (compactor is not null && toDelete.Count > 0)
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
                 options.LocalRoot, options.AllowRepackDownload, ct, lease);
 
-        if (trackedInfo is not null)
-            await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct);
-        else
-            await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
+        // 信息文件只在内容真的变了时才重写。变法只有两种：退役删掉了版本，或孤儿扫描从 info.Packs
+        // 里剔掉了包（压实也会改 info.Packs，但它只在有退役时才跑，已被第一项覆盖）。
+        // 判据不能写成"删了云端对象就重写"——删掉的孤儿本来就不在 info 里，那样写等于每次扫描
+        // 都白付一次信息文件写入，而这条路上的写是带 If-Match 的条件写：白写一次就白换一次 ETag。
+        if (toDelete.Count > 0 || prunedFromInfo.Count > 0)
+        {
+            if (trackedInfo is not null)
+                await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct);
+            else
+                await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
+        }
 
         // 死重压实是把 pack **重写**得更紧，不是删除，故不计入这里——把它算成"删掉了 N 个包"
         // 会让操作员以为有数据被退役了。
