@@ -95,6 +95,27 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
             : null;
 
     /// <summary>
+    /// 把这些单文件记录按**内容身份**交出去，喂给 <see cref="LocalDedupResolver.Build"/>。
+    /// <para>
+    /// 恢复本身是按路径认账的（见类注释），但这些块在云上的处境和索引里的块一模一样：
+    /// 传完了、地址占着。不告诉去重表的话，一个**同内容不同路径**的文件会认不出它，
+    /// 重压之后 ResolveAsync 给回同一个地址，上传前那一步清残卷就会把上一轮的成果删掉再传一遍。
+    /// 详见 <c>LocalDedupResolver.Build</c> 的 <c>confirmed</c> 参数说明。
+    /// </para>
+    /// <para>四项内容判据缺一不可，缺的记录直接跳过——身份不全就不该参与去重。</para>
+    /// </summary>
+    public IReadOnlyList<ConfirmedBlob> ConfirmedBlobs()
+    {
+        var list = new List<ConfirmedBlob>(_blobs.Count);
+        foreach (var r in _blobs.Values)
+            if (r is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail })
+                list.Add(new ConfirmedBlob(
+                    full, r.Length, head, tail,
+                    new ResolvedBlob(r.Ref, r.Raw, Math.Max(1, r.Volumes), r.VolumeSizes)));
+        return list;
+    }
+
+    /// <summary>
     /// 精确匹配一箱 pack。成员集合必须逐一相同，宽松不得。
     /// <para>
     /// 理由不在名字上（归档里的成员名就是成员自己的路径，见 <see cref="MemberKey"/>），

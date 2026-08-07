@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -136,7 +137,8 @@ public sealed class BackupResumeTests : IDisposable
         return (orchestrator, store, factory);
     }
 
-    private BackupRequest Request(Account account, string container, string? password = null) => new()
+    private BackupRequest Request(
+        Account account, string container, string? password = null, long? volumeBytes = null) => new()
     {
         Account = account,
         Container = container,
@@ -149,9 +151,22 @@ public sealed class BackupResumeTests : IDisposable
             // 但它并不保证停下来时只做完了一件：编排器起的是 Math.Max(2, UploadConcurrency + 1) 个
             // 工作者，第二件完全可能已经在半路上（详见下面用例里那段说明）。
             UploadConcurrency = 1,
+            VolumeBytes = volumeBytes,
             Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
         },
     };
+
+    /// <summary>某个 ref 名下现存的分卷：名字 + ETag。重传过一遍的话两样都会变。</summary>
+    private static async Task<List<(string Name, string ETag)>> VolumesOfAsync(
+        BlobContainerClient container, string blobRef)
+    {
+        var list = new List<(string Name, string ETag)>();
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, blobRef, default))
+            if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
+                list.Add((b.Name, b.Properties.ETag?.ToString() ?? ""));
+        list.Sort((x, y) => string.CompareOrdinal(x.Name, y.Name));
+        return list;
+    }
 
     [SkippableFact]
     public async Task Second_run_reuses_what_the_suspended_run_already_uploaded()
@@ -275,6 +290,86 @@ public sealed class BackupResumeTests : IDisposable
                     Assert.Equal(r.Ref, storage.Ref);
                     Assert.Equal(m.EntryName, storage.EntryName);
                 }
+            }
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 同内容不同路径：上一轮传完了 a.bin 就挂起，本轮多出一个与它逐字节相同的 b.bin。
+    /// b.bin 绝不能把 a.bin 那几卷删了重传一遍。
+    /// <para>
+    /// 恢复是按**路径**认账的，b.bin 在 journal 里查无此人。它重压之后拿到的却是**同一个**
+    /// 地址（内容寻址，同内容必同址），而多卷上传前那一步 <c>ClearLeftoverVolumesAsync</c>
+    /// 会无条件把该地址名下的分卷全删掉再传（7z 的 <c>-si</c> 不是逐字节确定的，新旧卷混在一起
+    /// 拼不出归档）。删了再传的这个窗口里被 Stop now 打断或进程崩掉，云上就只剩半套卷；
+    /// 下一轮采纳同一卷 journal，a.bin 照样复用、照样提交索引，指向的却是一份缺卷的内容——
+    /// 错要到还原或检查时才看得见。
+    /// </para>
+    /// <para>
+    /// 所以采纳来的块要一并喂进本地去重表（<c>LocalDedupResolver.Build</c> 的 confirmed 参数），
+    /// 让 b.bin 走跨版本去重那条路：不压、不传，那几卷根本没有被碰的机会。
+    /// 这条用例钉的正是"没被碰过"——分卷的名字与 ETag 一个都不许变。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_duplicate_of_a_resumed_file_reuses_its_volumes_instead_of_rewriting_them()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            // 不可压缩 + 2 MB 一卷 → 稳定压出多卷。单卷不清残留，这条用例就不成立了。
+            WriteIncompressible("a.bin", 6_000_000, seed: 7);
+
+            // 第一轮只有 a.bin：Suspend 不打断在途上传（只有 Stop now 才碰 AbortToken），
+            // 所以它的全部分卷都会传完、journal 也会记上，然后整轮以 Suspended 收场。
+            BackupRunControl? first = null;
+            var stopping = new CountingUploader(
+                new BlobUploader(factory0), stopAt: 1,
+                stop: () => { first!.RequestStop(StopKind.Suspend); return StopKind.Suspend; });
+            await using (var c = new BackupRunControl(_journals, 9, "run-a"))
+            {
+                first = c;
+                var (o1, _, _) = Build(stopping);
+                await Assert.ThrowsAsync<BackupSuspendedException>(
+                    () => o1.RunAsync(Request(account, name, volumeBytes: 2_000_000), null, default, c));
+            }
+
+            var done = (await _journals.ListAsync(account.Id, name, default))[0].Content.Records;
+            var record = Assert.Single(done);
+            Assert.Equal("a.bin", record.Path);
+            Assert.True(record.Volumes > 1, $"this test needs a multi-volume blob, got {record.Volumes}");
+            var before = await VolumesOfAsync(container, record.Ref);
+            Assert.Equal(record.Volumes, before.Count);
+
+            // 第二轮多一个与 a.bin 逐字节相同的 b.bin。
+            File.Copy(Path.Combine(_root, "a.bin"), Path.Combine(_root, "b.bin"));
+
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(
+                    Request(account, name, volumeBytes: 2_000_000), null, default, c2)).Version);
+
+            // 那几卷原封未动：删了再传的话名字（7z 卷号）和 ETag 都会变。这是本条用例的正题。
+            Assert.Equal(before, await VolumesOfAsync(container, record.Ref));
+            // a.bin 从 journal 复用，b.bin 从去重表复用 → 一个字节都没再传。
+            Assert.Equal(0, resuming.Uploads);
+
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            foreach (var path in new[] { "a.bin", "b.bin" })
+            {
+                var storage = index.Entries.Single(e => e.Path == path).Storage!;
+                Assert.Equal(record.Ref, storage.Ref);
+                Assert.Equal(record.Volumes, storage.Volumes);
             }
             Assert.Empty(await _journals.ListAsync(account.Id, name, default));
         }

@@ -476,13 +476,16 @@ public sealed class BackupOrchestrator(
                 ? previous
                 : await BeforeUploadAsync(t => indexCache.ReadAsync(
                     request.Account, request.Container, v.Version, identity, v.IndexBlob, password, t)));
-        var localResolver = LocalDedupResolver.Build(addressing, indexes);
 
         // journal 开卷：基线版本与寻址身份到这里才齐。恢复时靠这两样判断"这卷还作不作数"。
         if (control is not null)
             await control.OpenJournalAsync(
                 request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
                 startedAt, ct);
+
+        // 去重表在开卷**之后**才建：采纳来的那些块（云上有、索引里还没有）要和索引里的块一起进表，
+        // 否则一个同内容不同路径的文件会把它们删了重传一遍。原委见 Build 的 confirmed 参数。
+        var localResolver = LocalDedupResolver.Build(addressing, indexes, control?.Resume.ConfirmedBlobs());
 
         // 3./4./5. Diff 与「装箱 + 压缩 + 上传」流水线化。
         // 从前这三段严格串行：Diffing 全部跑完 → Plan → Uploading。首次备份的 diff 要把每个文件

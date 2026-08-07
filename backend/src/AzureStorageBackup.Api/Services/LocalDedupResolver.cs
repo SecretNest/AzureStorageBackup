@@ -7,6 +7,18 @@ namespace AzureStorageBackup.Api.Services;
 public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
 
 /// <summary>
+/// 一份"云上已经确认存在、但还没进任何版本索引"的内容：内容身份 + 它落在哪。
+/// <para>
+/// 来源只有一个——上一轮（或上几轮）留下、本轮采纳的 journal。这些块与既有版本索引里的块
+/// 处境完全相同（云端确认过、地址已占用），差别只在于记着它们的是 journal 而不是索引，
+/// 所以要一并喂进 <see cref="LocalDedupResolver.Build"/>，让去重、碰撞避让、预筛三处
+/// 都看得见它们。看不见的后果不是"多传一遍"那么轻——见 Build 上的说明。
+/// </para>
+/// </summary>
+public sealed record ConfirmedBlob(
+    string FullHash, long Length, string HeadHash, string TailHash, ResolvedBlob Blob);
+
+/// <summary>
 /// 某个既有 pack 里的一个成员。新条目指向它即完成去重——不压、不传、不装箱。
 /// <para>
 /// <paramref name="EntryName"/> 是**最初存进去时**那个路径（归档内的成员名），与现在引用它的
@@ -76,8 +88,28 @@ public sealed class LocalDedupResolver
 
     private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
-    /// <summary>从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。</summary>
-    public static LocalDedupResolver Build(BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes)
+    /// <summary>
+    /// 从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。
+    /// </summary>
+    /// <param name="confirmed">
+    /// 采纳来的 journal 里那些"云上确认过、索引里还没有"的块（<see cref="ConfirmedBlob"/>）。
+    /// <para>
+    /// **必须喂进来**，否则不只是多传一遍那么轻。恢复是按**路径**认账的：上一轮传完了 A 就挂起，
+    /// 还没走到与 A 同内容的 B。本轮 A 直接复用不再上传，B 却认不出自己已经有了，于是重压一遍，
+    /// 再 ResolveAsync 拿到**同一个** ref（内容寻址，同内容必同址），接着
+    /// <c>UploadStagedBlobAsync</c> 先调 <c>ClearLeftoverVolumesAsync</c> 把那个 ref 名下的分卷
+    /// 全删掉再重传——而 A 的索引条目正指着它们。这个删了再传的窗口里一旦被 Stop now 打断或
+    /// 进程崩掉，云上就只剩半套分卷，下一轮采纳 journal 时 A 照样复用、照样提交索引，
+    /// 指向的却是一份缺卷的内容。错要到还原或检查时才看得见。
+    /// </para>
+    /// <para>
+    /// 喂进来之后 B 走的是跨版本去重那条路：既不重压也不重传，那批分卷根本没有被碰的机会。
+    /// 一并进 <c>refs</c>（不同内容撞上这个地址时照常避让到 …~N）和预筛集。
+    /// </para>
+    /// </param>
+    public static LocalDedupResolver Build(
+        BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes,
+        IEnumerable<ConfirmedBlob>? confirmed = null)
     {
         var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
         var refs = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -118,6 +150,15 @@ public sealed class LocalDedupResolver
                 if (e.HeadHash is not null)
                     heads.Add(HeadKey(e.Length, e.HeadHash));
             }
+        }
+        foreach (var c in confirmed ?? [])
+        {
+            // TryAdd 而不是覆盖：已经提交进版本索引的那份说了算。两边真撞上（同内容身份）时
+            // 记的本来就是同一个 ref，谁赢都一样；不一样的只可能是索引更权威的那种情形。
+            var ck = ContentKey(c.FullHash, c.Length, c.HeadHash, c.TailHash);
+            byContent.TryAdd(ck, c.Blob);
+            refs.TryAdd(c.Blob.Ref, ck);
+            heads.Add(HeadKey(c.Length, c.HeadHash));
         }
         return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers);
     }
