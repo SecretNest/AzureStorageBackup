@@ -345,6 +345,10 @@ public sealed class PackAliasDedupTests : IDisposable
             Assert.Equal(packsAfterV1, await CountPacksAsync(cc));
 
             var info = await store.ReadInfoAsync(account, name, null);
+            // 这条测试的前提是 v1 已经退役（MaxVersions = 1），包才只能靠别名条目钉住。
+            // 不断言这一条，v1 万一没退役，"包没被删"就会因为 leader 自己在 v1 里的旧条目
+            // 而通过——测试变成一个测不出东西的假象，根本没验证到别名钉包这件事。
+            Assert.Single(info!.Versions);
             var v2 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             Assert.DoesNotContain(v2.Entries, e => e.Path == "a/first.txt");
             var second = v2.Entries.Single(e => e.Path == "c/second.txt");
