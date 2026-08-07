@@ -45,6 +45,7 @@ public class JournalResumeTests
         Assert.Null(r.FindPack([m1, m2, new JournalMember("c.txt", "0003_c.txt", "hc", 9)]));  // 多一个
         Assert.Null(r.FindPack([m1, m2 with { FullHash = "changed" }]));           // 成员内容变了
         Assert.Null(r.FindPack([m1, m2 with { Length = 8 }]));                     // 成员长度变了
+        Assert.Null(r.FindPack([m2, m1]));                                         // 同一组成员，顺序变了
     }
 
     [Fact]
