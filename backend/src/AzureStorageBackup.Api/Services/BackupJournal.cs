@@ -86,6 +86,27 @@ public sealed class BackupJournal : IAsyncDisposable
         return journal;
     }
 
+    /// <summary>
+    /// 接着往一卷**已经存在**的 journal 后面写。
+    /// <para>
+    /// 头一行不重写：调用方已经逐项核对过它还作数（见 <see cref="BackupRunControl.OpenJournalAsync"/>），
+    /// 重写等于把 append-only 变成可改写。用它而不是 <see cref="CreateAsync"/> 的唯一场合，
+    /// 就是本轮的 runId 与盘上那一卷重名——那里必须接着写，见调用点的说明。
+    /// </para>
+    /// </summary>
+    public static async Task<BackupJournal> OpenForAppendAsync(string path, CancellationToken ct)
+    {
+        var dir = System.IO.Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        var journal = new BackupJournal(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read));
+        // 先补一个换行。这个文件不逐条 fsync，崩溃后最后一行可能是半截的（见类注释）；直接接着写
+        // 会把那半截和新记的一条粘成一行，于是**新的这条**也跟着解析不出来——而它记的是本轮刚
+        // 确认上传的内容，丢了就是下一轮白传一遍。空行 ReadAsync 一律跳过，多写这一个字节无害。
+        await journal.WriteLineAsync("", ct);
+        return journal;
+    }
+
     /// <summary>追加一条。调用点必须在**上传确认返回之后**。</summary>
     public async Task AppendAsync(JournalRecord record, CancellationToken ct)
         => await WriteLineAsync(JsonSerializer.Serialize(record, Json), ct);

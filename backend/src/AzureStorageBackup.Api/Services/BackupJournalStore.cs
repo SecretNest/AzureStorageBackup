@@ -49,6 +49,11 @@ public sealed class BackupJournalStore(string rootDir)
         int accountId, string container, string runId, JournalHeader header, CancellationToken ct)
         => BackupJournal.CreateAsync(PathFor(accountId, container, runId), header, ct);
 
+    /// <summary>接着往一卷已经存在的 journal 后面写。只在"本轮 runId 与盘上那卷重名"时用，
+    /// 原委见 <see cref="BackupRunControl.OpenJournalAsync"/>。</summary>
+    public Task<BackupJournal> AppendAsync(int accountId, string container, string runId, CancellationToken ct)
+        => BackupJournal.OpenForAppendAsync(PathFor(accountId, container, runId), ct);
+
     /// <summary>列出该容器上所有能读通的 journal。读不通的（头坏了）直接当不存在。</summary>
     public async Task<IReadOnlyList<(string RunId, JournalContent Content)>> ListAsync(
         int accountId, string container, CancellationToken ct)

@@ -123,20 +123,33 @@ public sealed class BackupRunControl(
         // 哪天允许多个配置共用一个容器了，这一条必须改回"不是我们的就完全不碰"，
         // 否则会把别人正挂起着的运行的成果变成孤儿。
         var voided = false;
+        // 采纳到的那一卷正是本轮自己那卷（runId 重名）→ 接着往它后面写，绝不新开一卷盖上去。
+        var reopenMine = false;
         var adopted = new List<JournalContent>();
+        var myPath = store.PathFor(accountId, container, runId);
         foreach (var (oldRunId, content) in await store.ListAsync(accountId, container, ct))
         {
             var h = content.Header;
+            // 比的是**落到盘上的那个路径**而不是两个 runId 字符串：文件名经过 BackupJournalStore.Safe
+            // 扁平化，两个不同的 runId 完全可能落在同一个文件上——那时它们就是同一卷。
+            var mine = string.Equals(
+                store.PathFor(accountId, container, oldRunId), myPath, StringComparison.Ordinal);
             if (h.ConfigId == configId
                 && h.BaselineVersion == baselineVersion
                 && string.Equals(h.LocalRoot, localRoot, StringComparison.Ordinal)
                 && string.Equals(h.EncryptionIdentity, encryptionIdentity, StringComparison.Ordinal))
             {
                 adopted.Add(content);
-                _adopted.Add(oldRunId);
+                // 重名的那一卷**不**进 _adopted：它就是本轮自己那卷，CompleteAsync 已经按 runId 删过它。
+                if (mine)
+                    reopenMine = true;
+                else
+                    _adopted.Add(oldRunId);
             }
             else
             {
+                // 重名但判据对不上，照删不误：它按本轮的判据已经作废，而下面新开的那一卷本来
+                // 就要落在这个路径上（FileMode.Create），删与不删结果一样。
                 store.Delete(accountId, container, oldRunId);
                 voided = true;
             }
@@ -150,15 +163,25 @@ public sealed class BackupRunControl(
             ? JournalResume.Empty
             : new JournalResume([.. adopted.SelectMany(c => c.Records)]);
 
-        _journal = await store.CreateAsync(accountId, container, runId, new JournalHeader
-        {
-            RunId = runId,
-            ConfigId = configId,
-            StartedAt = startedAt,
-            BaselineVersion = baselineVersion,
-            LocalRoot = localRoot,
-            EncryptionIdentity = encryptionIdentity,
-        }, ct);
+        // runId 与刚采纳的那一卷重名时**接着写**，不能新开：CreateAsync 是 FileMode.Create，
+        // 会把刚刚采纳的那一卷当场截断。
+        //
+        // 今天撞不上——RunId 每次都是新生成的 GUID 前缀。**Task 15「启动时自动接着跑」正是撞上它
+        // 的那一步**：那里要沿用挂起那一轮的 runId，好让界面上的运行身份保持不变。
+        // 截断之后本轮内存里的 Resume 仍然是全的（上面已经读进来了），所以当轮跑下去不出错；
+        // 坏掉的是**盘上**那份担保：再挂起一次，新卷不为那批块作保，下一轮把它们全部重传，
+        // 而按 journal 判"这块有没有人认领"的清理/孤儿扫描会直接把它们当垃圾删掉。
+        _journal = reopenMine
+            ? await store.AppendAsync(accountId, container, runId, ct)
+            : await store.CreateAsync(accountId, container, runId, new JournalHeader
+            {
+                RunId = runId,
+                ConfigId = configId,
+                StartedAt = startedAt,
+                BaselineVersion = baselineVersion,
+                LocalRoot = localRoot,
+                EncryptionIdentity = encryptionIdentity,
+            }, ct);
     }
 
     /// <summary>记一个单文件 blob。**只能**在上传确认返回之后调。</summary>

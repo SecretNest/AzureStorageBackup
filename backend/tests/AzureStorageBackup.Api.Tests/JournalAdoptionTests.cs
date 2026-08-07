@@ -190,6 +190,31 @@ public sealed class JournalAdoptionTests : IDisposable
         Assert.True(File.Exists(_store.PathFor(AccountId, Container, "run-new")));
     }
 
+    /// <summary>
+    /// 本轮的 runId 与盘上那一卷重名：采纳之后**接着往它后面写**，不能新开一卷把它盖掉。
+    /// <para>
+    /// 今天的 RunId 是新生成的 GUID 前缀，撞不上；Task 15「启动时自动接着跑」要沿用挂起那一轮的
+    /// runId（好让界面上的运行身份不变），一沿用就撞上。截断之后当轮仍然是对的（Resume 已经在内存里），
+    /// 坏的是盘上那份担保——所以这条用例钉的是**文件里剩下什么**，不是 Resume 里有什么。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_volume_carrying_our_own_run_id_is_appended_to_not_truncated()
+    {
+        var planted = await PlantAsync("run-same");
+
+        await using (var control = await OpenAsync("run-same"))
+        {
+            Assert.Equal(1, control.Resume.RecordCount);
+            await control.RecordBlobAsync("b.bin", "data/b", "fb", "hb", "tb", 7, 1, false, [7], default);
+        }
+
+        var content = await BackupJournal.ReadAsync(planted, default);
+        Assert.NotNull(content);
+        Assert.Equal(ConfigId, content!.Header.ConfigId);
+        Assert.Equal(["a.bin", "b.bin"], content.Records.Select(r => r.Path));
+    }
+
     [Fact]
     public async Task Committing_deletes_the_adopted_volume_along_with_its_own()
     {
