@@ -58,6 +58,69 @@ public sealed class LocalDedupResolverTests
         Assert.True(res.Collision);
     }
 
+    /// <summary>
+    /// Task 10 采纳 journal 时的折入项：<c>confirmed</c> 里的块要和索引里的块享受同一套去重待遇。
+    /// 这条覆盖三项里的第一项——<c>byContent</c>：跨版本去重直接命中。
+    /// </summary>
+    [Fact]
+    public async Task Confirmed_Blob_Dedups_Like_An_Indexed_One()
+    {
+        var confirmed = new[]
+        {
+            new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
+                new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 2, VolumeSizes: [60, 40])),
+        };
+        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+
+        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl");
+
+        Assert.True(res.Exists);
+        Assert.Equal("data/xxh128:h", res.Ref);
+        Assert.True(res.Existing!.Raw);
+        Assert.Equal(2, res.Existing.Volumes);
+        Assert.False(res.Collision);
+    }
+
+    /// <summary>
+    /// 折入项第二条——<c>refs</c>：confirmed 块占的地址一样要挡碰撞。只喂 byContent 不喂 refs 的话，
+    /// 同 hash 不同内容的新文件会直接把这个地址当空的抢占，而不是避让到 …~1——那就是把新内容写进
+    /// 了 confirmed 块正占着的地址上。
+    /// </summary>
+    [Fact]
+    public async Task Confirmed_Blob_Ref_Is_Guarded_Against_Collision()
+    {
+        var confirmed = new[]
+        {
+            new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
+                new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 1, VolumeSizes: [100])),
+        };
+        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+
+        // 同 hash（地址算法只看 fullHash）、内容不同（长度/头/尾都变了）→ 碰撞，必须避让。
+        var res = await r.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2");
+
+        Assert.False(res.Exists);
+        Assert.Equal("data/xxh128:h~1", res.Ref);
+        Assert.True(res.Collision);
+    }
+
+    /// <summary>
+    /// 折入项第三条——<c>heads</c>：confirmed 块要能被预筛问到，否则同内容不同路径的文件
+    /// 会在预筛这一关就被判"没有候选"，白白重压一遍（见 JournalResume.ConfirmedBlobs 的说明）。
+    /// </summary>
+    [Fact]
+    public void Confirmed_Blob_Participates_In_Prescreen()
+    {
+        var confirmed = new[]
+        {
+            new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
+                new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 1, VolumeSizes: [100])),
+        };
+        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+
+        Assert.True(r.MayDeduplicate(100, "xxh128:hd"));
+    }
+
     [Fact]
     public async Task Same_Run_Duplicate_Waits_For_First_Uploader()
     {
