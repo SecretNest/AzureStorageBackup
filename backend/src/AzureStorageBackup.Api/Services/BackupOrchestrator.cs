@@ -484,34 +484,25 @@ public sealed class BackupOrchestrator(
         // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
         using var stopProducing = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        // 一件活撞上瞬时错误就在闸门前等，放行了原样重试。
-        // 重试整件活是安全的：单文件路径每次从头读/压/暂存（PlaceBlobAsync 的 finally 会释放上一次的
-        // 暂存物），pack 路径复用同一个 packId 且分卷逐卷 if-missing，重传只补缺的卷。
-        // journal 因此可能出现重复行——无害，恢复是按内容对号，重复只是多命中一次。
-        async Task WithPauseAsync(WorkItem item, CancellationToken token)
+        // 一件活撞上瞬时错误就在闸门前等，放行了重试——但重试的**单位**两条路不同。
+        //
+        // 单文件：整件重试是安全的，每次从头读/压/暂存（PlaceBlobAsync 的 finally 会释放上一次的
+        // 暂存物），分卷 if-missing 之前还会先清掉上一次尝试的残留卷。
+        //
+        // pack：一件活是**一整个池**，ProcessPackAsync 会把它切成若干组、每组各领一个包号。整件
+        // 重试就等于把第 9 组的一次抖动退回到第 1 组，而且退回去之后领的是**新的**包号——前 8 组
+        // 已经传上去的归档从此没有任何索引引用它，只在容器里占着地方；info.Packs 里也各留一条
+        // 指向孤儿的记录。所以 pack 的重试下沉到组里（见 ProcessPackAsync），这里直接调。
+        async Task RunItemAsync(WorkItem item, CancellationToken token)
         {
-            while (true)
-            {
-                try
-                {
-                    if (item.Single is { } single)
-                        await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                            overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, token);
-                    else
-                        await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
-                            info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
-                            uploadTracker, state, control, token);
-                    control?.Gate.ReportSuccess();
-                    return;
-                }
-                // 判据带上 token：用户按了取消时 OperationCanceledException 必须原样上抛，
-                // 被闸门当成"网络抖了一下"吞掉的话，取消按钮就静悄悄失效了。
-                catch (Exception ex) when (control is not null && TransientErrors.IsTransient(ex, token))
-                {
-                    if (!await control.Gate.WaitAsync(ex, token))
-                        throw new BackupSuspendedException(SuspendReason.AutoSuspended, ex.Message);
-                }
-            }
+            if (item.Single is { } single)
+                await WithPauseAsync(control, () => HandleBlobAsync(
+                    request, single, addressing, localResolver, storageByPath, tailByPath,
+                    overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, token), token);
+            else
+                await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
+                    info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
+                    uploadTracker, state, control, token);
         }
 
         async Task ConsumeAsync()
@@ -525,7 +516,7 @@ public sealed class BackupOrchestrator(
                     uploadTracker.BeginWork();
                     try
                     {
-                        await WithPauseAsync(item, ct);
+                        await RunItemAsync(item, ct);
                     }
                     finally
                     {
@@ -1394,6 +1385,37 @@ public sealed class BackupOrchestrator(
     }
 
     /// <summary>
+    /// 把一段活放到挂起闸门后面跑：撞上瞬时错误就在闸门前等，放行了原样重来一遍，直到成功、
+    /// 或者闸门失去耐心把这轮运行降级为挂起。
+    /// <para>
+    /// <paramref name="body"/> 就是重试的**单位**，所以它必须整段可重入：重来一遍不能留下上一遍
+    /// 的半成品，也不能把同一件事记两次。单文件 blob 传的是一整件，pack 传的是一**组**——
+    /// 两个调用点因此传进来的东西大小差着一个量级，但闸门那套等法完全一样，不该抄第二遍。
+    /// </para>
+    /// </summary>
+    /// <param name="ct">**运行本身**那个取消令牌，不是别的。瞬时判据要拿它区分"网络抖了一下"和
+    /// "用户按了取消"——传错了的话，取消会被当成抖动吞掉，按钮就静悄悄失效了。</param>
+    private static async Task WithPauseAsync(BackupRunControl? control, Func<Task> body, CancellationToken ct)
+    {
+        while (true)
+        {
+            try
+            {
+                await body();
+                // 一段活干成了就把连败清零：闸门的耐心是"从第一次不顺算起还没好过"，
+                // 中间成功过一次却不清零的话，几个钟头里零星抖几下也会攒够耐心把运行判挂起。
+                control?.Gate.ReportSuccess();
+                return;
+            }
+            catch (Exception ex) when (control is not null && TransientErrors.IsTransient(ex, ct))
+            {
+                if (!await control.Gate.WaitAsync(ex, ct))
+                    throw new BackupSuspendedException(SuspendReason.AutoSuspended, ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
     /// 处理**一箱**已封好的可分组小文件（§6/§9）：压缩 + 压缩后校验，压缩中变化的成员以稳定后的
     /// 新 hash 重新入队（自然进入下一箱），而非移出为单文件；仅当变大到超阈值、或反复变化达阈值
     /// 时才降级为单文件（后者报警）。
@@ -1438,98 +1460,113 @@ public sealed class BackupOrchestrator(
             }
             queue.RemoveRange(0, group.Count);
 
+            // 包号在重试**之外**领，一组一个，领定了就不再变。放进重试里的话，闸门每放行一次
+            // 这一组就换一个号：上一次尝试已经传上去的卷再没有任何索引引用得到，只在容器里占着
+            // 地方，info.Packs 里还各留一条指向孤儿的记录。
             var packId = state.NextPackId();
             // 这些 PlannedFile 全部由 ToPlannedFile(PackEntry) 而来，FullHash 按构造非空——
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
 
-            // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
-            // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
-            // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
-            // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
-            // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
-            // 逐成员 stat：一箱几百个成员，在 NAS 上不是白干的。与压缩后那一遍同报「读盘核对」。
-            uploadTracker.BeginChecking();
-            Dictionary<string, (long Mtime, long Length, int Mode)?> before;
-            try
+            // 「压这一组 + 传上去 + 记下来」是重试的单位：抖一下就把这一组从头做一遍，前面几组
+            // 不受牵连。整段可重入——包号不变，所以重压的产出盖回同一族卷（传之前先清残留，
+            // 见 UploadStagedPackAsync）；info.Packs 与 storageByPath 都按键覆盖；journal 允许重复行
+            // （恢复按内容对号，重复只是多命中一次）。变化成员的重新入队留在外面：那会动 queue
+            // 和 attempts，重来一遍就会把同一个成员排两次队、把重试次数记重。
+            async Task<List<PackEntry>> AttemptAsync()
             {
-                before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-            }
-            finally
-            {
-                uploadTracker.EndChecking();
-            }
-            var (staged, missing) = await CompressPackTolerantAsync(
-                request, packId, members, storeOnly, uploadTracker, state, ct);
-            // 这一箱的归档由本次迭代持有：本轮怎么结束都还回去。下面从这里到用完之间有一整段
-            // 会抛的代码（压缩后重校验里那次重算 hash，取消时抛的 OperationCanceledException 不在
-            // 那层 catch 的收集范围里），从前一穿出去这份账就永远挂在单例上了——而它是产出的背压
-            // 闸门，攒够就把所有运行的压缩一起卡住。用完仍会立刻显式 Release，这里只兜异常路径。
-            using var held = staging.Hold(staged);
-
-            // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
-            // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
-            // 于是一个缺成员的 pack 就被原样上传，索引却声称它在里面。
-            var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
-
-            // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
-            //
-            // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
-            // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
-            // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
-            uploadTracker.BeginChecking();
-            try
-            {
-                foreach (var m in members)
+                // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
+                // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
+                // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
+                // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
+                // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
+                // 逐成员 stat：一箱几百个成员，在 NAS 上不是白干的。与压缩后那一遍同报「读盘核对」。
+                uploadTracker.BeginChecking();
+                Dictionary<string, (long Mtime, long Length, int Mode)?> before;
+                try
                 {
-                    if (missing.Contains(m.EntryName))
-                        continue;
-
-                    var local = Local(request, m.Path);
-                    bool exclude;
-                    try
-                    {
-                        // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
-                        // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
-                        exclude = before[m.Path] is not { } snapshot
-                            || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        exclude = true;
-                    }
-                    if (exclude)
-                        changed.Add(m);
+                    before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
                 }
-            }
-            finally
-            {
-                uploadTracker.EndChecking();
+                finally
+                {
+                    uploadTracker.EndChecking();
+                }
+                var (staged, missing) = await CompressPackTolerantAsync(
+                    request, packId, members, storeOnly, uploadTracker, state, ct);
+                // 这一箱的归档由本次迭代持有：本轮怎么结束都还回去。下面从这里到用完之间有一整段
+                // 会抛的代码（压缩后重校验里那次重算 hash，取消时抛的 OperationCanceledException 不在
+                // 那层 catch 的收集范围里），从前一穿出去这份账就永远挂在单例上了——而它是产出的背压
+                // 闸门，攒够就把所有运行的压缩一起卡住。用完仍会立刻显式 Release，这里只兜异常路径。
+                using var held = staging.Hold(staged);
+
+                // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
+                // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
+                // 于是一个缺成员的 pack 就被原样上传，索引却声称它在里面。
+                var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
+
+                // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
+                //
+                // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
+                // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
+                // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
+                uploadTracker.BeginChecking();
+                try
+                {
+                    foreach (var m in members)
+                    {
+                        if (missing.Contains(m.EntryName))
+                            continue;
+
+                        var local = Local(request, m.Path);
+                        bool exclude;
+                        try
+                        {
+                            // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
+                            // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
+                            exclude = before[m.Path] is not { } snapshot
+                                || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            exclude = true;
+                        }
+                        if (exclude)
+                            changed.Add(m);
+                    }
+                }
+                finally
+                {
+                    uploadTracker.EndChecking();
+                }
+
+                if (changed.Count == 0)
+                {
+                    var vols = await UploadStagedPackAsync(
+                        request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
+                    await RecordPackAsync(request, packId, members, vols, storeOnly, info, storageByPath, control, ct);
+                    foreach (var m in members) await LogFileAsync(request, m.Path, ct);
+                    return changed;   // 空表：这一组干干净净地成了一个 pack
+                }
+
+                // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
+                // staged 为 null 只可能是整组成员都被 7z 丢掉（连空归档都没留下），此时无物可释放。
+                if (staged is not null)
+                    staging.Release(staged);
+                var stable = members.Where(m => !changed.Contains(m)).ToList();
+                if (stable.Count > 0)
+                {
+                    var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
+                    var vols2 = await UploadStagedPackAsync(
+                        request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
+                    await RecordPackAsync(request, packId, stable, vols2, storeOnly, info, storageByPath, control, ct);
+                    foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
+                }
+                return changed;
             }
 
-            if (changed.Count == 0)
-            {
-                var vols = await UploadStagedPackAsync(
-                    request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
-                await RecordPackAsync(request, packId, members, vols, storeOnly, info, storageByPath, control, ct);
-                foreach (var m in members) await LogFileAsync(request, m.Path, ct);
-                onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
-                continue;
-            }
+            List<PackEntry> changedMembers = [];
+            await WithPauseAsync(control, async () => changedMembers = await AttemptAsync(), ct);
 
-            // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
-            // staged 为 null 只可能是整组成员都被 7z 丢掉（连空归档都没留下），此时无物可释放。
-            if (staged is not null)
-                staging.Release(staged);
-            var stable = members.Where(m => !changed.Contains(m)).ToList();
-            if (stable.Count > 0)
-            {
-                var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
-                var vols2 = await UploadStagedPackAsync(
-                    request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
-                await RecordPackAsync(request, packId, stable, vols2, storeOnly, info, storageByPath, control, ct);
-                foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
-            }
             // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
             // total 里预留的一个槽位，必须**恰好上报一次**——即便 stable.Count == 0（整组成员一起
             // 读不开，Finding 2 命中的最坏情形），否则 uploaded 永远追不上 total，完工也显示不了 100%。
@@ -1537,9 +1574,12 @@ public sealed class BackupOrchestrator(
             // 多个成员一起失败时被重复计数（该组只占一个槽位，不是每个成员各占一个）。
             // 剩余时间的销账同理：整组的原始字节一次记清，哪怕组里没剩下一个稳定成员——
             // 这一组的活确实做完了，工作量不销就永远悬在那里，剩余时间收不到 0。
+            //
+            // 也正因为它在重试**之外**：这一组抖了几次、重压了几遍，账都只销一次。放进去的话，
+            // 一次抖动就让 uploaded 多涨一格，最后越过 total，速度和剩余时间跟着一起失真。
             onItem(bytes);
 
-            foreach (var m in changed)
+            foreach (var m in changedMembers)
             {
                 var local = Local(request, m.Path);
                 string newHash;
@@ -1573,9 +1613,13 @@ public sealed class BackupOrchestrator(
                     // 不重新用 try 包住整个调用：HandleBlobAsync 自己对源读取/处理/上传有正确范围的
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
-                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                    // 闸门是另一回事：它不吞异常，只是撞上瞬时错误时等一等再把**同一件**活重来一遍。
+                    // 这件活是从池子里掉出来的一个单文件，与消费循环里那条单文件路径同一个形状，
+                    // 因此也用同一个重试单位——不放进闸门的话，这一件抖一下就能带倒整轮备份。
+                    await WithPauseAsync(control, () => HandleBlobAsync(
+                        request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
                         storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                        uploadTracker, state, control, ct);
+                        uploadTracker, state, control, ct), ct);
                 }
                 else
                 {

@@ -1,0 +1,389 @@
+using System.Net.Sockets;
+using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Models;
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Tests;
+
+/// <summary>
+/// 闸门重试 pack 时，重试的**单位**必须是一组，不是一整个池。
+/// <para>
+/// 一件 pack 活是一个池，<c>ProcessPackAsync</c> 按 GroupIsFull 把它切成若干组，每组各领一个包号。
+/// 整件重试就等于第 9 组的一次抖动把前 8 组全部推倒重来，而且重来时领的是**新**包号：前 8 组
+/// 已经传上去的归档从此没有任何索引引用得到，只在容器里占着地方（保留清理要到下一轮才收），
+/// info.Packs 里还各留一条指向孤儿的记录，进度也跟着多销几笔。
+/// </para>
+/// <para>
+/// 这里的池靠"压缩期间成员变了"切成两组——这是编排器自己就有的那条路（变化成员以新 hash 重新
+/// 入队，自然进入下一组），不是为测试造的机关：装箱在 diff 那侧按同样的三条界封箱，所以正常
+/// 情况下一个池就是一组，多组只可能这么来。
+/// </para>
+/// </summary>
+[Trait("Category", "Integration")]
+public sealed class BackupPackRetryUnitTests : IDisposable
+{
+    private const string AzuriteKey =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+    private readonly string _root;
+    private readonly string _temp;
+    private readonly BackupJournalStore _journals;
+
+    public BackupPackRetryUnitTests()
+    {
+        var baseDir = Path.Combine(Path.GetTempPath(), "asb-pack-" + Guid.NewGuid().ToString("N"));
+        _root = Path.Combine(baseDir, "src");
+        _temp = Path.Combine(baseDir, "temp");
+        Directory.CreateDirectory(_root);
+        Directory.CreateDirectory(_temp);
+        _journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(Path.GetDirectoryName(_root)!, recursive: true); } catch { /* best effort */ }
+    }
+
+    private static Account AzuriteAccount() => new()
+    {
+        Id = 42,
+        Name = "azurite",
+        BlobEndpoint = "http://127.0.0.1:10000/devstoreaccount1",
+        AccountKeyProtected = TestSecrets.Protect(AzuriteKey),
+        Region = AzureRegion.Global,
+    };
+
+    private static bool AzuriteReachable()
+    {
+        try { using var c = new TcpClient(); c.Connect("127.0.0.1", 10000); return true; }
+        catch { return false; }
+    }
+
+    private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
+    private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
+
+    private const string TargetLeaf = "m3.bin";
+
+    /// <summary>一个目录、6 个小文件：按三条界这是**一个**池、一组。</summary>
+    private void WritePool()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "d"));
+        for (var i = 1; i <= 6; i++)
+            File.WriteAllBytes(Path.Combine(_root, "d", $"m{i}.bin"), new byte[20_000 + i]);
+    }
+
+    /// <summary>
+    /// 压 6 个成员那一下（也只有那一下）把其中一个成员改掉：编排器的压缩后重校验会把它排除出
+    /// 归档、以新 hash 重新入队，于是同一个池被切成两组——**不改动被测代码**就得到多组现场。
+    /// 顺带把每个包号被压了几次记下来，用来回答"已经传好的那组有没有被重压"。
+    /// </summary>
+    private sealed class MutatingCompressor(IFileCompressor inner, string root) : IFileCompressor
+    {
+        private readonly List<string> _compressed = [];
+        private int _mutations;
+
+        /// <summary>按调用顺序记下每次压缩的包号（同一个包号可以出现多次）。</summary>
+        public IReadOnlyList<string> Compressed
+        {
+            get { lock (_compressed) return [.. _compressed]; }
+        }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var packId = Path.GetFileNameWithoutExtension(request.OutputArchivePath);
+            lock (_compressed) _compressed.Add(packId);
+
+            // 只在"整组一起压"那一下动手：剔除变化成员后的重压只剩 5 个成员、后面那一组只剩 1 个，
+            // 都不含目标，于是不会没完没了地"又变了"（那会一路撞到 ProcessingMaxAttempts 降级成单文件）。
+            var target = request.Entries.FirstOrDefault(
+                e => e.EndsWith(TargetLeaf, StringComparison.Ordinal));
+            if (request.Entries.Count > 1 && target is not null)
+            {
+                // 每次改成**不同的长度**。压缩后重校验的第一道是元数据比对，只改内容不改长度的话，
+                // 同一秒内重写会得到相同的 (mtime, length)，比对就说"这个成员没变"——那样整件重试
+                // 的旧行为会伪装成正确的（一次抖动之后只剩一组），测试就失去了鉴别力。
+                var n = Interlocked.Increment(ref _mutations);
+                File.WriteAllBytes(
+                    Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)),
+                    new byte[33_000 + (n * 1_000)]);
+            }
+
+            return inner.CompressAsync(request, ct);
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+    }
+
+    /// <summary>第 N 个**包**的第一次上传抖一下（只抖一次）。N=2 就是"前面那组已经传好了才出事"。</summary>
+    private sealed class FlakyOnNthPack(IBlobUploader inner, int nth) : IBlobUploader
+    {
+        private readonly HashSet<string> _packs = new(StringComparer.Ordinal);
+        private int _thrown;
+
+        private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
+        {
+            if (blobName.StartsWith("packs/", StringComparison.Ordinal))
+            {
+                bool trip;
+                lock (_packs)
+                {
+                    var id = blobName[..(blobName.IndexOf(".7z", StringComparison.Ordinal) + 3)];
+                    trip = _packs.Add(id) && _packs.Count == nth;
+                }
+                if (trip && Interlocked.Exchange(ref _thrown, 1) == 0)
+                    throw new AggregateException("Retry failed after 6 tries.", new TaskCanceledException("timeout"));
+            }
+            return call();
+        }
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata));
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry, CancellationToken ct, IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress));
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, async () =>
+            {
+                await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+                return true;
+            });
+    }
+
+    /// <summary>取消令牌一按就抛 OperationCanceledException 的上传器：用来验证取消没有被闸门吞掉。</summary>
+    private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
+    {
+        private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
+        {
+            if (blobName.StartsWith("packs/", StringComparison.Ordinal))
+            {
+                cts.Cancel();
+                // 形状与"传到一半被取消"一模一样：真实的取消就是从这里抛出来的。
+                throw new OperationCanceledException(cts.Token);
+            }
+            return call();
+        }
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata));
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry, CancellationToken ct, IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress));
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, async () =>
+            {
+                await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+                return true;
+            });
+    }
+
+    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, IBackupInfoStore Store) Build(
+        IBlobUploader uploader, IFileCompressor compressor)
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var staging = new StagingArea(
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+        var compactor = new DeadWeightCompactor(
+            new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
+            staging);
+        var authority = new TestLocalAuthority(store);
+        var orchestrator = new BackupOrchestrator(
+            new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
+            compressor, uploader, factory, store, staging,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
+                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.IndexCache, authority.Tracked);
+        return (orchestrator, factory, store);
+    }
+
+    private BackupRequest Request(Account account, string container) => new()
+    {
+        Account = account,
+        Container = container,
+        LocalRoot = _root,
+        Name = "photos",
+        Password = null,
+        Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 } },
+    };
+
+    /// <summary>容器里的 pack 归档（.7z 基名），与索引真正引用到的那些。两者必须相等。</summary>
+    private static async Task<(HashSet<string> InContainer, HashSet<string> Referenced)> PacksAsync(
+        Azure.Storage.Blobs.BlobContainerClient cc, IBackupInfoStore store, Account account, string container)
+    {
+        var inContainer = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, "packs/", default))
+            inContainer.Add(b.Name[..(b.Name.IndexOf(".7z", StringComparison.Ordinal) + 3)]);
+
+        var info = await store.ReadInfoAsync(account, container, null);
+        var index = await store.ReadIndexAsync(account, container, info!.Versions[^1].IndexBlob, null);
+        var referenced = index.Entries
+            .Where(e => e.Storage is { Kind: "pack" })
+            .Select(e => $"packs/{e.Storage!.Ref}.7z")
+            .ToHashSet(StringComparer.Ordinal);
+        return (inContainer, referenced);
+    }
+
+    /// <summary>
+    /// 第 2 组上传抖一次：只有第 2 组重来，第 1 组既不重压也不重传，包号不变，容器里不留孤儿。
+    /// </summary>
+    [SkippableFact]
+    public async Task A_blip_in_the_second_group_reruns_only_that_group()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatingCompressor(new SevenZipCompressor(), _root);
+        var flaky = new FlakyOnNthPack(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), nth: 2);
+        var (orchestrator, factory, store) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-pack", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            var result = await orchestrator.RunAsync(Request(account, name), null, default, control);
+            Assert.Equal(1, result.Version);
+
+            var compressed = compressor.Compressed;
+            var packs = compressed.Distinct(StringComparer.Ordinal).ToList();
+            // 这个现场的前提：池确实被切成了两组。切不出来的话下面几条断言都是空转。
+            Assert.Equal(2, packs.Count);
+
+            // 第 1 组：整组压一次 + 剔掉变化成员后重压一次，就这两次。第 2 组抖完重来时若把整个池
+            // 推倒重来，这里会冒出第 3 次（而且是挂在一个**新**包号上）。
+            Assert.Equal(2, compressed.Count(p => p == packs[0]));
+            // 第 2 组：抖了一次，压了两次——**同一个包号**。号变了就等于在云上多留一份没人引用的归档。
+            Assert.Equal(2, compressed.Count(p => p == packs[1]));
+
+            var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
+            Assert.Equal(referenced, inContainer);   // 容器里没有索引引用不到的孤儿包
+            Assert.Equal(2, referenced.Count);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// 进度销账每组恰好一次，与抖了几次无关。整件重试会让已经销过账的那一组再销一次，
+    /// uploaded 就此虚高（越过 total 之后速度与剩余时间一起失真）。
+    /// </summary>
+    [SkippableFact]
+    public async Task Each_group_reports_progress_exactly_once_however_many_retries()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatingCompressor(new SevenZipCompressor(), _root);
+        var flaky = new FlakyOnNthPack(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), nth: 2);
+        var (orchestrator, factory, _) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-once", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            var peak = 0;
+            var progress = new Progress<BackupProgress>(p => peak = Math.Max(peak, p.UploadedItems));
+            await orchestrator.RunAsync(Request(account, name), progress, default, control);
+
+            // 两组 → 恰好两笔。整件重试时第 1 组会被再销一次，这里就成了 3。
+            Assert.Equal(2, peak);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>用户按的取消不是"网络抖了一下"：必须原样上抛，不能被闸门等成挂起。</summary>
+    [SkippableFact]
+    public async Task User_cancellation_still_propagates_through_the_group_retry()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        using var cts = new CancellationTokenSource();
+        var uploader = new CancellingUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), cts);
+        var (orchestrator, factory, _) = Build(uploader, new SevenZipCompressor());
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-cancel", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
+
+            // 光看异常类型不够：真正要守的是"取消根本没进过闸门"。瞬时判据若拿到的不是运行本身
+            // 那个令牌，取消就会被当成抖动，在闸门前一等再等，直到耐心耗尽把这轮判成挂起——
+            // 那时用户按的是取消，界面上出现的却是"已挂起，稍后自动接着跑"。
+            Assert.False(control.Gate.IsDowngraded, "取消被闸门吞成了自动挂起。");
+            Assert.Null(control.Gate.Current);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>没有 control 的运行（定时任务之外的老路径）行为不变：照样两组、照样不留孤儿。</summary>
+    [SkippableFact]
+    public async Task Runs_without_a_control_behave_exactly_as_before()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatingCompressor(new SevenZipCompressor(), _root);
+        var (orchestrator, factory, store) = Build(
+            new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            var result = await orchestrator.RunAsync(Request(account, name), null, default);
+
+            Assert.Equal(1, result.Version);
+            Assert.Equal(2, compressor.Compressed.Distinct(StringComparer.Ordinal).Count());
+            var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
+            Assert.Equal(referenced, inContainer);
+            Assert.Equal(2, referenced.Count);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+}
