@@ -296,4 +296,69 @@ public sealed class PackAliasDedupTests : IDisposable
             CancellationToken ct = default)
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
+
+    /// <summary>
+    /// T3——本特性最要紧的一条。leader 那个**路径**的文件被删掉之后，别名仍然要能还原。
+    /// <para>
+    /// 那时 liveByPack 里那个 entryName 由别名条目独自提供（RetentionCleaner 按 EntryName 归组，
+    /// 不按 fullHash），所以包不删、成员不死、解压目录里照样取得到。这条链每一环都对，别名才
+    /// 活得下来——而它极容易被将来某次"顺手改成按 hash 归组"的重构悄悄踩断。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_Alias_Survives_After_Its_Leader_Path_Is_Deleted()
+    {
+        Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
+
+        var (backup, restore, store) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("packaliasdel-");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await cc.CreateIfNotExistsAsync();
+
+        // 只保留最新一个版本：v1 退役，包只能靠 v2 里那条别名条目钉住。
+        var keepOne = Request(account, name) with
+        {
+            Options = new BackupEngineOptions
+            {
+                Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000, MaxPackMembers = 1 },
+                Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },
+            },
+        };
+
+        try
+        {
+            var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
+            Write("a/first.txt", payload);       // leader
+            Write("c/second.txt", payload);      // 别名
+            await backup.RunAsync(keepOne);
+
+            var packsAfterV1 = await CountPacksAsync(cc);
+            Assert.Equal(1, packsAfterV1);       // 同内容只装了一箱
+
+            // v2：把 leader 那个路径删掉。包里那个成员此后只被别名条目引用着。
+            File.Delete(Path.Combine(_src, "a", "first.txt"));
+            await backup.RunAsync(keepOne);
+
+            // 包一个都不能少——删了就等于把 c/second.txt 的数据删了。
+            Assert.Equal(packsAfterV1, await CountPacksAsync(cc));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v2 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            Assert.DoesNotContain(v2.Entries, e => e.Path == "a/first.txt");
+            var second = v2.Entries.Single(e => e.Path == "c/second.txt");
+            // 成员名仍是**最初**那个已经不存在的路径——还原要按它去归档里取。
+            Assert.Equal("a/first.txt", second.Storage!.EntryName);
+
+            // 决定性的一条：内容还在，还原得回来。
+            await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+            Assert.Equal(payload, await File.ReadAllTextAsync(Path.Combine(_dst, "c", "second.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "a", "first.txt")));
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
 }
