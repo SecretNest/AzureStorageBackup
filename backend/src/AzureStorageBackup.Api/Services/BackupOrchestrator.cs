@@ -362,6 +362,61 @@ public sealed class BackupOrchestrator(
         var opts = request.Options;
         var password = request.Password;
 
+        // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
+        // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
+        // 用户下达任何停法也走这一条：读盘同样没有意义了。
+        //
+        // 建在**最顶上**而不是等到流水线那一段才建：扫描与读版本索引各自都能跑上几分钟（本仓库
+        // 实测过 20 万条目的扫描、50 万条目的索引），而这两段全在任何一次上传之前。令牌若等到
+        // 流水线才有，用户在扫描两分钟时按下的停止要等整棵树扫完、每一版索引读完才起作用；
+        // 而 SuspendAsync/CancelAsync 是要等到终态才返回的，那段时间里 HTTP 请求就一直挂着。
+        using var stopProducing = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.StopToken);
+        // 消费者用的令牌：只有 Stop now 会打断在途上传。Suspend/Finish current files 走的是
+        // "循环顶上检查一下就 break"，在途那件活照做完。
+        using var working = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.AbortToken);
+
+        // 用户按下的停止，与"进程正在关停"（ct）是两回事：后者不是本轮的停法，照旧往上抛。
+        bool StoppedByUser() => control is { Stop: not StopKind.None } && !ct.IsCancellationRequested;
+
+        // 上传之前那两段（扫描、读版本索引）被叫停时的统一收场。
+        // 这两段跑在任何上传之前，所以没有在途、没有残留卷要清；但 journal 照样得落盘，
+        // 异常类型也照样得按停法映射对（Suspend → BackupSuspendedException，两种取消 →
+        // OperationCanceledException）——原始取消要是直接逃出去，BackupRunner 会把一次
+        // Suspend 记成 Canceled，而这一整套区分正是本功能的全部内容。SettleStopAsync 管这个。
+        async Task<T> BeforeUploadAsync<T>(Func<CancellationToken, Task<T>> body)
+        {
+            T result;
+            try
+            {
+                result = await body(stopProducing.Token);
+            }
+            catch (OperationCanceledException) when (StoppedByUser())
+            {
+                throw await SettleStopAsync(control!.Stop);
+            }
+            // 令牌未必被观察到（读索引命中本地缓存时一次 I/O 都没有），所以回来之后再问一次。
+            if (StoppedByUser())
+                throw await SettleStopAsync(control!.Stop);
+            return result;
+        }
+
+        // 停止收尾：journal 一律落盘（Cancel 也要落——已经传完的块留着给下一轮复用，
+        // 这是用户明确要的），Stop now 还要把在途文件的残留卷删掉。
+        // 全程用 CancellationToken.None：运行自己的令牌此刻多半已经触发，用它一句清理都做不下去。
+        async Task<Exception> SettleStopAsync(StopKind kind)
+        {
+            if (kind == StopKind.StopNow)
+                await PurgeInFlightAsync(request, control!);
+            await control!.FlushAsync(fsync: true, CancellationToken.None);
+            return kind == StopKind.Suspend
+                ? new BackupSuspendedException(SuspendReason.UserRequested, "Suspended by user.")
+                : new OperationCanceledException("Backup stopped by user.");
+        }
+
         // 0. 确保 container 存在（HTTP 触发的备份自足）
         await factory.CreateServiceClient(request.Account)
             .GetBlobContainerClient(request.Container)
@@ -371,7 +426,8 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scanTracker = new StageTracker("Scanning", total: 0, d =>   // 扫完才知道总数，故 total=0
             progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0) { Detail = d }));
-        var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct, scanTracker);
+        var scan = await BeforeUploadAsync(
+            t => scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, t, scanTracker));
         scanTracker.Complete();
 
         // 范围把所有文件都剔光了：diff 会把上一版本的一切判成删除，写出一个空版本。
@@ -398,8 +454,8 @@ public sealed class BackupOrchestrator(
         if (info.Versions.Count > 0)
         {
             var last = info.Versions[^1];
-            previous = await indexCache.ReadAsync(
-                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, ct);
+            previous = await BeforeUploadAsync(t => indexCache.ReadAsync(
+                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, t));
         }
 
         // data blob 寻址方案：加密备份用密钥化地址防指纹识别（密钥从密码 + 信息文件里的盐派生）。
@@ -418,7 +474,8 @@ public sealed class BackupOrchestrator(
         foreach (var v in info.Versions)
             indexes.Add(previous is not null && v.Version == lastVer
                 ? previous
-                : await indexCache.ReadAsync(request.Account, request.Container, v.Version, identity, v.IndexBlob, password, ct));
+                : await BeforeUploadAsync(t => indexCache.ReadAsync(
+                    request.Account, request.Container, v.Version, identity, v.IndexBlob, password, t)));
         var localResolver = LocalDedupResolver.Build(addressing, indexes);
 
         // journal 开卷：基线版本与寻址身份到这里才齐。恢复时靠这两样判断"这卷还作不作数"。
@@ -504,17 +561,7 @@ public sealed class BackupOrchestrator(
         var overlap = opts.OverlapDiffAndUpload;
         using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
 
-        // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
-        // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
-        // 用户下达任何停法也走这一条：读盘同样没有意义了。
-        using var stopProducing = control is null
-            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
-            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.StopToken);
-        // 消费者用的令牌：只有 Stop now 会打断在途上传。Suspend/Finish current files 走的是
-        // "循环顶上检查一下就 break"，在途那件活照做完。
-        using var working = control is null
-            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
-            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.AbortToken);
+        // stopProducing / working 两个令牌建在本方法最顶上（见那里的说明）：扫描与读索引也要看得见停止。
 
         // 一件活撞上瞬时错误就在闸门前等，放行了重试——但重试的**单位**两条路不同。
         //
@@ -566,19 +613,6 @@ public sealed class BackupOrchestrator(
                 await stopProducing.CancelAsync(); // 别再让 diff 白读盘
                 throw;
             }
-        }
-
-        // 停止收尾：journal 一律落盘（Cancel 也要落——已经传完的块留着给下一轮复用，
-        // 这是用户明确要的），Stop now 还要把在途文件的残留卷删掉。
-        // 全程用 CancellationToken.None：运行自己的令牌此刻多半已经触发，用它一句清理都做不下去。
-        async Task<Exception> SettleStopAsync(StopKind kind)
-        {
-            if (kind == StopKind.StopNow)
-                await PurgeInFlightAsync(request, control!);
-            await control!.FlushAsync(fsync: true, CancellationToken.None);
-            return kind == StopKind.Suspend
-                ? new BackupSuspendedException(SuspendReason.UserRequested, "Suspended by user.")
-                : new OperationCanceledException("Backup stopped by user.");
         }
 
         var workers = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
@@ -837,6 +871,14 @@ public sealed class BackupOrchestrator(
 
         // 先把消费者收干净再看有没有停止意愿：停了就不能再往下写版本索引——
         // 一轮没跑完的备份写出一个版本，等于宣称那些没传的文件已经备份好了。
+        //
+        // 这道检查与下面的写索引之间有一个窗口：停止意愿恰好在检查通过之后才到达的话，这一轮会
+        // 照常写完索引、报 Completed，而 SuspendAsync/CancelAsync 等到终态之后仍然返回 true。
+        // 这是**固有的、可接受的**：那一刻活其实已经全干完了，"停止"没有任何东西可停，用户拿到
+        // 的是一次完整成功的备份——比停在门口更好的结果。**不要**为此加锁把写索引与停止请求串起来：
+        // 那把锁会横跨写索引 + 写信息文件 + 写本地缓存三次 I/O，而停止请求是从 HTTP 线程同步
+        // 调进来的（BackupRunner.RequestStop 里 Cancel() 会在当前线程跑回调），等于让用户按下
+        // 停止按钮的那个请求挂在一串云端写上——为了消掉一个结果本来就正确的竞态。
         await SettleAsync(consumers);
         if (control is { Stop: var stopKind } && stopKind != StopKind.None)
             throw await SettleStopAsync(stopKind);

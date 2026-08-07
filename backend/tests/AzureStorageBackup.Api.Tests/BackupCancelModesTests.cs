@@ -90,8 +90,13 @@ public sealed class BackupCancelModesTests : IDisposable
         }
     }
 
-    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory) Build(
-        IBlobUploader uploader, IOperationLog? opLog = null, INotifier? notifier = null)
+    /// <param name="reuse">跨两次 Build 共用同一份本地权威（信息文件 + 索引缓存）。
+    /// "先跑成功一轮、再在第二轮读版本索引时叫停"这种用例非它不可：每次新建一份的话，
+    /// 第二轮根本看不到第一轮写下的版本，也就没有索引可读。</param>
+    /// <param name="wrapIndexCache">只包**编排器**手上那一份索引缓存；保留清理仍拿真的那份。</param>
+    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, TestLocalAuthority Authority) Build(
+        IBlobUploader uploader, IOperationLog? opLog = null, INotifier? notifier = null,
+        TestLocalAuthority? reuse = null, Func<ILocalIndexCache, ILocalIndexCache>? wrapIndexCache = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -100,18 +105,18 @@ public sealed class BackupCancelModesTests : IDisposable
         var compactor = new DeadWeightCompactor(
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
             staging);
-        var authority = new TestLocalAuthority(store);
+        var authority = reuse ?? new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+            new FileHasher(), wrapIndexCache?.Invoke(authority.IndexCache) ?? authority.IndexCache, authority.Tracked,
             notifier: notifier, opLog: opLog);
-        return (orchestrator, factory);
+        return (orchestrator, factory, authority);
     }
 
-    private BackupRequest Request(Account account, string container) => new()
+    private BackupRequest Request(Account account, string container, long? volumeBytes = null) => new()
     {
         Account = account,
         Container = container,
@@ -124,6 +129,7 @@ public sealed class BackupCancelModesTests : IDisposable
             // "第 2 次上传时叫停"这句话才说得准。
             UploadConcurrency = 1,
             Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+            VolumeBytes = volumeBytes,
         },
     };
 
@@ -319,7 +325,7 @@ public sealed class BackupCancelModesTests : IDisposable
         var uploader = new StopAt(
             new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), at: 1,
             stop: () => control!.RequestStop(StopKind.Suspend), thenThrow: false);
-        var (orchestrator, factory) = Build(uploader);
+        var (orchestrator, factory, _) = Build(uploader);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
@@ -341,6 +347,117 @@ public sealed class BackupCancelModesTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>读版本索引时挂住不返回，直到**递进来的那个令牌**被取消。
+    /// 50 万条目的索引真读起来要好几秒（本仓库实测过），几十个版本累起来就是几分钟；
+    /// 令牌若没接进这一步（用的还是运行自己的 ct），这个替身会一直挂着，用例超时红掉。</summary>
+    private sealed class BlockingIndexCache(ILocalIndexCache inner) : ILocalIndexCache
+    {
+        public TaskCompletionSource Reading { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<VersionIndex> ReadAsync(
+            Account account, string container, int version, long identityTicks,
+            string indexBlob, string? password, CancellationToken ct = default)
+        {
+            Reading.TrySetResult();
+            await Task.Delay(Timeout.Infinite, ct);   // 只有令牌救得了它
+            return await inner.ReadAsync(account, container, version, identityTicks, indexBlob, password, ct);
+        }
+
+        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index,
+            CancellationToken ct = default) => inner.PutAsync(accountId, container, version, identityTicks, index, ct);
+
+        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => inner.RemoveAsync(accountId, container, version, ct);
+
+        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
+            => inner.RemoveForContainerAsync(accountId, container, ct);
+    }
+
+    private static async Task<Exception> RunAndCatchAsync(Task run, StopKind kind) =>
+        kind == StopKind.Suspend
+            ? await Assert.ThrowsAsync<BackupSuspendedException>(() => run)
+            : await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+    /// <summary>扫描之前就下达停止：扫描必须当场看得见它，而且要**走收尾路径**退出——
+    /// 按停法产出对的异常类型，而不是让一个裸取消逃出去被 BackupRunner 记成 Failed。
+    /// <para>
+    /// "没开卷"就是"扫描确实被截断了"的判据：journal 开卷排在扫描与读索引**之后**，
+    /// 令牌若没接进扫描，这一轮会一路跑到开卷才被 diff 拦下，盘上就会留下一卷 journal。
+    /// </para></summary>
+    [SkippableTheory]
+    [InlineData(StopKind.Suspend)]
+    [InlineData(StopKind.FinishCurrentFiles)]
+    [InlineData(StopKind.StopNow)]
+    public async Task A_stop_before_the_scan_settles_without_ever_opening_a_journal(StopKind kind)
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        var uploader = new StopAt(
+            new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), at: -1, stop: () => { }, thenThrow: false);
+        var (orchestrator, factory, _) = Build(uploader);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WriteBytes("big1.bin", 6_000_000);
+            WriteBytes("big2.bin", 6_000_001);
+            await using var c = new BackupRunControl(_journals, 8, "run-early-" + (int)kind);
+            c.RequestStop(kind);
+
+            await RunAndCatchAsync(orchestrator.RunAsync(Request(account, name), null, default, c), kind);
+
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+            Assert.Equal(0, uploader.Calls);
+            Assert.Empty(await DataBlobsAsync(container));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>读版本索引读到一半按下停止：必须当场有反应，而不是等每一版索引都读完。
+    /// 用户按下停止之后 SuspendAsync/CancelAsync 一直等到终态才返回，不当场反应就是 HTTP 挂死。</summary>
+    [SkippableTheory]
+    [InlineData(StopKind.Suspend)]
+    [InlineData(StopKind.StopNow)]
+    public async Task A_stop_during_the_version_index_load_settles_instead_of_waiting_for_it(StopKind kind)
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        var real = new BlobUploader(new BlobClientFactory(TestSecrets.Reader));
+        var (first, factory, authority) = Build(real);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WriteBytes("small1.bin", 1024);
+            WriteBytes("small2.bin", 2048);
+            // 先跑成功一轮：第二轮才有版本索引可读。
+            Assert.Equal(1, (await first.RunAsync(Request(account, name), null, default)).Version);
+
+            BlockingIndexCache? blocking = null;
+            var (second, _, _) = Build(
+                real, reuse: authority, wrapIndexCache: inner => blocking = new BlockingIndexCache(inner));
+
+            await using var c = new BackupRunControl(_journals, 8, "run-index-" + (int)kind);
+            var run = second.RunAsync(Request(account, name), null, default, c);
+
+            await blocking!.Reading.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            c.RequestStop(kind);
+
+            // 令牌没接进读索引那一步的话，这一句会一直挂到超时——那正是这条用例要钉的回归。
+            await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(30)), kind);
+
+            // 停在开卷之前，所以盘上不该留下 journal；也不该写出第二个版本。
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+            var info = await authority.Tracked.LoadAsync(account, name, null, default);
+            Assert.Single(info!.Versions);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>用户按的取消不是事故：不留长存 Error，也不发失败 webhook。
     /// Task 9 之前这条靠的是"Cancel 取消了 ct，于是 Record 自己抛出、什么都没记"这个巧合；
     /// 现在 ct 不再被碰，必须有东西钉着。</summary>
@@ -358,7 +475,7 @@ public sealed class BackupCancelModesTests : IDisposable
         var uploader = new StopAt(
             new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), at: 1,
             stop: () => control!.RequestStop(StopKind.StopNow), thenThrow: false);
-        var (orchestrator, factory) = Build(uploader, opLog, notifier);
+        var (orchestrator, factory, _) = Build(uploader, opLog, notifier);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
@@ -402,7 +519,7 @@ public sealed class BackupCancelModesTests : IDisposable
         var uploader = new StopAt(
             new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), at: 2,
             stop: () => control!.RequestStop(StopKind.StopNow), thenThrow: true);
-        var (orchestrator, factory) = Build(uploader);
+        var (orchestrator, factory, _) = Build(uploader);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
