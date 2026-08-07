@@ -104,13 +104,14 @@ public enum RunStatus
     Suspended,
 }
 
-public enum SuspendReason { UserRequested, Crashed }
+public enum SuspendReason { UserRequested, AutoSuspended, Crashed }
 ```
 
-主动暂停与崩溃遗留**合并成同一个状态**：恢复路径、清理判据、界面按钮完全一致，
-拆成两个枚举值只会让那 15 处判断从考虑 5 种变成考虑 6 种。界面用 reason 区分措辞：
+主动暂停、自动降级、崩溃遗留**合并成同一个状态**：恢复路径、清理判据、界面按钮完全
+一致，拆成三个枚举值只会让那 15 处判断从考虑 5 种变成考虑 7 种。界面用 reason 区分措辞：
 
 - `Suspended — 3,412 items uploaded, paused by you`
+- `Suspended — 3,412 items uploaded, network unreachable for 10 min`
 - `Suspended — 3,412 items uploaded, interrupted by shutdown`
 
 `Suspended` 是终态，现有 `== Running` 的判断自动把它当"不在跑"——也正确。
@@ -122,9 +123,11 @@ public enum SuspendReason { UserRequested, Crashed }
 | `Running` | 正常跑 | 占席位、占忙碌锁 | `Suspend` `Cancel` |
 | `Running` + `Pause` | 撞网络墙，自愈重试中 | 占席位、占忙碌锁 | `Retry now` `Suspend` `Cancel` |
 | `Running` + `Suspending` | 收尾中，等在途上传返回 | 占席位、占忙碌锁 | （无，显示等待） |
+| `Running` + `Canceling` | 收尾中，见「取消」一节 | 占席位、占忙碌锁 | （无，显示等待） |
 | `Suspended` | 可恢复 | 全部已释放 | `Resume` `Discard` |
 
-`Suspend` 保住已传的，`Cancel` 才是放弃——顺带补上"停止即全丢"这个缺口。
+`Suspend` 保住恢复现场，`Cancel` 放弃这一轮——顺带补上"停止即全丢"这个缺口。
+两个过渡态的 `Status` **都仍是 `Running`**：资源还没交出去，所有判断仍应视为"正忙"。
 
 ## 挂起闸门
 
@@ -169,11 +172,46 @@ IsPausable(ex, ct) =
 2. 用户点 `Retry now`
 3. 用户点 `Cancel`（放行成取消）
 
-**闸门不释放暂存席位、不释放忙碌锁。** 代价是另一个并发备份在挂起期间只能拿到一半
-暂存额度（`StagingArea.QuotaFor` 按席位数均分）；好处是现场和账本一字不动，恢复时不必
-重新排队等额度。要交还资源就用主动暂停。
-
 挂起时发一条通知（沿用 `NotificationEvents` 那套），无人值守时才有人知道。
+
+### 挂起会绑架别的备份，必须限时
+
+闸门不释放暂存席位、不释放忙碌锁——现场和账本一字不动，恢复时不必重新排队等额度。
+但这有一个**必须解掉**的后果。
+
+`StagingArea.cs:87` 的第一道闸是全局的：
+
+```csharp
+private bool HasRoom(StagingLease? lease) =>
+    Interlocked.Read(ref _stagedBytes) < stagedLimit()      // ← 全局，不分席位
+    && (lease is null || lease.Bytes < QuotaFor(lease));
+```
+
+挂起的运行手上那批已压缩、待上传的产物**照样计在 `_stagedBytes` 里**。一旦吃满全局上限
+（默认 2 GB），另一个备份的 `HasRoom` 恒为 false，卡在 `WaitForRoomAsync` 的
+`await _releaseSignal.WaitAsync(ct)` 上——而 `SignalRelease` 只在有卷上传完或
+`Reservation.Dispose` 时发信号，挂起的运行不再上传，**信号永远不来**。
+
+不是永久死锁（网络一恢复就全活了），但等于：一个跟这次故障毫不相干的备份——可能是完全
+不同的账户、不同的网络路径——被绑架到故障恢复为止。第二道闸（席位均分）只是让它变慢，
+第一道闸是让它彻底停摆。
+
+**解法：挂起有耐心阈值，超时自动降级为 `Suspended`。**
+
+```
+撞墙 → 挂起，保持现场，自愈重试（30s → 1m → 5m → 每 5m）
+     → 累计超过阈值（默认 10 分钟）仍不通
+     → 自动走 Suspend 的收尾路径：清 staged、释放席位与忙碌锁、
+       journal 落盘、Task 结束，reason = UserRequested 之外的第三种：AutoSuspended
+```
+
+短暂抖动零成本（绝大多数情况几十秒内自愈，现场完好，别人最多等这几十秒）；长时间故障
+自动交还全部资源，别的备份立刻解放，而这一轮的进度一件不丢——随时可 Resume。
+
+复用的是已定的 Suspend 路径，不引入新机制。`SuspendReason` 因此有三个值：
+`UserRequested` / `AutoSuspended` / `Crashed`，界面措辞各不同，恢复路径完全一致。
+
+自动降级同样发通知。
 
 ## journal
 
@@ -278,8 +316,8 @@ pack 每轮随机前缀在这里反而是优势：重算出的新箱绝不会和
 - 备份完成时：既有的第 10 步 cleanup，天然覆盖
 - Discard 时：主动跑一次
 - 作废（前提校验不过）时：主动跑一次
-- `Cancel` 时：同 Discard——按下 `Cancel` 就是放弃这一轮，journal 随之摘出活动集合并
-  删除，然后跑一次正常清理。`Cancel` 与 `Suspend` 的区别正在于此，二者不能含糊。
+- **`Cancel` 时不清理**，理由见「取消」一节
+- 删除备份配置时：见「取消」一节末尾
 
 ### 暂存目录
 
@@ -313,6 +351,76 @@ pack 每轮随机前缀在这里反而是优势：重算出的新箱绝不会和
 
 自动挂起状态下也能点 `Suspend`，走同一条收尾路径。
 
+## 取消
+
+`Cancel` 与 `Suspend` 的唯一区别是**恢复现场留不留**：`Suspend` 留 journal，
+`Cancel` 删 journal。云上已传的块两者都留着（见下）。
+
+### 等收尾真正完成才返回
+
+现在 `BackupRunner.Cancel`（`BackupRunner.cs:185`）只是 `Cancellation.Cancel()` 然后
+立刻返回 `bool`，调用方无从知道那一轮到底停干净了没有。改成异步：端点等到 journal 落盘、
+临时文件清掉、席位与忙碌锁释放之后才返回。期间是 `Canceling` 子状态，界面显示
+`Canceling…`。
+
+理由与 `Suspend` 同：忙碌锁没释放时若端点已返回成功，用户下一步操作（改配置、删配置、
+再跑一次）会撞上一个还没死透的运行。
+
+### 两种停法，按下 Cancel 时问
+
+| 选项 | 行为 |
+|---|---|
+| `Stop now` | 取消令牌一穿到底，强杀在途上传。最快停下 |
+| `Finish current files` | 等在途的文件各自传完（**含全部分卷**）再停 |
+
+第二项对多卷大文件尤其值：一个 50 GB 的文件传到第 19 卷被强杀，那 19 卷全废；加密多卷
+下次还要被 `ClearLeftoverVolumesAsync` 全删重传（`BackupOrchestrator.cs:1283`）。
+
+`Suspend` 没有这个选项——它按定义就是 `Finish current files`（不强杀，见上一节）。
+所以 `Stop now` 是唯一会强杀在途上传的路径。
+
+### 完整的留着，不完整的当场删掉
+
+判据是 **journal**：它只记确认返回的那些，所以 journal 里的 = 完整，在途的 = 不完整。
+
+**完整传完的留着。** 单文件 blob 是内容寻址的 `data/{fullHash}`，下一次备份跑到同一个
+文件时 `If-None-Match` 直接命中，**这一轮传的字节一分不白费**；复用之后它被新版本索引
+引用，自然不再是孤儿。若 `Cancel` 时把它们也删干净，`Finish current files` 就等于白等
+——传完也是删。两个决定必须一致，这里选了让字节有价值的那一侧。
+
+**不完整的当场删掉。** `Stop now` 强杀在途上传时，那个文件可能已经传了一部分分卷：
+20 卷的归档只落地 19 卷，它是**解不开的**。收尾时按在途的 `blobRef` 列举并删除它自己的
+全部卷，复用 `ClearLeftoverVolumesAsync` 里的 `VolumeBlobIO.IsVolumeOf`
+（`BackupOrchestrator.cs:1300`）——那个判定只认这个归档自己的卷，不会误删碰撞避让的
+兄弟 `data/{hash}~1`，那是另一份内容、由别的索引条目引用着，误删就是真丢数据。
+
+于是两种停法的收尾是不同的：
+
+| 选项 | staged 未传的 | 完整传完的 | 在途那个文件 |
+|---|---|---|---|
+| `Stop now` | 删 | 留 | **删掉它的全部残留卷** |
+| `Finish current files` | 删 | 留 | 等它传完，也是完整的，留 |
+
+严格说，逐卷 if-missing 本来就能把缺的卷补上（`VolumeBlobIO.cs:110` 的注释记着这件事，
+明文下重压产出的卷逐字节相同，实测确认过），所以残留卷不至于导致错误。当场删的价值在
+另一头：**不必等到下一次备份才回收**，而 `Stop now` 的语义本来就是干净利落地停。
+
+pack 不享受"留着复用"：随机前缀让下一轮必然是新箱，旧 pack 永远是孤儿，会在下一次备份的
+第 10 步 cleanup 里被正常清掉。
+
+**代价**：如果就此不再跑这个备份，这批块会一直占着云存储费用。所以——
+
+### 删除备份配置时兜底清理
+
+`Cancel` 留下的块靠"下一次备份"回收，而删配置意味着不会有下一次了。删除路径
+（`BackupConfigEndpoints.cs:209`）要补上兜底：
+
+- `deleteContainer = true`：整个 container 删掉，孤儿一并消失，无需额外动作
+- `deleteContainer = false`：云端数据留着供以后导入，但那批孤儿是纯垃圾——删配置前
+  跑一次孤儿清理（journal 已摘出活动集合，走的还是统一判据），并删掉该配置的全部 journal
+
+同理，`Suspended` 状态下删配置也走这条：现场不再有人恢复，journal 和它护着的块一起清。
+
 ## 测试
 
 安全性优先，下面几条都是"错了就丢数据"的形状：
@@ -322,24 +430,30 @@ pack 每轮随机前缀在这里反而是优势：重算出的新箱绝不会和
 - 恢复命中判据：path 同、fullHash 不同 → 不命中
 - 清理判据：活动 journal 引用的块不被删；作废后走正常判据；**"info 已提交、journal 未删"
   那个边界——块已被新版本引用，作废清理绝不能碰它**
-- 状态模型：`Suspending` / `Suspended` 期间调度器不插进来另起一轮
+- 状态模型：`Suspending` / `Canceling` / `Suspended` 期间调度器不插进来另起一轮
+- **自动降级解绑架**：A 挂起且吃满 `stagedLimit` → B 卡在 `WaitForRoomAsync` →
+  A 超时降级 → B 解冻并跑完。这是并发时序测试，也是这一整节存在的理由
+- `Stop now` 删掉在途文件的残留卷，且**不碰** `data/{hash}~1` 这个碰撞避让的兄弟
+- 取消令牌区分：用户按 `Cancel` 不被误判成网络错误而挂起
 
 其余：`IsTransient` 分类表（含嵌套 `AggregateException`）、闸门放行的三个来源、
-主动暂停时在途上传等待收尾、启动清空暂存目录。
+主动暂停与取消时在途上传等待收尾、`Cancel` 端点等收尾完成才返回、
+删除配置时的兜底清理、启动清空暂存目录。
 
 Azurite 必须起着跑（`npx azurite --skipApiVersionCheck`），否则相关集成测试静默跳过。
 
 ## 实施顺序
 
-按"能独立上线"切：
+**一次性上线，不分批发版。** 下面的切分只是实施与验证的次序，每阶段各自可测。
 
-| 阶段 | 内容 | 价值 |
-|---|---|---|
-| 1 | 修 `IsTransient` + 错误分类 | 当场解决线上问题，退避真正生效 |
-| 2 | 启动时清空 `compress`/`staged` | 修掉现存目录泄漏 |
-| 3 | journal 只写不读 | 时序安全先立住，不改变任何行为 |
-| 4 | 挂起闸门 + 自愈重试 + API/UI | 网络抖动不再毁掉整轮 |
-| 5 | 恢复 + 清理判据 | 崩溃不再白跑 |
-| 6 | 主动暂停 | 资源可交还 |
+| 阶段 | 内容 |
+|---|---|
+| 1 | 修 `IsTransient` + 错误分类（含取消令牌的区分） |
+| 2 | 启动时清空 `compress`/`staged`，修掉现存目录泄漏 |
+| 3 | journal 只写不读——时序安全先立住，不改变任何行为 |
+| 4 | 挂起闸门 + 自愈重试 + 超时自动降级 |
+| 5 | 主动暂停与取消（两种停法、异步收尾、残留卷清理） |
+| 6 | 恢复 + 统一清理判据 + 删配置兜底 |
+| 7 | API 与前端：状态、按钮、Cancel 对话框、轮询适配 |
 
-阶段 1 单独就能合并上线，不必等后面。
+阶段 4 依赖 3（降级要 journal 落盘），6 依赖 3 和 5。
