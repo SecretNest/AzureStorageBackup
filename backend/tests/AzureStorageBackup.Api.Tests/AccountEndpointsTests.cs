@@ -102,6 +102,108 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
     }
 
+    /// <summary>
+    /// 还被备份占用的账户不能删。库里 <c>BackupConfig.AccountId</c> 没有外键约束，删了不会报错，
+    /// 只会留下一批指向空号的孤儿配置——而它们要到下次真跑起来才炸（<c>BackupRunner</c>/
+    /// <c>CheckRunner</c>/<c>RestoreRunner</c> 三处的 "Account {id} not found"）。定时任务的话
+    /// 就是半夜失败、第二天才看见；还原那条更糟，等到真要恢复数据时才发现配置是坏的。
+    /// </summary>
+    [Fact]
+    public async Task Delete_Is_Refused_While_A_Backup_Still_Uses_The_Account()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("del-in-use"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.BackupConfigs.Add(new BackupConfig
+            {
+                AccountId = created!.Id, ContainerName = "photos", Name = "Photos", LocalRoot = "/data/photos",
+            });
+            db.BackupConfigs.Add(new BackupConfig
+            {
+                AccountId = created.Id, ContainerName = "docs", Name = "Documents", LocalRoot = "/data/docs",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var del = await _client.DeleteAsync($"/api/accounts/{created!.Id}");
+        Assert.Equal(HttpStatusCode.Conflict, del.StatusCode);
+
+        // 占用者的名字要说出来——只说"删不了"，用户还得自己一个个翻备份去找是谁占着。
+        var body = await del.Content.ReadAsStringAsync();
+        Assert.Contains("Documents", body);
+        Assert.Contains("Photos", body);
+
+        // 而且真的没删。
+        var get = await _client.GetAsync($"/api/accounts/{created.Id}");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+    }
+
+    /// <summary>占用信息要随账户一起下发，界面才能在渲染那一刻就把删除按钮禁掉并说明原因。</summary>
+    [Fact]
+    public async Task Get_Reports_Which_Backups_Use_The_Account()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("usage-report"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        // 刚建出来的账户没人用。
+        Assert.Empty(created!.UsedByBackups);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            // 故意按倒序插入：响应里必须是排好序的，否则同一个页面每刷新一次悬浮提示就换个样。
+            db.BackupConfigs.Add(new BackupConfig
+            {
+                AccountId = created.Id, ContainerName = "z", Name = "Zeta", LocalRoot = "/data/z",
+            });
+            db.BackupConfigs.Add(new BackupConfig
+            {
+                AccountId = created.Id, ContainerName = "a", Name = "Alpha", LocalRoot = "/data/a",
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var get = await _client.GetAsync($"/api/accounts/{created.Id}");
+        var fetched = await get.Content.ReadFromJsonAsync<AccountResponse>();
+        Assert.Equal(["Alpha", "Zeta"], fetched!.UsedByBackups);
+
+        // 列表页走的是另一条（批量）路径，同样要带上。
+        var list = await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts");
+        Assert.Equal(["Alpha", "Zeta"], list!.Single(a => a.Id == created.Id).UsedByBackups);
+    }
+
+    /// <summary>
+    /// 编辑态的连通测试：Key 框留空表示"沿用现有凭据"，此时不能像不带 id 的那个端点一样
+    /// 甩一个 400 回来——"改了 endpoint 或代理，想先测一下现有 key 还连不连得上"正是编辑时
+    /// 最该能做的事。
+    /// </summary>
+    [Fact]
+    public async Task TestConnection_For_An_Existing_Account_Accepts_A_Blank_Key()
+    {
+        var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("test-conn-by-id"));
+        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+
+        var res = await _client.PostAsJsonAsync(
+            $"/api/accounts/{created!.Id}/test-connection", SampleRequest("test-conn-by-id") with { AccountKey = "" });
+
+        // 连不连得上取决于这个假 endpoint（连不上是必然的），但**不能**是"你没填 key"那种拒绝：
+        // 走到这一步就说明库里的密文被正确地搬了过来。
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var body = await res.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("AccountKey is required.", body);
+    }
+
+    [Fact]
+    public async Task TestConnection_For_A_Missing_Account_Returns_404()
+    {
+        var res = await _client.PostAsJsonAsync(
+            "/api/accounts/999999/test-connection", SampleRequest() with { AccountKey = "" });
+        Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
+    }
+
     [Fact]
     public async Task Put_Updates_Name()
     {

@@ -15,17 +15,24 @@ public record AccountResponse(
     int? ProxyPort,
     string? ProxyUsername,
     DateTimeOffset CreatedAt,
-    bool SecretsUnavailable)
+    bool SecretsUnavailable,
+    /// <summary>占用这个账户的备份名（按名字排序）。非空即不可删——界面据此禁用删除并说明原因。</summary>
+    IReadOnlyList<string> UsedByBackups)
 {
     /// <summary>
     /// <paramref name="secretsUnavailable"/> 必须按该账户密文的实际可解性传入
     /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
     /// 已重设成功的账户必须停止显示「待重设」。
     /// </summary>
-    public static AccountResponse From(Account a, bool secretsUnavailable = false) => new(
+    /// <param name="usedByBackups">
+    /// 占用这个账户的备份名。默认空＝没有占用；调用方拿不到占用信息时**不要**用默认值蒙混，
+    /// 那会让界面把一个不可删的账户显示成可删的。
+    /// </param>
+    public static AccountResponse From(
+        Account a, bool secretsUnavailable = false, IReadOnlyList<string>? usedByBackups = null) => new(
         a.Id, a.Name, a.Description, a.BlobEndpoint, a.Region,
         a.UseProxy, a.ProxyMode, a.ProxyHost, a.ProxyPort, a.ProxyUsername, a.CreatedAt,
-        secretsUnavailable);
+        secretsUnavailable, usedByBackups ?? []);
 }
 
 /// <summary>创建/更新账户请求体。更新时 AccountKey/ProxyPassword 为空表示保留原值。</summary>

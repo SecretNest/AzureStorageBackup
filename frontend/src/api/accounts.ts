@@ -23,6 +23,8 @@ export interface Account {
   proxyUsername: string | null
   createdAt: string
   secretsUnavailable: boolean
+  /** 占用这个账户的备份名（已排序）。非空即不可删。 */
+  usedByBackups: string[]
 }
 
 export interface AccountInput {
@@ -52,6 +54,12 @@ export const accountsApi = {
   remove: (id: number) => api.del(`/accounts/${id}`),
   testConnection: (input: AccountInput) =>
     api.post<ConnectionResult>('/accounts/test-connection', input),
+  /**
+   * 编辑态的连通测试：Key 留空时用库里已存的那份，其余字段用表单里改过的值。
+   * 不能复用上面那个——它对空 Key 直接 400，而编辑时 Key 框本来就是空的。
+   */
+  testConnectionFor: (id: number, input: AccountInput) =>
+    api.post<ConnectionResult>(`/accounts/${id}/test-connection`, input),
   resetSecrets: (id: number, accountKey: string, proxyPassword: string | null) =>
     api.post<void>(`/accounts/${id}/reset-secrets`, { accountKey, proxyPassword }),
 }

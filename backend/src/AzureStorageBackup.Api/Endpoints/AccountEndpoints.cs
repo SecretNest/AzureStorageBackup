@@ -15,13 +15,18 @@ public static class AccountEndpoints
         group.MapGet("/", async (IAccountService svc, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var list = await svc.ListAsync(ct);
-            return Results.Ok(list.Select(a => AccountResponse.From(a, Pending(keyring, encryption, a))));
+            var usage = await svc.GetBackupUsageAsync(ct);
+            return Results.Ok(list.Select(a =>
+                AccountResponse.From(a, Pending(keyring, encryption, a), usage.GetValueOrDefault(a.Id))));
         });
 
         group.MapGet("/{id:int}", async (int id, IAccountService svc, IKeyringHealth keyring, IEncryptionService encryption, CancellationToken ct) =>
         {
             var a = await svc.GetAsync(id, ct);
-            return a is null ? Results.NotFound() : Results.Ok(AccountResponse.From(a, Pending(keyring, encryption, a)));
+            if (a is null)
+                return Results.NotFound();
+            var usage = await svc.GetBackupUsageAsync(ct);
+            return Results.Ok(AccountResponse.From(a, Pending(keyring, encryption, a), usage.GetValueOrDefault(id)));
         })
         .WithName("GetAccount");
 
@@ -31,7 +36,9 @@ public static class AccountEndpoints
                 return Results.BadRequest(new { error = "AccountKey is required." });
 
             var created = await svc.CreateAsync(req.ToAccount(encryption), ct);
-            return Results.CreatedAtRoute("GetAccount", new { id = created.Id }, AccountResponse.From(created, Pending(keyring, encryption, created)));
+            // 刚建出来的账户不可能已被占用，显式传空比走默认值更能说明这里不是"拿不到所以留空"。
+            return Results.CreatedAtRoute("GetAccount", new { id = created.Id },
+                AccountResponse.From(created, Pending(keyring, encryption, created), []));
         });
 
         group.MapPut("/{id:int}", async (int id, AccountRequest req, IAccountService svc, IEncryptionService encryption, IKeyringHealth keyring, CancellationToken ct) =>
@@ -48,13 +55,30 @@ public static class AccountEndpoints
                 update.ProxyPasswordProtected = existing.ProxyPasswordProtected;
 
             var result = await svc.UpdateAsync(id, update, ct);
+            if (result is null)
+                return Results.NotFound();
+            var usage = await svc.GetBackupUsageAsync(ct);
             // 保留原密文的分支恰恰是密钥环丢失时解不开的那份密文，必须如实上报 SecretsUnavailable；
             // 而提交了新凭据的分支写入的是当前密钥环的密文，逐条试解会如实返回 false。
-            return result is null ? Results.NotFound() : Results.Ok(AccountResponse.From(result, Pending(keyring, encryption, result)));
+            return Results.Ok(AccountResponse.From(
+                result, Pending(keyring, encryption, result), usage.GetValueOrDefault(id)));
         });
 
         group.MapDelete("/{id:int}", async (int id, IAccountService svc, KeyringRecovery recovery, CancellationToken ct) =>
         {
+            // 还被备份占用就不能删。库里 BackupConfig.AccountId 没有外键约束，所以数据库那一层
+            // 拦不住——删完留下的是一批 AccountId 指向空号的孤儿配置，而它们一直到下次真跑起来
+            // 才炸（BackupRunner/CheckRunner/RestoreRunner 三处的 "Account {id} not found"）。
+            // 定时任务的话就是半夜失败、第二天才看见；还原那条更糟，等到真要恢复数据时才发现。
+            // 界面已经把删除按钮禁掉了，这里是同一道判断的服务端一侧——不设，那个禁用就只是装饰。
+            var usage = await svc.GetBackupUsageAsync(ct);
+            if (usage.GetValueOrDefault(id) is { Count: > 0 } inUse)
+                return Results.Conflict(new
+                {
+                    error = $"Account is used by {inUse.Count} backup(s): {string.Join(", ", inUse)}",
+                    usedByBackups = inUse,
+                });
+
             var ok = await svc.DeleteAsync(id, ct);
             // 删掉的可能正是唯一一条待重设的解不开的密文：不收尾就翻不回 Healthy，
             // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
@@ -73,6 +97,32 @@ public static class AccountEndpoints
 
             var result = await factory.TestConnectionAsync(req.ToAccount(encryption), ct);
             return Results.Ok(result);
+        });
+
+        // 用已存账户的凭据测试连通（编辑态）。
+        //
+        // 编辑一个已有账户时 Key 框是空的（"Leave blank to keep current"），而上面那个不带 id 的
+        // 端点会因为空 Key 直接 400——于是"改了 endpoint 或代理，想先测一下现有 key 还连不连得上"
+        // 这件最该能做的事，恰恰做不了。这里补上：空的敏感字段沿用库里的密文，其余字段一律用
+        // 请求里改过的值，所以测的是"新配置 + 旧凭据"这个真正要验证的组合。
+        //
+        // 与 PUT 用的是同一套"空即保留"的搬运逻辑（直接搬密文，不解密），两处必须保持一致——
+        // 否则会出现"测得通但存不进"或反过来的情形。
+        group.MapPost("/{id:int}/test-connection", async (
+            int id, AccountRequest req, IAccountService svc, IBlobClientFactory factory,
+            IEncryptionService encryption, CancellationToken ct) =>
+        {
+            var existing = await svc.GetAsync(id, ct);
+            if (existing is null)
+                return Results.NotFound();
+
+            var probe = req.ToAccount(encryption);
+            if (string.IsNullOrEmpty(req.AccountKey))
+                probe.AccountKeyProtected = existing.AccountKeyProtected;
+            if (string.IsNullOrEmpty(req.ProxyPassword))
+                probe.ProxyPasswordProtected = existing.ProxyPasswordProtected;
+
+            return Results.Ok(await factory.TestConnectionAsync(probe, ct));
         });
 
         // 凭据重设（设计 §3.4）。不复用 PUT——PUT 在恢复模式下受限，且此处必须验证后才落库。
