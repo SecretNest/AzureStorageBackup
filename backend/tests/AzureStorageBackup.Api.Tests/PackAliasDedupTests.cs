@@ -365,4 +365,44 @@ public sealed class PackAliasDedupTests : IDisposable
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// T7：两条条目指向同一个 pack 成员，检查必须把两条都判健康。
+    /// <para>
+    /// BackupChecker 逐条查 actual[entryName]，两条查的是同一项、内容当然相同；而
+    /// "归档吐出的成员数 == 列举出的成员数" 那条前提也不受影响——别名不进归档。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Check_Reports_Both_Entries_Healthy()
+    {
+        Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
+
+        var (backup, _, _) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("packaliaschk-");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await cc.CreateIfNotExistsAsync();
+
+        try
+        {
+            var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
+            Write("a/first.txt", payload);
+            Write("c/second.txt", payload);
+            await backup.RunAsync(Request(account, name));
+
+            var checker = new BackupChecker(
+                factory, new BackupInfoStore(factory, new SevenZipArchiveCodec()),
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            var report = await checker.CheckAsync(account, name, null, null, new CheckOptions());
+
+            // 一条损坏都不该有，两条条目都要出现在结论里。
+            Assert.True(report.Ok);
+            Assert.Empty(report.CorruptedPaths);
+            Assert.Contains(report.Findings, f => f.Path == "a/first.txt");
+            Assert.Contains(report.Findings, f => f.Path == "c/second.txt");
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
 }
