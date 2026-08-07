@@ -1011,16 +1011,50 @@ public sealed class BackupOrchestrator(
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        var cleanup = await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+
+        // 版本索引与信息文件都已提交（上面第 7/8/9 步），这一轮已经是一次完整、成功的备份——
+        // 接下来的清理只是顺手维护，不是"这次备份"本身的一部分。用户此刻的停止意愿绝不能
+        // 让这次已经成功的备份被记成 Suspended/Canceled：不走 SettleStopAsync，就是这个理由。
+        //
+        // Task 9 把旧 Cancel() 直接取消运行自己的 ct 那条路拆掉之后，这里成了唯一一处漏网的
+        // 尾巴：stopProducing/working 两个令牌都不接在这段上，用户在 CleaningUp 阶段按下停止，
+        // 死重压实该下载、重压、重传照样跑完（可能是几分钟到几小时），而 CancelAsync/SuspendAsync
+        // 是等到终态才返回的——HTTP 请求会跟着一起挂那么久。
+        //
+        // 停止意愿如果在**进入清理之前**就已经落定，直接整段跳过：该清的超期版本、该压实的
+        // 死重，下一轮 cleaner 照样会看一遍全部版本补上，不会有任何数据永久漏清或漏压。
+        // 不要把这句"跳过"当成可有可无的优化去掉——它就是本节存在的全部意义。
+        CleanupReport cleanup;
+        if (control is { Stop: not StopKind.None })
         {
-            Retention = request.Options.Retention,
-            DataTier = request.DataTier,
-            VolumeBytes = request.Options.VolumeBytes,
-            DeadWeightThreshold = request.Options.DeadWeightThreshold,
-            LocalRoot = request.LocalRoot,
-            AllowRepackDownload = request.Options.AllowRepackDownload,
-            // 收尾顺带压实用**本轮自己的**席位：另取一个会让均分的分母虚高，把并行的其它备份额度算小。
-        }, info, ct, stagingLease);
+            cleanup = CleanupReport.Empty;
+        }
+        else
+        {
+            try
+            {
+                cleanup = await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+                {
+                    Retention = request.Options.Retention,
+                    DataTier = request.DataTier,
+                    VolumeBytes = request.Options.VolumeBytes,
+                    DeadWeightThreshold = request.Options.DeadWeightThreshold,
+                    LocalRoot = request.LocalRoot,
+                    AllowRepackDownload = request.Options.AllowRepackDownload,
+                    // 收尾顺带压实用**本轮自己的**席位：另取一个会让均分的分母虚高，把并行的其它备份额度算小。
+                    // ct 传 stopProducing.Token（不是裸 ct）：停止意愿若是在压实*进行中途*才到达，
+                    // 这里也要能被打断，而不是只在进入清理前那一次检查里管用——这正是 Task 9 之前
+                    // 旧 Cancel() 取消运行自己的 ct 时，压实这一段本来就享有的行为，这里是照旧恢复。
+                }, info, stopProducing.Token, stagingLease);
+            }
+            catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // 压实半路被打断：版本早已提交，这仍然是一次成功的备份，只是清理没做完——
+                // 绝不能让这个取消原样逃出去，那会被 RunAsync 顶上的分支当成 Suspended/Canceled，
+                // 把一次成功的备份倒扣掉。跳过的部分留给下一轮 cleaner 补上。
+                cleanup = CleanupReport.Empty;
+            }
+        }
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
 
