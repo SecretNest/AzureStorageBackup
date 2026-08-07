@@ -482,7 +482,15 @@ public sealed class BackupOrchestrator(
 
         // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
         // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
-        using var stopProducing = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // 用户下达任何停法也走这一条：读盘同样没有意义了。
+        using var stopProducing = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.StopToken);
+        // 消费者用的令牌：只有 Stop now 会打断在途上传。Suspend/Finish current files 走的是
+        // "循环顶上检查一下就 break"，在途那件活照做完。
+        using var working = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.AbortToken);
 
         // 一件活撞上瞬时错误就在闸门前等，放行了重试——但重试的**单位**两条路不同。
         //
@@ -509,14 +517,19 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                while (await work.DequeueAsync(ct) is { } item)
+                while (await work.DequeueAsync(working.Token) is { } item)
                 {
+                    // 还没开工的活，停下来之后就不做了。已经开工的那件不受影响——
+                    // "做完当前这件再停"这句承诺就落在这个位置上。
+                    if (control is { Stop: not StopKind.None })
+                        break;
+
                     // 领走一件活。从这里到 BeginUpload（压完、开始抢流的额度）之间是压缩与暂存，
                     // 一箱 100 MB 过 7z 可以几十秒——界面上得看得见这段，否则就是"什么都没在发生"。
                     uploadTracker.BeginWork();
                     try
                     {
-                        await RunItemAsync(item, ct);
+                        await RunItemAsync(item, working.Token);
                     }
                     finally
                     {
@@ -531,9 +544,23 @@ public sealed class BackupOrchestrator(
             }
         }
 
+        // 停止收尾：journal 一律落盘（Cancel 也要落——已经传完的块留着给下一轮复用，
+        // 这是用户明确要的），Stop now 还要把在途文件的残留卷删掉。
+        // 全程用 CancellationToken.None：运行自己的令牌此刻多半已经触发，用它一句清理都做不下去。
+        async Task<Exception> SettleStopAsync(StopKind kind)
+        {
+            if (kind == StopKind.StopNow)
+                await PurgeInFlightAsync(request, control!);
+            await control!.FlushAsync(fsync: true, CancellationToken.None);
+            return kind == StopKind.Suspend
+                ? new BackupSuspendedException(SuspendReason.UserRequested, "Suspended by user.")
+                : new OperationCanceledException("Backup stopped by user.");
+        }
+
         var workers = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
         List<Task> consumers = [];
-        void StartConsumers() => consumers = [.. Enumerable.Range(0, workers).Select(_ => Task.Run(ConsumeAsync, ct))];
+        void StartConsumers() =>
+            consumers = [.. Enumerable.Range(0, workers).Select(_ => Task.Run(ConsumeAsync, working.Token))];
 
         if (overlap)
             StartConsumers();
@@ -757,7 +784,10 @@ public sealed class BackupOrchestrator(
         }
         catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            // diff 是被上传侧的失败叫停的：真正的原因在消费者那边，等它们把它抛出来。
+            // diff 是被叫停的：可能是上传侧失败，也可能是用户下达了停法。
+            await SettleAsync(consumers);
+            if (control is { Stop: var stopped } && stopped != StopKind.None)
+                throw await SettleStopAsync(stopped);
             await Task.WhenAll(consumers);
             throw; // 消费者居然没抛：那就把这个取消交上去，绝不静默当成功
         }
@@ -781,6 +811,11 @@ public sealed class BackupOrchestrator(
         // 这些告警也吞掉，而"有文件读不开"恰恰是最需要告诉操作员的时候。
         await RecordUnreadableWarningsAsync(request, scan, diff, ct);
 
+        // 先把消费者收干净再看有没有停止意愿：停了就不能再往下写版本索引——
+        // 一轮没跑完的备份写出一个版本，等于宣称那些没传的文件已经备份好了。
+        await SettleAsync(consumers);
+        if (control is { Stop: var stopKind } && stopKind != StopKind.None)
+            throw await SettleStopAsync(stopKind);
         await Task.WhenAll(consumers);
 
         // 本轮内跨箱去重的收尾：把挂在各 leader 身上的别名回填成与 leader 相同的 StorageRef。
@@ -1057,7 +1092,8 @@ public sealed class BackupOrchestrator(
         try
         {
             placement = await PlaceBlobAsync(
-                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, state, ct);
+                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, state,
+                control, ct);
         }
         // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
         // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
@@ -1126,7 +1162,8 @@ public sealed class BackupOrchestrator(
     private async Task<BlobPlacement> PlaceBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
-        VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, CancellationToken ct)
+        VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, BackupRunControl? control,
+        CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
@@ -1156,7 +1193,7 @@ public sealed class BackupOrchestrator(
             {
                 var (volumes, sizes) = await UploadStagedBlobAsync(
                     request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, state,
-                    file.Path, ct);
+                    file.Path, control, ct);
                 res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
             }
@@ -1290,7 +1327,7 @@ public sealed class BackupOrchestrator(
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
         BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
-        string sourceLabel, CancellationToken ct)
+        string sourceLabel, BackupRunControl? control, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
         // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
@@ -1303,11 +1340,14 @@ public sealed class BackupOrchestrator(
             if (content.Raw)
                 meta["raw"] = "1";
             await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, uploadTracker, ct);
+            control?.TrackInFlight(blobRef);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
                 onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
                 label: sourceLabel);                     // 界面上显示源文件路径，不是内容寻址的 blob 名
+            // 确认返回了才销账。抛异常时故意**不**销：那份残留正是 Stop now 要清掉的东西。
+            control?.ClearInFlight(blobRef);
             // 记在整件传完之后：中途失败会把整轮备份带失败，那时这个数字根本不会被用到，
             // 而按卷边传边记会让一次重试把同一批字节记两遍。
             state.AddUploaded(sizes.Sum());
@@ -1373,6 +1413,27 @@ public sealed class BackupOrchestrator(
         finally
         {
             uploadTracker.EndChecking();
+        }
+    }
+
+    /// <summary>
+    /// Stop now 的收尾：把还挂在在途登记里的内容连同它的全部分卷删掉。
+    /// 登记只在上传确认返回后才销账，所以留在里面的就是"传了一半、没人认得"的残留。
+    /// 完整传完的块不在此列——它们留着给下一轮复用，这是用户明确要的。
+    /// </summary>
+    private async Task PurgeInFlightAsync(BackupRequest request, BackupRunControl control)
+    {
+        var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+        foreach (var blobRef in control.InFlight)
+        {
+            await foreach (var b in container.GetBlobsAsync(
+                BlobTraits.None, BlobStates.None, blobRef, CancellationToken.None))
+            {
+                // 按前缀列举会连带捞到碰撞避让的兄弟（data/{hash}~1 及其分卷），那是**另一份内容**、
+                // 由别的索引条目引用着，误删就是真丢数据。IsVolumeOf 只认这个归档自己的卷。
+                if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
+                    await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
+            }
         }
     }
 
@@ -1543,7 +1604,7 @@ public sealed class BackupOrchestrator(
                 if (changed.Count == 0)
                 {
                     var vols = await UploadStagedPackAsync(
-                        request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
+                        request, packId, staged!, uploadScope, uploadTracker, state, members.Count, control, ct);
                     return (changed, members, vols);   // 空表：这一组干干净净地成了一个 pack
                 }
 
@@ -1556,7 +1617,7 @@ public sealed class BackupOrchestrator(
                 {
                     var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
                     var vols2 = await UploadStagedPackAsync(
-                        request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
+                        request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, control, ct);
                     return (changed, stable, vols2);
                 }
                 return (changed, [], []);   // 整组成员都被判为变化/读不开：没有稳定成员可记
@@ -1698,7 +1759,8 @@ public sealed class BackupOrchestrator(
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, VolumeUploadScope uploadScope,
-        StageTracker uploadTracker, RunState state, int memberCount, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, int memberCount, BackupRunControl? control,
+        CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
@@ -1711,12 +1773,15 @@ public sealed class BackupOrchestrator(
             // 通常逐字节相同，但"通常"不是能拿来赌数据的东西：成员的 mtime 在两次尝试之间变过
             // （内容没变，因此重校验不会把它排除）就足以让归档头不同，拼起来一样打不开。
             await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, uploadTracker, ct);
+            control?.TrackInFlight(blobName);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
                 onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
                 // 一箱装着几百个文件，列不下——报包号与成员数。
                 label: $"pack {packId} ({memberCount} files)");
+            // 确认返回了才销账。抛异常时故意**不**销：那份残留正是 Stop now 要清掉的东西。
+            control?.ClearInFlight(blobName);
             state.AddUploaded(sizes.Sum());   // 时机同单文件路径：整件传完才记
         }
         finally

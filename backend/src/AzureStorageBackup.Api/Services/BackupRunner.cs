@@ -209,17 +209,48 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
-    /// <summary>停止正在跑的那次备份。返回 false = 当前没有在跑的运行。</summary>
-    public bool Cancel(int configId)
+    /// <summary>下达停止意愿。返回被叫停的运行，没有在跑则返回 null。</summary>
+    private BackupRunState? RequestStop(int configId, StopKind kind)
     {
         BackupRunState? state;
+        // Cancel()/RequestStop() 会在**当前线程**同步执行已注册的回调；放在 _lock 里的话，
+        // 任一回调只要回头碰到这个 runner 就会自锁。锁只用来取那一条记录。
         lock (_lock)
             state = _runs.GetValueOrDefault(configId);
         if (state is not { Status: RunStatus.Running })
+            return null;
+        if (state.Control is { } control)
+        {
+            // 状态改成终态之前 control 就已经释放了（`await using` 先于 catch 块生效）。
+            // 那一瞬间进来的停止请求什么也做不了——这一轮反正已经在收尾了，当作"没在跑"。
+            try { control.RequestStop(kind); }
+            catch (ObjectDisposedException) { return null; }
+        }
+        else
+            state.Cancellation.Cancel();   // 还没跑到建 control 那一步（解析配置阶段）
+        return state;
+    }
+
+    /// <summary>立刻停（不等落盘）。保留给共用的 /cancel 端点与其它运行器同形。</summary>
+    public bool Cancel(int configId) => RequestStop(configId, StopKind.StopNow) is not null;
+
+    /// <summary>主动暂停：做完手上这件活，落盘，退出成 Suspended。等落盘完成才返回。</summary>
+    public async Task<bool> SuspendAsync(int configId, CancellationToken ct = default)
+    {
+        if (RequestStop(configId, StopKind.Suspend) is not { } state)
             return false;
-        // Cancel() 会在**当前线程**同步执行已注册的回调；放在 _lock 里的话，任一回调只要回头
-        // 碰到这个 runner 就会自锁。锁只用来取那一条记录。
-        state.Cancellation.Cancel();
+        await state.Completion.Task.WaitAsync(ct);
+        return true;
+    }
+
+    /// <summary>取消。<paramref name="finishCurrentFiles"/> 为 true 时等在途文件（含其全部分卷）传完。
+    /// 用户要求"Cancel 要等落盘成功再返回"，所以这里一定要等到终态。</summary>
+    public async Task<bool> CancelAsync(int configId, bool finishCurrentFiles, CancellationToken ct = default)
+    {
+        var kind = finishCurrentFiles ? StopKind.FinishCurrentFiles : StopKind.StopNow;
+        if (RequestStop(configId, kind) is not { } state)
+            return false;
+        await state.Completion.Task.WaitAsync(ct);
         return true;
     }
 

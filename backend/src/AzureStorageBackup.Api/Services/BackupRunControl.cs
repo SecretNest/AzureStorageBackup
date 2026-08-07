@@ -1,4 +1,21 @@
+using System.Collections.Concurrent;
+
 namespace AzureStorageBackup.Api.Services;
+
+/// <summary>怎么个停法。</summary>
+public enum StopKind
+{
+    None,
+
+    /// <summary>主动暂停：做完手上这件，落盘，退出成 Suspended。</summary>
+    Suspend,
+
+    /// <summary>取消，但把正在上传的文件（含它的全部分卷）做完再停。</summary>
+    FinishCurrentFiles,
+
+    /// <summary>取消，立刻中断在途上传，并删掉它留下的残留卷。</summary>
+    StopNow,
+}
 
 /// <summary>
 /// 一次备份运行的"外部把手"：编排器不认识运行注册表，也不该认识；它只认这一个对象。
@@ -15,6 +32,40 @@ public sealed class BackupRunControl(
     public PauseGate Gate { get; } = gate ?? new PauseGate();
 
     public string RunId => runId;
+
+    /// <summary>任何停法都会触发：叫停 diff（继续读盘没有意义）。</summary>
+    private readonly CancellationTokenSource _stop = new();
+
+    /// <summary>**只有** Stop now 会触发：打断在途上传。
+    /// Suspend 与 Finish current files 绝不能碰它，否则"做完当前这件再停"就是句空话。</summary>
+    private readonly CancellationTokenSource _abort = new();
+
+    private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.Ordinal);
+
+    private int _stopKind;
+
+    public StopKind Stop => (StopKind)Volatile.Read(ref _stopKind);
+    public CancellationToken StopToken => _stop.Token;
+    public CancellationToken AbortToken => _abort.Token;
+
+    /// <summary>登记/销账"正在上传的这块内容"。Stop now 收尾时按它删残留卷。</summary>
+    public void TrackInFlight(string blobRef) => _inFlight[blobRef] = 1;
+    public void ClearInFlight(string blobRef) => _inFlight.TryRemove(blobRef, out _);
+    public IReadOnlyCollection<string> InFlight => _inFlight.Keys.ToList();
+
+    /// <summary>下达停止意愿。重复下达只认第一次（用户点了 Stop now 之后再点 Suspend 没有意义）。</summary>
+    public void RequestStop(StopKind kind)
+    {
+        if (kind == StopKind.None)
+            return;
+        if (Interlocked.CompareExchange(ref _stopKind, (int)kind, (int)StopKind.None) != (int)StopKind.None)
+            return;
+        // 正卡在闸门上等重试的工作者要被叫醒，否则它们会一直等到下一次自愈计时器到点。
+        Gate.Downgrade();
+        _stop.Cancel();
+        if (kind == StopKind.StopNow)
+            _abort.Cancel();
+    }
 
     /// <summary>
     /// 开卷。必须等编排器算出基线版本与寻址身份之后再调——这两样是恢复的前置条件，
@@ -91,5 +142,7 @@ public sealed class BackupRunControl(
         if (_journal is not null)
             await _journal.DisposeAsync();
         _journal = null;
+        _stop.Dispose();
+        _abort.Dispose();
     }
 }
