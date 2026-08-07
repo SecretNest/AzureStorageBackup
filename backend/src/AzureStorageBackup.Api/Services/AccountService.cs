@@ -56,4 +56,22 @@ public class AccountService(AppDbContext db) : IAccountService
         await db.SaveChangesAsync(ct);
         return true;
     }
+
+    public async Task<IReadOnlyDictionary<int, IReadOnlyList<string>>> GetBackupUsageAsync(
+        CancellationToken ct = default)
+    {
+        // 一次取回全部再在内存里分组：列表页要的是**所有**账户的占用情况，逐个账户查就是 N+1。
+        // 个人备份的规模（账户个位数、备份几十条）下这一趟的代价可以忽略。
+        var rows = await db.BackupConfigs.AsNoTracking()
+            .Select(c => new { c.AccountId, c.Name })
+            .ToListAsync(ct);
+
+        return rows
+            .GroupBy(r => r.AccountId)
+            .ToDictionary(
+                g => g.Key,
+                // 按名字排序：这串要原样进界面的悬浮提示，顺序不稳定会让同一个页面每次刷新都换个样。
+                g => (IReadOnlyList<string>)[.. g.Select(r => r.Name)
+                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)]);
+    }
 }

@@ -13,10 +13,34 @@ import { Modal } from '../components/Modal'
 import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
+/// 新建时预填的模板。给的是**实际值**而不是 placeholder：这个 URL 只有一段需要改，
+/// 摆成可编辑的文本比摆成灰字提示更省事——用户把 <endpoint> 换掉就完事了。
+/// 漏改的那一半由 isValidEndpoint 兜着（见那里的注释）。
+const endpointTemplate = 'https://<endpoint>.blob.core.windows.net/'
+
+/**
+ * Blob endpoint 必须是一个合法的 http(s) URL。
+ *
+ * 不特判上面那个模板：`<` `>` 是 WHATWG 的 forbidden host code point，出现在**主机名**里会让
+ * `new URL()` 直接抛——而占位符恰好就在主机名那一段，所以通用的 URL 校验顺手就把没改完的
+ * 模板挡下了，还连带挡住了所有手滑输入。（放在 path 里的 `<>` 反倒是合法的，会被百分号编码，
+ * 这也正是"检查是不是合法 URL"比"找占位符"更对的地方。）
+ *
+ * 协议那一条是额外加的：`new URL()` 对 `ftp://` 之类同样放行。
+ */
+const isValidEndpoint = (s: string) => {
+  try {
+    const { protocol } = new URL(s.trim())
+    return protocol === 'https:' || protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
 const emptyForm: AccountInput = {
   name: '',
   description: '',
-  blobEndpoint: '',
+  blobEndpoint: endpointTemplate,
   region: AzureRegion.Global,
   accountKey: '',
   useProxy: false,
@@ -75,6 +99,12 @@ export function AccountsSection() {
   }
 
   const save = async () => {
+    // 先挡非法 endpoint，再进忙碌态：后端建账户时只校验 Key 非空、不看 URL，
+    // 放进去的话要等到第一次连云才会以一个面目全非的错误暴露出来。
+    if (!isValidEndpoint(form.blobEndpoint)) {
+      setError('Blob Endpoint must be a valid http(s) URL.')
+      return
+    }
     setBusy(true)
     setError(null)
     // 非 Global 分区仅代理下有效（PRD 1.1）：未启用代理则强制 Global。
@@ -102,6 +132,7 @@ export function AccountsSection() {
     if (!window.confirm(`Delete account "${a.name}"?`)) return
     try {
       await accountsApi.remove(a.id)
+      setShowForm(false)
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -112,7 +143,14 @@ export function AccountsSection() {
     setBusy(true)
     setTestResult(null)
     try {
-      setTestResult(await accountsApi.testConnection(form))
+      // 编辑态走带 id 的那个端点：Key 框此时是空的（"Leave blank to keep current"），
+      // 不带 id 的端点会因为空 Key 直接 400——而"改了 endpoint 或代理，想先测一下现有 key
+      // 还连不连得上"恰恰是编辑时最该能做的事。
+      setTestResult(
+        editing
+          ? await accountsApi.testConnectionFor(editing.id, form)
+          : await accountsApi.testConnection(form),
+      )
     } catch (e) {
       setTestResult({ success: false, error: e instanceof Error ? e.message : String(e) })
     } finally {
@@ -215,9 +253,6 @@ export function AccountsSection() {
                     </button>{' '}
                     <button type="button" className="btn-ghost" onClick={() => startEdit(a)}>
                       Edit
-                    </button>{' '}
-                    <button type="button" className="btn-ghost btn-danger" onClick={() => remove(a)}>
-                      Delete
                     </button>
                   </td>
                 </tr>
@@ -341,6 +376,32 @@ export function AccountsSection() {
             <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
               Cancel
             </button>
+
+            {/* 删除收在编辑表单里，不再摆在列表每一行上：它是这个页面上唯一不可撤销的操作，
+                摆在行尾等于让它和 Containers/Edit 一样近，而那两个都是随手点的。
+                title 挂在外层 span 而不是按钮上——禁用的按钮在多数浏览器里收不到指针事件，
+                提示会跟着一起失效，而这里恰恰是禁用时最需要说明原因。 */}
+            {editing && (
+              <span
+                style={{ marginLeft: 'auto' }}
+                title={
+                  editing.usedByBackups.length > 0
+                    ? `In use by ${editing.usedByBackups.length} backup${
+                        editing.usedByBackups.length > 1 ? 's' : ''
+                      }: ${editing.usedByBackups.join(', ')}`
+                    : undefined
+                }
+              >
+                <button
+                  type="button"
+                  className="btn-ghost btn-danger"
+                  onClick={() => remove(editing)}
+                  disabled={busy || editing.usedByBackups.length > 0}
+                >
+                  Delete
+                </button>
+              </span>
+            )}
           </div>
 
           {testResult && (

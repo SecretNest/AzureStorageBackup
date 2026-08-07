@@ -1368,6 +1368,22 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   const singlePercent =
     (details[0]?.workPercent ?? details[0]?.percent) ??
     (p.stage >= BackupStage.Uploading ? p.percent : null)
+  // 速度和剩余时间取**上传**那条，没有上传时才退回头条明细。
+  //
+  // 两条并行时不能取 diff 的：diff 的 ETA 说的是"这一轮判完还要多久"，而它判完之后还剩一整个
+  // 上传要跑——把那个数摆在顶上，等于给出一个必然远小于真实剩余的承诺。上传那条则是自洽的：
+  // 它的分母（totalItems）要等 diff 收工才由 SetTotal 定下来，在那之前后端的 Eta() 直接返回 null
+  // （分母都没有，别猜），所以并行期间这一栏自然是空的——不显示，好过显示一个会回退的数。
+  const pace = uploading ?? details[0]
+  // 速度那一条的门槛与明细行一致：有在途的流就显示，哪怕这一瞬的读数是 0（刚起流、还没落账），
+  // 否则数字会在每条流的首尾一闪一闪。
+  const speed =
+    pace && (pace.bytesPerSecond > 0 || pace.activeItems.length > 0)
+      ? `${formatBytes(pace.bytesPerSecond)}/s`
+      : null
+  // 从秒数算，不去切 estimatedRemaining 那个字符串——理由见 formatDuration。
+  const eta = pace?.etaSeconds != null ? `~${formatDuration(pace.etaSeconds)} left` : null
+
   const headline = [
     diffing && uploading
       ? diffing.percent != null && `${diffing.percent}% diffed`
@@ -1376,6 +1392,8 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
     // 两条变回一条的那一瞬，已经传上去的十几个 GB 就从顶行消失了——只剩一个按源字节算的百分比，
     // 而那个数在大备份的前期常年是 0%，看着就像整轮归零重来。绝对量是这里唯一不会回退的数。
     uploading && uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
+    speed,
+    eta,
   ]
     .filter(Boolean)
     .join(' · ')
