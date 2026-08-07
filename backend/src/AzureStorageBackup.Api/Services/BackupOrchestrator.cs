@@ -293,6 +293,27 @@ public sealed class BackupOrchestrator(
                 ct, OperationLogLevel.Warning);
             throw;
         }
+        // 同样必须排在通用 catch (Exception) 之前，理由比 Suspend 那条更硬：
+        // 用户按下的取消是**他自己做的事**，不是事故。落进下面那条兜底就会
+        //   1) 往操作日志里长存一条 Error「Backup failed: photos — Backup stopped by user.」，
+        //      从此这份备份顶着红字、要手动 Reset 才消；
+        //   2) 发一条失败 webhook，半夜把用户叫起来看他自己按的那个按钮。
+        // 两条都与 RunStatus.Canceled 的定义（既不算失败也不算成功）直接冲突。
+        //
+        // Task 9 之前 Cancel 走的是取消 ct，于是 Record 的 _recordGate.WaitAsync(ct) 当场抛出，
+        // 什么都没记——正确的结果，但靠的是一个巧合。现在 ct 不再被碰，就得把它写明白。
+        //
+        // 与 Suspend 那条的区别：这里**不发通知**。「没跑完、可以接着跑」是用户不在场时也要知道的
+        // 事，取消不是——他此刻正盯着界面。日志仍然记一条，但级别 Info、短存：审计上要留下
+        // "这一轮是被人停掉的、不是跑挂了"，而不是留下一条要人处理的告警。
+        catch (OperationCanceledException) when (control is { Stop: not StopKind.None })
+        {
+            // 用 CancellationToken.None：走到这里时运行自己的令牌多半已经触发，用它连这一条都写不下去。
+            await Record(NotificationEvents.BackupFailure, source, $"Backup canceled: {request.Name}",
+                "Stopped by user. Blocks already uploaded are kept for the next run.",
+                CancellationToken.None, OperationLogLevel.Info, notify: false, durable: false);
+            throw;
+        }
         catch (Exception ex)
         {
             await Record(NotificationEvents.BackupFailure, source, $"Backup failed: {request.Name}", ex.Message, ct);
@@ -304,16 +325,19 @@ public sealed class BackupOrchestrator(
     // 故串行化整个上报，避免并发访问 DbContext 击穿备份。
     private readonly SemaphoreSlim _recordGate = new(1, 1);
 
+    /// <param name="notify">false＝只进操作日志，不推 webhook。用户主动取消用它：那条消息在
+    /// 审计上有价值，但推给正盯着界面按下按钮的人没有。</param>
+    /// <param name="durable">日志是长存（审计，留到删备份）还是短存（14 天）。</param>
     private async Task Record(
         NotificationEvents evt, string source, string title, string body, CancellationToken ct,
-        OperationLogLevel? level = null)
+        OperationLogLevel? level = null, bool notify = true, bool durable = true)
     {
         await _recordGate.WaitAsync(ct);
         try
         {
             if (opLog is not null)
-                await opLog.AppendAsync(level ?? EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
-            if (notifier is not null)
+                await opLog.AppendAsync(level ?? EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable);
+            if (notifier is not null && notify)
                 await notifier.NotifyAsync(evt, title, body, ct);
         }
         finally

@@ -55,7 +55,43 @@ public sealed class BackupCancelModesTests : IDisposable
         File.WriteAllBytes(full, new byte[size]);
     }
 
-    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory) Build(IBlobUploader uploader)
+    /// <summary>把 AppendAsync 收进列表的 IOperationLog 替身（durable 一并记下：取消绝不能长存）。
+    /// 项目里已有的几份都是各自文件私有的嵌套类，这里照同一形状再写一份。</summary>
+    private sealed class RecordingOperationLog : IOperationLog
+    {
+        public List<(OperationLogLevel Level, string Source, string Message, bool? Durable)> Entries { get; } = [];
+
+        public Task AppendAsync(
+            OperationLogLevel level, string source, string message, CancellationToken ct = default,
+            bool? durable = null)
+        {
+            lock (Entries) Entries.Add((level, source, message, durable));
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(
+            OperationLogLevel? minLevel, string? source, DateTimeOffset? from, DateTimeOffset? to, int limit,
+            CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    private sealed class RecordingNotifier : INotifier
+    {
+        public List<(NotificationEvents Event, string Title, string Body)> Sent { get; } = [];
+
+        public Task NotifyAsync(NotificationEvents evt, string title, string body, CancellationToken ct = default)
+        {
+            lock (Sent) Sent.Add((evt, title, body));
+            return Task.CompletedTask;
+        }
+    }
+
+    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory) Build(
+        IBlobUploader uploader, IOperationLog? opLog = null, INotifier? notifier = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -70,7 +106,8 @@ public sealed class BackupCancelModesTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            new FileHasher(), authority.IndexCache, authority.Tracked,
+            notifier: notifier, opLog: opLog);
         return (orchestrator, factory);
     }
 
@@ -300,6 +337,53 @@ public sealed class BackupCancelModesTests : IDisposable
             var journal = Assert.Single(await _journals.ListAsync(account.Id, name, default));
             Assert.NotEmpty(journal.Content.Records);
             Assert.NotEmpty(await DataBlobsAsync(container));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>用户按的取消不是事故：不留长存 Error，也不发失败 webhook。
+    /// Task 9 之前这条靠的是"Cancel 取消了 ct，于是 Record 自己抛出、什么都没记"这个巧合；
+    /// 现在 ct 不再被碰，必须有东西钉着。</summary>
+    [SkippableFact]
+    public async Task Cancel_leaves_no_error_audit_entry_and_fires_no_failure_webhook()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stop");
+        BackupRunControl? control = null;
+        var opLog = new RecordingOperationLog();
+        var notifier = new RecordingNotifier();
+        var uploader = new StopAt(
+            new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), at: 1,
+            stop: () => control!.RequestStop(StopKind.StopNow), thenThrow: false);
+        var (orchestrator, factory) = Build(uploader, opLog, notifier);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WriteBytes("big1.bin", 6_000_000);
+            WriteBytes("big2.bin", 6_000_001);
+            await using var c = new BackupRunControl(_journals, 8, "run-cancel-audit");
+            control = c;
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => orchestrator.RunAsync(Request(account, name), null, default, c));
+
+            List<(OperationLogLevel Level, string Source, string Message, bool? Durable)> entries;
+            lock (opLog.Entries) entries = [.. opLog.Entries];
+            List<(NotificationEvents Event, string Title, string Body)> sent;
+            lock (notifier.Sent) sent = [.. notifier.Sent];
+
+            Assert.DoesNotContain(entries, e => e.Level >= OperationLogLevel.Warning);
+            Assert.DoesNotContain(entries, e => e.Message.Contains("Backup failed", StringComparison.Ordinal));
+            Assert.DoesNotContain(sent, n => n.Event == NotificationEvents.BackupFailure);
+
+            // 但审计上要留得下"这一轮是被人停掉的，不是跑挂了"：Info，且短存。
+            var canceled = Assert.Single(
+                entries, e => e.Message.Contains("Backup canceled", StringComparison.Ordinal));
+            Assert.Equal(OperationLogLevel.Info, canceled.Level);
+            Assert.False(canceled.Durable);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
