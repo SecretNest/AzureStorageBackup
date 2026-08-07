@@ -19,18 +19,7 @@ public class JournalResumeTests
     public void Empty_resume_finds_nothing()
     {
         Assert.True(JournalResume.Empty.IsEmpty);
-        Assert.False(JournalResume.Empty.MayResumeBlob("a.bin", 100, "haaa"));
         Assert.Null(JournalResume.Empty.FindBlob("a.bin", "aaa", 100, "haaa", "taaa"));
-    }
-
-    [Fact]
-    public void Prescreen_matches_on_path_length_and_head()
-    {
-        var r = new JournalResume([Blob("a.bin", "aaa")]);
-        Assert.True(r.MayResumeBlob("a.bin", 100, "haaa"));
-        Assert.False(r.MayResumeBlob("b.bin", 100, "haaa"));   // 路径不同
-        Assert.False(r.MayResumeBlob("a.bin", 101, "haaa"));   // 长度变了
-        Assert.False(r.MayResumeBlob("a.bin", 100, "other"));  // 文件头变了
     }
 
     [Fact]

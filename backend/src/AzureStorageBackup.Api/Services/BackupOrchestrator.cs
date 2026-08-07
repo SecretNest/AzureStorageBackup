@@ -1274,7 +1274,7 @@ public sealed class BackupOrchestrator(
         var headBytes = request.Options.Diff.HeadHashBytes;
 
         // 1. 预筛 + 探测。命中就到此为止：一个字节都不用压、不用传。
-        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, control, uploadTracker, ct) is { } p)
+        if (await ProbeForDedupAsync(localPath, headBytes, localResolver, uploadTracker, ct) is { } p)
         {
             // 第一档：上一轮已经确认传上去的这一份。路径 + 内容双对才认——中断之后文件完全
             // 可能被改过，光凭路径复用就是把旧内容当成新内容写进索引。
@@ -1334,18 +1334,17 @@ public sealed class BackupOrchestrator(
     /// 屏幕上是一动不动的 "1 object starting upload"，而它连压缩都还没开始。
     /// </remarks>
     private async Task<BlobContent?> ProbeForDedupAsync(
-        PlannedFile file, string localPath, int headBytes, LocalDedupResolver localResolver,
-        BackupRunControl? control, StageTracker uploadTracker, CancellationToken ct)
+        string localPath, int headBytes, LocalDedupResolver localResolver,
+        StageTracker uploadTracker, CancellationToken ct)
     {
         uploadTracker.BeginChecking();
         try
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
-            // journal 也要参与预筛。恢复时上一轮传上去的内容**还没进任何版本索引**，
-            // localResolver 根本认不出它——只问它一个，整轮的活会一件不落地重做一遍。
-            var may = localResolver.MayDeduplicate(length, head)
-                || (control?.Resume.MayResumeBlob(file.Path, length, head) ?? false);
+            // journal 也要参与预筛：采纳来的确认块已经在 LocalDedupResolver.Build 里折进
+            // localResolver 的预筛集了（见 JournalResume.ConfirmedBlobs），这里问它一个就够。
+            var may = localResolver.MayDeduplicate(length, head);
             localResolver.NoteInFlight(length, head);
             return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
         }

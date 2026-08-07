@@ -21,9 +21,6 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     /// <summary>按成员集合的规范化键索引的 pack 记录。</summary>
     private readonly Dictionary<string, JournalRecord> _packs = BuildPacks(records);
 
-    /// <summary>预筛用：(路径, 长度, head hash)。三样齐了才值得把整个文件读一遍算全文 hash。</summary>
-    private readonly HashSet<string> _prescreen = BuildPrescreen(records);
-
     public bool IsEmpty => _blobs.Count == 0 && _packs.Count == 0;
 
     public int RecordCount => _blobs.Count + _packs.Count;
@@ -46,19 +43,6 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
         return map;
     }
 
-    private static HashSet<string> BuildPrescreen(IReadOnlyList<JournalRecord> records)
-    {
-        var set = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var r in records)
-            if (r.Kind == "blob" && r.Path is { } p && r.HeadHash is { } h)
-                set.Add(PrescreenKey(p, r.Length, h));
-        return set;
-    }
-
-    /// <summary>分隔符一律用 NUL：路径里什么都可能有（空格、竖线、制表符），换个可打印字符就会撞键。</summary>
-    private static string PrescreenKey(string path, long length, string headHash)
-        => $"{path}\0{length}\0{headHash}";
-
     /// <summary>
     /// 成员集合的规范化键：按序拼 路径 + 全文 hash + 长度。
     /// <para>
@@ -75,14 +59,6 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     /// </summary>
     private static string MemberKey(IReadOnlyList<JournalMember> members)
         => string.Join('\n', members.Select(m => $"{m.Path}\0{m.FullHash}\0{m.Length}"));
-
-    /// <summary>
-    /// 预筛：只用（路径 + 长度 + head hash）问一句"值不值得把整个文件读一遍"。
-    /// 这一关必须存在——恢复时那份内容还没进任何版本索引，本地去重表认不出它，
-    /// 不在这里放行的话整轮的活会一件不落地重做一遍。
-    /// </summary>
-    public bool MayResumeBlob(string path, long length, string headHash)
-        => _prescreen.Contains(PrescreenKey(path, length, headHash));
 
     /// <summary>精确匹配一个单文件 blob。四项内容判据全对上才认。</summary>
     public JournalRecord? FindBlob(string path, string fullHash, long length, string headHash, string tailHash)
