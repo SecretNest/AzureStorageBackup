@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using AzureStorageBackup.Api.Data;
+using AzureStorageBackup.Api.Endpoints;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 using Microsoft.EntityFrameworkCore;
@@ -792,6 +793,14 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var restoreRunner = factory.Services.GetRequiredService<RestoreRunner>();
         var backupState = new BackupRunState { Status = RunStatus.Running };
         var restoreState = new RestoreRunState { Status = RunStatus.Running };
+        // 这条裸状态没有走 RunCoreAsync，没人会在它上面调 Completion.TrySetResult()。
+        // /cancel 的备份那一支现在会等 Completion 落定（StopAndWaitAsync），最多等 20 秒才死心——
+        // 不补这一手，本该是毫秒级的分发测试会在这里白等满上限，两次 cancel 调用合计吃掉 40 秒。
+        // 挂在 Cancellation 的 token 上：RequestStop 对没有 Control 的裸状态走的正是
+        // `state.Cancellation.Cancel()` 这条分支，回调与它同步触发，等效于真实收尾时机。
+        // 想诚实地测「真没落定」的那条分支，见 Suspend_Does_Not_Settle_Within_The_Cap 和
+        // Cancel_Does_Not_Settle_Within_The_Cap。
+        backupState.Cancellation.Token.Register(() => backupState.Completion.TrySetResult());
         InjectRun(backupRunner, created.Id, backupState);
         InjectRun(restoreRunner, created.Id, restoreState);
         try
@@ -800,6 +809,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.Equal(HttpStatusCode.OK, res.StatusCode);
             var body = await res.Content.ReadFromJsonAsync<CanceledBody>();
             Assert.Equal(["backup"], body!.canceled);
+            Assert.False(body.stopping);   // 落定得够快，没吃到 20 秒的封顶
 
             Assert.True(backupState.Cancellation.IsCancellationRequested);
             // 并发的还原不能被顺手一起停掉。
@@ -824,7 +834,74 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             (await _client.PostAsync("/api/backup-configs/999999/cancel", null)).StatusCode);
     }
 
-    private sealed record CanceledBody(List<string> canceled);
+    /// <summary>没落定就要老实说「还在停」——而不是假装已经停了。
+    /// 用一条永远不会调用 Completion.TrySetResult() 的裸运行状态制造出真的没落定：
+    /// 挂起请求发出去了（Cancellation 被置位），但没人给它收尾。把 <see cref="BackupConfigEndpoints.StopWaitCap"/>
+    /// 从生产环境的 20 秒调到几十毫秒，这样断言的是同一条超时分支，不用真的等 20 秒。</summary>
+    [Fact]
+    public async Task Suspend_Does_Not_Settle_Within_The_Cap()
+    {
+        var accountId = await CreateAccountAsync("suspend-timeout");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("st", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
+        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion 永不落定
+        InjectRun(backupRunner, created!.Id, backupState);
+        var original = BackupConfigEndpoints.StopWaitCap;
+        BackupConfigEndpoints.StopWaitCap = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/suspend", null);
+            Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
+            var body = await res.Content.ReadFromJsonAsync<StoppingBody>();
+            Assert.True(body!.stopping);
+
+            // 超时不代表没停下：请求确实已经发出去了。
+            Assert.True(backupState.Cancellation.IsCancellationRequested);
+        }
+        finally
+        {
+            BackupConfigEndpoints.StopWaitCap = original;
+            RemoveRun(backupRunner, created.Id);
+        }
+    }
+
+    /// <summary>同上，但走 /cancel。这一支刻意留在 200 OK，不像 /suspend 那样降到 202——
+    /// 见 f96866c 的提交信息：Settled 与 StillStopping 两种结局在 /cancel 上共用同一个
+    /// <c>Results.Ok</c>，区分全靠 body 里的 stopping 字段。</summary>
+    [Fact]
+    public async Task Cancel_Does_Not_Settle_Within_The_Cap()
+    {
+        var accountId = await CreateAccountAsync("cancel-timeout");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("ct", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
+        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion 永不落定
+        InjectRun(backupRunner, created!.Id, backupState);
+        var original = BackupConfigEndpoints.StopWaitCap;
+        BackupConfigEndpoints.StopWaitCap = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/cancel?what=backup", null);
+            Assert.Equal(HttpStatusCode.OK, res.StatusCode);   // 不是 202——/cancel 不用它
+            var body = await res.Content.ReadFromJsonAsync<CanceledBody>();
+            Assert.Equal(["backup"], body!.canceled);
+            Assert.True(body.stopping);
+
+            Assert.True(backupState.Cancellation.IsCancellationRequested);
+        }
+        finally
+        {
+            BackupConfigEndpoints.StopWaitCap = original;
+            RemoveRun(backupRunner, created.Id);
+        }
+    }
+
+    private sealed record CanceledBody(List<string> canceled, bool stopping);
+
+    private sealed record StoppingBody(bool stopping);
 
     private static Dictionary<int, TState> RunsOf<TRunner, TState>(TRunner runner) where TRunner : notnull =>
         (Dictionary<int, TState>)typeof(TRunner)

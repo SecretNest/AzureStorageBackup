@@ -889,7 +889,15 @@ public static class BackupConfigEndpoints
     private enum StopOutcome { NothingRunning, Settled, StillStopping }
 
     /// <summary>
-    /// 发出停止请求并等它落盘完成，但**最多等 20 秒**。
+    /// 落盘等待的封顶时长。HTTP 契约里没有这个数字——它纯粹是给测试项目开的缝：
+    /// 靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
+    /// "真没落定、答 202/200 stopping:true" 那条分支，不然一次诚实的超时测试就要真等 20 秒。
+    /// 生产环境永远是 20 秒；测试用完记得在 finally 里调回来，它是进程内共享的静态字段。
+    /// </summary>
+    internal static TimeSpan StopWaitCap = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// 发出停止请求并等它落盘完成，但**最多等 <see cref="StopWaitCap"/>（生产环境 20 秒）**。
     /// <para>
     /// 为什么要等：用户点完停止，要的是"现在现场已经安全了"，而不是"信号发出去了"。
     /// 为什么要封顶：Suspend 与 Finish current files 都会让正在传的文件（含它所有分卷）传完，
@@ -902,7 +910,7 @@ public static class BackupConfigEndpoints
         Func<CancellationToken, Task<bool>> stop, CancellationToken ct)
     {
         using var cap = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cap.CancelAfter(TimeSpan.FromSeconds(20));
+        cap.CancelAfter(StopWaitCap);
         try
         {
             return await stop(cap.Token) ? StopOutcome.Settled : StopOutcome.NothingRunning;
