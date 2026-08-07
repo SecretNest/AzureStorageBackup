@@ -115,4 +115,55 @@ public sealed class LocalDedupResolverTests
         // 这一次占位真的能被后续上传完成——证明它不是共享着上一个已判死的 TaskCompletionSource。
         retry.Complete(raw: false, volumes: 1, volumeSizes: [5]);
     }
+
+    /// <summary>
+    /// 「让出 ref」这一笔顺手把预约表的索引器从**全**变成了**偏**：抢占失败的后到者随后要读一次
+    /// <c>_run[refName]</c>，而持有者可能恰好在这两步之间失败并把这条记录撤走。
+    /// <para>
+    /// 撞上的后果不是"重试一次"：<see cref="KeyNotFoundException"/> 不在
+    /// <see cref="TransientErrors"/> 的瞬时判据里，闸门根本接不住它，整轮备份直接判死——
+    /// 正是闸门存在的意义所反对的那个结局。而它偏偏只在失败风暴里出现（多个工作者、同一份内容、
+    /// 失败与查表挤在一起），也就是闸门最该起作用的那一刻。
+    /// </para>
+    /// <para>
+    /// 窗口只有"抢占失败"到"查表"这几条指令宽，一次发令枪齐跑打不中（试过：持有者早在后到者
+    /// 摸到表之前就撤完了）。这里改成**持续搅动**：一群工作者在同一个地址上反复"抢到就立刻判死"，
+    /// 于是任一时刻都有人正在撤占位、也有人正卡在抢占失败之后——两者本来就在同一段代码里挤着，
+    /// 不必去凑。撞不上判失败的是断言而不是超时：只要出现一次 <see cref="KeyNotFoundException"/>
+    /// 就红。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Losing_The_Claim_Race_Survives_The_Holder_Failing_At_That_Instant()
+    {
+        var r = LocalDedupResolver.Build(Plain, []);
+        var stop = DateTime.UtcNow.AddMilliseconds(1500);
+        var workers = Math.Max(4, Environment.ProcessorCount);
+
+        var tasks = new Task[workers];
+        for (var i = 0; i < workers; i++)
+        {
+            tasks[i] = Task.Run(async () =>
+            {
+                while (DateTime.UtcNow < stop)
+                {
+                    try
+                    {
+                        var res = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+                        // 抢到就立刻判死：这一下既撤占位、又放掉所有等在它身上的后到者，
+                        // 地址随即空出来给下一个人抢——搅动就是这么来的。
+                        if (!res.Exists)
+                            res.Fail(new InvalidOperationException("upload boom"));
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // 后到者跟着持有者一起失败：既有行为，不变。
+                    }
+                    // KeyNotFoundException 一个都不许有，所以别的异常原样往上抛。
+                }
+            });
+        }
+
+        await Task.WhenAll(tasks);
+    }
 }

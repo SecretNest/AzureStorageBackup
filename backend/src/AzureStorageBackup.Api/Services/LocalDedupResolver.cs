@@ -170,32 +170,46 @@ public sealed class LocalDedupResolver
                     new ResolvedBlob(refName, false, 1, []), collision);
             }
 
-            // 占位失败后要能把这个 ref 让出来（见 Reservation.Fail）：Task 7 的闸门会把上传失败的
-            // 整件活原样重试，重试时还是同一个内容身份，会再走到这里——占位若不撤，重试者会撞上
-            // 这个已经失败的占位，`held.ContentKey == ck` 命中后直接等一个永远失败的 Completion，
-            // 原样重放同一个异常，永远等不到真正的第二次上传尝试。
-            Reservation? mine = null;
-            mine = new Reservation(ck, () =>
-                ((ICollection<KeyValuePair<string, Reservation>>)_run)
-                    .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
-            if (_run.TryAdd(refName, mine))
-                return Resolution.ForClaim(refName, collision, mine); // 由我上传
-
-            var held = _run[refName];
-            if (held.ContentKey == ck)
+            // 同一个地址上可能要试不止一次，所以这里再套一层循环——原委见下面 TryGetValue 落空那一支。
+            while (true)
             {
-                // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
-                tracker?.BeginWait(UploadWait.Peer);
-                try
+                // 占位失败后要能把这个 ref 让出来（见 Reservation.Fail）：Task 7 的闸门会把上传失败的
+                // 活原样重试，重试时还是同一个内容身份，会再走到这里——占位若不撤，重试者会撞上
+                // 这个已经失败的占位，`held.ContentKey == ck` 命中后直接等一个永远失败的 Completion，
+                // 原样重放同一个异常，永远等不到真正的第二次上传尝试。
+                Reservation? mine = null;
+                mine = new Reservation(ck, () =>
+                    ((ICollection<KeyValuePair<string, Reservation>>)_run)
+                        .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
+                if (_run.TryAdd(refName, mine))
+                    return Resolution.ForClaim(refName, collision, mine); // 由我上传
+
+                // 这里**不能**用索引器 `_run[refName]`。从前它是全的：预约一旦落表就永不移除。
+                // 而"上传失败让出 ref"正是本功能刚加的一笔（见上），于是从上面 TryAdd 判失败到
+                // 这一句之间，持有者完全可能已经在**另一个线程**上失败并把这条记录撤走——索引器
+                // 就此抛 KeyNotFoundException。它不在 TransientErrors 的瞬时判据里，闸门接不住，
+                // 整轮备份直接判死；而它偏偏只在失败风暴里出现（多个工作者、同一份内容、失败与
+                // 查表挤在一起），也就是闸门最该起作用的那一刻。
+                if (!_run.TryGetValue(refName, out var held))
+                    continue;   // 持有者刚撤了占位 → **原地**重抢这同一个地址
+
+                // 落空时绝不能 continue 到外层（换下一个候选地址 …~N）：那不是碰撞，
+                // 却会照碰撞报一条 "Hash collision avoided"，还白占一个避让地址。
+                if (held.ContentKey == ck)
                 {
-                    return Resolution.ForExisting(await held.Completion, collision);
+                    // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
+                    tracker?.BeginWait(UploadWait.Peer);
+                    try
+                    {
+                        return Resolution.ForExisting(await held.Completion, collision);
+                    }
+                    finally
+                    {
+                        tracker?.EndWait(UploadWait.Peer);
+                    }
                 }
-                finally
-                {
-                    tracker?.EndWait(UploadWait.Peer);
-                }
+                break; // 同批不同内容占此址 → 避让到下一个
             }
-            // 同批不同内容占此址 → 避让到下一个
         }
     }
 
