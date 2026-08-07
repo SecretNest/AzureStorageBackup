@@ -376,6 +376,80 @@ public sealed class BackupResumeTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// 预筛放行、内容判据挡下：文件在两轮之间被改了尾巴，长度和头一个字节都没动。
+    /// <para>
+    /// 预筛只问（路径 + 长度 + head hash），这三样全对得上，于是它放行。挡下这个文件的是
+    /// <c>FindBlob</c> 里预筛**没问过**的那两项（全文 hash 与 tail）。让 <c>FindBlob</c> 只认
+    /// 预筛问过的那三样——"都走到这一步了，还能是别的文件么"——它就会被当成"上一轮已经传过了"
+    /// 直接跳过，索引记下的是**旧内容**的 hash、指向**旧内容**的 blob：新写进去的那一段从此
+    /// 再也不在备份里，而界面上一切正常。恢复这条路上唯一能发现这件事的关卡就在这里。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_file_whose_tail_changed_is_uploaded_again_even_though_the_prescreen_passes()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WriteBytes("a.bin", 6_000_000);
+            WriteBytes("b.bin", 6_000_001);
+            WriteBytes("c.bin", 6_000_002);
+
+            BackupRunControl? first = null;
+            var stopping = new CountingUploader(
+                new BlobUploader(factory0), stopAt: 1,
+                stop: () => { first!.RequestStop(StopKind.Suspend); return StopKind.Suspend; });
+            await using (var c = new BackupRunControl(_journals, 9, "run-a"))
+            {
+                first = c;
+                var (o1, _, _) = Build(stopping);
+                await Assert.ThrowsAsync<BackupSuspendedException>(
+                    () => o1.RunAsync(Request(account, name), null, default, c));
+            }
+
+            var done = (await _journals.ListAsync(account.Id, name, default))[0].Content.Records;
+            Assert.NotEmpty(done);
+            Assert.True(done.Count < 3, $"the first run was supposed to be interrupted, it did all {done.Count}");
+
+            // 挑一个**已经传上去了**的文件，只改它的最后一个字节：长度不变、头不变，
+            // 于是预筛照样放行，只有尾部 hash（和全文 hash）能看出它变了。
+            var changed = done[0].Path!;
+            var full = Path.Combine(_root, changed.Replace('/', Path.DirectorySeparatorChar));
+            using (var fs = new FileStream(full, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(-1, SeekOrigin.End);
+                fs.WriteByte(0xFF);
+            }
+            var hasher = new FileHasher();
+            var rewritten = await hasher.FullHashAsync(full);
+            Assert.Equal(new FileInfo(full).Length, done[0].Length);   // 长度确实没变
+            Assert.NotEqual(done[0].FullHash, rewritten);
+
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
+
+            // 没做过的那几件 + 被改过尾巴的这一件。复用的只有其余那些原样没动的。
+            Assert.Equal(3 - done.Count + 1, resuming.Uploads);
+
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            var entry = index.Entries.Single(e => e.Path == changed);
+            Assert.Equal(rewritten, entry.FullHash);            // 记的是**新**内容
+            Assert.NotEqual(done[0].Ref, entry.Storage!.Ref);   // 也不再指着旧内容那个 blob
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task A_changed_key_voids_the_journal_instead_of_reusing_it()
     {
