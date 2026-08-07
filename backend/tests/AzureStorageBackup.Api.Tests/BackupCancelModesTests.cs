@@ -311,7 +311,7 @@ public sealed class BackupCancelModesTests : IDisposable
         for (var round = 0; round < 200; round++)
         {
             await using var c = NewControl();
-            var start = new ManualResetEventSlim(false);
+            using var start = new ManualResetEventSlim(false);
             var racers = new[] { StopKind.Suspend, StopKind.StopNow, StopKind.FinishCurrentFiles }
                 .Select(k => Task.Run(() => { start.Wait(); c.RequestStop(k); }))
                 .ToArray();
