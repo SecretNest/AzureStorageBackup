@@ -262,7 +262,8 @@ public sealed class BackupOrchestrator(
     private static bool IsEmptyFile(ScannedEntry entry) => entry.Kind == EntryKind.File && entry.Length == 0;
 
     public async Task<BackupRunResult> RunAsync(
-        BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
+        BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default,
+        BackupRunControl? control = null)
     {
         // 开始时刻在任何 I/O 之前取：这是操作员心里"这次备份几点开跑"的那一刻。
         var startedAt = DateTimeOffset.UtcNow;
@@ -270,7 +271,7 @@ public sealed class BackupOrchestrator(
         await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
         try
         {
-            var result = await RunCoreAsync(request, startedAt, progress, ct);
+            var result = await RunCoreAsync(request, startedAt, progress, ct, control);
             // 排版与"零值省略"规则见 BackupSummary：那条消息同时进操作日志和 webhook 通知，
             // 是操作员一定会看的一条，所以本轮动了什么、云上多了多少、清掉了多少，都得在里面。
             await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}",
@@ -314,7 +315,8 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task<BackupRunResult> RunCoreAsync(
-        BackupRequest request, DateTimeOffset startedAt, IProgress<BackupProgress>? progress, CancellationToken ct)
+        BackupRequest request, DateTimeOffset startedAt, IProgress<BackupProgress>? progress, CancellationToken ct,
+        BackupRunControl? control = null)
     {
         var opts = request.Options;
         var password = request.Password;
@@ -377,6 +379,12 @@ public sealed class BackupOrchestrator(
                 ? previous
                 : await indexCache.ReadAsync(request.Account, request.Container, v.Version, identity, v.IndexBlob, password, ct));
         var localResolver = LocalDedupResolver.Build(addressing, indexes);
+
+        // journal 开卷：基线版本与寻址身份到这里才齐。恢复时靠这两样判断"这卷还作不作数"。
+        if (control is not null)
+            await control.OpenJournalAsync(
+                request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
+                startedAt, ct);
 
         // 3./4./5. Diff 与「装箱 + 压缩 + 上传」流水线化。
         // 从前这三段严格串行：Diffing 全部跑完 → Plan → Uploading。首次备份的 diff 要把每个文件
@@ -472,11 +480,11 @@ public sealed class BackupOrchestrator(
                     {
                         if (item.Single is { } single)
                             await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, ct);
+                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, ct);
                         else
                             await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
                                 info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
-                                uploadTracker, state, ct);
+                                uploadTracker, state, control, ct);
                     }
                     finally
                     {
@@ -818,7 +826,7 @@ public sealed class BackupOrchestrator(
             var pool = side.OrderBy(f => f.Path, StringComparer.Ordinal).ToList();
             await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
                 storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                uploadTracker, state, ct);
+                uploadTracker, state, control, ct);
         }
 
         // 与扫描/差分同理：不强制产出终态，最后一批传完的字节就永远发布不出去——
@@ -862,6 +870,11 @@ public sealed class BackupOrchestrator(
         // 信息文件已提交 → 现在把版本索引写入本地缓存（冲突已在上一步抛出，不会到这里）。
         if (indexCache is not null)
             await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
+
+        // 索引已提交，journal 使命完成。必须删在清理之前：留着它，清理会以为这些内容还"在途"而不敢动；
+        // 删得比信息文件提交还早，则会出现两边都不认的空档，刚传上去的内容会被当成孤儿删掉。
+        if (control is not null)
+            await control.CompleteAsync();
 
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -1003,7 +1016,7 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, RunState state,
-        CancellationToken ct)
+        BackupRunControl? control, CancellationToken ct)
     {
         var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -1056,6 +1069,13 @@ public sealed class BackupOrchestrator(
             VolumeSizes = [.. placement.VolumeSizes],
         };
         tailByPath[file.Path] = content.TailHash;
+
+        // journal：上传（或 if-missing 命中）已经确认返回，这块内容此刻确实在云上了，现在才敢记。
+        // 顺序不能动——先记后传就会记下一块并不存在的内容，下次恢复直接跳过它，那是数据丢失。
+        if (control is not null)
+            await control.RecordBlobAsync(
+                file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
+                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], ct);
 
         await LogFileAsync(request, file.Path, ct);
         onItem(file.Length);
@@ -1335,7 +1355,7 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
-        RunState state, CancellationToken ct)
+        RunState state, BackupRunControl? control, CancellationToken ct)
     {
         var plan = request.Options.Plan;
         var threshold = plan.SingleFileThresholdBytes;
@@ -1433,7 +1453,7 @@ public sealed class BackupOrchestrator(
             {
                 var vols = await UploadStagedPackAsync(
                     request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
-                RecordPack(request, packId, members, vols, storeOnly, info, storageByPath);
+                await RecordPackAsync(request, packId, members, vols, storeOnly, info, storageByPath, control, ct);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
                 continue;
@@ -1449,7 +1469,7 @@ public sealed class BackupOrchestrator(
                 var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
                 var vols2 = await UploadStagedPackAsync(
                     request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
-                RecordPack(request, packId, stable, vols2, storeOnly, info, storageByPath);
+                await RecordPackAsync(request, packId, stable, vols2, storeOnly, info, storageByPath, control, ct);
                 foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
             }
             // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
@@ -1497,7 +1517,7 @@ public sealed class BackupOrchestrator(
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
                     await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
                         storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                        uploadTracker, state, ct);
+                        uploadTracker, state, control, ct);
                 }
                 else
                 {
@@ -1587,9 +1607,10 @@ public sealed class BackupOrchestrator(
     /// <param name="storeOnly">这一箱的压法，记进 <see cref="PackInfo.StoreOnly"/>。死重压实与修复重压会
     /// 重写同一个 packId 的归档，那时手上只有存活成员和一个包号、没有当初那份规则——不记在包上，
     /// 一个 store-only 包挨过一次版本退役就被重压成默认压法了，而且没有任何征兆。</param>
-    private static void RecordPack(
+    private static async Task RecordPackAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members, IReadOnlyList<long> volumeSizes,
-        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
+        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRunControl? control, CancellationToken ct)
     {
         foreach (var m in members)
             storageByPath[m.Path] = new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName };
@@ -1606,6 +1627,14 @@ public sealed class BackupOrchestrator(
         };
         lock (info.Packs)
             info.Packs[packId] = packInfo;
+
+        // journal：pack 已经传完确认。成员表要记全，恢复时得靠它重建 PackInfo——
+        // 信息文件是最后才提交的，崩溃时它里面根本没有这个包。
+        if (control is not null)
+            await control.RecordPackAsync(
+                packId,
+                [.. members.Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length))],
+                volumeSizes, storeOnly, ct);
     }
 
     private static string Local(BackupRequest request, string relPath) =>

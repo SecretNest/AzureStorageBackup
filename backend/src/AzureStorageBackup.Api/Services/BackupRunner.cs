@@ -29,6 +29,9 @@ public sealed class BackupRunState
     public DateTimeOffset? StartedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
 
+    /// <summary>这一次运行的标识。journal 文件名就是它，恢复时按它对上号。</summary>
+    public string RunId { get; } = Guid.NewGuid().ToString("N")[..12];
+
     /// <summary>
     /// 内部机制，不进 HTTP 契约：失败时的原始异常。RunCoreAsync 的 catch 里连 Error 一起设置，
     /// 供 TaskDispatcher 在向上抛出时挂作 InnerException——容器日志因此保留 Azure 异常自带的
@@ -211,9 +214,11 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
             var password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config);
 
+            await using var control = new BackupRunControl(
+                sp.GetRequiredService<BackupJournalStore>(), configId, state.RunId);
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
-                new StateProgress(state), ct);
+                new StateProgress(state), ct, control);
             state.Version = result.Version;
             state.UnreadableFiles = result.UnreadableFiles;
             state.StartedAt = result.StartedAt;
