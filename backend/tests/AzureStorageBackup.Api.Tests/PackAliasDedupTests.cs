@@ -205,4 +205,95 @@ public sealed class PackAliasDedupTests : IDisposable
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// T6：leader 在压缩窗口里被改写 → 它被踢出那一箱、以新 hash 重新处理，于是它最终存下去的
+    /// 内容**不再等于**别名的内容。这时别名绝不能指过去（那会让索引指向别人的内容、还原出错
+    /// 数据），必须自己被重新备份一遍。
+    /// <para>
+    /// 两个文件都还原成各自应有的内容，就是这条红线守住了。
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_Alias_Is_Rebuilt_When_Its_Leader_Changes_During_Compression()
+    {
+        Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
+
+        var account = AzuriteAccount();
+        var name = RandomName("packaliasorphan-");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await cc.CreateIfNotExistsAsync();
+
+        try
+        {
+            var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
+            const string mutated = "leader got rewritten while it was being compressed";
+            Write("a/first.txt", payload);       // leader
+            Write("c/second.txt", payload);      // 别名
+
+            // 压缩之后把 leader 的内容换掉：重校验会发现它变了，把它踢出那一箱、以新 hash 重处理。
+            var (backup, restore, store) = Build(
+                new MutatingAfterCompressCompressor(new SevenZipCompressor(), _src, "a/first.txt", mutated));
+
+            await backup.RunAsync(Request(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
+            var first = v1.Entries.Single(e => e.Path == "a/first.txt");
+            var second = v1.Entries.Single(e => e.Path == "c/second.txt");
+
+            // 两条条目的内容身份必须已经分道扬镳——别名绝不能还挂在 leader 那份新内容上。
+            Assert.NotEqual(first.FullHash, second.FullHash);
+
+            // 决定性的一条：还原出来的必须各是各的内容。
+            await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+            Assert.Equal(mutated, await File.ReadAllTextAsync(Path.Combine(_dst, "a", "first.txt")));
+            Assert.Equal(payload, await File.ReadAllTextAsync(Path.Combine(_dst, "c", "second.txt")));
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>压缩**之后**改写目标成员的内容，模拟"文件在处理中变化"（§9、PRD 特别说明 D）。
+    /// 分组路径先 hash 后压，所以挂在 CompressAsync 之后，重校验据此发现内容变了。
+    /// 与 BackupOrchestratorTests.MutatingCompressor 同一套手法，只覆盖这里用得到的那一半。</summary>
+    private sealed class MutatingAfterCompressCompressor(
+        IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
+    {
+        private int _fired;
+
+        public async Task<CompressionResult> CompressAsync(
+            CompressionRequest request, CancellationToken ct = default)
+        {
+            var result = await inner.CompressAsync(request, ct);
+            if (request.Entries.Contains(relPath) && Interlocked.Exchange(ref _fired, 1) == 0)
+            {
+                var full = Path.Combine(rootPath, relPath.Replace('/', Path.DirectorySeparatorChar));
+                File.WriteAllText(full, newContent);
+                File.SetLastWriteTimeUtc(full, File.GetLastWriteTimeUtc(full).AddSeconds(7));
+            }
+            return result;
+        }
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task ExtractAsync(
+            string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+    }
 }
