@@ -16,7 +16,8 @@
 - 不改 `NetworkTimeout`，不引入 `TransferOptions`（用户明确否决："第二条不建议改。100M应该不至于。"）。
 - **挂起状态不得被后续计划任务打断**——`Paused` 期间运行仍是 `Running`，调度器看到"在跑"就不会再起一轮；不要新增会让调度器认为它已结束的状态值。
 - **有未完成任务时不要清理临时文件夹**，除非明确知道不会干扰。本计划只在**进程启动**时清 `{tempPath}/compress` 与 `{tempPath}/staged`（此刻没有任何运行存活），不在每次备份开始时清。
-- **一次性上线，不分批发版。** 13 个任务全部做完再触发 docker-publish。
+- **一次性上线，不分批发版。** 15 个任务全部做完再触发 docker-publish。
+- **计划内重启 / 升级要能接上**（Task 14–15，用户追加）：docker 正常关闭时把在跑的运行挂起落盘、不丢文件；下次启动自动接着跑，带一个默认打开的设置。用户**亲手按停**的运行不在自动恢复之列——替他重开等于把他的意图擦掉。
 - 做完直接合并 `main`，不留分支；仓库只保留 `main` 一条线。
 - 后端测试：`dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj`
 - 集成测试需要 Azurite 在跑，否则 189 条会静悄悄跳过：`npx azurite --skipApiVersionCheck`
@@ -35,6 +36,8 @@
 | `Services/PauseGate.cs` | 挂起闸门：等待、自愈重试计时、超时降级 |
 | `Services/BackupRunControl.cs` | 把 journal / 闸门 / 停止意图 / 恢复查表打包传给编排器 |
 | `Services/BackupSuspendedException.cs` | 把"挂起退出"与"失败"区分开的信号异常 |
+| `Services/GracefulSuspendService.cs` | 进程正常退出时把在跑的运行挂起落盘（Task 14） |
+| `Services/AutoResumeService.cs` | 启动后把被打断的运行接着跑（Task 15） |
 
 **修改（后端源码）**
 
@@ -4947,6 +4950,690 @@ Stop button exactly when the operator most wants it.
 Interrupted runs left on disk are listed from a separate fetch on the
 list refresh, since the one-second tick only polls active configs and an
 interrupted run is by definition not active.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 14: 优雅关闭 = 自动挂起（计划内重启 / 升级）
+
+用户追加的需求：docker **正常关闭**（`docker stop` / 升级重启）时，在跑的备份要保住现场、不丢文件，下次起来能接上。
+
+关键在于"保住现场"到底要保什么。journal 里已经记着每一块**云端确认过**的内容，所以关闭时**不必**等在传的文件传完——放弃它最多让下次重传这一个文件，而等它可能要几十秒到几分钟，超过 docker 的宽限期就会被 SIGKILL，那才是真的丢现场（半截 journal 行、暂存区一地垃圾）。所以这里做的是：收到停止信号 → 让所有在跑的运行走 `StopKind.Suspend` → 等它们把 journal fsync 落盘 → 进程退出。全过程只有几十字节的写，秒级完成。
+
+**Files:**
+- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupSuspendedException.cs`（加 `SuspendReason.ShuttingDown`）
+- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupJournalStore.cs`（挂起标记的读写）
+- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupRunner.cs`（`SuspendAllAsync`）
+- Create: `backend/src/AzureStorageBackup.Api/Services/GracefulSuspendService.cs`
+- Modify: `backend/src/AzureStorageBackup.Api/Program.cs`（注册 + 拉长 `ShutdownTimeout`）
+- Modify: `docker-compose.yml`（`stop_grace_period`）
+- Test: `backend/tests/AzureStorageBackup.Api.Tests/GracefulSuspendTests.cs`
+
+**Interfaces:**
+- Consumes: `BackupRunControl.RequestStop(StopKind)`、`StopKind.Suspend`（Task 9）；`BackupJournalStore`（Task 4）；`RunStatus.Suspended`、`BackupRunState.Control`（Task 8）
+- Produces:
+  - `SuspendReason.ShuttingDown`
+  - `void BackupJournalStore.MarkSuspended(int accountId, string container, string runId, SuspendReason reason)`
+  - `SuspendReason? BackupJournalStore.ReadSuspendMark(int accountId, string container, string runId)`
+  - `Task<int> BackupRunner.SuspendAllAsync(SuspendReason reason, CancellationToken ct)`
+
+- [ ] **Step 1: 写失败的测试**
+
+新建 `backend/tests/AzureStorageBackup.Api.Tests/GracefulSuspendTests.cs`：
+
+```csharp
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Tests;
+
+public class GracefulSuspendTests : IDisposable
+{
+    private readonly string _dir =
+        Path.Combine(Path.GetTempPath(), "asb-mark-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    private BackupJournalStore Store() => new(_dir);
+
+    [Fact]
+    public void No_mark_means_nobody_wrote_one()
+    {
+        Assert.Null(Store().ReadSuspendMark(1, "c", "run-1"));
+    }
+
+    [Fact]
+    public void Mark_round_trips()
+    {
+        var store = Store();
+        store.MarkSuspended(1, "c", "run-1", SuspendReason.ShuttingDown);
+        Assert.Equal(SuspendReason.ShuttingDown, store.ReadSuspendMark(1, "c", "run-1"));
+    }
+
+    // 用户主动暂停的那一条必须能与"关机顺手挂起的"分开——Task 15 靠这个决定要不要自动接着跑。
+    [Fact]
+    public void User_requested_is_distinguishable_from_shutting_down()
+    {
+        var store = Store();
+        store.MarkSuspended(1, "c", "run-user", SuspendReason.UserRequested);
+        store.MarkSuspended(1, "c", "run-boot", SuspendReason.ShuttingDown);
+        Assert.Equal(SuspendReason.UserRequested, store.ReadSuspendMark(1, "c", "run-user"));
+        Assert.Equal(SuspendReason.ShuttingDown, store.ReadSuspendMark(1, "c", "run-boot"));
+    }
+
+    // 标记文件不能被当成 journal 列出来，否则清理器会拿它去解析、当成坏卷。
+    [Fact]
+    public async Task Mark_is_not_listed_as_a_journal()
+    {
+        var store = Store();
+        await using (await store.CreateAsync(1, "c", "run-1", Header("run-1"), default)) { }
+        store.MarkSuspended(1, "c", "run-1", SuspendReason.ShuttingDown);
+
+        var listed = await store.ListAsync(1, "c", default);
+        Assert.Equal(["run-1"], listed.Select(x => x.RunId));
+    }
+
+    // 删这一卷 journal 时标记也得跟着走，否则下次同名 runId 会读到上一次的理由。
+    [Fact]
+    public async Task Delete_takes_the_mark_with_it()
+    {
+        var store = Store();
+        await using (await store.CreateAsync(1, "c", "run-1", Header("run-1"), default)) { }
+        store.MarkSuspended(1, "c", "run-1", SuspendReason.UserRequested);
+
+        store.Delete(1, "c", "run-1");
+
+        Assert.Null(store.ReadSuspendMark(1, "c", "run-1"));
+        Assert.Empty(await store.ListAsync(1, "c", default));
+    }
+
+    // 标记文件被写坏（半截、手改）时按"没有标记"处理：宁可多跑一轮，不要在启动路径上抛。
+    [Fact]
+    public void Garbage_mark_reads_as_none()
+    {
+        var store = Store();
+        var path = store.PathFor(1, "c", "run-1") + ".suspend";
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "not-an-enum-value");
+        Assert.Null(store.ReadSuspendMark(1, "c", "run-1"));
+    }
+
+    private static JournalHeader Header(string runId) => new()
+    {
+        RunId = runId,
+        ConfigId = 5,
+        StartedAt = DateTimeOffset.UtcNow,
+        BaselineVersion = 0,
+        LocalRoot = "/src",
+        EncryptionIdentity = "plain",
+    };
+}
+```
+
+- [ ] **Step 2: 跑一次确认它失败**
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj --filter FullyQualifiedName~GracefulSuspendTests
+```
+
+Expected: 编译失败，`SuspendReason` 没有 `ShuttingDown`、`BackupJournalStore` 没有 `MarkSuspended` / `ReadSuspendMark`。
+
+- [ ] **Step 3: 加第三个挂起理由**
+
+编辑 `backend/src/AzureStorageBackup.Api/Services/BackupSuspendedException.cs`，在 `AutoSuspended` 之后加：
+
+```csharp
+    /// <summary>
+    /// 进程被要求正常退出（<c>docker stop</c>、升级重启），运行顺手挂起。
+    /// <para>
+    /// 与被砍掉的 <c>Crashed</c> 不是一回事：关机时代码**还在跑**，能给自己写下理由；
+    /// 崩溃时没有任何代码在跑，那种运行只能靠盘上还留着 journal 事后认出来。
+    /// </para>
+    /// </summary>
+    ShuttingDown,
+```
+
+- [ ] **Step 4: 挂起标记的读写**
+
+编辑 `backend/src/AzureStorageBackup.Api/Services/BackupJournalStore.cs`。
+
+标记单独放一个 `{runId}.jsonl.suspend` 文件，而**不是**往 journal 里加一条记录：`LoadActiveRefsAsync` 是 `r.Kind == "pack" ? packs : blobs` 的二分，多一种 `Kind` 会被静默丢进 blobs 桶，污染清理器的"别删我"名单。加文件不动既有格式，`ListAsync` 只枚举 `*.jsonl` 也天然不会把它当 journal。
+
+在 `PathFor` 之后加：
+
+```csharp
+    private string MarkPathFor(int accountId, string container, string runId)
+        => PathFor(accountId, container, runId) + ".suspend";
+
+    /// <summary>
+    /// 记下这一卷是**为什么**停的。Task 15 的自动恢复靠它区分"用户主动按了暂停"（不该替他重开）
+    /// 与"关机/崩溃打断的"（该接着跑）。
+    /// <para>没有这个文件 = 没人来得及写 = 崩溃或被 kill。</para>
+    /// </summary>
+    public void MarkSuspended(int accountId, string container, string runId, SuspendReason reason)
+    {
+        try
+        {
+            var path = MarkPathFor(accountId, container, runId);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, reason.ToString());
+        }
+        catch { /* 写不下就当没标记：后果是多跑一轮，不是丢数据 */ }
+    }
+
+    /// <summary>读挂起理由。文件不在、读不动、或内容不认识都返回 null（= 当没标记）。</summary>
+    public SuspendReason? ReadSuspendMark(int accountId, string container, string runId)
+    {
+        try
+        {
+            var text = File.ReadAllText(MarkPathFor(accountId, container, runId)).Trim();
+            return Enum.TryParse<SuspendReason>(text, ignoreCase: false, out var reason) ? reason : null;
+        }
+        catch { return null; }
+    }
+```
+
+并把 `Delete` 改成连标记一起删（否则下次撞上同名 runId 会读到上一次的理由）：
+
+```csharp
+    public void Delete(int accountId, string container, string runId)
+    {
+        try { File.Delete(PathFor(accountId, container, runId)); } catch { /* 删不掉下次再说 */ }
+        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* 同上 */ }
+    }
+```
+
+（`DeleteAll` 是整目录递归删，标记在同一个目录里，不必另加一句。）
+
+- [ ] **Step 5: 一次挂起所有在跑的运行**
+
+编辑 `backend/src/AzureStorageBackup.Api/Services/BackupRunner.cs`，加：
+
+```csharp
+    /// <summary>
+    /// 让**所有**在跑的运行挂起，并等它们各自把 journal 落盘。返回被挂起的运行数。
+    /// <para>
+    /// 关机路径专用。这里不等在传的文件传完：放弃它最多让下次重传这一个文件，而等它可能要几分钟，
+    /// 超过 docker 的宽限期就会挨 SIGKILL——那才是真丢现场（半截 journal 行 + 一地暂存垃圾）。
+    /// </para>
+    /// </summary>
+    public async Task<int> SuspendAllAsync(SuspendReason reason, CancellationToken ct)
+    {
+        var running = _runs.Where(kv => kv.Value.Status == RunStatus.Running).Select(kv => kv.Key).ToList();
+        var stopped = 0;
+        foreach (var configId in running)
+        {
+            try
+            {
+                if (await SuspendAsync(configId, ct))
+                    stopped++;
+            }
+            catch (Exception ex)
+            {
+                // 一个运行落盘失败不能挡住别的运行落盘——关机路径上没有第二次机会。
+                logger.LogWarning(ex, "Failed to suspend backup {ConfigId} during shutdown", configId);
+            }
+        }
+        return stopped;
+    }
+```
+
+（`SuspendAsync` 是 Task 9 产出的；它内部走 `RequestStop(StopKind.Suspend)` 并等落盘。`reason` 透传给它写进标记文件；若 Task 9 的 `SuspendAsync` 尚无 reason 参数，在这里加一个默认 `SuspendReason.UserRequested` 的可选参数，让关机路径显式传 `ShuttingDown`。）
+
+- [ ] **Step 6: 挂到宿主的停止钩子上**
+
+新建 `backend/src/AzureStorageBackup.Api/Services/GracefulSuspendService.cs`：
+
+```csharp
+namespace AzureStorageBackup.Api.Services;
+
+/// <summary>
+/// 进程正常退出时（<c>docker stop</c>、升级重启）把在跑的备份挂起落盘。
+/// <para>
+/// 用 <see cref="IHostedService.StopAsync"/> 而不是 <c>ApplicationStopping</c> 的回调：
+/// 前者是 await 得到的，宿主会等它返回才继续拆服务；后者是同步事件，等不住异步落盘。
+/// </para>
+/// <para>
+/// 注册顺序有意义：宿主按注册的**逆序**停服务，所以这个要注册在 <c>SchedulerService</c> **之后**，
+/// 才能先于调度器停下来——不然调度器可能在挂起进行到一半时又起一轮。
+/// </para>
+/// </summary>
+public sealed class GracefulSuspendService(BackupRunner runner, ILogger<GracefulSuspendService> logger)
+    : IHostedService
+{
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public async Task StopAsync(CancellationToken ct)
+    {
+        try
+        {
+            var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, ct);
+            if (stopped > 0)
+                logger.LogInformation("Suspended {Count} running backup(s) for shutdown", stopped);
+        }
+        catch (Exception ex)
+        {
+            // 关机路径上抛出去只会变成一条谁也看不见的宿主错误，还可能盖掉别的服务的收尾。
+            logger.LogError(ex, "Failed to suspend running backups during shutdown");
+        }
+    }
+}
+```
+
+- [ ] **Step 7: 注册 + 给关机留够时间**
+
+编辑 `backend/src/AzureStorageBackup.Api/Program.cs`，在 `SchedulerService` 的注册**之后**加：
+
+```csharp
+builder.Services.AddHostedService<GracefulSuspendService>();
+
+// 默认 5 秒不够：挂起本身只写几十字节，但要先等每个工作者从当前这步退出来。
+// 给到 30 秒，配合 docker-compose 的 stop_grace_period —— 两边都得放宽，短的那个说了算。
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
+```
+
+编辑 `docker-compose.yml`，给应用服务加：
+
+```yaml
+    stop_grace_period: 45s
+```
+
+比 `ShutdownTimeout` 长一截：docker 的宽限期跑完就是 SIGKILL，必须让 .NET 自己的超时先到，这样至少还有一次机会把日志写出来。
+
+- [ ] **Step 8: 跑测试**
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj --filter FullyQualifiedName~GracefulSuspendTests
+```
+
+Expected: PASS，6 个用例。
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj
+```
+
+Expected: 全绿、0 skipped。
+
+- [ ] **Step 9: 提交**
+
+```bash
+git add backend/src/AzureStorageBackup.Api/Services/BackupSuspendedException.cs \
+        backend/src/AzureStorageBackup.Api/Services/BackupJournalStore.cs \
+        backend/src/AzureStorageBackup.Api/Services/BackupRunner.cs \
+        backend/src/AzureStorageBackup.Api/Services/GracefulSuspendService.cs \
+        backend/src/AzureStorageBackup.Api/Program.cs \
+        docker-compose.yml \
+        backend/tests/AzureStorageBackup.Api.Tests/GracefulSuspendTests.cs
+git commit -m "feat(backup): suspend running backups on graceful shutdown
+
+A planned restart or an image upgrade now parks every running backup
+instead of having it killed mid-flight. The journal already records every
+block the cloud confirmed, so shutdown does not wait for the file
+currently uploading: abandoning it costs one re-upload next run, while
+waiting for it can outlast the container grace period and earn a SIGKILL,
+which is what actually loses the run.
+
+Why each run also gets a marker file next to its journal: the next
+startup has to tell 'the operator deliberately paused this' apart from
+'a restart interrupted this', and only the second should be resumed
+without asking. The marker is a sibling file rather than a journal
+record because the cleanup predicate buckets records by Kind into blobs
+or packs, and a third kind would silently land in the blob bucket.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 15: 启动时自动接着跑（可关的设置，默认开）
+
+用户追加需求的后半段：重启后，上次没跑完的备份自动接上。带一个设置，默认打开。
+
+判据是"这一轮是被打断的，不是被人按停的"：标记文件写着 `UserRequested` 的不碰——用户亲手按的暂停，重启替他重开就是把他的意图擦掉了。没有标记（崩溃 / 被 kill）和写着 `ShuttingDown` / `AutoSuspended` 的才自动接。
+
+**Files:**
+- Modify: `backend/src/AzureStorageBackup.Api/Models/GlobalSettings.cs`
+- Create: `backend/src/AzureStorageBackup.Api/Migrations/<stamp>_AddAutoResumeInterruptedRuns.cs`（脚手架生成后手改 `defaultValue`）
+- Modify: `backend/src/AzureStorageBackup.Api/Services/GlobalSettingsService.cs`
+- Create: `backend/src/AzureStorageBackup.Api/Services/AutoResumeService.cs`
+- Modify: `backend/src/AzureStorageBackup.Api/Program.cs`
+- Modify: `frontend/src/api/settings.ts`、`frontend/src/pages/SettingsPage.tsx`
+- Test: `backend/tests/AzureStorageBackup.Api.Tests/AutoResumeTests.cs`
+
+**Interfaces:**
+- Consumes: `BackupJournalStore.ReadSuspendMark` / `ListAsync`（Task 14 / Task 4）；`BackupRunner.StartAsync(int configId)`；`IGlobalSettingsService`
+- Produces:
+  - `bool GlobalSettings.AutoResumeInterruptedRuns`（默认 `true`）
+  - `static Task<IReadOnlyList<int>> AutoResumeService.PickResumableAsync(BackupJournalStore journals, IReadOnlyList<(int ConfigId, int AccountId, string Container)> configs, CancellationToken ct)`
+
+- [ ] **Step 1: 写失败的测试**
+
+新建 `backend/tests/AzureStorageBackup.Api.Tests/AutoResumeTests.cs`：
+
+```csharp
+using AzureStorageBackup.Api.Models;
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Tests;
+
+public class AutoResumeTests : IDisposable
+{
+    private readonly string _dir =
+        Path.Combine(Path.GetTempPath(), "asb-resume-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    private BackupJournalStore Store() => new(_dir);
+
+    private static readonly (int ConfigId, int AccountId, string Container)[] OneConfig =
+        [(7, 1, "photos")];
+
+    private async Task SeedJournalAsync(BackupJournalStore store, string runId)
+    {
+        await using var journal = await store.CreateAsync(1, "photos", runId, new JournalHeader
+        {
+            RunId = runId,
+            ConfigId = 7,
+            StartedAt = DateTimeOffset.UtcNow,
+            BaselineVersion = 0,
+            LocalRoot = "/src",
+            EncryptionIdentity = "plain",
+        }, default);
+    }
+
+    // 没有 journal = 上次跑完了（跑完会删掉自己那卷）= 没什么可接的。
+    [Fact]
+    public async Task Nothing_to_resume_when_no_journal_is_left()
+    {
+        Assert.Empty(await AutoResumeService.PickResumableAsync(Store(), OneConfig, default));
+    }
+
+    // 有 journal、没标记 = 崩溃或被 kill = 正是这个功能要救的那种。
+    [Fact]
+    public async Task Unmarked_journal_is_resumable()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-crash");
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    [Fact]
+    public async Task Shutdown_suspended_run_is_resumable()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-boot");
+        store.MarkSuspended(1, "photos", "run-boot", SuspendReason.ShuttingDown);
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    [Fact]
+    public async Task Auto_suspended_run_is_resumable()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-auto");
+        store.MarkSuspended(1, "photos", "run-auto", SuspendReason.AutoSuspended);
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    // 用户亲手按的暂停：重启替他重开，就是把他的意图擦掉。
+    [Fact]
+    public async Task User_paused_run_is_left_alone()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-user");
+        store.MarkSuspended(1, "photos", "run-user", SuspendReason.UserRequested);
+        Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    // 同一个备份留了两卷（上上次崩了没清），只该起一轮，不是两轮。
+    [Fact]
+    public async Task A_config_is_listed_once_however_many_journals_it_left()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-a");
+        await SeedJournalAsync(store, "run-b");
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    // 两卷里只要有一卷是用户按停的，就整个备份都别碰：分不清该接哪一卷时，不动是安全的那一侧。
+    [Fact]
+    public async Task One_user_paused_journal_holds_back_the_whole_config()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-a");
+        await SeedJournalAsync(store, "run-user");
+        store.MarkSuspended(1, "photos", "run-user", SuspendReason.UserRequested);
+        Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+    }
+
+    [Fact]
+    public void Setting_is_on_by_default()
+    {
+        Assert.True(new GlobalSettings().AutoResumeInterruptedRuns);
+    }
+}
+```
+
+- [ ] **Step 2: 跑一次确认它失败**
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj --filter FullyQualifiedName~AutoResumeTests
+```
+
+Expected: 编译失败，`AutoResumeService` 与 `GlobalSettings.AutoResumeInterruptedRuns` 都不存在。
+
+- [ ] **Step 3: 加设置**
+
+编辑 `backend/src/AzureStorageBackup.Api/Models/GlobalSettings.cs`，在 `OverlapDiffAndUpload` 之后加：
+
+```csharp
+    /// <summary>
+    /// 重启后自动接着跑上次被打断的备份（默认开）。为计划内重启与升级准备的：
+    /// 停机把运行挂起落盘，起来再自己接上，中间不需要人来点一下。
+    /// <para>
+    /// 只对**被打断**的运行生效。用户亲手按了暂停的那种不碰——替他重开等于把他的意图擦掉。
+    /// </para>
+    /// </summary>
+    public bool AutoResumeInterruptedRuns { get; set; } = true;
+```
+
+编辑 `backend/src/AzureStorageBackup.Api/Services/GlobalSettingsService.cs`，在 `UpsertAsync` 里 `existing.OverlapDiffAndUpload = s.OverlapDiffAndUpload;` 之后加一行：
+
+```csharp
+        existing.AutoResumeInterruptedRuns = s.AutoResumeInterruptedRuns;
+```
+
+- [ ] **Step 4: 迁移**
+
+```bash
+cd backend/src/AzureStorageBackup.Api && dotnet ef migrations add AddAutoResumeInterruptedRuns
+```
+
+脚手架给 `AddColumn<bool>` 生成的是 `defaultValue: false`，**必须手改成 `true`**：既有库升级上来的行会拿这个默认值，不改的话老用户默认是关的、新用户默认是开的，而这个差别只会在某天重启没接上时才被发现。改成：
+
+```csharp
+            migrationBuilder.AddColumn<bool>(
+                name: "AutoResumeInterruptedRuns",
+                table: "GlobalSettings",
+                type: "INTEGER",
+                nullable: false,
+                defaultValue: true);
+```
+
+先例见 `Migrations/20260727164733_AddOverlapDiffAndUpload.cs`，同样的手改。
+
+- [ ] **Step 5: 挑出该接着跑的备份**
+
+新建 `backend/src/AzureStorageBackup.Api/Services/AutoResumeService.cs`：
+
+```csharp
+using AzureStorageBackup.Api.Data;
+using Microsoft.EntityFrameworkCore;
+
+namespace AzureStorageBackup.Api.Services;
+
+/// <summary>
+/// 启动后把上次被打断的备份接着跑（受 <c>GlobalSettings.AutoResumeInterruptedRuns</c> 控制）。
+/// <para>
+/// 判据是盘上还留着 journal —— 跑完的运行会删掉自己那卷，所以留着就等于"没跑完"。
+/// 再看标记文件把用户亲手按停的那种摘出去。
+/// </para>
+/// </summary>
+public sealed class AutoResumeService(
+    IServiceScopeFactory scopes, BackupJournalStore journals, BackupRunner runner,
+    ILogger<AutoResumeService> logger) : BackgroundService
+{
+    /// <summary>让 Web 端口先起来、调度器先跑第一拍，再去抢产出锁。</summary>
+    private static readonly TimeSpan Delay = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// 从盘上挑出该自动接着跑的 configId。纯函数（只读盘），单测直接调它。
+    /// <para>同一个备份留了几卷都只算一次：接着跑是**一轮新的运行**，它会自己去认所有卷。</para>
+    /// </summary>
+    public static async Task<IReadOnlyList<int>> PickResumableAsync(
+        BackupJournalStore journals,
+        IReadOnlyList<(int ConfigId, int AccountId, string Container)> configs,
+        CancellationToken ct)
+    {
+        var picked = new List<int>();
+        foreach (var (configId, accountId, container) in configs)
+        {
+            var listed = await journals.ListAsync(accountId, container, ct);
+            if (listed.Count == 0)
+                continue;
+
+            // 只要有一卷是用户按停的就整个备份都别碰：分不清该接哪一卷时，不动是安全的那一侧。
+            var userPaused = listed.Any(x =>
+                journals.ReadSuspendMark(accountId, container, x.RunId) == SuspendReason.UserRequested);
+            if (!userPaused)
+                picked.Add(configId);
+        }
+        return picked;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try { await Task.Delay(Delay, stoppingToken); }
+        catch (OperationCanceledException) { return; }
+
+        try
+        {
+            using var scope = scopes.CreateScope();
+            var settings = scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>();
+            if (!(await settings.GetAsync(stoppingToken)).AutoResumeInterruptedRuns)
+                return;
+
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var configs = await db.BackupConfigs.AsNoTracking()
+                .Where(c => c.Enabled)
+                .Select(c => new { c.Id, c.AccountId, c.Container })
+                .ToListAsync(stoppingToken);
+
+            var resumable = await PickResumableAsync(
+                journals,
+                [.. configs.Select(c => (c.Id, c.AccountId, c.Container))],
+                stoppingToken);
+
+            // 逐个起，不并发：产出锁是全局的，一起冲上去只会互相排队，还看不出是谁在等谁。
+            foreach (var configId in resumable)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                    return;
+                var state = await runner.StartAsync(configId);
+                logger.LogInformation(
+                    "Auto-resumed interrupted backup {ConfigId}: {Status}", configId, state.Status);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            // 自动恢复失败不能让进程起不来：用户还可以自己去点一下。
+            logger.LogError(ex, "Auto-resume of interrupted backups failed");
+        }
+    }
+}
+```
+
+- [ ] **Step 6: 注册**
+
+编辑 `backend/src/AzureStorageBackup.Api/Program.cs`，在 `SchedulerService` 注册之后、`GracefulSuspendService` 注册之前加：
+
+```csharp
+builder.Services.AddHostedService<AutoResumeService>();
+```
+
+- [ ] **Step 7: 前端开关**
+
+编辑 `frontend/src/api/settings.ts`，在 `overlapDiffAndUpload: boolean` 之后加：
+
+```ts
+  autoResumeInterruptedRuns: boolean
+```
+
+编辑 `frontend/src/pages/SettingsPage.tsx`，在 "Overlap diffing and uploading" 那段说明文字之后加：
+
+```tsx
+      <Field label="Resume interrupted backups on startup">
+        <input type="checkbox" checked={s.autoResumeInterruptedRuns}
+          onChange={(e) => set('autoResumeInterruptedRuns', e.target.checked)} />
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        On by default: when the server restarts — a planned reboot, or an image upgrade — any
+        backup that was still running picks up where it stopped, without re-uploading what
+        already reached the cloud. Backups you paused yourself are left paused.
+      </p>
+```
+
+- [ ] **Step 8: 跑测试**
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj --filter FullyQualifiedName~AutoResumeTests
+```
+
+Expected: PASS，8 个用例。
+
+```bash
+dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj
+```
+
+Expected: 全绿、0 skipped。
+
+```bash
+cd frontend && npm run lint && npm run test && npm run build
+```
+
+Expected: 全绿。
+
+- [ ] **Step 9: 提交**
+
+```bash
+git add backend/src/AzureStorageBackup.Api/Models/GlobalSettings.cs \
+        backend/src/AzureStorageBackup.Api/Migrations/ \
+        backend/src/AzureStorageBackup.Api/Services/GlobalSettingsService.cs \
+        backend/src/AzureStorageBackup.Api/Services/AutoResumeService.cs \
+        backend/src/AzureStorageBackup.Api/Program.cs \
+        frontend/src/api/settings.ts frontend/src/pages/SettingsPage.tsx \
+        backend/tests/AzureStorageBackup.Api.Tests/AutoResumeTests.cs
+git commit -m "feat(backup): resume interrupted backups on startup
+
+A backup left unfinished by a restart now picks itself up once the server
+is back, skipping everything the journal says already reached the cloud.
+The setting is on by default, and the migration writes that default to
+existing rows explicitly: scaffolding would have given upgraded installs
+false while fresh ones got true, a split nobody would notice until the
+day a restart failed to resume.
+
+A run the operator paused by hand is deliberately left alone. Resuming it
+on their behalf would erase the intent behind pressing the button, so the
+run's marker file is what decides: absent (killed) or shutdown/auto means
+resume, user-requested means leave it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
