@@ -118,13 +118,22 @@ public sealed class BackupJournal : IAsyncDisposable
     /// <summary>读整卷。文件不在、空的、或头坏了都返回 null（= 这卷作废，当没有恢复点）。</summary>
     public static async Task<JournalContent?> ReadAsync(string path, CancellationToken ct)
     {
-        if (!File.Exists(path))
-            return null;
-
         JournalHeader? header = null;
         var records = new List<JournalRecord>();
-        using var reader = new StreamReader(
-            new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite), Encoding.UTF8);
+
+        // 不先 File.Exists 再打开——那两步之间有个真实的缺口：清理器在扫某个容器的活动 journal 时，
+        // 另一轮备份可能正好跑完并删掉自己那卷。缺口里删掉就会抛 FileNotFoundException，把整轮清理
+        // 掀掉。直接开、接住"不在了"，与"本来就不在"归到同一个答案：这卷作废。
+        FileStream stream;
+        try
+        {
+            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+        using var reader = new StreamReader(stream, Encoding.UTF8);
 
         while (await reader.ReadLineAsync(ct) is { } line)
         {
