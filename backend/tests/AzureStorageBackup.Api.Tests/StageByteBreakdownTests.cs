@@ -250,7 +250,8 @@ public sealed class StageByteBreakdownTests
         tracker.SetTransferred(0);
 
         // 一件活切成两卷，压缩后共 8000。第一卷传完了。
-        tracker.BeginItem("d.001", "photos/big.bin", 5_000);
+        tracker.BeginUpload("data/d");
+        tracker.BeginItem("d.001", "photos/big.bin", 5_000, "data/d");
         tracker.ItemProgress("d.001").Report(5_000);
         tracker.EndItem("d.001", 0);
         tracker.Complete();
@@ -258,9 +259,11 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(0, seen[^1].TransferredBytes);          // 件没完成，进不了这本账
         Assert.Equal(5_000, seen[^1].UnfinishedItemBytes);   // 但它已经在云上了，得看得见
 
-        tracker.BeginItem("d.002", "photos/big.bin", 3_000);
+        tracker.BeginItem("d.002", "photos/big.bin", 3_000, "data/d");
         tracker.ItemProgress("d.002").Report(3_000);
         tracker.EndItem("d.002", 0);
+        tracker.ConfirmUpload("data/d");
+        tracker.EndUpload("data/d");
         tracker.Advance(0, 10_000);
         tracker.SetTransferred(8_000);
         tracker.Complete();
@@ -280,16 +283,20 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig();
         tracker.SetTransferred(0);
 
-        void Volume(string name, string label, long size)
+        void Volume(string owner, string name, string label, long size)
         {
-            tracker.BeginItem(name, label, size);
+            tracker.BeginItem(name, label, size, owner);
             tracker.ItemProgress(name).Report(size);
             tracker.EndItem(name, 0);
         }
 
-        Volume("a.001", "a.bin", 500);    // A 的前半
-        Volume("b.001", "b.bin", 1_000);  // B 的前半（并发）
-        Volume("a.002", "a.bin", 500);    // A 齐了
+        tracker.BeginUpload("data/a");
+        tracker.BeginUpload("data/b");
+        Volume("data/a", "a.001", "a.bin", 500);    // A 的前半
+        Volume("data/b", "b.001", "b.bin", 1_000);  // B 的前半（并发）
+        Volume("data/a", "a.002", "a.bin", 500);    // A 齐了
+        tracker.ConfirmUpload("data/a");
+        tracker.EndUpload("data/a");
         tracker.Advance(0, 900);
         tracker.SetTransferred(1_000);    // A 销账：1000 = A 的两卷
         tracker.Complete();
@@ -297,7 +304,9 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(1_000, seen[^1].TransferredBytes);
         Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);  // 剩下的正是 B 已传的那一卷，没被误伤
 
-        Volume("b.002", "b.bin", 1_000);
+        Volume("data/b", "b.002", "b.bin", 1_000);
+        tracker.ConfirmUpload("data/b");
+        tracker.EndUpload("data/b");
         tracker.Advance(0, 2_500);
         tracker.SetTransferred(3_000);
         tracker.Complete();
@@ -316,11 +325,129 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig();
         tracker.SetTransferred(0);
 
-        tracker.BeginItem("d.001", "a.bin", 5_000);   // 申报了 5000，但一个字节也没传
+        tracker.BeginUpload("data/d");
+        tracker.BeginItem("d.001", "a.bin", 5_000, "data/d");   // 申报了 5000，但一个字节也没传
         tracker.EndItem("d.001", 0);
         tracker.Complete();
 
         Assert.Equal(0, seen[^1].UnfinishedItemBytes);
+    }
+
+    /// <summary>
+    /// 一族卷传掉几卷之后整件倒了，重试成功——作废那次的卷不能留在这一栏里。
+    /// <para>
+    /// 从前这本账是个只加的标量，件级销账时按 uploaded 的增量减。两边在失败路径上抵不平：
+    /// 第一次传掉的卷加了进去，而件级账只按成功那一次扣一遍，差额从此永久挂在屏幕上——
+    /// 实测一轮 3 TB 的备份攒到 2 GB，而那时一个字节都没在传。现在按**族**记账，
+    /// 云端没确认过的那次整条抹掉，重试从零开始。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Volumes_From_A_Discarded_Attempt_Do_Not_Linger()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        void Volume(string owner, string name, long size)
+        {
+            tracker.BeginItem(name, "photos/big.bin", size, owner);
+            tracker.ItemProgress(name).Report(size);
+            tracker.EndItem(name, 0);
+        }
+
+        // 第一次尝试：三卷里传掉两卷就倒了。没有 ConfirmUpload——云端从未确认过整族。
+        tracker.BeginUpload("data/abc");
+        Volume("data/abc", "data/abc.001", 1_000);
+        Volume("data/abc", "data/abc.002", 1_000);
+        tracker.EndUpload("data/abc");
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);
+
+        // 第二次尝试：三卷齐了，云端确认，件级销账把它们并进 uploaded。
+        tracker.BeginUpload("data/abc");
+        Volume("data/abc", "data/abc.001", 1_000);
+        Volume("data/abc", "data/abc.002", 1_000);
+        Volume("data/abc", "data/abc.003", 1_000);
+        tracker.ConfirmUpload("data/abc");
+        tracker.EndUpload("data/abc");
+        tracker.Advance(0, 5_000);
+        tracker.SetTransferred(3_000);
+        tracker.Complete();
+
+        Assert.Equal(3_000, seen[^1].TransferredBytes);
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // 干净归零，没有作废那两卷的残留
+    }
+
+    /// <summary>
+    /// 一族作废**只**抹掉它自己那条：并发在传的别的族，已经落云的卷一个字节都不能少。
+    /// 标量账做不到这件事——它不认哪一卷属于哪一族，只能整体加减。
+    /// </summary>
+    [Fact]
+    public void Discarding_One_Family_Leaves_The_Others_Untouched()
+    {
+        var (tracker, seen) = Rig();
+        tracker.SetTransferred(0);
+
+        void Volume(string owner, string name, long size)
+        {
+            tracker.BeginItem(name, owner, size, owner);
+            tracker.ItemProgress(name).Report(size);
+            tracker.EndItem(name, 0);
+        }
+
+        tracker.BeginUpload("data/aaa");
+        tracker.BeginUpload("data/bbb");
+        Volume("data/aaa", "data/aaa.001", 500);
+        Volume("data/bbb", "data/bbb.001", 1_000);   // B 与 A 并发
+
+        tracker.EndUpload("data/aaa");               // A 倒了，没确认过
+        tracker.Complete();
+
+        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);   // 只剩 B 的那一卷，没被连累
+    }
+
+    /// <summary>
+    /// 压完就进池子（背压要的是"盘上此刻占了多少"，晚记一秒就可能撑爆临时盘），可那一刻它还要
+    /// 过一遍压缩后重校验、多卷还要先清云端残留卷，一卷都没资格上路。这段时间把它算进
+    /// "ready to upload" 是过度承诺：重校验判出成员在压缩期间变了的话，这份归档会被整个丢掉重压，
+    /// 一个字节都传不出去。
+    /// </summary>
+    [Fact]
+    public void Bytes_Still_Being_Verified_Are_Not_Ready_To_Upload()
+    {
+        long pool = 0;
+        var (tracker, seen) = Rig(stagedBytes: () => pool);
+
+        pool = 100_000;                    // 一箱压完了，产出落盘、进了背压的账
+        tracker.BeginChecking(100_000);    // 但它正在逐成员重校验
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].StagedBytes);           // 不是"可以传了"
+        Assert.Equal(100_000, seen[^1].CheckingBytes);   // 是"还在核对"
+
+        tracker.EndChecking(100_000);
+        tracker.Complete();
+
+        Assert.Equal(100_000, seen[^1].StagedBytes);     // 核对过了才算数
+        Assert.Equal(0, seen[^1].CheckingBytes);
+    }
+
+    /// <summary>
+    /// 归档还不存在的那几段核对（单文件的去重预筛、一箱压缩**前**的逐成员 stat）不带字节：
+    /// 它们要核对的是源文件，池子里一个字节都还没有。件数那一栏照常算它们。
+    /// </summary>
+    [Fact]
+    public void Checking_Before_Anything_Is_Staged_Moves_No_Bytes()
+    {
+        long pool = 0;
+        var (tracker, seen) = Rig(stagedBytes: () => pool);
+
+        tracker.BeginChecking();   // 去重预筛：整读源文件算 hash，没有归档
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].CheckingBytes);
+        Assert.Equal(1, seen[^1].Checking);   // 件数那一栏照旧
     }
 
     /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>

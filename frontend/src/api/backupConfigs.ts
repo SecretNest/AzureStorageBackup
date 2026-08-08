@@ -204,7 +204,12 @@ export interface StageProgress {
   // 确实到了云上，可整件没完成，既进不了 transferredBytes（那本账按件记，才对得上按件销账的
   // workDone），也已不在 stagedBytes 里（池子逐卷释放）。整件完成时并入前者并归零。
   unfinishedItemBytes: number
-  stagedBytes: number // 已压好、还没送出去的（压缩后）
+  stagedBytes: number // 已压好、**且已核对过**、就等上路的（压缩后）；正在核对的见 checkingBytes
+  // 已压好落盘、但还卡在核对里没资格上路的字节（checking 的字节侧，已从 stagedBytes 里减出去）。
+  // 产出一压完就进背压的账（那笔账要的是"盘上此刻占了多少"，晚记一秒就可能撑爆临时盘），
+  // 可它还要过压缩后重校验——而重校验判出成员在压缩期间变了的话，这份归档会被**整个丢掉重压**，
+  // 一个字节都传不出去。管这段叫 "ready to upload" 是过度承诺，所以单列一栏。
+  checkingBytes: number
   transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
   workPercent: number | null // 按源字节算的完成度；总量未定时为 null
   // 差分判得比压缩上传快几个数量级，必然跑到上传前面去；多出来的活攒到磁盘上（累计件数，只增）。

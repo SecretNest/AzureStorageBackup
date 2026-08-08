@@ -1471,14 +1471,14 @@ public sealed class BackupOrchestrator(
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
         // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
         // 好把它与还在压缩的那些区分开。
-        uploadTracker.BeginUpload();
+        uploadTracker.BeginUpload(blobRef);
         try
         {
             var meta = new Dictionary<string, string>(
                 addressing.Metadata(content.FullHash, content.Length, content.HeadHash, content.TailHash));
             if (content.Raw)
                 meta["raw"] = "1";
-            await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, uploadTracker, ct);
+            await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, staged.Bytes, uploadTracker, ct);
             control?.TrackInFlight(blobRef);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
@@ -1490,11 +1490,12 @@ public sealed class BackupOrchestrator(
             // 记在整件传完之后：中途失败会把整轮备份带失败，那时这个数字根本不会被用到，
             // 而按卷边传边记会让一次重试把同一批字节记两遍。
             state.AddUploaded(sizes.Sum());
+            uploadTracker.ConfirmUpload(blobRef);
             return (staged.Files.Count, sizes);
         }
         finally
         {
-            uploadTracker.EndUpload();
+            uploadTracker.EndUpload(blobRef);
         }
     }
 
@@ -1529,7 +1530,8 @@ public sealed class BackupOrchestrator(
     /// </para>
     /// </summary>
     private async Task ClearLeftoverVolumesAsync(
-        BackupRequest request, string blobRef, int volumeCount, StageTracker uploadTracker, CancellationToken ct)
+        BackupRequest request, string blobRef, int volumeCount, long archiveBytes,
+        StageTracker uploadTracker, CancellationToken ct)
     {
         if (volumeCount <= 1)
             return;
@@ -1537,7 +1539,8 @@ public sealed class BackupOrchestrator(
         // 登记在早退之后：单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
         // 严格说这一段查的是云上的卷而不是本地文件，仍归进「核对」那一栏——单给它一栏不值当，
         // 要说的就一件事：这件活正在核对，不在传。
-        uploadTracker.BeginChecking();
+        // 带上归档字节：这一族的卷全在盘上等着，可要等这趟列举加删除走完才有第一卷能上路。
+        uploadTracker.BeginChecking(archiveBytes);
         try
         {
             var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -1551,7 +1554,7 @@ public sealed class BackupOrchestrator(
         }
         finally
         {
-            uploadTracker.EndChecking();
+            uploadTracker.EndChecking(archiveBytes);
         }
     }
 
@@ -1733,7 +1736,11 @@ public sealed class BackupOrchestrator(
                 // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
                 // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
                 // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
-                uploadTracker.BeginChecking();
+                // 带上这份归档的字节：它已经压完落盘、进了背压的账，可下面这一段判出任何一个成员
+                // 变过，它就会被整个丢掉重压（见下方 changed.Count 那一支）——一个字节都传不出去。
+                // 界面上因此把它从"待传"里减出去，单列成"正在核对"。
+                var checkingBytes = staged?.Bytes ?? 0;
+                uploadTracker.BeginChecking(checkingBytes);
                 try
                 {
                     foreach (var m in members)
@@ -1760,7 +1767,7 @@ public sealed class BackupOrchestrator(
                 }
                 finally
                 {
-                    uploadTracker.EndChecking();
+                    uploadTracker.EndChecking(checkingBytes);
                 }
 
                 if (changed.Count == 0)
@@ -1926,7 +1933,7 @@ public sealed class BackupOrchestrator(
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
-        uploadTracker.BeginUpload();   // 闸门与在途登记见 VolumeUploadScope，都在每卷那一层
+        uploadTracker.BeginUpload(blobName);   // 闸门与在途登记见 VolumeUploadScope，都在每卷那一层
         try
         {
             // 与单文件 blob 同一条纪律（见 ClearLeftoverVolumesAsync）：多卷才做，做的是不让
@@ -1934,7 +1941,7 @@ public sealed class BackupOrchestrator(
             // 重试——而重试正是挂起闸门每次放行都要走的那条路。包的成员按文件名压，两次产出
             // 通常逐字节相同，但"通常"不是能拿来赌数据的东西：成员的 mtime 在两次尝试之间变过
             // （内容没变，因此重校验不会把它排除）就足以让归档头不同，拼起来一样打不开。
-            await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, uploadTracker, ct);
+            await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, staged.Bytes, uploadTracker, ct);
             control?.TrackInFlight(blobName);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
@@ -1945,10 +1952,11 @@ public sealed class BackupOrchestrator(
             // 确认返回了才销账。抛异常时故意**不**销：那份残留正是 Stop now 要清掉的东西。
             control?.ClearInFlight(blobName);
             state.AddUploaded(sizes.Sum());   // 时机同单文件路径：整件传完才记
+            uploadTracker.ConfirmUpload(blobName);
         }
         finally
         {
-            uploadTracker.EndUpload();
+            uploadTracker.EndUpload(blobName);
             staging.Release(staged);
         }
         return sizes;

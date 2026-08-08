@@ -151,9 +151,14 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
     /// <param name="label">界面上显示的名字——**源文件路径**或包的描述，不是 blob 名。
     /// blob 是内容寻址的（加密时还是 HMAC），<c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。</param>
     /// <param name="volumeBytes">这一卷多大，供界面显示"传了多少 / 一共多大"。</param>
+    /// <param name="owner">这一族的 blobRef（<c>data/{hash}</c> 或 <c>packs/{packId}.7z</c>）。
+    /// 传完的卷按它记进"已落云、件未销账"那本账；跨重试不变，所以作废的那次能被整条抹掉。
+    /// **不用 ticket 代替**：票是每次 <see cref="VolumeBlobIO.UploadAsync"/> 现领的，重试就换一张，
+    /// 拿它当账本的键就找不回上一次那条了。</param>
     public async Task RunAsync(
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
-        long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0)
+        long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0,
+        string? owner = null)
     {
         // 闸门空着时 AcquireAsync 返回的是一个已完成的 Task，此时**不报**「在等额度」：
         // 那种情况下标记等于给每一卷平白加一次强制发布——一件大活上千卷就是上千次。
@@ -190,7 +195,7 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
         }
         try
         {
-            tracker.BeginItem(blobName, label, volumeBytes);
+            tracker.BeginItem(blobName, label, volumeBytes, owner);
             // 每卷各要一个 ItemProgress：DeltaProgress 的基线是 per-call 的，多卷并行共用一个实例，
             // 彼此的累计值会被当成对方的回退。带上 key，这一笔字节才落得到对应那条流的账上。
             await upload(tracker.ItemProgress(blobName));
@@ -265,7 +270,7 @@ public static class VolumeBlobIO
                 await scope.RunAsync(
                     name,
                     p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
-                    ct, ticket, index, LabelFor(index), SizeOf(file));
+                    ct, ticket, index, LabelFor(index), SizeOf(file), baseRef);
             onVolumeUploaded?.Invoke(file);
         }
 
