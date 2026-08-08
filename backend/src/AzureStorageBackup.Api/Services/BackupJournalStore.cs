@@ -55,6 +55,56 @@ public sealed class BackupJournalStore(string rootDir)
     public string PathFor(int accountId, string container, string runId)
         => Path.Combine(DirFor(accountId, container), Safe(runId) + ".jsonl");
 
+    /// <summary>挂起标记：与 journal 同名同目录，只多一个后缀。<c>ListAsync</c>/<c>PeekAsync</c>
+    /// 只枚举 <c>*.jsonl</c>，所以它天然不会被当成一卷 journal 去解析。</summary>
+    private string MarkPathFor(int accountId, string container, string runId)
+        => PathFor(accountId, container, runId) + ".suspend";
+
+    /// <summary>
+    /// 记下这一卷是**为什么**停的。自动恢复只认其中一种：读出
+    /// <see cref="SuspendReason.ShuttingDown"/> 才可以不问自取地接着跑（那是一次计划内的重启或升级），
+    /// 别的一律等操作员按 Resume。
+    /// <para>
+    /// 标记**不在**的含义要说准，它不等于"被 kill"：可能是被 kill、可能是进程崩了、可能是关机等
+    /// 落盘超时后这一卷被丢在半路、可能是操作员自己按了 Cancel（取消路径照样落盘，但不写标记）、
+    /// 也可能就是这次写文件本身失败了。这几种谁也不该被自动重开——所以判据是"只在读到
+    /// ShuttingDown 时才动手"，而不是"没有标记就当它是崩溃"。
+    /// </para>
+    /// <para>
+    /// 耐久性上还有一层不对称，别指望它：<c>SettleStopAsync</c> 那条路上标记是在 journal
+    /// fsync **之后**写的，所以标记不会比它描述的记录更"新"；但闸门降级（
+    /// <see cref="SuspendReason.AutoSuspended"/>）那条是从流水线深处直接抛上来的，标记先落、journal
+    /// 随 control 释放才关，而这里用的是 <c>File.WriteAllText</c>，没有 fsync。崩溃安全，掉电不安全：
+    /// 最坏情况是标记活下来、它描述的那几条记录没有，代价是下一轮多传一个文件。
+    /// </para>
+    /// <para>
+    /// 单开一个文件而不是往 journal 里加一条记录：journal 是只追加的记录流，而
+    /// <see cref="LoadActiveRefsAsync"/> 是 <c>r.Kind == "pack" ? packs : blobs</c> 的二分——
+    /// 多出来的第三种 Kind 会被静默丢进 blobs 桶，污染清理器的"别删我"名单。
+    /// </para>
+    /// </summary>
+    public void MarkSuspended(int accountId, string container, string runId, SuspendReason reason)
+    {
+        try
+        {
+            var path = MarkPathFor(accountId, container, runId);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, reason.ToString());
+        }
+        catch { /* 写不下就当没标记：后果是多跑一轮，不是丢数据 */ }
+    }
+
+    /// <summary>读挂起理由。文件不在、读不动、或内容不认识都返回 null（= 当没标记）。</summary>
+    public SuspendReason? ReadSuspendMark(int accountId, string container, string runId)
+    {
+        try
+        {
+            var text = File.ReadAllText(MarkPathFor(accountId, container, runId)).Trim();
+            return Enum.TryParse<SuspendReason>(text, ignoreCase: false, out var reason) ? reason : null;
+        }
+        catch { return null; }
+    }
+
     public Task<BackupJournal> CreateAsync(
         int accountId, string container, string runId, JournalHeader header, CancellationToken ct)
         => BackupJournal.CreateAsync(PathFor(accountId, container, runId), header, ct);
@@ -133,6 +183,8 @@ public sealed class BackupJournalStore(string rootDir)
     public void Delete(int accountId, string container, string runId)
     {
         try { File.Delete(PathFor(accountId, container, runId)); } catch { /* 删不掉下次再说 */ }
+        // 标记跟着 journal 一起走：留着它，下一轮撞上同名 runId 会读到上一次的理由。
+        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* 同上 */ }
     }
 
     /// <summary>删配置兜底用：这个容器的 journal 全不要了。</summary>

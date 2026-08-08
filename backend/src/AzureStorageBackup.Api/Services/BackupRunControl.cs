@@ -54,7 +54,23 @@ public sealed class BackupRunControl(
 
     private int _stopKind;
 
+    /// <summary>-1 = 还没人下达过 Suspend。用哨兵而不是默认值，是为了让"首次下达说了算"这句话
+    /// 能用一次 CAS 表达（见 <see cref="RequestStop"/>）。</summary>
+    private int _suspendReason = -1;
+
     public StopKind Stop => (StopKind)Volatile.Read(ref _stopKind);
+
+    /// <summary>这次挂起是为什么。没人下达过 Suspend 时按 UserRequested 报——挂起本来就只有
+    /// 被下达过才成立，这个取值只是让读它的地方不必先判一次"有没有"。</summary>
+    public SuspendReason SuspendReason
+    {
+        get
+        {
+            var v = Volatile.Read(ref _suspendReason);
+            return v < 0 ? Services.SuspendReason.UserRequested : (SuspendReason)v;
+        }
+    }
+
     public CancellationToken StopToken => _stop.Token;
     public CancellationToken AbortToken => _abort.Token;
 
@@ -79,10 +95,23 @@ public sealed class BackupRunControl(
     /// <see cref="StopToken"/> 早就为上一次较弱的下达点过了（<c>Cancel()</c> 幂等，重复调用无副作用）。
     /// </para>
     /// </summary>
-    public void RequestStop(StopKind kind)
+    /// <param name="reason">
+    /// 只对 <see cref="StopKind.Suspend"/> 有意义：这一卷被记在盘上的挂起理由（关机路径传
+    /// <see cref="SuspendReason.ShuttingDown"/>）。
+    /// <para>
+    /// 它**不**参与上面那套升级判定，而是另走一次 CAS：**首次**下达 Suspend 的那个理由说了算。
+    /// 一次已经在为"用户按了暂停"收尾的运行，不该因为随后到来的关机被改写成 ShuttingDown——
+    /// 那一位正是下次启动用来决定"要不要替他重新开跑"的依据，改错了等于替用户撤销他按下的暂停。
+    /// 反过来，理由在停法落定**之前**就写好，所以任何看见 <c>Stop == Suspend</c> 的线程都读得到
+    /// 配套的理由，不存在"停法到了、理由还没到"的窗口。
+    /// </para>
+    /// </param>
+    public void RequestStop(StopKind kind, SuspendReason reason = SuspendReason.UserRequested)
     {
         if (kind == StopKind.None)
             return;
+        if (kind == StopKind.Suspend)
+            Interlocked.CompareExchange(ref _suspendReason, (int)reason, -1);
         while (true)
         {
             var current = Volatile.Read(ref _stopKind);
@@ -230,6 +259,21 @@ public sealed class BackupRunControl(
             Kind = "pack", Ref = packId, Members = members, VolumeSizes = volumeSizes,
             Volumes = Math.Max(1, volumeSizes.Count), StoreOnly = storeOnly,
         }, ct);
+    }
+
+    /// <summary>
+    /// 把"这一卷为什么停下"写在 journal 旁边。内存里那份理由随进程一起没了，而"进程没了"
+    /// 恰恰是下次启动要判断的那种情形，所以必须落一份到盘上。
+    /// <para>
+    /// 还没开卷就挂起的（扫描阶段被叫停）什么都不写：盘上根本没有这一卷 journal，
+    /// 标记只会变成一个指向不存在 journal 的孤儿，反倒要让读它的人多一处判空。
+    /// </para>
+    /// </summary>
+    public void MarkSuspended(SuspendReason reason)
+    {
+        if (_journal is null)
+            return;
+        store.MarkSuspended(_accountId, _container, runId, reason);
     }
 
     public async Task FlushAsync(bool fsync, CancellationToken ct)

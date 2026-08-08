@@ -5,6 +5,10 @@ services:
     build:
       context: .
     image: ghcr.io/secretnest/azurestoragebackup:latest
+    # A running backup is suspended (journal fsynced, resumable) on SIGTERM. Give it more room than
+    # the app's own 30s shutdown timeout: whichever expires first wins, and docker's expiring first
+    # means SIGKILL, which is exactly what loses the run.
+    stop_grace_period: 45s
     ports:
       - "8080:8080"
     environment:

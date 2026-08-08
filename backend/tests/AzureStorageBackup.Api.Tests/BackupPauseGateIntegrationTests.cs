@@ -206,6 +206,11 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
             var ex = await Assert.ThrowsAsync<BackupSuspendedException>(
                 () => orchestrator.RunAsync(Request(account, name), null, default, control));
             Assert.Equal(SuspendReason.AutoSuspended, ex.Reason);
+            // 闸门降级这条挂起是从流水线深处直接抛上来的，**不经过** SettleStopAsync——标记因此只能写在
+            // RunAsync 的 catch 里。把它写回 SettleStopAsync（看起来更"内聚"）会让每一次闸门降级都
+            // 不留标记，而不留标记的那一卷与被 kill 的、被 cancel 的长得一模一样，谁也不敢替它接着跑。
+            // 这一行就是钉住那个位置的：内存里的 ex.Reason 对了不算数，盘上得有。
+            Assert.Equal(SuspendReason.AutoSuspended, _journals.ReadSuspendMark(account.Id, name, "run-susp"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

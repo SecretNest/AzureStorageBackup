@@ -283,6 +283,15 @@ public sealed class BackupOrchestrator(
         // 而现场其实好端端保着，下次跑就能接上。
         catch (BackupSuspendedException ex)
         {
+            // 先把理由落到盘上，再去发通知。顺序不能反：通知要过网络，超时或失败都可能把
+            // 这一句连坐吞掉，而下次启动全靠盘上这个标记区分"用户自己按的暂停"（不该替他重开）
+            // 与"关机打断的"（该接着跑）。
+            //
+            // 写在这里而不是写在 SettleStopAsync 里：三种挂起理由只有这一处全经过——
+            // 闸门降级那条（AutoSuspended）是从流水线深处直接抛上来的，根本不走 SettleStopAsync。
+            // 而 BackupRunner 那边的 catch 接不到：control 在它之前就已经随 `await using` 释放了，
+            // 账号 id 与容器名也只活在这一层的局部变量里。
+            control?.MarkSuspended(ex.Reason);
             // 走 BackupFailure 这个订阅频道，但级别降为 Warning：
             // 频道选它，是因为订阅"备份没跑完"的人要的正是这条消息，而为此新增一个通知事件位
             // 意味着所有已有用户默认都收不到——一个只在出事那天才发现的静默默认值。
@@ -412,9 +421,14 @@ public sealed class BackupOrchestrator(
             if (kind == StopKind.StopNow)
                 await PurgeInFlightAsync(request, control!);
             await control!.FlushAsync(fsync: true, CancellationToken.None);
-            return kind == StopKind.Suspend
-                ? new BackupSuspendedException(SuspendReason.UserRequested, "Suspended by user.")
-                : new OperationCanceledException("Backup stopped by user.");
+            if (kind != StopKind.Suspend)
+                return new OperationCanceledException("Backup stopped by user.");
+            // 理由由下达停止的那一端定（见 BackupRunControl.RequestStop）：同一条收尾路径既走
+            // 用户按的暂停，也走关机顺手的挂起，两者的区别一路要带到盘上的标记里去。
+            var reason = control.SuspendReason;
+            return new BackupSuspendedException(reason, reason == SuspendReason.ShuttingDown
+                ? "Suspended for shutdown."
+                : "Suspended by user.");
         }
 
         // 0. 确保 container 存在（HTTP 触发的备份自足）

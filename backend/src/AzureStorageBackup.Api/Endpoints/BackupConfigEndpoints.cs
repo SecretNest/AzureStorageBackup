@@ -317,7 +317,7 @@ public static class BackupConfigEndpoints
         // **没有对应的 resume 端点**——恢复不是一种模式：每一轮备份开卷时都会去认还有效的 journal，
         // 所以"继续"就是再点一次 /run，走的是同一条执行体。
         group.MapPost("/{id:int}/suspend", async (int id, BackupRunner runner, CancellationToken ct) =>
-            await StopAndWaitAsync(c => runner.SuspendAsync(id, c), ct) switch
+            await StopAndWaitAsync(c => runner.SuspendAsync(id, ct: c), ct) switch
             {
                 StopOutcome.NothingRunning => Results.Conflict(new { error = "No backup is running." }),
                 StopOutcome.StillStopping => Results.Accepted($"/api/backup-configs/{id}/run", new { stopping = true }),

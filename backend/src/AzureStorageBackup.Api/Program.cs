@@ -223,6 +223,15 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
+// 计划内退出（docker stop / 升级重启）时把在跑的备份挂起落盘。
+// **无条件注册**，且必须排在调度器之后：宿主按注册的逆序停服务，排在后面才停在前面——
+// 不然调度器可能在挂起进行到一半时又起一轮。调度器关着时这条路径同样要生效，所以不跟着那个 if。
+builder.Services.AddHostedService<GracefulSuspendService>();
+
+// 默认 5 秒不够：挂起本身只写几十字节，但要先等每个工作者从当前这步退出来。
+// 给到 30 秒，配合 docker-compose 的 stop_grace_period —— 两边都得放宽，短的那个说了算。
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
+
 // 本地路径边界（设计 §3）：Backup:Root 未配置时无边界，行为不变。
 // 这里**立即构造**（而不是交给容器懒加载），让「配了根但解析不出来」在启动期就炸掉，
 // 而不是拖到第一个请求——边界失效是配置错误，越早暴露越好。

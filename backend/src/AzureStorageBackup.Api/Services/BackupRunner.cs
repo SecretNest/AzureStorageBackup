@@ -210,7 +210,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     }
 
     /// <summary>下达停止意愿。返回被叫停的运行，没有在跑则返回 null。</summary>
-    private BackupRunState? RequestStop(int configId, StopKind kind)
+    private BackupRunState? RequestStop(
+        int configId, StopKind kind, SuspendReason reason = SuspendReason.UserRequested)
     {
         BackupRunState? state;
         // Cancel()/RequestStop() 会在**当前线程**同步执行已注册的回调；放在 _lock 里的话，
@@ -223,7 +224,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         {
             // 状态改成终态之前 control 就已经释放了（`await using` 先于 catch 块生效）。
             // 那一瞬间进来的停止请求什么也做不了——这一轮反正已经在收尾了，当作"没在跑"。
-            try { control.RequestStop(kind); }
+            try { control.RequestStop(kind, reason); }
             catch (ObjectDisposedException) { return null; }
         }
         else
@@ -235,12 +236,94 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     public bool Cancel(int configId) => RequestStop(configId, StopKind.StopNow) is not null;
 
     /// <summary>主动暂停：做完手上这件活，落盘，退出成 Suspended。等落盘完成才返回。</summary>
-    public async Task<bool> SuspendAsync(int configId, CancellationToken ct = default)
+    /// <param name="reason">写进盘上标记的挂起理由。界面上按的暂停用默认值，关机路径传
+    /// <see cref="SuspendReason.ShuttingDown"/>。</param>
+    public async Task<bool> SuspendAsync(
+        int configId, SuspendReason reason = SuspendReason.UserRequested, CancellationToken ct = default)
     {
-        if (RequestStop(configId, StopKind.Suspend) is not { } state)
+        if (RequestStop(configId, StopKind.Suspend, reason) is not { } state)
             return false;
         await state.Completion.Task.WaitAsync(ct);
         return true;
+    }
+
+    /// <summary>
+    /// 关机时等所有运行落盘的上限。三个数字是一串的，动其中一个就得回头看另外两个：
+    /// <code>
+    /// docker-compose stop_grace_period 45s  &gt;  HostOptions.ShutdownTimeout 30s  &gt;  这里的 20s
+    /// </code>
+    /// 45 &gt; 30：docker 的宽限期一到就是 SIGKILL，必须让 .NET 自己的超时先到，才还有机会把日志写出来。
+    /// 30 &gt; 20：宿主等 <c>StopAsync</c> 也是有超时的，超了它不等、直接往下拆服务——那时连"谁没停下来"
+    /// 都没人记得下。留出的这 10 秒是给下面那条警告日志和其余宿主服务收尾用的。
+    /// </summary>
+    private static readonly TimeSpan SuspendWaitCap = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// 让**所有**在跑的运行挂起，并等它们把 journal 落盘。返回真的停成
+    /// <see cref="RunStatus.Suspended"/> 的运行数。
+    /// <para>
+    /// 关机路径专用，而且要如实说清它做不到什么：<see cref="StopKind.Suspend"/> 有意不碰 AbortToken，
+    /// 消费循环也是在**下一件**活开始前才退出的，所以手上这件——可能是一个几 GB 的上传——会被放着跑完。
+    /// 因此这里的等待是**有上限**的（<see cref="SuspendWaitCap"/>）：到点还没落盘的运行就丢在半路，
+    /// 下次启动时它是一次**没有标记**的中断运行，得操作员自己按 Resume，不会被自动接着跑。
+    /// </para>
+    /// </summary>
+    public async Task<int> SuspendAllAsync(SuspendReason reason, CancellationToken ct)
+    {
+        // 先在锁里把 id 抄一份出来。_runs 是把普通 Dictionary，不加锁地枚举它，一边有人登记新运行
+        // 就会当场 InvalidOperationException——而这一下正落在关机路径上，没有第二次机会。
+        // 抄完就放锁：RequestStop 会在**当前线程**同步跑取消回调，攥着锁进去必然自锁
+        //（同 RequestStop 处的说明）。
+        List<int> running;
+        lock (_lock)
+            running = [.. _runs.Where(kv => kv.Value.Status == RunStatus.Running).Select(kv => kv.Key)];
+
+        // 分两趟：**先**把停止意愿发给每一个运行，**再**统一等它们落盘。
+        // 合成一趟（发一个、等一个）在并发备份下是致命的：排头那个若正压着一个几 GB 的上传，
+        // 它一个人就吃掉整个关机预算，后面的运行连 RequestStop 都收不到——没落盘、没标记、直接挨砍。
+        // 发信号本身只是几次赋值加同步回调，一瞬间就能全发完。
+        var pending = new List<(int ConfigId, BackupRunState State)>();
+        foreach (var configId in running)
+        {
+            try
+            {
+                if (RequestStop(configId, StopKind.Suspend, reason) is { } state)
+                    pending.Add((configId, state));
+            }
+            catch (Exception ex)
+            {
+                // 一个运行下达失败不能挡住别的运行——关机路径上没有第二次机会。
+                // 日志按本类既有做法临时开一个 scope 取（这个类没有注入的 logger），
+                // 而且只在出事那一次才开：正常关机一个 scope 都不必建。
+                using var scope = scopes.CreateScope();
+                scope.ServiceProvider.GetService<ILogger<BackupRunner>>()?
+                    .LogWarning(ex, "Failed to suspend backup {ConfigId} during shutdown", configId);
+            }
+        }
+        if (pending.Count == 0)
+            return 0;
+
+        using var capped = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        capped.CancelAfter(SuspendWaitCap);
+        try
+        {
+            await Task.WhenAll(pending.Select(p => p.State.Completion.Task)).WaitAsync(capped.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // 超时（或调用方的 ct 先断）不往上抛：抛出去就没人写下面这条日志了，而事后想弄明白
+            // "这一卷为什么没有标记"，就只剩这条日志能说清。
+            var stuck = pending.Where(p => !p.State.Completion.Task.IsCompleted).Select(p => p.ConfigId);
+            using var scope = scopes.CreateScope();
+            scope.ServiceProvider.GetService<ILogger<BackupRunner>>()?.LogWarning(
+                "Gave up after {Seconds}s waiting for backup(s) {ConfigIds} to suspend; they are left "
+                + "mid-flight and will come back as interrupted runs to be resumed by hand",
+                SuspendWaitCap.TotalSeconds, string.Join(", ", stuck));
+        }
+
+        // 只数真的停成 Suspended 的。等超时的、以及被同时到达的 Stop now 抢先按成 Canceled 的，
+        // 盘上都没有标记——把它们算进来，关机日志就在说大话。
+        return pending.Count(p => p.State.Status == RunStatus.Suspended);
     }
 
     /// <summary>取消。<paramref name="finishCurrentFiles"/> 为 true 时等在途文件（含其全部分卷）传完。
