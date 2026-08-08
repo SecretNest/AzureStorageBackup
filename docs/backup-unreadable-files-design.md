@@ -1,139 +1,122 @@
-# 备份遇到读不开的文件（2026-07-27）
+# Unreadable input during a backup
 
-> 一次备份因为单个文件被别的进程占用而整体失败：
+> A whole backup failed because one file was held open by another process:
 >
 > ```
-> Backup failed: Allen Tsui — The process cannot access the file
-> '/nas/Allen Tsui/Products/VDDatabase/Vistopia.mdf' because it is being used by another process.
+> Backup failed: The process cannot access the file
+> '/nas/.../VDDatabase/Vistopia.mdf' because it is being used by another process.
 > ```
 >
-> 一个文件读不开，不该让其余几万个文件的备份一起作废。
+> One unreadable file must not invalidate the backup of the other tens of thousands.
 >
-> 补充 [m4-backup-engine-design.md](m4-backup-engine-design.md) §9。
+> Supplements [m4-backup-engine-design.md](m4-backup-engine-design.md) §9.
 
-## 1. 先厘清：哪些已经是对的
+## 1. What was already correct
 
-排查中确认了两件**已经按设计工作**的事，本轮不动它们：
+Two things already worked as designed and are untouched:
 
-- **处理后重校验**：处理完比对 mtime/权限/长度，变了就重算 hash，内容确实变了就以新 hash 重处理；反复达 `ProcessingMaxAttempts`（默认 5）则告警并以当前内容保存。（当时由独立的 `ProcessingVerifier` 承担；流水线化之后这段逻辑并入 `BackupOrchestrator`，该类已删。）
-- **分组成员的重校验**（`BackupOrchestrator.UploadGroupablesAsync`）：压缩前给全部成员打 `Stat` 快照，压缩后逐个比对，发现变化就丢弃本次归档、排除变化成员后重压。
+- **The post-processing recheck**: after processing, compare mtime, permissions and length; if they changed, re-hash; if the content really changed, reprocess under the new hash. After `ProcessingMaxAttempts` repeats (5 by default), warn and save the current content.
+- **The pack-member recheck**: snapshot `Stat` for every member before compression, compare afterwards, and on any change discard that archive and recompress with the changed member excluded.
 
-关于分组，用户给出的是一条**不变量**而非实现方式：
+For grouping, the requirement was stated as an **invariant**, not an implementation:
 
-> 你可以把这个文件剔除后重新压缩一个包，也可以考虑整个压成一个包。但不要把一个含有已经变化了的文件当做垃圾保存在一个包里上传。
+> You may exclude the file and recompress the pack, or compress the whole thing again. But do not upload a pack that keeps an already-changed file in it as garbage.
 
-现有实现（排除后重压）已满足该不变量，故保留。
+Excluding and recompressing satisfies that invariant, so it stays.
 
-## 2. 设计决策（本轮锁定）
+## 2. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 读失败的后果 | **告警并跳过该文件，备份继续**。绝不因单个文件终止整轮 |
-| 2 | 捕获范围 | `IOException` 与 `UnauthorizedAccessException`。**不**捕获 `OperationCanceledException`——取消必须照常上抛 |
-| 3 | 已备份过的文件读不开 | **沿用上个版本的条目**，并在索引条目上标记本轮未能重读 |
-| 4 | 新文件第一次就读不开 | **不进入本版本**，只有告警。没有任何内容可指向，编造条目是撒谎 |
-| 5 | 绝不做的事 | 不可读**不得**被当作删除。否则保留策略滚过几轮后，一个长期被占用的文件会从所有版本里静默消失 |
-| 6 | 分组成员读不开 | 走与「成员已变化」相同的排除路径：排除该成员、重压包。满足§1 的不变量 |
-| 7 | 索引格式 | **可自由修改，不考虑兼容**——产品仍在测试阶段（用户确认） |
-| 8 | 重复告警 | 长期被占用的文件**每轮都告警**。这是有意的：它确实没被备起来 |
+| # | Question | Conclusion |
+|---|---|---|
+| 1 | Consequence of a read failure | **Warn, skip the file, continue.** Never abort the whole run over one file |
+| 2 | What is caught | `IOException` and `UnauthorizedAccessException`. **Not** `OperationCanceledException` — cancellation must keep propagating |
+| 3 | A previously backed-up file becomes unreadable | **Carry the previous version's entry forward**, marking on the index entry that it could not be re-read this round |
+| 4 | A new file is unreadable on first sight | **It does not enter this version**, only a warning. There is nothing to point at, and fabricating an entry would be a lie |
+| 5 | The thing never to do | Unreadable must **never** be treated as deleted. Otherwise, after retention rolls over a few rounds, a permanently locked file silently disappears from every version |
+| 6 | An unreadable pack member | Same exclusion path as "the member changed": exclude it and recompress. Satisfies the §1 invariant |
+| 7 | Repeated warnings | A permanently locked file warns **every round**. That is deliberate: it genuinely is not being backed up |
 
-## 3. 读失败的处理
+## 3. Handling a read failure
 
-`IFileHasher.FullHashAsync` 在四处被调用，任何一处抛出都会终止整轮备份。新增统一的「本轮不可读」判定，四处分别处置：
+**One precondition**: the diff only hashes files it suspects are new or modified — a file whose size and mtime are both unchanged is never re-read. So a file that has been locked for a long time but whose content matches the last round never triggers a read at all. What actually triggers this is "locked **and** the size or mtime changed" — exactly the `.mdf` case.
 
-**一个前提**：diff 只对疑似新增/修改的文件算 hash（大小与 mtime 均未变的文件不重读）。所以一个长期被占用、但内容与上轮一致的文件**根本不会触发读取**，也就不会走到这里。真正触发的是「被占用 **且** 大小或 mtime 变了」——正是那个 `.mdf` 的情形。
-
-| 位置 | 处置 |
+| Site | Handling |
 |---|---|
-| 扫描 / diff | 标记为本轮不可读，不进入计划 |
-| 单文件处理 | 同上，且不产生 blob |
-| 处理后重校验 | 视同不可读，丢弃本次处理结果 |
-| 分组成员重校验 | 排除该成员并重压包（决策 6） |
+| Scan / diff | Marked unreadable for this round, excluded from planning |
+| Single-file processing | As above, and no blob is produced |
+| Post-processing recheck | Treated as unreadable, this round's result discarded |
+| Pack-member recheck | Exclude the member and recompress (decision 6) |
 
-每个不可读文件记一条 **Warning** 级操作日志，源为 `backup:{accountId}/{container}`，消息含完整路径与系统给出的原因原文。系统原因必须原样保留——「被哪个进程占用」「权限不足」「设备读错误」需要不同的处理，把它们压成一句「无法读取」等于让操作员无从下手。
+### 3.1 Reporting goes through the push channel, not just the log
 
-> 实现时改了：操作日志是 pull-only，无人值守部署下没人会主动去看，所以改走既有的 `UnrecoverableError` 通知事件（唯一的 push 通道），日志级别随之变为 **Error**。见 §7。
+Operation logs are pull-only, and on an unattended deployment nobody goes looking. Unreadable files therefore reuse the existing `UnrecoverableError` notification event — the only push channel — which also raises the log level from Warning to Error. That is intentional: this information is supposed to be glaring.
 
-备份结果中增加不可读文件计数，与既有的计数一同呈现。
+The system's own reason must be preserved verbatim. "Held open by which process", "insufficient permissions" and "device read error" need different responses, and flattening them into "could not be read" leaves the operator with nowhere to start.
 
-## 4. 索引中的表示
+An unreadable **directory** pushes one summary (including the number of affected entries); the file-level entries derived from it are not pushed individually. A directory with five thousand files would otherwise become five thousand webhooks, which both drowns the operator and stalls the backup on pushing.
 
-索引格式可自由修改（决策 7）。
+### 3.2 Failures after the diff count too
 
-在 `Models/BackupIndex.cs` 的 `IndexEntry` 上新增一个可空字段：
+The diff is not the only place the source is opened — it is opened again for packing or raw passthrough, and on a large backup that window can be hours long. Failures there are handled identically to failures during the diff: no blob, the index carries the old entry forward, and it counts towards the total.
+
+Two boundaries here were both real defects:
+
+- **An upload failure must not be mistaken for an unreadable file.** The uploader classifies `IOException` as a retryable network error, and once the retry budget is exhausted it rethrows — with exactly the same shape as "the file could not be read". Accepting it on exception type alone means one NAS network outage gets recorded as several "unreadable files" while the run reports success, and the operator reads "Backup succeeded, 0 changed files". The catch filter therefore **probes the source again** (open it and genuinely read one byte); if it reads fine, the exception keeps propagating.
+- **Post-upload work must be outside the catch.** An early version wrapped the whole processing unit in the `try`, so a failure writing a verbose log *after* a successful upload was misread as an unreadable file — and a blob already in the cloud was dropped from the index. The catch now covers only the actual source read.
+
+## 4. How it appears in the index
+
+`IndexEntry` carries a nullable field:
 
 ```csharp
-/// <summary>本轮未能重读该文件（被占用/无权限/读错误），条目内容沿用上一版本。
-/// null = 本版本正常读取。值为发生时刻，便于操作员判断这份旧内容有多旧。</summary>
+/// This round could not re-read the file (locked / no permission / read error); the entry's
+/// content is carried over from the previous version. null = read normally this version.
 public DateTimeOffset? UnreadableAt { get; init; }
 ```
 
-- **上个版本有该文件**：新版本条目从上一版本条目**整体沿用**（`Length`/`Mtime`/`Permissions`/三段 hash/`Storage` 全部照抄，因此指向同一份已上传内容），仅额外置 `UnreadableAt`。还原时据此提示「这是上一次成功读取的内容」。
-- **上个版本没有**：不进入本版本索引。
+- **The previous version had the file**: the new entry is copied **wholesale** from it (length, mtime, permissions, all three hashes and storage), so it points at the same already-uploaded content, with only `UnreadableAt` added. Restore uses this to say "this is the last content that was read successfully".
+- **The previous version did not**: it does not enter this version's index.
 
-置 `UnreadableAt` 的条目**不重新上传任何内容**——它复用旧条目的 `Storage`，因此不产生新 blob，也不影响去重。
+An entry with `UnreadableAt` set **uploads nothing** — it reuses the old entry's storage, so it produces no new blob and does not affect dedup.
 
-## 5. 测试
+### 4.1 Semantics and where it surfaces
 
-- 四个调用点各一条：读抛 `IOException` 时备份继续，其余文件照常备份。
-- 已备份过的文件本轮不可读 → 新版本条目指向旧内容且带标记；**且不出现在删除集合中**。这条是决策 5 的护栏。
-- 新文件第一次不可读 → 不在本版本索引中，且有一条 Warning。
-- 分组成员不可读 → 上传的包**不含**该成员，其余成员照常成包。这条是§1 不变量的护栏。
-- 取消（`OperationCanceledException`）仍然终止备份，不被当成不可读吞掉。
-- 连续两轮都不可读 → 两轮各有一条告警（决策 8）。
+**Semantics**: it records **the first** time the file could not be read, and is not refreshed on subsequent rounds. The question it answers is "since when has this content been unable to update"; overwriting it with the current time each round would erase the answer. When a round reads the file successfully again the entry is rebuilt normally and the field returns to null.
 
-## 6. 已知后果
+It would otherwise be a write-only field — written into the index and read by nobody — so it surfaces in four places:
 
-- `.mdf` 这类被独占的文件会每轮告警且永远备不上。真正的解法是把它加入忽略规则、改用数据库自身的导出机制——那是运维决定，不是本工具应代为决定的事。
-- 沿用旧条目意味着还原该版本时拿到的是**旧内容**。索引里的标记使这一点可见，但仍需操作员理解其含义。
+- The run state and the success notification carry this round's unreadable count.
+- `GET /backup-configs/{id}/unreadable?version=` lists the carried-over entries in that version. Symmetric with `/unrecoverable`, but different in meaning: there the data is damaged and there is nothing to give, here the content is valid, just old.
+- Restore tree nodes and the restore dialog summary — the moment of choosing what to restore is exactly when it matters most to know that what you get is not the content as of that version's timestamp.
+- Check report entries — without it, `Local=Changed` reads as "the local file was modified", when the real cause is that the backup never managed to update the cloud copy.
 
----
+**No per-version substitution is offered.** Carried-over content is *valid* data and is the best this version can give. Flagging it is enough; adding a substitution picker would imply a better option exists. `UnrecoverablePaths` needs substitution because that data is actually broken.
 
-## 7. 实现说明（截至 2026-07-27）
+## 5. 7z silently drops members it cannot read
 
-设计落地后又经三轮修复。以下是与上文正文的差异，以及正文没有预见到的问题——**当前行为以本节为准**。
+The original assumption was that a failed compression fails. Measurement says otherwise: for a member it cannot read, 7z emits a **warning** (exit code 1), drops the member, and still produces a **completely valid** archive — including a 59-byte empty archive when no member could be read at all. The calling layer only threw at exit code ≥ 2.
 
-### 7.1 通知通道（改动了 §3 的表述）
+The consequence is a pack missing a member being uploaded as a normal result, while the index claims the member is inside, surfacing only at restore or deep check. **The compaction path is worse**: it overwrites in place, so a pack holding a/b/c is rewritten to hold only c while b is still referenced by a valid version — permanent data loss.
 
-不可读文件不再只落进 pull-only 的操作日志，而是复用既有的 `UnrecoverableError` 事件推送（与「处理中反复变化」共用一条通道，不新增开关、不改前端）。代价是日志级别从 Warning 变成 Error——已确认可接受：这条信息本来就该刺眼。
+On exit code 1 the compressor now lists the archive's actual contents (`7z l -slt`) and compares against the requested entries. Exit code 0 is necessarily complete, so this costs nothing on the happy path; encrypted archives need the password passed, since `-mhe=on` hides even the entry names otherwise. A confirmed absence throws, backup folds the missing members into the existing exclusion path, and compaction abandons the optimisation rather than ever overwriting an intact pack.
 
-读不开的**目录**只推一条汇总（含受影响条目数），其下派生的文件级条目不再逐条推送：一个五千文件的目录会变成五千条 webhook，既淹没操作员，也会把备份卡在推送上。
+## 6. Unreadable directories
 
-### 7.2 diff 之后才读不开
+The original design stopped at file level. A directory whose contents cannot be listed would crash the whole run during scanning — and **simply wrapping it in a `try` and skipping would be worse**: the subtree goes unscanned, the diff judges every entry beneath it Deleted, and one permission failure wipes an entire subtree out of the index, after which retention deletes the data blobs.
 
-正文只考虑了 diff 阶段的读失败，但 diff 通过之后源文件还会被再次打开（7z 打包、原样直传）。这段窗口对一次大备份可能长达数小时。现在这类失败与 diff 阶段读不开**同等处置**（`postDiffUnreadable`），不产生 blob、索引沿用旧条目、计入计数。
+The scan result now records these paths (directories and files marked separately), and the differ registers the whole subtree into `seen` and marks it unreadable **before** deletion is judged, so it takes exactly the same carry-forward path as the file-level case. An unreadable directory never enters `EmptyDirs` (that would make restore recreate an empty shell), while empty directories beneath it from the previous version are carried over so the restored structure is not missing a piece.
 
-两个由此而来的边界，都曾是真实缺陷：
+> **The rule of thumb**: whenever "what should happen when X cannot be read" comes up again, ask first — does this handling make the diff judge it deleted? If so, it is data loss.
 
-- **上传失败不得被误判为不可读。** `BlobUploader.IsTransient` 把 `IOException` 列为可重试的网络错误，重试预算耗尽后原样抛出，形状与「文件读不开」一模一样。仅凭异常类型收下它，一次 NAS 断网会被记成若干个「文件不可读」，整轮备份照常报告成功——操作员看到的是 "Backup succeeded, 0 changed files"。现在 catch filter 会**再探一次源文件**（`SourceUnreadable`：打开并真读一个字节），读得开就让异常照常向上抛。
-- **成功上传之后的收尾不进 catch。** 早期版本把整个「处理单元」圈进 try，于是上传成功后写 verbose 日志失败会被误判成文件不可读，已在云端的 blob 反而在索引里被丢弃。catch 范围现在只圈住真正的源读取。
+## 7. Check has to survive it too
 
-### 7.3 7z 会静默丢掉读不了的成员
+Local verification originally had no protection, so one unreadable local file crashed the entire check — and "there are unreadable files" is precisely when a check is most needed. It is now handled as `LocalState.Missing` (no usable local copy, and unusable as a repair source), consistent with the existing "path outside the root" case.
 
-正文假设「压缩失败会失败」。实测不成立：7z 对读不了的成员只报**警告**（退出码 1），把成员丢掉，仍产出一个**完全有效**的归档——全部成员都读不了时也照样产出一个 59 字节的空归档。而调用层原本只在退出码 >= 2 时抛。
+## 8. Known consequences
 
-后果是一个缺成员的包被当作正常产物上传，索引却声称该成员在里面，只在还原或深度检查时才暴露。**死重压实路径更严重**：它是覆盖式写入，一个 a/b/c 的包会被改写成只剩 c，而 b 仍被有效版本引用——数据永久丢失。
+- An exclusively locked file like that `.mdf` warns every round and is never backed up. The real fix is to add it to the ignore rules and use the database's own export mechanism — that is an operations decision, not one this tool should make on the operator's behalf.
+- Carrying an entry forward means restoring that version yields **old content**. The index marking makes it visible, but the operator still has to understand what it implies.
 
-现在 `SevenZipCompressor` 在退出码为 1 时用 `7z l -slt` 列出归档实际内容与请求条目比对（退出码 0 必然齐全，不付代价；加密归档带 `-p`，否则 `-mhe=on` 连条目名都列不出），确认缺席就抛 `ArchiveMembersMissingException`。备份把缺席成员并入既有的「排除成员」路径；压实则放弃本次优化，绝不覆盖一个完好的包。
+## 9. Pinned behaviour
 
-### 7.4 目录读不出来（正文完全没有覆盖）
-
-正文只做到文件级。一个列不出内容的目录会让整轮备份崩在扫描阶段——而**只加个 try 跳过会更糟**：子树没被扫到，diff 会把其下条目全判成 Deleted，一次权限故障就把整棵子树从索引里抹掉，保留策略随后清掉数据 blob。
-
-现在 `ScanResult.Unreadable` 记下这些路径（目录/文件分开标记），`BackupDiffer` 在「判删除」**之前**把整棵子树登记进 `seen` 并标为 `Unreadable`，因此走的是与文件级完全相同的沿用路径。读不开的目录绝不进 `EmptyDirs`（那会让还原重建出一个空壳）；上一版本里位于其下的空目录则原样带过来，避免目录结构在还原后少一块。
-
-**准绳**：再遇到「某某读不出来该怎么办」，先问——这个处置会不会让 diff 判成删除？会的话就是数据丢失。
-
-### 7.5 检查也要扛得住
-
-`BackupChecker` 的本地校验原本没有保护，一个读不开的本地文件会让整轮检查崩溃——而「有文件读不开」恰恰是最需要跑检查的时候。现在按 `LocalState.Missing` 处理（本地拿不出可用副本，也不能当修复来源），与既有的「路径越界」一致。
-
-### 7.6 `UnreadableAt` 的语义与出口
-
-- **语义**：记录的是**首次**读不开的时刻，连续多轮不刷新。它要回答的是「这份内容从什么时候起就没能再更新」；每轮刷成当前时间等于每轮把答案抹掉。某轮重新读到后条目正常重建，字段自然回到 null。
-- **出口**（此前它是纯只写字段，写进索引却无人读取）：
-  - 备份运行状态与成功通知摘要带上本轮的不可读文件数；
-  - `GET /backup-configs/{id}/unreadable?version=` 列出该版本中内容为沿用的条目（与 `/unrecoverable` 对称，但语义不同：那边是数据已损坏、无内容可给，这边内容有效，只是旧）；
-  - 还原树节点（`TreeNode.UnreadableAt`）与还原对话框汇总——选择还原内容的那一刻，正是最需要知道「拿到的不是这个版本时刻的内容」的时候；
-  - 检查报告条目（`FileFinding.UnreadableAt`）——没有它，`Local=Changed` 会被读成「本地被改了」，而真实原因是备份从未成功更新过云端那一份。
-- **不提供「按版本替代」**：沿用的内容是**有效**数据，就是这个版本能给出的最好结果。提示到位即可，加一套替代选择反而暗示存在更好的选项。`UnrecoverablePaths` 需要替代是因为那边的数据已经坏了。
+Each of the read sites continues the backup when reading throws, with the remaining files backed up normally. A previously backed-up file that becomes unreadable produces an entry pointing at the old content with the marker set, **and does not appear in the deletion set** — that assertion is the guard for decision 5. A new unreadable file is absent from the index and produces a warning. An unreadable pack member is absent from the uploaded pack while the other members pack normally — the guard for the §1 invariant. Cancellation still aborts the backup rather than being swallowed as unreadable. Two consecutive unreadable rounds produce two warnings.
