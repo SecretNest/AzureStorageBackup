@@ -1,137 +1,129 @@
-# 预置密码访问控制（2026-07-25）
+# Preset-password access control
 
-> 工具原为单用户、无认证。本轮增加一道访问门：进入系统需输入密码，密码由环境变量预置，无用户名。这是**访问控制**，不是加密体系的一部分——不改动 Data Protection 密钥环的用途，也不把用户密码变成任何数据的加密主密钥（PRD §107 那个开放问题不在本轮范围内）。
+> The tool was originally single-user with no authentication. This adds one gate: entering the
+> system requires a password, preset through an environment variable, with no username. It is
+> **access control**, not part of the encryption scheme — it does not change what the Data
+> Protection key ring is for, and it does not turn the user's password into a master key for any
+> data.
 >
-> 补充 [product-requirements.md](product-requirements.md)。与 [keyring-loss-recovery-design.md](keyring-loss-recovery-design.md) 有一处必须遵守的交互，见 §5。
+> Supplements [product-requirements.md](product-requirements.md). There is one mandatory
+> interaction with [keyring-loss-recovery-design.md](keyring-loss-recovery-design.md), in §5.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 会话机制 | **Cookie + Data Protection 签发**。密钥环已存在，直接复用；`HttpOnly` 使 XSS 偷不走；有内建过期与滑动续期；登出即删 cookie。不用 localStorage token（XSS 可读）或 HTTP Basic（无法自定义登录页、登出困难） |
-| 2 | 未设密码时 | **放行**，启动记一条 Warning。认证是可选加固，现有部署升级后行为不变。不做 UI 横幅 |
-| 3 | 密码存放 | 环境变量明文 `Auth__Password`。不做 hash 预生成——那要求用户先跑一个工具算 hash，对自建单用户工具是不成比例的负担 |
-| 4 | 保护范围 | 只拦 `/api/*`；静态资源不保护 |
-| 5 | 豁免 | 恰好六个：`GET /api/health`、`GET /api/health/ready`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/status`、SPA 回退。**逐端点**标注，不标在 group 上（否则将来加进 `/api/auth` 的端点会默默继承匿名）。这份清单由测试钉死 |
-| 6 | 未认证响应 | **401**，不重定向。前端是 SPA + `fetch`，重定向只会让 `fetch` 拿到一份 HTML |
-| 7 | 会话有效期 | 滑动过期 30 天 |
-| 8 | 与密钥环恢复的关系 | 登录门在密钥环闸门**之外**。密码比对不经密钥环，故 `Lost` 时仍可登录 |
-
-## 2. 配置
-
-`Auth__Password`（即配置键 `Auth:Password`，遵循项目既有的 `Section__Key` 约定）。
-
-- **未设置或为空** → 认证关闭，所有端点放行，启动时记一条 Warning：`Authentication is disabled: Auth__Password is not set.`
-- **已设置** → 认证开启
-
-镜像不为它设默认值——有默认密码比没有密码更危险。
-
-## 3. 会话
-
-ASP.NET Core cookie 认证，由现有 Data Protection 密钥环签发。
-
-| 属性 | 值 | 理由 |
+| # | Question | Conclusion |
 |---|---|---|
-| `HttpOnly` | `true` | XSS 无法读取 |
-| `SameSite` | `Lax` | 防 CSRF，同时不影响正常导航 |
-| `SecurePolicy` | **`SameAsRequest`** | 见下 |
-| 过期 | 滑动 30 天 | 日常使用无需重登；长期不用才失效 |
+| 1 | Session mechanism | **Cookie signed by Data Protection.** The key ring already exists, so reuse it; `HttpOnly` puts it out of reach of XSS; expiry and sliding renewal are built in; logging out just deletes the cookie. Not a localStorage token (readable by XSS), not HTTP Basic (no custom login page, and logging out is awkward) |
+| 2 | When no password is set | **Allow everything**, with a Warning logged at startup. Authentication is optional hardening, so existing deployments behave identically after upgrading. No UI banner |
+| 3 | Password storage | Plaintext in the `Auth__Password` environment variable. No pre-hashing — that would require the user to run a tool to compute a hash first, a disproportionate burden for a self-hosted single-user tool |
+| 4 | Protection scope | `/api/*` only; static assets are unprotected |
+| 5 | Exemptions | Exactly six: `GET /api/health`, `GET /api/health/ready`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/status`, and the SPA fallback. Marked **per endpoint**, never on the group — otherwise an endpoint added to `/api/auth` later would silently inherit anonymous access. The list is pinned by tests |
+| 6 | Unauthenticated response | **401**, no redirect. The frontend is an SPA using `fetch`, and a redirect would just hand `fetch` a page of HTML |
+| 7 | Session lifetime | Sliding expiry, 30 days |
+| 8 | Relationship to keyring recovery | The login gate sits **outside** the keyring gate. Password comparison never touches the key ring, so logging in still works while the ring is `Lost` |
 
-**`SecurePolicy` 必须是 `SameAsRequest`，不能硬编码为 `Always`。** 镜像默认监听 HTTP（`Dockerfile:33`，`ASPNETCORE_URLS=http://+:8080`）。若强制 `Secure`，浏览器在 HTTP 下根本不会回传 cookie，表现为「登录成功但立刻又被要求登录」——一个很难从症状反推到原因的故障。`SameAsRequest` 在 HTTPS 下自动加 `Secure`，在 HTTP 下不加。
+## 2. Configuration
 
-## 4. 端点与中间件
+`Auth__Password` (configuration key `Auth:Password`, following the project's existing `Section__Key` convention).
 
-### 4.1 端点
+- **Unset or empty** → authentication off, every endpoint open, with a Warning at startup: `Authentication is disabled: Auth__Password is not set.`
+- **Set** → authentication on
 
-| 端点 | 请求 | 响应 |
+The image sets no default for it — a default password is more dangerous than no password.
+
+## 3. The session
+
+ASP.NET Core cookie authentication, signed by the existing Data Protection key ring.
+
+| Property | Value | Reason |
 |---|---|---|
-| `POST /api/auth/login` | `{ "password": "..." }` | 正确 → **204** + `Set-Cookie`；错误 → **401** |
-| `POST /api/auth/logout` | — | **204**，清除 cookie |
+| `HttpOnly` | `true` | Unreadable by XSS |
+| `SameSite` | `Lax` | CSRF protection without breaking normal navigation |
+| `SecurePolicy` | **`SameAsRequest`** | See below |
+| Expiry | Sliding, 30 days | No re-login during normal use; only long disuse expires it |
+
+**`SecurePolicy` must be `SameAsRequest`, never hard-coded to `Always`.** The image listens on HTTP by default (`ASPNETCORE_URLS=http://+:8080`). Forcing `Secure` means the browser will not send the cookie back over HTTP at all, which presents as "login succeeds and immediately asks for login again" — a failure that is very hard to trace back from the symptom. `SameAsRequest` adds `Secure` under HTTPS and omits it under HTTP.
+
+## 4. Endpoints and middleware
+
+### 4.1 Endpoints
+
+| Endpoint | Request | Response |
+|---|---|---|
+| `POST /api/auth/login` | `{ "password": "..." }` | Correct → **204** plus `Set-Cookie`; wrong → **401** |
+| `POST /api/auth/logout` | — | **204**, cookie cleared |
 | `GET /api/auth/status` | — | `{ "required": bool, "authenticated": bool }` |
 
-`status` 是前端唯一的决策依据，必须在未认证时也可访问。
+`status` is the frontend's only basis for deciding what to render, so it must be reachable while unauthenticated.
 
-### 4.2 中间件位置
-
-管线顺序（`Program.cs` 现状加入本轮中间件后）：
+### 4.2 Where the middleware sits
 
 ```
-UseCors → UseDefaultFiles → UseStaticFiles → [认证] → UseSecretUnavailableMapping → Map*Endpoints → MapFallbackToFile
+UseCors → UseDefaultFiles → UseStaticFiles → [auth] → UseSecretUnavailableMapping → Map*Endpoints → MapFallbackToFile
 ```
 
-认证置于 `UseStaticFiles` 之后（静态资源不保护）、`UseSecretUnavailableMapping` 之前（先判断能不能进门，再处理门内的业务异常），只对路径前缀 `/api/` 生效。
+Authentication goes after `UseStaticFiles` (static assets are unprotected) and before `UseSecretUnavailableMapping` (decide whether they may come in, then handle business exceptions on the inside), and applies only to the `/api/` prefix.
 
-静态资源（HTML/JS/CSS）**不保护**：它们不含任何敏感数据，所有数据都经 API 获取；保护它们只会把登录页自身也挡在门外。
+Static assets (HTML/JS/CSS) are **not** protected: they contain no sensitive data — everything comes through the API — and protecting them would lock the login page itself outside the gate.
 
-健康探针必须豁免。否则 `docker healthcheck` 与编排层探针一律得到 401，容器被判定不健康并反复重启——一个由「加强安全」直接导致的可用性故障。
+Health probes must be exempt. Otherwise `docker healthcheck` and any orchestrator probe get a 401, the container is judged unhealthy and restarts in a loop — an availability failure caused directly by "improving security".
 
-但豁免的是**可达性**，不是**信息量**：`/api/health/ready` 的 200/503 保持不变（那才是探针消费的东西），而 `database`/`keyring` 两个布尔只在「认证已通过」或「未启用认证」时返回。否则任何匿名探测者都能读出「这台正处于密钥环恢复模式」。
+But the exemption covers **reachability**, not **information**: the 200/503 of `/api/health/ready` is unchanged (that is what probes consume), while the `database` and `keyring` booleans are only returned when authenticated, or when authentication is off. Otherwise any anonymous prober could read "this instance is in keyring recovery mode".
 
-### 4.3 安全细节
+### 4.3 Security details
 
-- 密码比对用 `CryptographicOperations.FixedTimeEquals`（对 UTF-8 字节比较）。防时序侧信道，零成本
-- 登录失败后固定延迟约 1 秒，且该延迟**全进程串行**（`SemaphoreSlim(1,1)`），使在线爆破不划算。逐请求各睡 1 秒是挡不住的：N 个请求同时在飞，摊到每次尝试的代价接近 0；串行后 N 次失败要花 N 秒真实时间。只串行失败路径，登录成功永不排队。**不做账户锁定**——单用户工具锁定等于把自己关在门外
-- 每次登录失败记一条 Warning（只记来源 IP，**绝不记提交的密码**），让爆破留下痕迹
-- 密码永不写入日志、永不出现在错误响应里
+- Password comparison uses `CryptographicOperations.FixedTimeEquals` over UTF-8 bytes. Timing side-channel protection, at zero cost.
+- A failed login sleeps about one second, and that delay is **serialised process-wide** (`SemaphoreSlim(1,1)`), which makes online brute force uneconomical. Sleeping one second per request independently does not work: with N requests in flight the amortised cost per attempt approaches zero, whereas serialised, N failures take N seconds of real time. Only the failure path serialises — a successful login never queues. **No account lockout**: on a single-user tool, lockout means locking yourself out.
+- Every failed login logs a Warning recording the source IP and **never the submitted password**, so brute force leaves a trace.
+- The password is never written to a log and never appears in an error response.
 
-### 4.4 CORS（仅影响本地开发）
+### 4.4 CORS (local development only)
 
-现有策略为 `WithOrigins(...).AllowAnyHeader().AllowAnyMethod()`（`Program.cs`），缺 `AllowCredentials()`。跨域请求默认不携带 cookie，因此本地跑 Vite dev server（`localhost:5173` → 后端 `localhost:8080`）会登录不上。需补 `AllowCredentials()`。
+The existing policy lacked `AllowCredentials()`. Cross-origin requests do not carry cookies by default, so running the Vite dev server (`localhost:5173` against a backend on `localhost:8080`) could not log in. Production is a same-origin single image and was unaffected.
 
-生产是同源单镜像部署，不受此影响。
+## 5. Interaction with keyring recovery (mandatory)
 
-## 5. 与密钥环恢复的交互（必须遵守）
+The login gate must sit **outside** the keyring gate, and the login path must not depend on Data Protection to decrypt anything.
 
-登录门必须在密钥环闸门**之外**，且登录路径不得依赖 Data Protection 解密任何东西。
+- Password comparison reads the plaintext environment variable and never touches the key ring → **login still works** while the ring is `Lost`.
+- The cookie is signed by the key ring → losing `/keys` invalidates existing sessions and requires one fresh login.
 
-- 密码比对读的是环境变量明文，不经密钥环 → 密钥环 `Lost` 时**仍可登录**
-- cookie 由密钥环签发 → `/keys` 丢失会使已有会话失效，需重新登录一次
+The correct sequence is: key ring lost → log in again (the password comes from the environment and is unaffected) → enter the system → see the recovery banner → reset credentials one by one.
 
-正确顺序：密钥环丢失 → 重新登录（密码来自 env，不受影响）→ 进入系统 → 见到恢复横幅 → 逐项重设凭据。
+Putting the login gate *after* `KeyringGuard`, or making login depend on the key ring, creates a deadlock: **recovery requires logging in, and logging in requires recovery.**
 
-若把登录门错误地置于 `KeyringGuard` 之后，或让登录依赖密钥环解密，就会形成死锁：**要恢复得先登录，要登录得先恢复**。
+## 6. Frontend
 
-## 6. 前端
+On mount, `App.tsx` requests `GET /api/auth/status` and picks one of three renderings:
 
-`App.tsx` 挂载时请求 `GET /api/auth/status`，据结果三选一：
-
-| 状态 | 渲染 |
+| State | Renders |
 |---|---|
-| `required: false` | 主界面，与当前行为完全一致 |
-| `required: true, authenticated: false` | **仅**登录页 |
-| `required: true, authenticated: true` | 主界面 + 导航栏 `Log out` |
+| `required: false` | The main UI, exactly as before |
+| `required: true, authenticated: false` | **Only** the login page |
+| `required: true, authenticated: true` | The main UI plus `Log out` in the nav bar |
 
-未认证时**不挂载**任何主界面组件，而不是加遮罩层——遮罩之下的组件仍会发起请求，制造一片 401 噪音。
+While unauthenticated, main-UI components are **not mounted** rather than covered by an overlay — components under an overlay still issue requests, producing a burst of 401 noise.
 
-`api/client.ts` 增加 401 处理：任何 API 响应 401 即把认证状态打回未登录，App 自动切回登录页。这覆盖「cookie 过期后继续操作界面」的情形。
+The API client treats any 401 as "no longer authenticated" and flips the app back to the login page, which covers the case of a cookie expiring while the UI is still in use.
 
-`fetch` 的 `credentials` 默认为 `same-origin`：同源部署下 cookie 自动携带，但**跨域部署下浏览器根本不会带上 cookie**，后端为此开的 `AllowCredentials()` 就白开了。因此 `api/client.ts` 统一设 `credentials: 'include'`（是 `same-origin` 的超集，同源部署行为不变）。
+`fetch` defaults `credentials` to `same-origin`: cookies are sent automatically under same-origin deployment, but under a cross-origin deployment the browser will not send them at all, which would render the backend's `AllowCredentials()` pointless. The client therefore sets `credentials: 'include'` throughout (a superset of `same-origin`, so same-origin behaviour is unchanged).
 
-界面文案一律英文。登录页只含一个密码输入框与一个按钮，沿用现有页面的内联样式风格。
+The login page holds one password field and one button.
 
-## 7. 测试
+## 7. Pinned behaviour
 
-- 未设密码：所有端点放行；`/api/auth/status` 报 `required: false`
-- 设了密码：未认证请求得 401
-- **设了密码时健康探针仍返回 200**——这条最易在后续重构中被破坏，且破坏后果是容器反复重启
-- 正确密码 → 204 + cookie；携带该 cookie 的后续请求通过
-- 错误密码 → 401，且不下发 cookie
-- 登出后原 cookie 失效
-- 登录端点自身不被拦截（否则永远登不进去）
-- `status` 端点在未认证时可访问
+With no password set, everything is open and `status` reports `required: false`. With one set, unauthenticated requests get 401, the correct password returns 204 plus a cookie that subsequent requests are accepted with, a wrong password returns 401 and issues no cookie, and logging out invalidates the cookie. The login and status endpoints are themselves never intercepted — otherwise there would be no way in.
 
-## 8. 文档
+**Health probes still return 200 when a password is set.** This is the one most likely to be broken by a later refactor, and breaking it restarts the container in a loop.
 
-`README.md` 环境变量表增加 `Auth__Password` 一行，并在表下补一段说明：
+## 8. Deployment note
 
-- 不设即无认证
-- cookie 由 `/keys` 的密钥环签发，故密钥环丢失需重新登录
-- **生产环境应配 HTTPS 反代**。明文 HTTP 下密码与 cookie 均在网络上明文传输，这道门只挡住「不知道密码的人」，挡不住能嗅探流量的人
+Production should sit behind an HTTPS reverse proxy. Over plain HTTP both the password and the cookie travel in the clear; this gate stops people who do not know the password, not people who can sniff the traffic.
 
-## 9. 明确不做
+## 9. Deliberately not done
 
-- 不做用户名、多用户、角色
-- 不做密码修改界面（改环境变量并重启即可）
-- 不做账户锁定（单用户工具会把自己锁死）
-- 不把用户密码用作任何数据的加密主密钥（PRD §107 的开放问题不在本轮范围）
-- 不保护静态资源
+- No usernames, multiple users or roles
+- No password-change UI (change the variable and restart)
+- No account lockout (a single-user tool would lock itself out)
+- The user's password is never used as a master key for encrypting data
+- Static assets stay unprotected
