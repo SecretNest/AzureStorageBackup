@@ -1,117 +1,127 @@
-# Azure Storage Backup — 产品需求文档（PRD）
+# Azure Storage Backup — product requirements (PRD)
 
-> 本文件忠实固化用户提供的完整需求，作为后续所有里程碑设计的唯一真相来源。
-> 全局约束：单用户系统、无身份验证；Azure Storage 一律用 Blob（不用 File Share）；界面文案一律英文。
+> This file records the complete requirements as given, and is the single source of truth for
+> every milestone design that follows.
+> Global constraints: single-user system, no authentication; Azure Storage always means Blob
+> (never File Share); all UI text is in English.
 >
-> **实现说明（以代码为准，「无身份验证」已放宽）**：仍然是**单用户**系统——没有用户名、没有账号体系、
-> 没有权限模型，这一条没变。变的是可以在整个界面前面加一道**可选**的密码闸门：设了环境变量
-> `Auth__Password` 就要求先登录（`AuthGate`），不设或设成空则维持原样敞开访问，启动时记一条警告。
-> 会话 cookie 用 `/keys` 里的 Data Protection 密钥环签名，密码本身直接读环境变量，
-> 因此丢了密钥环只会把人登出，不会把人锁在门外。改密码 = 改变量 + 重启。
-> 详见 [auth-password-design.md](auth-password-design.md)。
+> **Implementation note (code is authoritative; "no authentication" has been relaxed)**: it is
+> still a **single-user** system — no usernames, no account model, no permission model, and that
+> has not changed. What changed is that an **optional** password gate can be placed in front of
+> the whole UI: set the `Auth__Password` environment variable and a login is required
+> (`AuthGate`); leave it unset or empty and access stays open as before, with a warning logged at
+> startup. The session cookie is signed with the Data Protection key ring under `/keys`, while the
+> password itself is read straight from the environment — so losing the key ring only signs people
+> out, it does not lock them out. Changing the password means changing the variable and
+> restarting. See [auth-password-design.md](auth-password-design.md).
 
-## 0. 设置数据存储
+## 0. Settings storage
 
-设置内容需持久化。
-> **决策：SQLite**（2026-07-16 确定）。账户、组、任务、默认值、日志均存 SQLite——日志需按等级/时间/来源过滤，任务需查询，数据库更合适；骨架已具备 EF Core + SQLite。
-> 注：信息记录文件（PRD 1.5/1.6）是另一回事，存于 Azure container 中，不在本地数据库。
+Settings must be persisted.
 
----
-
-## 1. 账户设置
-
-- **1.1 账户增删改**：管理每个 Azure Storage Account。字段：
-  - 必填：endpoint、key 等必要连接信息；名字（name）
-  - 可选：描述（description）
-  - 可选：是否使用代理；若使用，可选「自定义独立代理」或「使用 docker 环境变量中的代理」；代理支持密码
-  - 若支持代理，允许选择 Azure 分区（如 China 等特定分区）；若不支持代理，仅用 Global 分区
-- **1.2 Container 管理**：对已配置账户，列出其 container，允许增删改 container。
-- **1.3 信息记录文件识别**：每个 container 指定一个文件名作为「信息记录文件」。若该文件存在，则认为此 container 是本工具使用的 container。**每个 container 最多只有一个备份。**
-- **1.4 新建账户引导**：新账户建立后，直接进入 container 列举界面，并建议直接建立一个 container。
-- **1.5 信息文件内容与恢复**：信息记录文件保存几乎所有相关配置与任务信息。在另一设备恢复时，只需设置好账户、选择 container，即可恢复「除设置（本章功能）外的所有内容」。
-- **1.6 信息文件的加密/非加密双版本**：
-  - 两个版本：加密备份用 / 不加密备份用
-  - 加密备份对应的信息文件本身也必须加密，可用不同文件名
-  - 两者都存在时，只用未加密的文件
-  - 发现加密文件时需用户输入密码，密码正确才能加载（用户可取消跳过加载）
-  - 已加载到本工具内的信息一律**不加密**存放；**密码除外**——密码需可逆加密存放
-- **1.7 信息文件读取时机**：仅在「将已有备份加入本工具时」「明确要检查该文件时」读取；平时不读取。
+> **Decision: SQLite** (settled 2026-07-16). Accounts, groups, tasks, defaults and logs all live in
+> SQLite — logs need filtering by level, time and source, tasks need querying, and a database fits
+> better; the skeleton already had EF Core plus SQLite.
+>
+> Note: the info file (PRD 1.5/1.6) is a separate thing, stored in the Azure container, not in the
+> local database.
 
 ---
 
-## 2. 计划任务
+## 1. Account settings
 
-- **2.1 备份列表**：列出所有已发现的备份（来自每个账户）。支持**手动刷新**，不自动刷新（加快加载、减少读取）。
-- **2.2 组（Group）**：允许建立组，每组含至少一个备份。组有名字，支持增删改查。对组做计划任务 = 对组内所有备份**依次**执行任务，前一个完成（无论成败）后再执行下一个。
-- **2.3 任务设置**：对每个备份或组，可分别设置「备份」「检查」任务。任务可设执行时间，用 cron 语法，但需提供便于非专业用户操作的图形界面。
-
----
-
-## 3. 默认值
-
-设置备份/检查的默认值；每个备份若勾选「使用默认」则套用这些值。
-
-- **3.1 Tier**（分别对索引文件、数据文件设置）：
-  - 索引文件：Hot（默认）、Cool、Cold
-  - 数据文件：Hot、Cool、Cold、**Archive（默认）**
-  - **实现说明（以代码为准）**：`StorageTier` 枚举为 `Hot/Cool/Cold/Archive`，**不含 Smart**（backup-feature-design.md「已确认」段：Azure SDK 不作为可选项，故删去）。数据文件默认 **Archive**（成本最优；还原前需 rehydrate，属备份归档语义的预期）。
-- **3.2 版本与时间**：最大版本数（默认 100）、最长时间（默认 180 天）、超量判断方式（两者都达到 / 任一达到 / 只看版本数 / 只看时间）。
-- **3.3 本地文件**：
-  - **3.3.1 忽略**：符合规则的路径/文件被忽略，支持特例（被包含），语法参考 gitignore。若已有备份含这些文件，则新版本中予以排除（如同删除）。
-  - **3.3.2 压缩与加密**（用 7z）：若用户既未选压缩也未选加密，且未用分组功能，则直接用原始文件；否则一律用 7z 封包。
-    - **3.3.2.1** 压缩值默认最大。
-    - **3.3.2.2 不压缩列表**：符合项不压缩但仍包含在备份中，语法同 3.3.1。
-    - **3.3.2.3 包尺寸**：目标包尺寸默认 100M，压缩时以此做分卷大小。
-    - **3.3.2.4 压缩后临时区尺寸**（默认 1GB）：备份时先压缩待备份文件存于此区供上传，上传完成后从此区删除。压缩应先以「压缩临时文件夹（另一文件夹）」为目标，压缩后将结果（可能多个分卷）移动到本目录，以避免压缩过程中分卷被改动。临时区超量时不对新文件压缩，直到不再超量；未达限制时分发下一个压缩任务。压缩任务不并发（不同备份间也不并发）。此设置可能导致临时区尺寸暂时超限（新加入的一个压缩结果所致）。
-    - **3.3.2.5 加密**：用户可选设置密码。
-  - **3.3.3 分组**（可选，默认启用）：将同一目录（不含子目录）中多个小文件合并打包，减少文件数量。
-    - **3.3.3.1 尺寸限制**（默认 5M）：超过者不列入分组，按单文件处理。仅对新增文件有效，已分组/未分组文件不因此变动状态。
-    - **3.3.3.2 不分组列表**：指定目录（含子目录）或文件按单文件处理，语法同 3.3.1。仅对新增文件有效。
-    - **3.3.3.3 单个分组上限**（默认 100M，压缩前为准）。
-    - **3.3.3.4 分组死重压实比例**（默认 30%）：分组内部分文件删除/变更后旧数据暂无法从包中移除；当其比例（原始文件尺寸为准）超过此比例时，原包剩余文件视为未包含在备份中，与其他文件一起重新参与处理（按新尺寸限制、不分组列表决定分组与否），原包在此次备份完成后删除。**仅当所有有效版本中均不再包含此文件时才算死重。**
-  - **3.3.4 Symbol link 处理**：符号链接文件如何处理——包含 或 跳过。默认待确认。（2026-07-16 补入）
-- **3.4 网络并发**：上传/下载并发数，默认 5。
-- **3.5 通知**：在「不可恢复错误」「备份（开始/成功/失败）」「还原（开始/成功/失败）」「检查（开始/成功/失败）」时是否发通知。
-- **3.6 执行记录保留**：与 3.2「版本与时间」区分——3.2 是数据版本保留，本项是执行记录/日志保留。
-  - **实现（以代码为准，2026-07-17，两级模型）**：日志分**长存**与**短存**两类。
-    - **长存**（任务开始/结束/错误等审计，`LogEntry.Ephemeral=false`；`AppendAsync` 默认 Warning 及以上、引擎起止事件显式长存）：保留至**删除该备份**（删配置连带删其日志，`DeleteForContainerAsync`）或**手工按时间清**（`DELETE /api/logs?before=<时间>`，删早于该时间的全部）。
-    - **短存**（info/debug 诊断，`Ephemeral=true`）：超期自动清，默认 `GlobalSettings.LogEphemeralMaxAgeDays`=14 天（调度器每分钟 `TrimAsync` 只删超期短存）。
-    - **verbose（debug）日志**（含操作文件名）默认**关**，可按备份（`BackupConfig.VerboseLogging`）或全局默认（`DefaultVerboseLogging`）开启。开启后逐文件日志**不写 SQLite**，而是落到**按备份+按日期的文本文件**：`{tempPath}/verbose-logs/{container}/{yyyyMMdd}.log`（`VerboseFileLog`）——避免每文件一次 DB 写成为超大备份瓶颈，并把高频诊断与可查询审计分开。文本文件与短存同窗口按日期清理（调度器每分钟 `Trim`，默认 14 天），路径在「目录」页展示供 Docker 卷映射。
-    - 原「按备份次数」的计数保留未实现——两级模型（长存至删备份 + 短存 14 天）已覆盖需求意图。
+- **1.1 Account CRUD** — manage each Azure Storage account. Fields:
+  - Required: endpoint, key and other necessary connection details; a name
+  - Optional: description
+  - Optional: whether to use a proxy; if so, either a dedicated proxy or the one from the docker environment variables. Proxies support a password
+  - Where proxies are supported, an Azure region may be selected (China and other specific regions); without proxy support, only Global
+- **1.2 Container management** — for a configured account, list its containers and allow creating, editing and deleting them.
+- **1.3 Info-file recognition** — each container designates one filename as its *info file*. If that file exists, the container is considered one this tool uses. **A container holds at most one backup.**
+- **1.4 New-account onboarding** — after an account is created, go straight to the container listing and suggest creating a container.
+- **1.5 Info-file contents and recovery** — the info file holds nearly all relevant configuration and task information. To recover on another machine, configure the account and pick the container, and everything except the settings in this chapter is restored.
+- **1.6 Encrypted and unencrypted variants of the info file**:
+  - Two variants: one for encrypted backups, one for unencrypted
+  - The info file for an encrypted backup must itself be encrypted, and may use a different filename
+  - When both exist, only the unencrypted one is used
+  - On finding an encrypted one, prompt for the password; loading proceeds only if it is correct (the user may cancel and skip loading)
+  - Information already loaded into the tool is stored **unencrypted** — **except passwords**, which are stored reversibly encrypted
+- **1.7 When the info file is read** — only when adding an existing backup to the tool, and when explicitly checking that file. Never during normal operation.
 
 ---
 
-## 4. 设置（全局）
+## 2. Scheduled tasks
 
-- **4.1 网络重试退避**：默认 5s、30s、90s、300s，之后每 300s，总上限 2h。
-- **4.2 通知**：一个支持 POST 或 GET 的服务器地址作为推送目的地，支持网络代理。
-  - GET：地址可含 `{Title}` `{Body}` 等占位符
-  - POST：除 GET 功能外，还支持一个文本体（含上述占位符）和一个 content-type
-
----
-
-## 5. 日志
-
-查看操作日志，支持按等级、时间、来源（如特定备份）过滤，允许清空。
+- **2.1 Backup list** — list every discovered backup across accounts. Refreshed **manually**, never automatically (faster loading, fewer reads).
+- **2.2 Groups** — groups can be created, each holding at least one backup. A group has a name and supports full CRUD. Scheduling a task on a group runs it against every backup in the group **in sequence**: the next one starts after the previous finishes, successfully or not.
+- **2.3 Task settings** — backup and check tasks can be configured per backup or per group. Execution times use cron syntax, but a graphical editor must be provided for non-technical users.
 
 ---
 
-## 6. 目录
+## 3. Defaults
 
-列出所有临时目录路径（仅查看），便于用户正确设置 docker 路径映射。
+Defaults for backup and check; a backup that ticks "use default" inherits them.
+
+- **3.1 Tier** (set separately for index files and data files):
+  - Index files: Hot (default), Cool, Cold
+  - Data files: Hot, Cool, Cold, **Archive (default)**
+  - **Implementation note (code is authoritative)**: the `StorageTier` enum is `Hot/Cool/Cold/Archive`, **without Smart** (dropped because the Azure SDK does not offer it as an option — see the "settled" section of [backup-feature-design.md](backup-feature-design.md)). Data files default to **Archive** (lowest cost; rehydration before restore is expected behaviour for archival backup semantics).
+- **3.2 Versions and time** — maximum version count (100 default), maximum age (180 days default), and how the two combine (both reached / either reached / count only / age only).
+- **3.3 Local files**:
+  - **3.3.1 Ignore** — matching paths and files are ignored, with support for exceptions (re-inclusion), using gitignore-style syntax. If an existing backup contains these files, new versions exclude them (as if deleted).
+  - **3.3.2 Compression and encryption** (via 7z) — if the user selects neither compression nor encryption and does not use grouping, the original file is used directly; otherwise everything goes through a 7z wrapper.
+    - **3.3.2.1** Compression level defaults to maximum.
+    - **3.3.2.2 Don't-compress list** — matches are not compressed but are still included in the backup; same syntax as 3.3.1.
+    - **3.3.2.3 Pack size** — target pack size defaults to 100 MB, which is also the volume size used when compressing.
+    - **3.3.2.4 Staging area size** (1 GB default) — files to be backed up are compressed into this area for upload and deleted from it once uploaded. Compression must target a separate *compress-temp* directory first, and the result (possibly several volumes) is then moved here, so that no volume can be modified mid-compression. While the area is over its limit, no new file is compressed until it is under again; below the limit, the next compression task is dispatched. Compression tasks never run concurrently, not even across different backups. This design may let the area exceed its limit temporarily, by one newly added result.
+    - **3.3.2.5 Encryption** — the user may set a password.
+  - **3.3.3 Grouping** (optional, on by default) — merge several small files from one directory (excluding subdirectories) into one pack to reduce file count.
+    - **3.3.3.1 Size limit** (5 MB default) — larger files are excluded from grouping and handled individually. Applies to newly added files only; already grouped or ungrouped files do not change state because of it.
+    - **3.3.3.2 Don't-group list** — designated directories (including subdirectories) or files are handled individually; same syntax as 3.3.1. Applies to newly added files only.
+    - **3.3.3.3 Per-group cap** (100 MB default, measured before compression).
+    - **3.3.3.4 Dead-weight compaction ratio** (30% default) — when files inside a group are deleted or changed, the old data cannot immediately be removed from the pack. Once that ratio (by original file size) exceeds the threshold, the pack's remaining files are treated as not included in the backup and reprocessed along with everything else (re-deciding grouping by the current size limit and don't-group list), and the old pack is deleted after that run completes. **A file only counts as dead weight when no valid version contains it any more.**
+  - **3.3.4 Symlink handling** — include or skip. Default to be confirmed. (Added 2026-07-16.)
+- **3.4 Network concurrency** — upload/download concurrency, 5 by default.
+- **3.5 Notifications** — whether to notify on unrecoverable errors, and on backup / restore / check start, success and failure.
+- **3.6 Run-record retention** — distinct from 3.2: that one retains data versions, this one retains run records and logs.
+  - **Implementation (code is authoritative, 2026-07-17, a two-tier model)**: logs are either **durable** or **ephemeral**.
+    - **Durable** (task start/end/error audit, `LogEntry.Ephemeral=false`; `AppendAsync` defaults to Warning and above, and engine start/stop events are explicitly durable): kept until the backup is **deleted** (deleting a configuration deletes its logs, `DeleteForContainerAsync`) or until **manually cleared by time** (`DELETE /api/logs?before=<time>` removes everything older).
+    - **Ephemeral** (info/debug diagnostics, `Ephemeral=true`): cleared automatically once expired, default `GlobalSettings.LogEphemeralMaxAgeDays` = 14 days (the scheduler's per-minute `TrimAsync` only removes expired ephemeral entries).
+    - **Verbose (debug) logging**, which includes filenames, is **off** by default and can be enabled per backup (`BackupConfig.VerboseLogging`) or globally (`DefaultVerboseLogging`). When on, per-file logs do **not** go to SQLite but to text files partitioned by backup and by date: `{tempPath}/verbose-logs/{container}/{yyyyMMdd}.log` (`VerboseFileLog`). This keeps one DB write per file from becoming the bottleneck of a very large backup, and separates high-frequency diagnostics from the queryable audit log. The text files are trimmed by date on the same window as ephemeral logs (the scheduler's per-minute `Trim`, 14 days by default), and the path is shown on the Directories page so it can be mapped to a docker volume.
+    - The original "retain by run count" was never implemented — the two-tier model (durable until the backup is deleted, ephemeral for 14 days) covers the intent.
 
 ---
 
-## 7. 版本
+## 4. Global settings
 
-显示当前工具版本，用于验证。
+- **4.1 Network retry backoff** — 5 s, 30 s, 90 s, 300 s by default, then every 300 s, capped at 2 hours total.
+- **4.2 Notifications** — one server address accepting POST or GET as the push destination, with proxy support.
+  - GET: the address may contain placeholders such as `{Title}` and `{Body}`
+  - POST: everything GET does, plus a text body (with the same placeholders) and a content type
 
 ---
 
-## 待澄清点（留到相应里程碑设计时确认）
+## 5. Logs
 
-- 信息记录文件的确切 schema 与文件名约定
-- 可逆加密的主密钥来源（自动生成 vs 用户主密码）
-- 「Smart」Tier 的 SDK 实际支持情况
-- 3.3.2.4 临时区调度的边界细节
-- 备份/检查/还原的运行时进度反馈方式（UI）
+View operation logs with filtering by level, time and source (a specific backup, for example), and allow clearing.
+
+---
+
+## 6. Directories
+
+List every temp directory path (read-only) so the user can set up docker path mappings correctly.
+
+---
+
+## 7. Version
+
+Display the current tool version, for verification.
+
+---
+
+## Open points (resolved during the relevant milestone design)
+
+- The exact schema and filename convention for the info file
+- Where the master key for reversible encryption comes from (generated vs. a user master password)
+- Whether the SDK actually supports a "Smart" tier
+- Boundary details of the staging scheduler in 3.3.2.4
+- How runtime progress for backup, check and restore is reported in the UI
