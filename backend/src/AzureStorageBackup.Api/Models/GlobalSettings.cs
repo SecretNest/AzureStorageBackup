@@ -110,6 +110,19 @@ public class GlobalSettings
     public bool OverlapDiffAndUpload { get; set; } = true;
 
     /// <summary>
+    /// 重启后自动接着跑上次被打断的备份（默认开）。为计划内重启与升级准备的：
+    /// 停机把运行挂起落盘，起来再自己接上，中间不需要人来点一下。
+    /// <para>
+    /// 判据窄得刻意：只有挂起标记写着 <see cref="SuspendReason.ShuttingDown"/> 的那种才自动接，
+    /// 因为只有它明确意味着"是这个进程自己计划内退出把它停在这儿的"。用户按的暂停、闸门降级、
+    /// 以及**没有标记**的那一大类（崩溃、被 kill、关机等落盘超时、操作员按的取消）一律不碰——
+    /// 没有标记说明不了"这是意外"，它同样可能是一次取消，而替用户重开他刚取消掉的运行，
+    /// 比不接着跑要糟得多。那几种都留着 Run 按钮等人来点。
+    /// </para>
+    /// </summary>
+    public bool AutoResumeInterruptedRuns { get; set; } = true;
+
+    /// <summary>
     /// 7z 进程的 CPU 优先级，默认最低。压缩与解压是这个程序唯一会把 CPU 吃满的动作，
     /// 而它跑在一台还有别的东西在跑的机器上——备份慢一点没人会注意，机器卡住会。
     /// <para>

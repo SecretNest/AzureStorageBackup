@@ -37,6 +37,7 @@ export interface GlobalSettings {
   stagedLimitBytes: number
   processingMaxAttempts: number
   overlapDiffAndUpload: boolean
+  autoResumeInterruptedRuns: boolean
   sevenZipPriority: number
 }
 

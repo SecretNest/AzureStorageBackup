@@ -223,6 +223,17 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
+// 启动后把上次被计划内退出打断的备份接着跑（Task 15）。**跟着调度器那个开关**，而不是像
+// GracefulSuspendService 那样无条件注册——两者不是一回事：关机挂起只是在停机路径上保住现场，
+// 而这个会**主动开一轮真备份**，与调度器同属"没人按就自己开工"这一类，该由同一个开关管。
+// 直接的好处在测试主机上：TestWebAppFactory 把所有 hosted service 都起起来，无条件注册的话，
+// 任何跑够久的集成用例都可能被它冷不丁开一轮真备份，撞上产出锁与容器。
+//
+// 排在调度器之后、GracefulSuspendService 之前：宿主按注册的逆序停服务，关机挂起因此停在它前面，
+// 会把它刚起的那一轮挂起落盘——而它正等着那一轮的终态，等待也就随之结束。
+if (builder.Configuration.GetValue("Scheduler:Enabled", true))
+    builder.Services.AddHostedService<AutoResumeService>();
+
 // 计划内退出（docker stop / 升级重启）时把在跑的备份挂起落盘。
 // **无条件注册**，且必须排在调度器之后：宿主按注册的逆序停服务，排在后面才停在前面——
 // 不然调度器可能在挂起进行到一半时又起一轮。调度器关着时这条路径同样要生效，所以不跟着那个 if。

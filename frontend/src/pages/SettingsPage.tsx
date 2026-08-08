@@ -176,6 +176,17 @@ function BackupDefaults() {
         enough that reading for the diff and reading for compression at the same time makes the
         whole run take longer.
       </p>
+      <Field label="Resume interrupted backups on startup">
+        <input type="checkbox" checked={s.autoResumeInterruptedRuns}
+          onChange={(e) => set('autoResumeInterruptedRuns', e.target.checked)} />
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        On by default: when the server shuts down cleanly — a planned reboot, or an image upgrade —
+        any backup that was still running is parked, and picks up where it stopped once the server
+        is back, without re-uploading what already reached the cloud. Only that case is resumed
+        automatically. A backup you paused or cancelled yourself, and one that stopped for any
+        other reason, waits for you to press Run.
+      </p>
       <Field label="7-Zip CPU priority">
         <select value={s.sevenZipPriority} onChange={(e) => set('sevenZipPriority', Number(e.target.value))}>
           {Object.entries(sevenZipPriorityLabels).map(([v, label]) => (
