@@ -192,6 +192,11 @@ public sealed class BackupRunControl(
                     //
                     // 抹掉之后这一卷不是就此没有标记了：本轮真挂起时会连它一起重新写上本轮的理由
                     //（见 MarkSuspended）。所以"这个配置停在什么状态"始终由**当前这一轮**说了算。
+                    //
+                    // 这一句在多数路径上是被 MarkSuspended 那半边盖住的冗余防线——本轮挂起时反正
+                    // 会把陈年理由覆盖掉，删掉它只有一条机制级测试会红。**别当脚手架删掉**：它守的是
+                    // 领养之后、本轮还没来得及挂起之前那个窗口（本轮被 SIGKILL / 撑爆关机上限），
+                    // 那时没有任何人会去覆盖这一卷，陈年的 AutoSuspended 就会留在盘上继续一票否决。
                     store.ClearSuspendMark(accountId, container, oldRunId);
                 }
             }

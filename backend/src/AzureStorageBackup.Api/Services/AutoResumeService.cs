@@ -23,12 +23,15 @@ public sealed class AutoResumeService(
     /// 先例是 <see cref="BackupRunner.SuspendWaitCap"/>。
     /// </para>
     /// <para>
-    /// 之所以敢开成可写的静态字段，是因为读它的人只有一个、而且在测试里根本不存在：
-    /// 本服务只在 <c>Scheduler:Enabled=true</c> 时才注册（见 Program.cs），而
-    /// <see cref="TestWebAppFactory"/> 一律把它设成 false。所以整个测试进程里跑着的
-    /// <see cref="AutoResumeService"/> 只有测试自己 new 出来的那一个，改这个字段影响不到别人。
-    /// 举个例子说清这个前提有多重要：哪天有人让测试主机也起这个服务，两个并行的用例一个把它改成
-    /// 50 毫秒、一个正等着它别开工，后者就会被前者的值捅穿——那时这个字段必须换成注入的选项。
+    /// 之所以敢开成可写的静态字段，靠的**不是**"测试里没有第二个实例"——那句话是错的：
+    /// AutoResumeTests 和 GracefulSuspendTests 各自的 SchedulerOnFactory 都把
+    /// <c>Scheduler:Enabled</c> 打成 true 并真的起了这个服务，而 xUnit 是允许这些类并行跑的。
+    /// 真正撑着的是另一条：<see cref="TestWebAppFactory"/> 每个主机都用自己的 SQLite 文件，那两个
+    /// 主机的 BackupConfigs 表是空的，<see cref="PickResumableAsync"/> 拿到的是空列表，于是它们
+    /// 读到 50 毫秒还是 15 秒都不改变任何行为。
+    /// 所以这个前提是"并行跑着的测试主机里没有备份配置"，不是"没有别的实例"。哪天有测试主机开始
+    /// 带着配置起这个服务，这个字段就必须换成注入的选项——那时两个并行用例，一个把它改成 50 毫秒、
+    /// 一个正等着它别开工，后者会被前者的值捅穿。
     /// </para>
     /// </summary>
     internal static TimeSpan Delay = TimeSpan.FromSeconds(15);
