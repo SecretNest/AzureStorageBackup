@@ -567,8 +567,10 @@ public sealed class BackupOrchestrator(
 
         // 并发额度按**卷**发放，不按件（见 VolumeUploadScope）：一件活可能是一个大文件切出来的
         // 上千卷，按件发的话它整段只占一条流，设置里那个数字在传大文件时根本不起作用。
+        // 而额度在件与件之间**按件龄**仲裁，不是先到先得（见 VolumeUploadGate）：消费者有
+        // UploadConcurrency + 1 个，先到先得会让这么多件同时半完成，中断时白扔掉的就是这么多件。
         var streams = Math.Max(1, opts.UploadConcurrency);
-        using var uploadGate = new SemaphoreSlim(streams, streams);
+        var uploadGate = new VolumeUploadGate(streams);
         var uploadScope = new VolumeUploadScope(uploadGate, uploadTracker, streams);
         // 跨目录并发共享的 pack 号（内容寻址 data blob 不受影响；pack 号只需唯一）。
         // pack 号的分配收在 RunState 里（见 NextPackId）：它必须跨运行唯一。
