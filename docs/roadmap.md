@@ -63,6 +63,32 @@
 - M4–M8 完成后的一轮完整审查修复：高危并发数据完整性、5 中危 bug、8 组需求缺口（含选择性还原、状态持久化、孤儿回收）、9 项低危清理 + CI 集成测试。
 - 详见 [backup-remediation.md](backup-remediation.md)。
 
+### M8 之后（按设计定稿日期）
+
+M1–M8 交付的是"能用"，这之后的每一项都是被实际使用暴露出来的：要么是安全边界，要么是
+大规模数据下的可观测性与可中断性。各项均已合并进 `main`，此处只记去向，细节以各设计文档为准。
+
+| 日期 | 内容 | 文档 |
+|---|---|---|
+| 07-25 | 密钥环丢失后的恢复模式（canary 判定 + 重设闸门） | [keyring-loss-recovery-design.md](keyring-loss-recovery-design.md) |
+| 07-25 | 可选的界面密码闸门（`Auth__Password`，放宽 PRD「无身份验证」） | [auth-password-design.md](auth-password-design.md) |
+| 07-26 | 本地路径边界 `Backup__Root` + 目录浏览器 | [local-path-root-design.md](local-path-root-design.md) |
+| 07-26 | 前端改版（设计令牌、组件体系） | [web-ui-modernization-design.md](web-ui-modernization-design.md) |
+| 07-26 | 备份默认值与 container 选择器 | [backup-defaults-and-container-picker-design.md](backup-defaults-and-container-picker-design.md) |
+| 07-26 | 运行进度可见性（分阶段计数、在途明细、ETA） | [backup-progress-visibility-design.md](backup-progress-visibility-design.md) |
+| 07-27 | 读不开的输入：不当作删除，标记并继续 | [backup-unreadable-files-design.md](backup-unreadable-files-design.md) |
+| 07-28 | 上传速度口径（端到端而非网络速度） | [upload-speed-clock-design.md](upload-speed-clock-design.md) |
+| 07-31 | 移动端适配 | [mobile-adaptation-design.md](mobile-adaptation-design.md) |
+| 08-01 | 7z CPU 优先级（默认 Lowest，NAS 上不抢资源） | [sevenzip-cpu-priority-design.md](sevenzip-cpu-priority-design.md) |
+| 08-02 | 版本起止时间戳 | [version-timestamps-design.md](version-timestamps-design.md) |
+| 08-03 | 备份范围选择（根内子集，`ScopeRuleSet`） | [backup-scope-selection-design.md](backup-scope-selection-design.md) |
+| 08-06 | 上传阶段的 "checking" 一档（把本地校验与待上传分开） | [specs/2026-08-06-upload-checking-stage-design.md](superpowers/specs/2026-08-06-upload-checking-stage-design.md) |
+| 08-06 | 改本地根路径（带校验的迁移，不再视根为不可变） | [change-local-root-design.md](change-local-root-design.md) |
+| 08-07 | 同一轮内跨箱打包成员去重（<5MB，leader 覆盖，alias 还原） | [specs/2026-08-07-pack-alias-dedup-design.md](superpowers/specs/2026-08-07-pack-alias-dedup-design.md) |
+| 08-08 | 可挂起、可暂停、可恢复的备份（journal、闸门、优雅关机、启动自动恢复） | [backup-suspend-resume-design.md](backup-suspend-resume-design.md) |
+
 ## 说明
 - 日志与通知的**基础设施**贯穿始终（早期即埋点），完整 UI 集中在后期里程碑。
 - M4 是核心难点与最大风险，进入该里程碑时会单独细化子任务。
+- M8 之后不再按里程碑推进，改为按「设计 → 计划 → 实现 → 审查 → 合并 `main`」逐项交付；
+  仓库只保留 `main` 一条线，做完即合并并删分支。

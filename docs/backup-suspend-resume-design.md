@@ -104,15 +104,22 @@ public enum RunStatus
     Suspended,
 }
 
-public enum SuspendReason { UserRequested, AutoSuspended, Crashed }
+public enum SuspendReason { UserRequested, AutoSuspended, ShuttingDown }
 ```
 
-主动暂停、自动降级、崩溃遗留**合并成同一个状态**：恢复路径、清理判据、界面按钮完全
+主动暂停、自动降级、计划内关机**合并成同一个状态**：恢复路径、清理判据、界面按钮完全
 一致，拆成三个枚举值只会让那 15 处判断从考虑 5 种变成考虑 7 种。界面用 reason 区分措辞：
 
 - `Suspended — 3,412 items uploaded, paused by you`
 - `Suspended — 3,412 items uploaded, network unreachable for 10 min`
 - `Suspended — 3,412 items uploaded, interrupted by shutdown`
+
+> **实现说明（以代码为准）**：第三个值最终是 `ShuttingDown`（`SIGTERM` 顺手挂起，见后文
+> 「优雅关机与自动恢复」），设计稿原本写的 `Crashed` **有意没有实现**
+> （`BackupSuspendedException.cs` 留了说明）。两者不是一回事：关机时代码还在跑，能给自己
+> 写下理由；崩溃时没有任何代码在跑，没人能写。为崩溃伪造一条既没有 `Control`、也没有忙碌锁
+> 的 `Suspended` 内存记录，代价是此后每个碰到它的分支都要额外记得"这一条是假的"。
+> 崩溃遗留因此改为**不进内存状态**，由 `GET /{id}/interrupted` 直接读 journal 目录得到。
 
 `Suspended` 是终态，现有 `== Running` 的判断自动把它当"不在跑"——也正确。
 
@@ -168,9 +175,15 @@ IsPausable(ex, ct) =
 
 放行有三个来源：
 
-1. 自愈重试定时器到点（复用 `RetryOptions` 的序列退避模式，PRD 4.1：30s → 1m → 5m，之后每 5m）
+1. 自愈重试定时器到点（30s → 1m → 5m，之后每 5m）
 2. 用户点 `Retry now`
 3. 用户点 `Cancel`（放行成取消）
+
+这条阶梯是闸门**自己的**，与 PRD 4.1 那套（`5s / 30s / 90s / 300s`，之后每 300s，上限 2h，
+落在 `GlobalSettings.RetryBackoffSeconds`）无关，也没有复用 `RetryOptions`——两层管的不是
+同一件事：那一层退避的是**单次 HTTP 调用**，量级是秒；这一层等的是**一条链路恢复**，量级是
+分钟，而且每多等一分钟就多占一分钟别人的全局暂存额度。硬编码在 `PauseGate` 里（连同 10 分钟
+的耐心阈值），只有构造函数参数可改，供测试注入毫秒级的值；生产不可配。
 
 挂起时发一条通知（沿用 `NotificationEvents` 那套），无人值守时才有人知道。
 
@@ -209,7 +222,8 @@ private bool HasRoom(StagingLease? lease) =>
 自动交还全部资源，别的备份立刻解放，而这一轮的进度一件不丢——随时可 Resume。
 
 复用的是已定的 Suspend 路径，不引入新机制。`SuspendReason` 因此有三个值：
-`UserRequested` / `AutoSuspended` / `Crashed`，界面措辞各不同，恢复路径完全一致。
+`UserRequested` / `AutoSuspended` / `ShuttingDown`（第三个值的由来见前文实现说明），
+界面措辞各不同，恢复路径完全一致。
 
 自动降级同样发通知。
 
@@ -217,7 +231,12 @@ private bool HasRoom(StagingLease? lease) =>
 
 ### 位置与格式
 
-`data/journal/{configId}/{runId}.jsonl`，追加式文本，**不进 SQLite**。
+`data/journal/{accountId}/{container}/{runId}.jsonl`，追加式文本，**不进 SQLite**。
+
+> **实现说明（以代码为准）**：分目录用的是 `(accountId, container)` 而不是设计稿原本写的
+> `configId`——清理器就是按这两样定位容器的，手上根本没有 `configId`。`configId` 记在
+> journal 头里，需要时从头读。挂起标记是同名同目录、只多一个后缀的兄弟文件，而枚举只认
+> `*.jsonl`，所以它天然不会被当成一卷 journal 去解析。
 
 理由是本项目自己的先例：`BackupOrchestrator.cs:307` 记着 verbose 日志"落到按备份+按日期的
 文本文件而非 SQLite，避免每文件一次 DB 写成为超大备份的瓶颈"。journal 是同一个形状——
@@ -267,10 +286,17 @@ private bool HasRoom(StagingLease? lease) =>
 
 ### 启动
 
-扫 `data/journal/`，每份未完成的 journal 在对应 configId 上登记一条 `Suspended`
-(`reason = Crashed`) 的 state：**不起 Task、不抢忙碌锁**。界面列出来等人点。
+扫 `data/journal/`，未完成的 journal **不进内存状态**：`GET /{id}/interrupted` 现读现返
+（`PeekAsync` 只读头一行、其余数行数——停在半路那卷可能有几十万条记录，而这是启动路径）。
+界面列出来等人点，`DELETE` 同一路径即 Discard。
 
-手动点 Run 时若存在 `Suspended`，等价于 Resume（不会从头来）。
+> **实现说明（以代码为准）**：设计稿原本写的是"登记一条 `Suspended (reason = Crashed)`
+> 的 state"。改掉的理由见前文 `SuspendReason` 那条说明——那会是一条没有 `Control`、
+> 没有忙碌锁的假记录。**「不起 Task、不抢忙碌锁」这个约束没变，变的是不必为此伪造一条状态。**
+
+手动点 Run 时若盘上还有作数的 journal，等价于 Resume（不会从头来）。这也是为什么
+**没有单独的 resume 端点**：恢复不是一种模式，每一轮开卷时都会去认还作数的 journal，
+界面上那个按钮叫 `Resume` 只是因为对用户来说这确实是"接着跑"。
 
 ### Resume
 
@@ -353,8 +379,18 @@ pack 每轮随机前缀在这里反而是优势：重算出的新箱绝不会和
 
 ## 取消
 
-`Cancel` 与 `Suspend` 的唯一区别是**恢复现场留不留**：`Suspend` 留 journal，
-`Cancel` 删 journal。云上已传的块两者都留着（见下）。
+`Cancel` 与 `Suspend` 的区别是**这一轮算不算数**：`Suspend` 落 `Suspended`（界面给
+`Resume` / `Discard`），`Cancel` 落 `Canceled`（界面回到普通的 `Run`）。云上已传的块
+两者都留着（见下）。
+
+> **实现说明（以代码为准）**：设计稿原本写的是"`Cancel` 删 journal"，实现**没有**这么做——
+> 两种停法都落盘（`SettleStopAsync` 里 journal 一律 `FlushAsync(fsync: true)`）。
+> 理由正是下面「完整的留着」那一节自己的结论：既然决定让已传完的块留在云上给下一轮复用，
+> 那就没有理由把"哪些块已经传完"这份账一并烧掉——删了账，下一轮只能靠 `If-None-Match`
+> 逐个撞运气，pack 更是一件都认不回来（随机前缀，见上）。于是 `Cancel` 之后下一次 Run
+> 同样是接着跑的，只是界面不把它叫作 `Resume`。
+> 真正删 journal 的只有三处：本轮成功提交索引（`BackupRunControl.Complete`）、
+> 用户点 `Discard`（`DELETE /{id}/interrupted`）、删除备份配置。
 
 ### 等收尾真正完成才返回
 
@@ -421,6 +457,66 @@ pack 不享受"留着复用"：随机前缀让下一轮必然是新箱，旧 pac
 
 同理，`Suspended` 状态下删配置也走这条：现场不再有人恢复，journal 和它护着的块一起清。
 
+## 优雅关机与自动恢复
+
+> 本节是设计稿定稿之后追加的（对应实施顺序里的阶段 8、9）。上面那套机制解决了"中断之后
+> 进度还在"，但计划内的重启——`docker stop`、换镜像升级——仍然要人事后回来点一下。
+> 这一节把那一下也去掉，且**只去掉这一种**。
+
+### 关机：`SIGTERM` 顺手挂起
+
+宿主收到停止信号时，让所有 `Running` 的运行走一遍已有的 Suspend 收尾路径，
+`reason = ShuttingDown`，journal `fsync` 落盘，并在 journal 旁边写一个**同名标记文件**记下这个理由。
+
+标记为什么是 journal 的兄弟文件、而不是 journal 里的一条记录：清理判据按 `Kind` 把记录分进
+"blob" 或 "pack" 两个桶，凭空多出第三种 Kind 会静悄悄落进 blob 桶里去。
+
+三个超时是**一串**的，动一个就得回头看另外两个：
+
+```
+docker stop_grace_period 45s  >  HostOptions.ShutdownTimeout 30s  >  等运行落盘 20s
+```
+
+- `45 > 30`：docker 的宽限期一到就是 `SIGKILL`。必须让 .NET 自己的超时先到，才还有机会把日志写出来。
+- `30 > 20`：宿主等 `StopAsync` 也有超时，超了它不等、直接往下拆服务——那时连"谁没停下来"都没人记得下。
+
+**这个等待必须有上限，而且要如实说清它做不到什么。** `StopKind.Suspend` 有意不碰 AbortToken，
+消费循环也是在**下一件**活开始前才退出的，所以手上这件（可能是一个几 GB 的上传）会被放着跑完。
+到点还没落盘的运行就丢在半路——它下次启动时是一次**没有标记**的中断运行，得人工点 Resume。
+这是有意的取舍：放弃一件在途文件的代价是重传它一次，而等它等到超过宿主宽限期的代价是 `SIGKILL`，
+那才是真的丢掉整轮。
+
+下达停止与等待落盘**必须分两趟**：先把停止意愿发给每一个运行，再统一等。合成一趟（发一个、
+等一个）在并发备份下是致命的——排头那个若压着一个几 GB 的上传，它一个人就吃掉整个关机预算，
+后面的运行连停止请求都收不到。
+
+### 启动：只认关机标记
+
+`AutoResumeService` 在启动约 15 秒后开工（让 Web 端口先起来、调度器先跑第一拍），受全局设置
+`AutoResumeInterruptedRuns`（默认开）控制，逐个起、**等前一个跑完再起下一个**——产出锁是全局的，
+一起冲上去只会互相排队，而且并发备份反而更慢（本仓库实测过）。
+
+判据只有一条：这个配置**至少留了一卷** journal，而且**每一卷**旁边的标记都是 `ShuttingDown`。
+
+| 盘上的样子 | 自动接着跑？ | 为什么 |
+|---|---|---|
+| `ShuttingDown` | **是** | 唯一一种"这个进程自己造成的中断、而且现场是好的" |
+| `UserRequested` | 否 | 替他重开等于把他按那一下的意图擦掉 |
+| `AutoSuspended` | 否 | 那个瞬时错误多半还在，马上接着跑只会立刻再撞一次墙 |
+| 没有标记 | 否 | 说不清 |
+
+最后一行是这套判据的重心：**盘上没有标记不说明"进程被 kill"**。崩溃、掉电、关机等落盘超时被丢在
+半路、操作员按了 Cancel（两种取消都照样落盘，都有意不写标记）、甚至写标记这一步本身失败，
+长在盘上一模一样。其中至少有一种（Cancel）是用户明确表达过"别跑了"的，所以这一大类整个不碰。
+
+要求**每一卷**都合格而不是"最新那卷说了算"：标记是按卷记的，一个配置底下完全可能出现取值打架的
+几卷（按暂停 → 又点 Run → 新一轮采纳了旧卷 → 一次关机把新一轮停成 `ShuttingDown`），而接着跑
+那一轮开卷时会把所有还作数的卷一起认下来。要求全票通过，就不必再发明一套"哪卷更新"的仲裁。
+
+被否掉的配置**每个都要记一句日志**，点名是哪一卷、什么标记。这不是排场：这个部署形态是 NAS 上的
+成品机，操作员既没有 shell 也没有看标记文件的工具。少了它，"重启之后我的备份怎么没接上"在他那边
+是完全没有线索的——界面上开关是开的，日志里一个字都没有，而真正的原因只长在盘上。
+
 ## 测试
 
 安全性优先，下面几条都是"错了就丢数据"的形状：
@@ -435,6 +531,9 @@ pack 不享受"留着复用"：随机前缀让下一轮必然是新箱，旧 pac
   A 超时降级 → B 解冻并跑完。这是并发时序测试，也是这一整节存在的理由
 - `Stop now` 删掉在途文件的残留卷，且**不碰** `data/{hash}~1` 这个碰撞避让的兄弟
 - 取消令牌区分：用户按 `Cancel` 不被误判成网络错误而挂起
+- **自动恢复的判据**：四种盘上形态（`ShuttingDown` / `UserRequested` / `AutoSuspended` /
+  无标记）各自该不该接着跑；一个配置底下几卷标记打架时**不**接着跑；设置关掉时真的不开工——
+  最后这条坏掉的样子是**静默**的（界面照样显示保存成功，直到某天重启后一轮他不想要的备份自己跑起来）
 
 其余：`IsTransient` 分类表（含嵌套 `AggregateException`）、闸门放行的三个来源、
 主动暂停与取消时在途上传等待收尾、`Cancel` 端点等收尾完成才返回、
@@ -455,5 +554,7 @@ Azurite 必须起着跑（`npx azurite --skipApiVersionCheck`），否则相关�
 | 5 | 主动暂停与取消（两种停法、异步收尾、残留卷清理） |
 | 6 | 恢复 + 统一清理判据 + 删配置兜底 |
 | 7 | API 与前端：状态、按钮、Cancel 对话框、轮询适配 |
+| 8 | 优雅关机：`SIGTERM` 挂起全部运行 + 落盘标记（定稿后追加） |
+| 9 | 启动自动恢复：只认关机标记，受全局设置控制（定稿后追加） |
 
-阶段 4 依赖 3（降级要 journal 落盘），6 依赖 3 和 5。
+阶段 4 依赖 3（降级要 journal 落盘），6 依赖 3 和 5，9 依赖 8（没有标记就没有判据）。

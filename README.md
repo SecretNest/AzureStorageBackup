@@ -173,6 +173,39 @@ Uploads themselves run in parallel (the per-backup upload concurrency setting); 
 
 A restore downloads each archive under `restore/` before writing files out. Single-file blobs — anything above the *single-file threshold* — are decompressed straight into the destination file, so they cost only the downloaded archive; the file's own bytes are never written twice. Packs are still extracted to disk first, so their peak is the downloaded pack plus its uncompressed contents, times the download concurrency.
 
+### Stopping, pausing and resuming
+
+A run that ends early no longer throws away what it already uploaded. Every object is recorded in a **journal** on disk — one file per run under `/data/journal/` — and the line is appended only *after* Azure confirms the write, never before. A later run reads that journal back and adopts what is already in the cloud instead of sending it again. An interrupted backup therefore costs the compression a second time, but not the bandwidth.
+
+Two buttons sit on a running backup:
+
+| Button | What it does |
+| --- | --- |
+| **Suspend** | Stops taking new work, lets the transfers already in flight finish, flushes the journal, and hands back the compression lock and the staging quota. The run ends as **Suspended**. |
+| **Cancel** | Asks how first. *Stop now* kills the in-flight transfers immediately and deletes the half-uploaded volumes they left behind; *Finish current files* lets each file that is already uploading finish all of its volumes. The run ends as **Canceled**. |
+
+Neither button returns until the run has really settled — journal on disk, temporary files gone, locks released. That is deliberate: an endpoint that returned early would let your next action (edit the config, delete it, start another run) collide with a run that had not finished dying.
+
+Both keep what finished uploading, and both keep the journal, so the next run picks those objects up rather than re-uploading them. The difference is what the UI offers next: a **Suspended** run shows **Resume** and **Discard**, a **Canceled** one goes back to a normal **Run** button. *Resume* is simply Run — every run adopts a still-valid journal on the way in, so there is no separate resume mode. *Discard* throws the recovery point away; the objects it was protecting stop being reserved and the next cleanup removes them.
+
+A journal is only adopted if the run it describes still matches: same local root, same baseline version, same encryption identity. If any of those changed, it is dropped rather than trusted, and a file only counts as already-uploaded when **both** its path and its content hash match — a file edited since the crash is uploaded again.
+
+#### Network trouble suspends the run instead of failing it
+
+Transient errors — connection resets, timeouts, `5xx`, `408`, `429`, and the `AggregateException` the Azure SDK raises when its own retries are exhausted — no longer end a backup. The worker that hit the wall waits at a gate while every other worker keeps going, and the gate reopens on a ladder of **30s → 1m → 5m, then every 5 minutes**. **Retry now** opens it immediately. While anything is waiting the row reads `Paused — <error> (attempt N)`, and the run's status is still Running: it is holding its staging quota and its slot, and the details of the workers still transferring stay on screen beside it.
+
+That is also why the wait is bounded. The staging limit is global, so a stuck run sitting on 2 GB of finished archives can freeze an unrelated backup — different account, different network path — because nothing will ever free the space. After **10 minutes** with no progress the run therefore gives itself up: journal flushed, quota and locks released, everything else unblocked, and its own progress kept. It ends as **Suspended**, and the row says so (`Suspended after repeated network errors`). Both suspending and downgrading send a notification.
+
+Errors a retry cannot fix — a wrong password, a full disk, a 7-Zip crash, a bad configuration — still fail the run immediately. Pressing **Cancel** during a pause is also never mistaken for a network timeout, even though both surface as the same exception type.
+
+#### Restarts and upgrades
+
+On `SIGTERM` — `docker stop`, a container upgrade — every running backup is suspended, its journal is flushed with `fsync`, and a marker recording *why* it stopped is written beside the journal. The app waits up to **20 seconds** for those runs to settle; anything still uploading a large file when the clock runs out is left mid-flight and comes back as an ordinary interrupted run. Give Docker enough grace period for this to happen at all — see *Shutdown grace period* under **Docker** below.
+
+On the next start, **Resume interrupted backups on startup** (Settings page, on by default) picks those runs back up about 15 seconds after boot, one at a time so they do not queue behind each other on the global compression lock.
+
+**Only runs carrying the planned-shutdown marker are resumed automatically**, and only when *every* journal left for that backup carries it. Everything else waits for you to press Run: a run you suspended by hand (resuming it would erase the intent behind the button), one that downgraded itself after network trouble (the outage is probably still there, so it would just hit the wall again), and one that died without writing a marker at all. That last group is deliberately broad — a `SIGKILL`, a power cut, a shutdown that timed out, and a cancel all look identical on disk, and at least one of them is you saying *stop*. When a backup is skipped for this reason the log says which journal blocked it and why. The Backups page lists interrupted runs it finds either way, so you can Resume or Discard them yourself.
+
 ## Docker
 
 The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.
@@ -181,7 +214,7 @@ Build and run locally:
 
 ```bash
 docker build -t azurestoragebackup .
-docker run -d --name asb -p 8080:8080 \
+docker run -d --name asb -p 8080:8080 --stop-timeout 45 \
   -v asb-data:/data -v asb-keys:/keys -v asb-temp:/temp \
   -v /path/to/files:/backup-source \
   azurestoragebackup
@@ -190,6 +223,16 @@ docker run -d --name asb -p 8080:8080 \
 Then open <http://localhost:8080>. Inside the app, set a backup's *local root* (and any restore target) to a path that exists **inside the container**, e.g. `/backup-source`.
 
 Or with Docker Compose (`docker compose up --build`), after copying `.env.example` to `.env`.
+
+### Shutdown grace period
+
+`--stop-timeout 45` (`stop_grace_period: 45s` in Compose) is not decoration. Three deadlines are nested, and they have to stay in that order:
+
+```
+docker's grace period 45s  >  the app's shutdown timeout 30s  >  the wait for backups to park 20s
+```
+
+On `SIGTERM` a running backup parks itself and flushes its journal so it can be resumed later. Docker's default grace period is **10 seconds**, which expires first and turns the stop into a `SIGKILL` — and a killed run is exactly the case the app refuses to resume on its own, because it cannot tell that from a power cut. Raising it to 45s costs nothing when nothing is running: a container with no backup in flight still stops immediately.
 
 ### Environment variables
 
@@ -289,23 +332,28 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 | Container path | Purpose | Persist? |
 | --- | --- | --- |
-| `/data` | SQLite database (`app.db`). | **Yes** |
+| `/data` | SQLite database (`app.db`) **and the backup journals** (`journal/`). | **Yes** |
 | `/keys` | Data Protection key ring. Losing it makes stored account keys/passwords undecryptable. | **Yes** |
-| `/temp` | Backup/restore working area (compress, staged, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
+| `/temp` | Backup/restore working area (compress, staged, diff-spill, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
 | *(your choice, e.g. `/backup-source`)* | Host directories to back up. Mount **read-only** if you only back up. A backup's *local root* is set to this in-container path. | Bind mount |
 | *(your choice, e.g. `/restore-target`)* | Where restores write. Mount read-write. | Bind mount |
 
 `GET /api/system/paths` returns the resolved absolute paths at runtime (PRD §6 "Directories"), useful when configuring Docker volume mappings.
 
-## Published image (GHCR)
+> Journals live next to `app.db` rather than under `Backup__TempPath`, and that is on purpose: `/temp` is the one directory the deployment instructions call *safe to discard*, while the journal is the only thing that lets an interrupted backup pick up where it stopped. Following the database means it lands on a volume you were already persisting, without a second environment variable to get right. It is also never cleared at startup — its whole content is "already in the cloud, not yet in the index".
 
-Multi-arch images are published to the GitHub Container Registry:
+## Published image
+
+Multi-arch images are published to **two** registries in the same run, under the same tags:
 
 ```
-ghcr.io/secretnest/azurestoragebackup:latest
+ghcr.io/secretnest/azurestoragebackup:latest              # GitHub Container Registry
+<ACR_REGISTRY>/secretnest/azurestoragebackup:latest       # Azure Container Registry
 ```
 
-Publishing is a **manual** GitHub Action (`.github/workflows/docker-publish.yml`, `workflow_dispatch`) that builds for `linux/amd64` and `linux/arm64` with Buildx and pushes to GHCR.
+Publishing is a **manual** GitHub Action (`.github/workflows/docker-publish.yml`, `workflow_dispatch`) that builds `linux/amd64` and `linux/arm64` with Buildx and pushes both, tagging each with the tag you type (required, defaults to `latest`) plus the commit SHA. The ACR host and its credentials come from the `ACR_REGISTRY`, `ACR_USERNAME` and `ACR_PASSWORD` repository secrets — the repository path within it is fixed — while the GHCR push uses the workflow's own `GITHUB_TOKEN`. The build cache is kept in GHCR (`:buildcache`) rather than the GitHub Actions cache, because exporting a two-architecture `mode=max` cache to `type=gha` runs *after* the push and has stalled a finished publish for eleven minutes.
+
+The examples elsewhere in this README use the GHCR name; either image is the same build.
 
 ## Documentation
 
