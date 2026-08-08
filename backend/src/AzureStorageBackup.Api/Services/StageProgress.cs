@@ -164,7 +164,17 @@ public sealed record StageProgress(
     /// <c>Processed + Preparing + Queued + WaitingOnArchive + Uploading ≡ Total</c>。
     /// </para>
     /// </summary>
-    int WaitingOnArchive = 0)
+    int WaitingOnArchive = 0,
+    /// <summary>
+    /// 已经压完落盘、但**还没资格上路**的字节：正卡在压缩后重校验或清云端残留卷那一段
+    /// （<see cref="Checking"/> 的字节侧）。已从 <see cref="StagedBytes"/> 里减出去，两栏互不重叠。
+    /// <para>
+    /// 拆出来的理由和当初拆 <see cref="Checking"/> 是同一个。产出一压完就进背压的账（晚记一秒
+    /// 就可能撑爆临时盘），可那一刻它还要过重校验——而重校验判出成员在压缩期间变了的话，
+    /// 这份归档会被**整个丢掉重压**，一个字节都传不出去。管这叫 "ready to upload" 是过度承诺。
+    /// </para>
+    /// </summary>
+    long CheckingBytes = 0)
 {
     /// <summary>某一种等待此刻卡着几个。</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -248,10 +258,15 @@ public sealed class StageTracker(
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     /// <summary>在途的流：key 是 blob/卷名（唯一），值带着给人看的标签、已传字节与总字节。</summary>
-    private sealed class InFlight(string label, long total)
+    private sealed class InFlight(string label, long total, string? owner)
     {
         public string Label { get; } = label;
         public long Total { get; } = total;
+
+        /// <summary>这一卷属于哪一族（blobRef）。<see cref="EndItem"/> 靠它把字节记进对的那本账，
+        /// 而不是往一个全局标量上堆——见 <see cref="StageTracker.BeginUpload"/>。
+        /// 下载侧与不走上传闸门的路径为 null：那些路径不碰这本账。</summary>
+        public string? Owner { get; } = owner;
         private long _sent;
         public long Sent => Interlocked.Read(ref _sent);
 
@@ -283,6 +298,10 @@ public sealed class StageTracker(
     private int _inStaging;
     private int _inPacking;
     private int _inChecking;
+    // 其中已经压完落盘、正卡在核对里的**字节**。见 StageProgress.CheckingBytes：产出一压完就进
+    // 背压的账（那笔账要的是"盘上此刻占了多少"），可它还要过重校验才轮得到上路，而重校验判出
+    // 成员变了的话这份归档会被整个丢掉重压。从待传里减出去，单列一栏。
+    private long _checkingBytes;
     // 各段等待的当前人数，按 UploadWait 的序号索引。数组而不是三个字段：调用方按枚举取用，
     // 加一段等待只需在枚举里多一项，发布那一头不必再各加一条。
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
@@ -296,9 +315,27 @@ public sealed class StageTracker(
     private long _transferred;
     // 上述权威读数是否已接管。见 SetTransferred。
     private bool _transferredByItem;
-    // 已落云、但所属那件活还没销账的字节。卷传完时加，件销账时按 _transferred 的增量减——
-    // 那个增量恰好是刚归档那件的全部卷。多件并发也对：这是笔总量守恒的账，不认哪一卷属于哪一件。
-    private long _unfinishedItemBytes;
+    // 已落云、但所属那件活还没销账的字节，**按族（blobRef）分条记**。
+    //
+    // 从前这是个只加的标量，件级销账时按 _transferred 的增量整体减掉。那本账在失败路径上抵不平：
+    // 一族卷传掉几卷之后整件倒了，那几卷已经加了进去，而件级账只按重试成功的那一次扣一遍，
+    // 差额从此永远挂在屏幕上（实测一轮 3 TB 的备份攒到 2 GB，而那时一个字节都没在传）。
+    // 夹到 0 的防守挡得住负数，挡不住这个方向。
+    //
+    // 按族分条之后每条有明确的一生：BeginUpload 开条（重试即重置）→ 每卷 EndItem 累加 →
+    // ConfirmUpload 标记云端已确认 → 件级销账并入 uploaded 时整条删掉；没被确认过的
+    // （失败、取消）在 EndUpload 就地作废。抵不平这件事从根上不存在了。
+    private readonly Dictionary<string, UnfinishedFamily> _unfinished = new(StringComparer.Ordinal);
+
+    /// <summary>一族卷已落云、还没并进 uploaded 的账。</summary>
+    private sealed class UnfinishedFamily
+    {
+        public long Bytes;
+        /// <summary>云端已确认整族传完、字节已进件级账（<c>state.AddUploaded</c>），
+        /// 只等下一次 <see cref="SetTransferred"/> 把它并进 uploaded。
+        /// 没被标记就走完的族＝这次尝试作废了，它的卷不算数。</summary>
+        public bool Confirmed;
+    }
     // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
     private long _transferTotal;
     // 正卡在下游上的调用方数量（差分侧被有界队列挡住时 >0）。
@@ -379,10 +416,13 @@ public sealed class StageTracker(
         lock (_gate)
         {
             _transferredByItem = true;
-            // 刚归档那件的全部卷从"未销账"里划走：增量就是它的量，不必知道哪一卷属于哪一件。
-            // 夹到 0 是防守——重传/失败重压等情形下卷侧可能加得比件侧少，宁可这一栏早一步归零，
-            // 也不能让它显示成负数。
-            _unfinishedItemBytes = Math.Max(0, _unfinishedItemBytes - (total - _transferred));
+            // 已经确认过的族就此并入 uploaded：它们的字节已经含在 total 里了，两边同时更新，
+            // 屏幕上那批字节从右边一栏平移到左边一栏，不闪。
+            //
+            // 删的是**条**，不是从一个标量里减一个数——这正是这本账重写的全部意义：没被确认过的族
+            // （失败、取消）根本不在这里，它们在 EndUpload 就作废了，于是不存在"减多了还是减少了"。
+            foreach (var owner in _unfinished.Where(e => e.Value.Confirmed).Select(e => e.Key).ToList())
+                _unfinished.Remove(owner);
             _transferred = total;
             PublishIfDue(force: false);
         }
@@ -427,11 +467,48 @@ public sealed class StageTracker(
     /// 槽位计数只归 Advance 管，在这里顺手加一次进度条就会冲过 100%。</summary>
     public void EndWork() => Interlocked.Decrement(ref _inWork);
 
-    /// <summary>一件活压完了、开始往上传（成对调 <see cref="EndUpload"/>）。只用来把"在准备"
-    /// 与"在上传"分开算，同样**不计数**。</summary>
-    public void BeginUpload() => Interlocked.Increment(ref _inUpload);
+    /// <summary>
+    /// 一族卷开始往上传（成对调 <see cref="EndUpload"/>）。同样**不计数**。
+    /// <para>
+    /// 顺手给这一族开一条空账。<b>开条是重置，不是新增</b>：重试走的是同一个 <paramref name="owner"/>
+    /// （单文件的 blobRef 是内容 hash，pack 的包号在重试之外领——两者都跨重试不变），
+    /// 于是上一次尝试传掉的卷在这里被干净抹掉，第二次从零开始记。
+    /// </para>
+    /// </summary>
+    /// <param name="owner">这一族的 blobRef：<c>data/{hash}</c> 或 <c>packs/{packId}.7z</c>。</param>
+    public void BeginUpload(string owner)
+    {
+        Interlocked.Increment(ref _inUpload);
+        lock (_gate)
+            _unfinished[owner] = new UnfinishedFamily();
+    }
 
-    public void EndUpload() => Interlocked.Decrement(ref _inUpload);
+    /// <summary>
+    /// 云端已确认这一族全部传完，字节也已经进了件级账——只等下一次 <see cref="SetTransferred"/>
+    /// 把它并进 uploaded。必须在 <c>state.AddUploaded</c> 之后、<see cref="EndUpload"/> 之前调。
+    /// <para>
+    /// 不在这里直接清账是为了那一段**平滑**：从整族传完到件级销账之间还隔着写索引、写 journal
+    /// 那一截，此刻清掉的话这批字节会在两栏之间凭空消失一会儿，而它们确实已经在云上了。
+    /// </para>
+    /// </summary>
+    public void ConfirmUpload(string owner)
+    {
+        lock (_gate)
+            if (_unfinished.TryGetValue(owner, out var family))
+                family.Confirmed = true;
+    }
+
+    /// <summary>这一族的处理结束：没被 <see cref="ConfirmUpload"/> 标记过的就地作废。
+    /// 放在 <c>finally</c> 里调——正常走完与抛出去用的是同一句，区别只在有没有确认过。</summary>
+    public void EndUpload(string owner)
+    {
+        Interlocked.Decrement(ref _inUpload);
+        lock (_gate)
+        {
+            if (_unfinished.TryGetValue(owner, out var family) && !family.Confirmed)
+                _unfinished.Remove(owner);
+        }
+    }
 
     /// <summary>
     /// 开始等某一段（成对调 <see cref="EndWait"/>）。
@@ -516,16 +593,25 @@ public sealed class StageTracker(
     /// 按卷算——一件大活上千卷，那才是不能强制发布的量级。
     /// </para>
     /// </summary>
-    public void BeginChecking()
+    /// <param name="bytes">这一段要核对的归档**已经落盘**的字节，从待传里减出去（见
+    /// <see cref="StageProgress.CheckingBytes"/>）。归档还不存在的那几段（去重预筛整读源文件、
+    /// 一箱压缩**前**的逐成员 stat）省略即可——那时池子里一个字节都还没有。</param>
+    public void BeginChecking(long bytes = 0)
     {
         Interlocked.Increment(ref _inChecking);
+        if (bytes > 0)
+            Interlocked.Add(ref _checkingBytes, bytes);
         lock (_gate)
             PublishIfDue(force: true);
     }
 
-    public void EndChecking()
+    /// <param name="bytes">必须和配对的 <see cref="BeginChecking"/> 传同一个数——少还一次，
+    /// 这一栏就在余下的运行里挂着一笔永不消失的账，而待传那一栏跟着永久少报。</param>
+    public void EndChecking(long bytes = 0)
     {
         Interlocked.Decrement(ref _inChecking);
+        if (bytes > 0)
+            Interlocked.Add(ref _checkingBytes, -bytes);
         lock (_gate)
             PublishIfDue(force: true);
     }
@@ -539,11 +625,13 @@ public sealed class StageTracker(
     /// <param name="label">给人看的名字（上传阶段传**源文件路径**，不是内容寻址的 blob 名）。
     /// 省略时退回用 key 本身，与从前的行为一致。</param>
     /// <param name="totalBytes">这一条一共多少字节；0 = 未知（下载在拿到响应头前不知道）。</param>
-    public void BeginItem(string item, string? label = null, long totalBytes = 0)
+    /// <param name="owner">这一卷属于哪一族（<see cref="BeginUpload"/> 的 blobRef）。上传侧必传——
+    /// 它决定这一卷的字节记进哪本账；下载侧与不走上传闸门的路径省略即可。</param>
+    public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null)
     {
         lock (_gate)
         {
-            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes)))
+            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner)))
                 return;
             if (speedWhileInFlight && _activeSince < 0)
             {
@@ -634,13 +722,19 @@ public sealed class StageTracker(
                 // "有多少已经**稳稳落在云上**"，所以在途的部分一律不算进去，走完才认。
                 // 有件级权威读数时（SetTransferred）这里让位——**按卷**累加与按件销账的
                 // 工作量不同步，两个数字摆在一起就读不成话，原委见 SetTransferred。
-                // 让位不等于把这批字节丢掉：它们确实已经在云上了，先记进"所属活未销账"那一栏，
-                // 等整件完成时并入。记标称大小（Total）才能和件级账的增量精确抵消——Sent 是
-                // **最后一次尝试**推到的位置，正常收尾时它就等于 Total，但失败/取消路径上
-                // 停在半截，抵不平会留下漂移。Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的
-                // blob），件级账也不会计它，所以这里同样不加。
+                // 让位不等于把这批字节丢掉：它们确实已经在云上了，先记进**它自己那一族**的账，
+                // 等整件完成时并入（见 _unfinished）。记标称大小（Total）而不是 Sent：后者是
+                // 最后一次尝试推到的位置，失败/取消路径上停在半截。从前这个差额会留下漂移，
+                // 现在作废的族整条抹掉，记哪个都不会积账——记 Total 纯粹因为它才是这一卷的真实大小。
+                // Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的 blob），件级账也不会计它，
+                // 所以这里同样不加。
                 if (_transferredByItem)
-                    _unfinishedItemBytes += flow.Sent > 0 ? (flow.Total > 0 ? flow.Total : flow.Sent) : 0;
+                {
+                    // owner 为 null = 上传侧漏传了族名。宁可这一卷不进账（这一栏少报），
+                    // 也不能凭空造一条没人认领、没人删得掉的账——那正是从前那个漂移的形状。
+                    if (flow.Owner is { } owner && _unfinished.TryGetValue(owner, out var family))
+                        family.Bytes += flow.Sent > 0 ? (flow.Total > 0 ? flow.Total : flow.Sent) : 0;
+                }
                 else
                     _transferred += flow.Sent + bytes;
                 if (speedWhileInFlight && _active.IsEmpty && _activeSince >= 0)
@@ -752,6 +846,17 @@ public sealed class StageTracker(
         }
     }
 
+    /// <summary>这一栏的读数：所有还没并进 uploaded 的族之和。同时在传的族最多
+    /// <c>UploadConcurrency + 1</c> 个（按件龄仲裁之后通常就一个），这个求和永远是个位数项。
+    /// 调用方须持 <c>_gate</c>。</summary>
+    private long UnfinishedBytes()
+    {
+        long sum = 0;
+        foreach (var family in _unfinished.Values)
+            sum += family.Bytes;
+        return sum;
+    }
+
     private void PublishIfDue(bool force)
     {
         var now = NowMs();
@@ -796,15 +901,18 @@ public sealed class StageTracker(
         var inFlight = _active.Values
             .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total))
             .ToList();
-        // 待传池子里还没送出去的：池子占用 - 在途那几条已经传走的部分（它们还整个躺在池子里，
-        // 逐卷释放要传完才删）。不减就会在这里和 ActiveItems 里把同一批字节数两遍。
+        // 待传池子里还没送出去的：池子占用 − 在途那几条已经传走的部分（它们还整个躺在池子里，
+        // 逐卷释放要传完才删）− 还卡在核对里、没资格上路的那些归档。三者互不重叠：
+        // 核对整段发生在第一卷起飞之前，所以一份归档不可能同时被后两个减法碰到。
+        // 不减就会在这里和 ActiveItems / CheckingBytes 里把同一批字节数两遍。
+        var checkingBytes = Math.Max(0, Volatile.Read(ref _checkingBytes));
         var staged = stagedBytes is null
             ? 0
-            : Math.Max(0, stagedBytes() - inFlight.Sum(f => f.Sent));
+            : Math.Max(0, stagedBytes() - inFlight.Sum(f => f.Sent) - checkingBytes);
 
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
-            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, _unfinishedItemBytes, staged,
+            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(), staged,
             Volatile.Read(ref _transferTotal), Interlocked.Read(ref _spilled),
             // 已经离开压缩/暂存段的件数 = 手上的件 - 还在暂存段的件。
             //
@@ -818,7 +926,8 @@ public sealed class StageTracker(
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
             Math.Max(0, Volatile.Read(ref _inChecking)),
-            waitingOnArchive));
+            waitingOnArchive,
+            checkingBytes));
     }
 
     /// <summary>

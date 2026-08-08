@@ -101,7 +101,7 @@ public sealed class StageProgressTests
         tracker.BeginPacking();
         tracker.EndPacking();
         tracker.EndStaging();
-        tracker.BeginUpload();
+        tracker.BeginUpload("data/x");
         tracker.BeginItem("packs/p0001.7z"); // 在途登记的是**卷**
         // 另一件正占着压缩锁在产出
         tracker.BeginStaging();
@@ -138,7 +138,7 @@ public sealed class StageProgressTests
         tracker.BeginPacking();
         tracker.BeginStaging();
         tracker.BeginStaging();
-        tracker.BeginUpload();    // 还有一件已经进了上传段……
+        tracker.BeginUpload("data/x");    // 还有一件已经进了上传段……
         for (var i = 1; i <= 5; i++)
             tracker.BeginItem($"data/big.{i:000}"); // ……它自己就有 5 卷同时在传
         tracker.Complete();

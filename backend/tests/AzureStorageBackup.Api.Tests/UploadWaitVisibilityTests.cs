@@ -44,7 +44,7 @@ public sealed class UploadWaitVisibilityTests
         tracker.BeginWork();           // 第三件：领走 → 压完出了暂存段 → 进上传段但还没有卷在飞
         tracker.BeginStaging();
         tracker.EndStaging();
-        tracker.BeginUpload();
+        tracker.BeginUpload("data/x");
 
         tracker.Complete();
 
@@ -64,7 +64,7 @@ public sealed class UploadWaitVisibilityTests
 
         tracker.Enqueue();
         tracker.BeginWork();
-        tracker.BeginUpload();
+        tracker.BeginUpload("data/x");
         // 一件活可以同时有好几卷在飞（MaxParallelPerItem）——件还是那一件。
         tracker.BeginItem("data/abc.002", "photo.raw (2/9)", 1024);
         tracker.BeginItem("data/abc.003", "photo.raw (3/9)", 1024);
@@ -144,7 +144,7 @@ public sealed class UploadWaitVisibilityTests
         tracker.BeginWork();
         tracker.BeginStaging();
         tracker.EndStaging();
-        tracker.BeginUpload();
+        tracker.BeginUpload("data/x");
 
         tracker.Complete();
 

@@ -13,6 +13,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { latestWins } from '../lib/latestWins'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
+import { stageLines } from '../lib/stageLines'
 import { Modal } from '../components/Modal'
 import {
   activityBadgeLabels,
@@ -1712,232 +1713,9 @@ function RunStatus({
 
 /// 阶段细节。在此之前，扫描和 diff 各自只在进入时上报一次——首次备份的 diff 要把每个文件
 /// 完整读一遍算 hash，可以跑几小时，界面上却只有一个一动不动的 0%，分不清是在干活还是挂死。
-// 每个阶段数的是**不同的东西**，光一个 "4,995 / 46,624" 会让人以为打包没生效：
-// 差分数的是文件（打包与否都是这个数），上传/还原数的才是包与单文件 blob。
-const STAGE_UNITS: Record<string, string> = {
-  Scanning: 'entries',
-  Diffing: 'files',
-  Uploading: 'objects',
-  Restoring: 'objects',
-  // 检查的各阶段。Cloud 数的是存储对象（一个 pack 一次 HEAD），Verifying 数的是下载解压
-  // 重算 hash 的包，Local 数的才是索引里的文件条目——三者数量差着数量级，不能共用一个词。
-  Cloud: 'objects',
-  Verifying: 'objects',
-  Local: 'files',
-  Orphans: 'blobs',
-}
-
-/**
- * 给一个数配上它自己的单位词，单复数跟着数走。
- *
- * 在途那一行里同时躺着两种口径的数——上传按**卷**登记（VolumeBlobIO 每卷一条，上传闸门也按卷
- * 排队），其余按**件**。从前只给卷那两项写了单位，件那几项光秃秃地摆着，一行读下来像是
- * 「1 volume uploading · 1 preparing」这样时有时无，反而更像笔误而不是刻意区分。现在每个数
- * 一律自报单位：读的人不必记住哪一项是哪种口径，也不会再拿这一行的数去凑总数。
- */
-function withUnit(n: number, plural: string): string {
-  const singular = plural === 'entries' ? 'entry' : plural.replace(/s$/, '')
-  return `${n.toLocaleString()} ${n === 1 ? singular : plural}`
-}
 
 function StageDetail({ detail }: { detail: StageProgress }) {
-  const unit = STAGE_UNITS[detail.stage] ?? 'items'
-  // 用 "of" 而不是 "/"：斜杠是分数记号，摆在那儿就是在邀人约一个百分比出来，而件数百分比在
-  // 上传阶段恰恰没什么意义（一件可能是 6.8 GB 的单文件，也可能是一箱几百个 5 KB 的小文件）。
-  // 真正的完成度按字节算，在下一行那个 "60.6 GB / 191.0 GB original (31%)" 上——那里用斜杠，
-  // 因为它的百分比就跟在后面，约得出来也约得对。
-  const counts =
-    detail.total > 0
-      ? `${detail.processed.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
-      : `${detail.processed.toLocaleString()} ${unit} so far` // 扫描时总数未知——它正是扫描要算出来的
-  // 在途分解。光一个"处理了 N 件"看不出是在干活还是卡住了：备份的上传阶段里，一件活要先过
-  // 7z（一箱 100 MB 可以压几十秒）才轮到推字节，那段时间 uploading 是 0 而 preparing 不是；
-  // 还原/校验阶段同理，下载一结束就退出在途窗口，随后的解压/算 hash 那段本地 CPU 工作同样要
-  // 占着 preparing 才不会从界面上消失。三个数各自有值才出现——扫描、差分这些阶段没有队列，
-  // 全是 0，这一段自然整体消失。
-  //
-  // preparing 现在是**阶段相关**的，不只是数值范围不同、连数的是什么都不同：上传阶段数的是
-  // "拿到全局压缩锁、正在产出卷文件"的活，压缩锁只有一把，永远是 0 或 1，排在它后面等锁的
-  // 活算进 queued；还原/校验阶段数的是"下载完、正在解压/算 hash"的组，那里没有全局锁，
-  // 最多可以有 DownloadConcurrency 个组同时在解，不是 0/1。标签跟着这层含义走。
-  //
-  // 一个字节都没在传、手上却有活在准备，这种时候**不能**只让 "N uploading" 悄悄消失：
-  // 那一刻速度是 0、进度条不动、在途路径一行都没有，界面上看跟卡死一模一样。把原因写出来。
-  // 措辞不提"压缩"：选了不压缩的备份一样要过一遍 7z（加密、打包、分卷），说 compressing 是错的；
-  // 还原/校验阶段则确实是在解压/算 hash，直说就行。
-  const preparingLabel = detail.stage === 'Uploading' ? 'preparing' : 'extracting'
-  // 压完了、字节却还没上网线的件卡在哪一段。三段的处置完全不同，所以分开说：
-  // · peer  —— 同一份内容正由别人上传，只能等它整件传完（几分钟起步）
-  // · slot  —— 全局上传闸门排满了（这一项数的是**卷**，闸门按卷排队）
-  // · cloud —— 在等云端应答（存在性/元数据 HEAD），网络一慢就是几十秒
-  // 不分开的话，屏幕上就只剩"什么都没在传"这一句，而这正是查不下去的地方。
-  //
-  // 件数口径：peer 与 cloud 数的是**件**，slot 数的是**卷**。所以只有前两项参与件数加法，
-  // slot 单独说，措辞里点明单位。
-  //
-  // 剩下的那些（uploading 减掉 peer 与 checking）是已进上传段、但字节还没上路、又说不出在等什么
-  // 的件：登记完"进上传段"到第一卷起飞之间、卷与卷之间的空档、查去重映射时没排上队的那一段。
-  // 读盘核对那几段（预筛整读、pack 逐成员 Stat、云端清残留）已经拆进 checking 自己那一栏，
-  // 必须从这里减掉——不减就是同一件活报两遍，屏幕上的数再也凑不出
-  // processed + preparing + queued + uploading 那条恒等式。
-  // 只在**一条流都没在传**时才报：有流在传时上面已经有一句 "N uploading" 了，再加一档只会让人
-  // 分不清哪个数是哪个。这个理由对 checking 不成立（那一栏说得清自己在干什么），所以它不设这个门。
-  const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
-  const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
-  const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
-  // 在途那个数的单位**两侧不一样**：
-  // · 上传：VolumeBlobIO 每一卷各登记一条，一件大活自己就能占满全部并发额度（默认 5）；
-  // · 下载：RestoreOrchestrator / BackupChecker 按整个对象（或整组）登记一条，多卷共用它。
-  // 点明单位的后果是实打实的：同一行里 processed 与 queued 数的是**件**，把卷数加进去就超过
-  // 总数——实测 5,346 + 5 + 1,031 = 6,382 > 6,378，多出的 4 正是「5 卷 − 1 件」。
-  // "5 volumes uploading" / "1 volume uploading" / "3 objects downloading"
-  const inFlightPhrase = `${withUnit(
-    detail.activeItems.length,
-    detail.stage === 'Uploading' ? 'volumes' : unit,
-  )} ${inFlightVerb}`
-  // 排列按**逆时间轴**：越接近"字节已经上了网线"的排越前，越早的阶段排越后，末尾落到 queued。
-  // 一件活的正序是 queued → waiting for the archive slot（排全局产出锁）→ preparing（占锁产出）
-  // → checking / starting upload（产出完到开传之间）→ waiting on peer/slot（等资源）→ uploading
-  // （在传），这一行倒着念就是它。
-  // preparing 从前排在 waiting 与 starting upload 的**前面**，读起来像"先压、再准备、再等"，
-  // 而它其实比那两段都早——屏幕上最常见的组合恰好是 waiting 三档全 0，于是错位就直接暴露成
-  // "preparing · starting upload"这种倒着的相邻两项。
-  // buffered to disk 与 nothing on the wire 不在这条时间轴上：前者是 diff 领先量，后者是一句
-  // 总述（解释为什么没有 "N volumes uploading"），都留在队首。
-  const inFlight = [
-    // 差分判得比压缩上传快几个数量级，跑到前面去是常态；多出来的活攒在磁盘上等下游消化。
-    // 这一行取代了从前那句 "waiting for upload to catch up"——写侧不再阻塞了，所以要说的
-    // 不再是"卡住了"，而是"领先了多少"。措辞里点明 buffered，别让人以为这是失败重试。
-    detail.spilledItems > 0 && `${withUnit(detail.spilledItems, unit)} buffered to disk`,
-    detail.activeItems.length > 0 && inFlightPhrase,
-    // "right now" 而不是 "yet"：这一条说的是**这一瞬**没有流在传（手上那件正占着压缩锁），
-    // 不是"还没开始过"。跑到一半时下面那行已经有几个 GB 的累计量了，说 "yet" 是错的——
-    // 用户正是拿这两句对着问的。
-    idleOnStaging && 'nothing on the wire right now',
-    // 压完了、字节却还没上路的件卡在哪一段。这几档存在的理由就是那个"几分钟纹丝不动"：
-    // 从前这些件不属于任何一栏，屏幕上 processed + preparing + queued 比总数少，而少掉的
-    // 恰恰是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
-    detail.waitingOnPeer > 0 &&
-      `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    // 单位是**卷**不是件（闸门按卷排队），与相邻各项刻意不同。
-    detail.waitingOnSlot > 0 &&
-      `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
-    detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
-    // 读盘核对那几段（去重预筛整读、pack 逐成员 stat、云端清残留卷）。**不**跟着上面那一栏加
-    // "一条流都没在传时才报"的条件：那个条件是因为 starting upload 说不清自己在干什么，有流在传
-    // 时再加一档只会让人分不清哪个数是哪个；这一栏说得清，而且它回答的正是"另外那件活为什么不动"。
-    // 位置按逆时间轴排在 preparing 之前——单文件的预筛其实早于压缩，pack 的重校验晚于压缩，
-    // 一栏横跨两头，只能取一个位置，取的是"离网线更近"的那一端。
-    // 措辞不写成 "in checking files"：整行每一项都是 `N objects <现在分词>`（starting upload、
-    // downloading、waiting for an upload slot、preparing），插一个介词进来就成了整行唯一的异类。
-    detail.checking > 0 && `${withUnit(detail.checking, unit)} checking files`,
-    detail.preparing > 0 && `${withUnit(detail.preparing, unit)} ${preparingLabel}`,
-    // 排在那把全局归档锁后面干等的。措辞刻意**不**说 compressing/compressor：这把锁保护的是
-    // "产出这件活的卷文件"，而 store-only 只打包不压、raw 直传连 7z 都不过，三条路占的是同一把锁。
-    // "archive slot" 与上面的 "waiting for an upload slot" 对仗——两者都是全局闸门，一个管产出、
-    // 一个管上传，而屏幕上同时出现这两句时，那正是这条流水线的两个瓶颈各卡了多少。
-    //
-    // 这一栏是从 queued 里拆出来的，屏幕上的恒等式因此多一项：
-    // processed + preparing + queued + waitingOnArchive + uploading ≡ total。
-    // 拆开的理由是并发跑两个备份：那把锁可以整段在**另一个备份**手里，此时本备份 preparing=0，
-    // 合报成 queued 的话，屏幕上就只剩一万条 "queued"，看不出自己是被别人挡着的。
-    // 判别方法免费送：preparing=1 + 这一栏非 0 = 锁在自己手里，正常排队；
-    // preparing=0 + 这一栏非 0 = 锁在别的运行手里，可以去把那个停掉。
-    detail.waitingOnArchive > 0 &&
-      `${withUnit(detail.waitingOnArchive, unit)} waiting for the archive slot`,
-    detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
-  ]
-    .filter(Boolean)
-    .join(' · ')
-  // 门开在"有没有在途流"上，不开在数值上：卡住的流会被心跳一路摁到 0（见 StageTracker.Tick），
-  // 这正是要显示出来的信号——真卡住时应该看到 "0 B/s"，而不是这一行整段消失、让人分不清
-  // 是没在传还是卡死了。Uploading/Restoring/Verifying 三个会登记在途项的阶段都是边传边报字节
-  // （下载同样挂了逐卷 progress，见 VolumeBlobIO.DownloadAsync），此前只有 Uploading 是这样，
-  // 现在三者对称，不必再单独把 Uploading 摘出来。其余七个阶段从不调 BeginItem，
-  // activeItems 恒为空，条件退化回原来的 bytesPerSecond > 0，行为不变。
-  const speed =
-    detail.bytesPerSecond > 0 || detail.activeItems.length > 0
-      ? ` · ${formatBytes(detail.bytesPerSecond)}/s`
-      : ''
-  // 从秒数算，不去切 estimatedRemaining 那个字符串——理由见 formatDuration。
-  const eta = detail.etaSeconds !== null ? ` · ~${formatDuration(detail.etaSeconds)} left` : ''
-
-  // 字节明细另起一行：件数那行已经够长了，再塞进去在窄屏上会折得没法读。
-  // 各段刻意互不重叠，加起来才是全貌；为零的整段省略，所以扫描/差分这些阶段这一行自然消失。
-  //
-  // 上传与下载是两个方向，措辞不能共用：上传是「压缩 → 送走」，下载是「拉下来 → 写出去」，
-  // 而且下载侧的总量事先就知道（索引里记着各卷尺寸），上传侧压完才知道，只能报已完成的。
-  const downloading = detail.stage === 'Restoring' || detail.stage === 'Verifying'
-  const bytesLine = (
-    downloading
-      ? [
-          // 已下载 / 总下载：分母来自索引；老索引缺卷尺寸时后端报 0，这里就只显示分子。
-          detail.transferredBytes > 0 &&
-            (detail.transferTotal > 0
-              ? `${formatBytes(detail.transferredBytes)} / ${formatBytes(detail.transferTotal)} downloaded`
-              : `${formatBytes(detail.transferredBytes)} downloaded`),
-          // 已恢复 / 待恢复：解压后写出去的源字节。
-          detail.workDone > 0 && `${formatBytes(detail.workDone)} restored`,
-          detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
-        ]
-      : [
-          // 已完成 / 总量，两边都是**源端**字节（压缩前）。分数只有同口径才有意义——拿实传
-          // 字节当分子是不行的：分母（压缩后的总量）在开始传之前根本不存在，压完才知道，
-          // 而且压缩率随文件类型大幅摆动，跨口径的比例读不出任何东西。
-          //
-          // 措辞用 original / compressed 这一对，跟压缩工具里 Original Size / Compressed Size
-          // 的惯例一致。原先叫 "uploaded" 是错的：它让人以为这是传上去的量，而这两个数说的是
-          // **原始文件有多大**——压不动的内容两个数几乎相等，那个词就把口径彻底藏起来了。
-          //
-          // 完成度百分比就跟在这个分数后面——它算的正是这两个数，摆在一起谁都不会认错。
-          // 从件数那行挪过来的：搁在 "2,003 of 2,661 objects" 旁边，读起来是那个分数的完成度，
-          // 而件数 75% 时字节可能才 31%。
-          detail.workTotal > 0 &&
-            `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} original${
-              detail.workPercent != null ? ` (${detail.workPercent}%)` : ''
-            }`,
-          // 这一轮真正传出去的字节，后面跟上它占原始尺寸的比例。
-          //
-          // 措辞换了四轮，每一轮都指出同一件事——这个数的**口径**看不出来：
-          // · 叫 "stored" 被读成"云上一共存了多少"（它和整条明细一样只说本次运行）；
-          // · 与前面那个分数"有什么不同"同样看不出来，两个数都以 GB 结尾，口径却一个是原始尺寸
-          //   一个是实传，而压不动的内容（媒体、已压缩文件）两者几乎相等，光摆着像重复了一遍；
-          // · 叫 "on the wire" 更糟——上面那句 "nothing on the wire right now" 正用着同一个词，
-          //   一处说没有、一处说 2 GB；
-          // · 叫 "compressed" 会自相矛盾：不压缩(store-only)又加了密时，7z 封装加 AES 让产物
-          //   **比原文件大**，小文件的归档头开销同样如此，于是出现 "compressed (105%)"。
-          //
-          // 落回 "uploaded"——分数改叫 original 之后这个词就空出来了，而它本来就是最准的：
-          // 传出去多少就是多少，不预设变大还是变小。超过 100% 照样读得通（上传了原始尺寸的
-          // 105%），而且那正是要告诉用户的事：这样配下来云上反而更占地方。
-          detail.transferredBytes > 0 &&
-            `${formatBytes(detail.transferredBytes)} uploaded${
-              detail.workDone > 0
-                // 括号里必须带上"of original"。光一个 (95%) 会被读成"上传进度 95%"——
-                // 而上一行**就有**一个真正的进度百分比，两个挨着，混读几乎是必然的。
-                // 重复一次 original 换来零歧义，值得。
-                ? ` (${Math.round((100 * detail.transferredBytes) / detail.workDone)}% of original)`
-                : ''
-            }`,
-          // 已经落在云上、但所属那件活还没完成的字节。左边那个 uploaded 按**件**记（才对得上
-          // 同样按件销账的原始字节），所以一件大活分卷上传的几十分钟里，传完的卷进不了那个数——
-          // 而它们确实已经在云上了，也早已不在 "ready to upload" 里（池子逐卷释放）。没有这一项，
-          // 这批字节就在界面上凭空消失，看着像什么都没发生。整件完成时并入左边，这里归零消失。
-          //
-          // 措辞：`+` 表示它是左边那个数之外的追加量；复用 "uploaded" 是因为口径确实相同
-          // （都是已落云的压缩后字节），换个词反而像是另一种东西；单位跟着上一行的 "objects"
-          // 走，不另起 "items"——同一屏里两个词指同一件事，读起来就得先猜它们是不是一回事。
-          detail.unfinishedItemBytes > 0 &&
-            `+${formatBytes(detail.unfinishedItemBytes)} uploaded in unfinished objects`,
-          // "ready to upload" 而不是 "staged"：后者是内部术语（暂存区），对着屏幕的人没理由知道，
-          // 而且同一行里还有个 "N preparing"——那个是**正在压**的件数，这个是**已经压完**、
-          // 躺在临时盘上等上传的字节，两者被混问过。
-          // 这个数还顺带说明压缩与网络谁跑在前面：它涨＝压缩快过上传，落＝上传追上来了。
-          detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} ready to upload`,
-        ]
-  )
-    .filter(Boolean)
-    .join(' · ')
+  const { counts, done, pipeline, speed, eta, inFlightPhrase } = stageLines(detail)
 
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
@@ -1952,10 +1730,7 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           而压缩是全局串行的（一把锁，就是上面那个 N preparing），并发的是上传/下载。 */}
       {detail.activeItems.length > 0 && (
         <div className="text-faint">
-          {`${withUnit(
-            detail.activeItems.length,
-            detail.stage === 'Uploading' ? 'volumes' : unit,
-          )} ${inFlightVerb} in parallel:`}
+          {`${inFlightPhrase} in parallel:`}
         </div>
       )}
       {/* 全部列出，不再截到 3 条。在途条数有上界——它就是设置里的上传/下载并发数（默认 5），
@@ -1977,17 +1752,18 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
         <span className="text-faint">{detail.stage}: </span>
         {counts}
-        {/* 按字节的完成度**不放这里**——它紧跟在 "2,003 of 2,661 objects" 后面，会被读成那个数
-            的完成度，而两者差得很远（实测件数 75% 时字节才 31%）。它挪去下一行，紧跟自己的那个
-            分数（"60.6 GB / 191.0 GB original (31%)"），谁的百分比一眼可见，也就不必再加口径标注。
-            这里只留件数百分比，且只在按字节算不出来时（扫描/差分不申报字节工作量）才出现——
-            那时它和旁边的分数本来就是同一个口径。 */}
+        {/* 件数百分比只在按字节算不出来时（扫描/差分不申报字节工作量）才出现——那时它和
+            旁边那个分数本来就是同一个口径。按字节的完成度跟在自己那个分数后面。 */}
         {detail.workPercent == null && detail.percent != null && ` · ${detail.percent}%`}
-        {inFlight && ` · ${inFlight}`}
+        {done && ` · ${done}`}
         {speed}
         {eta}
       </div>
-      {bytesLine && <div className="text-faint">{bytesLine}</div>}
+      {/* 第二行整条是流水线，按逆时间轴排。前缀点明"这些都还没落定"——没有它，第一行的
+          "1.9 TB uploaded" 与第二行的 "+3.7 GB on the cloud" 摆在一起又成了一道谜题：
+          两个都是已经在云上的字节，凭什么分两行？答案是前者所属的活已经销账、不会再变，
+          后者所属的活还在跑，整件重来时那些卷就不算数了。 */}
+      {pipeline && <div className="text-faint">In flight: {pipeline}</div>}
     </div>
   )
 }
