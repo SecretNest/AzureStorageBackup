@@ -1,128 +1,143 @@
-# 备份功能详细设计
+# Backup feature design
 
-> 用户 2026-07-16 提供。对应里程碑 **M3**（计划任务/备份列表 UI）、**M4**（备份引擎）、**M5**（检查/还原）。补充 [product-requirements.md](product-requirements.md) 第 2 章。
+> Provided by the user on 2026-07-16. Covers milestones **M3** (scheduled tasks, backup list UI),
+> **M4** (the backup engine) and **M5** (check and restore). Supplements chapter 2 of
+> [product-requirements.md](product-requirements.md).
 
-## 备份列表与状态
+## The backup list and status
 
-列出工具中所有已有备份。每个备份可：新建、删除、执行、查看执行结果（每次执行的情况）、查看当前状态。
+List every backup in the tool. Each one can be created, deleted, run, inspected (per-run results) and shown with its current status.
 
-**状态定义：**
-- **一般**：上次任务正常结束
-- **错误**：上次任务失败，或检查结果异常
-- **备份中** / **还原中** / **检查中**
+**Status values:**
 
-## 1. 新建备份
+- **Normal** — the last task ended cleanly
+- **Error** — the last task failed, or a check found something wrong
+- **Backing up** / **Restoring** / **Checking**
 
-**步骤 1 —— 基础信息（除名字、描述外，创建后均不可再编辑）：**
-- 账户 + container（可在此新建 container）
-- 本地根路径（只能有一个）
-- 名字
-- 描述（可选）
-- 密码（可选）
-- Tier：索引文件（含信息记录文件）Tier + 数据文件 Tier
+## 1. Creating a backup
 
-**步骤 2 —— 基于默认值的本备份设置：**
-- 依据设置中的默认值，允许逐项设置，或对每项勾选「使用默认值」
-- **Symbol link 处理**：包含 或 跳过（默认值中需含此项）
-- **执行记录保留**：备份次数 / 天数，达到之一即删除（默认值中需含此项）
+**Step 1 — basics** (immutable after creation, except name and description):
 
-**完成后：** 可选「立即备份」或「暂不执行」（后续可到计划任务设置）。
+- Account plus container (a container can be created here)
+- The local root path (exactly one)
+- Name
+- Description (optional)
+- Password (optional)
+- Tiers: one for index files (including the info file), one for data files
 
-## 2. 执行进度（备份 / 还原）
+**Step 2 — per-backup settings derived from the defaults:**
 
-执行时可见进度：
-- 百分比
-- 本次变更文件（**未压缩、分组前**）的数量、尺寸（删除的不计入尺寸）
-- 备份需包含**空文件夹**；还原时需创建这些空文件夹
+- Every item can be set individually or ticked as "use default"
+- **Symlink handling**: include or skip (must be present in the defaults)
+- **Run-record retention**: by run count or by age, whichever is reached first (must be present in the defaults)
 
-## 3. 错误状态重置
+**On completion**: either "back up now" or "not yet" (configurable later through scheduled tasks).
 
-处于「错误」状态的备份任务，可 reset 回「一般」。
+## 2. Run progress (backup / restore)
 
-## 4. 编辑
+Progress is visible while running:
 
-- 非执行期间，可编辑除「新建时标注不可编辑」以外的项
-- 改名字后需同步界面
+- A percentage
+- The count and size of this run's changed files (**uncompressed, before grouping**; deletions do not count towards size)
+- Backups must include **empty directories**, and restore must recreate them
 
-## 5. 删除
+The full design of what is displayed and why is in [progress-display-design.md](progress-display-design.md).
 
-删除备份时，提醒用户是否同时删除 container。
-- container 的独立增删改在**账户设置的 container 管理界面**（PRD 1.2）进行。
-- 删除备份流程本身**不提供单独删除 container**，只提供「是否同时删除」的询问。
+## 3. Resetting the error state
 
-## 6. 导入已有备份
+A backup sitting in **Error** can be reset back to **Normal**.
 
-- 选择账户（选择到 container）
-- 若为加密备份，输入密码
-- 选择对应的本地路径
-- 除「账户、密码、本地路径」外，其余配置都保存在信息记录文件中（从中恢复）
+## 4. Editing
 
-## 7. 还原
+- Outside a run, everything except the items marked immutable at creation can be edited
+- A renamed backup must be reflected in the UI
 
-- 用户选择目的地根目录，或选择「还原到原地」
-- 冲突处理（遇到相同文件时）：**覆盖（仅当变更时）** / **跳过** / **重命名同时保留**
-- 显示来源版本供选择
-- 显示文件树（**晚期加载 / 懒加载**）供用户选择，包含所有文件夹、文件
-- 若涉及 **Archive tier** 的数据，需用户指定 **Rehydrate Priority：Standard（默认）/ High**
-- 确认后开始执行还原
+## 5. Deleting
 
-## 8. 检查
+Deleting a backup asks whether to delete the container as well.
 
-检查时（含计划任务触发时）选择检查方式：
-- 是否检查**云端文件存在**（列表，默认：是）
-- 是否检查**云端文件内容**（下载，默认：否）
-- 是否检查**本地文件存在**（日期、长度；当日期不同但长度相同时，检查 hash）
+- Independent container CRUD lives in the account settings screen (PRD 1.2).
+- The delete-backup flow itself does **not** offer standalone container deletion — only the "delete it too?" question.
 
-执行检查。
+## 6. Importing an existing backup
 
-## 9. 历史版本清理
+- Pick the account, down to the container
+- If the backup is encrypted, enter the password
+- Pick the corresponding local path
+- Everything other than account, password and local path is held in the info file and restored from it
 
-对不再需要的历史版本进行清理，触发时机：
-- 备份完成时
-- 计划任务中新增一个「清理」任务类型
+## 7. Restore
 
----
+- The user picks a destination root, or "restore in place"
+- Conflict handling when a file already exists: **overwrite (only if changed)** / **skip** / **rename and keep both**
+- The source version is selectable
+- A file tree (**lazily loaded**) lets the user choose, and includes all folders and files
+- If any of the data is in the **Archive** tier, the user must specify a **rehydrate priority: Standard (default) or High**
+- Restore starts on confirmation
 
-## 特别说明（关键技术约束）
+## 8. Check
 
-### A. 索引文件内容与比对逻辑
-- 索引文件需包含每个文件的：**权限、变更日期、长度、hash**
-- 比对文件时：若**长度相同但日期、权限不同**，则比对 hash
-- 若**仅权限、日期变更**（内容未变）：下次备份**只需更新索引**，不重传数据
+When a check runs (including from a scheduled task), the method is selectable:
 
-### B. 索引分散化与两级索引
-- 索引文件本身需**分散化**，避免单个索引过大或反复变更
-- 索引文件同样做**压缩、加密**
-- 可考虑**按版本分割，做成两级索引**
+- Whether to check **cloud file existence** (listing; default yes)
+- Whether to check **cloud file content** (downloading; default no)
+- Whether to check **local file existence** (date and length; when the date differs but the length matches, compare hashes)
 
-### C. 原子性与安全
-- 由于分组文件可能变更，**历史版本的索引文件也可能变更**
-- 变更时须保证安全：**不得因网络传输失败导致整体损坏**（需原子更新 / 写入新文件后切换等策略）
+## 9. Historical version cleanup
 
-### D. 文件处理后的重校验与反复保护
-- 对每个文件处理（读取/压缩/打包）完成后，**再次检查**其最后变更时间/日期、权限
-- 若发生变化 → **重新计算 hash**
-- 若 hash 也变化 → **重新处理该文件**
-- 若同一文件反复处理达阈值（默认 **5** 次，经环境变量配置）→ 记录一条**报警**，并以该文件的**当前版本**保存（停止重试）
-- **分组文件**：分组压缩后，同样对组内**原始文件**执行上述重校验；若某原始文件已变更，将其移出分组，**放入当前目录的下一个分组处理**；若当前目录已无其他分组，则**作为单独文件处理**
-- **收尾检查**：全部备份处理结束后、**上传索引之前**，再对所有文件做一次上述重校验并收尾；**已报警的文件跳过**（不再检查）
+Cleaning up versions that are no longer needed, triggered:
+
+- When a backup completes
+- By a new "cleanup" scheduled task type
 
 ---
 
-## 待澄清点
+## Key technical constraints
 
-### 已确认（2026-07-16）
-1. **密码 = 加密**：新建备份设了密码 → 该备份用加密信息文件 + 7z 加密；不设 → 全程不加密（单一开关）。
-2. **Symbol link 默认跳过**。
-3. **执行记录保留 与 版本保留是两套独立策略**（执行日志 vs 数据版本），理解确认。
-4. **还原「覆盖仅当变更时」用 hash 比对**（与索引中的 hash 对齐）。
-5. **Tier / Smart（已查证 Azure .NET SDK）**：`AccessTier` 只支持 Hot/Cool/Cold/Archive；「Smart tier」是**账户级自动分层**功能，不是可对单个 blob 设置的 tier。故本工具**不提供 Smart 选项**：
-   - 索引文件 Tier = Hot（默认）/ Cool / Cold
-   - 数据文件 Tier = Hot / Cool / Cold / Archive（默认）
-   - Cold 需 SDK ≥ 12.15.0（当前 12.29.1 满足）。
+### A. Index contents and comparison logic
 
-### 留到 M4 设计文档提方案
-- 信息文件完整 schema
-- 两级索引的具体结构（版本级 → 文件级切分）
-- 临时区调度边界细节（3.3.2.4）
-- 检查「本地文件存在」判定中权限是否纳入
+- The index must hold, for each file: **permissions, modification date, length, hash**
+- When comparing: if the **length matches but the date or permissions differ**, compare hashes
+- If **only permissions or date changed** (content did not): the next backup **only updates the index** and does not re-upload data
+
+### B. Index distribution and two levels
+
+- The index must be **distributed** so that no single index becomes enormous or is rewritten repeatedly
+- Index files are themselves **compressed and encrypted**
+- Consider **splitting by version into a two-level index**
+
+### C. Atomicity and safety
+
+- Because grouped files can change, **the index of a historical version can change too**
+- Such changes must be safe: **a network failure must not corrupt the whole thing** (atomic update, or write-new-then-switch)
+
+### D. Post-processing recheck and repeat protection
+
+- After processing a file (read / compress / pack), **check its modification time and permissions again**
+- If they changed → **recompute the hash**
+- If the hash changed too → **reprocess the file**
+- If one file is reprocessed up to the threshold (**5** by default, configurable by environment variable) → record a **warning** and save the file's **current** version, stopping retries
+- **Grouped files**: after compressing a group, run the same recheck against the group's **original files**; a changed one is moved out of the group and into the **next group for that directory**, or handled as a single file if that directory has no other group
+- **Final sweep**: after all processing and **before uploading the index**, run the recheck once more across everything, **skipping files that already warned**
+
+---
+
+## Settled questions (2026-07-16)
+
+1. **Password means encryption**: a backup created with a password uses an encrypted info file plus 7z encryption; without one, nothing is encrypted anywhere. It is a single switch.
+2. **Symlinks are skipped by default.**
+3. **Run-record retention and version retention are two independent policies** (execution logs versus data versions).
+4. **Restore's "overwrite only if changed" compares hashes**, aligned with the hashes in the index.
+5. **Tiers and "Smart"** (verified against the Azure .NET SDK): `AccessTier` supports only Hot/Cool/Cold/Archive. "Smart tier" is an *account-level* auto-tiering feature, not a tier settable on an individual blob, so the tool offers no Smart option:
+   - Index file tier: Hot (default) / Cool / Cold
+   - Data file tier: Hot / Cool / Cold / Archive (default)
+   - Cold requires SDK ≥ 12.15.0 (12.29.1 in use satisfies this).
+
+## Deferred to the M4 design
+
+- The full info-file schema
+- The concrete structure of the two-level index (version level → file level)
+- Boundary details of the staging scheduler (PRD 3.3.2.4)
+- Whether permissions count towards "local file exists" during a check
+
+All four are answered in [m4-backup-engine-design.md](m4-backup-engine-design.md).

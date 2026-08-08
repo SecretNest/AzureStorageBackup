@@ -1,127 +1,122 @@
-# 本地路径根边界与目录浏览（2026-07-26）
+# Local path root boundary and directory browsing
 
-> 工具部署在 Docker 里，备份必然操作本地路径，而本地路径目前只能在网页上手工键入。本轮增加两件事：网页上的目录/文件树浏览，以及由环境变量指定的根目录边界——所有本地路径操作（备份、还原、修复、浏览）不得越过该根。
+> The tool is deployed in Docker and backups necessarily operate on local paths, which until now
+> could only be typed by hand into a web form. This adds two things: a directory/file tree browser
+> in the UI, and a root boundary set by an environment variable — no local path operation (backup,
+> restore, repair, browse) may cross it.
 >
-> 根**只做安全过滤**：不改写路径、不截断路径、不作为相对路径的基准。存储、显示、日志中一律是完整原始路径。根为 `/nas` 时，`/nas/photos/2024` 就显示 `/nas/photos/2024`。
+> The root is **a security filter only**: it does not rewrite paths, truncate them, or serve as the
+> base for relative paths. Storage, display and logs all carry the full original path. With a root
+> of `/nas`, `/nas/photos/2024` is displayed as `/nas/photos/2024`.
 >
-> 补充 [product-requirements.md](product-requirements.md)。顺带修掉还原路径穿越缺陷，见 §5。
+> Supplements [product-requirements.md](product-requirements.md). It also fixes a restore path
+> traversal defect, §5.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 边界判定方式 | **逐段解析真实路径后比较**。仅做 `GetFullPath` + 前缀比较挡不住符号链接，而「用软链把散落各处的目录聚到一处」正是本功能面向的用法 |
-| 2 | 未设根时 | **无限制**，与本轮之前行为完全一致。浏览从 `/` 开始 |
-| 3 | 已存在的越界配置 | **保留配置、拒绝执行**。列表里照常显示，备份/还原/检查/修复一律 409。不阻止启动 |
-| 4 | 校验时机 | **每次操作都校验**，不只在设置时。配置可能来自旧版本、手工改库或 `/import` |
-| 5 | 越界响应 | **409** + 错误码 `path_outside_root`，消息含根与被拒路径 |
-| 6 | 浏览返回内容 | 目录与文件都返回；**只有目录可选**。越界子项返回但带 `outsideRoot` 标记，前端灰显不可点 |
-| 7 | 前端形态 | 保留手输输入框，旁加 `Browse` 按钮。手输值同样过校验 |
-| 8 | 还原路径穿越 | **独立于本功能必修**。即使未设根，还原也绝不能写到 `TargetRoot` 之外 |
+| # | Question | Conclusion |
+|---|---|---|
+| 1 | How the boundary is judged | **Resolve the real path segment by segment, then compare.** `GetFullPath` plus a prefix comparison does not stop symlinks — and "use symlinks to gather scattered directories into one place" is exactly the usage this feature is aimed at |
+| 2 | With no root set | **No restriction**, behaviour identical to before. Browsing starts at `/` |
+| 3 | Existing out-of-bounds configurations | **Keep the configuration, refuse to run it.** It still appears in the list, but backup / restore / check / repair all return 409. Startup is not blocked |
+| 4 | When validation happens | **On every operation**, not only when settings are saved. A configuration may come from an older version, a hand-edited database, or `/import` |
+| 5 | Out-of-bounds response | **409** with error code `path_outside_root`, and a message naming both the root and the rejected path |
+| 6 | What browsing returns | Both directories and files; **only directories are selectable**. Out-of-bounds children are returned but flagged `outsideRoot`, greyed out and unclickable |
+| 7 | Frontend shape | Keep the free-text field, add a `Browse` button beside it. Typed values go through the same validation |
+| 8 | Restore path traversal | **Must be fixed independently of this feature.** Even with no root set, restore must never write outside `TargetRoot` |
 
-## 2. 配置
+## 2. Configuration
 
-`Backup__Root`（配置键 `Backup:Root`，遵循项目既有的 `Section__Key` 约定）。
+`Backup__Root` (configuration key `Backup:Root`, following the project's `Section__Key` convention).
 
-- **未设置或为空** → 无边界，所有本地路径放行
-- **已设置** → 启动时对根自身解析一次真实路径并缓存；此后所有判定以该真实根为准
+- **Unset or empty** → no boundary, every local path allowed
+- **Set** → the root's own real path is resolved once at startup and cached; every subsequent judgement uses that resolved root
 
-根自身必须先解析：若 `/nas` 本身是指向 `/mnt/disk1` 的软链，而判定时拿字符串 `/nas` 去比较真实路径，则一切合法路径都会被误拒。
+Resolving the root itself first is mandatory: if `/nas` is itself a symlink to `/mnt/disk1`, comparing the literal string `/nas` against resolved real paths would reject every legitimate path.
 
-## 3. 边界判定
+## 3. Judging the boundary
 
-### 3.1 为什么必须逐段解析
+### 3.1 Why it must be segment by segment
 
-.NET 没有 `realpath`。`Directory.ResolveLinkTarget(path, returnFinalTarget: true)` 只解析**最后一段**：若 `/nas/link` 是指向 `/etc` 的软链，查询 `/nas/link/passwd` 时它返回 `null`——因为 `passwd` 自身不是链接。仅靠它做判定会漏掉**中间段**是软链的全部情形，而那恰恰是最容易被利用的形状。
+.NET has no `realpath`. `Directory.ResolveLinkTarget(path, returnFinalTarget: true)` resolves **only the last segment**: if `/nas/link` is a symlink to `/etc`, querying `/nas/link/passwd` returns `null`, because `passwd` itself is not a link. Relying on it alone misses every case where an **intermediate** segment is a symlink — which is precisely the shape most easily exploited.
 
-因此需要自己实现逐段展开：从根开始，逐段拼接并检查该段是否为符号链接，是则替换为其目标（目标可能是相对路径，需就地规范化）后继续。
+So the expansion is implemented directly: start at the root, append one segment at a time, check whether that segment is a symlink, and if so substitute its target (which may be relative and needs normalising in place) before continuing.
 
-### 3.2 判定规则
+### 3.2 The rules
 
-1. 对候选路径做 `Path.GetFullPath` 规范化（消除 `..`、`.`、重复分隔符）
-2. 逐段展开符号链接，得到最终真实路径
-3. 与真实根比较，**必须按路径段边界**：`/nasty` 不得因前缀匹配 `/nas` 而通过。等于根本身也算在内
-4. 符号链接成环时设深度上限，超限即判定为越界（而非抛异常或死循环）
-5. 路径不存在时，对其**最近的已存在祖先**做上述判定——还原目标可以是尚未创建的目录，不能因为「还不存在」就拒绝
+1. Normalise the candidate with `Path.GetFullPath` (removing `..`, `.` and repeated separators).
+2. Expand symlinks segment by segment to reach the real path.
+3. Compare against the resolved root **on path segment boundaries**: `/nasty` must not pass by prefix-matching `/nas`. Equality with the root itself counts as inside.
+4. Cap the depth for symlink cycles; exceeding it is judged out of bounds (not an exception, and not an infinite loop).
+5. For a path that does not exist, judge its **nearest existing ancestor** — a restore target may be a directory that has not been created yet, and "does not exist yet" is not grounds for rejection.
 
-## 4. 校验点
+## 4. Where validation happens
 
-每次操作都校验，不只在设置时：
+Every operation, not just settings:
 
-| 位置 | 校验对象 |
+| Site | What is validated |
 |---|---|
-| 创建备份配置 | `LocalRoot` |
-| 备份 / 检查 / 修复 / 清理启动时 | `config.LocalRoot` |
-| 还原启动时 | `TargetRoot`（含缺省回落到 `config.LocalRoot` 的情形，见 `BackupConfigEndpoints.cs:198`） |
-| 目录浏览 API | 请求的 `path`，以及返回的每个子项 |
+| Creating a backup configuration | `LocalRoot` |
+| Starting a backup / check / repair / cleanup | `config.LocalRoot` |
+| Starting a restore | `TargetRoot`, including when it falls back to `config.LocalRoot` |
+| The browse API | The requested `path`, and every child returned |
 
-只在入口校验是不够的：边界的意义是「无论配置从哪来都不能越界」，而配置可以来自旧版本、手工改库、或 `/import` 导入的任意容器。
+Validating only at the entry point is not enough: the boundary means "no configuration may cross it regardless of where it came from", and configurations can come from an older version, a hand-edited database, or an arbitrary container imported through `/import`.
 
-## 5. 还原路径穿越（独立必修）
+## 5. Restore path traversal (an independent must-fix)
 
-`RestoreOrchestrator.cs:304` 是 `Path.Combine(request.TargetRoot, ToLocal(entry.Path))`，而 `ToLocal`（`:396`）只做分隔符替换，对 `..` 无任何校验。`entry.Path` 来自**云端索引**，因此含 `../../etc/cron.d/x` 的条目会被写到 `TargetRoot` 之外。
+Restore combined `TargetRoot` with the entry path, and the conversion to a local path only substituted separators — it validated nothing about `..`. The entry path comes from **the cloud index**, so an entry containing `../../etc/cron.d/x` would be written outside `TargetRoot`.
 
-这不是理论风险：`/import` 端点允许导入任意容器的备份，导入一份来路不明的容器再还原，即可向容器内任意路径写文件。
+This is not a theoretical risk: the `/import` endpoint accepts any container, so importing a backup of unknown provenance and restoring it can write a file anywhere inside the container.
 
-**修法**：拼接后校验结果仍在 `TargetRoot` 之内；越界条目**跳过并计入 `FailedFiles`**，不中断整次还原（与既有的逐组容错语义一致）。`RestoreSymlink`（`:312`）创建链接时同理。
+**The fix**: validate that the combined result is still inside `TargetRoot`; an out-of-bounds entry is **skipped and counted in `FailedFiles`** rather than aborting the restore (consistent with the existing per-group tolerance). Symlink creation is treated the same way.
 
-此项**独立于 `Backup__Root`**：即使未设根，还原也绝不能写到 `TargetRoot` 之外。
+This is **independent of `Backup__Root`**: even with no root set, restore must never write outside `TargetRoot`.
 
-## 6. 浏览 API
+## 6. The browse API
 
-`GET /api/system/browse?path=...`，懒加载，只返回直接子项。项目中 `/{id}/tree`（云端版本树）已是此模式，沿用。
+`GET /api/system/browse?path=...`, lazy, returning direct children only. The cloud version tree already works this way and the pattern is reused.
 
-**`path` 缺省**：设了根则为根，未设根则为文件系统根（部署目标是 Linux 容器，即 `/`；本机开发时取当前驱动器/卷的根）。
+**Default `path`**: the root if one is set, otherwise the filesystem root (the deployment target is a Linux container, so `/`; on a development machine, the root of the current drive or volume).
 
-未设根时 `outsideRoot` 恒为 `false`——没有边界就没有「界外」。
+With no root set, `outsideRoot` is always `false` — no boundary means no outside.
 
-**响应**：当前路径、父路径（到根为止）、子项数组。每个子项含名称、完整路径、是否目录、大小与修改时间，以及 `outsideRoot` 标记。
+**The response** carries the current path, the parent path (stopping at the root) and the children. Each child has a name, full path, whether it is a directory, size and modification time, plus the `outsideRoot` flag.
 
-**为什么越界子项要返回而不是过滤掉**：`/nas/link → /etc` 若直接不返回，用户会困惑「目录里明明有这个东西」。返回并标记则说明了它为何不可用。
+**Why out-of-bounds children are returned rather than filtered out**: if `/nas/link → /etc` simply did not appear, the user would be confused about a directory entry they can plainly see elsewhere. Returning it with a flag explains why it cannot be used.
 
-**健壮性**：
+**Robustness**: a child that cannot be read (permissions, for instance) is skipped while the rest are still returned, so one failure does not fail the whole request. There is a cap on how many children come back in one response, so a directory with a hundred thousand entries cannot blow it up — and **truncation is stated explicitly**, never silently short.
 
-- 单个子项读取失败（权限不足等）时跳过该项、继续返回其余，不使整个请求失败
-- 单次返回设数量上限，避免十万条目的目录撑爆响应；**截断时明确告知**，不静默少给
+## 7. Frontend
 
-## 7. 前端
+The local root field and the restore target field each gain a `Browse` button, sharing one path-browser dialog (breadcrumb, list, parent). The parent button stops at the root.
 
-`BackupConfigsPage` 的 local root 输入框、`RestoreDialog` 的 target 输入框各加一个 `Browse` 按钮，共用一个 `PathBrowser` 弹窗组件（面包屑 + 列表 + 上级）。上级按钮到根为止。
+The text fields stay: typing is faster for someone who knows the path, and typed values go through the same validation, so it is not a bypass.
 
-输入框保留：手输对熟悉路径的人更快，且手输值同样过校验，不构成绕过。
+Files are shown in the list but are not selectable — both `LocalRoot` and `TargetRoot` are directories by definition, while being able to see files is how you confirm you picked the right place.
 
-文件在列表中显示但不可选——`LocalRoot` 与 `TargetRoot` 语义上都只能是目录，而能看到文件才能确认选对了位置。
+## 8. Pinned behaviour
 
-界面文案一律英文。
+Boundary judgement is the one place here where it is easy to write tests that look like they are testing something and are not. **Symlink cases must construct real links in a temp directory and must not be mocked** — the entire point of this feature is handling what the filesystem really does.
 
-## 8. 测试
+- `..` escapes are rejected.
+- `/nasty` does not pass by prefix-matching `/nas`.
+- A root that is itself a symlink still admits paths inside it.
+- A path whose **intermediate** segment is a symlink pointing outside the root (`/nas/link/photos/a.jpg`) is rejected. This is the case `ResolveLinkTarget` alone would miss.
+- A symlink cycle terminates and is judged out of bounds.
+- A path that does not exist yet is judged by its nearest existing ancestor.
+- An out-of-bounds configuration returns 409 from backup, restore, check and repair alike.
+- Restore traversal: an index entry containing `../` is skipped and counted in `FailedFiles` while the rest restore normally — **and this holds with no root set as well**.
+- With no root set, every path is allowed, browsing starts at `/`, and behaviour matches the previous release.
+- The browse API returns 409 for an out-of-bounds `path`, flags out-of-bounds children, and states truncation when it truncates.
 
-边界判定是本轮唯一容易写出「看起来在测、其实没测」的地方，重点在此。**符号链接相关用例必须在临时目录里构造真实软链，不得 mock**——本功能的全部意义就是处理文件系统的真实行为。
+## 9. Deployment note
 
-- `..` 逃逸被拒
-- `/nasty` 不因前缀匹配 `/nas` 而通过
-- 根自身是符号链接时，根内路径正常通过
-- **路径中间段**是符号链接且指向根外（`/nas/link/photos/a.jpg`）被拒——这是 `ResolveLinkTarget` 单独使用会漏掉的情形
-- 符号链接成环时不死循环，判定为越界
-- 尚不存在的路径按最近已存在祖先判定
-- 越界的备份配置：备份、还原、检查、修复各自 409
-- 还原路径穿越：索引含 `../` 的条目被跳过并计入 `FailedFiles`，其余条目照常还原；**且未设根时同样成立**
-- 未设根：所有路径放行，浏览从 `/` 开始，行为与本轮之前一致
-- 浏览 API：越界 `path` 得 409；子项越界带 `outsideRoot` 标记；截断时有告知
+`Backup__Root` constrains paths **inside the container**, so it works together with volume mounts: mount every host directory you want to back up beneath that root. Unset means unrestricted. It only filters; it never rewrites, migrates or truncates paths in existing configurations, and the UI still shows full paths. Once set, existing out-of-bounds configurations are refused at run time while the configuration itself is preserved.
 
-## 9. 文档
+## 10. Deliberately not done
 
-`README.md` 环境变量表增加 `Backup__Root` 一行，并说明：
-
-- 不设即无限制
-- 它只做安全过滤，不改写路径；界面显示的仍是完整路径
-- 设置后，已存在的越界备份配置会被拒绝执行（配置本身保留）
-- 它约束的是**容器内**路径，因此与卷挂载配合使用：把要备份的宿主目录都挂到该根之下
-
-## 10. 明确不做
-
-- 不把根作为相对路径基准（路径一律完整）
-- 不因设置根而重写、迁移或截断已有配置中的路径
-- 不做多根（一个根 + 卷挂载已覆盖「多处目录聚到一处」的需求）
-- 不做浏览结果的分页（只做数量上限 + 截断告知）
-- 不允许在浏览器中选择文件作为 local root / restore target
+- The root is not a base for relative paths (paths are always complete)
+- No multiple roots (one root plus volume mounts already covers "gather directories from several places")
+- No pagination for browse results (a cap plus an explicit truncation notice instead)
+- No selecting a file as a local root or restore target
