@@ -68,10 +68,6 @@ verification on its own and delivers something verifiable. Requirements live in
 - Temp directory paths displayed
 - Version display
 
-### Remediation round — backup review fixes (2026-07-18)
-
-A full review pass after M4–M8: one high-severity concurrency/data-integrity issue, five medium bugs, eight requirement gaps (including selective restore, state persistence and orphan reclamation), nine low-severity cleanups, plus CI integration tests. See [backup-remediation.md](backup-remediation.md).
-
 ## After M8 (by design sign-off date)
 
 M1–M8 delivered something usable. Everything after that was surfaced by actual use: either a
@@ -102,3 +98,4 @@ the authority.
 - M4 was the core difficulty and the largest risk, which is why it was broken into subtasks.
 - After M8 the work stopped following milestones and became per-item delivery: design → plan → implement → review → merge to `main`. The repository keeps a single `main` line; a branch is merged and deleted as soon as it is done.
 - Documents are organised **by topic, not by date**. A round that extends an existing topic is merged into that topic's document rather than filed as a new dated one — see the 07-26 → 08-09 row above, which is five rounds in one document.
+- **Neither implementation plans nor completion records are kept.** Planning still happens between design and implementation, and rounds still get reviewed — but the task lists and the "what was delivered, which commits, how many tests" write-ups are scaffolding. Once the work has shipped, the code and the design document are the sources of truth, and a stale plan is worse than none: it reads like a specification while describing a shape the code has moved past. Whatever is worth surviving a round belongs in the design document; what the round cost belongs in the commit history.
