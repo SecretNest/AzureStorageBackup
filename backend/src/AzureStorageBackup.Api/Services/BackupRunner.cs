@@ -255,8 +255,17 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// 45 &gt; 30：docker 的宽限期一到就是 SIGKILL，必须让 .NET 自己的超时先到，才还有机会把日志写出来。
     /// 30 &gt; 20：宿主等 <c>StopAsync</c> 也是有超时的，超了它不等、直接往下拆服务——那时连"谁没停下来"
     /// 都没人记得下。留出的这 10 秒是给下面那条警告日志和其余宿主服务收尾用的。
+    /// <para>
+    /// <c>internal</c> 而非 <c>private</c>：同 <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/>
+    /// 的先例——测试项目靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
+    /// "到点还没落盘"那条分支，不用真的等 20 秒。跟那个先例一样，它是**进程内共享的可变静态字段**，
+    /// 安全性靠两条没有代码强制的约定撑着：(1) 只有 GracefulSuspendTests.cs 这一个测试文件碰
+    /// <c>SuspendAllAsync</c>，改这个字段不会绊到别的文件；(2) xUnit 同一个类里的 <c>[Fact]</c>
+    /// 顺序执行，改字段的用例把它放进 try/finally 复原，不会和同类里的别的用例打架。
+    /// 生产环境永远是 20 秒。
+    /// </para>
     /// </summary>
-    private static readonly TimeSpan SuspendWaitCap = TimeSpan.FromSeconds(20);
+    internal static TimeSpan SuspendWaitCap = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// 让**所有**在跑的运行挂起，并等它们把 journal 落盘。返回真的停成
@@ -312,13 +321,30 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         catch (OperationCanceledException)
         {
             // 超时（或调用方的 ct 先断）不往上抛：抛出去就没人写下面这条日志了，而事后想弄明白
-            // "这一卷为什么没有标记"，就只剩这条日志能说清。
+            // "这一卷为什么没有标记"，就只剩这条日志能说清。但这条日志本身不能认错超时是谁的——
+            // 同一个 catch 既接得住这里自己的 SuspendWaitCap（20s），也接得住调用方 ct 先断
+            // （宿主的 ShutdownTimeout，30s）。两者的证据价值一样大，名字却不能张冠李戴：
+            // 真到了排查"为什么没有标记"的时候，一条指错了截止时间的日志比没有日志更误导人。
             var stuck = pending.Where(p => !p.State.Completion.Task.IsCompleted).Select(p => p.ConfigId);
             using var scope = scopes.CreateScope();
-            scope.ServiceProvider.GetService<ILogger<BackupRunner>>()?.LogWarning(
-                "Gave up after {Seconds}s waiting for backup(s) {ConfigIds} to suspend; they are left "
-                + "mid-flight and will come back as interrupted runs to be resumed by hand",
-                SuspendWaitCap.TotalSeconds, string.Join(", ", stuck));
+            var logger = scope.ServiceProvider.GetService<ILogger<BackupRunner>>();
+            if (capped.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // 是我们自己的 SuspendWaitCap 到点了：可以点名具体秒数。
+                logger?.LogWarning(
+                    "Gave up after {Seconds}s waiting for backup(s) {ConfigIds} to suspend; they are left "
+                    + "mid-flight and will come back as interrupted runs to be resumed by hand",
+                    SuspendWaitCap.TotalSeconds, string.Join(", ", stuck));
+            }
+            else
+            {
+                // 调用方的令牌先断了（宿主自己的 ShutdownTimeout），不是我们的 20 秒——措辞中立，
+                // 不点名一个可能根本没到期的数字。
+                logger?.LogWarning(
+                    "Gave up waiting for backup(s) {ConfigIds} to suspend because shutdown was cancelled; "
+                    + "they are left mid-flight and will come back as interrupted runs to be resumed by hand",
+                    string.Join(", ", stuck));
+            }
         }
 
         // 只数真的停成 Suspended 的。等超时的、以及被同时到达的 Stop now 抢先按成 Canceled 的，

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using Azure.Storage.Blobs.Models;
@@ -187,6 +188,95 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
+    /// F3：没有任何测试真的把 <see cref="BackupRunner.SuspendWaitCap"/> 撑爆过——删掉
+    /// <c>capped.CancelAfter(SuspendWaitCap)</c> 那一行，整套照样全绿，这条上限形同虚设。
+    /// <para>
+    /// 用反射直接往 <c>_runs</c> 里塞一条"停不下来"的运行：<c>Status = Running</c> 但没有
+    /// <c>Control</c>，于是 <c>RequestStop</c> 走的是 <c>state.Cancellation.Cancel()</c> 那条分支——
+    /// 意愿发出去了，但没人把 <c>Completion</c> 落定，模拟一次卡在落盘路上、迟迟不退出的运行。
+    /// 把 <see cref="BackupRunner.SuspendWaitCap"/> 从生产环境的 20 秒调到 100 毫秒（就近抄
+    /// <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/> 那几条测试的手法），断言：
+    /// <list type="bullet">
+    /// <item>到点**不抛**——<c>SuspendAllAsync</c> 正常返回，而不是把 <c>OperationCanceledException</c>
+    /// 甩给关机钩子；</item>
+    /// <item>返回的计数里**不算**这一个——它没有落地成 <see cref="RunStatus.Suspended"/>，盘上没有标记，
+    /// 算进去关机日志就在说大话；</item>
+    /// <item>日志留下"谁没停下来"这条线索，而且点名的是我们自己的 <c>SuspendWaitCap</c>，不是
+    /// 调用方的 <c>ct</c>（F2）。</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Suspend_all_gives_up_after_the_cap_and_reports_the_run_as_not_suspended()
+    {
+        var log = new CapturingLoggerProvider();
+        using var factory = new LoggedFactory(log);
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+
+        var stuck = new BackupRunState { Status = RunStatus.Running };   // Completion 永不落定
+        InjectRun(runner, 900_777, stuck);
+
+        var original = BackupRunner.SuspendWaitCap;
+        BackupRunner.SuspendWaitCap = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default);
+
+            Assert.Equal(0, stopped);
+            Assert.Equal(RunStatus.Running, stuck.Status);   // 没有落地：不是 Suspended
+            Assert.True(stuck.Cancellation.IsCancellationRequested);   // 但意愿确实发出去了
+            Assert.Contains(log.Messages, m =>
+                m.Contains("Gave up after", StringComparison.Ordinal)
+                && m.Contains("900777", StringComparison.Ordinal));
+        }
+        finally
+        {
+            BackupRunner.SuspendWaitCap = original;
+            RemoveRun(runner, 900_777);
+        }
+    }
+
+    private static Dictionary<int, BackupRunState> RunsOf(BackupRunner runner) =>
+        (Dictionary<int, BackupRunState>)typeof(BackupRunner)
+            .GetField("_runs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(runner)!;
+
+    private static void InjectRun(BackupRunner runner, int configId, BackupRunState state) =>
+        RunsOf(runner)[configId] = state;
+
+    private static void RemoveRun(BackupRunner runner, int configId) =>
+        RunsOf(runner).Remove(configId);
+
+    /// <summary>捕获所有类别的日志，不挑category——只有 SuspendAllAsync 那条 warning 会在这个测试里响。</summary>
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        public List<string> Messages { get; } = [];
+        public ILogger CreateLogger(string categoryName) => new Logger(this);
+        public void Dispose() { }
+
+        private sealed class Logger(CapturingLoggerProvider owner) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(
+                LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                lock (owner.Messages) owner.Messages.Add(formatter(state, exception));
+            }
+        }
+    }
+
+    private sealed class LoggedFactory(CapturingLoggerProvider provider) : TestWebAppFactory
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(services => services.AddLogging(b => b.AddProvider(provider)));
+        }
+    }
+
+    /// <summary>
     /// 宿主按注册的**逆序**停服务，所以关机挂起必须注册在调度器**之后**才能先于它停下来——
     /// 不然调度器可能在挂起进行到一半时又起一轮备份，而那一轮永远等不到关机钩子了。
     /// </summary>
@@ -234,8 +324,22 @@ public class GracefulSuspendTests : IDisposable
             + "docker would SIGKILL before the app's own shutdown timeout ever fires");
     }
 
-    /// <summary>从仓库里的 docker-compose.yml 读出 <c>stop_grace_period</c>。读不到就让用例失败：
-    /// 这条用例守的就是两个数之间的关系，其中一个不见了，"通过"是没有意义的。</summary>
+    /// <summary>
+    /// 从仓库里的 docker-compose.yml 读出 <c>stop_grace_period</c>。读不到就让用例失败：
+    /// 这条用例守的就是两个数之间的关系，其中一个不见了，"通过"是没有意义的。
+    /// <para>
+    /// 正则只认整数秒（<c>45s</c>），这是有意的窄：写成 <c>1m30s</c>、加了引号、或者行尾跟一句
+    /// <c>\# comment</c> 都会让这条用例读不到数、直接失败，而不是悄悄按错误的数字通过。
+    /// 这是应该失败的一侧——docker compose 的 <c>stop_grace_period</c> 支持好几种写法，这里没有
+    /// 打算做一个通用解析器，读不出预期形状就如实报错，让人去核对，好过猜一个可能错的值。
+    /// </para>
+    /// <para>
+    /// 另外这条用例的视野也就到这为止：它只看得见提交进仓库的这份 docker-compose.yml。真跑起来时
+    /// 如果用了 override 文件（<c>docker-compose.override.yml</c>）或者 <c>docker compose -f</c>
+    /// 指了别的文件覆盖这个值，这条用例是看不见的——它守的是"仓库里写的这份配置内部自洽"，
+    /// 不是"部署时实际生效的那个数字"。
+    /// </para>
+    /// </summary>
     private static TimeSpan ComposeStopGracePeriod()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
@@ -253,9 +357,16 @@ public class GracefulSuspendTests : IDisposable
     /// 并发备份下，关机必须**先给每一个运行下达停止**，再统一等落盘。
     /// <para>
     /// 逐个"发一个、等一个"的写法在这里是致命的：排头那个若压着一个几 GB 的上传，它一个人就吃掉整个
-    /// 关机预算，后面的运行连停止请求都收不到——没落盘、没标记、直接挨砍。这条用例摆的正是这个局：
-    /// 900_001 收到停止后要磨蹭 2 秒才落地，900_002 则立刻应声。串行版里 900_002 只能等到 900_001
-    /// 落地之后才被通知到，<c>_secondSignalledWhileFirstStillSettling</c> 就是 false。
+    /// 关机预算，后面的运行连停止请求都收不到——没落盘、没标记、直接挨砍。
+    /// </para>
+    /// <para>
+    /// 早先这条用例给两个运行配了不同的落地时延（"慢的"先处理、"快的"后处理），靠的是
+    /// <c>Dictionary</c> 恰好按插入顺序枚举——这不是契约，只是这个运行时的实现细节。复审把这个洞
+    /// 坐实了：把 <c>SuspendAllAsync</c> 退回串行发信号+等（同一个 I1 回归），同时把内部枚举顺序反过来
+    /// （<c>Enumerable.Reverse</c>），旧版用例照样通过。现在两个运行给**同样**的落地时延，不区分谁慢
+    /// 谁快，直接记录每次信号到达的时刻与"第一个真正落地"的时刻，断言"两次信号都发生在第一次落地
+    /// 之前"——这个说法不依赖谁先谁后，在两种枚举顺序下对串行实现都成立（串行版无论先处理哪一个，
+    /// 处理第二个之前都必然已经等到第一个落地）。
     /// </para>
     /// <para>
     /// 顺带钉住返回的条数：这两个运行都还没走到建 control 那一步，停下来是 Canceled、盘上没有标记，
@@ -265,7 +376,7 @@ public class GracefulSuspendTests : IDisposable
     [Fact]
     public async Task Shutdown_signals_every_run_before_waiting_for_any_of_them()
     {
-        var configs = new StallingConfigs(slowId: 900_001, settleDelay: TimeSpan.FromSeconds(2));
+        var configs = new StallingConfigs(settleDelay: TimeSpan.FromMilliseconds(500));
         using var factory = new StalledRunFactory(configs);
         var runner = factory.Services.GetRequiredService<BackupRunner>();
 
@@ -279,8 +390,14 @@ public class GracefulSuspendTests : IDisposable
         await service.StopAsync(default);
 
         await runs;
-        Assert.True(configs.SecondSignalledWhileFirstStillSettling,
-            "900_002 was only told to stop after 900_001 had finished settling");
+
+        var signals = configs.SignalledAt;
+        var firstSettledAt = configs.FirstSettledAt;
+        Assert.Equal(2, signals.Count);
+        Assert.True(firstSettledAt >= 0, "neither run ever settled");
+        Assert.True(signals.Max() < firstSettledAt,
+            $"a signal ({string.Join(", ", signals)}) arrived at or after the first settle "
+            + $"({firstSettledAt}): every run must be signalled before any of them is waited on");
         Assert.DoesNotContain(log.Messages, m => m.Contains("Suspended", StringComparison.Ordinal));
     }
 
@@ -288,32 +405,46 @@ public class GracefulSuspendTests : IDisposable
     /// 两个卡在配置查询上的运行：<c>RunTrackedAsync</c> 先把状态登记进 <c>_runs</c> 再来查配置，
     /// 所以在这里赖着不返回，就得到两个货真价实的 Running。停止请求会取消传进来的 ct（这两个运行
     /// 还没有 control，走的是取消源那条），于是这里也就看得见"谁是什么时候被通知到的"。
+    /// <para>
+    /// 两个运行给**同样**的 <paramref name="settleDelay"/>：不区分"慢的"和"快的"，避免测试本身
+    /// 又踩进"靠某种固定顺序才成立"的坑（见类上的方法注释）。
+    /// </para>
     /// </summary>
-    private sealed class StallingConfigs(int slowId, TimeSpan settleDelay) : IBackupConfigService
+    private sealed class StallingConfigs(TimeSpan settleDelay) : IBackupConfigService
     {
-        private readonly TaskCompletionSource _first = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource _second = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int _firstSettled;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly List<long> _signalledAt = [];
+        private long _firstSettledAt = -1;
+        private readonly TaskCompletionSource _bothStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _started;
 
-        public bool SecondSignalledWhileFirstStillSettling { get; private set; }
+        /// <summary>每次 ct 被取消时（= 每个运行被通知到时）记的时刻，来自共享的单调时钟。</summary>
+        public IReadOnlyList<long> SignalledAt { get { lock (_signalledAt) return [.. _signalledAt]; } }
+
+        /// <summary>第一个运行落地（settleDelay 之后）的时刻；还没有任何运行落地则是 -1。</summary>
+        public long FirstSettledAt => Interlocked.Read(ref _firstSettledAt);
 
         /// <summary>等到两个运行都真的挂在这里，再动手关机——否则测的是启动竞速，不是关机顺序。</summary>
-        public Task BothRunningAsync() => Task.WhenAll(_first.Task, _second.Task).WaitAsync(TimeSpan.FromSeconds(30));
+        public Task BothRunningAsync() => _bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         public async Task<BackupConfig?> GetAsync(int id, CancellationToken ct = default)
         {
-            (id == slowId ? _first : _second).TrySetResult();
+            if (Interlocked.Increment(ref _started) == 2)
+                _bothStarted.TrySetResult();
+
             var stopped = new TaskCompletionSource();
-            await using (ct.Register(() => stopped.TrySetResult()))
+            await using (ct.Register(() =>
+            {
+                // 信号到达的那一刻记时刻，就在回调里记——不要等到方法后面才补记，
+                // 补记会把"通知到了"和"轮到我处理了"这两个不同的时刻混成一个。
+                lock (_signalledAt) _signalledAt.Add(_clock.ElapsedTicks);
+                stopped.TrySetResult();
+            }))
                 await stopped.Task;
 
-            if (id == slowId)
-            {
-                await Task.Delay(settleDelay, CancellationToken.None);   // 慢吞吞地收尾
-                Interlocked.Exchange(ref _firstSettled, 1);
-            }
-            else
-                SecondSignalledWhileFirstStillSettling = Volatile.Read(ref _firstSettled) == 0;
+            await Task.Delay(settleDelay, CancellationToken.None);   // 两个运行同样磨蹭这么久才落地
+            // 只有第一个到达的写得进去：sentinel -1 保证"第一次落地的时刻"不会被第二个运行的落地覆盖。
+            Interlocked.CompareExchange(ref _firstSettledAt, _clock.ElapsedTicks, -1);
 
             ct.ThrowIfCancellationRequested();
             return null;
