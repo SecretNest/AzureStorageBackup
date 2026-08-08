@@ -1,167 +1,132 @@
-# 网页界面视觉改版与 Container 错误处理（2026-07-26）
+# Web UI rework and container error handling
 
-> 界面目前没有设计：`index.css` / `App.css` 仍是 Vite 脚手架模板的残留且**正在生效**，应用样式全是散落在 3455 行 JSX 里的内联 `style`，控件一律浏览器默认外观，深色模式下多处失效。本轮建立一套设计系统与应用外壳，把界面做成紧凑运维控制台的观感。
+> The UI had no design: `index.css` and `App.css` were still leftover Vite scaffolding and were
+> **in effect**, application styling was inline `style` scattered through 3,455 lines of JSX,
+> every control had the browser default appearance, and several things broke in dark mode. This
+> round establishes a design system and an app shell, aiming at the look of a compact operations
+> console.
 >
-> 同时修掉一个独立缺陷：新建 container 时后端返回裸 500，界面只显示 `ApiError: Internal Server error`。
+> It also fixes an unrelated defect: creating a container returned a bare 500 and the UI showed
+> nothing but `ApiError: Internal Server error`.
 >
-> 本轮**只动视觉与布局骨架**，不改任何交互流程。
+> This round touches **visuals and layout skeleton only** — no interaction flow changes.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 改版范围 | **视觉 + 布局骨架**。建立设计系统并重做外壳；页面内部的交互流程与信息组织保持不变 |
-| 2 | 样式技术 | **零运行时依赖，手写 CSS**。不引入 Tailwind，不引入组件库；`package.json` 不新增任何依赖 |
-| 3 | 视觉方向 | **紧凑运维控制台**（Linear / Vercel Dashboard 那类）。细分隔线而非阴影，4–6px 圆角，14px 正文，中性灰阶 + 单一强调色 |
-| 4 | 深色模式 | **跟随系统，两套 token 都做**，无手动切换开关 |
-| 5 | 样式组织 | **全局语义化 class**。以元素选择器打底（`button` / `input` / `select` / `table` 无需加类即生效），辅以少量语义类。不用 CSS Module，不用 TS 样式常量对象 |
-| 6 | 表单字段宽度 | **按内容长度分档**。Blob Endpoint、Account Key、代理主机、本地路径等长内容走宽档 |
-| 7 | Container 500 | **逐端点捕获 `RequestFailedException`**，不引入全局异常处理器——`KeyringGuard.cs:30` 记录的"不接管全局异常"决定继续有效 |
-| 8 | 前端测试 | **本轮不引入前端测试框架**。视觉回归靠手工逐页核对，这是已知局限 |
-
-## 2. 缺陷修复：新建 container 返回 500
-
-### 2.1 根因
-
-三层，逐层确认：
-
-1. **触发**：输入的 container 名不符合 Azure 命名规则，Azure 返回 `400 InvalidResourceName`。
-2. **后端**：`ContainerEndpoints.cs:42` 调用 `ContainerService.CreateContainerAsync` 未捕获 `RequestFailedException`；项目刻意没有全局异常处理器（仅 `UseSecretUnavailableMapping` 处理 `SecretUnavailableException`），因此 Azure 的 400 一路冒泡，由 Kestrel 兜底成裸 500。GET 与 DELETE 两个端点同样未捕获。
-3. **前端**：`ContainersPage.tsx:23` 的 `create` 对名字零校验，直接把用户输入送上云；`client.ts:34` 在响应体为空时回落到 `res.statusText`，于是 `String(e)` 得到 `ApiError: Internal Server error`——一个既不说明哪里错、也不指向如何改的字符串。
-
-### 2.2 修法
-
-**后端**
-
-新增静态校验器 `Services/ContainerName.cs` 的 `ContainerName.Validate(name)`，返回违规说明或 `null`，实现 Azure container 命名规则：
-
-- 长度 3–63 字符
-- 仅允许小写字母、数字、连字符
-- 首尾必须是字母或数字
-- 不允许连续连字符
-
-POST 端点在**连云之前**调用校验，不合法直接 400 并指明违反的具体规则。理由：本地校验能给出可操作的消息，而 Azure 回的 "contains invalid characters" 不告诉用户哪个字符、也不告诉规则是什么。
-
-GET / POST / DELETE 三个端点各自捕获 `RequestFailedException`：
-
-- `Status` 落在 400–499 → 原样透传该状态码，消息含 `ErrorCode` 与 Azure 的说明
-- 其余（含 `Status == 0` 的连接失败、5xx）→ 映射为 **502**，消息为存储账户不可达
-
-响应体统一为项目既有形状 `new { error = "…" }`，与 `AccountEndpoints.cs` 等保持一致。
-
-逐端点捕获而非注册全局 handler：全局 handler 会一并接管本轮范围之外的所有未处理异常，改变既有失败语义。
-
-**前端**
-
-- `ContainersPage` 用一份与后端等价的 TypeScript 规则实现做提交前校验（规则重复实现于两端，后端为准、前端为提前反馈），非法时禁用创建按钮，并在输入框下方常驻规则说明。
-- `client.ts` 的 `request` 解析后端既有的错误响应形状 `{ error, code? }`（见 `AccountEndpoints.cs:31`、`KeyringGuard.cs:14` 等，全项目统一使用此形状而非 ProblemDetails），取 `error` 作为 `ApiError.message` 并保留 `code`，解析不出再回落到原文与 `statusText`。**此项对全站所有错误提示生效**，不限于 container。
-- `containersApi.remove` 拼 URL 时补 `encodeURIComponent`。
-
-### 2.3 测试
-
-- `ContainerName.Validate` 的单元测试：合法名、过短、过长、大写、下划线、首尾连字符、连续连字符各一例。
-- 端点测试：非法名返回 400 且消息含规则说明；`RequestFailedException` 的 4xx 与连接失败分别映射为透传状态码与 502。
-- 现有 `ContainerEndpointsTests` 的 Azurite 集成用例必须仍绿。
-
-## 3. 设计基础
-
-### 3.1 清理
-
-以下全部删除——它们是 Vite 模板残留，且 `#root` 那条正在干扰真实布局：
-
-- `index.css` 中：`#root { width: 1126px; text-align: center; border-inline }`、`font: 18px` 基准、`.counter`、模板配色变量
-- `App.css` 整个文件（`.hero`、`#center`、`#next-steps`、`#docs`、`#spacer`、`.ticks`）
-- `src/assets/hero.png`、`src/assets/react.svg`、`src/assets/vite.svg`
-- `public/icons.svg`——经确认为模板自带的社交图标集（bluesky 等），`index.html` 与 `src/` 均未引用
-
-`public/favicon.svg` 目前是 Vite 的紫色闪电标志，由 `index.html:5` 引用。替换为与 `--accent` 一致的简单标记；`index.html` 的 `<title>` 已是 `Azure Storage Backup`，无需改动。
-
-### 3.2 Token
-
-在 `index.css` 的 `:root` 定义浅色，`@media (prefers-color-scheme: dark)` 覆盖深色。
-
-| 组 | 变量 |
-|---|---|
-| 表面 | `--bg` 画布、`--bg-subtle` 侧栏与表头、`--bg-raised` 卡片与弹窗 |
-| 描边 | `--border`、`--border-strong` |
-| 文字 | `--text`、`--text-muted`、`--text-faint` |
-| 强调 | `--accent`、`--accent-hover`、`--accent-fg`、`--accent-subtle` |
-| 语义 | `--ok` / `--warn` / `--danger`，各配 `-bg` 与 `-border` 变体 |
-| 排版 | `--font-sans` 系统字体栈、`--font-mono`；正文 14px/1.5，h1 20px/600，h2 16px/600，辅助文字 12px |
-| 间距 | `--sp-1` … `--sp-6` = 4 / 8 / 12 / 16 / 24 / 32 |
-| 圆角 | `--r-sm` 4px、`--r-md` 6px、`--r-lg` 8px |
-| 阴影 | 仅 `--shadow-overlay`，供弹窗与浮层使用 |
-
-平面区域一律不用阴影——这是"紧凑控制台"与"卡片式 SaaS"的分界点，也是本轮视觉方向的执行要点。
-
-端点、路径、容器名、哈希值一律使用 `--font-mono`。这类内容等宽后可读性差别显著。
-
-### 3.3 焦点与可访问性
-
-统一 `:focus-visible` 双层 ring（内圈用 `--bg` 隔开、外圈用 `--accent`），覆盖按钮、输入、链接、表格行内操作。禁用态统一降低不透明度并设 `cursor: not-allowed`。
-
-## 4. 应用外壳
-
-现状是 `App.tsx` 里一排裸 `<button>` 充当 tab。改为：
-
-- **左侧固定侧栏，宽 220px**：顶部产品名，中部 8 个导航项（Accounts / Backups / Discovered / Groups / Tasks / Notifications / Logs / Settings），底部 `Log out`。选中态为左侧 2px `--accent` 竖条加深背景。
-- **右侧内容区**：统一的 page header（h1 左、主操作按钮右），下方为页面内容。内容区最大宽度 1280px，左右 24px 内边距。
-- **KeyringBanner** 置于内容区最顶、page header 之上，确保任何页面都优先可见。
-- **窄屏（< 900px）**：侧栏塌缩为顶部横向滚动 tab 条。纯 CSS 媒体查询实现，React 组件结构与状态逻辑不变。
-- **LoginPage** 用同一套 token 重做为居中卡片。
-
-导航项的数据结构（`App.tsx` 中的 `tabs` 数组）与切换逻辑保持不变，只换外观。
-
-## 5. 组件层
-
-以元素选择器打底，绝大多数位置无需添加 `className`：
-
-**按钮**：默认样式为次要按钮（描边 + `--bg-subtle`）。语义类 `.btn-primary`（`--accent` 实心）、`.btn-danger`、`.btn-ghost`（表格行内操作，无边框）。
-
-**输入控件**：`input` / `select` / `textarea` 统一高度、圆角、描边、焦点 ring；placeholder 用 `--text-faint`。
-
-**字段宽度分档**：`.w-sm` 160px、`.w-md` 280px、`.w-lg` 480px、`.w-full`。Blob Endpoint、Account Key、Proxy Host、本地路径走 `.w-lg` 或 `.w-full`。
-
-**Field 组件去重**：当前存在**四份**各不相同的实现：
-
-| 位置 | label 宽度 | 对齐 |
+| # | Question | Conclusion |
 |---|---|---|
-| `components/modal.tsx:4` | 200 | center |
-| `pages/AccountsPage.tsx:417` | 140 | center |
-| `pages/SettingsPage.tsx:148` | 200 | flex-start |
-| `pages/NotificationsPage.tsx:147` | 130 | flex-start |
+| 1 | Scope | **Visuals plus layout skeleton.** Establish a design system and rebuild the shell; interaction flows and information architecture inside pages stay as they are |
+| 2 | Styling technology | **Hand-written CSS with zero runtime dependencies.** No Tailwind, no component library, no new entries in `package.json` |
+| 3 | Visual direction | **Compact operations console** (the Linear / Vercel dashboard family). Hairline dividers instead of shadows, 4–6px radii, 14px body text, a neutral grey scale plus one accent |
+| 4 | Dark mode | **Follows the system**, both token sets implemented, no manual toggle |
+| 5 | Style organisation | **Global semantic classes.** Element selectors do the groundwork (`button` / `input` / `select` / `table` work without any class), with a few semantic classes on top. No CSS Modules, no TypeScript style-constant objects |
+| 6 | Form field widths | **Tiered by content length.** Blob endpoint, account key, proxy host and local paths take the wide tier |
+| 7 | The container 500 | **Catch `RequestFailedException` per endpoint**, no global exception handler — the existing decision not to take over global exception handling still stands |
+| 8 | Frontend testing | **No test framework introduced this round.** Visual regression is checked by hand, page by page; a known limitation |
 
-统一为 `components/modal.tsx` 中的单一实现，布局改为 `grid-template-columns: 200px 1fr`，`align-items: start`（对复选框与多行控件都成立），删除其余三份副本并改为导入。
+## 2. Defect: creating a container returned 500
 
-**表格**：表头用 `--bg-subtle`、12px 字号并放大字距；行 `hover` 高亮；单元格内边距 8px / 12px；行分隔用 1px `--border`。统一 `.empty-state` 呈现空列表。
+### 2.1 Root cause
 
-**弹窗**：`modalStyles.ts` 当前硬编码 `background: '#fff'`，深色模式下描边与内部控件配色全部失配。改为使用 `--bg-raised` 与 `--shadow-overlay`，遮罩加轻微模糊。
+Three layers, each confirmed:
 
-**横幅**：`.alert` 及 `.alert-warn` / `.alert-error` / `.alert-ok` 四态，替换 `KeyringBanner` 中硬编码的 `#fffbeb` / `#b45309` / `#7c2d12`。
+1. **Trigger**: the entered container name violated Azure's naming rules and Azure returned `400 InvalidResourceName`.
+2. **Backend**: the create endpoint did not catch `RequestFailedException`, and the project deliberately has no global exception handler, so Azure's 400 bubbled all the way up and Kestrel turned it into a bare 500. The GET and DELETE endpoints had the same gap.
+3. **Frontend**: the containers page validated nothing before sending the name to the cloud, and the API client fell back to `res.statusText` when the response body was empty — producing `ApiError: Internal Server error`, a string that says neither what is wrong nor what to change.
 
-**状态徽章**：`.badge` 配语义色，供 Tasks 与 Backups 页的状态列使用。
+### 2.2 The fix
 
-## 6. 实施顺序
+**Backend**
 
-| 阶段 | 内容 |
+A static `ContainerName.Validate(name)` returns a description of the violation or `null`, implementing Azure's rules: 3–63 characters, lowercase letters, digits and hyphens only, first and last character alphanumeric, no consecutive hyphens.
+
+The POST endpoint validates **before reaching the cloud** and returns 400 naming the specific rule broken. The reasoning: local validation can produce an actionable message, whereas Azure's "contains invalid characters" names neither the character nor the rule.
+
+All three endpoints catch `RequestFailedException`:
+
+- `Status` in 400–499 → pass the status code through, with the message carrying the `ErrorCode` and Azure's own description
+- Everything else (including `Status == 0` connection failures, and 5xx) → mapped to **502**, meaning the storage account is unreachable
+
+Response bodies use the project's existing `new { error = "…" }` shape.
+
+Catching per endpoint rather than registering a global handler: a global handler would also take over every unhandled exception outside this round's scope, changing existing failure semantics.
+
+**Frontend**
+
+- The containers page validates with a TypeScript implementation equivalent to the backend's (the rules are implemented on both sides — backend authoritative, frontend for immediate feedback), disables the create button while invalid, and keeps the rules visible below the field.
+- The API client parses the project's existing error shape `{ error, code? }`, using `error` as the message and preserving `code`, falling back to the raw text and `statusText` only when that fails. **This applies to every error message in the app**, not just containers.
+- The delete call encodes the container name into the URL.
+
+## 3. Design foundations
+
+### 3.1 Cleanup
+
+All of the following was deleted — Vite scaffolding, with the `#root` rule actively interfering with real layout: the `#root` width/centring/border rules, the 18px base font, the `.counter` class and template colour variables in `index.css`; the whole of `App.css`; the template images; and the template's social icon set, which nothing referenced.
+
+The favicon was the Vite lightning bolt and was replaced with a simple mark matching `--accent`.
+
+### 3.2 Tokens
+
+Light values on `:root` in `index.css`, dark overrides under `@media (prefers-color-scheme: dark)`.
+
+| Group | Variables |
 |---|---|
-| 0 | §2 的缺陷修复。与样式无关，可独立验证与提交 |
-| 1 | §3 清理与 token、全局元素样式、§4 外壳（`App.tsx`、`LoginPage`、`KeyringBanner`、`modalStyles`） |
-| 2 | §5 组件层：`Field` 去重与宽度分档、`.btn-*`、`.badge`、`.empty-state`、`.alert` |
-| 3 | 逐页移除内联 `style`：Accounts + Containers → Groups → Backups → Tasks → Notifications → Logs → Settings → `BackupConfigsPage`(1020 行) + `RestoreDialog`(484 行) + `PathBrowser` + `CronEditor` |
+| Surfaces | `--bg` canvas, `--bg-subtle` sidebar and table headers, `--bg-raised` cards and dialogs |
+| Borders | `--border`, `--border-strong` |
+| Text | `--text`, `--text-muted`, `--text-faint` |
+| Accent | `--accent`, `--accent-hover`, `--accent-fg`, `--accent-subtle` |
+| Semantic | `--ok` / `--warn` / `--danger`, each with `-bg` and `-border` variants |
+| Type | `--font-sans` system stack, `--font-mono`; body 14px/1.5, h1 20px/600, h2 16px/600, secondary text 12px |
+| Spacing | `--sp-1` … `--sp-6` = 4 / 8 / 12 / 16 / 24 / 32 |
+| Radii | `--r-sm` 4px, `--r-md` 6px, `--r-lg` 8px |
+| Shadow | `--shadow-overlay` only, for dialogs and floating layers |
 
-阶段 1 完成后，所有页面在不改一行页面代码的前提下即已获得大部分改善——因为控件样式走元素选择器。
+**Flat regions never take a shadow.** That is the dividing line between "compact console" and "card-based SaaS", and it is the operative point of this visual direction.
 
-大文件排在阶段 3 末尾：前面几页会把类名体系跑熟，届时大文件的改动是纯机械替换。
+Endpoints, paths, container names and hashes always use `--font-mono` — monospacing makes a marked difference to readability for that kind of content.
 
-**明确不做**（守住范围）：不拆分 `BackupConfigsPage`、不新增仪表盘页、不改动任何交互流程、不引入前端路由、不引入前端测试框架。
+### 3.3 Focus and accessibility
 
-## 7. 验证
+One `:focus-visible` treatment throughout: a double ring (inner in `--bg` for separation, outer in `--accent`) covering buttons, inputs, links and inline table actions. Disabled states uniformly reduce opacity and set `cursor: not-allowed`.
 
-- 后端 `dotnet test` 全量绿；新增 §2.3 所列测试；Azurite 可达时集成用例照常执行。
-- 前端 `npm run build`（含 `tsc -b`）与 `npm run lint`（oxlint）均通过。
-- 手工逐页核对浅色、深色、窄屏三态。
+## 4. The app shell
 
-## 8. 已知局限
+It used to be a row of bare `<button>` elements acting as tabs. Now:
 
-前端目前没有任何测试，本轮亦不引入测试框架，因此视觉回归无法自动化，只能靠手工核对。这一点在交付时如实说明，不以"已验证"表述掩盖。
+- **A fixed 220px sidebar on the left**: product name at the top, eight navigation items in the middle, `Log out` at the bottom. The selected item gets a 2px `--accent` bar on its left edge and a deeper background.
+- **Content on the right**: one page header (h1 left, primary action right) above the page body. Content is capped at 1280px wide with 24px horizontal padding.
+- **The keyring banner** sits at the very top of the content area, above the page header, so it is visible first on any page.
+- **Narrow screens (< 900px)**: the sidebar collapses into a horizontally scrolling tab strip at the top. Pure CSS media queries; React component structure and state logic are unchanged.
+- **The login page** is rebuilt with the same tokens as a centred card.
+
+The navigation data structure and the switching logic are untouched — only the appearance changes.
+
+## 5. The component layer
+
+Element selectors do the groundwork, so most places need no `className` at all.
+
+**Buttons**: the default is the secondary style (outline plus `--bg-subtle`). Semantic classes are `.btn-primary` (solid `--accent`), `.btn-danger` and `.btn-ghost` (inline table actions, borderless).
+
+**Inputs**: `input` / `select` / `textarea` share height, radius, border and focus ring; placeholders use `--text-faint`.
+
+**Width tiers**: `.w-sm` 160px, `.w-md` 280px, `.w-lg` 480px, `.w-full`. Blob endpoint, account key, proxy host and local paths take `.w-lg` or `.w-full`.
+
+**Deduplicating `Field`**: there were **four** different implementations, with label widths of 200 / 140 / 200 / 130 and alignments of center / center / flex-start / flex-start. They collapse into the single implementation in the modal component, laid out as `grid-template-columns: 200px 1fr` with `align-items: start` (which is correct for both checkboxes and multi-line controls). The other three are deleted and replaced with imports.
+
+**Tables**: headers in `--bg-subtle` at 12px with increased letter spacing; rows highlight on hover; cell padding 8px / 12px; 1px `--border` between rows. One `.empty-state` presentation for empty lists.
+
+**Dialogs**: the styles hard-coded `background: '#fff'`, which mismatched borders and inner controls in dark mode. They use `--bg-raised` and `--shadow-overlay`, with a light blur on the backdrop.
+
+**Banners**: `.alert` plus `.alert-warn` / `.alert-error` / `.alert-ok`, replacing hard-coded hex colours in the keyring banner.
+
+**Status badges**: `.badge` with semantic colours, used by the status columns on the tasks and backups pages.
+
+## 6. Scope boundaries
+
+Explicitly not done, to hold the line: no splitting up the large page components, no new dashboard page, no interaction flow changes, no frontend router, no frontend test framework.
+
+## 7. Known limitations
+
+There is no component-rendering test coverage. The project runs vitest over pure functions in `src/lib/` and `src/constants/`, but has no testing-library or jsdom, so anything that requires rendering — and all visual regression — is checked by hand across light, dark and narrow layouts. Say so plainly when delivering; do not describe it as "verified".
+
+> **A trap this system has sprung three times**: overriding a rule in `index.css` requires counting specificity against *every* rule in the group being overridden, not just the obvious one. Element-selector groundwork means a new rule frequently competes with something written far away, and a rule that appears to lose has, each time, turned out to be losing to a selector nobody thought to check.
