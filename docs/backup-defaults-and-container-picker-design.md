@@ -1,153 +1,142 @@
-# 备份表单：默认值继承与 container 选择器（2026-07-26）
+# Backup form: default inheritance and the container picker
 
-> 新建备份的表单有两处缺口，都在同一个界面上，本轮一并处理。
+> The new-backup form had two gaps, both on the same screen.
 >
-> **一、`使用默认` 没有实现。** PRD §3 要求「每个备份若勾选『使用默认』则套用这些值」，代码却在打开表单时把全局默认**抄了一份具体数值**（`BackupConfigsPage.tsx` 的 `startNew`）。存进配置的是快照，此后改全局设置，已有备份一个都不跟随。这是实现未达 PRD，不是新需求。
+> **One: "use default" was never implemented.** PRD §3 requires that a backup ticking "use
+> default" adopts those values, but the code copied **concrete numbers** out of the global
+> defaults when opening the form. What got stored was a snapshot, so changing a global setting
+> afterwards moved nothing. That was an implementation falling short of the PRD, not a new
+> requirement.
 >
-> **二、container 只能手打。** account 是下拉选的，container 却是纯文本框，尽管应用已有列举容器的接口。后端 `POST /api/backup-configs` 只校验非空，既不查存在也不建，打错一个字母就静默存下一份跑起来才失败的配置。
+> **Two: the container could only be typed.** The account was a dropdown while the container was
+> a plain text field, even though the app already had an endpoint that lists containers. The
+> create endpoint only checked non-empty — it neither verified existence nor created anything — so
+> one typo silently stored a configuration that failed only once it ran.
 >
-> 补充 [product-requirements.md](product-requirements.md) §3 与 §4。
+> Supplements [product-requirements.md](product-requirements.md) §3 and §4.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 两件事的关系 | **同一份 spec、同一轮实现**，但在计划中保持独立任务组与独立提交，评审与回滚仍分得开 |
-| 2 | 继承粒度 | **每个字段一个勾选**。整份配置一个总开关会让「tier 自定、保留策略跟随」这类常见组合无法表达 |
-| 3 | 继承的表示 | **字段为 NULL 即继承，非 NULL 即覆盖**。11 个可继承字段一条规则，无例外，不引入 -1 之类的哨兵值 |
-| 4 | `VolumeBytes` 的冲突 | 该字段现有 `null` = 关闭分卷，与继承撞车。**把「关闭」挪到 `0`**，让 `null` 在全部可继承字段上含义一致。Settings 页本就写着 `0=off`，界面语义已经是 0 |
-| 5 | 三个规则字段的冲突 | `null` = 继承，`''` = 明确无规则。已验证 `string?` 从 DTO 到实体全程直传（`BackupConfigDtos.cs:108`），两者可区分 |
-| 6 | 解析时机 | **使用时解析，不在读取时填充**。见 §3.2——填充会让功能自我作废 |
-| 7 | 现有配置的迁移 | **一律保持覆盖**，11 个字段全部保留当前具体值，不静默改成继承 |
-| 8 | `IndexTier` / `DataTier` | **不可继承**。`BackupConfigService.cs:40-45` 在创建后拒绝变更这两个字段，而继承的含义正是「随全局设置变化」——即一次创建后的变更。改为新建时以全局默认预填，保存即固定 |
-| 9 | 已有备份的容器 | 在下拉里**标记但不禁用**。本地库对 `(accountId, container)` 无唯一约束，禁用等于替用户定一条产品规则，超出本轮范围。**已于 2026-07-31 部分推翻**——见下方「2026-07-31 修订」 |
-
-## 2. Container 选择器
-
-### 2.1 行为
-
-选定 account 后拉取 `GET /api/accounts/{accountId}/containers`（现有接口，`ContainersPage` 已在用），下拉呈现结果，末项固定为 `+ New container…`。选中末项才显示输入框，用 `validateContainerName`（`frontend/src/api/containers.ts`）即时校验。
-
-- **标记已有备份**：该接口返回 `BackupPresence`，据此在选项后附 `● has backup`。指向已有备份的容器通常是误操作，那种场景应走 Import 流程；但仅提示，不阻止（决策 8）。
-- **标记本地已占用**（2026-07-31 追加）：该接口另返回 `inUseBy`，本地已有备份配置占着这个 container 时是那条备份的名字。这一项**禁用**该选项，文案为 `● in use by "<名字>"`。
-- **切换 account 清空已选容器**：否则会残留属于上一个账户的名字，而后端不校验存在性。
-- **列举失败可继续**：列举需连云。失败时下拉降级为纯输入框，并显示失败原因——不能因为列不出来就无法新建备份。
-
-编辑模式下该字段本就锁定（`disabled={!!editing}`），不受影响。
-
-### 2.2 不做
-
-不改后端。不为 `POST /api/backup-configs` 增加容器存在性校验——`BackupOrchestrator.cs:158` 会在首次备份时 `CreateIfNotExistsAsync`，指定尚不存在的容器是受支持的正常流程。
-
-### 2.3 2026-07-31 修订：占用改由本地判定，重复直接拒绝
-
-决策 9 当初的理由是「本地库对 `(accountId, container)` 无唯一约束」。那条约束现在有了，理由随之失效。
-
-推翻它的是一次真实事故：**首次备份跑到一半时，同一个 container 在下拉里显示为空容器**。`BackupPresence` 只看云端信息文件在不在，而那个文件是 `BackupOrchestrator` 最后一步才写的——容器里已经躺着这一轮上传的数据，云端却还什么标记都没有。用户照着这份列表把它又配给了第二条备份，两条各写各的版本历史互相覆盖，各自的数据 blob 在对方的保留清理里被当成孤儿删掉。
-
-- **占用的权威在本地**：库里那条 `BackupConfig` 从创建的那一刻就在，不必等任何云端产物。`GET /api/accounts/{id}/containers` 由 `ContainerEndpoints` 合入 `inUseBy`；备份进行中、备份失败留下半成品、云端一时读不到，三种情况一并覆盖。
-- **服务端硬拒绝**：`POST /api/backup-configs` 与 `POST /api/backup-configs/import` 在写库之前查 `FindAsync(accountId, container)`，已占用返回 409（import 的判定排在读云之前——本地能回答的问题不该先花一趟网络，也不该为一次注定被拒的导入把云端信息文件种进 `TrackedInfoStore`）。
-- **库上兜底**：`BackupConfigs` 加 `(AccountId, ContainerName)` 唯一索引，堵住绕过端点的写入与挤进「查—写」窗口的并发。
-- **迁移不删数据**：`EnforceOneBackupPerContainer` 先把已有重复挪开——保留每组 `Id` 最小的那条，其余的 `ContainerName` 改成带点的名字（Azure 一概不收，于是再也碰不到任何真实 container）、标 `Error` 并写明原因，一条都不删。重复配置指着真实的云端数据，删掉本地记录只会让用户再也看不见它。
-
-§2.2「不改后端」同样只对当初那一轮成立：这次改了后端，但仍**不**校验容器在云端是否存在——`CreateIfNotExistsAsync` 那条理由依然有效。
-
-## 3. 「使用默认」继承
-
-### 3.1 字段清单
-
-`BackupConfig` 中在 `GlobalSettings` 有对应 `Default*` 的字段共 13 个。逐个审过「创建后能否变更」后，**11 个可继承**，2 个不可。
-
-判据是 `BackupConfigService.UpdateAsync` 的锁定清单（`AccountId` / `ContainerName` / `LocalRoot` / `IndexTier` / `DataTier` 与密码）。落在这 13 个里的只有两个 tier；其余 11 个在 `UpdateAsync:51-63` 中逐一赋值，即用户本就能在编辑页修改，跟随全局变化并不比这更危险。
-
-**不可继承（新建时预填，保存即固定）**
-
-| 字段 | 全局默认 | 原因 |
+| # | Question | Conclusion |
 |---|---|---|
-| `IndexTier` | `DefaultIndexTier` | `UpdateAsync:43` 拒绝创建后变更 |
-| `DataTier` | `DefaultDataTier` | `UpdateAsync:44` 拒绝创建后变更 |
+| 1 | How the two relate | **One spec, one round**, but kept as separate task groups and separate commits so review and rollback stay separable |
+| 2 | Inheritance granularity | **One checkbox per field.** A single switch for the whole configuration cannot express common combinations like "custom tier, inherited retention" |
+| 3 | How inheritance is represented | **NULL means inherit, non-NULL means override.** One rule across all eleven inheritable fields, no exceptions, no sentinel values like -1 |
+| 4 | The `VolumeBytes` conflict | That field used `null` to mean "volume splitting off", which collides with inheritance. **"Off" moves to `0`**, so `null` means the same thing on every inheritable field. The settings page already said `0 = off`, so the UI semantics were already there |
+| 5 | The three rule fields' conflict | `null` = inherit, `''` = explicitly no rules. Verified that `string?` passes through from DTO to entity untouched, so the two are distinguishable |
+| 6 | When resolution happens | **At use, never filled in at read time.** See §3.2 — filling in would make the feature cancel itself |
+| 7 | Migrating existing configurations | **All treated as overrides**; all eleven fields keep their current concrete values, never silently converted to inheritance |
+| 8 | `IndexTier` / `DataTier` | **Not inheritable.** The service refuses to change them after creation, and inheritance means exactly "follows the global setting" — i.e. a change after creation. They are pre-filled from the global defaults on the new form and fixed on save |
+| 9 | Containers that already hold a backup | Flagged in the dropdown but not disabled. **Partly overturned on 2026-07-31** — see §2.3 |
 
-这两行在界面上不显示勾选框，改为标注 `locked after creation`——同一个表单里不应出现两种行为不同、仅靠文案区分的勾选框。
+## 2. The container picker
 
-**可继承（11 个）**
+### 2.1 Behaviour
 
-| 字段 | 全局默认 | 类型变更 | 「明确不要」如何表达 |
+Once an account is chosen, the existing containers endpoint is called and its results fill the dropdown, with a fixed final entry `+ New container…`. Selecting that entry reveals a text field validated live by the existing name validator.
+
+- **Flagging existing backups**: the endpoint returns a presence flag, rendered as `● has backup` after the option. Pointing at a container that already holds a backup is usually a mistake — that case wants the Import flow — but it is only a hint, not a block.
+- **Flagging local occupancy** (added 2026-07-31): the endpoint also returns `inUseBy`, the name of the local backup configuration already holding that container. That option **is** disabled, reading `● in use by "<name>"`.
+- **Changing account clears the selection**: otherwise a name belonging to the previous account lingers, and the backend does not verify existence.
+- **Listing failures are survivable**: listing requires the cloud. On failure the dropdown degrades to a plain text field showing the reason — being unable to list must not prevent creating a backup.
+
+In edit mode the field is already locked and is unaffected.
+
+### 2.2 What was left alone
+
+The backend was not changed to verify that the container exists. The orchestrator calls `CreateIfNotExistsAsync` on the first backup, so naming a container that does not exist yet is a supported, normal flow.
+
+### 2.3 Revision, 2026-07-31: occupancy is judged locally, and duplicates are refused outright
+
+Decision 9's original reasoning was that the local database had no uniqueness constraint on `(accountId, container)`. It has one now, and the reasoning expired with it.
+
+What overturned it was a real incident: **while a first backup was halfway through, that same container showed up in the dropdown as empty.** The presence flag only looked at whether the cloud info file existed, and that file is the very last thing the orchestrator writes — so the container already held this run's uploaded data while the cloud carried no marker at all. Following that list, the user assigned it to a second backup as well. The two then wrote competing version histories over each other, and each one's data blobs were deleted as orphans by the other's retention cleanup.
+
+- **Occupancy is authoritative locally**: the `BackupConfig` row exists from the moment it is created, without waiting for any cloud artefact. The containers endpoint merges in `inUseBy`, which covers all three cases at once: a backup in progress, a failed backup leaving a partial result, and the cloud being momentarily unreadable.
+- **The server refuses hard**: both create and import look up `(accountId, container)` before writing and return 409 if taken. Import checks this *before* reading the cloud — a question the local database can answer should not cost a network round trip first, and an import destined for rejection should not seed the cloud info file into the tracked store on its way.
+- **The database backs it up**: a unique index on `(AccountId, ContainerName)` closes both writes that bypass the endpoint and races squeezing into the check-then-write window.
+- **The migration deletes nothing**: existing duplicates are moved aside — the lowest `Id` in each group is kept, and the rest have their `ContainerName` rewritten to a dotted name (which Azure never accepts, so it can never touch a real container again), are marked `Error`, and carry a reason. Nothing is deleted. A duplicate configuration points at real cloud data, and deleting the local record would only make that data invisible.
+
+§2.2's "the backend was left alone" held only for the original round: the backend did change here, but it still does **not** verify cloud-side existence — the `CreateIfNotExistsAsync` reasoning still stands.
+
+## 3. "Use default" inheritance
+
+### 3.1 The fields
+
+Thirteen `BackupConfig` fields have a `Default*` counterpart in the global settings. After auditing each for "can this change after creation?", **eleven are inheritable** and two are not.
+
+The criterion is the update service's locked list (account, container, local root, both tiers, and the password). Only the two tiers fall inside those thirteen; the other eleven are already assignable from the edit page, so following a global change is no more dangerous than what the user can already do by hand.
+
+**Not inheritable** (pre-filled at creation, fixed on save): `IndexTier` and `DataTier`, both refused after creation by the update path. These two rows show no checkbox and are labelled `locked after creation` instead — one form should not contain two checkboxes that behave differently and are distinguished only by their caption.
+
+**Inheritable (eleven)**
+
+| Field | Global default | Type change | How "explicitly none" is expressed |
 |---|---|---|---|
-| `MaxVersions` | `DefaultMaxVersions` | → `int?` | 不适用 |
-| `MaxAgeDays` | `DefaultMaxAgeDays` | → `int?` | 不适用 |
-| `RetentionMode` | `DefaultRetentionMode` | → `RetentionMode?` | 不适用 |
-| `SingleFileThresholdBytes` | `DefaultSingleFileThresholdBytes` | → `long?` | 不适用 |
-| `GroupCapBytes` | `DefaultGroupCapBytes` | → `long?` | 不适用 |
-| `IncludeSymlinks` | `DefaultIncludeSymlinks` | → `bool?` | 不适用 |
-| `VerboseLogging` | `DefaultVerboseLogging` | → `bool?` | 不适用 |
-| `VolumeBytes` | `DefaultVolumeBytes` | 已可空 | **`0` = 关闭分卷** |
-| `IgnoreRules` | `DefaultIgnoreRules` | 已可空 | **`''` = 无规则** |
-| `DontCompressRules` | `DefaultDontCompressRules` | 已可空 | **`''` = 无规则** |
-| `DontGroupRules` | `DefaultDontGroupRules` | 已可空 | **`''` = 无规则** |
+| `MaxVersions` | `DefaultMaxVersions` | → `int?` | n/a |
+| `MaxAgeDays` | `DefaultMaxAgeDays` | → `int?` | n/a |
+| `RetentionMode` | `DefaultRetentionMode` | → `RetentionMode?` | n/a |
+| `SingleFileThresholdBytes` | `DefaultSingleFileThresholdBytes` | → `long?` | n/a |
+| `GroupCapBytes` | `DefaultGroupCapBytes` | → `long?` | n/a |
+| `IncludeSymlinks` | `DefaultIncludeSymlinks` | → `bool?` | n/a |
+| `VerboseLogging` | `DefaultVerboseLogging` | → `bool?` | n/a |
+| `VolumeBytes` | `DefaultVolumeBytes` | already nullable | **`0` = splitting off** |
+| `IgnoreRules` | `DefaultIgnoreRules` | already nullable | **`''` = no rules** |
+| `DontCompressRules` | `DefaultDontCompressRules` | already nullable | **`''` = no rules** |
+| `DontGroupRules` | `DefaultDontGroupRules` | already nullable | **`''` = no rules** |
 
-`GlobalSettings` 中无 per-backup 对应项的设置不在范围内：`RepackDownloadHot/Cool/Cold/Archive`、`UploadConcurrency`、`DownloadConcurrency`、`LogEphemeralMaxAgeDays`、`RetryBackoffSeconds`、`RetryMaxTotalMinutes`、`DeadWeightThresholdPercent`、`StagedLimitBytes`、`ProcessingMaxAttempts`。
+Global settings with no per-backup counterpart are out of scope: the repack-download switches, upload and download concurrency, ephemeral log age, retry backoff and cap, the dead-weight threshold, the staging limit, and the processing attempt limit.
 
-### 3.2 解析
+### 3.2 Resolution
 
-新增 `ResolvedBackupSettings`：输入 `(BackupConfig, GlobalSettings)`，输出 11 个可继承字段的生效值，全部非空。规则单一——字段为 `null` 取全局，否则取字段本身。两个 tier 不经解析器，直接读配置。
+`ResolvedBackupSettings` takes `(BackupConfig, GlobalSettings)` and produces the effective value of all eleven, every one non-null. One rule: `null` takes the global value, anything else takes the field. The two tiers bypass the resolver and are read straight from the configuration.
 
-**解析必须发生在使用时，不得在 `BackupConfigService.GetAsync` 中就地填充。** 一旦读取时填充，编辑界面就无法区分「继承来的 100」与「自己填的 100」，保存时会把继承悄悄固化为覆盖，功能自我作废。
+**Resolution must happen at use, and must not fill values in when the configuration is read.** Fill them in at read time and the edit screen can no longer tell "an inherited 100" from "a 100 I typed", so saving quietly converts inheritance into an override and the feature cancels itself.
 
-改为经解析器取值的路径有四条：备份（`BackupOrchestrator`）、检查（`BackupChecker`）、清理（保留策略求值）、还原。每条路径都要有回归测试确认走的是解析后的值。
+Four paths go through the resolver: backup, check, cleanup (evaluating retention) and restore.
 
-### 3.3 API 形状
+### 3.3 API shape
 
-`BackupConfigResponse` 同时返回两组：
+The response carries both:
 
-- 原始字段（可空），界面据此决定每个勾选框的状态；
-- `effective` 对象（全部非空），界面在勾选状态下显示为只读的当前生效值。
+- the raw fields (nullable), which the UI uses to decide each checkbox's state;
+- an `effective` object (all non-null), which the UI shows read-only where a box is ticked.
 
-`BackupConfigRequest` 的 11 个可继承字段改为可空；`null` 即请求继承。两个 tier 保持非空。
+On the request, the eleven inheritable fields become nullable, with `null` meaning "inherit". The two tiers stay non-null.
 
-### 3.4 界面
+### 3.4 UI
 
-每个可继承字段一行，`Field` 左侧标签不变，右侧改为「勾选框 + 控件」。新增 `DefaultableField` 组件包住现有控件，不重写表单。
+One row per inheritable field, label unchanged on the left, "checkbox plus control" on the right. A `DefaultableField` component wraps the existing controls rather than rewriting the form.
 
-- 勾选：隐藏控件，以只读灰字显示 `effective` 值。
-- 取消勾选：显示控件，并**预填当前生效值**，使「在默认基础上微调」不必重新输入。
-- 重新勾上：该字段回到继承，已输入的值**丢弃**（保存时发 `null`）。表单不保留隐藏的草稿值——留着它会让界面显示的与将要保存的不一致。
-- 全局设置变更后，勾选中的行下次打开即显示新值，无需任何操作。
+- Ticked: hide the control and show the `effective` value as read-only grey text.
+- Unticked: show the control, **pre-filled with the current effective value**, so "adjust slightly from the default" does not mean retyping.
+- Re-ticked: the field returns to inheritance and the typed value is **discarded** (`null` is sent on save). The form keeps no hidden draft — keeping one would make what is displayed differ from what will be saved.
+- After a global setting changes, ticked rows show the new value the next time the form opens, with no action required.
 
-新建备份时 11 个可继承字段**默认全部勾选继承**。这正是 PRD §3 的本意。两个 tier 以全局默认预填，可改，保存即固定。
+A new backup starts with all eleven **ticked**, which is what PRD §3 meant. The two tiers are pre-filled from the global defaults, editable, and fixed on save.
 
-Settings 页不变（但见 §6 关于保留策略的建议）。
+## 4. Migration
 
-## 4. 迁移
+1. The eleven inheritable columns become nullable (SQLite rebuilds the table; EF Core handles it). The two tiers are unchanged.
+2. Existing `NULL` in `VolumeBytes` is rewritten to `0`, preserving the original "splitting off" meaning (decision 4).
+3. The other ten columns keep their values — every existing configuration is treated as an override (decision 7).
 
-1. 11 个可继承列改为可空（SQLite 需重建表，EF Core 迁移处理）。`IndexTier` / `DataTier` 不变。
-2. `VolumeBytes` 现有的 `NULL` 改写为 `0`，保住「关闭分卷」原意（决策 4）。
-3. 其余 10 列的现有值原样保留——现有配置全部视为覆盖（决策 7）。
+Silently converting existing configurations to follow the global settings would change the behaviour of already-running backups without the user knowing: a backup deliberately set to `MaxVersions=10` would suddenly become 100. A change like that has to be made by a person, explicitly.
 
-把已有配置静默改成跟随全局，等于在用户不知情的情况下改变已在运行的备份行为：一份特意设了 `MaxVersions=10` 的备份会突然变成 100。这类改动必须由人明确做出。
+## 5. Pinned behaviour
 
-## 5. 测试
+Each of the eleven fields resolves correctly on both the null and non-null path. The three-state cases hold: `VolumeBytes` distinguishes `null` (inherit), `0` (off) and a positive value, and each rule field distinguishes `null` (inherit), `''` (no rules) and content.
 
-**后端**
+The migration is pinned: an old row with `NULL` in `VolumeBytes` must become `0`, not inheritance.
 
-- `ResolvedBackupSettings` 单测：11 个可继承字段各自的 null / 非 null 两条路径。
-- 三态用例：`VolumeBytes` 的 `null`（继承）/ `0`（关闭）/ 正数；三个规则字段的 `null`（继承）/ `''`（无规则）/ 有内容。
-- 迁移测试：`VolumeBytes` 为 `NULL` 的旧行迁移后必须是 `0`，而非继承。
-- 端点测试：将某字段 `PUT` 为 `null` 后修改全局设置，`GET` 返回的 `effective` 必须随之改变。这条直接钉住「跟随而非快照」。
-- 四条使用路径各一条回归测试。
-- 锁定字段回归：`PUT` 一份 tier 与现存值不同的配置仍必须 400，本轮不得放松该约束。
+**The assertion that pins "follows rather than snapshots"**: `PUT` a field to `null`, change the global setting, and the `effective` value returned by a subsequent `GET` must change with it.
 
-**前端**
+The locked-field regression still holds: a `PUT` carrying a tier different from the stored one must still be rejected — this round must not loosen that.
 
-无自动化测试（项目既有约束，见 [web-ui-modernization-design.md](web-ui-modernization-design.md) §8）。验证为 `npm run build` 与 `npm run lint`，加人工核对。
+## 6. Known consequence: inheriting retention is destructive
 
-## 6. 已知后果：保留策略的继承是破坏性的
+`MaxVersions`, `MaxAgeDays` and `RetentionMode` being inheritable means that lowering the global `MaxVersions` from 100 to 10 causes every backup inheriting it to **actually delete the surplus versions at the next cleanup**.
 
-`MaxVersions` / `MaxAgeDays` / `RetentionMode` 可继承，意味着把全局 `MaxVersions` 从 100 调到 10，所有勾选继承的备份在**下次清理时会真的删除多余版本**。
+That is the correct meaning of "follows the default", not a defect — the user could produce the same outcome backup by backup. But it turns one settings edit into a destructive operation across backups, with no indication of the blast radius on screen.
 
-这是「跟随默认」的正确语义，不是缺陷——用户本就能逐个备份改出同样的结果。但它把一次设置编辑变成了跨备份的破坏性操作，而界面上看不出影响范围。
-
-**建议**：在 Settings 页保留策略各项旁显示「N backups inherit this」。只读一行文字，数据来自现有的备份配置列表，不需要新端点。是否纳入本轮由人决定；不纳入也不影响本设计成立。
-
-## 7. 已知局限
-
-前端仍无测试框架，因此界面行为——勾选切换、预填、`effective` 显示、容器下拉的降级——只能人工核对。交付时如实说明，不以「已验证」表述掩盖。
+**Suggested**: show "N backups inherit this" beside each retention item on the settings page. One read-only line, sourced from the existing configuration list, needing no new endpoint.
