@@ -86,6 +86,7 @@ M1–M8 交付的是"能用"，这之后的每一项都是被实际使用暴露�
 | 08-06 | 改本地根路径（带校验的迁移，不再视根为不可变） | [change-local-root-design.md](change-local-root-design.md) |
 | 08-07 | 同一轮内跨箱打包成员去重（<5MB，leader 覆盖，alias 还原） | [specs/2026-08-07-pack-alias-dedup-design.md](superpowers/specs/2026-08-07-pack-alias-dedup-design.md) |
 | 08-08 | 可挂起、可暂停、可恢复的备份（journal、闸门、优雅关机、启动自动恢复） | [backup-suspend-resume-design.md](backup-suspend-resume-design.md) |
+| 08-09 | unfinished 字节按 blobRef 记账、核对中的归档不算待传、进度两行合成一条时间轴 | [specs/2026-08-09-unfinished-bytes-ledger-design.md](superpowers/specs/2026-08-09-unfinished-bytes-ledger-design.md) |
 
 ## 说明
 - 日志与通知的**基础设施**贯穿始终（早期即埋点），完整 UI 集中在后期里程碑。
