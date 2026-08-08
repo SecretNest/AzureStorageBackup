@@ -176,9 +176,24 @@ public sealed class BackupRunControl(
                 adopted.Add(content);
                 // 重名的那一卷**不**进 _adopted：它就是本轮自己那卷，CompleteAsync 已经按 runId 删过它。
                 if (mine)
+                {
                     reopenMine = true;
+                }
                 else
+                {
                     _adopted.Add(oldRunId);
+                    // 采纳的同时把旧卷的挂起标记抹掉：那个标记说的是**已经被顶替掉的那一轮**为什么停下，
+                    // 而"这一卷现在归本轮管"正是让它作废的那个事件——操作员按了 Run，或者启动时自动接了一轮。
+                    //
+                    // 不抹的话它会一直粘着，直到某一轮真的跑成功为止（旧卷只在 CompleteAsync 里删）。
+                    // 后果落在自动接着跑的判据上：那条判据要求这个配置底下**每一卷**都写着 ShuttingDown，
+                    // 于是一卷陈年的 AutoSuspended / UserRequested 就能一票否决掉后面每一次计划内重启，
+                    // 而越是长跑、越是不容易跑完一整轮的配置，越容易卡在这个状态里——恰恰是这个功能要救的那些。
+                    //
+                    // 抹掉之后这一卷不是就此没有标记了：本轮真挂起时会连它一起重新写上本轮的理由
+                    //（见 MarkSuspended）。所以"这个配置停在什么状态"始终由**当前这一轮**说了算。
+                    store.ClearSuspendMark(accountId, container, oldRunId);
+                }
             }
             else
             {
@@ -210,8 +225,10 @@ public sealed class BackupRunControl(
         // runId 与刚采纳的那一卷重名时**接着写**，不能新开：CreateAsync 是 FileMode.Create，
         // 会把刚刚采纳的那一卷当场截断。
         //
-        // 今天撞不上——RunId 每次都是新生成的 GUID 前缀。**Task 15「启动时自动接着跑」正是撞上它
-        // 的那一步**：那里要沿用挂起那一轮的 runId，好让界面上的运行身份保持不变。
+        // 今天撞不上，而且**今天没有任何调用方会撞上**：runId 一律取自 BackupRunState.RunId，
+        // 那是每轮新生成的 GUID 前缀，没有哪条路径会沿用上一轮的。启动时自动接着跑（AutoResumeService）
+        // 也不例外——它走的是上面的**采纳**分支（_adopted），新开自己那一卷。
+        // 这段分支是给"哪天真有人让某一轮沿用旧 runId"准备的：譬如为了让界面上的运行身份跨挂起保持不变。
         // 截断之后本轮内存里的 Resume 仍然是全的（上面已经读进来了），所以当轮跑下去不出错；
         // 坏掉的是**盘上**那份担保：再挂起一次，新卷不为那批块作保，下一轮把它们全部重传，
         // 而按 journal 判"这块有没有人认领"的清理/孤儿扫描会直接把它们当垃圾删掉。
@@ -268,12 +285,21 @@ public sealed class BackupRunControl(
     /// 还没开卷就挂起的（扫描阶段被叫停）什么都不写：盘上根本没有这一卷 journal，
     /// 标记只会变成一个指向不存在 journal 的孤儿，反倒要让读它的人多一处判空。
     /// </para>
+    /// <para>
+    /// 写的是**本轮名下每一卷**：自己那卷，加上开卷时采纳来的所有旧卷。理由是标记按卷记、判据按卷读
+    /// （<see cref="AutoResumeService.PickResumableAsync"/> 要求每一卷都写着 ShuttingDown），
+    /// 而采纳之后这几卷就是同一轮运行的现场，一起停下、一起接着跑，没有哪一卷可以停在别的理由上。
+    /// 只写自己那卷的话，采纳来的旧卷会停在"开卷时被抹掉的那个空标记"上，于是**从第二次重启起**
+    /// 判据就再也凑不齐——一次计划内重启接上了，第二次就悄没声地不接了。
+    /// </para>
     /// </summary>
     public void MarkSuspended(SuspendReason reason)
     {
         if (_journal is null)
             return;
         store.MarkSuspended(_accountId, _container, runId, reason);
+        foreach (var old in _adopted)
+            store.MarkSuspended(_accountId, _container, old, reason);
     }
 
     public async Task FlushAsync(bool fsync, CancellationToken ct)

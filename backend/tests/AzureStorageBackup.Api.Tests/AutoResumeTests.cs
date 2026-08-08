@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Migrations;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -7,6 +8,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore.Migrations.Operations;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -146,6 +148,153 @@ public class AutoResumeTests : IDisposable
         Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default));
     }
 
+    /// <summary>
+    /// 真开一轮（只走开卷 + 挂起这两步，不碰云），好让"采纳旧卷"这件事按生产路径真的发生。
+    /// 判据是按**卷**读的，而卷与标记的关系只有走这条路才长得出来——手工 seed 出来的现场
+    /// 永远是"一卷配一份标记"，正好绕开了下面几条要说的话。
+    /// </summary>
+    private static async Task RunAndSuspendAsync(
+        BackupJournalStore store, string runId, SuspendReason reason)
+    {
+        await using var control = new BackupRunControl(store, 7, runId);
+        await control.OpenJournalAsync(
+            1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, default);
+        control.MarkSuspended(reason);
+    }
+
+    /// <summary>盘上每一份 <c>.suspend</c> 都得有一卷 journal 与之对应。孤儿标记不会报错，
+    /// 只会永远躺在那里，并且让"这个配置停在什么状态"多出一个没人认领的答案。</summary>
+    private void AssertNoOrphanMarks()
+    {
+        var dir = Path.Combine(_dir, "1", "photos");
+        foreach (var mark in Directory.EnumerateFiles(dir, "*.suspend"))
+            Assert.True(
+                File.Exists(mark[..^".suspend".Length]),
+                $"{Path.GetFileName(mark)} has no journal next to it");
+    }
+
+    /// <summary>
+    /// **连着两次**计划内重启都得接上，不是只有第一次。
+    /// <para>
+    /// 第二轮走的是与第一轮完全不同的一条路：它开卷时把第一轮那卷**采纳**下来，然后新开自己那卷，
+    /// 于是这个配置底下有了两卷 journal，而判据要求**每一卷**都写着 ShuttingDown。第二轮挂起时
+    /// 只给自己那卷写标记的话，第一轮那卷就停在"被采纳时抹掉的空标记"上，判据从此再也凑不齐——
+    /// 而它坏掉的方式是完全静默的：第一次重启接上了，看上去这个功能是好的。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Two_shutdown_cycles_in_a_row_are_both_picked_up()
+    {
+        var store = Store();
+
+        await RunAndSuspendAsync(store, "run-1", SuspendReason.ShuttingDown);
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+
+        // 第二轮：接着跑起来的那一轮，采纳了 run-1 那卷，然后又被一次关机停在半路。
+        await RunAndSuspendAsync(store, "run-2", SuspendReason.ShuttingDown);
+        Assert.Equal(2, (await store.PeekAsync(1, "photos", default)).Count);
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+
+        // 第三轮同理——第二轮之后就不该再有"第 N 次开始不灵了"这回事。
+        await RunAndSuspendAsync(store, "run-3", SuspendReason.ShuttingDown);
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+
+        AssertNoOrphanMarks();
+    }
+
+    /// <summary>
+    /// 一卷被采纳的那一刻，它旧主人的标记就该退休：写下那个理由的运行已经被顶替掉了。
+    /// <para>
+    /// 采纳只是只读地认下旧卷，旧卷本身要等新一轮**成功收尾**才删——而"成功收尾"恰恰是长跑配置
+    /// 最不容易到达的那一步。标记不在采纳时清掉的话，它就一直粘着，用一个陈年的理由替当前这一轮
+    /// 回答"你停在什么状态"。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Adopting_a_volume_retires_the_mark_of_the_run_it_took_over()
+    {
+        var store = Store();
+        await RunAndSuspendAsync(store, "run-old", SuspendReason.AutoSuspended);
+
+        await using var control = new BackupRunControl(store, 7, "run-new");
+        await control.OpenJournalAsync(1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, default);
+
+        // 旧卷是被**采纳**的，不是被作废删掉的——否则"标记没了"就没说明任何事。
+        Assert.Equal(2, (await store.PeekAsync(1, "photos", default)).Count);
+        Assert.Null(store.ReadSuspendMark(1, "photos", "run-old"));
+    }
+
+    /// <summary>
+    /// 操作员按 Run 就是在推翻他自己（或闸门）先前那次暂停——之后的一次计划内重启，仍然该接着跑。
+    /// <para>
+    /// 判据要求每一卷都是 ShuttingDown，而旧卷的标记只在"某一轮真的跑成功"时才会被删掉。少了
+    /// "采纳即退休 + 挂起时连采纳来的卷一起写"这两条，一次 AutoSuspended / UserRequested 就会
+    /// 一票否决掉此后的每一次重启，而且是**永久**的——直到某一轮跑完为止。卡在这个状态里的，
+    /// 恰恰是那些跑不完一整轮的长跑配置，也就是这个功能存在的理由本身。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(SuspendReason.AutoSuspended)]
+    [InlineData(SuspendReason.UserRequested)]
+    public async Task An_earlier_pause_does_not_veto_a_later_shutdown_forever(SuspendReason earlier)
+    {
+        var store = Store();
+        await RunAndSuspendAsync(store, "run-paused", earlier);
+        Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+
+        // 操作员按了 Run，这一轮又撞上一次计划内重启。
+        await RunAndSuspendAsync(store, "run-after-run", SuspendReason.ShuttingDown);
+
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default));
+        AssertNoOrphanMarks();
+    }
+
+    /// <summary>
+    /// 被否掉的配置必须留下一句话。这个部署形态是 NAS 上的成品机：操作员没有 shell，没有任何
+    /// 看标记文件的工具，界面上那个开关还明晃晃开着。少了这一句，"重启之后备份怎么没接上"
+    /// 在他那边是彻底无从下手的。
+    /// </summary>
+    [Fact]
+    public async Task A_declined_config_says_which_volume_held_it_back()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-user");
+        store.MarkSuspended(1, "photos", "run-user", SuspendReason.UserRequested);
+
+        var log = new RecordingLogger();
+        Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default, log));
+
+        var line = Assert.Single(log.Messages);
+        Assert.Contains("7", line);
+        Assert.Contains("run-user", line);
+        Assert.Contains("UserRequested", line);
+    }
+
+    /// <summary>没有标记那一类同样要说清，而且要说"没有"，不能说成某个理由。</summary>
+    [Fact]
+    public async Task A_declined_config_reports_a_missing_mark_as_none()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-crash");
+
+        var log = new RecordingLogger();
+        Assert.Empty(await AutoResumeService.PickResumableAsync(store, OneConfig, default, log));
+        Assert.Contains("none", Assert.Single(log.Messages));
+    }
+
+    /// <summary>接上了的配置不该记这一句：它说的是"为什么不接"。</summary>
+    [Fact]
+    public async Task A_resumable_config_is_not_reported_as_declined()
+    {
+        var store = Store();
+        await SeedJournalAsync(store, "run-boot");
+        store.MarkSuspended(1, "photos", "run-boot", SuspendReason.ShuttingDown);
+
+        var log = new RecordingLogger();
+        Assert.Equal([7], await AutoResumeService.PickResumableAsync(store, OneConfig, default, log));
+        Assert.Empty(log.Messages);
+    }
+
     [Fact]
     public void Setting_is_on_by_default()
     {
@@ -219,6 +368,155 @@ public class AutoResumeTests : IDisposable
             builder.UseSetting("Scheduler:Enabled", "true");
             builder.ConfigureServices(services => Captured = services);
         }
+    }
+
+    internal sealed class RecordingLogger : ILogger<AutoResumeService>
+    {
+        /// <summary>级别一起记下来：这个服务的日志有一半意义在**级别**上（被否掉的配置要说得出口，
+        /// 失败的自动恢复要比成功的显眼一档），只比对文字的话那一半是钉不住的。</summary>
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IReadOnlyList<string> Messages
+        {
+            get { lock (Entries) return [.. Entries.Select(e => e.Message)]; }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries)
+                Entries.Add((logLevel, formatter(state, exception)));
+        }
+    }
+}
+
+/// <summary>
+/// 那个开关本身：**关掉它，就真的什么都不开。**
+/// <para>
+/// 这是这个功能最该被钉住的一句话，因为它坏掉的样子是静默的：操作员取消勾选，界面照样显示保存成功，
+/// 直到某天重启之后一轮他不想要的备份自己跑起来，抢走产出锁、烧掉一晚上的带宽。而这条路上恰好有两处
+/// 都会以完全一样的方式静默失效——<c>GlobalSettingsService.UpsertAsync</c> 里那一行赋值（漏了就是
+/// 存不进去），和 <c>ExecuteAsync</c> 里那个提前 return（漏了就是存进去了也不看）。
+/// </para>
+/// <para>
+/// 不需要 Azurite，也不需要一轮真备份：配置指向一个**不存在的账号**，
+/// <c>BackupRunner.RunCoreAsync</c> 在查账号那一步就摔了，而它照样会登记运行、照样会放行
+/// <c>Completion</c>——于是那个串行化的 await 也一并走到了。
+/// </para>
+/// </summary>
+public sealed class AutoResumeSwitchTests : IDisposable
+{
+    private const string Container = "autoresume-switch";
+    private const int AccountId = 987654;   // 故意查无此账号
+
+    private readonly string _dir =
+        Path.Combine(Path.GetTempPath(), "asb-resume-switch-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task The_setting_decides_whether_a_backup_is_started_at_all(bool on)
+    {
+        using var factory = new TestWebAppFactory();
+        var scopes = factory.Services.GetRequiredService<IServiceScopeFactory>();
+
+        int configId;
+        using (var scope = scopes.CreateScope())
+        {
+            var settings = scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>();
+            // 存两次：第一次建行走的是 Add 分支（整个对象原样落库），只有第二次才走**逐字段赋值**
+            // 那条路——而漏掉那一行赋值正是这里要防的失效方式之一。
+            await settings.UpsertAsync(new GlobalSettings());
+            await settings.UpsertAsync(new GlobalSettings { AutoResumeInterruptedRuns = on });
+            Assert.Equal(on, (await settings.GetAsync()).AutoResumeInterruptedRuns);
+
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var config = new BackupConfig
+            {
+                AccountId = AccountId,
+                ContainerName = Container,
+                Name = "switch",
+                LocalRoot = _dir,
+            };
+            db.BackupConfigs.Add(config);
+            await db.SaveChangesAsync();
+            configId = config.Id;
+        }
+
+        // 盘上的现场：一卷 journal + 一份 ShuttingDown 标记 = 挑件人一定会挑中它。
+        var journals = new BackupJournalStore(_dir);
+        await using (await journals.CreateAsync(AccountId, Container, "run-boot", new JournalHeader
+        {
+            RunId = "run-boot",
+            ConfigId = configId,
+            StartedAt = DateTimeOffset.UtcNow,
+            BaselineVersion = 0,
+            LocalRoot = _dir,
+            EncryptionIdentity = "plain",
+        }, default)) { }
+        journals.MarkSuspended(AccountId, Container, "run-boot", SuspendReason.ShuttingDown);
+        Assert.Equal(
+            [configId],
+            await AutoResumeService.PickResumableAsync(
+                journals, [(configId, AccountId, Container)], default));
+
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+        var original = AutoResumeService.Delay;
+        AutoResumeService.Delay = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            var log = new AutoResumeTests.RecordingLogger();
+            var service = new AutoResumeService(scopes, journals, runner, log);
+            await service.StartAsync(default);
+            try
+            {
+                if (on)
+                {
+                    // 起来了：运行注册表里有它。等一小会儿——StartAsync 之后还要过 50ms 的延时。
+                    var started = await SpinAsync(() => runner.Get(configId) is not null);
+                    Assert.True(started, "the setting is on, so the interrupted backup should have started");
+
+                    // 这一轮必然失败（账号查无此人），而**失败的自动恢复要比成功的显眼一档**：
+                    // 没人守在旁边看这一轮的结果，记成 Information 就等于埋进正常流水里。
+                    var reported = await SpinAsync(() =>
+                    {
+                        lock (log.Entries)
+                            return log.Entries.Any(
+                                e => e.Level == LogLevel.Warning && e.Message.Contains($"backup {configId} failed"));
+                    });
+                    Assert.True(reported, "a failed auto-resume has to be reported as a warning, "
+                        + $"got: {string.Join(" | ", log.Messages)}");
+                }
+                else
+                {
+                    // 关着：给它足够长的时间去做错事，然后确认它什么都没做。
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                    Assert.Null(runner.Get(configId));
+                }
+            }
+            finally { await service.StopAsync(default); }
+        }
+        finally { AutoResumeService.Delay = original; }
+    }
+
+    private static async Task<bool> SpinAsync(Func<bool> until)
+    {
+        for (var i = 0; i < 200; i++)
+        {
+            if (until())
+                return true;
+            await Task.Delay(50);
+        }
+        return false;
     }
 }
 

@@ -231,7 +231,8 @@ if (builder.Configuration.GetValue("Scheduler:Enabled", true))
 //
 // 排在调度器之后、GracefulSuspendService 之前：宿主按注册的逆序停服务，关机挂起因此停在它前面，
 // 会把它刚起的那一轮挂起落盘——而它正等着那一轮的终态，等待也就随之结束。
-if (builder.Configuration.GetValue("Scheduler:Enabled", true))
+var autoResumeRegistered = builder.Configuration.GetValue("Scheduler:Enabled", true);
+if (autoResumeRegistered)
     builder.Services.AddHostedService<AutoResumeService>();
 
 // 计划内退出（docker stop / 升级重启）时把在跑的备份挂起落盘。
@@ -348,6 +349,18 @@ if (authGate.Required)
 else
 {
     app.Logger.LogWarning("Authentication is disabled: Auth__Password is not set.");
+}
+
+// 调度器关着的时候，Settings 页上那个"Resume interrupted backups on startup"开关是**死的**——
+// 自动接着跑跟着同一个开关走（见上面的注册处）。而界面照样把它画成开着的，因为它读的是数据库里
+// 那一位，看不见部署侧的 Scheduler__Enabled。说一句出来，不然这个差别只在某天重启没接上时才被发现，
+// 而那时人会先去怀疑那个明明是开着的开关。
+if (!autoResumeRegistered)
+{
+    app.Logger.LogInformation(
+        "Automatic resume of interrupted backups is off because the scheduler is disabled "
+        + "(Scheduler__Enabled=false), whatever the setting on the Settings page says. "
+        + "Interrupted backups wait for you to press Run.");
 }
 
 // 深度防御（设计 §3.1）：漏网的 SecretUnavailableException 统一映射为 409 keyring_lost，

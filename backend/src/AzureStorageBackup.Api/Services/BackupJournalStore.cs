@@ -94,6 +94,21 @@ public sealed class BackupJournalStore(string rootDir)
         catch { /* 写不下就当没标记：后果是多跑一轮，不是丢数据 */ }
     }
 
+    /// <summary>
+    /// 抹掉这一卷的挂起标记。给"这一卷换了主人"用：标记描述的是**某一轮运行**为什么停下，
+    /// 而一卷 journal 被新一轮采纳之后，写下那个理由的那一轮已经被顶替了，它的理由随之作废。
+    /// <para>
+    /// 与 <see cref="Delete"/> 的差别是 journal 本身还留着：采纳是只读的，旧卷要一直等到新一轮
+    /// 成功提交索引才删（<see cref="BackupRunControl.CompleteAsync"/>）。中间这段时间里，
+    /// 它的标记该由**接手的那一轮**重新写（见 <see cref="BackupRunControl.MarkSuspended"/>），
+    /// 而不是继续拿着上一轮的旧值。
+    /// </para>
+    /// </summary>
+    public void ClearSuspendMark(int accountId, string container, string runId)
+    {
+        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* 删不掉下次再说 */ }
+    }
+
     /// <summary>读挂起理由。文件不在、读不动、或内容不认识都返回 null（= 当没标记）。</summary>
     public SuspendReason? ReadSuspendMark(int accountId, string container, string runId)
     {
