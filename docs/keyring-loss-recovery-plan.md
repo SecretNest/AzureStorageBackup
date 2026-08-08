@@ -1587,7 +1587,7 @@ rm backend/src/AzureStorageBackup.Api/Services/AzureStorageService.cs \
 `README.md`：从 `docker run` 示例（`:62`）中删除 `-e ConnectionStrings__AzureStorage=...` 一行；从环境变量表中删除 `ConnectionStrings__AzureStorage` 一行（`:78`）。在该表下方新增一段说明：
 
 ```markdown
-> Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](docs/keyring-loss-recovery-design.md).
+> Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](keyring-loss-recovery-design.md).
 ```
 
 - [ ] **Step 6: 全量测试并提交**

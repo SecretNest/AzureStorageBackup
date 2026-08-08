@@ -8,7 +8,7 @@
 
 **Tech Stack:** .NET 10 / ASP.NET Core Minimal API / xUnit；React 19 + TypeScript + Vite。
 
-设计文档：[backup-progress-visibility-design.md](backup-progress-visibility-design.md)
+设计文档：[progress-display-design.md](progress-display-design.md)（本文件描述的那一轮已并入其中）
 
 ## Global Constraints
 

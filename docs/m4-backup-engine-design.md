@@ -1,65 +1,71 @@
-# M4 — 备份引擎设计
+# M4 — Backup engine design
 
-> 对应 PRD 第 3 章、backup-feature-design.md。本文件是 M4 的详细设计，供 review。
-> 已确认前提：密码=加密（单开关）、symlink 默认跳过、变更判定用 hash、Tier 无 Smart（Hot/Cool/Cold[/Archive]）。
+> Covers PRD chapter 3 and [backup-feature-design.md](backup-feature-design.md). Settled premises:
+> password = encryption (one switch), symlinks skipped by default, change detection by hash,
+> tiers without Smart (Hot/Cool/Cold[/Archive]).
+>
+> Sections 1–13 are the original M4 design. Where the implementation has since moved on, the
+> **Implementation notes** blocks are authoritative and the surrounding prose is kept for context.
 
-## 1. 核心概念
+## 1. Core concepts
 
-- **备份（Backup）**：一个 container 内的一份备份，由 `(Account, Container)` 标识（每 container 最多一个，PRD 1.3）。含配置、多个版本、索引、数据。
-- **版本（Version）**：每次执行备份产生一个不可变版本。版本引用文件清单（第二级索引）。
-- **信息记录文件**：container 内的权威元数据 blob，保存配置 + 版本列表 + 分组包元数据。跨设备恢复的唯一真相源（PRD 1.5）。平时不读取（PRD 1.7），仅导入/检查时读。
-- **本地缓存**：本地 SQLite 缓存备份状态（上一版本索引、pack 元数据），加速对比，避免每次读 container。恢复时从信息文件重建。
+- **Backup** — one backup inside one container, identified by `(Account, Container)` (at most one per container, PRD 1.3). Holds the configuration, several versions, indexes and data.
+- **Version** — every run produces one immutable version, referencing a file manifest (the second-level index).
+- **Info file** — the authoritative metadata blob inside the container: configuration + version list + pack metadata. The single source of truth for recovery on another machine (PRD 1.5). Not read during normal operation (PRD 1.7), only on import and check.
+- **Local cache** — SQLite holds backup state (previous version index, pack metadata) so a run does not have to read the container. Rebuilt from the info file on recovery.
 
-> **实现更新（以代码为准，2026-07）**：
-> - hash 用 **XxHash128**（`xxh128:` 前缀），本文档 §2/§3.2 中出现的 `sha256:` 示例均按 §13.2 读作 `xxh128:`。
-> - 信息文件与第二级索引为**紧凑二进制序列化**（§13.4，`IndexSerializer` BinaryWriter），blob 名仍字面保留 `.json[.enc]` 后缀；§3.1/§3.2 的 JSON 示例仅描述**逻辑结构**，非磁盘字节格式。
-> - data blob 与 pack 均可**分卷**：多卷时实际 blob 名为 `data/{hash}.001/.002…`、`packs/{id}.7z.001/.002…`（单卷用基名），读写/清理经 `VolumeBlobIO` 按分卷族处理。
-> - **分卷数记入版本文件**（§7）：单文件 blob 记在索引条目 `StorageRef.Volumes`，pack 记在 `PackInfo.Volumes`（压实会改，随信息文件更新，不改版本索引）。检查据此核验全部分卷存在，检测 Azure 端误删/丢失。多卷各卷**并发上传、先后不论**；.001 曾作为「整族齐全」提交标记最后单独写，随云端存在性去重一并取消（那个标记让 2–5 卷的文件上传耗时翻倍，而去重已不问云端）。
-> - **hash 碰撞避让**：data blob 元数据存原始长度 + headHash；去重时须元数据一致才跳过，否则判为碰撞、改用备用名 `data/{hash}~1/~2…` 并报 UnrecoverableError。索引 `StorageRef.Ref` 记实际名，还原/检查/清理据此。（残余「同 hash+同长度+同 headHash」碰撞概率可忽略，不再下载内容比对。）
-> - **加密备份密钥化寻址（防指纹识别）**：加密备份的 data blob 名改为 `data/{HMAC(key, fullHash)[:16]}`（key = HKDF(password, `BackupMeta.KdfSalt`)），碰撞元数据改为不透明 `v = HMAC(key, fullHash|len|head)`，不泄露长度/头部。未授权者即使能列 container 也无法用公开 hash 反推「是否备份过某文件」。去重照常（同内容→同地址）。非加密备份仍明文寻址。仅编排器创建 blob 时用密钥；还原/检查/清理用索引里记录的实际地址。残余泄露：blob 数量与大小。见 `BlobAddressScheme`。
-> - **原始文件直传（PRD 3.3.2，`StorageRef.Raw`）**：单文件 data blob 若**命中不压缩列表(store-only) + 无密码 + 单卷内(≤VolumeBytes)**，则直接把原文件拷到待上传区、上传**原始字节**（不走 7z 封装），`StorageRef.Raw=true`；raw 属性同时记入 blob 元数据(`raw=1`)，去重时以既有 blob 为准（同内容不同 don't-compress 状态也正确）。还原直接写回、深度检查直接重算 hash，均不解压。因单文件 blob 内容寻址去重可被多路径引用，还原/检查对同一 blob 复制/校验给**每个**引用条目。加密（keyed）备份永不 raw。见 `BackupOrchestrator.CopyRawAsync`。
-> - **计划任务遇忙碌跳过（`BackupBusyTracker`）**：备份按 账户/container 标识忙碌态；备份/还原/检查任一操作期间标记忙碌。计划任务（`TaskDispatcher`）目标忙碌 → 记 Warning 报警并跳过该目标，不打断在执行的任务；HTTP 备份/还原忙碌则拒绝并发，手动检查忙碌返回 409。
-> - **去重碰撞加固：三段 hash**。data blob 碰撞元数据由「长度 + 头 4KB hash」增加「尾 4KB hash」（`IFileHasher.TailHashAsync`）。误去重需 fullHash(128 位全文件)+长度+头+尾 同时相同，实际不可能——无需逐字节全文件比对。`TailHash` 一并存入索引条目（`IndexEntry.TailHash`，序列化 format 2）。加密备份的不透明校验 `v` 也纳入尾部。
-> - **分级检查 + 本地修复 + 不可恢复标记 + 还原替代**（PRD 2.3 扩展）：
->   - **检查双轴**（`CheckOptions`，替换旧 `deep` 布尔）：云端 `CloudCheckLevel`（不查 / 元数据比对本地缓存 / 存在+尺寸（默认，HEAD 比对索引里存的 `VolumeSizes`，免下载识破截断/错包）/ 内容（下载重算 hash，Archive 可选活化 tier））；本地 `LocalCheckLevel`（不查 / 存在+尺寸+权限 / 内容 hash（默认，＝可从本地修复的判据））。结果 `CheckReport` 按文件给 `CloudState`/`LocalState`/`Repairable`。计划任务的 Check 也带这两级（`ScheduledTask.Check*Level`）。
->   - **每分卷尺寸入索引**：`StorageRef.VolumeSizes` / `PackInfo.VolumeSizes`（序列化 format 3/2），供上面「存在+尺寸」级。
->   - **从本地修复**（`BackupRepairer`，显式动作）：对云端坏掉的 blob，从本地文件（hash 校验）重压并**完整替换**（先删旧全部分卷）；单文件 blob 更新所有引用版本的尺寸/卷数（去重共享），pack 按所有版本存活成员整体重压。修不了（本地删/hash 变）→ 该文件在相关版本 `VersionIndex.UnrecoverablePaths` 标记不可恢复。归档内 mtime 不重要（展示用索引元数据，还原重设时间/权限）。
->   - **还原替代**（`RestoreRequest.Substitutions` path→版本）：不可恢复文件由用户逐个（可批量、就近优先）选另一版本替代；未指定的不可恢复文件跳过（不报错）。候选由 `GET /file-versions?path=` 给出。
-> - **单文件 blob 去重纯本地化（自建备份零云端读，`LocalDedupResolver`）**：自建备份的本地缓存已含每个 blob 的内容身份（fullHash+长度+头+尾）与存储信息（ref/raw/分卷数），故备份时**不发云端 HEAD**判断去重/碰撞：
->   - 跨版本：从保留版本索引建「内容身份 → 既有 blob」映射直接命中。
->   - 同一次备份内：运行内预约表（每 ref 一个 `TaskCompletionSource`）协调——同内容后到者等首个上传者完成，拿到相同 (ref, raw, 分卷数)（顺带修一个潜在竞态：同内容但不压缩设置不同的两文件曾各写各的 raw 标志、还原时损坏）；不同内容撞同址避让到 …~N；上传失败则令等待者一并失败，绝不去重到未成功写入的 blob。
->   - **权威判定**：一律本地解析，没有云端回退。导入时就把信息文件与每个版本的索引全部拉进本地（`/import` 端点），此后不存在「没有本地权威」这种状态。没有本地权威时信任云端本身就是危险的——不知道那些 blob 是谁写的、用的什么密码、内容还对不对，而一次误判的「已存在」就是把一份从没传上去的文件静默记成备份完成。
->   - **行为取舍**（与「尽量不读云端」一致）：备份信任本地索引＝云端真相，不再自动重传被外部误删的 blob——该漂移交由**检查(Check)**发现。
-> - **打包成员去重（`PackAliasTable`，2026-08）**：小文件装箱那条路以前只有两层去重——同一箱内靠 7z 的 solid 归档（字典跨成员匹配）、跨版本靠 `LocalDedupResolver.TryFindPackMember` 查既有保留版本的索引、命中即让新条目直接指过去不装箱。缺的是**同一轮备份内、跨箱**那一段：不同箱之间压缩不共享字典，首次备份或一次新增大量重复小文件时，同内容一旦被分进不同箱就实打实各存一份。新增 `PackAliasTable` 补上：diff 期间后到的同内容文件（四项内容身份——fullHash+长度+head+tail——严格相等，判据与 `TryFindPackMember` 一致）不入箱，只挂在首个（leader）名下；等全部消费者 join 之后按 leader 的**最终态**统一回填 `StorageRef`（leader 可能在压缩窗口里被改写、读不开、或变大改走单文件 blob，回填因此不能在装箱当时做）；leader 走岔则挂在它身上的别名判为悬空、当作普通文件重新跑一遍。设计与取舍见 `docs/superpowers/specs/2026-08-07-pack-alias-dedup-design.md`。
+> **Implementation notes (code is authoritative, 2026-07)**
+>
+> - Hashing is **XxHash128** (`xxh128:` prefix). The `sha256:` examples in §2 and §3.2 read as `xxh128:` per §13.2.
+> - The info file and second-level indexes are **compact binary** (§13.4, `IndexSerializer` over `BinaryWriter`); blob names still literally end in `.json[.enc]`. The JSON in §3.1/§3.2 describes the *logical* structure, not the on-disk bytes.
+> - Both data blobs and packs can be **split into volumes**: `data/{hash}.001/.002…`, `packs/{id}.7z.001/.002…` (a single volume uses the base name). Read, write and cleanup all go through `VolumeBlobIO`, which treats a family as a unit.
+> - **Volume count is recorded in the version file** (§7): `StorageRef.Volumes` for single-file blobs, `PackInfo.Volumes` for packs (compaction may change it, which updates the info file, not the version index). Check verifies every volume exists, catching deletion or loss on the Azure side. Volumes upload **concurrently and in any order**; `.001` was once written last as an "the family is complete" marker, and was dropped together with cloud-side existence dedup — that marker doubled upload time for 2–5 volume files, and dedup no longer asks the cloud.
+> - **Hash collision avoidance**: a data blob's metadata carries the original length plus headHash; dedup only skips when the metadata matches, otherwise it is treated as a collision, gets the alternate name `data/{hash}~1/~2…`, and raises an UnrecoverableError. `StorageRef.Ref` records the actual name for restore, check and cleanup. (The residual "same hash + same length + same headHash" collision probability is negligible; contents are no longer compared byte by byte.)
+> - **Keyed addressing for encrypted backups (fingerprint resistance)**: data blobs are named `data/{HMAC(key, fullHash)[:16]}` with `key = HKDF(password, BackupMeta.KdfSalt)`, and collision metadata becomes an opaque `v = HMAC(key, fullHash|len|head)` that leaks neither length nor header. Someone who can list the container still cannot use a public hash to decide whether a given file was backed up. Dedup is unaffected (same content, same address). Unencrypted backups keep plain addressing. Only the orchestrator uses the key when creating blobs; restore, check and cleanup use the address recorded in the index. Residual leak: blob count and sizes. See `BlobAddressScheme`.
+> - **Raw passthrough (PRD 3.3.2, `StorageRef.Raw`)**: a single-file data blob that hits the don't-compress list, has no password and fits in one volume is copied straight to staging and uploaded as **raw bytes**, skipping the 7z wrapper. `raw=1` also goes into the blob metadata so dedup follows the existing blob (correct even when two files with identical content have different don't-compress settings). Restore writes it back directly and deep check re-hashes it directly, neither extracting. Because a content-addressed blob can be referenced by several paths, restore and check copy/verify for **every** referencing entry. Keyed (encrypted) backups are never raw. See `BackupOrchestrator.CopyRawAsync`.
+> - **Scheduled tasks skip a busy target (`BackupBusyTracker`)**: busy state is tracked per account/container and set during backup, restore or check. A scheduled task whose target is busy raises a Warning and skips rather than interrupting. HTTP backup/restore refuse to run concurrently; a manual check returns 409.
+> - **Three-segment hashing against dedup collisions**: collision metadata gained a trailing 4 KB hash (`IFileHasher.TailHashAsync`) on top of length and leading 4 KB. A false dedup would need fullHash (128-bit, whole file) + length + head + tail to all match, which is not achievable in practice — no byte-by-byte comparison needed. `TailHash` is stored in the index entry (`IndexEntry.TailHash`, serialisation format 2). Encrypted backups fold the tail into the opaque `v` as well.
+> - **Graduated check + local repair + unrecoverable marking + restore substitution** (PRD 2.3 extended):
+>   - **Two check axes** (`CheckOptions`, replacing the old `deep` boolean): cloud `CloudCheckLevel` (skip / compare metadata against the local cache / existence + size (default: `HEAD` against the `VolumeSizes` in the index, catching truncation and wrong blobs without downloading) / content (download and re-hash, optionally rehydrating Archive)); local `LocalCheckLevel` (skip / existence + size + permissions / content hash (default, and the criterion for "repairable from local")). `CheckReport` gives each file a `CloudState`, `LocalState` and `Repairable`. Scheduled checks carry both levels (`ScheduledTask.Check*Level`).
+>   - **Per-volume sizes in the index**: `StorageRef.VolumeSizes` / `PackInfo.VolumeSizes` (serialisation format 3/2), feeding the existence + size level above.
+>   - **Repair from local** (`BackupRepairer`, an explicit action): for a broken cloud blob, recompress from the local file (hash-verified) and **replace completely** (deleting all old volumes first). Single-file blobs update size and volume count in every referencing version (dedup shares them); packs are recompressed whole from the surviving members across all versions. If repair is impossible (local file deleted or changed) the file is marked in `VersionIndex.UnrecoverablePaths` for the affected versions. mtime inside the archive does not matter — display uses index metadata and restore resets times and permissions.
+>   - **Restore substitution** (`RestoreRequest.Substitutions`, path → version): the user picks a replacement version per unrecoverable file (in bulk, nearest-first). Unrecoverable files without a substitution are skipped without an error. `GET /file-versions?path=` supplies the candidates.
+> - **Single-file dedup is purely local — zero cloud reads for backups this instance created (`LocalDedupResolver`)**: the local cache already holds each blob's content identity (fullHash + length + head + tail) and its storage details (ref, raw, volume count), so a backup issues **no cloud `HEAD`** to decide dedup or collisions:
+>   - Across versions: a map from content identity to existing blob, built from the retained version indexes.
+>   - Within one run: a reservation table (one `TaskCompletionSource` per ref) coordinates — later arrivals with identical content wait for the first uploader and receive the same `(ref, raw, volume count)`. This incidentally fixed a latent race where two files with identical content but different compression settings each wrote their own raw flag and corrupted restore. Different content colliding on one address diverts to `…~N`. A failed upload fails the waiters too — never dedup onto a blob that was not successfully written.
+>   - **Authority is local, with no cloud fallback.** Import pulls the info file and every version index into the local store (`/import`), so "no local authority" is not a reachable state. Trusting the cloud without local authority is itself dangerous: you do not know who wrote those blobs, with which password, or whether the contents are still correct — and one wrong "already exists" silently records a file that was never uploaded as backed up.
+>   - **The trade-off** (consistent with "avoid reading the cloud"): a backup trusts the local index as the cloud's truth and will not re-upload a blob deleted behind its back. That drift is **check**'s job to find.
 
-## 2. 存储布局（container 内 blob 组织）
+## 2. Storage layout (blobs inside the container)
 
 ```
-azurestoragebackup.index.json          # 信息记录文件（非加密版；内容为二进制，见上）
-azurestoragebackup.index.json.enc      # 加密版（与非加密二选一；两者都在用非加密，PRD 1.6）
-indexes/v{N}.json[.enc]                # 第二级：每版本一个文件级索引（二进制）
-data/{xxh128}[.001,.002,...]           # 数据 blob，按内容哈希寻址（天然去重）；大 blob 分卷
-packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
+azurestoragebackup.index.json          # info file (unencrypted variant; contents are binary, see above)
+azurestoragebackup.index.json.enc      # encrypted variant (one or the other; both in use per PRD 1.6)
+indexes/v{N}.json[.enc]                # second level: one file manifest per version (binary)
+data/{xxh128}[.001,.002,...]           # data blobs, content-addressed (dedup for free); large ones split
+packs/{packId}.7z[.001,.002,...]       # grouped / split 7z packs
 ```
 
-**两级索引**（PRD 特别说明 B）：
-- 第一级 = 信息记录文件里的 `versions[]`（版本号、时间、第二级索引引用、统计）——小，每次备份只追加+更新。
-- 第二级 = `indexes/v{N}.json`——该版本全部文件清单。新版本只写新的第二级，不改旧的（除非分组死重导致，见 §6）。
+**Two index levels** (PRD note B):
 
-避免单一巨型索引反复重写；索引文件本身也压缩、加密（PRD 特别说明 B）。
+- Level one is `versions[]` inside the info file (version number, timestamp, reference to the second level, statistics) — small, appended and updated once per run.
+- Level two is `indexes/v{N}.json` — the full manifest for that version. A new version writes only its own file and never rewrites older ones (except where dead-weight compaction forces it, §6).
 
-## 3. 数据模型
+This avoids repeatedly rewriting one enormous index. The index files are themselves compressed and encrypted (PRD note B).
 
-### 3.1 信息记录文件 schema（草案）
+## 3. Data model
+
+### 3.1 Info file schema (draft)
+
 ```jsonc
 {
   "schemaVersion": 1,
   "backup": {
     "name": "...", "description": "...",
-    "sourceRootHint": "/data/photos",     // 仅提示；恢复时用户重新指定
+    "sourceRootHint": "/data/photos",     // hint only; the user re-specifies on recovery
     "encrypted": true,
     "createdAt": "...",
-    "settings": { /* 本备份生效的设置（默认值的解析结果快照） */ }
+    "settings": { /* settings in force for this backup: a snapshot of the resolved defaults */ }
   },
   "versions": [
     { "version": 1, "createdAt": "...", "indexBlob": "indexes/v1.json.enc",
@@ -71,7 +77,8 @@ packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
 }
 ```
 
-### 3.2 第二级索引 schema（indexes/v{N}.json）
+### 3.2 Second-level index schema (`indexes/v{N}.json`)
+
 ```jsonc
 {
   "version": 1,
@@ -84,131 +91,194 @@ packs/{packId}.7z[.001,.002,...]       # 分组/分卷 7z 包
       "headHash": "...", "fullHash": "...",
       "storage": { "kind": "pack", "ref": "p0001", "entryName": "sub/small.txt" } }
   ],
-  "emptyDirs": ["sub/empty1", "sub/empty2"]   // 空文件夹（备份需包含，还原需创建）
+  "emptyDirs": ["sub/empty1", "sub/empty2"]   // empty directories (backed up, recreated on restore)
 }
 ```
-- 权限、mtime、length、hash 均记录（PRD 特别说明 A）。
-- symlink：默认跳过；若用户选包含，则 `kind:"symlink"` + `target` 字段。
 
-### 3.3 本地状态（SQLite，新增表）
+- Permissions, mtime, length and hashes are all recorded (PRD note A).
+- Symlinks: skipped by default; if the user opts in, `kind:"symlink"` plus a `target` field.
 
-> **已实现（2026-07，`CachedVersionIndex` 表 + `LocalIndexCache`）**：
-> - 缓存**版本索引**（大）：按 (AccountId, Container, Version) 存序列化索引字节。版本索引写入即不可变，故命中即有效；
->   `IdentityTicks`=备份创建时间戳，用于识别 container 删后重建（版本号复用但内容不同）→ 不匹配即失效重下。
-> - **信息文件本地权威（`LocalBackupState` 表 + `TrackedInfoStore`）**：信息文件也不再每次从云端读——它可能落 Cold、读内容有取回费。本地存序列化副本 + 云端 ETag；备份写入用 `If-Match` 乐观并发检测外部改动（多机/container 重建），冲突则清本地状态并报错、下次重同步。仅本地无副本时（首次/导入前）才读云端并回填。**净效果：除导入/深度检查/重 pack 外，备份对信息文件与版本索引都零云端读。**（单用户假设：不处理真正的并发多写；ETag 把该罕见情形变成干净的中止+重同步而非丢历史。）
-> - 命中/回填：编排器 diff 读上一版本索引走缓存、写完新版本回填缓存；保留清理读保留版本索引走缓存、退役版本从缓存移除；
->   **导入时下载全部版本索引入缓存**——之后（除导入/深度检查/重 pack 外）备份/清理平时不再下载云端版本索引与数据。
-> - 缓存存的是**解密后**的索引元数据（路径/hash）；与密钥化寻址的威胁模型一致（攻击者只有云端 list 权限，本机是可信端、源文件本就在此）。
+### 3.3 Local state (new SQLite tables)
+
+> **Implemented (2026-07, `CachedVersionIndex` table + `LocalIndexCache`)**
 >
-> 原设计草案（未采用其字段布局，仅保留意图参考）：
-> - `LocalBackupState`：AccountId, ContainerName, LastVersion, LastIndexCacheJson, UpdatedAt。
-> - `PackState`：packId, members, originalBytes, deadBytes。
-> - 本地缓存是优化；权威在 container 信息文件。
+> - **Version indexes are cached** (they are the large ones), keyed by `(AccountId, Container, Version)` as serialised bytes. A version index is immutable once written, so a hit is valid by construction. `IdentityTicks` (the backup's creation timestamp) detects a container deleted and recreated — version numbers get reused but the contents differ — and a mismatch invalidates and re-downloads.
+> - **The info file is locally authoritative too** (`LocalBackupState` + `TrackedInfoStore`): it is no longer read from the cloud each run, since it may sit in Cold where reads cost money. A serialised copy plus the cloud ETag is kept locally; a backup writes with `If-Match` to detect external changes (another machine, a recreated container), and on conflict it clears local state and reports, resyncing next time. Only when no local copy exists (first run, before import) is the cloud read and the copy backfilled. **Net effect: outside import, deep check and repacking, a backup performs zero cloud reads of the info file and version indexes.** (Single-user assumption: genuine concurrent writers are not handled; the ETag turns that rare case into a clean abort and resync rather than lost history.)
+> - Hits and backfills: the orchestrator's diff reads the previous version index from the cache and backfills the new one after writing; retention cleanup reads retained indexes from the cache and evicts retired versions. **Import downloads every version index into the cache**, after which routine backups and cleanups no longer download version indexes or data.
+> - The cache stores **decrypted** index metadata (paths, hashes), consistent with the keyed-addressing threat model: the attacker has cloud list access only, while this machine is trusted and holds the source files anyway.
+>
+> The original draft (field layout not adopted, kept for intent): `LocalBackupState` (AccountId, ContainerName, LastVersion, LastIndexCacheJson, UpdatedAt) and `PackState` (packId, members, originalBytes, deadBytes). The local cache is an optimisation; authority is the container's info file.
 
-## 4. 备份流程（状态机）
+## 4. Backup flow (state machine)
 
 ```
 Scan → Diff → Plan(group/dedup) → Compress → Upload → WriteIndex → Finalize → Cleanup
 ```
 
-1. **Scan**：遍历本地根，应用 gitignore 忽略规则（§5），产出条目（path/kind/length/mtime/permissions）。收集空文件夹。
-2. **Diff**（PRD 特别说明 A）：对比上一版本索引：
-   - length 不同 → 变更，需处理。
-   - length 同、mtime 或权限不同 → 先比 **headHash**（文件头部一小段，默认 4 KB，可配）：不同 → 变更；相同 → 再比 **fullHash**；fullHash 不同 → 变更；相同 → 仅更新索引元数据（不重传）。
-   - 上版本有、本次无 → 删除（新版本排除）。
-   - **归类为单文件 blob 的条目跳过 fullHash**（`BackupDiffer` 的 `fullHashDeferred`）：那条路上 hash 是压缩那一遍读顺手算出来的（`StreamAndStageAsync`），算完还会覆盖 diff 记的值，diff 再读一遍等于把每个大文件从头到尾读了两遍。归类只看路径与长度（§6），扫描一结束就定得下来。**仅**对已经确定变更的判定生效（新增、以及长度不同的修改）；「length 同、mtime/权限变」那条两级哈希路径不受影响——那里的 fullHash 正是区分 MetadataOnly 与 Modified 的唯一依据。
-3. **Plan**：对变更文件决定分组/单文件（§6），死重压实检查。
-4. **Compress**：7z 压缩/加密/分卷，经临时区状态机（§7）；处理后重校验（§9）。
-5. **Upload**：并发上传 data/pack blob，设置 Tier（索引=索引 Tier，数据=数据 Tier），重试退避（PRD 4.1）。
-6. **WriteIndex**：写第二级 `indexes/v{N}.json`（先上传，成功）。
-7. **Finalize**：原子更新信息记录文件（§8）——先写新内容到临时 blob，成功后覆盖，避免网络失败导致整体损坏（PRD 特别说明 C）。
-8. **Cleanup**：按保留策略清理超期版本及其独占数据（§10）。
+1. **Scan** — walk the local root applying gitignore rules (§5), producing entries (path/kind/length/mtime/permissions). Collect empty directories.
+2. **Diff** (PRD note A) — compare against the previous version index:
+   - Different length → changed, needs processing.
+   - Same length, different mtime or permissions → compare **headHash** first (a leading slice, 4 KB by default, configurable): different → changed; same → compare **fullHash**; different → changed; same → update index metadata only (no re-upload).
+   - Present in the previous version, absent now → deleted (excluded from the new version).
+   - **Entries classified as single-file blobs skip fullHash** (`BackupDiffer`'s `fullHashDeferred`): on that path the hash is computed as a by-product of the compression read (`StreamAndStageAsync`) and then overwrites what diff recorded, so having diff read it too means reading every large file twice end to end. Classification depends only on path and length (§6) and is settled as soon as the scan ends. This applies **only** to entries already known to have changed (added, and modified with a different length); the two-level hash path for "same length, mtime or permissions changed" is untouched — there, fullHash is the only thing distinguishing MetadataOnly from Modified.
+3. **Plan** — decide grouping vs single file for changed files (§6), and check for dead-weight compaction.
+4. **Compress** — 7z compression / encryption / volume splitting through the staging state machine (§7), with a post-processing recheck (§9).
+5. **Upload** — upload data and pack blobs concurrently, setting the tier (index tier for indexes, data tier for data) with retry backoff (PRD 4.1).
+6. **WriteIndex** — write `indexes/v{N}.json` (upload first, confirm success).
+7. **Finalize** — update the info file atomically (§8): write the new contents to a temporary blob, then overwrite on success, so a network failure cannot corrupt the whole thing (PRD note C).
+8. **Cleanup** — apply the retention policy to expired versions and the data only they referenced (§10).
 
-进度反馈（PRD 备份设计 §2）：百分比 + 变更文件数/尺寸（未压缩、分组前，删除不计）。
+Progress reporting (PRD backup design §2): percentage plus changed file count and size (uncompressed, pre-grouping, deletions excluded). The full design is in [progress-display-design.md](progress-display-design.md).
 
-## 5. gitignore 规则引擎（统一组件）
+## 5. The gitignore rule engine (shared component)
 
-三处复用（忽略 3.3.1 / 不压缩 3.3.2.2 / 不分组 3.3.3.2），语法一致（gitignore 风格，支持否定 `!` 特例）。
-- 输入：规则集 + 相对路径 → 命中判定。
-- 单一实现，三处各持一份规则集。
+Reused in three places (ignore 3.3.1 / don't-compress 3.3.2.2 / don't-group 3.3.3.2) with identical syntax (gitignore style, including negation with `!`).
 
-## 6. 分组打包与死重压实（PRD 3.3.3）
+- Input: a rule set plus a relative path → a match decision.
+- One implementation; each of the three sites holds its own rule set.
 
-- **分组**：默认把同一目录（不含子目录）的小文件合并成一个 7z pack，减少 blob 数。
-  - **跨路径打包**（2026-07-27 新增，`CrossDirGroupRules`，全局默认 + 每备份覆盖，默认空）：命中规则的路径改为**无视目录边界**按完整路径排序装箱。
-    起因是实测：散列分片目录（Emby/Jellyfin 元数据、Git objects、各类缓存——目录极多、每个目录一两个文件）下按目录切分会让包数逼近文件数，
-    46,624 个文件产生上万个包，每个包一次 7z 进程加一次计费的上传请求，分组的意义完全落空。路径排序天然让同目录文件相邻，故局部性不丢。
-    优先级：**不分组 > 跨路径打包 > 按目录打包**。默认空 = 与历史行为逐字节一致。
-  - 尺寸限制（默认 5M）：超过者不入组，单文件处理。仅对新增文件生效。
-  - 不分组列表（gitignore 语法）：命中者单文件处理。
-  - 单组上限（默认 100M，压缩前）。
-- **死重压实**（默认 30%）：pack 内文件被删/变更后旧数据留存；当死重比例（原始尺寸）> 阈值，pack 中**仍有效**的文件重新参与处理（按当前尺寸限制/不分组列表重新决定分组），旧 pack 在本次备份完成后删除。
-  - **死重判定**：仅当所有有效版本都不再引用该文件，才算死重（§10 保留策略影响）。
+## 6. Grouping, packing and dead-weight compaction (PRD 3.3.3)
 
-> **实现说明（以代码为准）**：
-> - `GroupingPlanner` 对本次全部变更文件（Added **与** Modified）统一套用尺寸阈值/不分组列表。
-> - **死重压实已接入清理管线**（`DeadWeightCompactor` + `RetentionCleaner`，2026-07-17）：采用**原地重压**而非「重新参与规划」——
->   pack 死重比例超阈值（默认 30%，`GlobalSettings.DeadWeightThresholdPercent`）时，下载该 pack→解压→**仅保留仍有效成员**重压→覆盖同 packId blob（删旧分卷）。
->   因 pack 按 `packId+entryName` 引用、有效成员 entryName 不变，**无需改写任何版本索引**（比 §6 原始「重新决定分组」更简单且避免跨版本改索引）。仅在版本退役时触发（死重只在此时增加）。
-> - **成员内容来源：本地优先**。重压时先看仍有效成员在**本地是否有相同内容**（须 hash 确认，即便长度/时间/权限相同）：有则直接用本地、**无需下载**。仅本地缺失的成员才需从云端取回旧 pack 解压补齐。
->   - 因此**全部有效成员本地可得时，Archive tier 的 pack 也能压实**（不读云端）。
->   - 本地缺失成员时，是否下载云端 pack 由**按数据 tier 的开关**决定：`GlobalSettings.RepackDownload{Hot,Cool,Cold,Archive}`（默认 真/真/真/**假**——Archive 关，避免高成本取回/rehydrate）。不允许下载则**放弃该 pack 的重打包**（保留死重、记 `DeadBytes` 以便观测）。
->   - 先按存在性判断本地缺失、再做 hash 比对（短路优化）。见 `DeadWeightCompactor`。
+- **Grouping** — by default, small files in one directory (excluding subdirectories) are merged into one 7z pack to reduce blob count.
+  - **Cross-directory packing** (2026-07-27, `CrossDirGroupRules`, global default plus per-backup override, empty by default): matching paths are packed by full-path order, ignoring directory boundaries. This came from measurement: under hash-sharded directory trees (Emby/Jellyfin metadata, Git objects, assorted caches — very many directories with one or two files each), splitting by directory drives the pack count towards the file count. 46,624 files produced over ten thousand packs, each costing a 7z process and a billable upload request, which defeats grouping entirely. Path ordering keeps same-directory files adjacent, so locality is not lost. Precedence: **don't-group > cross-directory > by-directory**. Empty by default, i.e. byte-for-byte identical to the historical behaviour.
+  - Size limit (5 MB default): larger files are handled individually. Applies to newly added files only.
+  - Don't-group list (gitignore syntax): matches are handled individually.
+  - Per-group cap (100 MB default, pre-compression).
+- **Dead-weight compaction** (30% default) — when files inside a pack are deleted or changed, the old data remains. Once the dead ratio (by original size) exceeds the threshold, the pack's **still-live** files are reprocessed (re-deciding grouping by the current size limit and don't-group list) and the old pack is deleted after the run completes.
+  - **Dead-weight criterion**: only when no valid version references the file any more (affected by the retention policy, §10).
 
-## 7. 临时区状态机（PRD 3.3.2.4）
+> **Implementation notes (code is authoritative)**
+>
+> - `GroupingPlanner` applies the size threshold and don't-group list uniformly to all changed files (Added **and** Modified).
+> - **Compaction is wired into the cleanup pipeline** (`DeadWeightCompactor` + `RetentionCleaner`, 2026-07-17), using **in-place recompression** rather than "reprocess through planning": when a pack's dead ratio exceeds the threshold (30% default, `GlobalSettings.DeadWeightThresholdPercent`), the pack is downloaded, extracted, recompressed from **only the still-live members**, and written over the same packId (deleting old volumes). Because packs are referenced by `packId + entryName` and live members keep their entryName, **no version index needs rewriting** — simpler than the original §6 plan and avoiding cross-version index edits. Triggered only when a version retires, since that is the only time dead weight grows.
+> - **Member content comes from local first.** Before recompressing, check whether each live member has identical content **locally** (hash-confirmed, even when length, time and permissions match): if so, use the local file and **skip the download**. Only members missing locally require fetching the old pack from the cloud.
+>   - Consequently **a pack in the Archive tier can still be compacted when every live member is available locally** (no cloud read).
+>   - When members are missing locally, whether to download is decided **per data tier**: `GlobalSettings.RepackDownload{Hot,Cool,Cold,Archive}` (defaults true/true/true/**false** — Archive off, to avoid expensive retrieval and rehydration). If downloading is not permitted, **the repack is abandoned** for that pack (the dead weight stays, recorded as `DeadBytes` for observability).
+>   - Existence is checked before hashing (a short-circuit). See `DeadWeightCompactor`.
 
-两个目录：
-- **压缩临时文件夹**（compress-temp）：7z 的输出目标。
-- **压缩后临时区**（staged-temp，默认上限 1GB）：压缩结果移入，供上传。
+### 6.1 Cross-pack member dedup within one run (`PackAliasTable`)
 
-规则：
-- 压缩先输出到 compress-temp → 完成后**移动**整套分卷到 staged-temp（避免压缩中分卷被改动）。
-- **压缩全局非并发**（跨备份也不并发）——单一压缩队列/锁。
-- staged-temp 未达上限 → 分发下一个压缩任务；已超量 → 暂停新压缩，直到上传腾出空间。
-- 允许「新加入的一个压缩结果导致暂时超限」。
-- 上传完成即从 staged-temp 删除。
+Small files being packed used to have only two layers of dedup:
 
-## 8. 索引/信息文件原子性（PRD 特别说明 C）
+- **Within one pack** — 7z's solid archive dictionary matches across members, so duplicates cost almost nothing.
+- **Across versions** — `LocalDedupResolver.TryFindPackMember` looks up the indexes of retained versions; a hit points the new entry straight at the existing member without compressing, uploading or packing it.
 
-- 数据/pack blob：内容寻址，先传数据再改索引；重复传等价（幂等）。
-- 第二级索引：新版本写新文件，不覆盖旧。
-- 信息记录文件更新：写到临时 blob → 校验 → 覆盖正式名（或用 blob 版本/ETag 乐观并发）。网络失败时旧文件仍完整。
+What was missing is **within one run, across packs**. The member table was only built from the historical `VersionIndex` passed into `LocalDedupResolver.Build`, so packs sealed during this run never entered it. On a first backup, or one adding many duplicate small files, identical content landing in different packs really was stored once per pack — compression dictionaries are not shared between packs.
 
-## 9. 处理后重校验与反复保护（PRD 特别说明 D）
+**The criterion is four-way strict equality**: `fullHash` + `length` + `headHash` + `tailHash`. Any one differing or missing disqualifies. This matches `TryFindPackMember` exactly, for the reason recorded there: the criterion is either all four or it is not one, and making an exception for compatibility means leaving an ambiguous case in the one place that must not be ambiguous — "is this the same content?". All four are guaranteed present for pack candidates, since Added and Modified are computed by a single `ContentIdentityAsync` read; only unchanged entries can lack them, and they never take this path.
 
-- 每个文件处理后重查 mtime/权限 → 变则重算 hash → hash 变则重处理。
-- 反复达阈值（默认 5，env 可配）→ 报警，以当前版本保存，停重试。
-- 分组文件：压缩后对组内原始文件重校验；变更的移出分组，放当前目录下一个分组，无则单文件。
-- 收尾检查：全部处理结束、上传索引前再校验一遍，已报警的跳过。
+**Where the decision happens** — one more tier after the existing `TryFindPackMember` lookup:
 
-## 10. 版本保留与清理（PRD 3.2、9）
+```
+existing-pack hit (cross-version, unchanged)  → write the StorageRef directly, file = null
+    ↓ miss
+this-run alias hit                            → record as an alias, file = null, not packed
+    ↓ miss
+register self as leader                       → packed as usual
+```
 
-- 保留策略：最大版本数（默认 100）+ 最长时间（默认 180 天），超量判断方式（两者都到/任一到/仅版本/仅时间）。
-- 清理时机：备份完成时 + 计划任务 Cleanup。
-- 删除版本 → 删其第二级索引 + 不再被任何有效版本引用的数据 blob/pack。
-  - **分卷清理（以代码为准）**：`RetentionCleaner` 在比对引用时把 data blob 名 `data/{hash}.NNN` 归一化回基名，pack 按 `packId` 归组枚举 `packs/` 前缀，确保「删除时整个分卷族一起删、被引用的分卷不会被误删」（§7）。
+The alias branch ends **exactly like** the existing-pack hit (`file = null`), taking the established "this entry did not change" path: directory counters decrement as usual, sealing timing is unaffected, no upload slot is taken and nothing needs settling. As a result the consumer side — `ProcessPackAsync`, `RecordPack`, `CompressPackTolerantAsync`, `UploadStagedPackAsync` — needs **no changes at all**.
 
-## 11. 前端：新建备份流程（PRD 备份设计 §1）
+Ordering cannot conflict with cross-version dedup: if the leader hits an existing pack, later files with the same content use the same member table and the same four-way criterion and also hit the first tier, never reaching the alias table. So any leader in the alias table is one newly packed in this run.
 
-两步向导：
-1. 基础信息（创建后不可改，除名字/描述）：账户+container（可新建 container）、本地根路径、名字、描述、密码（可选=加密）、索引 Tier、数据 Tier。
-2. 基于默认值的本备份设置（逐项或勾选「使用默认」）：忽略/压缩/分组规则、版本保留、并发、symlink（默认跳过）、执行记录保留。
-完成后「立即备份」或「暂不执行」。
+**Backfill happens at the end**, after all consumers join and before entries are built. By then everything has stopped and the decision is purely synchronous. For each leader:
 
-## 12. 子任务拆分（建议分阶段实现，每阶段可独立验证）
+```
+storageByPath[leader] is { Kind: "pack" }
+  and leader ∉ overrides
+  and leader ∉ postDiffUnreadable
+      → copy that StorageRef to every alias of this leader
+otherwise
+      → all its aliases are orphaned
+```
 
-- **M4a — 扫描与索引基础**：gitignore 引擎、本地扫描、索引 schema + 序列化（含加密）、信息文件读写 + 原子更新、本地状态缓存。验证：对一个目录产出/读取索引往返（Azurite）。
-- **M4b — 对比引擎**：版本 diff（length/mtime/权限/hash），仅元数据变更只更新索引。验证：改动文件→正确识别变更/仅元数据/删除。
-- **M4c — 压缩与临时区**：7z 封装（压缩/加密/分卷）、临时区状态机（非并发、超量阻塞、先临时后移动）、处理后重校验。验证：压缩产出分卷 + 临时区调度。
-- **M4d — 分组与死重**：分组打包、死重压实。验证：小文件合并、死重触发重组。
-- **M4e — 上传与保留**：并发上传 + 重试退避 + Tier、版本保留清理。验证：上传到 Azurite、清理旧版本。
-- **M4f — 编排器与前端**：串联全流程 + 进度反馈、新建备份向导。验证：端到端跑一次真实备份（Azurite）。
+The three veto conditions map to the three real ways a leader goes astray:
 
-## 13. 决策（已定，2026-07-16）
+| Condition | Meaning |
+|---|---|
+| `overrides[leader]` set | The content changed inside the compression window (a new hash was written). **The alias's content no longer equals the leader's** — this is the correctness red line of the whole feature |
+| `postDiffUnreadable[leader]` set | The leader was unreadable on the second attempt too and was downgraded in place, producing no blob |
+| `storageByPath[leader]` not a pack, or missing | It grew past the threshold and became a single-file blob, or the whole group was unreadable |
 
-1. **7z 实现**：用**官方 7-Zip**——backend Dockerfile 装 Debian `7zip` 包（提供 `7zz`）。命令：`7zz a -p{pwd} -mhe=on -v{size} out.7z ...`（AES-256 + 头加密 + 分卷），解包 `7zz x out.7z.001`。若 apt 版本过旧则改用官网二进制。
-2. **hash 算法**：**XxHash128**（fullHash 与 headHash 均用；`xxh128:` 前缀，16 字节）。原定 SHA-256，后改为非加密的 XxHash128——更快、更短（索引体积减半），128 位对个人备份规模的内容寻址去重碰撞概率可忽略。**不用 CRC**：CRC 碰撞率太高，作去重键会丢数据。
-3. **去重 / 变更检测**：整文件级去重（去重键 = fullHash）。变更检测用**两级 hash**——索引存 headHash（头部一小段，默认 4 KB，可配）+ fullHash；Diff 先比 headHash 快速预筛，相同再比 fullHash。分块（CDC）去重留后续优化。
-4. **索引序列化**：**紧凑自定义二进制** + 7z 压缩。原定 JSON，后改为二进制以减小体积——hash 存 16 字节裸字节（而非 `xxh128:`+hex 文本）、枚举/时间/长度定宽编码。`IndexSerializer` 公开 API 不变（字节数组往返），备份/还原/blob 存储透明。
-5. **检查「本地文件存在」**：与 §4 Diff 一致（length → mtime/权限 → headHash → fullHash）。
-6. **前端进度**：先用轮询（`GET /api/backups/{id}/progress`），简单可靠；后续可升级 SSE。
+The decision looks only at the **final state** and never tracks intermediate steps, so there is no race where the diff thread attaches an alias just as a consumer condemns the leader. That is the entire point of deferring backfill to the end, and it is why no new concurrency primitive is needed.
+
+**Orphaned aliases are re-run.** When a leader goes astray, the alias files themselves are usually fine and should not be dragged down; they are pushed through as ordinary files and the first one naturally becomes a new leader. The upload gate, staging lease and upload scope are all still in scope at that point and are reused directly. They are split into two pools by compression mode first — one pack has one mode, and that cut must happen before packing — and `storeOnly` is evaluated against the **alias's own path**, since rules match by path and an alias may live in a different directory from its leader. Orphaned aliases are **not** deduplicated against each other: reaching this path requires the leader to be rewritten or become unreadable inside the compression window, which is rare to begin with, and storing a few extra copies on a rare path buys a linear, readable, testable finish.
+
+**Progress counting pairs to zero.** Aliases neither `Enqueue` nor report an item — both sides are zero, which balances by construction, since an alias genuinely corresponds to no work. The orphan re-run passes a no-op item callback for the same reason: `Enqueue` is "once per work item", while `ProcessPackAsync` calls back once per group and how many groups `GroupIsFull` produces is its own decision, which the caller cannot declare in advance. On screen: with no orphans the behaviour is identical to before (the path does not execute); with orphans, the bar has already reached 100% and the finish runs silently for a while. The trade-off is deliberate — better a brief unreported stretch on an extremely rare path than any chance of a wrong denominator on the normal path.
+
+**Read-only guarantees for existing backups:**
+
+1. The alias table is built only from **this run's** changes and never reads or writes the previous index. Old indexes are untouched.
+2. The reference written is `{Kind="pack", Ref=packId, EntryName=leaderPath}` — byte-for-byte the same shape `RecordPack` and cross-version dedup already wrote. No schema change, no new field.
+3. Unchanged entries always carry their storage forward and never take this path. **No existing reference is released**, so existing packs' `deadBytes` do not move at all.
+4. Every consumer was verified individually: retention collects live packs by `Storage.Ref` and groups live members by `EntryName`; the compactor's `liveBytes` deduplicates by EntryName against an `OriginalBytes` that counts actual members, so `liveBytes ≤ OriginalBytes` always holds and `deadBytes` cannot go negative or trigger compaction spuriously; restore copies each entry from `extractDir/EntryName` to its own path; check looks up each `entryName` and passes when both entries find the same item; repair collects by `(packId, EntryName)`.
+5. **Two entries in one version index pointing at the same `(packId, EntryName)`** was already producible when cross-version dedup shipped. This feature introduces no new shape, it only makes that one common.
+6. **No retroactive merging.** Duplicates already in history stay as they are until their versions retire. Merging them would mean rewriting old packs — a destructive operation on already-backed-up data.
+
+**Aliases make a member harder to kill, not easier.** Live members are grouped by EntryName, so a member survives as long as **any** referencing path survives; an alias is one more pin. That is deliberate — references collecting on older packs make those packs less likely to be rewritten by compaction. The corollary is that **after the leader's own file is deleted, an alias must still restore**: at that point the entryName is kept alive by the alias entry alone, the pack is not deleted, the member does not die, and `extractDir/leaderEntryName` is still extractable. Every link in that chain was verified, but it is the part most likely to be quietly broken by a future refactor, so it is pinned by a test.
+
+**Known trade-off: aliases degrade "repairable from local".** `BackupRepairer` looks for exactly one local repair source when fixing a member, and that path is `entryName` — the leader's path. Once the local file at the leader's path is gone or changed, the member cannot be repaired, and **every** path referencing it (the leader plus all aliases) is marked unrecoverable — even when a byte-identical file is sitting at one of the alias paths. `DeadWeightCompactor` probes the same single path and degrades the same way. This is not a new category: cross-version dedup has always had it, since local repair only ever looks at `entryName` regardless of how many entries reference the member. But this feature turns it from **occasional** into **routine**: cross-version hit rates depend on files being renamed or moved between versions, whereas within-run dedup fires whenever a backup contains duplicate small files. The fix is cheap and safe — the reference set already contains every path pointing at the member, so trying them in turn as local sources costs only a few extra `File.Exists` calls and hash computations, and `LocalMatchesAsync` verifies by hash anyway. It touches local probing in both the repairer and the compactor, so it is recorded here rather than done in passing.
+
+**`PackInfo.Members` narrowed in meaning.** It lists the `fullHash` of each member. It used to double as "does this pack contain this content" and roughly as "how many references does this pack have". Now identical content is registered once per pack (aliases point at the same `EntryName` and create no new member), so `Members` equals neither the number of index entries referencing the pack nor a way to tell whether a piece of content appears twice. No consumer relies on that today — they all go by `EntryName` or `Ref` — but anyone reaching for `Members.Count` to estimate "how much did dedup save" will get a number that is too low.
+
+## 7. The staging state machine (PRD 3.3.2.4)
+
+Two directories:
+
+- **compress-temp** — 7z's output target.
+- **staged-temp** (1 GB default cap) — compression results are moved here for upload.
+
+Rules:
+
+- Compression writes into compress-temp and **moves** the whole volume set into staged-temp on completion (so a volume cannot be modified mid-compression).
+- **Compression never runs concurrently, not even across backups** — one global queue and lock.
+- Below the cap, the next compression is dispatched; over it, new compressions pause until uploads free space.
+- One newly added result is allowed to overshoot the cap temporarily.
+- A completed upload deletes from staged-temp immediately.
+
+## 8. Index and info-file atomicity (PRD note C)
+
+- Data and pack blobs are content-addressed: upload data first, then update the index; re-uploading is equivalent (idempotent).
+- Second-level indexes: a new version writes a new file and never overwrites an old one.
+- Info file updates: write to a temporary blob, verify, then overwrite the real name (or use blob versioning / ETag for optimistic concurrency). On network failure the old file is still intact.
+
+## 9. Post-processing recheck and repeat protection (PRD note D)
+
+- After processing a file, re-read mtime and permissions; if changed, re-hash; if the hash changed, reprocess.
+- After a threshold of repeats (5 by default, configurable by env), raise a warning, save as-is and stop retrying.
+- Grouped files: after compression, recheck the group's original files; changed members are moved out of the group into the next group for that directory, or handled individually if there is none.
+- Final sweep: after all processing and before uploading the index, recheck once more, skipping anything already warned about.
+
+## 10. Version retention and cleanup (PRD 3.2, 9)
+
+- Retention policy: maximum version count (100 default) plus maximum age (180 days default), with a configurable rule for how the two combine (both / either / count only / age only).
+- Triggered when a backup completes, and by the scheduled Cleanup task.
+- Deleting a version deletes its second-level index plus any data blob or pack no longer referenced by a valid version.
+  - **Volume-aware cleanup (code is authoritative)**: `RetentionCleaner` normalises `data/{hash}.NNN` back to the base name when comparing references, and groups packs by `packId` over the `packs/` prefix, so a volume family is deleted as a unit and a referenced volume is never deleted by mistake (§7).
+
+## 11. Frontend: the new-backup flow (PRD backup design §1)
+
+A two-step wizard:
+
+1. Basics (immutable after creation, except name and description): account + container (a new container can be created), local root path, name, description, optional password (= encryption), index tier, data tier.
+2. Per-backup settings derived from the defaults (individually, or "use default"): ignore / compression / grouping rules, version retention, concurrency, symlinks (skipped by default), run-record retention.
+
+Then "back up now" or "not yet".
+
+## 12. Subtask breakdown (historical, all delivered)
+
+- **M4a — scanning and index foundations**: the gitignore engine, local scanning, index schema and serialisation (including encryption), info-file read/write with atomic updates, local state cache.
+- **M4b — the diff engine**: version diff (length/mtime/permissions/hash), metadata-only changes updating the index alone.
+- **M4c — compression and staging**: the 7z wrapper (compression, encryption, volume splitting), the staging state machine (non-concurrent, blocking over the cap, temp-then-move), the post-processing recheck.
+- **M4d — grouping and dead weight**: pack grouping, dead-weight compaction.
+- **M4e — upload and retention**: concurrent upload with retry backoff and tiers, version retention cleanup.
+- **M4f — orchestrator and frontend**: the full pipeline with progress reporting, and the new-backup wizard.
+
+## 13. Decisions (settled 2026-07-16)
+
+1. **7z implementation** — the **official 7-Zip**: the backend Dockerfile installs the Debian `7zip` package (which provides `7zz`). Command: `7zz a -p{pwd} -mhe=on -v{size} out.7z ...` (AES-256, header encryption, volume splitting); extraction is `7zz x out.7z.001`. If the apt version is too old, fall back to the official binary. (It since had to: p7zip / 7-Zip 23.01 write a zero attribute for `-si` stdin input, which makes single-file blobs unrestorable, so the image fetches the official `7zz`.)
+2. **Hash algorithm** — **XxHash128** for both fullHash and headHash (`xxh128:` prefix, 16 bytes). Originally SHA-256, changed to the non-cryptographic XxHash128: faster and shorter (halving index size), and 128 bits makes collision probability negligible for content-addressed dedup at personal-backup scale. **Not CRC**: its collision rate is far too high to use as a dedup key without losing data.
+3. **Dedup and change detection** — whole-file dedup keyed on fullHash. Change detection uses **two hash levels**: the index stores headHash (a leading slice, 4 KB default, configurable) and fullHash, and diff compares headHash first as a fast filter. Content-defined chunking is deferred.
+4. **Index serialisation** — **compact custom binary** plus 7z compression. Originally JSON, changed to binary for size: hashes stored as 16 raw bytes rather than `xxh128:`+hex text, with fixed-width encoding for enums, times and lengths. `IndexSerializer`'s public API is unchanged (byte-array round trip), so backup, restore and blob storage are unaffected.
+5. **"Local file exists" during check** — same ladder as the §4 diff (length → mtime/permissions → headHash → fullHash).
+6. **Frontend progress** — polling first, simple and reliable. (See [progress-display-design.md](progress-display-design.md) for where that went.)

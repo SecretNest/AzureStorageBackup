@@ -8,7 +8,7 @@
 
 **Tech Stack:** .NET 10 / C# 13、xunit（`SkippableFact` 用于集成测试）、`System.Threading.Timer`、`System.Threading.Lock`。
 
-设计文档：`docs/upload-speed-clock-design.md`。
+设计文档：[progress-display-design.md](progress-display-design.md)（本文件描述的那一轮已并入其中；下文出现的 `docs/upload-speed-clock-design.md` 是当时的实现记录，保留原样）。
 
 ## Global Constraints
 
