@@ -7,6 +7,9 @@ namespace AzureStorageBackup.Api.Services;
 /// 也不行——journal 是按路径记的，同内容不同路径在索引里是两条不同的条目。
 /// </para>
 /// <para>
+/// 多卷之间同一条路径重复时新的胜，判据见 <see cref="FromVolumes"/>。
+/// </para>
+/// <para>
 /// 纯内存、纯本地，不读云端。记录能进 journal 的前提就是"上传已经确认返回"，所以这里不需要
 /// （也不应该）再去云上核对一次——那会违反"备份期间零云读"这条底线。
 /// </para>
@@ -15,7 +18,26 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
 {
     public static readonly JournalResume Empty = new([]);
 
-    /// <summary>按路径索引的单文件 blob 记录。重复路径先命中者胜（多卷 journal 会有重复）。</summary>
+    /// <summary>
+    /// 从若干卷 journal 建表。**按开跑时刻从新到旧**把记录串起来，让下面的"先命中者胜"落成"新的胜"。
+    /// <para>
+    /// 不排的话顺序来自 <see cref="BackupJournalStore.ListAsync"/>，那是按文件名的序数序，而文件名是
+    /// runId——每轮新生成的 GUID 前缀。于是"同一条路径在两卷里记着不同内容"（两次挂起之间文件被改过）
+    /// 时谁胜是掷骰子。掷输了不会漏传：被盖住的那条记录从 <see cref="FindBlob"/> 和
+    /// <see cref="ConfirmedBlobs"/> 都够不着，四项内容判据对不上就当没有，照传不误；
+    /// 而清理器那边 <c>LoadActiveRefsAsync</c> 是逐条过所有记录的，被盖住的块照样受保护。
+    /// 代价只是"明明上一轮传过的那一版，这一轮又传一遍"，且随运行不同时有时无——这种不确定性
+    /// 本身就不该留在恢复路径上。
+    /// </para>
+    /// </summary>
+    public static JournalResume FromVolumes(IReadOnlyList<JournalContent> volumes)
+        => volumes.Count == 0
+            ? Empty
+            : new JournalResume([..
+                volumes.OrderByDescending(v => v.Header.StartedAt).SelectMany(v => v.Records)]);
+
+    /// <summary>按路径索引的单文件 blob 记录。重复路径先命中者胜；调用方
+    /// （<see cref="FromVolumes"/>）已把各卷按开跑时刻从新到旧排好，所以胜出的是最新那一卷记的。</summary>
     private readonly Dictionary<string, JournalRecord> _blobs = BuildBlobs(records);
 
     /// <summary>按成员集合的规范化键索引的 pack 记录。</summary>

@@ -223,9 +223,7 @@ public sealed class BackupRunControl(
         SweepNeeded = voided || adopted.Count > 0 || firstRun;
         // 采纳是**只读**的：本轮仍新开自己那一卷，旧卷原样留着。这样就不必把复用来的记录再抄一遍，
         // 也不会出现"抄到一半又崩了"的半截状态。旧卷等本轮成功提交索引时一起删。
-        Resume = adopted.Count == 0
-            ? JournalResume.Empty
-            : new JournalResume([.. adopted.SelectMany(c => c.Records)]);
+        Resume = JournalResume.FromVolumes(adopted);
 
         // runId 与刚采纳的那一卷重名时**接着写**，不能新开：CreateAsync 是 FileMode.Create，
         // 会把刚刚采纳的那一卷当场截断。

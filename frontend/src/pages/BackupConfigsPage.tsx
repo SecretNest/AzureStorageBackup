@@ -11,6 +11,7 @@ import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { latestWins } from '../lib/latestWins'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { Modal } from '../components/Modal'
 import {
@@ -139,10 +140,18 @@ export function BackupConfigsPage() {
   // 下一轮再说。load() 之外，无人触发的 5 秒后台刷新也要走这条路——否则程序在页面开着的时候
   // 重启，内存里的运行状态没了，interrupted 却只在挂载和用户动作时才更新，中断现场提示
   // 永远冒不出来，只有整页刷新才能看到。
+  // 两个触发点（用户动作走的 load()、无人触发的 5 秒轮询）会让两轮请求同时在飞，而它们整份地
+  // 覆盖同一份状态。谁先回来不由发起顺序决定，所以要一道"只让最后发起的那次写"的闸门，
+  // 否则旧快照会盖掉新快照，界面上留着一条已经不存在的中断现场直到下一拍。为什么不是 cancelled
+  // 标志，见 latestWins 的说明。
+  const interruptedGate = useRef(latestWins())
   const refreshInterrupted = (list: BackupConfig[]) => {
+    const isLatest = interruptedGate.current.begin()
     void Promise.all(
       list.map(async (c) => [c.id, await backupConfigsApi.interrupted(c.id).catch(() => [])] as const),
-    ).then((pairs) => setInterrupted(Object.fromEntries(pairs)))
+    ).then((pairs) => {
+      if (isLatest()) setInterrupted(Object.fromEntries(pairs))
+    })
   }
 
   const load = () => {

@@ -15,6 +15,42 @@ public class JournalResumeTests
         Kind = "pack", Ref = packId, Members = members, VolumeSizes = [500], Volumes = 1,
     };
 
+    private static JournalContent Volume(int startedAtHour, params JournalRecord[] records) => new(
+        new JournalHeader
+        {
+            RunId = "r" + startedAtHour, ConfigId = 1, StartedAt = DateTimeOffset.UnixEpoch.AddHours(startedAtHour),
+            BaselineVersion = 0, LocalRoot = "/data/src", EncryptionIdentity = "plain",
+        },
+        records);
+
+    /// <summary>
+    /// 同一条路径在两卷里记着不同内容（两次挂起之间文件被改过）时，胜出的必须是**新的那一卷**，
+    /// 而且与两卷送进来的先后无关。
+    /// <para>
+    /// 不定序不会漏传（内容判据对不上就当没有，照传不误），但会让"上一轮传过的那一版这轮还算不算数"
+    /// 随运行掷骰子——同样的输入两次跑出不同的重传量，这种事不该留在恢复路径上。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void The_newest_volume_wins_a_path_recorded_twice()
+    {
+        var older = Volume(0, Blob("a.bin", "aaa"));
+        var newer = Volume(1, Blob("a.bin", "zzz"));
+
+        foreach (var volumes in new[] { new[] { older, newer }, [newer, older] })
+        {
+            var r = JournalResume.FromVolumes(volumes);
+            Assert.Equal(1, r.RecordCount);
+            Assert.Equal("data/zzz", r.FindBlob("a.bin", "zzz", 100, "hzzz", "tzzz")!.Ref);
+            Assert.Null(r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa"));
+            Assert.Equal(["data/zzz"], r.ConfirmedBlobs().Select(b => b.Blob.Ref));
+        }
+    }
+
+    [Fact]
+    public void No_volumes_gives_the_empty_resume()
+        => Assert.True(JournalResume.FromVolumes([]).IsEmpty);
+
     [Fact]
     public void Empty_resume_finds_nothing()
     {

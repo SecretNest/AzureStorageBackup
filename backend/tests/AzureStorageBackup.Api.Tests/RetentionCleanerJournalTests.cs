@@ -111,9 +111,10 @@ public sealed class RetentionCleanerJournalTests : IDisposable
             await j.AppendAsync(r, default);
     }
 
-    private static CleanupOptions Options() => new()
+    private static CleanupOptions Options(string? localRoot = null) => new()
     {
         Retention = new RetentionPolicy { MaxVersions = 50, MaxAgeDays = 365, Mode = RetentionMode.EitherTriggers },
+        LocalRoot = localRoot,
     };
 
     [SkippableFact]
@@ -277,6 +278,15 @@ public sealed class RetentionCleanerJournalTests : IDisposable
             await PutAsync(container, "packs/p1.7z", "a pack that is 99.9% dead weight on paper");
             await PutAsync(container, "data/gone", "orphan");
 
+            // 存活成员在本地实打实放一份、hash 也是真算的：压实一旦被叫起来，它走的就是**成功**
+            // 那一支（本地取料、重压、覆盖上传），而不是"放弃/抛异常"那两支。这一点是这条测试的
+            // 判据能不能分辨"没跑过"的关键——放弃与失败会把 DeadBytes 写成 999，一眼可见；
+            // 唯独成功那一支把 DeadBytes 写回 0，与"从来没跑过"长得一模一样。
+            var localRoot = Path.Combine(_temp, "src");
+            Directory.CreateDirectory(localRoot);
+            await File.WriteAllTextAsync(Path.Combine(localRoot, "a.bin"), "x");
+            var liveHash = await new FileHasher().FullHashAsync(Path.Combine(localRoot, "a.bin"), default);
+
             // 版本 1 只引用 p1 里的一个 1 字节成员，而这一箱记着 1000 字节原始尺寸 →
             // 死重 99.9%，远超默认 30% 阈值。压实一旦被叫起来，一定会动这一箱。
             var indexBlob = await store.WriteIndexAsync(account, name, 1, new VersionIndex
@@ -286,7 +296,7 @@ public sealed class RetentionCleanerJournalTests : IDisposable
                 [
                     new IndexEntry
                     {
-                        Path = "a.bin", Kind = "file", Length = 1, Permissions = "644", FullHash = "h",
+                        Path = "a.bin", Kind = "file", Length = 1, Permissions = "644", FullHash = liveHash,
                         Storage = new StorageRef { Kind = "pack", Ref = "p1", EntryName = "a.bin" },
                     },
                 ],
@@ -303,7 +313,7 @@ public sealed class RetentionCleanerJournalTests : IDisposable
                         Stats = new VersionStats(1, 1, 1, 1),
                     },
                 },
-                Packs = { ["p1"] = new PackInfo { Blob = "packs/p1.7z", OriginalBytes = 1000, Members = ["h"] } },
+                Packs = { ["p1"] = new PackInfo { Blob = "packs/p1.7z", OriginalBytes = 1000, Members = [liveHash] } },
             };
 
             var staging = new StagingArea(
@@ -314,12 +324,18 @@ public sealed class RetentionCleanerJournalTests : IDisposable
 
             // 保留 50 版 → 唯一那个版本一个都不退役，但仍要求扫孤儿。
             var report = await Cleaner(factory, compactor).CleanupAsync(
-                account, name, null, Options(), info, default, sweepOrphans: true);
+                account, name, null, Options(localRoot), info, default, sweepOrphans: true);
 
             Assert.Equal(1, report.DeletedBlobs);                       // 扫确实做了
             Assert.Equal(0, report.RetiredVersions);                    // 而且没有任何版本退役
             Assert.Empty(await NamesAsync(container, "data/"));
-            // 压实跑过的话，这一箱的 DeadBytes 会被写成 999（重压成功、放弃、抛异常，三条路都写）。
+            // 判据落在**只有压实会写**的两项上。不看 DeadBytes：成功压实把它写成 0，与从没跑过
+            // 一模一样，这条测试等于分辨不出自己有没有生效。OriginalBytes 则一定从 1000 掉到 1
+            //（只剩那个存活成员），成员表也会被整份换掉。
+            Assert.Equal(1000, info.Packs["p1"].OriginalBytes);
+            Assert.Equal([liveHash], info.Packs["p1"].Members);
+            Assert.Empty(info.Packs["p1"].VolumeSizes);
+            // 放弃与失败那两支写的是 DeadBytes=999，顺带一并挡住。
             Assert.Equal(0, info.Packs["p1"].DeadBytes);
             // 信息文件也一个字节都没写过：这个容器里从头到尾就没有过信息文件 blob。
             Assert.False((await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync()).Value);

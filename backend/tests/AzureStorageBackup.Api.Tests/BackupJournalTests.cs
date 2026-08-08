@@ -66,6 +66,33 @@ public class BackupJournalTests : IDisposable
         Assert.Equal("data/aaa", content.Records[0].Ref);
     }
 
+    /// <summary>
+    /// 接着往一卷"最后一行是半截"的 journal 后面写：新记的那一条必须还读得出来。
+    /// <para>
+    /// 这是 <see cref="BackupJournal.OpenForAppendAsync"/> 先补一个换行的全部理由。不补的话，
+    /// 半截行和新写的这一条会粘成一行，于是**新的这条**也跟着解析不出来——而它记的是本轮刚刚
+    /// 确认上传的内容，丢了就是下一轮把那块白传一遍，且盘上没有任何人再为它作保。
+    /// 而"最后一行是半截"恰恰是崩溃留下的常态：这个文件不逐条 fsync。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Appending_after_a_torn_last_line_does_not_swallow_the_next_record()
+    {
+        var file = Path_("torn.jsonl");
+        await using (var j = await BackupJournal.CreateAsync(file, Header(), default))
+            await j.AppendAsync(
+                new JournalRecord { Kind = "blob", Ref = "data/aaa", Path = "p", FullHash = "aaa" }, default);
+        await File.AppendAllTextAsync(file, "{\"Kind\":\"blob\",\"Ref\":\"data/hal");   // 崩在写一半上
+
+        await using (var j = await BackupJournal.OpenForAppendAsync(file, default))
+            await j.AppendAsync(
+                new JournalRecord { Kind = "blob", Ref = "data/zzz", Path = "q", FullHash = "zzz" }, default);
+
+        var content = await BackupJournal.ReadAsync(file, default);
+        Assert.NotNull(content);
+        Assert.Equal(["data/aaa", "data/zzz"], content!.Records.Select(r => r.Ref));
+    }
+
     [Fact]
     public async Task Corrupt_header_voids_the_whole_journal()
     {

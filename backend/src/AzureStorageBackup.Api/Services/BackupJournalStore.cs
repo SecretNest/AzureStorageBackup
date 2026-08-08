@@ -147,7 +147,44 @@ public sealed class BackupJournalStore(string rootDir)
         return result;
     }
 
-    /// <summary>列出该容器上每卷 journal 的概览。头读不通的直接跳过（= 这卷作废）。</summary>
+    /// <summary>
+    /// 一卷 journal 已经数过的行数。<see cref="PeekAsync"/> 靠它避免每次轮询都把整卷重走一遍。
+    /// </summary>
+    /// <param name="StartedAt">数这一份时那卷的头里写的开跑时刻。见 <see cref="PeekAsync"/> 里的作废判据。</param>
+    /// <param name="Length">数完时的文件长度。</param>
+    /// <param name="SafeOffset">最后一个换行符之后的偏移。只有它之前的行才算数完了。</param>
+    /// <param name="CompleteLines">SafeOffset 之前的非空行数（含头一行）。</param>
+    /// <param name="TotalLines">连同末尾那截没换行的残行一起算的非空行数（含头一行）。</param>
+    private sealed record LineMemo(
+        DateTimeOffset StartedAt, long Length, long SafeOffset, int CompleteLines, int TotalLines);
+
+    private readonly Dictionary<string, LineMemo> _lineMemos = new(StringComparer.Ordinal);
+    private readonly Lock _memoLock = new();
+
+    /// <summary>测试用：这个实例至今为了数行数真正读过的字节数。备忘生不生效，只有数出来才算钉住。
+    /// 挂在实例上而不是静态字段上：测试类之间是并行跑的，静态计数会被别的类的 <see cref="PeekAsync"/> 搅浑。</summary>
+    internal long BytesScanned;
+
+    /// <summary>
+    /// 列出该容器上每卷 journal 的概览。头读不通的直接跳过（= 这卷作废）。
+    /// <para>
+    /// 行数是**增量**数出来的，不是每次重走一遍。界面开着的时候这个端点每 5 秒被每个配置各调一次，
+    /// 而一卷 journal 在一次二十万文件的运行里能长到几百 MB——重走一遍就是每分钟几百 MB 的读，
+    /// 抢的还是备份自己正在读的那块盘；挂起的那一卷停在盘上不动，这份开销还永远不会停。
+    /// </para>
+    /// <para>
+    /// 备忘作废判据（journal 是只追加的，这三条合起来就够）：
+    /// <list type="bullet">
+    /// <item>头里的 <see cref="JournalHeader.StartedAt"/> 变了 → 这卷被<b>另起一轮重写</b>过
+    /// （<see cref="BackupJournal.CreateAsync"/> 是 <c>FileMode.Create</c>，会截断），旧计数全不作数，从头数。
+    /// 单看长度挡不住这一条：重写出来的长度完全可能与旧的相等或更长。</item>
+    /// <item>文件比记下的短 → 同样是被换过，从头数。</item>
+    /// <item>长度没变且 StartedAt 没变 → 只追加的文件长度不变就是内容不变，直接交出上次的数。</item>
+    /// </list>
+    /// 长了就只数新增的那一段，且只从**上一次数到的最后一个换行符**接着数：这个文件不逐条 fsync，
+    /// 快照可能正落在半行中间，从文件末尾接着数会把那半行的后半截再当成一行算一遍。
+    /// </para>
+    /// </summary>
     public async Task<IReadOnlyList<JournalSummary>> PeekAsync(int accountId, string container, CancellationToken ct)
     {
         var dir = DirFor(accountId, container);
@@ -158,31 +195,104 @@ public sealed class BackupJournalStore(string rootDir)
         foreach (var file in Directory.EnumerateFiles(dir, "*.jsonl").OrderBy(f => f, StringComparer.Ordinal))
         {
             JournalHeader? header;
-            var lines = 0;
+            long length;
+            int lines;
             try
             {
-                using var reader = new StreamReader(
-                    new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite), Encoding.UTF8);
-                var first = await reader.ReadLineAsync(ct);
+                using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                string? first;
+                using (var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true))
+                    first = await reader.ReadLineAsync(ct);
                 if (first is null)
                     continue;
                 try { header = JsonSerializer.Deserialize<JournalHeader>(first, JournalJson.Options); }
                 catch (JsonException) { continue; }
                 if (header is null)
                     continue;
-                while (await reader.ReadLineAsync(ct) is { } line)
-                    if (line.Length > 0)
-                        lines++;
+
+                // 长度从已经打开的这个句柄上取，不另开 FileInfo：数行数与记长度必须是**同一个**快照，
+                // 两次取样之间那卷可能又长了一截，记下的备忘就会声称"这个长度我数到过这么多行"。
+                length = stream.Length;
+                lines = await CountLinesAsync(file, stream, header, length, ct);
             }
             catch (IOException)
             {
                 continue;   // 正在被写的那一卷偶尔读不开；下次轮询再说
             }
+            // 头一行不是记录，从总行数里扣掉。
             result.Add(new JournalSummary(
-                Path.GetFileNameWithoutExtension(file), header, lines, new FileInfo(file).Length));
+                Path.GetFileNameWithoutExtension(file), header, Math.Max(0, lines - 1), length));
         }
         return result;
     }
+
+    /// <summary>数出这一卷到 <paramref name="length"/> 为止的非空行数（含头一行），能接着上次数就接着数。</summary>
+    private async Task<int> CountLinesAsync(
+        string file, FileStream stream, JournalHeader header, long length, CancellationToken ct)
+    {
+        LineMemo? memo;
+        lock (_memoLock)
+            memo = _lineMemos.GetValueOrDefault(file);
+
+        var reusable = memo is not null && memo.StartedAt == header.StartedAt && memo.Length <= length;
+        if (reusable && memo!.Length == length)
+            return memo.TotalLines;
+
+        var from = reusable ? memo!.SafeOffset : 0;
+        var completeBefore = reusable ? memo!.CompleteLines : 0;
+
+        stream.Seek(from, SeekOrigin.Begin);
+        var buffer = new byte[64 * 1024];
+        var complete = 0;
+        var scanned = 0L;
+        var lastNewlineEnd = from;
+        var segmentHasContent = false;
+        while (scanned < length - from)
+        {
+            var want = (int)Math.Min(buffer.Length, length - from - scanned);
+            var n = await stream.ReadAsync(buffer.AsMemory(0, want), ct);
+            if (n <= 0)
+                break;
+            // 行尾按字节找。UTF-8 里 0x0A 不可能出现在多字节字符的续字节上，所以按字节扫与按字符扫
+            // 结果相同，而不必为了数一个数字把几百 MB 解码成字符串。IndexOf 走的是向量化的那条路，
+            // 逐字节自己比要慢好几倍——而这段代码要吃的正是几百 MB。
+            var rest = buffer.AsSpan(0, n);
+            var consumed = 0;
+            while (true)
+            {
+                var nl = rest.IndexOf((byte)'\n');
+                if (nl < 0)
+                {
+                    segmentHasContent |= HasContent(rest);
+                    break;
+                }
+                if (segmentHasContent || HasContent(rest[..nl]))
+                    complete++;
+                segmentHasContent = false;
+                consumed += nl + 1;
+                lastNewlineEnd = from + scanned + consumed;
+                rest = rest[(nl + 1)..];
+            }
+            scanned += n;
+        }
+        Interlocked.Add(ref BytesScanned, scanned);
+
+        // 末尾那截没换行的残行照 StreamReader.ReadLine 的老规矩算一行，但**不进备忘**：
+        // 它随时可能被后面的字节补全成一整行，记下来下次就会连着新行重复算。
+        var total = completeBefore + complete + (segmentHasContent ? 1 : 0);
+        lock (_memoLock)
+        {
+            if (_lineMemos.Count > 512 && !_lineMemos.ContainsKey(file))
+                foreach (var stale in _lineMemos.Keys.Where(k => !File.Exists(k)).ToList())
+                    _lineMemos.Remove(stale);
+            _lineMemos[file] = new LineMemo(
+                header.StartedAt, length, lastNewlineEnd, completeBefore + complete, total);
+        }
+        return total;
+    }
+
+    /// <summary>这一段里有没有正文。空行不算一行，只有 <c>\r</c> 的也不算（<c>ReadLine</c> 把 CRLF 当一个行尾）。</summary>
+    private static bool HasContent(ReadOnlySpan<byte> segment) => segment.IndexOfAnyExcept((byte)'\r') >= 0;
 
     /// <summary>汇总该容器上所有活动 journal 引用到的内容。清理判据的一半。</summary>
     public async Task<ActiveJournalRefs> LoadActiveRefsAsync(int accountId, string container, CancellationToken ct)
