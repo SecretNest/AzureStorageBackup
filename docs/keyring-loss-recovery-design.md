@@ -1,158 +1,148 @@
-# 密钥环丢失的检测与恢复（2026-07-25）
+# Detecting and recovering from key ring loss
 
-> Data Protection 密钥环（`/keys`）丢失后，库中密文字段全部无法解密。当前实现会在 EF 实体物化时抛异常，导致账号列表、备份配置列表整体 500，用户连界面都进不去，更无从修复。本文件固化该问题的设计决策与方案：**密文入库、按需解密**，配合 canary 检测与引导式重新录入。
->
-> 顺带清理 `ConnectionStrings__AzureStorage` 及其死代码链。补充 [product-requirements.md](product-requirements.md)、[backup-feature-design.md](backup-feature-design.md)。
+> When the Data Protection key ring (`/keys`) is lost, every encrypted field in the database
+> becomes undecryptable. The original implementation threw during EF entity materialisation, so
+> the account list and the backup configuration list returned 500 wholesale — the user could not
+> even reach the UI, let alone repair anything. The answer: **store ciphertext, decrypt on
+> demand**, with a canary for detection and a guided re-entry flow.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 密文的解密时机 | **去掉 ValueConverter，密文原样入库**。解密只发生在真正读懂内容的咽喉处，列表/主界面不触发解密，密钥环丢失时 UI 照常可用。 |
-| 2 | 属性命名 | 敏感属性加 `Protected` 后缀（`AccountKeyProtected` 等），用 `HasColumnName` 保持数据库列名不变。改名的编译错误清单即为需逐个审计的使用点清单。 |
-| 3 | 密钥环健康检测 | 单行表 `KeyringCanary` 存已知常量明文的密文，**不走任何转换**，由服务层显式 `Protect`/`Unprotect`。启动判定一次，结果缓存在单例。 |
-| 4 | 升级老库的判定 | canary 行不存在时，**确定性地取 `Id` 最小的 Account** 的密钥密文试解（无 Account 则回退到 `Id` 最小且密码非空的 BackupConfig）。不可用「任取一条」——EF 无 `OrderBy` 的 `FirstOrDefault` 返回顺序不确定，判定不可复现。 |
-| 5 | 重设密码的验证 | **验证通过才落库**。账号走已有的 `TestConnectionAsync`；备份密码拉云端加密信息文件试解——它是备份的元数据根节点，全容器最小的加密对象，不碰数据包、不触发 Archive 取回费。 |
-| 6 | 想不起备份密码的出口 | **无出口**。不提供「放弃历史、改用新密码」，也不做历史包重加密迁移。密码想不起来只能删除该备份配置重建。 |
-| 7 | 恢复顺序 | **先账号、后备份配置**。验证备份密码必须连云，连云必须先有账号密钥——物理约束，UI 强制该顺序。 |
-| 8 | 备份密码不可更改 | 普通 PUT 路径下 `Password` 非空一律拒绝，重设走专用端点。 |
-| 9 | `ConnectionStrings__AzureStorage` | **删除**，连同全局 `BlobServiceClient` 单例与 `IAzureStorageService`/`AzureStorageService`。 |
-| 10 | `/api/health/ready` | 保留，改为**纯本地**就绪检查（SQLite 可打开 + canary 可解），零云读。 |
-
-## 2. 现状与根因
-
-敏感字段共三个，均通过 `AppDbContext.cs:28-33` 定义的 ValueConverter 在落库边界自动加解密：
-
-| 字段 | 位置 | 可空 |
+| # | Question | Conclusion |
 |---|---|---|
-| `Account.AccountKey` | `AppDbContext.cs:40` | 否（`IsRequired`） |
-| `Account.ProxyPassword` | `AppDbContext.cs:41` | 是 |
-| `BackupConfig.Password` | `AppDbContext.cs:70` | 是 |
+| 1 | When ciphertext is decrypted | **Drop the ValueConverter; store ciphertext as-is.** Decryption happens only at the chokepoints that genuinely need the content. Lists and the main UI trigger none, so the UI stays usable with the key ring gone |
+| 2 | Property naming | Sensitive properties gain a `Protected` suffix, with `HasColumnName` keeping the database column names unchanged. The compile errors from renaming *are* the list of call sites to audit |
+| 3 | Health detection | A single-row `KeyringCanary` table holds the ciphertext of a known constant, **bypassing all converters**, with the service layer calling `Protect`/`Unprotect` explicitly. Judged once at startup and cached in a singleton |
+| 4 | Judging an upgraded database | With no canary row, **deterministically take the lowest-`Id` Account** and try to decrypt its key (falling back to the lowest-`Id` BackupConfig with a non-empty password if there are no accounts). "Any one row" will not do — `FirstOrDefault` without `OrderBy` has undefined ordering in EF, which makes the judgement irreproducible |
+| 5 | Verifying a reset password | **Verify before persisting.** Accounts use the existing connection test; backup passwords are verified by fetching the encrypted info file from the cloud and decrypting it — it is the metadata root of the backup, the smallest encrypted object in the container, and touching it neither reads data packs nor triggers Archive retrieval fees |
+| 6 | Escape hatch for a forgotten backup password | **There is none.** No "abandon history and use a new password", and no re-encryption migration of historical packs. A forgotten password means deleting that backup configuration and starting over |
+| 7 | Recovery order | **Accounts first, then backup configurations.** Verifying a backup password requires the cloud, and reaching the cloud requires the account key — a physical constraint the UI enforces |
+| 8 | Backup passwords are immutable | The ordinary PUT path rejects any non-empty `Password`; resets go through a dedicated endpoint |
+| 9 | `ConnectionStrings__AzureStorage` | **Deleted**, along with the global `BlobServiceClient` singleton and the storage service built on it |
+| 10 | `/api/health/ready` | Kept, but changed to a **purely local** readiness check (SQLite opens, canary decrypts), with zero cloud reads |
 
-**根因**：ValueConverter 在 EF **实体物化**时无条件解密，与调用方是否需要该字段无关。`db.Accounts.ToListAsync()` 即使只为读 `Name`，也会对每一行的密钥密文调用 `Decrypt`。密钥环丢失后该调用抛 `CryptographicException`，且代码中无任何捕获或降级路径，于是列表查询整体失败。
+## 2. The root cause
 
-**关键观察**：这三个字段真正被「读懂」的地方极少，其余全是搬运——而搬运密文与搬运明文等价。
+Three sensitive fields were encrypted and decrypted automatically at the persistence boundary by a ValueConverter: the account key, the proxy password, and the backup password.
 
-| 消费点 | 位置 | 用途 |
+**The root cause**: a ValueConverter decrypts unconditionally at **entity materialisation**, regardless of whether the caller wants that field. Listing accounts to read nothing but their names still called `Decrypt` on every row's key ciphertext. Once the key ring was gone that threw, and no code path caught it or degraded, so the list query failed entirely.
+
+**The key observation**: the places that genuinely *read* these three fields are very few; everything else is transport — and transporting ciphertext is exactly as good as transporting plaintext.
+
+| Consumer | Purpose |
+|---|---|
+| Account key | Building `StorageSharedKeyCredential` in the blob client factory |
+| Proxy password | Building `NetworkCredential` in the same factory |
+| Backup password | Passed to 7z as `-p` by the compressor and the archive codec |
+
+Everything else — service layers, endpoint handlers, request mappers, runners, the dispatcher, the orchestrators — moves the value without interpreting it, and needs no plaintext.
+
+## 3. The design
+
+### 3.1 Ciphertext in the database, decryption at the chokepoints
+
+The ValueConverters are removed and the three fields store ciphertext in EF, with the service layer encrypting and decrypting explicitly. Properties gain the `Protected` suffix while `HasColumnName` pins the original column names.
+
+**Where decryption lands** (chokepoints, not scattered checks):
+
+- **Account key and proxy password** — inside the blob client factory. `CreateServiceClient` is the sole entry to every cloud operation, so any path that reaches Azure must pass through it, and decrypting there covers all of them without repeating it per action.
+- **Backup password** — two concentration points: the request mapper's password accessor, and a helper replacing the six copies of `var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;` scattered through the backup config endpoints. Collapsing those into one helper is both the decryption point and the removal of a duplication.
+
+Downstream, plaintext still flows exactly as before, so no transport code changes. A failed decryption throws `SecretUnavailableException`, which pins the error to the action that triggered it.
+
+That exception and the 409 gate in §3.3 are two different layers. When the canary says `Lost`, action endpoints fail fast at the entry with 409 and normally never reach a decryption site; the exception is defence in depth for cases the canary has not covered — a new code path bypassing the gate, or the key ring being replaced while the process runs — so that failure is unambiguous rather than producing a pack encrypted with the wrong password.
+
+**The property this buys**: the main UI and both lists query only non-sensitive fields. When `Healthy`, no decryption is triggered at all. While `Lost`, computing the per-row `secretsUnavailable` flags (§3.3) does attempt one `TryDecrypt` per record — but that call does not throw, so the lists remain fully usable with the key ring gone. Only concrete actions (listing containers, backing up, restoring, checking) need credentials and can throw.
+
+**Problems this dissolves on its own**: the "submitting an empty value keeps the existing one" logic in the account and backup-config endpoints becomes a straight copy of the existing ciphertext — correct, and requiring no decryption.
+
+**Two things that needed adjusting:**
+
+1. Checking "is this an encrypted backup?" with `!string.IsNullOrEmpty(Password)` still works: non-empty ciphertext ⟺ non-empty plaintext. **No change needed.**
+2. Comparing `update.Password != existing.Password` **had to change.** Data Protection uses a random IV per encryption, so the same plaintext encrypts to different ciphertext each time and ciphertexts cannot be compared. That line's intent was "the password cannot be changed after creation", which per decision 8 becomes: the ordinary PUT path rejects any non-empty `Password` with *Password cannot be changed after creation; leave it empty.* The only behavioural change is that resubmitting the identical password now fails instead of passing — and the frontend has always used an empty field to mean "unchanged".
+
+### 3.2 The canary and status detection
+
+A single-row `KeyringCanary` table holds the ciphertext of the constant `canary.v1`, read and written **with no converter**, using explicit `Protect`/`Unprotect` — otherwise the canary itself would be swallowed by the degradation logic and lose all diagnostic value.
+
+A singleton holds `KeyringStatus = Healthy | Lost`, judged once at process start, cached, and flipped explicitly when the reset flow completes.
+
+**Startup judgement:**
+
+| Canary row | Probe source | Conclusion |
 |---|---|---|
-| `AccountKey` | `BlobClientFactory.cs:28` | 构造 `StorageSharedKeyCredential` |
-| `ProxyPassword` | `BlobClientFactory.cs:74` | 构造 `NetworkCredential` |
-| `Password` | `SevenZipCompressor.cs:37,39`、`SevenZipArchiveCodec.cs:35,62` | 传给 7z 的 `-p` |
+| Present and decrypts | The canary itself | `Healthy` |
+| Present, fails, and undecryptable ciphertext remains | Full scan of all three families | `Lost` |
+| Present, fails, but no undecryptable ciphertext remains | Full scan | Rebuild the canary, `Healthy` |
+| Absent | The lowest-`Id` Account's key ciphertext | Decrypts → write the canary, `Healthy`; fails → `Lost` |
+| Absent, and no accounts | The lowest-`Id` BackupConfig with a password | As above |
+| Absent, and neither exists | — | Brand-new database → write the canary, `Healthy` |
 
-搬运点（`AccountService.cs:35,41`、`AccountEndpoints.cs:43-46`、`BackupRequestMapper.cs:88`、`RestoreRunner.cs:83`、`TaskDispatcher.cs:78`、`BackupOrchestrator`/`RestoreOrchestrator` 各处、`BackupConfigEndpoints.cs` 各处）不解读内容，不需要明文。
+The fourth row is the mandatory branch for upgrading an older database. Without a canary row, blindly writing a new one and declaring `Healthy` would miss "the key ring was already lost at upgrade time" — and miss it forever, since the new canary is written by the new key ring and will always decrypt.
 
-## 3. 方案
+The fifth row is a cheap backstop, costing one extra query only when there is not a single account, and it closes the narrow window where all accounts were deleted but backup configurations remain.
 
-### 3.1 密文入库，咽喉处解密
+The third row is the startup backstop for `Lost`, and it cannot be omitted. Outside the canary itself, the thing that rewrites it is the completion check in §3.4 — reached from the two reset endpoints and from the account and backup-config delete endpoints (deleting the last pending record triggers it too), all of which require at least one record to exist at that moment. So "key ring lost → the user gives up and deletes every account and encrypted backup configuration" could, if the delete endpoints did not get to finish (direct database edits, or an older build), leave no ciphertext in the database at all while a stale canary pins the status to `Lost`: `/api/health/ready` permanently 503, the scheduler skipping everything, every action 409, and the banner reading "**0** credentials need to be re-entered" — no way out until a restart passes through here. Judging this row by the same full scan §3.4 uses guarantees that "`Lost` with zero pending resets" cannot become permanent: the delete endpoints clear it during the run, and this row catches it at the next start.
 
-移除 `AppDbContext.cs:28-33` 的两个 ValueConverter，三个字段在 EF 层原样存取密文；加解密由服务层显式进行。属性按决策 2 改名加 `Protected` 后缀，并以 `HasColumnName` 固定原列名。
+### 3.3 What `Lost` mode allows
 
-**解密落点（咽喉，而非散落检查）：**
+- The scheduler skips every task, logging **one** summary Warning per tick (not one per task, which would flood the log)
+- Manually triggering backup / restore / check / cleanup returns **409** with error code `keyring_lost`
+- The account and backup configuration lists **still return**, carrying `secretsUnavailable: true`
+- `/api/health/ready` returns 503 `degraded`
+- The only permitted write is a credential reset
 
-- **账号密钥与代理密码** —— `BlobClientFactory` 内部。`CreateServiceClient` 是所有云操作的唯一入口，任何访问 Azure 的路径都必须经过它，在 `:28`、`:74` 就地解密即可，无需在各动作入口重复。
-- **备份密码** —— 两个集中点：`BackupRequestMapper.Password(config)`（`BackupRequestMapper.cs:88`，被 `TaskDispatcher.cs:78` 等调用）与 `BackupConfigEndpoints.cs` 中重复出现六次的 `var password = string.IsNullOrEmpty(config.Password) ? null : config.Password;`（`:190,215,239,265,361,389`）。后者收敛为一个统一的解密辅助方法，既是解密入口也顺带消除重复。
+The pending count and the per-row `secretsUnavailable` flags **must be computed from each record's actual decryptability**, never from the global status.
 
-解密后链路中流动的仍是明文，所有传递代码无需改动。解密失败抛 `SecretUnavailableException`，错误精确定位到发起的那个动作。
+"`Lost` means nothing decrypts" holds only at the instant the key ring is lost. Recovery necessarily passes through an intermediate state: every account has been reset successfully while backup passwords are still old ciphertext. The global status must still be `Lost` there (§3.4 requires all three families to decrypt), but the account pending count must already have reached zero. Counting from the global status instead would make the ordering dependency in §3.5 — backup password `Re-enter` stays disabled until accounts reach zero — read a permanently non-zero account count. The button would never enable, the password could never be reset, the status could never flip: **the recovery flow deadlocks in the UI.**
 
-`SecretUnavailableException` 与 3.3 的 409 闸门是两个层次：canary 判定 `Lost` 时，动作端点在入口即以 409 快速失败，正常情况下走不到解密处；该异常是深度防御，用于「闸门被新代码路径绕过」或「密钥环在进程运行期间被替换」等 canary 尚未覆盖的情形，确保失败方式明确，而非产出用错误密码加密的包。
+So while `Lost`, the ciphertext columns are probed row by row: accounts check the key and the proxy password (one reset covers both), backup configurations check the password (unencrypted ones have nothing to lose and are neither counted nor flagged). When `Healthy` it short-circuits to zero, so the list endpoints still trigger no decryption at all and §3.1's core property is untouched. Record counts are small, on the same order as §3.4's completion scan, and the cost is negligible.
 
-**因此获得的性质：**主界面、账号列表、备份配置列表只查非敏感字段。`Healthy` 时根本不触发任何解密；`Lost` 期间为算出逐条 `secretsUnavailable` 标记（见 3.3），会对每条记录的密文做一次 `TryDecrypt`——但该调用不抛异常（`SecretAvailability.Unreadable`），因此密钥环丢失时列表仍然完全可用。真正需要凭据、解密失败会抛异常的，只有具体动作（列容器、备份、还原、检查）。
+### 3.4 The reset flow
 
-**自动消除的问题：**`AccountEndpoints.cs:43-46` 与 `BackupConfigEndpoints.cs:98-99` 的「提交空值 = 保留原值」逻辑，在密文模型下就是把 existing 的密文原样搬运，正确且无需解密。
+Two dedicated endpoints, not a reuse of PUT (PUT should be restricted wholesale in recovery mode):
 
-**需配套调整的两处：**
+- `POST /api/accounts/{id}/reset-secrets` — body carries `accountKey` and optionally `proxyPassword`; the existing connection test runs first and only a pass persists.
+- `POST /api/backup-configs/{id}/reset-password` — body carries `password`; the encrypted info file is fetched from the cloud and decrypted, and only a pass persists.
 
-1. `BackupConfigDtos.cs:39` 与 `BackupOrchestrator.cs:729` 用 `!string.IsNullOrEmpty(Password)` 判断「是否加密备份」。密文非空 ⟺ 明文非空，判定依然成立，**无需改动**。
-2. `BackupConfigService.cs:49` 的 `update.Password != existing.Password` **必须改**。Data Protection 每次加密使用随机 IV，同一明文两次加密得到不同密文，密文之间不可比较。该行的意图正是「密码创建后不可更改」，按决策 8 改为：普通 PUT 路径下 `Password` 非空一律拒绝，提示 `Password cannot be changed after creation; leave it empty.`。行为上的唯一变化是「重新提交完全相同的密码」由放行变为拒绝——前端本就以留空表示不改。
+**Why the info file verifies the password**: the info file of an encrypted backup is itself a 7z encrypted with that password. It is the metadata root of the whole backup, holding only the version list and similar, and is the smallest encrypted object in the container. Decrypting it proves the password.
 
-### 3.2 Canary 与状态判定
+**An implementation constraint**: verification must use the plain read path, **not** the tracked store's seed-from-cloud method — the latter backfills local authoritative state. Verification is an operation that may fail and may be retried repeatedly, and it must have no side effects.
 
-新增单行表 `KeyringCanary`（`Id`、`Ciphertext`、`CreatedAt`）。`Ciphertext` 为常量明文 `canary.v1` 的密文，**不经任何转换**存取，由服务层显式 `Protect`/`Unprotect`——否则 canary 自身也会被降级逻辑吞掉而失去判定意义。
+Unencrypted backup configurations have no key to lose and never enter the pending list.
 
-`IKeyringHealth`（单例）持有 `KeyringStatus = Healthy | Lost`，进程启动时判定一次并缓存，重设流程完成时显式翻转。
+**The completion check**: probe every record holding ciphertext, and only once all succeed rebuild the canary and flip the status back to `Healthy`. Flipping on the first successful reset would be wrong — the rest still do not decrypt.
 
-**启动判定：**
+### 3.5 The guided UI
 
-| canary 行 | 探测源 | 结论 |
-|---|---|---|
-| 存在，且解得开 | canary 自身 | `Healthy` |
-| 存在，解不开，且仍有解不开的密文 | 三族密文全扫 | `Lost` |
-| 存在，解不开，但已无解不开的密文 | 三族密文全扫 | 重建 canary，`Healthy` |
-| 不存在 | `Id` 最小的 Account 的密钥密文 | 解得开 → 写入 canary，`Healthy`；解不开 → `Lost` |
-| 不存在，且无 Account | `Id` 最小且密码非空的 BackupConfig | 同上 |
-| 不存在，且两者皆无 | — | 全新库 → 写入 canary，`Healthy` |
+- In recovery mode, a persistent banner: `Data protection keys were lost — N credentials need to be re-entered`, expanding to the pending list
+- The list is grouped **Accounts → Backup Configs**, with the second group disabled until the first is complete, expressing decision 7's ordering dependency
+- On each page, affected rows show a badge and a `Re-enter` button opening a dialog with just the one field, with verifying / verification-failed feedback
+- Backup, restore and check buttons are disabled in recovery mode, with a tooltip explaining why
 
-第四行是升级老库的必经分支：老版本库没有 canary 行，若无脑写入一条新的即判 `Healthy`，则「升级时密钥环恰好已丢失」会被漏检，且从此永远检测不出——新 canary 由新密钥环写入，永远解得开。第五行是廉价兜底，仅在一条账号都没有时多查一次，堵住「账号被删光但备份配置仍在」的窄窗口。
+### 3.6 Dead code removed
 
-第三行是 `Lost` 时的启动期兜底，不可省略。canary 之外重写它的地方是 3.4 的完成判定：两个重设端点，以及账号/备份配置的删除端点（删掉最后一条待重设记录时同样调用）都会触发它，但都要求「操作的那一刻还有一条现存记录」。于是「密钥环丢失 → 用户放弃恢复、删光全部账号与加密备份配置」若发生在删除端点尚未收尾（例如直接操作数据库、或跑的是本次收尾修复之前的旧版本）的情形下，仍可能让库中一条密文都不剩，却被陈旧 canary 钉在 `Lost`：`/api/health/ready` 恒 503、调度器全跳过、一切动作 409，而横幅只写「**0** credentials need to be re-entered」——用户没有任何出口，直到进程重启才会经过这里被放行。判定条件用与 3.4 完全相同的那次全扫（`KeyringProbe.AllStoredSecretsReadableAsync`），从而保证「`Lost` 且待重设数为 0」这个状态不会永久卡死——运行期由删除端点的收尾调用及时消除，兜底由本行在下次启动时兜住。
+`ConnectionStrings__AzureStorage` fed a global `BlobServiceClient` singleton, which fed a storage service used by nothing but `/api/health/ready`. The frontend never called that endpoint and no test referenced the service. Real backups go through `BlobClientFactory.CreateServiceClient(account)` and never touched this chain. The probe also issued a `GetProperties` to the cloud on every call, which conflicts with the "zero cloud reads at run time" principle.
 
-### 3.3 恢复模式（`Lost`）的行为边界
+`/api/health/ready` now checks that SQLite opens and the canary decrypts — both local.
 
-- `SchedulerService` 的 tick 跳过全部任务，每个 tick 只记**一条**汇总 Warning（非每任务一条，否则日志被刷爆）
-- 手动触发备份/还原/检查/清理的端点返回 **409**，错误码 `keyring_lost`
-- 账号列表、备份配置列表**照常返回**，附带 `secretsUnavailable: true`
-- `/api/health/ready` 返回 503 `degraded`
-- 唯一放行的写操作：重设凭据
+## 4. Data and migration
 
-待重设计数与逐条 `secretsUnavailable` 标记**必须按每条记录的实际可解性判定**，不能沿用全局状态。
+**Existing data needs no migration.** What the ValueConverter wrote to disk was already `_protector.Protect(plaintext)`, so storing ciphertext as-is produces an identical on-disk format. Renaming properties while pinning column names produces no column changes either.
 
-「`Lost` 即全部解不开」只在密钥环刚丢失的那一刻成立。恢复必然经过一个中间态：账户已全部重设成功，备份密码仍是旧密文——此时全局状态仍须是 `Lost`（3.4 的完成判定要求三族密文全部可解），但账户的待重设数必须已经归零。若按全局状态直接计数，3.5 的顺序依赖（账户未清零则禁用备份密码的 `Re-enter`）会永远读到非零的账户待重设数，按钮永不可用，密码永不能重设，状态永不翻转——恢复流程在 UI 上彻底死锁。
+The only migration creates the `KeyringCanary` table, which the startup `Migrate()` call applies automatically.
 
-因此 `Lost` 期间读取密文列逐条试解：账户看密钥与代理密码（`reset-secrets` 一次重设两者），备份配置看密码（未加密的没有密文可丢，不计不标）。`Healthy` 时短路返回 0，列表端点仍然完全不触发解密（3.1 的核心性质不受影响）。记录数很少，与 3.4 的完成扫描同量级，开销可忽略。
+## 5. Pinned behaviour
 
-### 3.4 重设流程
+The canary's four branches (brand-new database; upgraded database that decrypts; upgraded database that does not; canary present but undecryptable) each reach the documented conclusion. Ciphertext round-trips: what is written is ciphertext, what is read back is ciphertext, and the chokepoint recovers the original plaintext.
 
-两个专用端点，不复用 PUT（PUT 在恢复模式下应整体受限）：
+**The core regression**: with the key ring lost, querying the account list and the backup configuration list still **succeeds**. That is the entire point of the change.
 
-- `POST /api/accounts/{id}/reset-secrets` —— body 含 `accountKey`、可选 `proxyPassword`；先走 `BlobClientFactory.TestConnectionAsync`（`BlobClientFactory.cs:38`）验证，通过才落库
-- `POST /api/backup-configs/{id}/reset-password` —— body 含 `password`；拉云端加密信息文件试解，通过才落库
+The gate holds: the scheduler skips tasks in `Lost` and logs one summary per tick; action endpoints return 409 `keyring_lost`. Resets do not persist on a failed verification, do persist on a successful one, and the verification path has no side effects. The status flips only when every record has been reset, not partway. The ordinary PUT rejects a non-empty password. `/api/health/ready` judges locally and returns 503 while `Lost`.
 
-**验证备份密码的依据**：加密备份的信息文件（`BackupDiscovery.EncryptedIndexBlobName`）本身就是用备份密码加密的 7z（`BackupInfoStore.cs:38-43` → `WriteAtomicAsync` → `codec.EncodeAsync(json, password)`）。它是整个备份的元数据根节点，仅含版本列表等少量信息，是容器内最小的加密对象。解得开即证明密码正确。
+## 6. Deliberately not done
 
-**实现约束**：验证必须调用 `IBackupInfoStore.ReadInfoWithETagAsync`（纯读，`BackupInfoStore.cs:14-29`），**不可**使用 `TrackedInfoStore.SeedFromCloudAsync`（`TrackedInfoStore.cs:53-60`）——后者会回填本地权威状态。验证是可能失败、可能被反复尝试的操作，不允许有副作用。
-
-未加密的备份配置（`Password` 为 null）没有密钥可丢，不进入待重设清单。
-
-**完成判定**：对所有含密文的记录逐条试解，全部成功后重建 canary 并将状态翻回 `Healthy`。不可在首条重设成功时就翻转——彼时其余记录仍解不开。该扫描在恢复流程末尾执行一次，记录数很少，开销可忽略。
-
-### 3.5 UI 引导
-
-界面文案一律英文。
-
-- 恢复模式下顶部常驻横幅：`Data protection keys were lost — N credentials need to be re-entered`，点击展开待重设清单
-- 清单按 **Accounts → Backup Configs** 两组排列；账号组未全部完成前，备份配置组保持禁用，以体现决策 7 的顺序依赖
-- 各自页面内，受影响行显示 badge 与 `Re-enter` 按钮，打开仅含密码字段的重设弹窗，带「验证中 / 验证失败」反馈
-- 备份、还原、检查等动作按钮在恢复模式下禁用，并以 tooltip 说明原因
-
-### 3.6 死代码清理
-
-`ConnectionStrings__AzureStorage` → 全局 `BlobServiceClient` 单例（`Program.cs:33`）→ `IAzureStorageService`/`AzureStorageService` → 仅被 `/api/health/ready` 调用。前端从未调用该端点，测试亦未引用 `AzureStorageService`。真正的备份走 `BlobClientFactory.CreateServiceClient(account)`，与该链无关。该探针每次向云端发起 `GetProperties`，与「运行期零云读」原则相冲突。
-
-删除范围：`Program.cs:26-36`（连接串解析、单例注册、服务注册）、`Services/AzureStorageService.cs`、`Services/IAzureStorageService.cs`、`appsettings.json:11`、`docker-compose.yml:11-12`、`.env.example` 中的 `AZURE_STORAGE_CONNECTION_STRING`、`README.md:62,78`。
-
-`/api/health/ready`（`HealthEndpoints.cs:15-22`）改为检查 SQLite 可打开 + canary 可解密，二者皆本地。
-
-## 4. 数据与迁移
-
-**现有数据零迁移**。ValueConverter 当前写入磁盘的正是 `_protector.Protect(plaintext)` 的结果；改为「原样存密文」后磁盘格式完全一致。属性改名通过 `HasColumnName` 保持列名不变，同样不产生列变更。
-
-唯一的 migration 是新建 `KeyringCanary` 表。项目在 `Program.cs:156` 启动时执行 `db.Database.Migrate()`，新表随启动自动创建。
-
-## 5. 测试计划
-
-- **canary 判定四分支**：全新库、老库密文解得开、老库密文解不开、canary 行存在但解不开
-- **密文往返**：写入后库中为密文、读出仍为密文、咽喉处解密还原出原明文
-- **关键回归**：密钥环丢失时账号列表与备份配置列表查询**依然成功**（这是本轮改动的核心目的）
-- **恢复模式闸门**：`SchedulerService` 在 `Lost` 下跳过任务且每 tick 仅记一条汇总日志；动作端点返回 409 `keyring_lost`
-- **重设**：验证失败不落库；验证成功才落库；验证路径无副作用（不回填本地权威状态）
-- **状态翻转**：全部记录重设完成后 canary 重建、状态回到 `Healthy`；仅完成部分时不翻转
-- **`BackupConfigService`**：普通 PUT 提交非空密码被拒
-- **`/api/health/ready`**：纯本地判定，`Lost` 时返回 503
-- **既有用例回归**：现有 332 个测试中受 ValueConverter 移除与属性改名影响的部分
-
-## 6. 明确不做
-
-- 不提供备份密码的更改或迁移功能（历史包重加密）
-- 不提供「放弃历史、改用新密码」的出口（决策 6）
-- 不引入 `ProtectedValue` 值类型——决策 2 的改名已使误用需要显式动作，额外收益不足以抵消其侵入性
-- 不做密文字段的逐条降级**落库**标记——`secretsUnavailable` 与待重设计数是读时按实际可解性算出来的（3.3），不新增任何持久化列
+- No changing or migrating a backup password (which would mean re-encrypting historical packs)
+- No "abandon history and use a new password" escape hatch (decision 6)
+- No `ProtectedValue` wrapper type — the rename in decision 2 already makes misuse require a deliberate act, and the extra intrusion is not worth the marginal gain
+- No persisted per-row degradation flag: `secretsUnavailable` and the pending count are computed at read time from actual decryptability (§3.3), adding no columns
