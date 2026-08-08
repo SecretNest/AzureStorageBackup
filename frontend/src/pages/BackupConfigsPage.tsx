@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
+import { ApiError } from '../api/client'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { ChangeLocalRootDialog } from '../components/ChangeLocalRootDialog'
@@ -7,8 +8,10 @@ import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { ScopeTree } from '../components/ScopeTree'
+import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { latestWins } from '../lib/latestWins'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { Modal } from '../components/Modal'
 import {
@@ -31,6 +34,7 @@ import {
   type BackupConfigInput,
   type BackupRun,
   type BackupVersionInfo,
+  type InterruptedRun,
   type StageProgress,
   type RestoreRun,
   type CheckRun,
@@ -96,6 +100,13 @@ function without<T>(map: Record<number, T>, id: number): Record<number, T> {
   return next
 }
 
+// 下次重试还有多久。这个数每秒都在变，但整行本来就每秒重渲染一次（轮询），不额外起计时器。
+// 已经过点了就说 "now"，而不是显示一个负数——真正放行还要等当前这一拍走到闸门。
+function formatRetryIn(at: string): string {
+  const seconds = Math.round((new Date(at).getTime() - Date.now()) / 1000)
+  return seconds <= 0 ? 'now' : `in ${formatDuration(seconds)}`
+}
+
 export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
@@ -103,6 +114,10 @@ export function BackupConfigsPage() {
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checks, setChecks] = useState<Record<number, CheckRun>>({})
+  // 盘上留着的中断现场，按配置 id 存。程序重启后内存里什么都没有，只能从这里知道"有活儿没干完"。
+  const [interrupted, setInterrupted] = useState<Record<number, InterruptedRun[]>>({})
+  // 打开着的停止对话框对应的配置。
+  const [stopping, setStopping] = useState<BackupConfig | null>(null)
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
   const [deleteModal, setDeleteModal] = useState<BackupConfig | null>(null)
@@ -121,8 +136,32 @@ export function BackupConfigsPage() {
   const [resettingPassword, setResettingPassword] = useState<BackupConfig | null>(null)
   const keyring = useKeyringStatus()
 
+  // 按当前配置列表把「中断现场」重新拉一遍。单个配置失败不打断整页：拿不到就当没有，
+  // 下一轮再说。load() 之外，无人触发的 5 秒后台刷新也要走这条路——否则程序在页面开着的时候
+  // 重启，内存里的运行状态没了，interrupted 却只在挂载和用户动作时才更新，中断现场提示
+  // 永远冒不出来，只有整页刷新才能看到。
+  // 两个触发点（用户动作走的 load()、无人触发的 5 秒轮询）会让两轮请求同时在飞，而它们整份地
+  // 覆盖同一份状态。谁先回来不由发起顺序决定，所以要一道"只让最后发起的那次写"的闸门，
+  // 否则旧快照会盖掉新快照，界面上留着一条已经不存在的中断现场直到下一拍。为什么不是 cancelled
+  // 标志，见 latestWins 的说明。
+  const interruptedGate = useRef(latestWins())
+  const refreshInterrupted = (list: BackupConfig[]) => {
+    const isLatest = interruptedGate.current.begin()
+    void Promise.all(
+      list.map(async (c) => [c.id, await backupConfigsApi.interrupted(c.id).catch(() => [])] as const),
+    ).then((pairs) => {
+      if (isLatest()) setInterrupted(Object.fromEntries(pairs))
+    })
+  }
+
   const load = () => {
-    backupConfigsApi.list().then(setConfigs).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+    backupConfigsApi
+      .list()
+      .then((list) => {
+        setConfigs(list)
+        refreshInterrupted(list)
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
   // 选定账户后列举其容器（PRD 1.2 的接口，ContainersPage 已在用）。
@@ -143,7 +182,14 @@ export function BackupConfigsPage() {
   // 这是无人触发的后台刷新：一次网络抖动不该弹一条错误横幅——它可能盖掉用户正在看的
   // 另一条错误，且用户对这次刷新没有可做的动作。下一拍会自然重试(Fix 7)。
   useEffect(() => {
-    const refresh = () => backupConfigsApi.list().then(setConfigs).catch(() => {})
+    const refresh = () =>
+      backupConfigsApi
+        .list()
+        .then((list) => {
+          setConfigs(list)
+          refreshInterrupted(list)
+        })
+        .catch(() => {})
     const t = setInterval(refresh, 5000)
     // 浏览器把后台标签页的定时器节流到分钟级，切回来那一瞬看到的还是上一拍的旧快照，
     // 要再等一个周期才更新——长任务跑着时，那正是"看起来卡住了"的一半原因。
@@ -195,9 +241,22 @@ export function BackupConfigsPage() {
               const tasks: Promise<void>[] = []
               if (item.activity === 'BackingUp') {
                 tasks.push(
-                  backupConfigsApi.runStatus(item.id).then((s) => {
-                    if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
-                  }),
+                  backupConfigsApi
+                    .runStatus(item.id)
+                    .then((s) => {
+                      if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
+                    })
+                    .catch((e) => {
+                      // 404＝后端进程重启后内存里已经没有这个运行了，再显示旧进度就是在撒谎。
+                      // 清掉 runs[id]：下一拍 5 秒刷新会把它从 interrupted 里捞出来，界面自然
+                      // 换成中断现场提示。非 404（网络抖动等瞬时失败）不清，原样往外抛，交给
+                      // 下面按配置的 catch 静默吞掉、下一拍重试——不然一次抖动就会把这一行拍没。
+                      if (e instanceof ApiError && e.status === 404) {
+                        if (!cancelled) setRuns((r) => without(r, item.id))
+                        return
+                      }
+                      throw e
+                    }),
                 )
                 // activity 是单值：并发还原时会被 BackingUp 盖住(见 RestoreRunner.cs 顶部注释——
                 // 还原不占忙碌锁，允许与备份并行)。本地若还记得这个配置的还原仍在跑，就不管
@@ -266,7 +325,12 @@ export function BackupConfigsPage() {
             void backupConfigsApi
               .runStatus(item.id)
               .then((s) => setRuns((r) => ({ ...r, [item.id]: s })))
-              .catch(() => {})
+              .catch((e) => {
+                // 同上：这里的「离场」本身就可能是后端重启造成的（configs 里读到的 activity
+                // 已经变回 Idle）。404 时把陈旧进度一并清掉，别的失败仍旧静默——收尾请求本就是
+                // 尽力而为，不该在这里弹错误打断整页。
+                if (e instanceof ApiError && e.status === 404) setRuns((r) => without(r, item.id))
+              })
             if (restoresRef.current[item.id]?.status === 'Running') {
               void backupConfigsApi
                 .restoreStatus(item.id)
@@ -504,6 +568,11 @@ export function BackupConfigsPage() {
   // NAS 上，那会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
   // 逐操作停而不是一键停光：备份与还原可以并发，误停另一条同样是几小时的损失。
   const stopOp = async (c: BackupConfig, what: 'backup' | 'restore' | 'repair' | 'check', label: string) => {
+    // 备份要问清楚"正在传的文件是传完还是扔掉"，一句 confirm 说不清，走对话框。
+    if (what === 'backup') {
+      setStopping(c)
+      return
+    }
     if (!window.confirm(`Stop the running ${label} for "${c.name}"? Work done so far is kept, but the operation will not finish.`))
       return
     setError(null)
@@ -511,6 +580,39 @@ export function BackupConfigsPage() {
       await backupConfigsApi.cancel(c.id, what)
       // 取消是异步的：信号发出后要等到下一个取消检查点才真的收尾，所以这里不动状态，
       // 让统一轮询把真实的终态（Canceled）拉回来。
+      load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const suspendBackup = async (c: BackupConfig) => {
+    setError(null)
+    try {
+      await backupConfigsApi.suspend(c.id)
+      load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const retryNow = async (c: BackupConfig) => {
+    setError(null)
+    try {
+      await backupConfigsApi.retryNow(c.id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const discardInterrupted = async (c: BackupConfig) => {
+    if (!window.confirm(
+      `Discard the interrupted run for "${c.name}"? The blocks already uploaded stop being reserved and will be removed by the next cleanup, so the next backup re-uploads them.`))
+      return
+    setError(null)
+    try {
+      await backupConfigsApi.discardInterrupted(c.id)
+      setRuns((m) => without(m, c.id))
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -673,7 +775,27 @@ export function BackupConfigsPage() {
               // 运行状态挪出操作列、单独占一行（见 index.css .ops-row）：操作列是 nowrap 的，
               // 而正在处理的那个路径动辄几百字符，放在那里会把整张表撑到出屏。
               const ops = [
-                runs[c.id] && <RunStatus key="run" run={runs[c.id]} onStop={() => stopOp(c, 'backup', 'backup')} />,
+                runs[c.id] && (
+                  <RunStatus
+                    key="run"
+                    run={runs[c.id]}
+                    onStop={() => stopOp(c, 'backup', 'backup')}
+                    onSuspend={() => void suspendBackup(c)}
+                    onRetryNow={() => void retryNow(c)}
+                    onResume={() => void run(c)}
+                    onDiscard={() => void discardInterrupted(c)}
+                  />
+                ),
+                // 内存里没有运行、盘上却有 journal＝程序重启前那一轮没跑完。摆出来等用户点，
+                // 不替他决定要不要接着跑。
+                !runs[c.id] && interrupted[c.id]?.length > 0 && (
+                  <InterruptedNotice
+                    key="interrupted"
+                    runs={interrupted[c.id]}
+                    onResume={() => void run(c)}
+                    onDiscard={() => void discardInterrupted(c)}
+                  />
+                ),
                 restores[c.id] && <RestoreStatus key="restore" run={restores[c.id]} onStop={() => stopOp(c, 'restore', 'restore')} />,
                 repairs[c.id] && <RepairStatus key="repair" run={repairs[c.id]} onStop={() => stopOp(c, 'repair', 'repair')} />,
                 checks[c.id] && <CheckStatus key="check" run={checks[c.id]} onStop={() => stopOp(c, 'check', 'check')} />,
@@ -1300,12 +1422,28 @@ export function BackupConfigsPage() {
           onClose={closeResetPassword}
         />
       )}
+      {stopping && (
+        <StopBackupDialog
+          name={stopping.name}
+          onStop={async (finishCurrentFiles) => {
+            setError(null)
+            try {
+              await backupConfigsApi.cancel(stopping.id, 'backup', finishCurrentFiles)
+              load()
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e))
+            }
+          }}
+          onClose={() => setStopping(null)}
+        />
+      )}
     </section>
   )
 }
 
 // 停止按钮：只在运行中出现。停止是异步的（信号发出后要等到下一个取消检查点），所以点完
-// 这一行不会立刻变——文案里不作"已停止"的承诺。
+// 这一行不会立刻变——文案里不作"已停止"的承诺。还原/修复/检查三支仍用这一个（没有 Suspend/
+// Retry now 的概念）；备份那一支改用下面的 RunButtons。
 function StopButton({ onStop }: { onStop: () => void }) {
   return (
     <>
@@ -1317,7 +1455,94 @@ function StopButton({ onStop }: { onStop: () => void }) {
   )
 }
 
-function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
+// 运行中的按钮组，备份专用（多了 Suspend / Retry now，还原/修复/检查没有这两个概念）。
+// 停止是异步的（信号发出后要等到下一个取消检查点），所以点完这一行不会立刻变——
+// 文案里不作"已停止"的承诺。
+function RunButtons({
+  onStop,
+  onSuspend,
+  onRetryNow,
+}: {
+  onStop: () => void
+  onSuspend: () => void
+  onRetryNow?: () => void
+}) {
+  return (
+    <>
+      {onRetryNow && (
+        <>
+          {' '}
+          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onRetryNow}>
+            Retry now
+          </button>
+        </>
+      )}{' '}
+      <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onSuspend}>
+        Suspend
+      </button>{' '}
+      <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onStop}>
+        Stop
+      </button>
+    </>
+  )
+}
+
+// 中断现场：程序重启前那一轮没跑完，journal 还在盘上。
+function InterruptedNotice({
+  runs,
+  onResume,
+  onDiscard,
+}: {
+  runs: InterruptedRun[]
+  onResume: () => void
+  onDiscard: () => void
+}) {
+  // resumable 只在「journal 属于这份配置、且 local root 没变」时才成立。这个列表按
+  // (accountId, containerName) 摆，不按 config id——同一容器上**另一份**配置留下的 journal
+  // 也会被列进来，那种情况下 resumable=false：真正开卷时它会被判作废而不是被接上，
+  // 所以"已上传的块会被复用"这句话只对 resumable 的那些成立，不能算全部 runs 的块数。
+  const resumable = runs.filter((r) => r.resumable)
+  const blocks = resumable.reduce((n, r) => n + r.blocks, 0)
+  return (
+    <div className="text-warn">
+      {resumable.length > 0 ? (
+        <>Interrupted run — {blocks.toLocaleString()} block(s) already uploaded are kept and will be reused</>
+      ) : (
+        <>Interrupted run — cannot be picked up (it belongs to a different backup sharing this container)</>
+      )}
+      {' '}
+      <button
+        type="button"
+        className="btn-ghost"
+        style={{ padding: '0 0.3rem' }}
+        onClick={onResume}
+        disabled={resumable.length === 0}
+        title={resumable.length === 0 ? 'Not resumable — only Discard applies' : undefined}
+      >
+        Resume
+      </button>{' '}
+      <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onDiscard}>
+        Discard
+      </button>
+    </div>
+  )
+}
+
+function RunStatus({
+  run,
+  onStop,
+  onSuspend,
+  onRetryNow,
+  onResume,
+  onDiscard,
+}: {
+  run: BackupRun
+  onStop: () => void
+  onSuspend: () => void
+  onRetryNow: () => void
+  onResume: () => void
+  onDiscard: () => void
+}) {
   // 展开状态留在组件内：轮询每秒都在换 props，但 React 保留同一个实例，所以展开不会被刷掉。
   const [showDetail, setShowDetail] = useState(false)
 
@@ -1326,6 +1551,24 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
   // 停止既不是成功也不是失败：后端不会把它写成该备份的 Error 状态，这里也不用红色。
   if (run.status === 'Canceled')
     return <div className="text-warn">Backup stopped — nothing was recorded for this run</div>
+  // 挂起同理，而且比停止更进一步：现场保着，下次跑会从这里接上，所以按钮是 Resume 而不是 Run。
+  // 「Resume」调的其实就是 run()——恢复不是一种模式，每一轮开卷时都会去认还有效的 journal。
+  // 没有对应的 resume 端点（Task 12 没做），文案叫 Resume 只是因为对用户来说这确实是"接着跑"。
+  if (run.status === 'Suspended')
+    return (
+      <div className="text-warn">
+        {run.suspendReason === 'AutoSuspended'
+          ? 'Suspended after repeated network errors — progress is saved'
+          : 'Suspended — progress is saved'}
+        {' '}
+        <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onResume}>
+          Resume
+        </button>{' '}
+        <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onDiscard}>
+          Discard
+        </button>
+      </div>
+    )
   if (run.status === 'Completed')
     return (
       <div className="text-ok">
@@ -1341,7 +1584,13 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
       </div>
     )
   const p = run.progress
-  if (!p) return <div className="text-faint">Starting…<StopButton onStop={onStop} /></div>
+  if (!p)
+    return (
+      <div className="text-faint">
+        Starting…
+        <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} />
+      </div>
+    )
 
   // 流水线化之后 Diffing 与 Uploading 会同时在跑，明细因此可能有两条。老后端只发 detail，
   // 所以两边都要认。
@@ -1410,7 +1659,13 @@ function RunStatus({ run, onStop }: { run: BackupRun; onStop: () => void }) {
       {label}
       {headline && ` ${headline}`}
       {changed}
-      <StopButton onStop={onStop} />
+      {run.pause && (
+        <div className="text-warn">
+          Paused — {run.pause.reason} (attempt {run.pause.failures})
+          {run.pause.nextRetryAt && `; retrying ${formatRetryIn(run.pause.nextRetryAt)}`}
+        </div>
+      )}
+      <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} />
       {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
           默认只留一行总进度，需要看的时候再展开。 */}
       {details.length > 0 && (

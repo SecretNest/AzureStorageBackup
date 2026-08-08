@@ -119,6 +119,10 @@ public sealed class TaskDispatcher(
                     // 备份会被记成跑成功了，还会把之前真实的 Error 状态一并抹掉。
                     if (backupState.Status == RunStatus.Canceled)
                         return;
+                    // 挂起不是失败：抛异常会给这次计划任务记一笔红色错误，而现场其实好端端保着，
+                    // 下一轮会接着跑。与 Canceled 同等处置：安静收场。
+                    if (backupState.Status == RunStatus.Suspended)
+                        return;
                     break;
 
                 case ScheduledTaskType.Check:
@@ -144,9 +148,12 @@ public sealed class TaskDispatcher(
                     // 独立跑的清理自己取一个席位：它顺带做的死重压实会往同一块临时盘上写，
                     // 额度得和正在跑的备份一起均分（备份收尾那条路传的是备份自己的席位）。
                     using var cleanupLease = sp.GetRequiredService<StagingArea>().AcquireLease();
+                    // 独立跑的清理永远做孤儿扫描——它就是干这个的。取消/崩溃留下的块要是没被
+                    // 下一次备份复用掉，就只有这条路会来收。
                     var cleanup = await sp.GetRequiredService<RetentionCleaner>().CleanupAsync(
                         account, container, password,
-                        BackupRequestMapper.CleanupOf(config, cleanupSettings), ct, cleanupLease);
+                        BackupRequestMapper.CleanupOf(config, cleanupSettings), ct, cleanupLease,
+                        sweepOrphans: true);
                     // 备份收尾那次清理会把删掉的东西写进成功摘要；独立跑的这一次没有理由更沉默——
                     // 无人值守部署下，操作日志是回头查"保留策略到底腾出了多少空间"的唯一地方。
                     // 长存：这条记的是数据被删除，属于审计内容，不该随短存日志 14 天后消失。

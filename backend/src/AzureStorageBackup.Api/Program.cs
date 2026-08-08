@@ -90,6 +90,16 @@ builder.Services.AddSingleton(sp =>
 // verbose 逐文件 debug 日志的文件后端（按备份+按日期文本文件，PRD 3.6）。
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
+// journal 放在**库文件旁边**，不放 tempPath 下：后者没配 Backup:TempPath 时是 /tmp，容器重建
+// 就没了——而 journal 存在的全部理由正是"容器重建之后还认得出上一轮传到哪了"。跟着库走，
+// 它自然落在同一个持久卷上，用户不必为了让崩溃恢复生效而额外配一个环境变量。
+// 另注意**不能**在启动时清它：它记的正是"云上已有、索引还没有"的内容，清了等于让恢复白跑。
+var journalRoot = Path.Combine(
+    Path.GetDirectoryName(Path.GetFullPath(
+        new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource)) ?? ".",
+    "journal");
+builder.Services.AddSingleton(new BackupJournalStore(journalRoot));
+
 // diff→上传那条队列的溢出区。写侧永不阻塞：内存装不下就落到这里，diff 因此能一路跑到底——
 // 这是上传阶段能显示剩余时间的前提（分母 SetTotal 只有 diff 收工才确定，见 StageProgress.Eta）。
 var spillDir = Path.Combine(tempPath, "diff-spill");
@@ -97,6 +107,9 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // 必须在**进程启动**时清，不能在每次备份开始时清：多个备份可以同时在跑，
 // 按运行清会把别人正在写的文件删掉。正常收尾各删各的（DiffWorkQueue.Dispose）。
 DiffWorkQueue.ClearStale(spillDir);
+// 同理：上次非正常退出留下的压缩中间产物与暂存分卷也在这里清掉。
+// 恢复靠的是 journal（云端已确认的内容），不靠这些本地半成品。
+StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
 // 装箱的两条**按机器**定的界。GroupCapBytes 是每个备份自己的设置，不在这里——
 // 这两条约束的是这台机器上 7z 进程的内存与 argv 上限，换台机器合适的值就不一样。
 builder.Services.AddSingleton(new PackLimits(
@@ -210,6 +223,27 @@ builder.Services.AddSingleton<TaskDispatcher>();
 if (builder.Configuration.GetValue("Scheduler:Enabled", true))
     builder.Services.AddHostedService<SchedulerService>();
 
+// 启动后把上次被计划内退出打断的备份接着跑（Task 15）。**跟着调度器那个开关**，而不是像
+// GracefulSuspendService 那样无条件注册——两者不是一回事：关机挂起只是在停机路径上保住现场，
+// 而这个会**主动开一轮真备份**，与调度器同属"没人按就自己开工"这一类，该由同一个开关管。
+// 直接的好处在测试主机上：TestWebAppFactory 把所有 hosted service 都起起来，无条件注册的话，
+// 任何跑够久的集成用例都可能被它冷不丁开一轮真备份，撞上产出锁与容器。
+//
+// 排在调度器之后、GracefulSuspendService 之前：宿主按注册的逆序停服务，关机挂起因此停在它前面，
+// 会把它刚起的那一轮挂起落盘——而它正等着那一轮的终态，等待也就随之结束。
+var autoResumeRegistered = builder.Configuration.GetValue("Scheduler:Enabled", true);
+if (autoResumeRegistered)
+    builder.Services.AddHostedService<AutoResumeService>();
+
+// 计划内退出（docker stop / 升级重启）时把在跑的备份挂起落盘。
+// **无条件注册**，且必须排在调度器之后：宿主按注册的逆序停服务，排在后面才停在前面——
+// 不然调度器可能在挂起进行到一半时又起一轮。调度器关着时这条路径同样要生效，所以不跟着那个 if。
+builder.Services.AddHostedService<GracefulSuspendService>();
+
+// 默认 5 秒不够：挂起本身只写几十字节，但要先等每个工作者从当前这步退出来。
+// 给到 30 秒，配合 docker-compose 的 stop_grace_period —— 两边都得放宽，短的那个说了算。
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
+
 // 本地路径边界（设计 §3）：Backup:Root 未配置时无边界，行为不变。
 // 这里**立即构造**（而不是交给容器懒加载），让「配了根但解析不出来」在启动期就炸掉，
 // 而不是拖到第一个请求——边界失效是配置错误，越早暴露越好。
@@ -315,6 +349,18 @@ if (authGate.Required)
 else
 {
     app.Logger.LogWarning("Authentication is disabled: Auth__Password is not set.");
+}
+
+// 调度器关着的时候，Settings 页上那个"Resume interrupted backups on startup"开关是**死的**——
+// 自动接着跑跟着同一个开关走（见上面的注册处）。而界面照样把它画成开着的，因为它读的是数据库里
+// 那一位，看不见部署侧的 Scheduler__Enabled。说一句出来，不然这个差别只在某天重启没接上时才被发现，
+// 而那时人会先去怀疑那个明明是开着的开关。
+if (!autoResumeRegistered)
+{
+    app.Logger.LogInformation(
+        "Automatic resume of interrupted backups is off because the scheduler is disabled "
+        + "(Scheduler__Enabled=false), whatever the setting on the Settings page says. "
+        + "Interrupted backups wait for you to press Run.");
 }
 
 // 深度防御（设计 §3.1）：漏网的 SecretUnavailableException 统一映射为 409 keyring_lost，

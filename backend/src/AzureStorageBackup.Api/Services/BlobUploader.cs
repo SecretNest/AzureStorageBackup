@@ -86,11 +86,13 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
 
         try
         {
+            // 将实际取消令牌转发给 TransientErrors.IsTransient，令其区分用户取消与网络超时。
+            // 不转发的话，OperationCanceledException 会被误判为瞬时错误而进入重试流程。
             await RetryPolicy.ExecuteAsync(async token =>
             {
                 await using var stream = File.OpenRead(filePath);
                 await blob.UploadAsync(stream, options, token);
-            }, retry, IsTransient, ct);
+            }, retry, ex => TransientErrors.IsTransient(ex, ct), ct);
         }
         catch (RequestFailedException ex) when (!overwrite && IsAlreadyThere(ex))
         {
@@ -117,12 +119,4 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     /// </summary>
     private static bool IsAlreadyThere(RequestFailedException ex) =>
         ex.Status == 412 || ex.ErrorCode is "BlobAlreadyExists" or "BlobArchived";
-
-    /// <summary>可重试的瞬时错误：服务端 5xx、超时(408)、限流(429)、网络 IO。</summary>
-    private static bool IsTransient(Exception ex) => ex switch
-    {
-        RequestFailedException rfe => rfe.Status == 0 || rfe.Status >= 500 || rfe.Status is 408 or 429,
-        IOException => true,
-        _ => false,
-    };
 }

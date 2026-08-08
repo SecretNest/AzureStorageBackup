@@ -619,6 +619,15 @@ tbody tr.ops-row:hover {
   gap: var(--sp-2);
 }
 
+/* 停止对话框里两组「按钮 + 后果说明」竖排。与 .stack 分开一条规则，是因为间距要更紧
+   （.stack 的 gap 是给整段留白的，这里按钮和它自己的说明文字要贴得更近）。
+   类名是新引入的，不覆盖任何既有规则，不必对着 .btn-ghost/.btn-danger 那组算 specificity。 */
+.stacked-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
 /* 目录选择器的一行。原先是个 .btn-ghost，高 32px、左右各 8px 内边距，
    手机上要瞄准才点得中；整行可点就没有瞄准这回事了。 */
 .browse-row {

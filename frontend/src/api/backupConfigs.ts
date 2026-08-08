@@ -242,7 +242,31 @@ export interface BackupProgress {
 
 // 后台运行的终态。Canceled = 用户按了停止：既不是成功也不是失败，后端因此不会把它写成
 // 该备份的 Error 状态（否则停一次就要手动 Reset 一次）。
-export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled'
+// Suspended = 现场安全保存后停下的，语义上离 Canceled 更近而不是 Failed：下次跑会原样接上。
+export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspended'
+
+// 卡在瞬时错误上等自愈重试。**这不是一种状态**：status 仍然是 Running，因为后台那个 Task
+// 还活着、暂存席位也还占着。写成状态会让停止按钮消失，而卡住的时候恰恰是最想停的时候。
+export interface PauseInfo {
+  reason: string
+  since: string
+  // 下次自动重试的时刻（UTC）。已经在重试路上时为 null。
+  nextRetryAt: string | null
+  // 连续失败次数。涨到阈值就自动转挂起。
+  failures: number
+}
+
+// 盘上留着的一次中途停下的运行（程序重启后内存里什么都没有，只能从这里知道）。
+export interface InterruptedRun {
+  runId: string
+  startedAt: string
+  // journal 里已确认在云上的块数。接着跑能省下的，大致就是这么多。
+  blocks: number
+  journalBytes: number
+  // 便宜的那几项前置校验的预览，**不是承诺**：基线版本与加密身份要读索引和密码才能核，
+  // 那要等真正开卷时才做。这里为 true 而开卷时仍被判作废是可能的。
+  resumable: boolean
+}
 
 export interface BackupRun {
   status: RunStatus
@@ -255,6 +279,12 @@ export interface BackupRun {
   // 运行中、以及未带这两个字段的老后端，为 null。
   startedAt: string | null
   completedAt: string | null
+  // 本次运行的标识，与盘上的 journal 文件同名。
+  runId: string
+  // 非 null＝正卡在瞬时错误上等重试。status 仍是 'Running'。
+  pause: PauseInfo | null
+  // status === 'Suspended' 时的缘由：UserRequested / AutoSuspended。
+  suspendReason: string | null
 }
 
 export interface RestoreRun {
@@ -460,11 +490,29 @@ export const backupConfigsApi = {
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
-  // 停止正在跑的操作。what 省略＝停掉这个配置上所有在跑的操作。停止是异步的：
-  // 这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾，所以界面上不会立刻变。
-  cancel: (id: number, what?: 'backup' | 'restore' | 'repair' | 'check') =>
-    api.post<{ canceled: string[] }>(
-      `/backup-configs/${id}/cancel${what ? `?what=${what}` : ''}`, {}),
+  // 停止正在跑的操作。what 省略＝停掉这个配置上所有在跑的操作。
+  //
+  // 备份这一支后端是**等落盘再答**的，所以这个 Promise resolve 就意味着现场已经安全了——
+  // 除非 stopping 为 true：那表示后端等了 20 秒还没收尾（正在传的大文件还没传完），
+  // 运行仍会走到终态，界面继续轮询即可。
+  //
+  // finishCurrentFiles=true：正在传的文件（含它所有分卷）传完再停，这部分算数；
+  // false：立刻停，半截的分卷和在途的块都删掉，不留没法用的残渣。
+  cancel: (id: number, what?: 'backup' | 'restore' | 'repair' | 'check', finishCurrentFiles = false) => {
+    const p = new URLSearchParams()
+    if (what) p.set('what', what)
+    if (finishCurrentFiles) p.set('finishCurrentFiles', 'true')
+    const q = p.toString()
+    return api.post<{ canceled: string[]; stopping?: boolean }>(
+      `/backup-configs/${id}/cancel${q ? `?${q}` : ''}`, {})
+  },
+  // 挂起：安全落盘后停下。**没有对应的 resume**——恢复不是一种模式，每一轮备份开卷时都会去认
+  // 还有效的 journal，所以"继续"就是再调一次 run()。
+  suspend: (id: number) => api.post<void>(`/backup-configs/${id}/suspend`, {}),
+  // 不等自愈计时器，立刻放行一次重试。
+  retryNow: (id: number) => api.post<void>(`/backup-configs/${id}/retry-now`, {}),
+  interrupted: (id: number) => api.get<InterruptedRun[]>(`/backup-configs/${id}/interrupted`),
+  discardInterrupted: (id: number) => api.del(`/backup-configs/${id}/interrupted`),
   resetPassword: (id: number, password: string) =>
     api.post<void>(`/backup-configs/${id}/reset-password`, { password }),
 }

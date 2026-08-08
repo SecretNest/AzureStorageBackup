@@ -7,6 +7,18 @@ namespace AzureStorageBackup.Api.Services;
 public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
 
 /// <summary>
+/// 一份"云上已经确认存在、但还没进任何版本索引"的内容：内容身份 + 它落在哪。
+/// <para>
+/// 来源只有一个——上一轮（或上几轮）留下、本轮采纳的 journal。这些块与既有版本索引里的块
+/// 处境完全相同（云端确认过、地址已占用），差别只在于记着它们的是 journal 而不是索引，
+/// 所以要一并喂进 <see cref="LocalDedupResolver.Build"/>，让去重、碰撞避让、预筛三处
+/// 都看得见它们。看不见的后果不是"多传一遍"那么轻——见 Build 上的说明。
+/// </para>
+/// </summary>
+public sealed record ConfirmedBlob(
+    string FullHash, long Length, string HeadHash, string TailHash, ResolvedBlob Blob);
+
+/// <summary>
 /// 某个既有 pack 里的一个成员。新条目指向它即完成去重——不压、不传、不装箱。
 /// <para>
 /// <paramref name="EntryName"/> 是**最初存进去时**那个路径（归档内的成员名），与现在引用它的
@@ -76,8 +88,28 @@ public sealed class LocalDedupResolver
 
     private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
-    /// <summary>从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。</summary>
-    public static LocalDedupResolver Build(BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes)
+    /// <summary>
+    /// 从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。
+    /// </summary>
+    /// <param name="confirmed">
+    /// 采纳来的 journal 里那些"云上确认过、索引里还没有"的块（<see cref="ConfirmedBlob"/>）。
+    /// <para>
+    /// **必须喂进来**，否则不只是多传一遍那么轻。恢复是按**路径**认账的：上一轮传完了 A 就挂起，
+    /// 还没走到与 A 同内容的 B。本轮 A 直接复用不再上传，B 却认不出自己已经有了，于是重压一遍，
+    /// 再 ResolveAsync 拿到**同一个** ref（内容寻址，同内容必同址），接着
+    /// <c>UploadStagedBlobAsync</c> 先调 <c>ClearLeftoverVolumesAsync</c> 把那个 ref 名下的分卷
+    /// 全删掉再重传——而 A 的索引条目正指着它们。这个删了再传的窗口里一旦被 Stop now 打断或
+    /// 进程崩掉，云上就只剩半套分卷，下一轮采纳 journal 时 A 照样复用、照样提交索引，
+    /// 指向的却是一份缺卷的内容。错要到还原或检查时才看得见。
+    /// </para>
+    /// <para>
+    /// 喂进来之后 B 走的是跨版本去重那条路：既不重压也不重传，那批分卷根本没有被碰的机会。
+    /// 一并进 <c>refs</c>（不同内容撞上这个地址时照常避让到 …~N）和预筛集。
+    /// </para>
+    /// </param>
+    public static LocalDedupResolver Build(
+        BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes,
+        IEnumerable<ConfirmedBlob>? confirmed = null)
     {
         var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
         var refs = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -118,6 +150,15 @@ public sealed class LocalDedupResolver
                 if (e.HeadHash is not null)
                     heads.Add(HeadKey(e.Length, e.HeadHash));
             }
+        }
+        foreach (var c in confirmed ?? [])
+        {
+            // TryAdd 而不是覆盖：已经提交进版本索引的那份说了算。两边真撞上（同内容身份）时
+            // 记的本来就是同一个 ref，谁赢都一样；不一样的只可能是索引更权威的那种情形。
+            var ck = ContentKey(c.FullHash, c.Length, c.HeadHash, c.TailHash);
+            byContent.TryAdd(ck, c.Blob);
+            refs.TryAdd(c.Blob.Ref, ck);
+            heads.Add(HeadKey(c.Length, c.HeadHash));
         }
         return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers);
     }
@@ -170,25 +211,46 @@ public sealed class LocalDedupResolver
                     new ResolvedBlob(refName, false, 1, []), collision);
             }
 
-            var mine = new Reservation(ck);
-            if (_run.TryAdd(refName, mine))
-                return Resolution.ForClaim(refName, collision, mine); // 由我上传
-
-            var held = _run[refName];
-            if (held.ContentKey == ck)
+            // 同一个地址上可能要试不止一次，所以这里再套一层循环——原委见下面 TryGetValue 落空那一支。
+            while (true)
             {
-                // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
-                tracker?.BeginWait(UploadWait.Peer);
-                try
+                // 占位失败后要能把这个 ref 让出来（见 Reservation.Fail）：Task 7 的闸门会把上传失败的
+                // 活原样重试，重试时还是同一个内容身份，会再走到这里——占位若不撤，重试者会撞上
+                // 这个已经失败的占位，`held.ContentKey == ck` 命中后直接等一个永远失败的 Completion，
+                // 原样重放同一个异常，永远等不到真正的第二次上传尝试。
+                Reservation? mine = null;
+                mine = new Reservation(ck, () =>
+                    ((ICollection<KeyValuePair<string, Reservation>>)_run)
+                        .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
+                if (_run.TryAdd(refName, mine))
+                    return Resolution.ForClaim(refName, collision, mine); // 由我上传
+
+                // 这里**不能**用索引器 `_run[refName]`。从前它是全的：预约一旦落表就永不移除。
+                // 而"上传失败让出 ref"正是本功能刚加的一笔（见上），于是从上面 TryAdd 判失败到
+                // 这一句之间，持有者完全可能已经在**另一个线程**上失败并把这条记录撤走——索引器
+                // 就此抛 KeyNotFoundException。它不在 TransientErrors 的瞬时判据里，闸门接不住，
+                // 整轮备份直接判死；而它偏偏只在失败风暴里出现（多个工作者、同一份内容、失败与
+                // 查表挤在一起），也就是闸门最该起作用的那一刻。
+                if (!_run.TryGetValue(refName, out var held))
+                    continue;   // 持有者刚撤了占位 → **原地**重抢这同一个地址
+
+                // 落空时绝不能 continue 到外层（换下一个候选地址 …~N）：那不是碰撞，
+                // 却会照碰撞报一条 "Hash collision avoided"，还白占一个避让地址。
+                if (held.ContentKey == ck)
                 {
-                    return Resolution.ForExisting(await held.Completion, collision);
+                    // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
+                    tracker?.BeginWait(UploadWait.Peer);
+                    try
+                    {
+                        return Resolution.ForExisting(await held.Completion, collision);
+                    }
+                    finally
+                    {
+                        tracker?.EndWait(UploadWait.Peer);
+                    }
                 }
-                finally
-                {
-                    tracker?.EndWait(UploadWait.Peer);
-                }
+                break; // 同批不同内容占此址 → 避让到下一个
             }
-            // 同批不同内容占此址 → 避让到下一个
         }
     }
 
@@ -199,7 +261,7 @@ public sealed class LocalDedupResolver
         $"{fullHash}\n{length}\n{head}\n{tail}";
 
     /// <summary>运行内某 ref 的预约：内容身份 + 上传完成信号。</summary>
-    internal sealed class Reservation(string contentKey)
+    internal sealed class Reservation(string contentKey, Action release)
     {
         private readonly TaskCompletionSource<ResolvedBlob> _tcs =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -208,7 +270,16 @@ public sealed class LocalDedupResolver
         public Task<ResolvedBlob> Completion => _tcs.Task;
         public void Complete(string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
             _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes, volumeSizes));
-        public void Fail(Exception ex) => _tcs.TrySetException(ex);
+
+        /// <summary>上传失败：先唤醒已经在等的同批同内容后到者（他们绝不该去重到一个没传成功的 blob，
+        /// 这一半行为不变），再把这个 ref 的占位从预约表撤掉——让接下来同内容身份的新一轮
+        /// ResolveAsync（不论是 Task 7 闸门发起的整件重试，还是巧合的下一个同内容文件）能重新
+        /// 占坑、真正再传一次，而不是撞上一个已经判死的占位、原样重放这同一个异常。</summary>
+        public void Fail(Exception ex)
+        {
+            _tcs.TrySetException(ex);
+            release();
+        }
     }
 
     /// <summary>解析结果：去重命中(Exists) 或 需上传的占位(Claim)。</summary>

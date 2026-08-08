@@ -262,7 +262,8 @@ public sealed class BackupOrchestrator(
     private static bool IsEmptyFile(ScannedEntry entry) => entry.Kind == EntryKind.File && entry.Length == 0;
 
     public async Task<BackupRunResult> RunAsync(
-        BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default)
+        BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default,
+        BackupRunControl? control = null)
     {
         // 开始时刻在任何 I/O 之前取：这是操作员心里"这次备份几点开跑"的那一刻。
         var startedAt = DateTimeOffset.UtcNow;
@@ -270,12 +271,57 @@ public sealed class BackupOrchestrator(
         await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
         try
         {
-            var result = await RunCoreAsync(request, startedAt, progress, ct);
+            var result = await RunCoreAsync(request, startedAt, progress, ct, control);
             // 排版与"零值省略"规则见 BackupSummary：那条消息同时进操作日志和 webhook 通知，
             // 是操作员一定会看的一条，所以本轮动了什么、云上多了多少、清掉了多少，都得在里面。
             await Record(NotificationEvents.BackupSuccess, source, $"Backup succeeded: {request.Name}",
                 BackupSummary.Format(result), ct);
             return result;
+        }
+        // 必须排在下面这个通用 catch (Exception ex) 之前：BackupSuspendedException 也是 Exception，
+        // 匹配顺序反了的话它会先被那条兜底逻辑接住，用户看到的就是一条"Backup failed"——
+        // 而现场其实好端端保着，下次跑就能接上。
+        catch (BackupSuspendedException ex)
+        {
+            // 先把理由落到盘上，再去发通知。顺序不能反：通知要过网络，超时或失败都可能把
+            // 这一句连坐吞掉，而下次启动全靠盘上这个标记区分"用户自己按的暂停"（不该替他重开）
+            // 与"关机打断的"（该接着跑）。
+            //
+            // 写在这里而不是写在 SettleStopAsync 里：三种挂起理由只有这一处全经过——
+            // 闸门降级那条（AutoSuspended）是从流水线深处直接抛上来的，根本不走 SettleStopAsync。
+            // 而 BackupRunner 那边的 catch 接不到：control 在它之前就已经随 `await using` 释放了，
+            // 账号 id 与容器名也只活在这一层的局部变量里。
+            control?.MarkSuspended(ex.Reason);
+            // 走 BackupFailure 这个订阅频道，但级别降为 Warning：
+            // 频道选它，是因为订阅"备份没跑完"的人要的正是这条消息，而为此新增一个通知事件位
+            // 意味着所有已有用户默认都收不到——一个只在出事那天才发现的静默默认值。
+            // 级别降下来，是因为这不是错误：Error 会让它长存进审计日志、在界面上顶着红字，
+            // 而它其实是一个可以接着跑的中点。措辞里把"接下来该做什么"直说。
+            await Record(NotificationEvents.BackupFailure, source, $"Backup suspended: {request.Name}",
+                $"{ex.Message} Progress is saved; run this backup again to pick up where it stopped.",
+                ct, OperationLogLevel.Warning);
+            throw;
+        }
+        // 同样必须排在通用 catch (Exception) 之前，理由比 Suspend 那条更硬：
+        // 用户按下的取消是**他自己做的事**，不是事故。落进下面那条兜底就会
+        //   1) 往操作日志里长存一条 Error「Backup failed: photos — Backup stopped by user.」，
+        //      从此这份备份顶着红字、要手动 Reset 才消；
+        //   2) 发一条失败 webhook，半夜把用户叫起来看他自己按的那个按钮。
+        // 两条都与 RunStatus.Canceled 的定义（既不算失败也不算成功）直接冲突。
+        //
+        // Task 9 之前 Cancel 走的是取消 ct，于是 Record 的 _recordGate.WaitAsync(ct) 当场抛出，
+        // 什么都没记——正确的结果，但靠的是一个巧合。现在 ct 不再被碰，就得把它写明白。
+        //
+        // 与 Suspend 那条的区别：这里**不发通知**。「没跑完、可以接着跑」是用户不在场时也要知道的
+        // 事，取消不是——他此刻正盯着界面。日志仍然记一条，但级别 Info、短存：审计上要留下
+        // "这一轮是被人停掉的、不是跑挂了"，而不是留下一条要人处理的告警。
+        catch (OperationCanceledException) when (control is { Stop: not StopKind.None })
+        {
+            // 用 CancellationToken.None：走到这里时运行自己的令牌多半已经触发，用它连这一条都写不下去。
+            await Record(NotificationEvents.BackupFailure, source, $"Backup canceled: {request.Name}",
+                "Stopped by user. Blocks already uploaded are kept for the next run.",
+                CancellationToken.None, OperationLogLevel.Info, notify: false, durable: false);
+            throw;
         }
         catch (Exception ex)
         {
@@ -288,14 +334,19 @@ public sealed class BackupOrchestrator(
     // 故串行化整个上报，避免并发访问 DbContext 击穿备份。
     private readonly SemaphoreSlim _recordGate = new(1, 1);
 
-    private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
+    /// <param name="notify">false＝只进操作日志，不推 webhook。用户主动取消用它：那条消息在
+    /// 审计上有价值，但推给正盯着界面按下按钮的人没有。</param>
+    /// <param name="durable">日志是长存（审计，留到删备份）还是短存（14 天）。</param>
+    private async Task Record(
+        NotificationEvents evt, string source, string title, string body, CancellationToken ct,
+        OperationLogLevel? level = null, bool notify = true, bool durable = true)
     {
         await _recordGate.WaitAsync(ct);
         try
         {
             if (opLog is not null)
-                await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
-            if (notifier is not null)
+                await opLog.AppendAsync(level ?? EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable);
+            if (notifier is not null && notify)
                 await notifier.NotifyAsync(evt, title, body, ct);
         }
         finally
@@ -314,10 +365,71 @@ public sealed class BackupOrchestrator(
     }
 
     private async Task<BackupRunResult> RunCoreAsync(
-        BackupRequest request, DateTimeOffset startedAt, IProgress<BackupProgress>? progress, CancellationToken ct)
+        BackupRequest request, DateTimeOffset startedAt, IProgress<BackupProgress>? progress, CancellationToken ct,
+        BackupRunControl? control = null)
     {
         var opts = request.Options;
         var password = request.Password;
+
+        // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
+        // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
+        // 用户下达任何停法也走这一条：读盘同样没有意义了。
+        //
+        // 建在**最顶上**而不是等到流水线那一段才建：扫描与读版本索引各自都能跑上几分钟（本仓库
+        // 实测过 20 万条目的扫描、50 万条目的索引），而这两段全在任何一次上传之前。令牌若等到
+        // 流水线才有，用户在扫描两分钟时按下的停止要等整棵树扫完、每一版索引读完才起作用；
+        // 而 SuspendAsync/CancelAsync 是要等到终态才返回的，那段时间里 HTTP 请求就一直挂着。
+        using var stopProducing = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.StopToken);
+        // 消费者用的令牌：只有 Stop now 会打断在途上传。Suspend/Finish current files 走的是
+        // "循环顶上检查一下就 break"，在途那件活照做完。
+        using var working = control is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, control.AbortToken);
+
+        // 用户按下的停止，与"进程正在关停"（ct）是两回事：后者不是本轮的停法，照旧往上抛。
+        bool StoppedByUser() => control is { Stop: not StopKind.None } && !ct.IsCancellationRequested;
+
+        // 上传之前那两段（扫描、读版本索引）被叫停时的统一收场。
+        // 这两段跑在任何上传之前，所以没有在途、没有残留卷要清；但 journal 照样得落盘，
+        // 异常类型也照样得按停法映射对（Suspend → BackupSuspendedException，两种取消 →
+        // OperationCanceledException）——原始取消要是直接逃出去，BackupRunner 会把一次
+        // Suspend 记成 Canceled，而这一整套区分正是本功能的全部内容。SettleStopAsync 管这个。
+        async Task<T> BeforeUploadAsync<T>(Func<CancellationToken, Task<T>> body)
+        {
+            T result;
+            try
+            {
+                result = await body(stopProducing.Token);
+            }
+            catch (OperationCanceledException) when (StoppedByUser())
+            {
+                throw await SettleStopAsync(control!.Stop);
+            }
+            // 令牌未必被观察到（读索引命中本地缓存时一次 I/O 都没有），所以回来之后再问一次。
+            if (StoppedByUser())
+                throw await SettleStopAsync(control!.Stop);
+            return result;
+        }
+
+        // 停止收尾：journal 一律落盘（Cancel 也要落——已经传完的块留着给下一轮复用，
+        // 这是用户明确要的），Stop now 还要把在途文件的残留卷删掉。
+        // 全程用 CancellationToken.None：运行自己的令牌此刻多半已经触发，用它一句清理都做不下去。
+        async Task<Exception> SettleStopAsync(StopKind kind)
+        {
+            if (kind == StopKind.StopNow)
+                await PurgeInFlightAsync(request, control!);
+            await control!.FlushAsync(fsync: true, CancellationToken.None);
+            if (kind != StopKind.Suspend)
+                return new OperationCanceledException("Backup stopped by user.");
+            // 理由由下达停止的那一端定（见 BackupRunControl.RequestStop）：同一条收尾路径既走
+            // 用户按的暂停，也走关机顺手的挂起，两者的区别一路要带到盘上的标记里去。
+            var reason = control.SuspendReason;
+            return new BackupSuspendedException(reason, reason == SuspendReason.ShuttingDown
+                ? "Suspended for shutdown."
+                : "Suspended by user.");
+        }
 
         // 0. 确保 container 存在（HTTP 触发的备份自足）
         await factory.CreateServiceClient(request.Account)
@@ -328,7 +440,8 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scanTracker = new StageTracker("Scanning", total: 0, d =>   // 扫完才知道总数，故 total=0
             progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0) { Detail = d }));
-        var scan = await scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, ct, scanTracker);
+        var scan = await BeforeUploadAsync(
+            t => scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, t, scanTracker));
         scanTracker.Complete();
 
         // 范围把所有文件都剔光了：diff 会把上一版本的一切判成删除，写出一个空版本。
@@ -345,6 +458,13 @@ public sealed class BackupOrchestrator(
                 + "Nothing would be backed up, so this run was stopped. "
                 + "Check the scope selection on this backup.");
 
+        // 本地权威状态还没建立 = 这是这个配置在这个容器上的**第一轮**：要么是新建的备份，要么是
+        // 「删了配置、留着容器、又在同一个容器上重建」——删配置时 localState.RemoveAsync 把它清掉了。
+        // 后者正是 journal 被整批丢弃、那批块失去保护的情形，收尾清理必须做一次孤儿扫描才能兑现
+        // 删配置端点写下的承诺。必须问在 LoadAsync **之前**：它会顺手用云端信息文件把本地状态回填上。
+        var firstRun = trackedInfo is not null
+            && !await trackedInfo.HasLocalAsync(request.Account, request.Container, ct);
+
         // 2. 载入上一版本。信息文件优先走本地权威副本（§3.3，避免读云端 Cold 信息文件）；大的版本索引优先走本地缓存。
         var info = (trackedInfo is not null
             ? await trackedInfo.LoadAsync(request.Account, request.Container, password, ct)
@@ -355,8 +475,8 @@ public sealed class BackupOrchestrator(
         if (info.Versions.Count > 0)
         {
             var last = info.Versions[^1];
-            previous = await indexCache.ReadAsync(
-                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, ct);
+            previous = await BeforeUploadAsync(t => indexCache.ReadAsync(
+                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, t));
         }
 
         // data blob 寻址方案：加密备份用密钥化地址防指纹识别（密钥从密码 + 信息文件里的盐派生）。
@@ -375,8 +495,18 @@ public sealed class BackupOrchestrator(
         foreach (var v in info.Versions)
             indexes.Add(previous is not null && v.Version == lastVer
                 ? previous
-                : await indexCache.ReadAsync(request.Account, request.Container, v.Version, identity, v.IndexBlob, password, ct));
-        var localResolver = LocalDedupResolver.Build(addressing, indexes);
+                : await BeforeUploadAsync(t => indexCache.ReadAsync(
+                    request.Account, request.Container, v.Version, identity, v.IndexBlob, password, t)));
+
+        // journal 开卷：基线版本与寻址身份到这里才齐。恢复时靠这两样判断"这卷还作不作数"。
+        if (control is not null)
+            await control.OpenJournalAsync(
+                request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
+                startedAt, ct, firstRun);
+
+        // 去重表在开卷**之后**才建：采纳来的那些块（云上有、索引里还没有）要和索引里的块一起进表，
+        // 否则一个同内容不同路径的文件会把它们删了重传一遍。原委见 Build 的 confirmed 参数。
+        var localResolver = LocalDedupResolver.Build(addressing, indexes, control?.Resume.ConfirmedBlobs());
 
         // 3./4./5. Diff 与「装箱 + 压缩 + 上传」流水线化。
         // 从前这三段严格串行：Diffing 全部跑完 → Plan → Uploading。首次备份的 diff 要把每个文件
@@ -455,28 +585,46 @@ public sealed class BackupOrchestrator(
         var overlap = opts.OverlapDiffAndUpload;
         using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
 
-        // 上传侧出错要让 diff 停下来（继续读盘没有意义），但**不**打断已经在跑的其它上传——
-        // 与从前 Task.WhenAll 的收场方式一致：在途的做完，再把第一个真实异常抛出去。
-        using var stopProducing = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // stopProducing / working 两个令牌建在本方法最顶上（见那里的说明）：扫描与读索引也要看得见停止。
+
+        // 一件活撞上瞬时错误就在闸门前等，放行了重试——但重试的**单位**两条路不同。
+        //
+        // 单文件：整件重试是安全的，每次从头读/压/暂存（PlaceBlobAsync 的 finally 会释放上一次的
+        // 暂存物），分卷 if-missing 之前还会先清掉上一次尝试的残留卷。
+        //
+        // pack：一件活是**一整个池**，ProcessPackAsync 会把它切成若干组、每组各领一个包号。整件
+        // 重试就等于把第 9 组的一次抖动退回到第 1 组，而且退回去之后领的是**新的**包号——前 8 组
+        // 已经传上去的归档从此没有任何索引引用它，只在容器里占着地方；info.Packs 里也各留一条
+        // 指向孤儿的记录。所以 pack 的重试下沉到组里（见 ProcessPackAsync），这里直接调。
+        async Task RunItemAsync(WorkItem item, CancellationToken token)
+        {
+            if (item.Single is { } single)
+                await WithPauseAsync(control, () => HandleBlobAsync(
+                    request, single, addressing, localResolver, storageByPath, tailByPath,
+                    overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control, token), token);
+            else
+                await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
+                    info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
+                    uploadTracker, state, control, token);
+        }
 
         async Task ConsumeAsync()
         {
             try
             {
-                while (await work.DequeueAsync(ct) is { } item)
+                while (await work.DequeueAsync(working.Token) is { } item)
                 {
+                    // 还没开工的活，停下来之后就不做了。已经开工的那件不受影响——
+                    // "做完当前这件再停"这句承诺就落在这个位置上。
+                    if (control is { Stop: not StopKind.None })
+                        break;
+
                     // 领走一件活。从这里到 BeginUpload（压完、开始抢流的额度）之间是压缩与暂存，
                     // 一箱 100 MB 过 7z 可以几十秒——界面上得看得见这段，否则就是"什么都没在发生"。
                     uploadTracker.BeginWork();
                     try
                     {
-                        if (item.Single is { } single)
-                            await HandleBlobAsync(request, single, addressing, localResolver, storageByPath, tailByPath,
-                                overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, ct);
-                        else
-                            await ProcessPackAsync(request, item.Pack!, item.StoreOnly, addressing, localResolver,
-                                info, storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem,
-                                uploadTracker, state, ct);
+                        await RunItemAsync(item, working.Token);
                     }
                     finally
                     {
@@ -493,7 +641,8 @@ public sealed class BackupOrchestrator(
 
         var workers = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
         List<Task> consumers = [];
-        void StartConsumers() => consumers = [.. Enumerable.Range(0, workers).Select(_ => Task.Run(ConsumeAsync, ct))];
+        void StartConsumers() =>
+            consumers = [.. Enumerable.Range(0, workers).Select(_ => Task.Run(ConsumeAsync, working.Token))];
 
         if (overlap)
             StartConsumers();
@@ -717,7 +866,10 @@ public sealed class BackupOrchestrator(
         }
         catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            // diff 是被上传侧的失败叫停的：真正的原因在消费者那边，等它们把它抛出来。
+            // diff 是被叫停的：可能是上传侧失败，也可能是用户下达了停法。
+            await SettleAsync(consumers);
+            if (control is { Stop: var stopped } && stopped != StopKind.None)
+                throw await SettleStopAsync(stopped);
             await Task.WhenAll(consumers);
             throw; // 消费者居然没抛：那就把这个取消交上去，绝不静默当成功
         }
@@ -741,6 +893,19 @@ public sealed class BackupOrchestrator(
         // 这些告警也吞掉，而"有文件读不开"恰恰是最需要告诉操作员的时候。
         await RecordUnreadableWarningsAsync(request, scan, diff, ct);
 
+        // 先把消费者收干净再看有没有停止意愿：停了就不能再往下写版本索引——
+        // 一轮没跑完的备份写出一个版本，等于宣称那些没传的文件已经备份好了。
+        //
+        // 这道检查与下面的写索引之间有一个窗口：停止意愿恰好在检查通过之后才到达的话，这一轮会
+        // 照常写完索引、报 Completed，而 SuspendAsync/CancelAsync 等到终态之后仍然返回 true。
+        // 这是**固有的、可接受的**：那一刻活其实已经全干完了，"停止"没有任何东西可停，用户拿到
+        // 的是一次完整成功的备份——比停在门口更好的结果。**不要**为此加锁把写索引与停止请求串起来：
+        // 那把锁会横跨写索引 + 写信息文件 + 写本地缓存三次 I/O，而停止请求是从 HTTP 线程同步
+        // 调进来的（BackupRunner.RequestStop 里 Cancel() 会在当前线程跑回调），等于让用户按下
+        // 停止按钮的那个请求挂在一串云端写上——为了消掉一个结果本来就正确的竞态。
+        await SettleAsync(consumers);
+        if (control is { Stop: var stopKind } && stopKind != StopKind.None)
+            throw await SettleStopAsync(stopKind);
         await Task.WhenAll(consumers);
 
         // 本轮内跨箱去重的收尾：把挂在各 leader 身上的别名回填成与 leader 相同的 StorageRef。
@@ -818,7 +983,7 @@ public sealed class BackupOrchestrator(
             var pool = side.OrderBy(f => f.Path, StringComparer.Ordinal).ToList();
             await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
                 storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                uploadTracker, state, ct);
+                uploadTracker, state, control, ct);
         }
 
         // 与扫描/差分同理：不强制产出终态，最后一批传完的字节就永远发布不出去——
@@ -863,18 +1028,57 @@ public sealed class BackupOrchestrator(
         if (indexCache is not null)
             await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
 
+        // 索引已提交，journal 使命完成。必须删在清理之前：留着它，清理会以为这些内容还"在途"而不敢动；
+        // 删得比信息文件提交还早，则会出现两边都不认的空档，刚传上去的内容会被当成孤儿删掉。
+        if (control is not null)
+            await control.CompleteAsync();
+
         // 10. Cleanup（按保留策略清理超期版本及其独占数据，§10）
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        var cleanup = await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+
+        // 版本索引与信息文件都已提交（上面第 7/8/9 步），这一轮已经是一次完整、成功的备份——
+        // 接下来的清理只是顺手维护，不是"这次备份"本身的一部分。用户此刻的停止意愿绝不能
+        // 让这次已经成功的备份被记成 Suspended/Canceled：不走 SettleStopAsync，就是这个理由。
+        //
+        // Task 9 把旧 Cancel() 直接取消运行自己的 ct 那条路拆掉之后，这里成了唯一一处漏网的
+        // 尾巴：stopProducing/working 两个令牌都不接在这段上，用户在 CleaningUp 阶段按下停止，
+        // 死重压实该下载、重压、重传照样跑完（可能是几分钟到几小时），而 CancelAsync/SuspendAsync
+        // 是等到终态才返回的——HTTP 请求会跟着一起挂那么久。
+        //
+        // 停止意愿如果在**进入清理之前**就已经落定，直接整段跳过：该清的超期版本、该压实的
+        // 死重，下一轮 cleaner 照样会看一遍全部版本补上，不会有任何数据永久漏清或漏压。
+        // 不要把这句"跳过"当成可有可无的优化去掉——它就是本节存在的全部意义。
+        CleanupReport cleanup;
+        if (control is { Stop: not StopKind.None })
         {
-            Retention = request.Options.Retention,
-            DataTier = request.DataTier,
-            VolumeBytes = request.Options.VolumeBytes,
-            DeadWeightThreshold = request.Options.DeadWeightThreshold,
-            LocalRoot = request.LocalRoot,
-            AllowRepackDownload = request.Options.AllowRepackDownload,
-            // 收尾顺带压实用**本轮自己的**席位：另取一个会让均分的分母虚高，把并行的其它备份额度算小。
-        }, info, ct, stagingLease);
+            cleanup = CleanupReport.Empty;
+        }
+        else
+        {
+            try
+            {
+                cleanup = await cleaner.CleanupAsync(request.Account, request.Container, password, new CleanupOptions
+                {
+                    Retention = request.Options.Retention,
+                    DataTier = request.DataTier,
+                    VolumeBytes = request.Options.VolumeBytes,
+                    DeadWeightThreshold = request.Options.DeadWeightThreshold,
+                    LocalRoot = request.LocalRoot,
+                    AllowRepackDownload = request.Options.AllowRepackDownload,
+                    // 收尾顺带压实用**本轮自己的**席位：另取一个会让均分的分母虚高，把并行的其它备份额度算小。
+                    // ct 传 stopProducing.Token（不是裸 ct）：停止意愿若是在压实*进行中途*才到达，
+                    // 这里也要能被打断，而不是只在进入清理前那一次检查里管用——这正是 Task 9 之前
+                    // 旧 Cancel() 取消运行自己的 ct 时，压实这一段本来就享有的行为，这里是照旧恢复。
+                }, info, stopProducing.Token, stagingLease, sweepOrphans: control?.SweepNeeded ?? false);
+            }
+            catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // 压实半路被打断：版本早已提交，这仍然是一次成功的备份，只是清理没做完——
+                // 绝不能让这个取消原样逃出去，那会被 RunAsync 顶上的分支当成 Suspended/Canceled，
+                // 把一次成功的备份倒扣掉。跳过的部分留给下一轮 cleaner 补上。
+                cleanup = CleanupReport.Empty;
+            }
+        }
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
 
@@ -981,8 +1185,10 @@ public sealed class BackupOrchestrator(
         string FullHash, string HeadHash, string TailHash, long Length, DateTimeOffset Mtime, bool Raw);
 
     /// <summary>单文件 blob 的最终落位：存储引用 + 实际存下去的内容身份。</summary>
+    /// <param name="Resumed">命中了 journal 里上一轮已经传完的记录。它已经被记过，本轮不必再记。</param>
     private sealed record BlobPlacement(
-        string Ref, bool Collision, int Volumes, IReadOnlyList<long> VolumeSizes, BlobContent Content);
+        string Ref, bool Collision, int Volumes, IReadOnlyList<long> VolumeSizes, BlobContent Content,
+        bool Resumed = false);
 
     /// <summary>
     /// 处理单文件内容寻址 blob：**一遍读**同时算 hash 并压缩，然后上传 data/{hash}。
@@ -1003,7 +1209,7 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, RunState state,
-        CancellationToken ct)
+        BackupRunControl? control, CancellationToken ct)
     {
         var localPath = Local(request, file.Path);
         var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(file.Path) ?? false;
@@ -1012,7 +1218,8 @@ public sealed class BackupOrchestrator(
         try
         {
             placement = await PlaceBlobAsync(
-                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, state, ct);
+                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, state,
+                control, ct);
         }
         // 这个 try 圈住的不只是源文件读取，还有压缩、暂存和上传——所以异常类型本身不足以判定
         // "文件读不开"：BlobUploader 把 IOException 归为可重试的网络错误（BlobUploader.IsTransient），
@@ -1033,19 +1240,35 @@ public sealed class BackupOrchestrator(
             return;
         }
 
+        // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
+        // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
+        // file.FullHash 为空（diff 把全文 hash 延后给了这一遍读）时必然不等，于是照常写覆盖——
+        // 索引里的 hash 因此永远来自"真正压进归档的那些字节"，而不是 diff 时看到的那一份。
+        var content = placement.Content;
+
+        // journal：上传（或 if-missing 命中）已经确认返回，这块内容此刻确实在云上了，现在才敢记。
+        // 顺序不能动——先记后传就会记下一块并不存在的内容，下次恢复直接跳过它，那是数据丢失。
+        // 放在下面的碰撞告警**之前**：告警要打数据库和 webhook，是一次与这条记录无关的 I/O，
+        // 失败了不该连累 journal——journal 追加只是几十字节的本地写，成本比告警低得多，
+        // 而且是下一次运行真正要靠它判断"这块内容要不要重传"的东西，不能因为无关的失败而丢失。
+        // 传的是 CancellationToken.None，不是这次运行的 ct：Task 9 会取消同一个 ct 来挂起/取消
+        // 运行，而这一刻上传早已确认，云上已经有这块内容了——取消这个写入不会撤销任何东西，
+        // 只会让下次恢复以为这块没传过、白白重传一次。半截写的风险也一样：write 被取消可能截断
+        // 这一行，下次拼接进新 journal 时把它连同下一条一起解析坏掉。
+        // Resumed 的那一份是从旧卷复用来的，旧卷本轮成功之前一直留着，不必再抄一遍。
+        if (control is not null && !placement.Resumed)
+            await control.RecordBlobAsync(
+                file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
+                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
+
         // 碰撞告警是内容已成功处理/上传之后的事后上报，不再触碰源文件——绝不能留在上面的 try 里：
         // 否则这条通知（或其内部日志写入）失败会被误判成"文件读不开"，导致已经成功上传的内容
         // 在索引里被沿用旧条目或整条丢弃，而云端其实已经有这份数据。
         if (placement.Collision)
             await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                 $"Hash collision avoided: {file.Path}",
-                $"Different content shares hash {placement.Content.FullHash}; stored at {placement.Ref}", ct);
+                $"Different content shares hash {content.FullHash}; stored at {placement.Ref}", ct);
 
-        // 实际存下去的内容与 diff 时看到的不是同一份：以前者覆盖索引条目，保证 fullHash/长度/头尾 hash
-        // 与 data/{hash} 里的字节一致。这些值全都来自刚才那一遍读，**不再重开源文件**。
-        // file.FullHash 为空（diff 把全文 hash 延后给了这一遍读）时必然不等，于是照常写覆盖——
-        // 索引里的 hash 因此永远来自"真正压进归档的那些字节"，而不是 diff 时看到的那一份。
-        var content = placement.Content;
         if (content.FullHash != file.FullHash)
             overrides[file.Path] = new EntryOverride(
                 content.FullHash, content.HeadHash, content.Length, content.Mtime);
@@ -1066,15 +1289,24 @@ public sealed class BackupOrchestrator(
     private async Task<BlobPlacement> PlaceBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
-        VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, CancellationToken ct)
+        VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, BackupRunControl? control,
+        CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
-        // 1. 预筛 + 探测。命中既有 blob 就到此为止：一个字节都不用压、不用传。
-        if (await ProbeForDedupAsync(file, localPath, headBytes, localResolver, uploadTracker, ct) is { } p
-            && localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+        // 1. 预筛 + 探测。命中就到此为止：一个字节都不用压、不用传。
+        if (await ProbeForDedupAsync(localPath, headBytes, localResolver, uploadTracker, ct) is { } p)
         {
-            return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
+            // 第一档：上一轮已经确认传上去的这一份。路径 + 内容双对才认——中断之后文件完全
+            // 可能被改过，光凭路径复用就是把旧内容当成新内容写进索引。
+            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done)
+                return new BlobPlacement(
+                    done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
+                    Resumed: true);
+
+            // 第二档：跨版本的既有 blob（原有行为，一字未动）。
+            if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+                return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
         }
 
         // 2. 一遍读：边读边算三段 hash，边把字节喂进 7z（或直接拷成 raw 临时文件）。
@@ -1096,7 +1328,7 @@ public sealed class BackupOrchestrator(
             {
                 var (volumes, sizes) = await UploadStagedBlobAsync(
                     request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, state,
-                    file.Path, ct);
+                    file.Path, control, ct);
                 res.Complete(content.Raw, volumes, sizes); // 唤醒同批同内容的后到者，给它们相同存储信息
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
             }
@@ -1123,7 +1355,7 @@ public sealed class BackupOrchestrator(
     /// 屏幕上是一动不动的 "1 object starting upload"，而它连压缩都还没开始。
     /// </remarks>
     private async Task<BlobContent?> ProbeForDedupAsync(
-        PlannedFile file, string localPath, int headBytes, LocalDedupResolver localResolver,
+        string localPath, int headBytes, LocalDedupResolver localResolver,
         StageTracker uploadTracker, CancellationToken ct)
     {
         uploadTracker.BeginChecking();
@@ -1131,6 +1363,8 @@ public sealed class BackupOrchestrator(
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
+            // journal 也要参与预筛：采纳来的确认块已经在 LocalDedupResolver.Build 里折进
+            // localResolver 的预筛集了（见 JournalResume.ConfirmedBlobs），这里问它一个就够。
             var may = localResolver.MayDeduplicate(length, head);
             localResolver.NoteInFlight(length, head);
             return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
@@ -1230,7 +1464,7 @@ public sealed class BackupOrchestrator(
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
         BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
-        string sourceLabel, CancellationToken ct)
+        string sourceLabel, BackupRunControl? control, CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
         // 闸门与在途登记都下沉到了每一卷（VolumeUploadScope）；这里只标记"这件活进入上传段了"，
@@ -1243,11 +1477,14 @@ public sealed class BackupOrchestrator(
             if (content.Raw)
                 meta["raw"] = "1";
             await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, uploadTracker, ct);
+            control?.TrackInFlight(blobRef);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, staged.Files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
                 onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
                 label: sourceLabel);                     // 界面上显示源文件路径，不是内容寻址的 blob 名
+            // 确认返回了才销账。抛异常时故意**不**销：那份残留正是 Stop now 要清掉的东西。
+            control?.ClearInFlight(blobRef);
             // 记在整件传完之后：中途失败会把整轮备份带失败，那时这个数字根本不会被用到，
             // 而按卷边传边记会让一次重试把同一批字节记两遍。
             state.AddUploaded(sizes.Sum());
@@ -1260,33 +1497,42 @@ public sealed class BackupOrchestrator(
     }
 
     /// <summary>
-    /// 加密的多卷归档上传前，先抹掉这个地址上可能残留的旧卷。
+    /// 多卷归档上传前，先抹掉这个地址上可能残留的旧卷。
     /// <para>
-    /// 走到这里意味着本地权威判定"这个 ref 上不该有东西"。云端却仍可能有——上一次运行传到一半
-    /// 倒了，而收尾（写索引、写信息文件、写本地状态）是最后才做的，那批已经落地的卷于是既不在
-    /// 任何索引里，也不在本地状态里。下一次跑到同一个文件会重新压、重新传，但上传是 if-missing 的
-    /// （<see cref="IBlobUploader.UploadIfMissingAsync"/> 用 If-None-Match 交给服务端判），
-    /// 已经在的卷会被跳过。
+    /// 走到这里意味着本地权威判定"这个 ref 上不该有东西"。云端却仍可能有：上一次运行传到一半
+    /// 倒了（收尾的写索引/写信息文件是最后才做的，那批已落地的卷因此既不在任何索引里也不在本地
+    /// 状态里），或者**本轮**这一件活撞上瞬时错误、在挂起闸门前等过一轮又重来了一次。
+    /// 上传是 if-missing 的（<see cref="IBlobUploader.UploadIfMissingAsync"/> 用 If-None-Match
+    /// 交给服务端判），已经在的卷会被跳过——于是云上那一族卷成了**两次压缩的混合体**。
     /// </para>
     /// <para>
-    /// 明文下这不要紧：同样的输入配同样的参数，7z 压出来的卷逐字节相同（实测确认），跳过旧卷
-    /// 与传一遍新卷结果一致，还省了流量。**加密则不然**——AES 每次生成新的随机 salt/IV，同一个
-    /// 文件两次压出来的密文必然不同。于是 .001 是上一次的密文、.003 是这一次的，拼起来解不开，
-    /// 那个文件就此还原不了，而 blob 名是从明文内容 hash 派生的，两次跑拿到的又恰恰是同一个名字。
+    /// 从前这里对不加密的备份直接早退，依据是"同样的输入配同样的参数，7z 压出来的卷逐字节相同"。
+    /// 这条依据对单文件 blob 那条路**不成立**，实测（7-Zip 26.00）：
     /// </para>
     /// <para>
-    /// 只对多卷做。单卷即使跳过了旧密文也无妨：它是一份完整、自洽的归档，解出来还是同一个文件。
-    /// 多卷才有"半旧半新"这种拼不起来的形状。而多卷都是大文件，一次列举加几次删除相对于要传的
-    /// 字节数可以忽略——反过来，对每个新 blob 都先列一遍，首次备份就是几十万次白问。
+    /// 单文件走的是 <c>-si</c> 从 stdin 读（<see cref="CompressStreamingAsync"/>），而我们喂给它的
+    /// stdin 是一根**管道**。7z 拿不到源文件的 mtime，就把归档成员的 kMTime 属性写成**压缩那一刻**
+    /// 的时间。两次压缩因此差在：末卷里的 8 字节 FILETIME，以及首卷 32 字节签名头里那两个覆盖
+    /// 尾部头的 CRC。压缩数据本身逐字节相同——可正因为首卷的 CRC 校验的是末卷的头，把第一次的
+    /// 首卷和第二次的末卷拼在一起，7z 直接 <c>Headers Error / Can't open as archive</c>。
+    /// 索引却声称这个 blob 好好的：静默的数据损坏，而不是少传一次。
+    /// （对照组：pack 那条路按**文件名**压，mtime 取自磁盘上的文件，两次产出确实逐字节相同——
+    /// 见 SevenZipDeterminismTests。加密则两条路都不确定：AES 每次换随机 salt/IV。）
+    /// </para>
+    /// <para>
+    /// 所以判据只剩"是不是多卷"，不再问加不加密。单卷不必清：它是一份完整、自洽的归档，
+    /// 跳过它与传一遍新的结果一致。多卷才有"半旧半新"这种拼不起来的形状，而多卷都是大文件，
+    /// 一次列举加几次删除相对于要传的字节数可以忽略——反过来，对每个新 blob 都先列一遍，
+    /// 首次备份就是几十万次白问。
     /// </para>
     /// </summary>
     private async Task ClearLeftoverVolumesAsync(
         BackupRequest request, string blobRef, int volumeCount, StageTracker uploadTracker, CancellationToken ct)
     {
-        if (volumeCount <= 1 || string.IsNullOrEmpty(request.Password))
+        if (volumeCount <= 1)
             return;
 
-        // 登记在早退之后：不加密或单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
+        // 登记在早退之后：单卷时这里什么都不做，那种情况下在屏幕上闪一栏出来纯属噪声。
         // 严格说这一段查的是云上的卷而不是本地文件，仍归进「核对」那一栏——单给它一栏不值当，
         // 要说的就一件事：这件活正在核对，不在传。
         uploadTracker.BeginChecking();
@@ -1307,12 +1553,64 @@ public sealed class BackupOrchestrator(
         }
     }
 
+    /// <summary>
+    /// Stop now 的收尾：把还挂在在途登记里的内容连同它的全部分卷删掉。
+    /// 登记只在上传确认返回后才销账，所以留在里面的就是"传了一半、没人认得"的残留。
+    /// 完整传完的块不在此列——它们留着给下一轮复用，这是用户明确要的。
+    /// </summary>
+    private async Task PurgeInFlightAsync(BackupRequest request, BackupRunControl control)
+    {
+        var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+        foreach (var blobRef in control.InFlight)
+        {
+            await foreach (var b in container.GetBlobsAsync(
+                BlobTraits.None, BlobStates.None, blobRef, CancellationToken.None))
+            {
+                // 按前缀列举会连带捞到碰撞避让的兄弟（data/{hash}~1 及其分卷），那是**另一份内容**、
+                // 由别的索引条目引用着，误删就是真丢数据。IsVolumeOf 只认这个归档自己的卷。
+                if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
+                    await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
+            }
+        }
+    }
+
     private async Task<EntryOverride> BuildOverrideAsync(
         string localPath, string fullHash, int headBytes, CancellationToken ct)
     {
         var info = new FileInfo(localPath);
         var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
         return new EntryOverride(fullHash, head, info.Length, new DateTimeOffset(info.LastWriteTimeUtc));
+    }
+
+    /// <summary>
+    /// 把一段活放到挂起闸门后面跑：撞上瞬时错误就在闸门前等，放行了原样重来一遍，直到成功、
+    /// 或者闸门失去耐心把这轮运行降级为挂起。
+    /// <para>
+    /// <paramref name="body"/> 就是重试的**单位**，所以它必须整段可重入：重来一遍不能留下上一遍
+    /// 的半成品，也不能把同一件事记两次。单文件 blob 传的是一整件，pack 传的是一**组**——
+    /// 两个调用点因此传进来的东西大小差着一个量级，但闸门那套等法完全一样，不该抄第二遍。
+    /// </para>
+    /// </summary>
+    /// <param name="ct">**运行本身**那个取消令牌，不是别的。瞬时判据要拿它区分"网络抖了一下"和
+    /// "用户按了取消"——传错了的话，取消会被当成抖动吞掉，按钮就静悄悄失效了。</param>
+    private static async Task WithPauseAsync(BackupRunControl? control, Func<Task> body, CancellationToken ct)
+    {
+        while (true)
+        {
+            try
+            {
+                await body();
+                // 一段活干成了就把连败清零：闸门的耐心是"从第一次不顺算起还没好过"，
+                // 中间成功过一次却不清零的话，几个钟头里零星抖几下也会攒够耐心把运行判挂起。
+                control?.Gate.ReportSuccess();
+                return;
+            }
+            catch (Exception ex) when (control is not null && TransientErrors.IsTransient(ex, ct))
+            {
+                if (!await control.Gate.WaitAsync(ex, ct))
+                    throw new BackupSuspendedException(SuspendReason.AutoSuspended, ex.Message);
+            }
+        }
     }
 
     /// <summary>
@@ -1335,7 +1633,7 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
-        RunState state, CancellationToken ct)
+        RunState state, BackupRunControl? control, CancellationToken ct)
     {
         var plan = request.Options.Plan;
         var threshold = plan.SingleFileThresholdBytes;
@@ -1360,98 +1658,151 @@ public sealed class BackupOrchestrator(
             }
             queue.RemoveRange(0, group.Count);
 
+            // 包号在重试**之外**领，一组一个，领定了就不再变。放进重试里的话，闸门每放行一次
+            // 这一组就换一个号：上一次尝试已经传上去的卷再没有任何索引引用得到，只在容器里占着
+            // 地方，info.Packs 里还各留一条指向孤儿的记录。
             var packId = state.NextPackId();
             // 这些 PlannedFile 全部由 ToPlannedFile(PackEntry) 而来，FullHash 按构造非空——
             // 延后计算只发生在单文件 blob 上，那条路不产生 pack。
             var members = group.Select(f => new PackEntry(f.Path, f.Path, f.FullHash!, f.Length)).ToList();
 
-            // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
-            // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
-            // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
-            // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
-            // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
-            // 逐成员 stat：一箱几百个成员，在 NAS 上不是白干的。与压缩后那一遍同报「读盘核对」。
-            uploadTracker.BeginChecking();
-            Dictionary<string, (long Mtime, long Length, int Mode)?> before;
-            try
-            {
-                before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-            }
-            finally
-            {
-                uploadTracker.EndChecking();
-            }
-            var (staged, missing) = await CompressPackTolerantAsync(
-                request, packId, members, storeOnly, uploadTracker, state, ct);
-            // 这一箱的归档由本次迭代持有：本轮怎么结束都还回去。下面从这里到用完之间有一整段
-            // 会抛的代码（压缩后重校验里那次重算 hash，取消时抛的 OperationCanceledException 不在
-            // 那层 catch 的收集范围里），从前一穿出去这份账就永远挂在单例上了——而它是产出的背压
-            // 闸门，攒够就把所有运行的压缩一起卡住。用完仍会立刻显式 Release，这里只兜异常路径。
-            using var held = staging.Hold(staged);
-
-            // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
-            // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
-            // 于是一个缺成员的 pack 就被原样上传，索引却声称它在里面。
-            var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
-
-            // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
+            // 恢复：这一整箱上一轮已经确认传上去了。成员集合必须逐一对得上——下面的
+            // RecordPackAsync 会拿**本轮这一组**的成员表去写 PackInfo.Members/OriginalBytes，
+            // 并给每个成员写一条指向这个包的索引条目。超集就是宣称归档里有一些它根本没有的成员
+            // （还原解不出、检查报缺失，索引却一口咬定它在），子集则让 OriginalBytes 算少、
+            // 死重压实据此误判这箱还剩多少活肉。
             //
-            // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
-            // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
-            // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
-            uploadTracker.BeginChecking();
-            try
+            // 仍然要走 RecordPackAsync（只是不上传）：本轮内跨箱去重的收尾靠 storageByPath[leaderPath]
+            // 判 leader 有没有走岔，在这里直接 continue 掉，挂在这个 leader 身上的别名会全部悬空重跑。
+            //
+            // control 传 null：这条记录还留在被采纳的那卷 journal 里，本轮成功提交索引之前一直在，
+            // 不必再抄一遍。
+            var journalMembers = members
+                .Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length)).ToList();
+            if (control?.Resume.FindPack(journalMembers) is { } donePack)
             {
-                foreach (var m in members)
-                {
-                    if (missing.Contains(m.EntryName))
-                        continue;
-
-                    var local = Local(request, m.Path);
-                    bool exclude;
-                    try
-                    {
-                        // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
-                        // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
-                        exclude = before[m.Path] is not { } snapshot
-                            || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        exclude = true;
-                    }
-                    if (exclude)
-                        changed.Add(m);
-                }
-            }
-            finally
-            {
-                uploadTracker.EndChecking();
-            }
-
-            if (changed.Count == 0)
-            {
-                var vols = await UploadStagedPackAsync(
-                    request, packId, staged!, uploadScope, uploadTracker, state, members.Count, ct);
-                RecordPack(request, packId, members, vols, storeOnly, info, storageByPath);
+                await RecordPackAsync(
+                    request, donePack.Ref, members, donePack.VolumeSizes, donePack.StoreOnly, info,
+                    storageByPath, control: null, ct);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
-                onItem(bytes); // 销账用整组的原始字节：入队时申报的是整个池，池被拆成的每一组各销一份
+                onItem(bytes);   // 这一组的槽位与字节照常销账，否则进度永远追不上 total
                 continue;
             }
 
-            // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
-            // staged 为 null 只可能是整组成员都被 7z 丢掉（连空归档都没留下），此时无物可释放。
-            if (staged is not null)
-                staging.Release(staged);
-            var stable = members.Where(m => !changed.Contains(m)).ToList();
-            if (stable.Count > 0)
+            // 「压这一组 + 传上去」是重试的单位：抖一下就把这一组从头做一遍，前面几组不受牵连。
+            // 整段可重入——包号不变，所以重压的产出盖回同一族卷（传之前先清残留，见
+            // UploadStagedPackAsync）。journal append 与 oplog 写**不**在重试单位之内（见下方调用处的
+            // 注释）：它们发生在云端已确认之后，重来一遍只会把上传字节和索引成员表算重/算错，而不是
+            // 让"这一组"重新可重入。变化成员的重新入队也留在外面：那会动 queue 和 attempts，
+            // 重来一遍就会把同一个成员排两次队、把重试次数记重。
+            async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
             {
-                var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
-                var vols2 = await UploadStagedPackAsync(
-                    request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, ct);
-                RecordPack(request, packId, stable, vols2, storeOnly, info, storageByPath);
-                foreach (var m in stable) await LogFileAsync(request, m.Path, ct);
+                // 这份快照离 diff 可能已隔了几小时：封箱之后这个包还要在有界队列里排队，前面挤着多少
+                // 活、消费者有几个，都不归它管。期间一个成员完全可能被删掉（构建产物）或被收回权限，
+                // 而 Stat 会就此抛出，让整轮备份倒在与本分支所修完全相同的形状上。不另起机制：读不到
+                // 就把快照记成 null，交给下面既有的"排除成员"路径处理（与"内容在压缩期间变了"同一条
+                // 路：排除出归档 → 重取新内容 → 仍读不开则降级）。
+                // 逐成员 stat：一箱几百个成员，在 NAS 上不是白干的。与压缩后那一遍同报「读盘核对」。
+                uploadTracker.BeginChecking();
+                Dictionary<string, (long Mtime, long Length, int Mode)?> before;
+                try
+                {
+                    before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
+                }
+                finally
+                {
+                    uploadTracker.EndChecking();
+                }
+                var (staged, missing) = await CompressPackTolerantAsync(
+                    request, packId, members, storeOnly, uploadTracker, state, ct);
+                // 这一箱的归档由本次迭代持有：本轮怎么结束都还回去。下面从这里到用完之间有一整段
+                // 会抛的代码（压缩后重校验里那次重算 hash，取消时抛的 OperationCanceledException 不在
+                // 那层 catch 的收集范围里），从前一穿出去这份账就永远挂在单例上了——而它是产出的背压
+                // 闸门，攒够就把所有运行的压缩一起卡住。用完仍会立刻显式 Release，这里只兜异常路径。
+                using var held = staging.Hold(staged);
+
+                // 被 7z 丢出归档的成员必须**直接**判为排除，不能指望下面的比对发现：那段比对看的是
+                // 元数据与内容 hash，而权限被收回并不改 mtime/length——比对会说"这个成员没变"，
+                // 于是一个缺成员的 pack 就被原样上传，索引却声称它在里面。
+                var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
+
+                // 压缩后重校验：元数据变且内容 hash 变 → 该成员在压缩期间变化。
+                //
+                // 整段登记为「读盘核对」：逐成员 stat 已经不便宜，撞上一个变过的大成员还要把它整读一遍
+                // 重算 hash。这一段跑在出了暂存段、还没登记任何在途卷的时候，一个进度事件都不发——
+                // 不报出来的话屏幕上就是几十秒不动的 "1 object starting upload"。
+                uploadTracker.BeginChecking();
+                try
+                {
+                    foreach (var m in members)
+                    {
+                        if (missing.Contains(m.EntryName))
+                            continue;
+
+                        var local = Local(request, m.Path);
+                        bool exclude;
+                        try
+                        {
+                            // 读不开与内容变了，对这个包而言后果相同：都不能把它留在归档里上传。
+                            // 快照阶段就已经读不到（before 为 null）同样归入这一类，不必再读第二次去确认。
+                            exclude = before[m.Path] is not { } snapshot
+                                || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            exclude = true;
+                        }
+                        if (exclude)
+                            changed.Add(m);
+                    }
+                }
+                finally
+                {
+                    uploadTracker.EndChecking();
+                }
+
+                if (changed.Count == 0)
+                {
+                    var vols = await UploadStagedPackAsync(
+                        request, packId, staged!, uploadScope, uploadTracker, state, members.Count, control, ct);
+                    return (changed, members, vols);   // 空表：这一组干干净净地成了一个 pack
+                }
+
+                // 丢弃本次归档；稳定成员照常成 pack；变化成员以新 hash 处理。
+                // staged 为 null 只可能是整组成员都被 7z 丢掉（连空归档都没留下），此时无物可释放。
+                if (staged is not null)
+                    staging.Release(staged);
+                var stable = members.Where(m => !changed.Contains(m)).ToList();
+                if (stable.Count > 0)
+                {
+                    var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
+                    var vols2 = await UploadStagedPackAsync(
+                        request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, control, ct);
+                    return (changed, stable, vols2);
+                }
+                return (changed, [], []);   // 整组成员都被判为变化/读不开：没有稳定成员可记
             }
+
+            List<PackEntry> changedMembers = [];
+            IReadOnlyList<PackEntry> recordedMembers = [];
+            IReadOnlyList<long> recordedVolumes = [];
+            await WithPauseAsync(control, async () =>
+                (changedMembers, recordedMembers, recordedVolumes) = await AttemptAsync(), ct);
+
+            // journal append 与 oplog 写挪到这里、退出重试单位之后：上面 AttemptAsync 一旦成功返回，
+            // 云端已经确认了这次上传，闸门不会再让这一组重来——RecordPackAsync/LogFileAsync 因而
+            // 只会跑这一次，不会像挪进去之前那样，因为它们自己抛出瞬时错误（比如本地盘 IOException）
+            // 而触发整组重压：重压会把已传的字节在 state.AddUploaded 里算第二遍（速度/ETA 失真），
+            // 单卷 pack 还会被 UploadIfMissing 当"已存在"跳过，导致这次重压出的新 Members/VolumeSizes
+            // 记进索引，而容器里躺着的还是上一次的归档——两者从此对不上，只有 check/repair 才会发现。
+            // 整组成员都读不开、没有任何东西可记（recordedMembers 为空）时自然跳过，不必特判。
+            if (recordedMembers.Count > 0)
+            {
+                await RecordPackAsync(
+                    request, packId, recordedMembers, recordedVolumes, storeOnly, info, storageByPath, control, ct);
+                foreach (var m in recordedMembers) await LogFileAsync(request, m.Path, ct);
+            }
+
             // 无论这一组里有多少成员被排除出稳定 pack（内容变化、还是读不开)，这次分组迭代都对应
             // total 里预留的一个槽位，必须**恰好上报一次**——即便 stable.Count == 0（整组成员一起
             // 读不开，Finding 2 命中的最坏情形），否则 uploaded 永远追不上 total，完工也显示不了 100%。
@@ -1459,9 +1810,12 @@ public sealed class BackupOrchestrator(
             // 多个成员一起失败时被重复计数（该组只占一个槽位，不是每个成员各占一个）。
             // 剩余时间的销账同理：整组的原始字节一次记清，哪怕组里没剩下一个稳定成员——
             // 这一组的活确实做完了，工作量不销就永远悬在那里，剩余时间收不到 0。
+            //
+            // 也正因为它在重试**之外**：这一组抖了几次、重压了几遍，账都只销一次。放进去的话，
+            // 一次抖动就让 uploaded 多涨一格，最后越过 total，速度和剩余时间跟着一起失真。
             onItem(bytes);
 
-            foreach (var m in changed)
+            foreach (var m in changedMembers)
             {
                 var local = Local(request, m.Path);
                 string newHash;
@@ -1495,9 +1849,13 @@ public sealed class BackupOrchestrator(
                     // 不重新用 try 包住整个调用：HandleBlobAsync 自己对源读取/处理/上传有正确范围的
                     // catch（成功上传后的收尾不在其内），这里的职责只是"别再包一层"，不是重新兜底
                     // 它已经处理过的失败（Finding 1：调用方的 catch 不应该圈住被调用方的全部工作）。
-                    await HandleBlobAsync(request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                    // 闸门是另一回事：它不吞异常，只是撞上瞬时错误时等一等再把**同一件**活重来一遍。
+                    // 这件活是从池子里掉出来的一个单文件，与消费循环里那条单文件路径同一个形状，
+                    // 因此也用同一个重试单位——不放进闸门的话，这一件抖一下就能带倒整轮备份。
+                    await WithPauseAsync(control, () => HandleBlobAsync(
+                        request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
                         storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                        uploadTracker, state, ct);
+                        uploadTracker, state, control, ct), ct);
                 }
                 else
                 {
@@ -1561,19 +1919,29 @@ public sealed class BackupOrchestrator(
     /// <returns>该 pack 各分卷的字节尺寸（按 .001..N 顺序；供记录，核验分卷完整性/尺寸用）。</returns>
     private async Task<IReadOnlyList<long>> UploadStagedPackAsync(
         BackupRequest request, string packId, StagedItem staged, VolumeUploadScope uploadScope,
-        StageTracker uploadTracker, RunState state, int memberCount, CancellationToken ct)
+        StageTracker uploadTracker, RunState state, int memberCount, BackupRunControl? control,
+        CancellationToken ct)
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // Release 前先取尺寸
         var blobName = $"packs/{packId}.7z";
         uploadTracker.BeginUpload();   // 闸门与在途登记见 VolumeUploadScope，都在每卷那一层
         try
         {
+            // 与单文件 blob 同一条纪律（见 ClearLeftoverVolumesAsync）：多卷才做，做的是不让
+            // 这一族卷混进上一次尝试的产物。pack 号本轮唯一，所以残留只可能来自**本轮自己的**
+            // 重试——而重试正是挂起闸门每次放行都要走的那条路。包的成员按文件名压，两次产出
+            // 通常逐字节相同，但"通常"不是能拿来赌数据的东西：成员的 mtime 在两次尝试之间变过
+            // （内容没变，因此重校验不会把它排除）就足以让归档头不同，拼起来一样打不开。
+            await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, uploadTracker, ct);
+            control?.TrackInFlight(blobName);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
                 onVolumeUploaded: staging.ReleaseFile,   // 传完一卷就把它从临时盘上撤掉
                 // 一箱装着几百个文件，列不下——报包号与成员数。
                 label: $"pack {packId} ({memberCount} files)");
+            // 确认返回了才销账。抛异常时故意**不**销：那份残留正是 Stop now 要清掉的东西。
+            control?.ClearInFlight(blobName);
             state.AddUploaded(sizes.Sum());   // 时机同单文件路径：整件传完才记
         }
         finally
@@ -1587,9 +1955,10 @@ public sealed class BackupOrchestrator(
     /// <param name="storeOnly">这一箱的压法，记进 <see cref="PackInfo.StoreOnly"/>。死重压实与修复重压会
     /// 重写同一个 packId 的归档，那时手上只有存活成员和一个包号、没有当初那份规则——不记在包上，
     /// 一个 store-only 包挨过一次版本退役就被重压成默认压法了，而且没有任何征兆。</param>
-    private static void RecordPack(
+    private static async Task RecordPackAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members, IReadOnlyList<long> volumeSizes,
-        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath)
+        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        BackupRunControl? control, CancellationToken ct)
     {
         foreach (var m in members)
             storageByPath[m.Path] = new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName };
@@ -1606,6 +1975,17 @@ public sealed class BackupOrchestrator(
         };
         lock (info.Packs)
             info.Packs[packId] = packInfo;
+
+        // journal：pack 已经传完确认。成员表要记全，恢复时得靠它重建 PackInfo——
+        // 信息文件是最后才提交的，崩溃时它里面根本没有这个包。
+        // 同样传 CancellationToken.None：这次运行的 ct 是 Task 9 挂起/取消要取消的那一个，
+        // 而此刻整箱已经在云上确认了，取消这个写入救不回任何东西，只会让下次恢复以为
+        // 这箱没传过、白白重传一次；写到一半被取消还可能留下半截行，拖累下一条记录。
+        if (control is not null)
+            await control.RecordPackAsync(
+                packId,
+                [.. members.Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length))],
+                volumeSizes, storeOnly, CancellationToken.None);
     }
 
     private static string Local(BackupRequest request, string relPath) =>

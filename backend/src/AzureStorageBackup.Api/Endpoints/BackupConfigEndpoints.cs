@@ -206,7 +206,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
         // 避免云端删除失败时本地记录已丢失、用户无法重试。
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, BackupJournalStore journals, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -256,6 +256,20 @@ public static class BackupConfigEndpoints
                 await BestEffort(logger, "remove local backup state",
                     () => localState.RemoveAsync(accountId, container, ct));
 
+                // 配置没了就再没人会来采纳这个容器上的 journal，留着它只会永远保住那批块不被清理
+                // （清理判据认 journal，不认 configId）。**只删 journal 文件，不去删它引用的 blob**：
+                // journal 记的既包括真上传，也包括 if-missing 命中，后者完全可能同时被一个已提交的
+                // 版本索引引用着，删了就是把保留下来的版本挖穿。
+                //
+                // 失去保护之后由谁来收：等这个容器上再有配置时，**那个配置的第一轮备份**收尾会做
+                // 一次孤儿扫描，用完整判据（读得到索引、认得出引用）把真孤儿扫掉。这条路成立靠的是
+                // 紧挨着的上一步——localState.RemoveAsync 把本地权威状态清了，重建的配置因此认得出
+                // 自己是第一轮（见 BackupOrchestrator 的 firstRun 与 BackupRunControl.SweepNeeded）。
+                // 那两步的先后不重要（都是 best-effort，互不依赖），但少了那一步，这里就只剩
+                // "用户恰好配了 Cleanup 计划任务"这一条指望，而那是配不配全凭他的。
+                await BestEffort(logger, "discard backup journals",
+                    () => { journals.DeleteAll(accountId, container); return Task.CompletedTask; });
+
                 // 删掉的可能正是唯一一条待重设的解不开的密文（备份密码）：不收尾就翻不回 Healthy，
                 // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
                 await recovery.TryCompleteAsync(ct);
@@ -297,6 +311,58 @@ public static class BackupConfigEndpoints
         {
             var state = runner.Get(id);
             return state is null ? Results.NotFound() : Results.Ok(BackupRunResponse.From(state));
+        });
+
+        // 挂起：安全落盘后停下，现场留着，下次点 Run 会原样接上。
+        // **没有对应的 resume 端点**——恢复不是一种模式：每一轮备份开卷时都会去认还有效的 journal，
+        // 所以"继续"就是再点一次 /run，走的是同一条执行体。
+        group.MapPost("/{id:int}/suspend", async (int id, BackupRunner runner, CancellationToken ct) =>
+            await StopAndWaitAsync(c => runner.SuspendAsync(id, ct: c), ct) switch
+            {
+                StopOutcome.NothingRunning => Results.Conflict(new { error = "No backup is running." }),
+                StopOutcome.StillStopping => Results.Accepted($"/api/backup-configs/{id}/run", new { stopping = true }),
+                _ => Results.NoContent(),
+            });
+
+        // 卡在瞬时错误上自愈等待时，用户点「Retry now」不等计时器，立刻放行一次重试。
+        group.MapPost("/{id:int}/retry-now", (int id, BackupRunner runner) =>
+            runner.RetryNow(id)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "This backup is not waiting to retry." }));
+
+        // 这个容器上有哪些中途停下的运行。程序刚起来时界面靠它把"有活儿没干完"摆出来等用户点，
+        // 而不是替用户决定要不要接着跑。
+        group.MapGet("/{id:int}/interrupted", async (
+            int id, IBackupConfigService svc, BackupJournalStore journals, CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+
+            var runs = await journals.PeekAsync(config.AccountId, config.ContainerName, ct);
+            return Results.Ok(runs.Select(r => new InterruptedRunResponse(
+                r.RunId, r.Header.StartedAt, r.Records, r.SizeBytes,
+                r.Header.ConfigId == id && r.Header.LocalRoot == config.LocalRoot)).ToList());
+        });
+
+        // 用户不想接着跑了：把现场丢掉。
+        // 云上那批块并不在这里删——判断"它到底还被哪个版本引用着"要读版本索引，那需要备份密码，
+        // 而这个端点拿不到。丢掉 journal 之后它们失去保护，下一次带孤儿扫描的清理会用完整判据收走
+        // （Task 11）。
+        group.MapDelete("/{id:int}/interrupted", async (
+            int id, IBackupConfigService svc, BackupJournalStore journals, BackupRunner runner,
+            CancellationToken ct) =>
+        {
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            // 正在跑的那一轮自己就握着一卷 journal，从它脚下把文件抽走只会让收尾时报一堆
+            // 莫名其妙的 IO 错误。让用户先停下来。
+            if (runner.Get(id) is { Status: RunStatus.Running })
+                return Results.Conflict(new { error = "This backup is running; stop it first." });
+
+            journals.DeleteAll(config.AccountId, config.ContainerName);
+            return Results.NoContent();
         });
 
         // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
@@ -597,7 +663,8 @@ public static class BackupConfigEndpoints
         //
         // 在此之前根本没有"停"这个动作：一次跑错了的备份只能等它跑完，或者重启整个容器——
         // 而用户跑在 NAS 上，重启会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
-        group.MapPost("/{id:int}/cancel", async (int id, string? what, IBackupConfigService svc,
+        group.MapPost("/{id:int}/cancel", async (int id, string? what, bool? finishCurrentFiles,
+            IBackupConfigService svc,
             BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner,
             CancellationToken ct) =>
         {
@@ -606,16 +673,27 @@ public static class BackupConfigEndpoints
                 return Results.NotFound();
 
             var canceled = new List<string>();
-            if (Wanted(what, "backup") && backupRunner.Cancel(id)) canceled.Add("backup");
+            var stopping = false;
+
+            // 备份这一支是**等落盘再返回**的，另外三个仍是发个信号就走——它们没有需要落盘的现场。
+            // finishCurrentFiles=true：正在传的文件（含它所有分卷）传完再停，这部分算数；
+            // false：立刻停，半截的分卷和在途的块都删掉，不留没法用的残渣。
+            if (Wanted(what, "backup"))
+                switch (await StopAndWaitAsync(c => backupRunner.CancelAsync(id, finishCurrentFiles ?? false, c), ct))
+                {
+                    case StopOutcome.Settled: canceled.Add("backup"); break;
+                    case StopOutcome.StillStopping: canceled.Add("backup"); stopping = true; break;
+                }
+
             if (Wanted(what, "restore") && restoreRunner.Cancel(id)) canceled.Add("restore");
             if (Wanted(what, "repair") && repairRunner.Cancel(id)) canceled.Add("repair");
             if (Wanted(what, "check") && checkRunner.Cancel(id)) canceled.Add("check");
 
-            // 停止是异步的：这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾。
+            // 除备份外，停止仍是异步的：这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾。
             // 界面据此把按钮改成「Stopping…」，而不是立刻当成已经停了。
             return canceled.Count == 0
                 ? Results.Conflict(new { error = "Nothing is running for this backup." })
-                : Results.Ok(new { canceled });
+                : Results.Ok(new { canceled, stopping });
         });
 
         // 备份密码重设（设计 §3.4）。验证依据：加密备份的信息文件本身就是用该密码加密的 7z，
@@ -806,6 +884,42 @@ public static class BackupConfigEndpoints
     /// <summary>/cancel 的 what 过滤：省略即全选。</summary>
     private static bool Wanted(string? what, string kind) =>
         string.IsNullOrWhiteSpace(what) || string.Equals(what, kind, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>停止请求的三种结局。</summary>
+    private enum StopOutcome { NothingRunning, Settled, StillStopping }
+
+    /// <summary>
+    /// 落盘等待的封顶时长。HTTP 契约里没有这个数字——它纯粹是给测试项目开的缝：
+    /// 靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
+    /// "真没落定、答 202/200 stopping:true" 那条分支，不然一次诚实的超时测试就要真等 20 秒。
+    /// 生产环境永远是 20 秒；测试用完记得在 finally 里调回来，它是进程内共享的静态字段。
+    /// </summary>
+    internal static TimeSpan StopWaitCap = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// 发出停止请求并等它落盘完成，但**最多等 <see cref="StopWaitCap"/>（生产环境 20 秒）**。
+    /// <para>
+    /// 为什么要等：用户点完停止，要的是"现在现场已经安全了"，而不是"信号发出去了"。
+    /// 为什么要封顶：Suspend 与 Finish current files 都会让正在传的文件（含它所有分卷）传完，
+    /// 一个大文件可能要好几分钟；而用户跑在 NAS 上，前面多半有一层反向代理，六十秒就把连接掐了，
+    /// 界面上看到的会是一条网络错误，尽管后台一切正常。
+    /// </para>
+    /// <para>超时不代表没停下：停止请求在 await 之前就发出去了，闸门也已经降级，运行一定会走到终态。</para>
+    /// </summary>
+    private static async Task<StopOutcome> StopAndWaitAsync(
+        Func<CancellationToken, Task<bool>> stop, CancellationToken ct)
+    {
+        using var cap = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cap.CancelAfter(StopWaitCap);
+        try
+        {
+            return await stop(cap.Token) ? StopOutcome.Settled : StopOutcome.NothingRunning;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return StopOutcome.StillStopping;
+        }
+    }
 
     /// <summary>把 DeriveActivity 的驼峰标签写成一句话里读得通的样子（BackingUp → backing up）。</summary>
     private static string Humanize(string activity) =>
