@@ -1,68 +1,65 @@
-# 手机端适配：触屏与小尺寸屏幕（2026-07-31）
+# Mobile adaptation: touch input and small screens
 
-> 界面目前只有一个 900px 断点（`index.css:371/565/674`），做了侧栏塌成顶部 tab 条、`.field` 变单列、弹窗全宽三件事。这些是**窄屏**适配，**触屏**适配基本没做：控件高 32px（低于 44px 触摸目标）、输入框 14px（iOS Safari 聚焦时会自动放大整页）、8 张表格没有横向滚动容器、多处交互只挂了 `:hover`。
+> The UI had a single 900px breakpoint doing three things: collapsing the sidebar into a top tab
+> strip, making `.field` single-column, and widening dialogs. Those are **narrow-screen**
+> adaptations; **touch** adaptation was essentially absent. Controls were 32px tall (below the
+> 44px touch target), inputs were 14px (which makes iOS Safari zoom the whole page on focus),
+> eight tables had no horizontal scroll container, and several interactions had only `:hover`.
 >
-> 本轮目标是**手机上完整可操作**——包括新建/编辑备份配置的两步向导、还原对话框的目录树选择，而不是只保证"能看状态"。
+> The goal is **fully operable on a phone** — including the two-step new/edit backup wizard and
+> the restore dialog's directory tree — not merely "you can check status".
 >
-> 本轮**不改任何业务逻辑与交互流程**，只改布局、命中区域与弹窗结构。
+> No business logic or interaction flow changes; layout, hit areas and dialog structure only.
 
-## 1. 设计决策（本轮锁定）
+## 1. Decisions
 
-| # | 决策点 | 结论 |
-|---|--------|------|
-| 1 | 适配目标 | **完整可操作**。所有页面、所有弹窗在手机上都能正常完成操作，不留"这个功能得回电脑上做"的缺口 |
-| 2 | 断点策略 | **尺寸轴与输入轴正交**。`max-width` 管布局（900px 平板层保留 + 新增 640px 手机层），`pointer: coarse` 管命中区域。桌面鼠标用户零可见变化 |
-| 3 | 表格 | **主表卡片化，次表横滚**。Backups / Tasks 在手机层每行变一张卡片；Logs / Accounts / Containers / Groups / 还原版本表包一层横向滚动 |
-| 4 | 弹窗 | **手机层全屏面板**。顶部固定标题栏、底部固定动作栏、中间内容区自己滚 |
-| 5 | 弹窗结构 | **统一为 header/body/footer 三段**，不只在手机层打补丁。桌面端外观不变 |
-| 6 | 主导航 | **手机层底部固定 tab 栏**。`Log out` 迁到 Settings 页，桌面端 sidebar 也一并去掉，两端一致 |
-| 7 | 样式技术 | **沿用现有约定**：零运行时依赖、手写 CSS、全局语义化 class。`package.json` 不新增任何依赖 |
-| 8 | 前端测试 | **本轮不引入前端测试框架**。理由与验证方式见 §8 |
+| # | Question | Conclusion |
+|---|---|---|
+| 1 | Target | **Fully operable.** Every page and every dialog can complete its task on a phone, with no "you have to go back to a computer for this" gap |
+| 2 | Breakpoint strategy | **Size and input are orthogonal axes.** `max-width` governs layout (the 900px tablet tier stays, a 640px phone tier is added), `pointer: coarse` governs hit areas. Desktop mouse users see no change at all |
+| 3 | Tables | **Primary tables become cards, secondary ones scroll horizontally.** Backups and Tasks turn each row into a card on the phone tier; Logs, Accounts, Containers, Groups and the restore version table get a horizontal scroll wrapper |
+| 4 | Dialogs | **Full-screen panels on the phone tier**: fixed title bar on top, fixed action bar at the bottom, scrolling content between |
+| 5 | Dialog structure | **A uniform header/body/footer**, not a phone-tier patch. Desktop appearance is unchanged |
+| 6 | Primary navigation | **A fixed bottom tab bar on the phone tier.** `Log out` moves to the settings page, and the desktop sidebar loses it too, so both ends agree |
+| 7 | Styling technology | **The existing conventions**: zero runtime dependencies, hand-written CSS, global semantic classes. No new packages |
+| 8 | Frontend testing | No test framework introduced this round; see §8 |
 
-## 2. 断点策略
+## 2. Breakpoint strategy
 
-现有的 900px 断点同时承担了两件不同的事：布局重排（该按**尺寸**决定）和交互尺度（该按**输入方式**决定）。混在一起会导致两个方向的错误：桌面用户缩窄窗口时按钮突然变粗大；1000px 宽的触屏平板拿不到大命中区。
+The existing 900px breakpoint was carrying two different jobs: layout reflow (which should follow **size**) and interaction scale (which should follow **input method**). Conflating them produces errors in both directions — a desktop user narrowing their window suddenly gets chunky buttons, while a 1000px-wide touch tablet gets no enlarged hit areas.
 
-拆成两条正交的轴：
+Split into two orthogonal axes:
 
 ```
-尺寸轴（max-width）           输入轴（pointer: coarse）
-├─ >900px  桌面：侧栏 + 表格   ├─ fine（鼠标）  32px 控件，保留 hover
-├─ ≤900px  平板：顶部条 + 单列   └─ coarse（触屏）44px 控件，关掉 hover 粘滞
-└─ ≤640px  手机：底部栏 + 卡片 + 全屏弹窗
+Size axis (max-width)                 Input axis (pointer)
+├─ >900px  desktop: sidebar + tables  ├─ fine   (mouse) 32px controls, hover kept
+├─ ≤900px  tablet:  top strip, 1 col  └─ coarse (touch) 44px controls, hover disabled
+└─ ≤640px  phone:   bottom bar + cards + full-screen dialogs
 ```
 
-640px 的取舍：iPhone 15 Pro Max 横屏（932px）会落在平板层而非手机层。这是刻意的——横屏下宽度足够，表格形态比卡片形态更有效率。
+The 640px choice: an iPhone 15 Pro Max in landscape (932px) lands on the tablet tier, not the phone tier. That is deliberate — in landscape there is enough width, and the table form is more efficient than the card form.
 
-`pointer: coarse` 在所有现代浏览器可用；不支持时退化为不生效，得到当前行为，无回归风险。
+`pointer: coarse` is available in every modern browser; where it is not, it simply does not apply and the current behaviour results, so there is no regression risk.
 
-## 3. 触摸与输入基础（`index.css`）
+## 3. Touch and input foundations
 
-### 3.1 控件尺寸
+### 3.1 Control size
 
-`--control-h` 从 32px 提到 44px，**只在 `pointer: coarse` 下**：
+`--control-h` goes from 32px to 44px, **only under `pointer: coarse`**. Because every control references that variable (an existing convention of the design system), one change covers all of them.
+
+### 3.2 iOS auto-zoom
+
+On the phone tier, `input / select / textarea` go to **16px**. Below 16px, iOS Safari zooms the entire page the instant an input takes focus — **and does not zoom back out when it loses focus**. The user is left with a magnified interface they have to pinch back manually. This is a hard defect to fix, not a matter of taste.
+
+The rest of the body text stays at 14px: only focused form controls trigger the behaviour.
+
+### 3.3 Small hit areas
+
+Some elements must keep their visual size (enlarging them would wreck the compact-console look) while their hit area grows to 44px. A pseudo-element does it, because a pseudo-element takes no part in layout and therefore pushes nothing aside:
 
 ```css
 @media (pointer: coarse) {
-  :root { --control-h: 44px; }
-}
-```
-
-因为全部控件都引用这个变量（设计系统的既有约定），一处改动即全局生效。
-
-### 3.2 iOS 自动缩放
-
-手机层把 `input / select / textarea` 的 `font-size` 提到 **16px**。低于 16px 时 iOS Safari 在聚焦输入框的瞬间会放大整个页面，**且失焦后不会缩回**——用户此后看到的是一个被放大、需要手动双指缩小的界面。这是必须修的硬伤，不是观感问题。
-
-正文其余部分保持 14px：只有获得焦点的表单控件会触发这个行为。
-
-### 3.3 小命中区
-
-以下元素视觉尺寸必须保持不变（放大会破坏紧凑控制台的观感），但命中区要扩到 44px。用伪元素实现——伪元素不参与布局，因此不会推开周围内容：
-
-```css
-@media (pointer: coarse) {
-  .icon-btn { position: relative; }   /* 伪元素的定位基准 */
+  .icon-btn { position: relative; }   /* the pseudo-element's positioning context */
   .icon-btn::after {
     content: '';
     position: absolute;
@@ -73,186 +70,147 @@
 }
 ```
 
-宿主元素必须是 `position: relative`，否则伪元素会相对更外层的定位祖先摊开，命中区落在错误的位置。
+**The host must be `position: relative`**, or the pseudo-element spreads relative to some outer positioned ancestor and the hit area lands in the wrong place.
 
-需要处理的：`.icon-btn`（`index.css:186`，折叠三角）、还原对话框树形展开三角（`RestoreDialog.tsx:454`，现在宽 18px）、表格行内的 `.btn-ghost` 按钮。
+Applies to the collapse triangles, the restore dialog's tree disclosure triangle (18px wide), and inline `.btn-ghost` buttons in tables.
 
-### 3.4 hover 与 active
+### 3.4 hover and active
 
-触屏上 `:hover` 会在点击后**粘住不消失**，直到点别处——表格行会留下一片高亮，看着像"选中了"。
+On touch, `:hover` **sticks after a tap** until something else is tapped — a table row keeps a highlight that reads as "selected".
 
-- `pointer: coarse` 下关掉 `tbody tr:hover`（`index.css:271`）的背景变化
-- 所有目前只有 `:hover` 反馈的元素补 `:active`，触屏才有按下反馈
-- 设 `-webkit-tap-highlight-color: transparent`，避免系统默认的蓝色方块盖住自定义的 `:active`
+- Under `pointer: coarse`, the row hover background is disabled.
+- Everything whose only feedback was `:hover` gains `:active`, so touch gets press feedback.
+- `-webkit-tap-highlight-color: transparent` stops the system's default blue rectangle from covering the custom `:active`.
 
-### 3.5 安全区
+### 3.5 Safe areas
 
-`index.html:6` 的 viewport 加 `viewport-fit=cover`，底部导航栏与全屏弹窗的底部动作栏吃 `env(safe-area-inset-bottom)`——否则 iPhone 的下巴横条会盖住按钮。
+The viewport meta gains `viewport-fit=cover`, and both the bottom navigation bar and the full-screen dialog's action bar consume `env(safe-area-inset-bottom)` — otherwise the iPhone home indicator sits over the buttons.
 
-### 3.6 固定宽度
+### 3.6 Fixed widths
 
-`.w-md`（280px）与 `.w-lg`（480px）在手机层变 `width: 100%`。
+`.w-md` (280px) and `.w-lg` (480px) become `width: 100%` on the phone tier.
 
-`.w-sm`（160px）**不动**：这一档全是数字框——代理端口、版本数、保留天数，以及计划编辑器里 `at [__] h`、`min [__]` 这些夹在文字中间的输入框（`CronEditor.tsx:87/101/115`）。让它们占满一行既难看，又会把那两个标签挤散。160px 在最窄的 320px 屏上也放得下。
+`.w-sm` (160px) **does not change**: that tier is all numeric fields — proxy port, version count, retention days, and the cron editor's inputs embedded mid-sentence in `at [__] h` and `min [__]`. Making those full-width is both ugly and pulls those labels apart. 160px fits even a 320px screen.
 
-三处内联固定宽度另行处理：`NotificationsPage.tsx:121`（`width: 200`）、`RestoreDialog.tsx:277`（`width: 340`）、PathBrowser 目录列表的 `maxHeight: 320`（后者在弹窗改用 `.modal-body` 滚动后会造成嵌套滚动条，一并删掉）。
+## 4. Primary navigation: a bottom tab bar on the phone tier
 
-## 4. 主导航：手机层底部 tab 栏
+At ≤640px the shell becomes `grid-template-rows: 1fr auto`, with `order` moving the sidebar after the content and `position: fixed` pinning it to the bottom. The brand block hides (the page already has a title) and the nav items divide the width evenly.
 
-`.app-shell` 在 ≤640px 改为 `grid-template-rows: 1fr auto`，用 `order` 把 `.sidebar` 排到内容之后，`position: fixed` 钉在底部。`.sidebar-brand` 隐藏（标题在页面里已有），`.sidebar-nav` 四等分铺满。
+The content area gains `padding-bottom` equal to the bar height plus the safe area, or the last row of content is permanently covered.
 
-内容区加 `padding-bottom`，值为底部栏高度 + 安全区，否则最后一行内容会被永久遮住。
+### 4.1 Where `Log out` goes
 
-### 4.1 `Log out` 的去处
+Four slots leave no room for a fifth entry, so `Log out` moves from the sidebar footer to the settings page.
 
-底部栏只有 4 格，容不下第 5 个入口。把 `Log out` 从 `App.tsx:72-86` 的 `.sidebar-footer` 迁到 `SettingsPage`。
+The desktop sidebar loses it **as well** — no "on Settings on mobile, in the sidebar on desktop" fork. One function in two places is exactly the kind of thing that later maintenance forgets to keep in sync.
 
-桌面端 sidebar 的 `Log out` **也一并去掉**，不做"手机上在 Settings、桌面上在侧栏"的分叉——同一个功能两个位置，是后续维护里最容易忘记同步的那种东西。
+This means passing the logout logic down to the settings page, including the security consideration recorded in its comment (clear local state regardless of whether the server call succeeded), along with the "is auth required" flag. The logic itself moves unchanged.
 
-这需要把 `App.tsx` 里的登出逻辑（含"无论服务端成功与否都清本地状态"那条注释记录的安全考量，`App.tsx:75-77`）连同 `auth.required` 判断一起下传给 `SettingsPage`。逻辑本身原样搬，不改。
+## 5. Tables
 
-## 5. 表格
+### 5.1 Cards (Backups / Tasks)
 
-### 5.1 卡片化（Backups / Tasks）
-
-手机层把 `table / thead / tbody / tr / td` 转成 block，隐藏 `thead`，每个 `tr` 成为一张带边框的卡片，`td` 内用 `::before { content: attr(data-label) }` 在左侧显示字段名：
+On the phone tier, `table / thead / tbody / tr / td` become blocks, `thead` is hidden, each `tr` becomes a bordered card, and each `td` shows its field name on the left via `::before { content: attr(data-label) }`:
 
 ```
 ┌──────────────────────────────┐
-│ Photos                       │  ← 首列（名称）放大加粗，不显示标签
+│ Photos                       │  ← first column (name) enlarged and bold, no label
 │ Account/Ctn  acct1 / photos  │
 │ Local Root   /volume1/photo  │
 │ Encrypted    Yes             │
 │ Status       ● Idle          │
 │ ──────────────────────────── │
-│ [Back up] [Restore] [⋯]      │  ← 操作列，data-label 留空
+│ [Back up] [Restore] [⋯]      │  ← action column, data-label left empty
 └──────────────────────────────┘
 ```
 
-CSS 拿不到表头文字，所以要给这两张表的 `<td>` 补 `data-label` 属性——这是本节在 JSX 侧的全部改动（`BackupConfigsPage.tsx:560` 起、`TasksPage.tsx:153` 起）。
+CSS cannot reach the header text, so those two tables' cells need a `data-label` attribute — that is the entire JSX-side change in this section.
 
-### 5.2 运行状态行（`.ops-row`）
+### 5.2 The run-status row
 
-Backups 表把运行中的备份/还原/修复/检查状态单独放一行、跨全部列（`BackupConfigsPage.tsx:585` 起，`index.css:275-289`）。这个设计的原因记录在案：操作列是 `nowrap` 的，几百字符的路径放进去会把表撑到出屏。
+The Backups table puts a running backup/restore/repair/check status on its own row spanning every column. The reason is on record: the action column is `nowrap`, and a path of several hundred characters would stretch the table off screen.
 
-卡片化后它自然接在卡片底部。但现有的"与上一行之间不划线"规则依赖 `tr.has-ops + tr.ops-row` 的相邻关系与表格边框模型，在 block 布局下要重写：手机层让 `.has-ops` 卡片去掉下边框、`.ops-row` 去掉上边框并与前者视觉合并成一张卡。
+Once cards are in play it naturally follows the card. But the existing "no divider between this row and the one above" rule depends on adjacency plus the table border model, which does not survive block layout: on the phone tier the preceding card drops its bottom border and the status row drops its top border, so the two merge visually into one card.
 
-### 5.3 横向滚动（其余 6 张表）
+### 5.3 Horizontal scrolling (the other six tables)
 
-Logs（`LogsPage.tsx:103`）、Accounts（`AccountsPage.tsx:177`）、Containers（`ContainersPage.tsx:94`）、Groups（`GroupsPage.tsx:109`）、还原版本表（`RestoreDialog.tsx:323`）、`BackupConfigsPage.tsx:2100` 的明细表包一层：
+Logs, Accounts, Containers, Groups, the restore version table and the backup detail table get a wrapper:
 
 ```css
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 ```
 
-容器加 `tabindex="0"`，否则只能靠触摸滑动，键盘用户无法滚动溢出内容（WCAG 2.1.1）。
+The container takes `tabindex="0"`, without which the overflow can only be reached by touch-dragging and keyboard users cannot scroll it (WCAG 2.1.1).
 
-Logs 不卡片化的理由："时间/级别/来源/消息"是扫读型日志流，卡片化后一屏看不了几条，比横滚更难用。
+Logs are not turned into cards: "time / level / source / message" is a scan-oriented stream, and cards would fit only a handful per screen — worse than horizontal scrolling.
 
-## 6. 弹窗：手机层全屏
+## 6. Dialogs: full screen on the phone tier
 
-### 6.1 现状
+### 6.1 Starting point
 
-`modalStyles.ts` 只是 `.modal-overlay` / `.modal-panel` 的常量别名，**所有弹窗共用同一套 CSS**（`index.css:646-679`）。这让全屏化的 CSS 部分成本很低。
+The modal styles are just constant aliases for `.modal-overlay` / `.modal-panel`, and **every dialog shares one stylesheet**, which makes the CSS side of going full-screen very cheap.
 
-### 6.2 三段结构
+### 6.2 A three-part structure
 
-给弹窗补统一结构，桌面端外观不变：
+Dialogs gain a uniform structure, with desktop appearance unchanged:
 
 ```
 .modal-panel
-├─ .modal-header   标题 + 关闭按钮
-├─ .modal-body     内容，overflow-y: auto
-└─ .modal-footer   动作按钮
+├─ .modal-header   title + close button
+├─ .modal-body     content, overflow-y: auto
+└─ .modal-footer   action buttons
 ```
 
-手机层：
+On the phone tier the panel becomes `100vw` by `100dvh` with no border, radius or padding, laid out as `grid-template-rows: auto 1fr auto`, and the footer's bottom padding includes the safe area.
 
-```css
-@media (max-width: 640px) {
-  .modal-overlay { padding: 0; }
-  .modal-panel {
-    width: 100vw; height: 100dvh;
-    max-width: none; max-height: none;
-    border: none; border-radius: 0; padding: 0;
-    display: grid; grid-template-rows: auto 1fr auto;
-  }
-  .modal-footer { padding-bottom: calc(var(--sp-3) + env(safe-area-inset-bottom)); }
-}
-```
+**`dvh`, not `vh`**: a mobile browser's address bar collapsing changes how `vh` resolves, so `vh` makes the bottom action bar jump during scrolling or hide behind the address bar.
 
-用 `dvh` 而非 `vh`：手机浏览器地址栏收缩会改变 `vh` 的解析值，用 `vh` 会导致底部动作栏在滚动过程中跳动或被地址栏盖住。
+### 6.3 Stacking nested dialogs
 
-### 6.3 嵌套弹窗的层级
+The restore dialog opens the path browser on top of itself. The overlay had a fixed `z-index: 50`, so two of them stacked worked only by accident of DOM order. On desktop the two panels are different sizes and the lower one's edge is visible, so the problem stays obscure; on the phone tier both are full screen, and getting the order wrong presents as "I tapped Browse and nothing happened".
 
-还原对话框会在自身之上再开 PathBrowser（`RestoreDialog.tsx:282`）。`.modal-overlay` 现在是固定的 `z-index: 50`（`index.css:650`），两层叠在一起时靠 DOM 顺序侥幸生效——桌面端因为两个面板尺寸不同、能看见下面那层的边缘，问题不明显；手机层两层都是全屏，一旦顺序不对就是"点了 Browse 什么也没发生"。
+The nested layer is now raised explicitly: the path browser uses `z-index: 60` as a second-level dialog. Its click-the-backdrop-to-close behaviour is kept, but on a full-screen phone dialog the backdrop is invisible and closing depends on the `✕` in the title bar — which is exactly why §6.2's header close button is required.
 
-改为让嵌套层显式提升：PathBrowser 作为二级弹窗使用 `z-index: 60`。同时保留其 `onClick={onClose}` 的遮罩点击关闭行为——手机全屏下遮罩不可见，关闭要靠标题栏的 `✕`，这正是 §6.2 三段结构里 header 关闭按钮的必要性所在。
+### 6.4 The wizard is not a dialog
 
-### 6.4 需要改造的弹窗
+The new/edit backup wizard is an inline panel that expands below the table and scrolls with the page, so it cannot take §6.2's full-screen structure.
 
-全部 8 处弹窗共用 `.modal-overlay` / `.modal-panel`。目前动作按钮都是散在内容末尾的 `.row`，要包进 `.modal-footer`：
+It is also the single most critical thing for the "fully operable" goal: step 1's form is long, and on a phone you have to scroll a full screen to reach "next" at the bottom, and "back / save" after that.
 
-| # | 弹窗 | 位置 |
-|---|---|---|
-| 1 | 目录选择器 PathBrowser | `PathBrowser.tsx:38` |
-| 2 | 账户表单 | `AccountsPage.tsx:382` |
-| 3 | 还原对话框 | `RestoreDialog.tsx:273` |
-| 4 | 末次错误 ErrorModal | `BackupConfigsPage.tsx:1552` |
-| 5 | 删除备份确认 | `BackupConfigsPage.tsx:1774` |
-| 6 | 创建完成 PostCreateModal | `BackupConfigsPage.tsx:1812` |
-| 7 | 重输密码 ResetPasswordModal | `BackupConfigsPage.tsx:1843` |
-| 8 | 检查/修复 | `BackupConfigsPage.tsx:1981` |
+Both button groups are wrapped in `.form-actions`, which on the phone tier is `position: sticky; bottom: 0` with a background and top border so content does not show through. The `bottom` offset has to clear the bottom navigation bar (§4), or the two bars overlap.
 
-`components/modal.tsx` **不是**弹窗组件——它导出的是表单字段行 `Field`，不在本节范围内。
+Sticky rather than converting the wizard into a dialog: the latter would disturb state management and where `showForm` renders, which is far more risk than the benefit, while keeping the buttons permanently visible achieves the same thing.
 
-### 6.4.1 新建/编辑备份向导：不是弹窗
+### 6.5 Background scroll locking
 
-向导是内联面板 `<div className="panel">`（`BackupConfigsPage.tsx:684`），展开在表格下方，随页面一起滚动。它拿不到 §6.2 的全屏三段结构。
+An open dialog locks body scrolling. Scroll chaining — reaching the end of the dialog's content and continuing to drag, which then moves the page behind it — is common on phones and makes people think the dialog closed.
 
-但它恰恰是"完整可操作"目标里最关键的一处：Step 1 的表单很长，手机上要滚过整屏才能摸到底部的"下一步"（`:865`）和"上一步 / 保存"（`:1098`）。
+A `useModalScrollLock()` hook adds `overflow: hidden` to `body` on mount, records the scroll position, and restores both on unmount, so the locking logic exists once and each dialog calls it once.
 
-处理方式：把这两组按钮包进 `.form-actions`，手机层 `position: sticky; bottom: 0` 钉在视口底部，加背景色与上边框以免内容透上来。`bottom` 值要让开底部导航栏的高度（§4），否则两条栏会叠在一起。
+**The hook must be reference-counted**: the restore dialog opens the path browser on top of itself, and without counting, closing the inner one restores `body` overflow while the outer dialog is still open, letting the background scroll again. A module-level counter restores only when it reaches zero.
 
-选 sticky 而不是把向导改成弹窗：后者要动状态管理与 `showForm` 的渲染位置，风险远大于收益，而按钮常驻可见的效果是一样的。
+## 7. Per-page touch details
 
-### 6.5 背景滚动锁定
+**Path browser**: directory rows were 32px-tall `btn-ghost` with 8px padding, hard to hit. They become full-width rows, minimum 44px tall, with a `›` indicator on the right. File rows (not clickable) are unchanged. Out-of-bounds items keep their greying and `title` hint — `title` does not appear on touch, but it was only ever supplementary, and unclickability is already expressed by `disabled`.
 
-弹窗打开时锁住 body 滚动。手机上"滚透"（滚动弹窗内容到底后继续滑动会带动背后页面）很常见，会让人以为弹窗关掉了。
+**Restore dialog**: the tree disclosure triangle's hit area grows to 44px, the fixed-width input becomes responsive, and the version table gets a scroll wrapper.
 
-实现：在 `modalStyles.ts` 旁新增一个 `useModalScrollLock()` hook——挂载时给 `body` 加 `overflow: hidden` 并记录当前滚动位置，卸载时恢复两者。每个弹窗组件调用一次这个 hook，锁定逻辑只写一份。
+**Cron editor**: no vertical stacking needed. The simple-mode container already has `flexWrap: 'wrap'`, so three 160px numeric fields wrap naturally; only the advanced-mode container lacked `flexWrap`, where a full-width input pushes the Simple button off the edge.
 
-**hook 必须带引用计数**：还原对话框会在自身之上再开 PathBrowser（`RestoreDialog.tsx:282`）。没有计数的话，内层 PathBrowser 关闭时会把 `body` 的 `overflow` 恢复掉，而外层还原对话框还开着，背景又能滚了。用模块级计数器：归零时才恢复。
+**Notifications**: the fixed 200px event multi-select row becomes a responsive grid, single-column on the phone tier.
 
-## 7. 逐页触屏细节
+**`.field`** already goes single-column at 900px and needs no change.
 
-**PathBrowser**（`PathBrowser.tsx:56-70`）：目录项现在是 `btn-ghost`，高 32px、左右内边距 8px，手机上很难点中。改成整行可点、最小高 44px、右侧带 `›` 指示。文件项（不可点）保持现状。越界项的灰显与 `title` 提示不变——`title` 在触屏上不显示，但它本来就只是补充信息，可点性已由 `disabled` 表达。
+## 8. How this is verified
 
-**RestoreDialog**：树形展开三角（`:454`）命中区扩到 44px；`:277` 的 `width: 340` 输入框改响应式；版本表包横滚。
+Frontend testing runs vitest over the pure functions in `src/lib/` and `src/constants/`, but there is no testing-library or jsdom, so nothing that requires rendering can be asserted — and layout, hit areas and touch behaviour least of all. Verification is therefore `tsc -b`, `npm run build`, `npm run lint`, a page-by-page review against this document, and **the user testing it on a real phone**.
 
-**CronEditor**（`CronEditor.tsx`）：不需要纵向堆叠。简单模式的容器（`:60`）本来就带 `flexWrap: 'wrap'`，三个数字框保持 160px 后会自然折行；只有高级模式的容器（`:45`）缺 `flexWrap`——那里的 `.w-md` 输入框占满宽度后会把 Simple 按钮挤出去，补上折行即可。
+Playwright is not introduced: a viewport screenshot regression suite needs its baseline images maintained forever, and for a single-user tool that cost outweighs the benefit. This is a **known limitation**, consistent with the same judgement in [web-ui-modernization-design.md](web-ui-modernization-design.md).
 
-**NotificationsPage**（`:121`）：`width: 200` 的事件多选行改为响应式栅格，手机层单列。
+## 9. Not done
 
-**`.field`**：已在 900px 变单列（`index.css:565`），无需改动。
-
-## 8. 验证
-
-前端**没有任何测试设施**——`package.json` 的 scripts 只有 `dev` / `build` / `lint` / `preview`，无 vitest、无 playwright。
-
-本轮验证方式：
-
-1. `npx tsc -b` 与 `npm run build` 必须通过
-2. `npm run lint`（oxlint）必须通过
-3. 逐页代码审查，对照本文档的清单核对
-4. **真机效果由用户在手机上实测**
-
-不引入 Playwright 的理由：一套视口截图回归测试需要持续维护基线图片，对一个单用户工具的收益不足以抵消成本。这是**已知局限**，与 `web-ui-modernization-design.md` §1 第 8 条的判断一致。
-
-## 9. 不做的事
-
-- 不改任何业务逻辑、API、数据模型
-- 不引入 CSS 框架或组件库
-- 不做手势交互（滑动删除、下拉刷新）——它们需要额外的可发现性设计，且都有等价的显式按钮
-- 不做 PWA / 离线支持
-- 不做手动的浅色/深色切换开关（沿用跟随系统）
+- No changes to business logic, APIs or the data model
+- No CSS framework or component library
+- No gesture interactions (swipe to delete, pull to refresh) — they need extra discoverability design, and each has an explicit button equivalent
+- No PWA or offline support
+- No manual light/dark toggle (it continues to follow the system)
