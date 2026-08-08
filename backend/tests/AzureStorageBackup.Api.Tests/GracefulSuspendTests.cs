@@ -220,14 +220,23 @@ public class GracefulSuspendTests : IDisposable
         BackupRunner.SuspendWaitCap = TimeSpan.FromMilliseconds(100);
         try
         {
-            var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default);
+            // 外面再套一层 5 秒的硬上限。这条测试要抓的变异就是"删掉 capped.CancelAfter"，
+            // 而那一删的直接后果是这里永远等下去——不加这层，变异的表现是整套测试挂死、连哪一条卡住
+            // 都不知道，比一条有名有姓的失败糟得多。
+            var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default)
+                .WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.Equal(0, stopped);
             Assert.Equal(RunStatus.Running, stuck.Status);   // 没有落地：不是 Suspended
             Assert.True(stuck.Cancellation.IsCancellationRequested);   // 但意愿确实发出去了
+            // 点名的必须是我们自己的 cap，不是调用方的 ct：两条分支现在都以 "Gave up after" 开头
+            //（都报实测时长），把它们分开的是 "(cap …s)" 这一段，只有 cap 那条分支写得出来。
             Assert.Contains(log.Messages, m =>
                 m.Contains("Gave up after", StringComparison.Ordinal)
+                && m.Contains("(cap ", StringComparison.Ordinal)
                 && m.Contains("900777", StringComparison.Ordinal));
+            Assert.DoesNotContain(log.Messages, m =>
+                m.Contains("HostOptions.ShutdownTimeout", StringComparison.Ordinal));
         }
         finally
         {

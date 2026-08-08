@@ -259,9 +259,12 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// <c>internal</c> 而非 <c>private</c>：同 <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/>
     /// 的先例——测试项目靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
     /// "到点还没落盘"那条分支，不用真的等 20 秒。跟那个先例一样，它是**进程内共享的可变静态字段**，
-    /// 安全性靠两条没有代码强制的约定撑着：(1) 只有 GracefulSuspendTests.cs 这一个测试文件碰
-    /// <c>SuspendAllAsync</c>，改这个字段不会绊到别的文件；(2) xUnit 同一个类里的 <c>[Fact]</c>
-    /// 顺序执行，改字段的用例把它放进 try/finally 复原，不会和同类里的别的用例打架。
+    /// 安全性靠两条没有代码强制的约定撑着：(1) xUnit 同一个类里的 <c>[Fact]</c> 顺序执行，改字段的
+    /// 用例把它放进 try/finally 复原，不会和同类里的别的用例打架；(2) 类与类之间是并行的，而
+    /// **每一次 TestWebAppFactory 释放都会走 GracefulSuspendService.StopAsync，也就是都会调
+    /// <c>SuspendAllAsync</c>** —— 所以真正撑着的那条并不是"只有一个文件碰它"，而是"字段被调低的
+    /// 那一百来毫秒里，并行跑着的用例都没有在跑的备份"。眼下确实如此，而且就算撞上，后果也只是那
+    /// 一次关机少等一会儿，不是错误的结果。
     /// 生产环境永远是 20 秒。
     /// </para>
     /// </summary>
@@ -314,6 +317,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
         using var capped = CancellationTokenSource.CreateLinkedTokenSource(ct);
         capped.CancelAfter(SuspendWaitCap);
+        // 实测等了多久。两条分支都要报它：光说"是哪个截止时间到了"还不够，读日志的人真正要判断的是
+        // "差一点就够了，还是从头就没戏"——而归因本身有一道窄缝（cap 先到、宿主令牌随后也断，
+        // 下面那个 if 就会走中立分支），实测时长不受这道缝影响，是唯一永远说得准的那个数。
+        var waited = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             await Task.WhenAll(pending.Select(p => p.State.Completion.Task)).WaitAsync(capped.Token);
@@ -325,25 +332,32 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             // 同一个 catch 既接得住这里自己的 SuspendWaitCap（20s），也接得住调用方 ct 先断
             // （宿主的 ShutdownTimeout，30s）。两者的证据价值一样大，名字却不能张冠李戴：
             // 真到了排查"为什么没有标记"的时候，一条指错了截止时间的日志比没有日志更误导人。
-            var stuck = pending.Where(p => !p.State.Completion.Task.IsCompleted).Select(p => p.ConfigId);
+            //
+            // 点名 runId 而不只是 configId：事后第一句要问的永远是"那是盘上哪一卷 journal"，
+            // 而 journal 文件名就是 runId，写上它就省掉一次翻查。
+            var stuck = pending
+                .Where(p => !p.State.Completion.Task.IsCompleted)
+                .Select(p => $"{p.ConfigId} (run {p.State.RunId})");
             using var scope = scopes.CreateScope();
             var logger = scope.ServiceProvider.GetService<ILogger<BackupRunner>>();
             if (capped.IsCancellationRequested && !ct.IsCancellationRequested)
             {
                 // 是我们自己的 SuspendWaitCap 到点了：可以点名具体秒数。
                 logger?.LogWarning(
-                    "Gave up after {Seconds}s waiting for backup(s) {ConfigIds} to suspend; they are left "
-                    + "mid-flight and will come back as interrupted runs to be resumed by hand",
-                    SuspendWaitCap.TotalSeconds, string.Join(", ", stuck));
+                    "Gave up after {Elapsed:0.0}s (cap {Seconds}s) waiting for backup(s) {ConfigIds} to "
+                    + "suspend; they are left mid-flight and will come back as interrupted runs to be "
+                    + "resumed by hand",
+                    waited.Elapsed.TotalSeconds, SuspendWaitCap.TotalSeconds, string.Join(", ", stuck));
             }
             else
             {
-                // 调用方的令牌先断了（宿主自己的 ShutdownTimeout），不是我们的 20 秒——措辞中立，
-                // 不点名一个可能根本没到期的数字。
+                // 调用方的令牌先断了，不是我们的 20 秒。措辞要说清是**宿主的关机截止时间到了**，
+                // 而不是"关机被取消了"——后者会把人引去找"谁中止了这次关机"，根本没有这么个人。
                 logger?.LogWarning(
-                    "Gave up waiting for backup(s) {ConfigIds} to suspend because shutdown was cancelled; "
-                    + "they are left mid-flight and will come back as interrupted runs to be resumed by hand",
-                    string.Join(", ", stuck));
+                    "Gave up after {Elapsed:0.0}s waiting for backup(s) {ConfigIds} to suspend because the "
+                    + "host's shutdown deadline (HostOptions.ShutdownTimeout) expired first; they are left "
+                    + "mid-flight and will come back as interrupted runs to be resumed by hand",
+                    waited.Elapsed.TotalSeconds, string.Join(", ", stuck));
             }
         }
 
