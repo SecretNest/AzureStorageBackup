@@ -752,7 +752,23 @@ export function BackupConfigsPage() {
           被服务端拒掉的保存会把原因显示在离按钮几屏远的地方，看着就是"点了没反应"。 */}
       {!showForm && error && <p className="text-danger">{error}</p>}
 
-      <table className="cards">
+      {/* 兜底，不是主力：table-fluid 已经把表宽下限压到 ~656px，正常情况这层不会出现滚动条。
+          它接的是两种边角——窗口正好卡在 641~672px（卡片布局还没接手），以及用户把账户名或
+          容器名起得极长（那是没有分隔符的单个词，撑高的是下限本身）。有这层，最坏结果是表格
+          自己横滚，而不是整页跟着横滚。tabIndex 是给键盘用户滚它的（WCAG 2.1.1）。 */}
+      <div className="table-scroll" tabIndex={0}>
+      {/* cards＝手机上塌成卡片；table-fluid＝桌面上宽度跟着窗口走（见 index.css 那一组注释）。 */}
+      <table className="cards table-fluid">
+        {/* 只标要在窄屏定份额的那两列（见 index.css 的列宽建议），其余留空交给 auto 分。
+            用 colgroup 而不是给 th 挂类：列宽本来就是列的属性，写在这里加删列时不会漏改。 */}
+        <colgroup>
+          <col />
+          <col />
+          <col className="col-root" />
+          <col />
+          <col />
+          <col className="col-actions" />
+        </colgroup>
         <thead>
           <tr>
             <th>Name</th>
@@ -822,7 +838,9 @@ export function BackupConfigsPage() {
                 <td data-label="Account / Container">
                   {accountName(c.accountId)} / {c.containerName}
                 </td>
-                <td className="mono text-faint" data-label="Local Root">{c.localRoot}</td>
+                {/* cell-path：允许从任意字符断开（见 index.css）。只给路径用——
+                    它没有单词边界可依，其余列断在词中间只会更难读。 */}
+                <td className="mono text-faint cell-path" data-label="Local Root">{c.localRoot}</td>
                 <td data-label="Encrypted">{c.hasPassword ? 'Yes' : 'No'}</td>
                 <td data-label="Status">
                   <StatusBadge
@@ -831,7 +849,10 @@ export function BackupConfigsPage() {
                     onShowError={() => setErrorModal(c)}
                   />
                 </td>
-                <td className="card-actions" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                {/* 对齐与折行都交给 .card-actions（index.css）。原先写成内联样式，
+                    而内联样式的特异度高于任何选择器——手机卡片布局里那条改左对齐的规则
+                    因此一直是哑的，按钮在手机上仍然靠右挤着。 */}
+                <td className="card-actions">
                   <button
                     type="button"
                     className="btn-ghost"
@@ -881,6 +902,7 @@ export function BackupConfigsPage() {
           )}
         </tbody>
       </table>
+      </div>
 
       {showForm && (
         <div className="panel">

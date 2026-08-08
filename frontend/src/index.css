@@ -49,6 +49,8 @@
 
   --control-h: 32px;
   --sidebar-w: 220px;
+  /* 只约束"读文字"的区域（.panel 里的表单与说明），不约束整个内容区：
+     表格页要跟着窗口一起变宽，宽屏上右侧不该留一条空白。 */
   --content-max: 1280px;
 
   color-scheme: light dark;
@@ -293,6 +295,78 @@ tbody tr.ops-row:hover {
   background: var(--bg-hover);
 }
 
+/* 宽度跟着容器走的表。默认的 table-layout: auto 下，表宽的下限是各列 min-content
+   之和，而这张表原先有三处不肯收缩，加起来就把整页顶出了横向滚动条。下面逐个拆掉。
+   拆完实测下限 656px（Backups 那张六列表），≥700px 的窗口整页都不再横滚；剩下的
+   641~656px 窄缝交给外层 .table-scroll 兜着。
+   没有改用 table-layout: fixed：fixed 要给六列全部写死百分比，而这张表里 Encrypted
+   只装 Yes/No、Local Root 却要多少有多少，一套百分比在 760px 和 2560px 不可能都对。
+   auto 在宽屏按 max-content 分配的结果本来就是对的，只需修窄屏那一档（见第四条）。 */
+
+/* 一、表头。全局 thead th 是 nowrap 的，光「Account / Container」一个列名就锁死约
+   170px。这条 (0,2,1) 压得住那条 (0,0,2)，与源码顺序无关。 */
+.table-fluid thead th {
+  white-space: normal;
+}
+
+/* 二、单元格内容。两档，别用一档打发：
+   兜底档是 break-word——放不下的超长词能断，但 min-content 不跟着变小。这一点正是
+   要的：备份名"documents"该整体挤窄别的列，而不是被劈成"docum/ents"。
+   路径档是 anywhere——只有它会把 min-content 尺寸一起算小，break-word 仅改变渲染时
+   在哪断行、min-content 照旧按"整段不断"撑着，表格于是照样溢出。长路径断不开的根因
+   就在这一处；也只有路径这种没有语义单词边界的内容，才配得上从任意字符断开。 */
+.table-fluid tbody td {
+  overflow-wrap: break-word;
+}
+.table-fluid tbody td.cell-path,
+.table-fluid tbody tr.ops-row > td {
+  overflow-wrap: anywhere;
+}
+
+/* 三、操作列。四个按钮之间本来就有空格，去掉 nowrap 就能折行；按钮自身的 nowrap 由
+   全局 button 规则保着，不会从中间断开。
+   不能改用 display: flex 排它们：那会让 td 不再是 table-cell，整张表的列对齐会散架。
+   按钮是 inline-block，行距只能由 td 的 line-height 决定，默认值会让折行后的上下两排
+   按钮几乎贴在一起，这里把行盒撑得比按钮本身再高一档。 */
+.table-fluid tbody td.card-actions {
+  text-align: right;
+  line-height: calc(var(--control-h) + var(--sp-2));
+}
+
+/* 四、窄屏的列宽建议。auto 布局宽窄两档的分配逻辑不同：宽的时候按 max-content 比例
+   分，结果本来就是对的（路径列拿到最多、四个按钮一行排开），所以宽屏一个字都别写；
+   窄的时候改按 min-content 比例分，而上面那条 anywhere 恰好把路径列的 min-content
+   压到近 0——最该给宽度的那列于是抢得最少，操作列也跟着塌成一个按钮一行。
+   1100px 这个界不是断点，是实测中 auto 开始分错的位置。
+
+   两条规则分工不同，别照字面理解成"各占多少"——760/900px 实测（列宽 px）：
+     都不设：root 104 / actions 170、186 / 201
+     只设 actions：root 71  / actions 215、127 / 295   ← 路径列被榨干
+     两条都设：root 104 / actions 182、183 / 257
+   也就是说 actions 的 34% 是真在扩张，而 root 的 26% 扩不动（给到 55% 也只多 12px），
+   它的价值是当一道地板，挡住 actions 扩张时把路径列压没。缺了它反而更糟。 */
+@media (max-width: 1249px) {
+  .table-fluid col.col-root {
+    width: 26%;
+  }
+  .table-fluid col.col-actions {
+    width: 34%;
+  }
+}
+
+/* 五、宽屏把操作列拉回一行。这是原样恢复改动前的桌面观感，不是新加的效果：
+   操作列原先挂着内联 nowrap，min-content 被锁在四个按钮的总宽上，auto 布局不得不
+   满足它，于是一行排开。单纯把 nowrap 去掉后，路径列的 max-content 极大、按比例分
+   配时一路把宽度吃走，操作列到 2400px 上下才够排一行——1280~1920 这段最常见的桌面
+   宽度全塌成了两行。这里只在装得下的那一档把 nowrap 还回去。
+   1250px 这个界是倒推的：nowrap 下表宽下限约 978px（含 Backing up… 那个更宽的态），
+   加侧栏 220 与左右内边距 48，视口要 1246px 才装得下。 */
+@media (min-width: 1250px) {
+  .table-fluid tbody td.card-actions {
+    white-space: nowrap;
+  }
+}
+
 /* 窄屏上装不下的表包一层它。表格本身不变形——日志这类扫读型的表，
    横滚比拆成卡片好用：卡片化后一屏看不了几条。 */
 .table-scroll {
@@ -369,9 +443,10 @@ tbody tr.ops-row:hover {
   font-weight: 600;
 }
 
+/* 内容区撑满可用宽度。上限收在 .panel 上而不是这里：封顶整个内容区的话，
+   宽屏上表格右边会永远空一块，而表格恰恰是越宽越好用的那种内容。 */
 .app-main {
   min-width: 0;
-  max-width: var(--content-max);
   padding: var(--sp-5);
 }
 
@@ -505,12 +580,15 @@ tbody tr.ops-row:hover {
 .w-full { width: 100%; }
 
 /* ── Blocks ───────────────────────────────────────────────────────────────── */
+/* 面板装的是表单和说明文字。内容区已经放开撑满，若面板跟着撑满，
+   4K 屏上一行说明会横跨整个屏幕，眼睛回行时找不到下一行的开头。 */
 .panel {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   padding: var(--sp-4);
   margin-top: var(--sp-5);
+  max-width: var(--content-max);
 }
 .panel > h2:first-child,
 .panel > h3:first-child {
