@@ -6,6 +6,102 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
+/// 全局上传额度闸门。容量就是设置里那个「上传并发数」，区别只在**谁先拿到**：不是先到先得，
+/// 而是**按件龄**——最早开始上传的那一族卷优先，它用不完的余量才轮到后来的件。
+/// <para>
+/// 先到先得会把额度摊薄到所有在传的件上。压缩是全局串行的，所以稳态是「1 件在压 + N 件在传」
+/// （N = 并发数），这 N 件各分到大约一条流，于是**N 件同时半完成**，而且每一件都推进得很慢。
+/// 代价不只是难看：整族卷传完、云端确认返回之后才记 journal、才销在途账，所以「同时半完成的件数」
+/// 就是一次中断会白扔掉多少活——<c>Stop now</c> 要把在途件的残卷全删，挂起/崩溃则让它们整件重来。
+/// 按件龄仲裁把这个数从 N 降到通常 1~2 件。
+/// </para>
+/// <para>
+/// 吞吐不受影响：额度始终满载。老件的滑动窗口用不满时（比如它只剩一卷没传），空出来的额度当场
+/// 落到下一件手上，不会闲着。
+/// </para>
+/// </summary>
+public sealed class VolumeUploadGate
+{
+    /// <summary>排序键 <c>(票号, 卷号)</c>：先按件龄，同一件内按卷号升序。
+    /// 后者不是可有可无的整齐——界面上那张在途列表照着这个顺序读，一件一件往下推进才看得懂。</summary>
+    private readonly PriorityQueue<TaskCompletionSource, (long Ticket, int Volume)> _waiters = new();
+    private readonly Lock _lock = new();
+    private long _nextTicket;
+    private int _free;
+
+    public VolumeUploadGate(int capacity)
+    {
+        Capacity = Math.Max(1, capacity);
+        _free = Capacity;
+    }
+
+    public int Capacity { get; }
+
+    /// <summary>此刻还空着几份额度。给测试与诊断用——判「额度有没有被漏掉」只能看这个数。</summary>
+    public int Free { get { lock (_lock) return _free; } }
+
+    /// <summary>领一张票。**一族卷领一张**，也就是「这个归档开始上传的时刻」。</summary>
+    public long NextTicket() => Interlocked.Increment(ref _nextTicket);
+
+    /// <summary>
+    /// 要一份额度。返回的 Task **已完成**就表示闸门当时空着、一次队都没排——调用方据此决定要不要
+    /// 报「在等额度」（见 <see cref="VolumeUploadScope.RunAsync"/>）。
+    /// </summary>
+    public Task AcquireAsync(long ticket, int volume, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled(ct);
+
+        // 续体必须异步跑：Pump 是在锁里置结果的，同步续体会直接在锁内跑到调用方的代码里去。
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_lock)
+        {
+            // **一律入队**，不留「闸门空着就随手拿走」的快速通道。那条通道正是要修掉的行为：
+            // 它让一个刚到的新件绕过队列，插到已经等在那里的老件前面去。
+            _waiters.Enqueue(tcs, (ticket, volume));
+            Pump();
+        }
+        return tcs.Task.IsCompletedSuccessfully ? tcs.Task : WaitAsync(tcs, ct);
+    }
+
+    private static async Task WaitAsync(TaskCompletionSource tcs, CancellationToken ct)
+    {
+        // 取消与 Pump 抢同一个 TCS：谁先置上谁说了算，输的那一方什么都拿不到。
+        // 取消赢了 → 这个等待者变成队里的一具尸体，下次 Pump 弹到它时 TrySetResult 失败、跳过，
+        // 额度不会记到它头上。Pump 赢了 → 额度已经是它的了，await 正常返回，随后调用方自己的
+        // 上传会因为令牌已断而抛，finally 照常把额度还回来。两条路都不漏额度。
+        await using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
+        await tcs.Task;
+    }
+
+    public void Release()
+    {
+        lock (_lock)
+        {
+            // 被换掉的 SemaphoreSlim 在还多了的时候会抛 SemaphoreFullException，这一句是把那道
+            // 保险接回来。重复归还不是小事：额度凭空变多，在途流数就静静地超过用户设的并发数，
+            // 而它坏起来不响——只会看见备份莫名其妙比设定的更吃带宽。
+            if (_free >= Capacity)
+                throw new InvalidOperationException(
+                    $"Upload slot released more times than acquired (capacity {Capacity}).");
+            _free++;
+            Pump();
+        }
+    }
+
+    /// <summary>把空着的额度发给优先级最高的**活**等待者。必须在锁内调用。</summary>
+    private void Pump()
+    {
+        // 循环而不是只弹一个：弹出来的可能是已取消的尸体，那时额度还没送出去，得继续往下找。
+        // 也正因为每次都从 _free > 0 起循环，不存在「队里全是尸体 + 有空额度 = 谁都拿不到」
+        // 那种死锁——尸体会被后续的 Pump 一路清掉。
+        while (_free > 0 && _waiters.TryDequeue(out var waiter, out _))
+            if (waiter.TrySetResult())
+                _free--;
+    }
+}
+
+/// <summary>
 /// 每一卷上传时套的外围：向全局闸门要一份**流**的额度、把这一卷登记为在途、给它一个独立的进度回报。
 /// <para>
 /// 额度按**卷**而不是按**件**计。按件计时，一个 100 GB 文件切出来的上千卷整段只占一条流——
@@ -18,33 +114,61 @@ namespace AzureStorageBackup.Api.Services;
 /// SDK 的 256 MB 单发阈值，一卷就是一个 PUT、一条连接，所以「一卷 = 一条流」是精确的而非近似。
 /// </para>
 /// </summary>
-public sealed class VolumeUploadScope(SemaphoreSlim gate, StageTracker tracker, int maxParallelPerItem)
+public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracker, int maxParallelPerItem)
 {
-    /// <summary>单件活最多同时压几卷上去。不放开成「整族一起排队」是为了公平：
-    /// <see cref="SemaphoreSlim"/> 先到先得，上千个等待者会把后来的小活整段挡在队尾，
-    /// 它们的暂存文件也就一直堆在临时盘上不走。</summary>
+    /// <summary>单件活最多同时压几卷上去。留着这道窗口**不是**为了让后来的小活插得进来——
+    /// 额度已经按件龄仲裁（见 <see cref="VolumeUploadGate"/>），挡住后来者正是有意为之。
+    /// 它守的是另一件事：别把一个大文件的上千卷一次性全塞进等待队列，那是白占内存，
+    /// 而且这些卷的暂存文件也只能等各自传完才撤得下去。</summary>
     public int MaxParallelPerItem { get; } = Math.Max(1, maxParallelPerItem);
 
+    /// <summary>
+    /// 滑动窗口的宽度：<see cref="MaxParallelPerItem"/> **再加一卷**。多出来的那一卷是接力棒。
+    /// <para>
+    /// 少了它，按件龄仲裁会在每次换卷的缝里漏一份额度出去：一卷传完是在 <c>RunAsync</c> 的
+    /// finally 里 <c>Release</c> 的，而这一族的下一卷要等 <c>WhenAny</c> 的续体跑起来才排得上队。
+    /// <c>Release</c> 里的放行是同步的，那一瞬间队里只有别的件——额度当场就送出去了。
+    /// 每传完一卷漏一份，老件的优先权也就名存实亡。
+    /// </para>
+    /// <para>
+    /// 多排一卷之后，换卷那一瞬这一族在闸门上通常还留着一个等待者，它凭更小的票号把额度接住。
+    /// 代价只是每件多占一个等待者的内存。
+    /// </para>
+    /// <para>
+    /// **它盖住的是常见时序，不是全部。** 那一族被放行之后要等续体才补上下一个等待者，这中间仍有
+    /// 一道缝；线程池被饿着时续体迟到，缝里正好有别的卷传完，额度就漏给新件了。生产上这道缝以
+    /// 微秒计而一卷上传以秒计，所以漏的至多是偶尔一卷——够不上要为它去改造成「一族卷各自攥着
+    /// 额度不放」的写法（那才能做到绝对，代价是把这一层整个翻掉）。
+    /// </para>
+    /// </summary>
+    public int WindowPerItem => MaxParallelPerItem + 1;
+
+    /// <summary>领一张票，一族卷一张。见 <see cref="VolumeUploadGate.NextTicket"/>。</summary>
+    public long NextTicket() => gate.NextTicket();
+
+    /// <param name="ticket">这一族卷的票号，决定它在闸门上的优先级。</param>
+    /// <param name="volumeIndex">族内第几卷（0 起）。同票号之间按它升序放行。</param>
     /// <param name="label">界面上显示的名字——**源文件路径**或包的描述，不是 blob 名。
     /// blob 是内容寻址的（加密时还是 HMAC），<c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。</param>
     /// <param name="volumeBytes">这一卷多大，供界面显示"传了多少 / 一共多大"。</param>
     public async Task RunAsync(
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
-        string? label = null, long volumeBytes = 0)
+        long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0)
     {
-        // 先试一次非阻塞获取：闸门空着时随手就拿到，那种情况下标记「在等额度」等于给每一卷平白
-        // 加一次强制发布——一件大活上千卷就是上千次。只有真的要排队才报，而真排上队的时候，
-        // 屏幕上一个字节都没在动，那一栏正是唯一说得出「在等什么」的东西。
-        // Wait(0) 不看取消令牌，而它替下来的 WaitAsync(ct) 是看的：不补这一句，已经取消的运行
-        // 在闸门空着时会照常传完这一卷才发现自己该停了。
+        // 闸门空着时 AcquireAsync 返回的是一个已完成的 Task，此时**不报**「在等额度」：
+        // 那种情况下标记等于给每一卷平白加一次强制发布——一件大活上千卷就是上千次。
+        // 只有真的排上队才报，而真排上队的时候，屏幕上一个字节都没在动，那一栏正是唯一
+        // 说得出「在等什么」的东西。
+        // 这一句先问一次取消：不补它，已经取消的运行在闸门空着时会照常传完这一卷才发现该停了。
         ct.ThrowIfCancellationRequested();
-        if (!gate.Wait(0))
+        var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
+        if (!acquire.IsCompletedSuccessfully)
         {
             tracker.BeginWait(UploadWait.Slot);
             var acquired = false;
             try
             {
-                await gate.WaitAsync(ct);
+                await acquire;
                 acquired = true;
             }
             finally
@@ -128,6 +252,11 @@ public static class VolumeBlobIO
             ? baseRef
             : volumeFiles.Count > 1 ? $"{label} ({index + 1}/{volumeFiles.Count})" : label;
 
+        // 一族卷领一张票，也就是「这个归档开始上传的时刻」——闸门据此把额度优先给老的那一族，
+        // 而不是摊薄到所有在传的件上（见 VolumeUploadGate）。一箱的每一组各自调一次本方法，
+        // 因此各领各的票；组与组之间本来就是串行的，这是对的。
+        var ticket = scope?.NextTicket() ?? 0;
+
         async Task One(string name, string file, int index)
         {
             if (scope is null)
@@ -136,7 +265,7 @@ public static class VolumeBlobIO
                 await scope.RunAsync(
                     name,
                     p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
-                    ct, LabelFor(index), SizeOf(file));
+                    ct, ticket, index, LabelFor(index), SizeOf(file));
             onVolumeUploaded?.Invoke(file);
         }
 
@@ -154,9 +283,11 @@ public static class VolumeBlobIO
         // 滑动窗口：完成一卷就补一卷。分批 Task.WhenAll 的话，一批里最慢的那一卷会让其余几条流
         // 全程空转等它——卷与卷的耗时本来就不齐（重试、分块并行度、服务端限流各不相同），
         // 界面上的表现是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
-        // 窗口宽度仍卡在 MaxParallelPerItem 上：不能把上千卷一次性全塞进全局闸门的等待队列，
-        // SemaphoreSlim 先到先得，那样后来的小活会被整段挡在队尾（见 VolumeUploadScope）。
-        var window = scope?.MaxParallelPerItem ?? 1;
+        // 窗口宽度仍是有界的：不能把上千卷一次性全塞进全局闸门的等待队列，那是白占内存，
+        // 而且排在队里的卷各自的暂存文件也只能等它传完才撤得下去（见 VolumeUploadScope）。
+        // 宽度取 MaxParallelPerItem + 1（见 WindowPerItem）：等于闸门容量的那部分让这一族能一个人
+        // 吃满全部额度，多出来的一卷是换卷时接住额度的接力棒。
+        var window = scope?.WindowPerItem ?? 1;
         var started = new List<Task>(volumeFiles.Count);
         var running = new List<Task>(window);
         for (var i = 0; i < volumeFiles.Count; i++)

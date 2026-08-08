@@ -131,7 +131,7 @@ The identity **`processed + preparing + queued + uploading ≡ total`** always h
 | `N volumes uploading` / `N downloading` | volumes / items | Transfers actually moving bytes. Upload registers one entry **per volume**, so a single large item can occupy the whole concurrency allowance on its own; download registers one per object. |
 | `nothing on the wire right now` | — | This instant has no transfer in flight while an item is being prepared. It says *right now*, not *not yet*: several GB may already have gone up earlier in the run. |
 | `N waiting on the same content elsewhere` | items | The identical content is already being uploaded by another item in this run; this one waits for that upload to finish rather than sending the bytes twice. Can take minutes. |
-| `N volumes waiting for an upload slot` | **volumes** | The global upload gate is saturated. |
+| `N volumes waiting for an upload slot` | **volumes** | The global upload gate is saturated. Slots are handed out **oldest item first**, not first-come-first-served — see below. |
 | `N starting upload` | items | Compression is done and the bytes have not left yet, for none of the reasons above — the item is doing the local work between the two: re-`stat`ing each pack member, looking up the dedup map (a dedup hit never uploads at all). Shown **only when no transfer is in flight**; an item that gets a slot immediately simply appears under `volumes uploading` instead. |
 | `N preparing` (Uploading) | items | Holding the **global compression lock** and producing volume files. There is exactly one lock, so this is always `0` or `1`; everything queuing behind it counts as `queued`. |
 | `N extracting` (Restoring / Verifying) | items | Downloaded and now extracting / re-hashing. No global lock here, so this can go up to the download concurrency. |
@@ -159,6 +159,8 @@ During **Restoring / Verifying** the direction reverses, and the download total 
 #### The in-flight transfer list
 
 Each concurrent transfer is listed on its own line with its own progress — `path — 41.2 MB / 220.0 MB · 18%`. The header says *parallel* explicitly because seeing two or three names at once suggests parallel compression, which never happens: compression is globally serialised behind one lock (that is the `N preparing` above), and only transfers run in parallel. The list is never truncated — its length is bounded by the upload/download concurrency setting — since the stuck transfer is usually the one that would have been folded away.
+
+Normally the list shows **one item's volumes at a time, in volume order**, because upload slots go to the item that started uploading earliest rather than to whoever asked first. That is not cosmetic. An object only counts as uploaded once its whole set of volumes is confirmed, so several large files sharing the slots evenly would all sit half-finished at once — which is what `+X uploaded in unfinished objects` measures, and exactly what a stop or a crash throws away. Handing the slots out oldest-first keeps that number to roughly one item instead of one per upload stream, at no cost to throughput: the slots stay full, and whatever the oldest item cannot use goes to the next one immediately. You will therefore still see a second file appear near the end of the first — that is the leftover capacity being used, not the ordering breaking down.
 
 ### Working space
 

@@ -207,7 +207,7 @@ public sealed class UploadWaitVisibilityTests
     {
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true);
-        using var gate = new SemaphoreSlim(1, 1);
+        var gate = new VolumeUploadGate(1);
         var scope = new VolumeUploadScope(gate, tracker, maxParallelPerItem: 5);
 
         // 闸门空着：拿额度不该产生任何 "waiting" 读数。
@@ -215,7 +215,7 @@ public sealed class UploadWaitVisibilityTests
         Assert.All(seen, s => Assert.Equal(0, s.Waiting(UploadWait.Slot)));
 
         // 闸门被占满：这一次必须报出来，否则界面上又是「什么都没在传，也没说在等什么」。
-        await gate.WaitAsync();
+        await gate.AcquireAsync(0, 0, CancellationToken.None);
         var blocked = scope.RunAsync("data/b.001", _ => Task.CompletedTask, CancellationToken.None);
 
         // 让它跑到 gate.WaitAsync 上挂住。

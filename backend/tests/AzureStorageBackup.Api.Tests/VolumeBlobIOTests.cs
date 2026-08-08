@@ -88,8 +88,74 @@ public sealed class VolumeBlobIOTests
             => throw new NotSupportedException();
     }
 
-    private static VolumeUploadScope Scope(SemaphoreSlim gate, int perItem) =>
+    private static VolumeUploadScope Scope(VolumeUploadGate gate, int perItem) =>
         new(gate, new StageTracker("Uploading", 0, static _ => { }), perItem);
+
+    /// <summary>记录每一卷开始上传的先后，并让上传慢到足以让两族卷真的抢起来。</summary>
+    private sealed class OrderProbe : IBlobUploader
+    {
+        private readonly Lock _gate = new();
+        public List<string> Started { get; } = [];
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            lock (_gate) Started.Add(blobName);
+            await Task.Delay(20, ct);
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// 两族卷同时抢额度时，老的那一族**基本上是整族连着传完的**，新的那族插不进来。
+    /// <para>
+    /// 这条守的是中断代价。整族传完、云端确认返回之后才记 journal、才销在途账，所以「同时半完成
+    /// 的族数」就是一次 <c>Stop now</c> / 挂起 / 崩溃白扔掉多少已经压好传上去的字节。先到先得会让
+    /// 额度摊薄到所有在传的族上，几族一起卡在半路；按件龄仲裁之后基本上只有一族。
+    /// </para>
+    /// <para>
+    /// **断言为什么不是「一卷都插不进来」**：一卷传完是在 <c>RunAsync</c> 的 finally 里放行的，
+    /// 而这一族的下一卷要等 <c>WhenAny</c> 的续体跑起来才排得上队——这两件事之间有一道缝。
+    /// <c>WindowPerItem</c> 多排的那一卷（接力棒）盖住了常见时序：换卷那一瞬本族在闸门上还留着
+    /// 一个等待者，凭更小的票号把额度接住。但线程池被饿着时续体可能迟到几百毫秒，那一缝里新族
+    /// 确实可能捡走一卷。生产上这道缝以微秒计、而一卷上传以秒计，所以它是可以忍的漏，不是错误。
+    /// 界限取 2：先到先得下这里稳定是 3 卷（一半），修好之后正常是 0、最坏 1，两边离得很开。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task An_Older_Archive_Is_Not_Interleaved_With_A_Newer_One()
+    {
+        var up = new OrderProbe();
+        var gate = new VolumeUploadGate(2);
+        var scope = Scope(gate, perItem: 2);
+        var older = Enumerable.Range(1, 6).Select(i => $"/tmp/a.{i:000}").ToList();
+        var newer = Enumerable.Range(1, 6).Select(i => $"/tmp/b.{i:000}").ToList();
+
+        // 票号在 UploadAsync 的同步段就领掉了，所以先调的这一族一定更老——不靠 sleep 猜时序。
+        var first = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/older", older, AccessTier.Hot, scope: scope);
+        var second = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/newer", newer, AccessTier.Hot, scope: scope);
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(12, up.Started.Count);
+        var lastOfOlder = up.Started.FindLastIndex(n => n.StartsWith("data/older", StringComparison.Ordinal));
+        var newerBeforeOlderFinished = up.Started
+            .Take(lastOfOlder)
+            .Count(n => n.StartsWith("data/newer", StringComparison.Ordinal));
+
+        Assert.True(newerBeforeOlderFinished < 2,
+            $"新族在老族传完之前抢走了 {newerBeforeOlderFinished} 卷：{string.Join(", ", up.Started)}");
+        Assert.Equal(2, gate.Free);
+    }
 
     /// <summary>
     /// 每一卷都传上去了，顺序不作要求。首卷曾经是最后单独传的「整族齐全」提交标记，那个语义
@@ -120,7 +186,7 @@ public sealed class VolumeBlobIOTests
     public async Task Volumes_Of_One_Archive_Ride_The_Gate_In_Parallel()
     {
         var up = new ConcurrencyProbe(expectPeak: 2);
-        using var gate = new SemaphoreSlim(2, 2);
+        var gate = new VolumeUploadGate(2);
         var files = Enumerable.Range(1, 7).Select(i => $"/tmp/a.{i:000}").ToList();
 
         await VolumeBlobIO.UploadAsync(
@@ -128,7 +194,7 @@ public sealed class VolumeBlobIOTests
 
         Assert.Equal(2, up.Max);              // 既确实并行了（>1），又没越过闸门（≤2）
         Assert.Equal(7, up.Order.Count);
-        Assert.Equal(2, gate.CurrentCount);   // 额度全数归还
+        Assert.Equal(2, gate.Free);   // 额度全数归还
     }
 
     /// <summary>
@@ -143,14 +209,14 @@ public sealed class VolumeBlobIOTests
     public async Task Two_Volumes_Go_Up_At_The_Same_Time()
     {
         var up = new ConcurrencyProbe(expectPeak: 2);
-        using var gate = new SemaphoreSlim(5, 5);
+        var gate = new VolumeUploadGate(5);
 
         await VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002"], AccessTier.Hot,
             scope: Scope(gate, perItem: 5));
 
         Assert.Equal(2, up.Max);
-        Assert.Equal(5, gate.CurrentCount);
+        Assert.Equal(5, gate.Free);
     }
 
     /// <summary>没给 scope 的调用（修复/替换等非备份主路径）保持老样子：串行、一次一卷。</summary>
@@ -294,7 +360,7 @@ public sealed class VolumeBlobIOTests
     {
         // 十卷全进窗口（首卷不再是最后单独传的提交标记），卡住的是 .002，其余 9 卷该照跑。
         var up = new OneStuckVolume("data/h.002", expectOthers: 9);
-        using var gate = new SemaphoreSlim(3, 3);
+        var gate = new VolumeUploadGate(3);
         var files = Enumerable.Range(1, 10).Select(i => $"/tmp/a.{i:D3}").ToList();
 
         var upload = VolumeBlobIO.UploadAsync(
@@ -342,7 +408,7 @@ public sealed class VolumeBlobIOTests
     public async Task A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running()
     {
         var up = new FailingVolume("data/h.004");
-        using var gate = new SemaphoreSlim(3, 3);
+        var gate = new VolumeUploadGate(3);
         var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
 
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
@@ -351,7 +417,7 @@ public sealed class VolumeBlobIOTests
         // 倒在第 4 卷，后面几卷就不该再起飞了——8 卷不可能都跑过一遍。
         Assert.True(up.Order.Count < files.Count, $"倒了之后还在起新卷：{up.Order.Count} 卷都跑了");
         // 闸门额度全数归还＝没有卷还攥在手里。抛出时仍在跑的话，这里会少。
-        Assert.Equal(3, gate.CurrentCount);
+        Assert.Equal(3, gate.Free);
     }
 
     /// <summary>
@@ -369,7 +435,7 @@ public sealed class VolumeBlobIOTests
     [Fact]
     public async Task A_Broken_Progress_Sink_Does_Not_Swallow_The_Upload_Slot()
     {
-        using var gate = new SemaphoreSlim(1, 1);
+        var gate = new VolumeUploadGate(1);
         var tracker = new StageTracker("Uploading", 0, static _ => throw new IOException("progress sink broke"))
         {
             Clock = () => 0,
@@ -379,7 +445,7 @@ public sealed class VolumeBlobIOTests
         await Assert.ThrowsAsync<IOException>(() =>
             scope.RunAsync("data/h.001", _ => Task.CompletedTask, CancellationToken.None));
 
-        Assert.Equal(1, gate.CurrentCount);
+        Assert.Equal(1, gate.Free);
     }
 
     /// <summary>
@@ -389,7 +455,7 @@ public sealed class VolumeBlobIOTests
     [Fact]
     public async Task A_Broken_Progress_Sink_Does_Not_Swallow_The_Slot_It_Just_Waited_For()
     {
-        using var gate = new SemaphoreSlim(1, 1);
+        var gate = new VolumeUploadGate(1);
         var publishes = 0;
         // 头一次是 BeginWait——那时额度还没到手，抛出去不带走任何东西，放过它。
         // 第二次是 EndWait，闸门已经放行，那一份额度正攥在手里。
@@ -403,12 +469,12 @@ public sealed class VolumeBlobIOTests
         };
         var scope = new VolumeUploadScope(gate, tracker, 1);
 
-        await gate.WaitAsync();  // 把唯一那份额度占住，逼它去排队
+        await gate.AcquireAsync(0, 0, CancellationToken.None);  // 把唯一那份额度占住，逼它去排队
         var run = scope.RunAsync("data/h.001", _ => Task.CompletedTask, CancellationToken.None);
         gate.Release();          // 放行：等待者醒来，随即撞上坏掉的 sink
 
         await Assert.ThrowsAsync<IOException>(() => run);
-        Assert.Equal(1, gate.CurrentCount);
+        Assert.Equal(1, gate.Free);
     }
 
     [Theory]
