@@ -71,8 +71,8 @@ public class ResolvedBackupSettingsTests
         Assert.Equal("mine-dg", r.DontGroupRules);
     }
 
-    // false 与 0 是合法的覆盖值，不能被当成「未设置」而回落到全局。
-    // 这正是用 null 而非哨兵值的理由，值得单独钉住。
+    // false and 0 are legitimate override values and must not be taken as "unset" and fall back to the global.
+    // This is exactly why null is used rather than a sentinel value, and it is worth pinning down on its own.
     [Fact]
     public void False_And_Zero_Are_Overrides_Not_Absence()
     {
@@ -85,7 +85,7 @@ public class ResolvedBackupSettingsTests
         Assert.Equal(0, r.MaxVersions);
     }
 
-    // VolumeBytes 三态：null = 继承，0 = 明确关闭分卷，正数 = 分卷大小。
+    // VolumeBytes has three states: null = inherit, 0 = volumes explicitly off, positive = volume size.
     [Theory]
     [InlineData(null, 333L)]
     [InlineData(0L, 0L)]
@@ -96,10 +96,10 @@ public class ResolvedBackupSettingsTests
         Assert.Equal(expected, r.VolumeBytes);
     }
 
-    // 规则字段三态：null = 继承，"" = 明确没有规则，有内容 = 覆盖。
-    // 空串必须活下来，否则「我不要任何忽略规则」就无法表达。
-    // 三个规则字段的迁移语义完全相同（这正是 Fix 1 漏掉的那类 bug），
-    // 因此三个都要单独钉住，不能只测 IgnoreRules 一个。
+    // Rule fields have three states: null = inherit, "" = explicitly no rules, non-empty = override.
+    // The empty string must survive, otherwise "I want no ignore rules at all" cannot be expressed.
+    // All three rule fields migrate with identical semantics (exactly the class of bug Fix 1 missed),
+    // so all three are pinned down separately; testing IgnoreRules alone is not enough.
     [Theory]
     [InlineData(null, "global-ignore")]
     [InlineData("", "")]

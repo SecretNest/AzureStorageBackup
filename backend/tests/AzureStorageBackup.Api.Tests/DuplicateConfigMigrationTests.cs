@@ -8,14 +8,14 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 「一个 container 只能有一条备份配置」这条唯一索引是补加的，而它要落到的库里可能已经躺着
-/// 重复——那正是这次修复要堵的 bug 的产物。直接 CREATE UNIQUE INDEX 会失败，而迁移失败
-/// 就是应用起不来；用户在 NAS 上，拿不到命令行，那等于整台设备的备份停摆。
+/// The unique index behind "a container can have only one backup config" was added after the fact, and the database it has to
+/// land on may already be holding duplicates — the very product of the bug this fix plugs. A plain CREATE UNIQUE INDEX would fail,
+/// and a failed migration means the app does not start; the user is on a NAS with no command line, so that amounts to backups for the whole device grinding to a halt.
 /// <para>
-/// 所以迁移必须自己把重复挪开，而且**一条都不许删**：重复的那些配置指着真实的云端数据，
-/// 删掉本地记录不会让云端数据消失，只会让用户再也看不见它。挪开的做法是把 ContainerName
-/// 改成一个 Azure 根本不接受的名字（带点），这样它既不会再碰任何真实 container，又原样留在
-/// 界面上——连同一条说明为什么的 LastError，让用户自己决定怎么处置。
+/// So the migration has to move the duplicates aside itself, and **must not delete a single one**: those duplicate configs point at real
+/// cloud data, and deleting the local record does not make the cloud data go away, it only makes it invisible to the user forever. Moving
+/// aside is done by changing ContainerName to a name Azure will never accept (it contains a dot), so it can no longer touch any real
+/// container while still showing up in the UI exactly as it was — along with a LastError explaining why, leaving the user to decide what to do with it.
 /// </para>
 /// </summary>
 public class DuplicateConfigMigrationTests
@@ -56,9 +56,9 @@ public class DuplicateConfigMigrationTests
         await db.Database.MigrateAsync();
 
         var rows = await db.BackupConfigs.OrderBy(c => c.Id).ToListAsync();
-        Assert.Equal(3, rows.Count); // 一条都没丢
+        Assert.Equal(3, rows.Count); // not a single one lost
 
-        // 最早的那条是原样的赢家：它才是那个 container 真正的主人。
+        // The earliest one is the untouched winner: it is the real owner of that container.
         Assert.Equal("shared", rows[0].ContainerName);
         Assert.Equal(BackupStatus.Normal, rows[0].Status);
         Assert.Null(rows[0].LastError);
@@ -66,17 +66,17 @@ public class DuplicateConfigMigrationTests
         foreach (var moved in rows.Skip(1))
         {
             Assert.NotEqual("shared", moved.ContainerName);
-            // 带点的名字 Azure 一概不收，所以这条配置绝无可能再动到任何真实 container。
+            // Azure rejects any name containing a dot, so this config can never touch a real container again.
             Assert.Contains(".", moved.ContainerName, StringComparison.Ordinal);
             Assert.Contains("shared", moved.ContainerName, StringComparison.Ordinal);
             Assert.Equal(BackupStatus.Error, moved.Status);
             Assert.NotNull(moved.LastError);
-            // 说清是谁占着、以及这条配置现在处在什么状态——否则界面上只是莫名其妙多了个错。
+            // Spell out who is holding it and what state this config is now in — otherwise the UI just inexplicably grows an extra error.
             Assert.Contains("First", moved.LastError!, StringComparison.Ordinal);
         }
     }
 
-    /// <summary>没有重复的库（绝大多数）迁过去必须一个字节都不变。</summary>
+    /// <summary>A database with no duplicates (the vast majority) must come through the migration byte-identical.</summary>
     [Fact]
     public async Task A_Clean_Database_Passes_Through_Untouched()
     {
@@ -86,7 +86,7 @@ public class DuplicateConfigMigrationTests
 
         await db.Database.ExecuteSqlRawAsync(InsertSql(1, "photos", "Photos"));
         await db.Database.ExecuteSqlRawAsync(InsertSql(1, "docs", "Docs"));
-        // 不同账户下的同名 container 是合法的，不能被当成重复挪走。
+        // The same container name under a different account is legal and must not be moved aside as a duplicate.
         await db.Database.ExecuteSqlRawAsync(InsertSql(2, "photos", "Other"));
 
         await db.Database.MigrateAsync();

@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>纯文件系统逻辑单测（无 Azurite 依赖）：还原冲突「重命名保留」（决策 3）。</summary>
+/// <summary>Pure filesystem-logic unit tests (no Azurite dependency): the restore conflict mode "rename and keep" (decision 3).</summary>
 public sealed class RestoreConflictTests : IDisposable
 {
     private readonly List<string> _dirs = [];
@@ -29,10 +29,10 @@ public sealed class RestoreConflictTests : IDisposable
         File.WriteAllText(dest, "OLD");
         var now = new DateTimeOffset(2026, 7, 18, 14, 30, 22, TimeSpan.Zero);
 
-        var bak = RestoreConflict.RenameExisting(dest, now);   // 返回改名后的备份路径
+        var bak = RestoreConflict.RenameExisting(dest, now);   // returns the path of the renamed backup
         Assert.Equal(Path.Combine(dir, "file.txt.bak-20260718-143022"), bak);
-        Assert.False(File.Exists(dest));                        // 原名腾空
-        Assert.Equal("OLD", File.ReadAllText(bak));             // 旧内容保留
+        Assert.False(File.Exists(dest));                        // the original name is freed
+        Assert.Equal("OLD", File.ReadAllText(bak));             // the old content is preserved
     }
 
     [Fact]
@@ -42,11 +42,11 @@ public sealed class RestoreConflictTests : IDisposable
         var dest = Path.Combine(dir, "file.txt");
         File.WriteAllText(dest, "OLD");
         var now = new DateTimeOffset(2026, 7, 18, 14, 30, 22, TimeSpan.Zero);
-        File.WriteAllText(Path.Combine(dir, "file.txt.bak-20260718-143022"), "PREV"); // 已存在
+        File.WriteAllText(Path.Combine(dir, "file.txt.bak-20260718-143022"), "PREV"); // already exists
 
         var bak = RestoreConflict.RenameExisting(dest, now);
         Assert.Equal(Path.Combine(dir, "file.txt.bak-20260718-143022-1"), bak);
-        Assert.Equal("PREV", File.ReadAllText(Path.Combine(dir, "file.txt.bak-20260718-143022"))); // 先前备份未被覆盖
+        Assert.Equal("PREV", File.ReadAllText(Path.Combine(dir, "file.txt.bak-20260718-143022"))); // the earlier backup was not overwritten
         Assert.Equal("OLD", File.ReadAllText(bak));
     }
 

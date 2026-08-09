@@ -26,7 +26,7 @@ public sealed class VolumeBlobIOTests
 
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    /// <summary>记录上传顺序的假 uploader。</summary>
+    /// <summary>A fake uploader that records the upload order.</summary>
     private sealed class RecordingUploader : IBlobUploader
     {
         public List<string> Order { get; } = [];
@@ -52,8 +52,9 @@ public sealed class VolumeBlobIOTests
 
     private static Account Acc() => new() { Name = "a", BlobEndpoint = "http://x", AccountKeyProtected = TestSecrets.Protect("k") };
 
-    /// <summary>并发峰值探针：达到 <paramref name="expectPeak"/> 个同时在传才放行。
-    /// 不用 sleep 猜时序——并行真没发生的话这里会一直等到超时，<c>Max</c> 停在 1，断言自然失败。</summary>
+    /// <summary>A concurrency peak probe: nothing is let through until <paramref name="expectPeak"/> uploads are
+    /// in flight at once. No sleeps guessing at timing — if parallelism never happens this waits until the
+    /// timeout, <c>Max</c> stays at 1, and the assertion fails on its own.</summary>
     private sealed class ConcurrencyProbe(int expectPeak) : IBlobUploader
     {
         private readonly TaskCompletionSource _peak = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -91,7 +92,7 @@ public sealed class VolumeBlobIOTests
     private static VolumeUploadScope Scope(VolumeUploadGate gate, int perItem) =>
         new(gate, new StageTracker("Uploading", 0, static _ => { }), perItem);
 
-    /// <summary>记录每一卷开始上传的先后，并让上传慢到足以让两族卷真的抢起来。</summary>
+    /// <summary>Records the order in which volumes start uploading, and makes uploads slow enough that two volume families really contend.</summary>
     private sealed class OrderProbe : IBlobUploader
     {
         private readonly Lock _gate = new();
@@ -115,19 +116,26 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 两族卷同时抢额度时，老的那一族**基本上是整族连着传完的**，新的那族插不进来。
+    /// When two volume families contend for slots, the older one **essentially uploads straight through as a
+    /// whole family** and the newer one cannot cut in.
     /// <para>
-    /// 这条守的是中断代价。整族传完、云端确认返回之后才记 journal、才销在途账，所以「同时半完成
-    /// 的族数」就是一次 <c>Stop now</c> / 挂起 / 崩溃白扔掉多少已经压好传上去的字节。先到先得会让
-    /// 额度摊薄到所有在传的族上，几族一起卡在半路；按件龄仲裁之后基本上只有一族。
+    /// This guards the cost of an interruption. The journal is written and the in-flight ledger cleared only after
+    /// the whole family is uploaded and the cloud has confirmed, so "how many families are half-done at once" is
+    /// how many already-compressed, already-uploaded bytes a <c>Stop now</c> / suspend / crash throws away.
+    /// First-come-first-served spreads the slots thin across every family in flight, leaving several stuck
+    /// halfway; arbitrating by item age leaves essentially one.
     /// </para>
     /// <para>
-    /// **断言为什么不是「一卷都插不进来」**：一卷传完是在 <c>RunAsync</c> 的 finally 里放行的，
-    /// 而这一族的下一卷要等 <c>WhenAny</c> 的续体跑起来才排得上队——这两件事之间有一道缝。
-    /// <c>WindowPerItem</c> 多排的那一卷（接力棒）盖住了常见时序：换卷那一瞬本族在闸门上还留着
-    /// 一个等待者，凭更小的票号把额度接住。但线程池被饿着时续体可能迟到几百毫秒，那一缝里新族
-    /// 确实可能捡走一卷。生产上这道缝以微秒计、而一卷上传以秒计，所以它是可以忍的漏，不是错误。
-    /// 界限取 2：先到先得下这里稳定是 3 卷（一半），修好之后正常是 0、最坏 1，两边离得很开。
+    /// **Why the assertion is not "not a single volume cuts in"**: a finished volume releases its slot in
+    /// <c>RunAsync</c>'s finally, while this family's next volume cannot queue up until the <c>WhenAny</c>
+    /// continuation gets to run — there is a crack between those two things. The extra volume
+    /// <c>WindowPerItem</c> queues (the baton) covers the common timing: at the changeover instant this family
+    /// still has a waiter on the gate that catches the slot on its smaller ticket. But when the thread pool is
+    /// starved the continuation can be hundreds of milliseconds late, and in that crack the new family really can
+    /// pick up a volume. In production the crack is measured in microseconds while a volume upload takes seconds,
+    /// so it is a tolerable leak, not a bug.
+    /// The bound is 2: under first-come-first-served this is reliably 3 volumes (half of them), and after the fix
+    /// it is normally 0 and at worst 1 — the two sides are far apart.
     /// </para>
     /// </summary>
     [Fact]
@@ -139,7 +147,8 @@ public sealed class VolumeBlobIOTests
         var older = Enumerable.Range(1, 6).Select(i => $"/tmp/a.{i:000}").ToList();
         var newer = Enumerable.Range(1, 6).Select(i => $"/tmp/b.{i:000}").ToList();
 
-        // 票号在 UploadAsync 的同步段就领掉了，所以先调的这一族一定更老——不靠 sleep 猜时序。
+        // The ticket is taken in UploadAsync's synchronous section, so the family called first is guaranteed to
+        // be the older one — no sleeps guessing at timing.
         var first = VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/older", older, AccessTier.Hot, scope: scope);
         var second = VolumeBlobIO.UploadAsync(
@@ -153,14 +162,16 @@ public sealed class VolumeBlobIOTests
             .Count(n => n.StartsWith("data/newer", StringComparison.Ordinal));
 
         Assert.True(newerBeforeOlderFinished < 2,
-            $"新族在老族传完之前抢走了 {newerBeforeOlderFinished} 卷：{string.Join(", ", up.Started)}");
+            $"the newer family grabbed {newerBeforeOlderFinished} volumes before the older one finished: {string.Join(", ", up.Started)}");
         Assert.Equal(2, gate.Free);
     }
 
     /// <summary>
-    /// 每一卷都传上去了，顺序不作要求。首卷曾经是最后单独传的「整族齐全」提交标记，那个语义
-    /// 已经随云端存在性去重一并删掉——它换来的是 2–5 卷的文件上传耗时翻倍（收尾那一趟只有一条流
-    /// 在动），而去重现在只看本地权威索引，根本不问云端有什么。
+    /// Every volume goes up; nothing is required about the order. The first volume used to be sent last on its
+    /// own as the "the whole family is here" commit marker, and that semantic was deleted along with cloud-side
+    /// existence dedup — what it bought was doubling the upload time of 2–5 volume files (only one stream moves
+    /// on that final trip), while dedup now looks only at the local authoritative index and never asks what the
+    /// cloud has.
     /// </summary>
     [Fact]
     public async Task Every_Volume_Goes_Up_Regardless_Of_Order()
@@ -174,12 +185,13 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 同一归档的分卷必须并行上传，且在途流数受闸门约束。
+    /// The volumes of one archive must upload in parallel, with the in-flight stream count bounded by the gate.
     /// <para>
-    /// 这条测试守的是那个真实故障：一个大文件切出上千卷时，从前它整段只占**一个**槽位，
-    /// 一卷传完才轮下一卷——设置里的「并发 5」在传大文件时形同虚设，实测只跑出单条 TCP
-    /// 到 Azure 的 4–6 MB/s。额度改按卷发放之后，在途流数与队列里是一个大文件还是一万个
-    /// 小文件无关。
+    /// This test guards a real failure: when a large file split into thousands of volumes, it used to occupy
+    /// **one** slot for that whole stretch, one volume finishing before the next began — the "concurrency 5" in
+    /// the settings was meaningless while a large file uploaded, measured at only the 4–6 MB/s of a single TCP
+    /// connection to Azure. Once slots were handed out per volume, the in-flight stream count no longer depends
+    /// on whether the queue holds one huge file or ten thousand small ones.
     /// </para>
     /// </summary>
     [Fact]
@@ -192,17 +204,20 @@ public sealed class VolumeBlobIOTests
         await VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, perItem: 4));
 
-        Assert.Equal(2, up.Max);              // 既确实并行了（>1），又没越过闸门（≤2）
+        Assert.Equal(2, up.Max);              // really parallel (>1) and never past the gate (≤2)
         Assert.Equal(7, up.Order.Count);
-        Assert.Equal(2, gate.Free);   // 额度全数归还
+        Assert.Equal(2, gate.Free);   // every slot returned
     }
 
     /// <summary>
-    /// 两卷也要真并发——这正是首卷单独收尾最贵的地方。
+    /// Two volumes must really run concurrently too — this is exactly where sending the first volume separately
+    /// at the end was most expensive.
     /// <para>
-    /// 默认卷 100 MB、并发 5，一个 100–500 MB 的文件切成 2–5 卷。首卷留到最后单传的话，这样的
-    /// 文件永远是"其余几卷并行一轮，再单独一轮传首卷"，整件耗时翻倍，而这个尺寸段在真实备份里
-    /// 是大头。探针要等到 2 卷同时在传才放行：旧实现下峰值只会是 1，这条会卡到超时后失败。
+    /// With the default 100 MB volumes and concurrency 5, a 100–500 MB file splits into 2–5 volumes. Holding the
+    /// first volume back to the end means such a file is always "one parallel round for the rest, then another
+    /// round on its own for the first volume", doubling the item's total time — and that size band is the bulk of
+    /// a real backup. The probe only lets go once 2 volumes are in flight at once: under the old implementation
+    /// the peak could only be 1, so this case would hang until the timeout and fail.
     /// </para>
     /// </summary>
     [Fact]
@@ -219,7 +234,7 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(5, gate.Free);
     }
 
-    /// <summary>没给 scope 的调用（修复/替换等非备份主路径）保持老样子：串行、一次一卷。</summary>
+    /// <summary>Calls with no scope (repair/replace and other non-backup paths) keep the old behaviour: serial, one volume at a time.</summary>
     [Fact]
     public async Task Without_A_Scope_Volumes_Still_Go_Up_One_At_A_Time()
     {
@@ -241,7 +256,7 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(["data/h"], up.Order);
     }
 
-    /// <summary>记录每次调用返回的实例是否互不相同的假进度回调。</summary>
+    /// <summary>A fake progress callback used to record whether each call returns a distinct instance.</summary>
     private sealed class SpyProgress : IProgress<long>
     {
         public long LastReported { get; private set; } = -1;
@@ -249,16 +264,19 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 用户实际会看到的症状（修复前）：<c>DownloadAsync</c> 若把进度回调只拿一次、多卷共用，
-    /// 后一卷的字节会被 <see cref="StageTracker"/> 里的 <c>DeltaProgress</c> 误判成"前一卷的
-    /// 回退重传"而错记账，还原/校验速度读数因此失真（见 <c>VolumeBlobIO.DownloadAsync</c> 方法头
-    /// 注释）。
+    /// The symptom users actually saw (before the fix): if <c>DownloadAsync</c> takes the progress callback once
+    /// and shares it across volumes, the bytes of a later volume are mistaken by the <c>DeltaProgress</c> inside
+    /// <see cref="StageTracker"/> for "the previous volume rewinding and re-sending" and booked wrongly, so the
+    /// restore/verify speed readout is distorted (see the method header comment on
+    /// <c>VolumeBlobIO.DownloadAsync</c>).
     /// <para>
-    /// 直接钉死 Part 1 的字面契约——"工厂每卷各调一次、拿到的是各不相同的实例"——而不是拐个弯去看
-    /// 下游 <c>StageTracker</c> 累计的总字节数：后者经过 mutation 验证过，对本项目 7z 分卷天然产生
-    /// 的"除末卷外各卷等大、末卷最小"这种大小序列并不敏感（<c>DeltaProgress</c> 的回退判定在这种
-    /// 序列下会自我纠正，共享实例照样能凑出正确的总数，测不出这个缺陷）。工厂调用次数/实例身份
-    /// 是本次改动唯一能保证在 mutation 下必现的信号。
+    /// This pins the literal contract of Part 1 — "the factory is called once per volume and hands back distinct
+    /// instances" — rather than taking a detour through the total bytes <c>StageTracker</c> accumulates
+    /// downstream: the latter was checked by mutation testing and is not sensitive to the size sequence 7z
+    /// volumes naturally produce in this project, "every volume equal except the last, which is smallest"
+    /// (<c>DeltaProgress</c>'s rewind detection self-corrects on such a sequence, so even a shared instance adds
+    /// up to the right total and the defect goes undetected). The factory call count / instance identity is the
+    /// only signal from this change guaranteed to show up under mutation.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -299,19 +317,22 @@ public sealed class VolumeBlobIOTests
                 try { Directory.Delete(workDir, recursive: true); } catch { /* best effort */ }
             }
 
-            // 工厂调用次数＝卷数：若实现把 progress() 提到循环外只调一次，这里会是 1 而不是 4。
+            // Factory call count = volume count: if the implementation hoisted progress() out of the loop and
+            // called it once, this would be 1 instead of 4.
             Assert.Equal(sizes.Length, instances.Count);
-            // 每个实例互不相同——ReferenceEquals 意义上真的是"各卷各要一个"，不是同一个引用重复入列。
+            // Every instance is distinct — in the ReferenceEquals sense this really is "one per volume", not the
+            // same reference queued over and over.
             Assert.Equal(instances.Count, instances.Distinct().Count());
-            // 每个实例确实收到了对应那一卷的最终累计字节，证明工厂返回值真被接到了那一卷的下载上，
-            // 不是造了个没人用的实例、实际下载另外共享着别的回调。
+            // Each instance really received the final cumulative byte count of its own volume, proving the
+            // factory's return value was actually wired into that volume's download, rather than an unused
+            // instance being created while the real download shared some other callback.
             for (var i = 0; i < sizes.Length; i++)
                 Assert.Equal(sizes[i], instances[i].LastReported);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>一卷挂住不动，其余卷照常放行；记下谁传完了。</summary>
+    /// <summary>One volume hangs and never moves while the rest go through as usual; records who finished.</summary>
     private sealed class OneStuckVolume(string stuck, int expectOthers) : IBlobUploader
     {
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -343,22 +364,26 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 卷的并发额度是**滑动窗口**：完成一卷立刻补一卷，不等同批的其它卷。
+    /// Volume concurrency slots are a **sliding window**: one volume finishes and one more starts immediately,
+    /// without waiting for the rest of its batch.
     /// <para>
-    /// 从前是一批一批来（<c>Task.WhenAll</c> 每 N 卷一个栅栏），一批里最慢的那一卷会让其余几条流
-    /// 全程空转等它。卷与卷的耗时本来就不齐——重试、分块并行度、服务端限流各不相同——所以界面上
-    /// 看到的是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
+    /// It used to go batch by batch (<c>Task.WhenAll</c> as a barrier every N volumes), and the slowest volume in
+    /// a batch made the other streams spin idle waiting for it. Volumes never take the same time — retries, block
+    /// parallelism, server-side throttling all differ — so what showed on screen was "5 streams counting down to
+    /// 0 one by one, then 5 more appearing" instead of holding steadily at 5.
     /// </para>
     /// <para>
-    /// 这条测试专挑那个故障：窗口 3、共 10 卷，第二卷挂死不动。补位生效的话，剩下 9 卷照样能全部
-    /// 传完（慢卷只占住一个位子）；换回分批实现，第一批就整批卡在慢卷上，最多传完 2 卷，
-    /// 下面这个等待会超时。
+    /// This test aims straight at that failure: window 3, 10 volumes total, the second one hanging forever. With
+    /// refill working, the remaining 9 still all finish (the slow volume only occupies one slot); go back to the
+    /// batched implementation and the very first batch is stuck on the slow volume, at most 2 volumes finish, and
+    /// the wait below times out.
     /// </para>
     /// </summary>
     [Fact]
     public async Task A_Slow_Volume_Does_Not_Stall_The_Others()
     {
-        // 十卷全进窗口（首卷不再是最后单独传的提交标记），卡住的是 .002，其余 9 卷该照跑。
+        // All ten volumes enter the window (the first is no longer the commit marker sent separately at the
+        // end); .002 is the one that hangs, and the other 9 should keep running.
         var up = new OneStuckVolume("data/h.002", expectOthers: 9);
         var gate = new VolumeUploadGate(3);
         var files = Enumerable.Range(1, 10).Select(i => $"/tmp/a.{i:D3}").ToList();
@@ -367,14 +392,14 @@ public sealed class VolumeBlobIOTests
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3));
 
         await up.OthersFinished.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.False(upload.IsCompleted, "慢卷还挂着，整件不该已经收工");
+        Assert.False(upload.IsCompleted, "the slow volume is still hanging, so the whole item must not be done");
 
         up.Release();
         await upload.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(10, up.Order.Count);
     }
 
-    /// <summary>某一卷倒了。</summary>
+    /// <summary>One volume dies.</summary>
     private sealed class FailingVolume(string bad) : IBlobUploader
     {
         public List<string> Order { get; } = [];
@@ -401,8 +426,10 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 有卷倒了时：不再往上起新的卷，而且抛出之前要把已经起飞的等完。半路撒手会留下没人观察的
-    /// 孤儿任务，它们还占着闸门额度、还在读临时盘上的卷文件——而上层收到异常后就要去释放暂存区了。
+    /// When a volume dies: no new volumes start, and the ones already in flight are awaited before throwing.
+    /// Letting go halfway leaves orphan tasks nobody observes, still holding gate slots and still reading volume
+    /// files off the temp disk — while the layer above, having received the exception, is about to release the
+    /// staging area.
     /// </summary>
     [Fact]
     public async Task A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running()
@@ -414,22 +441,25 @@ public sealed class VolumeBlobIOTests
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
 
-        // 倒在第 4 卷，后面几卷就不该再起飞了——8 卷不可能都跑过一遍。
-        Assert.True(up.Order.Count < files.Count, $"倒了之后还在起新卷：{up.Order.Count} 卷都跑了");
-        // 闸门额度全数归还＝没有卷还攥在手里。抛出时仍在跑的话，这里会少。
+        // It dies on volume 4, so the ones after it must not take off — all 8 cannot possibly have run.
+        Assert.True(up.Order.Count < files.Count, $"new volumes still started after the failure: {up.Order.Count} volumes ran");
+        // Every gate slot returned = no volume is still holding one. If anything were still running at the throw, this would come up short.
         Assert.Equal(3, gate.Free);
     }
 
     /// <summary>
-    /// 进度回调坏掉时，那一份上传额度必须还回闸门。
+    /// When the progress sink breaks, that upload slot must still go back to the gate.
     /// <para>
-    /// 进度上报不是旁路——<c>EndItem</c>/<c>EndWait</c> 都会直接调用方给的 publish，而那是外部代码
-    /// （写库、推 SSE），抛异常的概率不为零，<c>StageProgress</c> 也明说非心跳路径故意让它往外传。
-    /// 从前 <c>gate.Release()</c> 跟 <c>EndItem</c> 排在同一个 <c>finally</c> 里的后一句，前一句抛出
-    /// 就把它整个跳过去了：额度一去不回。这种泄漏还不响——异常往上撞到"文件读不开"那条兜底
-    /// （<c>MarkPostDiffUnreadableAsync</c> 收 IOException）就被吞了，备份照跑，只是少一条流。
-    /// 攒够设定的并发数，全部上传就永远停在闸门上：界面上是「什么都没在传，暂存池却压着一堆」，
-    /// 而且不会自愈。
+    /// Progress reporting is not a side channel — <c>EndItem</c>/<c>EndWait</c> both call straight into the
+    /// publish the caller supplied, which is external code (writing the database, pushing SSE) with a non-zero
+    /// chance of throwing, and <c>StageProgress</c> states outright that non-heartbeat paths deliberately let it
+    /// propagate. <c>gate.Release()</c> used to be the second statement after <c>EndItem</c> in the same
+    /// <c>finally</c>, so a throw from the first skipped it entirely: the slot never came back. And this leak is
+    /// silent — the exception travels up into the "file cannot be read" catch-all
+    /// (<c>MarkPostDiffUnreadableAsync</c> catches IOException) and is swallowed there, the backup keeps running,
+    /// just one stream short. Accumulate as many as the configured concurrency and all uploads stall at the gate
+    /// forever: the UI shows "nothing is uploading while the staging pool is piled high", and it never heals
+    /// itself.
     /// </para>
     /// </summary>
     [Fact]
@@ -449,16 +479,17 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>
-    /// 同上，但坏在**刚排到队**那一下：额度已经到手、<c>EndWait</c> 才抛。
-    /// 这一段在另一个 <c>finally</c> 里，与上面那处是两条独立的路。
+    /// Same as above, but breaking at the moment it **has just been let off the queue**: the slot is already in
+    /// hand when <c>EndWait</c> throws. That stretch lives in a different <c>finally</c>, an independent path from
+    /// the one above.
     /// </summary>
     [Fact]
     public async Task A_Broken_Progress_Sink_Does_Not_Swallow_The_Slot_It_Just_Waited_For()
     {
         var gate = new VolumeUploadGate(1);
         var publishes = 0;
-        // 头一次是 BeginWait——那时额度还没到手，抛出去不带走任何东西，放过它。
-        // 第二次是 EndWait，闸门已经放行，那一份额度正攥在手里。
+        // The first call is BeginWait — no slot in hand yet, so throwing there takes nothing with it; let it pass.
+        // The second is EndWait, by which point the gate has let it through and that slot is being held.
         var tracker = new StageTracker("Uploading", 0, _ =>
         {
             if (Interlocked.Increment(ref publishes) >= 2)
@@ -469,26 +500,27 @@ public sealed class VolumeBlobIOTests
         };
         var scope = new VolumeUploadScope(gate, tracker, 1);
 
-        await gate.AcquireAsync(0, 0, CancellationToken.None);  // 把唯一那份额度占住，逼它去排队
+        await gate.AcquireAsync(0, 0, CancellationToken.None);  // take the only slot so it is forced to queue
         var run = scope.RunAsync("data/h.001", _ => Task.CompletedTask, CancellationToken.None);
-        gate.Release();          // 放行：等待者醒来，随即撞上坏掉的 sink
+        gate.Release();          // let it through: the waiter wakes up and immediately hits the broken sink
 
         await Assert.ThrowsAsync<IOException>(() => run);
         Assert.Equal(1, gate.Free);
     }
 
     [Theory]
-    // 自身卷：基名、卷后缀（含 >3 位数）
+    // Own volumes: the base name, and volume suffixes (including more than 3 digits)
     [InlineData("data/abc", "data/abc", true)]
     [InlineData("data/abc", "data/abc.001", true)]
     [InlineData("data/abc", "data/abc.1000", true)]
     [InlineData("packs/1.7z", "packs/1.7z.002", true)]
-    // 碰撞避让兄弟：同前缀但内容不同，必须排除（ReplaceAsync 删残留卷时不得误删）
+    // Collision-avoidance siblings: same prefix but different content, must be excluded
+    // (ReplaceAsync must not delete them by mistake while clearing leftover volumes)
     [InlineData("data/abc", "data/abc~1", false)]
     [InlineData("data/abc", "data/abc~1.001", false)]
     [InlineData("data/abc~1", "data/abc~10", false)]
     [InlineData("data/abc~1", "data/abc~1.001", true)]
-    // 其它同前缀噪声
+    // Other same-prefix noise
     [InlineData("data/abc", "data/abcd", false)]
     [InlineData("data/abc", "data/abc.00x", false)]
     [InlineData("data/abc", "data/abc.", false)]

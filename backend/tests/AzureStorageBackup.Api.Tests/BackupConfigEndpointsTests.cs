@@ -15,8 +15,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     private readonly HttpClient _client = factory.CreateClient();
     private readonly IServiceProvider _services = factory.Services;
 
-    // AccountId 默认 0：不是一个真实账户，调用方必须显式传入 CreateAccountAsync 建出的账户 id
-    // （否则从 P2T7 起会被「Account not found.」拦下）。仅当测试确实要断言这条拒绝时才保留 0/999999。
+    // AccountId defaults to 0: not a real account, so callers must explicitly pass the account id created by CreateAccountAsync
+    // (otherwise, as of P2T7, they get stopped by "Account not found."). Keep 0/999999 only when the test really means to assert that refusal.
     private static BackupConfigRequest SampleRequest(string name = "photos", int accountId = 0) => new(
         AccountId: accountId,
         ContainerName: "photos",
@@ -36,7 +36,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         SingleFileThresholdBytes: 5_000_000,
         GroupCapBytes: 100_000_000);
 
-    /// <summary>建一个真实账户，供需要通过「Account not found.」闸门的测试使用。</summary>
+    /// <summary>Creates a real account for tests that need to get past the "Account not found." gate.</summary>
     private async Task<int> CreateAccountAsync(string name)
     {
         var req = new AccountRequest(
@@ -63,7 +63,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var created = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
         Assert.True(created!.Id > 0);
         Assert.Equal("photos", created.Name);
-        Assert.True(created.HasPassword); // 有加密密码，但不回传明文
+        Assert.True(created.HasPassword); // it has an encryption password, but the plaintext is never returned
 
         var body = await (await _client.GetAsync($"/api/backup-configs/{created.Id}")).Content.ReadAsStringAsync();
         Assert.DoesNotContain("s3cret", body);
@@ -115,7 +115,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
         var updated = await res.Content.ReadFromJsonAsync<BackupConfigResponse>();
         Assert.Equal("renamed", updated!.Name);
-        Assert.True(updated.HasPassword); // 密码保留
+        Assert.True(updated.HasPassword); // password preserved
     }
 
     [Fact]
@@ -145,10 +145,10 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.NotFound, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
     }
 
-    /// <summary>删除留下的那条审计行，来源键必须带 accountId。它一度是改版前的旧格式
-    /// "backup:{container}"：少了 account 维度，两个账户下的同名 container 写出的行完全一样，
-    /// 而日志页按来源精确相等过滤，于是这条最该留痕的记录哪个备份的视图里都翻不到。
-    /// 顺带钉住它写在清理**之后**——写在前面会被 DeleteForContainerAsync 连自己一起删掉。</summary>
+    /// <summary>The audit line a deletion leaves behind must carry accountId in its source key. It was once in the pre-revamp format
+    /// "backup:{container}": without the account dimension, the same container name under two accounts writes identical lines,
+    /// and since the log page filters by exact source equality, the record that most deserves a trace cannot be found in either backup's view.
+    /// This also pins down that it is written **after** the cleanup — written before, DeleteForContainerAsync would delete it along with everything else.</summary>
     [Fact]
     public async Task Delete_Records_The_Audit_Line_Under_The_Backups_Own_Source_Key()
     {
@@ -165,15 +165,15 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var entry = Assert.Single(db.LogEntries.Where(e => e.Source == $"backup:{accountId}/{container}"));
         Assert.Equal(OperationLogLevel.Warning, entry.Level);
-        Assert.False(entry.Ephemeral);          // 审计：长存
+        Assert.False(entry.Ephemeral);          // audit: long-lived
         Assert.Contains("deleted", entry.Message);
     }
 
-    /// <summary>删配置不会停掉后台那次运行。放行的话，它会继续跑、继续占着
-    /// (account, container) 的忙碌锁，而进度状态是按 config id 存的——配置一删就再也查不到，
-    /// 于是同一 container 上新建的备份被"busy"拒掉，状态却显示 BackingUp 且没有任何细节。
-    /// 用户真踩到了这个（还顺带勾了「同时删除 container」，那次运行就一直在往一个已不存在的
-    /// container 上传）。所以正在忙时必须直接拒掉删除。</summary>
+    /// <summary>Deleting a config does not stop the background run. Let it through and the run keeps going, keeps holding
+    /// the (account, container) busy lock, while the progress state is keyed by config id — delete the config and it can never be queried again,
+    /// so a newly created backup on the same container is refused as "busy" while the status says BackingUp with no detail at all.
+    /// A user really hit this (and had also ticked "delete the container too", so that run went on uploading into a container that no longer
+    /// existed). Hence a deletion while busy must be refused outright.</summary>
     [Fact]
     public async Task Delete_Is_Refused_While_An_Operation_Is_Running()
     {
@@ -190,7 +190,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
             var body = await refused.Content.ReadFromJsonAsync<Dictionary<string, string>>();
             Assert.Contains("backing up", body!["error"]);
-            // 配置必须还在：拒绝要是"半拒绝"，比不拒还糟。
+            // The config must still be there: a refusal that only half refuses is worse than not refusing at all.
             Assert.Equal(HttpStatusCode.OK, (await _client.GetAsync($"/api/backup-configs/{created.Id}")).StatusCode);
         }
         finally
@@ -201,7 +201,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/backup-configs/{created.Id}")).StatusCode);
     }
 
-    // Azurite 的 well-known 账户与密钥（与其它集成测试一致，见 BackupRunEndpointsTests）。
+    // Azurite's well-known account and key (same as the other integration tests, see BackupRunEndpointsTests).
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
     private const string AzuriteEndpoint = "http://127.0.0.1:10000/devstoreaccount1";
@@ -234,7 +234,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         try
         {
-            // deleteContainer=false（默认）：本地配置删除，云端 container 仍在。
+            // deleteContainer=false (the default): the local config is deleted, the cloud container is still there.
             var config1 = await (await _client.PostAsJsonAsync("/api/backup-configs",
                     SampleRequest("del-keep") with { AccountId = account!.Id, ContainerName = containerName }))
                 .Content.ReadFromJsonAsync<BackupConfigResponse>();
@@ -243,7 +243,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                 (await _client.DeleteAsync($"/api/backup-configs/{config1!.Id}?deleteContainer=false")).StatusCode);
             Assert.True((await cc.ExistsAsync()).Value);
 
-            // deleteContainer=true：另建一个指向同 container 的配置，删除时云端 container 一并被删。
+            // deleteContainer=true: create another config pointing at the same container; deleting it removes the cloud container too.
             var config2 = await (await _client.PostAsJsonAsync("/api/backup-configs",
                     SampleRequest("del-purge") with { AccountId = account.Id, ContainerName = containerName }))
                 .Content.ReadFromJsonAsync<BackupConfigResponse>();
@@ -258,9 +258,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         }
     }
 
-    /// <summary>P2T6 review follow-up：删配置连带清本地权威缓存/状态（CachedVersionIndex + LocalBackupState），
-    /// 否则同 account+container 重建备份会命中孤儿行、与新备份的版本身份错配。按 (accountId, container) 精确
-    /// 清除，不同 account 或不同 container 的行必须保留（不可越界误删）。</summary>
+    /// <summary>P2T6 review follow-up: deleting a config also purges the local authoritative cache/state (CachedVersionIndex + LocalBackupState),
+    /// otherwise rebuilding a backup on the same account+container hits orphan rows whose version identity does not match the new backup. The purge is
+    /// scoped exactly to (accountId, container); rows under a different account or a different container must survive (no collateral damage).</summary>
     [Fact]
     public async Task Delete_Config_Purges_Local_Index_Cache_And_Local_Backup_State_Scoped_To_Account_Container()
     {
@@ -278,10 +278,10 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = accountId, Container = container, Version = 1, IdentityTicks = 1, Bytes = [1] });
             db.LocalBackupStates.Add(new LocalBackupState { AccountId = accountId, Container = container, InfoBytes = [1], ETag = "e1" });
-            // 同 account，不同 container → 必须保留
+            // same account, different container → must survive
             db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = accountId, Container = otherContainer, Version = 1, IdentityTicks = 1, Bytes = [1] });
             db.LocalBackupStates.Add(new LocalBackupState { AccountId = accountId, Container = otherContainer, InfoBytes = [1], ETag = "e2" });
-            // 不同 account，同名 container → 必须保留
+            // different account, same container name → must survive
             db.CachedVersionIndexes.Add(new CachedVersionIndex { AccountId = otherAccountId, Container = container, Version = 1, IdentityTicks = 1, Bytes = [1] });
             db.LocalBackupStates.Add(new LocalBackupState { AccountId = otherAccountId, Container = container, InfoBytes = [1], ETag = "e3" });
             await db.SaveChangesAsync();
@@ -325,8 +325,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs", req))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        // 模拟检查持有的忙碌锁，且 CheckRunner 里没有对应记录（例如检查由计划任务发起）：
-        // DeriveActivity 必须靠 BackupBusyTracker 兜底判出 Checking。
+        // Simulate the busy lock held by a check with no matching record in CheckRunner (e.g. a check started by a scheduled task):
+        // DeriveActivity has to fall back to BackupBusyTracker to work out Checking.
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
         Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName));
         try
@@ -349,13 +349,13 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal("Idle", afterRelease!.Activity);
     }
 
-    // 前端 api/backupConfigs.ts 里的 BackupActivity 联合类型（'Idle' | 'BackingUp' | 'Restoring' |
-    // 'Checking' | 'Repairing' | 'CleaningUp'）镜像的正是这六个字符串，但那边没有对应的测试。
-    // 谁在后端改动了其中一个字面量，两边各自都还能编译通过——前端只会悄悄地不再轮询那一类。
-    // 这里逐一逼出 DeriveActivity 的六条分支（BackingUp/Checking/CleaningUp/Repairing 走
-    // BackupBusyTracker 的兜底渠道，与 TaskDispatcher.cs、BackupRunner.cs、RepairRunner.cs
-    // 里真实使用的字面量同源；Restoring 是唯一不占忙碌锁的一个——见 RestoreRunner.cs 顶部
-    // 注释，只能靠反射注入它自己的运行态来触发），断在字面量上，改名会在这里响亮地炸掉(Fix 8)。
+    // The BackupActivity union type in the frontend's api/backupConfigs.ts ('Idle' | 'BackingUp' | 'Restoring' |
+    // 'Checking' | 'Repairing' | 'CleaningUp') mirrors exactly these six strings, but there is no test for it over there.
+    // Change one of these literals in the backend and both sides still compile — the frontend just quietly stops polling that kind.
+    // This drives out all six branches of DeriveActivity one by one (BackingUp/Checking/CleaningUp/Repairing go through
+    // BackupBusyTracker's fallback channel, sharing their source with the literals really used in TaskDispatcher.cs, BackupRunner.cs
+    // and RepairRunner.cs; Restoring is the only one that does not take the busy lock — see the comment at the top of RestoreRunner.cs,
+    // it can only be triggered by reflecting its own run state in), asserting on the literals, so a rename blows up loudly right here (Fix 8).
     [Fact]
     public async Task Activity_Strings_Match_The_Frontend_BackupActivity_Union()
     {
@@ -371,9 +371,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
 
-        // BackingUp/Checking/CleaningUp/Repairing：DeriveActivity 在没有对应 Runner 记录时
-        // 兜底读 BackupBusyTracker.CurrentActivity，这几个字面量正是 TaskDispatcher.cs 的
-        // switch 和 BackupRunner.cs / RepairRunner.cs 里 TryAcquire 调用真实传入的那几个。
+        // BackingUp/Checking/CleaningUp/Repairing: with no matching Runner record, DeriveActivity falls back to reading
+        // BackupBusyTracker.CurrentActivity, and these literals are exactly the ones really passed by the switch in
+        // TaskDispatcher.cs and by the TryAcquire calls in BackupRunner.cs / RepairRunner.cs.
         foreach (var label in new[] { "BackingUp", "Checking", "CleaningUp", "Repairing" })
         {
             Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName, label));
@@ -389,9 +389,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         Assert.Equal("Idle", await ActivityAsync());
 
-        // Restoring 不占忙碌锁（RestoreRunner.cs 顶部注释：还原可与备份并行），DeriveActivity
-        // 只看 RestoreRunner 自己的运行态——直接反射进它的私有字典模拟一次"正在跑"的还原，
-        // 避免为了触发这一个分支去真的跑一次还原、依赖 Azure/Azurite 的时序。
+        // Restoring does not take the busy lock (comment at the top of RestoreRunner.cs: restore can run in parallel with backup), so DeriveActivity
+        // only looks at RestoreRunner's own run state — reflect straight into its private dictionary to fake a "running" restore,
+        // rather than running a real restore just to trigger this one branch and depending on Azure/Azurite timing.
         var restoreRunner = factory.Services.GetRequiredService<RestoreRunner>();
         var runsField = typeof(RestoreRunner).GetField("_runs", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
         var runs = (Dictionary<int, RestoreRunState>)runsField.GetValue(restoreRunner)!;
@@ -415,7 +415,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("status-error", accountId)))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        // 模拟某个 runner 写状态点因操作失败落库 Error（决策 2）。
+        // Simulate one of the runners persisting Error at its status-writing point because an operation failed (decision 2).
         using (var scope = factory.Services.CreateScope())
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .SetErrorAsync(created!.Id, "simulated failure");
@@ -451,9 +451,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         return (await (await _client.PostAsJsonAsync("/api/accounts", req)).Content.ReadFromJsonAsync<AccountResponse>())!;
     }
 
-    /// <summary>直接写本地权威信息文件（TrackedInfoStore.LoadAsync 命中本地则不读云端），供 /versions、/tree、
-    /// /file-versions、/unrecoverable 端点做无需 Azurite 的本地态测试。返回 identityTicks（=Backup.CreatedAt.UtcTicks），
-    /// 供 /tree 端点匹配 CachedVersionIndex.IdentityTicks。</summary>
+    /// <summary>Writes the local authoritative info file directly (when TrackedInfoStore.LoadAsync hits locally it never reads the cloud), so the /versions, /tree,
+    /// /file-versions and /unrecoverable endpoints can be tested against local state without Azurite. Returns identityTicks (= Backup.CreatedAt.UtcTicks),
+    /// which the /tree endpoint uses to match CachedVersionIndex.IdentityTicks.</summary>
     private long SeedLocalInfo(int accountId, string container, List<BackupVersion> versions)
     {
         var createdAt = DateTimeOffset.UtcNow;
@@ -504,8 +504,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(100, row.bytes);
     }
 
-    /// <summary>还原对话框靠这两个时刻认版本。升级前写下的版本没有开始时刻，端点如实给 null，
-    /// 界面写「—」——不拿上一版本的结束时刻冒充。</summary>
+    /// <summary>The restore dialog identifies versions by these two timestamps. Versions written before the upgrade have no start time and the endpoint honestly reports null,
+    /// with the UI showing "—" — it does not pass off the previous version's finish time as a substitute.</summary>
     [Fact]
     public async Task Versions_Endpoint_Exposes_Start_Time_And_Null_For_Legacy_Versions()
     {
@@ -520,7 +520,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         [
             new BackupVersion
             {
-                Version = 1, CreatedAt = finished.AddDays(-1), IndexBlob = "v1.index",  // 升级前写下的：无 StartedAt
+                Version = 1, CreatedAt = finished.AddDays(-1), IndexBlob = "v1.index",  // written before the upgrade: no StartedAt
                 Stats = new VersionStats(1, 10, 1, 10),
             },
             new BackupVersion
@@ -539,8 +539,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(finished, rows.Single(r => r.version == 2).createdAt);
     }
 
-    /// <summary>还原/检查的版本下拉里，"Latest" 之后必须是从新到旧——最可能被选的就在最近处。
-    /// 端点按版本号降序给，与 /file-versions 的"就近排序"一致。</summary>
+    /// <summary>In the version dropdown for restore/check, everything after "Latest" must run newest to oldest — the most likely pick is closest to hand.
+    /// The endpoint returns them in descending version order, consistent with the "nearest first" ordering of /file-versions.</summary>
     [Fact]
     public async Task Versions_Endpoint_Returns_Newest_First()
     {
@@ -610,22 +610,22 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.False(node.IsDir);
         Assert.Equal(5, node.Length);
 
-        // 指定不存在的版本 → 200 空数组（与 /unrecoverable、/file-versions 一致，非 404）。
+        // Requesting a version that does not exist → 200 with an empty array (same as /unrecoverable and /file-versions, not 404).
         var missingVer = await _client.GetAsync($"/api/backup-configs/{created.Id}/tree?version=999");
         Assert.Equal(HttpStatusCode.OK, missingVer.StatusCode);
         Assert.Empty((await missingVer.Content.ReadFromJsonAsync<List<TreeNode>>())!);
     }
 
     /// <summary>
-    /// 读版本索引的端点必须走**本地权威缓存**，不能在运行期读云端（设计核心原则：本地索引权威、
-    /// 运行期零云读）。/tree 一直是对的，而 /unrecoverable、/file-versions、/unreadable 三个
-    /// 直接调 IBackupInfoStore.ReadIndexAsync ——还原对话框一打开就至少两次云端索引下载，
-    /// /file-versions 更是**每个版本各一次**：延迟之外还是实打实的 Azure 出站流量费，
-    /// 而本地就躺着权威副本。
+    /// Endpoints that read version indexes must go through the **local authoritative cache** and must not read the cloud at runtime
+    /// (core design principle: the local index is authoritative, zero cloud reads at runtime). /tree was always right, while /unrecoverable,
+    /// /file-versions and /unreadable all called IBackupInfoStore.ReadIndexAsync directly — opening the restore dialog meant at least two
+    /// cloud index downloads, and /file-versions did **one per version**: on top of the latency that is real Azure egress traffic charges,
+    /// while an authoritative copy is lying right there locally.
     /// <para>
-    /// 判据很干净：本测试的 container 在 Azurite 上**根本不存在**，本地缓存里却有完整索引。
-    /// 走本地则三个端点都能返回正确内容；走云端则必然失败。修复前 /unrecoverable 与 /unreadable
-    /// 返回 500，/file-versions 返回空。
+    /// The criterion is clean: this test's container **does not exist at all** on Azurite, yet the local cache holds a complete index.
+    /// Going local, all three endpoints return the correct content; going to the cloud they are bound to fail. Before the fix, /unrecoverable and /unreadable
+    /// returned 500 and /file-versions returned empty.
     /// </para>
     /// </summary>
     [Fact]
@@ -676,7 +676,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             await db.SaveChangesAsync();
         }
 
-        // /unreadable —— 云端没有这个 container，能返回内容就证明读的是本地缓存。
+        // /unreadable — the cloud has no such container, so returning content proves it read the local cache.
         var unread = await _client.GetAsync($"/api/backup-configs/{created.Id}/unreadable?version=1");
         Assert.Equal(HttpStatusCode.OK, unread.StatusCode);
         var unreadRow = Assert.Single((await unread.Content.ReadFromJsonAsync<List<UnreadableRow>>())!);
@@ -688,14 +688,14 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.OK, unrec.StatusCode);
         Assert.Equal(["broken.txt"], (await unrec.Content.ReadFromJsonAsync<List<string>>())!);
 
-        // /file-versions —— 循环里每个版本各读一次索引，最该走本地。
+        // /file-versions — the loop reads one index per version, so it is the one that most needs to go local.
         var fv = await _client.GetAsync(
             $"/api/backup-configs/{created.Id}/file-versions?path={Uri.EscapeDataString("carried.txt")}");
         Assert.Equal(HttpStatusCode.OK, fv.StatusCode);
         var candidate = Assert.Single((await fv.Content.ReadFromJsonAsync<List<FileVersionCandidate>>())!);
         Assert.Equal(1, candidate.version);
 
-        // 标记为不可恢复的路径不得出现在替代候选里（本地读没有把这条既有语义读丢）。
+        // A path marked unrecoverable must not show up among the substitution candidates (reading locally did not lose that existing semantic).
         var fvBroken = await _client.GetAsync(
             $"/api/backup-configs/{created.Id}/file-versions?path={Uri.EscapeDataString("broken.txt")}");
         Assert.Empty((await fvBroken.Content.ReadFromJsonAsync<List<FileVersionCandidate>>())!);
@@ -708,7 +708,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
                 SampleRequest("ep-fv-empty") with { AccountId = account.Id, ContainerName = "ep-fv-empty-container" }))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
-        SeedLocalInfo(account.Id, created!.ContainerName, []); // 无版本 → 两端点均短路，不触碰云端
+        SeedLocalInfo(account.Id, created!.ContainerName, []); // no versions → both endpoints short-circuit and never touch the cloud
 
         var fv = await _client.GetFromJsonAsync<List<FileVersionCandidate>>(
             $"/api/backup-configs/{created.Id}/file-versions?path=a.txt");
@@ -717,15 +717,15 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var unrec = await _client.GetFromJsonAsync<List<string>>($"/api/backup-configs/{created.Id}/unrecoverable");
         Assert.Empty(unrec!);
 
-        // /unreadable 与 /unrecoverable 同构：无版本时同样短路成 200 空数组，不触碰云端。
+        // /unreadable is shaped like /unrecoverable: with no versions it also short-circuits to 200 with an empty array and never touches the cloud.
         var unread = await _client.GetFromJsonAsync<List<UnreadableRow>>($"/api/backup-configs/{created.Id}/unreadable");
         Assert.Empty(unread!);
     }
 
     private sealed record UnreadableRow(string path, DateTimeOffset unreadableAt);
 
-    /// <summary>检查改成后台 job 之后，忙碌不再是同步的 409：POST 只负责把运行起起来，
-    /// 冲突要在**运行态**里体现（与 /repair 同一约定）。</summary>
+    /// <summary>Now that the check is a background job, busy is no longer a synchronous 409: the POST only gets the run started,
+    /// and the conflict has to surface in the **run state** (the same convention as /repair).</summary>
     [Fact]
     public async Task Check_Endpoint_Reports_Busy_Through_The_Run_State()
     {
@@ -759,8 +759,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         }
     }
 
-    /// <summary>没跑过检查要答 204 而不是 404：对话框一打开就问一次，404 会在浏览器控制台
-    /// 留下一条红色报错，看着像故障。</summary>
+    /// <summary>With no check ever run, answer 204 rather than 404: the dialog asks once as soon as it opens, and a 404 leaves
+    /// a red error in the browser console that looks like a malfunction.</summary>
     [Fact]
     public async Task Check_Status_Endpoint_Is_204_Until_A_Check_Has_Been_Started()
     {
@@ -773,8 +773,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             (await _client.GetAsync($"/api/backup-configs/{created!.Id}/check")).StatusCode);
     }
 
-    /// <summary>停止：在此之前，一次跑了几小时的备份唯一的停法是重启容器。逐操作停而不是
-    /// 一键停光——备份与还原可以并发，误停另一条同样是几小时的损失。</summary>
+    /// <summary>Stopping: before this, the only way to stop a backup that had been running for hours was to restart the container. Stop per operation rather than
+    /// stopping everything with one button — backup and restore can run concurrently, and accidentally stopping the other one is just as many hours lost.</summary>
     [Fact]
     public async Task Cancel_Endpoint_Signals_Only_The_Requested_Operation()
     {
@@ -783,23 +783,23 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                 SampleRequest("cancel-dispatch", accountId) with { ContainerName = "cancel-dispatch-container" }))
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        // 没有任何运行 → 409：与「停了什么都没停到」区分开，界面才好如实说明。
+        // Nothing running → 409: distinguishable from "we stopped, but nothing was actually stopped", so the UI can report it honestly.
         var idle = await _client.PostAsync($"/api/backup-configs/{created!.Id}/cancel", null);
         Assert.Equal(HttpStatusCode.Conflict, idle.StatusCode);
 
-        // 直接往两个 runner 的私有字典里塞一条 Running 记录（同 Activity_Strings 测试的手法）：
-        // 为了触发取消分发而去真跑一次备份/还原，会把这个测试绑死在 Azurite 的时序上。
+        // Stuff a Running record straight into both runners' private dictionaries (the same trick as the Activity_Strings test):
+        // running a real backup/restore just to trigger the cancel dispatch would chain this test to Azurite's timing.
         var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
         var restoreRunner = factory.Services.GetRequiredService<RestoreRunner>();
         var backupState = new BackupRunState { Status = RunStatus.Running };
         var restoreState = new RestoreRunState { Status = RunStatus.Running };
-        // 这条裸状态没有走 RunCoreAsync，没人会在它上面调 Completion.TrySetResult()。
-        // /cancel 的备份那一支现在会等 Completion 落定（StopAndWaitAsync），最多等 20 秒才死心——
-        // 不补这一手，本该是毫秒级的分发测试会在这里白等满上限，两次 cancel 调用合计吃掉 40 秒。
-        // 挂在 Cancellation 的 token 上：RequestStop 对没有 Control 的裸状态走的正是
-        // `state.Cancellation.Cancel()` 这条分支，回调与它同步触发，等效于真实收尾时机。
-        // 想诚实地测「真没落定」的那条分支，见 Suspend_Does_Not_Settle_Within_The_Cap 和
-        // Cancel_Does_Not_Settle_Within_The_Cap。
+        // This bare state never went through RunCoreAsync, so nobody will ever call Completion.TrySetResult() on it.
+        // The backup branch of /cancel now waits for Completion to settle (StopAndWaitAsync), giving up only after 20 seconds —
+        // without this extra step, a dispatch test that should take milliseconds would sit here burning the full cap, with the two cancel calls eating 40 seconds between them.
+        // Hook it onto Cancellation's token: for a bare state with no Control, RequestStop takes exactly the
+        // `state.Cancellation.Cancel()` branch, and the callback fires synchronously with it, equivalent to the real wind-down moment.
+        // To test the "genuinely did not settle" branch honestly, see Suspend_Does_Not_Settle_Within_The_Cap and
+        // Cancel_Does_Not_Settle_Within_The_Cap.
         backupState.Cancellation.Token.Register(() => backupState.Completion.TrySetResult());
         InjectRun(backupRunner, created.Id, backupState);
         InjectRun(restoreRunner, created.Id, restoreState);
@@ -809,13 +809,13 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.Equal(HttpStatusCode.OK, res.StatusCode);
             var body = await res.Content.ReadFromJsonAsync<CanceledBody>();
             Assert.Equal(["backup"], body!.canceled);
-            Assert.False(body.stopping);   // 落定得够快，没吃到 20 秒的封顶
+            Assert.False(body.stopping);   // it settled fast enough not to hit the 20-second cap
 
             Assert.True(backupState.Cancellation.IsCancellationRequested);
-            // 并发的还原不能被顺手一起停掉。
+            // A concurrent restore must not get stopped along the way.
             Assert.False(restoreState.Cancellation.IsCancellationRequested);
 
-            // 不带 what → 停掉该配置上所有在跑的操作。
+            // Without what → stop every operation running on this config.
             var all = await _client.PostAsync($"/api/backup-configs/{created.Id}/cancel", null);
             Assert.Equal(HttpStatusCode.OK, all.StatusCode);
             Assert.True(restoreState.Cancellation.IsCancellationRequested);
@@ -834,10 +834,10 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             (await _client.PostAsync("/api/backup-configs/999999/cancel", null)).StatusCode);
     }
 
-    /// <summary>没落定就要老实说「还在停」——而不是假装已经停了。
-    /// 用一条永远不会调用 Completion.TrySetResult() 的裸运行状态制造出真的没落定：
-    /// 挂起请求发出去了（Cancellation 被置位），但没人给它收尾。把 <see cref="BackupConfigEndpoints.StopWaitCap"/>
-    /// 从生产环境的 20 秒调到几十毫秒，这样断言的是同一条超时分支，不用真的等 20 秒。</summary>
+    /// <summary>If it has not settled, say honestly that it is "still stopping" — do not pretend it already stopped.
+    /// A genuinely unsettled run is produced with a bare run state on which Completion.TrySetResult() is never called:
+    /// the suspend request went out (Cancellation is set) but nobody winds it down. Turning <see cref="BackupConfigEndpoints.StopWaitCap"/>
+    /// down from production's 20 seconds to a few dozen milliseconds asserts the very same timeout branch without really waiting 20 seconds.</summary>
     [Fact]
     public async Task Suspend_Does_Not_Settle_Within_The_Cap()
     {
@@ -846,7 +846,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
-        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion 永不落定
+        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion never settles
         InjectRun(backupRunner, created!.Id, backupState);
         var original = BackupConfigEndpoints.StopWaitCap;
         BackupConfigEndpoints.StopWaitCap = TimeSpan.FromMilliseconds(50);
@@ -857,7 +857,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             var body = await res.Content.ReadFromJsonAsync<StoppingBody>();
             Assert.True(body!.stopping);
 
-            // 超时不代表没停下：请求确实已经发出去了。
+            // A timeout does not mean it did not stop: the request really did go out.
             Assert.True(backupState.Cancellation.IsCancellationRequested);
         }
         finally
@@ -867,9 +867,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         }
     }
 
-    /// <summary>同上，但走 /cancel。这一支刻意留在 200 OK，不像 /suspend 那样降到 202——
-    /// 见 f96866c 的提交信息：Settled 与 StillStopping 两种结局在 /cancel 上共用同一个
-    /// <c>Results.Ok</c>，区分全靠 body 里的 stopping 字段。</summary>
+    /// <summary>Same as above, but through /cancel. This branch deliberately stays at 200 OK instead of dropping to 202 the way /suspend does —
+    /// see the commit message of f96866c: on /cancel the Settled and StillStopping outcomes share the same
+    /// <c>Results.Ok</c>, and the only thing telling them apart is the stopping field in the body.</summary>
     [Fact]
     public async Task Cancel_Does_Not_Settle_Within_The_Cap()
     {
@@ -878,14 +878,14 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
         var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
-        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion 永不落定
+        var backupState = new BackupRunState { Status = RunStatus.Running };  // Completion never settles
         InjectRun(backupRunner, created!.Id, backupState);
         var original = BackupConfigEndpoints.StopWaitCap;
         BackupConfigEndpoints.StopWaitCap = TimeSpan.FromMilliseconds(50);
         try
         {
             var res = await _client.PostAsync($"/api/backup-configs/{created.Id}/cancel?what=backup", null);
-            Assert.Equal(HttpStatusCode.OK, res.StatusCode);   // 不是 202——/cancel 不用它
+            Assert.Equal(HttpStatusCode.OK, res.StatusCode);   // not 202 — /cancel does not use it
             var body = await res.Content.ReadFromJsonAsync<CanceledBody>();
             Assert.Equal(["backup"], body!.canceled);
             Assert.True(body.stopping);
@@ -965,8 +965,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             }
             Assert.Equal("Completed", backup!.Status);
 
-            // /check：健康备份 → ok=true，单文件在案。检查是后台 job（202 + 轮询）：
-            // 内容级检查要把整个备份下载重算一遍 hash，同步端点会先被浏览器/反代超时掐断。
+            // /check: a healthy backup → ok=true, with the single file on record. The check is a background job (202 + polling):
+            // a content-level check downloads the whole backup and recomputes hashes, and a synchronous endpoint would get cut off by a browser/reverse-proxy timeout first.
             var checkStart = await _client.PostAsync($"/api/backup-configs/{config.Id}/check", null);
             Assert.Equal(HttpStatusCode.Accepted, checkStart.StatusCode);
             CheckRunResponse? check = null;
@@ -982,7 +982,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.True(checkReport!.Ok);
             Assert.Single(checkReport.Findings);
 
-            // /repair：无需修复 → Completed
+            // /repair: nothing to repair → Completed
             var repairStart = await _client.PostAsync($"/api/backup-configs/{config.Id}/repair", null);
             Assert.Equal(HttpStatusCode.Accepted, repairStart.StatusCode);
             RepairRunResponse? repair = null;
@@ -994,7 +994,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             }
             Assert.Equal("Completed", repair!.Status);
 
-            // /restore-estimate：单文件下载量估算
+            // /restore-estimate: download volume estimate for a single file
             var estimateRes = await _client.PostAsJsonAsync($"/api/backup-configs/{config.Id}/restore-estimate",
                 new RestoreEstimateRequestBody(null, ["a.txt"]));
             Assert.Equal(HttpStatusCode.OK, estimateRes.StatusCode);
@@ -1002,7 +1002,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.Equal(1, estimate!.fileCount);
             Assert.True(estimate.downloadBytes > 0);
 
-            // /file-versions + /unrecoverable：健康备份下 candidate 存在、无不可恢复项
+            // /file-versions + /unrecoverable: on a healthy backup the candidate exists and there are no unrecoverable items
             var fv = await _client.GetFromJsonAsync<List<FileVersionCandidate>>($"/api/backup-configs/{config.Id}/file-versions?path=a.txt");
             var candidate = Assert.Single(fv!);
             Assert.Equal(1, candidate.version);
@@ -1037,7 +1037,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.NoContent,
             (await _client.DeleteAsync($"/api/backup-configs/{created.Id}")).StatusCode);
 
-        // 配置没了就再没人会来采纳这卷 journal；留着它只会永远保住那批块不被清理。
+        // With the config gone, nobody will ever adopt this journal again; keeping it around only protects that batch of blocks from cleanup forever.
         Assert.Empty(await journals.ListAsync(accountId, "photos", default));
     }
 
@@ -1088,7 +1088,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         Assert.Single(listed!);
         Assert.Equal("run-1", listed![0].RunId);
-        Assert.Equal(2, listed[0].Blocks);          // 头一行不算进去
+        Assert.Equal(2, listed[0].Blocks);          // the header line does not count
         Assert.True(listed[0].JournalBytes > 0);
         Assert.True(listed[0].Resumable);
     }

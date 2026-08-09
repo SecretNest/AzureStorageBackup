@@ -5,7 +5,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>钉住「跟随而非快照」：配置字段为 null 时，改全局设置必须改变生效值。</summary>
+/// <summary>Pins down "follow, not snapshot": when a config field is null, changing the global setting must change the effective value.</summary>
 [Trait("Category", "Integration")]
 public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
@@ -31,7 +31,7 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
 
     private async Task<ConfigDto> CreateConfigAsync(int accountId)
     {
-        // 12 个可继承字段全部不传 = 全部继承。
+        // Sending none of the 12 inheritable fields = inherit all of them.
         var res = await _client.PostAsJsonAsync("/api/backup-configs", new
         {
             AccountId = accountId,
@@ -59,13 +59,13 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
         var accountId = await CreateAccountAsync();
         var created = await CreateConfigAsync(accountId);
 
-        Assert.Null(created.MaxVersions);              // 落库的是 null，不是快照
+        Assert.Null(created.MaxVersions);              // what is persisted is null, not a snapshot
         await SetGlobalMaxVersionsAsync(42);
 
         var after = await _client.GetFromJsonAsync<ConfigDto>($"/api/backup-configs/{created.Id}");
 
-        Assert.Null(after!.MaxVersions);               // 仍然是继承
-        Assert.Equal(42, after.Effective.MaxVersions); // 生效值跟着变了
+        Assert.Null(after!.MaxVersions);               // still inheriting
+        Assert.Equal(42, after.Effective.MaxVersions); // the effective value followed the change
     }
 
     [Fact]
@@ -88,7 +88,7 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
         Assert.Equal(5, after.Effective.MaxVersions);
     }
 
-    // 本轮不得放松 tier 锁定：继承之所以不适用于 tier，正是因为这条约束。
+    // This round must not relax the tier lock: the reason inheritance does not apply to tiers is precisely this constraint.
     [Fact]
     public async Task Changing_A_Tier_After_Creation_Is_Still_Rejected()
     {
@@ -106,7 +106,7 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
     }
 }
 
-/// <summary>映射器必须把解析后的值交给引擎——否则 API 显示跟随、实际备份仍用旧值。</summary>
+/// <summary>The mapper must hand the resolved values to the engine — otherwise the API shows the change being followed while the actual backup still uses the old values.</summary>
 public class BackupRequestMapperInheritanceTests
 {
     private static readonly Account Account = new() { Id = 1, Name = "a", BlobEndpoint = "http://x" };
@@ -145,7 +145,7 @@ public class BackupRequestMapperInheritanceTests
         Assert.Equal(555, options.VolumeBytes);
     }
 
-    // 0 是「明确关闭分卷」，不得回落到全局的 555。
+    // 0 means "volumes explicitly off" and must not fall back to the global 555.
     [Fact]
     public void VolumeBytes_Zero_Means_Off_Not_Inherit()
     {

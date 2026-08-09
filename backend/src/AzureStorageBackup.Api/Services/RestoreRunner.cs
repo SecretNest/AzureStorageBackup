@@ -1,24 +1,24 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一次还原运行的内存状态。</summary>
+/// <summary>In-memory state of a single restore run.</summary>
 public sealed class RestoreRunState
 {
     public RunStatus Status { get; set; } = RunStatus.Running;
     public RestoreResult? Result { get; set; }
     public string? Error { get; set; }
 
-    /// <summary>当前阶段说明（如「等待活化…」），供前端显示长等待原因。最近一条。</summary>
+    /// <summary>Description of the current phase (e.g. "waiting for rehydration…"), so the frontend can show why a long wait is happening. The most recent one only.</summary>
     public string? Phase { get; set; }
 
-    /// <summary>最近若干条事件。Phase 是单值，后一条覆盖前一条——跳过/失败了几十个文件时，
-    /// 跑完只剩最后一条，其余只体现为一个计数。这里把它们留住。</summary>
+    /// <summary>The most recent handful of events. Phase is a single value and each new one overwrites the previous — when dozens of files are skipped/failed,
+    /// only the last one survives the run and the rest show up as a bare count. This keeps them.</summary>
     public RecentEvents Events { get; } = new();
 
-    /// <summary>当前阶段在做什么（正在还原哪个包、已完成多少组、多快）。</summary>
+    /// <summary>What the current stage is doing (which pack is being restored, how many groups are done, how fast).</summary>
     public StageProgress? Detail { get; set; }
 
-    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。
-    /// 还原尤其需要它——等 Archive 活化可以等上几小时，中途改主意只能干等着。</summary>
+    /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.
+    /// Restore needs it especially — waiting for Archive rehydration can take hours, and changing your mind midway would otherwise mean just sitting there.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
@@ -32,9 +32,9 @@ public sealed record RestoreRunResponse(
 }
 
 /// <summary>
-/// 后台还原运行器：按配置 id 在后台跑 RestoreOrchestrator，状态存内存供轮询。
-/// **不占用 BackupBusyTracker**——还原只读云端，可与备份并行；长时（如等 Archive 活化）也不挡备份（用户要求）。
-/// 仅限每配置同时一个还原（避免同目标并发写）。
+/// Background restore runner: runs RestoreOrchestrator in the background per config id, keeping state in memory for polling.
+/// **Does not take BackupBusyTracker** — restore only reads from the cloud and can run alongside a backup; even a long one (e.g. waiting for Archive rehydration) must not block backups (user's requirement).
+/// Limited to one restore per config at a time (to avoid concurrent writes to the same target).
 /// </summary>
 public sealed class RestoreRunner(IServiceScopeFactory scopes)
 {
@@ -65,8 +65,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
             return _runs.GetValueOrDefault(configId);
     }
 
-    /// <summary>停止正在跑的那次还原。返回 false = 当前没有在跑的还原。
-    /// Cancel() 在当前线程同步跑回调，故取记录用锁、取消不用（见 BackupRunner.Cancel 同处注释）。</summary>
+    /// <summary>Stops the restore that is currently running. Returns false = there is no restore running right now.
+    /// Cancel() runs its callbacks synchronously on the current thread, so the lock is taken to look the record up but not to cancel (see the matching comment on BackupRunner.Cancel).</summary>
     public bool Cancel(int configId)
     {
         RestoreRunState? state;
@@ -98,9 +98,9 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            // 不占忙碌锁：还原与备份可并行。遇 Archive 自动发起活化并轮询（可长等），完成后重新归档。
-            // Phase 保留「最近一条」供一行摘要用；同一条同时进环形缓冲，这样跳过/失败的条目
-            // 不会被后一条冲掉——它们恰恰是还原之后最需要逐条看的东西。
+            // No busy lock: restore and backup can run in parallel. On Archive, rehydration is started and polled automatically (possibly a long wait), then re-archived once done.
+            // Phase keeps "the most recent one" for the single-line summary; the same message also goes into the ring buffer, so skipped/failed entries
+            // don't get flushed away by the next one — those are exactly what you most want to read one by one after a restore.
             var progress = new Progress<string>(p =>
             {
                 state.Phase = p;
@@ -125,8 +125,8 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
         }
         catch (OperationCanceledException)
         {
-            // 用户按了停止：不是失败，不写 Error 状态（与 BackupRunner 同一约定）。
-            // 已经落盘的那些文件保留——还原是逐文件写出的，没有"回滚"这回事。
+            // The user hit stop: this is not a failure, so don't write an Error status (same convention as BackupRunner).
+            // Files already written to disk stay — restore writes file by file, there is no such thing as a "rollback".
             state.Phase = null;
             state.Status = RunStatus.Canceled;
         }
@@ -134,7 +134,7 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
         {
             state.Error = ex.Message;
             state.Status = RunStatus.Failed;
-            // 原 scope 可能已随异常释放（`using var scope` 在 try 块退出时释放）：另开一个写状态。
+            // The original scope may already have been disposed along with the exception (`using var scope` disposes when the try block exits): open another one to write the status.
             using var scope = scopes.CreateScope();
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<RestoreRunner>>());

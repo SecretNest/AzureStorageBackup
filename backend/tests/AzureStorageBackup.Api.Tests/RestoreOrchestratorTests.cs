@@ -4,7 +4,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>同步收集 phase 上报（Progress&lt;T&gt; 会把回调排到同步上下文，测试里读不到）。</summary>
+/// <summary>Collects phase reports synchronously (Progress&lt;T&gt; queues its callbacks onto the synchronization context, where the test can't read them).</summary>
 internal sealed class SyncProgress : IProgress<string>
 {
     public List<string> Messages { get; } = [];
@@ -61,11 +61,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    /// <param name="restoreCompressor">还原侧注入的压缩器，默认 null 时用真的 <see cref="SevenZipCompressor"/>。
-    /// 备份侧固定用真的——这个口子只为了让某些测试在**解压**这一步接一个假的（例如探测
-    /// "解压这一刻在途标记是否已经摘掉"），不影响打包过程本身。</param>
-    /// <param name="restoreClock">还原侧注入给内部 <see cref="StageTracker"/> 的时间源，见
-    /// <see cref="RestoreOrchestrator.Clock"/> 上的注释——只为让节流窗口失效，不影响下载/解压本身。</param>
+    /// <param name="restoreCompressor">The compressor injected on the restore side; when null (the default) the real <see cref="SevenZipCompressor"/> is used.
+    /// The backup side always uses the real one — this hook exists only so that certain tests can splice a fake in at the **extraction** step (e.g. to probe
+    /// "has the in-flight marker already been dropped at the moment of extraction"), without affecting the packing process itself.</param>
+    /// <param name="restoreClock">The time source injected into the restore side's internal <see cref="StageTracker"/>; see
+    /// the comment on <see cref="RestoreOrchestrator.Clock"/> — purely to disable the throttle window, it doesn't affect the download/extraction itself.</param>
     private (BackupOrchestrator Backup, RestoreOrchestrator Restore, IBackupInfoStore Store, BlobClientFactory Factory) Build(
         IFileCompressor? restoreCompressor = null, Func<long>? restoreClock = null)
     {
@@ -112,7 +112,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            // 把 data blob 设为 Archive；若 Azurite 不支持则跳过。
+            // Set the data blob to Archive; skip if Azurite doesn't support it.
             try
             {
                 await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
@@ -123,7 +123,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 Skip.If(true, "Azurite does not support Archive tier");
             }
 
-            // 还原应自动活化后取回内容（轮询间隔设小）。
+            // The restore should rehydrate automatically and then fetch the content (with a small poll interval).
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst, RehydratePollSeconds = 1,
@@ -154,19 +154,19 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("a.txt", "version two");
             await backup.RunAsync(BackupReq(account, name));   // v2
 
-            // 把 v2 的 a.txt 标记为不可恢复（模拟修复后无法从本地恢复）。
+            // Mark v2's a.txt as unrecoverable (simulating a repair that couldn't recover it from local files).
             var info = await store.ReadInfoAsync(account, name, null);
             var v2 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v2.IndexBlob, null);
             idx.UnrecoverablePaths.Add("a.txt");
             await store.WriteIndexAsync(account, name, v2.Version, idx, null);
 
-            // 不给替代 → a.txt 跳过（其余照常）。
+            // No substitution given → a.txt is skipped (everything else proceeds as usual).
             await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst, Version = 2 });
             Assert.False(File.Exists(Path.Combine(_dst, "a.txt")));
             Assert.True(File.Exists(Path.Combine(_dst, "keep.txt")));
 
-            // 指定用 v1 替代 → a.txt 还原为 v1 内容。
+            // Substitute from v1 → a.txt is restored with v1's content.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst, Version = 2,
@@ -197,23 +197,23 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("a.txt", "version two");
             await backup.RunAsync(BackupReq(account, name));   // v2
 
-            // 把 v2 的 a.txt 标记为不可恢复（模拟修复后无法从本地恢复）。
+            // Mark v2's a.txt as unrecoverable (simulating a repair that couldn't recover it from local files).
             var info = await store.ReadInfoAsync(account, name, null);
             var v2 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v2.IndexBlob, null);
             idx.UnrecoverablePaths.Add("a.txt");
             await store.WriteIndexAsync(account, name, v2.Version, idx, null);
 
-            // 声明替代到一个不存在的版本（如已被保留清理删除）→ 应回落跳过，而不是整体报错。
+            // Declare a substitution to a version that doesn't exist (e.g. already removed by retention cleanup) → it should fall back to skipping rather than failing the whole run.
             var result = await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst, Version = 2,
-                Substitutions = new Dictionary<string, int> { ["a.txt"] = 99 }, // 不存在的版本
+                Substitutions = new Dictionary<string, int> { ["a.txt"] = 99 }, // a version that doesn't exist
             });
 
-            Assert.True(result.SkippedFiles >= 1);                    // a.txt 回落跳过
+            Assert.True(result.SkippedFiles >= 1);                    // a.txt falls back to being skipped
             Assert.False(File.Exists(Path.Combine(_dst, "a.txt")));
-            Assert.True(File.Exists(Path.Combine(_dst, "b.txt")));    // b.txt 正常还原
+            Assert.True(File.Exists(Path.Combine(_dst, "b.txt")));    // b.txt restores normally
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -232,8 +232,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            WriteSrc("dir/small.txt", "grouped");       // pack 成员
-            WriteSrc("big.bin", new string('y', 6_000_000)); // 密钥化寻址的单文件 data blob
+            WriteSrc("dir/small.txt", "grouped");       // pack member
+            WriteSrc("big.bin", new string('y', 6_000_000)); // single-file data blob with keyed addressing
 
             await backup.RunAsync(BackupReq(account, name, password: "pw"));
             var result = await restore.RunAsync(new RestoreRequest
@@ -278,22 +278,22 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 },
             };
 
-            var v1 = await backup.RunAsync(Req("b/", "c/")); // 阶段1：只 a
-            var v2 = await backup.RunAsync(Req("c/"));       // 阶段2：去掉 b → 加 b
-            var v3 = await backup.RunAsync(Req());           // 阶段3：去掉 c → 加 c（完整）
+            var v1 = await backup.RunAsync(Req("b/", "c/")); // stage 1: only a
+            var v2 = await backup.RunAsync(Req("c/"));       // stage 2: stop ignoring b → b is added
+            var v3 = await backup.RunAsync(Req());           // stage 3: stop ignoring c → c is added (now complete)
 
-            // 各阶段只处理新解禁的文件，旧的结转不重传。
+            // Each stage only processes the newly un-ignored files; the older ones carry over and are not re-uploaded.
             Assert.Equal(1, v1.ChangedFiles);
-            Assert.Equal(1, v2.ChangedFiles); // 只 b/2.txt
-            Assert.Equal(1, v3.ChangedFiles); // 只 c/3.txt
+            Assert.Equal(1, v2.ChangedFiles); // only b/2.txt
+            Assert.Equal(1, v3.ChangedFiles); // only c/3.txt
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx1 = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             var idx3 = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
-            Assert.Equal(["a/1.txt"], idx1.Entries.Select(e => e.Path).OrderBy(x => x)); // v1 不全
-            Assert.Equal(["a/1.txt", "b/2.txt", "c/3.txt"], idx3.Entries.Select(e => e.Path).OrderBy(x => x)); // v3 完整
+            Assert.Equal(["a/1.txt"], idx1.Entries.Select(e => e.Path).OrderBy(x => x)); // v1 is incomplete
+            Assert.Equal(["a/1.txt", "b/2.txt", "c/3.txt"], idx3.Entries.Select(e => e.Path).OrderBy(x => x)); // v3 is complete
 
-            // 还原最终版本 = 全部文件。
+            // Restoring the final version = every file.
             var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
             Assert.Equal(3, result.RestoredFiles);
             Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "a", "1.txt")));
@@ -312,7 +312,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        foreach (var storeOnly in new[] { false, true }) // 非 raw(7z) 与 raw 两种单文件 blob
+        foreach (var storeOnly in new[] { false, true }) // both flavors of single-file blob: non-raw (7z) and raw
         {
             var (backup, restore, _, factory) = Build();
             var account = AzuriteAccount();
@@ -324,20 +324,20 @@ public sealed class RestoreOrchestratorTests : IDisposable
             try
             {
                 WriteSrc("x.txt", "identical content");
-                WriteSrc("y.txt", "identical content"); // 同内容 → 同 hash → 共享一个 data blob（去重）
+                WriteSrc("y.txt", "identical content"); // same content → same hash → they share one data blob (dedup)
 
                 await backup.RunAsync(BackupReq(account, name) with
                 {
                     Options = new BackupEngineOptions
                     {
-                        Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // 单文件 blob
+                        Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // single-file blob
                         DontCompress = storeOnly ? new IgnoreRuleSet(["*"]) : null,
                     },
                 });
 
                 var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = dst });
 
-                Assert.Equal(2, result.RestoredFiles); // 两个引用同一 blob 的文件都还原
+                Assert.Equal(2, result.RestoredFiles); // both files referencing the same blob get restored
                 Assert.Equal("identical content", File.ReadAllText(Path.Combine(dst, "x.txt")));
                 Assert.Equal("identical content", File.ReadAllText(Path.Combine(dst, "y.txt")));
             }
@@ -368,7 +368,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 Options = new BackupEngineOptions
                 {
                     Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
-                    DontCompress = new IgnoreRuleSet(["*"]), // store-only → 原始直传
+                    DontCompress = new IgnoreRuleSet(["*"]), // store-only → uploaded raw
                 },
             });
 
@@ -444,7 +444,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             {
                 Options = new BackupEngineOptions
                 {
-                    // 阈值调低 → big.bin 走单文件 blob；不压缩 + 20KB 分卷 → 多卷
+                    // Lower the threshold → big.bin goes through a single-file blob; no compression + 20KB volumes → multiple volumes
                     Plan = new PlanOptions { SingleFileThresholdBytes = 1000 },
                     DontCompress = new IgnoreRuleSet(["*.bin"]),
                     VolumeBytes = 20_000,
@@ -452,7 +452,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             };
             await backup.RunAsync(req);
 
-            // 应产出多卷 data blob（data/{hash}.001 存在）
+            // Should produce a multi-volume data blob (data/{hash}.001 exists)
             var volumeBlobs = new List<string>();
             await foreach (var b in container.GetBlobsAsync(
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", default))
@@ -468,16 +468,16 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 端到端兜底：走真实备份/还原全流程产出一个真正的多卷 7z 归档，断言 Restoring 阶段最终
-    /// 累计的字节数与云端归档的真实（压缩后）大小一致。
+    /// End-to-end backstop: run the real backup/restore pipeline to produce a genuine multi-volume 7z archive, then assert that the byte count
+    /// the Restoring stage finally accumulates matches the real (compressed) size of the archive in the cloud.
     /// <para>
-    /// 这条测不出"工厂被换成共用实例"这个缺陷本身——按 mutation 验证过：本项目 7z 分卷天然是
-    /// "除末卷外各卷等大、末卷最小"的大小序列，<c>DeltaProgress</c> 的回退判定（见
-    /// <see cref="StageTracker"/>）在这种序列下会自我纠正，共享一个实例照样能凑出与本测试相同的
-    /// 正确总数，不会让这条断言变红。真正钉死 Part 1 契约（"每卷各调一次工厂、拿到各不相同的
-    /// 实例"）的是 <c>VolumeBlobIOTests.DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance</c>——
-    /// 那条直接测 <c>DownloadAsync</c> 本身、不经过分卷大小序列这层间接性。这条测试留着是为了兜住
-    /// "整条还原链路的字节账目没被这次改动弄错"这个更朴素的不变量，与 mutation-检测无关。
+    /// This one does not detect the "the factory got replaced by a shared instance" defect itself — verified by mutation: this project's 7z volumes are naturally
+    /// a size sequence of "every volume equal except the last, which is the smallest", and <c>DeltaProgress</c>'s regression check (see
+    /// <see cref="StageTracker"/>) self-corrects under such a sequence, so a shared instance still adds up to exactly the same
+    /// correct total this test expects and would not turn this assertion red. What really pins down the Part 1 contract ("call the factory once per volume, getting a distinct
+    /// instance each time") is <c>VolumeBlobIOTests.DownloadAsync_Calls_Progress_Factory_Once_Per_Volume_With_A_Fresh_Instance</c> —
+    /// that one tests <c>DownloadAsync</c> directly, without going through the indirection of the volume-size sequence. This test is kept to cover
+    /// the more mundane invariant that "the byte accounting across the whole restore path wasn't broken by this change", and has nothing to do with mutation detection.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -494,8 +494,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 小分卷逼出一个真正的多卷归档（5+ 卷）——只有卷数足够多，"每卷各要一个进度实例"
-            // 与"全程共用一个实例"两条路径的累计结果才会显著分岔。
+            // Small volumes force a genuinely multi-volume archive (5+ volumes) — only with enough volumes do the accumulated results of
+            // "a fresh progress instance per volume" and "one shared instance throughout" diverge noticeably.
             WriteSrc("big.bin", new string('x', 100_000));
             var req = BackupReq(account, name) with
             {
@@ -508,8 +508,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
             };
             await backup.RunAsync(req);
 
-            // 云端归档的真实大小：下载会实打实传过网线的字节数，即改动之后 Restoring 阶段
-            // 应该累计到的数字。
+            // The real size of the archive in the cloud: the byte count the download genuinely puts over the wire, i.e. the number the Restoring stage
+            // should accumulate to after this change.
             long archivedBytes = 0;
             var volumeCount = 0;
             await foreach (var b in container.GetBlobsAsync(
@@ -556,7 +556,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var first = await restore.RunAsync(req);
             Assert.Equal(2, first.RestoredFiles);
 
-            var second = await restore.RunAsync(req); // 本地已相同 → 全部跳过
+            var second = await restore.RunAsync(req); // local copies already identical → everything is skipped
             Assert.Equal(0, second.RestoredFiles);
             Assert.Equal(2, second.SkippedFiles);
         }
@@ -580,19 +580,19 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 三个小文件 → 同一个 pack（默认阈值 5M 以下走分组）。
+            // Three small files → one and the same pack (below the default 5M threshold they go through grouping).
             WriteSrc("dir/a.txt", "alpha");
             WriteSrc("dir/b.txt", "bravo");
             WriteSrc("dir/c.txt", "charlie");
             await backup.RunAsync(BackupReq(account, name));
 
-            // 确认确实打成了一个 pack（一次下载语义的前提）。
+            // Confirm they really were packed into a single pack (the premise of the download-once semantics).
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             var packRefs = idx.Entries.Where(e => e.Storage?.Kind == "pack").Select(e => e.Storage!.Ref).Distinct().ToList();
-            Assert.Single(packRefs); // 三个成员同属一个 pack
+            Assert.Single(packRefs); // all three members belong to the same pack
 
-            // 只选中 pack 内一个成员 → 只该成员落地，其余不 over-restore。
+            // Select only one member inside the pack → only that member lands on disk, the rest are not over-restored.
             var result = await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -601,28 +601,28 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             Assert.Equal(1, result.RestoredFiles);
             Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
-            Assert.False(File.Exists(Path.Combine(_dst, "dir", "b.txt"))); // 未选成员不落地
+            Assert.False(File.Exists(Path.Combine(_dst, "dir", "b.txt"))); // unselected members don't land on disk
             Assert.False(File.Exists(Path.Combine(_dst, "dir", "c.txt")));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 钉住 RestoreGroupAsync 里那对内层 try/finally：下载一结束就把 <c>EndItem</c> 摘掉，解压/写盘
-    /// 这段本地 CPU 工作不该继续算"在途"。这不是不痛不痒的细节——测速分母只认在途窗口，
-    /// 解压一个大 pack 能有几十秒，多算进去会把显示的速度腰斩。
+    /// Pins down that inner try/finally pair in RestoreGroupAsync: <c>EndItem</c> is dropped as soon as the download ends, and the local CPU work of
+    /// extraction/disk writes must not keep counting as "in flight". This is not a harmless detail — the speed denominator only recognizes the in-flight window,
+    /// extracting a large pack can take tens of seconds, and counting that in halves the displayed speed.
     /// <para>
-    /// 直接读 <c>onProgress</c> 收到的"最近一次发布"靠不住：发布有 200ms 节流，真实时钟下载一个
-    /// 几十字节的测试包全程往往就几十毫秒，下载中 SDK 至少报一次进度（首次调用必发布），
-    /// 随后 EndItem/BeginPacking 各自的发布多半被这同一个节流窗口吞掉——于是无论 fix 还是
-    /// mutant，观察到的"最近一次"都可能还停在"下载中"的快照上，测试测不出任何东西
-    /// （已用 Diagnostic 探针实测验证过这个失效模式）。
+    /// Reading the "most recent publish" that <c>onProgress</c> received directly is unreliable: publishing is throttled at 200ms, and on the real clock downloading
+    /// a test pack of a few dozen bytes often takes a few dozen milliseconds end to end; during the download the SDK reports progress at least once (the first call always publishes),
+    /// after which the publishes from EndItem and BeginPacking are most likely swallowed by that very same throttle window — so with either the fix or
+    /// the mutant, the observed "most recent" one may still be stuck on the "downloading" snapshot and the test measures nothing at all
+    /// (this failure mode was verified empirically with a Diagnostic probe).
     /// </para>
     /// <para>
-    /// 用注入的假时钟绕开它：每查一次时间就往前跳一大步，节流条件 <c>now - last &lt; 200ms</c>
-    /// 因此永远不成立，每一次状态变化都会被发布——不是赌真实时钟恰好跨过节流窗口，
-    /// 是让节流窗口对这个测试彻底失效。不涉及 Thread.Sleep/Task.Delay，下载/解压仍是对
-    /// Azurite 的真实调用，只是"现在几点"这一件事被接管了。
+    /// Sidestep it with an injected fake clock: every time query jumps a long way forward, so the throttle condition <c>now - last &lt; 200ms</c>
+    /// never holds and every state change gets published — this is not gambling on the real clock happening to cross the throttle window,
+    /// it makes the throttle window entirely ineffective for this test. No Thread.Sleep/Task.Delay is involved; the download/extraction are still real calls against
+    /// Azurite, only the single question of "what time is it now" has been taken over.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -641,7 +641,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 三个小文件同目录 → 单个 pack、单个组：只有一件在途项，断言不必按名字过滤。
+            // Three small files in the same directory → a single pack, a single group: only one in-flight item, so the assertion doesn't have to filter by name.
             WriteSrc("dir/a.txt", "alpha");
             WriteSrc("dir/b.txt", "bravo");
             WriteSrc("dir/c.txt", "charlie");
@@ -653,18 +653,18 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             Assert.Equal(3, result.RestoredFiles);
             Assert.True(probe.ExtractCallCount > 0, "fake compressor's ExtractAsync should have been invoked");
-            // 解压这一刻，假时钟已经保证了下载结束时那次 EndItem 触发的发布没被节流吞掉——
-            // 拿到的就是解压开始那一瞬间真正的在途集合，不是碰运气捞到的一张旧快照。
-            // 没抓到快照本身就是失败——原先靠塞一个非空哨兵集合来表达，现在直接断言非空，意思一样但更直白。
+            // At the moment of extraction the fake clock has already guaranteed that the publish triggered by EndItem at the end of the download wasn't swallowed by the throttle —
+            // what we get is the genuine in-flight set at the instant extraction began, not an old snapshot scooped up by luck.
+            // Failing to capture a snapshot at all is itself a failure — this used to be expressed by seeding a non-empty sentinel set; now we just assert non-null, same meaning but more direct.
             Assert.NotNull(probe.ActiveItemsAtExtractCall);
             Assert.Empty(probe.ActiveItemsAtExtractCall);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>包一层真压缩器，只在 <see cref="ExtractAsync"/> 这一步截住，记下调用那一刻
-    /// 最近一次发布的 <see cref="StageProgress.ActiveItems"/>——解压本身仍然照常委托给内层真的
-    /// <see cref="SevenZipCompressor"/> 完成，被测的只是"调用顺序"，不是解压结果。</summary>
+    /// <summary>Wraps the real compressor, intercepting only at the <see cref="ExtractAsync"/> step to record the
+    /// <see cref="StageProgress.ActiveItems"/> of the most recent publish at the moment of the call — the extraction itself is still delegated as usual to the inner real
+    /// <see cref="SevenZipCompressor"/>; what is under test is only the "call ordering", not the extraction result.</summary>
     private sealed class ActiveItemsProbeCompressor(IFileCompressor inner) : IFileCompressor
     {
         public StageProgress? LatestPublished { get; set; }
@@ -711,7 +711,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("a.txt", "cloud content");
             await backup.RunAsync(BackupReq(account, name));
 
-            // 目标已存在且内容不同 → Skip 模式应原样保留，不覆盖，不新增。
+            // The target already exists with different content → Skip mode should leave it exactly as is: no overwrite, nothing added.
             Directory.CreateDirectory(_dst);
             File.WriteAllText(Path.Combine(_dst, "a.txt"), "local content");
 
@@ -723,7 +723,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             Assert.Equal(0, result.RestoredFiles);
             Assert.Equal(1, result.SkippedFiles);
-            Assert.Equal("local content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 未被覆盖
+            Assert.Equal("local content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // not overwritten
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -745,7 +745,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("a.txt", "cloud content");
             await backup.RunAsync(BackupReq(account, name));
 
-            // 目标已存在且内容不同 → RenameKeep：旧内容改名保留，还原内容落原名。
+            // The target already exists with different content → RenameKeep: the old content is renamed and preserved, the restored content lands under the original name.
             Directory.CreateDirectory(_dst);
             File.WriteAllText(Path.Combine(_dst, "a.txt"), "local content");
 
@@ -756,10 +756,10 @@ public sealed class RestoreOrchestratorTests : IDisposable
             });
 
             Assert.Equal(1, result.RestoredFiles);
-            Assert.Equal("cloud content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 原名 = 还原内容
+            Assert.Equal("cloud content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // original name = the restored content
             var baks = Directory.GetFiles(_dst, "a.txt.bak-*");
             Assert.Single(baks);
-            Assert.Equal("local content", File.ReadAllText(baks[0])); // 旧内容永不丢失
+            Assert.Equal("local content", File.ReadAllText(baks[0])); // the old content is never lost
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -778,19 +778,19 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 阈值调到 1 字节 → a.txt 走单文件 data blob（而非 pack），
-            // 使得还原时内容按 blob 整体复用、不依赖归档内的条目名——
-            // 这样恶意条目才会真的把内容写到它自己声明的（越界）路径上，
-            // 忠实重现 /import 场景下可信度为零的索引所能触发的写入。
+            // Drop the threshold to 1 byte → a.txt goes through a single-file data blob (rather than a pack),
+            // so that on restore the content is reused as a whole blob and doesn't depend on the entry name inside the archive —
+            // only then does the malicious entry really write the content to the (escaping) path it declares for itself,
+            // faithfully reproducing the writes a zero-trust index can trigger in the /import scenario.
             WriteSrc("a.txt", "safe content");
             await backup.RunAsync(BackupReq(account, name) with
             {
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            // 模拟一条被篡改/来自不可信容器（/import 可导入任意容器）的索引：追加一条
-            // Path 含 .. 的条目，复用 a.txt 的 Storage（同一个下载分组），
-            // 验证写入前的越界检查会拦下它，而不是让它落到 TargetRoot 之外。
+            // Simulate an index that was tampered with / came from an untrusted container (/import can import any container): append an entry
+            // whose Path contains .., reusing a.txt's Storage (the same download group),
+            // and verify the pre-write escape check blocks it rather than letting it land outside TargetRoot.
             var info = await store.ReadInfoAsync(account, name, null);
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
@@ -800,18 +800,18 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
 
-            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));       // 正常条目照常还原
-            Assert.False(File.Exists(Path.Combine(_base, "pwned.txt"))); // 越界条目未写到目标根之外
-            Assert.Equal(1, result.FailedFiles);                         // 计入失败数，其余照常，不中断整次还原
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));       // the normal entry restores as usual
+            Assert.False(File.Exists(Path.Combine(_base, "pwned.txt"))); // the escaping entry was not written outside the target root
+            Assert.Equal(1, result.FailedFiles);                         // counted as a failure, everything else proceeds, the whole restore is not aborted
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// C1（Critical）：还原**先**建 symlink 条目、**后**写文件条目。索引里一条
-    /// <c>evil -&gt; &lt;根外&gt;</c> 加一条 <c>evil/x</c>，词法判定看 <c>&lt;root&gt;/evil/x</c> 完全在根内，
-    /// 而 File.Copy 会跟随那条链接把内容落到根外——没有竞态，纯靠还原自身的顺序。
-    /// 判定必须作用在解析后的真实路径上才拦得住。
+    /// C1 (Critical): restore creates symlink entries **first** and writes file entries **after**. One
+    /// <c>evil -&gt; &lt;outside the root&gt;</c> entry plus one <c>evil/x</c> entry in the index, and the lexical check sees <c>&lt;root&gt;/evil/x</c> as entirely inside the root,
+    /// while File.Copy follows that link and lands the content outside it — no race involved, purely restore's own ordering.
+    /// Only a check operating on the resolved real path can stop it.
     /// </summary>
     [SkippableFact]
     public async Task Restore_Does_Not_Write_Through_A_Symlink_Entry_That_Points_Outside_The_Target()
@@ -830,8 +830,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 阈值 1 → a.txt 走单文件 data blob，内容按条目声明的路径整体复制，
-            // 于是恶意条目真的会把内容写到它声明的位置（忠实重现 /import 场景）。
+            // Threshold 1 → a.txt goes through a single-file data blob and the content is copied wholesale to the path the entry declares,
+            // so the malicious entry really does write the content where it says it should (faithfully reproducing the /import scenario).
             WriteSrc("a.txt", "safe content");
             await backup.RunAsync(BackupReq(account, name) with
             {
@@ -843,24 +843,24 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
             var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
 
-            // 恶意索引：一条指向根外目录的软链条目 + 一条「在它下面」的文件条目。
+            // Malicious index: a symlink entry pointing at a directory outside the root + a file entry "underneath it".
             idx.Entries.Add(aEntry with { Path = "evil", Kind = "symlink", Target = outside, Storage = null });
             idx.Entries.Add(aEntry with { Path = "evil/x" });
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
             var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
 
-            // 核心断言：目标根之外不能出现任何东西。
+            // Core assertion: nothing whatsoever may appear outside the target root.
             Assert.False(Path.Exists(Path.Combine(outside, "x")));
             Assert.Empty(Directory.GetFileSystemEntries(outside));
 
-            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // 合法条目照常
-            Assert.Equal(1, result.FailedFiles);                                          // 穿链写入被计入失败
+            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_dst, "a.txt"))); // the legitimate entry proceeds as usual
+            Assert.Equal(1, result.FailedFiles);                                          // the write-through-link is counted as a failure
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>C6：symlink 条目自身的路径越界（<c>../</c>）必须被拦下，并计入失败而不是静默跳过（C3）。</summary>
+    /// <summary>C6: a symlink entry whose own path escapes (<c>../</c>) has to be blocked, and counted as a failure rather than silently skipped (C3).</summary>
     [SkippableFact]
     public async Task Restore_Rejects_Symlink_Entry_Whose_Own_Path_Escapes_The_Target_Root()
     {
@@ -893,19 +893,19 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
                 phase: reports);
 
-            Assert.False(Path.Exists(Path.Combine(_base, "evil-link"))); // 根外没建出链接
-            Assert.Equal(1, result.FailedFiles);                         // 计入失败，不是跳过
+            Assert.False(Path.Exists(Path.Combine(_base, "evil-link"))); // no link was created outside the root
+            Assert.Equal(1, result.FailedFiles);                         // counted as a failure, not a skip
             Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));
 
-            // C3：安全检查被触发必须可见，不能和「未变」一样静默。
+            // C3: a security check that fires has to be visible, it must not be as silent as "unchanged".
             Assert.Contains(reports.Messages, m => m.Contains("../evil-link", StringComparison.Ordinal));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// C6：空目录条目的两条越界路线——词法 <c>../</c>，以及穿过一条**上次还原留下**的指向根外的软链。
-    /// 同时钉住 C4：RestoredDirs 报的是真正创建成功的数量。
+    /// C6: the two escape routes for empty-directory entries — the lexical <c>../</c>, and passing through a symlink **left behind by the previous restore** that points outside the root.
+    /// Also pins down C4: RestoredDirs reports the number that were actually created successfully.
     /// </summary>
     [SkippableFact]
     public async Task Restore_Skips_Empty_Dir_Entries_That_Would_Escape_Target_Root()
@@ -932,11 +932,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
             Assert.Contains("emptydir", idx.EmptyDirs);
-            idx.EmptyDirs.Add("../pwned-dir");   // 词法越界
-            idx.EmptyDirs.Add("leftover/sub");   // 穿过既有软链越界
+            idx.EmptyDirs.Add("../pwned-dir");   // lexical escape
+            idx.EmptyDirs.Add("leftover/sub");   // escape by passing through an existing symlink
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
-            // 真实软链：模拟上一次还原（或用户自己）在根内留下的、指向根外的链接。
+            // A real symlink: simulates a link left inside the root by a previous restore (or by the user) that points outside it.
             Directory.CreateDirectory(_dst);
             Directory.CreateSymbolicLink(Path.Combine(_dst, "leftover"), outside);
 
@@ -946,14 +946,14 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.False(Directory.Exists(Path.Combine(outside, "sub")));
             Assert.Empty(Directory.GetFileSystemEntries(outside));
             Assert.True(Directory.Exists(Path.Combine(_dst, "emptydir")));
-            Assert.Equal(1, result.RestoredDirs);  // C4：三条条目只成功创建了一条
-            Assert.Equal(2, result.FailedFiles);   // M1：两条越界的空目录条目也要算进失败，不能只走 phase 上报
+            Assert.Equal(1, result.RestoredDirs);  // C4: of the three entries, only one was created successfully
+            Assert.Equal(2, result.FailedFiles);   // M1: the two escaping empty-directory entries have to count as failures too, not just be reported through phase
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>M1：一份只含越界 EmptyDirs 的恶意索引，此前 FailedFiles 冻在 0——唯一信号是 phase 流。
-    /// 与 symlink 越界（C3）同一原则：安全检查触发必须计入 FailedFiles，操作者的汇总才是他们真正会看的东西。</summary>
+    /// <summary>M1: with a malicious index containing nothing but escaping EmptyDirs, FailedFiles used to be frozen at 0 — the only signal was the phase stream.
+    /// Same principle as symlink escapes (C3): a security check that fires has to count towards FailedFiles, because the operator's summary is what they actually look at.</summary>
     [SkippableFact]
     public async Task Restore_With_Only_Escaping_Empty_Dirs_Reports_Nonzero_FailedFiles()
     {
@@ -974,7 +974,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
-            idx.EmptyDirs.Clear();               // 只留恶意越界条目，没有任何合法空目录条目
+            idx.EmptyDirs.Clear();               // leave only the malicious escaping entry, with no legitimate empty-directory entries at all
             idx.EmptyDirs.Add("../pwned-dir-only");
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
@@ -982,15 +982,15 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             Assert.False(Directory.Exists(Path.Combine(_base, "pwned-dir-only")));
             Assert.Equal(0, result.RestoredDirs);
-            Assert.Equal(1, result.FailedFiles); // 唯一条目就是被拦下的越界目录 —— 不能是 0
+            Assert.Equal(1, result.FailedFiles); // the only entry is the escaping directory that got blocked — this must not be 0
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// C2：越界条目在「是否需要还原」阶段就被拦下。此前它会先对根外路径做 File.Exists +
-    /// 全量 hash（存在性/内容旁道），且根外已有同内容文件时被判成「跳过」——
-    /// 于是走不到写入处的检查，既不计失败也不上报，一次被拦下的越界完全不可见。
+    /// C2: an escaping entry is blocked as early as the "does this need restoring" stage. It used to do a File.Exists +
+    /// full hash on the out-of-root path first (an existence/content side channel), and when a file with identical content already existed outside the root it was judged "skipped" —
+    /// so it never reached the check at the write site, counted as neither a failure nor a report, and a blocked escape was completely invisible.
     /// </summary>
     [SkippableFact]
     public async Task Escaping_Entry_Whose_Out_Of_Root_Twin_Exists_Is_Counted_As_Failed_Not_Skipped()
@@ -1019,7 +1019,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             idx.Entries.Add(aEntry with { Path = "../twin.txt" });
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
-            // 根外已存在同内容的「孪生」文件 → 旧代码会判定「无需还原」并计成跳过。
+            // A "twin" file with identical content already exists outside the root → the old code would judge it "no restore needed" and count it as skipped.
             Directory.CreateDirectory(_base);
             File.WriteAllText(Path.Combine(_base, "twin.txt"), "safe content");
 
@@ -1027,14 +1027,14 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             Assert.Equal(1, result.FailedFiles);
             Assert.Equal(0, result.SkippedFiles);
-            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_base, "twin.txt"))); // 根外文件未被动过
+            Assert.Equal("safe content", File.ReadAllText(Path.Combine(_base, "twin.txt"))); // the out-of-root file was never touched
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 目标根**自身**经软链到达时还原必须照常工作——判定同时解析根，否则每一条合法条目
-    /// 都会被误判成越界。这是把判定改成「解析后路径」的主要回归风险。
+    /// When the target root **itself** is reached through a symlink, restore has to keep working — the check resolves the root as well, otherwise every legitimate entry
+    /// would be misjudged as an escape. This is the main regression risk of switching the check over to "resolved paths".
     /// </summary>
     [SkippableFact]
     public async Task Restore_Into_A_Target_Root_Reached_Through_A_Symlink_Still_Works()
@@ -1051,7 +1051,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
         var real = Path.Combine(_base, "real-dst");
         var link = Path.Combine(_base, "link-dst");
         Directory.CreateDirectory(real);
-        Directory.CreateSymbolicLink(link, real); // 真实软链，非 mock
+        Directory.CreateSymbolicLink(link, real); // a real symlink, not a mock
 
         try
         {
@@ -1073,8 +1073,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 合法备份会如实记录指向根外的**绝对**软链，还原它是正确行为（被禁止的只是穿过链接写）。
-    /// 重复还原同一条链接必须仍判「未变」，不能因为末段已是那条链接就被判成越界。
+    /// A legitimate backup faithfully records an **absolute** symlink pointing outside the root, and restoring it is the correct behavior (what is forbidden is only writing through a link).
+    /// Restoring the same link again has to still be judged "unchanged"; it must not be judged an escape just because the final segment is already that link.
     /// </summary>
     [SkippableFact]
     public async Task Symlink_Entry_Targeting_Outside_The_Root_Restores_And_Second_Restore_Is_A_No_Op()
@@ -1109,7 +1109,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.Equal(0, first.FailedFiles);
             Assert.Equal(outside, new FileInfo(Path.Combine(_dst, "dir", "link")).LinkTarget);
 
-            var second = await restore.RunAsync(req); // 幂等：链接未变 → 跳过，不是越界失败
+            var second = await restore.RunAsync(req); // idempotent: the link is unchanged → skipped, not an escape failure
             Assert.Equal(0, second.FailedFiles);
             Assert.Equal(outside, new FileInfo(Path.Combine(_dst, "dir", "link")).LinkTarget);
         }
@@ -1117,9 +1117,9 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// M3：symlink 条目缺 Target（云端索引损坏/被篡改）此前被判成 <c>SymlinkOutcome.Unchanged</c>——
-    /// 与「链接已经是对的，无事发生」同一个结果，但畸形条目从没成功还原过，操作者应该看得见、
-    /// 应该算进 FailedFiles，不能套上「未变」的名义悄悄计成 Skipped。
+    /// M3: a symlink entry missing its Target (a corrupt/tampered cloud index) used to be judged <c>SymlinkOutcome.Unchanged</c> —
+    /// the same outcome as "the link is already correct, nothing happened", but a malformed entry has never been restored successfully, so the operator should see it,
+    /// it should count towards FailedFiles, and it must not be quietly counted as Skipped under the guise of "unchanged".
     /// </summary>
     [SkippableFact]
     public async Task Restore_Symlink_Entry_With_Missing_Target_Fails_That_Entry_Not_Marked_Unchanged()
@@ -1142,7 +1142,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
             var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
-            // 畸形 symlink 条目：Kind=symlink 但 Target 缺失。
+            // Malformed symlink entry: Kind=symlink but Target is missing.
             idx.Entries.Add(aEntry with { Path = "malformed-link", Kind = "symlink", Target = null, Storage = null });
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
@@ -1151,8 +1151,8 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
                 phase: reports);
 
-            Assert.False(Path.Exists(Path.Combine(_dst, "malformed-link"))); // 没能还原，什么都没建出来
-            Assert.Equal(1, result.FailedFiles); // 算失败，不是 SkippedFiles——「未变」语义不适用于「从没成功过」
+            Assert.False(Path.Exists(Path.Combine(_dst, "malformed-link"))); // failed to restore, nothing was created
+            Assert.Equal(1, result.FailedFiles); // counts as a failure, not SkippedFiles — "unchanged" semantics don't apply to "never succeeded in the first place"
             Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));
             Assert.Contains(reports.Messages, m => m.Contains("malformed-link", StringComparison.Ordinal));
         }
@@ -1160,11 +1160,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// M6：索引里两条条目共享同一个 Path（/import 可导入任意容器，索引本身可自相矛盾）。
-    /// 此前 <c>index.Entries.ToDictionary(e =&gt; e.Path, ...)</c> 直接抛 <see cref="ArgumentException"/>，
-    /// 中止整次还原——包括 keep.txt 这样完全无关、完全正常的条目也一并遭殃。
-    /// 决策：两条互相矛盾，无法判断哪条权威，选择两条都不写（不猜 last-wins/first-wins），
-    /// 该 Path 只算一次失败，其余条目照常还原。
+    /// M6: two entries in the index share the same Path (/import can import any container, and the index itself can be self-contradictory).
+    /// <c>index.Entries.ToDictionary(e =&gt; e.Path, ...)</c> used to throw <see cref="ArgumentException"/> outright,
+    /// aborting the whole restore — taking completely unrelated, completely normal entries like keep.txt down with it.
+    /// Decision: the two contradict each other and there is no telling which is authoritative, so write neither (no guessing at last-wins/first-wins);
+    /// that Path counts as exactly one failure, and the remaining entries restore as usual.
     /// </summary>
     [SkippableFact]
     public async Task Restore_With_Duplicate_Index_Entry_Path_Fails_That_One_Entry_Not_The_Whole_Run()
@@ -1191,24 +1191,24 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
             var aEntry = idx.Entries.Single(e => e.Path == "a.txt");
-            // 重复 Path：索引本身自相矛盾。此前这里的 ToDictionary 直接抛出，整次还原被中止。
+            // Duplicate Path: the index contradicts itself. The ToDictionary here used to throw outright and abort the whole restore.
             idx.Entries.Add(aEntry with { Path = "dup.txt" });
             idx.Entries.Add(aEntry with { Path = "dup.txt" });
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
             var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
 
-            Assert.False(File.Exists(Path.Combine(_dst, "dup.txt"))); // 两条都不写——无法判断哪条权威
-            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));    // 其余条目未被中止的整次还原拖累
+            Assert.False(File.Exists(Path.Combine(_dst, "dup.txt"))); // neither is written — no telling which one is authoritative
+            Assert.True(File.Exists(Path.Combine(_dst, "a.txt")));    // the remaining entries weren't dragged down by an aborted restore
             Assert.True(File.Exists(Path.Combine(_dst, "keep.txt")));
-            Assert.Equal(1, result.FailedFiles); // 一个重复 Path 只算一次失败，不是每条重复各算一次
+            Assert.Equal(1, result.FailedFiles); // one duplicated Path counts as one failure, not once per duplicate entry
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// C5：畸形条目（Path 为 "" / "." → 目标就是 TargetRoot 本身）只能失败它自己。
-    /// 此前文件条目会让**整组**合法条目一起判失败，symlink 条目更是让**整次还原**抛出中止。
+    /// C5: a malformed entry (Path is "" or "." → the destination is TargetRoot itself) may only fail itself.
+    /// A file entry used to fail the **whole group** of legitimate entries, and a symlink entry went further and made the **whole restore** throw and abort.
     /// </summary>
     [SkippableFact]
     public async Task Degenerate_Entry_Path_Fails_Only_That_Entry()
@@ -1224,7 +1224,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 两个小文件同属一个 pack：畸形条目若冒泡到组处理器，会把它们一起判失败。
+            // Two small files in the same pack: if a malformed entry bubbles up to the group handler, it fails them along with it.
             WriteSrc("dir/a.txt", "alpha");
             WriteSrc("dir/b.txt", "bravo");
             await backup.RunAsync(BackupReq(account, name));
@@ -1233,17 +1233,17 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var v1 = info!.Versions[^1];
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
             var aEntry = idx.Entries.Single(e => e.Path == "dir/a.txt");
-            idx.Entries.Add(aEntry with { Path = "" });                                            // 文件条目 → 目标 = 根（目录）
-            idx.Entries.Add(aEntry with { Path = ".", Kind = "symlink", Target = "/tmp", Storage = null }); // symlink 条目 → 抛出
+            idx.Entries.Add(aEntry with { Path = "" });                                            // file entry → destination = the root (a directory)
+            idx.Entries.Add(aEntry with { Path = ".", Kind = "symlink", Target = "/tmp", Storage = null }); // symlink entry → throws
             await store.WriteIndexAsync(account, name, v1.Version, idx, null);
 
             var result = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
 
-            Assert.Equal(2, result.RestoredFiles); // 合法条目全部还原
-            Assert.Equal(2, result.FailedFiles);   // 两条畸形条目各算一条
+            Assert.Equal(2, result.RestoredFiles); // all legitimate entries restored
+            Assert.Equal(2, result.FailedFiles);   // the two malformed entries count one each
             Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
             Assert.Equal("bravo", File.ReadAllText(Path.Combine(_dst, "dir", "b.txt")));
-            Assert.True(Directory.Exists(_dst));   // 根仍是目录，没被覆写
+            Assert.True(Directory.Exists(_dst));   // the root is still a directory, not overwritten
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -1280,11 +1280,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 覆盖判定要先读一遍目标位置已有的文件，看它是不是已经等于要还原的内容。此前那次读取没有保护，
-    /// 而它抛出后会被**整组**的 catch 接住——同一个 pack 里的其它文件因此一个都还原不了。
-    /// 一个文件的权限问题不该有这么大的爆炸半径：它自己失败即可，同伴照常落地。
-    /// <para>三个小文件同目录 → 同一个 pack。目标位置预先放一个读不开的 b.txt（权限位清零，
-    /// 不是替身抛的假异常）。修复前：整组失败，a 和 c 根本不会出现在目标目录里。</para>
+    /// The overwrite decision first reads whatever file already sits at the destination, to see whether it already equals the content to be restored. That read used to be unguarded,
+    /// and once it threw it got caught by the **whole group's** catch — so not one other file in the same pack could be restored.
+    /// One file's permission problem should not have a blast radius that large: it can fail on its own while its companions land as usual.
+    /// <para>Three small files in the same directory → the same pack. An unreadable b.txt is placed at the destination beforehand (permission bits zeroed,
+    /// not a fake exception thrown by a stand-in). Before the fix: the whole group failed and a and c never appeared in the destination directory at all.</para>
     /// </summary>
     [SkippableFact]
     public async Task An_Unreadable_Target_File_Does_Not_Sink_Its_Whole_Restore_Group()
@@ -1305,9 +1305,9 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("d/a.txt", "alpha");
             WriteSrc("d/b.txt", "bravo");
             WriteSrc("d/c.txt", "charlie");
-            await backup.RunAsync(BackupReq(account, name)); // 默认阈值 5MB → 三个小文件同成一个 pack
+            await backup.RunAsync(BackupReq(account, name)); // default threshold 5MB → the three small files end up in one pack
 
-            // 目标位置已有一个同名文件，且读不开——覆盖判定第一步就撞上它。
+            // A file with the same name already exists at the destination and can't be read — the very first step of the overwrite decision runs into it.
             Directory.CreateDirectory(Path.GetDirectoryName(blocked)!);
             await File.WriteAllTextAsync(blocked, "pre-existing and unreadable");
             File.SetUnixFileMode(blocked, UnixFileMode.None);
@@ -1317,12 +1317,12 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 Account = account, Container = name, TargetRoot = _dst,
             });
 
-            // 同伴照常落地——修复前这两个文件连碰都碰不到。
+            // The companions land as usual — before the fix these two files were never even touched.
             Assert.Equal("alpha", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "a.txt")));
             Assert.Equal("charlie", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "c.txt")));
             Assert.Equal(2, result.RestoredFiles);
 
-            // 读不开的那个自己失败，恰好一个——不是整组三个。
+            // The unreadable one fails on its own, exactly one — not all three of the group.
             Assert.Equal(1, result.FailedFiles);
         }
         finally
@@ -1332,9 +1332,9 @@ public sealed class RestoreOrchestratorTests : IDisposable
         }
     }
 
-    /// <summary>还原此前只有一个自由文本的 phase 字段，而它承载的其实是**错误流**
-    /// （Failed to restore…／Skipped unsafe…），且是单值覆盖：说不出"还剩多少组"，
-    /// 逐文件失败也只剩最后一条。这里验证结构化进度确实报出来了。</summary>
+    /// <summary>Restore used to have only a free-text phase field, and what it actually carried was the **error stream**
+    /// (Failed to restore… / Skipped unsafe…), overwritten as a single value: it could never say "how many groups are left",
+    /// and per-file failures came down to just the last one. This verifies that structured progress really does get reported.</summary>
     [SkippableFact]
     public async Task Restore_Reports_Structured_Progress_For_Each_Group()
     {
@@ -1349,7 +1349,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 三个分处不同目录的文件 → 三个 pack → 三组，进度有多步可报。
+            // Three files in three different directories → three packs → three groups, so progress has several steps to report.
             WriteSrc("a/1.txt", "alpha");
             WriteSrc("b/2.txt", "bravo");
             WriteSrc("c/3.txt", "charlie");
@@ -1363,7 +1363,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.Equal(3, result.RestoredFiles);
             Assert.NotEmpty(snapshots);
 
-            // 收尾必须产出终态：所有组都完成，否则进度永远差最后一下。
+            // The wrap-up has to produce a terminal state with every group complete, otherwise progress is forever one step short.
             var final = snapshots[^1];
             Assert.Equal(final.Total, final.Processed);
             Assert.Equal(100, final.Percent);
@@ -1373,11 +1373,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 单文件 blob 直接从归档流到目标，不再落一份临时解压件——于是"写出来的东西对不对"
-    /// 必须自己核对：<c>7z x -so</c> 取不到内容时输出为空却**退出码 0**（本项目已经踩过一次），
-    /// 光靠"没抛异常"会把一个空文件或别人的内容当成还原成功盖到用户文件上。
-    /// 这里把 data blob 换成另一个**合法**归档（内容与长度都不同）：解压这一步会成功，
-    /// 只有长度/hash 这道关能拦住它。
+    /// A single-file blob streams straight from the archive to the destination, no longer landing a temporary extracted copy — so "is what got written correct"
+    /// has to be verified here: when <c>7z x -so</c> can't get the content it produces empty output but **exit code 0** (this project has been bitten by that once already),
+    /// and relying on "nothing was thrown" would pass an empty file or somebody else's content off as a successful restore and stamp it over the user's file.
+    /// Here the data blob is swapped for another **legitimate** archive (different content and different length): the extraction step succeeds,
+    /// and only the length/hash gate can stop it.
     /// </summary>
     [SkippableFact]
     public async Task Streamed_Blob_Whose_Content_Does_Not_Match_The_Index_Fails_That_Entry_And_Leaves_No_Debris()
@@ -1404,7 +1404,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             WriteSrc("victim.txt", "the content the index describes");
             await backup.RunAsync(blobOnly);
 
-            // 另一次备份产出一个内容不同的合法 7z 单文件归档，拿它顶掉上面那条的 data blob。
+            // A second backup produces a legitimate single-file 7z archive with different content; use it to displace the data blob of the one above.
             File.Delete(Path.Combine(_src, "victim.txt"));
             WriteSrc("decoy.txt", "a different payload of a different length entirely");
             await backup.RunAsync(blobOnly with { Container = other });
@@ -1423,7 +1423,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.Equal(1, result.FailedFiles);
             Assert.Contains(phase.Messages, m => m.Contains("victim.txt", StringComparison.Ordinal));
 
-            // 内容对不上就一个字节都不该落到目标上——半截件、临时件都不留。
+            // If the content doesn't match, not a single byte should land at the destination — no truncated file and no temp file left behind.
             Assert.False(File.Exists(Path.Combine(_dst, "victim.txt")));
             Assert.False(File.Exists(Path.Combine(_dst, "victim.txt.asb-part")));
         }
@@ -1443,14 +1443,14 @@ public sealed class RestoreOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 进度回调坏掉时，还原不能就此挂死。检查侧同形状那条是
-    /// <c>BackupCheckerTests.A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check</c>——
-    /// 两处各自独立，谁也不替谁兜底。
+    /// When the progress callback breaks, the restore must not hang on it. The same-shaped test on the check side is
+    /// <c>BackupCheckerTests.A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check</c> —
+    /// the two are independent, neither backstops the other.
     /// <para>
-    /// <c>EndItem</c> 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
-    /// 而这条路上的异常是**故意**往外传的。从前 <c>gate.Release()</c> 跟它排在同一个 <c>finally</c>
-    /// 里的后一句，前一句抛出就把它整个跳过——下载额度一去不回。这里只有一份额度，第一组吞掉它，
-    /// 第二组就永远等在闸门上。所以**超时本身就是失败**，抛什么异常出来倒无所谓。
+    /// <c>EndItem</c> calls straight into the caller's publish (external code that writes to the database, pushes SSE and the like), which can throw,
+    /// and exceptions on this path are **deliberately** propagated. <c>gate.Release()</c> used to be the statement right after it in the same <c>finally</c>,
+    /// so a throw from the first skipped it entirely — and the download permit was gone for good. There is only one permit here, so once the first group swallows it,
+    /// the second group waits on the gate forever. That is why **the timeout itself is the failure**; what exception comes out doesn't matter.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -1459,7 +1459,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        // 假时钟让每次发布都越过 200ms 的节流窗口，否则这条测试成了看下载耗时的运气。
+        // The fake clock makes every publish clear the 200ms throttle window; otherwise this test comes down to the luck of how long the download takes.
         long fakeNow = 0;
         var (backup, restore, _, factory) = Build(restoreClock: () => Interlocked.Add(ref fakeNow, 1000));
         var account = AzuriteAccount();
@@ -1469,7 +1469,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
         try
         {
-            // 两个目录各一个文件 → 两个 pack，就是两个还原组；闸门只发一份额度。
+            // One file in each of two directories → two packs, which is two restore groups; the gate hands out only one permit.
             WriteSrc("d1/a.txt", "alpha");
             WriteSrc("d2/b.txt", "bravo");
             await backup.RunAsync(BackupReq(account, name));
@@ -1479,7 +1479,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 {
                     Account = account, Container = name, TargetRoot = _dst, DownloadConcurrency = 1,
                 },
-                // 只坏在下载还原这一段：整条 sink 都坏的话，还原在前面的阶段就炸了，走不到闸门那儿。
+                // Break only during the download/restore stage: if the whole sink were broken the restore would blow up in an earlier stage and never reach the gate.
                 onProgress: d =>
                 {
                     if (d.Stage == "Restoring")
@@ -1488,7 +1488,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
 
             var ex = await Xunit.Record.ExceptionAsync(() => run.WaitAsync(TimeSpan.FromSeconds(20)));
 
-            Assert.IsNotType<TimeoutException>(ex); // 挂住了＝额度被吞了
+            Assert.IsNotType<TimeoutException>(ex); // hung = the permit got swallowed
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

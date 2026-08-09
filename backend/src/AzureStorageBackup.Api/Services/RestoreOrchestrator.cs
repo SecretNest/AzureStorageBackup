@@ -5,7 +5,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一次还原请求。Version 为 null 时还原最新版本。</summary>
+/// <summary>A single restore request. When Version is null, the latest version is restored.</summary>
 public sealed record RestoreRequest
 {
     public required Account Account { get; init; }
@@ -14,43 +14,43 @@ public sealed record RestoreRequest
     public string? Password { get; init; }
     public int? Version { get; init; }
 
-    /// <summary>下载并发上限（PRD 3.4，默认 5）。</summary>
+    /// <summary>Download concurrency cap (PRD 3.4, default 5).</summary>
     public int DownloadConcurrency { get; init; } = 5;
 
-    /// <summary>不可恢复文件的替代来源：路径 → 用哪个版本的该文件内容替代（用户逐个选，可批量）。</summary>
+    /// <summary>Substitution sources for unrecoverable files: path → which version's copy of that file to substitute with (the user picks them one at a time, in bulk if they like).</summary>
     public IReadOnlyDictionary<string, int> Substitutions { get; init; } =
         new Dictionary<string, int>(StringComparer.Ordinal);
 
-    /// <summary>选择性还原（需求 B）：为 null 时还原整版本（现状）；非 null 时只还原恰好这些路径。
-    /// 过滤在分组前生效——pack 因此只下载一次、只写选中成员，不会 over-restore 未选成员。</summary>
+    /// <summary>Selective restore (requirement B): null restores the whole version (current behavior); non-null restores exactly these paths and nothing else.
+    /// The filter takes effect before grouping — so a pack is still downloaded once and only the selected members are written, never over-restoring the unselected ones.</summary>
     public IReadOnlyList<string>? SelectedPaths { get; init; }
 
-    /// <summary>冲突处理模式（决策 3）。默认 OverwriteIfChanged = 现状。</summary>
+    /// <summary>Conflict handling mode (decision 3). Default OverwriteIfChanged = the current behavior.</summary>
     public RestoreConflictMode Conflict { get; init; } = RestoreConflictMode.OverwriteIfChanged;
 
-    /// <summary>Archive blob 活化优先级（透传 Azure RehydratePriority）。默认 Standard。</summary>
+    /// <summary>Rehydrate priority for Archive blobs (passed straight through to Azure's RehydratePriority). Default Standard.</summary>
     public RestoreRehydratePriority RehydratePriority { get; init; } = RestoreRehydratePriority.Standard;
 
-    /// <summary>遇 Archive blob 的活化目标 tier（Archive 无法直接下载，需先活化，异步几小时）。</summary>
+    /// <summary>The tier to rehydrate an Archive blob into when we hit one (Archive can't be downloaded directly; it has to be rehydrated first, asynchronously, over hours).</summary>
     public AccessTier RehydrateTier { get; init; } = AccessTier.Hot;
 
-    /// <summary>活化轮询间隔秒（还原 job 不占锁，可长等）。</summary>
+    /// <summary>Rehydration poll interval in seconds (the restore job holds no lock, so it can afford to wait a long time).</summary>
     public int RehydratePollSeconds { get; init; } = 60;
 
-    /// <summary>还原完成后把活化过的 blob 重新归档回 Archive（默认 true，保持备份原 tier、避免长期热存费）。</summary>
+    /// <summary>After the restore finishes, put rehydrated blobs back into Archive (default true, to keep the backup's original tier and avoid paying for hot storage long-term).</summary>
     public bool ReArchiveAfterRestore { get; init; } = true;
 }
 
-/// <summary>还原结果。SkippedFiles = 本地已是相同内容而跳过（仅当变更时覆盖）。
-/// FailedFiles = 未能还原的条目数：所在存储分组下载/解压失败、条目会写到目标根之外
-/// （含 symlink 与空目录条目）、条目本身畸形导致写入抛错、symlink 条目缺 Target，
-/// 或索引中出现重复 Path（无法判断哪条权威，两条都不写）。
-/// RestoredDirs = **实际创建成功**的空目录数（越界/失败的不计）。</summary>
+/// <summary>Restore result. SkippedFiles = skipped because the local copy already holds identical content (overwrite only when changed).
+/// FailedFiles = the number of entries that could not be restored: their storage group failed to download/extract, the entry would be written outside the target root
+/// (including symlink and empty-directory entries), the entry itself is malformed so the write throws, a symlink entry is missing its Target,
+/// or the index contains a duplicate Path (no way to tell which one is authoritative, so neither is written).
+/// RestoredDirs = the number of empty directories **actually created successfully** (escaping/failed ones don't count).</summary>
 public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFiles, int RestoredDirs, int FailedFiles);
 
 /// <summary>
-/// 还原编排器（M5、PRD 1.5）：读信息文件+第二级索引，下载 data blob / pack 并 7z 解压，
-/// 写回本地根，恢复权限/mtime 与空文件夹。"覆盖仅当变更时"——本地已是相同 hash 则跳过。
+/// Restore orchestrator (M5, PRD 1.5): reads the info file plus the second-level index, downloads data blobs / packs and extracts them with 7z,
+/// writes them back under the local root, and restores permissions/mtime and empty folders. "Overwrite only when changed" — skip if the local file already has the same hash.
 /// </summary>
 public sealed class RestoreOrchestrator(
     IBlobClientFactory factory,
@@ -61,14 +61,14 @@ public sealed class RestoreOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null)
 {
-    /// <summary>测试注入的毫秒时间源，原样转给内部建的 <see cref="StageTracker"/>（见其上同名字段的注释）。
-    /// 生产为 null，走真实墙钟。用来让"下载结束就摘掉在途标记、解压期间不再算在途"这类
-    /// 时序断言摆脱 200ms 节流窗口——注入后每次查询时间都保证前进，节流因此永不生效，
-    /// 每一次状态变化都会被发布出来，断言不必赌真实时钟是否恰好跨过节流窗口。</summary>
+    /// <summary>Test-injected millisecond time source, handed straight through to the <see cref="StageTracker"/> built internally (see the comment on the field of the same name there).
+    /// Null in production, meaning the real wall clock. It exists so timing assertions like "the in-flight marker is dropped the moment the download ends, extraction no longer counts as in flight"
+    /// can escape the 200ms throttle window — once injected, every time query is guaranteed to move forward, so throttling never kicks in,
+    /// every state change gets published, and the assertion doesn't have to gamble on whether the real clock happened to cross the throttle window.</summary>
     internal Func<long>? Clock { get; init; }
 
-    /// <param name="onProgress">阶段进度（正在还原哪个包、完成多少组、多快）。此前只有 phase 那条
-    /// 自由文本，且它承载的其实是错误流，说不出"还剩多少"。</param>
+    /// <param name="onProgress">Stage progress (which pack is being restored, how many groups are done, how fast). Before this there was only that one free-text
+    /// phase string, and what it actually carried was the error stream — it could never say "how much is left".</param>
     public async Task<RestoreResult> RunAsync(
         RestoreRequest request, CancellationToken ct = default, IProgress<string>? phase = null,
         Action<StageProgress>? onProgress = null)
@@ -115,28 +115,28 @@ public sealed class RestoreOrchestrator(
         Directory.CreateDirectory(request.TargetRoot);
         var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
 
-        // 目标根解析一次，全程复用（与 PathBoundary 同款单例思路：request.TargetRoot 本轮不变，
-        // 没必要让每个条目、每个文件条目两次地重新走一遍 lstat）。per-目标路径的解析仍在
-        // WriteStaysInsideRoot/LinkStaysInsideRoot 里逐条目进行——那一处必须每次都重新算，
-        // 因为它要抓的正是「本轮还原期间新建的链接」。
+        // Resolve the target root once and reuse it throughout (same singleton reasoning as PathBoundary: request.TargetRoot doesn't change during this run,
+        // so there's no point making every entry — and file entries twice over — walk lstat all over again). Per-destination-path resolution still happens
+        // entry by entry inside WriteStaysInsideRoot/LinkStaysInsideRoot — that one has to be recomputed every single time,
+        // because what it is there to catch is precisely "a link created during this very restore".
         var realRoot = PathBoundary.ResolveReal(request.TargetRoot);
 
         var restored = 0;
         var skipped = 0;
         var failed = 0;
 
-        // 逐路径生效条目：默认取本版本；被替代的路径改用指定版本的同路径条目（内容+元数据取该版本）。
+        // The effective entry per path: by default the one from this version; a substituted path uses the same-path entry from the chosen version (content + metadata both from that version).
         var byPath = IndexByPath(index.Entries, phase, out var duplicatePaths);
-        failed += duplicatePaths; // 重复 Path 的索引条目：两条都不写，各算一次失败，不中断整次还原。
-        var resolved = new HashSet<string>(StringComparer.Ordinal); // 真正解析成功的替代路径
+        failed += duplicatePaths; // Index entries with a duplicate Path: neither is written, each such path counts as one failure, and the whole restore is not aborted.
+        var resolved = new HashSet<string>(StringComparer.Ordinal); // the substitution paths that actually resolved
         foreach (var grp in request.Substitutions.GroupBy(kv => kv.Value))
         {
             var sv = info.Versions.FirstOrDefault(x => x.Version == grp.Key);
             if (sv is null)
-                continue; // 替代版本已被保留清理删除 → 该组全部回落跳过
+                continue; // the substitute version was deleted by retention cleanup → the whole group falls back to being skipped
             var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, ct);
-            // 替代来源版本的索引同样来自云端，同样可能有重复 Path；解析不到的替代路径
-            // 走既有的「声明了意图但替代不可得」回落跳过语义（下面的 TryGetValue 找不到）。
+            // The substitute source version's index also comes from the cloud and can equally well contain duplicate Paths; a substitution path that can't be resolved
+            // falls back to the existing "intent declared but the substitute isn't available" skip semantics (the TryGetValue below simply doesn't find it).
             var srcByPath = IndexByPath(srcIndex.Entries, phase, out _);
             foreach (var kv in grp)
                 if (srcByPath.TryGetValue(kv.Key, out var se))
@@ -146,8 +146,8 @@ public sealed class RestoreOrchestrator(
                 }
         }
 
-        // 选择性还原（需求 B）：把生效集限制到用户选中的路径。过滤在分组前生效，
-        // 于是每个 pack 仍只下载一次，但只写选中成员——未选成员根本不进入 fileEntries，不会 over-restore。
+        // Selective restore (requirement B): narrow the effective set down to the paths the user selected. The filter takes effect before grouping,
+        // so each pack is still downloaded only once but only the selected members get written — unselected members never enter fileEntries at all, so no over-restore.
         HashSet<string>? selected = request.SelectedPaths is null
             ? null
             : new HashSet<string>(request.SelectedPaths, StringComparer.Ordinal);
@@ -155,18 +155,18 @@ public sealed class RestoreOrchestrator(
             foreach (var key in byPath.Keys.Where(k => !selected.Contains(k)).ToList())
                 byPath.Remove(key);
 
-        // 不可恢复且未「解析成功」替代 → 跳过（声明了意图但替代不可得的也回落跳过，不报错）。
-        // 选择性还原时只计入选中的不可恢复路径。
+        // Unrecoverable with no substitute that "resolved successfully" → skip (declaring the intent but not having the substitute available also falls back to skipping, not erroring).
+        // Under selective restore, only the selected unrecoverable paths are counted.
         var unresolved = index.UnrecoverablePaths
             .Where(p => !resolved.Contains(p) && (selected is null || selected.Contains(p)))
             .ToHashSet(StringComparer.Ordinal);
         skipped += unresolved.Count;
 
-        // 空文件夹（还原需重建）——选择性还原只针对选中文件，不重建整棵空目录树。
-        // 同样来自云端索引：目录名含 .. 时会创到目标根之外，越界的目录条目跳过、不创建。
-        // 判定作用在**解析后的真实路径**上：CreateDirectory 会跟随路径中间段的软链，
-        // 前一次还原（或用户自己）在根内留下的一条指向根外的链接足以让「看起来在根内」
-        // 的目录落到根外。
+        // Empty folders (restore has to recreate them) — selective restore only targets the selected files, it does not rebuild the entire empty-directory tree.
+        // These come from the cloud index as well: a directory name containing .. would be created outside the target root, so escaping directory entries are skipped, not created.
+        // The check operates on the **resolved real path**: CreateDirectory follows symlinks in the intermediate path segments,
+        // and a single link left inside the root by a previous restore (or by the user) that points outside is enough to make a directory that "looks like it is inside the root"
+        // land outside it.
         var restoredDirs = 0;
         if (selected is null)
             foreach (var dir in index.EmptyDirs)
@@ -174,14 +174,14 @@ public sealed class RestoreOrchestrator(
                 var dest = Path.Combine(request.TargetRoot, ToLocal(dir));
                 if (!WriteStaysInsideRoot(realRoot, dest))
                 {
-                    // 与 symlink 路径同一原则（C3）：安全检查触发必须可见，且必须计入失败——
-                    // 只走 phase 上报会让一份只含越界 EmptyDirs 的恶意索引把 FailedFiles 冻在 0。
+                    // Same principle as the symlink path (C3): a security check that fires must be visible, and must count as a failure —
+                    // reporting only through phase would let a malicious index containing nothing but escaping EmptyDirs freeze FailedFiles at 0.
                     phase?.Report($"Skipped unsafe directory entry (escapes the target root): {dir}");
                     failed++;
                     continue;
                 }
 
-                // 畸形目录条目（中间段是文件等）只失败它自己，不中断整次还原。
+                // A malformed directory entry (an intermediate segment is a file, and so on) fails only itself and does not abort the whole restore.
                 try
                 {
                     Directory.CreateDirectory(dest);
@@ -198,7 +198,7 @@ public sealed class RestoreOrchestrator(
                 }
             }
 
-        // symlink 与文件分开处理
+        // symlinks and files are handled separately
         var fileEntries = new List<IndexEntry>();
         foreach (var e in byPath.Values)
         {
@@ -206,8 +206,8 @@ public sealed class RestoreOrchestrator(
                 continue;
             if (e.Kind == "symlink")
             {
-                // 畸形条目（如 Path 为 "" / "."）会让 CreateSymbolicLink 抛错；
-                // 这里逐条兜住，否则一条脏条目会中断整次还原。
+                // A malformed entry (e.g. Path is "" or ".") makes CreateSymbolicLink throw;
+                // catch it per entry here, otherwise one dirty entry aborts the whole restore.
                 SymlinkOutcome outcome;
                 try
                 {
@@ -233,14 +233,14 @@ public sealed class RestoreOrchestrator(
                         skipped++;
                         break;
                     case SymlinkOutcome.Malformed:
-                        // entry.Target 缺失：与「未变」不是一回事——未变是无事发生，
-                        // 这条是没能还原，必须让用户看得见、算进失败，而不是套上
-                        // 「已是最新」的名义悄悄计成 Skipped（M3）。
+                        // entry.Target is missing: not the same thing as "unchanged" — unchanged means nothing happened,
+                        // whereas this one failed to restore, so the user has to be able to see it and it has to count as a failure, rather than being
+                        // quietly counted as Skipped under the guise of "already up to date" (M3).
                         phase?.Report($"Skipped malformed symlink entry (missing target): {e.Path}");
                         failed++;
                         break;
                     default:
-                        // 安全检查触发必须可见：与「未变」同样静默会让用户完全看不到被拦下的条目。
+                        // A security check that fires must be visible: being as silent as "unchanged" would leave the user completely unaware of the entry that got blocked.
                         phase?.Report(UnsafeRestorePathException.MessageFor(e.Path));
                         failed++;
                         break;
@@ -252,10 +252,10 @@ public sealed class RestoreOrchestrator(
             }
         }
 
-        // 0 字节文件没有存储引用可分组——备份侧压根不给它产生（见 BackupOrchestrator.IsEmptyFile），
-        // 因为它没有任何内容需要存。它的全部信息就是"长度为零"，这里据此直接把文件建出来。
-        // 放在分组之前：下面那句 Where(e => e.Storage is not null) 会把它们滤掉，漏掉这一段的话
-        // 还原出来的树就会**静默地少几个文件**，而所有按内容比对的校验都会照常通过。
+        // A 0-byte file has no storage reference to group by — the backup side never produces one for it (see BackupOrchestrator.IsEmptyFile),
+        // because it has no content that needs storing. Its entire information content is "length is zero", so the file is created directly from that here.
+        // This goes before the grouping: the Where(e => e.Storage is not null) below filters them out, and without this block
+        // the restored tree would be **silently missing a few files**, while every content-comparison check would still pass.
         foreach (var e in fileEntries.Where(IsEmptyFileEntry))
         {
             switch (await TryCreateEmptyFileAsync(request, realRoot, e, phase, ct))
@@ -266,22 +266,22 @@ public sealed class RestoreOrchestrator(
             }
         }
 
-        // 按存储分组：同一 pack 只下载/解压一次。各组并发下载（PRD 3.4），每组独立临时子目录避免冲突。
+        // Group by storage: the same pack is downloaded/extracted only once. Groups download concurrently (PRD 3.4), each with its own temp subdirectory to avoid collisions.
         var work = NewTempDir();
-        var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // 活化过的 blob 基名，完成后重新归档
+        var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // base names of the blobs that were rehydrated; re-archived once we're done
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
         {
             var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
-            // 总数只有在分完组之后才知道（同一个 pack 只下一次），所以 tracker 在这里才建得起来。
+            // The total is only known once grouping is done (the same pack is downloaded once), which is why the tracker can't be built any earlier.
             var tracker = onProgress is null
                 ? null
                 : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
 
-            // 申报两笔工作量：要写出多少源字节（解压后），以及要拉多少网线字节（压缩后）。
-            // 光按组数报进度是失真的——一组可能是一个 100 GB 的单文件，也可能是一箱几百个小文件。
-            // 下载总量**必须整组都问得出才报**：老索引缺卷尺寸时给一个偏小的分母，
-            // 百分比会一路虚高然后卡在 100% 上不动，比不显示更糟。
+            // Declare two units of work: how many source bytes will be written out (after extraction), and how many bytes will come over the wire (compressed).
+            // Reporting progress by group count alone is distorted — one group can be a single 100 GB file, or a box of several hundred small ones.
+            // The download total **must only be reported if every single group can answer it**: handing out an undersized denominator when an old index lacks volume sizes
+            // makes the percentage run high the whole way and then sit stuck at 100%, which is worse than showing nothing.
             var groupWork = groups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
             var downloadSizes = groups.ToDictionary(
                 g => g.Key, g => TransferLabel.DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
@@ -305,13 +305,13 @@ public sealed class RestoreOrchestrator(
                 }
                 finally
                 {
-                    // 计数与在途分开：一个组恰好占一个槽位。工作量同理一次销清——失败的组也要销，
-                    // 否则剩余量永远归不了零，剩余时间就一直挂着。
+                    // Counting and in-flight are separate concerns: a group occupies exactly one slot. Work units are likewise retired in one go — failed groups have to retire too,
+                    // otherwise the remaining amount never reaches zero and the ETA hangs there forever.
                     tracker?.Advance(0, groupWork[g.Key]);
                 }
             });
             var counts = await Task.WhenAll(tasks);
-            tracker?.Complete(); // 不强制产出终态，最后一组的字节会被节流压住再也发不出去
+            tracker?.Complete(); // without forcing a terminal state, the last group's bytes get squashed by the throttle and never go out
             restored += counts.Sum(c => c.Restored);
             skipped += counts.Sum(c => c.Skipped);
             failed += counts.Sum(c => c.Failed);
@@ -321,7 +321,7 @@ public sealed class RestoreOrchestrator(
             TryDelete(work);
         }
 
-        // 还原完成后把活化过的 blob 重新归档回 Archive（保持备份原 tier；best effort）。
+        // After the restore, put the rehydrated blobs back into Archive (keeping the backup's original tier; best effort).
         if (request.ReArchiveAfterRestore && !rehydrated.IsEmpty)
         {
             phase?.Report($"Re-archiving {rehydrated.Distinct().Count()} object(s)…");
@@ -342,11 +342,11 @@ public sealed class RestoreOrchestrator(
         var needed = new List<IndexEntry>();
         foreach (var e in group)
         {
-            // 边界判定必须在 NeedsRestoreAsync **之前**：后者会对目标做 File.Exists 与全量
-            // hash，越界条目等于让调用方拿一条索引记录去探测目标根之外任意路径的存在性与
-            // 内容（结果通过 RestoredFiles/SkippedFiles 计数可见）。更糟的是根外若已有同内容
-            // 文件，它会返回 false 而被计成「跳过」，于是根本走不到写入处的检查，
-            // 既不计入失败也不上报——一次被拦下的越界变成了完全不可见的无事发生。
+            // The boundary check has to come **before** NeedsRestoreAsync: the latter does a File.Exists and a full
+            // hash on the destination, so an escaping entry amounts to letting the caller use a single index record to probe the existence and
+            // content of any path outside the target root (the answer is visible through the RestoredFiles/SkippedFiles counters). Worse still, if a file with
+            // identical content already exists outside the root, it returns false and gets counted as "skipped", so we never reach the check at the write site:
+            // neither counted as a failure nor reported — a blocked escape turns into a completely invisible non-event.
             var dest = Path.Combine(request.TargetRoot, ToLocal(e.Path));
             if (!WriteStaysInsideRoot(realRoot, dest))
             {
@@ -366,23 +366,23 @@ public sealed class RestoreOrchestrator(
         var storage = group[0].Storage!;
         var blobName = storage.Kind == "pack" ? $"packs/{storage.Ref}.7z" : storage.Ref;
 
-        // 每组独立临时目录（并发安全）。
+        // A separate temp directory per group (concurrency-safe).
         var groupDir = Path.Combine(work, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(groupDir);
         var restored = 0;
         await gate.WaitAsync(ct);
-        // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
-        // await，若在那之前标记，几千个包会一股脑全算"正在还原"——既与事实不符
-        // （同时只跑 DownloadConcurrency 个），每次快照还要复制一份几千项的数组。
-        // 名字用**源文件路径**（pack 用包号+成员数），不是内容寻址的 blob 名——与上传侧同一形状。
-        // 用 needed 而不是 group：跳过的那些（本地已是相同内容）本来就不在这次传输里。
+        // The in-flight marker must only be set **after** acquiring the gate: every group's delegate is enumerated and run up to its first real
+        // await right at the start, and marking before that would make thousands of packs all count as "restoring" at once — which is both untrue
+        // (only DownloadConcurrency of them actually run at a time) and means copying a thousands-of-items array on every snapshot.
+        // The name uses the **source file path** (for packs, the pack number + member count), not the content-addressed blob name — the same shape as on the upload side.
+        // Use needed rather than group: the skipped ones (local copy already identical) were never part of this transfer to begin with.
         tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
         try
         {
-            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
-            // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
-            // （上限是前一卷的大小），不是虚高。
-            // tracker 为 null（没人接进度）时整个表达式退化为 null，DownloadAsync 不挂回调。
+            // A factory rather than a single IProgress<long>: see the comment on VolumeBlobIO.DownloadAsync —
+            // sharing one instance across volumes gets the baseline of a large volume's first report wrong whenever "a small volume is followed by a large one", under-counting a chunk of that whole volume
+            // (bounded by the previous volume's size) rather than over-counting.
+            // When tracker is null (nobody is listening for progress) the whole expression degenerates to null and DownloadAsync attaches no callback.
             Func<IProgress<long>>? itemProgress = tracker is null ? null : () => tracker.ItemProgress(blobName);
 
             string firstVolume;
@@ -394,58 +394,58 @@ public sealed class RestoreOrchestrator(
                 }
                 catch (RequestFailedException ex) when (ex.ErrorCode == "BlobArchived" || ex.Status == 409)
                 {
-                    // Archive 未活化：发起活化并轮询到就绪，这一等按 EnsureOnlineAsync 自己的注释
-                    // 是"几小时级"。在途标记的窗口现在是测速时钟的分母——「网线上有几条流」，
-                    // 活化排队和轮询期间网线上什么都没有，标记不摘的话虚拟时钟会照样走上几个
-                    // 小时，心跳把速度硬拖到 0，界面报"卡住"，而备份其实在正确地等 Azure。
-                    // 摘掉的只是测速窗口的标记，不是进度信号本身：EnsureOnlineAsync 自己会在
-                    // 每次轮询时把 "Waiting for rehydration of {baseRef} — N volume(s) still
-                    // archived…" 报到 phase 上，操作员看得到组的动向，不会以为它消失了。
-                    // 已知的粗糙之处：phase 的顶行（RestoreRunner 里的 state.Phase）是所有并发组
-                    // 共用的一个槽，多组同跑时这条消息会被别的组顶掉，只在 state.Events 里留底；
-                    // 但轮询每 RehydratePollSeconds 重报一次，它自己会再回来。这是既有的进度模型，
-                    // 不是这里引入的。
+                    // Archive, not yet rehydrated: start rehydration and poll until it's ready — a wait that, by EnsureOnlineAsync's own comment,
+                    // is "on the order of hours". The in-flight marker's window is now the denominator of the speed clock — "how many streams are on the wire" —
+                    // and during rehydration queuing and polling there is nothing on the wire at all; leaving the marker set would let the virtual clock keep running for
+                    // hours, the heartbeat would drag the speed down to 0, the UI would report "stuck", while the backup is in fact correctly waiting on Azure.
+                    // What gets dropped is only the speed-window marker, not the progress signal itself: EnsureOnlineAsync reports
+                    // "Waiting for rehydration of {baseRef} — N volume(s) still
+                    // archived…" to phase on every poll, so the operator can see the group is moving and won't think it vanished.
+                    // Known rough edge: the top line of phase (state.Phase in RestoreRunner) is a single slot shared by every concurrent
+                    // group, so with several groups running this message gets bumped by another group and only survives in state.Events;
+                    // but polling re-reports it every RehydratePollSeconds, so it comes back on its own. That's the existing progress model,
+                    // not something introduced here.
                     tracker?.EndItem(blobName, 0);
                     await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
                     rehydrated.Add(blobName);
-                    // 活化完成、真正要下载了才重新打开窗口——与最初 BeginItem 同一节奏。
+                    // Only reopen the window once rehydration is done and we're actually about to download — the same rhythm as the original BeginItem.
                     tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
                     firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
                 }
             }
             finally
             {
-                // 下载一结束（成功，或两次都失败向上抛）就把在途标记摘掉：字节已经在下载过程中
-                // 边传边计过了，测速窗口不该被随后不占网线的解压/写盘时间继续拖长。
-                // 走到这里时标记可能已经被上面 catch 块摘过一次（活化路径先摘再重打）——
-                // EndItem 对不在集合里的项是安全的空操作（ConcurrentDictionary.TryRemove 返回
-                // false，后面 _bytes += 0 与 PublishIfDue 照跑，不影响任何计数），这里不需要
-                // 区分是否已经摘过，反正传的是 0 字节，摘第二次没有副作用。
-                // 下面外层 finally 里那句兜底 EndItem(blobName, 0) 因此在正常路径下不会二次生效——
-                // EndItem 本身**不是**幂等的（_bytes += bytes 和 PublishIfDue 都在 TryRemove 之外
-                // 无条件跑），兜底调用能安全重复，只是因为它传的是 0 字节；真传了非零字节的第二次
-                // 调用会悄悄把这批字节多计一遍。
+                // Drop the in-flight marker the moment the download ends (either successfully, or with both attempts failing and rethrowing): the bytes were
+                // counted as they streamed, and the speed window shouldn't keep being stretched by the extraction/disk-write time that follows and uses no network.
+                // By the time we get here the marker may already have been dropped once by the catch block above (the rehydration path drops it then re-sets it) —
+                // EndItem is a safe no-op for an item that isn't in the set (ConcurrentDictionary.TryRemove returns
+                // false, and the subsequent _bytes += 0 and PublishIfDue still run without affecting any counter), so there's no need
+                // to distinguish whether it was already dropped: we pass 0 bytes, so dropping it a second time has no side effect.
+                // That is also why the fallback EndItem(blobName, 0) in the outer finally below has no second effect on the normal path —
+                // EndItem itself is **not** idempotent (_bytes += bytes and PublishIfDue both run unconditionally, outside TryRemove);
+                // the fallback call is only safe to repeat because the byte count it passes is 0. A second call that really did pass nonzero bytes
+                // would quietly count that batch twice.
                 tracker?.EndItem(blobName, 0);
             }
 
-            // 下载已经摘出在途窗口，但解压/算 hash/写盘这段本地 CPU 工作不能就此从界面上消失——
-            // 没有它，一个大 pack 解压的几十秒里 ActiveItems 空、preparing/queued 也都是 0，
-            // 界面冻在下载刚结束那一刻的快照上，跟卡死一模一样（b6db78a 已经为压缩段修过同一个
-            // 问题，这里是它在还原/校验侧的对称件）。BeginPacking/EndPacking 不影响测速分母
-            // （那个窗口只认 BeginItem/EndItem），单纯是"正在准备"这个信号的载体。
+            // The download has left the in-flight window, but the local CPU work of extracting/hashing/writing to disk must not disappear from the UI along with it —
+            // without this, for the tens of seconds a large pack takes to extract, ActiveItems is empty and preparing/queued are both 0,
+            // so the UI freezes on the snapshot from the instant the download ended, indistinguishable from a hang (b6db78a already fixed the same
+            // problem for the compression stage; this is its counterpart on the restore/check side). BeginPacking/EndPacking do not affect the speed denominator
+            // (that window only recognizes BeginItem/EndItem), they are purely the carrier for the "preparing" signal.
             try
             {
-                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
-                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
-                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
-                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                // BeginPacking moved inside the try: it now calls publish(...) under _gate, and on the non-heartbeat path an exception thrown by
+                // publish is deliberately allowed to propagate (see the notes on BeginPacking in StageProgress.cs).
+                // Left outside the try, a throw here would mean _inPacking was incremented with no matching EndPacking,
+                // and preparing would sit at an inflated number for the rest of the run; moving it inside gives it the finally below as a backstop.
                 tracker?.BeginPacking();
                 if (storage.Kind == "blob")
                 {
-                    // 单文件 blob：内容就是一个文件（raw=原始字节；否则 7z 里唯一条目）。
-                    // 内容寻址去重时同一 blob 可被多个路径引用 → 第一条写好之后，其余从它复制。
-                    // 非 raw 的那条直接从归档流到目标：先解压到临时目录再复制，等于把同样的字节
-                    // 写两遍盘（一个 20 GB 的 blob 就是 40 GB 的写入 + 20 GB 的临时空间）。
+                    // Single-file blob: the content is exactly one file (raw = the original bytes; otherwise the sole entry inside the 7z).
+                    // With content-addressed dedup the same blob can be referenced by several paths → once the first one is written, the rest are copied from it.
+                    // The non-raw case streams straight from the archive to the destination: extracting to a temp directory and then copying would write the same bytes
+                    // to disk twice (a 20 GB blob means 40 GB of writes + 20 GB of temp space).
                     string? content = storage.Raw ? firstVolume : null;
                     foreach (var e in needed)
                     {
@@ -457,7 +457,7 @@ public sealed class RestoreOrchestrator(
                                 failedEntries++;
                                 continue;
                             }
-                            // 后续引用从这一份复制。它在目标根内、内容已按长度和 hash 核对过。
+                            // Later references copy from this one. It lives inside the target root and its content has already been checked against the length and hash.
                             content = streamed;
                             restored++;
                         }
@@ -469,19 +469,19 @@ public sealed class RestoreOrchestrator(
                 }
                 else
                 {
-                    // pack：解压后按各成员的归档条目名复制。
+                    // pack: after extraction, copy by each member's archive entry name.
                     var extractDir = Path.Combine(groupDir, "x");
                     await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
                     foreach (var e in needed)
                     {
-                        // 归档里的成员名是 EntryName，**不是**条目自己的 Path。两者从前恒等
-                        // （RecordPack 拿 f.Path 填 EntryName），所以按 Path 取一直是对的；
-                        // 打包成员开始跨版本去重之后就不再恒等了——同一份内容被另一个路径引用时，
-                        // 归档里只有最初那个成员名。按 Path 取会在解压目录里找不到文件，
-                        // 于是这一条被记成失败、内容悄悄地没还原出来。
-                        // 检查器那边（BackupChecker）一直用的就是 EntryName ?? Path，这里补齐；
-                        // 对已有备份逐字节等价，因为那些条目的 EntryName 就等于 Path。
+                        // The member name inside the archive is EntryName, **not** the entry's own Path. The two used to be identical
+                        // (RecordPack filled EntryName from f.Path), so looking up by Path was always correct;
+                        // once pack members started being deduped across versions they stopped being identical — when the same content is referenced by another path,
+                        // the archive only holds the original member name. Looking up by Path then finds no file in the extraction directory,
+                        // so that entry gets recorded as a failure and the content quietly never gets restored.
+                        // The checker side (BackupChecker) has been using EntryName ?? Path all along; this brings it in line.
+                        // Byte-for-byte equivalent for existing backups, because for those entries EntryName equals Path.
                         var source = Path.Combine(extractDir, ToLocal(e.Storage?.EntryName ?? e.Path));
                         if (TryWriteRestoredFile(request, realRoot, e, source, phase))
                             restored++;
@@ -497,16 +497,16 @@ public sealed class RestoreOrchestrator(
         }
         finally
         {
-            // 兜底摘除：正常路径下载结束时已经在上面的 finally 里摘过一次（真正的字节也已经
-            // 边传边计完）。这里传 0 字节纯粹是防御——万一 BeginItem 之后、进下载 try 之前
-            // 抛出异常，在途集合不能漏摘。EndItem 本身不是幂等的（见上面那处同样的说明），
-            // 这句在正常路径下之所以不会二次生效、不会重复计数，纯粹是因为它传的字节数是 0。
+            // Fallback removal: on the normal path the marker was already dropped once in the finally above (and the real bytes were
+            // counted as they streamed). Passing 0 bytes here is purely defensive — if an exception is thrown after BeginItem but before
+            // entering the download try, the in-flight set must not be left holding the item. EndItem itself is not idempotent (see the same note above),
+            // and the only reason this line has no second effect and double-counts nothing on the normal path is that the byte count it passes is 0.
             //
-            // 放闸门与删临时目录要各自躲在 EndItem 后面的 finally 里：EndItem 会调到调用方给的
-            // publish（写库、推 SSE 之类的外部代码），它可以抛，而这条路上的异常是**故意**往外传的。
-            // 三句排排站的写法下，第一句一抛就把后两句整个跳过——额度一去不回，下一个组永远等在
-            // 闸门上，整个还原再也回不来。同一形状见 VolumeUploadScope.RunAsync 与
-            // BackupChecker.VerifyGroupAsync（那一处由 A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check 钉住）。
+            // Releasing the gate and deleting the temp directory each have to hide behind their own finally after EndItem: EndItem calls into the caller's
+            // publish (external code that writes to the database, pushes SSE and the like), which can throw, and exceptions on this path are **deliberately** propagated.
+            // Written as three statements in a row, a throw from the first skips the other two entirely — the permit is gone for good, the next group waits on
+            // the gate forever, and the whole restore never comes back. The same shape appears in VolumeUploadScope.RunAsync and
+            // BackupChecker.VerifyGroupAsync (which is pinned down by A_Broken_Progress_Sink_Does_Not_Wedge_The_Content_Check).
             try
             {
                 tracker?.EndItem(blobName, 0);
@@ -520,17 +520,17 @@ public sealed class RestoreOrchestrator(
         return (restored, skipped, failedEntries);
     }
 
-    /// <summary>零长度的普通文件条目：没有存储引用，因此不属于任何下载分组，得单独建出来。
-    /// 只认 <c>Kind == "file"</c>，symlink 的内容是 Target 字段、另有分支。
-    /// <para>刻意**不**兜住 <c>Length &gt; 0</c> 却没有存储引用的条目：那是畸形/损坏的索引，
-    /// 拿一个空文件冒充它等于用静默的数据损坏换掉一次显式的失败。</para></summary>
+    /// <summary>A zero-length regular file entry: it has no storage reference, so it belongs to no download group and has to be created on its own.
+    /// Only <c>Kind == "file"</c> counts; a symlink's content is the Target field and it has its own branch.
+    /// <para>Deliberately does **not** catch entries with <c>Length &gt; 0</c> but no storage reference: that is a malformed/corrupt index,
+    /// and passing an empty file off as it would trade an explicit failure for silent data corruption.</para></summary>
     private static bool IsEmptyFileEntry(IndexEntry e) => e.Storage is null && e.Kind == "file" && e.Length == 0;
 
     private enum EmptyFileOutcome { Created, Unchanged, Failed }
 
     /// <summary>
-    /// 建一个空文件。走的是与有内容条目**完全相同**的边界检查、冲突模式与元数据恢复——
-    /// 空文件也是文件，少一道检查就是少一道；尤其越界判定必须在任何写动作之前。
+    /// Creates an empty file. It goes through **exactly the same** boundary check, conflict mode and metadata restoration as an entry with content —
+    /// an empty file is still a file, and one check fewer is one check fewer; the escape check in particular has to come before any write action.
     /// </summary>
     private async Task<EmptyFileOutcome> TryCreateEmptyFileAsync(
         RestoreRequest request, string? realRoot, IndexEntry entry, IProgress<string>? phase, CancellationToken ct)
@@ -550,8 +550,8 @@ public sealed class RestoreOrchestrator(
             Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
             if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
                 RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
-            // 没有内容可写，也就没有"中途失败留下半截并覆盖掉用户原文件"的风险——
-            // 不必像有内容的条目那样先落 .asb-part 再顶上去。
+            // There is no content to write, hence no risk of "a mid-way failure leaving a truncated file that has already overwritten the user's original" —
+            // no need to land a .asb-part first and swap it in the way entries with content do.
             File.Create(dest).Dispose();
             ApplyMetadata(dest, entry);
             return EmptyFileOutcome.Created;
@@ -562,24 +562,24 @@ public sealed class RestoreOrchestrator(
         }
         catch (Exception ex)
         {
-            // 与其它条目同样的容错语义：把失败圈在这一条上，不让一条脏条目中断整次还原。
+            // The same fault-tolerance semantics as every other entry: keep the failure confined to this one entry, don't let one dirty entry abort the whole restore.
             phase?.Report($"Failed to restore '{entry.Path}': {ex.Message}");
             return EmptyFileOutcome.Failed;
         }
     }
 
-    /// <summary><paramref name="dest"/> 必须是**已通过边界检查**的目标路径（见 RestoreGroupAsync）：
-    /// 本方法会对它做 File.Exists 和全量 hash，绝不能作用在目标根之外的路径上。</summary>
+    /// <summary><paramref name="dest"/> must be a destination path that has **already passed the boundary check** (see RestoreGroupAsync):
+    /// this method does a File.Exists and a full hash on it, and must never operate on a path outside the target root.</summary>
     private async Task<bool> NeedsRestoreAsync(string dest, IndexEntry entry, RestoreConflictMode conflict, CancellationToken ct)
     {
         if (!File.Exists(dest))
             return true;
 
-        // Skip：目标存在即跳过（无论内容异同）。
+        // Skip: skip as soon as the target exists (whether or not the content differs).
         if (conflict == RestoreConflictMode.Skip)
             return false;
 
-        // OverwriteIfChanged / RenameKeep：本地已是相同内容则跳过；FullHash 缺失无从比较则视为需还原。
+        // OverwriteIfChanged / RenameKeep: skip if the local content is already identical; if FullHash is missing there is nothing to compare against, so treat it as needing restore.
         if (entry.FullHash is null)
             return true;
         try
@@ -588,18 +588,18 @@ public sealed class RestoreOrchestrator(
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // 目标位置那个文件读不开，就无从判断它是否已经是要还原的内容——保守地当作「需要还原」。
-            // 真去写它若同样失败，TryWriteRestoredFile 的逐文件兜底会记一条并继续；
-            // 而在这里抛出会被**整组**的 catch 接住，让同一个包里其它文件也一并还原不了——
-            // 一个文件的权限问题不该有那么大的爆炸半径。
+            // If the file at the destination can't be opened, there is no way to tell whether it already holds the content to be restored — conservatively treat it as "needs restore".
+            // If actually writing it fails too, TryWriteRestoredFile's per-file backstop records one failure and carries on;
+            // whereas throwing here would be caught by the **whole group's** catch, taking every other file in the same pack down with it —
+            // one file's permission problem should not have a blast radius that large.
             return true;
         }
     }
 
     /// <summary>
-    /// 写一个条目，把失败圈在这一条上：越界、以及畸形条目（如 Path 为 ""/"." 使目标就是一个目录，
-    /// File.Copy 会抛 UnauthorizedAccess/IOException）都只让本条目失败并上报，
-    /// 绝不冒泡到分组处理器——那会把整组合法条目一起判失败。返回是否写入成功。
+    /// Writes one entry, keeping the failure confined to that entry: an escape, or a malformed entry (e.g. Path is ""/"." so the destination is a directory and
+    /// File.Copy throws UnauthorizedAccess/IOException), only fails this one entry and gets reported.
+    /// It must never bubble up to the group handler — that would fail the group's entire set of legitimate entries. Returns whether the write succeeded.
     /// </summary>
     private static bool TryWriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile, IProgress<string>? phase)
     {
@@ -625,27 +625,27 @@ public sealed class RestoreOrchestrator(
     }
 
     /// <summary>
-    /// 把单文件 blob 从归档直接流到目标，不经过临时解压目录。成功返回写好的目标路径，失败返回 null
-    /// （错误已上报，只圈在这一条上，与 <see cref="TryWriteRestoredFile"/> 同样的容错语义）。
+    /// Streams a single-file blob straight from the archive to the destination, bypassing the temporary extraction directory. Returns the destination path written on success, null on failure
+    /// (the error has been reported and is confined to this one entry, the same fault-tolerance semantics as <see cref="TryWriteRestoredFile"/>).
     /// </summary>
     private async Task<string?> TryStreamRestoredFileAsync(
         RestoreRequest request, string? realRoot, IndexEntry entry, string firstVolume,
         IProgress<string>? phase, CancellationToken ct)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
-        // 越界判定必须在**任何**写动作之前：临时件也是写，也会跟随链接落到根外。
+        // The escape check has to come before **any** write action: the temp file is a write too, and it will follow links out of the root just the same.
         if (!WriteStaysInsideRoot(realRoot, dest))
         {
             phase?.Report(UnsafeRestorePathException.MessageFor(entry.Path));
             return null;
         }
 
-        // 先写同目录的临时件、核对无误再顶上去：直接往 dest 写的话，一次中途失败
-        // （网络断、归档坏、取消）留下的就是一个半截的、覆盖掉用户原文件的东西。
+        // Write a temp file in the same directory first, verify it, then swap it in: writing straight to dest means one mid-way failure
+        // (network drop, corrupt archive, cancellation) leaves behind something truncated that has already overwritten the user's original file.
         var part = dest + ".asb-part";
-        // 临时件同样要过边界判定：索引（可能来自 /import 的任意容器）里放一条
-        // `<某文件>.asb-part -> /etc/cron.d/x` 的 symlink 条目，软链先于文件条目还原，
-        // 之后 FileStream 会跟随它把归档内容写到根外——只查 dest 挡不住这一条。
+        // The temp file has to pass the boundary check as well: put a symlink entry
+        // `<somefile>.asb-part -> /etc/cron.d/x` into the index (which may come from any container via /import); symlinks are restored before file entries,
+        // and FileStream will then follow it and write the archive content outside the root — checking dest alone does not stop this one.
         if (!WriteStaysInsideRoot(realRoot, part))
         {
             phase?.Report(UnsafeRestorePathException.MessageFor(entry.Path));
@@ -660,13 +660,13 @@ public sealed class RestoreOrchestrator(
             await using (var file = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None))
             await using (var sink = new HashingStream(hasher, file))
             {
-                // 不带成员名：去重之后归档里的条目名来自**最先上传这份内容**的那个路径，
-                // 未必等于当前索引条目的 Path；单文件归档只有一个成员，整个输出就是它的内容。
+                // No member name: after dedup the entry name inside the archive comes from the path that **uploaded this content first**,
+                // which isn't necessarily the current index entry's Path; a single-file archive has only one member, so the entire output is its content.
                 written = await compressor.ExtractToStreamAsync(firstVolume, entryName: null, request.Password, sink, ct);
             }
 
-            // `7z x -so` 取不到成员时输出为空却**退出码 0**，所以退出码不能作为通过依据——
-            // 长度和 hash 才是。归档里若不止一个条目，内容会首尾相接，长度这一关同样拦得住。
+            // When `7z x -so` can't find the member it produces empty output but **exit code 0**, so the exit code can't be the basis for passing —
+            // the length and the hash are. If the archive holds more than one entry the contents get concatenated, and the length gate stops that too.
             if (written != entry.Length)
             {
                 throw new IOException(
@@ -699,17 +699,17 @@ public sealed class RestoreOrchestrator(
         try { File.Delete(path); } catch { /* best effort */ }
     }
 
-    /// <summary>把还原内容写到目标路径。RenameKeep 且目标已存在（能进到这一步即内容不同或无法比较）→
-    /// 先把现有本地文件改名为 {name}.bak-{ts} 保留旧内容，再写还原内容到原名（旧内容永不丢失）。</summary>
+    /// <summary>Writes the restored content to the destination path. RenameKeep with the target already present (getting this far means the content differs or can't be compared) →
+    /// rename the existing local file to {name}.bak-{ts} to preserve the old content, then write the restored content under the original name (the old content is never lost).</summary>
     private static void WriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
 
-        // 索引来自云端（可能是 /import 导入的任意容器）：条目路径含 .. 时会写到目标根之外。
-        // 判定作用在**解析后的真实路径**上——纯词法判定挡不住「先建链接再穿过它写」：
-        // 索引里一条 symlink 条目（先于文件条目还原）指向根外，之后 <root>/link/x 词法上
-        // 完全在根内，File.Copy 却会跟随链接落到根外。
-        // 跳过该条目而不是中断整次还原——与既有的逐组容错语义一致。
+        // The index comes from the cloud (possibly any container imported via /import): an entry path containing .. would be written outside the target root.
+        // The check operates on the **resolved real path** — a purely lexical check can't stop "create the link first, then write through it":
+        // a symlink entry in the index (restored before file entries) points outside the root, after which <root>/link/x is lexically
+        // entirely inside the root, yet File.Copy follows the link and lands outside it.
+        // Skip that entry rather than aborting the whole restore — consistent with the existing per-group fault-tolerance semantics.
         if (!WriteStaysInsideRoot(realRoot, dest))
             throw new UnsafeRestorePathException(entry.Path);
 
@@ -720,10 +720,10 @@ public sealed class RestoreOrchestrator(
         ApplyMetadata(dest, entry);
     }
 
-    /// <summary>symlink 条目的还原结果。三者互不相同，不能互相顶替：
-    /// 「未变」是无事发生；「越界」是安全检查被触发，用户必须看得见；
-    /// 「畸形」（M3）是条目本身缺 Target，没能还原，同样必须可见——不能套上
-    /// 「未变」的名义悄悄计成 Skipped（那意味着链接已经是对的，畸形条目并非如此）。</summary>
+    /// <summary>The outcome of restoring a symlink entry. All three differ and none can stand in for another:
+    /// "unchanged" means nothing happened; "unsafe" means a security check fired and the user has to be able to see it;
+    /// "malformed" (M3) means the entry itself is missing its Target and failed to restore, which has to be equally visible — it must not be
+    /// quietly counted as Skipped under the guise of "unchanged" (that would imply the link is already correct, which is not true of a malformed entry).</summary>
     private enum SymlinkOutcome
     {
         Created,
@@ -739,47 +739,47 @@ public sealed class RestoreOrchestrator(
 
         var dest = Path.Combine(targetRoot, ToLocal(entry.Path));
 
-        // 同 WriteRestoredFile：索引条目路径含 .. 或穿过一条指向根外的链接时，
-        // 链接会被建到目标根之外，拦下。
-        // 注意这里用的是「只解析父目录」的版本：entry.Target 指向根外是**合法**的
-        // （备份如实记录了原本的绝对软链，还原它是对的），被禁止的只是「穿过链接写」。
+        // Same as WriteRestoredFile: when the index entry's path contains .. or passes through a link pointing outside the root,
+        // the link would be created outside the target root, so block it.
+        // Note this uses the "resolve the parent directory only" variant: entry.Target pointing outside the root is **legitimate**
+        // (the backup faithfully recorded an original absolute symlink, and restoring it is correct); what is forbidden is only "writing through a link".
         if (!LinkStaysInsideRoot(realRoot, dest))
             return SymlinkOutcome.Unsafe;
 
-        // 用 LinkTarget（底层 lstat）判「未变」，不用 FileInfo.Exists：后者对**指向目录的**
-        // 软链恒为 false，于是这类链接永远判不出「未变」，第二次还原必然走到
-        // CreateSymbolicLink 并因已存在抛错（改动前这会中止整次还原）。
-        // LinkTarget 在「不是链接」和「不存在」时都为 null，正好是需要重建的两种情形。
+        // Use LinkTarget (lstat underneath) to decide "unchanged", not FileInfo.Exists: the latter is always false for a symlink
+        // that **points at a directory**, so such links can never be judged "unchanged" and a second restore inevitably reaches
+        // CreateSymbolicLink and throws because it already exists (before this change that aborted the whole restore).
+        // LinkTarget is null both when "it isn't a link" and when "it doesn't exist" — exactly the two cases that need recreating.
         var existingLink = new FileInfo(dest).LinkTarget;
         if (existingLink == entry.Target)
-            return SymlinkOutcome.Unchanged; // 未变
+            return SymlinkOutcome.Unchanged; // unchanged
 
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-        // 既有链接用 File.Delete 直接 unlink（不跟随），既有普通文件同样先删。
-        // Path.Exists 跟随链接，悬空链接靠 existingLink 兜住。
+        // An existing link is unlinked directly with File.Delete (no following); an existing regular file is deleted first as well.
+        // Path.Exists follows links, so dangling links are covered by existingLink.
         if (existingLink is not null || Path.Exists(dest)) File.Delete(dest);
         File.CreateSymbolicLink(dest, entry.Target);
         return SymlinkOutcome.Created;
     }
 
     /// <summary>
-    /// 写入（文件/目录）前的越界判定，作用在**解析后的真实路径**上。
+    /// The escape check before a write (file/directory), operating on the **resolved real path**.
     /// <para>
-    /// 纯词法的 <see cref="PathBoundary.IsWithin"/> 不足以守住这里：还原**先**建 symlink 条目、
-    /// **后**写文件条目，于是索引里一条 <c>evil -&gt; /etc/cron.d</c> 加一条 <c>evil/x</c> 就能让
-    /// <c>&lt;root&gt;/evil/x</c> 在词法上完全合规地通过检查，而 <c>File.Copy</c> / <c>CreateDirectory</c>
-    /// 会跟随该链接把内容落到 <c>/etc/cron.d/x</c>。判定必须和内核一样在软链展开之后结算。
+    /// The purely lexical <see cref="PathBoundary.IsWithin"/> is not enough to hold the line here: restore creates symlink entries **first**
+    /// and writes file entries **after**, so one <c>evil -&gt; /etc/cron.d</c> entry plus one <c>evil/x</c> entry in the index is enough to let
+    /// <c>&lt;root&gt;/evil/x</c> pass the check as entirely lexically compliant, while <c>File.Copy</c> / <c>CreateDirectory</c>
+    /// follow that link and land the content in <c>/etc/cron.d/x</c>. The check has to settle after symlink expansion, exactly the way the kernel does.
     /// </para>
     /// <para>
-    /// <paramref name="realRoot"/> 是目标根**自身**解析后的真实路径，由调用方（<see cref="RunCoreAsync"/>）
-    /// 在本轮还原开始时算**一次**并全程复用——<c>request.TargetRoot</c> 本轮不变，没必要让
-    /// 每个条目（文件条目还两次）重新走一遍 lstat（对照 <see cref="PathBoundary"/> 对同一个值
-    /// 的「单例：构造时解析一次」）。<paramref name="dest"/> 这一侧**必须**每次都重新解析，
-    /// 不能一并缓存：它是本轮还原期间可能被新建/改变的候选路径，缓存会让「先建链接再穿过它写」
-    /// 这条攻击面探测不到。还原到一个本身经软链到达的目录（<c>/data -&gt; /mnt/disk1/data</c>）
-    /// 必须继续可用，所以根也必须解析，不能只解析候选路径。
+    /// <paramref name="realRoot"/> is the resolved real path of the target root **itself**, computed **once** by the caller (<see cref="RunCoreAsync"/>)
+    /// at the start of this restore and reused throughout — <c>request.TargetRoot</c> doesn't change during the run, so there's no point making
+    /// every entry (twice over for file entries) walk lstat again (compare <see cref="PathBoundary"/>'s "singleton: resolve once at construction"
+    /// for the same value). The <paramref name="dest"/> side **must** be re-resolved every time
+    /// and cannot be cached alongside it: it is a candidate path that may be created/changed during this very restore, and caching would make the
+    /// "create the link first, then write through it" attack surface undetectable. Restoring into a directory that is itself reached through a symlink
+    /// (<c>/data -&gt; /mnt/disk1/data</c>) has to keep working, so the root must be resolved as well — resolving only the candidate path is not enough.
     /// </para>
-    /// <para>解析失败（成环 / 含 \0 / 空串）一律判越界——失败关闭。</para>
+    /// <para>A failed resolution (a cycle / contains \0 / an empty string) is always treated as an escape — fail closed.</para>
     /// </summary>
     private static bool WriteStaysInsideRoot(string? realRoot, string dest)
     {
@@ -788,13 +788,13 @@ public sealed class RestoreOrchestrator(
     }
 
     /// <summary>
-    /// 建 symlink 前的越界判定：<paramref name="realRoot"/> 同 <see cref="WriteStaysInsideRoot"/>——
-    /// 本轮还原开始时解析一次、全程复用；末段按名字拼接、**不解析**。
+    /// The escape check before creating a symlink: <paramref name="realRoot"/> is the same as in <see cref="WriteStaysInsideRoot"/> —
+    /// resolved once at the start of this restore and reused throughout; the final segment is joined by name and **not resolved**.
     /// <para>
-    /// 末段不能解析，因为创建/删除链接本身不跟随末段（<c>symlinkat</c>/<c>unlinkat</c> 语义），
-    /// 而且合法备份里那条指向根外的绝对软链在第二次还原时，末段就是它自己——
-    /// 解析末段会把「重复还原一条合法链接」误判成越界。父目录仍然必须**每次重新**解析：
-    /// 链接建在哪个目录里，取决于路径中间段跟随后的真实位置，这一段可能在本轮还原期间改变。
+    /// The final segment must not be resolved, because creating/deleting a link doesn't follow the final segment itself (<c>symlinkat</c>/<c>unlinkat</c> semantics),
+    /// and because on a second restore of that legitimate absolute symlink pointing outside the root, the final segment is that very link —
+    /// resolving it would misjudge "re-restoring a legitimate link" as an escape. The parent directory still **must** be re-resolved every time:
+    /// which directory the link is created in depends on the real location the intermediate path segments lead to once followed, and that can change during this restore.
     /// </para>
     /// </summary>
     private static bool LinkStaysInsideRoot(string? realRoot, string dest)
@@ -807,7 +807,7 @@ public sealed class RestoreOrchestrator(
         if (realRoot is null || realParent is null)
             return false;
 
-        // 末段可能是 ".."/"."（畸形条目）：交给 IsWithin 的词法规范化收口。
+        // The final segment may be ".."/"." (a malformed entry): leave IsWithin's lexical normalization to close that off.
         return PathBoundary.IsWithin(realRoot, Path.Combine(realParent, Path.GetFileName(dest)));
     }
 
@@ -822,15 +822,15 @@ public sealed class RestoreOrchestrator(
             {
                 File.SetUnixFileMode(dest, (UnixFileMode)Convert.ToInt32(entry.Permissions, 8));
             }
-            catch (FormatException) { /* 非八进制权限，忽略 */ }
+            catch (FormatException) { /* not an octal permission, ignore */ }
         }
     }
 
     /// <summary>
-    /// 按 Path 建索引，重复 Path 的**所有**条目一律不生效——两条互相矛盾时无法判断哪条权威，
-    /// 宁可都不写也不猜。索引来自云端（<c>/import</c> 可导入任意容器），重复 Path 是索引自身
-    /// 矛盾，按既有的逐条目容错原则处理：只让重复的路径失败，不能让 <c>ToDictionary</c> 的
-    /// <see cref="ArgumentException"/> 中止整次还原。
+    /// Indexes by Path, with **every** entry under a duplicated Path taking no effect — when two entries contradict each other there is no telling which is authoritative,
+    /// so we would rather write neither than guess. The index comes from the cloud (<c>/import</c> can import any container), and a duplicate Path is the index
+    /// contradicting itself; handle it under the existing per-entry fault-tolerance principle: fail only the duplicated path, and never let <c>ToDictionary</c>'s
+    /// <see cref="ArgumentException"/> abort the whole restore.
     /// </summary>
     private static Dictionary<string, IndexEntry> IndexByPath(
         List<IndexEntry> entries, IProgress<string>? phase, out int duplicateCount)
@@ -856,7 +856,7 @@ public sealed class RestoreOrchestrator(
 
 
 
-    /// <summary>确保某归档（含全部分卷）已从 Archive 活化为可下载：对未活化的发起活化，轮询到全部就绪。</summary>
+    /// <summary>Ensures an archive (including all of its volumes) has been rehydrated out of Archive and is downloadable: starts rehydration for the ones that haven't, then polls until all are ready.</summary>
     private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>
         p == RestoreRehydratePriority.High ? RehydratePriority.High : RehydratePriority.Standard;
 
@@ -868,10 +868,10 @@ public sealed class RestoreOrchestrator(
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
             vols.Add(b.Name);
 
-        // 未开始活化的分卷发起活化（标准优先级；全部分卷，非仅首卷）。
-        // 注意：此处故意不复用 BlobRehydration.BeginAsync（它逐卷吞掉 SetAccessTierAsync 异常）——
-        // 本方法持有下载并发 gate 并无限期轮询，活化请求失败必须快速传播为还原失败，
-        // 否则会在吞掉异常后无限期挂起并占住 gate。
+        // Start rehydration for the volumes that haven't started yet (standard priority; all volumes, not just the first).
+        // Note: this deliberately does not reuse BlobRehydration.BeginAsync (which swallows SetAccessTierAsync exceptions per volume) —
+        // this method holds the download concurrency gate and polls indefinitely, so a failed rehydration request has to propagate quickly as a restore failure,
+        // otherwise it would hang indefinitely while holding the gate after the exception got swallowed.
         foreach (var name in vols)
         {
             var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
@@ -879,7 +879,7 @@ public sealed class RestoreOrchestrator(
                 await container.GetBlobClient(name).SetAccessTierAsync(tier, rehydratePriority: priority, cancellationToken: ct);
         }
 
-        // 轮询到全部分卷不再是 Archive（活化完成，几小时级）。
+        // Poll until no volume is in Archive any more (rehydration complete, on the order of hours).
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -897,7 +897,7 @@ public sealed class RestoreOrchestrator(
         }
     }
 
-    /// <summary>把某归档的全部分卷设为指定 tier（best effort，用于还原后重新归档）。</summary>
+    /// <summary>Sets all volumes of an archive to the given tier (best effort, used to re-archive after a restore).</summary>
     private static async Task SetTierForVolumesAsync(BlobContainerClient container, string baseRef, AccessTier tier, CancellationToken ct)
     {
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
@@ -922,14 +922,14 @@ public sealed class RestoreOrchestrator(
     }
 }
 
-/// <summary>还原条目的目标路径逃出了 TargetRoot（索引被篡改或来自不可信容器）。</summary>
+/// <summary>A restore entry's destination path escaped TargetRoot (the index was tampered with or came from an untrusted container).</summary>
 public sealed class UnsafeRestorePathException(string entryPath)
     : Exception(UnsafeRestorePathException.MessageFor(entryPath))
 {
     /// <summary>
-    /// 共享的消息拼接：异常构造器与仅需一行文案的上报点（<see cref="RestoreOrchestrator"/>
-    /// 里越界目录/symlink/文件条目的 phase 上报）都用它，后者不必为了取一个字符串
-    /// 而分配一个异常对象。
+    /// Shared message construction: used both by the exception's constructor and by the report sites that only need one line of text
+    /// (the phase reports for escaping directory/symlink/file entries inside <see cref="RestoreOrchestrator"/>), so the latter
+    /// don't have to allocate an exception object just to get hold of a string.
     /// </summary>
     public static string MessageFor(string entryPath) => $"Restore entry path escapes the target root: {entryPath}";
 }

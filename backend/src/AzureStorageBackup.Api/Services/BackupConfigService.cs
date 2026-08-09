@@ -6,9 +6,9 @@ namespace AzureStorageBackup.Api.Services;
 
 public class BackupConfigService(AppDbContext db) : IBackupConfigService
 {
-    /// <summary>按名字排序。<c>COLLATE NOCASE</c> 不是可有可无的润色：SQLite 的默认排序是
-    /// 按字节码点比的，大写字母全部排在小写字母前面（"Zoo" 会跑到 "apple" 前面），
-    /// 在界面上看就是「没按字母排」。</summary>
+    /// <summary>Ordered by name. <c>COLLATE NOCASE</c> is not optional polish: SQLite's default ordering
+    /// compares byte code points, so every uppercase letter sorts ahead of every lowercase one ("Zoo" lands before "apple"),
+    /// which on screen simply looks like "not sorted alphabetically".</summary>
     public async Task<IReadOnlyList<BackupConfig>> ListAsync(CancellationToken ct = default) =>
         await db.BackupConfigs.AsNoTracking()
             .OrderBy(c => EF.Functions.Collate(c.Name, "NOCASE")).ToListAsync(ct);
@@ -31,14 +31,14 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
     }
 
     /// <summary>
-    /// 更新配置。基础字段（AccountId/ContainerName/LocalRoot/IndexTier/DataTier）与密码创建后锁定
-    /// （§4.5）：本地权威状态（TrackedInfoStore/LocalIndexCache）按 账户+container 键控，改这些字段会与云端/本地
-    /// 索引失步。检测到变更时抛 <see cref="InvalidOperationException"/>，端点映射为 400。
+    /// Update a config. The base fields (AccountId/ContainerName/LocalRoot/IndexTier/DataTier) and the password are locked
+    /// after creation (§4.5): the local authoritative state (TrackedInfoStore/LocalIndexCache) is keyed by account+container, so changing these fields
+    /// desynchronizes it from the cloud/local index. Throws <see cref="InvalidOperationException"/> when a change is detected; the endpoint maps that to 400.
     ///
     /// <para>
-    /// LocalRoot 另有一条带校验的专用通道 <see cref="ChangeLocalRootAsync"/>（挂载点搬家用）。
-    /// **这里的检查不因此放松**：常规编辑路径继续拒绝改根，否则一次顺手的改名保存就能悄悄换掉根，
-    /// 绕开那条通道的全部防呆。
+    /// LocalRoot has its own validated channel, <see cref="ChangeLocalRootAsync"/> (for moving the mount point).
+    /// **That does not relax the check here**: the regular edit path still refuses to change the root, otherwise one casual rename-and-save could quietly swap the root out,
+    /// bypassing every safeguard on that channel.
     /// </para>
     /// </summary>
     public async Task<BackupConfig?> UpdateAsync(int id, BackupConfig update, CancellationToken ct = default)
@@ -54,7 +54,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
             || existing.DataTier != update.DataTier)
             throw new InvalidOperationException("Base fields cannot be changed after creation.");
 
-        // 密码创建后不可更改（设计决策 8）。空 = 保留原值；非空一律拒绝，重设走专用端点。
+        // The password cannot be changed after creation (design decision 8). Empty = keep the existing value; anything non-empty is refused, and resets go through the dedicated endpoint.
         if (!string.IsNullOrEmpty(update.PasswordProtected))
             throw new InvalidOperationException("Password cannot be changed after creation; leave it empty.");
 
@@ -64,7 +64,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.DontCompressRules = update.DontCompressRules;
         existing.DontGroupRules = update.DontGroupRules;
         existing.CrossDirGroupRules = update.CrossDirGroupRules;
-        // 范围可改（不属于锁定的基础字段），改后下次备份生效。
+        // Scope is editable (it is not one of the locked base fields); a change takes effect on the next backup.
         existing.ScopeRules = update.ScopeRules;
         existing.IncludeSymlinks = update.IncludeSymlinks;
         existing.MaxVersions = update.MaxVersions;
@@ -86,8 +86,8 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         if (existing is null)
             return null;
 
-        // 只动这一个字段。ScopeRules 尤其不能顺手改写：它是相对根的坐标，
-        // 新根下是同一份数据时，规则原样继续正确命中。
+        // Touch this one field only. ScopeRules in particular must not be rewritten along the way: they are coordinates relative to the root,
+        // so when the new root holds the same data the rules keep matching correctly, unchanged.
         existing.LocalRoot = newRoot;
         await db.SaveChangesAsync(ct);
         return existing;
@@ -128,6 +128,6 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         await db.SaveChangesAsync(ct);
     }
 
-    // 手动 reset 与「成功自清」同实现（决策 2）。
+    // Manual reset shares its implementation with "auto-clear on success" (decision 2).
     public Task ResetStatusAsync(int id, CancellationToken ct = default) => SetNormalAsync(id, ct);
 }

@@ -8,11 +8,11 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 两条备份配置指到同一个 (账户, container) 上，就是两套互不知情的版本号与索引写在同一个地方：
-/// 后跑的那一条读到的云端信息文件要么还没写出来、要么是别人的，于是从 version 1 重新开始，
-/// 把对方的 index.json 覆盖掉，对方的数据 blob 变成孤儿、下一轮保留清理就把它们删了。
+/// Two backup configs pointing at the same (account, container) means two mutually unaware sets of version numbers and indexes written to the same place:
+/// whichever runs second reads a cloud info file that either has not been written yet or belongs to the other one, so it starts over from version 1,
+/// overwrites the other's index.json, turns the other's data blobs into orphans, and the next retention cleanup deletes them.
 /// <para>
-/// 所以创建与导入都必须在**写库之前**拒绝，库上再加唯一索引兜住绕过端点的那条路。
+/// So both create and import must refuse **before anything is written to the database**, with a unique index on the database catching the path that bypasses the endpoints.
 /// </para>
 /// </summary>
 public class DuplicateBackupConfigTests
@@ -58,16 +58,16 @@ public class DuplicateBackupConfigTests
 
         Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
         var body = await second.Content.ReadFromJsonAsync<ErrorBody>();
-        // 点名占着这个 container 的是谁——否则用户只知道"不让建"，不知道该去看哪条备份。
+        // Name who is holding this container — otherwise the user only learns "you may not create it" and has no idea which backup to go look at.
         Assert.Contains("Photos", body!.error);
 
-        // 要害：拒绝必须发生在写库之前，库里只能留下第一条。
+        // The crux: the refusal must happen before the database write, so only the first row is left behind.
         using var scope = factory.Services.CreateScope();
         var configs = await scope.ServiceProvider.GetRequiredService<IBackupConfigService>().ListAsync();
         Assert.Equal(["Photos"], configs.Select(c => c.Name));
     }
 
-    /// <summary>导入同样要挡，而且判定要排在读云之前：本地就能回答的问题，不该先花一趟网络。</summary>
+    /// <summary>Import has to be blocked too, and the check must come before any cloud read: a question the local database can answer should not cost a network round trip first.</summary>
     [Fact]
     public async Task Importing_Into_A_Container_A_Config_Already_Holds_Is_Refused()
     {
@@ -100,8 +100,8 @@ public class DuplicateBackupConfigTests
     }
 
     /// <summary>
-    /// 端点的判定是「先查再写」，两次请求撞在一起时中间有窗口。库上的唯一索引是兜底：
-    /// 绕过端点直接写也好、并发挤进窗口也好，第二条都落不了地。
+    /// The endpoint's check is "look, then write", which leaves a window when two requests collide. The unique index on the database is the backstop:
+    /// whether you write straight past the endpoint or squeeze concurrently into that window, the second row never lands.
     /// </summary>
     [Fact]
     public async Task The_Database_Itself_Rejects_A_Duplicate_Written_Behind_The_Service()

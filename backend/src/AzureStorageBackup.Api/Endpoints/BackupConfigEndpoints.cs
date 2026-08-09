@@ -7,7 +7,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>备份配置管理端点（PRD §11 向导产物的持久化）。响应不含密码；更新时空密码保留原值。</summary>
+/// <summary>Backup config management endpoints (persistence for the output of the PRD §11 wizard). Responses carry no password; on update, an empty password keeps the existing value.</summary>
 public static class BackupConfigEndpoints
 {
     public static IEndpointRouteBuilder MapBackupConfigEndpoints(this IEndpointRouteBuilder app)
@@ -32,7 +32,7 @@ public static class BackupConfigEndpoints
         })
         .WithName("GetBackupConfig");
 
-        // 手动清错（决策 2）：与「下次成功自动清错」同语义，供用户主动 dismiss。
+        // Manual error clearing (decision 2): same semantics as "auto-clear on the next success", so the user can dismiss it themselves.
         group.MapPost("/{id:int}/reset-status", async (int id, IBackupConfigService svc, CancellationToken ct) =>
         {
             if (await svc.GetAsync(id, ct) is null)
@@ -41,14 +41,14 @@ public static class BackupConfigEndpoints
             return Results.NoContent();
         });
 
-        // 导入已有备份：读 container 的信息文件恢复配置，回填本地权威状态 + 全部版本索引入本地缓存（roadmap，PRD 1.5、§3.3）
+        // Import an existing backup: read the container's info file to rebuild the config, seed the local authoritative state, and pull every version index into the local cache (roadmap, PRD 1.5, §3.3)
         group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
-            // 排在读云之前：本地就能回答的问题不该先花一趟网络，何况那趟网络还会把云端信息文件
-            // 种进 TrackedInfoStore——为一次注定要被拒绝的导入改动本地权威状态，是白留一份脏数据。
+            // Ahead of any cloud read: a question the local database can answer should not cost a network round trip first, especially since that round trip would also
+            // seed the cloud info file into TrackedInfoStore — mutating the local authoritative state for an import that is bound to be rejected just leaves dirty data behind.
             if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
                 return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
@@ -59,14 +59,14 @@ public static class BackupConfigEndpoints
             }
             catch (SecretUnavailableException)
             {
-                // 密钥环丢失导致读不了账户密钥，与备份密码无关——不能把责任推给用户输的密码
-                // （与 reset-password 同处理）。
+                // A lost keyring means the account key cannot be read, which has nothing to do with the backup password — do not pin the blame on what the user typed
+                // (handled the same way as reset-password).
                 return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // 取消（客户端断开 / 进程关停）不是「密码不对」：吞掉会把它伪装成用户错误，
-                // 与仓库既有约定一致（见 a3ac967「孤儿清理不吞取消」），一律放行上抛。
+                // Cancellation (client disconnect / process shutdown) is not "wrong password": swallowing it would disguise it as a user error.
+                // Consistent with the existing convention in this repo (see a3ac967 "orphan cleanup does not swallow cancellation"), always let it propagate.
                 return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
             }
             if (seeded is null)
@@ -80,18 +80,18 @@ public static class BackupConfigEndpoints
                 Name = info.Backup.Name,
                 Description = info.Backup.Description,
                 LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
-                // 请求体里的密码是明文，落到实体上时立即加密（设计 §3.1）。
+                // The password in the request body is plaintext; encrypt it the moment it lands on the entity (design §3.1).
                 PasswordProtected = info.Backup.Encrypted && !string.IsNullOrEmpty(req.Password)
                     ? encryption.Encrypt(req.Password)
                     : null,
             };
             var created = await svc.CreateAsync(config, ct);
 
-            // B2：无 SourceRootHint 时 LocalRoot 落成空串，一旦设了 Backup__Root，这条配置之后
-            // 任何操作都会撞上和「本地根真的越界」一模一样的 409 path_outside_root——IsInside 对
-            // 空串和真正界外路径给出的是同一个拒绝，操作员从响应里分不清是自己配错了根，还是这份
-            // 导入压根没抓到路径提示。这里在导入当下就把原因摊开，写进操作日志，而不是留到下次
-            // 手滑点了 run 才让人一头雾水。
+            // B2: with no SourceRootHint, LocalRoot ends up an empty string, and once Backup__Root is set, every later operation
+            // on this config hits exactly the same 409 path_outside_root as a genuinely out-of-bounds local root — IsInside gives the
+            // identical refusal for an empty string and for a real out-of-bounds path, so from the response the operator cannot tell
+            // whether they configured the root wrong or this import simply never captured a path hint. Spell the reason out right here
+            // at import time, in the operation log, instead of leaving it to bewilder someone the next time they slip and click run.
             if (string.IsNullOrEmpty(info.Backup.SourceRootHint))
             {
                 await log.AppendAsync(
@@ -101,12 +101,12 @@ public static class BackupConfigEndpoints
                     ct);
             }
 
-            // 下载全部版本索引到本地缓存（版本文件是 metadata、不在 Archive）：备份/清理/还原此后
-            // 一律读本地这一份，云端不再问——导入之后就没有"没有本地权威"这种状态了。
+            // Download every version index into the local cache (version files are metadata and never in Archive): from now on
+            // backup/cleanup/restore all read this local copy and never ask the cloud again — after an import there is no such thing as "no local authority".
             //
-            // 某个版本的索引读不出来**不中断整次导入**：坏的只是那一个版本，其余版本连同这条配置
-            // 都还是好的，而配置建起来了用户才有地方去查、去修。把它写进操作日志，下面那次自动
-            // 检查也会把牵连到的东西一并列出来。
+            // A version whose index cannot be read **does not abort the whole import**: only that one version is broken, the rest of them
+            // and this config are fine, and the user needs the config to exist before they have anywhere to investigate or repair from. Write it
+            // into the operation log; the automatic check below will list everything it drags in as well.
             var identity = info.Backup.CreatedAt.UtcTicks;
             var unreadable = new List<int>();
             foreach (var v in info.Versions)
@@ -134,10 +134,10 @@ public static class BackupConfigEndpoints
                     ct);
             }
 
-            // 账本抓全了，接着核一次账：云端那些 data blob 和分卷是不是都还在、尺寸对不对。
-            // 只发 HEAD，不下载。**不查本地**——导入这一刻 LocalRoot 多半还是空的（信息文件里
-            // 没有 SourceRootHint 时就是如此），拿它比对只会满屏报"本地缺失"。
-            // 走内部调用而不是打自己的 /check 端点，正是为了绕开那上面的 LocalRoot 边界闸门。
+            // The ledger is complete, so now audit it: are all those cloud data blobs and volumes still there, and are the sizes right?
+            // HEAD requests only, no downloads. **Do not check locally** — at this moment LocalRoot is most likely still empty (which is exactly
+            // what happens when the info file has no SourceRootHint), and comparing against it would just fill the screen with "missing locally".
+            // Going through an internal call instead of hitting our own /check endpoint is precisely to bypass the LocalRoot boundary gate on it.
             var checkStarted = req.CheckAfterImport ?? true;
             if (checkStarted)
             {
@@ -157,9 +157,9 @@ public static class BackupConfigEndpoints
 
         group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IAccountService accounts, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
-            // 向导没有任何强校验的欠账（review 发现）：先做便宜的本地字符串检查，
-            // 再做不碰文件系统/数据库的路径边界检查，最后才是需要查库的账户存在性检查——
-            // 让最贵的检查排在最后，任何一步不合格都不必再往下走。
+            // Paying off the debt of a wizard with no hard validation at all (found in review): do the cheap local string checks first,
+            // then the path boundary check that touches neither the file system nor the database, and only then the account-existence check that needs a database query —
+            // the most expensive check goes last, and any step that fails means we never get further.
             if (string.IsNullOrWhiteSpace(req.LocalRoot))
                 return Results.BadRequest(new { error = "LocalRoot is required." });
             if (string.IsNullOrWhiteSpace(req.ContainerName))
@@ -181,12 +181,12 @@ public static class BackupConfigEndpoints
         {
             if (await svc.GetAsync(id, ct) is null)
                 return Results.NotFound();
-            // LocalRoot/ContainerName/Tier/加密性创建后锁定，已由 BackupConfigService.UpdateAsync 拒绝；
-            // Name 不在锁定字段之列，仍可编辑，因此仍需在这里挡空白（与创建端点同一条规则）。
+            // LocalRoot/ContainerName/Tier/encryptedness are locked after creation and already refused by BackupConfigService.UpdateAsync;
+            // Name is not one of the locked fields and stays editable, so blanks still have to be blocked here (the same rule as on the create endpoint).
             if (string.IsNullOrWhiteSpace(req.Name))
                 return Results.BadRequest(new { error = "Name is required." });
 
-            // 空密码 = 保留原值、非空 = 拒绝（决策 8），均由服务层判定：密文含随机 IV，不能在此比较。
+            // Empty password = keep the existing value, non-empty = refuse (decision 8), both decided in the service layer: the ciphertext carries a random IV, so it cannot be compared here.
             var update = req.ToConfig(encryption);
 
             try
@@ -199,24 +199,24 @@ public static class BackupConfigEndpoints
             }
             catch (InvalidOperationException ex)
             {
-                // 基础字段创建后锁定（§4.5）：账户/container/本地根/Tier/加密性变更被拒。
+                // Base fields are locked after creation (§4.5): changes to account/container/local root/Tier/encryptedness are refused.
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
 
-        // deleteContainer=true（默认 false）：连云端 container 整体删除（不可逆，§4.3）。先删云端再删本地配置，
-        // 避免云端删除失败时本地记录已丢失、用户无法重试。
+        // deleteContainer=true (default false): delete the whole cloud container along with it (irreversible, §4.3). Delete the cloud side first, then the local config,
+        // so a failed cloud deletion does not leave the local record already gone with no way for the user to retry.
         group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, BackupJournalStore journals, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
 
-            // 正在跑操作时不许删。删配置**不会**停掉后台那次运行：它会继续跑完，继续占着
-            // BackupBusyTracker 里 (account, container) 那把锁，而 _runs 是按 config id 存的，
-            // 配置一删，界面就再也找不到它的进度——于是同一个 container 上新建的备份被拒（busy），
-            // 状态却显示 BackingUp 且没有任何细节，像是凭空卡死。若同时勾了「删除 container」，
-            // 那次运行还会继续往一个已经不存在的 container 上传。这些都是用户实际踩到的。
+            // No deleting while an operation is running. Deleting the config does **not** stop the background run: it keeps going to
+            // completion and keeps holding the (account, container) lock in BackupBusyTracker, while _runs is keyed by config id —
+            // delete the config and the UI can never find its progress again, so a newly created backup on the same container gets refused
+            // (busy) while the status says BackingUp with no detail at all, looking like it wedged out of nowhere. If "delete the container"
+            // was ticked as well, that run also keeps uploading into a container that no longer exists. Users hit every one of these for real.
             var activity = DeriveActivity(config, backupRunner, restoreRunner, repairRunner, checkRunner, busy);
             if (activity != "Idle")
                 return Results.Conflict(new
@@ -224,15 +224,15 @@ public static class BackupConfigEndpoints
                     error = $"This backup is currently {Humanize(activity)}. Wait for it to finish before deleting it.",
                 });
 
-            // 先于删配置行捕获 account/container：本地缓存/状态按 (accountId, container) 归属，配置行删完就拿不到了。
+            // Capture account/container before deleting the config row: the local cache/state belong to (accountId, container), and once the row is gone they are out of reach.
             var accountId = config.AccountId;
             var container = config.ContainerName;
 
             if (deleteContainer ?? false)
             {
-                // 只有连删云端 container 这一支需要账户密钥 → 密钥环丢失时 409。
-                // deleteContainer=false 那一支纯本地，必须保持不设闸门：它是决策 6 下
-                // 「想不起备份密码」的唯一出口，恢复模式里也得能走。
+                // Only the branch that also deletes the cloud container needs the account key → 409 when the keyring is lost.
+                // The deleteContainer=false branch is purely local and must stay ungated: under decision 6 it is the only way out of
+                // "I cannot remember the backup password", and it has to work in recovery mode too.
                 if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
                 var account = await accounts.GetAsync(accountId, ct);
@@ -244,44 +244,44 @@ public static class BackupConfigEndpoints
             var ok = await svc.DeleteAsync(id, ct);
             if (ok)
             {
-                // 善后清理各自 best-effort：配置行已删（主操作成功），单步失败不应回 500、也不阻断其余步骤。
-                // 残留的孤儿日志/缓存/状态无害且可被后续清理/重建覆盖。
+                // Each cleanup step is best-effort on its own: the config row is already gone (the main operation succeeded), so a single failing step must not return 500 or block the remaining steps.
+                // Leftover orphan logs/cache/state are harmless and get overwritten by a later cleanup/rebuild.
                 var logger = loggerFactory.CreateLogger("BackupConfigDelete");
                 await BestEffort(logger, "delete audit logs",
-                    () => log.DeleteForContainerAsync(accountId, container, ct)); // 连带删审计日志（PRD 3.6）
-                // 连带清本地权威缓存/状态（本地权威原则，设计 §3.3）：否则同 account+container 重建备份时会
-                // 命中孤儿的 CachedVersionIndex/LocalBackupState 行，与新备份的版本身份错配。
+                    () => log.DeleteForContainerAsync(accountId, container, ct)); // delete the audit logs along with it (PRD 3.6)
+                // Purge the local authoritative cache/state along with it (local-authority principle, design §3.3): otherwise rebuilding a backup on the same
+                // account+container hits orphan CachedVersionIndex/LocalBackupState rows whose version identity does not match the new backup.
                 await BestEffort(logger, "evict local index cache",
                     () => indexCache.RemoveForContainerAsync(accountId, container, ct));
                 await BestEffort(logger, "remove local backup state",
                     () => localState.RemoveAsync(accountId, container, ct));
 
-                // 配置没了就再没人会来采纳这个容器上的 journal，留着它只会永远保住那批块不被清理
-                // （清理判据认 journal，不认 configId）。**只删 journal 文件，不去删它引用的 blob**：
-                // journal 记的既包括真上传，也包括 if-missing 命中，后者完全可能同时被一个已提交的
-                // 版本索引引用着，删了就是把保留下来的版本挖穿。
+                // With the config gone, nobody will ever adopt this container's journal again, and keeping it around only protects
+                // that batch of blocks from cleanup forever (the cleanup criterion looks at journals, not at configId). **Delete the journal
+                // files only, never the blobs they reference**: a journal records both real uploads and if-missing hits, and the latter may well
+                // also be referenced by an already-committed version index — deleting them would punch a hole through a retained version.
                 //
-                // 失去保护之后由谁来收：等这个容器上再有配置时，**那个配置的第一轮备份**收尾会做
-                // 一次孤儿扫描，用完整判据（读得到索引、认得出引用）把真孤儿扫掉。这条路成立靠的是
-                // 紧挨着的上一步——localState.RemoveAsync 把本地权威状态清了，重建的配置因此认得出
-                // 自己是第一轮（见 BackupOrchestrator 的 firstRun 与 BackupRunControl.SweepNeeded）。
-                // 那两步的先后不重要（都是 best-effort，互不依赖），但少了那一步，这里就只剩
-                // "用户恰好配了 Cleanup 计划任务"这一条指望，而那是配不配全凭他的。
+                // Who collects them once they lose that protection: when this container gets a config again, the **first backup run of that
+                // config** does an orphan sweep on the way out, using the full criterion (index readable, references recognizable) to sweep the
+                // real orphans away. That path only works because of the step immediately above — localState.RemoveAsync clears the local
+                // authoritative state, which is how the rebuilt config recognizes it is on its first run (see firstRun in BackupOrchestrator and BackupRunControl.SweepNeeded).
+                // The order of those two steps does not matter (both best-effort, neither depends on the other), but without that step all that
+                // is left here is the hope that "the user happens to have configured a Cleanup scheduled task", and that is entirely up to them.
                 await BestEffort(logger, "discard backup journals",
                     () => { journals.DeleteAll(accountId, container); return Task.CompletedTask; });
 
-                // 删掉的可能正是唯一一条待重设的解不开的密文（备份密码）：不收尾就翻不回 Healthy，
-                // 用户直到下次重启前都会卡在「Lost 但无一条待重设」的死角（设计 §3.4 fix）。
+                // What we just deleted may have been the one and only undecryptable ciphertext awaiting reset (the backup password): without
+                // finishing up, the keyring never flips back to Healthy and the user is stuck in the "Lost but nothing left to reset" dead end until the next restart (design §3.4 fix).
                 await recovery.TryCompleteAsync(ct);
 
-                // 审计行写在清理**之后**：DeleteForContainerAsync 会把该 (account, container) 的日志
-                // 全部删掉，写在前面等于自己把自己删了。删除是这里唯一会抹掉历史的操作，
-                // 它本身却不留痕，日志页就会莫名其妙地整个变空——用户报过这个现象。
+                // The audit line is written **after** the cleanup: DeleteForContainerAsync wipes every log for that (account, container),
+                // so writing it first would mean deleting itself. Deletion is the one operation here that erases history, and if it left no
+                // trace of its own the log page would inexplicably go completely empty — a user reported exactly that.
                 //
-                // 来源键带 accountId：这条曾是改版前的旧格式 "backup:{container}"，漏改了。少了
-                // account 维度，两个账户下的同名 container 写出的是一模一样的行，谁也说不清是哪个；
-                // 日志页按来源精确相等过滤，于是它哪个备份的视图里都不出现。写在清理之后这一点
-                // 不受影响——那次清理早已跑完，它删不到自己。
+                // The source key carries accountId: this line used to be in the pre-revamp format "backup:{container}" and was missed in the
+                // change. Without the account dimension, the same container name under two accounts writes identical lines and nobody can tell
+                // which is which; the log page filters by exact source equality, so it shows up in neither backup's view. Writing it after the
+                // cleanup does not affect this — that cleanup finished long before, and it cannot reach this line.
                 await BestEffort(logger, "record deletion", () => log.AppendAsync(
                     OperationLogLevel.Warning, $"backup:{accountId}/{container}",
                     (deleteContainer ?? false)
@@ -292,7 +292,7 @@ public static class BackupConfigEndpoints
             return ok ? Results.NoContent() : Results.NotFound();
         });
 
-        // 启动一次备份（后台运行，进度轮询）
+        // Start one backup run (runs in the background, progress by polling)
         group.MapPost("/{id:int}/run", async (int id, IBackupConfigService svc, BackupRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -306,16 +306,16 @@ public static class BackupConfigEndpoints
             return Results.Accepted($"/api/backup-configs/{id}/run", BackupRunResponse.From(state));
         });
 
-        // 查询运行进度/状态
+        // Query the run's progress/status
         group.MapGet("/{id:int}/run", (int id, BackupRunner runner) =>
         {
             var state = runner.Get(id);
             return state is null ? Results.NotFound() : Results.Ok(BackupRunResponse.From(state));
         });
 
-        // 挂起：安全落盘后停下，现场留着，下次点 Run 会原样接上。
-        // **没有对应的 resume 端点**——恢复不是一种模式：每一轮备份开卷时都会去认还有效的 journal，
-        // 所以"继续"就是再点一次 /run，走的是同一条执行体。
+        // Suspend: stop once everything is safely on disk, leave the scene in place, and the next click on Run picks it up as it was.
+        // **There is no matching resume endpoint** — resuming is not a mode: every backup run looks for a still-valid journal when it opens,
+        // so "continue" is just clicking /run again, going down the very same execution path.
         group.MapPost("/{id:int}/suspend", async (int id, BackupRunner runner, CancellationToken ct) =>
             await StopAndWaitAsync(c => runner.SuspendAsync(id, ct: c), ct) switch
             {
@@ -324,14 +324,14 @@ public static class BackupConfigEndpoints
                 _ => Results.NoContent(),
             });
 
-        // 卡在瞬时错误上自愈等待时，用户点「Retry now」不等计时器，立刻放行一次重试。
+        // While parked on a transient error waiting to self-heal, "Retry now" lets the user skip the timer and release one retry immediately.
         group.MapPost("/{id:int}/retry-now", (int id, BackupRunner runner) =>
             runner.RetryNow(id)
                 ? Results.NoContent()
                 : Results.Conflict(new { error = "This backup is not waiting to retry." }));
 
-        // 这个容器上有哪些中途停下的运行。程序刚起来时界面靠它把"有活儿没干完"摆出来等用户点，
-        // 而不是替用户决定要不要接着跑。
+        // Which runs on this container stopped partway. Right after startup the UI uses this to put "there is unfinished work" in front of the user and wait for a click,
+        // rather than deciding on their behalf whether to keep going.
         group.MapGet("/{id:int}/interrupted", async (
             int id, IBackupConfigService svc, BackupJournalStore journals, CancellationToken ct) =>
         {
@@ -345,10 +345,10 @@ public static class BackupConfigEndpoints
                 r.Header.ConfigId == id && r.Header.LocalRoot == config.LocalRoot)).ToList());
         });
 
-        // 用户不想接着跑了：把现场丢掉。
-        // 云上那批块并不在这里删——判断"它到底还被哪个版本引用着"要读版本索引，那需要备份密码，
-        // 而这个端点拿不到。丢掉 journal 之后它们失去保护，下一次带孤儿扫描的清理会用完整判据收走
-        // （Task 11）。
+        // The user does not want to continue: throw the scene away.
+        // The blocks in the cloud are not deleted here — deciding "which version still references this" means reading version indexes, which
+        // needs the backup password, and this endpoint cannot get it. Once the journal is gone they lose their protection, and the next cleanup
+        // with an orphan sweep collects them using the full criterion (Task 11).
         group.MapDelete("/{id:int}/interrupted", async (
             int id, IBackupConfigService svc, BackupJournalStore journals, BackupRunner runner,
             CancellationToken ct) =>
@@ -356,8 +356,8 @@ public static class BackupConfigEndpoints
             var config = await svc.GetAsync(id, ct);
             if (config is null)
                 return Results.NotFound();
-            // 正在跑的那一轮自己就握着一卷 journal，从它脚下把文件抽走只会让收尾时报一堆
-            // 莫名其妙的 IO 错误。让用户先停下来。
+            // The run in progress is holding a journal of its own, and pulling the file out from under it only produces a pile of
+            // baffling IO errors on the way out. Make the user stop it first.
             if (runner.Get(id) is { Status: RunStatus.Running })
                 return Results.Conflict(new { error = "This backup is running; stop it first." });
 
@@ -365,7 +365,7 @@ public static class BackupConfigEndpoints
             return Results.NoContent();
         });
 
-        // 启动还原（后台运行；targetRoot 缺省用配置的本地根，version 缺省用最新）
+        // Start a restore (runs in the background; targetRoot defaults to the config's local root, version defaults to the latest)
         group.MapPost("/{id:int}/restore", async (int id, RestoreRequestBody body, IBackupConfigService svc, RestoreRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -380,7 +380,7 @@ public static class BackupConfigEndpoints
             return Results.Accepted($"/api/backup-configs/{id}/restore", RestoreRunResponse.From(state));
         });
 
-        // 某路径可从哪些版本恢复（含该路径且有存储、且未标记不可恢复的版本，就近排序），供还原时逐文件替代选择。
+        // Which versions a given path can be restored from (versions that contain the path, have storage, and are not marked unrecoverable, ordered nearest-first), for per-file substitution during restore.
         group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -395,9 +395,9 @@ public static class BackupConfigEndpoints
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var candidates = new List<object>();
-            // 本地权威缓存优先（与 /tree 一致）。这里尤其要紧：循环里**每个版本各读一次索引**，
-            // 直接读云端就是每次点击「选择替代版本」下载 N 个索引 blob——延迟之外还是实打实的
-            // Azure 出站流量费，而本地就有权威副本。
+            // Local authoritative cache first (same as /tree). It matters especially here: the loop reads **one index per version**,
+            // so reading straight from the cloud means downloading N index blobs on every click of "pick a substitute version" — on top of the
+            // latency that is real Azure egress traffic charges, while an authoritative copy is sitting right here locally.
             var fvIdentity = info?.Backup.CreatedAt.UtcTicks ?? 0;
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
             {
@@ -411,7 +411,7 @@ public static class BackupConfigEndpoints
             return Results.Ok(candidates);
         });
 
-        // 某版本被标记为不可恢复的文件路径（还原时驱动逐文件替代选择）。
+        // The file paths marked unrecoverable in a given version (drives per-file substitution during restore).
         group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -435,9 +435,9 @@ public static class BackupConfigEndpoints
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
-        // 某版本里内容为**沿用**的文件：备份那几轮读不开源文件，索引沿用了更早版本的条目。
-        // 与 /unrecoverable 对称，但语义不同：那边是数据已损坏、无内容可给；这边内容有效，只是旧。
-        // 还原前需要知道这件事——否则还原了这个版本，却拿到更早时刻的内容而毫不知情。
+        // Files in a version whose content was **carried over**: on those backup runs the source file could not be opened, so the index reused an entry from an earlier version.
+        // Symmetric with /unrecoverable but different in meaning: there the data is corrupt and there is no content to give; here the content is valid, just old.
+        // The user needs to know this before restoring — otherwise they restore this version and unknowingly get content from an earlier point in time.
         group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -464,8 +464,8 @@ public static class BackupConfigEndpoints
                 .ToList());
         });
 
-        // 还原懒加载目录树（§4.1a，决策 1）：返回 path 目录的直接子节点（子目录+文件），供前端逐层展开，
-        // 不必一次性拉整棵树。数据源为版本索引，本地权威缓存优先，缺失/身份不符才回落云端（ILocalIndexCache.ReadAsync 内部处理）。
+        // Lazily loaded directory tree for restore (§4.1a, decision 1): returns the direct children (subdirectories + files) of the path directory so the frontend can expand level by level
+        // instead of pulling the whole tree at once. The data source is the version index, local authoritative cache first, falling back to the cloud only when it is missing or the identity does not match (handled inside ILocalIndexCache.ReadAsync).
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
             ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
@@ -485,15 +485,15 @@ public static class BackupConfigEndpoints
                 return Results.Ok(Array.Empty<TreeNode>());
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
-                return Results.Ok(Array.Empty<TreeNode>()); // 指定版本不存在 → 空结果，与 /unrecoverable、/file-versions 一致
+                return Results.Ok(Array.Empty<TreeNode>()); // the requested version does not exist → empty result, same as /unrecoverable and /file-versions
 
             var identity = info.Backup.CreatedAt.UtcTicks;
             var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
             return Results.Ok(VersionTreeService.Children(idx, path));
         });
 
-        // 还原下载量/解压量估算（§4.1b，需求 A + 决策 5）：选中路径先本地纯算下载量（去重后的存储对象体积合计，
-        // 共享 pack/去重 blob 只计一次）与解压量，再对各去重对象首卷发起 HEAD 查活化状态（Archive/待就绪）。
+        // Restore download/uncompressed volume estimate (§4.1b, requirement A + decision 5): for the selected paths, first compute the download volume purely locally (the total size of the
+        // deduplicated storage objects, a shared pack/deduplicated blob counted only once) and the uncompressed volume, then HEAD the first volume of each deduplicated object for its rehydration state (Archive / pending).
         group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
             IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
             IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
@@ -519,7 +519,7 @@ public static class BackupConfigEndpoints
             var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
             var estimate = RestoreEstimator.Compute(idx, info, body.Paths ?? []);
 
-            // 各去重存储对象的首卷 blob 名 + 分卷数（pack 用 PackInfo.Volumes；blob 用该 Ref 首个条目的 StorageRef.Volumes）。
+            // First-volume blob name + volume count for each deduplicated storage object (packs use PackInfo.Volumes; blobs use StorageRef.Volumes from the first entry with that Ref).
             var volumesByKey = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (var e in idx.Entries)
             {
@@ -553,7 +553,7 @@ public static class BackupConfigEndpoints
                 }
                 catch (RequestFailedException)
                 {
-                    // best effort：单个对象 HEAD 失败（如已被删）不影响其余对象的估算，直接跳过其活化计数。
+                    // best effort: a failed HEAD on a single object (e.g. it has already been deleted) must not affect the estimate for the rest, so just skip its rehydration count.
                 }
                 finally
                 {
@@ -571,7 +571,7 @@ public static class BackupConfigEndpoints
             });
         });
 
-        // 从本地修复云端损坏/缺失的 blob（显式动作，后台 job）：持忙碌锁到完成，期间该备份不能做别的。修不了的标记不可恢复。
+        // Repair corrupt/missing cloud blobs from local files (an explicit action, background job): holds the busy lock until it finishes, during which this backup can do nothing else. Whatever cannot be repaired is marked unrecoverable.
         group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -596,7 +596,7 @@ public static class BackupConfigEndpoints
             return state is null ? Results.NotFound() : Results.Ok(RestoreRunResponse.From(state));
         });
 
-        // 列出某备份的全部版本（供还原/检查选择版本）。走本地权威信息文件，平时不读云端。
+        // List all versions of a backup (for picking a version when restoring/checking). Goes through the local authoritative info file and normally does not read the cloud.
         group.MapGet("/{id:int}/versions", async (int id, IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -610,12 +610,12 @@ public static class BackupConfigEndpoints
 
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
-            // 从新到旧：界面上 "Latest" 紧跟着的就该是次新的一版，与 /file-versions 的就近排序一致。
+            // Newest first: in the UI the entry right after "Latest" should be the second-newest version, consistent with the nearest-first ordering of /file-versions.
             var versions = (info?.Versions ?? []).OrderByDescending(v => v.Version).Select(v => new
             {
                 v.Version,
                 v.CreatedAt,
-                v.StartedAt,   // 升级前写下的版本没有 → null，界面写「—」
+                v.StartedAt,   // versions written before the upgrade do not have one → null, and the UI shows "—"
                 files = v.Stats.Files,
                 bytes = v.Stats.Bytes,
                 changedFiles = v.Stats.ChangedFiles,
@@ -623,9 +623,9 @@ public static class BackupConfigEndpoints
             return Results.Ok(versions);
         });
 
-        // 完整性检查（Content 级下载解压重算 hash 深度校验）。**后台 job**：
-        // 内容级检查要把整个备份下载一遍，几百 GB 就是几小时——同步端点时代请求会先被浏览器
-        // 或反向代理超时掐断，检查白跑，而且全程没有任何进度可看。现在返回 202，用 GET 轮询。
+        // Integrity check (Content level: download, extract and recompute hashes for a deep verification). **A background job**:
+        // a content-level check downloads the entire backup, which for a few hundred GB means hours — back in the synchronous-endpoint days
+        // the request got cut off by a browser or reverse-proxy timeout first, the check ran for nothing, and there was no progress to watch the whole time. Now it returns 202 and you poll with GET.
         group.MapPost("/{id:int}/check", async (int id, int? version, CloudCheckLevel? cloud, LocalCheckLevel? local, StorageTier? rehydrate, bool? listOrphans, IBackupConfigService svc, CheckRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -639,9 +639,9 @@ public static class BackupConfigEndpoints
             {
                 Cloud = cloud ?? CloudCheckLevel.ExistenceSize,
                 Local = local ?? LocalCheckLevel.Content,
-                // 显式转为 AccessTier?：AccessTier 有 string 隐式转换构造函数，三元表达式与裸 null 混用时
-                // 编译器会走「null→string→AccessTier(string)」这条隐式转换路径而非「AccessTier→AccessTier?」，
-                // 导致 rehydrate 为空时对 AccessTier(string) 传 null 触发 ArgumentNullException（真实生产 bug）。
+                // Cast explicitly to AccessTier?: AccessTier has an implicit conversion constructor from string, and when a ternary is mixed with a bare null
+                // the compiler takes the "null → string → AccessTier(string)" implicit conversion path rather than "AccessTier → AccessTier?",
+                // so when rehydrate is empty it passes null to AccessTier(string) and throws ArgumentNullException (a real production bug).
                 RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                 ListOrphans = listOrphans ?? false,
             };
@@ -649,20 +649,20 @@ public static class BackupConfigEndpoints
             return Results.Accepted($"/api/backup-configs/{id}/check", CheckRunResponse.From(state));
         });
 
-        // 最近一次检查的状态与报告。跑完之后**报告仍然留着**：关掉对话框再打开要能看回结果。
+        // The status and report of the most recent check. **The report stays around** after the run finishes: closing the dialog and reopening it has to bring the result back.
         group.MapGet("/{id:int}/check", (int id, CheckRunner runner) =>
         {
             var state = runner.Get(id);
-            // 「从没查过」不是错误：检查对话框一打开就问一次，而 404 会在浏览器控制台留下一条
-            // 红色报错，看上去像故障（用户就是这么报上来的）。204 = 没有可报告的检查。
+            // "Never checked" is not an error: the check dialog asks once as soon as it opens, and a 404 leaves a red error in the
+            // browser console that looks like a malfunction (which is exactly how a user reported it). 204 = there is no check to report.
             return state is null ? Results.NoContent() : Results.Ok(CheckRunResponse.From(state));
         });
 
-        // 停止该备份上正在跑的操作。what 省略＝全部停；否则只停指定的一种
-        // （一个配置可能同时在备份和还原——还原刻意不占忙碌锁，见 RestoreRunner 顶部注释）。
+        // Stop whatever operations are running on this backup. Omitting what = stop everything; otherwise stop only the specified kind
+        // (one config may be backing up and restoring at the same time — restore deliberately does not take the busy lock, see the comment at the top of RestoreRunner).
         //
-        // 在此之前根本没有"停"这个动作：一次跑错了的备份只能等它跑完，或者重启整个容器——
-        // 而用户跑在 NAS 上，重启会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
+        // Before this there was no "stop" action at all: a backup started by mistake could only be waited out or dealt with by restarting the whole container —
+        // and the user runs on a NAS, where a restart takes other services down with it, while "no deleting a config while it is busy" had closed off deletion as an escape route too.
         group.MapPost("/{id:int}/cancel", async (int id, string? what, bool? finishCurrentFiles,
             IBackupConfigService svc,
             BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner,
@@ -675,9 +675,9 @@ public static class BackupConfigEndpoints
             var canceled = new List<string>();
             var stopping = false;
 
-            // 备份这一支是**等落盘再返回**的，另外三个仍是发个信号就走——它们没有需要落盘的现场。
-            // finishCurrentFiles=true：正在传的文件（含它所有分卷）传完再停，这部分算数；
-            // false：立刻停，半截的分卷和在途的块都删掉，不留没法用的残渣。
+            // The backup branch **waits for the flush to disk before returning**; the other three still just raise a signal and leave — they have no scene that needs flushing.
+            // finishCurrentFiles=true: finish uploading the file currently in flight (including all of its volumes) and then stop, and that part counts;
+            // false: stop immediately and delete the half-written volumes and in-flight blocks, leaving no unusable residue.
             if (Wanted(what, "backup"))
                 switch (await StopAndWaitAsync(c => backupRunner.CancelAsync(id, finishCurrentFiles ?? false, c), ct))
                 {
@@ -689,15 +689,15 @@ public static class BackupConfigEndpoints
             if (Wanted(what, "repair") && repairRunner.Cancel(id)) canceled.Add("repair");
             if (Wanted(what, "check") && checkRunner.Cancel(id)) canceled.Add("check");
 
-            // 除备份外，停止仍是异步的：这里只发出取消信号，运行本身要等到下一个取消检查点才真的收尾。
-            // 界面据此把按钮改成「Stopping…」，而不是立刻当成已经停了。
+            // Apart from backup, stopping is still asynchronous: this only raises the cancellation signal, and the run itself does not actually wind down until the next cancellation checkpoint.
+            // The UI uses that to switch the button to "Stopping…" instead of treating it as already stopped.
             return canceled.Count == 0
                 ? Results.Conflict(new { error = "Nothing is running for this backup." })
                 : Results.Ok(new { canceled, stopping });
         });
 
-        // 备份密码重设（设计 §3.4）。验证依据：加密备份的信息文件本身就是用该密码加密的 7z，
-        // 它是元数据根节点、容器内最小的加密对象，解得开即证明密码正确。
+        // Backup password reset (design §3.4). The basis for verification: for an encrypted backup, the info file is itself a 7z encrypted with that password;
+        // it is the metadata root node and the smallest encrypted object in the container, so being able to open it proves the password is correct.
         group.MapPost("/{id:int}/reset-password", async (
             int id, ResetBackupPasswordRequest req, IBackupConfigService svc, IAccountService accounts,
             IBackupInfoStore store, IEncryptionService encryption, AppDbContext db,
@@ -716,29 +716,29 @@ public static class BackupConfigEndpoints
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
 
-            // 顺序依赖：连云需要账户密钥，故账户必须先恢复。
+            // Ordering dependency: reaching the cloud needs the account key, so the account has to be recovered first.
             try
             {
-                // 纯读，不可用 TrackedInfoStore.SeedFromCloudAsync——那会回填本地权威状态。
+                // Read-only; TrackedInfoStore.SeedFromCloudAsync must not be used here — that would seed the local authoritative state.
                 var info = await store.ReadInfoWithETagAsync(account, config.ContainerName, req.Password, ct);
                 if (info is null)
                     return Results.BadRequest(new { error = "No backup info file found in the container." });
-                // ReadInfoWithETagAsync 优先探测未加密 blob 名——若容器里恰好有一份未加密的信息文件，
-                // 它会用 password: null 读回来，提交的密码根本没被用于解密。必须核对返回内容确实来自
-                // 加密对象，否则会把任意字符串当密码落库，真密码永久丢失。
+                // ReadInfoWithETagAsync probes the unencrypted blob name first — if the container happens to hold an unencrypted info
+                // file, it reads it back with password: null and the submitted password was never used for decryption at all. We must verify
+                // the returned content really came from an encrypted object, otherwise an arbitrary string gets stored as the password and the real one is lost forever.
                 //
-                // 这里查的是返回 JSON 里的自述标志位，而不是「解密成功」本身，看着像个洞，其实不是：
-                // 写侧最终只有 BackupInfoStore.WriteInfoConditionalAsync 一条路，它按 password 是否为空
-                // 二选一地决定 blob 名（IndexBlobName / EncryptedIndexBlobName），而 Backup.Encrypted
-                // 由同一次写入的内容携带。因此经本应用写出的信息文件，标志位与所在 blob 名（即是否加密）
-                // 不可能相左：Encrypted=true 意味着这份 JSON 只能来自 .enc 那条分支，也就意味着上面这次读
-                // 确实是用提交的密码解开的。
+                // What is checked here is the self-declared flag inside the returned JSON rather than "decryption succeeded" itself, which looks
+                // like a hole but is not: on the write side there is ultimately only one path, BackupInfoStore.WriteInfoConditionalAsync, which picks
+                // the blob name (IndexBlobName / EncryptedIndexBlobName) by whether password is empty, while Backup.Encrypted is carried by the
+                // content of that same write. So for an info file written by this application, the flag and the blob name it lives under (i.e. whether
+                // it is encrypted) cannot disagree: Encrypted=true means this JSON can only have come from the .enc branch, which in turn means the
+                // read above really was opened with the submitted password.
                 //
-                // 「只有一条路」是可核验的，别被调用点数量迷惑：接口上另有 IBackupInfoStore.WriteInfoAsync，
-                // 且 BackupOrchestrator / BackupRepairer / RetentionCleaner 都直接调它——但它的实现体本身
-                // 就是一句 `=> WriteInfoConditionalAsync(..., ifMatch: null, ct)`（BackupInfoStore.WriteInfoAsync），
-                // 并不自己拼 blob 名。故不变量成立的充要条件是：**WriteInfoAsync 继续保持这层委托，
-                // 且不新增第三个自行决定 blob 名的写入实现**。任一条被打破，此处必须改成以解密结果为准。
+                // "Only one path" is verifiable — do not be fooled by the number of call sites: the interface also has IBackupInfoStore.WriteInfoAsync,
+                // and BackupOrchestrator / BackupRepairer / RetentionCleaner all call it directly — but its implementation body is literally the one line
+                // `=> WriteInfoConditionalAsync(..., ifMatch: null, ct)` (BackupInfoStore.WriteInfoAsync), and it does not assemble a blob name itself.
+                // So the invariant holds if and only if **WriteInfoAsync keeps delegating like this and no third write implementation that decides its
+                // own blob name is added**. Break either condition and this check must be changed to rely on the decryption result instead.
                 if (!info.Value.Info.Backup.Encrypted)
                     return Results.BadRequest(new { error = "This container's backup is not encrypted; the password cannot be verified." });
             }
@@ -748,13 +748,13 @@ public static class BackupConfigEndpoints
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // 取消（客户端断开 / 进程关停）不是「验证失败」，不能伪装成用户的密码错误
-                // （与 a3ac967「孤儿清理不吞取消」同一约定）：放行上抛。
+                // Cancellation (client disconnect / process shutdown) is not "verification failed" and must not be disguised as a wrong password from the user
+                // (the same convention as a3ac967 "orphan cleanup does not swallow cancellation"): let it propagate.
                 return Results.BadRequest(new { error = $"Verification failed: {ex.Message}" });
             }
 
-            // 验证要连云，与前面的存在性检查之间窗口不短：配置行可能已被删除。
-            // FirstAsync 会抛成 500，而全仓约定是 404。
+            // Verification goes to the cloud, so the window between it and the existence check above is not short: the config row may already have been deleted.
+            // FirstAsync would blow up as a 500, while the repo-wide convention is 404.
             var row = await db.BackupConfigs.FirstOrDefaultAsync(c => c.Id == id, ct);
             if (row is null)
                 return Results.NotFound();
@@ -765,9 +765,9 @@ public static class BackupConfigEndpoints
             return Results.NoContent();
         });
 
-        // 迁移本地根路径（设计 docs/change-local-root-design.md）。
-        // preview 与 apply 分开：preview 是纯查询、幂等、可反复重试（换个路径再试一次不留痕迹），
-        // apply 的确认语义在日志里独立可辨。同形先例是 restore-estimate 与 restore。
+        // Migrate the local root path (design docs/change-local-root-design.md).
+        // preview and apply are separate: preview is a pure query, idempotent and freely retryable (trying another path leaves no trace),
+        // while apply's confirmation semantics are independently identifiable in the log. The same shape already exists in restore-estimate and restore.
         group.MapPost("/{id:int}/local-root/preview", async (
             int id, LocalRootPreviewRequest req, IBackupConfigService svc, IAccountService accounts,
             ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
@@ -784,9 +784,9 @@ public static class BackupConfigEndpoints
             IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, IOperationLog log,
             IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
-            // 不信任前端传来的 preview 结果，自己重跑一遍完整校验——这正是 Inspect
-            // 必须是纯查询、可安全重入的原因。preview 之后新根被拔掉、或备份在两次调用之间
-            // 开跑，都由这一遍兜住。
+            // Do not trust the preview result the frontend sends; rerun the full validation ourselves — which is exactly why Inspect
+            // has to be a pure query that is safe to re-enter. The new root being unplugged after the preview, or the backup starting
+            // between the two calls, are both caught by this second pass.
             var prepared = await PrepareLocalRootAsync(
                 id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct);
             if (prepared.Failure is { } failure)
@@ -811,16 +811,16 @@ public static class BackupConfigEndpoints
             if (moved is null)
                 return Results.NotFound();
 
-            // 来源键必须是全仓统一的 "{op}:{accountId}/{container}"（OperationLogService.cs:91-96）。
-            // 写成裸 "backup" 会同时破两处：DeleteForContainerAsync 按 ":{accountId}/{container}"
-            // 后缀清理，这条 Warning 级（长存）审计就再也删不掉；QueryAsync 按来源精确相等过滤，
-            // 于是按备份看日志时，换根这件最该留痕的事反而看不见。
+            // The source key must be the repo-wide "{op}:{accountId}/{container}" (OperationLogService.cs:91-96).
+            // Writing a bare "backup" breaks two things at once: DeleteForContainerAsync cleans up by the ":{accountId}/{container}"
+            // suffix, so this Warning-level (long-lived) audit line could never be deleted again; and QueryAsync filters by exact source
+            // equality, so when reading the log per backup, a root change — the thing that most deserves a trace — is nowhere to be seen.
             //
-            // NoBaseline / BaselineUnreadable 这两档一条都没抽样，样本计数得整句省掉
-            // ——"0/0 sampled entries matched" 读起来像"全都对不上"，与实情正相反。
-            // 换成 reason：BaselineUnreadable 的 reason 里是底层异常原文，而设计 §5 把它算作
-            // NAS 上那位拿不到命令行的用户唯一的诊断。只写进 HTTP 响应等于随手一关就没了，
-            // 得落在这条长存的审计行里。
+            // The NoBaseline / BaselineUnreadable verdicts sample nothing at all, so the sample count has to be dropped from the sentence
+            // entirely — "0/0 sampled entries matched" reads like "nothing matched at all", the exact opposite of the truth.
+            // Use reason instead: BaselineUnreadable's reason carries the underlying exception verbatim, and design §5 counts that as the
+            // only diagnostic available to the user on the NAS who cannot get to a command line. Writing it only into the HTTP response
+            // means it is gone the moment they close the dialog; it has to land in this long-lived audit line.
             var compared = preview.Sampled > 0
                 ? $", {preview.Matched}/{preview.Sampled} sampled entries matched"
                 : string.IsNullOrEmpty(preview.Reason) ? "" : $", {preview.Reason}";
@@ -839,11 +839,11 @@ public static class BackupConfigEndpoints
     }
 
     /// <summary>
-    /// 一个 container 只能挂一条备份配置。两条配置指到同一个 (账户, container) 上，就是两套互不
-    /// 知情的版本号与索引写在同一个地方：后跑的那条读到的云端信息文件要么还没写出来、要么是别人的，
-    /// 于是从 version 1 重新开始，把对方的 index.json 覆盖掉，对方的数据 blob 变成孤儿，
-    /// 下一轮保留清理就把它们删了。<see cref="AppDbContext"/> 里的唯一索引兜住绕过端点的写入；
-    /// 这里负责在写库之前就说清楚是谁占着它。
+    /// A container can hold only one backup config. Two configs pointing at the same (account, container) means two mutually
+    /// unaware sets of version numbers and indexes written to the same place: whichever runs second reads a cloud info file that either
+    /// has not been written yet or belongs to the other one, so it starts over from version 1, overwrites the other's index.json, turns
+    /// the other's data blobs into orphans, and the next retention cleanup deletes them. The unique index in <see cref="AppDbContext"/>
+    /// catches writes that bypass the endpoint; this message's job is to say who is holding it, before anything is written to the database.
     /// </summary>
     private static string ContainerTaken(string container, string holder) =>
         $"Container '{container}' already holds the backup \"{holder}\". A container can only hold one "
@@ -852,17 +852,17 @@ public static class BackupConfigEndpoints
         + "container, or delete that backup first.";
 
     /// <summary>
-    /// 该备份配置是否仍待重设密码。Healthy 时短路，列表端点不触发任何解密（设计 §3.1 的核心性质）；
-    /// Lost 时逐条试解，使已重设成功的备份立刻停止显示「待重设」（设计 §3.3）。
+    /// Whether this backup config is still awaiting a password reset. When Healthy it short-circuits, so the list endpoint triggers no
+    /// decryption at all (the core property of design §3.1); when Lost it tries to decrypt each one, so a backup that has already been reset successfully immediately stops showing "needs reset" (design §3.3).
     /// </summary>
     private static bool Pending(IKeyringHealth keyring, IEncryptionService encryption, BackupConfig config) =>
         keyring.Status == KeyringStatus.Lost && SecretAvailability.Unreadable(encryption, config);
 
     /// <summary>
-    /// 瞬时态派生（不落库，§4.2 决策 2）：优先看各 runner 对该 config id 是否有正在跑的运行态
-    /// （各 Runner 已各自暴露 <c>Get(id)</c>，无需新增 accessor）；
-    /// 都没有但 BackupBusyTracker 显示忙碌，则取其记录的操作标签（BackingUp/Checking/CleaningUp）——
-    /// 计划任务的备份/检查/清理都同步持锁运行，不经过任何 Runner。
+    /// Derives the transient state (not persisted, §4.2 decision 2): first look at whether any runner has a running state for this config id
+    /// (each Runner already exposes <c>Get(id)</c>, so no new accessor is needed);
+    /// if none does but BackupBusyTracker says busy, take the operation label it recorded (BackingUp/Checking/CleaningUp) —
+    /// scheduled backup/check/cleanup all run synchronously while holding the lock and never go through a Runner.
     /// </summary>
     private static string DeriveActivity(
         BackupConfig c, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner,
@@ -876,35 +876,35 @@ public static class BackupConfigEndpoints
             return "Repairing";
         if (checkRunner.Get(c.Id)?.Status == RunStatus.Running)
             return "Checking";
-        // 非 Runner 的持锁操作（计划任务的备份/检查/清理）：读忙碌跟踪记录的实际操作标签，
-        // 避免把计划备份/清理一律误标为 Checking。
+        // Lock-holding operations that are not Runners (scheduled backup/check/cleanup): read the actual operation label recorded by the
+        // busy tracker, so scheduled backups/cleanups are not all mislabeled as Checking.
         return busy.CurrentActivity(c.AccountId, c.ContainerName) ?? "Idle";
     }
 
-    /// <summary>/cancel 的 what 过滤：省略即全选。</summary>
+    /// <summary>The what filter for /cancel: omitting it selects everything.</summary>
     private static bool Wanted(string? what, string kind) =>
         string.IsNullOrWhiteSpace(what) || string.Equals(what, kind, StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>停止请求的三种结局。</summary>
+    /// <summary>The three outcomes of a stop request.</summary>
     private enum StopOutcome { NothingRunning, Settled, StillStopping }
 
     /// <summary>
-    /// 落盘等待的封顶时长。HTTP 契约里没有这个数字——它纯粹是给测试项目开的缝：
-    /// 靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
-    /// "真没落定、答 202/200 stopping:true" 那条分支，不然一次诚实的超时测试就要真等 20 秒。
-    /// 生产环境永远是 20 秒；测试用完记得在 finally 里调回来，它是进程内共享的静态字段。
+    /// The cap on how long we wait for the flush to disk. This number is not part of the HTTP contract — it is purely a seam opened up for
+    /// the test project: with <c>InternalsVisibleTo</c> (see AssemblyInfo.cs) the 20 seconds can be turned down to milliseconds, which is the
+    /// only affordable way to test the "genuinely did not settle, answer 202/200 stopping:true" branch; otherwise one honest timeout test would really wait 20 seconds.
+    /// In production it is always 20 seconds; tests must remember to set it back in a finally block, since it is a static field shared across the process.
     /// </summary>
     internal static TimeSpan StopWaitCap = TimeSpan.FromSeconds(20);
 
     /// <summary>
-    /// 发出停止请求并等它落盘完成，但**最多等 <see cref="StopWaitCap"/>（生产环境 20 秒）**。
+    /// Raise the stop request and wait for it to finish flushing to disk, but **for at most <see cref="StopWaitCap"/> (20 seconds in production)**.
     /// <para>
-    /// 为什么要等：用户点完停止，要的是"现在现场已经安全了"，而不是"信号发出去了"。
-    /// 为什么要封顶：Suspend 与 Finish current files 都会让正在传的文件（含它所有分卷）传完，
-    /// 一个大文件可能要好几分钟；而用户跑在 NAS 上，前面多半有一层反向代理，六十秒就把连接掐了，
-    /// 界面上看到的会是一条网络错误，尽管后台一切正常。
+    /// Why wait: after clicking stop the user wants "the scene is safe now", not "the signal has been sent".
+    /// Why cap it: both Suspend and Finish current files let the file currently in flight (including all of its volumes) finish uploading,
+    /// and one large file can take several minutes; meanwhile the user runs on a NAS, most likely behind a reverse proxy that cuts the connection
+    /// at sixty seconds, and what they see in the UI is a network error even though everything in the background is fine.
     /// </para>
-    /// <para>超时不代表没停下：停止请求在 await 之前就发出去了，闸门也已经降级，运行一定会走到终态。</para>
+    /// <para>A timeout does not mean it did not stop: the stop request went out before the await and the gate has already been lowered, so the run is certain to reach a terminal state.</para>
     /// </summary>
     private static async Task<StopOutcome> StopAndWaitAsync(
         Func<CancellationToken, Task<bool>> stop, CancellationToken ct)
@@ -921,13 +921,13 @@ public static class BackupConfigEndpoints
         }
     }
 
-    /// <summary>把 DeriveActivity 的驼峰标签写成一句话里读得通的样子（BackingUp → backing up）。</summary>
+    /// <summary>Turns DeriveActivity's camel-case label into something that reads correctly inside a sentence (BackingUp → backing up).</summary>
     private static string Humanize(string activity) =>
         string.Concat(activity.Select((ch, i) => i > 0 && char.IsUpper(ch) ? " " + char.ToLowerInvariant(ch) : $"{char.ToLowerInvariant(ch)}"));
 
-    /// <summary>删配置的善后步骤：吞异常并记 Warning，一步失败不阻断其余、也不把已成功的主删除变成 500。
-    /// 取消除外——那不是「这一步失败了」，而是整条请求该停下（与 a3ac967 的孤儿清理同一约定）；
-    /// 吞掉只会给每个剩余步骤各记一条误导性 Warning。</summary>
+    /// <summary>A cleanup step for config deletion: swallow the exception and log a Warning, so one failing step neither blocks the rest nor turns an already successful main deletion into a 500.
+    /// Cancellation is the exception — that is not "this step failed" but "the whole request should stop" (the same convention as the orphan cleanup in a3ac967);
+    /// swallowing it would only log one misleading Warning per remaining step.</summary>
     private static async Task BestEffort(ILogger logger, string what, Func<Task> action)
     {
         try { await action(); }
@@ -941,8 +941,8 @@ public static class BackupConfigEndpoints
         IResult? Failure, BackupConfig? Config, string? ResolvedRoot, LocalRootPreviewResponse? Preview);
 
     /// <summary>
-    /// preview 与 apply 共用的前置：取配置 → 忙检查 → 路径校验 → 取基线索引 → Inspect。
-    /// 顺序短路，任一步失败就带着对应的 IResult 回去。
+    /// The preamble shared by preview and apply: fetch the config → busy check → path validation → load the baseline index → Inspect.
+    /// Short-circuits in order; any step that fails returns straight back with the corresponding IResult.
     /// </summary>
     private static async Task<PreparedLocalRoot> PrepareLocalRootAsync(
         int id, string newRoot, IBackupConfigService svc, IAccountService accounts,
@@ -956,7 +956,7 @@ public static class BackupConfigEndpoints
         if (config is null)
             return new PreparedLocalRoot(Results.NotFound(), null, null, null);
 
-        // 忙检查在最前面：正在备份/还原/检查时换根，是在给一个正在读的目录抽地毯。
+        // The busy check comes first: changing the root while a backup/restore/check is running is pulling the rug out from under a directory that is being read.
         if (busy.IsBusy(config.AccountId, config.ContainerName))
             return new PreparedLocalRoot(
                 Results.Json(
@@ -971,7 +971,7 @@ public static class BackupConfigEndpoints
             return new PreparedLocalRoot(
                 Results.BadRequest(new { error = "The new local root must be an absolute path." }), null, null, null);
 
-        // 越界走全仓统一的 409 + path_outside_root，不为本功能另立一套。
+        // Out-of-bounds goes through the repo-wide 409 + path_outside_root; no separate scheme just for this feature.
         if (PathBoundaryGuard.Blocked(boundary, newRoot) is { } outside)
             return new PreparedLocalRoot(outside, null, null, null);
 
@@ -992,9 +992,9 @@ public static class BackupConfigEndpoints
         var baseline = await LoadBaselineAsync(config, accounts, indexCache, trackedInfo, secrets, ct);
         if (baseline.Error is { } error)
         {
-            // 这个备份确实有历史，只是这一份索引读不出来——不能落到 Inspect(null) 那条 NoBaseline
-            // 分支，那条分支是给「压根没有历史」用的，会被直接放行。用户在 NAS 上没有命令行，
-            // 这条 Reason 里的异常消息是他们能看到的唯一诊断。
+            // This backup does have history, it is just that this one index cannot be read — it must not fall into the NoBaseline branch of
+            // Inspect(null), which is meant for "there is no history at all" and gets let straight through. The user on the NAS has no command line,
+            // and the exception message in this Reason is the only diagnostic they can see.
             var unreadable = new LocalRootPreviewResponse(
                 nameof(LocalRootVerdict.BaselineUnreadable), Sampled: 0, Matched: 0, Missing: 0,
                 SizeMismatch: 0, MtimeDiffers: 0, MatchRate: 0,
@@ -1007,18 +1007,18 @@ public static class BackupConfigEndpoints
     }
 
     /// <summary>
-    /// 取最新版本索引作为比对基线的三种结果：<c>Index</c> 非空 = 取到了；两者皆空 = 确实没有基线
-    /// （没账户/没信息文件/没版本，走 Inspect 判成 NoBaseline）；<c>Error</c> 非空 = 有历史但读取本身
-    /// 失败——这三者必须分开，第三种绝不能被当成第二种直接放行（见下方 LoadBaselineAsync 的注释）。
+    /// The three outcomes of loading the latest version index as a comparison baseline: <c>Index</c> non-null = we got it; both null = there
+    /// genuinely is no baseline (no account / no info file / no versions, which Inspect judges as NoBaseline); <c>Error</c> non-null = there is
+    /// history but the read itself failed — these three must stay apart, and the third must never be treated as the second and let straight through (see the comment on LoadBaselineAsync below).
     /// </summary>
     private readonly record struct BaselineLoad(VersionIndex? Index, string? Error);
 
     /// <summary>
-    /// 取最新版本的索引作为比对基线。走本地权威缓存（与 /tree、/file-versions 同一套依赖）。
-    /// 没有账户/没有信息文件/没有任何版本 —— 这是「真的没有基线」，交给 Inspect 判成 NoBaseline。
-    /// 但信息文件损坏、密码解不开、索引 blob 读取失败 —— 这是「有基线但读不出来」，**不能**
-    /// 也归进 NoBaseline：那条分支会被直接放行，而这恰恰是最该让用户多看一眼、需要 force 的情形
-    /// （详见 Finding 1）。
+    /// Load the latest version's index as a comparison baseline. Goes through the local authoritative cache (the same set of dependencies as /tree and /file-versions).
+    /// No account / no info file / no versions at all — that is "there really is no baseline", handed to Inspect to judge as NoBaseline.
+    /// But a corrupt info file, a password that will not decrypt, or a failed index blob read — that is "there is a baseline but it cannot be read", and it **must not**
+    /// be lumped into NoBaseline either: that branch gets let straight through, whereas this is precisely the case that most deserves a second look from the user and requires force
+    /// (see Finding 1 for details).
     /// </summary>
     private static async Task<BaselineLoad> LoadBaselineAsync(
         BackupConfig config, IAccountService accounts, ILocalIndexCache indexCache,
@@ -1041,7 +1041,7 @@ public static class BackupConfigEndpoints
                 info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, ct);
             return new BaselineLoad(index, null);
         }
-        // 取消不是「失败」，是整条请求该停下——照旧不拦。
+        // Cancellation is not a "failure", it means the whole request should stop — as always, do not intercept it.
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new BaselineLoad(null, ex.Message);

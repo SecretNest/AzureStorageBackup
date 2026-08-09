@@ -4,11 +4,11 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 装箱那两条**按机器**（而不是按备份）定的界，由环境变量给：<c>Backup__MaxPackMembers</c> 与
-/// <c>Backup__MaxPackPathBytes</c>。第三条 <c>GroupCapBytes</c> 是每个备份自己的设置，不在这里。
+/// The two packing limits that are set **per machine** (not per backup), supplied by environment variables: <c>Backup__MaxPackMembers</c> and
+/// <c>Backup__MaxPackPathBytes</c>. The third one, <c>GroupCapBytes</c>, is a per-backup setting and does not belong here.
 /// <para>
-/// 之所以按机器给：这两条约束的是**这台机器上 7z 进程的内存与 argv 上限**，
-/// 与"这份备份想把包切多大"无关。同一份配置搬到另一台机器上，合适的值可能完全不同。
+/// Why per machine: these two constrain **the memory and argv limit of the 7z process on this machine**,
+/// which has nothing to do with "how big this backup wants its packs to be". Move the same config to another machine and the right values may be completely different.
 /// </para>
 /// </summary>
 public sealed record PackLimits(int MaxPackMembers = 20_000, long MaxPackPathBytes = 1_000_000)
@@ -16,12 +16,12 @@ public sealed record PackLimits(int MaxPackMembers = 20_000, long MaxPackPathByt
     public static readonly PackLimits Default = new();
 }
 
-/// <summary>把持久化的 BackupConfig 映射为引擎的 BackupRequest（BackupRunner 与调度器共用）。</summary>
+/// <summary>Maps the persisted BackupConfig to the engine's BackupRequest (shared by BackupRunner and the scheduler).</summary>
 public static class BackupRequestMapper
 {
     /// <summary>
-    /// <paramref name="password"/> 是**明文**，由调用方经 ISecretReader.RevealBackupPassword 取得
-    /// （设计 §3.1：解密只在咽喉处；映射器是静态的，拿不到 ISecretReader）。
+    /// <paramref name="password"/> is the **plaintext**, obtained by the caller via ISecretReader.RevealBackupPassword
+    /// (design §3.1: decryption happens only at the chokepoint; the mapper is static and cannot get hold of ISecretReader).
     /// </summary>
     public static BackupRequest From(
         BackupConfig config, Account account, string? password, GlobalSettings? settings = null,
@@ -45,7 +45,7 @@ public static class BackupRequestMapper
                 DontCompress = OptionalRules(r.DontCompressRules),
                 DontGroup = OptionalRules(r.DontGroupRules),
                 CrossDirGroup = OptionalRules(r.CrossDirGroupRules),
-                // ScopeRules 不可继承，直接从 config 取而不是从 r（ResolvedBackupSettings）。
+                // ScopeRules is not inheritable, so take it straight from config rather than from r (ResolvedBackupSettings).
                 Scan = new ScanOptions
                 {
                     IncludeSymlinks = r.IncludeSymlinks,
@@ -72,7 +72,7 @@ public static class BackupRequestMapper
         };
     }
 
-    /// <summary>把全局设置的网络重试退避（PRD 4.1）映射为上传路径的 RetryOptions。</summary>
+    /// <summary>Maps the global settings' network retry backoff (PRD 4.1) to the upload path's RetryOptions.</summary>
     public static RetryOptions RetryOf(GlobalSettings? settings)
     {
         if (settings is null)
@@ -109,7 +109,7 @@ public static class BackupRequestMapper
         };
     }
 
-    /// <summary>清理选项（保留 + 死重压实所需 tier/分卷/阈值），调度器 Cleanup 任务用。</summary>
+    /// <summary>Cleanup options (retention + the tier/volume/threshold needed for dead-weight compaction), used by the scheduler's Cleanup task.</summary>
     public static CleanupOptions CleanupOf(BackupConfig config, GlobalSettings? settings = null)
     {
         var r = ResolvedBackupSettings.From(config, settings);
@@ -125,7 +125,7 @@ public static class BackupRequestMapper
         };
     }
 
-    // 备份密码改由 ISecretReader.RevealBackupPassword 提供（设计 §3.1），此处不再暴露。
+    // The backup password now comes from ISecretReader.RevealBackupPassword (design §3.1); it is no longer exposed here.
 
     public static AccessTier MapTier(StorageTier tier) => tier switch
     {
@@ -135,9 +135,9 @@ public static class BackupRequestMapper
         _ => AccessTier.Hot,
     };
 
-    /// <summary>把一段可选的规则文本映射为规则集（空/空白 → null，表示「没有规则」）。
-    /// 公开是因为修复路径（RepairRunner → BackupRepairer）也要按同一套 DontCompress 规则决定是否只存不压，
-    /// 否则修好的归档与全新备份写出的压缩方式不一致。</summary>
+    /// <summary>Maps an optional block of rule text to a rule set (empty/whitespace → null, meaning "no rules").
+    /// It is public because the repair path (RepairRunner → BackupRepairer) has to use the same DontCompress rules to decide store-only vs. compress,
+    /// otherwise a repaired archive ends up compressed differently from what a fresh backup writes.</summary>
     public static IgnoreRuleSet? OptionalRules(string? text) =>
         string.IsNullOrWhiteSpace(text) ? null : new IgnoreRuleSet(SplitLines(text));
 

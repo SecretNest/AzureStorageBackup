@@ -9,10 +9,12 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 同一轮备份内、跨箱的打包成员去重。跨版本那一路由 <see cref="PackMemberDedupTests"/> 覆盖；
-/// 这里要钉的是**同一轮**：本轮新封的箱之间，同内容只该装一次。
+/// Cross-pack dedup of packed members within one backup run. The cross-version path is covered by
+/// <see cref="PackMemberDedupTests"/>; what gets pinned here is the **within-run** case: among the packs sealed
+/// in this run, identical content must be packed only once.
 /// <para>
-/// 装箱用 MaxPackMembers = 1 逼成一箱一个成员，跨箱因此是确定的，不必猜装箱结果。
+/// Packing uses MaxPackMembers = 1 to force one member per pack, which makes "across packs" deterministic and
+/// removes any guessing about the packing result.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -78,9 +80,9 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <param name="deadWeightCompaction">
-    /// 给保留清理接上真正的 <see cref="DeadWeightCompactor"/>（生产里 Program.cs 就是这么接的，
-    /// 且与备份共用同一个 <see cref="StagingArea"/>）。默认不接：多数用例只关心装箱与还原，
-    /// 接上等于每轮备份收尾都多下载/重压一遍包。
+    /// Wires the real <see cref="DeadWeightCompactor"/> into retention cleanup (which is how Program.cs wires it
+    /// in production, sharing the same <see cref="StagingArea"/> as the backup). Off by default: most cases only
+    /// care about packing and restore, and wiring it in means every backup ends with an extra download/repack of the pack.
     /// </param>
     private (BackupOrchestrator Backup, RestoreOrchestrator Restore, IBackupInfoStore Store) Build(
         IFileCompressor? compressor = null, bool deadWeightCompaction = false)
@@ -106,7 +108,7 @@ public sealed class PackAliasDedupTests : IDisposable
         return (backup, restore, store);
     }
 
-    /// <summary>阈值给足让所有文件走 pack 路径；一箱只装一个成员，跨箱因此是确定的。</summary>
+    /// <summary>Threshold set high enough that every file takes the pack path; one member per pack makes "across packs" deterministic.</summary>
     private BackupRequest Request(Account account, string container) => new()
     {
         Account = account,
@@ -127,8 +129,10 @@ public sealed class PackAliasDedupTests : IDisposable
         return ids.Count;
     }
 
-    /// <summary>把某个包解开，列出归档里**实际**有哪些成员（含目录段，ordinal 序）。
-    /// 索引怎么写是一回事，归档里到底装了几个成员是另一回事——去重与压实都要看后者才算数。</summary>
+    /// <summary>Unpacks a pack and lists which members the archive **actually** holds (directory segments
+    /// included, in ordinal order).
+    /// What the index says is one thing, how many members the archive really contains is another — for dedup and
+    /// compaction only the latter counts.</summary>
     private async Task<List<string>> PackEntryNamesAsync(Azure.Storage.Blobs.BlobContainerClient cc, string packId)
     {
         var work = Path.Combine(_temp, "peek-" + Guid.NewGuid().ToString("N"));
@@ -141,7 +145,8 @@ public sealed class PackAliasDedupTests : IDisposable
             .OrderBy(x => x, StringComparer.Ordinal)];
     }
 
-    /// <summary>某个包在容器里占的总字节（含全部分卷）。压实前后比一比，就知道包是不是真被重写了。</summary>
+    /// <summary>Total bytes a pack occupies in the container (all volumes included). Compare before and after
+    /// compaction to tell whether the pack really got rewritten.</summary>
     private static async Task<long> PackBytesAsync(Azure.Storage.Blobs.BlobContainerClient cc, string packId)
     {
         long total = 0;
@@ -151,7 +156,8 @@ public sealed class PackAliasDedupTests : IDisposable
         return total;
     }
 
-    /// <summary>确定性的伪随机字母串：压不动多少，尺寸差异藏不住。同 seed 出同一串，不同 seed 内容必不同。</summary>
+    /// <summary>A deterministic pseudo-random letter string: barely compressible, so size differences cannot hide.
+    /// The same seed yields the same string, different seeds necessarily yield different content.</summary>
     private static string Noise(int seed, int length)
     {
         var rnd = new Random(seed);
@@ -162,14 +168,16 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// T1 + T2：**同一轮**里三个小文件、其中两个同内容，一箱只装一个成员。
-    /// 去重生效时只该有两个包（不是三个），第二条条目指向第一条那个成员，而且两条都还原得回来。
+    /// T1 + T2: three small files in **one run**, two of them with identical content, one member per pack.
+    /// With dedup working there should be only two packs (not three), the second entry points at the first one's
+    /// member, and both restore.
     /// <para>
-    /// T2 的后半句同样要钉：两条条目共用同一个归档成员，但 mtime 与权限是**各自**的。
-    /// 归档里只躺着 leader 那一份字节，元数据却必须来自各条目自己（<c>RestoreOrchestrator</c> 的
-    /// <c>ApplyMetadata(dest, entry)</c>）。写错的形状是"别名还原出来带着 leader 的时间戳/权限"——
-    /// 内容对、元数据错，还原结果看着没问题，下一轮备份却会因为 mtime 变了而把它整个重备一遍，
-    /// 而权限错则是实打实的安全问题（0600 的文件还原成 0644）。
+    /// The second half of T2 gets pinned as well: the two entries share one archive member, but mtime and
+    /// permissions are **their own**. Only the leader's bytes lie in the archive, yet the metadata must come from
+    /// each entry itself (<c>RestoreOrchestrator</c>'s <c>ApplyMetadata(dest, entry)</c>). The shape of getting it
+    /// wrong is "the alias restores carrying the leader's timestamp/permissions" — right content, wrong metadata,
+    /// a restore that looks fine, but the next backup re-backs the whole file because its mtime changed, while
+    /// wrong permissions are an outright security problem (a 0600 file restored as 0644).
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -186,14 +194,15 @@ public sealed class PackAliasDedupTests : IDisposable
 
         try
         {
-            // 不可压缩的内容：万一真的装了两箱，体积差异藏不住。
+            // Incompressible content: if two packs really got built, the size difference cannot hide.
             var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
-            Write("a/first.txt", payload);              // leader（ordinal 路径序最先）
+            Write("a/first.txt", payload);              // leader (first in ordinal path order)
             Write("b/other.txt", "something else entirely");
-            Write("c/second.txt", payload);             // 别名
+            Write("c/second.txt", payload);             // alias
 
-            // 两条路径的元数据必须**不同**，否则"各自正确"与"都取了 leader 的"是同一个结果，测不出东西。
-            // mtime 由 Write 自增（leader = base+1min，别名 = base+3min）；权限在这里再拉开一档。
+            // The metadata of the two paths must **differ**, otherwise "each correct" and "both took the leader's"
+            // give the same result and the test measures nothing.
+            // mtime is bumped by Write (leader = base+1min, alias = base+3min); permissions are pulled further apart here.
             var leaderSrc = Path.Combine(_src, "a", "first.txt");
             var aliasSrc = Path.Combine(_src, "c", "second.txt");
             if (!OperatingSystem.IsWindows())
@@ -210,11 +219,12 @@ public sealed class PackAliasDedupTests : IDisposable
 
             var run = await backup.RunAsync(Request(account, name));
 
-            // 三个文件、一箱一个成员：没有去重就是 3 个包，有去重是 2 个。
+            // Three files, one member per pack: without dedup that is 3 packs, with dedup 2.
             Assert.Equal(2, await CountPacksAsync(cc));
 
-            // T8：别名仍然是一个**变更文件**，只是不占一个包。记账口径不能因为去重而漏掉它——
-            // 它在索引里实实在在有一条条目，用户也确实新加了这个文件。
+            // T8: an alias is still a **changed file**, it just does not occupy a pack. The accounting must not
+            // drop it because of dedup — it really does have an entry in the index, and the user really did add
+            // that file.
             Assert.Equal(3, run.ChangedFiles);
 
             var info = await store.ReadInfoAsync(account, name, null);
@@ -222,12 +232,12 @@ public sealed class PackAliasDedupTests : IDisposable
             var first = v1.Entries.Single(e => e.Path == "a/first.txt");
             var second = v1.Entries.Single(e => e.Path == "c/second.txt");
 
-            // 引用形状必须与 RecordPack 从前写的逐字节相同：Kind=pack + 同一个 Ref + leader 的 EntryName。
+            // The reference shape must be byte-for-byte what RecordPack used to write: Kind=pack + the same Ref + the leader's EntryName.
             Assert.Equal("pack", second.Storage!.Kind);
             Assert.Equal(first.Storage!.Ref, second.Storage.Ref);
             Assert.Equal("a/first.txt", second.Storage.EntryName);
 
-            // 两条都要还原到**自己**的路径上。
+            // Both must restore to **their own** paths.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -237,7 +247,7 @@ public sealed class PackAliasDedupTests : IDisposable
             Assert.Equal(payload, await File.ReadAllTextAsync(leaderDst));
             Assert.Equal(payload, await File.ReadAllTextAsync(aliasDst));
 
-            // 元数据各归各的：别名拿到的绝不能是 leader 那一份。
+            // Metadata belongs to each of them: the alias must never end up with the leader's.
             Assert.Equal(leaderMtime, File.GetLastWriteTimeUtc(leaderDst));
             Assert.Equal(aliasMtime, File.GetLastWriteTimeUtc(aliasDst));
             if (!OperatingSystem.IsWindows())
@@ -255,8 +265,9 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 内容不同就绝不能合并——哪怕长度一样。这一条是去重判据的反向保险：
-    /// 判错的后果是索引指向别人的内容、还原出来是错数据。
+    /// Different content must never be merged — not even at the same length. This one is the reverse safety net
+    /// on the dedup criteria: getting it wrong means the index points at someone else's content and restore hands
+    /// back wrong data.
     /// </summary>
     [SkippableFact]
     public async Task Different_Content_Of_The_Same_Length_Is_Never_Merged()
@@ -273,11 +284,11 @@ public sealed class PackAliasDedupTests : IDisposable
         try
         {
             Write("a/first.txt", new string('x', 300));
-            Write("c/second.txt", new string('y', 300));   // 同长度、不同内容
+            Write("c/second.txt", new string('y', 300));   // same length, different content
 
             await backup.RunAsync(Request(account, name));
 
-            Assert.Equal(2, await CountPacksAsync(cc));   // 各装各的
+            Assert.Equal(2, await CountPacksAsync(cc));   // each packed separately
 
             await restore.RunAsync(new RestoreRequest
             {
@@ -290,11 +301,12 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// T6：leader 在压缩窗口里被改写 → 它被踢出那一箱、以新 hash 重新处理，于是它最终存下去的
-    /// 内容**不再等于**别名的内容。这时别名绝不能指过去（那会让索引指向别人的内容、还原出错
-    /// 数据），必须自己被重新备份一遍。
+    /// T6: the leader is rewritten inside the compression window → it gets kicked out of that pack and
+    /// reprocessed under a new hash, so the content it finally stores **no longer equals** the alias's content.
+    /// At that point the alias must never point at it (that would make the index point at someone else's content
+    /// and restore hand back wrong data); it has to be backed up again on its own.
     /// <para>
-    /// 两个文件都还原成各自应有的内容，就是这条红线守住了。
+    /// Both files restoring to the content each should have is this red line holding.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -313,9 +325,10 @@ public sealed class PackAliasDedupTests : IDisposable
             var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
             const string mutated = "leader got rewritten while it was being compressed";
             Write("a/first.txt", payload);       // leader
-            Write("c/second.txt", payload);      // 别名
+            Write("c/second.txt", payload);      // alias
 
-            // 压缩之后把 leader 的内容换掉：重校验会发现它变了，把它踢出那一箱、以新 hash 重处理。
+            // Swap the leader's content after compression: revalidation notices it changed, kicks it out of that
+            // pack and reprocesses it under a new hash.
             var (backup, restore, store) = Build(
                 new MutatingAfterCompressCompressor(new SevenZipCompressor(), _src, "a/first.txt", mutated));
 
@@ -326,10 +339,10 @@ public sealed class PackAliasDedupTests : IDisposable
             var first = v1.Entries.Single(e => e.Path == "a/first.txt");
             var second = v1.Entries.Single(e => e.Path == "c/second.txt");
 
-            // 两条条目的内容身份必须已经分道扬镳——别名绝不能还挂在 leader 那份新内容上。
+            // The content identities of the two entries must have parted ways — the alias must not still hang off the leader's new content.
             Assert.NotEqual(first.FullHash, second.FullHash);
 
-            // 决定性的一条：还原出来的必须各是各的内容。
+            // The decisive one: what restores must be each file's own content.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -340,9 +353,11 @@ public sealed class PackAliasDedupTests : IDisposable
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>压缩**之后**改写目标成员的内容，模拟"文件在处理中变化"（§9、PRD 特别说明 D）。
-    /// 分组路径先 hash 后压，所以挂在 CompressAsync 之后，重校验据此发现内容变了。
-    /// 与 BackupOrchestratorTests.MutatingCompressor 同一套手法，只覆盖这里用得到的那一半。</summary>
+    /// <summary>Rewrites the target member's content **after** compression, simulating "the file changed while it
+    /// was being processed" (§9, PRD special note D).
+    /// The grouped path hashes first and compresses second, so this hooks in after CompressAsync, and that is how
+    /// revalidation discovers the content changed.
+    /// Same technique as BackupOrchestratorTests.MutatingCompressor, covering only the half needed here.</summary>
     private sealed class MutatingAfterCompressCompressor(
         IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
     {
@@ -381,11 +396,13 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// T3——本特性最要紧的一条。leader 那个**路径**的文件被删掉之后，别名仍然要能还原。
+    /// T3 — the most important case of this feature. After the file at the leader's **path** is deleted, the
+    /// alias must still restore.
     /// <para>
-    /// 那时 liveByPack 里那个 entryName 由别名条目独自提供（RetentionCleaner 按 EntryName 归组，
-    /// 不按 fullHash），所以包不删、成员不死、解压目录里照样取得到。这条链每一环都对，别名才
-    /// 活得下来——而它极容易被将来某次"顺手改成按 hash 归组"的重构悄悄踩断。
+    /// At that point the entryName in liveByPack is supplied by the alias entry alone (RetentionCleaner groups by
+    /// EntryName, not by fullHash), so the pack is not deleted, the member does not die, and it is still there in
+    /// the extraction directory. Every link in that chain has to hold for the alias to survive — and it is very
+    /// easy for some future "let's just group by hash while we're here" refactor to quietly snap it.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -400,7 +417,7 @@ public sealed class PackAliasDedupTests : IDisposable
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await cc.CreateIfNotExistsAsync();
 
-        // 只保留最新一个版本：v1 退役，包只能靠 v2 里那条别名条目钉住。
+        // Keep only the newest version: v1 retires, so the pack can only be pinned by the alias entry in v2.
         var keepOne = Request(account, name) with
         {
             Options = new BackupEngineOptions
@@ -414,31 +431,32 @@ public sealed class PackAliasDedupTests : IDisposable
         {
             var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
             Write("a/first.txt", payload);       // leader
-            Write("c/second.txt", payload);      // 别名
+            Write("c/second.txt", payload);      // alias
             await backup.RunAsync(keepOne);
 
             var packsAfterV1 = await CountPacksAsync(cc);
-            Assert.Equal(1, packsAfterV1);       // 同内容只装了一箱
+            Assert.Equal(1, packsAfterV1);       // identical content was packed only once
 
-            // v2：把 leader 那个路径删掉。包里那个成员此后只被别名条目引用着。
+            // v2: delete the leader's path. From then on that member in the pack is referenced only by the alias entry.
             File.Delete(Path.Combine(_src, "a", "first.txt"));
             await backup.RunAsync(keepOne);
 
-            // 包一个都不能少——删了就等于把 c/second.txt 的数据删了。
+            // Not one pack may go missing — deleting it deletes c/second.txt's data.
             Assert.Equal(packsAfterV1, await CountPacksAsync(cc));
 
             var info = await store.ReadInfoAsync(account, name, null);
-            // 这条测试的前提是 v1 已经退役（MaxVersions = 1），包才只能靠别名条目钉住。
-            // 不断言这一条，v1 万一没退役，"包没被删"就会因为 leader 自己在 v1 里的旧条目
-            // 而通过——测试变成一个测不出东西的假象，根本没验证到别名钉包这件事。
+            // This test's premise is that v1 has already retired (MaxVersions = 1), which is what makes the alias
+            // entry the pack's only pin. Without asserting it, if v1 somehow did not retire, "the pack was not
+            // deleted" would pass on the strength of the leader's own old entry in v1 — the test becomes an
+            // illusion that measures nothing and never verifies that an alias pins a pack at all.
             Assert.Single(info!.Versions);
             var v2 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             Assert.DoesNotContain(v2.Entries, e => e.Path == "a/first.txt");
             var second = v2.Entries.Single(e => e.Path == "c/second.txt");
-            // 成员名仍是**最初**那个已经不存在的路径——还原要按它去归档里取。
+            // The member name is still the **original** path, which no longer exists — restore fetches from the archive by it.
             Assert.Equal("a/first.txt", second.Storage!.EntryName);
 
-            // 决定性的一条：内容还在，还原得回来。
+            // The decisive one: the content is still there and it restores.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -450,10 +468,11 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// T7：两条条目指向同一个 pack 成员，检查必须把两条都判健康。
+    /// T7: two entries point at the same pack member, and check must report both healthy.
     /// <para>
-    /// BackupChecker 逐条查 actual[entryName]，两条查的是同一项、内容当然相同；而
-    /// "归档吐出的成员数 == 列举出的成员数" 那条前提也不受影响——别名不进归档。
+    /// BackupChecker looks up actual[entryName] entry by entry; both look up the same item, so of course the
+    /// content matches. And the premise "the member count the archive yields == the member count enumerated" is
+    /// unaffected too — aliases never enter the archive.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -480,7 +499,7 @@ public sealed class PackAliasDedupTests : IDisposable
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
             var report = await checker.CheckAsync(account, name, null, null, new CheckOptions());
 
-            // 一条损坏都不该有，两条条目都要出现在结论里。
+            // Not one corruption may appear, and both entries must show up in the findings.
             Assert.True(report.Ok);
             Assert.Empty(report.CorruptedPaths);
             Assert.Contains(report.Findings, f => f.Path == "a/first.txt");
@@ -490,15 +509,19 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 生产里最常见的那个形状：**同一个目录**里放了两份一样的文件（下载两遍、复制一份改个名）。
+    /// The shape seen most often in production: two identical files sitting in **the same directory**
+    /// (downloaded twice, or copied and renamed).
     /// <para>
-    /// 上面所有别名用例都是跨目录的，而同目录这一档的行为是真的变了：从前两个文件是同一个 solid
-    /// 归档里的两个成员（7z 的字典跨成员匹配，本来就几乎不占额外字节），现在第二个成了别名、
-    /// 归档里只剩一个成员。逻辑上等价——两条索引条目、一份内容——但"等价"是推出来的，没跑过。
+    /// Every alias case above crosses directories, and the same-directory case really did change behaviour: the
+    /// two files used to be two members of one solid archive (7z's dictionary matching across members already
+    /// cost almost no extra bytes), whereas now the second becomes an alias and the archive holds only one
+    /// member. Logically equivalent — two index entries, one copy of the content — but "equivalent" was reasoned,
+    /// never run.
     /// </para>
     /// <para>
-    /// 一箱只装一个成员（MaxPackMembers = 1），所以没有去重就是两个包；有去重是一个包、
-    /// 且归档里只有一个成员。两个数都断言：只看包数，万一将来变成"一箱两个成员"也照样过。
+    /// One member per pack (MaxPackMembers = 1), so without dedup that is two packs; with dedup it is one pack
+    /// holding exactly one member. Both numbers are asserted: on pack count alone this would still pass if the
+    /// behaviour ever became "two members in one pack".
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -516,8 +539,8 @@ public sealed class PackAliasDedupTests : IDisposable
         try
         {
             var payload = Noise(20260807, 4000);
-            Write("d/one.txt", payload);        // leader（同目录内 ordinal 路径序最先）
-            Write("d/two.txt", payload);        // 别名，同目录
+            Write("d/one.txt", payload);        // leader (first in ordinal path order within the directory)
+            Write("d/two.txt", payload);        // alias, same directory
 
             await backup.RunAsync(Request(account, name));
 
@@ -525,7 +548,7 @@ public sealed class PackAliasDedupTests : IDisposable
 
             var info = await store.ReadInfoAsync(account, name, null);
             var packId = Assert.Single(info!.Packs.Keys);
-            // 归档里实际只有一个成员——这才是"只存了一份"的直接证据。
+            // The archive really holds only one member — that is the direct evidence of "stored only once".
             Assert.Equal(["d/one.txt"], await PackEntryNamesAsync(cc, packId));
 
             var v1 = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
@@ -535,7 +558,7 @@ public sealed class PackAliasDedupTests : IDisposable
             Assert.Equal(one.Storage!.Ref, two.Storage.Ref);
             Assert.Equal("d/one.txt", two.Storage.EntryName);
 
-            // 两条都要还原到自己的路径上。
+            // Both must restore to their own paths.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -547,24 +570,28 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// T5 的端到端版，也是本特性最凶的一条链：**本特性产出的别名** → 触发死重压实**重写**那个包
-    /// → 压实之后别名仍能还原出正确内容。
+    /// The end-to-end version of T5, and the nastiest chain in this feature: **an alias produced by this
+    /// feature** → triggering dead-weight compaction that **rewrites** that pack → the alias still restoring the
+    /// correct content afterwards.
     /// <para>
-    /// 与 <c>DeadWeightCompactorTests</c> 里那些用例的区别：那边的包和 liveByPack 都是手工构造的
-    /// 历史形状，且压实完从没跑过一次还原。这里从头到尾是真的——包由本轮备份封出来、别名由本
-    /// 特性产生、liveByPack 由 <c>RetentionCleaner</c> 自己扫索引归组、压实由阈值真的触发、
-    /// 最后真的还原一次。
+    /// How this differs from the cases in <c>DeadWeightCompactorTests</c>: there the pack and liveByPack are
+    /// hand-built historical shapes, and no restore was ever run after compaction. Here it is real from end to
+    /// end — the pack is sealed by this run's backup, the alias is produced by this feature, liveByPack is
+    /// grouped by <c>RetentionCleaner</c> scanning the index itself, compaction is really triggered by the
+    /// threshold, and a real restore runs at the end.
     /// </para>
     /// <para>
-    /// 挑的是 T3 叠加压实这个最凶的组合：v2 把 leader 那个**路径**连同三个死重一起删掉，于是
+    /// The combination chosen is the nastiest one, T3 stacked on compaction: v2 deletes the leader's **path**
+    /// together with three pieces of dead weight, so that
     /// <list type="bullet">
-    /// <item>包里唯一的存活成员 <c>a/leader.txt</c> 只由别名条目 <c>c/alias.txt</c> 独自钉住
-    /// （liveByPack 按 EntryName 归组）；</item>
-    /// <item><c>hasAbsentLocal</c> 为真（本地已经没有 a/leader.txt 了），压实走的是**下载重组**
-    /// 那条路：下载旧包 → 解压 → 只把存活成员放进 compose 目录 → 重压覆盖同一个 packId。</item>
+    /// <item>the pack's only surviving member <c>a/leader.txt</c> is pinned by the alias entry
+    /// <c>c/alias.txt</c> alone (liveByPack groups by EntryName);</item>
+    /// <item><c>hasAbsentLocal</c> is true (a/leader.txt is gone locally), so compaction takes the **download and
+    /// reassemble** path: download the old pack → extract → put only the surviving members into the compose directory → recompress over the same packId.</item>
     /// </list>
-    /// 这条链每一环理论上都通，但从没实跑过。踩断其中任何一环（比如归组改按 fullHash、或者
-    /// 本地探测不到就整包放弃），别名的数据就在一次自动清理里静默没了。
+    /// Every link in this chain works in theory, but it had never actually been run. Snap any one of them
+    /// (grouping switched to fullHash, say, or giving up on the whole pack when local probing fails) and the
+    /// alias's data silently disappears during one automatic cleanup.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -572,7 +599,7 @@ public sealed class PackAliasDedupTests : IDisposable
     {
         Skip.IfNot(AzuriteReachable() && SevenZip(), "Azurite/7-Zip unavailable");
 
-        // 接上真正的死重压实器（生产 DI 就是这么接的）。
+        // Wire in the real dead-weight compactor (which is how production DI wires it).
         var (backup, restore, store) = Build(deadWeightCompaction: true);
         var account = AzuriteAccount();
         var name = RandomName("packaliascompact-");
@@ -580,10 +607,12 @@ public sealed class PackAliasDedupTests : IDisposable
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await cc.CreateIfNotExistsAsync();
 
-        // 默认 MaxPackMembers（不是 1）：a/ 整个目录装一箱，leader 才可能和死重同处一包——
-        // 一箱一个成员的话，死重和存活成员各在各的包里，压实根本无从发生。
-        // MaxVersions = 1：v1 退役，死重才会出现（死重只在版本退役时增加）。
-        // DeadWeightThreshold 用默认的 0.30，AllowRepackDownload 用默认的 true（下载重组要它）。
+        // Default MaxPackMembers (not 1): the whole a/ directory goes into one pack, which is the only way the
+        // leader can share a pack with the dead weight — with one member per pack, dead weight and surviving
+        // members sit in separate packs and compaction can never happen.
+        // MaxVersions = 1: v1 retires, which is what makes dead weight appear (it only grows when a version retires).
+        // DeadWeightThreshold stays at the default 0.30 and AllowRepackDownload at the default true (the
+        // download-and-reassemble path needs it).
         var request = Request(account, name) with
         {
             Options = new BackupEngineOptions
@@ -596,54 +625,58 @@ public sealed class PackAliasDedupTests : IDisposable
         try
         {
             var payload = Noise(1, 400);
-            Write("a/leader.txt", payload);       // leader：v2 之后是包里唯一的存活成员
-            Write("a/dead1.txt", Noise(2, 20_000));   // 三份将来的死重，各不相同（否则它们之间也会去重）
+            Write("a/leader.txt", payload);       // leader: after v2 it is the pack's only surviving member
+            Write("a/dead1.txt", Noise(2, 20_000));   // three future pieces of dead weight, all different (otherwise they would dedup against each other)
             Write("a/dead2.txt", Noise(3, 20_000));
             Write("a/dead3.txt", Noise(4, 20_000));
-            Write("c/alias.txt", payload);        // 别名，另一个目录，本轮不入箱
+            Write("c/alias.txt", payload);        // alias, another directory, not packed this run
 
             await backup.RunAsync(request);
 
             var infoV1 = await store.ReadInfoAsync(account, name, null);
             var packId = Assert.Single(infoV1!.Packs.Keys);
-            // 前提确认：五个文件、一个包、包里四个成员（别名不入箱）。
+            // Premise check: five files, one pack, four members in it (the alias is not packed).
             Assert.Equal(1, await CountPacksAsync(cc));
             Assert.Equal(4, infoV1.Packs[packId].Members.Count);
             Assert.Equal(
                 ["a/dead1.txt", "a/dead2.txt", "a/dead3.txt", "a/leader.txt"],
                 await PackEntryNamesAsync(cc, packId));
             var v1 = await store.ReadIndexAsync(account, name, infoV1.Versions[^1].IndexBlob, null);
-            // 前提确认：c/alias.txt 确实是**本特性产出的别名**，不是碰巧各存各的。
+            // Premise check: c/alias.txt really is **an alias produced by this feature**, not two copies that happened to be stored separately.
             Assert.Equal("a/leader.txt", v1.Entries.Single(e => e.Path == "c/alias.txt").Storage!.EntryName);
             var bytesBefore = await PackBytesAsync(cc, packId);
 
-            // v2：整个 a/ 目录删掉。leader 那个路径连同三份死重一起消失，包里只剩 a/leader.txt
-            // 这一个成员还被引用着——而引用它的只有别名条目。
+            // v2: delete the whole a/ directory. The leader's path disappears along with the three pieces of dead
+            // weight, leaving a/leader.txt as the pack's only still-referenced member — and the only thing
+            // referencing it is the alias entry.
             Directory.Delete(Path.Combine(_src, "a"), recursive: true);
             var run2 = await backup.RunAsync(request);
 
-            // 压实真的触发了吗？逐条钉死，不靠"跑完没报错"：
-            // ① v1 必须真的退役，死重才存在（不退役 → 三份死重仍被 v1 引用 → ratio = 0 → 不触发）。
+            // Did compaction really trigger? Pinned item by item, not by "it ran without erroring":
+            // ① v1 must really retire, or there is no dead weight (no retirement → the three dead pieces stay referenced by v1 → ratio = 0 → no trigger).
             Assert.Equal(1, run2.Cleanup.RetiredVersions);
             var infoV2 = await store.ReadInfoAsync(account, name, null);
             Assert.Single(infoV2!.Versions);
-            // ② 包还在（别名钉住了它），且**同一个 packId**——压实是原地重写，不是新建。
+            // ② The pack is still there (the alias pins it), and it is the **same packId** — compaction rewrites in place, it does not create a new one.
             Assert.Contains(packId, infoV2.Packs.Keys);
-            // ③ 成员表从 4 缩到 1，死重归零：这只可能是 RecompactAsync 走完 newSizes.Count > 0
-            //    那一支才写得出来（放弃压实那一支只改 DeadBytes，成员表原封不动）。
+            // ③ The member table shrinks from 4 to 1 and dead weight goes to zero: only RecompactAsync completing
+            //    the newSizes.Count > 0 branch can write that (the give-up branch only updates DeadBytes and
+            //    leaves the member table untouched).
             Assert.Single(infoV2.Packs[packId].Members);
             Assert.Equal(0, infoV2.Packs[packId].DeadBytes);
             Assert.Equal(payload.Length, infoV2.Packs[packId].OriginalBytes);
-            // ④ 云端归档本身被改写了：只剩存活成员，尺寸大幅缩小（三份 2 万字节的伪随机文本没了）。
+            // ④ The cloud archive itself was rewritten: only the surviving member is left and the size shrank
+            //    sharply (three 20,000-byte pseudo-random texts are gone).
             Assert.Equal(["a/leader.txt"], await PackEntryNamesAsync(cc, packId));
             var bytesAfter = await PackBytesAsync(cc, packId);
             Assert.True(bytesAfter < bytesBefore / 2,
                 $"pack should have been rewritten much smaller, was {bytesBefore} → {bytesAfter}");
-            // ⑤ 走的确实是**下载重组**那条路：压实时本地根本没有 a/leader.txt 可用作修复源，
-            //    唯一的来源只能是下载旧包解压出来的那一份。
+            // ⑤ It really took the **download and reassemble** path: at compaction time there was no local
+            //    a/leader.txt to use as a repair source, so the only possible source was the copy extracted from
+            //    the downloaded old pack.
             Assert.False(Directory.Exists(Path.Combine(_src, "a")));
 
-            // 决定性的一条：压实重写过的包里，别名仍然还原得出正确内容。
+            // The decisive one: in a pack that compaction rewrote, the alias still restores the correct content.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -655,18 +688,21 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 悬空重跑按压法分两组（<c>orphanAliases.ToLookup(… DontCompress …)</c>）。此前所有用例的
-    /// <c>DontCompress</c> 都是 null，<c>ToLookup</c> 永远只出一组，那个 <c>foreach</c> 有一半从没执行过。
+    /// The orphan rerun splits into two groups by compression mode (<c>orphanAliases.ToLookup(… DontCompress …)</c>).
+    /// In every case so far <c>DontCompress</c> was null, <c>ToLookup</c> always produced exactly one group, and
+    /// half of that <c>foreach</c> had never executed.
     /// <para>
-    /// 这里让悬空的别名**跨越两种压法**：leader 在压缩窗口里被改写 → 挂在它身上的两个别名一起悬空，
-    /// 一个命中不压缩规则、一个不命中。两组都得被跑到，且各自用对的压法——一箱只能有一种压法，
-    /// 混装的话规则对被打包的文件就等于不存在。
+    /// Here the orphaned aliases **straddle both compression modes**: the leader is rewritten inside the
+    /// compression window → the two aliases hanging off it are orphaned together, one matching the
+    /// do-not-compress rule and one not. Both groups have to be reached, each with the right mode — a pack can
+    /// only have one mode, and mixing them would make the rule effectively nonexistent for packed files.
     /// </para>
     /// <para>
-    /// 怎么确认两组**都**走到了、而且是分开走的：两个别名落在**不同**的包上，且这两个包的
-    /// <c>PackInfo.StoreOnly</c> 一真一假，云端尺寸也一大一小（只存的那箱约等于原文件大小，
-    /// 压缩的那箱小两三个数量级）。要是分流被去掉、两个别名塞进同一次 ProcessPackAsync，
-    /// 它们的压法就会是同一个，这三条断言会一起变红。
+    /// How we confirm **both** groups were reached, and separately: the two aliases land in **different** packs,
+    /// those two packs have <c>PackInfo.StoreOnly</c> one true and one false, and their cloud sizes are one large
+    /// and one small (the store-only pack is about the original file size, the compressed one two to three orders
+    /// of magnitude smaller). If the split were removed and both aliases went through a single ProcessPackAsync,
+    /// their compression mode would be identical and these three assertions would all go red together.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -682,16 +718,16 @@ public sealed class PackAliasDedupTests : IDisposable
 
         try
         {
-            // 高度可压缩且够大：只存的那一箱与压缩的那一箱尺寸差距因此是肉眼级的，压法有没有落到
-            // 7z 上不必靠推理。
+            // Highly compressible and big enough: the size gap between the store-only pack and the compressed one
+            // is therefore visible to the naked eye, and whether the mode reached 7z needs no reasoning.
             const int filler = 200_000;
             var payload = new string('q', filler);
             const string mutated = "leader got rewritten while it was being compressed";
-            Write("a/first.txt", payload);        // leader（ordinal 路径序最先）
-            Write("c/second.txt", payload);       // 别名一：不命中规则 → 压缩箱
-            Write("n/third.log", payload);        // 别名二：命中 *.log → 只存箱
+            Write("a/first.txt", payload);        // leader (first in ordinal path order)
+            Write("c/second.txt", payload);       // alias one: does not match the rule → compressed pack
+            Write("n/third.log", payload);        // alias two: matches *.log → store-only pack
 
-            // 压缩之后改写 leader：重校验发现它变了 → overrides 记下新 hash → 两个别名一起悬空。
+            // Rewrite the leader after compression: revalidation notices the change → overrides records the new hash → both aliases are orphaned.
             var (backup, restore, store) = Build(
                 new MutatingAfterCompressCompressor(new SevenZipCompressor(), _src, "a/first.txt", mutated));
 
@@ -710,19 +746,19 @@ public sealed class PackAliasDedupTests : IDisposable
             var second = index.Entries.Single(e => e.Path == "c/second.txt");
             var third = index.Entries.Single(e => e.Path == "n/third.log");
 
-            // 前提确认：两个别名真的悬空了（没有指向 leader 那份新内容），各自另存了一份。
+            // Premise check: both aliases really were orphaned (neither points at the leader's new content) and each stored its own copy.
             Assert.NotEqual(leader.FullHash, second.FullHash);
             Assert.Equal(second.FullHash, third.FullHash);
             Assert.Equal("pack", second.Storage!.Kind);
             Assert.Equal("pack", third.Storage!.Kind);
-            // 悬空别名之间不再互相去重（设计里写明的取舍），所以它们必然各在一箱。
+            // Orphaned aliases no longer dedup against each other (a trade-off stated in the design), so they necessarily sit in separate packs.
             Assert.NotEqual(second.Storage.Ref, third.Storage.Ref);
 
-            // 两组都走到了、且各用各的压法。
+            // Both groups were reached, each with its own compression mode.
             Assert.False(info.Packs[second.Storage.Ref].StoreOnly);
             Assert.True(info.Packs[third.Storage.Ref].StoreOnly);
 
-            // 压法真的落到 7z 上了：只存的那箱约等于原文件大小，压缩的那箱小得多。
+            // The mode really reached 7z: the store-only pack is about the original file size, the compressed one far smaller.
             var compressedBytes = await PackBytesAsync(cc, second.Storage.Ref);
             var storedBytes = await PackBytesAsync(cc, third.Storage.Ref);
             Assert.True(storedBytes > filler * 0.9,
@@ -730,7 +766,7 @@ public sealed class PackAliasDedupTests : IDisposable
             Assert.True(compressedBytes < filler / 10,
                 $"compressed pack should be far smaller than the original, was {compressedBytes}");
 
-            // 决定性的一条：三条路径全都还原出各自应有的内容。
+            // The decisive one: all three paths restore the content each should have.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -743,17 +779,20 @@ public sealed class PackAliasDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 装箱决定点那段顺序论证的用例："leader 若命中既有包，后来的同内容文件用同一张 _packMembers、
-    /// 同一套四项判据也会命中第一档，根本走不到别名表。"——至今只靠推理成立。
+    /// The case for the ordering argument at the packing decision point: "if the leader hits an existing pack,
+    /// later files with the same content hit that same first tier through the same _packMembers table and the same
+    /// four-part criteria, and never reach the alias table at all." — which has so far held on reasoning alone.
     /// <para>
-    /// 两轮备份：v1 存下某内容；v2 里新增**两个**同内容的新文件。两个都该命中跨版本去重、指向 v1
-    /// 那个包的成员，不产生任何新包，也不该形成"别名指向本轮 leader"的形状。
+    /// Two backup runs: v1 stores some content; v2 adds **two** new files with that same content. Both should hit
+    /// cross-version dedup and point at the member in v1's pack, producing no new pack and never forming the shape
+    /// "alias pointing at this run's leader".
     /// </para>
     /// <para>
-    /// 判据就在 <c>EntryName</c> 上：命中跨版本去重时它是 v1 那个路径（<c>a/first.txt</c>）；
-    /// 若两档的先后被调换、或者别名表抢先一步，第二、三条会指向本轮的 <c>c/second.txt</c>，
-    /// 而且会多出一个包。两条都不是无害的差别——引用聚到本轮的新包上，老包一退役就要被重写，
-    /// 而 <c>LocalDedupResolver</c> 特意把引用聚到老包正是为了避免这件事。
+    /// The criterion is <c>EntryName</c>: on a cross-version dedup hit it is v1's path (<c>a/first.txt</c>);
+    /// if the two tiers were swapped in order, or the alias table got in first, the second and third entries would
+    /// point at this run's <c>c/second.txt</c> and there would be one extra pack. Neither difference is harmless —
+    /// references piling onto this run's new pack means the old pack has to be rewritten the moment it retires,
+    /// and <c>LocalDedupResolver</c> deliberately piles references onto the old pack precisely to avoid that.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -779,12 +818,12 @@ public sealed class PackAliasDedupTests : IDisposable
             var infoV1 = await store.ReadInfoAsync(account, name, null);
             var packId = Assert.Single(infoV1!.Packs.Keys);
 
-            // v2：两个同内容的**新**文件。都该指向 v1 那个包的成员。
+            // v2: two **new** files with the same content. Both should point at the member in v1's pack.
             Write("c/second.txt", payload);
             Write("d/third.txt", payload);
             await backup.RunAsync(Request(account, name));
 
-            // 一个新包都不该有——两条都在跨版本那一档就被拦下了，根本没进装箱。
+            // Not one new pack may appear — both are caught at the cross-version tier and never reach packing.
             Assert.Equal(packsAfterV1, await CountPacksAsync(cc));
 
             var infoV2 = await store.ReadInfoAsync(account, name, null);
@@ -795,11 +834,11 @@ public sealed class PackAliasDedupTests : IDisposable
                 var storage = v2.Entries.Single(e => e.Path == path).Storage!;
                 Assert.Equal("pack", storage.Kind);
                 Assert.Equal(packId, storage.Ref);
-                // 关键：成员名是 **v1** 那个路径。别名表抢了先的话，后两条会指向 c/second.txt。
+                // The key: the member name is **v1's** path. If the alias table got in first, the last two would point at c/second.txt.
                 Assert.Equal("a/first.txt", storage.EntryName);
             }
 
-            // 三条都还原得回来。
+            // All three restore.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,

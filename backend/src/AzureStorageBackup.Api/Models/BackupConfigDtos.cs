@@ -3,9 +3,9 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Models;
 
 /// <summary>
-/// 备份配置响应体。刻意不含 Password，仅暴露 HasPassword（是否加密）。
-/// <c>Status</c>/<c>LastError</c>/<c>LastErrorAt</c> 为持久状态（§4.2 决策 2）；
-/// <c>Activity</c> 为派生瞬时态（Idle/BackingUp/Restoring/Checking/Repairing），不落库，调用方按需计算后传入。
+/// Response body of a backup config. Deliberately carries no Password, only HasPassword (whether it is encrypted).
+/// <c>Status</c>/<c>LastError</c>/<c>LastErrorAt</c> are persistent state (§4.2 decision 2);
+/// <c>Activity</c> is a derived transient state (Idle/BackingUp/Restoring/Checking/Repairing), not persisted — the caller computes it as needed and passes it in.
 /// </summary>
 public record BackupConfigResponse(
     int Id,
@@ -39,13 +39,13 @@ public record BackupConfigResponse(
     string? ScopeRules = null)
 {
     /// <summary>
-    /// <paramref name="secretsUnavailable"/> 必须按该配置密文的实际可解性传入
-    /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
-    /// 已重设成功的备份必须停止显示「待重设」。无密码的备份没有密文可丢，恒为 false。
+    /// <paramref name="secretsUnavailable"/> must be passed according to whether this config's ciphertext can actually be
+    /// decrypted (see <see cref="SecretAvailability"/>); do not pass the global Lost status — halfway through recovery,
+    /// a backup that has already been reset successfully must stop showing "needs reset". A backup with no password has no ciphertext to lose, so it is always false.
     ///
-    /// <paramref name="settings"/> 是必填而非可选：界面要靠 Effective 显示继承字段的当前生效值，
-    /// 少传一处就会显示成 GlobalSettings 的编译期默认而不是用户实际配置的默认。设为必填，
-    /// 让编译器把每个调用点都找出来。
+    /// <paramref name="settings"/> is required rather than optional: the UI relies on Effective to show the current effective value of inherited fields,
+    /// and missing it at a single call site makes it display GlobalSettings' compile-time defaults instead of the defaults the user actually configured. Making it required
+    /// forces the compiler to point out every call site.
     /// </summary>
     public static BackupConfigResponse From(
         BackupConfig c, GlobalSettings? settings, string activity = "Idle", bool secretsUnavailable = false) => new(
@@ -59,9 +59,9 @@ public record BackupConfigResponse(
         ResolvedBackupSettings.From(c, settings), c.CrossDirGroupRules, c.ScopeRules);
 }
 
-/// <summary>还原请求体。TargetRoot 为空则用配置的本地根；Version 为空则还原最新版本。
-/// SelectedPaths 为空则还原整版本；非空则只还原恰好这些路径（需求 B，pack 只下一次、只写选中成员）。
-/// Conflict 为冲突模式（决策 3）；RehydratePriority 为 Archive 活化优先级。</summary>
+/// <summary>Restore request body. An empty TargetRoot means the config's local root; an empty Version means the latest version.
+/// An empty SelectedPaths restores the whole version; non-empty restores exactly those paths (requirement B: a pack is downloaded once and only the selected members are written).
+/// Conflict is the conflict mode (decision 3); RehydratePriority is the Archive rehydration priority.</summary>
 public record RestoreRequestBody(
     string? TargetRoot,
     int? Version,
@@ -70,29 +70,29 @@ public record RestoreRequestBody(
     RestoreConflictMode Conflict = RestoreConflictMode.OverwriteIfChanged,
     RestoreRehydratePriority RehydratePriority = RestoreRehydratePriority.Standard);
 
-/// <summary>还原量估算请求体（§4.1b，需求 A）：选中路径的下载/解压量预估。Version 为空则用最新版本。</summary>
+/// <summary>Restore-estimate request body (§4.1b, requirement A): estimated download/uncompressed volume for the selected paths. An empty Version means the latest version.</summary>
 public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
 
-/// <summary>导入已有备份请求：读 container 的信息文件恢复配置（roadmap，PRD 1.5）。加密备份需提供密码。</summary>
-/// <param name="CheckAfterImport">导入完成后顺手核验一次云端数据（存在 + 尺寸，不下载）。
-/// 省略视为 true：导入只保证把云端记着的**账本**抓全了，账本上写的东西是不是还都在，
-/// 得问过云端才知道，而这件事没有理由要用户自己再去点一次。</param>
+/// <summary>Request to import an existing backup: read the container's info file to rebuild the config (roadmap, PRD 1.5). An encrypted backup requires the password.</summary>
+/// <param name="CheckAfterImport">Once the import finishes, verify the cloud data while we are at it (existence + size, no download).
+/// Omitted means true: the import only guarantees that the **ledger** the cloud keeps has been fetched in full; whether the things written in that ledger are all still there
+/// can only be answered by asking the cloud, and there is no reason to make the user click that separately.</param>
 public record ImportRequest(int AccountId, string ContainerName, string? Password, bool? CheckAfterImport = null);
 
-/// <summary>导入的结果：建好的配置，外加这次导入自己发现的两件事。</summary>
-/// <param name="CheckStarted">云端核验已经在后台跑了，前端可以直接把检查面板打开，
-/// 不必让用户再去找那个按钮。</param>
-/// <param name="UnreadableVersions">文件列表读不出来的版本号。这些版本还原不了也检查不了，
-/// 其余版本不受影响；详情在操作日志里。</param>
+/// <summary>The result of an import: the config that was created, plus the two things the import itself discovered.</summary>
+/// <param name="CheckStarted">The cloud verification is already running in the background, so the frontend can open the check panel directly
+/// instead of making the user hunt for that button.</param>
+/// <param name="UnreadableVersions">Version numbers whose file list could not be read. These versions can be neither restored nor checked;
+/// the rest are unaffected, and the details are in the operation log.</param>
 public record ImportResponse(
     BackupConfigResponse Config, bool CheckStarted, IReadOnlyList<int> UnreadableVersions);
 
-/// <summary>备份密码重设请求。必须是当初加密云端包的那个密码——不支持更改密码（设计决策 6、8）。</summary>
+/// <summary>Backup password reset request. It has to be the very password that encrypted the cloud archives — changing the password is not supported (design decisions 6 and 8).</summary>
 public record ResetBackupPasswordRequest(string Password);
 
-/// <summary>创建/更新备份配置请求体。更新时 Password 为空表示保留原值。
-/// 12 个可继承字段为 null 表示「使用默认」——落库即 null，运行时经
-/// <see cref="ResolvedBackupSettings"/> 解析。IndexTier/DataTier 不可继承，保持必填。</summary>
+/// <summary>Create/update request body for a backup config. On update, an empty Password means keep the existing value.
+/// null on any of the 12 inheritable fields means "use the default" — it is stored as null and resolved at runtime through
+/// <see cref="ResolvedBackupSettings"/>. IndexTier/DataTier are not inheritable and stay required.</summary>
 public record BackupConfigRequest(
     int AccountId,
     string ContainerName,
@@ -116,7 +116,7 @@ public record BackupConfigRequest(
     string? CrossDirGroupRules = null,
     string? ScopeRules = null)
 {
-    /// <summary>请求体里的 Password 是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。</summary>
+    /// <summary>The Password in the request body is plaintext; it is encrypted the moment it lands on the entity (design §3.1: the entity holds ciphertext only).</summary>
     public BackupConfig ToConfig(IEncryptionService encryption) => new()
     {
         VolumeBytes = VolumeBytes,
@@ -143,33 +143,33 @@ public record BackupConfigRequest(
     };
 }
 
-/// <summary>迁移本地根路径的判定结论（设计 docs/change-local-root-design.md §5）。</summary>
+/// <summary>The verdict of a local-root migration check (design docs/change-local-root-design.md §5).</summary>
 public enum LocalRootVerdict
 {
-    /// <summary>抽样匹配率 ≥95%，直接放行。</summary>
+    /// <summary>Sampled match rate ≥95%: let it straight through.</summary>
     Ok = 0,
 
-    /// <summary>匹配率落在 [5%, 95%)，需要用户确认（Force）。</summary>
+    /// <summary>Match rate falls in [5%, 95%): needs the user to confirm (Force).</summary>
     NeedsConfirm = 1,
 
-    /// <summary>匹配率 &lt;5%（含一个都找不到），默认拒绝，仍可 Force 越过。</summary>
+    /// <summary>Match rate &lt;5% (including finding nothing at all): refused by default, but Force can still override it.</summary>
     Rejected = 2,
 
-    /// <summary>没有可比对的基线（当前根为空、无任何版本），只校验了路径本身。</summary>
+    /// <summary>No baseline to compare against (the current root is empty, or there are no versions at all); only the path itself was validated.</summary>
     NoBaseline = 3,
 
-    /// <summary>这个备份确实有历史版本，但它的索引读不出来（信息文件损坏、解密失败、索引 blob 读取失败等），
-    /// 没能做成比对——这恰恰是最该多看一眼的情形，因此按需要确认处理，而不是像 NoBaseline 那样直接放行。</summary>
+    /// <summary>This backup really does have historical versions, but its index cannot be read (corrupt info file, decryption failure, index blob read failure, and so on),
+    /// so no comparison could be made — which is precisely the case that most deserves a second look, so it is treated as needing confirmation instead of being let straight through like NoBaseline.</summary>
     BaselineUnreadable = 4,
 }
 
 /// <summary>
-/// 迁移本地根路径的校验报告。<c>MtimeDiffers</c> 仅供参考、**不参与判定**——跨文件系统搬迁时
-/// mtime 的精度与保留情况经常不一致，拿它当判据会大面积误伤，而它对不上的真实后果只是
-/// 下次备份重传这些文件。
+/// The validation report for a local-root migration. <c>MtimeDiffers</c> is informational only and **plays no part in the verdict** — when moving across
+/// file systems, mtime precision and preservation are frequently inconsistent, so using it as a criterion causes widespread false alarms, while the real
+/// consequence of a mismatch is merely that the next backup re-uploads those files.
 /// </summary>
-/// <param name="Examples">最多 10 条不匹配的相对路径。这不是装饰：用户在 NAS 上拿不到命令行，
-/// 界面必须把「到底哪些文件对不上」直接摆出来，否则一个 68% 的匹配率无从判断该不该强制。</param>
+/// <param name="Examples">At most 10 mismatching relative paths. This is not decoration: the user is on a NAS with no command line,
+/// so the UI has to put "which files exactly do not match" right in front of them, otherwise a 68% match rate gives them nothing to judge whether to force it.</param>
 public record LocalRootPreviewResponse(
     string Verdict,
     int Sampled,
@@ -181,20 +181,20 @@ public record LocalRootPreviewResponse(
     string? Reason,
     IReadOnlyList<string> Examples);
 
-/// <summary>迁移本地根路径请求。<c>Force</c> 用于越过 NeedsConfirm / Rejected。</summary>
+/// <summary>Local-root migration request. <c>Force</c> is used to get past NeedsConfirm / Rejected.</summary>
 public record LocalRootChangeRequest(string NewRoot, bool Force = false);
 
-/// <summary>preview 端点请求体。</summary>
+/// <summary>Request body for the preview endpoint.</summary>
 public record LocalRootPreviewRequest(string NewRoot);
 
 /// <summary>
-/// 一次中途停下的运行，供界面列出来等用户决定。
+/// One run that stopped partway, for the UI to list while it waits for the user to decide.
 /// </summary>
-/// <param name="Blocks">journal 里已确认在云上的块数。接着跑能省下的，大致就是这么多。</param>
+/// <param name="Blocks">The number of blocks the journal confirms are already in the cloud. Roughly what resuming would save.</param>
 /// <param name="Resumable">
-/// 便宜的那几项前置校验的预览：configId 与本地根对不对得上。
-/// **不是承诺**——基线版本与加密身份要读索引和密码才能核，那要等真正开卷时才做（Task 10）。
-/// 这里为 true 而开卷时仍被判作废是可能的，界面别把它说成"一定能接上"。
+/// A preview of the cheap pre-checks: whether configId and the local root line up.
+/// **Not a promise** — the baseline version and the encryption identity need the index and the password to verify, and that only happens when the run actually opens the journal (Task 10).
+/// It is possible for this to be true and for the journal to still be discarded at open time, so the UI must not present it as "this will definitely resume".
 /// </param>
 public sealed record InterruptedRunResponse(
     string RunId, DateTimeOffset StartedAt, int Blocks, long JournalBytes, bool Resumable);

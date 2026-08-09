@@ -7,13 +7,13 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 迁移前 VolumeBytes 的 null 表示「关闭分卷」，迁移后 null 表示「继承」。
-/// 若不改写，每一份明确关掉分卷的备份都会在升级后突然开始跟随全局设置。
+/// Before the migration, null on VolumeBytes meant "volumes off"; after it, null means "inherit".
+/// Without a rewrite, every backup that had explicitly turned volumes off would suddenly start following the global setting after the upgrade.
 ///
-/// IgnoreRules / DontCompressRules / DontGroupRules 三列语义翻转完全相同：
-/// 迁移前 null = 无规则，迁移后 null = 继承。这三列本来就是 nullable，不出现在
-/// AlterColumn 名单里，正因如此才在最初的审查中被漏掉——这里连同 VolumeBytes
-/// 一起用同一份迁移前记录来钉住，不能只测 VolumeBytes 这一列。
+/// The three columns IgnoreRules / DontCompressRules / DontGroupRules flip meaning in exactly the same way:
+/// before the migration null = no rules, after it null = inherit. Those three were nullable already, so they do not show up in
+/// the AlterColumn list — which is exactly why they were missed in the original review. They are pinned down here together with
+/// VolumeBytes using the same pre-migration row; testing the VolumeBytes column alone is not enough.
 /// </summary>
 public class BackupDefaultsMigrationTests
 {
@@ -26,7 +26,7 @@ public class BackupDefaultsMigrationTests
         var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite(connection).Options;
         await using var db = new AppDbContext(options);
 
-        // 迁移到本轮之前的那一版，插入一份「关闭分卷、无任何规则」的配置，再迁到最新。
+        // Migrate to the version just before this round, insert a config with "volumes off, no rules at all", then migrate to the latest.
         var migrations = db.Database.GetMigrations().ToList();
         var target = migrations[migrations.IndexOf(
             migrations.First(m => m.EndsWith("MakeBackupDefaultsInheritable", StringComparison.Ordinal))) - 1];

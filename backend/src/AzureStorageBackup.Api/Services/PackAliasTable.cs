@@ -1,75 +1,86 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 一个不入箱的后到者：内容与某个 leader 相同，索引条目将直接指向 leader 在包里的那个成员。
+/// A latecomer that does not get packed: its content equals some leader's, and its index entry will point
+/// straight at the leader's member inside the pack.
 /// <para>
-/// 带齐四项内容身份，是为了 leader 走岔时能把它当作一个普通待处理文件重新跑一遍
-/// （见编排器收尾处的悬空重跑）——那时手上必须有它自己的长度与 hash。
+/// It carries the full four-part content identity so that, if the leader goes astray, it can be rerun as an
+/// ordinary pending file (see the orphan rerun at the end of the orchestrator) — that needs its own length and hashes.
 /// </para>
 /// </summary>
 public sealed record PlannedAlias(
     string Path, long Length, string FullHash, string HeadHash, string TailHash);
 
 /// <summary>
-/// 同一轮备份内、跨箱的打包成员去重。
+/// Cross-pack dedup of packed members within a single backup run.
 /// <para>
-/// 打包的小文件从前只有两条去重：同一箱内靠 7z 的 solid 归档（字典跨成员匹配），跨版本靠
-/// <see cref="LocalDedupResolver.TryFindPackMember"/>。缺的是**本轮之内、跨箱**那一段——
-/// 不同箱之间压缩不共享字典，同一份内容会实打实地存两遍，而 <c>_packMembers</c> 只从历史
-/// 版本索引构建，本轮新封的箱不进那张表。
+/// Packed small files used to have only two dedup paths: within one pack via 7z's solid archive (dictionary
+/// matching across members), and across versions via <see cref="LocalDedupResolver.TryFindPackMember"/>. What
+/// was missing is the **within-run, cross-pack** stretch — different packs share no compression dictionary, so
+/// the same content really does get stored twice, and <c>_packMembers</c> is built from historical version
+/// indexes only, so packs sealed in this run never make it into that table.
 /// </para>
 /// <para>
-/// 这张表只登记"谁是第一份"，**不**登记"它最后存到哪儿去了"——那要等消费者全部收工才知道
-/// （leader 可能在压缩窗口里被改写、可能读不开、可能变大到改走单文件 blob）。回填因此放在
-/// 收尾统一做，判断只看最终态。代价是别名要多等一会儿，换来的是这里一个并发原语都不需要。
+/// This table only records "who came first", **not** "where it finally ended up" — that is unknown until every
+/// consumer has finished (the leader may be rewritten inside the compression window, may be unreadable, may grow
+/// past the threshold into a single-file blob). Backfill therefore happens once at the end, judging only the final
+/// state. Aliases wait a little longer; in exchange this class needs no concurrency primitive at all.
 /// </para>
 /// <para>
-/// diff 单线程独占，不加锁——与编排器里的 <c>dirPending</c>/<c>crossPending</c> 同一条约束。
+/// Exclusively owned by the single-threaded diff, so no locking — the same constraint as
+/// <c>dirPending</c>/<c>crossPending</c> in the orchestrator.
 /// </para>
 /// </summary>
 public sealed class PackAliasTable
 {
-    // 四项内容身份 → 第一个见到这份内容的路径。首次备份时每个变更小文件各占一条。
+    // Four-part content identity → the path that saw this content first. On a first backup every changed
+    // small file takes one row.
     //
-    // 估算口径（按对象布局推算，非实测——本项目的规矩是先跑实测再下判断，这里只是给个数量级）：
-    // key 是 ContentKey 拼出来的字符串，形如 "xxh128:<32 hex>\n<length>\n xxh128:<32 hex>\n xxh128:<32 hex>"，
-    // 约 124 字符 → string 实例约 272 B；加上 Dictionary 条目本身约 40 B（value 是 leader 路径的
-    // 引用，diff.Changes 本来就持有同一份，不重复计），合计约 312 B/条。20 万条约 62 MB，
-    // 50 万条约 155 MB——diff.Changes 本来就是每个扫描条目一个 FileChange，这张表和那份既有
-    // 基线是**同一个量级**，不是新增一个数量级。
+    // How the estimate was derived (reasoned from object layout, not measured — the rule in this project is
+    // to measure before judging; this is only an order of magnitude):
+    // the key is the string ContentKey builds, shaped like "xxh128:<32 hex>\n<length>\n xxh128:<32 hex>\n xxh128:<32 hex>",
+    // about 124 chars → roughly 272 B per string instance; plus about 40 B for the Dictionary entry itself
+    // (the value is a reference to the leader path, which diff.Changes already holds, so it is not counted
+    // twice), about 312 B per row in total. 200k rows is about 62 MB, 500k rows about 155 MB — diff.Changes
+    // already holds one FileChange per scanned entry, so this table is the **same order of magnitude** as
+    // that existing baseline, not a new order on top of it.
     private readonly Dictionary<string, string> _leaderByContent = new(StringComparer.Ordinal);
 
-    // leader 路径 → 挂在它身上的别名。**只有真有别名的 leader 才建列表**：
-    // 一次首备有几十万个 leader，给每个都建一个空 List 是白占几十 MB。
+    // Leader path → the aliases hanging off it. **Only leaders that actually have aliases get a list**:
+    // a first backup has hundreds of thousands of leaders, and an empty List for each wastes tens of MB.
     private readonly Dictionary<string, List<PlannedAlias>> _aliasesByLeader = new(StringComparer.Ordinal);
 
-    /// <summary>只含真有别名的 leader。收尾回填遍历它。</summary>
+    /// <summary>Contains only leaders that actually have aliases. The end-of-run backfill walks this.</summary>
     public IReadOnlyDictionary<string, List<PlannedAlias>> AliasesByLeader => _aliasesByLeader;
 
     /// <summary>
-    /// 本轮这份内容是不是已经有 leader 了。
+    /// Whether this content already has a leader in this run.
     /// <para>
-    /// 返回 <c>true</c>：已有，<paramref name="path"/> 已登记为那个 leader 的别名，
-    /// 调用方**不要**入箱。返回 <c>false</c>：这是第一份（或四项不全，不参与去重），照旧入箱。
+    /// Returns <c>true</c>: it does, <paramref name="path"/> has been registered as an alias of that leader,
+    /// and the caller must **not** pack it. Returns <c>false</c>: this is the first copy (or the four parts are
+    /// incomplete, so it takes no part in dedup) and it gets packed as usual.
     /// </para>
     /// <para>
-    /// 四项**严格**相等，缺失也算不等——与 <see cref="LocalDedupResolver.TryFindPackMember"/>
-    /// 同一套判据。同样是"这份内容是不是已经有了"的判断，两条路各有一套标准是说不通的：
-    /// 判错就让索引指向别人的内容、还原时出来错误数据。
+    /// All four parts must match **exactly**, and a missing one counts as unequal — the same criteria as
+    /// <see cref="LocalDedupResolver.TryFindPackMember"/>. Both are answering "does this content already exist",
+    /// and two different standards for the same question makes no sense: get it wrong and the index points at
+    /// someone else's content, and restore hands back wrong data.
     /// </para>
     /// <para>
-    /// 四项与 <paramref name="path"/> 一起在这里内部拼成 <see cref="PlannedAlias"/>，不让调用方
-    /// 各拼一份传进来——用来判定"是不是同一份内容"的那组值，和最终记进 <see cref="PlannedAlias"/>
-    /// 的那组值，只可能是同一组，不给"两条路各拼各的、迟早走岔"留口子（同样的教训见
-    /// <see cref="LocalDedupResolver.ContentKey"/> 提为 public 时那段注释）。
+    /// The four parts and <paramref name="path"/> are assembled into a <see cref="PlannedAlias"/> here, inside,
+    /// rather than letting each caller build one and pass it in — the values used to decide "is this the same
+    /// content" and the values finally recorded in <see cref="PlannedAlias"/> can then only ever be the same set,
+    /// leaving no opening for "two paths each build their own and drift apart sooner or later" (same lesson as in
+    /// the comment written when <see cref="LocalDedupResolver.ContentKey"/> was promoted to public).
     /// </para>
     /// </summary>
     public bool TryClaim(string? fullHash, long length, string? headHash, string? tailHash, string path)
     {
-        // 生产路径上调用方已经用模式匹配（file.FullHash is { } / c.HeadHash is { } / c.TailHash is
-        // { }）做完三项非空检查，传进来的必是非空值——这条分支今天只有单测在跑（见
-        // PackAliasTableTests.A_Missing_Component_Never_Participates）。留着不是为了防生产调用，
-        // 是防将来有人从别处、不带那层检查地调用这个公共方法。
+        // On the production path the caller has already done the three non-null checks with pattern matching
+        // (file.FullHash is { } / c.HeadHash is { } / c.TailHash is { }), so what arrives here is always
+        // non-null — today this branch is exercised only by unit tests (see
+        // PackAliasTableTests.A_Missing_Component_Never_Participates). It stays not to guard the production
+        // caller, but to guard against someone later calling this public method from elsewhere without that check.
         if (fullHash is null || headHash is null || tailHash is null)
             return false;
 

@@ -3,14 +3,14 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 备份配置的生效值。配置字段为 null 表示继承全局设置（PRD §3「使用默认」）。
+/// The effective values of a backup config. A null field on the config means "inherit the global setting" (PRD §3 "use default").
 ///
-/// 解析必须发生在**使用时**，不能在 BackupConfigService.GetAsync 里就地填充：一旦填充，
-/// 编辑界面就分不清「继承来的 100」和「自己填的 100」，保存时会把继承悄悄固化成覆盖，
-/// 这个功能就自己废了自己。
+/// Resolution must happen **at the point of use**; it must not be filled in inside BackupConfigService.GetAsync. Once filled in,
+/// the edit screen can no longer tell "an inherited 100" from "a 100 I typed myself", and saving quietly freezes the inheritance
+/// into an override — the feature would defeat itself.
 ///
-/// IndexTier / DataTier 不在此列——它们创建后锁定（BackupConfigService.UpdateAsync），
-/// 而继承意味着随全局变化，即一次创建后的变更。
+/// IndexTier / DataTier are not on this list — they are locked after creation (BackupConfigService.UpdateAsync),
+/// and inheriting means following the global setting, which is exactly a change after creation.
 /// </summary>
 public sealed record ResolvedBackupSettings(
     string? IgnoreRules,
@@ -26,8 +26,8 @@ public sealed record ResolvedBackupSettings(
     long? VolumeBytes,
     bool VerboseLogging)
 {
-    /// <summary><paramref name="settings"/> 为 null 时用 GlobalSettings 的编译期默认值，
-    /// 与既有调用方对 <c>GlobalSettings?</c> 的处理保持一致。</summary>
+    /// <summary>When <paramref name="settings"/> is null, fall back to GlobalSettings' compile-time defaults,
+    /// consistent with how existing callers handle <c>GlobalSettings?</c>.</summary>
     public static ResolvedBackupSettings From(BackupConfig config, GlobalSettings? settings)
     {
         var s = settings ?? new GlobalSettings();

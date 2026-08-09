@@ -3,11 +3,12 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 进度里的字节明细。跑长任务时用户要回答的是「还剩多少、压好了多少没送走、真正落到云上多少」，
-/// 而这三段**必须互不重叠**——同一批字节被数两遍，加起来对不上总量，这一行就比没有更糟。
+/// The byte breakdown inside progress. On a long run the questions a user needs answered are "how much is left, how
+/// much is packed but not yet shipped, how much has actually landed in the cloud", and those three **must not
+/// overlap** — count the same bytes twice and have them fail to add up, and the line is worse than no line at all.
 /// <para>
-/// 完成度也从件数改成按源字节算：一件活可能是一个 100 GB 的单文件，也可能是一箱几百个 5 KB 的
-/// 小文件，按件数等于把它们当成一样重。
+/// Completion also switched from item count to source bytes: an item may be one 100 GB single file, or a pack of
+/// several hundred 5 KB files, and counting by item treats the two as equally heavy.
 /// </para>
 /// </summary>
 public sealed class StageByteBreakdownTests
@@ -20,8 +21,8 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// 已传只认**走完**的流。在途那条传了一半时，它的字节属于"在途"，不属于"已传"——
-    /// 界面上那个已传要能回答"有多少已经稳稳落在云上"。
+    /// Transferred counts only streams that **finished**. While an in-flight stream is half sent its bytes belong to
+    /// "in flight", not "transferred" — the transferred figure in the UI has to answer "how much is safely in the cloud".
     /// </summary>
     [Fact]
     public void Transferred_Counts_Only_Finished_Flows()
@@ -31,16 +32,17 @@ public sealed class StageByteBreakdownTests
         tracker.BeginItem("data/aaa.001", "photos/a.bin", 1000);
         tracker.ItemProgress("data/aaa.001").Report(400);
         tracker.Complete();
-        Assert.Equal(0, seen[^1].TransferredBytes);   // 还在途，一个字节都不算"已传"
+        Assert.Equal(0, seen[^1].TransferredBytes);   // still in flight; not one byte counts as "transferred"
 
         tracker.EndItem("data/aaa.001", 0);
         tracker.Complete();
-        Assert.Equal(400, seen[^1].TransferredBytes); // 走完了才认
+        Assert.Equal(400, seen[^1].TransferredBytes); // only counted once it finished
     }
 
     /// <summary>
-    /// 待传 = 池子占用 − 在途已经传走的那部分。那几卷确实还整个躺在池子里（逐卷释放，传完才删），
-    /// 送走的只是其中一截；不减就会在这里和在途列表里把同一批字节各数一遍。
+    /// Staged = pool usage − the part the in-flight flows have already sent. Those volumes really are still sitting
+    /// whole in the pool (released per volume, deleted only once sent) and only a slice of them has gone; without the
+    /// subtraction the same bytes get counted once here and once in the in-flight list.
     /// </summary>
     [Fact]
     public void Staged_Subtracts_What_The_In_Flight_Flows_Already_Sent()
@@ -50,14 +52,14 @@ public sealed class StageByteBreakdownTests
 
         tracker.BeginItem("data/aaa.001", "photos/a.bin", 600);
         tracker.Complete();
-        Assert.Equal(1000, seen[^1].StagedBytes);   // 一个字节都还没送出去
+        Assert.Equal(1000, seen[^1].StagedBytes);   // not one byte has gone out yet
 
         tracker.ItemProgress("data/aaa.001").Report(250);
         tracker.Complete();
-        Assert.Equal(750, seen[^1].StagedBytes);    // 送走 250，池子里还剩 750 没走
+        Assert.Equal(750, seen[^1].StagedBytes);    // 250 sent, 750 still sitting in the pool
     }
 
-    /// <summary>在途每一条都要带得出「是谁、多大、传了多少」——标签是源文件路径，不是内容寻址的 blob 名。</summary>
+    /// <summary>Every in-flight row must carry "who, how big, how much sent" — the label is the source file path, not the content-addressed blob name.</summary>
     [Fact]
     public void In_Flight_Carries_Label_Size_And_Progress()
     {
@@ -74,7 +76,7 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(25, flow.Percent);
     }
 
-    /// <summary>省略标签时退回用 key，与从前的行为一致（还原/校验那两条路暂时没有源路径可给）。</summary>
+    /// <summary>With the label omitted it falls back to the key, matching the old behaviour (the restore/verify paths have no source path to give yet).</summary>
     [Fact]
     public void A_Flow_Without_A_Label_Falls_Back_To_Its_Key()
     {
@@ -87,8 +89,8 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// 完成度按源字节算。总量还没定下来时（diff 还在往队列里塞活）必须给 null——
-    /// 那时分母还在长，算出来的百分比会先冲高再掉回去。
+    /// Completion is computed on source bytes. While the total is not yet settled (diff is still pushing work into
+    /// the queue) it must be null — the denominator is still growing, so the percentage would shoot up and fall back.
     /// </summary>
     [Fact]
     public void Work_Percent_Waits_Until_The_Total_Is_Settled()
@@ -99,9 +101,9 @@ public sealed class StageByteBreakdownTests
         tracker.Enqueue(work: 200);
         tracker.Advance(0, work: 500);
         tracker.Complete();
-        Assert.Null(seen[^1].WorkPercent);   // 件数总量未定 → 分母还可能长
+        Assert.Null(seen[^1].WorkPercent);   // item total not settled → the denominator can still grow
 
-        tracker.SetTotal(2);                  // diff 收工，总量到此确定
+        tracker.SetTotal(2);                  // diff wraps up; the total is fixed from here on
         tracker.Complete();
         Assert.Equal(50, seen[^1].WorkPercent);
         Assert.Equal(1000, seen[^1].WorkTotal);
@@ -110,8 +112,8 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// 按字节与按件数会给出**不同**的答案，这正是改用字节的理由：一件 100 GB 加一件 1 KB，
-    /// 传完那件小的，按件数是 50%，按字节几乎还是 0。
+    /// By bytes and by item count give **different** answers, which is exactly why we switched to bytes: one 100 GB
+    /// item plus one 1 KB item, finish the small one, and it is 50% by item count but still practically 0 by bytes.
     /// </summary>
     [Fact]
     public void Byte_Percent_Does_Not_Follow_Item_Percent()
@@ -120,36 +122,38 @@ public sealed class StageByteBreakdownTests
 
         tracker.Enqueue(work: 100_000_000_000);
         tracker.Enqueue(work: 1_000);
-        tracker.Advance(0, work: 1_000);      // 小的那件传完了
+        tracker.Advance(0, work: 1_000);      // the small one is through
         tracker.Complete();
 
-        Assert.Equal(50, seen[^1].Percent);   // 件数：一半
-        Assert.Equal(0, seen[^1].WorkPercent); // 字节：几乎没动
+        Assert.Equal(50, seen[^1].Percent);   // by item count: half
+        Assert.Equal(0, seen[^1].WorkPercent); // by bytes: barely moved
     }
 
     /// <summary>
-    /// 下载侧能事先报出总传输量（索引里记着各卷尺寸），上传侧报不出——压完才知道有多大。
-    /// 分母缺失时必须是 0 而不是一个偏小的数：拿它算百分比会一路虚高，然后卡在 100% 上不动。
+    /// The download side can declare the total transfer size up front (the index records each volume's size); the
+    /// upload side cannot — the size is only known once compression is done. A missing denominator must be 0 rather
+    /// than an undersized number: computing a percentage from that runs inflated all the way, then sticks at 100%.
     /// </summary>
     [Fact]
     public void Transfer_Total_Is_Only_Reported_When_Declared()
     {
         var (tracker, seen) = Rig();
 
-        tracker.Enqueue(work: 1000);                    // 上传侧：只申报源字节
+        tracker.Enqueue(work: 1000);                    // upload side: declares source bytes only
         tracker.Complete();
         Assert.Equal(0, seen[^1].TransferTotal);
 
-        tracker.Enqueue(work: 500, transfer: 120);      // 下载侧：两笔都申报
+        tracker.Enqueue(work: 500, transfer: 120);      // download side: declares both
         tracker.Enqueue(work: 500, transfer: 80);
         tracker.Complete();
         Assert.Equal(200, seen[^1].TransferTotal);
     }
 
     /// <summary>
-    /// 「diff 已经跑到上传前面、开始往盘上攒活」要能被看见，而且**头一件**必须立刻发布——
-    /// 那一刻正是这段说明存在的理由，压进节流窗口的话界面会先安静一段再突然蹦出个大数。
-    /// 之后的更新照常走节流：它只是同一个数在长，没有一次值得单独打断。
+    /// "diff has run ahead of the upload and started spilling work to disk" has to be visible, and the **first** one
+    /// must publish immediately — that instant is the whole reason this readout exists, and squeezing it into the
+    /// throttle window makes the UI go quiet for a while and then blurt out a big number.
+    /// Later updates go through the throttle as usual: it is the same number growing, none worth interrupting for.
     /// </summary>
     [Fact]
     public void First_Spilled_Item_Is_Published_Immediately()
@@ -164,28 +168,31 @@ public sealed class StageByteBreakdownTests
         tracker.SetSpilled(1);
         Assert.Equal(1, seen[^1].SpilledItems);
 
-        // 0 → 非 0 已经发生过了，之后只是同一个数在长，没有哪一次值得单独打断节流。
-        // 这里不去断言"下一拍还没发出来"——那要赌节流窗口的长短。要守的是另一件事：
-        // 一旦有人强制发布（阶段收尾就是），带出来的必须是最新的值，而不是停在 1。
+        // The 0 → non-zero transition has already happened; from here it is the same number growing, and no single
+        // update is worth breaking the throttle for. We do not assert "the next tick has not been published" — that
+        // would bet on the throttle window's length. What we guard is a different thing: once anything forces a
+        // publish (the stage wrap-up does), it must carry the latest value rather than stay at 1.
         tracker.SetSpilled(4096);
         tracker.Complete();
         Assert.Equal(4096, seen[^1].SpilledItems);
     }
 
     /// <summary>
-    /// 上传侧的「已传」按**件**记，不按卷——因为它要和按件销账的原始字节摆在一起读。
-    /// 一件大活分成许多卷，前几卷传完时那些字节**确实已经在云上**（按卷累加没有虚报），
-    /// 但原始字节要等整件完成才跳，于是分子按卷、分母按件，两个真实的数字凑不出能读的比值：
-    /// 界面上那个 "X uploaded (N% of original)" 会结构性地冲过 100%（实测 112%，那件活完成后
-    /// 落回 99%），文件越大差得越远，和压缩率毫无关系。
+    /// The upload side's "transferred" is booked per **item**, not per volume — because it is read alongside the
+    /// original bytes, which are also settled per item. A big item splits into many volumes, and when the first few
+    /// finish those bytes **really are in the cloud** (per-volume accumulation does not over-report), but the original
+    /// bytes only jump once the whole item completes. Numerator per volume, denominator per item: two truthful numbers
+    /// that cannot form a readable ratio — the "X uploaded (N% of original)" in the UI structurally overshoots 100%
+    /// (measured 112%, falling back to 99% once that item completed); the bigger the file the worse it gets, and it
+    /// has nothing to do with the compression ratio.
     /// </summary>
     [Fact]
     public void Uploaded_Never_Runs_Ahead_Of_The_Original_Bytes_It_Is_Compared_With()
     {
         var (tracker, seen) = Rig();
-        tracker.SetTransferred(0);   // 上传侧宣告：已传字节由件级读数接管
+        tracker.SetTransferred(0);   // upload side declares: transferred bytes are taken over by the item-level reading
 
-        // 一件 10 GB 的活切成 4 卷，压缩后共 8 GB。前 3 卷传完了。
+        // A 10 GB item split into 4 volumes, 8 GB after compression. The first 3 volumes are through.
         tracker.Enqueue(10_000);
         foreach (var (vol, size) in new[] { ("d.001", 2_000L), ("d.002", 2_000L), ("d.003", 2_000L) })
         {
@@ -195,12 +202,12 @@ public sealed class StageByteBreakdownTests
         }
         tracker.Complete();
 
-        // 那 6 GB 确实在云上了，但这件活还没销账（WorkDone 仍是 0）。此刻报出去就是
-        // 分子有、分母无——正是 112% 的来源。
+        // Those 6 GB really are in the cloud, but the item has not settled yet (WorkDone is still 0). Reporting it
+        // now means numerator without denominator — exactly where the 112% came from.
         Assert.Equal(0, seen[^1].WorkDone);
         Assert.Equal(0, seen[^1].TransferredBytes);
 
-        // 末卷传完，整件销账：两个数字同一时刻落地，比值这才第一次有意义。
+        // The last volume lands and the whole item settles: both numbers land at the same instant, and only now does the ratio mean anything.
         tracker.BeginItem("d.004", "photos/big.bin", 2_000);
         tracker.ItemProgress("d.004").Report(2_000);
         tracker.EndItem("d.004", 0);
@@ -210,14 +217,15 @@ public sealed class StageByteBreakdownTests
 
         Assert.Equal(10_000, seen[^1].WorkDone);
         Assert.Equal(8_000, seen[^1].TransferredBytes);
-        Assert.True(seen[^1].TransferredBytes <= seen[^1].WorkDone, "已传不该跑在它被拿来比的原始字节前面");
+        Assert.True(seen[^1].TransferredBytes <= seen[^1].WorkDone, "transferred must not run ahead of the original bytes it is compared with");
     }
 
     /// <summary>
-    /// 件级读数是**绝对值**，不是增量：它取自运行期那本"整件传完才记"的账
-    /// （<c>RunState.UploadedBytes</c>），与完工日志里那个"本次上传量"同源，界面和日志因此对得上。
-    /// 顺带免疫两处按卷累加固有的偏差——重传的字节（DeltaProgress 把回退按"重新开始"处理，
-    /// 对测速是对的，但云上还是那一份）和 if-missing 命中已存在 blob（一个字节都没上网线）。
+    /// The item-level reading is an **absolute** value, not a delta: it comes from the run's "only booked once the
+    /// whole item is through" ledger (<c>RunState.UploadedBytes</c>), the same source as the "uploaded this run" figure
+    /// in the completion log, so UI and log agree. It also comes immune to two biases inherent in per-volume
+    /// accumulation — retransmitted bytes (DeltaProgress treats a rewind as "starting over", which is right for speed,
+    /// but the cloud still holds one copy) and if-missing hitting an existing blob (not one byte on the wire).
     /// </summary>
     [Fact]
     public void The_Item_Level_Reading_Overrides_Per_Volume_Accumulation()
@@ -225,23 +233,23 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig();
         tracker.SetTransferred(0);
 
-        // 同一卷传到一半断了、重来一遍：网线上过了 1500 字节，云上只落了 1000。
+        // The same volume died halfway and was redone: 1500 bytes crossed the wire, only 1000 landed in the cloud.
         tracker.BeginItem("d.001", "a.bin", 1000);
         tracker.ItemProgress("d.001").Report(500);
-        tracker.ItemProgress("d.001").Report(1000);   // 累计回退＝重传，DeltaProgress 按重新开始处理
+        tracker.ItemProgress("d.001").Report(1000);   // cumulative rewind = retransmit; DeltaProgress treats it as starting over
         tracker.EndItem("d.001", 0);
         tracker.Advance(0, 4000);
-        tracker.SetTransferred(1000);                 // 件级账只认真正落云的那一份
+        tracker.SetTransferred(1000);                 // the item-level ledger only counts the copy that actually landed in the cloud
         tracker.Complete();
 
         Assert.Equal(1000, seen[^1].TransferredBytes);
-        // 测速那本账**照旧**含重传——那些字节确实又过了一遍网线，当下网速要的正是这个。
+        // The speed ledger **still** includes the retransmit — those bytes really did cross the wire again, and current wire speed wants exactly that.
         Assert.Equal(1500, seen[^1].Bytes);
     }
 
     /// <summary>
-    /// 按件记账把"传完的卷"挤出了 uploaded，但那些字节**确实已经在云上**，不能就此从界面上消失。
-    /// 它们落在单独一栏里，整件完成时并入 uploaded 并归零。
+    /// Booking per item squeezes "finished volumes" out of uploaded, but those bytes **really are in the cloud** and
+    /// must not simply vanish from the UI. They land in a column of their own, folded into uploaded and zeroed when the item completes.
     /// </summary>
     [Fact]
     public void Volumes_Already_On_The_Cloud_Are_Shown_While_Their_Item_Is_Unfinished()
@@ -249,15 +257,15 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig();
         tracker.SetTransferred(0);
 
-        // 一件活切成两卷，压缩后共 8000。第一卷传完了。
+        // One item split into two volumes, 8000 after compression. The first volume is through.
         tracker.BeginUpload("data/d");
         tracker.BeginItem("d.001", "photos/big.bin", 5_000, "data/d");
         tracker.ItemProgress("d.001").Report(5_000);
         tracker.EndItem("d.001", 0);
         tracker.Complete();
 
-        Assert.Equal(0, seen[^1].TransferredBytes);          // 件没完成，进不了这本账
-        Assert.Equal(5_000, seen[^1].UnfinishedItemBytes);   // 但它已经在云上了，得看得见
+        Assert.Equal(0, seen[^1].TransferredBytes);          // the item is not complete, so it cannot enter this ledger
+        Assert.Equal(5_000, seen[^1].UnfinishedItemBytes);   // but it is already in the cloud, so it has to stay visible
 
         tracker.BeginItem("d.002", "photos/big.bin", 3_000, "data/d");
         tracker.ItemProgress("d.002").Report(3_000);
@@ -269,13 +277,14 @@ public sealed class StageByteBreakdownTests
         tracker.Complete();
 
         Assert.Equal(8_000, seen[^1].TransferredBytes);
-        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // 并入之后归零，界面上整段消失
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // zeroed once folded in; the whole row disappears from the UI
     }
 
     /// <summary>
-    /// 多件同时在传时，一件完成**不能**把这一栏清零——那会连别的活已经传上去的卷一起抹掉。
-    /// 记的是笔总量守恒的账：卷传完就加，件销账时按 uploaded 的增量减，那个增量恰好是刚归档
-    /// 那件的全部卷，因此不必知道哪一卷属于哪一件。
+    /// With several items in flight, one completing **must not** zero this column — that would wipe out volumes other
+    /// items have already sent. The ledger is conservation-based: add when a volume finishes, subtract by uploaded's
+    /// delta when an item settles, and that delta is exactly all the volumes of the item just archived, so there is no
+    /// need to know which volume belongs to which item.
     /// </summary>
     [Fact]
     public void One_Item_Finishing_Does_Not_Wipe_Another_Items_Uploaded_Volumes()
@@ -292,17 +301,17 @@ public sealed class StageByteBreakdownTests
 
         tracker.BeginUpload("data/a");
         tracker.BeginUpload("data/b");
-        Volume("data/a", "a.001", "a.bin", 500);    // A 的前半
-        Volume("data/b", "b.001", "b.bin", 1_000);  // B 的前半（并发）
-        Volume("data/a", "a.002", "a.bin", 500);    // A 齐了
+        Volume("data/a", "a.001", "a.bin", 500);    // A's first half
+        Volume("data/b", "b.001", "b.bin", 1_000);  // B's first half (concurrent)
+        Volume("data/a", "a.002", "a.bin", 500);    // A is complete
         tracker.ConfirmUpload("data/a");
         tracker.EndUpload("data/a");
         tracker.Advance(0, 900);
-        tracker.SetTransferred(1_000);    // A 销账：1000 = A 的两卷
+        tracker.SetTransferred(1_000);    // A settles: 1000 = A's two volumes
         tracker.Complete();
 
         Assert.Equal(1_000, seen[^1].TransferredBytes);
-        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);  // 剩下的正是 B 已传的那一卷，没被误伤
+        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);  // what remains is exactly B's already-sent volume, no collateral damage
 
         Volume("data/b", "b.002", "b.bin", 1_000);
         tracker.ConfirmUpload("data/b");
@@ -316,8 +325,9 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// if-missing 撞上已存在的 blob 时一个字节都没上网线，件级账也不会计它——这一栏同样不能加，
-    /// 否则它永远减不回 0，界面上会挂着一笔根本不存在的"已上传"。中断重跑时这种命中成片发生。
+    /// When if-missing hits an existing blob not one byte goes on the wire and the item-level ledger does not book it
+    /// — so this column must not add either, or it can never subtract back to 0 and the UI carries an "uploaded" figure
+    /// that never existed. On a rerun after an interruption these hits happen in swathes.
     /// </summary>
     [Fact]
     public void A_Skipped_Blob_Never_Enters_The_Unfinished_Column()
@@ -326,7 +336,7 @@ public sealed class StageByteBreakdownTests
         tracker.SetTransferred(0);
 
         tracker.BeginUpload("data/d");
-        tracker.BeginItem("d.001", "a.bin", 5_000, "data/d");   // 申报了 5000，但一个字节也没传
+        tracker.BeginItem("d.001", "a.bin", 5_000, "data/d");   // declares 5000, but not one byte is sent
         tracker.EndItem("d.001", 0);
         tracker.Complete();
 
@@ -334,12 +344,14 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// 一族卷传掉几卷之后整件倒了，重试成功——作废那次的卷不能留在这一栏里。
+    /// A family sends a few volumes, then the whole item dies and the retry succeeds — the discarded attempt's volumes
+    /// must not linger in this column.
     /// <para>
-    /// 从前这本账是个只加的标量，件级销账时按 uploaded 的增量减。两边在失败路径上抵不平：
-    /// 第一次传掉的卷加了进去，而件级账只按成功那一次扣一遍，差额从此永久挂在屏幕上——
-    /// 实测一轮 3 TB 的备份攒到 2 GB，而那时一个字节都没在传。现在按**族**记账，
-    /// 云端没确认过的那次整条抹掉，重试从零开始。
+    /// This ledger used to be an add-only scalar, subtracted by uploaded's delta when an item settled. The two sides do
+    /// not balance on the failure path: the first attempt's sent volumes were added, while the item-level ledger only
+    /// deducts once for the successful attempt, and the difference hangs on the screen forever — measured at 2 GB over
+    /// one 3 TB backup run, at a moment when not a byte was being transferred. It is now booked per **family**: an
+    /// attempt the cloud never confirmed is wiped out entirely and the retry starts from zero.
     /// </para>
     /// </summary>
     [Fact]
@@ -355,7 +367,7 @@ public sealed class StageByteBreakdownTests
             tracker.EndItem(name, 0);
         }
 
-        // 第一次尝试：三卷里传掉两卷就倒了。没有 ConfirmUpload——云端从未确认过整族。
+        // First attempt: two of the three volumes went before it died. No ConfirmUpload — the cloud never confirmed the family.
         tracker.BeginUpload("data/abc");
         Volume("data/abc", "data/abc.001", 1_000);
         Volume("data/abc", "data/abc.002", 1_000);
@@ -364,7 +376,7 @@ public sealed class StageByteBreakdownTests
 
         Assert.Equal(0, seen[^1].UnfinishedItemBytes);
 
-        // 第二次尝试：三卷齐了，云端确认，件级销账把它们并进 uploaded。
+        // Second attempt: all three volumes land, the cloud confirms, and the item-level settle folds them into uploaded.
         tracker.BeginUpload("data/abc");
         Volume("data/abc", "data/abc.001", 1_000);
         Volume("data/abc", "data/abc.002", 1_000);
@@ -376,12 +388,13 @@ public sealed class StageByteBreakdownTests
         tracker.Complete();
 
         Assert.Equal(3_000, seen[^1].TransferredBytes);
-        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // 干净归零，没有作废那两卷的残留
+        Assert.Equal(0, seen[^1].UnfinishedItemBytes);   // cleanly zero, no residue from the two discarded volumes
     }
 
     /// <summary>
-    /// 一族作废**只**抹掉它自己那条：并发在传的别的族，已经落云的卷一个字节都不能少。
-    /// 标量账做不到这件事——它不认哪一卷属于哪一族，只能整体加减。
+    /// Discarding one family wipes **only** its own row: other families transferring concurrently must not lose a
+    /// single byte of the volumes already in the cloud. A scalar ledger cannot do this — it does not know which volume
+    /// belongs to which family and can only add and subtract in bulk.
     /// </summary>
     [Fact]
     public void Discarding_One_Family_Leaves_The_Others_Untouched()
@@ -399,19 +412,20 @@ public sealed class StageByteBreakdownTests
         tracker.BeginUpload("data/aaa");
         tracker.BeginUpload("data/bbb");
         Volume("data/aaa", "data/aaa.001", 500);
-        Volume("data/bbb", "data/bbb.001", 1_000);   // B 与 A 并发
+        Volume("data/bbb", "data/bbb.001", 1_000);   // B runs concurrently with A
 
-        tracker.EndUpload("data/aaa");               // A 倒了，没确认过
+        tracker.EndUpload("data/aaa");               // A died, never confirmed
         tracker.Complete();
 
-        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);   // 只剩 B 的那一卷，没被连累
+        Assert.Equal(1_000, seen[^1].UnfinishedItemBytes);   // only B's volume is left, untouched by the fallout
     }
 
     /// <summary>
-    /// 压完就进池子（背压要的是"盘上此刻占了多少"，晚记一秒就可能撑爆临时盘），可那一刻它还要
-    /// 过一遍压缩后重校验、多卷还要先清云端残留卷，一卷都没资格上路。这段时间把它算进
-    /// "ready to upload" 是过度承诺：重校验判出成员在压缩期间变了的话，这份归档会被整个丢掉重压，
-    /// 一个字节都传不出去。
+    /// An archive enters the pool the moment compression ends (backpressure wants "how much is on disk right now",
+    /// and booking it a second late can blow out the temp disk), but at that instant it still has to go through
+    /// post-compression re-verification, and a multi-volume one must first clear leftover volumes in the cloud — not
+    /// one volume is cleared to go. Counting that stretch as "ready to upload" over-promises: if re-verification finds
+    /// a member changed during compression, the whole archive is thrown away and recompressed, and not a byte is ever transferred.
     /// </summary>
     [Fact]
     public void Bytes_Still_Being_Verified_Are_Not_Ready_To_Upload()
@@ -419,23 +433,24 @@ public sealed class StageByteBreakdownTests
         long pool = 0;
         var (tracker, seen) = Rig(stagedBytes: () => pool);
 
-        pool = 100_000;                    // 一箱压完了，产出落盘、进了背压的账
-        tracker.BeginChecking(100_000);    // 但它正在逐成员重校验
+        pool = 100_000;                    // a pack finished compressing; the output hit the disk and entered the backpressure ledger
+        tracker.BeginChecking(100_000);    // but it is re-verifying member by member
         tracker.Complete();
 
-        Assert.Equal(0, seen[^1].StagedBytes);           // 不是"可以传了"
-        Assert.Equal(100_000, seen[^1].CheckingBytes);   // 是"还在核对"
+        Assert.Equal(0, seen[^1].StagedBytes);           // not "ready to send"
+        Assert.Equal(100_000, seen[^1].CheckingBytes);   // but "still being checked"
 
         tracker.EndChecking(100_000);
         tracker.Complete();
 
-        Assert.Equal(100_000, seen[^1].StagedBytes);     // 核对过了才算数
+        Assert.Equal(100_000, seen[^1].StagedBytes);     // only counts once it has been checked
         Assert.Equal(0, seen[^1].CheckingBytes);
     }
 
     /// <summary>
-    /// 归档还不存在的那几段核对（单文件的去重预筛、一箱压缩**前**的逐成员 stat）不带字节：
-    /// 它们要核对的是源文件，池子里一个字节都还没有。件数那一栏照常算它们。
+    /// The checking stretches where no archive exists yet (a single file's dedup pre-screen, a pack's per-member stat
+    /// **before** compression) carry no bytes: what they check is the source file, and the pool holds not one byte yet.
+    /// The item-count column still counts them as usual.
     /// </summary>
     [Fact]
     public void Checking_Before_Anything_Is_Staged_Moves_No_Bytes()
@@ -443,14 +458,14 @@ public sealed class StageByteBreakdownTests
         long pool = 0;
         var (tracker, seen) = Rig(stagedBytes: () => pool);
 
-        tracker.BeginChecking();   // 去重预筛：整读源文件算 hash，没有归档
+        tracker.BeginChecking();   // dedup pre-screen: read the whole source file to hash it, no archive involved
         tracker.Complete();
 
         Assert.Equal(0, seen[^1].CheckingBytes);
-        Assert.Equal(1, seen[^1].Checking);   // 件数那一栏照旧
+        Assert.Equal(1, seen[^1].Checking);   // the item-count column carries on as usual
     }
 
-    /// <summary>没有池子的阶段（扫描/差分/本地检查）不报待传字节，那一行在界面上整段消失。</summary>
+    /// <summary>Stages with no pool (scanning/diffing/local checks) report no staged bytes, and that row disappears from the UI entirely.</summary>
     [Fact]
     public void Stages_Without_A_Pool_Report_No_Staged_Bytes()
     {

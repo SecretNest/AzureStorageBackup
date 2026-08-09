@@ -3,8 +3,9 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 本轮内跨箱打包成员去重的表结构。判据与 <see cref="LocalDedupResolver.TryFindPackMember"/>
-/// 一致：fullHash + 长度 + head + tail 四项严格相等，缺失也算不等。
+/// The table behind within-run, cross-pack dedup of packed members. The criteria match
+/// <see cref="LocalDedupResolver.TryFindPackMember"/>: fullHash + length + head + tail, all four strictly
+/// equal, and a missing component counts as unequal.
 /// </summary>
 public sealed class PackAliasTableTests
 {
@@ -13,7 +14,7 @@ public sealed class PackAliasTableTests
     {
         var table = new PackAliasTable();
 
-        // 第一份内容：调用方照旧入箱。
+        // First occurrence of this content: the caller packs it as usual.
         Assert.False(table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt"));
         Assert.Empty(table.AliasesByLeader);
     }
@@ -44,12 +45,13 @@ public sealed class PackAliasTableTests
         Assert.Equal(["b/y.txt", "c/z.txt"], aliases.Select(a => a.Path));
     }
 
-    // 四项各差一项：都不该合并。判错的后果是索引指向别人的内容、还原出错数据。
+    // Vary one of the four components at a time: none of these may be merged. Getting it wrong means
+    // the index points at someone else's content and restore hands back wrong data.
     [Theory]
-    [InlineData("xxh128:bb", 100L, "xxh128:hh", "xxh128:tt")]  // fullHash 不同
-    [InlineData("xxh128:aa", 101L, "xxh128:hh", "xxh128:tt")]  // 长度不同
-    [InlineData("xxh128:aa", 100L, "xxh128:zz", "xxh128:tt")]  // head 不同
-    [InlineData("xxh128:aa", 100L, "xxh128:hh", "xxh128:zz")]  // tail 不同
+    [InlineData("xxh128:bb", 100L, "xxh128:hh", "xxh128:tt")]  // different fullHash
+    [InlineData("xxh128:aa", 101L, "xxh128:hh", "xxh128:tt")]  // different length
+    [InlineData("xxh128:aa", 100L, "xxh128:zz", "xxh128:tt")]  // different head
+    [InlineData("xxh128:aa", 100L, "xxh128:hh", "xxh128:zz")]  // different tail
     public void Any_Differing_Component_Prevents_Aliasing(
         string full, long length, string head, string tail)
     {
@@ -60,8 +62,9 @@ public sealed class PackAliasTableTests
         Assert.Empty(table.AliasesByLeader);
     }
 
-    // 缺项即不参与——老索引里那些没有尾部的成员就是这么被挡在外面的，
-    // 代价只是那份内容会被再存一次，而这正是我们要的方向。
+    // A missing component means no participation — that is exactly how members without a tail in old
+    // indexes are kept out. The cost is only that the content gets stored one more time, and that is
+    // the direction we want.
     [Theory]
     [InlineData(null, "xxh128:hh", "xxh128:tt")]
     [InlineData("xxh128:aa", null, "xxh128:tt")]
@@ -70,9 +73,9 @@ public sealed class PackAliasTableTests
     {
         var table = new PackAliasTable();
 
-        // 既不登记为 leader……
+        // Neither registered as a leader...
         Assert.False(table.TryClaim(full, 100, head, tail, "a/x.txt"));
-        // ……第二次同样缺项的也不会认出它来。
+        // ...nor recognized by a second call that is missing the same component.
         Assert.False(table.TryClaim(full, 100, head, tail, "c/z.txt"));
         Assert.Empty(table.AliasesByLeader);
     }
@@ -85,8 +88,8 @@ public sealed class PackAliasTableTests
         table.TryClaim("xxh128:bb", 100, "xxh128:hh", "xxh128:tt", "b/y.txt");
         table.TryClaim("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "c/z.txt");
 
-        // 只有真有别名的 leader 才进这张表：一次首备有几十万个 leader，
-        // 给每个都建一个空 List 是白占几十 MB。
+        // Only leaders that actually have aliases go into this table: a first backup has hundreds of
+        // thousands of leaders, and giving each one an empty List wastes tens of MB for nothing.
         Assert.Equal(["a/x.txt"], table.AliasesByLeader.Keys);
     }
 }

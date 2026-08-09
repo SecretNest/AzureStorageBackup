@@ -6,15 +6,17 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// pack 号必须**跨运行**唯一。
+/// Pack ids must be unique **across runs**.
 /// <para>
-/// 它不像 data blob 那样内容寻址——名字里没有内容的影子。号码从前接着信息文件里的最大号往下发，
-/// 于是上一次运行失败时会重号：那一次已经把 <c>packs/p0001.7z</c> 传上去了、却没能写成信息文件，
-/// 下一次又从 p0001 发起，而这个同号包装的是**另一批成员**。上传走 if-missing，撞上同名就跳过，
-/// 索引却声称它含这一次的成员——还原时从那个包里根本取不到，静默地少一批文件。
+/// Unlike data blobs they are not content-addressed — the name carries no trace of the content. Ids used to be
+/// handed out continuing from the largest one in the info file, so a failed previous run produced a collision:
+/// that run had already uploaded <c>packs/p0001.7z</c> but never managed to write the info file, and the next
+/// run starts from p0001 again — with that same-numbered pack holding **a different set of members**. Uploads
+/// go through if-missing, so a name clash is silently skipped, while the index claims the pack contains this
+/// run's members — restore finds nothing there and a batch of files goes silently missing.
 /// </para>
 /// <para>
-/// 这是用户容器的真实状态：一次失败的备份留下了 data/ 和 packs/，信息文件没写成。
+/// This is a real state of the user's container: a failed backup left data/ and packs/ behind, with no info file.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -96,9 +98,10 @@ public sealed class PackIdUniquenessTests : IDisposable
     };
 
     /// <summary>
-    /// 模拟"上一次运行失败、信息文件没写成"：备份一批文件，然后把索引与信息文件删掉，
-    /// 只留下 data/ 与 packs/——正是用户容器的形状。再跑一次**换成另一批文件**的备份，
-    /// 新包绝不能撞上那些遗留的包名，还原出来的内容必须是这一次的。
+    /// Simulates "the previous run failed and never wrote the info file": back up a batch of files, then delete
+    /// the index and the info file, leaving only data/ and packs/ — exactly the shape of the user's container.
+    /// Then run another backup **with a different batch of files**; the new packs must not collide with any of
+    /// the leftover pack names, and what restores must be this run's content.
     /// </summary>
     [SkippableFact]
     public async Task A_Rerun_After_A_Failed_Run_Never_Reuses_A_Leftover_Pack_Name()
@@ -114,7 +117,7 @@ public sealed class PackIdUniquenessTests : IDisposable
 
         try
         {
-            // 第一轮：留下 data/ 与 packs/。
+            // Round one: leaves data/ and packs/ behind.
             Write("first/a.txt", new string('a', 400));
             Write("first/b.txt", new string('b', 400));
             await backup.RunAsync(Request(account, name));
@@ -124,18 +127,20 @@ public sealed class PackIdUniquenessTests : IDisposable
                 leftoverPacks.Add(b.Name);
             Assert.NotEmpty(leftoverPacks);
 
-            // 把索引与信息文件抹掉 = "那一轮没能收尾"。data/ 与 packs/ 留在原地。
+            // Wiping the index and the info file = "that run never finished". data/ and packs/ stay where they are.
             await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, "indexes/", CancellationToken.None))
                 await cc.GetBlobClient(b.Name).DeleteIfExistsAsync();
             await cc.GetBlobClient(BackupDiscovery.IndexBlobName).DeleteIfExistsAsync();
 
-            // 第二轮换一个编排器，因为"那一轮没能收尾"在本地也留不下任何东西：写本地状态是
-            // 收尾动作的一部分，运行倒在半路时它压根没执行。沿用上一个编排器的话，本地状态里
-            // 还记着第一轮写成的信息文件和它的 ETag——那不是"运行失败"的形状，而是"云端被
-            // 别人动过"，写回时会撞 412 并清本地状态要求重跑（见 TrackedInfoStore.WriteAsync）。
+            // Round two uses a fresh orchestrator, because "that run never finished" leaves nothing behind
+            // locally either: writing local state is part of the finishing sequence, and a run that dies halfway
+            // never gets there. Reusing the previous orchestrator would leave local state still remembering round
+            // one's info file and its ETag — that is not the shape of "the run failed" but of "someone else
+            // touched the cloud", and the write-back would hit a 412, clear local state and demand a rerun
+            // (see TrackedInfoStore.WriteAsync).
             var (backup2, _, _) = Build();
 
-            // **另一批**文件。本地与云端都没有信息文件，所以这是一次"全新"备份。
+            // **A different batch** of files. Neither local nor cloud has an info file, so this is a "brand new" backup.
             Directory.Delete(Path.Combine(_src, "first"), recursive: true);
             Write("second/c.txt", new string('c', 400));
             Write("second/d.txt", new string('d', 400));
@@ -147,11 +152,11 @@ public sealed class PackIdUniquenessTests : IDisposable
                 .Select(e => $"packs/{e.Storage!.Ref}.7z").Distinct(StringComparer.Ordinal).ToList();
             Assert.NotEmpty(refs);
 
-            // 要害：这一轮的包名一个都不能是上一轮遗留的那些。撞上就等于索引指着一个装着
-            // 别人成员的包，而 if-missing 会安静地跳过上传。
+            // The crux: not one pack name from this run may be among the leftovers. A collision means the index
+            // points at a pack holding someone else's members, while if-missing quietly skips the upload.
             Assert.Empty(refs.Intersect(leftoverPacks, StringComparer.Ordinal));
 
-            // 而且还原出来的必须是**这一轮**的内容。
+            // And what restores must be **this run's** content.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -162,7 +167,7 @@ public sealed class PackIdUniquenessTests : IDisposable
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>同一轮里发出的号必须互不相同——这是"唯一"最起码的那一半。</summary>
+    /// <summary>Ids handed out within one run must all differ — the bare minimum half of "unique".</summary>
     [SkippableFact]
     public async Task Packs_Within_One_Run_Get_Distinct_Names()
     {
@@ -177,7 +182,7 @@ public sealed class PackIdUniquenessTests : IDisposable
 
         try
         {
-            // 每个目录各自成箱（默认按目录打包），于是这一轮会发出好几个号。
+            // Each directory becomes its own pack (packing is per-directory by default), so this run hands out several ids.
             for (var i = 0; i < 5; i++)
                 Write($"dir{i}/f.txt", new string((char)('a' + i), 300));
             await backup.RunAsync(Request(account, name));
@@ -188,13 +193,13 @@ public sealed class PackIdUniquenessTests : IDisposable
                 .Select(e => e.Storage!.Ref).ToList();
 
             var distinct = packIds.Distinct(StringComparer.Ordinal).ToList();
-            Assert.True(distinct.Count > 1, "这一轮本该产生多个包");
-            // 每个包名在容器里都确实存在（号发对了，没有指向不存在的对象）。
+            Assert.True(distinct.Count > 1, "this run should have produced multiple packs");
+            // Every pack name really exists in the container (the ids were handed out right, nothing points at a missing object).
             foreach (var id in distinct)
             {
                 var single = await cc.GetBlobClient($"packs/{id}.7z").ExistsAsync();
                 var first = await cc.GetBlobClient($"packs/{id}.7z.001").ExistsAsync();
-                Assert.True(single.Value || first.Value, $"packs/{id}.7z 应该在容器里");
+                Assert.True(single.Value || first.Value, $"packs/{id}.7z should be in the container");
             }
         }
         finally { await cc.DeleteIfExistsAsync(); }

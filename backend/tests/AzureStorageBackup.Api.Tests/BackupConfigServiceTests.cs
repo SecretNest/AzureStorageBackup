@@ -30,8 +30,8 @@ public sealed class BackupConfigServiceTests : IDisposable
         _connection.Dispose();
     }
 
-    // 一个 container 只挂得住一条备份（AppDbContext 上的唯一索引），所以要两条并存的用例
-    // 必须各给各的 container——从前它们共用 "photos"，靠的正是这次修掉的那个漏洞。
+    // A container can hold only one backup (the unique index on AppDbContext), so any case that needs two of them side by side
+    // must give each its own container — they used to share "photos", relying on exactly the hole that was fixed this time.
     private static BackupConfig Sample(string name = "photos", string container = "photos") => new()
     {
         AccountId = 1,
@@ -54,7 +54,7 @@ public sealed class BackupConfigServiceTests : IDisposable
 
         var fetched = await _sut.GetAsync(created.Id);
         Assert.Equal("photos", fetched!.Name);
-        // 实体里始终是密文；明文只经 ISecretReader 取（设计 §3.1）。
+        // The entity always holds ciphertext; the plaintext is obtained only through ISecretReader (design §3.1).
         Assert.NotEqual("s3cret", fetched.PasswordProtected);
         Assert.Equal("s3cret", TestSecrets.Reader.RevealBackupPassword(fetched));
         Assert.Equal(StorageTier.Cool, fetched.DataTier);
@@ -62,15 +62,15 @@ public sealed class BackupConfigServiceTests : IDisposable
     }
 
     /// <summary>
-    /// 钉住**列名**：实体属性叫 PasswordProtected，落库仍必须是历史列名 Password（无 schema 变更）。
-    /// 这条不再证明「加密」——密文是本测试自己经 CreateAsync 写进去的，断言只能说明它不等于明文。
+    /// Pins down the **column name**: the entity property is called PasswordProtected, but it must still land in the historical column Password (no schema change).
+    /// This no longer proves "encryption" — the ciphertext was written by this very test through CreateAsync, so the assertion can only say it is not equal to the plaintext.
     /// </summary>
     [Fact]
     public async Task Password_Is_Written_To_The_Legacy_Password_Column()
     {
         var created = await _sut.CreateAsync(Sample());
 
-        // 直接读原始列（列名写错就查不到表/列，测试失败）。
+        // Read the raw column directly (get the column name wrong and the table/column is not found, failing the test).
         var raw = _connection.CreateCommand();
         raw.CommandText = "SELECT Password FROM BackupConfigs WHERE Id = $id";
         raw.Parameters.AddWithValue("$id", created.Id);
@@ -95,7 +95,7 @@ public sealed class BackupConfigServiceTests : IDisposable
         var created = await _sut.CreateAsync(Sample());
 
         var update = Sample();
-        update.PasswordProtected = null; // 更新请求不带密码（创建后不可更改，见 Clone 注释）
+        update.PasswordProtected = null; // update requests carry no password (it cannot be changed after creation, see the Clone comment)
         update.Name = "renamed";
         update.MaxVersions = 10;
         var result = await _sut.UpdateAsync(created.Id, update);
@@ -110,9 +110,9 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Null(await _sut.UpdateAsync(999, Sample()));
     }
 
-    // BackupConfig 是 class（非 record），用逐字段克隆代替 `with` 表达式来构造更新请求。
-    // 刻意**不**复制 PasswordProtected：密码创建后不可更改（决策 8），更新请求一律不带密码
-    // （端点侧 BackupConfigRequest.Password 为空时 PasswordProtected 就是 null）。
+    // BackupConfig is a class (not a record), so update requests are built with a field-by-field clone instead of a `with` expression.
+    // PasswordProtected is deliberately **not** copied: the password cannot be changed after creation (decision 8), so update requests never carry one
+    // (on the endpoint side, an empty BackupConfigRequest.Password means PasswordProtected is null).
     private static BackupConfig Clone(BackupConfig c) => new()
     {
         Id = c.Id,
@@ -166,7 +166,7 @@ public sealed class BackupConfigServiceTests : IDisposable
         changeDataTier.DataTier = StorageTier.Hot;
         await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, changeDataTier));
 
-        // Name/规则/保留策略等可变字段可以正常更新。
+        // Editable fields such as Name/rules/retention policy update normally.
         var ok = Clone(created);
         ok.Name = "renamed";
         ok.IgnoreRules = "*.tmp";
@@ -177,8 +177,8 @@ public sealed class BackupConfigServiceTests : IDisposable
         Assert.Equal(7, result.MaxVersions);
     }
 
-    // 密码创建后不可更改（决策 8）：密文含随机 IV，「是不是同一个密码」不可比较，
-    // 所以只要带了密码就拒绝——无论是新密码，还是原样回传的原密文。
+    // The password cannot be changed after creation (decision 8): the ciphertext carries a random IV, so "is this the same password" cannot be compared,
+    // hence any request carrying a password is refused — whether it is a new password or the original ciphertext echoed back.
     [Fact]
     public async Task Update_Rejects_Any_Non_Empty_Password()
     {
@@ -196,9 +196,9 @@ public sealed class BackupConfigServiceTests : IDisposable
     [Fact]
     public async Task Update_Empty_Password_Preserves_Existing_Without_Rejecting()
     {
-        var created = await _sut.CreateAsync(Sample()); // 密码明文 "s3cret"
+        var created = await _sut.CreateAsync(Sample()); // password plaintext "s3cret"
 
-        var update = Clone(created); // 不带密码 = 保留原值（约定见 BackupConfigEndpoints PUT）
+        var update = Clone(created); // no password = keep the existing value (convention documented at BackupConfigEndpoints PUT)
         update.Name = "renamed";
 
         var result = await _sut.UpdateAsync(created.Id, update);
@@ -236,9 +236,9 @@ public sealed class BackupConfigServiceTests : IDisposable
     public async Task ChangeLocalRoot_Moves_The_Root_And_Leaves_Everything_Else_Alone()
     {
         var created = await _sut.CreateAsync(Sample());
-        // 范围规则是相对根的坐标，换根后必须原文保留、一字不改。
+        // Scope rules are coordinates relative to the root, so after the move they must be kept verbatim, not one character changed.
         created.ScopeRules = "+ albums\n- albums/tmp";
-        created.PasswordProtected = null; // 更新请求不带密码（创建后不可更改，见决策 8）
+        created.PasswordProtected = null; // update requests carry no password (it cannot be changed after creation, see decision 8)
         await _sut.UpdateAsync(created.Id, created);
         var before = await _sut.GetAsync(created.Id);
 
@@ -270,8 +270,8 @@ public sealed class BackupConfigServiceTests : IDisposable
     }
 
     /// <summary>
-    /// 新通道是另开的一道门，不是把旧锁撬开：常规更新路径必须**依然**拒绝改根，
-    /// 否则日后一次顺手的编辑就能悄悄换掉根路径。
+    /// The new channel is a separate door, not the old lock pried open: the regular update path must **still** refuse to change the root,
+    /// otherwise one casual edit later on could quietly swap the root path out.
     /// </summary>
     [Fact]
     public async Task Update_Still_Refuses_To_Change_The_Local_Root()
@@ -279,7 +279,7 @@ public sealed class BackupConfigServiceTests : IDisposable
         var created = await _sut.CreateAsync(Sample());
         var update = await _sut.GetAsync(created.Id);
         update!.LocalRoot = "/mnt/photos";
-        update.PasswordProtected = null;   // 空 = 保留原值，避免撞上密码那条拒绝
+        update.PasswordProtected = null;   // empty = keep the existing value, so we do not run into the password refusal
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(created.Id, update));
     }

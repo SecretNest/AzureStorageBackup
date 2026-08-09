@@ -9,15 +9,18 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 打包小文件的**文件级**去重。单文件 blob 一直是内容寻址的，同内容只存一份；打包成员却没有——
-/// 同一份内容出现在两个箱里就实打实地存两遍。
+/// **File-level** dedup for packed small files. Single-file blobs have always been content-addressed, so
+/// identical content is stored once; packed members never were — the same content appearing in two packs really
+/// does get stored twice.
 /// <para>
-/// 同一箱内的重复本来就被 7z 的 solid 归档消掉了（字典跨成员匹配），所以这里要覆盖的是**跨箱、
-/// 跨版本**那部分：不同箱之间压缩不共享字典。
+/// Duplicates inside one pack are already eaten by 7z's solid archive (dictionary matching across members), so
+/// what has to be covered here is the **cross-pack, cross-version** part: different packs share no compression
+/// dictionary.
 /// </para>
 /// <para>
-/// 对已有备份必须是**只读**的：老索引一字不改，只是多一种命中可能；命中后写下的引用形状与从前
-/// 逐字节相同，所以保留清理、死重压实、还原三处都不必改。这几条都在下面钉住。
+/// It must be **read-only** with respect to existing backups: not a character of the old indexes changes, there
+/// is merely one more way to get a hit; the reference shape written after a hit is byte-for-byte what it used to
+/// be, so retention cleanup, dead-weight compaction and restore all stay untouched. Each of these is pinned below.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -88,7 +91,7 @@ public sealed class PackMemberDedupTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
-        // 本地权威接线：打包成员去重靠本地缓存的索引判定，不读云端。
+        // Local-authoritative wiring: packed-member dedup decides from the locally cached index, never reading the cloud.
         var indexCache = new LocalIndexCache(_db, store);
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
         var backup = new BackupOrchestrator(
@@ -101,7 +104,7 @@ public sealed class PackMemberDedupTests : IDisposable
         return (backup, restore, store);
     }
 
-    /// <summary>阈值给足，让这些几十字节的文件全都走 pack 路径。</summary>
+    /// <summary>Threshold set high enough that all these few-dozen-byte files take the pack path.</summary>
     private BackupRequest Request(Account account, string container) => new()
     {
         Account = account,
@@ -123,8 +126,9 @@ public sealed class PackMemberDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 第二个版本新增一个与既有成员**同内容、不同路径**的小文件：不该产生新的 pack，
-    /// 新条目直接指向老包里那个成员，而且还原出来的内容必须对。
+    /// The second version adds a small file with **the same content but a different path** as an existing
+    /// member: no new pack should appear, the new entry points straight at that member in the old pack, and what
+    /// restores must be correct.
     /// </summary>
     [SkippableFact]
     public async Task A_New_File_Matching_An_Existing_Pack_Member_Reuses_It()
@@ -140,32 +144,32 @@ public sealed class PackMemberDedupTests : IDisposable
 
         try
         {
-            // 不可压缩的内容：万一真的重装了一箱，体积差异藏不住。
+            // Incompressible content: if a second pack really got built, the size difference cannot hide.
             var payload = string.Concat(Enumerable.Range(0, 400).Select(i => ((char)('a' + i % 26)).ToString()));
             Write("docs/original.txt", payload);
             Write("docs/neighbour.txt", "something else entirely");
             await backup.RunAsync(Request(account, name));
 
             var packsAfterV1 = await CountPacksAsync(cc);
-            Assert.True(packsAfterV1 > 0, "v1 应该产生了至少一个包");
+            Assert.True(packsAfterV1 > 0, "v1 should have produced at least one pack");
 
-            // v2：新增一个同内容、不同路径的文件。
+            // v2: add a file with the same content at a different path.
             Write("archive/copy-of-original.txt", payload);
             await backup.RunAsync(Request(account, name));
 
-            Assert.Equal(packsAfterV1, await CountPacksAsync(cc)); // 一个新包都不该有
+            Assert.Equal(packsAfterV1, await CountPacksAsync(cc)); // not one new pack may appear
 
             var info = await store.ReadInfoAsync(account, name, null);
             var v2 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             var original = v2.Entries.Single(e => e.Path == "docs/original.txt");
             var copy = v2.Entries.Single(e => e.Path == "archive/copy-of-original.txt");
 
-            // 指向同一个包的同一个成员——成员名是**最初**那个路径，不是新路径。
+            // Points at the same member of the same pack — the member name is the **original** path, not the new one.
             Assert.Equal("pack", copy.Storage!.Kind);
             Assert.Equal(original.Storage!.Ref, copy.Storage.Ref);
             Assert.Equal(original.Storage.EntryName ?? original.Path, copy.Storage.EntryName ?? copy.Path);
 
-            // 而且还原得回来，写到**自己**的路径上。
+            // And it restores, written to **its own** path.
             await restore.RunAsync(new RestoreRequest
             {
                 Account = account, Container = name, TargetRoot = _dst,
@@ -178,8 +182,8 @@ public sealed class PackMemberDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 保留清理必须看得见这种跨版本引用。老版本退役后，那个包仍被新版本的条目引用着——
-    /// 删掉它就等于把新版本的数据删了。
+    /// Retention cleanup has to see this kind of cross-version reference. After the old version retires, that
+    /// pack is still referenced by an entry in the new version — deleting it deletes the new version's data.
     /// </summary>
     [SkippableFact]
     public async Task Retention_Keeps_A_Pack_Still_Referenced_Through_Dedup()
@@ -208,7 +212,7 @@ public sealed class PackMemberDedupTests : IDisposable
             Write("a/one.txt", payload);
             await backup.RunAsync(keepOne);
 
-            // v2 新增同内容文件 → 去重指向 v1 的包；同时 v1 会被退役（只留 1 个版本）。
+            // v2 adds a same-content file → dedup points it at v1's pack; meanwhile v1 retires (only 1 version kept).
             Write("b/two.txt", payload);
             await backup.RunAsync(keepOne);
 
@@ -216,11 +220,11 @@ public sealed class PackMemberDedupTests : IDisposable
             var v = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             var two = v.Entries.Single(e => e.Path == "b/two.txt");
 
-            // 它引用的包必须还在——不然还原就取不到内容了。
+            // The pack it references must still be there — otherwise restore cannot fetch the content.
             var packBlob = $"packs/{two.Storage!.Ref}.7z";
             var exists = await cc.GetBlobClient(packBlob).ExistsAsync()
                          || await cc.GetBlobClient(packBlob + ".001").ExistsAsync();
-            Assert.True(exists, $"{packBlob} 被 b/two.txt 引用着，不该被保留清理删掉");
+            Assert.True(exists, $"{packBlob} is referenced by b/two.txt and must not be deleted by retention cleanup");
 
             await restore.RunAsync(new RestoreRequest
             {
@@ -232,12 +236,13 @@ public sealed class PackMemberDedupTests : IDisposable
     }
 
     /// <summary>
-    /// 新写的打包成员条目要带上尾部 hash——判据与单文件 blob 那条路一致（四项），
-    /// 不能两条路各有一套标准。
+    /// Newly written packed-member entries must carry the tail hash — the same criteria as the single-file blob
+    /// path (all four parts); the two paths cannot each have their own standard.
     /// <para>
-    /// 但**未变文件不补**：它本来一趟 IO 都不付，专程去读就是凭空多出来的随机读
-    /// （NAS 机械盘上 50 万小文件接近一小时），换来的加固边际价值极小。老条目因此保持缺失，
-    /// 去重那边按"缺失即不参与判定"处理。
+    /// But **unchanged files are not backfilled**: they pay no IO at all today, and going out to read them is
+    /// pure added random IO (close to an hour for 500k small files on a NAS spinning disk) for hardening whose
+    /// marginal value is tiny. Old entries therefore stay missing, and dedup treats it as "missing means it takes
+    /// no part in the decision".
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -261,26 +266,27 @@ public sealed class PackMemberDedupTests : IDisposable
             var v1 = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             var packed = v1.Entries.Single(e => e.Path == "docs/a.txt");
             Assert.Equal("pack", packed.Storage!.Kind);
-            Assert.NotNull(packed.TailHash);   // 新写的条目就该有
+            Assert.NotNull(packed.TailHash);   // a newly written entry should have one
 
-            // 文件被改动后，新条目照样带着它。
+            // After the file changes, the new entry still carries it.
             Write("docs/a.txt", new string('b', 400));
             await backup.RunAsync(Request(account, name));
             var info2 = await store.ReadInfoAsync(account, name, null);
             var v2 = await store.ReadIndexAsync(account, name, info2!.Versions[^1].IndexBlob, null);
             var changed = v2.Entries.Single(e => e.Path == "docs/a.txt");
             Assert.NotNull(changed.TailHash);
-            Assert.NotEqual(packed.TailHash, changed.TailHash);   // 内容变了，尾部也该变
+            Assert.NotEqual(packed.TailHash, changed.TailHash);   // content changed, so the tail should change too
 
-            // 「未变文件不补尾部」在 BackupDifferTests 那一层测——这里隔着本地索引缓存，
-            // 改云端的索引 blob 影响不到下一轮读到的 previous。
+            // "unchanged files get no tail backfill" is tested at the BackupDifferTests level — here the local
+            // index cache sits in between, so editing the cloud index blob cannot affect the previous that the
+            // next run reads.
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 内容**不同**的文件绝不能被误判成同一个成员。这条守的是去重键本身：
-    /// 三项（fullHash + 长度 + head）里任何一项不同就必须各存一份。
+    /// Files with **different** content must never be mistaken for the same member. This one guards the dedup
+    /// key itself: if any of the three parts (fullHash + length + head) differs, each must be stored separately.
     /// </summary>
     [SkippableFact]
     public async Task Different_Content_Is_Never_Folded_Together()
@@ -299,7 +305,7 @@ public sealed class PackMemberDedupTests : IDisposable
             Write("x/first.txt", new string('p', 500));
             await backup.RunAsync(Request(account, name));
 
-            // 等长但内容不同：只有长度相同，hash 不同 → 必须各存一份。
+            // Same length, different content: only the length matches, the hashes differ → each must be stored separately.
             Write("y/second.txt", new string('q', 500));
             await backup.RunAsync(Request(account, name));
 

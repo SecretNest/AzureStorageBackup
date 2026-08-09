@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>Blob 访问层。索引 Tier 应为 Hot/Cool/Cold；数据 Tier 可含 Archive（M4 §13）。</summary>
+/// <summary>Blob access tier. The index tier should be Hot/Cool/Cold; the data tier may include Archive (M4 §13).</summary>
 public enum StorageTier
 {
     Hot = 0,
@@ -12,8 +12,8 @@ public enum StorageTier
 }
 
 /// <summary>
-/// 一个备份的本地配置（PRD §11 新建备份向导产物）。
-/// 记录设备本地的根路径与设置；加密密码在应用层与库中均为密文，解密只经 ISecretReader（设计 §3.1）。
+/// The local config of one backup (the output of the PRD §11 new-backup wizard).
+/// Records the device-local root path and settings; the encryption password is ciphertext both in the app layer and in the database, and decryption goes only through ISecretReader (design §3.1).
 /// </summary>
 public class BackupConfig
 {
@@ -25,59 +25,59 @@ public class BackupConfig
     public string Name { get; set; } = string.Empty;
     public string? Description { get; set; }
 
-    /// <summary>本地根路径（设备本地；跨设备恢复时重新指定）。</summary>
+    /// <summary>Local root path (device-local; re-specified when restoring on another device).</summary>
     public string LocalRoot { get; set; } = string.Empty;
 
-    /// <summary>加密密码密文。空 = 不加密。取明文用 ISecretReader.RevealBackupPassword。</summary>
+    /// <summary>Ciphertext of the encryption password. Empty = not encrypted. Use ISecretReader.RevealBackupPassword to get the plaintext.</summary>
     public string? PasswordProtected { get; set; }
 
-    // Tier 创建后锁定（BackupConfigService.UpdateAsync），因此**不可继承**——
-    // 继承意味着随全局设置变化，那正是一次创建后的变更。新建时由前端以全局默认预填。
+    // Tiers are locked after creation (BackupConfigService.UpdateAsync) and are therefore **not inheritable** —
+    // inheriting means following the global setting, which is exactly a change after creation. On create, the frontend prefills them from the global defaults.
     public StorageTier IndexTier { get; set; } = StorageTier.Hot;
     public StorageTier DataTier { get; set; } = StorageTier.Archive;
 
-    // 以下字段：null = 继承全局设置（PRD §3「使用默认」），非 null = 本配置自己的覆盖值。
-    // 三个规则字段的 "" 表示「明确没有规则」，与继承区分开。
-    // 规则（gitignore 语法，每行一条）
+    // The fields below: null = inherit the global setting (PRD §3 "use default"), non-null = this config's own override.
+    // On the three rule fields, "" means "explicitly no rules", which is distinct from inheriting.
+    // Rules (gitignore syntax, one per line)
     public string? IgnoreRules { get; set; }
     public string? DontCompressRules { get; set; }
     public string? DontGroupRules { get; set; }
 
-    /// <summary>命中者允许跨目录装箱；null = 用全局默认。</summary>
+    /// <summary>Matches are allowed to be packed across directories; null = use the global default.</summary>
     public string? CrossDirGroupRules { get; set; }
 
     /// <summary>
-    /// 备份范围（设计 docs/backup-scope-selection-design.md）：每行一条 `+ path` / `- path`，
-    /// 判定取最长前缀匹配。null/空 = 根下**全部内容**。
+    /// Backup scope (design docs/backup-scope-selection-design.md): one `+ path` / `- path` per line,
+    /// decided by longest-prefix match. null/empty = **everything** under the root.
     /// <para>
-    /// 注意它与上面几个规则字段的 null 含义**不同**：那些是「继承全局默认」，这个是
-    /// 「全部包含」。范围是这个备份自己的事，全局默认没有意义，因此它不进
-    /// <see cref="ResolvedBackupSettings"/>。
+    /// Note that null here means something **different** from null on the rule fields above: those mean "inherit the global default",
+    /// this one means "include everything". Scope is this backup's own business, a global default would be meaningless, so it does not go into
+    /// <see cref="ResolvedBackupSettings"/>.
     /// </para>
     /// </summary>
     public string? ScopeRules { get; set; }
 
     public bool? IncludeSymlinks { get; set; }
 
-    // 版本保留（§10）
+    // Version retention (§10)
     public int? MaxVersions { get; set; }
     public int? MaxAgeDays { get; set; }
     public RetentionMode? RetentionMode { get; set; }
 
-    // 分组（§6）
+    // Grouping (§6)
     public long? SingleFileThresholdBytes { get; set; }
     public long? GroupCapBytes { get; set; }
 
-    // null = 继承；0 = 明确关闭分卷；>0 = 分卷大小。
-    // 「关闭」从 null 挪到 0，好让 null 在所有可继承字段上含义一致（Settings 页本就写着 0=off）。
+    // null = inherit; 0 = volumes explicitly off; >0 = volume size.
+    // "Off" moved from null to 0 so that null means the same thing on every inheritable field (the Settings page already says 0=off).
     public long? VolumeBytes { get; set; }
 
-    /// <summary>是否写 debug 级日志（含操作文件名，短存 14 天）。默认关。</summary>
+    /// <summary>Whether to write debug-level logs (they include the names of the files being operated on, kept short-term for 14 days). Off by default.</summary>
     public bool? VerboseLogging { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }
 
-    // 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态（备份中/还原中…）不落库，DTO 时派生。
+    // Persistent status (§4.2 decision 2): Normal/Error only. Transient states (backing up, restoring, …) are not persisted; they are derived when building the DTO.
     public BackupStatus Status { get; set; } = BackupStatus.Normal;
     public string? LastError { get; set; }
     public DateTimeOffset? LastErrorAt { get; set; }

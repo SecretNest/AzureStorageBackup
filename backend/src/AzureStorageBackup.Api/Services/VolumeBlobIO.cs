@@ -6,24 +6,30 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 全局上传额度闸门。容量就是设置里那个「上传并发数」，区别只在**谁先拿到**：不是先到先得，
-/// 而是**按件龄**——最早开始上传的那一族卷优先，它用不完的余量才轮到后来的件。
+/// The global upload slot gate. The capacity is exactly the "upload concurrency" from the settings; the only
+/// difference is **who gets one first**: not first-come-first-served, but **by item age** — the volume family
+/// that started uploading earliest wins, and only the surplus it cannot use goes to later items.
 /// <para>
-/// 先到先得会把额度摊薄到所有在传的件上。压缩是全局串行的，所以稳态是「1 件在压 + N 件在传」
-/// （N = 并发数），这 N 件各分到大约一条流，于是**N 件同时半完成**，而且每一件都推进得很慢。
-/// 代价不只是难看：整族卷传完、云端确认返回之后才记 journal、才销在途账，所以「同时半完成的件数」
-/// 就是一次中断会白扔掉多少活——<c>Stop now</c> 要把在途件的残卷全删，挂起/崩溃则让它们整件重来。
-/// 按件龄仲裁把这个数从 N 降到通常 1~2 件。
+/// First-come-first-served spreads the slots thin across every item in flight. Compression is globally serial,
+/// so the steady state is "1 item compressing + N items uploading" (N = the concurrency), each of those N
+/// getting roughly one stream, which means **N items half-done at once**, every one of them crawling.
+/// The cost is not just ugliness: the journal is written and the in-flight ledger cleared only after the whole
+/// volume family is uploaded and the cloud has confirmed, so "how many items are half-done at once" is exactly
+/// how much work an interruption throws away — <c>Stop now</c> deletes the leftover volumes of every in-flight
+/// item, and suspend/crash makes them start the whole item over. Arbitrating by item age drops that number from
+/// N to typically 1~2 items.
 /// </para>
 /// <para>
-/// 吞吐不受影响：额度始终满载。老件的滑动窗口用不满时（比如它只剩一卷没传），空出来的额度当场
-/// 落到下一件手上，不会闲着。
+/// Throughput is unaffected: the slots stay fully loaded. When an older item's sliding window cannot fill them
+/// (say it has only one volume left to send), the freed slot lands on the next item right away rather than
+/// sitting idle.
 /// </para>
 /// </summary>
 public sealed class VolumeUploadGate
 {
-    /// <summary>排序键 <c>(票号, 卷号)</c>：先按件龄，同一件内按卷号升序。
-    /// 后者不是可有可无的整齐——界面上那张在途列表照着这个顺序读，一件一件往下推进才看得懂。</summary>
+    /// <summary>Sort key <c>(ticket, volume)</c>: item age first, then ascending volume number within one item.
+    /// The latter is not optional tidiness — the in-flight list on screen reads in this order, and it only reads
+    /// sensibly when each item advances one volume after another.</summary>
     private readonly PriorityQueue<TaskCompletionSource, (long Ticket, int Volume)> _waiters = new();
     private readonly Lock _lock = new();
     private long _nextTicket;
@@ -37,27 +43,30 @@ public sealed class VolumeUploadGate
 
     public int Capacity { get; }
 
-    /// <summary>此刻还空着几份额度。给测试与诊断用——判「额度有没有被漏掉」只能看这个数。</summary>
+    /// <summary>How many slots are free right now. For tests and diagnostics — this number is the only way to tell whether a slot has leaked.</summary>
     public int Free { get { lock (_lock) return _free; } }
 
-    /// <summary>领一张票。**一族卷领一张**，也就是「这个归档开始上传的时刻」。</summary>
+    /// <summary>Take a ticket. **One per volume family**, i.e. "the moment this archive started uploading".</summary>
     public long NextTicket() => Interlocked.Increment(ref _nextTicket);
 
     /// <summary>
-    /// 要一份额度。返回的 Task **已完成**就表示闸门当时空着、一次队都没排——调用方据此决定要不要
-    /// 报「在等额度」（见 <see cref="VolumeUploadScope.RunAsync"/>）。
+    /// Ask for a slot. A returned Task that is **already completed** means the gate was free at the time and
+    /// nothing queued at all — the caller uses that to decide whether to report "waiting for a slot"
+    /// (see <see cref="VolumeUploadScope.RunAsync"/>).
     /// </summary>
     public Task AcquireAsync(long ticket, int volume, CancellationToken ct)
     {
         if (ct.IsCancellationRequested)
             return Task.FromCanceled(ct);
 
-        // 续体必须异步跑：Pump 是在锁里置结果的，同步续体会直接在锁内跑到调用方的代码里去。
+        // Continuations must run asynchronously: Pump sets the result while holding the lock, so a synchronous
+        // continuation would run straight into the caller's code inside that lock.
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_lock)
         {
-            // **一律入队**，不留「闸门空着就随手拿走」的快速通道。那条通道正是要修掉的行为：
-            // 它让一个刚到的新件绕过队列，插到已经等在那里的老件前面去。
+            // **Always enqueue**; no fast path for "the gate is free, just grab one". That fast path is exactly
+            // the behaviour being fixed: it lets a freshly arrived new item bypass the queue and cut in front of
+            // an older item already waiting there.
             _waiters.Enqueue(tcs, (ticket, volume));
             Pump();
         }
@@ -66,10 +75,11 @@ public sealed class VolumeUploadGate
 
     private static async Task WaitAsync(TaskCompletionSource tcs, CancellationToken ct)
     {
-        // 取消与 Pump 抢同一个 TCS：谁先置上谁说了算，输的那一方什么都拿不到。
-        // 取消赢了 → 这个等待者变成队里的一具尸体，下次 Pump 弹到它时 TrySetResult 失败、跳过，
-        // 额度不会记到它头上。Pump 赢了 → 额度已经是它的了，await 正常返回，随后调用方自己的
-        // 上传会因为令牌已断而抛，finally 照常把额度还回来。两条路都不漏额度。
+        // Cancellation and Pump race over the same TCS: whoever sets it first wins, and the loser gets nothing.
+        // Cancellation wins → this waiter becomes a corpse in the queue; the next time Pump pops it, TrySetResult
+        // fails and it is skipped, so no slot is charged to it. Pump wins → the slot is already its own, the
+        // await returns normally, the caller's own upload then throws because the token is already broken, and
+        // the finally returns the slot as usual. Neither path leaks a slot.
         await using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
         await tcs.Task;
     }
@@ -78,9 +88,10 @@ public sealed class VolumeUploadGate
     {
         lock (_lock)
         {
-            // 被换掉的 SemaphoreSlim 在还多了的时候会抛 SemaphoreFullException，这一句是把那道
-            // 保险接回来。重复归还不是小事：额度凭空变多，在途流数就静静地超过用户设的并发数，
-            // 而它坏起来不响——只会看见备份莫名其妙比设定的更吃带宽。
+            // The SemaphoreSlim this replaced threw SemaphoreFullException on an over-release; this line wires
+            // that safety net back up. A double release is not a small thing: slots appear out of nowhere and the
+            // in-flight stream count silently exceeds the concurrency the user set, and it fails silently — all
+            // you see is a backup mysteriously eating more bandwidth than configured.
             if (_free >= Capacity)
                 throw new InvalidOperationException(
                     $"Upload slot released more times than acquired (capacity {Capacity}).");
@@ -89,12 +100,13 @@ public sealed class VolumeUploadGate
         }
     }
 
-    /// <summary>把空着的额度发给优先级最高的**活**等待者。必须在锁内调用。</summary>
+    /// <summary>Hand the free slots to the highest-priority **live** waiter. Must be called under the lock.</summary>
     private void Pump()
     {
-        // 循环而不是只弹一个：弹出来的可能是已取消的尸体，那时额度还没送出去，得继续往下找。
-        // 也正因为每次都从 _free > 0 起循环，不存在「队里全是尸体 + 有空额度 = 谁都拿不到」
-        // 那种死锁——尸体会被后续的 Pump 一路清掉。
+        // A loop rather than a single pop: what comes out may be a cancelled corpse, in which case the slot has
+        // not been handed over yet and the search must continue. And because the loop always restarts from
+        // _free > 0, there is no "queue full of corpses + free slots = nobody gets one" deadlock — the corpses
+        // get cleared out by subsequent Pumps.
         while (_free > 0 && _waiters.TryDequeue(out var waiter, out _))
             if (waiter.TrySetResult())
                 _free--;
@@ -102,69 +114,82 @@ public sealed class VolumeUploadGate
 }
 
 /// <summary>
-/// 每一卷上传时套的外围：向全局闸门要一份**流**的额度、把这一卷登记为在途、给它一个独立的进度回报。
+/// The wrapper around every volume upload: ask the global gate for one **stream** slot, register the volume as
+/// in-flight, and give it its own progress sink.
 /// <para>
-/// 额度按**卷**而不是按**件**计。按件计时，一个 100 GB 文件切出来的上千卷整段只占一条流——
-/// 界面上设的「并发 5」在传大文件时形同虚设，实测 4–6 MB/s，正是单条 TCP 到 Azure 的天花板。
-/// 按卷计之后，在途流数恒等于设定值，与队列里躺的是一个大文件还是一万个小文件无关。
+/// Slots are counted per **volume**, not per **item**. Counted per item, the thousands of volumes a 100 GB file
+/// splits into occupy a single stream for the whole stretch — the "concurrency 5" set in the UI is meaningless
+/// while a large file uploads, measured at 4–6 MB/s, which is exactly the ceiling of one TCP connection to Azure.
+/// Counted per volume, the in-flight stream count always equals the configured value, no matter whether the queue
+/// holds one huge file or ten thousand small ones.
 /// </para>
 /// <para>
-/// 有意**不去动** SDK 的 <c>TransferOptions.MaximumConcurrency</c>（blob 内部的块级并发）：
-/// 那一层会与这里的额度相乘，设定的 5 就不再等于任何能解释的数字。而默认卷大小 100 MB 低于
-/// SDK 的 256 MB 单发阈值，一卷就是一个 PUT、一条连接，所以「一卷 = 一条流」是精确的而非近似。
+/// The SDK's <c>TransferOptions.MaximumConcurrency</c> (block-level concurrency inside a blob) is deliberately
+/// **left alone**: that layer would multiply with the slots here, and the 5 that was configured would no longer
+/// equal any number anyone can explain. And the default volume size of 100 MB is below the SDK's 256 MB
+/// single-shot threshold, so one volume is one PUT on one connection — "one volume = one stream" is exact, not
+/// an approximation.
 /// </para>
 /// </summary>
 public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracker, int maxParallelPerItem)
 {
-    /// <summary>单件活最多同时压几卷上去。留着这道窗口**不是**为了让后来的小活插得进来——
-    /// 额度已经按件龄仲裁（见 <see cref="VolumeUploadGate"/>），挡住后来者正是有意为之。
-    /// 它守的是另一件事：别把一个大文件的上千卷一次性全塞进等待队列，那是白占内存，
-    /// 而且这些卷的暂存文件也只能等各自传完才撤得下去。</summary>
+    /// <summary>How many volumes of a single item may be pushed up at once. This window is **not** here to let
+    /// later small items squeeze in — slots are already arbitrated by item age (see <see cref="VolumeUploadGate"/>),
+    /// and keeping latecomers out is exactly the intent.
+    /// It guards something else: do not shove all thousand-odd volumes of one large file into the waiting queue
+    /// at once, which wastes memory, and their staging files cannot be torn down until each has finished.</summary>
     public int MaxParallelPerItem { get; } = Math.Max(1, maxParallelPerItem);
 
     /// <summary>
-    /// 滑动窗口的宽度：<see cref="MaxParallelPerItem"/> **再加一卷**。多出来的那一卷是接力棒。
+    /// The width of the sliding window: <see cref="MaxParallelPerItem"/> **plus one volume**. That extra volume
+    /// is the baton.
     /// <para>
-    /// 少了它，按件龄仲裁会在每次换卷的缝里漏一份额度出去：一卷传完是在 <c>RunAsync</c> 的
-    /// finally 里 <c>Release</c> 的，而这一族的下一卷要等 <c>WhenAny</c> 的续体跑起来才排得上队。
-    /// <c>Release</c> 里的放行是同步的，那一瞬间队里只有别的件——额度当场就送出去了。
-    /// 每传完一卷漏一份，老件的优先权也就名存实亡。
+    /// Without it, age-based arbitration leaks one slot through the crack at every volume changeover: a finished
+    /// volume calls <c>Release</c> in <c>RunAsync</c>'s finally, while this family's next volume cannot queue up
+    /// until the <c>WhenAny</c> continuation gets to run. The handover inside <c>Release</c> is synchronous, and
+    /// at that instant the queue holds only other items — the slot is given away on the spot.
+    /// One leak per completed volume, and the older item's priority is priority in name only.
     /// </para>
     /// <para>
-    /// 多排一卷之后，换卷那一瞬这一族在闸门上通常还留着一个等待者，它凭更小的票号把额度接住。
-    /// 代价只是每件多占一个等待者的内存。
+    /// With one extra volume queued, at the changeover instant this family usually still has a waiter sitting on
+    /// the gate, and it catches the slot on the strength of its smaller ticket.
+    /// The cost is only the memory of one extra waiter per item.
     /// </para>
     /// <para>
-    /// **它盖住的是常见时序，不是全部。** 那一族被放行之后要等续体才补上下一个等待者，这中间仍有
-    /// 一道缝；线程池被饿着时续体迟到，缝里正好有别的卷传完，额度就漏给新件了。生产上这道缝以
-    /// 微秒计而一卷上传以秒计，所以漏的至多是偶尔一卷——够不上要为它去改造成「一族卷各自攥着
-    /// 额度不放」的写法（那才能做到绝对，代价是把这一层整个翻掉）。
+    /// **It covers the common timing, not all of it.** After that family is let through, the next waiter is only
+    /// added once the continuation runs, and there is still a crack in between; when the thread pool is starved
+    /// the continuation is late, and if another volume happens to finish inside that crack the slot leaks to a
+    /// new item. In production this crack is measured in microseconds while a volume upload takes seconds, so
+    /// what leaks is at most the occasional volume — not enough to justify rebuilding this into "each volume
+    /// family holds on to its own slots" (that would be absolute, at the cost of turning this whole layer over).
     /// </para>
     /// </summary>
     public int WindowPerItem => MaxParallelPerItem + 1;
 
-    /// <summary>领一张票，一族卷一张。见 <see cref="VolumeUploadGate.NextTicket"/>。</summary>
+    /// <summary>Take a ticket, one per volume family. See <see cref="VolumeUploadGate.NextTicket"/>.</summary>
     public long NextTicket() => gate.NextTicket();
 
-    /// <param name="ticket">这一族卷的票号，决定它在闸门上的优先级。</param>
-    /// <param name="volumeIndex">族内第几卷（0 起）。同票号之间按它升序放行。</param>
-    /// <param name="label">界面上显示的名字——**源文件路径**或包的描述，不是 blob 名。
-    /// blob 是内容寻址的（加密时还是 HMAC），<c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。</param>
-    /// <param name="volumeBytes">这一卷多大，供界面显示"传了多少 / 一共多大"。</param>
-    /// <param name="owner">这一族的 blobRef（<c>data/{hash}</c> 或 <c>packs/{packId}.7z</c>）。
-    /// 传完的卷按它记进"已落云、件未销账"那本账；跨重试不变，所以作废的那次能被整条抹掉。
-    /// **不用 ticket 代替**：票是每次 <see cref="VolumeBlobIO.UploadAsync"/> 现领的，重试就换一张，
-    /// 拿它当账本的键就找不回上一次那条了。</param>
+    /// <param name="ticket">This volume family's ticket, which decides its priority at the gate.</param>
+    /// <param name="volumeIndex">Which volume within the family (0-based). Within one ticket they are let through in ascending order.</param>
+    /// <param name="label">The name shown in the UI — the **source file path** or a description of the pack, not
+    /// the blob name. Blobs are content-addressed (an HMAC when encrypted), and <c>data/9f2a3b7c…001</c> means nothing to the person at the screen.</param>
+    /// <param name="volumeBytes">How big this volume is, so the UI can show "how much uploaded / how much in total".</param>
+    /// <param name="owner">This family's blobRef (<c>data/{hash}</c> or <c>packs/{packId}.7z</c>).
+    /// Finished volumes are recorded under it in the "landed in the cloud, item not yet settled" ledger; it stays the same across retries, so an abandoned attempt can be wiped out in one row.
+    /// **Do not use ticket instead**: a ticket is taken fresh on every <see cref="VolumeBlobIO.UploadAsync"/> call, so a retry gets a new one,
+    /// and using it as the ledger key would never find the previous attempt's row again.</param>
     public async Task RunAsync(
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
         long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0,
         string? owner = null)
     {
-        // 闸门空着时 AcquireAsync 返回的是一个已完成的 Task，此时**不报**「在等额度」：
-        // 那种情况下标记等于给每一卷平白加一次强制发布——一件大活上千卷就是上千次。
-        // 只有真的排上队才报，而真排上队的时候，屏幕上一个字节都没在动，那一栏正是唯一
-        // 说得出「在等什么」的东西。
-        // 这一句先问一次取消：不补它，已经取消的运行在闸门空着时会照常传完这一卷才发现该停了。
+        // When the gate is free AcquireAsync returns an already-completed Task, and in that case we do **not**
+        // report "waiting for a slot": marking it there would add one forced publish per volume for nothing — a
+        // big item with thousands of volumes means thousands of them. Only a real queue-up is reported, and when
+        // that happens not a byte is moving on screen, so that field is the only thing that can say what is
+        // being waited on.
+        // This line asks about cancellation first: without it, an already-cancelled run would happily finish
+        // uploading this volume while the gate is free, and only then notice it should stop.
         ct.ThrowIfCancellationRequested();
         var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
         if (!acquire.IsCompletedSuccessfully)
@@ -178,9 +203,11 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
             }
             finally
             {
-                // EndWait 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
-                // 而且这条路上的异常是**故意**往外传的（见 StageProgress）。抛出的那一刻额度已经
-                // 到手了，就这么让它走，那一份额度再也回不来——泄漏的形状见下面 Release 处的说明。
+                // EndWait calls straight into the publish the caller supplied (external code: writing the
+                // database, pushing SSE), which may throw, and exceptions on this path are **deliberately**
+                // propagated (see StageProgress). At the moment it throws the slot is already in hand, and just
+                // letting it go means that slot never comes back — see the note at Release below for the shape
+                // of the leak.
                 try
                 {
                     tracker.EndWait(UploadWait.Slot);
@@ -196,20 +223,23 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
         try
         {
             tracker.BeginItem(blobName, label, volumeBytes, owner);
-            // 每卷各要一个 ItemProgress：DeltaProgress 的基线是 per-call 的，多卷并行共用一个实例，
-            // 彼此的累计值会被当成对方的回退。带上 key，这一笔字节才落得到对应那条流的账上。
+            // One ItemProgress per volume: DeltaProgress's baseline is per call, so if parallel volumes share
+            // one instance each other's cumulative values look like a rewind. With the key, these bytes land on
+            // the account of the right stream.
             await upload(tracker.ItemProgress(blobName));
         }
         finally
         {
-            // Release 必须自己有一层 finally，不能跟 EndItem 排在同一句之后：EndItem 同样会调
-            // publish，它一抛就把后面那句整个跳过去。而这种泄漏还不响——异常往上撞到「文件读不开」
-            // 那条兜底就被吞了（MarkPostDiffUnreadableAsync 收 IOException），备份照跑，只是少一条流；
-            // 攒够设定的并发数，全部上传就永远停在闸门上，界面上是「什么都没在传、暂存池却压着一堆」，
-            // 而且不会自愈。BeginItem 一并挪进 try：它抛出时 EndItem 找不到这条流会直接短路，无害。
+            // Release needs a finally of its own; it cannot simply follow EndItem in the same block: EndItem
+            // also calls publish, and one throw from it skips the following statement entirely. And this leak is
+            // silent — the exception travels up into the "file cannot be read" catch-all and is swallowed there
+            // (MarkPostDiffUnreadableAsync catches IOException), the backup keeps running, just one stream short;
+            // accumulate as many as the configured concurrency and all uploads stall at the gate forever, showing
+            // "nothing is uploading while the staging pool is piled high", and it never heals itself. BeginItem
+            // moved into the try as well: if it throws, EndItem short-circuits because it cannot find the stream — harmless.
             try
             {
-                // 字节在传输过程中已逐笔计过，这里再加一次总量就是双计。
+                // The bytes were already counted report by report during transfer, so adding the total again here would double-count.
                 tracker.EndItem(blobName, 0);
             }
             finally
@@ -221,45 +251,53 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
 }
 
 /// <summary>
-/// 单卷/多卷归档在 blob 上的读写（§7）。单卷用基名；多卷用 基名.001/.002...
-/// 供数据 blob 与 pack 共用，还原/检查按同规则重组下载。
+/// Reading and writing single/multi-volume archives on blobs (§7). A single volume uses the base name;
+/// multi-volume uses baseName.001/.002...
+/// Shared by data blobs and packs; restore/check reassemble their downloads by the same rules.
 /// </summary>
 public static class VolumeBlobIO
 {
     /// <summary>
-    /// 上传压缩产出的卷文件。单卷→baseRef；多卷→baseRef.001、baseRef.002...
+    /// Upload the volume files produced by compression. Single volume → baseRef; multi-volume → baseRef.001,
+    /// baseRef.002...
     /// <para>
-    /// 每一卷都进滑动窗口，**先后不论**——按文件顺序进队，谁先落地不作要求。
+    /// Every volume enters the sliding window, **order irrelevant** — they queue in file order, and nothing is
+    /// required about which one lands first.
     /// </para>
     /// <para>
-    /// 从前 .001 是最后单独传的，用作「整族齐全」的提交标记，好让部分上传不被去重的存在性检查
-    /// 误判成已存在。那条检查（云端 HEAD 比对）已经删了——去重一律走本地权威索引，不问云端。
-    /// 而这个标记的代价从来不像注释里算的那样便宜：按上千卷算确实可以忽略，可默认卷 100 MB、
-    /// 并发 5，一个 100–500 MB 的文件正好切成 2–5 卷，收尾那一趟单卷串行就把整件的上传时间
-    /// 翻了一倍——而那个尺寸段在真实备份里是大头。中断残留由别处兜着：逐卷 if-missing 会把缺的
-    /// 补齐，加密多卷则在上传前先清（见 BackupOrchestrator.ClearLeftoverVolumesAsync）。
+    /// .001 used to be sent last, on its own, as the "the whole family is here" commit marker, so that a partial
+    /// upload would not be mistaken for an existing one by dedup's existence check. That check (a HEAD comparison
+    /// against the cloud) has been deleted — dedup always goes through the local authoritative index and never
+    /// asks the cloud. And that marker was never as cheap as the old comment computed: negligible measured against
+    /// a thousand volumes, yes, but with the default 100 MB volumes and concurrency 5, a 100–500 MB file splits
+    /// into exactly 2–5 volumes and that final serial single-volume trip doubled the item's upload time — and
+    /// that size band is the bulk of a real backup. Leftovers from interruptions are handled elsewhere: per-volume
+    /// if-missing fills in what is missing, and encrypted multi-volume archives are cleared before upload
+    /// (see BackupOrchestrator.ClearLeftoverVolumesAsync).
     /// </para>
     /// </summary>
-    /// <param name="scope">每卷的并发额度与进度登记（见 <see cref="VolumeUploadScope"/>）。
-    /// 为 null 时退化成老样子：串行、不限流、不报进度——修复/替换那些不在备份主路径上的调用用。</param>
-    /// <param name="onVolumeUploaded">某一卷传完后立刻调用，参数是它的**本地**文件路径。
-    /// 备份路径把暂存区的逐卷释放挂在这里：整族传完才删的话，临时盘峰值等于整个归档
-    /// （一个 100 GB 的文件就要 100 GB 临时空间），水位还会整段贴在上限上把压缩堵死。</param>
+    /// <param name="scope">Per-volume concurrency slots and progress registration (see <see cref="VolumeUploadScope"/>).
+    /// When null it degrades to the old behaviour: serial, unthrottled, no progress reporting — for repair/replace calls that are not on the main backup path.</param>
+    /// <param name="onVolumeUploaded">Called the moment a volume finishes, with its **local** file path.
+    /// The backup path hangs per-volume staging release on this: if deletion waited for the whole family, the temp
+    /// disk peak would equal the entire archive (a 100 GB file would need 100 GB of temp space), and the watermark would sit against the ceiling the whole time and choke compression.</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
         Action<string>? onVolumeUploaded = null, string? label = null)
     {
-        // 多卷时在标签上标出这是第几卷：一个大文件切成上千卷，光显示路径的话界面上会是同一行
-        // 重复上千次，看不出在推进。
+        // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
+        // volumes, and showing only the path would repeat the same line thousands of times with no sign of
+        // progress.
         string LabelFor(int index) => label is null
             ? baseRef
             : volumeFiles.Count > 1 ? $"{label} ({index + 1}/{volumeFiles.Count})" : label;
 
-        // 一族卷领一张票，也就是「这个归档开始上传的时刻」——闸门据此把额度优先给老的那一族，
-        // 而不是摊薄到所有在传的件上（见 VolumeUploadGate）。一箱的每一组各自调一次本方法，
-        // 因此各领各的票；组与组之间本来就是串行的，这是对的。
+        // One ticket per volume family, i.e. "the moment this archive started uploading" — the gate uses it to
+        // give slots to the older family first rather than spreading them thin across every item in flight (see
+        // VolumeUploadGate). Each group of a pack calls this method once and therefore takes its own ticket;
+        // groups are serial with respect to each other anyway, so that is correct.
         var ticket = scope?.NextTicket() ?? 0;
 
         async Task One(string name, string file, int index)
@@ -285,13 +323,15 @@ public static class VolumeBlobIO
             return;
         }
 
-        // 滑动窗口：完成一卷就补一卷。分批 Task.WhenAll 的话，一批里最慢的那一卷会让其余几条流
-        // 全程空转等它——卷与卷的耗时本来就不齐（重试、分块并行度、服务端限流各不相同），
-        // 界面上的表现是"5 条流一条条减到 0，然后又冒出 5 条"，而不是稳稳保持 5 条。
-        // 窗口宽度仍是有界的：不能把上千卷一次性全塞进全局闸门的等待队列，那是白占内存，
-        // 而且排在队里的卷各自的暂存文件也只能等它传完才撤得下去（见 VolumeUploadScope）。
-        // 宽度取 MaxParallelPerItem + 1（见 WindowPerItem）：等于闸门容量的那部分让这一族能一个人
-        // 吃满全部额度，多出来的一卷是换卷时接住额度的接力棒。
+        // Sliding window: one volume finishes, one more starts. With batched Task.WhenAll, the slowest volume in
+        // a batch makes the other streams spin idle waiting for it — volumes never take the same time (retries,
+        // block parallelism, server-side throttling all differ), and on screen it shows as "5 streams counting
+        // down to 0 one by one, then 5 more appearing" instead of holding steadily at 5.
+        // The window width is still bounded: thousands of volumes must not be shoved into the global gate's
+        // waiting queue at once, which wastes memory, and the staging files of queued volumes cannot be torn
+        // down until each has finished uploading (see VolumeUploadScope).
+        // The width is MaxParallelPerItem + 1 (see WindowPerItem): the part equal to the gate capacity lets this
+        // family eat every slot on its own, and the extra volume is the baton that catches the slot at a changeover.
         var window = scope?.WindowPerItem ?? 1;
         var started = new List<Task>(volumeFiles.Count);
         var running = new List<Task>(window);
@@ -301,9 +341,10 @@ public static class VolumeBlobIO
             {
                 var done = await Task.WhenAny(running);
                 running.Remove(done);
-                // 有卷倒了就不再起新的。已经起飞的仍在下面等完——半路撒手会留下没人观察的
-                // 孤儿任务，它们还占着闸门额度和临时盘。异常本身留给 WhenAll 抛，与原先分批时
-                // 的语义一致：全部落定之后再抛，抛的是第一个。
+                // Once a volume dies, no new ones start. The ones already in flight are still awaited below —
+                // letting go halfway would leave orphan tasks nobody observes, still holding gate slots and temp
+                // disk. The exception itself is left for WhenAll to throw, matching the semantics of the old
+                // batched version: throw after everything has settled, and throw the first one.
                 if (done.IsFaulted || done.IsCanceled)
                     break;
             }
@@ -315,9 +356,12 @@ public static class VolumeBlobIO
     }
 
     /// <summary>
-    /// 替换某归档全部分卷：以**覆盖**方式上传新卷（单卷→baseRef；多卷→baseRef.001..M），
-    /// 全部成功后再删除残留旧卷（尾部 .M+1..N，或旧单卷/新多卷时的旧基名等不属于新卷集者）。
-    /// **先传后删**——崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可经检查/修复恢复）。
+    /// Replace every volume of an archive: upload the new volumes with **overwrite** (single → baseRef;
+    /// multi → baseRef.001..M), and only after all of them succeed delete the leftover old volumes (the tail
+    /// .M+1..N, or the old base name when going from a single old volume to multiple new ones, and anything else
+    /// outside the new volume set).
+    /// **Upload first, delete after** — the crash window drops from "the whole blob is gone" to "old and new
+    /// volumes mixed" (recoverable via check/repair).
     /// </summary>
     public static async Task ReplaceAsync(
         IBlobUploader uploader, Account account, BlobContainerClient container, string baseRef,
@@ -326,13 +370,15 @@ public static class VolumeBlobIO
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
-        // 1) 覆盖上传新卷。单卷时循环仅一次写 baseRef。
+        // 1) Overwrite-upload the new volumes. For a single volume the loop runs once and writes baseRef.
         for (var i = 0; i < volumeFiles.Count; i++)
             await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
 
-        // 2) 删除不属于新卷集的残留旧卷（如旧卷数 > 新卷数的尾部，或单卷↔多卷切换后的旧命名）。
-        //    只删本归档自身的卷（baseRef 精确 或 baseRef.<数字> 卷后缀）——前缀扫描会连带匹配到
-        //    碰撞避让兄弟 data/{hash}~N（内容不同、独立引用），必须排除，否则会误删他人数据。
+        // 2) Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
+        //    one, or the old naming after a single↔multi switch).
+        //    Only this archive's own volumes are deleted (exactly baseRef, or the baseRef.<digits> volume suffix)
+        //    — a prefix scan would also match the collision-avoidance siblings data/{hash}~N (different content,
+        //    independently referenced), which must be excluded or someone else's data gets deleted by mistake.
         var keep = new HashSet<string>(newNames, StringComparer.Ordinal);
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
             if (IsVolumeOf(baseRef, b.Name) && !keep.Contains(b.Name))
@@ -340,8 +386,8 @@ public static class VolumeBlobIO
     }
 
     /// <summary>
-    /// <paramref name="name"/> 是否为归档 <paramref name="baseRef"/> 自身的卷：等于基名，或形如 基名.NNN（后缀为 <c>.</c>+纯数字）。
-    /// 用于按前缀枚举后精确过滤，排除同前缀但内容不同的碰撞避让兄弟（如 data/{hash}~1、data/{hash}~1.001）。
+    /// Whether <paramref name="name"/> is a volume of the archive <paramref name="baseRef"/> itself: equal to the base name, or shaped like baseName.NNN (a suffix of <c>.</c> plus digits only).
+    /// Used to filter precisely after a prefix enumeration, excluding collision-avoidance siblings that share the prefix but hold different content (e.g. data/{hash}~1, data/{hash}~1.001).
     /// </summary>
     public static bool IsVolumeOf(string baseRef, string name)
     {
@@ -354,8 +400,9 @@ public static class VolumeBlobIO
     }
 
     /// <summary>
-    /// 归档的全部分卷 blob 名：单卷（count≤1）→[baseRef]；多卷→[baseRef.001..count]。
-    /// 单一命名真相源——上传/替换/引用集构造共用，避免各处各自拼名而漂移。
+    /// All volume blob names of an archive: single volume (count ≤ 1) → [baseRef]; multi-volume → [baseRef.001..count].
+    /// The single source of truth for naming — shared by upload, replace and reference-set construction, so no
+    /// place builds its own names and drifts.
     /// </summary>
     public static IReadOnlyList<string> VolumeNames(string baseRef, int count)
         => count <= 1
@@ -363,10 +410,12 @@ public static class VolumeBlobIO
             : Enumerable.Range(1, count).Select(i => VolumeName(baseRef, i)).ToList();
 
     /// <summary>
-    /// 这个归档**沾到边**没有：单卷的基名在，或多卷的首卷在。
+    /// Whether this archive has been **touched at all**: the single-volume base name exists, or the first volume
+    /// of a multi-volume set exists.
     /// <para>
-    /// 说不了「整族齐全」——各卷并发上传，谁先落地不作要求，首卷在只代表有人往这个地址写过。
-    /// 要核验齐全用 <see cref="VerifyVolumesAsync"/>，它按索引记的卷数逐卷查。
+    /// It cannot say "the whole family is here" — volumes upload concurrently, nothing is required about which
+    /// lands first, and the first volume existing only means somebody wrote to that address. To verify
+    /// completeness use <see cref="VerifyVolumesAsync"/>, which checks volume by volume against the count recorded in the index.
     /// </para>
     /// </summary>
     public static async Task<bool> ExistsAsync(BlobContainerClient cc, string baseRef, CancellationToken ct)
@@ -374,8 +423,8 @@ public static class VolumeBlobIO
            || (await cc.GetBlobClient(VolumeName(baseRef, 1)).ExistsAsync(ct)).Value;
 
     /// <summary>
-    /// 「存在 + 尺寸」检查：核验全部分卷存在，且当 <paramref name="expectedSizes"/> 非空时每卷尺寸匹配。
-    /// 只发 HEAD（GetProperties），不下载；Archive 亦可读属性无需活化。尺寸未知（为空）则只验存在。
+    /// The "existence + size" check: verify that every volume exists, and when <paramref name="expectedSizes"/> is non-empty that each volume's size matches.
+    /// Only HEAD requests (GetProperties), no downloads; Archive-tier blobs can have their properties read without rehydration. When the sizes are unknown (empty), only existence is verified.
     /// </summary>
     public static async Task<(bool Present, bool SizeOk)> VerifyVolumesAsync(
         BlobContainerClient cc, string baseRef, int expectedVolumes, IReadOnlyList<long> expectedSizes, CancellationToken ct)
@@ -407,24 +456,27 @@ public static class VolumeBlobIO
         catch (RequestFailedException e) when (e.Status == 404) { return null; }
     }
 
-    /// <summary>把归档（单卷或多卷）下载到 workDir，返回供 7z 解压的首卷本地路径。</summary>
-    /// <param name="progress">每卷的进度回调**工厂**。为什么必须是工厂而不是单个 <see cref="IProgress{T}"/>：
-    /// SDK 的 <c>ProgressHandler</c> 报的是本次 <c>DownloadToAsync</c> 调用内的累计字节，
-    /// <see cref="StageTracker.ItemProgress"/> 返回的 <c>DeltaProgress</c> 把累计转增量时是按
-    /// **这一个实例自己的基线** <c>_last</c> 算的，且每次 <c>Report</c> 之后 <c>_last</c> 都**无条件**
-    /// 更新一次（见 <see cref="StageTracker"/> 里 <c>DeltaProgress</c> 的注释）。
+    /// <summary>Download the archive (single or multi-volume) into workDir and return the local path of the first volume for 7z to extract.</summary>
+    /// <param name="progress">A **factory** of per-volume progress callbacks. Why it must be a factory rather than a single <see cref="IProgress{T}"/>:
+    /// the SDK's <c>ProgressHandler</c> reports bytes cumulative within this one <c>DownloadToAsync</c> call, and
+    /// the <c>DeltaProgress</c> returned by <see cref="StageTracker.ItemProgress"/> turns cumulative into
+    /// incremental against **that one instance's own baseline** <c>_last</c>, which is updated **unconditionally**
+    /// after every <c>Report</c> (see the <c>DeltaProgress</c> comment inside <see cref="StageTracker"/>).
     /// <para>
-    /// 多卷下载若共用一个实例：设上一卷收尾时的基线为 L，卷 k 的首次上报为 c₁。若 c₁ ≥ L，
-    /// 这一下只会被记成 c₁ − L，之后卷 k 自己的增量照常累加，结果是**整卷少计 L 个字节**——
-    /// 是漏记，不是虚高，且漏记的上限就是上一卷的大小。触发条件：一个较小的卷后面紧跟一个
-    /// 较大的卷，大卷的第一个上报块超过了小卷收尾时的基线。（反过来，若 c₁ &lt; L，"当作重新
-    /// 开始"的复位对这一卷而言算对了，不会漏。）真正的虚高只有一种来路：同一串 <c>Report</c>
-    /// 调用里累计值忽然下跌（SDK 重试），那种情况换不换实例表现一致，是设计上刻意允许的
-    /// （见 <c>DeltaProgress</c> 上的注释）。
+    /// If a multi-volume download shared one instance: let L be the baseline left when the previous volume ended
+    /// and c₁ be volume k's first report. If c₁ ≥ L, that report is only counted as c₁ − L, after which volume k's
+    /// own increments accumulate as usual, so **the volume as a whole is undercounted by L bytes** — an
+    /// undercount, not an inflation, and its upper bound is the size of the previous volume. The trigger: a
+    /// smaller volume followed immediately by a larger one whose first reported block exceeds the baseline the
+    /// small volume left behind. (Conversely, if c₁ &lt; L, the "treat it as a fresh start" reset happens to be
+    /// right for this volume and nothing is lost.) Real inflation has only one source: the cumulative value
+    /// suddenly dropping within one series of <c>Report</c> calls (an SDK retry), which behaves identically
+    /// whether or not instances are swapped and is deliberately allowed by design
+    /// (see the comment on <c>DeltaProgress</c>).
     /// </para>
-    /// 每卷调一次工厂拿一个全新实例，就是不让上一卷的基线泄漏进下一卷，
-    /// 与 <see cref="VolumeUploadScope.RunAsync"/> 里"每卷各要一个 ItemProgress()"是同一个道理。
-    /// 为 null 时不挂进度回调——修复/压实等不在途登记的调用路径用。</param>
+    /// Calling the factory once per volume for a brand new instance is exactly what keeps the previous volume's baseline from leaking into the next,
+    /// the same reasoning as "one ItemProgress() per volume" in <see cref="VolumeUploadScope.RunAsync"/>.
+    /// When null no progress callback is attached — for call paths such as repair/compaction that are not registered as in-flight.</param>
     public static async Task<string> DownloadAsync(
         BlobContainerClient cc, string baseRef, string workDir, CancellationToken ct,
         Func<IProgress<long>>? progress = null)

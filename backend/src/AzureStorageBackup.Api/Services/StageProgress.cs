@@ -4,179 +4,179 @@ using System.Diagnostics;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 一条正在传的流。<paramref name="Label"/> 是给人看的名字——上传阶段是**源文件路径**，
-/// 而不是 blob 名：blob 是内容寻址的（加密时还是 HMAC 后的乱码），
-/// <c>data/9f2a3b7c…001</c> 对着屏幕的人毫无意义。一箱 pack 装着几百个文件，列不下，
-/// 报的是包号与成员数。
+/// One stream currently in flight. <paramref name="Label"/> is the human-facing name — during upload it is the **source file path**,
+/// not the blob name: blobs are content-addressed (and with encryption on it is post-HMAC gibberish),
+/// and <c>data/9f2a3b7c…001</c> means nothing to the person staring at the screen. A pack holds hundreds of files, too many to list,
+/// so we report the pack id and the member count.
 /// </summary>
-/// <param name="Sent">这一条已经过网线的字节。</param>
-/// <param name="Total">这一条一共有多少字节；0 = 未知（下载路径在拿到响应头之前不知道）。</param>
+/// <param name="Sent">Bytes of this stream that have already crossed the wire.</param>
+/// <param name="Total">Total bytes of this stream; 0 = unknown (the download path does not know until the response headers arrive).</param>
 public sealed record ActiveTransfer(string Label, long Sent, long Total)
 {
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Sent / Total) : null;
 }
 
 /// <summary>
-/// 一件活压完之后、字节真正上网线之前，可能停在哪一段。三段的处置完全不同，所以必须分开报：
-/// 一句笼统的「在等」等于把三种病症合成一个症状。
+/// Where a work item can stall after it is packed but before its bytes actually hit the wire. The three are handled
+/// completely differently, so they must be reported apart: one vague "waiting" fuses three ailments into a single symptom.
 /// </summary>
 public enum UploadWait
 {
-    /// <summary>等同批同内容的首个上传者（预约协调）。同一份内容只能由一个上传者定调，
-    /// 后到者挂在它的完成信号上——等的时长就是那一件的整个上传时长。</summary>
+    /// <summary>Waiting on the first uploader of the same content in the same batch (reservation coordination). A given piece of content
+    /// can only be settled by one uploader; latecomers hang on its completion signal — the wait lasts that item's entire upload.</summary>
     Peer,
 
-    /// <summary>等全局上传闸门的额度。额度被别的卷占满时才会出现；闸门空着时随手就拿到，不报。</summary>
+    /// <summary>Waiting for a slot in the global upload gate. Only appears when other volumes have taken every slot; when the gate is free you grab one instantly and nothing is reported.</summary>
     Slot,
 
 }
 
 /// <summary>
-/// 某个阶段正在做什么。备份/还原/检查共用一套形状，阶段名各用各的。
+/// What a stage is currently doing. Backup/restore/check share one shape; only the stage names differ.
 /// <para>
-/// 存在的理由：在此之前，界面上一个阶段只在**进入**时上报一次。首次备份的 Diffing 要把每个文件
-/// 完整读一遍算 hash，1 TB 数据在 100 MB/s 的盘上就是三小时——全程一个不动的 0%，
-/// 分不清是在干活还是挂死了（而 FIFO 那个 bug 恰好会真的挂死）。
+/// Why it exists: before this, the UI reported a stage exactly once, when it was **entered**. Diffing on a first backup
+/// reads every file end to end to hash it — 1 TB of data on a 100 MB/s disk is three hours — showing a frozen 0% the whole time,
+/// with no way to tell real work from a hang (and that FIFO bug did in fact hang for real).
 /// </para>
 /// </summary>
 public sealed record StageProgress(
     string Stage,
     int Processed,
-    /// <summary>0 = 总数未知（例如扫描还没走完，根本不知道有多少文件）。</summary>
+    /// <summary>0 = total unknown (e.g. the scan has not finished, so we have no idea how many files there are).</summary>
     int Total,
     long Bytes,
-    /// <summary>当前正在处理的那一个（串行阶段）。</summary>
+    /// <summary>The one item being processed right now (serial stages).</summary>
     string? CurrentItem,
-    /// <summary>正在并发处理的多个（上传/下载阶段）。</summary>
+    /// <summary>The several items being processed concurrently (upload/download stages).</summary>
     IReadOnlyList<ActiveTransfer> ActiveItems,
     long BytesPerSecond,
-    /// <summary>正在做本地 CPU 工作、既不在排队也不产生传输字节的件数。三个阶段各用各的含义：
-    /// 上传＝正占着压缩锁在产出卷文件；还原/校验＝下载已完成、正在解压/算 hash。
-    /// 这段时间可以长达几十秒（一箱 100 MB 过 7z -mx9 是压，解一箱同样大小的包是解），此前它在
-    /// 界面上完全不可见：不在 <see cref="ActiveItems"/> 里、不产生字节，于是连测速窗口都是空的。
+    /// <summary>Items doing local CPU work, neither queued nor producing transfer bytes. Each stage means something different by it:
+    /// upload = holding the compression lock and producing volume files; restore/verify = download finished, now decompressing/hashing.
+    /// This stretch can last tens of seconds (a 100 MB pack through 7z -mx9 is the compressing, unpacking a pack of the same size is the decompressing), and until now it was
+    /// completely invisible in the UI: not in <see cref="ActiveItems"/>, producing no bytes, so even the speed window was empty.
     /// <para>
-    /// 三个阶段的界限不一样：上传阶段用的是 <c>StagingArea</c> 里那把全局压缩锁，这个数只会是
-    /// 0 或 1，工作线程池比它大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让压完的
-    /// 活各自去占一条上传流，不是为了并行压缩——它们排在锁后面干等，那些件算 <see cref="Queued"/>。
-    /// 还原/校验阶段复用同一对方法记这一段，但那里没有全局锁，解压/算 hash 各组各干各的，
-    /// 这个数可以到 <c>DownloadConcurrency</c>，不是 0/1。
+    /// The boundaries differ per stage: the upload stage uses that global compression lock inside <c>StagingArea</c>, so this number is only ever
+    /// 0 or 1, while the worker pool is much larger (<c>UploadConcurrency + 1</c>); the extra threads exist so that packed
+    /// items can each grab an upload stream, not to compress in parallel — they sit idle behind the lock and those items count as <see cref="Queued"/>.
+    /// Restore/verify reuse the same pair of methods for this phase, but there is no global lock there and each group decompresses/hashes on its own,
+    /// so the number can reach <c>DownloadConcurrency</c>, not 0/1.
     /// </para></summary>
     int Preparing = 0,
-    /// <summary>还没被领走的件数——只数队列里的。已领走、正排在归档锁后面干等的**不**在这里，
-    /// 它们有自己的一栏（<see cref="WaitingOnArchive"/>），原委见那里。</summary>
+    /// <summary>Items nobody has picked up yet — only what is sitting in the queue. Items already picked up and idling behind the archive lock are **not**
+    /// here; they have their own column (<see cref="WaitingOnArchive"/>), and the reasoning lives there.</summary>
     int Queued = 0,
-    /// <summary>由 <see cref="StageTracker"/> 按「本阶段全程平均进度」算出的剩余秒数；
-    /// 阶段没有申报工作量、或还没干完一件时为 null，此时退回下面那个基于当前速度的粗估。</summary>
+    /// <summary>Seconds remaining, computed by <see cref="StageTracker"/> from "this stage's whole-run average progress";
+    /// null when the stage declares no workload or has not finished a single item yet, in which case we fall back to the rough current-speed estimate below.</summary>
     double? EtaSeconds = null,
-    /// <summary>本阶段申报的**源端**字节总量（压缩前）。上传阶段是渐增的——diff 边判边入队，
-    /// 判完之前这个数还会往上长。0 = 该阶段不申报工作量。</summary>
+    /// <summary>Total **source-side** bytes declared by this stage (before compression). It grows during upload — diff enqueues as it decides,
+    /// so this number keeps climbing until diff is done. 0 = the stage declares no workload.</summary>
     long WorkTotal = 0,
-    /// <summary>其中已经彻底完工的源端字节。**不含在途**：一件活整件做完才销账。</summary>
+    /// <summary>Of those, the source-side bytes fully finished. **In-flight excluded**: an item is written off only once the whole item is done.</summary>
     long WorkDone = 0,
-    /// <summary>已完工的项真正推上网线的字节（压缩后）。同样**不含在途**——
-    /// 与 <see cref="Bytes"/> 的区别正在这里：那个是边传边加的，用于测速，含正在传的那部分。</summary>
+    /// <summary>Bytes of finished items actually pushed over the wire (after compression). Again **excluding in-flight** —
+    /// that is exactly the difference from <see cref="Bytes"/>: that one adds as it transfers, is used for speed, and includes the part still in flight.</summary>
     long TransferredBytes = 0,
     /// <summary>
-    /// 已经**稳稳落在云上、但所属的那件活还没销账**的字节（压缩后）。一件大活切成许多卷，
-    /// 前几卷传完时那些字节确实已经到了云上，可整件还没完成，于是既进不了
-    /// <see cref="TransferredBytes"/>（那本账按件记，才对得上按件销账的
-    /// <see cref="WorkDone"/>），也早已不在 <see cref="StagedBytes"/> 里（池子逐卷释放）。
-    /// 没有这一项，这批字节在界面上就凭空消失了，大文件上传的几十分钟里看着像什么都没发生。
-    /// <para>整件完成时它并入 TransferredBytes 并归零；0 = 没有这种半完成的活，界面上整段不显示。</para>
+    /// Bytes that have **landed safely in the cloud while their owning item has not been written off yet** (after compression). A big item is cut into many volumes;
+    /// when the first few volumes finish, those bytes really are in the cloud, but the item as a whole is not done, so they can neither enter
+    /// <see cref="TransferredBytes"/> (that ledger counts per item, which is what makes it line up with the per-item
+    /// <see cref="WorkDone"/>) nor still be in <see cref="StagedBytes"/> (the pool releases volume by volume).
+    /// Without this field those bytes simply vanish from the UI, and the tens of minutes of a large-file upload look like nothing is happening.
+    /// <para>When the item completes it is folded into TransferredBytes and reset to zero; 0 = no such half-finished item, and the UI hides the whole section.</para>
     /// </summary>
     long UnfinishedItemBytes = 0,
     /// <summary>
-    /// 待传池子里**还没送出去**的字节（压缩后）：池子里所有文件的总尺寸，减去在途那几条已经
-    /// 传出去的那部分。压缩跑在上传前面时它会涨，上传跟上来就落回去——这个数把「压缩快还是
-    /// 网络快」直接摆在脸上。
+    /// Bytes in the staging pool that **have not been shipped yet** (after compression): the total size of every file in the pool, minus the part of
+    /// the in-flight streams already sent. It rises when compression runs ahead of upload and falls back when upload catches up — this number puts
+    /// "is compression or the network faster" right in your face.
     /// <para>
-    /// 减的是在途的**已传**字节而不是整卷：那几卷确实还整个躺在池子里（逐卷释放，传完才删），
-    /// 已经送走的只是其中一截。不减的话，同一批字节会在这里和 <see cref="ActiveItems"/> 里各数一遍。
+    /// What is subtracted is the in-flight **sent** bytes, not whole volumes: those volumes really are still lying in the pool in full (per-volume release deletes only after the transfer),
+    /// and only a slice of them has shipped. Without the subtraction the same bytes get counted twice, here and in <see cref="ActiveItems"/>.
     /// </para>
     /// </summary>
     long StagedBytes = 0,
     /// <summary>
-    /// 这一阶段一共要过多少网线字节（压缩后）。0 = 未知。
+    /// How many bytes this stage has to push over the wire in total (after compression). 0 = unknown.
     /// <para>
-    /// 只有下载侧填得出：要拉哪些对象、各多大，索引里都记着。上传侧给不出——压完才知道有多大，
-    /// 开始传之前这个数不存在。老索引缺卷尺寸时同样报 0：宁可不显示，也不能给一个偏小的分母，
-    /// 那会让百分比一路虚高然后卡在 100% 上不动。
+    /// Only the download side can fill it in: which objects to pull and how big each one is are all recorded in the index. The upload side cannot — the size is known only after packing,
+    /// so before the transfer starts the number does not exist. Old indexes missing volume sizes report 0 as well: better to show nothing than to hand out a too-small denominator,
+    /// which would make the percentage run high the whole way and then sit stuck at 100%.
     /// </para>
     /// </summary>
     long TransferTotal = 0,
     /// <summary>
-    /// 这一阶段已经攒到磁盘上、还等着下游来消化的件数（累计值，只增）。
+    /// Items this stage has piled onto disk waiting for the downstream to digest them (cumulative, only grows).
     /// <para>
-    /// 差分判得比压缩上传快几个数量级（判一条未变文件只要一次 stat），diff 必然把队列灌满。
-    /// 从前那时候写侧会被挡住，界面上只能报一句"在等上传追上来"；现在写侧不停了，多出来的活
-    /// 落到临时文件上（见 <c>DiffWorkQueue</c>），于是这个数取代了那句话——它说的是同一件事
-    /// （diff 领先了多少），但它是个量，而且 diff 因此能跑到底，上传的剩余时间才算得出来。
+    /// Diffing decides orders of magnitude faster than compress-and-upload (deciding one unchanged file costs a single stat), so diff inevitably floods the queue.
+    /// Back then the write side would be blocked and the UI could only say "waiting for upload to catch up"; now the write side never stops and the surplus work
+    /// lands in temp files (see <c>DiffWorkQueue</c>), so this number replaces that sentence — it says the same thing
+    /// (how far ahead diff is), but as a quantity, and because of it diff can run to completion, which is what makes the upload's remaining time computable.
     /// </para>
     /// </summary>
     long SpilledItems = 0,
     /// <summary>
-    /// 已经进了上传段的**件**数：出了暂存段之后的一切。此后要么有卷在飞，要么正卡在
-    /// <see cref="UploadWait"/> 说的那几段之一上，要么在读盘核对（<see cref="Checking"/>）。
+    /// **Items** that have entered the upload phase: everything past the staging phase. From here on an item either has volumes in flight, or is stuck in one of
+    /// the phases <see cref="UploadWait"/> describes, or is reading from disk to check (<see cref="Checking"/>).
     /// <para>
-    /// 与 <see cref="ActiveItems"/> 是两个口径，不能互相代替：那里装的是**卷**，一件活可以同时有
-    /// 好几卷在飞，也可以一卷都没有（正卡着）。没有这一栏，「压完了但一个字节都没在传」的活
-    /// 在屏幕上不属于任何一栏——<c>processed + preparing + queued</c> 加起来比总数少，而少掉的
-    /// 恰恰就是卡住的那件，只能靠把几屏截图排在一起做减法才发现得了。
+    /// This and <see cref="ActiveItems"/> are two different units and cannot substitute for each other: that one holds **volumes**, and one item can have
+    /// several volumes in flight at once, or none at all (while stuck). Without this column, an item that is "packed but not transferring a single byte"
+    /// belongs to no column on screen — <c>processed + preparing + queued</c> adds up to less than the total, and what is missing
+    /// is exactly the stuck item, discoverable only by lining up several screenshots and doing the subtraction.
     /// </para>
     /// </summary>
     int Uploading = 0,
-    /// <summary>其中正卡在同批预约上的件数（<see cref="UploadWait.Peer"/>）。</summary>
+    /// <summary>Of those, the items stuck on a same-batch reservation (<see cref="UploadWait.Peer"/>).</summary>
     int WaitingOnPeer = 0,
-    /// <summary>其中正卡在全局上传闸门上的**卷**数（<see cref="UploadWait.Slot"/>）。
-    /// 闸门是按卷排队的，所以这一个数的单位与另外两个不同。</summary>
+    /// <summary>Of those, the **volumes** stuck on the global upload gate (<see cref="UploadWait.Slot"/>).
+    /// The gate queues per volume, so this one number's unit differs from the other two.</summary>
     int WaitingOnSlot = 0,
     /// <summary>
-    /// 其中正在**读盘核对**、既不推字节也不在等任何东西的件数：单文件的去重预筛要把整个文件读
-    /// 一遍算三段 hash，一箱 pack 压缩前后各要逐成员 <c>Stat</c>（变了的还得整读重算 hash），
-    /// 加密多卷上传前还要列一遍云端清残留卷。这几段在 NAS 上都能跑几十秒。
+    /// Of those, the items **reading from disk to check**, pushing no bytes and waiting on nothing: single-file dedup pre-screening reads the whole file
+    /// once to compute the three-segment hash, a pack needs a per-member <c>Stat</c> both before and after compression (changed members get fully re-read and re-hashed),
+    /// and an encrypted multi-volume upload lists the cloud first to clear leftover volumes. On a NAS every one of these can run for tens of seconds.
     /// <para>
-    /// 是 <see cref="Uploading"/> 的**细分**而不是新的一段：它们全发生在出了暂存段、还没登记
-    /// 在途卷的时候，所以 <c>Checking ≤ Uploading</c>，那条件数恒等式一个字都不用改。界面上
-    /// 要把它从 "starting upload" 里减出去——同一件活报两栏，账就多出来了。
+    /// It is a **subdivision** of <see cref="Uploading"/>, not a new phase: they all happen after leaving staging and before any in-flight volume is
+    /// registered, so <c>Checking ≤ Uploading</c> and that item-count identity needs not a single character changed. The UI
+    /// must subtract it out of "starting upload" — report one item in two columns and the books gain a phantom entry.
     /// </para>
     /// <para>
-    /// 单独列一栏的理由和当初加 <see cref="Uploading"/> 是同一个：这几段一个进度事件都不发，
-    /// 而心跳只在有流在传时才跑，于是屏幕上是几十秒纹丝不动的 "1 object starting upload"——
-    /// 既没在 starting，也没在 upload。
+    /// The reason it gets its own column is the same one that added <see cref="Uploading"/> back then: these phases emit not one progress event,
+    /// and the heartbeat only runs while a stream is transferring, so the screen shows a stone-still "1 object starting upload" for tens of seconds —
+    /// neither starting nor uploading.
     /// </para>
     /// </summary>
     int Checking = 0,
     /// <summary>
-    /// 已经被工作线程领走、正排在**归档锁**后面干等的件数：拿到锁才轮到它产出自己的卷文件
-    /// （压、或者 store-only 时只打包、或者 raw 时只拷贝——三条路占的是同一把锁）。
+    /// Items already picked up by a worker thread and idling behind the **archive lock**: only after taking the lock does an item get to produce its own volume files
+    /// (compress, or merely pack when store-only, or merely copy when raw — all three paths take the same lock).
     /// <para>
-    /// 这把锁是全局的：<see cref="StagingArea"/> 是单例，产出跨备份也不并发。于是一个备份的线程
-    /// 可以整段排在**另一个备份**手里的锁后面，而 <see cref="Preparing"/> 只数拿到锁的自己人——
-    /// 那时它是 0。合进 <see cref="Queued"/> 的话（从前就是），屏幕上只剩一万条 "queued"，
-    /// 没有任何一栏说得出"这个备份被别的运行挡着"。
+    /// That lock is global: <see cref="StagingArea"/> is a singleton, so production does not run concurrently across backups either. A thread of one backup
+    /// can therefore spend the entire stretch queued behind a lock held by **another backup**, while <see cref="Preparing"/> counts only our own lock holder —
+    /// which is 0 at that moment. Folded into <see cref="Queued"/> (as it used to be), the screen is left with ten thousand "queued" entries and
+    /// no column able to say "this backup is blocked by another run".
     /// </para>
     /// <para>
-    /// 拆开之后判别是免费的，不必再去暴露锁的持有者：<c>preparing=1</c> + 有人在等 = 锁在自己
-    /// 手里，正常排队；<c>preparing=0</c> + 有人在等 = 锁在别的运行手里。
+    /// Once split apart, telling them apart is free and we no longer have to expose the lock holder: <c>preparing=1</c> + someone waiting = the lock is in our own
+    /// hands, normal queueing; <c>preparing=0</c> + someone waiting = the lock is held by another run.
     /// </para>
     /// <para>
-    /// 件数恒等式因此多一项：
-    /// <c>Processed + Preparing + Queued + WaitingOnArchive + Uploading ≡ Total</c>。
+    /// The item-count identity therefore gains a term:
+    /// <c>Processed + Preparing + Queued + WaitingOnArchive + Uploading ≡ Total</c>.
     /// </para>
     /// </summary>
     int WaitingOnArchive = 0,
     /// <summary>
-    /// 已经压完落盘、但**还没资格上路**的字节：正卡在压缩后重校验或清云端残留卷那一段
-    /// （<see cref="Checking"/> 的字节侧）。已从 <see cref="StagedBytes"/> 里减出去，两栏互不重叠。
+    /// Bytes already packed onto disk but **not yet cleared to travel**: stuck in the post-compression re-verify or the clear-leftover-cloud-volumes phase
+    /// (the byte side of <see cref="Checking"/>). Already subtracted out of <see cref="StagedBytes"/>, so the two columns never overlap.
     /// <para>
-    /// 拆出来的理由和当初拆 <see cref="Checking"/> 是同一个。产出一压完就进背压的账（晚记一秒
-    /// 就可能撑爆临时盘），可那一刻它还要过重校验——而重校验判出成员在压缩期间变了的话，
-    /// 这份归档会被**整个丢掉重压**，一个字节都传不出去。管这叫 "ready to upload" 是过度承诺。
+    /// The reason for splitting it out is the same one that split out <see cref="Checking"/>. Output enters the backpressure ledger the moment it is packed (recording it a second
+    /// late can blow out the temp disk), but at that moment it still has to pass the re-verify — and if the re-verify finds that a member changed during compression,
+    /// this archive gets **thrown away whole and repacked**, with not one byte transferred. Calling that "ready to upload" is overpromising.
     /// </para>
     /// </summary>
     long CheckingBytes = 0)
 {
-    /// <summary>某一种等待此刻卡着几个。</summary>
+    /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
     {
         UploadWait.Peer => WaitingOnPeer,
@@ -184,16 +184,16 @@ public sealed record StageProgress(
         _ => 0,
     };
 
-    /// <summary>还没开始处理的源端字节（压缩前）。</summary>
+    /// <summary>Source-side bytes not yet started (before compression).</summary>
     public long WorkRemaining => Math.Max(0, WorkTotal - WorkDone);
 
     /// <summary>
-    /// 按**源端字节**（压缩前）算的完成度。上传阶段应当优先用它而不是 <see cref="Percent"/>：
-    /// 一件活可能是一个 100 GB 的单文件，也可能是一箱几百个 5 KB 的小文件，按件数算等于把它们
-    /// 当成一样重——界面上会先飞快冲到 90%，再在最后一件上卡住半小时。
+    /// Completion measured in **source-side bytes** (before compression). The upload stage should prefer it over <see cref="Percent"/>:
+    /// one item can be a single 100 GB file or a pack of several hundred 5 KB files, and counting by item treats them
+    /// as equally heavy — the UI races to 90% and then sits on the last item for half an hour.
     /// <para>
-    /// 只在总量已经定下来（<see cref="Total"/> &gt; 0）时才给。上传的工作量是 diff 边判边入队的，
-    /// 判完之前分母还在长，这时算出来的百分比会先冲高再掉下去。件数那边用同一个信号。
+    /// Only produced once the total is settled (<see cref="Total"/> &gt; 0). The upload workload is enqueued by diff as it decides,
+    /// so the denominator is still growing until diff finishes, and a percentage computed then shoots up and falls back. The item count gates on the same signal.
     /// </para>
     /// </summary>
     public int? WorkPercent => Total > 0 && WorkTotal > 0
@@ -203,16 +203,16 @@ public sealed record StageProgress(
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Processed / Total) : null;
 
     /// <summary>
-    /// 估算的剩余时间。首选 <see cref="EtaSeconds"/>——它按「已用时间 × 剩余工作量 ÷ 已完成工作量」
-    /// 外推，等价于用**全程平均**吞吐，而不是眼下这一瞬的速度。
+    /// Estimated time remaining. Prefers <see cref="EtaSeconds"/> — it extrapolates from "elapsed time × remaining work ÷ completed work",
+    /// which is equivalent to using **whole-run average** throughput rather than the speed of this instant.
     /// <para>
-    /// 为什么不用 <see cref="BytesPerSecond"/> 算：那是 10 秒滚动窗口，量的是"此刻网线上有多快"。
-    /// 备份的实际节奏是「压一箱几十秒 → 传几秒」，压缩期间窗口里一个字节都没有，速度掉到 0，
-    /// 剩余时间就整段消失，压完又猛地冒出一个很小的数——用户看到的就是"很飘"。而压缩那几十秒
-    /// 同样是剩余时间的一部分，全程平均天然把它算了进去。
+    /// Why not compute it from <see cref="BytesPerSecond"/>: that is a 10-second rolling window, measuring "how fast the wire is right now".
+    /// A backup's actual rhythm is "pack for tens of seconds → transfer for a few", and during compression the window holds not one byte, the speed drops to 0,
+    /// the remaining time disappears entirely, and once packing ends a very small number suddenly pops out — what the user sees is "jittery". Yet those tens of seconds of compression
+    /// are just as much a part of the remaining time, and the whole-run average accounts for them naturally.
     /// </para>
     /// <para>
-    /// 回退公式（阶段没申报工作量时）仍是老样子：拿"平均每件字节 × 剩余件数 ÷ 当前速度"粗估。
+    /// The fallback formula (when the stage declares no workload) is unchanged: rough-estimate from "average bytes per item × remaining items ÷ current speed".
     /// </para>
     /// </summary>
     public TimeSpan? EstimatedRemaining =>
@@ -224,20 +224,20 @@ public sealed record StageProgress(
 }
 
 /// <summary>
-/// 阶段进度的累加与**节流**。
+/// Accumulation and **throttling** of stage progress.
 /// <para>
-/// 节流是必需的而不是优化：百万文件逐个上报会产生百万次对象分配，而人眼一秒也看不了几次。
-/// 但阶段收尾时必须强制产出一次终态，否则进度会永远停在 99%——这类"差最后一下"的 bug
-/// 在这个项目里已经出现过（见 onItem 计数那一轮）。
+/// Throttling is a requirement, not an optimization: reporting a million files one by one costs a million object allocations, and the human eye cannot take in more than a few updates a second.
+/// But when a stage wraps up it must force out a final state, or the progress will sit at 99% forever — this project has already had
+/// that kind of "one step short" bug (see the onItem counting round).
 /// </para>
 /// </summary>
-/// <param name="speedWhileInFlight">测速的分母是否只算「至少有一条在途项开着」的时间。
-/// 会登记在途项的阶段（上传/还原/校验）置 true：它们的节奏是「压一箱几十秒 → 传几秒」，
-/// 拿墙钟当分母量出来的既不是传输速度也不是墙钟吞吐。从不调 <see cref="BeginItem"/> 的阶段
-/// （扫描/差分/本地检查）必须保持 false——虚拟时钟对它们永远不走，速度会恒为 0。</param>
+/// <param name="speedWhileInFlight">Whether the speed denominator counts only the time with "at least one in-flight item open".
+/// Set true for stages that register in-flight items (upload/restore/verify): their rhythm is "pack for tens of seconds → transfer for a few",
+/// and what the wall clock as denominator measures is neither the transfer speed nor the wall-clock throughput. Stages that never call <see cref="BeginItem"/>
+/// (scan/diff/local check) must keep it false — the virtual clock never advances for them and the speed would be permanently 0.</param>
 /// <param name="stagedBytes">
-/// 待传池子当前占用（压缩后字节）的读数。上传阶段传本次运行的暂存席位；其余阶段没有池子，省略。
-/// 每次发布时现读——它随压缩与上传此消彼长，缓存下来就永远慢一拍。
+/// A reading of the staging pool's current occupancy (post-compression bytes). The upload stage passes this run's staging reservation; other stages have no pool and omit it.
+/// Read fresh on every publish — it seesaws with compression and upload, so a cached value is permanently one beat behind.
 /// </param>
 public sealed class StageTracker(
     string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false,
@@ -246,39 +246,39 @@ public sealed class StageTracker(
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
     private const int HeartbeatMs = 1_000;
-    // 采样队列的硬上限，防的是虚拟时钟冻结期间"按时间淘汰"这一半条件永远不成立的那种增长：
-    // 冻着的时候每个采样的 Ms 都相同，tick - _samples.Peek().Ms 恒为 0，谁都淘汰不掉。
-    // 200ms 节流下最多 5 个采样/秒，10 秒窗口正常撑满时最多约 50 个——256 是它的 5 倍余量，
-    // 这条子句在正常运行下摸不到，只会在真出现长时间冻结（活跃段内密集发布、但虚拟时钟
-    // 本身不走的那种边角）时把陈年残留顺手清掉，不靠"多久发布一次"这种运气兜底。
-    // 要动这个数（或调小 ThrottleMs）之前先知道它触发时的代价：冻结期所有采样的 Ms 相同，
-    // 按个数淘汰是从队头丢，先丢掉的恰是**冻结前**那些带着真实 spanMs 的采样；一旦丢过了头，
-    // oldest.Ms == tick、spanMs == 0，速度就从"保留最后一次在网线上的读数"塌成 0。
+    // Hard cap on the sample queue, guarding against the growth where the "evict by time" half of the condition never holds while the virtual clock is frozen:
+    // while frozen every sample carries the same Ms, tick - _samples.Peek().Ms is always 0, and nothing can be evicted at all.
+    // Under 200ms throttling that is at most 5 samples/sec, so a normally full 10-second window holds about 50 — 256 is 5x that headroom,
+    // this clause is unreachable in normal operation and only fires during a genuinely long freeze (dense publishing inside an active segment while the virtual
+    // clock itself does not move) to sweep out stale leftovers, instead of relying on the luck of "how often do we publish".
+    // Before touching this number (or lowering ThrottleMs), know what it costs when it fires: during a freeze all samples share the same Ms,
+    // and count-based eviction drops from the head, so the first ones dropped are exactly the **pre-freeze** samples carrying a real spanMs; drop too many and
+    // oldest.Ms == tick, spanMs == 0, and the speed collapses from "keep the last reading seen on the wire" to 0.
     private const int MaxSamples = 256;
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
-    /// <summary>在途的流：key 是 blob/卷名（唯一），值带着给人看的标签、已传字节与总字节。</summary>
+    /// <summary>An in-flight stream: the key is the blob/volume name (unique), the value carries the human-facing label, bytes sent and total bytes.</summary>
     private sealed class InFlight(string label, long total, string? owner)
     {
         public string Label { get; } = label;
         public long Total { get; } = total;
 
-        /// <summary>这一卷属于哪一族（blobRef）。<see cref="EndItem"/> 靠它把字节记进对的那本账，
-        /// 而不是往一个全局标量上堆——见 <see cref="StageTracker.BeginUpload"/>。
-        /// 下载侧与不走上传闸门的路径为 null：那些路径不碰这本账。</summary>
+        /// <summary>Which family (blobRef) this volume belongs to. <see cref="EndItem"/> uses it to book the bytes into the right ledger
+        /// instead of piling them onto one global scalar — see <see cref="StageTracker.BeginUpload"/>.
+        /// Null on the download side and on paths that do not go through the upload gate: those paths never touch this ledger.</summary>
         public string? Owner { get; } = owner;
         private long _sent;
         public long Sent => Interlocked.Read(ref _sent);
 
-        /// <summary>本次尝试推到哪儿了。是**赋值**不是累加——重试整卷重来时它跟着退回去，
-        /// 这一条才和自己的 <see cref="Total"/> 同口径。累加的话重传会让分子越过分母：
-        /// 实测出现过 <c>200.0 MB / 100.0 MB</c>（一次重试），而那一卷随后正常传完了。</summary>
+        /// <summary>How far this attempt has pushed. It is an **assignment**, not an accumulation — when a retry restarts the whole volume it rewinds along with it,
+        /// which is what keeps this stream on the same footing as its own <see cref="Total"/>. Accumulate instead and a retransmit pushes the numerator past the denominator:
+        /// we measured <c>200.0 MB / 100.0 MB</c> in the field (one retry), and that volume then transferred just fine.</summary>
         public void Set(long attemptCumulative) => Interlocked.Exchange(ref _sent, attemptCumulative);
     }
 
     private readonly ConcurrentDictionary<string, InFlight> _active = new(StringComparer.Ordinal);
-    // (毫秒, 累计字节) 采样，用于算最近一段时间的速度。文件大小差异很大时，
-    // 全程平均值会长期偏离当下的实际速度，滚动窗口才对得上用户看到的现象。
+    // (milliseconds, cumulative bytes) samples, used to compute the speed over the recent window. When file sizes vary wildly,
+    // the whole-run average drifts away from the actual current speed for long stretches; only a rolling window matches what the user sees.
     private readonly Queue<(long Ms, long Bytes)> _samples = new();
     private readonly Lock _gate = new();
 
@@ -289,86 +289,86 @@ public sealed class StageTracker(
     private long _lastPublishMs = -ThrottleMs;
     private int _enqueued;
     private int _inWork;
-    // 已经进入"上传"这一段的**件**数。不能拿 _active.Count 代替：那里装的是**卷**，
-    // 一件活可以同时有好几卷在飞，相减会把还在压缩的件算没了（preparing 被压成 0）。
+    // **Items** that have entered the "upload" phase. _active.Count is not a substitute: that holds **volumes**,
+    // and one item can have several volumes in flight at once, so the subtraction would erase items still compressing (preparing squashed to 0).
     private int _inUpload;
-    // 进了暂存区这一段的件数，以及其中真正拿到压缩锁的件数（后者按锁的定义只会是 0 或 1）。
-    // 必须分开记，不能拿"手上件数 - 在上传件数"反推：那样会把排在锁后面干等的线程算成"在准备"，
-    // 默认配置下界面显示 5 preparing，看着像五件活在并行推进，实际是一件在压、四个在闲等。
+    // Items inside the staging phase, and among them the ones actually holding the compression lock (the latter is only ever 0 or 1, by definition of the lock).
+    // They must be tracked separately, not derived from "items in hand - items uploading": that counts threads idling behind the lock as "preparing",
+    // and under the default config the UI shows 5 preparing, which looks like five items progressing in parallel when really one is packing and four are idling.
     private int _inStaging;
     private int _inPacking;
     private int _inChecking;
-    // 其中已经压完落盘、正卡在核对里的**字节**。见 StageProgress.CheckingBytes：产出一压完就进
-    // 背压的账（那笔账要的是"盘上此刻占了多少"），可它还要过重校验才轮得到上路，而重校验判出
-    // 成员变了的话这份归档会被整个丢掉重压。从待传里减出去，单列一栏。
+    // Among those, the **bytes** already packed onto disk and stuck in checking. See StageProgress.CheckingBytes: output enters the
+    // backpressure ledger the moment it is packed (that ledger wants "how much is on disk right now"), but it still has to pass the re-verify before it may travel, and if the re-verify
+    // finds a member changed this archive gets thrown away whole and repacked. Subtracted out of staged, given its own column.
     private long _checkingBytes;
-    // 各段等待的当前人数，按 UploadWait 的序号索引。数组而不是三个字段：调用方按枚举取用，
-    // 加一段等待只需在枚举里多一项，发布那一头不必再各加一条。
+    // Current occupancy of each wait phase, indexed by the UploadWait ordinal. An array rather than three fields: callers index by the enum,
+    // so adding a wait phase takes only one more enum member and the publish end needs no extra line per phase.
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
-    // 剩余时间用的"工作量"。与 _bytes 是两回事：后者是真正过了网线的字节（压缩后、去重命中为 0），
-    // 拿它当完成度会让剩余时间随压缩率和去重命中率乱跳。没有阶段申报工作量时（0），
-    // 剩余时间退回按件数外推。
+    // The "workload" used for remaining time. A different thing from _bytes: the latter is bytes that actually crossed the wire (post-compression, 0 on a dedup hit),
+    // and using it as completion makes the remaining time jump around with the compression ratio and the dedup hit rate. When no stage declares a workload (0),
+    // remaining time falls back to extrapolating from item counts.
     private long _totalWork;
     private long _doneWork;
-    // 已经稳稳落在云上/盘上的字节（压缩后）。与 _bytes 的区别：那个边传边加、含在途的部分，
-    // 用来测速；这个只认走完的。上传侧由 SetTransferred 按**件**给出权威读数，下载侧按卷累加。
+    // Bytes that have landed safely in the cloud / on disk (post-compression). The difference from _bytes: that one adds as it transfers and includes the in-flight part,
+    // and is used for speed; this one only counts what finished. On the upload side SetTransferred supplies the authoritative per-**item** reading; the download side accumulates per volume.
     private long _transferred;
-    // 上述权威读数是否已接管。见 SetTransferred。
+    // Whether that authoritative reading has taken over. See SetTransferred.
     private bool _transferredByItem;
-    // 已落云、但所属那件活还没销账的字节，**按族（blobRef）分条记**。
+    // Bytes already in the cloud whose owning item has not been written off yet, **kept as one entry per family (blobRef)**.
     //
-    // 从前这是个只加的标量，件级销账时按 _transferred 的增量整体减掉。那本账在失败路径上抵不平：
-    // 一族卷传掉几卷之后整件倒了，那几卷已经加了进去，而件级账只按重试成功的那一次扣一遍，
-    // 差额从此永远挂在屏幕上（实测一轮 3 TB 的备份攒到 2 GB，而那时一个字节都没在传）。
-    // 夹到 0 的防守挡得住负数，挡不住这个方向。
+    // This used to be an increment-only scalar, reduced wholesale by the delta of _transferred at per-item write-off. That ledger did not balance on failure paths:
+    // a family ships a few volumes and then the whole item falls over; those volumes were already added, while the per-item ledger deducts only once, for the attempt that succeeded,
+    // and the difference hangs on the screen forever after (measured: one 3 TB backup accumulated 2 GB while not a single byte was transferring).
+    // Clamping to 0 defends against negatives; it does not defend against this direction.
     //
-    // 按族分条之后每条有明确的一生：BeginUpload 开条（重试即重置）→ 每卷 EndItem 累加 →
-    // ConfirmUpload 标记云端已确认 → 件级销账并入 uploaded 时整条删掉；没被确认过的
-    // （失败、取消）在 EndUpload 就地作废。抵不平这件事从根上不存在了。
+    // Split per family, each entry has a well-defined life: BeginUpload opens it (a retry is a reset) → each volume's EndItem adds to it →
+    // ConfirmUpload marks it confirmed by the cloud → the per-item write-off folds it into uploaded and deletes the entry outright; entries never confirmed
+    // (failed, cancelled) are voided on the spot in EndUpload. Failing to balance simply cannot happen anymore.
     private readonly Dictionary<string, UnfinishedFamily> _unfinished = new(StringComparer.Ordinal);
 
-    /// <summary>一族卷已落云、还没并进 uploaded 的账。</summary>
+    /// <summary>The ledger for one family's volumes that are in the cloud but not yet folded into uploaded.</summary>
     private sealed class UnfinishedFamily
     {
         public long Bytes;
-        /// <summary>云端已确认整族传完、字节已进件级账（<c>state.AddUploaded</c>），
-        /// 只等下一次 <see cref="SetTransferred"/> 把它并进 uploaded。
-        /// 没被标记就走完的族＝这次尝试作废了，它的卷不算数。</summary>
+        /// <summary>The cloud has confirmed the whole family transferred and the bytes have entered the per-item ledger (<c>state.AddUploaded</c>),
+        /// so it only waits for the next <see cref="SetTransferred"/> to fold it into uploaded.
+        /// A family that finishes without the mark = this attempt was voided, and its volumes do not count.</summary>
         public bool Confirmed;
     }
-    // 这一阶段一共要过网线多少字节（压缩后）。只有下载侧申报得出，上传侧压完才知道，恒为 0。
+    // How many bytes this stage has to push over the wire in total (post-compression). Only the download side can declare it; the upload side knows only after packing, so it stays 0.
     private long _transferTotal;
-    // 正卡在下游上的调用方数量（差分侧被有界队列挡住时 >0）。
+    // Number of callers currently stuck on the downstream (>0 when the diff side is blocked by the bounded queue).
     private long _spilled;
-    // 本阶段真正开工的时刻。上传阶段的 tracker 在 diff 刚起步时就建好了，此后可能空等一阵才
-    // 有第一件活；从建对象那一刻起算平均速度，会把这段空转摊进去，ETA 一路偏长。
-    // -1 = 还没开工（没人调 BeginWork 的阶段——如 diff——一律按"建对象即开工"处理，那是对的）。
+    // The moment this stage really started working. The upload stage's tracker is constructed as soon as diff kicks off, and there may be a stretch of
+    // idle waiting before the first item shows up; measuring the average speed from construction smears that idling in and stretches the ETA the whole way.
+    // -1 = not started yet (stages where nobody calls BeginWork — diff, for one — are uniformly treated as "construction is the start", which is correct).
     private long _workStartMs = -1;
 
-    // 测速用的时间轴：只在 _active 非空时前进（speedWhileInFlight 为 true 时）。
-    // 压缩期它冻着，于是停顿两侧的采样在窗口里是连着的——速度既不被空转稀释，
-    // 也不会出现"老采样整批超龄 → 当场报 0 → 压完猛跳"。
+    // The timeline used for speed: it advances only while _active is non-empty (when speedWhileInFlight is true).
+    // It freezes during compression, so the samples on both sides of the pause are contiguous within the window — the speed is neither diluted by idling
+    // nor subject to "the whole batch of old samples ages out → report 0 on the spot → jump wildly once packing ends".
     private long _activeMs;
-    // 当前活跃段的起点；-1 = 当下一条流都没开。
+    // Start of the current active segment; -1 = not a single stream is open right now.
     private long _activeSince = -1;
-    // 只在活跃段内跑的定时器。压缩期停着，一个多余的快照都不发。
+    // A timer that runs only inside an active segment. Stopped during compression, it emits not one redundant snapshot.
     private Timer? _heartbeat;
-    // Complete() 之后收到的迟到回调（已经排上线程池、Dispose 也叫不停）必须原地作废——
-    // 见 Tick() 里的用法。
+    // Late callbacks arriving after Complete() (already queued on the thread pool, and Dispose cannot call them back) must be voided on the spot —
+    // see how it is used in Tick().
     private bool _completed;
 
-    /// <summary>测试注入的毫秒时间源。10 秒测速窗口不可能靠真等来验，注入之后整个跟踪器
-    /// 在时间上完全确定。生产为 null，走内部的 <see cref="Stopwatch"/>。</summary>
+    /// <summary>Millisecond time source injected by tests. A 10-second speed window cannot be verified by actually waiting; with injection the whole tracker
+    /// is fully deterministic in time. Null in production, which falls through to the internal <see cref="Stopwatch"/>.</summary>
     internal Func<long>? Clock { get; init; }
 
     private long NowMs() => Clock?.Invoke() ?? _clock.ElapsedMilliseconds;
 
-    /// <summary>测速用的时刻。开了开关的阶段走"有流才走"的虚拟轴，其余照走墙钟。</summary>
+    /// <summary>The timestamp used for speed. Stages with the switch on use the "only advances while a stream is open" virtual axis; the rest stay on the wall clock.</summary>
     private long SpeedNow(long now) =>
         speedWhileInFlight ? _activeMs + (_activeSince >= 0 ? now - _activeSince : 0) : now;
 
-    /// <summary>把总数定下来。流水线化之后上传阶段的总数是**边跑边长出来的**（diff 还在往队列里
-    /// 塞活），在它定下来之前只能报 0＝未知——报一个还在涨的分母，百分比会先冲到 100 再掉回去。</summary>
+    /// <summary>Settle the total. Since pipelining, the upload stage's total **grows as it runs** (diff is still stuffing work into
+    /// the queue), and until it settles we can only report 0 = unknown — report a still-growing denominator and the percentage races to 100 and falls back.</summary>
     public void SetTotal(int value)
     {
         lock (_gate)
@@ -378,12 +378,12 @@ public sealed class StageTracker(
         }
     }
 
-    /// <summary>处理完一项：计数 +1 并累加已读字节。**不动**当前项——当前项由 <see cref="Touch"/>
-    /// 维护，让它一直停留在最后进入的那个路径上，卡住时才看得到究竟卡在哪。</summary>
-    /// <param name="bytes">计入测速与 <c>Bytes</c> 的字节。</param>
-    /// <param name="work">计入剩余时间估算的工作量，默认与 <paramref name="bytes"/> 相同。
-    /// 上传阶段两者不同：字节是压缩后真正传上去的（去重命中时是 0），工作量则是这一件活对应的
-    /// 原始字节——必须与 <see cref="Enqueue"/> 时申报的是同一个量，否则完工时剩余量归不了零。</param>
+    /// <summary>One item processed: count +1 and add the bytes read. **Does not touch** the current item — that is maintained by <see cref="Touch"/>,
+    /// which keeps it parked on the last path entered, so that when things stall you can see exactly where.</summary>
+    /// <param name="bytes">Bytes counted toward the speed and toward <c>Bytes</c>.</param>
+    /// <param name="work">Workload counted toward the remaining-time estimate; defaults to the same as <paramref name="bytes"/>.
+    /// The two differ in the upload stage: bytes are what actually went up after compression (0 on a dedup hit), while the workload is this item's
+    /// original bytes — it must be the same quantity declared at <see cref="Enqueue"/> time, or the remaining work will not reach zero at completion.</param>
     public void Advance(long bytes, long? work = null)
     {
         lock (_gate)
@@ -396,19 +396,19 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 「已传字节」改由调用方按**件**给出权威读数（绝对值，不是增量），此后 <see cref="EndItem"/>
-    /// 的按卷累加让位。调用一次即接管，之后每件活销账时刷新。
+    /// "Bytes transferred" is henceforth an authoritative per-**item** reading supplied by the caller (an absolute value, not a delta), and the per-volume
+    /// accumulation in <see cref="EndItem"/> steps aside. One call takes over; after that it refreshes as each item is written off.
     /// <para>
-    /// 上传侧非用它不可，因为这个数字要和<b>按件</b>销账的原始字节摆在一起读（界面上的
-    /// "X uploaded (N% of original)"）。按卷累加的话，一件大活边压边传的那几十分钟里分子一路涨、
-    /// 分母纹丝不动——它要等整件完成才跳——百分比于是结构性地冲过 100%（实测 112%，那件活
-    /// 完成后落回 99%）。文件越大差得越远，和压缩率毫无关系。
+    /// The upload side has no choice but to use it, because this number has to be read side by side with the <b>per-item</b> original bytes written off (the UI's
+    /// "X uploaded (N% of original)"). With per-volume accumulation, during the tens of minutes a big item spends packing and transferring, the numerator climbs while
+    /// the denominator sits stone-still — it only jumps once the whole item completes — so the percentage structurally overshoots 100% (measured 112%, falling back
+    /// to 99% after that item completed). The bigger the file the further off it gets, and it has nothing whatsoever to do with the compression ratio.
     /// </para>
     /// <para>
-    /// 顺带修掉两处按卷累加固有的偏差：重传的字节不再重复计（<see cref="DeltaProgress"/> 把回退
-    /// 按"重新开始"处理，对测速是对的，但云上还是那一份），去重命中也不再被当成传过
-    /// （if-missing 撞上已存在的 blob 时一个字节都没上网线）。件级读数天生没有这两个问题，
-    /// 而且与完工日志里那个"本次上传量"同源，界面和日志从此对得上。
+    /// It also fixes two biases inherent to per-volume accumulation: retransmitted bytes are no longer double-counted (<see cref="DeltaProgress"/> treats a rewind
+    /// as "start over", which is right for the speed, but the cloud still holds just that one copy), and dedup hits are no longer counted as transferred
+    /// (when if-missing runs into an already-existing blob, not one byte went over the wire). The per-item reading has neither problem by construction,
+    /// and it shares a source with the "uploaded this run" figure in the completion log, so the UI and the log finally agree.
     /// </para>
     /// </summary>
     public void SetTransferred(long total)
@@ -416,11 +416,11 @@ public sealed class StageTracker(
         lock (_gate)
         {
             _transferredByItem = true;
-            // 已经确认过的族就此并入 uploaded：它们的字节已经含在 total 里了，两边同时更新，
-            // 屏幕上那批字节从右边一栏平移到左边一栏，不闪。
+            // Confirmed families are folded into uploaded right here: their bytes are already included in total, both sides update at once,
+            // and on screen those bytes slide from the right-hand column into the left-hand one without a flicker.
             //
-            // 删的是**条**，不是从一个标量里减一个数——这正是这本账重写的全部意义：没被确认过的族
-            // （失败、取消）根本不在这里，它们在 EndUpload 就作废了，于是不存在"减多了还是减少了"。
+            // What is deleted is an **entry**, not a number subtracted from a scalar — that is the whole point of rewriting this ledger: families never confirmed
+            // (failed, cancelled) are simply not here, having been voided back in EndUpload, so "did we subtract too much or too little" does not arise.
             foreach (var owner in _unfinished.Where(e => e.Value.Confirmed).Select(e => e.Key).ToList())
                 _unfinished.Remove(owner);
             _transferred = total;
@@ -428,7 +428,7 @@ public sealed class StageTracker(
         }
     }
 
-    /// <summary>进入下一项（在**处理之前**调用）。只改"正在处理什么"，不计数。</summary>
+    /// <summary>Move on to the next item (call it **before** processing). It only changes "what is being processed"; it does not count.</summary>
     public void Touch(string? current)
     {
         lock (_gate)
@@ -438,14 +438,14 @@ public sealed class StageTracker(
         }
     }
 
-    /// <summary>一件活排进了队列。生产侧（diff）单线程调用，但它与消费侧并发，故用 Interlocked。
-    /// **不**用它去动 <c>_total</c>：那个分母在 diff 收工前一直在涨，拿它算百分比会先冲到 100 再掉回来。</summary>
-    /// <param name="work">这件活的工作量（原始字节），累加成本阶段的总工作量。
-    /// 它在 diff 收工前一直在涨，所以 ETA 与百分比一样用 <c>_total &gt; 0</c> 把门——
-    /// 拿一个还在涨的分母外推，剩余时间会先缩到很小再弹回去。</param>
-    /// <param name="work">这一件活的**源端**字节（压缩前）——完成度与剩余时间按它外推。</param>
-    /// <param name="transfer">这一件活要过网线的字节（压缩后）。只有下载侧给得出，见
-    /// <see cref="StageProgress.TransferTotal"/>。</param>
+    /// <summary>One item queued. Called single-threaded by the producer side (diff), but concurrently with the consumer side, hence Interlocked.
+    /// Do **not** use it to touch <c>_total</c>: that denominator keeps growing until diff wraps up, and a percentage off it races to 100 and falls back.</summary>
+    /// <param name="work">This item's workload (original bytes), accumulated into the stage's total workload.
+    /// It keeps growing until diff wraps up, so the ETA gates on <c>_total &gt; 0</c> just like the percentage does —
+    /// extrapolate from a still-growing denominator and the remaining time shrinks to almost nothing and then springs back.</param>
+    /// <param name="work">This item's **source-side** bytes (before compression) — completion and remaining time extrapolate from it.</param>
+    /// <param name="transfer">Bytes this item has to push over the wire (after compression). Only the download side can supply it, see
+    /// <see cref="StageProgress.TransferTotal"/>.</param>
     public void Enqueue(long work = 0, long transfer = 0)
     {
         Interlocked.Increment(ref _enqueued);
@@ -455,27 +455,27 @@ public sealed class StageTracker(
             Interlocked.Add(ref _transferTotal, transfer);
     }
 
-    /// <summary>工作线程领走一件活（此后它算"在准备"，直到 <see cref="BeginItem"/> 开始推字节）。</summary>
+    /// <summary>A worker thread picks up an item (from here it counts as "preparing", until <see cref="BeginItem"/> starts pushing bytes).</summary>
     public void BeginWork()
     {
         Interlocked.Increment(ref _inWork);
-        // 第一件活被领走 = 本阶段真正开工，平均速度从这里开始量。
+        // The first item being picked up = this stage really started working; the average speed is measured from here.
         Interlocked.CompareExchange(ref _workStartMs, NowMs(), -1);
     }
 
-    /// <summary>工作线程干完一件活（成功或失败都要调）。与 <see cref="Advance"/> 一样**不计数**——
-    /// 槽位计数只归 Advance 管，在这里顺手加一次进度条就会冲过 100%。</summary>
+    /// <summary>A worker thread finished an item (call it on both success and failure). Like <see cref="Advance"/>, it **does not count** —
+    /// slot counting belongs to Advance alone, and bumping the progress bar here on the side would push it past 100%.</summary>
     public void EndWork() => Interlocked.Decrement(ref _inWork);
 
     /// <summary>
-    /// 一族卷开始往上传（成对调 <see cref="EndUpload"/>）。同样**不计数**。
+    /// A family of volumes starts uploading (pair it with <see cref="EndUpload"/>). Again, it **does not count**.
     /// <para>
-    /// 顺手给这一族开一条空账。<b>开条是重置，不是新增</b>：重试走的是同一个 <paramref name="owner"/>
-    /// （单文件的 blobRef 是内容 hash，pack 的包号在重试之外领——两者都跨重试不变），
-    /// 于是上一次尝试传掉的卷在这里被干净抹掉，第二次从零开始记。
+    /// It also opens an empty ledger entry for this family. <b>Opening it is a reset, not an insert</b>: a retry goes through the same <paramref name="owner"/>
+    /// (a single file's blobRef is the content hash, and a pack's id is taken outside the retry — both stay unchanged across retries),
+    /// so the volumes shipped by the previous attempt are wiped clean here and the second attempt counts from zero.
     /// </para>
     /// </summary>
-    /// <param name="owner">这一族的 blobRef：<c>data/{hash}</c> 或 <c>packs/{packId}.7z</c>。</param>
+    /// <param name="owner">This family's blobRef: <c>data/{hash}</c> or <c>packs/{packId}.7z</c>.</param>
     public void BeginUpload(string owner)
     {
         Interlocked.Increment(ref _inUpload);
@@ -484,11 +484,11 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 云端已确认这一族全部传完，字节也已经进了件级账——只等下一次 <see cref="SetTransferred"/>
-    /// 把它并进 uploaded。必须在 <c>state.AddUploaded</c> 之后、<see cref="EndUpload"/> 之前调。
+    /// The cloud has confirmed this whole family transferred and the bytes have entered the per-item ledger — it only waits for the next <see cref="SetTransferred"/>
+    /// to fold it into uploaded. Must be called after <c>state.AddUploaded</c> and before <see cref="EndUpload"/>.
     /// <para>
-    /// 不在这里直接清账是为了那一段**平滑**：从整族传完到件级销账之间还隔着写索引、写 journal
-    /// 那一截，此刻清掉的话这批字节会在两栏之间凭空消失一会儿，而它们确实已经在云上了。
+    /// We do not clear the ledger right here, for the sake of **smoothness** across that gap: between the whole family finishing and the per-item write-off there is still
+    /// the index write and the journal write to get through, and clearing now would make those bytes vanish between the two columns for a while even though they really are in the cloud.
     /// </para>
     /// </summary>
     public void ConfirmUpload(string owner)
@@ -498,8 +498,8 @@ public sealed class StageTracker(
                 family.Confirmed = true;
     }
 
-    /// <summary>这一族的处理结束：没被 <see cref="ConfirmUpload"/> 标记过的就地作废。
-    /// 放在 <c>finally</c> 里调——正常走完与抛出去用的是同一句，区别只在有没有确认过。</summary>
+    /// <summary>This family's processing ends: anything not marked by <see cref="ConfirmUpload"/> is voided on the spot.
+    /// Call it in a <c>finally</c> — the normal path and the throwing path use the same line, the only difference being whether it was confirmed.</summary>
     public void EndUpload(string owner)
     {
         Interlocked.Decrement(ref _inUpload);
@@ -511,12 +511,12 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 开始等某一段（成对调 <see cref="EndWait"/>）。
+    /// Start waiting on one phase (pair it with <see cref="EndWait"/>).
     /// <para>
-    /// 进 <c>_gate</c> 强制发一次，**不**受 200ms 节流约束：等待期间本调用方不再产生任何事件，
-    /// 而心跳只在有流在传时才跑（见 <see cref="Tick"/> 里那条虚拟时钟的短路）。零流在传的时候
-    /// 被节流吞掉的这一次发布没有任何后续补偿，界面就冻在旧快照上直到等待结束——那正是这一栏
-    /// 要说明的那几分钟。等待事件本身不密集（闸门那一路还先试过非阻塞获取），代价可以忽略。
+    /// Takes <c>_gate</c> and forces one publish, **not** subject to the 200ms throttle: while waiting, this caller produces no further events,
+    /// and the heartbeat only runs while a stream is transferring (see that virtual-clock short-circuit in <see cref="Tick"/>). With zero streams transferring,
+    /// a publish swallowed by the throttle gets no compensation later, and the UI freezes on the stale snapshot until the wait ends — which is exactly the few minutes
+    /// this column exists to explain. Wait events themselves are not dense (the gate path even tries a non-blocking acquire first), so the cost is negligible.
     /// </para>
     /// </summary>
     public void BeginWait(UploadWait kind)
@@ -533,13 +533,13 @@ public sealed class StageTracker(
             PublishIfDue(force: true);
     }
 
-    /// <summary>一件活进了暂存区这一段——此刻它多半还在排压缩锁，所以算"排队中"
-    /// （成对调 <see cref="EndStaging"/>）。</summary>
-    /// <summary>本阶段累计落了多少件活到磁盘上。
+    /// <summary>An item enters the staging phase — at this moment it is most likely still queueing for the compression lock, so it counts as "queued"
+    /// (pair it with <see cref="EndStaging"/>).</summary>
+    /// <summary>How many items this stage has spilled to disk in total.
     /// <para>
-    /// 不走节流：从 0 变成非 0 那一刻正是"diff 已经跑到上传前面去了"的开始，压着它不发，
-    /// 界面上就是一段无法解释的安静。之后每次都是同一个值覆盖，<see cref="PublishIfDue"/>
-    /// 自己会按节流窗口收敛。</para></summary>
+    /// No throttling: the moment it goes from 0 to non-zero is precisely the start of "diff has run ahead of upload", and holding that back
+    /// leaves an inexplicable silence in the UI. Every call after that just overwrites with the same value, and <see cref="PublishIfDue"/>
+    /// converges it on its own throttle window.</para></summary>
     public void SetSpilled(long items)
     {
         var previous = Interlocked.Exchange(ref _spilled, items);
@@ -551,16 +551,16 @@ public sealed class StageTracker(
 
     public void EndStaging() => Interlocked.Decrement(ref _inStaging);
 
-    /// <summary>拿到压缩锁、真正开始产出卷文件（成对调 <see cref="EndPacking"/>）。
-    /// 界面上上传阶段的 "N preparing" 只数这个，因此按锁的定义永远是 0 或 1；还原/校验阶段
-    /// 复用同一对方法标记"下载完、正在解压/算 hash"这一段本地 CPU 工作，那里没有全局锁，
-    /// 同时几个组各自解压，这个数可以大于 1。
+    /// <summary>The compression lock is taken and volume files really start being produced (pair it with <see cref="EndPacking"/>).
+    /// The UI's "N preparing" in the upload stage counts only this, so by definition of the lock it is always 0 or 1; restore/verify
+    /// reuse the same pair of methods to mark the "download finished, now decompressing/hashing" stretch of local CPU work, and there is no global lock there —
+    /// several groups decompress at once, so the number can exceed 1.
     /// <para>
-    /// 进 <c>_gate</c> 发一次 <see cref="PublishIfDue"/>：这一段的前后手（<c>EndItem</c> 摘掉在途项、
-    /// 随后进入这一段）本身不产生任何字节，若不在这里主动推一次，preparing 从 0 变到 1 这件事
-    /// 只能等下一次别的调用顺带发布才会被界面看到——而下载刚结束、解压/算 hash 期间恰恰没有别的
-    /// 调用在跑，这一拍就会一直卡在旧快照上，界面冻结到这一段结束，正是它要修的那个"冻住"。
-    /// 200ms 节流仍然生效，不是每次调用都真发。</para></summary>
+    /// Takes <c>_gate</c> and issues one <see cref="PublishIfDue"/>: the moves on either side of this phase (<c>EndItem</c> removing the in-flight item,
+    /// then entering this phase) produce no bytes of their own, and without an explicit push here the fact that preparing went from 0 to 1
+    /// could only reach the UI when some other call happens to publish next — and right after a download, during decompression/hashing, there is precisely no other
+    /// call running, so this beat would stay stuck on the stale snapshot and the UI would freeze until this phase ends, which is exactly the "freeze" it is meant to fix.
+    /// The 200ms throttle still applies; not every call really publishes.</para></summary>
     public void BeginPacking()
     {
         lock (_gate)
@@ -580,22 +580,22 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 开始一段读盘核对（成对调 <see cref="EndChecking"/>）：去重预筛整读算 hash、pack 逐成员
-    /// <c>Stat</c>、加密多卷上传前列举云端残留卷。含义见 <see cref="StageProgress.Checking"/>。
+    /// Start a stretch of disk-reading checks (pair it with <see cref="EndChecking"/>): dedup pre-screening's full read and hash, a pack's per-member
+    /// <c>Stat</c>, listing leftover cloud volumes before an encrypted multi-volume upload. See <see cref="StageProgress.Checking"/> for the meaning.
     /// <para>
-    /// <b>强制发布</b>，与 <see cref="BeginWait"/> 同理而与 <see cref="BeginPacking"/> 不同：
-    /// 核对期间本调用方一个事件都不产生，而心跳只在有流在传时才跑（见 <see cref="Tick"/> 里那条
-    /// 虚拟时钟的短路）。零流在传的时候被节流吞掉的这一次发布没有任何后续补偿，界面会冻在旧快照上
-    /// 直到这一段结束——而那正是这一栏要说明的那几十秒，吞掉它等于白加。
+    /// <b>Forced publish</b>, for the same reason as <see cref="BeginWait"/> and unlike <see cref="BeginPacking"/>:
+    /// during a check this caller produces not one event, and the heartbeat only runs while a stream is transferring (see that
+    /// virtual-clock short-circuit in <see cref="Tick"/>). With zero streams transferring, a publish swallowed by the throttle gets no compensation later, and the UI freezes on the stale snapshot
+    /// until this phase ends — and that is exactly the tens of seconds this column exists to explain, so swallowing it makes adding the column pointless.
     /// </para>
     /// <para>
-    /// 代价可以忽略：登记按**件**发生（一件单文件一次、一箱 pack 前后各一次），不像在途登记那样
-    /// 按卷算——一件大活上千卷，那才是不能强制发布的量级。
+    /// The cost is negligible: registration happens per **item** (once for a single file, once before and once after for a pack), not per volume the way
+    /// in-flight registration does — a big item has a thousand volumes, and that is the scale at which you cannot force a publish.
     /// </para>
     /// </summary>
-    /// <param name="bytes">这一段要核对的归档**已经落盘**的字节，从待传里减出去（见
-    /// <see cref="StageProgress.CheckingBytes"/>）。归档还不存在的那几段（去重预筛整读源文件、
-    /// 一箱压缩**前**的逐成员 stat）省略即可——那时池子里一个字节都还没有。</param>
+    /// <param name="bytes">Bytes of the archive being checked that are **already on disk**, subtracted out of staged (see
+    /// <see cref="StageProgress.CheckingBytes"/>). Just omit it for the phases where the archive does not exist yet (dedup pre-screening's full read of the source file,
+    /// a pack's per-member stat **before** compression) — at that point there is not a single byte in the pool.</param>
     public void BeginChecking(long bytes = 0)
     {
         Interlocked.Increment(ref _inChecking);
@@ -605,8 +605,8 @@ public sealed class StageTracker(
             PublishIfDue(force: true);
     }
 
-    /// <param name="bytes">必须和配对的 <see cref="BeginChecking"/> 传同一个数——少还一次，
-    /// 这一栏就在余下的运行里挂着一笔永不消失的账，而待传那一栏跟着永久少报。</param>
+    /// <param name="bytes">Must pass the same number as the paired <see cref="BeginChecking"/> — miss one repayment and
+    /// this column carries an entry that never goes away for the rest of the run, with the staged column permanently under-reporting along with it.</param>
     public void EndChecking(long bytes = 0)
     {
         Interlocked.Decrement(ref _inChecking);
@@ -616,17 +616,17 @@ public sealed class StageTracker(
             PublishIfDue(force: true);
     }
 
-    /// <summary>登记一个在途的传输对象。上传阶段登记的是**卷**（<c>data/xxx.007</c>），
-    /// 不是件——界面上那个 "N uploading" 要回答的是"网线上现在有几条流"。
+    /// <summary>Register an in-flight transfer object. The upload stage registers **volumes** (<c>data/xxx.007</c>),
+    /// not items — what the UI's "N uploading" has to answer is "how many streams are on the wire right now".
     /// <para>
-    /// 空→非空这一下同时开启测速时钟：在此之前的压缩与排队不算进速度的分母。
-    /// 集合的增删挪进锁里，是为了让"是不是空的"与时钟开关在同一个临界区内定下来。
+    /// The empty→non-empty transition also starts the speed clock: the compression and queueing before it do not enter the speed denominator.
+    /// The collection's add/remove was moved inside the lock so that "is it empty" and the clock switch are settled in the same critical section.
     /// </para></summary>
-    /// <param name="label">给人看的名字（上传阶段传**源文件路径**，不是内容寻址的 blob 名）。
-    /// 省略时退回用 key 本身，与从前的行为一致。</param>
-    /// <param name="totalBytes">这一条一共多少字节；0 = 未知（下载在拿到响应头前不知道）。</param>
-    /// <param name="owner">这一卷属于哪一族（<see cref="BeginUpload"/> 的 blobRef）。上传侧必传——
-    /// 它决定这一卷的字节记进哪本账；下载侧与不走上传闸门的路径省略即可。</param>
+    /// <param name="label">The human-facing name (the upload stage passes the **source file path**, not the content-addressed blob name).
+    /// Omitted, it falls back to the key itself, matching the previous behavior.</param>
+    /// <param name="totalBytes">Total bytes of this stream; 0 = unknown (a download does not know until the response headers arrive).</param>
+    /// <param name="owner">Which family this volume belongs to (<see cref="BeginUpload"/>'s blobRef). Mandatory on the upload side —
+    /// it decides which ledger this volume's bytes go into; the download side and paths that skip the upload gate can just omit it.</param>
     public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null)
     {
         lock (_gate)
@@ -642,29 +642,29 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 造一个交给上传器的进度回调：把「本次调用内的累计字节」转成增量，边传边累加进本阶段的字节数。
-    /// **每个上传项各要一个**——累计基线是 per-call 的，共用一个实例会把别人的进度当成回退。
+    /// Build a progress callback to hand to the uploader: it turns "cumulative bytes within this call" into deltas and adds them to the stage's byte count as the transfer runs.
+    /// **One per upload item** — the cumulative baseline is per-call, and sharing one instance makes somebody else's progress look like a rewind.
     /// <para>
-    /// 用它的项在结束时应当调 <c>EndItem(item, 0)</c>：字节已经在传输过程中逐笔计过了，
-    /// 收尾再加一次总量就是双计。
+    /// Items that use it should call <c>EndItem(item, 0)</c> when they end: the bytes were already counted piece by piece during the transfer,
+    /// so adding the total again at wrap-up is double counting.
     /// </para>
     /// </summary>
-    /// <param name="item">对应 <see cref="BeginItem"/> 的 key：这一笔字节要记到那一条流的账上，
-    /// 界面才显示得出「这一条传了多少 / 一共多大」。省略则只累加阶段总字节，不落到具体某条流上。</param>
+    /// <param name="item">The key matching <see cref="BeginItem"/>: these bytes are booked against that stream's ledger,
+    /// which is what lets the UI show "how much this one sent / how big it is". Omitted, it only accumulates the stage total and lands on no particular stream.</param>
     public IProgress<long> ItemProgress(string? item = null) =>
         new DeltaProgress((delta, attemptCumulative) => AddBytes(item, delta, attemptCumulative));
 
     /// <summary>
-    /// 记一笔字节。**两个口径，两个数**，刻意不共用：
+    /// Book some bytes. **Two units, two numbers**, deliberately not shared:
     /// <list type="bullet">
-    /// <item>阶段总量按**增量**累加——它是测速的分子，重传的字节要再算一次，那些字节确实又过了
-    /// 一遍网线，当下的网速就是这么快。</item>
-    /// <item>这一条流自己的读数按**本次尝试的累计值**赋值——它是界面上「传了多少 / 一共多大」的
-    /// 分子，跟分母（这一卷的标称大小）同口径。重试整卷重来时它跟着退回去。</item>
+    /// <item>The stage total accumulates by **delta** — it is the numerator for the speed, and retransmitted bytes have to count again, because those bytes really did cross
+    /// the wire a second time and that is how fast the network is right now.</item>
+    /// <item>This stream's own reading is assigned from **this attempt's cumulative value** — it is the numerator of the UI's "how much sent / how big",
+    /// on the same footing as the denominator (this volume's nominal size). When a retry restarts the whole volume, it rewinds along with it.</item>
     /// </list>
-    /// 从前两处共用同一个增量，于是重传会把分子推过分母：实测出现过
-    /// <c>DJI_0032.MP4 (30/36) — 200.0 MB / 100.0 MB · 100%</c>（百分比被夹在 100 上，
-    /// 两个字节数却明摆着矛盾），而那一卷随后正常传完了。
+    /// The two used to share one delta, so a retransmit pushed the numerator past the denominator: we measured
+    /// <c>DJI_0032.MP4 (30/36) — 200.0 MB / 100.0 MB · 100%</c> in the field (the percentage clamped at 100 while
+    /// the two byte counts plainly contradicted each other), and that volume then transferred just fine.
     /// </summary>
     private void AddBytes(string? item, long delta, long attemptCumulative)
     {
@@ -678,13 +678,13 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// SDK 报的是本次上传调用内的累计值，而我们的 <see cref="RetryPolicy"/> 重试会让它从 0 重来
-    /// （多卷上传同理，每卷各自从 0 开始）。回退一律按「重新开始」处理，两个数一起交出去：
-    /// 增量（重传的算新流量）与本次尝试的累计值（重传的退回去），用途见 <see cref="AddBytes"/>。
+    /// The SDK reports a cumulative value within one upload call, and our <see cref="RetryPolicy"/> retries make it restart from 0
+    /// (same for multi-volume uploads, where each volume starts from 0 on its own). A rewind is uniformly treated as "start over", and both numbers are handed out together:
+    /// the delta (retransmits count as new traffic) and this attempt's cumulative value (retransmits rewind); see <see cref="AddBytes"/> for what each is for.
     /// <para>
-    /// 分块并行上传时 <see cref="Report"/> 会被并发调用，所以要上锁；回调也在锁内发，
-    /// 「算」与「落账」得是同一笔——放到锁外的话两笔回调可能乱序到达，后到的那个旧累计值
-    /// 会把新的盖回去，界面上就是往回跳。
+    /// With chunked parallel uploads <see cref="Report"/> is called concurrently, hence the lock; the callback is fired inside the lock too,
+    /// because "compute" and "book" have to be one transaction — outside the lock two callbacks could arrive out of order and the later one's stale cumulative value
+    /// would overwrite the newer one, which on screen is a jump backwards.
     /// </para>
     /// </summary>
     private sealed class DeltaProgress(Action<long, long> onProgress) : IProgress<long>
@@ -699,39 +699,39 @@ public sealed class StageTracker(
                 var delta = cumulative >= _last ? cumulative - _last : cumulative;
                 var restarted = cumulative < _last;
                 _last = cumulative;
-                // delta == 0 时也要放行**回退**：重试从 0 重来的那一下增量正好是 0，
-                // 而这一条流的读数恰恰要在那一刻退回去，吞掉它界面就停在旧数字上。
+                // Let a **rewind** through even when delta == 0: the moment a retry restarts from 0 the delta is exactly 0,
+                // and that is precisely the moment this stream's reading has to rewind; swallow it and the UI stays on the old number.
                 if (delta > 0 || restarted)
                     onProgress(delta, cumulative);
             }
         }
     }
 
-    /// <summary>一个在途项结束：移出在途集合并累加字节，**不计数**。
-    /// 计数归 <see cref="Advance"/> 专管——上传的槽位计数有"恰好一次"的精确约束
-    /// （一个 pack 可能因成员变化被重压多次，却始终只占 total 里的一个槽位），
-    /// 在这里顺手加一次就会重复计数，进度条会冲过 100%。
-    /// <para>最后一条流收工时把这一段活跃时长落账，测速时钟就此停下，直到下一条流开起来。</para></summary>
+    /// <summary>An in-flight item ends: remove it from the in-flight set and add its bytes, **without counting**.
+    /// Counting belongs solely to <see cref="Advance"/> — the upload's slot counting has an exact "exactly once" constraint
+    /// (a pack may be repacked several times because its members changed, yet it always occupies just one slot in total),
+    /// and bumping it here on the side would double count and push the progress bar past 100%.
+    /// <para>When the last stream finishes, this active segment's duration is booked and the speed clock stops there until the next stream opens.</para></summary>
     public void EndItem(string item, long bytes)
     {
         lock (_gate)
         {
             if (_active.TryRemove(item, out var flow))
             {
-                // 这一条走完了：把它的字节从"在途"挪进"已传"。界面上那个"已传"要能回答
-                // "有多少已经**稳稳落在云上**"，所以在途的部分一律不算进去，走完才认。
-                // 有件级权威读数时（SetTransferred）这里让位——**按卷**累加与按件销账的
-                // 工作量不同步，两个数字摆在一起就读不成话，原委见 SetTransferred。
-                // 让位不等于把这批字节丢掉：它们确实已经在云上了，先记进**它自己那一族**的账，
-                // 等整件完成时并入（见 _unfinished）。记标称大小（Total）而不是 Sent：后者是
-                // 最后一次尝试推到的位置，失败/取消路径上停在半截。从前这个差额会留下漂移，
-                // 现在作废的族整条抹掉，记哪个都不会积账——记 Total 纯粹因为它才是这一卷的真实大小。
-                // Sent == 0 表示这一卷根本没上网线（if-missing 撞上已有的 blob），件级账也不会计它，
-                // 所以这里同样不加。
+                // This stream is done: move its bytes from "in flight" into "transferred". The UI's "transferred" has to be able to answer
+                // "how much has **landed safely in the cloud**", so the in-flight part never counts; only what finished does.
+                // When an authoritative per-item reading exists (SetTransferred) this steps aside — **per-volume** accumulation and per-item
+                // write-off of workload are out of sync, and the two numbers side by side do not read as a sentence; see SetTransferred for the reasoning.
+                // Stepping aside does not mean throwing these bytes away: they really are in the cloud, so they are first booked into **their own family's** ledger
+                // and folded in when the whole item completes (see _unfinished). We book the nominal size (Total) rather than Sent: the latter is
+                // wherever the last attempt pushed to, stopping halfway on the failure/cancel paths. That difference used to leave drift behind;
+                // now a voided family's entry is wiped whole, so neither choice accumulates a balance — booking Total is purely because it is this volume's real size.
+                // Sent == 0 means this volume never hit the wire at all (if-missing ran into an existing blob), and the per-item ledger will not count it either,
+                // so we do not add it here either.
                 if (_transferredByItem)
                 {
-                    // owner 为 null = 上传侧漏传了族名。宁可这一卷不进账（这一栏少报），
-                    // 也不能凭空造一条没人认领、没人删得掉的账——那正是从前那个漂移的形状。
+                    // owner null = the upload side forgot to pass the family name. Better to leave this volume out of the ledger (this column under-reports)
+                    // than to conjure an entry nobody owns and nobody can delete — that is exactly the shape of the old drift.
                     if (flow.Owner is { } owner && _unfinished.TryGetValue(owner, out var family))
                         family.Bytes += flow.Sent > 0 ? (flow.Total > 0 ? flow.Total : flow.Sent) : 0;
                 }
@@ -749,40 +749,40 @@ public sealed class StageTracker(
         }
     }
 
-    /// <summary>心跳的一拍：重算一次测速窗口并上报。卡住的流不产生任何事件，
-    /// 没有它，速度会一直冻在卡住前的数字上。</summary>
+    /// <summary>One heartbeat tick: recompute the speed window and publish. A stalled stream produces no events at all,
+    /// and without this the speed would stay frozen at whatever number it read before the stall.</summary>
     internal void Tick()
     {
         lock (_gate)
         {
-            // 阶段已经收尾：Complete() 发过的终态快照就是界面该看到的最后一条。
-            // Dispose() 不能撤回一个已经在排队或正在跑的回调，它排到这把锁时 Complete()
-            // 早就放行了——不挡住的话，终态之后还会再冒出一条，把"最后一条是真终态"的承诺破了。
+            // The stage has already wrapped up: the final snapshot published by Complete() is the last thing the UI should see.
+            // Dispose() cannot recall a callback already queued or already running, and by the time it reaches this lock Complete()
+            // has long since let go — without this guard another snapshot would appear after the final one, breaking the promise that "the last one is the real final state".
             if (_completed)
                 return;
-            // 一条流都没开：这段时间本就不进分母，也没有新东西可报。
-            // 这条与上面那条是两回事：即便阶段没收尾，虚拟时钟冻着的时候采样也不能进——
-            // 冻着的采样全带同一个时间戳，永远挤不出 _samples 窗口。
+            // Not a single stream is open: this time does not enter the denominator anyway, and there is nothing new to report.
+            // This is a different matter from the one above: even when the stage has not wrapped up, samples must not go in while the virtual clock is frozen —
+            // frozen samples all carry the same timestamp and can never be squeezed out of the _samples window.
             if (speedWhileInFlight && _activeSince < 0)
                 return;
             PublishIfDue(force: false);
         }
     }
 
-    /// <summary>随活跃段启停心跳。必须在 <c>_gate</c> 内调用。
-    /// 注入了时钟＝单测在手工驱动 <see cref="Tick"/>，此时不叠一个真定时器上去，结果才确定。</summary>
+    /// <summary>Start/stop the heartbeat along with the active segment. Must be called while holding <c>_gate</c>.
+    /// An injected clock = a unit test is driving <see cref="Tick"/> by hand, and not stacking a real timer on top of that is what makes the result deterministic.</summary>
     private void Heartbeat(bool on)
     {
         if (Clock is not null)
             return;
         if (on)
         {
-            // 心跳跑在线程池定时器线程上，没有调用方能接住它抛出的异常——顶到运行时手里，
-            // .NET 的默认行为是直接打掉整个进程。这条回调经 Task 3 之后会挂在 RestoreOrchestrator/
-            // BackupChecker 传进来的 onProgress 上，那是调用方自己的代码，出故障的概率不为零。
-            // 进度上报只是锦上添花的旁路，宁可丢这一拍也不能把正在跑的备份/还原/校验拖下水一起死，
-            // 所以这里必须吞掉——其余路径（Advance/Touch/EndItem 等）都在调用方线程上跑，
-            // 异常能传回能处理它的人，那些地方**不**该照抄这个 catch。
+            // The heartbeat runs on a thread-pool timer thread, where no caller can catch what it throws — it lands in the runtime's hands, and
+            // .NET's default behavior there is to take down the entire process. After Task 3 this callback hangs off the onProgress passed in by RestoreOrchestrator/
+            // BackupChecker, which is the caller's own code, and its chance of failing is not zero.
+            // Progress reporting is a nice-to-have side path; better to lose this tick than to drag a running backup/restore/verify down to die with it,
+            // so it must be swallowed here — every other path (Advance/Touch/EndItem, etc.) runs on the caller's thread where
+            // the exception can propagate back to someone who can handle it, and those places should **not** copy this catch.
             _heartbeat ??= new Timer(_ =>
             {
                 try
@@ -791,21 +791,21 @@ public sealed class StageTracker(
                 }
                 catch
                 {
-                    // 见上面的注释：故意吞掉，别把定时器线程的异常带到进程头上。但吞完不能就此
-                    // 当没事发生——如果什么都不做，下一拍还会原样再跑一次 Tick()，publish 大概率
-                    // 还是那个坏掉的 sink，于是异常每秒发生一次、每次都被悄悄吃掉，整条跟踪器
-                    // 剩下的生命周期里全程隐身重试，没有任何痕迹能让人发现进度上报早就废了。
-                    // 两个更极端的做法都想过：什么都不做＝原样重试，就是刚说的隐身循环；
-                    // 往外抛＝顶到 .NET 默认行为直接打掉整个进程，让一条"锦上添花"的旁路
-                    // 拖死正在跑的备份/还原/校验，比吞掉还糟。折中是停表：一个刚失败的 sink
-                    // 大概率还是坏的，重试不会有产出，不如先撤下来——只停这一个 tracker 的
-                    // 心跳，不影响其余状态变化路径（Advance/Touch/EndItem 等）照常在调用方
-                    // 线程上跑，异常照常传给能处理它的人，那些地方不该照抄这个 catch。
-                    // 注意这不是永久停用：StopHeartbeat 把 _heartbeat 置回 null，而 Heartbeat(on:true)
-                    // 是 `??=`，所以**下一个活跃段**开始时会重新建表再试一次。要的正是这个粒度——
-                    // 从"每秒一次"降到"每段一次"，既止住隐身循环，sink 恢复了也能自己续上。
-                    // Tick() 抛出时锁已经在它自己的 try 块里被释放（lock 语句的 finally 语义），
-                    // 这里重新拿一次 _gate 是安全的，不会自锁。
+                    // See the comment above: swallowed on purpose, do not let a timer-thread exception reach the process. But having swallowed it we cannot
+                    // act as if nothing happened — do nothing and the next tick runs Tick() exactly the same way, publish is most likely
+                    // still that broken sink, so the exception happens once a second and is quietly eaten every time, and the whole tracker
+                    // spends the rest of its life retrying invisibly, with no trace for anyone to notice that progress reporting died long ago.
+                    // Both more extreme options were considered: do nothing = retry unchanged, which is the invisible loop just described;
+                    // rethrow = hit .NET's default behavior and take down the entire process, letting a "nice-to-have" side path
+                    // kill a running backup/restore/verify, which is worse than swallowing. The middle ground is stopping the timer: a sink that just failed
+                    // is most likely still broken, retrying will produce nothing, so it is better to pull it out first — this stops only this tracker's
+                    // heartbeat and does not affect the other state-change paths (Advance/Touch/EndItem, etc.), which keep running on the caller's
+                    // thread with exceptions still handed to someone who can handle them; those places should not copy this catch.
+                    // Note this is not a permanent shutdown: StopHeartbeat sets _heartbeat back to null, and Heartbeat(on:true)
+                    // is a `??=`, so the **next active segment** builds a new timer and tries again. That granularity is exactly what we want —
+                    // from "once a second" down to "once a segment", which both stops the invisible loop and lets it pick itself back up if the sink recovers.
+                    // When Tick() throws, the lock was already released inside its own try block (the lock statement's finally semantics),
+                    // so re-taking _gate here is safe and will not self-deadlock.
                     lock (_gate)
                     {
                         StopHeartbeat();
@@ -824,16 +824,16 @@ public sealed class StageTracker(
         _heartbeat = null;
     }
 
-    /// <summary>阶段收尾：无条件产出一次，把进度落到实处，并停掉心跳。</summary>
+    /// <summary>Wrap up the stage: publish once unconditionally so the progress is settled, and stop the heartbeat.</summary>
     public void Complete()
     {
         lock (_gate)
         {
             _current = null;
-            // PublishIfDue 若抛出（比如 publish 回调本身坏了），下面两句收尾动作不能跟着漏掉——
-            // 漏了 _completed=true，Tick() 会把这个"本该已经收尾"的阶段当成还活着继续处理；
-            // 漏了 StopHeartbeat()，定时器留着继续跑，成了没人管的泄漏。两句都只是内存里的
-            // 状态清理，不会自己再抛第二次异常，包一层 finally 就能把它们从"跟着陪葬"里摘出来。
+            // If PublishIfDue throws (say the publish callback itself is broken), the two wrap-up lines below must not be skipped along with it —
+            // skip _completed=true and Tick() will treat a stage that "should already have wrapped up" as still alive and keep processing it;
+            // skip StopHeartbeat() and the timer stays running as an unowned leak. Both lines are pure in-memory
+            // state cleanup and cannot throw a second exception of their own, so one layer of finally is enough to spare them from going down with the ship.
             try
             {
                 PublishIfDue(force: true);
@@ -846,9 +846,9 @@ public sealed class StageTracker(
         }
     }
 
-    /// <summary>这一栏的读数：所有还没并进 uploaded 的族之和。同时在传的族最多
-    /// <c>UploadConcurrency + 1</c> 个（按件龄仲裁之后通常就一个），这个求和永远是个位数项。
-    /// 调用方须持 <c>_gate</c>。</summary>
+    /// <summary>This column's reading: the sum over every family not yet folded into uploaded. At most
+    /// <c>UploadConcurrency + 1</c> families transfer at once (usually just one after item-age arbitration), so this sum always has a single-digit number of terms.
+    /// The caller must hold <c>_gate</c>.</summary>
     private long UnfinishedBytes()
     {
         long sum = 0;
@@ -864,11 +864,11 @@ public sealed class StageTracker(
             return;
         _lastPublishMs = now;
 
-        // 节流用墙钟（它管的是"多久刷一次界面"），测速用虚拟轴（它管的是"这些字节花了多少传输时间"）。
+        // Throttling uses the wall clock (it governs "how often to refresh the UI"), the speed uses the virtual axis (it governs "how much transfer time these bytes took").
         var tick = SpeedNow(now);
         _samples.Enqueue((tick, _bytes));
-        // 按时间淘汰（正路）之外再加一条按数量硬淘汰：虚拟时钟冻结期间所有采样共享同一个
-        // Ms，第一个条件永远不成立，队列只能靠这条兜住上限（见 MaxSamples 上的注释）。
+        // Besides time-based eviction (the main path), a hard count-based eviction: while the virtual clock is frozen all samples share the same
+        // Ms, the first condition never holds, and only this clause caps the queue (see the comment on MaxSamples).
         while (_samples.Count > 1 && (tick - _samples.Peek().Ms > SpeedWindowMs || _samples.Count > MaxSamples))
             _samples.Dequeue();
 
@@ -881,30 +881,30 @@ public sealed class StageTracker(
                 speed = (_bytes - oldest.Bytes) * 1000 / spanMs;
         }
 
-        // 几个计数各自独立推进，读到的是错开半拍的快照——不夹到 0 以上，界面上就会闪出负数。
+        // The several counters advance independently, so what we read is a snapshot half a beat out of step — without clamping at 0 the UI would flash negative numbers.
         var inWork = Volatile.Read(ref _inWork);
         var preparing = Math.Max(0, Volatile.Read(ref _inPacking));
-        // 没开工的 = 还在队列里、没被任何线程领走的。已领走但在排归档锁的那些从这里分了出去
-        // （waitingOnArchive），理由见 StageProgress.WaitingOnArchive。
-        // 刻意**不**用「入队 - 完成 - 在压 - 在传」那个减法：压完到开传之间还有一段实打实的活
-        // （pack 逐成员重新 Stat、单文件查去重映射，去重命中的甚至根本不上传），减法会把它们
-        // 全报成"排队中"——把正在干活的说成在排队，比原先那个虚高的 preparing 更误导。
-        // 那段活里最耗时的几处如今各自登记成 _inChecking，在界面上单列一栏（见 StageProgress.Checking）；
-        // 这里的算法不变——它们照样属于 uploading，checking 只是它的细分。
-        // 在暂存段里、又没拿到锁的那些：全排在归档锁后面。单列一栏，**不**并进 queued——
-        // 并发跑两个备份时那把锁可能整段在别人手里，而 queued 说不出这件事（见 WaitingOnArchive）。
+        // Not started = still in the queue, picked up by no thread. Those already picked up but queueing for the archive lock are split out of here
+        // (waitingOnArchive); see StageProgress.WaitingOnArchive for the reason.
+        // Deliberately **not** the "enqueued - done - packing - uploading" subtraction: between the end of packing and the start of the transfer there is real work
+        // (a pack re-Stats every member, a single file looks up the dedup map, and a dedup hit does not even upload), and the subtraction would report all of it
+        // as "queued" — calling items that are working queued is more misleading than the inflated preparing it replaced.
+        // The most time-consuming parts of that work now register as _inChecking and get their own column in the UI (see StageProgress.Checking);
+        // the arithmetic here is unchanged — they still belong to uploading, and checking is merely a subdivision of it.
+        // Those inside staging that have not got the lock: all queueing behind the archive lock. Its own column, **not** folded into queued —
+        // with two backups running concurrently that lock can be in someone else's hands the whole time, and queued cannot say that (see WaitingOnArchive).
         var waitingOnArchive = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
 
-        // 在途快照。各条流的已传字节是并发更新的，这里取的是同一瞬的读数，
-        // 下面那个减法也用同一批值——分两次读会让"待传"偶尔算出个负数再被夹回 0，界面上就是跳。
+        // In-flight snapshot. Each stream's sent bytes are updated concurrently, so what we take here are readings from a single instant,
+        // and the subtraction below uses the same batch of values — reading twice would occasionally make "staged" compute a negative that gets clamped back to 0, which on screen is a jump.
         var inFlight = _active.Values
             .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total))
             .ToList();
-        // 待传池子里还没送出去的：池子占用 − 在途那几条已经传走的部分（它们还整个躺在池子里，
-        // 逐卷释放要传完才删）− 还卡在核对里、没资格上路的那些归档。三者互不重叠：
-        // 核对整段发生在第一卷起飞之前，所以一份归档不可能同时被后两个减法碰到。
-        // 不减就会在这里和 ActiveItems / CheckingBytes 里把同一批字节数两遍。
+        // Not yet shipped out of the staging pool: pool occupancy − the part of the in-flight streams already sent (those volumes still lie in the pool in full,
+        // since per-volume release deletes only after the transfer) − the archives still stuck in checking and not cleared to travel. The three never overlap:
+        // checking happens entirely before the first volume takes off, so one archive cannot be hit by both of the latter two subtractions.
+        // Without the subtraction the same bytes get counted twice here and in ActiveItems / CheckingBytes.
         var checkingBytes = Math.Max(0, Volatile.Read(ref _checkingBytes));
         var staged = stagedBytes is null
             ? 0
@@ -914,14 +914,14 @@ public sealed class StageTracker(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
             Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(), staged,
             Volatile.Read(ref _transferTotal), Interlocked.Read(ref _spilled),
-            // 已经离开压缩/暂存段的件数 = 手上的件 - 还在暂存段的件。
+            // Items that have left the compression/staging phase = items in hand - items still in staging.
             //
-            // 刻意**不**用 _inUpload（BeginUpload/EndUpload 那一对）：它从 UploadStagedBlobAsync
-            // 才开始算，而压完之后到那里之间还隔着预约协调——一件活能在那儿卡上几分钟，
-            // 却不在 _inUpload 里。用它当口径，件数账在最需要对得上的时候恰好对不上，
-            // 而账对不上正是这一栏存在的理由。这个减法把那段空隙一并算了进来，于是
-            // processed + preparing + queued + waitingOnArchive + uploading ≡ total 是个恒等式，
-            // 不依赖任何调用位置。
+            // Deliberately **not** _inUpload (the BeginUpload/EndUpload pair): that only starts counting at UploadStagedBlobAsync,
+            // and between the end of packing and getting there lies the reservation coordination — an item can stall there for minutes
+            // while not being in _inUpload. Use that as the unit and the item ledger fails to balance exactly when balancing matters most,
+            // and a ledger that does not balance is the very reason this column exists. This subtraction folds that gap in as well, so
+            // processed + preparing + queued + waitingOnArchive + uploading ≡ total is an identity,
+            // independent of any call site.
             Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
@@ -931,23 +931,23 @@ public sealed class StageTracker(
     }
 
     /// <summary>
-    /// 剩余时间 = 已开工时长 × 剩余量 ÷ 已完成量。也就是拿**本阶段全程的平均进度**外推，
-    /// 而不是拿最近 10 秒的网速——后者在"压一箱几十秒、传几秒"的节奏下会在 0 和峰值之间来回跳，
-    /// 而压缩那几十秒同样是剩余时间的一部分，全程平均天然把它算进去了。
+    /// Remaining time = elapsed working time × remaining amount ÷ completed amount. That is, extrapolate from **this stage's whole-run average progress**
+    /// rather than from the last 10 seconds of network speed — the latter swings between 0 and peak under the "pack for tens of seconds, transfer for a few" rhythm,
+    /// while those tens of seconds of compression are just as much part of the remaining time, which the whole-run average accounts for naturally.
     /// <para>
-    /// 「量」优先用申报的工作量（上传阶段＝原始字节）；没人申报就退回件数。
-    /// 上传阶段非用字节不可：一件活可能是 100 GB 的单文件，也可能是一箱几百个 5 KB 的小文件，
-    /// 按件数外推等于把它们当成一样重。反过来 diff 阶段件数才对——那里绝大多数条目只 stat 一下就过。
+    /// The "amount" prefers the declared workload (upload stage = original bytes); with nobody declaring one, it falls back to item counts.
+    /// The upload stage has no choice but to use bytes: one item can be a single 100 GB file or a pack of several hundred 5 KB files,
+    /// and extrapolating by item count treats them as equally heavy. Conversely the diff stage is right to use item counts — there, the vast majority of entries pass with a single stat.
     /// </para>
     /// <para>
-    /// 已知的粗糙之处：在途那一件的进度不算数（完工才一次性销账）。只剩一个 100 GB 文件在传时，
-    /// 剩余时间会一路涨到它传完才掉下来。要修得把在途项的部分进度也折算进来，那需要每一项的
-    /// 预期总量（压完才知道），代价比收益大——先让它在"多件活"的常态下准。
+    /// A known rough edge: the progress of the in-flight item does not count (write-off happens all at once at completion). When only one 100 GB file is left transferring,
+    /// the remaining time climbs the whole way and only drops once it finishes. Fixing that means folding in the partial progress of in-flight items, which requires each item's
+    /// expected total (known only after packing) — more cost than benefit, so let it be accurate in the normal "many items" case first.
     /// </para>
     /// </summary>
     private double? Eta(long now)
     {
-        if (_total <= 0)   // 总数还没定下来（diff 还在往队列里塞活）——分母都没有，别猜
+        if (_total <= 0)   // The total is not settled yet (diff is still stuffing work into the queue) — no denominator at all, do not guess
             return null;
 
         var totalWork = Volatile.Read(ref _totalWork);
@@ -963,12 +963,12 @@ public sealed class StageTracker(
         return (double)elapsedMs * (total - done) / done / 1000;
     }
 
-    /// <summary>停掉心跳。阶段收尾时 <see cref="Complete"/> 已经做过一次；异常路径漏掉也不要紧——
-    /// 三处在途登记都在 <c>finally</c> 里成对调 <see cref="EndItem"/>，最后一条流一结束心跳就已停了。
+    /// <summary>Stop the heartbeat. <see cref="Complete"/> already did it once when the stage wrapped up; missing it on an exception path does not matter —
+    /// all three in-flight registrations call <see cref="EndItem"/> pairwise in a <c>finally</c>, and the heartbeat already stopped the moment the last stream ended.
     /// <para>
-    /// 与 <see cref="Complete"/> 一样要先置 <see cref="_completed"/>：单单停表并不能挡住已经排上
-    /// 线程池、Dispose 也叫不停的那一拍回调，留着这条缝就是白留——<see cref="Tick"/> 靠的正是
-    /// 这个标记，不是靠表停没停。
+    /// As in <see cref="Complete"/>, set <see cref="_completed"/> first: stopping the timer alone cannot block the one tick of callback already queued on
+    /// the thread pool that Dispose cannot call back, and leaving that crack open defeats the purpose — <see cref="Tick"/> relies on exactly
+    /// this flag, not on whether the timer stopped.
     /// </para></summary>
     public void Dispose()
     {

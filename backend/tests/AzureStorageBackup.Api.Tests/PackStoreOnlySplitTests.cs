@@ -7,16 +7,19 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 「不压缩」规则对**被打包的**小文件也要生效。
+/// The "do not compress" rule has to apply to **packed** small files too.
 /// <para>
-/// 从前 <c>CompressPackAsync</c> 把 storeOnly 硬编码成 false，规则只对单文件 blob 起作用：
-/// 一个目录里小于阈值的 jpg/mp4/已压缩归档照样被 <c>-mx9</c> 啃一遍，纯浪费 CPU。现在规划器
-/// 按可压缩性把同一目录切成两箱，压法随箱走到 7z。
+/// <c>CompressPackAsync</c> used to hard-code storeOnly to false, so the rule only affected single-file blobs:
+/// jpg/mp4/already-compressed archives under the threshold in a directory still got chewed through by
+/// <c>-mx9</c>, pure wasted CPU. The planner now splits one directory into two packs by compressibility, and
+/// the compression mode rides along with the pack all the way down to 7z.
 /// </para>
 /// <para>
-/// 尺寸断言而非参数断言：内容是高度可压的同一字符重复，<c>-mx0</c> 与 <c>-mx9</c> 的归档差
-/// 三个数量级，不会卡在边界上。pack 一定要过 7z（多成员），所以不必像单文件那条路那样必须加密
-/// 才测得到——未加密的 store-only **单文件**走原始直传（CopyRawAsync），根本不过 7z。
+/// Asserting on size rather than on arguments: the content is a highly compressible repeat of one character, so
+/// the archives from <c>-mx0</c> and <c>-mx9</c> differ by three orders of magnitude and never sit near a
+/// boundary. A pack always goes through 7z (multiple members), so unlike the single-file path this needs no
+/// encryption to be observable — an unencrypted store-only **single file** takes the raw passthrough
+/// (CopyRawAsync) and never touches 7z.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -25,7 +28,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-    /// <summary>高度可压：-mx9 压完只剩几百字节，-mx0 原样保留 20 万。</summary>
+    /// <summary>Highly compressible: -mx9 leaves a few hundred bytes, -mx0 keeps all 200,000 as they are.</summary>
     private const int Filler = 200_000;
 
     private readonly string _base;
@@ -83,7 +86,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
     private static async Task<long> SizeOfAsync(BlobContainerClient container, string blobRef) =>
         (await container.GetBlobClient(blobRef).GetPropertiesAsync()).Value.ContentLength;
 
-    // ---- 用例 1：全新备份 ----
+    // ---- Case 1: a brand new backup ----
 
     [SkippableFact]
     public async Task A_Mixed_Directory_Is_Split_Into_A_Compressed_Pack_And_A_Store_Only_Pack()
@@ -108,8 +111,8 @@ public sealed class PackStoreOnlySplitTests : IDisposable
 
         try
         {
-            // 同一个目录，两种命运。内容不同：同内容会被内容寻址/成员去重合成一份，那样就只剩
-            // 一条路径可验了。
+            // One directory, two fates. Different content: identical content would be folded into a single copy
+            // by content addressing / member dedup, leaving only one path left to verify.
             Write(_src, "d/keep.log", new string('a', Filler));
             Write(_src, "d/comp.txt", new string('b', Filler));
 
@@ -121,7 +124,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
                 Name = "packsplit",
                 Options = new BackupEngineOptions
                 {
-                    // 阈值抬高，让这两个 20 万字节的文件都走分组打包而不是单文件 blob。
+                    // Threshold raised so both 200,000-byte files take the grouped-pack path instead of single-file blobs.
                     Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
                     DontCompress = new IgnoreRuleSet(["*.log"]),
                 },
@@ -133,7 +136,8 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             var stored = Assert.Single(info.Packs.Values, p => p.StoreOnly);
             var compressed = Assert.Single(info.Packs.Values, p => !p.StoreOnly);
 
-            // 压法真的落到了 7z 上：只存的那一箱几乎就是原文件大小，压缩的那一箱小三个数量级。
+            // The compression mode really reached 7z: the store-only pack is almost exactly the original file
+            // size, the compressed one three orders of magnitude smaller.
             var storedSize = await SizeOfAsync(container, stored.Blob);
             var compressedSize = await SizeOfAsync(container, compressed.Blob);
             Assert.True(storedSize > Filler * 0.9,
@@ -141,7 +145,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             Assert.True(compressedSize < Filler / 10,
                 $"compressed pack should be far smaller than the original, was {compressedSize}");
 
-            // 两个文件确实分属两箱，且各自进了对的那一箱。
+            // The two files really landed in two different packs, each in the right one.
             var idx = await store.ReadIndexAsync(account, name, info.Versions.Single().IndexBlob, null);
             var logRef = idx.Entries.Single(e => e.Path == "d/keep.log").Storage!;
             var txtRef = idx.Entries.Single(e => e.Path == "d/comp.txt").Storage!;
@@ -151,7 +155,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             Assert.Equal($"packs/{logRef.Ref}.7z", stored.Blob);
             Assert.Equal($"packs/{txtRef.Ref}.7z", compressed.Blob);
 
-            // 只存的那一箱照样解得开、内容一字不差——store-only 不是"没存好"。
+            // The store-only pack still extracts, byte for byte — store-only does not mean "stored badly".
             var work = Path.Combine(_temp, "x" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(work);
             var first = await VolumeBlobIO.DownloadAsync(container, stored.Blob, work, CancellationToken.None);
@@ -164,12 +168,14 @@ public sealed class PackStoreOnlySplitTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    // ---- 用例 2：版本退役后的死重压实 ----
+    // ---- Case 2: dead-weight compaction after a version retires ----
 
     /// <summary>
-    /// 压实是**原地重写**同一个 packId 的归档，而它手上只有存活成员和一个包号、没有当初那份规则。
-    /// 压法必须从 <see cref="PackInfo.StoreOnly"/> 取回来，否则一个只存不压的包挨过一次版本退役
-    /// 就被重压成默认压法了——而压实是保留清理之后自动跑的，没有任何人会看见这次改变。
+    /// Compaction **rewrites in place** the archive under the same packId, and all it holds is the surviving
+    /// members and a pack id — not the rule set from back then. The compression mode must be read back from
+    /// <see cref="PackInfo.StoreOnly"/>, otherwise a store-only pack that survives one version retirement gets
+    /// recompressed with the default mode — and compaction runs automatically after retention cleanup, so nobody
+    /// ever sees the change happen.
     /// </summary>
     [SkippableFact]
     public async Task Compaction_Keeps_A_Store_Only_Pack_Store_Only()
@@ -184,7 +190,8 @@ public sealed class PackStoreOnlySplitTests : IDisposable
 
         try
         {
-            // 三个成员打成一个 store-only 包；随后只有 b、c 仍被引用（a 成死重，1/3 > 30% 触发压实）。
+            // Three members packed into one store-only pack; afterwards only b and c stay referenced
+            // (a becomes dead weight, 1/3 > 30% triggers compaction).
             Write(_packSrc, "a.log", new string('a', Filler));
             Write(_packSrc, "b.log", new string('b', Filler));
             Write(_packSrc, "c.log", new string('c', Filler));
@@ -225,7 +232,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
                 },
             };
 
-            // 存活成员在本地取得到 → 不必下载即可压实。
+            // The surviving members are available locally → compaction needs no download.
             Write(_local, "b.log", new string('b', Filler));
             Write(_local, "c.log", new string('c', Filler));
 
@@ -236,7 +243,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
                 account, container, null, info, live, AccessTier.Hot, null, threshold: 0.30,
                 _local, allowDownload: false, CancellationToken.None);
 
-            // 确实压实了（丢掉了 a），而且**仍然是只存不压**。
+            // It really compacted (a is gone), and it is **still store-only**.
             Assert.Equal(2, info.Packs["p0001"].Members.Count);
             Assert.True(info.Packs["p0001"].StoreOnly, "compaction must not clear the store-only flag");
             var after = await SizeOfAsync(container, "packs/p0001.7z");
