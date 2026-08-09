@@ -1,6 +1,7 @@
 import { api } from './client'
 
-// 7z 进程的 CPU 优先级。Lowest 是 0——后端枚举照着"加列时既有行填 0 就该落在最低档"排的。
+// The 7z process's CPU priority. Lowest is 0 — the backend enum is ordered so that adding the
+// column with 0 for existing rows lands them on the lowest tier.
 export const SevenZipCpuPriority = { Lowest: 0, BelowNormal: 1, Normal: 2 } as const
 
 export const sevenZipPriorityLabels: Record<number, string> = {

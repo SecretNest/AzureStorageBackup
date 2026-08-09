@@ -64,7 +64,7 @@ export function NotificationsSection() {
     }
   }
 
-  // 通知配置本质就是一项全局设置，所以作为 Settings 页里的一个分区，而不是自成一个顶级标签。
+  // Notification configuration is really just another global setting, so it is a section on the Settings page rather than a top-level tab of its own.
   return (
     <>
       <h2 style={{ marginTop: '2rem' }}>Notifications</h2>

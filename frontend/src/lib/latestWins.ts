@@ -1,17 +1,21 @@
-// 只让"最后发起的那一次"写状态的小闸门。抽成纯函数是为了能测：仓库没有组件渲染测试的基建
-// （见 localRootVerdict.ts 同款说明）。
+// A small gate that lets only the most recently started call write state. Extracted as a pure
+// function so it can be tested: the repository has no component-rendering infrastructure
+// (see the same note in localRootVerdict.ts).
 //
-// 为什么不用这个文件里到处都在用的 cancelled 标志：那个标志是 effect 的清理钩子在**卸载/重建**时
-// 掀掉自己那一次请求，管的是"组件还在不在"。这里要管的是另一回事——同一个刷新函数被两个互不相识的
-// 触发点（用户动作走的 load()、无人触发的 5 秒轮询）先后叫起来，两次请求同时在飞。谁先回来不由
-// 发起顺序决定：后发的那次可能先回，先发的那次后回，于是**旧快照盖掉新快照**，界面上就留着一条
-// 已经不存在的"中途停下的运行"，直到下一拍才被纠正过来。
+// Why not the `cancelled` flag used throughout this codebase: that flag is an effect's cleanup
+// discarding its own request on unmount or re-run, and it answers "does the component still
+// exist?". This answers something else — the same refresh function is started by two unrelated
+// triggers (a user action calling load(), and the unattended 5-second poll), leaving two requests
+// in flight. Which returns first is not decided by which started first: the later one can return
+// first and the earlier one second, so **an old snapshot overwrites a new one** and the UI keeps
+// showing a run that stopped midway until the next tick corrects it.
 //
-// 判据只能是"我还是不是最新的那一次"，所以要一个单调递增的号，而不是一个布尔。
+// The only workable predicate is "am I still the latest?", which needs a monotonically increasing
+// number rather than a boolean.
 export interface LatestWins {
   /**
-   * 开始一次新的请求，作废在它之前发起的每一次。
-   * @returns 一个断言：结果回来时调它，为 true 才允许写状态。
+   * Start a new request, invalidating every one started before it.
+   * @returns a predicate: call it when the result arrives; only true permits writing state.
    */
   begin(): () => boolean
 }

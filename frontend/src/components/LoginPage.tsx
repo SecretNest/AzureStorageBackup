@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { authApi } from '../api/auth'
 import { ApiError } from '../api/client'
 
-/** 预置密码登录页（设计 §6）。无用户名；文案一律英文。 */
+/** Preset-password login page (design §6). No username. */
 export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -17,8 +17,8 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
       setPassword('')
       onSignedIn()
     } catch (e) {
-      // 只有 401 才是「密码不对」。把网络故障/500 也说成密码错，会让人在故障期间
-      // 反复重打一个本来就正确的密码。
+      // Only a 401 means "wrong password". Reporting a network failure or a 500 as a bad password
+      // makes people retype a perfectly correct password over and over during an outage.
       if (e instanceof ApiError && e.status === 401) setError('Incorrect password.')
       else if (e instanceof ApiError)
         setError(`Sign-in failed: the server returned ${e.status}. Please try again.`)
@@ -36,8 +36,8 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
           <input
             type="password"
             name="password"
-            // 让密码管理器认得出这是登录框并愿意保存/填充——一串又长又随机的密码
-            // 只有在能被自动填充时才用得下去。
+            // Let password managers recognise this as a login form and offer to save or fill it —
+            // a long random password is only usable if it can be autofilled.
             autoComplete="current-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}

@@ -31,6 +31,6 @@ export const logsApi = {
     return api.get<LogEntry[]>(`/logs${qs ? `?${qs}` : ''}`)
   },
   clear: () => api.del('/logs'),
-  // 删除早于 cutoff（ISO）的全部日志（含长存审计）。
+  // Delete every log older than cutoff (ISO), durable audit entries included.
   purgeBefore: (cutoffIso: string) => api.del(`/logs?before=${encodeURIComponent(cutoffIso)}`),
 }

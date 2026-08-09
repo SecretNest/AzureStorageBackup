@@ -94,7 +94,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const poolKeys = new Set(pool.map(backupKey))
   const extraKeys = [...selected].filter((k) => !poolKeys.has(k))
 
-  // 组只被计划任务使用，所以作为 Tasks 页里的一个分区，而不是自成一个顶级标签。
+  // Groups are only used by scheduled tasks, so this is a section on the Tasks page rather than a top-level tab of its own.
   return (
     <>
       <div className="page-header" style={{ marginTop: '2rem' }}>

@@ -1,11 +1,13 @@
 import { useKeyringStatus } from '../api/keyring'
 
 /**
- * 密钥环丢失时的常驻横幅(设计 §3.5)。文案一律英文。
- * 账户必须先恢复——验证备份密码需要连云，连云需要账户密钥。
+ * The persistent banner shown while the key ring is lost (design §3.5).
+ * Accounts must be recovered first — verifying a backup password needs the cloud, and reaching
+ * the cloud needs the account key.
  *
- * 状态取自共享 store 而非自己拉一次：重设成功后各页面会 refreshKeyringStatus()，
- * 横幅随之消失。自己在 useEffect(…, []) 里拉一次的话，恢复完成后警告会一直挂到硬刷新。
+ * The status comes from the shared store rather than a fetch of its own: after a successful reset,
+ * each page calls refreshKeyringStatus() and the banner disappears with it. Fetching once in
+ * useEffect(…, []) would leave the warning up after recovery until a hard refresh.
  */
 export function KeyringBanner({ onGoToAccounts }: { onGoToAccounts: () => void }) {
   const status = useKeyringStatus()
@@ -22,8 +24,8 @@ export function KeyringBanner({ onGoToAccounts }: { onGoToAccounts: () => void }
         <>
           {' '}
           Start with{' '}
-          {/* 点了会跳到 Settings——Accounts 现在是那一页最上面的一个区域，所以按钮得把
-              "在 Settings 里"说出来，否则点完会有一瞬"我点的是 Accounts 怎么到 Settings 了"。 */}
+          {/* Clicking goes to Settings — Accounts is now the top section of that page, so the button
+              has to say "in Settings", or the click lands somewhere unexpected. */}
           <button type="button" className="btn-ghost" onClick={onGoToAccounts}>
             Accounts in Settings
           </button>

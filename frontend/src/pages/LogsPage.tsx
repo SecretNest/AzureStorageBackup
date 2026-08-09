@@ -41,7 +41,7 @@ export function LogsPage() {
     }
   }
 
-  // 删除早于某时间的全部日志（含长存审计）。用 "To" 值作截止点。
+  // Delete every log older than a given time, durable audit entries included. The "To" value is the cutoff.
   const purgeBefore = async () => {
     if (!to) {
       setError('Set the "To" time to purge everything before it.')
@@ -124,7 +124,7 @@ export function LogsPage() {
                     {new Date(l.timestamp).toLocaleString()}
                   </td>
                   <td>
-                    {/* 严重程度顺序须与 OperationLogLevel 一致：之前的映射有偏移，Error 会被渲染成和 Debug 一样的纯灰徽标。 */}
+                    {/* Severity order must match OperationLogLevel: the previous mapping was off by one, which rendered Error as the same plain grey badge as Debug. */}
                     <span className={
                       l.level === OperationLogLevel.Error ? 'badge badge-danger'
                       : l.level === OperationLogLevel.Warning ? 'badge badge-warn'

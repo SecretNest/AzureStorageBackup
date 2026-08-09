@@ -1,9 +1,10 @@
 /**
- * 一个版本的起止时刻。时间以 UTC 存储，这里按浏览器所在时区渲染。
+ * A version's start and end. Times are stored in UTC and rendered in the browser's timezone.
  *
- * 同一个**本地**日期只写一次日期（判断也必须按本地时区做——按 UTC 判断的话，本地明明同一天
- * 的备份会因为跨了 UTC 零点被写成两个日期）；跨日则两侧都写全。升级前写下的版本没有开始
- * 时刻，写「—」，不拿别的时间冒充。
+ * The date is written once for a single **local** date (and the comparison must be made in local
+ * time — comparing UTC dates makes two backups on the same local day print two dates whenever they
+ * straddle UTC midnight); across midnight, both sides spell it out. Versions written before the
+ * upgrade have no start time and get an em dash rather than some other time standing in for it.
  */
 export function formatVersionSpan(startedAt: string | null, completedAt: string): string {
   const end = new Date(completedAt)
@@ -14,14 +15,16 @@ export function formatVersionSpan(startedAt: string | null, completedAt: string)
 }
 
 /**
- * 剩余时长的人类可读形式，每一段都带单位。
+ * A human-readable remaining duration, with a unit on every segment.
  *
- * 别去切 .NET 那个 TimeSpan 字符串：它序列化成 `[d.]hh:mm:ss[.fffffff]`，天数后面那个点
- * 和小数秒前面那个点长得一模一样。曾经用 `split('.')[0]` 想砍掉小数秒，结果一超过一天就
- * 只剩下天数那个数字——3 天 5 小时显示成孤零零一个「~3 left」，没单位，也说不清是天是时。
- * 秒数是后端直接给的（etaSeconds），从它算起就没有这种歧义。
+ * Do not slice .NET's TimeSpan string: it serialises as `[d.]hh:mm:ss[.fffffff]`, and the dot after
+ * the day count is indistinguishable from the one before fractional seconds. `split('.')[0]` was
+ * once used to drop the fraction, and anything over a day collapsed to just the day number — 3 days
+ * 5 hours rendered as a bare "~3 left", with no unit and no way to tell days from hours.
+ * The seconds come straight from the backend (etaSeconds), where that ambiguity does not exist.
  *
- * 只显示两级：「3d 5h」比「3d 5h 20m 11s」好读，而剩三天的时候那 11 秒也没人在乎。
+ * Two units only: "3d 5h" reads better than "3d 5h 20m 11s", and with three days left nobody cares
+ * about the 11 seconds.
  */
 export function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.round(seconds))
@@ -34,7 +37,7 @@ export function formatDuration(seconds: number): string {
   return `${s}s`
 }
 
-/** 字节数的人类可读形式。备份界面到处都要用（尺寸、速度），集中一处避免各写一份走样。 */
+/** Human-readable byte counts. Used all over the backup UI (sizes, speeds); centralised so the copies cannot drift. */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
   const units = ['KB', 'MB', 'GB', 'TB']

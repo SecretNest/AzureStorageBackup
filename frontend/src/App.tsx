@@ -9,8 +9,9 @@ import { accountsApi } from './api/accounts'
 import { authApi, type AuthStatus } from './api/auth'
 import { setUnauthorizedHandler } from './api/client'
 
-// Accounts 不再是顶级标签，它收进了 Settings（排在最前面）：账户是"配一次就不再碰"的东西，
-// 常驻一个导航项名不副实。代价是新用户没有明显的入口——由下面挑默认标签那段补上。
+// Accounts is no longer a top-level tab; it moved into Settings (first section): accounts are
+// configured once and never touched again, so a permanent nav entry misrepresents them. The cost is
+// that new users have no obvious entry point — handled by the default-tab logic below.
 type Tab = 'backups' | 'tasks' | 'logs' | 'settings'
 
 const tabs: { key: Tab; label: string }[] = [
@@ -21,8 +22,9 @@ const tabs: { key: Tab; label: string }[] = [
 ]
 
 function App() {
-  // null = 还没决定看哪一页。要先问一句"有没有账户"：一个都没有时先带去 Settings
-  // （账户区在那一页最上面），否则默认 Backups——那才是天天要看的那页。
+  // null = which page to show is undecided. Ask "are there any accounts?" first: with none, go to
+  // Settings (the accounts section is at the top of it); otherwise default to Backups, the page
+  // people actually look at every day.
   const [tab, setTab] = useState<Tab | null>(null)
   const [auth, setAuth] = useState<AuthStatus | null>(null)
 
@@ -30,8 +32,8 @@ function App() {
     authApi.status().then(setAuth).catch(() => setAuth({ required: true, authenticated: false }))
   }
 
-  // 无论服务端登出成功与否都清掉本地状态：失败却停在主界面，
-  // 会让人以为自己已经退出了——在共用机器上这就是个安全问题。
+  // Clear local state whether or not the server logout succeeded: failing and staying on the main UI
+  // makes people believe they logged out — on a shared machine that is a security problem.
   const logout = () => {
     const signedOut = () => setAuth({ required: true, authenticated: false })
     authApi.logout().then(signedOut, signedOut)
@@ -42,8 +44,9 @@ function App() {
     refreshAuth()
   }, [])
 
-  // 认证过了才问账户——没认证就发这个请求只会拿回 401。查不出来时按"有账户"处理：
-  // 把老用户扔到 Settings 比让新用户多点一下更烦人。
+  // Only ask about accounts once authenticated — asking earlier just returns 401. If it cannot be
+  // determined, assume there are accounts: sending an existing user to Settings is more annoying
+  // than one extra click for a new one.
   const signedIn = auth !== null && (!auth.required || auth.authenticated)
   useEffect(() => {
     if (!signedIn || tab !== null) return
@@ -53,10 +56,10 @@ function App() {
       .catch(() => setTab('backups'))
   }, [signedIn, tab])
 
-  // 状态未知时不渲染任何东西，避免主界面闪一下再被登录页替换
+  // Render nothing while the status is unknown, so the main UI does not flash before the login page replaces it
   if (auth === null) return null
 
-  // 未认证时**不挂载**主界面组件——挂了它们会各自发请求，拿回一片 401
+  // While unauthenticated, do **not** mount the main UI — its components would each fire requests and get back a wall of 401s
   if (auth.required && !auth.authenticated)
     return <LoginPage onSignedIn={refreshAuth} />
 

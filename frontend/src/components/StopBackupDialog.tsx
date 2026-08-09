@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { Modal } from './Modal'
 
 /**
- * 停止一次备份要问清楚：正在传的那个文件（连同它所有分卷）是传完再停，还是立刻扔掉。
- * 从前这里只有一句 window.confirm，两种后果被含混成一个"停止"——而它们差得很远：
- * 一个是"这部分算数，下次接着传"，另一个是"这部分删掉，下次重来"。
+ * Stopping a backup has to ask one thing about the file currently uploading (and all its
+ * volumes): finish it, or drop it. This used to be a single window.confirm, which blurred two
+ * very different outcomes into one "stop" — one means "this part counts, continue next time",
+ * the other means "this part is deleted, start over".
  */
 export function StopBackupDialog({
   name,

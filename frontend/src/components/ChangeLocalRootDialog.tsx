@@ -6,8 +6,8 @@ import { Modal } from './Modal'
 import { PathBrowser } from './PathBrowser'
 
 /**
- * 迁移本地根路径。流程刻意分两步——先 Check 看报告，再 Apply——因为这个操作改错了，
- * 下次备份会把整个备份记成全删全增。
+ * Migrating the local root. Deliberately two steps — Check for a report, then Apply — because
+ * getting this wrong makes the next backup record the entire backup as fully deleted and re-added.
  */
 export function ChangeLocalRootDialog({
   configId,
@@ -17,7 +17,7 @@ export function ChangeLocalRootDialog({
 }: {
   configId: number
   currentRoot: string
-  /** newRoot 是刚生效的路径——调用方要用它去更新自己手上的那份配置快照，不能只 reload 列表。 */
+  /** newRoot is the path that just took effect — the caller needs it to update its own config snapshot, not just reload the list. */
   onDone: (newRoot: string) => void
   onClose: () => void
 }) {
@@ -87,13 +87,14 @@ export function ChangeLocalRootDialog({
             <div className="mono">{currentRoot || '(none)'}</div>
           </div>
 
-          {/* 用 .row 默认的 8px 间距，不再压到 4px：输入框获焦时的 outline 向外扩 4px
-              （2px 描边 + 2px offset），间距只有 4px 时紧邻的 Browse 按钮正好把它盖掉。 */}
+          {/* Keep .row's default 8px gap rather than tightening to 4px: a focused input's outline
+              extends 4px (2px ring + 2px offset), and at 4px the adjacent Browse button covers it. */}
           <div className="row">
             <input
               className="w-lg mono"
-              // 占位符用原值：换根多半是「同一堆文件挪了个地方」，原路径是最有用的起草模板，
-              // 一个凭空的 /mnt/photos 只会让人以为那是当前设置。
+              // The placeholder is the current value: a root change is usually "the same files moved",
+              // so the old path is the most useful draft. An invented /mnt/photos would read as the
+              // current setting.
               placeholder={currentRoot || '/mnt/photos'}
               value={newRoot}
               onChange={(e) => {
@@ -112,8 +113,8 @@ export function ChangeLocalRootDialog({
 
           {error && <div className="text-danger">{error}</div>}
 
-          {/* 还没 Check 过时 Apply 恒为灰色。不写这一句，用户改完路径只看见一个点不动的
-              按钮，无从知道是自己少做了一步还是界面坏了。 */}
+          {/* Apply stays greyed out until a Check has run. Without saying so, the user changes the
+              path and sees a dead button, unable to tell a missed step from a broken UI. */}
           {!preview && <div className="text-info">{decision.headline}</div>}
 
           {preview && (

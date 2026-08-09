@@ -11,9 +11,11 @@ export const keyringApi = {
   status: () => api.get<KeyringStatus>('/system/keyring'),
 }
 
-// 进程内的单一状态副本 + 订阅(设计 §3.5)。横幅、账户页、备份页读的必须是同一份:
-// 任一处重设成功后调用 refreshKeyringStatus(),所有订阅者立即更新——否则横幅只在挂载时
-// 拉一次,恢复完成后仍挂着"密钥已丢失"的警告,直到用户硬刷新页面才消失。
+// One in-process copy of the status, plus subscriptions (design §3.5). The banner, the accounts
+// page and the backups page must all read the same one: after any of them resets successfully,
+// calling refreshKeyringStatus() updates every subscriber at once — otherwise the banner fetches
+// once on mount and keeps showing "keys were lost" after recovery has finished, until the user
+// hard-refreshes the page.
 let cached: KeyringStatus | null = null
 const listeners = new Set<(s: KeyringStatus | null) => void>()
 

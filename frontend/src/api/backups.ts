@@ -1,6 +1,6 @@
 import { api } from './client'
 
-// 已发现的备份（来自各账户 container 发现，PRD 2.1）
+// A discovered backup, found by scanning each account's containers (PRD 2.1)
 export const backupPresenceLabels: Record<number, string> = {
   1: 'Plain',
   2: 'Encrypted',
@@ -13,7 +13,7 @@ export interface DiscoveredBackup {
   presence: number
 }
 
-// 备份的稳定标识：account + container
+// A backup's stable identity: account + container
 export const backupKey = (b: { accountId: number; containerName: string }) =>
   `${b.accountId}/${b.containerName}`
 

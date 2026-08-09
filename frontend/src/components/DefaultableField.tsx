@@ -2,11 +2,11 @@ import type { ReactNode } from 'react'
 import { Field } from './Field'
 
 /**
- * 可继承字段的一行（PRD §3「使用默认」）。勾选 = 该字段存 null，运行时读全局设置；
- * 取消勾选 = 显示控件并存具体值。
+ * One row for an inheritable field (PRD §3, "use default"). Ticked = the field stores null and
+ * the global setting is read at run time; unticked = show the control and store a concrete value.
  *
- * 勾选状态下不渲染控件，只显示当前生效值——留着一个隐藏的草稿值，会让界面显示的
- * 与将要保存的不一致。
+ * While ticked, the control is not rendered at all and only the effective value is shown — keeping
+ * a hidden draft value would make what is displayed differ from what will be saved.
  */
 export function DefaultableField({
   label,
@@ -32,7 +32,7 @@ export function DefaultableField({
           />
           Use default
         </label>
-        {/* defaultable-effective：与勾选行同高，好让这一行文字跟左边的标题落在同一条中线上。 */}
+        {/* defaultable-effective: same height as the checkbox row, so this line of text sits on the same centreline as the label to its left. */}
         {useDefault ? <span className="defaultable-effective text-muted">{effectiveText}</span> : children}
       </span>
     </Field>

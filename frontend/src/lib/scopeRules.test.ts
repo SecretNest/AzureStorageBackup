@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { isAll, isInScope, isPartial, parseScope, scopeState, scopeToText, withRule } from './scopeRules'
 
-// 与后端 ScopeRuleSetTests 读的是同一份文件。两份实现行为分叉时，两边同时红。
+// The backend's ScopeRuleSetTests reads this same file. If the two implementations diverge, both turn red.
 const fixture = JSON.parse(
   readFileSync(new URL('../../../shared/scope-rule-cases.json', import.meta.url), 'utf8'),
 ) as {
@@ -50,7 +50,7 @@ describe('scopeState', () => {
   })
 
   it('needs no knowledge of the file system', () => {
-    // 整个功能的承重点：没有加载任何子节点，三态照样算得出来。
+    // The load-bearing point of the whole feature: tri-state is computable without loading a single child.
     const rules = parseScope('- docs\n+ docs/2026')
 
     expect(scopeState(rules, 'docs')).toBe('indeterminate')

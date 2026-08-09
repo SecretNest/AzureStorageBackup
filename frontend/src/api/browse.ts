@@ -13,19 +13,20 @@ export interface BrowseResult {
   path: string
   parent: string | null
   truncated: boolean
-  /** 属性读不出来因而未列出的子项数（例如目录 mode 为 r--：可 readdir、不可 stat 子项）。 */
+  /** Children omitted because their attributes could not be read (e.g. a directory with mode r--: readdir works, stat on children does not). */
   skipped: number
-  /** 该目录的子项总数，不受分页影响。 */
+  /** Total children in the directory, unaffected by paging. */
   total: number
-  /** 本页起始位置。 */
+  /** Where this page starts. */
   offset: number
   entries: BrowseEntry[]
 }
 
 export const browseApi = {
-  // signal：调用方（PathBrowser）在目录快速切换时用它取消上一次尚未完成的请求，
-  // 避免慢的旧响应后到达反而覆盖了新目录的数据。
-  // offset/limit：ScopeTree 用来分页拉大目录；都不传时是老行为（一次性，超量则 truncated）。
+  // signal: the caller (PathBrowser) uses it to cancel a still-pending request when directories are
+  // switched quickly, so a slow old response cannot arrive late and overwrite the new directory.
+  // offset/limit: ScopeTree pages through large directories. Omitting both is the old behaviour
+  // (everything at once, truncated past the cap).
   list: (path?: string, signal?: AbortSignal, page?: { offset: number; limit: number }) => {
     const params = new URLSearchParams()
     if (path) params.set('path', path)

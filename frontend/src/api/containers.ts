@@ -1,6 +1,6 @@
 import { api } from './client'
 
-// 与后端 BackupPresence 对应
+// Mirrors the backend's BackupPresence
 export const BackupPresence = { None: 0, Plain: 1, Encrypted: 2 } as const
 
 export const backupPresenceLabels: Record<number, string> = {
@@ -9,7 +9,7 @@ export const backupPresenceLabels: Record<number, string> = {
   2: 'Backup (encrypted)',
 }
 
-// 信息记录文件的约定文件名（后端 BackupDiscovery，PRD 1.3）。用于展示。
+// The conventional filename of the info file (backend BackupDiscovery, PRD 1.3). Display only.
 export const infoFileName = (presence: number): string | null =>
   presence === BackupPresence.Plain
     ? 'azurestoragebackup.index.json'
@@ -21,15 +21,16 @@ export interface ContainerInfo {
   name: string
   backup: number
   /**
-   * 本地已有一条备份配置占着这个 container 时，是那条备份的名字。
+   * When a local backup configuration already holds this container, the name of that backup.
    *
-   * `backup` 只说得出「云端信息文件在不在」，而那个文件是备份的最后一步才写的：首次备份跑到
-   * 一半的 container 里已经躺着这一轮的数据，云端却还什么标记都没有。占用的权威在本地。
+   * `backup` can only say whether the cloud info file exists, and that file is written by the very
+   * last step of a backup: a container holding a half-finished first run already has this run's data
+   * in it while carrying no cloud marker at all. Occupancy is authoritative locally.
    */
   inUseBy?: string | null
 }
 
-/** container 在列表里那一格状态文案。占用优先于云端 presence——它更早、也更确定。 */
+/** The status cell for a container in the list. Occupancy outranks cloud presence — it is both earlier and more certain. */
 export const containerStatusLabel = (c: ContainerInfo): string =>
   c.inUseBy
     ? `In use by "${c.inUseBy}"`
@@ -44,9 +45,9 @@ export const containersApi = {
 }
 
 /**
- * Azure container 命名规则。与后端 Services/ContainerName.cs 保持等价——
- * 后端是权威，这份存在只是为了在敲键时就给出反馈，而不是等一趟网络往返。
- * 改动其中一处务必同步另一处。
+ * Azure container naming rules. Equivalent to the backend's Services/ContainerName.cs — the backend
+ * is authoritative, and this copy exists only to give feedback while typing rather than after a
+ * network round trip. Change one and you must change the other.
  */
 export const containerNameRule =
   '3–63 characters; lowercase letters, digits, and hyphens only; must begin and end with a letter or digit; no consecutive hyphens.'

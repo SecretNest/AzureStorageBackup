@@ -2,7 +2,7 @@ import { api } from './client'
 
 export const NotificationMethod = { Get: 0, Post: 1 } as const
 
-// 与后端 [Flags] NotificationEvents 对应
+// Mirrors the backend's [Flags] NotificationEvents
 export const NotificationEvent = {
   BackupStart: 1,
   BackupSuccess: 2,

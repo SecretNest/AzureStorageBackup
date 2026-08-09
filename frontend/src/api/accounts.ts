@@ -1,6 +1,6 @@
 import { api } from './client'
 
-// 与后端 enum 对应（System.Text.Json 默认序列化为数字）
+// Mirrors the backend enum (System.Text.Json serialises it as a number by default)
 export const AzureRegion = { Global: 0, China: 1, UsGov: 2 } as const
 export const ProxyMode = { Independent: 0, DockerEnv: 1 } as const
 
@@ -23,7 +23,7 @@ export interface Account {
   proxyUsername: string | null
   createdAt: string
   secretsUnavailable: boolean
-  /** 占用这个账户的备份名（已排序）。非空即不可删。 */
+  /** Names of the backups using this account, sorted. Non-empty means it cannot be deleted. */
   usedByBackups: string[]
 }
 
@@ -55,8 +55,9 @@ export const accountsApi = {
   testConnection: (input: AccountInput) =>
     api.post<ConnectionResult>('/accounts/test-connection', input),
   /**
-   * 编辑态的连通测试：Key 留空时用库里已存的那份，其余字段用表单里改过的值。
-   * 不能复用上面那个——它对空 Key 直接 400，而编辑时 Key 框本来就是空的。
+   * Connectivity test while editing: an empty Key means "use the one already stored", while every
+   * other field comes from the form. It cannot reuse the one above — that returns 400 for an empty
+   * Key, and an empty Key box is exactly the normal state while editing.
    */
   testConnectionFor: (id: number, input: AccountInput) =>
     api.post<ConnectionResult>(`/accounts/${id}/test-connection`, input),

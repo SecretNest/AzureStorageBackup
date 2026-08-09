@@ -39,10 +39,10 @@ describe('localRootDecision', () => {
     expect(d.canApply).toBe(false)
     expect(d.needsForce).toBe(true)
     expect(d.tone).toBe('warn')
-    // 用户看不到命令行，数字必须直接摆在标题上。
+    // The user has no command line; the numbers have to be on the heading itself.
     expect(d.headline).toContain('137')
     expect(d.headline).toContain('200')
-    // 真的比对过，且有真的不匹配的文件——文案说「记成删除再重传」是准确的。
+    // A real comparison with real mismatches, so "recorded as deleted and re-uploaded" is accurate.
     expect(d.confirmBody).toContain('record every file that no longer matches as deleted')
   })
 
@@ -51,7 +51,7 @@ describe('localRootDecision', () => {
     expect(d.canApply).toBe(false)
     expect(d.needsForce).toBe(true)
     expect(d.tone).toBe('danger')
-    // 同样是真的比对过——和 NeedsConfirm 共用同一句話。
+    // Also a real comparison — it shares the sentence with NeedsConfirm.
     expect(d.confirmBody).toContain('record every file that no longer matches as deleted')
   })
 
@@ -66,13 +66,13 @@ describe('localRootDecision', () => {
     })
     expect(d.canApply).toBe(false)
     expect(d.needsForce).toBe(true)
-    // 「有历史但读不出来」绝不能被当成「没有历史」放行。
-    expect(d.headline).toContain('bad decrypt')
-    // 这里压根没有比对过（Sampled/Matched 都是 0），所以不能说「记成删除再重传」——
-    // 那句话对 NeedsConfirm/Rejected 是真的，对这个 verdict 是编的。
+    // "There is history but it cannot be read" must never be waved through as "there is no history".
+
+    // Nothing was actually compared here (Sampled and Matched are both 0), so it must not claim
+    // "recorded as deleted and re-uploaded" — true for NeedsConfirm/Rejected, invented for this one.
     expect(d.confirmBody).not.toContain('record every file that no longer matches as deleted')
-    // 真正的后果：换根本身会成功，但索引读不出来是另一个问题，这个操作不解决它，
-    // 下次备份大概率会栽在同一处（TrackedInfoStore.LoadAsync 没有 try/catch）。
+    // The real consequence: the root change itself succeeds, but an unreadable index is a separate
+    // problem this operation does not solve, and the next backup will most likely hit the same wall.
     expect(d.confirmBody).toContain('index')
     expect(d.confirmBody).toContain('next backup')
   })

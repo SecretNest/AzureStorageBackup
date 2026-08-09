@@ -7,7 +7,7 @@ describe('latestWins', () => {
     expect(gate.begin()()).toBe(true)
   })
 
-  // 要害就在这一条：后发的先回、先发的后回时，先发的那次绝不能再写状态。
+  // This is the crux: when the later call returns first and the earlier one second, the earlier one must never write state again.
   it('rejects an earlier call that resolves after a later one', () => {
     const gate = latestWins()
     const first = gate.begin()
@@ -17,7 +17,7 @@ describe('latestWins', () => {
     expect(first()).toBe(false)
   })
 
-  // 到达顺序不改变结论：谁最后发起的，谁说了算。
+  // Arrival order does not change the conclusion: whoever started last wins.
   it('keeps rejecting the stale call no matter the arrival order', () => {
     const gate = latestWins()
     const first = gate.begin()

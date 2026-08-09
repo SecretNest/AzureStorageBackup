@@ -1,8 +1,7 @@
-// 后端 API 基础客户端。所有请求走 /api（开发经 Vite proxy，生产经 nginx 反代）。
-
-const BASE = '/api'
-
-// 会话过期时由 App 重新挂上登录页（设计 §6）。
+// The base API client. Every request goes through /api (via the Vite proxy in development, via the
+// reverse proxy in production).
+//
+// App remounts the login page when the session expires (design §6).
 let onUnauthorized: (() => void) | null = null
 
 export function setUnauthorizedHandler(handler: () => void) {
@@ -11,7 +10,7 @@ export function setUnauthorizedHandler(handler: () => void) {
 
 export class ApiError extends Error {
   status: number
-  /** 后端在部分场景附带的机器可读码，例如 keyring_lost。 */
+  /** A machine-readable code the backend attaches in some cases, e.g. keyring_lost. */
   code?: string
 
   constructor(status: number, message: string, code?: string) {
@@ -25,8 +24,9 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
-    // fetch 默认 same-origin，会话 cookie 在跨域部署（SPA 单独托管）下根本不会被带上，
-    // 后端为此开的 AllowCredentials() 就白开了。include 是 same-origin 的超集，同源部署不受影响。
+    // fetch defaults to same-origin, so the session cookie is not sent at all under a cross-origin
+    // deployment (the SPA hosted separately), which would make the backend's AllowCredentials()
+    // pointless. include is a superset of same-origin, so same-origin deployments are unaffected.
     credentials: 'include',
     ...init,
   })
@@ -35,9 +35,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (res.status === 401) onUnauthorized?.()
     const text = await res.text().catch(() => '')
 
-    // 后端统一用 { error, code? } 报错（见 AccountEndpoints.cs、KeyringGuard.cs）。
-    // 不解析的话，用户看到的是整段 JSON 原文，或者——响应体为空时——回落成
-    // "Internal Server Error" 这种毫无信息量的字样。
+    // The backend reports errors uniformly as { error, code? }. Without parsing it, the user sees
+    // the raw JSON — or, when the body is empty, a fallback to something as uninformative as
+    // "Internal Server Error".
     let message = text || res.statusText
     let code: string | undefined
     try {
@@ -45,13 +45,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof body.error === 'string' && body.error) message = body.error
       if (typeof body.code === 'string') code = body.code
     } catch {
-      // 非 JSON（如反代返回的 HTML 错误页）：保留原文。
+      // Not JSON (an HTML error page from a reverse proxy, say): keep the raw text.
     }
 
     throw new ApiError(res.status, message, code)
   }
 
-  // 204 无内容
+  // 204, no content
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
 }

@@ -17,7 +17,7 @@ function buildCron(freq: Freq, minute: number, hour: number, dow: number, dom: n
   }
 }
 
-// 图形化 cron 编辑器（PRD 2.3）：常用频率可视化选择，高级用户可切换到手输。
+// Graphical cron editor (PRD 2.3): common frequencies picked visually, with a switch to raw entry for advanced users.
 export function CronEditor({ value, onChange }: { value: string; onChange: (cron: string) => void }) {
   const [advanced, setAdvanced] = useState(false)
   const [freq, setFreq] = useState<Freq>('daily')
