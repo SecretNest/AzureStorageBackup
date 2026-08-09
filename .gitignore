@@ -10,7 +10,7 @@ node_modules/
 dist/
 .vite/
 
-# --- 数据 / 密钥 / 临时 ---
+# --- Data / keys / temp ---
 data/
 keys/
 temp/
@@ -19,16 +19,17 @@ temp/
 *.db-wal
 .env
 
-# --- Azurite（集成测试用的本地 Azure Storage 模拟器）---
-# 跑集成测试时在仓库根目录生成，纯运行时状态：不起 Azurite，那批集成测试会静悄悄跳过，
-# 起了它就多出这一堆。删掉只是丢掉测试数据，下次跑会重建。
+# --- Azurite (the local Azure Storage emulator the integration tests use) ---
+# Generated in the repository root when the integration tests run; pure runtime state. Without
+# Azurite that batch of integration tests silently skips rather than fails; start it and you get
+# this pile instead. Deleting it only throws away test data, the next run recreates it.
 AzuriteConfig
 __azurite_db_*.json
 __blobstorage__/
 __queuestorage__/
 __tablestorage__/
 
-# --- 编辑器 / 系统 ---
+# --- Editor / OS ---
 .idea/
 .vscode/
 *.swp

@@ -18,9 +18,11 @@ jobs:
           dotnet-version: "10.0.x"
 
       - name: Install 7-Zip
-        # 官方最新正式版，和 Dockerfile 装进镜像的是同一个东西。发行版打包的 7zip/p7zip
-        # 从 stdin 压缩时把条目属性写成 0（解出来是 ----------），跑出来的结果代表不了生产。
-        # 老归档那条路由 Fixtures/zero-attr-si.7z 覆盖，不靠这里装什么版本。
+        # The latest official release, the very same thing the Dockerfile installs into the image.
+        # The distro-packaged 7zip/p7zip writes entry attributes as 0 when compressing from stdin
+        # (extraction gives ----------), so its results would not represent production.
+        # The legacy-archive path is covered by Fixtures/zero-attr-si.7z and does not depend on
+        # whichever version gets installed here.
         run: |
           set -eux
           ver="$(curl -fsSL https://www.7-zip.org/download.html \

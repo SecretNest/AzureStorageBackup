@@ -27,7 +27,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- 归档固件：内容由固件本身固定下来，跑测试的机器上装的是哪个 7z 版本都不影响。 -->
+    <!-- Archive fixtures: the content is pinned by the fixture itself, so whichever 7z version is installed on the test machine makes no difference. -->
     <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

@@ -1,18 +1,18 @@
 /* ── Design tokens ──────────────────────────────────────────────────────────
-   浅色为默认，深色只覆盖颜色。所有组件一律引用变量，不写字面色值。 */
+   Light is the default; dark only overrides colors. Every component references variables, never literal color values. */
 :root {
   --bg: #ffffff;
   --bg-subtle: #f7f7f8;
   --bg-raised: #ffffff;
   --bg-hover: #f1f1f4;
-  --overlay-scrim: rgba(0, 0, 0, 0.45); /* 深色模式需更深的半透明度，因为深色背景与对话框对比度不足 */
+  --overlay-scrim: rgba(0, 0, 0, 0.45); /* Dark mode needs a heavier scrim: against a dark background the dialog has too little contrast */
 
   --border: #e4e4e7;
   --border-strong: #cfcfd6;
 
   --text: #18181b;
   --text-muted: #6b6b76;
-  --text-faint: #75757f; /* 需 ≥4.5:1 对比度（WCAG AA），实测对 --bg 为 4.56:1 */
+  --text-faint: #75757f; /* Needs ≥4.5:1 contrast (WCAG AA); measured 4.56:1 against --bg */
 
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
@@ -44,13 +44,13 @@
   --r-md: 6px;
   --r-lg: 8px;
 
-  /* 阴影只给浮层。平面区域用描边分隔——这是紧凑控制台与卡片式 SaaS 的分界。 */
+  /* Shadows are for overlays only. Flat areas are separated by borders - that is the line between a compact console and card-style SaaS. */
   --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
 
   --control-h: 32px;
   --sidebar-w: 220px;
-  /* 只约束"读文字"的区域（.panel 里的表单与说明），不约束整个内容区：
-     表格页要跟着窗口一起变宽，宽屏上右侧不该留一条空白。 */
+  /* Constrains only the areas you actually read text in (the forms and prose inside .panel), not the whole content area:
+     table pages have to widen along with the window, and on a wide screen there should be no blank strip down the right. */
   --content-max: 1280px;
 
   color-scheme: light dark;
@@ -74,7 +74,7 @@
 
     --text: #e8e8ec;
     --text-muted: #9a9ba6;
-    --text-faint: #7a7a8a; /* 需 ≥4.5:1 对比度（WCAG AA），实测对 --bg 为 4.51:1 */
+    --text-faint: #7a7a8a; /* Needs ≥4.5:1 contrast (WCAG AA); measured 4.51:1 against --bg */
 
     --accent: #60a5fa;
     --accent-hover: #93c5fd;
@@ -155,14 +155,14 @@ hr {
   margin: var(--sp-5) 0;
 }
 
-/* 焦点：用真正的 outline 描边，颜色只用强调色，不需要匹配任何底色；
-   outline 会自动跟随获焦元素自身的圆角。 */
+/* Focus: draw a real outline. The color is just the accent - it does not need to match any background;
+   an outline automatically follows the focused element's own corner radius. */
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  /* outline 画在盒子外面且不占布局，紧跟其后的兄弟元素（典型是输入框后面的 Browse 按钮）
-     会连自己的背景一起盖掉那一段描边。抬一层让获焦元素画在最上面；relative 不带偏移，
-     不影响任何布局。 */
+  /* An outline is painted outside the box and takes up no layout, so the immediately following sibling (typically the
+     Browse button after an input) paints its own background straight over that stretch of it. Lift a layer so the focused
+     element paints on top; relative with no offset affects no layout at all. */
   position: relative;
   z-index: 1;
 }
@@ -188,8 +188,8 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* 无边框图标按钮：全局控件高度对需要与文字同行内联的字形（如折叠三角）是错的，
-   这里重置高宽、内边距与边框，让它随字形本身的行高排布。 */
+/* Borderless icon button: the global control height is wrong for glyphs that have to sit inline with text (the collapse
+   triangle, say), so reset height, width, padding and border and let it lay out on the glyph's own line height. */
 .icon-btn {
   height: auto;
   width: auto;
@@ -271,18 +271,18 @@ thead th {
 tbody td {
   border-bottom: 1px solid var(--border);
   padding: var(--sp-2) var(--sp-3);
-  /* 居中而非贴顶：行内有 32px 高的操作按钮时，贴顶会让同一行的纯文字明显偏高。
-     表格里几乎每一行都有操作列，所以居中是这里的常态。 */
+  /* Centered, not top-aligned: when a row carries 32px-tall action buttons, top alignment leaves the plain text in that
+     same row sitting visibly too high. Almost every row in these tables has an actions column, so centered is the norm here. */
   vertical-align: middle;
 }
 tbody tr:hover {
   background: var(--bg-hover);
 }
 
-/* 运行状态（备份/还原/修复）自占一整行，横跨所有列。
-   放在操作列里时，那一列是 white-space: nowrap 的（按钮不许折行），而 white-space 会继承——
-   于是一条几百字符的路径撑成一行，把整张表挤到出屏。这里给它整个表宽去折行。
-   与上一行之间不划线：它讲的是同一个备份的事。 */
+/* Running status (backup/restore/repair) takes a whole row to itself, spanning every column.
+   Back when it lived in the actions column, that column is white-space: nowrap (buttons must not wrap) and white-space inherits -
+   so a several-hundred-character path stretched into a single line and shoved the entire table off screen. Here it gets the
+   full table width to wrap in. No rule line between it and the row above: it is talking about the same backup. */
 tbody tr.has-ops > td {
   border-bottom: none;
 }
@@ -295,26 +295,30 @@ tbody tr.ops-row:hover {
   background: var(--bg-hover);
 }
 
-/* 宽度跟着容器走的表。默认的 table-layout: auto 下，表宽的下限是各列 min-content
-   之和，而这张表原先有三处不肯收缩，加起来就把整页顶出了横向滚动条。下面逐个拆掉。
-   拆完实测下限 656px（Backups 那张六列表），≥700px 的窗口整页都不再横滚；剩下的
-   641~656px 窄缝交给外层 .table-scroll 兜着。
-   没有改用 table-layout: fixed：fixed 要给六列全部写死百分比，而这张表里 Encrypted
-   只装 Yes/No、Local Root 却要多少有多少，一套百分比在 760px 和 2560px 不可能都对。
-   auto 在宽屏按 max-content 分配的结果本来就是对的，只需修窄屏那一档（见第四条）。 */
+/* Tables whose width follows their container. Under the default table-layout: auto the floor on table width is the sum of
+   the columns' min-content, and this table originally had three places that refused to shrink; together they pushed a
+   horizontal scrollbar onto the whole page. They are dismantled one at a time below.
+   With them gone the measured floor is 656px (the six-column Backups table), and any window ≥700px stops scrolling
+   horizontally; the remaining 641-656px sliver is left to the outer .table-scroll to absorb.
+   table-layout: fixed was not adopted: fixed needs hard percentages written for all six columns, and in this table Encrypted
+   only ever holds Yes/No while Local Root takes as much as it likes - one set of percentages cannot be right at both 760px
+   and 2560px. On wide screens auto's max-content distribution is already correct; only the narrow band needed fixing (see
+   item four). */
 
-/* 一、表头。全局 thead th 是 nowrap 的，光「Account / Container」一个列名就锁死约
-   170px。这条 (0,2,1) 压得住那条 (0,0,2)，与源码顺序无关。 */
+/* One: the header. The global thead th is nowrap, and the single column name "Account / Container" alone locks in about
+   170px. This rule's (0,2,1) beats that one's (0,0,2), regardless of source order. */
 .table-fluid thead th {
   white-space: normal;
 }
 
-/* 二、单元格内容。两档，别用一档打发：
-   兜底档是 break-word——放不下的超长词能断，但 min-content 不跟着变小。这一点正是
-   要的：备份名"documents"该整体挤窄别的列，而不是被劈成"docum/ents"。
-   路径档是 anywhere——只有它会把 min-content 尺寸一起算小，break-word 仅改变渲染时
-   在哪断行、min-content 照旧按"整段不断"撑着，表格于是照样溢出。长路径断不开的根因
-   就在这一处；也只有路径这种没有语义单词边界的内容，才配得上从任意字符断开。 */
+/* Two: cell content. Two tiers - do not try to get away with one:
+   The fallback tier is break-word: an overlong word that does not fit can break, but min-content does not shrink with it.
+   That is exactly what is wanted here: the backup name "documents" should squeeze the other columns as a whole rather than
+   be split into "docum/ents".
+   The path tier is anywhere: only it also shrinks the min-content size. break-word changes nothing but where the line breaks
+   at render time, while min-content still holds out at "the whole run, unbroken", so the table overflows all the same. That
+   one spot is the root cause of long paths refusing to break; and only content like paths, with no semantic word
+   boundaries, earns the right to break at an arbitrary character. */
 .table-fluid tbody td {
   overflow-wrap: break-word;
 }
@@ -323,28 +327,32 @@ tbody tr.ops-row:hover {
   overflow-wrap: anywhere;
 }
 
-/* 三、操作列。四个按钮之间本来就有空格，去掉 nowrap 就能折行；按钮自身的 nowrap 由
-   全局 button 规则保着，不会从中间断开。
-   不能改用 display: flex 排它们：那会让 td 不再是 table-cell，整张表的列对齐会散架。
-   按钮是 inline-block，行距只能由 td 的 line-height 决定，默认值会让折行后的上下两排
-   按钮几乎贴在一起，这里把行盒撑得比按钮本身再高一档。 */
+/* Three: the actions column. There are already spaces between the four buttons, so dropping nowrap is all it takes to let
+   them wrap; each button's own nowrap is held by the global button rule, so none of them breaks down the middle.
+   display: flex is not an option for laying them out: it stops the td being a table-cell and the column alignment of the
+   whole table falls apart. The buttons are inline-block, so their line spacing can only come from the td's line-height, and
+   the default leaves the two rows of buttons after a wrap almost touching; here the line box is stretched one notch taller
+   than the buttons themselves. */
 .table-fluid tbody td.card-actions {
   text-align: right;
   line-height: calc(var(--control-h) + var(--sp-2));
 }
 
-/* 四、窄屏的列宽建议。auto 布局宽窄两档的分配逻辑不同：宽的时候按 max-content 比例
-   分，结果本来就是对的（路径列拿到最多、四个按钮一行排开），所以宽屏一个字都别写；
-   窄的时候改按 min-content 比例分，而上面那条 anywhere 恰好把路径列的 min-content
-   压到近 0——最该给宽度的那列于是抢得最少，操作列也跟着塌成一个按钮一行。
-   1100px 这个界不是断点，是实测中 auto 开始分错的位置。
+/* Four: column width hints for narrow screens. The auto layout splits differently in the wide and the narrow regime: when
+   wide it splits in proportion to max-content, which is already correct (the path column gets the most, the four buttons lay
+   out on one line), so do not write a single word for wide screens; when narrow it switches to splitting in proportion to
+   min-content, and the anywhere rule above happens to squash the path column's min-content down to nearly 0 - so the column
+   that most deserves width grabs the least, and the actions column collapses to one button per line along with it.
+   The 1100px boundary is not a breakpoint; it is the measured point where auto starts splitting wrong.
 
-   两条规则分工不同，别照字面理解成"各占多少"——760/900px 实测（列宽 px）：
-     都不设：root 104 / actions 170、186 / 201
-     只设 actions：root 71  / actions 215、127 / 295   ← 路径列被榨干
-     两条都设：root 104 / actions 182、183 / 257
-   也就是说 actions 的 34% 是真在扩张，而 root 的 26% 扩不动（给到 55% 也只多 12px），
-   它的价值是当一道地板，挡住 actions 扩张时把路径列压没。缺了它反而更糟。 */
+   The two rules do different jobs - do not read them literally as "how much each gets". Measured at 760/900px (column
+   widths in px):
+     neither set:  root 104 / actions 170, then 186 / 201
+     actions only: root 71  / actions 215, then 127 / 295   <- the path column is wrung dry
+     both set:     root 104 / actions 182, then 183 / 257
+   That is, actions' 34% really does expand, while root's 26% cannot (push it to 55% and it gains all of 12px); its value is
+   acting as a floor that stops actions, as it expands, from crushing the path column out of existence. Dropping it makes
+   things worse, not better. */
 @media (max-width: 1249px) {
   .table-fluid col.col-root {
     width: 26%;
@@ -354,27 +362,28 @@ tbody tr.ops-row:hover {
   }
 }
 
-/* 五、宽屏把操作列拉回一行。这是原样恢复改动前的桌面观感，不是新加的效果：
-   操作列原先挂着内联 nowrap，min-content 被锁在四个按钮的总宽上，auto 布局不得不
-   满足它，于是一行排开。单纯把 nowrap 去掉后，路径列的 max-content 极大、按比例分
-   配时一路把宽度吃走，操作列到 2400px 上下才够排一行——1280~1920 这段最常见的桌面
-   宽度全塌成了两行。这里只在装得下的那一档把 nowrap 还回去。
-   1250px 这个界是倒推的：nowrap 下表宽下限约 978px（含 Backing up… 那个更宽的态），
-   加侧栏 220 与左右内边距 48，视口要 1246px 才装得下。 */
+/* Five: on wide screens pull the actions column back onto one line. This restores the desktop look exactly as it was
+   before the change; it is not some new effect. The actions column used to carry an inline nowrap, which locked min-content
+   to the total width of the four buttons, and the auto layout had no choice but to satisfy it, so they laid out on one line.
+   Once nowrap was simply removed, the path column's max-content is enormous and the proportional split ate the width away,
+   leaving the actions column enough for one line only at around 2400px - the 1280-1920 band, the most common desktop width
+   there is, all collapsed to two lines. Here nowrap is handed back only in the regime that can fit it.
+   The 1250px boundary is derived backwards: with nowrap the table's width floor is about 978px (including the wider
+   Backing up… state), plus the 220 sidebar and 48 of left and right padding, so the viewport needs 1246px to fit it. */
 @media (min-width: 1250px) {
   .table-fluid tbody td.card-actions {
     white-space: nowrap;
   }
 }
 
-/* 窄屏上装不下的表包一层它。表格本身不变形——日志这类扫读型的表，
-   横滚比拆成卡片好用：卡片化后一屏看不了几条。 */
+/* Wrap this around tables that do not fit on a narrow screen. The table itself is not reshaped - for scan-and-read tables
+   like the logs, horizontal scrolling beats breaking them into cards: once carded a screen holds barely a few rows. */
 .table-scroll {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
-/* 容器可聚焦（用法处加 tabIndex），键盘用户才能滚动溢出的内容（WCAG 2.1.1）。
-   但它不是控件，获焦时的 outline 会画出一个没有意义的大方框。 */
+/* The container is focusable (tabIndex is added at the usage site) so that keyboard users can scroll the overflowing
+   content (WCAG 2.1.1). But it is not a control, and a focus outline would draw a big meaningless box around it. */
 .table-scroll:focus {
   outline: none;
 }
@@ -418,7 +427,7 @@ tbody tr.ops-row:hover {
   overflow-y: auto;
 }
 
-/* 导航项是 <button>，所以要把按钮的默认外观整个抹掉再重画。 */
+/* Nav items are <button>, so the button's default appearance has to be wiped out entirely and repainted. */
 .nav-item {
   height: auto;
   padding: var(--sp-2) var(--sp-3);
@@ -443,8 +452,9 @@ tbody tr.ops-row:hover {
   font-weight: 600;
 }
 
-/* 内容区撑满可用宽度。上限收在 .panel 上而不是这里：封顶整个内容区的话，
-   宽屏上表格右边会永远空一块，而表格恰恰是越宽越好用的那种内容。 */
+/* The content area fills the available width. The cap sits on .panel rather than here: capping the whole content area
+   would leave a permanent empty block to the right of tables on wide screens, and tables are precisely the kind of content
+   that gets more useful the wider it is. */
 .app-main {
   min-width: 0;
   padding: var(--sp-5);
@@ -458,7 +468,8 @@ tbody tr.ops-row:hover {
   margin-bottom: var(--sp-4);
 }
 
-/* 窄屏：侧栏塌成顶部横向滚动的 tab 条。React 结构不变，只换 CSS。 */
+/* Narrow screens: the sidebar collapses into a horizontally scrolling tab strip at the top. The React structure is
+   unchanged; only the CSS differs. */
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
@@ -545,10 +556,10 @@ tbody tr.ops-row:hover {
   border-color: var(--accent-hover);
 }
 
-/* 表格行内操作：一行里挤三四个按钮时，边框会把行切碎。
-   这条规则必须排在 .btn-danger（以及其他颜色变体）之前：两者特异度相同，
-   源码顺序在后的会赢；.btn-ghost 若排在后面会覆盖 .btn-danger.btn-ghost
-   组合上的颜色，导致删除按钮失去红色警示。 */
+/* In-row table actions: with three or four buttons crammed into one line, borders chop the line to pieces.
+   This rule has to come before .btn-danger (and the other color variants): their specificity is identical, so
+   whichever comes later in source order wins; if .btn-ghost came later it would override the color on the
+   .btn-danger.btn-ghost combination and the delete button would lose its red warning. */
 .btn-ghost {
   border-color: transparent;
   background: transparent;
@@ -565,9 +576,9 @@ tbody tr.ops-row:hover {
   color: var(--danger);
   border-color: var(--danger-border);
 }
-/* color 必须在这里重申：.btn-ghost:hover 排在前面且设了 color，
-   同特异度下不写就会被它盖掉——而 hover 正是即将点下删除的那一刻，
-   最不该丢掉红色警示的时候。 */
+/* color has to be restated here: .btn-ghost:hover comes earlier and sets color, so at equal specificity
+   leaving it out means being overridden by it - and hover is exactly the instant before delete gets clicked,
+   the moment when losing the red warning is least acceptable. */
 .btn-danger:hover:not(:disabled) {
   background: var(--danger-bg);
   color: var(--danger);
@@ -580,8 +591,9 @@ tbody tr.ops-row:hover {
 .w-full { width: 100%; }
 
 /* ── Blocks ───────────────────────────────────────────────────────────────── */
-/* 面板装的是表单和说明文字。内容区已经放开撑满，若面板跟着撑满，
-   4K 屏上一行说明会横跨整个屏幕，眼睛回行时找不到下一行的开头。 */
+/* Panels hold forms and explanatory prose. The content area is already turned loose to fill the width; if panels filled it
+   too, on a 4K screen one line of prose would span the entire screen and the eye would lose the start of the next line on
+   the way back. */
 .panel {
   background: var(--bg-raised);
   border: 1px solid var(--border);
@@ -606,9 +618,10 @@ tbody tr.ops-row:hover {
   color: var(--text-muted);
   padding-top: 6px;
 }
-/* 值区只有一个光秃秃的勾选框时（Enabled 之类）：它既没有输入框的高度也没有内边距，
-   而标题为了跟输入框的文字对齐往下压了 6px，两者于是错开——看上去就是「勾偏上」。
-   这一行改为整行居中，标题那 6px 的补偿也一并撤掉。 */
+/* When the value area is nothing but a bare checkbox (Enabled and the like): it has neither an input's height nor its
+   padding, while the label was pushed down 6px to line up with the text inside an input, so the two end up offset - which
+   reads on screen as "the checkbox sits too high". This row switches to centering the whole row, and the label's 6px of
+   compensation is dropped along with it. */
 .field:has(> span > input[type='checkbox']:only-child),
 .field:has(> span > .field-check) {
   align-items: center;
@@ -617,28 +630,29 @@ tbody tr.ops-row:hover {
 .field:has(> span > .field-check) > .field-label {
   padding-top: 0;
 }
-/* 「勾选框 + 一句说明」的值区。勾选框默认坐在文字基线上，看着比说明文字高出一截；
-   按行内 flex 居中，勾与字才在同一条中线上。 */
+/* A "checkbox + one line of explanation" value area. By default the checkbox sits on the text baseline and looks a notch
+   higher than the explanation; centering it as an inline flex is what puts box and text on the same midline. */
 .field-check {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
 }
 
-/* 「Use default」行：勾选框在前，控件或只读生效值在后。 */
+/* The "Use default" row: the checkbox first, then either the control or the read-only effective value. */
 .defaultable {
   display: flex;
-  /* 顶部对齐而非居中：值区是多行控件（规则用的 textarea）时，居中会把「Use default」拖到
-     文本框的半腰上，而左边的标题还在顶上。勾与字的对齐由 .defaultable-toggle 自己管，
-     所以这里改成 flex-start 不会让它们错开。 */
+  /* Top-aligned rather than centered: when the value area is a multi-line control (the textarea used for rules), centering
+     drags "Use default" down to the waist of the text box while the label on the left is still up at the top. Alignment
+     between box and text is handled by .defaultable-toggle itself, so flex-start here will not knock them out of line. */
   align-items: flex-start;
   gap: var(--sp-3);
   flex-wrap: wrap;
 }
-/* 勾选行与只读生效值都撑到一个控件的高度，并在其中居中。
-   标题那 6px 的 padding-top 是为了跟 32px 输入框里的文字对齐的；值区只有一行文字时没有
-   对应的高度，标题就被那 6px 压得比右边低了一截——Step 2 整页都是这种字段，于是整列都歪。
-   撑到同样的高度，两边的文字就落在同一条中线上。 */
+/* Both the checkbox row and the read-only effective value stretch to one control's height and center inside it.
+   The label's 6px of padding-top is there to line up with the text inside a 32px input; when the value area is a single line
+   of text there is no matching height, so that 6px pushes the label a notch lower than the right side - Step 2 is nothing
+   but fields like this, so the entire column comes out crooked.
+   Stretch both to the same height and the text on either side lands on the same midline. */
 .defaultable-toggle,
 .defaultable-effective {
   display: inline-flex;
@@ -681,33 +695,36 @@ tbody tr.ops-row:hover {
   align-items: center;
 }
 
-/* .row 是块级 flex，若与同级文本放在一起（例如表格单元格里紧跟在文字后面），
-   会强制换行；这里用 inline-flex 让它留在行内继续参与文字流。 */
+/* .row is a block-level flex, so putting it alongside sibling text (right after text inside a table cell, for example)
+   forces a line break; inline-flex here keeps it on the line and still part of the text flow. */
 .row-inline {
   display: inline-flex;
   gap: var(--sp-2);
   align-items: center;
 }
 
-/* .col 是 .stack 的别名——迁移根路径对话框（ChangeLocalRootDialog）沿用 .row 的命名对称性
-   叫它 .col，两者规则完全一致，合并成一条选择器以免以后各改各的、悄悄分叉出两份行为。 */
+/* .col is an alias for .stack - the migrate-root-path dialog (ChangeLocalRootDialog) followed the naming symmetry of .row
+   and called it .col. The rules are word for word identical, so they are merged into one selector to keep someone from
+   editing them separately later and quietly forking two behaviors out of one. */
 .stack, .col {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
 }
 
-/* 停止对话框里两组「按钮 + 后果说明」竖排。与 .stack 分开一条规则，是因为间距要更紧
-   （.stack 的 gap 是给整段留白的，这里按钮和它自己的说明文字要贴得更近）。
-   类名是新引入的，不覆盖任何既有规则，不必对着 .btn-ghost/.btn-danger 那组算 specificity。 */
+/* Stacks the two "button + what it will do" groups in the stop dialog vertically. It is a rule apart from .stack because
+   the spacing has to be tighter (.stack's gap is there to give a whole block breathing room; here a button and its own
+   explanatory text need to sit closer together).
+   The class name is newly introduced and overrides no existing rule, so there is no need to do specificity arithmetic
+   against the .btn-ghost/.btn-danger group. */
 .stacked-actions {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
 }
 
-/* 目录选择器的一行。原先是个 .btn-ghost，高 32px、左右各 8px 内边距，
-   手机上要瞄准才点得中；整行可点就没有瞄准这回事了。 */
+/* One row of the directory picker. It used to be a .btn-ghost, 32px tall with 8px of padding on each side, which on a
+   phone takes aim to hit; make the whole row clickable and there is no aiming left to do. */
 .browse-row {
   display: flex;
   align-items: center;
@@ -737,7 +754,7 @@ tbody tr.ops-row:hover {
   content: none;
 }
 
-/* 事件多选项：桌面上排成 200px 的多列，窄屏上自然掉成单列。 */
+/* Event checkboxes: laid out in 200px columns on desktop, dropping naturally to a single column on narrow screens. */
 .notify-event {
   flex: 1 1 200px;
   min-width: 0;
@@ -780,8 +797,8 @@ tbody tr.ops-row:hover {
 .text-danger { color: var(--danger); }
 .text-ok { color: var(--ok); }
 .text-warn { color: var(--warn); }
-/* ChangeLocalRootDialog 的 NoBaseline 判定用 tone: 'info'（badge-info 同色，--accent）；
-   brief 的 Step 2 核对清单没列这个类，是核对时另外发现的缺口。 */
+/* ChangeLocalRootDialog's NoBaseline verdict uses tone: 'info' (same color as badge-info, --accent);
+   the brief's Step 2 checklist did not list this class - it was a gap turned up separately while cross-checking. */
 .text-info { color: var(--accent); }
 
 /* ── Modal ────────────────────────────────────────────────────────────────── */
@@ -808,8 +825,8 @@ tbody tr.ops-row:hover {
   overflow: auto;
 }
 
-/* 内容区自己滚，标题栏与动作栏不动。桌面上 max-height 由 .modal-panel 限制，
-   手机上（见下）改成占满视口。 */
+/* The body scrolls on its own while the header and action bars stay put. On desktop max-height is capped by .modal-panel;
+   on phones (see below) it switches to filling the viewport. */
 .modal-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -838,8 +855,8 @@ tbody tr.ops-row:hover {
   font-size: 16px;
   line-height: 1;
 }
-/* 二级弹窗（叠在另一个弹窗之上的 PathBrowser）。原先两层同为 z-index 50，
-   靠 DOM 顺序侥幸生效；手机上两层都是全屏，顺序不对就是"点了没反应"。 */
+/* A second-level modal (the PathBrowser stacked on top of another modal). Both layers used to be z-index 50 and worked
+   only by the luck of DOM order; on a phone both layers are full screen, and the wrong order means "tapping does nothing". */
 .modal-overlay-secondary {
   z-index: 60;
 }
@@ -852,34 +869,35 @@ tbody tr.ops-row:hover {
 }
 
 /* ── Mobile (≤640px) ────────────────────────────────────────────────────────
-   手机层。平板层（≤900px）已经处理了侧栏塌陷与 .field 单列，这里只加手机独有的东西。 */
+   The phone layer. The tablet layer (≤900px) already handles the sidebar collapse and the single-column .field, so this
+   only adds what is specific to phones. */
 @media (max-width: 640px) {
-  /* 16px 是硬门槛，不是观感问题：低于 16px 时 iOS Safari 会在聚焦输入框的瞬间
-     放大整个页面，并且失焦后不缩回——用户此后看到的是一个需要手动双指缩小的界面。
-     只有表单控件会触发这个行为，正文其余部分保持 14px。 */
+  /* 16px is a hard threshold, not a question of taste: below 16px iOS Safari zooms the entire page the instant an input
+     takes focus, and does not zoom back out on blur - from then on the user is looking at an interface they have to pinch
+     back down by hand. Only form controls trigger this behavior; the rest of the body text stays at 14px. */
   input,
   select,
   textarea {
     font-size: 16px;
   }
 
-  /* .mono 的 font-size: 0.9em 是 (0,1,0)，比上面那条 (0,0,1) 高，不管源码顺序都赢——
-     于是等宽字体的那几个框（Local Root、Restore to、cron 表达式…）实际是 12.6px，
-     照样会触发 iOS 的聚焦缩放。这一条 (0,1,1) 才压得住。 */
+  /* .mono's font-size: 0.9em is (0,1,0), higher than the (0,0,1) above, and wins no matter the source order - so the
+     monospace boxes (Local Root, Restore to, the cron expression...) are in fact 12.6px and still trigger iOS's
+     focus zoom. Only this rule's (0,1,1) holds it down. */
   input.mono,
   select.mono,
   textarea.mono {
     font-size: 16px;
   }
 
-  /* 长输入框占满可用宽度：480px 在任何手机上都溢出，280px 在 320px 屏上也贴边。 */
+  /* Long inputs fill the available width: 480px overflows on any phone, and 280px is flush against the edge at 320px. */
   .w-md,
   .w-lg {
     width: 100%;
   }
 
-  /* 底部固定 tab 栏：拇指够得着，且不随页面滚走。
-     结构不变（仍是 .sidebar），只是换个位置和方向。 */
+  /* Fixed bottom tab bar: within reach of a thumb, and it does not scroll away with the page.
+     The structure is unchanged (still .sidebar); only its position and direction change. */
   .app-shell {
     grid-template-rows: minmax(0, 1fr) auto;
   }
@@ -887,7 +905,7 @@ tbody tr.ops-row:hover {
     order: 2;
     position: fixed;
     inset: auto 0 0 0;
-    z-index: 40; /* 低于 .modal-overlay 的 50：全屏弹窗必须盖住导航栏 */
+    z-index: 40; /* Below .modal-overlay's 50: a full-screen modal has to cover the nav bar */
     flex-direction: row;
     border-top: 1px solid var(--border);
     border-bottom: none;
@@ -895,7 +913,7 @@ tbody tr.ops-row:hover {
     padding-bottom: env(safe-area-inset-bottom);
     overflow: visible;
   }
-  /* 品牌名在手机上是纯装饰：页面自己有 <h1>，这条只是在抢高度。 */
+  /* On a phone the brand name is pure decoration: the page has its own <h1>, so this is only stealing height. */
   .sidebar-brand {
     display: none;
   }
@@ -917,13 +935,13 @@ tbody tr.ops-row:hover {
     border-bottom: none;
     border-top-color: var(--accent);
   }
-  /* 底部栏是 fixed 的，脱离了文档流：不给内容留出等高的下边距，
-     最后一行内容会被永久盖住，而且没有任何办法滚出来。 */
+  /* The bottom bar is fixed and out of the document flow: reserve no bottom padding of equal height on the content and
+     the last row of it is covered for good, with no way whatsoever to scroll it back out. */
   .app-main {
     padding-bottom: calc(52px + var(--sp-4) + env(safe-area-inset-bottom));
   }
 
-  /* 卡片化的表。只有显式标了 .cards 的表才变形——日志那类表要留在 Task 3 的横滚里。 */
+  /* Carded tables. Only tables explicitly marked .cards get reshaped - tables like the logs stay in Task 3's h-scroll. */
   table.cards,
   table.cards tbody,
   table.cards tr,
@@ -931,8 +949,8 @@ tbody tr.ops-row:hover {
     display: block;
     width: auto;
   }
-  /* 列名改由每个 td 自己用 ::before 显示，表头就没用了。
-     用 position:absolute 而不是 display:none：后者会让屏幕阅读器也读不到。 */
+  /* Column names are now shown by each td itself via ::before, which leaves the header with no job.
+     Use position:absolute rather than display:none: the latter would hide it from screen readers as well. */
   table.cards thead {
     position: absolute;
     width: 1px;
@@ -947,9 +965,10 @@ tbody tr.ops-row:hover {
     padding: var(--sp-2) var(--sp-3);
     background: var(--bg-raised);
   }
-  /* 触屏层（文件末尾）有一组四个选择器的 hover 抑制，其中三个带 class，specificity 比
-     table.cards tbody tr 高——光压住第一个不够。正在跑备份的那张卡（has-ops + ops-row
-     合并而成）会在点击后塌掉底色，而那正是手机上盯着看的那张。 */
+  /* The touch layer (end of file) has a hover-suppression group of four selectors, three of which carry a class and so
+     outrank table.cards tbody tr in specificity - beating the first one alone is not enough. The card for a backup that is
+     running (has-ops + ops-row merged into one) would drop its background after a tap, and that is the very card being
+     stared at on a phone. */
   table.cards tbody tr,
   table.cards tbody tr.has-ops,
   table.cards tbody tr.ops-row,
@@ -969,18 +988,18 @@ tbody tr.ops-row:hover {
     color: var(--text-muted);
     font-size: 12px;
   }
-  /* 卡片化之后 td 是 grid，格子里的东西默认被拉满整列：grid item 会被 blockify，
-     .badge / .row-inline 的 inline-flex 一律变成 flex，再被 justify-self 的初始值
-     stretch 撑到列宽——于是一个本该裹着文字的胶囊横贯整屏。
-     不能改在 td 上加 justify-items：纯文本单元格是**匿名 grid item**，一起收缩会改掉
-     长路径（Local Root）的换行位置。只按住这两个自成一体的行内块。
-     specificity：这条 (0,2,2) 压得住 .badge 的 (0,1,0) 与 .row-inline 的 (0,1,0)，
-     与源码顺序无关——本文件的覆盖规则在这一点上已经栽过三次。 */
+  /* Once carded the td is a grid, and by default whatever is in a cell gets pulled across the whole column: grid items are
+     blockified, the inline-flex on .badge / .row-inline turns into plain flex, and then justify-self's initial value of
+     stretch blows it out to the column width - so a pill that ought to hug its text spans the entire screen.
+     Adding justify-items on the td is not an option: plain-text cells are **anonymous grid items**, and shrinking them
+     along with the rest would change where long paths (Local Root) wrap. Pin down only these two self-contained inline
+     blocks. specificity: this rule's (0,2,2) beats .badge's (0,1,0) and .row-inline's (0,1,0), regardless of source order -
+     the override rules in this file have already tripped over that three times. */
   table.cards td > .badge,
   table.cards td > .row-inline {
     justify-self: start;
   }
-  /* 首列是这张卡片的标题——给它标签反而是噪音。 */
+  /* The first column is this card's title - giving it a label would be nothing but noise. */
   table.cards td.card-title {
     display: block;
     font-weight: 600;
@@ -990,8 +1009,8 @@ tbody tr.ops-row:hover {
   table.cards td.card-title::before {
     content: none;
   }
-  /* 操作列：按钮横排在卡片底部，上面划一条线与字段区分开。
-     它的 data-label 是空的，所以不占标签列。 */
+  /* Actions column: the buttons run across the bottom of the card, with a line above separating them from the fields.
+     Its data-label is empty, so it does not take up the label column. */
   table.cards td.card-actions {
     display: flex;
     flex-wrap: wrap;
@@ -1004,15 +1023,15 @@ tbody tr.ops-row:hover {
   table.cards td.card-actions::before {
     content: none;
   }
-  /* 空表提示不是卡片，别给它画边框。 */
+  /* The empty-table message is not a card; do not draw a border around it. */
   table.cards td.empty-state {
     display: block;
   }
   table.cards td.empty-state::before {
     content: none;
   }
-  /* tr 才是画卡片的那一层，上面两条只管住了 td——不撤掉这一层，
-     "No backups yet." 就会被裱进一个空卡片里。 */
+  /* The tr is the layer that actually draws the card, and the two rules above only cover the td - leave this layer in
+     place and "No backups yet." ends up framed inside an empty card. */
   table.cards tr:has(td.empty-state) {
     border: none;
     border-radius: 0;
@@ -1021,7 +1040,8 @@ tbody tr.ops-row:hover {
     margin-bottom: 0;
   }
 
-  /* 运行状态行在桌面上是跨全列的独立一行，卡片化后要和上面那张卡合成一张。 */
+  /* On desktop the running-status row is a separate row spanning every column; once carded it has to merge with the card
+     above it into one. */
   table.cards tr.has-ops {
     margin-bottom: 0;
     border-bottom: none;
@@ -1042,13 +1062,14 @@ tbody tr.ops-row:hover {
     content: none;
   }
 
-  /* 全屏面板：长表单的动作按钮必须常驻可见，这是"手机上完整可操作"的关键一处。 */
+  /* Full-screen panel: the action buttons of a long form must stay visible at all times - this is the key piece of being
+     "fully operable on a phone". */
   .modal-overlay {
     padding: 0;
   }
   .modal-panel {
     width: 100vw;
-    height: 100dvh; /* 不用 vh：地址栏收缩会改变它的解析值，动作栏会跟着跳 */
+    height: 100dvh; /* Not vh: the address bar collapsing changes what it resolves to, and the action bar jumps along with it */
     min-width: 0;
     max-width: none;
     max-height: none;
@@ -1065,22 +1086,23 @@ tbody tr.ops-row:hover {
   .modal-footer {
     padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
   }
-  /* 动作按钮在手机上占满一行更好点，主按钮排在最前面。 */
+  /* On a phone the action buttons are easier to hit filling a whole line, with the primary button first. */
   .modal-footer > button {
     flex: 1 1 auto;
     min-width: 120px;
   }
 
-  /* 内联表单（新建备份向导）的动作栏。它不是弹窗，拿不到 .modal-footer 的固定位置，
-     用 sticky 达到同样效果：按钮始终贴在视口底部，而不是躺在表单末尾等人滚过去。 */
+  /* The action bar of an inline form (the new-backup wizard). It is not a modal, so it cannot have .modal-footer's fixed
+     positioning; sticky gets the same effect: the buttons always hug the bottom of the viewport instead of lying at the end
+     of the form waiting for someone to scroll down to them. */
   .form-actions {
     position: sticky;
-    /* 让开底部导航栏，否则两条栏叠在一起。52px 与 .nav-item 的 min-height 一致。 */
+    /* Clear the bottom nav bar, or the two bars stack on each other. The 52px matches .nav-item's min-height. */
     bottom: calc(52px + env(safe-area-inset-bottom));
-    z-index: 30; /* 低于 .sidebar 的 40 */
+    z-index: 30; /* Below .sidebar's 40 */
     margin: var(--sp-4) calc(-1 * var(--sp-4)) 0;
     padding: var(--sp-3) var(--sp-4);
-    /* 背景与上边框不能省：sticky 元素下面的表单内容会从它背后透上来。 */
+    /* The background and top border cannot be skipped: form content under a sticky element shows through from behind it. */
     background: var(--bg-raised);
     border-top: 1px solid var(--border);
   }
@@ -1091,18 +1113,19 @@ tbody tr.ops-row:hover {
 }
 
 /* ── Touch ──────────────────────────────────────────────────────────────────
-   与屏幕宽度无关，只看指针精度：1000px 宽的触屏平板同样需要大命中区，
-   而桌面用户把窗口拖窄不该让按钮突然变粗。
-   这个块必须排在文件最后：@media 不增加 specificity，同 specificity 时源码顺序
-   靠后者胜出，放前面会被下面无条件的 tbody tr:hover 等规则盖掉，在触屏设备上失效。 */
+   Nothing to do with screen width, only with pointer precision: a 1000px-wide touch tablet needs big hit areas just the
+   same, while a desktop user dragging the window narrow should not make the buttons suddenly go chunky.
+   This block has to sit last in the file: @media adds no specificity, and at equal specificity source order decides with
+   the later one winning; put it earlier and the unconditional rules below it, tbody tr:hover and friends, override it and
+   it stops working on touch devices. */
 @media (pointer: coarse) {
   :root {
     --control-h: 44px;
   }
 
-  /* 触屏上 :hover 会在点击后粘住不消失，表格会留下一片高亮，看着像"选中了"。
-     四个选择器要写全：.has-ops / .ops-row 那组带 class，specificity 比裸的
-     tbody tr:hover 高，只覆盖后者的话运行状态行仍然会粘住。 */
+  /* On touch, :hover sticks after a tap and never goes away, leaving a highlighted patch on the table that reads as
+     "this is selected". All four selectors have to be spelled out: the .has-ops / .ops-row group carries a class and so
+     outranks bare tbody tr:hover in specificity; override only the latter and the running-status row still sticks. */
   tbody tr:hover,
   tbody tr.has-ops:hover,
   tbody tr.has-ops:hover + tr.ops-row,
@@ -1110,7 +1133,7 @@ tbody tr.ops-row:hover {
     background: transparent;
   }
 
-  /* 系统默认的蓝色点击方块会盖住下面这些自定义的按下反馈。 */
+  /* The system's default blue tap rectangle covers up the custom press feedback below. */
   button,
   a,
   label,
@@ -1118,7 +1141,7 @@ tbody tr.ops-row:hover {
     -webkit-tap-highlight-color: transparent;
   }
 
-  /* 没有 hover 就必须有 active，否则触屏上点下去毫无反馈。 */
+  /* With no hover there has to be an active state, or a tap on touch gives no feedback whatsoever. */
   button:active:not(:disabled) {
     background: var(--bg-hover);
   }
@@ -1132,11 +1155,11 @@ tbody tr.ops-row:hover {
     background: var(--bg-hover);
   }
 
-  /* 视觉尺寸保持不变——放大会破坏紧凑控制台的观感——只把命中区撑到 44px。
-     用伪元素实现：它不参与布局，因此不会推开周围内容。 */
+  /* The visual size stays exactly as it is - scaling it up would wreck the compact-console look - and only the hit area
+     is stretched to 44px. Done with a pseudo-element: it takes no part in layout, so it pushes nothing around it aside. */
   .icon-btn,
   .hit-target {
-    position: relative; /* 伪元素的定位基准；缺了它命中区会落到更外层的定位祖先上 */
+    position: relative; /* Positioning reference for the pseudo-element; without it the hit area lands on some outer positioned ancestor */
   }
   .icon-btn::after,
   .hit-target::after {
@@ -1148,10 +1171,10 @@ tbody tr.ops-row:hover {
     transform: translate(-50%, -50%);
   }
 
-  /* 还原树的行只有约 18px 高（.text-sm 的 12px × 1.5），44px 的方形命中盒会和上下两行
-     重叠 26px——点这一行的三角，展开的是下一行；而 disabled 的三角还会变成一块吞掉
-     邻居的死区。密集列表不适用通用的方形命中盒：横向仍扩到 44px（手指的宽度方向），
-     纵向老实跟着行高走。 */
+  /* Rows in the restore tree are only about 18px tall (.text-sm's 12px x 1.5), so a 44px square hit box overlaps the rows
+     above and below by 26px - tap this row's triangle and the next row is what expands; and a disabled triangle turns into
+     a dead zone that swallows its neighbors. The generic square hit box does not suit dense lists: horizontally it still
+     stretches to 44px (the direction a finger is wide), vertically it honestly follows the line height. */
   .row.text-sm .icon-btn::after,
   .row.text-sm .hit-target::after {
     height: 100%;
