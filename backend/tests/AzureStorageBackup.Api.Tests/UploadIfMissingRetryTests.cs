@@ -6,13 +6,14 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// "仅当不存在时上传"必须是**幂等**的，而且这件事得由服务端保证。
+/// "Upload only if it is missing" must be **idempotent**, and it is the server side that has to guarantee that.
 /// <para>
-/// 从前是"先 Exists 再上传"，两步之间有个不原子的窗口，而上传是会重试的：网络抖一下（NAS 上
-/// 很常见），服务端其实已经写进去了、客户端只收到超时，重试于是去覆盖一个已经存在的 blob。
-/// 数据层是 Archive 时这一下直接失败——归档 blob 不允许被覆盖，返回 409 BlobArchived，
-/// 而它不在可重试之列，整轮备份就此倒掉，容器里只留下之前传成功的那些对象。
-/// 这是用户实际踩到的。
+/// It used to be "Exists first, then upload", with a non-atomic window between the two steps — and uploads get retried: the network
+/// hiccups (very common on a NAS), the server has actually already written the data while the client only sees a timeout, and the
+/// retry then goes off and overwrites a blob that already exists.
+/// On the Archive tier that fails outright — an archived blob may not be overwritten, it returns 409 BlobArchived, which is not on
+/// the retryable list, so the entire backup run falls over and the container keeps only the objects that were uploaded before it.
+/// This is something a user actually hit.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -58,8 +59,8 @@ public sealed class UploadIfMissingRetryTests : IDisposable
     }
 
     /// <summary>
-    /// 同一个 blob 名连传两次：第二次必须**安静地**返回"没传"，而不是去覆盖。
-    /// 这就是重试碰上自己刚写成功那一份时的形状。
+    /// Upload the same blob name twice in a row: the second time must **quietly** report "did not upload" instead of overwriting.
+    /// This is exactly the shape of a retry running into the copy it had just written successfully.
     /// </summary>
     [SkippableFact]
     public async Task Uploading_The_Same_Name_Twice_Is_A_No_Op_The_Second_Time()
@@ -80,7 +81,7 @@ public sealed class UploadIfMissingRetryTests : IDisposable
             Assert.True(await uploader.UploadIfMissingAsync(
                 account, name, "data/x", file, AccessTier.Hot, null, CancellationToken.None, null, null));
 
-            // 第二次：blob 已经在了。必须返回 false 且不抛——重试路径正是走到这里。
+            // Second time around: the blob is already there. Must return false and must not throw — this is precisely where the retry path lands.
             Assert.False(await uploader.UploadIfMissingAsync(
                 account, name, "data/x", file, AccessTier.Hot, null, CancellationToken.None, null, null));
         }
@@ -88,8 +89,8 @@ public sealed class UploadIfMissingRetryTests : IDisposable
     }
 
     /// <summary>
-    /// 并发对同一个 blob 名走 if-missing：**恰好一个**报告"传了"，其余安静返回 false。
-    /// 从前两个任务会先后走过存在性检查、都看到"不存在"，于是都去写。
+    /// Concurrent if-missing uploads against the same blob name: **exactly one** reports "uploaded", the rest quietly return false.
+    /// It used to be that two tasks would each walk through the existence check, both see "not there", and both go write.
     /// </summary>
     [SkippableFact]
     public async Task Concurrent_If_Missing_Uploads_Elect_Exactly_One_Writer()
@@ -117,7 +118,7 @@ public sealed class UploadIfMissingRetryTests : IDisposable
     }
 
     /// <summary>
-    /// 覆盖语义**不**受影响：修复与死重压实要能替换已有对象，那条路不该被条件请求挡住。
+    /// Overwrite semantics are **not** affected: repair and dead-weight compaction have to be able to replace an existing object, and that path must not be blocked by the conditional request.
     /// </summary>
     [SkippableFact]
     public async Task Overwrite_Still_Replaces_An_Existing_Blob()

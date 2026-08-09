@@ -5,9 +5,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 摘要里的数字是真跑出来的，不是转述 diff 的自述。这里跑真实的备份，验证三件在纯函数测试里
-/// 验不到的事：各 ChangeKind 数得对、实传字节只算真正推上去的（去重命中一个字节都不能算）、
-/// 保留清理删了多少东西能被数出来。
+/// The numbers in the summary come out of a real run; they are not the differ parroting its own diff back.
+/// These tests run actual backups to verify three things a pure-function test cannot: each ChangeKind is
+/// counted correctly, uploaded bytes count only what was really pushed (a dedup hit must not add one byte),
+/// and retention cleanup can report how much it deleted.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupStatsTests : IDisposable
@@ -52,7 +53,7 @@ public sealed class BackupStatsTests : IDisposable
     private static readonly DateTime MtimeBase = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
     private int _mtimeSeq;
 
-    /// <summary>写文件并推进 mtime——等长改写不动 mtime 会被差异检测判为未变。</summary>
+    /// <summary>Write a file and advance its mtime — a same-length rewrite that leaves mtime alone is judged unchanged by the differ.</summary>
     private void Write(string rel, string content)
     {
         var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
@@ -78,9 +79,11 @@ public sealed class BackupStatsTests : IDisposable
     }
 
     /// <summary>
-    /// 阈值压到 20 KB（默认是 5 MB），好用几十 KB 的小文件就把两条存储路径都走到：超过阈值的走
-    /// 内容寻址的单文件 data blob（**会**去重），低于阈值的成组进 pack（每轮新建一个包，不跨包去重）。
-    /// 不压的话得写 5 MB 以上的文件才碰得到 blob 那条路，测试白慢一大截。
+    /// Threshold squeezed down to 20 KB (the default is 5 MB) so that files of a few tens of KB already exercise
+    /// both storage paths: above the threshold goes to a content-addressed single-file data blob (which **does**
+    /// dedup), below it gets grouped into a pack (a fresh pack every run, no cross-pack dedup).
+    /// Without squeezing it we would have to write files over 5 MB to reach the blob path, making the test far
+    /// slower for nothing.
     /// </summary>
     private const long SingleFileThreshold = 20_000;
 
@@ -118,29 +121,30 @@ public sealed class BackupStatsTests : IDisposable
             Write("gone.txt", "doomed");
             var v1 = await orchestrator.RunAsync(Request(account, name));
 
-            // 首轮：三个文件全是新增，没有变更也没有删除。
+            // First run: all three files are new, nothing modified and nothing deleted.
             Assert.Equal(3, v1.NewFiles);
             Assert.Equal(0, v1.ModifiedFiles);
             Assert.Equal(0, v1.DeletedFiles);
 
-            Write("edit.txt", "after-and-longer");   // 改一个
-            Write("added.txt", "brand new");         // 加一个
-            Delete("gone.txt");                      // 删一个
+            Write("edit.txt", "after-and-longer");   // modify one
+            Write("added.txt", "brand new");         // add one
+            Delete("gone.txt");                      // delete one
             var v2 = await orchestrator.RunAsync(Request(account, name));
 
             Assert.Equal(1, v2.NewFiles);
             Assert.Equal(1, v2.ModifiedFiles);
             Assert.Equal(1, v2.DeletedFiles);
-            // 未变的 keep.txt 既不算新增也不算变更——这正是增量备份要省下的那部分。
+            // Unchanged keep.txt counts as neither new nor modified — that is precisely the part incremental backup saves.
             Assert.Equal(v2.ChangedFiles, v2.NewFiles + v2.ModifiedFiles);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 实传字节只能算真正推上云的那些。把同一份内容换个路径再备份一次：去重会命中，
-    /// 于是这一轮源侧"变更"了整整一个文件，实传却必须是 0——两个口径分开报的全部意义就在这里。
-    /// <para>内容必须**超过**单文件阈值：去重是内容寻址 data blob 的性质，pack 每轮都新建一个包，不跨包去重。</para>
+    /// Uploaded bytes may only count what actually went up to the cloud. Back the same content up again under a
+    /// different path: dedup hits, so on the source side this run "changed" an entire file while uploaded bytes
+    /// must be 0 — reporting the two figures separately exists for exactly this case.
+    /// <para>The content must be **above** the single-file threshold: dedup is a property of content-addressed data blobs; packs get a fresh pack every run and never dedup across packs.</para>
     /// </summary>
     [SkippableFact]
     public async Task Uploaded_Bytes_Exclude_Deduplicated_Content()
@@ -159,22 +163,22 @@ public sealed class BackupStatsTests : IDisposable
             var payload = new string('x', 50_000);
             Write("one.txt", payload);
             var v1 = await orchestrator.RunAsync(Request(account, name));
-            Assert.True(v1.UploadedBytes > 0, "首轮必须真的传了东西");
+            Assert.True(v1.UploadedBytes > 0, "the first run must really have uploaded something");
 
-            // 同一份内容，另一个路径：源侧是一个新增文件，云端一个字节都不该涨。
+            // Same content, different path: a new file on the source side, but not one extra byte in the cloud.
             Write("copy.txt", payload);
             var v2 = await orchestrator.RunAsync(Request(account, name));
 
             Assert.Equal(1, v2.NewFiles);
-            Assert.True(v2.ChangedBytes >= 50_000, "源侧确实变更了一整个文件");
+            Assert.True(v2.ChangedBytes >= 50_000, "the source side really did change an entire file");
             Assert.Equal(0, v2.UploadedBytes);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 保留策略退役旧版本时，删掉的东西要能被数出来——否则日志里那行永远是 0。
-    /// pack 与 data blob 两条路都要覆盖：它们分开计数，只测一条就发现不了另一条压根没在数。
+    /// When retention retires an old version, whatever it deleted has to be countable — otherwise that line in the log stays 0 forever.
+    /// Both the pack path and the data blob path must be covered: they are counted separately, so testing only one hides that the other is not counting at all.
     /// </summary>
     [SkippableFact]
     public async Task Reports_What_Retention_Deleted()
@@ -190,11 +194,11 @@ public sealed class BackupStatsTests : IDisposable
 
         try
         {
-            // 只留 1 个版本：第二轮一跑完，第一版及其独占数据就该被清掉。
-            Write("big.bin", new string('a', 60_000));    // > 阈值 → 单文件 data blob
-            Write("small.txt", new string('a', 5_000));   // < 阈值 → 成组进 pack
+            // Keep only 1 version: the moment the second run finishes, v1 and the data only it references should be swept away.
+            Write("big.bin", new string('a', 60_000));    // > threshold → single-file data blob
+            Write("small.txt", new string('a', 5_000));   // < threshold → grouped into a pack
             var v1 = await orchestrator.RunAsync(Request(account, name, maxVersions: 1));
-            Assert.True(v1.Cleanup.IsEmpty, "只有一个版本时无可退役");
+            Assert.True(v1.Cleanup.IsEmpty, "nothing to retire when there is only one version");
 
             Write("big.bin", new string('b', 60_000));
             Write("small.txt", new string('b', 5_000));
@@ -202,10 +206,10 @@ public sealed class BackupStatsTests : IDisposable
 
             Assert.False(v2.Cleanup.IsEmpty);
             Assert.Equal(1, v2.Cleanup.RetiredVersions);
-            // v1 的两份内容都再没人引用了，两条存储路径各自的对象都该被删掉并计入释放量。
-            Assert.True(v2.Cleanup.DeletedBlobs > 0, "v1 的独占 data blob 应被删除");
-            Assert.True(v2.Cleanup.DeletedPacks > 0, "v1 的独占 pack 应被删除");
-            Assert.True(v2.Cleanup.FreedBytes > 0, "释放的字节应被累加");
+            // Neither of v1's two contents is referenced any more; the objects on both storage paths should be deleted and counted as freed.
+            Assert.True(v2.Cleanup.DeletedBlobs > 0, "v1's exclusive data blob should be deleted");
+            Assert.True(v2.Cleanup.DeletedPacks > 0, "v1's exclusive pack should be deleted");
+            Assert.True(v2.Cleanup.FreedBytes > 0, "freed bytes should be accumulated");
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

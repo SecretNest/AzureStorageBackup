@@ -6,8 +6,8 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 定时备份此前绕开 BackupRunner 直接调 BackupOrchestrator，进度回调传的是 null，
-/// 因此界面永远查不到它的状态。而定时备份恰恰是常态。
+/// Scheduled backups used to go around BackupRunner and call BackupOrchestrator directly, passing null for the progress callback,
+/// so the UI could never look up their state. And a scheduled backup is precisely the normal case.
 /// </summary>
 [Trait("Category", "Integration")]
 public class ScheduledBackupProgressTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
@@ -55,12 +55,12 @@ public class ScheduledBackupProgressTests(TestWebAppFactory factory) : IClassFix
         taskRes.EnsureSuccessStatusCode();
         var task = await taskRes.Content.ReadFromJsonAsync<TaskResponse>();
 
-        // 立即执行该计划任务，走的是调度器的分发路径。端点内部 await 完整个 DispatchAsync
-        // 才返回，但仍按指示轮询，防止将来该端点改成异步触发。
+        // Run the scheduled task right now, going through the scheduler's dispatch path. The endpoint awaits the whole DispatchAsync
+        // before it returns, but we still poll as instructed, in case the endpoint is ever changed to fire asynchronously.
         (await _client.PostAsync($"/api/tasks/{task!.Id}/run", null)).EnsureSuccessStatusCode();
 
-        // 备份多半会失败（本地根不存在），但**必须留下可轮询的状态**。
-        // 修复前这里是 null：调度器根本没经过 BackupRunner。
+        // The backup will most likely fail (the local root does not exist), but it **must leave behind a state the UI can poll**.
+        // Before the fix this was null: the scheduler never went through BackupRunner at all.
         var runner = factory.Services.GetRequiredService<BackupRunner>();
         BackupRunState? state = null;
         var deadline = DateTime.UtcNow.AddSeconds(10);

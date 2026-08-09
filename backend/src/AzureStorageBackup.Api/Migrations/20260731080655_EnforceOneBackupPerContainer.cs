@@ -10,16 +10,16 @@ namespace AzureStorageBackup.Api.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            // 这条唯一索引要落到的库里可能已经躺着重复——那正是它要堵的 bug 的产物（从前
-            // 创建/导入都不查重）。直接建索引会失败，而迁移失败就是应用起不来。
+            // The database this unique index has to land in may already be holding duplicates — the very product of the bug it plugs
+            // (create/import never checked for duplicates before). Creating the index outright fails, and a failed migration means the app will not start.
             //
-            // 所以先把重复挪开，而且**一条都不许删**：那些配置指着真实的云端数据，删掉本地记录
-            // 不会让云端数据消失，只会让用户再也看不见它。挪法是把 ContainerName 改成一个 Azure
-            // 根本不接受的名字（带点），于是它既不可能再碰任何真实 container，又原样留在界面上，
-            // 连同一条说明为什么的 LastError，由用户自己决定怎么处置。
+            // So move the duplicates aside first, and **delete not a single one**: those configs point at real cloud data; deleting the
+            // local record does not make the cloud data disappear, it only makes the user unable to ever see it again. Moving one aside
+            // means rewriting ContainerName into a name Azure flatly refuses (it has a dot in it), so it can never touch a real container
+            // again while staying visible in the UI as-is, together with a LastError explaining why, for the user to deal with as they choose.
             //
-            // 赢家取每组 Id 最小的那条：先建的那条才是这个 container 真正的主人。SQLite 里 SET
-            // 各表达式读的都是本行的旧值，所以下面的子查询按旧 ContainerName 仍能匹配到整组。
+            // The winner is the smallest Id in each group: the one created first is this container's true owner. In SQLite every expression
+            // in a SET reads this row's old values, so the subquery below still matches the whole group by the old ContainerName.
             migrationBuilder.Sql(
                 """
                 UPDATE BackupConfigs
@@ -47,9 +47,9 @@ namespace AzureStorageBackup.Api.Migrations
 
         /// <inheritdoc />
         /// <remarks>
-        /// 只撤索引，不还原被挪开的名字：还原就等于把重复重新放回去，而降级之后紧接着的那次
-        /// 升级又会再挪一遍（这次赢家还是同一条，被挪的却会带上第二层后缀）。挪开的配置在界面上
-        /// 看得见、删得掉，交给用户处置比让迁移来回搬更安全。
+        /// Only the index is dropped; the names that were moved aside are not restored. Restoring them would put the duplicates straight
+        /// back, and the very next upgrade after the downgrade would move them aside again (same winner, but the moved-aside one would
+        /// pick up a second layer of suffix). A moved-aside config is visible and deletable in the UI, and leaving it to the user is safer than having the migration shuttle it back and forth.
         /// </remarks>
         protected override void Down(MigrationBuilder migrationBuilder)
         {

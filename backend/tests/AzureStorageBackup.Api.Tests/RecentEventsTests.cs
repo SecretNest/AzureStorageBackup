@@ -3,8 +3,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 还原的逐文件消息此前写进一个**单值**字段，后一条覆盖前一条——跳过/失败几十个文件，
-/// 跑完只剩最后一条，其余仅体现为 FailedFiles 那个数字，而"哪几个、为什么"才是要看的。
+/// Restore's per-file messages used to go into a **single-valued** field where each new one overwrote the last — skip or fail dozens of
+/// files and the run ends with only the final message, the rest showing up merely as the FailedFiles number, when "which ones, and why" is what you need to see.
 /// </summary>
 public sealed class RecentEventsTests
 {
@@ -21,8 +21,8 @@ public sealed class RecentEventsTests
         Assert.Contains("b.txt", events.Snapshot()[2]);
     }
 
-    /// <summary>有上限：这类消息可能与文件数同量级，无上限地留着就是拿内存换一份没人翻得完的日志。
-    /// 满了丢最旧的——最近发生的更可能与当下的问题相关。</summary>
+    /// <summary>Bounded: messages like these can be of the same order as the file count, and keeping them unbounded trades memory for a log nobody can read to the end.
+    /// When it is full the oldest goes — what happened most recently is more likely to bear on the problem at hand.</summary>
     [Fact]
     public void Drops_The_Oldest_Once_Full()
     {
@@ -33,7 +33,7 @@ public sealed class RecentEventsTests
         Assert.Equal(["event 3", "event 4", "event 5"], events.Snapshot());
     }
 
-    /// <summary>快照必须是副本：写入方在还原线程上，读取方在 HTTP 序列化线程上。</summary>
+    /// <summary>The snapshot must be a copy: the writer sits on the restore thread, the reader on the HTTP serialization thread.</summary>
     [Fact]
     public void Snapshot_Is_Isolated_From_Later_Writes()
     {

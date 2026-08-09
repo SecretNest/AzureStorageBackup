@@ -5,17 +5,17 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 本地权威的信息文件读写（设计 §3.3）。正常备份**不从云端读信息文件**（它可能落 Cold，取回有费）：
-/// 本地有序列化副本就用本地；写入用 ETag <c>If-Match</c> 检测外部改动（多机/container 重建），冲突则清本地状态并报错重跑重同步。
-/// 仅本地无副本时（首次/导入前）才读云端并回填。
+/// Locally authoritative reads and writes of the info file (design §3.3). A normal backup **never reads the info file from the cloud** (it may sit in Cold, where retrieval costs money):
+/// if a serialized copy exists locally, use the local one; writes use an ETag <c>If-Match</c> to detect external modification (several machines / a rebuilt container), and on conflict the local state is cleared and an error tells you to re-run to re-sync.
+/// Only when there is no local copy (first run / before an import) does it read the cloud and backfill.
 /// </summary>
 public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateStore state)
 {
-    /// <summary>本地是否已有权威状态（此备份由本工具建立并同步过）。为 true 时去重可纯本地判断，不读云端。</summary>
+    /// <summary>Whether authoritative state already exists locally (this backup was created and synced by this tool). When true, dedup can be decided purely locally without reading the cloud.</summary>
     public async Task<bool> HasLocalAsync(Account account, string container, CancellationToken ct = default) =>
         await state.TryGetAsync(account.Id, container, ct) is not null;
 
-    /// <summary>加载信息文件：本地有则用本地（不读云端）；否则读云端并回填。均无返回 null（→ 新建）。</summary>
+    /// <summary>Loads the info file: if a local copy exists, use it (no cloud read); otherwise read the cloud and backfill. If neither exists, returns null (→ create a new one).</summary>
     public async Task<BackupInfoFile?> LoadAsync(Account account, string container, string? password, CancellationToken ct = default)
     {
         var local = await state.TryGetAsync(account.Id, container, ct);
@@ -30,7 +30,7 @@ public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateSt
         return cloud.Value.Info;
     }
 
-    /// <summary>提交信息文件：以本地记录的 ETag 做 If-Match 写云端，成功后更新本地。外部已改动 → 清本地并抛异常。</summary>
+    /// <summary>Commits the info file: writes to the cloud with the locally recorded ETag as If-Match, then updates the local copy on success. Changed externally → clear the local state and throw.</summary>
     public async Task WriteAsync(
         Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, CancellationToken ct = default)
     {
@@ -41,12 +41,12 @@ public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateSt
                 account, container, info, password, tier, ifMatch: local?.ETag, ct);
             await state.PutAsync(account.Id, container, IndexSerializer.SerializeInfoFile(info), newEtag, ct);
         }
-        // 412 = ETag 对不上，409 BlobAlreadyExists = 我们以为没有、它却已经在了。两者都确实是
-        // "信息文件被别处改过"。
+        // 412 = the ETag does not match; 409 BlobAlreadyExists = we assumed it was absent and it was already there. Both really do mean
+        // "the info file was changed somewhere else".
         //
-        // 但**不能**把 409 一律收下：BlobArchived 也是 409，它说的是"这个 blob 已归档、动不了"，
-        // 与"被别处改了"毫无关系。混在一起会给出一条彻底误导的错误，还顺手把本地权威状态清掉——
-        // 而那份状态正是下一次备份免于读云端的依据，清了就得重新回填。
+        // But we must **not** take every 409: BlobArchived is a 409 too, and it says "this blob is archived, you cannot touch it",
+        // which has nothing to do with "changed somewhere else". Lumping them together produces a thoroughly misleading error and wipes
+        // the local authoritative state on the way out — and that state is exactly what lets the next backup skip reading the cloud; clear it and it all has to be backfilled again.
         catch (RequestFailedException ex) when (ex.Status == 412 || ex.ErrorCode == "BlobAlreadyExists")
         {
             await state.RemoveAsync(account.Id, container, ct);
@@ -55,7 +55,7 @@ public sealed class TrackedInfoStore(IBackupInfoStore store, ILocalBackupStateSt
         }
     }
 
-    /// <summary>导入：用云端信息文件回填本地权威状态（供之后备份不再读云端）。返回读到的信息文件。</summary>
+    /// <summary>Import: backfills the local authoritative state from the cloud info file (so later backups no longer read the cloud). Returns the info file that was read.</summary>
     public async Task<(BackupInfoFile Info, string ETag)?> SeedFromCloudAsync(
         Account account, string container, string? password, CancellationToken ct = default)
     {

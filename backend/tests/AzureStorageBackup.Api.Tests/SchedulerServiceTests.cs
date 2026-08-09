@@ -9,11 +9,11 @@ using Microsoft.Extensions.Logging;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// Task 5 复审 Finding 2/3：TickAsync 的密钥环跳过分支此前零覆盖。这里直接驱动
-/// internal 的 TickAsync（经 InternalsVisibleTo 对测试程序集开放，不必为测试把
-/// 生产代码方法开成 public，也不必走完整 BackgroundService 生命周期/等待轮询）。
-/// 断言两件事：①密钥环丢失时到期任务不被触发（LastRunAt 不写入）；②即便丢失，
-/// 短存日志清理仍照常执行（trimming 与凭据无关，被移到闸门之前，见 Finding 2）。
+/// Task 5 re-review, Findings 2/3: the keyring skip branch of TickAsync previously had zero coverage. Here we drive the
+/// internal TickAsync directly (opened to the test assembly via InternalsVisibleTo, so no production method has to be
+/// made public just for tests, and there is no need to go through the full BackgroundService lifecycle or wait on polling).
+/// Two things are asserted: (1) when the keyring is lost, a due task is not fired (LastRunAt stays unwritten); (2) even when it is lost,
+/// ephemeral log cleanup still runs as usual (trimming is unrelated to credentials and was moved ahead of the gate, see Finding 2).
 /// </summary>
 public class SchedulerServiceTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
@@ -37,7 +37,7 @@ public class SchedulerServiceTests(TestWebAppFactory factory) : IClassFixture<Te
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             db.LogEntries.Add(new LogEntry
             {
-                Timestamp = DateTimeOffset.UtcNow.AddDays(-30), // 远超默认 14 天短存窗口
+                Timestamp = DateTimeOffset.UtcNow.AddDays(-30), // far beyond the default 14-day ephemeral window
                 Level = OperationLogLevel.Info,
                 Source = "scheduler-gate-test",
                 Message = "old ephemeral entry",
@@ -49,7 +49,7 @@ public class SchedulerServiceTests(TestWebAppFactory factory) : IClassFixture<Te
                 AccountId = 1,
                 ContainerName = "scheduler-gate-test-container",
                 TaskType = ScheduledTaskType.Backup,
-                CronExpression = "* * * * *", // 每分钟，创建时间在过去 → 立即到期
+                CronExpression = "* * * * *", // every minute, and created in the past → due immediately
                 Enabled = true,
                 CreatedAt = DateTimeOffset.UtcNow.AddDays(-1),
             };
@@ -72,10 +72,10 @@ public class SchedulerServiceTests(TestWebAppFactory factory) : IClassFixture<Te
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            // 日志清理与凭据无关，密钥环丢失也照常执行（Finding 2）。
+            // Log cleanup is unrelated to credentials, so it runs as usual even with the keyring lost (Finding 2).
             Assert.False(await db.LogEntries.AnyAsync(e => e.Source == "scheduler-gate-test"));
 
-            // 到期任务被跳过，未触发（LastRunAt 仍为 null）——闸门确实生效（Finding 1/3）。
+            // The due task was skipped and never fired (LastRunAt is still null) — the gate really does hold (Findings 1/3).
             var reloaded = await db.ScheduledTasks.FindAsync(taskId);
             Assert.Null(reloaded!.LastRunAt);
         }
@@ -106,12 +106,12 @@ public class SchedulerServiceTests(TestWebAppFactory factory) : IClassFixture<Te
             taskId = task.Id;
         }
 
-        Assert.Equal(KeyringStatus.Healthy, keyring.Status); // 确认基线：本测试类未被前一测试污染
+        Assert.Equal(KeyringStatus.Healthy, keyring.Status); // confirm the baseline: this test class was not polluted by the previous test
         await scheduler.TickAsync(CancellationToken.None);
 
         using var verifyScope = factory.Services.CreateScope();
         var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var reloaded = await verifyDb.ScheduledTasks.FindAsync(taskId);
-        Assert.NotNull(reloaded!.LastRunAt); // 到期即触发（LastRunAt 先于后台 dispatch 写入，不依赖 dispatch 是否成功）
+        Assert.NotNull(reloaded!.LastRunAt); // due means fired (LastRunAt is written before the background dispatch, regardless of whether the dispatch succeeds)
     }
 }

@@ -37,7 +37,7 @@ public sealed class OperationLogServiceTests : IDisposable
         var all = await _sut.QueryAsync(null, null, null, null, 100);
 
         Assert.Equal(2, all.Count);
-        Assert.Equal("second", all[0].Message); // 最新在前
+        Assert.Equal("second", all[0].Message); // newest first
     }
 
     [Fact]
@@ -108,9 +108,9 @@ public sealed class OperationLogServiceTests : IDisposable
         await _sut.TrimAsync(maxAgeDays: 14, now);
 
         var kept = (await _sut.QueryAsync(null, null, null, null, 100)).Select(x => x.Message).ToHashSet();
-        Assert.DoesNotContain("old-ephemeral", kept);      // 超期短存 → 删
-        Assert.Contains("old-durable", kept);              // 长存不受年龄影响
-        Assert.Contains("new-ephemeral", kept);            // 未超期短存保留
+        Assert.DoesNotContain("old-ephemeral", kept);      // expired ephemeral → deleted
+        Assert.Contains("old-durable", kept);              // durable is unaffected by age
+        Assert.Contains("new-ephemeral", kept);            // ephemeral still within the window is kept
     }
 
     [Fact]
@@ -139,29 +139,30 @@ public sealed class OperationLogServiceTests : IDisposable
         Assert.Equal("new", Assert.Single(await _sut.QueryAsync(null, null, null, null, 100)).Message);
     }
 
-    /// <summary>§5.3：source 携带 account 维度（"{op}:{accountId}/{container}"）。
-    /// DeleteForContainerAsync 按 accountId+container 精确匹配（":{accountId}/{container}" 后缀）：
-    /// 删除某 account 下某 container 的日志时，同一 container 的其他 account 日志、以及同 account 下
-    /// 其他 container 的日志都必须保留（BackupConfig 在 (AccountId, ContainerName) 唯一索引，
-    /// 两个 account 可有同名 container——container-only 匹配会跨 account 误删，故不可用）。</summary>
+    /// <summary>§5.3: source carries the account dimension ("{op}:{accountId}/{container}").
+    /// DeleteForContainerAsync matches accountId+container exactly (the ":{accountId}/{container}" suffix):
+    /// when deleting the logs of one container under one account, logs of the same container under other
+    /// accounts, and logs of other containers under the same account, must all survive (BackupConfig has a
+    /// unique index on (AccountId, ContainerName), so two accounts may own containers of the same name —
+    /// a container-only match would delete across accounts, which rules it out).</summary>
     [Fact]
     public async Task DeleteForContainer_Removes_Only_That_Accounts_Container_Logs()
     {
         await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/photos", "a", durable: true);
         await _sut.AppendAsync(OperationLogLevel.Info, "check:3/photos", "b", durable: true);
         await _sut.AppendAsync(OperationLogLevel.Info, "restore:3/photos", "c", durable: true);
-        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/docs", "d", durable: true);      // 同 account，不同 container → 保留
-        await _sut.AppendAsync(OperationLogLevel.Info, "backup:5/photos", "e", durable: true);    // 不同 account，同名 container → 保留
-        await _sut.AppendAsync(OperationLogLevel.Info, "check:5/photos", "f", durable: true);     // 不同 account，同名 container → 保留
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:3/docs", "d", durable: true);      // same account, different container → kept
+        await _sut.AppendAsync(OperationLogLevel.Info, "backup:5/photos", "e", durable: true);    // different account, same container name → kept
+        await _sut.AppendAsync(OperationLogLevel.Info, "check:5/photos", "f", durable: true);     // different account, same container name → kept
 
         await _sut.DeleteForContainerAsync(3, "photos");
 
         var kept = (await _sut.QueryAsync(null, null, null, null, 100)).Select(e => e.Message).ToHashSet();
-        Assert.Equal(new HashSet<string> { "d", "e", "f" }, kept); // 仅 account 3 的 photos 日志被删
+        Assert.Equal(new HashSet<string> { "d", "e", "f" }, kept); // only account 3's photos logs were deleted
     }
 
-    /// <summary>改版前遗留的旧格式行（"{op}:{container}"，无 account 维度）故意不再兜底匹配——
-    /// 项目尚未上线，宁可留极少量孤儿旧日志，也不能有跨 account 误删风险（见 DeleteForContainerAsync 注释）。</summary>
+    /// <summary>Legacy rows left over from before the format change ("{op}:{container}", no account dimension) deliberately get no fallback match —
+    /// the project is not live yet, and a tiny number of orphaned old logs beats any risk of deleting across accounts (see the DeleteForContainerAsync comment).</summary>
     [Fact]
     public async Task DeleteForContainer_Does_Not_Match_Legacy_Account_Less_Format()
     {
@@ -170,11 +171,11 @@ public sealed class OperationLogServiceTests : IDisposable
         await _sut.DeleteForContainerAsync(3, "photos");
 
         var kept = await _sut.QueryAsync(null, null, null, null, 100);
-        Assert.Equal("legacy", Assert.Single(kept).Message); // 未被删除
+        Assert.Equal("legacy", Assert.Single(kept).Message); // not deleted
     }
 
-    /// <summary>回归锁定（§5.5）：DeleteForContainerAsync 按 source 后缀匹配，不区分 level/Ephemeral，
-    /// 故短存(ephemeral) Debug/verbose 日志与长存日志一样，在删配置时一并被清——不会遗留孤儿诊断日志。</summary>
+    /// <summary>Regression lock (§5.5): DeleteForContainerAsync matches on the source suffix and does not distinguish level/Ephemeral,
+    /// so ephemeral Debug/verbose logs are swept away together with durable ones when a config is deleted — no orphaned diagnostic logs are left behind.</summary>
     [Fact]
     public async Task DeleteForContainer_Removes_All_Levels_Including_Debug()
     {

@@ -16,7 +16,7 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     {
         var cc = Container(account, container);
 
-        // 优先非加密（PRD 1.6）。非加密仅压缩（空密码），加密用备份密码。
+        // Prefer the unencrypted one (PRD 1.6). Unencrypted means compression only (empty password); encrypted uses the backup password.
         var plain = cc.GetBlobClient(BackupDiscovery.IndexBlobName);
         if ((await plain.ExistsAsync(ct)).Value)
             return await ReadWithETagAsync(plain, password: null, ct);
@@ -29,10 +29,10 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     }
 
     /// <summary>
-    /// 无条件写（无 ETag 前提）。**必须保持为对 <see cref="WriteInfoConditionalAsync"/> 的纯委托**：
-    /// 「信息文件的 blob 名只由 WriteInfoConditionalAsync 按 password 是否为空决定」是 reset-password
-    /// 端点据以只查 <c>Backup.Encrypted</c> 标志位、而不必以解密结果为准的不变量
-    /// （见 BackupConfigEndpoints 的 reset-password 注释）。在此自行拼 blob 名会静默打破它。
+    /// Unconditional write (no ETag precondition). **Must remain a pure delegation to <see cref="WriteInfoConditionalAsync"/>**:
+    /// "the info file's blob name is decided solely by WriteInfoConditionalAsync, from whether password is empty" is the invariant
+    /// the reset-password endpoint leans on when it checks only the <c>Backup.Encrypted</c> flag instead of going by a decryption
+    /// result (see the reset-password comment in BackupConfigEndpoints). Assembling a blob name here would silently break it.
     /// </summary>
     public Task WriteInfoAsync(
         Account account, string container, BackupInfoFile info, string? password, AccessTier? tier = null, CancellationToken ct = default)
@@ -70,8 +70,8 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     }
 
     /// <summary>
-    /// 原子写：编码→写临时 blob→下载校验（解码+反序列化）→写正式名（带 tier，可选 If-Match）→删临时。返回正式名的新 ETag。
-    /// ifMatch 非空且外部已改动 → 正式写抛 RequestFailedException(412)，不触碰旧内容（§8）。
+    /// Atomic write: encode → write a temp blob → download and verify (decode + deserialize) → write the real name (with tier, optionally If-Match) → delete the temp. Returns the new ETag of the real name.
+    /// ifMatch non-empty and something changed externally → the real write throws RequestFailedException(412) and never touches the old content (§8).
     /// </summary>
     private async Task<string> WriteAtomicAsync(
         BlobContainerClient cc, string finalName, byte[] json, string? password, Action<byte[]> verify,

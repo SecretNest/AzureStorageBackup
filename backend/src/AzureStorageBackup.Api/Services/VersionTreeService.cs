@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一个目录节点的懒加载条目：文件或子目录（§4.1a）。</summary>
+/// <summary>A lazily loaded entry under one directory node: a file or a subdirectory (§4.1a).</summary>
 public sealed record TreeNode(
     string Name,
     string Path,
@@ -12,15 +12,15 @@ public sealed record TreeNode(
     DateTimeOffset? Mtime,
     string? StorageKind,
     string? StorageRef,
-    /// <summary>非空＝这条记录是从更早的版本沿用来的（此后一直没能读到源文件），
-    /// 值为"自何时起没能再更新"。选择还原内容的那一刻，操作员最需要知道这件事：
-    /// 还原这个版本拿到的不是这个版本时刻的内容。</summary>
+    /// <summary>Non-null means this record was carried over from an earlier version (the source file has been unreadable ever since),
+    /// and the value says "since when it could no longer be updated". At the moment of choosing what content to restore this is what
+    /// the operator most needs to know: restoring this version does not give you the content as of this version's point in time.</summary>
     DateTimeOffset? UnreadableAt = null);
 
 /// <summary>
-/// 从版本索引懒加载目录树（M4 §4.1a，决策 1）：给定目录路径，返回其直接子节点（子目录 + 文件），
-/// 不递归展开。目录节点标注 HasChildren 供前端决定是否可展开；空目录（EmptyDirs）也作为可展开目录节点纳入。
-/// 纯逻辑，不做任何 IO，供端点复用。
+/// Lazily loads the directory tree out of a version index (M4 §4.1a, decision 1): given a directory path, returns its direct children
+/// (subdirectories + files) without recursing. Directory nodes are tagged with HasChildren so the frontend can decide whether they are expandable; empty directories (EmptyDirs) are included as expandable directory nodes too.
+/// Pure logic, no IO whatsoever, reusable by the endpoints.
 /// </summary>
 public static class VersionTreeService
 {
@@ -37,14 +37,14 @@ public static class VersionTreeService
             var slash = rest.IndexOf('/');
             if (slash < 0)
             {
-                // 直接子项是文件本身
+                // The direct child is the file itself
                 var childPath = prefix.Length == 0 ? entry.Path : $"{prefix}/{rest}";
                 nodes[rest] = new TreeNode(rest, childPath, IsDir: false, HasChildren: false,
                     entry.Length, entry.Mtime, entry.Storage?.Kind, entry.Storage?.Ref, entry.UnreadableAt);
             }
             else
             {
-                // 直接子项是一个目录（该文件在更深处）
+                // The direct child is a directory (the file sits deeper down)
                 var name = rest[..slash];
                 var childPath = prefix.Length == 0 ? name : $"{prefix}/{name}";
                 nodes[name] = new TreeNode(name, childPath, IsDir: true, HasChildren: true,
@@ -60,7 +60,7 @@ public static class VersionTreeService
             var slash = rest.IndexOf('/');
             if (slash < 0)
             {
-                // 空目录本身是直接子项：可展开（自身无子项，除非其它 EmptyDirs/Entries 在其下方补齐）
+                // The empty directory itself is the direct child: expandable (with no children of its own, unless other EmptyDirs/Entries fill in underneath it)
                 var childPath = prefix.Length == 0 ? rest : $"{prefix}/{rest}";
                 if (!nodes.ContainsKey(rest))
                     nodes[rest] = new TreeNode(rest, childPath, IsDir: true, HasChildren: false,
@@ -68,7 +68,7 @@ public static class VersionTreeService
             }
             else
             {
-                // 空目录在更深处 → 直接子项是中间目录，必有子内容
+                // The empty directory sits deeper down → the direct child is an intermediate directory and must have content beneath it
                 var name = rest[..slash];
                 var childPath = prefix.Length == 0 ? name : $"{prefix}/{name}";
                 nodes[name] = new TreeNode(name, childPath, IsDir: true, HasChildren: true,
@@ -79,11 +79,11 @@ public static class VersionTreeService
         return nodes.Values.ToList();
     }
 
-    /// <summary>去除前后 '/'，规范化为空串（根）或不带首尾斜杠的路径。</summary>
+    /// <summary>Strips leading and trailing '/', normalizing to the empty string (root) or a path with no slash at either end.</summary>
     private static string NormalizePrefix(string? dirPath) =>
         string.IsNullOrEmpty(dirPath) ? string.Empty : dirPath.Trim('/');
 
-    /// <summary>路径是否在 prefix 目录下，是则输出其相对于 prefix 的剩余部分。</summary>
+    /// <summary>Whether the path lies under the prefix directory; if so, outputs the remainder relative to prefix.</summary>
     private static bool TryGetRelative(string path, string prefix, out string rest)
     {
         if (prefix.Length == 0)

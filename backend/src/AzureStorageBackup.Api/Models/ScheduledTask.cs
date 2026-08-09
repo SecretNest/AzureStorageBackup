@@ -1,13 +1,13 @@
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>任务目标类型：单个备份 或 组。</summary>
+/// <summary>Task target kind: a single backup, or a group.</summary>
 public enum TaskTargetKind
 {
     Backup = 0,
     Group = 1
 }
 
-/// <summary>任务类型（PRD 2.3、9）。</summary>
+/// <summary>Task type (PRD 2.3, 9).</summary>
 public enum ScheduledTaskType
 {
     Backup = 0,
@@ -16,8 +16,8 @@ public enum ScheduledTaskType
 }
 
 /// <summary>
-/// 计划任务配置（PRD 2.3）。仅存配置；调度执行在 M6。
-/// 目标为备份时用 (AccountId, ContainerName)，为组时用 GroupId。
+/// Scheduled task configuration (PRD 2.3). Stores configuration only; the scheduled execution lands in M6.
+/// When the target is a backup it uses (AccountId, ContainerName); when it is a group, GroupId.
 /// </summary>
 public class ScheduledTask
 {
@@ -25,11 +25,11 @@ public class ScheduledTask
 
     public TaskTargetKind TargetKind { get; set; }
 
-    // 目标为备份
+    // Target is a backup
     public int? AccountId { get; set; }
     public string? ContainerName { get; set; }
 
-    // 目标为组
+    // Target is a group
     public int? GroupId { get; set; }
 
     public ScheduledTaskType TaskType { get; set; }
@@ -37,13 +37,13 @@ public class ScheduledTask
     public bool Enabled { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; }
 
-    /// <summary>计划检查任务的检查级别（仅 TaskType=Check 有意义）。默认云端「存在+尺寸」、本地「内容 hash」。</summary>
+    /// <summary>Check level for a scheduled check task (only meaningful when TaskType=Check). Defaults to "existence + size" on the cloud side and "content hash" on the local side.</summary>
     public CloudCheckLevel CheckCloudLevel { get; set; } = CloudCheckLevel.ExistenceSize;
     public LocalCheckLevel CheckLocalLevel { get; set; } = LocalCheckLevel.Content;
 
-    /// <summary>Content 级遇 Archive 的活化目标 tier（null=不活化）。</summary>
+    /// <summary>Target rehydration tier when a Content-level check hits Archive (null = do not rehydrate).</summary>
     public StorageTier? CheckRehydrateTier { get; set; }
 
-    /// <summary>上次触发时刻（调度器维护）；用于计算下次是否到期，避免重启后重放。</summary>
+    /// <summary>Timestamp of the last firing (maintained by the scheduler); used to work out whether the next one is due, and to keep a restart from replaying it.</summary>
     public DateTimeOffset? LastRunAt { get; set; }
 }

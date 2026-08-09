@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>把事件映射到日志级别（失败类 → Error）。</summary>
+/// <summary>Maps events to log levels (the failure kinds → Error).</summary>
 public static class EventLog
 {
     public static OperationLogLevel LevelOf(NotificationEvents evt) => evt switch
@@ -17,11 +17,11 @@ public static class EventLog
     };
 }
 
-/// <summary>操作日志的记录与查询（PRD 5）。按等级/来源/时间过滤，可清空。</summary>
+/// <summary>Recording and querying of the operation log (PRD 5). Filter by level/source/time, and clear.</summary>
 public interface IOperationLog
 {
     /// <param name="durable">
-    /// null=按级别自动判定（Warning 及以上长存，其余短存）；true=长存（审计，保留至删备份/手工清）；false=短存(14 天)。
+    /// null = decided automatically from the level (Warning and above durable, the rest ephemeral); true = durable (audit, kept until the backup is deleted or manually purged); false = ephemeral (14 days).
     /// </param>
     Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null);
 
@@ -31,15 +31,15 @@ public interface IOperationLog
 
     Task ClearAsync(CancellationToken ct = default);
 
-    /// <summary>删除某备份（account+container）的全部日志（删除备份时调用，PRD 3.6"长存日志保留至删除备份"）。
-    /// 按 accountId 精确限定：<c>BackupConfig</c> 在 (AccountId, ContainerName) 上唯一索引，不同 account 可有
-    /// 同名 container，绝不能用 container-only 匹配（会跨 account 误删审计日志）。</summary>
+    /// <summary>Deletes every log of one backup (account+container); called when a backup is deleted (PRD 3.6 "durable logs are kept until the backup is deleted").
+    /// Scoped to accountId exactly: <c>BackupConfig</c> is uniquely indexed on (AccountId, ContainerName), so different accounts may own
+    /// containers of the same name, and a container-only match is out of the question (it would delete another account's audit logs).</summary>
     Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default);
 
-    /// <summary>手工清理：删除早于 cutoff 的**全部**日志（长存+短存，PRD 3.6"指定时间早于此全删"）。</summary>
+    /// <summary>Manual purge: deletes **all** logs older than cutoff (durable + ephemeral, PRD 3.6 "everything earlier than the given time is deleted").</summary>
     Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default);
 
-    /// <summary>短存日志保留清理（PRD 3.6）：删除超期(默认 14 天)的短存(ephemeral)日志；长存不受影响。</summary>
+    /// <summary>Ephemeral log retention cleanup (PRD 3.6): deletes ephemeral logs past their age limit (14 days by default); durable logs are untouched.</summary>
     Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default);
 }
 
@@ -75,7 +75,7 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
             q = q.Where(e => e.Timestamp <= t);
 
         return await q
-            .OrderByDescending(e => e.Id) // 最新在前（Id 单调，避免同刻 Timestamp 并列）
+            .OrderByDescending(e => e.Id) // newest first (Id is monotonic, avoiding ties between identical Timestamps)
             .Take(limit)
             .ToListAsync(ct);
     }
@@ -88,11 +88,11 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
 
     public async Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default)
     {
-        // 来源形如 "backup:{accountId}/{container}"、"check:{accountId}/{container}"、
-        // "restore:{accountId}/{container}"、"schedule:{accountId}/{container}"（§5.3）。冒号在 accountId 前，
-        // 故 ":{accountId}/{container}" 后缀精确定位该 account 的该 container，绝不匹配其他 account 的同名 container。
-        // 项目尚未上线，格式可自由演进：改版前遗留的旧格式行 "{op}:{container}"（无 account 维度、无法安全归属
-        // 某个 account）故意不做兜底匹配——宁可留下少量孤儿旧日志，也不能有跨 account 误删的风险。
+        // Sources look like "backup:{accountId}/{container}", "check:{accountId}/{container}",
+        // "restore:{accountId}/{container}", "schedule:{accountId}/{container}" (§5.3). The colon sits ahead of accountId,
+        // so the ":{accountId}/{container}" suffix pins down exactly that container of that account and never matches a same-named container of another account.
+        // The project is not live yet, so the format may evolve freely: legacy rows from before the change, "{op}:{container}" (no account dimension, impossible
+        // to attribute safely to any account), deliberately get no fallback match — a few orphaned old logs beat any risk of deleting across accounts.
         var suffix = $":{accountId}/{container}";
         await db.LogEntries
             .Where(e => e.Source.EndsWith(suffix))
@@ -104,9 +104,9 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
 
     public async Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
     {
-        var days = maxAgeDays is > 0 ? maxAgeDays.Value : 14; // 默认 14 天
+        var days = maxAgeDays is > 0 ? maxAgeDays.Value : 14; // 14 days by default
         var cutoff = now.AddDays(-days);
-        // 仅删短存(ephemeral)日志；长存(审计)日志保留至删除备份或手工清。
+        // Only ephemeral logs are deleted; durable (audit) logs stay until the backup is deleted or manually purged.
         await db.LogEntries.Where(e => e.Ephemeral && e.Timestamp < cutoff).ExecuteDeleteAsync(ct);
     }
 }

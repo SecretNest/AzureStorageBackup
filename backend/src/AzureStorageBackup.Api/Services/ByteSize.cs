@@ -3,9 +3,9 @@ using System.Globalization;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 把字节数排成给人看的样子。单位用**十进制**（KB/MB/GB，1000 进制）而非二进制（KiB/MiB）：
-/// 这些数字出现在备份摘要里，操作员多半是拿它去和 Azure 的用量账单对照的，而账单按十进制计。
-/// 用二进制单位会让两边差出 7%（GB 一级），足以让人以为是哪里算错了。
+/// Lays byte counts out for people to read. The units are **decimal** (KB/MB/GB, base 1000) rather than binary (KiB/MiB):
+/// these numbers show up in backup summaries, and an operator will most likely hold them against the Azure usage bill, which counts in decimal.
+/// Binary units would put the two 7% apart (at the GB level) — enough to make someone think something is miscalculated.
 /// </summary>
 public static class ByteSize
 {
@@ -13,9 +13,9 @@ public static class ByteSize
 
     public static string Human(long bytes)
     {
-        // 负数在备份里不该出现，但这个函数跑在"备份已经成功"之后的收尾路径上——
-        // 在这里抛异常等于让一次成功的备份报告成失败。原样印出来，不做算术（long.MinValue
-        // 取绝对值会溢出），让不该出现的东西自己显形。
+        // Negative numbers should not occur in a backup, but this function runs on the wrap-up path after "the backup already succeeded" —
+        // throwing here would report a successful backup as a failure. Print it as-is and do no arithmetic (taking the absolute value of
+        // long.MinValue overflows), letting the thing that should not be there show itself.
         if (bytes < 0)
             return bytes.ToString(CultureInfo.InvariantCulture) + " B";
         if (bytes < 1000)
@@ -29,8 +29,8 @@ public static class ByteSize
             unit++;
         }
 
-        // 保留一位小数之后才可能达到 1000（999_960 B = 999.96 KB → "1000.0 KB"）。那不是任何人
-        // 会写的数字，所以进位要在**舍入之后**再判一次，而不是只看舍入前的值。
+        // It can only reach 1000 after being rounded to one decimal place (999_960 B = 999.96 KB → "1000.0 KB"). That is not a number
+        // anyone would write, so the carry has to be checked once more **after rounding**, not just on the pre-rounding value.
         if (Math.Round(value, 1) >= 1000 && unit < Units.Length - 1)
         {
             value /= 1000;

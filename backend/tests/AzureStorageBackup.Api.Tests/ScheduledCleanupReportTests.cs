@@ -8,11 +8,12 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 定时清理任务此前是只做不说的：它退役版本、删 pack、删 data blob，删完一声不吭。备份收尾那次
-/// 清理现在会把删掉的东西写进成功摘要，独立跑的这一次没有理由更沉默——无人值守部署下，操作日志
-/// 是操作员唯一能回头查"上个月保留策略到底腾出了多少空间"的地方。
-/// <para>反过来，什么都没清掉时必须一个字都不写：每晚一条 "retired 0 version(s)" 会让这条信号
-/// 迅速变成背景噪音，而任务确实跑过了这件事另有任务运行记录可查。</para>
+/// The scheduled cleanup task used to do its work without saying a word: it retired versions, deleted packs, deleted data blobs, and
+/// reported none of it. The cleanup at the tail of a backup now writes what it deleted into the success summary, and the standalone run
+/// has no reason to be any quieter — in an unattended deployment the operation log is the only place an operator can go back and check
+/// "how much space did retention actually free up last month".
+/// <para>Conversely, when nothing was cleaned up it must not write a single word: a nightly "retired 0 version(s)" turns this signal into
+/// background noise fast, and the fact that the task really did run can be looked up in the task run records instead.</para>
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class ScheduledCleanupReportTests : IDisposable
@@ -76,8 +77,8 @@ public sealed class ScheduledCleanupReportTests : IDisposable
     };
 
     /// <summary>
-    /// 自己搭一台编排器造版本，用的是**默认**保留策略（100 版 / 180 天）——这几轮备份因此绝不会
-    /// 顺手把旧版本清掉，退役留给后面那次定时清理去做，测的才是那条分发分支。
+    /// Builds its own orchestrator to produce the versions, using the **default** retention policy (100 versions / 180 days) — so these
+    /// backup runs never sweep old versions away on the side; retiring is left to the scheduled cleanup that follows, which is the dispatch branch actually under test.
     /// </summary>
     private BackupOrchestrator BuildOrchestrator()
     {
@@ -123,7 +124,7 @@ public sealed class ScheduledCleanupReportTests : IDisposable
 
         try
         {
-            // 只留 1 个版本的配置——退役由定时清理触发，而不是备份自己顺手做掉。
+            // A config that keeps only 1 version — retiring is triggered by the scheduled cleanup, not done on the side by the backup itself.
             using (var scope = factory.Services.CreateScope())
             {
                 await scope.ServiceProvider.GetRequiredService<IBackupConfigService>().CreateAsync(new BackupConfig
@@ -138,8 +139,8 @@ public sealed class ScheduledCleanupReportTests : IDisposable
             }
 
             var orchestrator = BuildOrchestrator();
-            Write("big.bin", new string('a', 60_000));    // > 阈值 → 单文件 data blob
-            Write("small.txt", new string('a', 5_000));   // < 阈值 → 成组进 pack
+            Write("big.bin", new string('a', 60_000));    // > threshold → single-file data blob
+            Write("small.txt", new string('a', 5_000));   // < threshold → grouped into a pack
             await orchestrator.RunAsync(Request(AzuriteAccount(), container));
             Write("big.bin", new string('b', 60_000));
             Write("small.txt", new string('b', 5_000));
@@ -163,12 +164,12 @@ public sealed class ScheduledCleanupReportTests : IDisposable
             var afterFirst = await ReadLogAsync(factory, source);
             var report = Assert.Single(afterFirst, e => e.Message.Contains("Retention"));
             Assert.Contains("1 version(s)", report.Message);
-            // 两条存储路径的对象都该被数出来，且释放量非零——否则这行就是个没内容的占位。
+            // Objects from both storage paths should be counted and the freed amount must be non-zero — otherwise this line is a placeholder with nothing in it.
             Assert.Contains("pack(s)", report.Message);
             Assert.Contains("blob(s)", report.Message);
             Assert.DoesNotContain("freed 0 B", report.Message);
 
-            // 再跑一次：已经没有可退役的版本了，不得再写任何一条清理日志。
+            // Run it once more: there is no version left to retire, so not one further cleanup log line may be written.
             await dispatcher.DispatchAsync(task, CancellationToken.None);
 
             var afterSecond = await ReadLogAsync(factory, source);

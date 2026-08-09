@@ -4,16 +4,16 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 引用集构造的纯逻辑单测（无需 Azurite）。这是孤儿删除路径的**承重安全测试**：
-/// 引用集必须涵盖 信息文件 + 每个保留版本的 IndexBlob + 每个 StorageRef 的全部分卷（跨全部版本，
-/// 含仅被旧版本引用者）。漏掉任何一项都会把被引用数据误判为孤儿而删除 = 数据丢失。
+/// Pure-logic unit tests for building the referenced set (no Azurite required). This is the **load-bearing safety test** of the orphan
+/// deletion path: the referenced set must cover the info file + the IndexBlob of every retained version + every volume of every StorageRef
+/// (across all versions, including those referenced only by an old version). Miss any one of them and referenced data is misjudged as an orphan and deleted = data loss.
 /// </summary>
 public sealed class BackupReferencedSetTests
 {
     [Fact]
     public void Referenced_Set_Includes_Info_Indexes_And_All_Volumes_Across_Versions()
     {
-        // 2 版本：v1 IndexBlob=idx/1（引用 3 卷 pack p1 的成员），v2 IndexBlob=idx/2（引用单卷 data/h）。
+        // 2 versions: v1 IndexBlob=idx/1 (references a member of the 3-volume pack p1), v2 IndexBlob=idx/2 (references the single-volume data/h).
         var info = new BackupInfoFile
         {
             Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },
@@ -53,24 +53,24 @@ public sealed class BackupReferencedSetTests
 
         var refs = BackupChecker.ReferencedBlobNames(info, indexes);
 
-        // 信息文件（两种命名都保护，绝不删）。
+        // The info file (both namings are protected, never deleted).
         Assert.Contains(BackupDiscovery.IndexBlobName, refs);
         Assert.Contains(BackupDiscovery.EncryptedIndexBlobName, refs);
-        // 每个版本的第二级索引。
+        // The second-level index of every version.
         Assert.Contains("idx/1", refs);
         Assert.Contains("idx/2", refs);
-        // pack p1 的全部 3 卷（仅被 v1 引用，仍在集内）。
+        // All 3 volumes of pack p1 (referenced only by v1, still in the set).
         Assert.Contains("packs/p1.7z.001", refs);
         Assert.Contains("packs/p1.7z.002", refs);
         Assert.Contains("packs/p1.7z.003", refs);
-        // 单卷 data blob（被 v2 引用）。
+        // The single-volume data blob (referenced by v2).
         Assert.Contains("data/h", refs);
     }
 
     [Fact]
     public void Referenced_Set_Throws_When_Pack_Metadata_Missing()
     {
-        // pack 被引用但 info.Packs 无其元数据 → 无法确定分卷数 → 抛错，迫使调用方放弃删除（安全优先）。
+        // The pack is referenced but info.Packs holds no metadata for it → the volume count cannot be determined → throw, forcing the caller to abandon the deletion (safety first).
         var info = new BackupInfoFile
         {
             Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },

@@ -3,17 +3,17 @@ using System.Globalization;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// verbose（debug）逐文件日志的**文件**后端（PRD 3.6）：按备份分目录、按日期分文件写文本，
-/// 避免每文件一次 SQLite 写（超大备份下 DB 写会成瓶颈），也把高频诊断日志与可查询的审计日志分开存放。
+/// The **file** backend of the verbose (debug) per-file log (PRD 3.6): text written into one directory per backup and one file per date,
+/// avoiding one SQLite write per file (on a huge backup DB writes become the bottleneck) and keeping high-frequency diagnostic logs stored apart from the queryable audit log.
 ///
-/// 布局：<c>{Root}/{container}/{yyyyMMdd}.log</c>，每行 <c>{UTC 时间戳}  {消息}</c>，追加写。
-/// 追加经单一轻量门串行（文件追加远快于 DB 事务）；<see cref="Trim"/> 按文件名日期删超期文件。
+/// Layout: <c>{Root}/{container}/{yyyyMMdd}.log</c>, one line per entry as <c>{UTC timestamp}  {message}</c>, appended.
+/// Appends are serialized through a single lightweight gate (a file append is far faster than a DB transaction); <see cref="Trim"/> deletes expired files by the date in their name.
 /// </summary>
 public sealed class VerboseFileLog(string root)
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
 
-    /// <summary>日志根目录（供「目录」页展示，便于 Docker 卷映射）。</summary>
+    /// <summary>The log root directory (shown on the Directories page, to make Docker volume mapping easier).</summary>
     public string Root => root;
 
     public async Task AppendAsync(string container, string message, CancellationToken ct = default)
@@ -34,7 +34,7 @@ public sealed class VerboseFileLog(string root)
         }
     }
 
-    /// <summary>删除文件名日期早于 now-maxAgeDays 的日志文件（与短存 SQLite 日志同一保留窗口）。</summary>
+    /// <summary>Deletes log files whose file-name date is earlier than now-maxAgeDays (the same retention window as the ephemeral SQLite log).</summary>
     public void Trim(int maxAgeDays, DateTimeOffset now)
     {
         if (!Directory.Exists(root))
@@ -48,7 +48,7 @@ public sealed class VerboseFileLog(string root)
         }
     }
 
-    // container 名不含路径分隔符（Azure 命名规则：小写字母/数字/连字符），仍防御性剥离，避免逃逸出根目录。
+    // A container name holds no path separator (Azure naming rules: lowercase letters/digits/hyphens), but strip defensively anyway so nothing can escape the root directory.
     private static string Sanitize(string container) =>
         string.Concat(container.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 }

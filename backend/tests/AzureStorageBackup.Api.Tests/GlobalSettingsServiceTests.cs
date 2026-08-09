@@ -7,7 +7,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>全局设置往返（§5.1）：ProcessingMaxAttempts 等字段随 Upsert 持久化。</summary>
+/// <summary>Global settings round-trip (§5.1): fields such as ProcessingMaxAttempts are persisted along with Upsert.</summary>
 public sealed class GlobalSettingsServiceTests : IDisposable
 {
     private readonly SqliteConnection _connection;
@@ -51,12 +51,12 @@ public sealed class GlobalSettingsServiceTests : IDisposable
     [Fact]
     public async Task GetAsync_Normalizes_Zero_Migrated_Columns_To_Defaults()
     {
-        // 模拟迁移遗留行：新列 SQL 默认 0。
+        // Simulates a row left over by a migration: new columns default to 0 in SQL.
         _db.GlobalSettings.Add(new Models.GlobalSettings { StagedLimitBytes = 0, ProcessingMaxAttempts = 0 });
         await _db.SaveChangesAsync();
 
         var s = await _sut.GetAsync();
-        Assert.Equal(2L * 1024 * 1024 * 1024, s.StagedLimitBytes); // 2GB 默认
+        Assert.Equal(2L * 1024 * 1024 * 1024, s.StagedLimitBytes); // 2GB default
         Assert.Equal(5, s.ProcessingMaxAttempts);
     }
 
@@ -78,8 +78,8 @@ public sealed class GlobalSettingsServiceTests : IDisposable
     [Fact]
     public async Task GetAsync_Leaves_Migrated_Zero_SevenZipPriority_As_Lowest()
     {
-        // 迁移给既有行填的是 0。枚举正是照着这一点排的（Lowest = 0），所以这一行**不该**
-        // 被上面那段"读到 0 就换回默认值"的规范化碰到——它读出来本就已经是默认值。
+        // The migration filled existing rows with 0. The enum is ordered around exactly that (Lowest = 0), so this row must **not**
+        // be caught by the "read a 0, swap the default back in" normalization above — what it reads back already is the default.
         _db.GlobalSettings.Add(new Models.GlobalSettings { SevenZipPriority = 0 });
         await _db.SaveChangesAsync();
 
@@ -96,8 +96,8 @@ public sealed class GlobalSettingsServiceTests : IDisposable
     [Fact]
     public void Maps_Unknown_Value_To_Lowest()
     {
-        // 数据库里存了个我们不认识的档位（降级、手改）：认不出来时压慢一点是小事，
-        // 把机器卡住不是——所以 default 分支必须倒向最低，而不是 Normal。
+        // The database holds a level we do not recognize (a downgrade, a hand edit): compressing a little slower when we cannot identify it
+        // is a small matter, wedging the machine is not — so the default branch has to fall to the lowest, not to Normal.
         Assert.Equal(ProcessPriorityClass.Idle, ((SevenZipCpuPriority)99).ToProcessPriorityClass());
     }
 }

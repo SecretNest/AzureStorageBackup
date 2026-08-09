@@ -8,22 +8,22 @@ public sealed record RetryOptions
     public TimeSpan MaxDelay { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// 显式退避序列（PRD 4.1）。非空 → 使用序列模式：按序列逐次退避，序列耗尽后重复 <see cref="SteadyInterval"/>，
-    /// 累计退避超过 <see cref="MaxTotalDelay"/> 即停止（放弃并抛出）。为空 → 使用指数退避 + <see cref="MaxAttempts"/> 计数封顶。
+    /// Explicit backoff sequence (PRD 4.1). Non-empty → sequence mode: back off along the sequence step by step, repeating
+    /// <see cref="SteadyInterval"/> once the sequence is exhausted, and stop (give up and throw) as soon as the accumulated backoff exceeds <see cref="MaxTotalDelay"/>. Empty → exponential backoff capped by the <see cref="MaxAttempts"/> count.
     /// </summary>
     public IReadOnlyList<TimeSpan>? Backoff { get; init; }
 
-    /// <summary>序列耗尽后的固定重复间隔（默认取序列最后一项，即 PRD 的「之后每 300s」）。</summary>
+    /// <summary>The fixed interval repeated once the sequence is exhausted (defaults to the last item of the sequence, i.e. the PRD's "every 300s thereafter").</summary>
     public TimeSpan? SteadyInterval { get; init; }
 
-    /// <summary>序列模式下的累计退避总上限（PRD 默认 2h）。为空则不封顶（仅受安全上限约束）。</summary>
+    /// <summary>Total cap on accumulated backoff in sequence mode (PRD default 2h). Empty means no cap (bounded only by the safety limit).</summary>
     public TimeSpan? MaxTotalDelay { get; init; }
 }
 
-/// <summary>指数退避重试（M4 §5、PRD 4.1）。isTransient 判定异常是否可重试，默认全部可重试。</summary>
+/// <summary>Exponential-backoff retry (M4 §5, PRD 4.1). isTransient decides whether an exception is retryable; by default everything is.</summary>
 public static class RetryPolicy
 {
-    // 序列模式无 MaxTotalDelay 时的安全上限，避免无限重试。
+    // Safety cap for sequence mode when no MaxTotalDelay is set, so retrying cannot go on forever.
     private const int MaxSequenceRetries = 100_000;
 
     public static async Task<T> ExecuteAsync<T>(
@@ -57,9 +57,9 @@ public static class RetryPolicy
         => ExecuteAsync<object?>(async token => { await action(token); return null; }, options, isTransient, ct);
 
     /// <summary>
-    /// 生成每次重试前的退避时长序列（首次尝试不计）。产出的元素个数 = 允许的重试次数。
-    /// 序列模式：按 Backoff 逐项、耗尽后重复 SteadyInterval，累计不超过 MaxTotalDelay。
-    /// 计数模式：指数退避，产出 MaxAttempts-1 项（对应 MaxAttempts 次尝试）。
+    /// Produces the backoff durations to wait before each retry (the first attempt does not count). Number of elements yielded = number of retries allowed.
+    /// Sequence mode: item by item through Backoff, repeating SteadyInterval once exhausted, never accumulating past MaxTotalDelay.
+    /// Count mode: exponential backoff, yielding MaxAttempts-1 items (corresponding to MaxAttempts attempts).
     /// </summary>
     public static IEnumerable<TimeSpan> DelaySchedule(RetryOptions options)
     {
@@ -85,7 +85,7 @@ public static class RetryPolicy
 
     private static TimeSpan ExponentialDelay(int attempt, RetryOptions options)
     {
-        // attempt 从 1 起：第 1 次失败后退避 BaseDelay，之后按 Factor 递增，封顶 MaxDelay。
+        // attempt starts at 1: after the 1st failure back off by BaseDelay, then grow by Factor, capped at MaxDelay.
         var millis = options.BaseDelay.TotalMilliseconds * Math.Pow(options.Factor, attempt - 1);
         return TimeSpan.FromMilliseconds(Math.Min(millis, options.MaxDelay.TotalMilliseconds));
     }

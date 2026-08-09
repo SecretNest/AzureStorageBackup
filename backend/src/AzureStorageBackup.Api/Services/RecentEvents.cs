@@ -1,14 +1,14 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 一次运行中最近若干条事件（跳过了什么、哪个文件失败了、在等什么）。
+/// The last few events of a run (what got skipped, which file failed, what it is waiting on).
 /// <para>
-/// 为什么需要：还原此前把这类消息写进一个**单值**字段（`RestoreRunState.Phase`），
-/// 后一条直接覆盖前一条。于是一次还原跳过/失败了几十个文件，跑完界面上只剩最后一条，
-/// 其余全部无从追溯——只体现为 FailedFiles 那个数字，而"哪几个文件、为什么"才是操作员要的。
+/// Why it is needed: restore used to write messages like these into a **single-valued** field (`RestoreRunState.Phase`),
+/// where each new one simply overwrote the previous. So a restore that skipped or failed dozens of files finished with only
+/// the last message on screen and no way to trace the rest — visible only as the FailedFiles number, when "which files, and why" is what the operator actually wants.
 /// </para>
-/// <para>容量有上限：这类消息可能与文件数同量级，无上限地留着就是拿内存换一份没人会翻到底的日志。
-/// 满了丢最旧的——最近发生的更可能与当下的问题相关。</para>
+/// <para>The capacity is bounded: messages like these can be of the same order as the file count, and keeping them unbounded trades memory
+/// for a log nobody will ever read to the end. When it is full the oldest goes — what happened most recently is more likely to bear on the problem at hand.</para>
 /// </summary>
 public sealed class RecentEvents(int capacity = 200)
 {
@@ -25,7 +25,7 @@ public sealed class RecentEvents(int capacity = 200)
         }
     }
 
-    /// <summary>取快照。返回副本而非内部集合——调用方（HTTP 序列化）与写入方在不同线程上。</summary>
+    /// <summary>Takes a snapshot. Returns a copy rather than the internal collection — the caller (HTTP serialization) and the writer sit on different threads.</summary>
     public IReadOnlyList<string> Snapshot()
     {
         lock (_gate)

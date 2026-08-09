@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>全局设置（单例）的读取与更新。</summary>
+/// <summary>Reading and updating the global settings (a singleton).</summary>
 public interface IGlobalSettingsService
 {
     Task<GlobalSettings> GetAsync(CancellationToken ct = default);
@@ -15,15 +15,15 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
 {
     public async Task<GlobalSettings> GetAsync(CancellationToken ct = default)
     {
-        // OrderBy 不是多余的：单例表也得给 First 一个确定的顺序，否则 EF 每次调用都记一条
-        // 10103 警告（"First without OrderBy may lead to unpredictable results"）。
-        // 这个方法几乎每个请求都会走一遍，docker logs 里刷屏的就是它。
+        // The OrderBy is not redundant: even a singleton table has to hand First a definite order, otherwise EF logs a
+        // 10103 warning ("First without OrderBy may lead to unpredictable results") on every single call.
+        // This method runs on very nearly every request, and it is exactly what floods docker logs.
         var s = await db.GlobalSettings.AsNoTracking().OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
         if (s is null)
             return new GlobalSettings();
 
-        // 迁移新列（StagedLimitBytes/ProcessingMaxAttempts）对既有行 SQL 默认 0，
-        // 规范化为模型默认，使 GET /settings 与引擎行为（>0?:回退）一致，避免 UI 显示 0。
+        // Columns added by a migration (StagedLimitBytes/ProcessingMaxAttempts) default to 0 in SQL for pre-existing rows;
+        // normalize them to the model defaults so GET /settings agrees with engine behavior (the >0 ?: fallback) and the UI never shows 0.
         var defaults = new GlobalSettings();
         if (s.StagedLimitBytes <= 0)
             s.StagedLimitBytes = defaults.StagedLimitBytes;

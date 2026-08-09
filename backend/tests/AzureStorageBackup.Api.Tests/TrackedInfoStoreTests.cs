@@ -30,7 +30,7 @@ public sealed class TrackedInfoStoreTests : IDisposable
         _connection.Dispose();
     }
 
-    /// <summary>可配返回/抛错、记录调用的假 store。</summary>
+    /// <summary>A fake store with configurable returns/throws that records the calls it receives.</summary>
     private sealed class FakeStore : IBackupInfoStore
     {
         public (BackupInfoFile Info, string ETag)? CloudInfo { get; set; }
@@ -71,7 +71,7 @@ public sealed class TrackedInfoStoreTests : IDisposable
         var info = await tracked.LoadAsync(Acc(), "c", null);
 
         Assert.Equal("local", info!.Backup.Name);
-        Assert.Equal(0, store.InfoReads); // 本地命中，不读云端
+        Assert.Equal(0, store.InfoReads); // local hit, no cloud read
     }
 
     [Fact]
@@ -84,7 +84,7 @@ public sealed class TrackedInfoStoreTests : IDisposable
 
         Assert.Equal("cloud", info!.Backup.Name);
         Assert.Equal(1, store.InfoReads);
-        Assert.Equal("etagX", (await _state.TryGetAsync(1, "c"))!.Value.ETag); // 回填了本地
+        Assert.Equal("etagX", (await _state.TryGetAsync(1, "c"))!.Value.ETag); // the local copy was backfilled
     }
 
     [Fact]
@@ -96,9 +96,9 @@ public sealed class TrackedInfoStoreTests : IDisposable
 
         await tracked.WriteAsync(Acc(), "c", Info("v2"), null, null);
 
-        Assert.Equal("etag0", store.LastIfMatch);                       // 用本地 ETag 做 If-Match
+        Assert.Equal("etag0", store.LastIfMatch);                       // uses the local ETag as If-Match
         var local = await _state.TryGetAsync(1, "c");
-        Assert.Equal("etag-1", local!.Value.ETag);                      // 更新为新 ETag
+        Assert.Equal("etag-1", local!.Value.ETag);                      // updated to the new ETag
         Assert.Equal("v2", IndexSerializer.DeserializeInfoFile(local.Value.InfoBytes).Backup.Name);
     }
 
@@ -112,6 +112,6 @@ public sealed class TrackedInfoStoreTests : IDisposable
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => tracked.WriteAsync(Acc(), "c", Info("v2"), null, null));
 
-        Assert.Null(await _state.TryGetAsync(1, "c")); // 冲突后清本地，下次重同步
+        Assert.Null(await _state.TryGetAsync(1, "c")); // after a conflict the local state is cleared, and re-synced next time
     }
 }

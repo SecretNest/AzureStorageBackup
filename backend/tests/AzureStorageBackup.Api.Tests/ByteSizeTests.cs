@@ -3,8 +3,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 备份摘要里的字节数要给人看，不是给机器解析的。单位取十进制（KB/MB/GB）而非二进制（KiB/MiB），
-/// 与 Azure 账单的口径对齐——操作员拿这个数字去和账单对照时，不该还要自己换算一次。
+/// The byte counts in a backup summary are for people to read, not for machines to parse. The units are decimal (KB/MB/GB) rather than
+/// binary (KiB/MiB), to line up with how Azure bills — an operator holding this number against the bill should not have to convert it first.
 /// </summary>
 public class ByteSizeTests
 {
@@ -12,8 +12,8 @@ public class ByteSizeTests
     [InlineData(0, "0 B")]
     [InlineData(1, "1 B")]
     [InlineData(512, "512 B")]
-    [InlineData(999, "999 B")]           // 最后一个仍用 B 的值
-    [InlineData(1_000, "1.0 KB")]        // 进位的第一个值
+    [InlineData(999, "999 B")]           // the last value still shown in B
+    [InlineData(1_000, "1.0 KB")]        // the first value that carries over
     [InlineData(1_500, "1.5 KB")]
     [InlineData(1_000_000, "1.0 MB")]
     [InlineData(4_700_000_000, "4.7 GB")]
@@ -24,8 +24,8 @@ public class ByteSizeTests
         Assert.Equal(expected, ByteSize.Human(bytes));
 
     /// <summary>
-    /// 四舍五入的进位不能停在本级单位上：999_960 是 999.96 KB，保留一位小数就成了 "1000.0 KB"——
-    /// 一个没人这样写的数字。舍入后达到 1000 必须再往上进一级。
+    /// Rounding must not carry within the current unit and stop there: 999_960 is 999.96 KB, and one decimal place turns it into "1000.0 KB" —
+    /// a number nobody writes. Once rounding reaches 1000, it has to carry up one more unit.
     /// </summary>
     [Theory]
     [InlineData(999_960, "1.0 MB")]
@@ -33,13 +33,13 @@ public class ByteSizeTests
     public void Carries_Into_Next_Unit_When_Rounding_Reaches_1000(long bytes, string expected) =>
         Assert.Equal(expected, ByteSize.Human(bytes));
 
-    /// <summary>long.MaxValue 也得有单位可用，不能溢出到 "9223372036854775807 B"。</summary>
+    /// <summary>long.MaxValue must have a unit available too; it must not spill out as "9223372036854775807 B".</summary>
     [Fact]
     public void Handles_MaxValue() => Assert.Equal("9.2 EB", ByteSize.Human(long.MaxValue));
 
     /// <summary>
-    /// 备份里的字节数不会是负的，但格式化函数绝不该因为一个不该出现的输入而抛异常——
-    /// 它跑在备份成功之后的收尾路径上，在这里抛等于把一次成功的备份变成失败。
+    /// Byte counts in a backup are never negative, but the formatter must never throw over an input that should not have occurred —
+    /// it runs on the wrap-up path after a backup has already succeeded, and throwing here turns a successful backup into a failed one.
     /// </summary>
     [Theory]
     [InlineData(-1)]

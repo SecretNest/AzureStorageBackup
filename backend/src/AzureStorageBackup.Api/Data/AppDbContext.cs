@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Data;
 
 /// <summary>
-/// 应用数据上下文（SQLite）。敏感字段在库与实体中均为密文，不在此处加解密（设计 §3.1）。
+/// The application data context (SQLite). Sensitive fields are ciphertext both in the database and on the entities; nothing is encrypted or decrypted here (design §3.1).
 /// </summary>
 public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
 {
@@ -27,7 +27,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasKey(e => e.Id);
             entity.Property(e => e.Name).IsRequired().HasMaxLength(200);
             entity.Property(e => e.BlobEndpoint).IsRequired();
-            // 属性名带 Protected 后缀，列名保持原样（无 schema 变更）。
+            // The property names carry a Protected suffix while the column names stay as they were (no schema change).
             entity.Property(e => e.AccountKeyProtected).IsRequired().HasColumnName("AccountKey");
             entity.Property(e => e.ProxyPasswordProtected).HasColumnName("ProxyPassword");
         });
@@ -58,10 +58,10 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             e.Property(x => x.Name).IsRequired().HasMaxLength(200);
             e.Property(x => x.ContainerName).IsRequired();
             e.Property(x => x.LocalRoot).IsRequired();
-            e.Property(x => x.PasswordProtected).HasColumnName("Password"); // 密文落库，列名不变
-            // 一个 container 只能挂一条备份。两条配置写同一个地方，就是两套互不知情的版本号
-            // 与索引互相覆盖，各自的数据 blob 在对方的保留清理里被当成孤儿删掉。端点会先查一次
-            // 并给出说得清的 409；这条索引兜住绕过端点的写入与并发挤进那个窗口的第二条。
+            e.Property(x => x.PasswordProtected).HasColumnName("Password"); // ciphertext in the database, column name unchanged
+            // One container can carry only one backup. Two configs writing to the same place means two sets of version numbers and
+            // indexes that know nothing of each other overwriting one another, each one's data blobs deleted as orphans by the other's
+            // retention cleanup. The endpoint checks first and returns a 409 that explains itself; this index catches writes that bypass the endpoint and a second config that squeezes into that window concurrently.
             e.HasIndex(x => new { x.AccountId, x.ContainerName }).IsUnique();
         });
 
@@ -72,7 +72,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.Id);
             e.Property(x => x.Source).IsRequired();
-            // DateTimeOffset 在 SQLite 上无法翻译范围比较：落库为 UtcTicks（可比较、可排序）。
+            // SQLite cannot translate range comparisons on DateTimeOffset: stored as UtcTicks (comparable and sortable).
             e.Property(x => x.Timestamp).HasConversion(
                 v => v.UtcTicks,
                 v => new DateTimeOffset(v, TimeSpan.Zero));

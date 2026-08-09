@@ -1,9 +1,9 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 常驻调度器（M6、PRD 2.2/2.3）：每分钟检查启用的计划任务，到期即触发（fire-and-forget，
-/// 组内由 TaskDispatcher 依次执行）。触发前先记录 LastRunAt，避免同一时刻重复触发或重启后重放。
-/// cron 时区由 Scheduler:TimeZone（IANA id）配置，缺省/非法则 UTC。
+/// The resident scheduler (M6, PRD 2.2/2.3): checks enabled scheduled tasks every minute and fires whatever is due (fire-and-forget;
+/// within a group TaskDispatcher runs them one after another). LastRunAt is recorded before firing, so the same moment cannot fire twice and a restart cannot replay it.
+/// The cron time zone comes from Scheduler:TimeZone (an IANA id); missing or invalid falls back to UTC.
 /// </summary>
 public sealed class SchedulerService(
     IServiceScopeFactory scopes, TaskDispatcher dispatcher, IConfiguration config, ILogger<SchedulerService> logger,
@@ -13,7 +13,7 @@ public sealed class SchedulerService(
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
     private readonly TimeZoneInfo _tz = ResolveTimeZone(config["Scheduler:TimeZone"]);
 
-    /// <summary>解析 IANA/系统时区 id；空或非法回退 UTC。</summary>
+    /// <summary>Resolves an IANA/system time zone id; empty or invalid falls back to UTC.</summary>
     public static TimeZoneInfo ResolveTimeZone(string? id)
     {
         if (string.IsNullOrWhiteSpace(id))
@@ -44,23 +44,23 @@ public sealed class SchedulerService(
         }
     }
 
-    /// <summary>单次 tick（internal 供测试直接驱动，覆盖密钥环跳过分支）。</summary>
+    /// <summary>A single tick (internal so tests can drive it directly and cover the keyring skip branch).</summary>
     internal async Task TickAsync(CancellationToken ct)
     {
         using var scope = scopes.CreateScope();
         var now = DateTimeOffset.UtcNow;
 
-        // 短存日志保留清理（PRD 3.6），天数取自全局设置。与密钥环状态无关，
-        // 即便密钥环丢失也要继续清理——密钥环丢失可能持续很久，此时日志膨胀的危害
-        // 与日志对排障的重要性都更高，故置于密钥环闸门之前（不受跳过影响）。
+        // Ephemeral log retention cleanup (PRD 3.6), with the day count taken from the global settings. It has nothing to do with the
+        // keyring status: cleanup has to keep running even when the keyring is lost — a lost keyring can last a long time, and in that
+        // state both the harm of log bloat and the value of logs for troubleshooting are higher, so this sits ahead of the keyring gate (unaffected by the skip).
         var settings = await scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
         await scope.ServiceProvider.GetRequiredService<IOperationLog>().TrimAsync(
             settings.LogEphemeralMaxAgeDays, now, ct);
-        verboseLog.Trim(settings.LogEphemeralMaxAgeDays, now); // verbose 文本日志同窗口按日期删旧文件
+        verboseLog.Trim(settings.LogEphemeralMaxAgeDays, now); // verbose text logs use the same window, deleting old files by date
 
         if (keyring.Status == KeyringStatus.Lost)
         {
-            // 每 tick 只记一条汇总，不逐任务记——否则日志会被刷爆（设计 §3.3）
+            // One summary line per tick, not one per task — otherwise the log gets flooded (design §3.3)
             logger.LogWarning("Keyring lost; skipping all scheduled tasks until credentials are re-entered.");
             return;
         }
@@ -72,8 +72,8 @@ public sealed class SchedulerService(
             if (!SchedulerPlanner.IsDue(task, now, _tz))
                 continue;
 
-            await tasks.SetLastRunAsync(task.Id, now, ct); // 先记录，防止重复触发
-            _ = dispatcher.DispatchAsync(task, ct);         // 后台执行；不阻塞下一个任务
+            await tasks.SetLastRunAsync(task.Id, now, ct); // record it first, to prevent a duplicate fire
+            _ = dispatcher.DispatchAsync(task, ct);         // runs in the background; does not block the next task
         }
     }
 }

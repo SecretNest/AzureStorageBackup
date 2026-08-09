@@ -1,13 +1,13 @@
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>推送方法（PRD 4.2）。</summary>
+/// <summary>Push method (PRD 4.2).</summary>
 public enum NotificationMethod
 {
     Get = 0,
     Post = 1,
 }
 
-/// <summary>触发通知的事件集合（PRD 3.5）。位标志，可任意组合。</summary>
+/// <summary>The set of events that trigger a notification (PRD 3.5). Bit flags, combinable in any way.</summary>
 [Flags]
 public enum NotificationEvents
 {
@@ -25,8 +25,8 @@ public enum NotificationEvents
 }
 
 /// <summary>
-/// 全局通知配置（PRD 4.2）。单例（Id=1）。
-/// GET：URL 含 {Title}/{Body} 占位符；POST：另加 body 模板 + content-type。支持代理。
+/// Global notification configuration (PRD 4.2). A singleton (Id=1).
+/// GET: the URL carries {Title}/{Body} placeholders; POST: additionally a body template + content-type. Proxies are supported.
 /// </summary>
 public class NotificationConfig
 {
@@ -36,15 +36,15 @@ public class NotificationConfig
     public string Url { get; set; } = string.Empty;
     public NotificationMethod Method { get; set; }
 
-    /// <summary>POST 请求体模板（含占位符）。</summary>
+    /// <summary>POST request body template (with placeholders).</summary>
     public string? BodyTemplate { get; set; }
 
-    /// <summary>POST content-type（如 application/json、text/plain）。</summary>
+    /// <summary>POST content-type (e.g. application/json, text/plain).</summary>
     public string? ContentType { get; set; }
 
-    /// <summary>启用的事件（位标志）。</summary>
+    /// <summary>Enabled events (bit flags).</summary>
     public NotificationEvents Events { get; set; }
 
-    /// <summary>代理地址（如 http://host:port）；空则直连。</summary>
+    /// <summary>Proxy address (e.g. http://host:port); empty means connect directly.</summary>
     public string? ProxyUrl { get; set; }
 }

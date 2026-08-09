@@ -4,15 +4,15 @@ using Azure;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 瞬时（可重试、可挂起）错误的唯一判据。上传重试与挂起闸门共用一套，
-/// 免得两边各判各的，出现"重试层认为该重试、闸门层认为该失败"这种自相矛盾。
+/// The one and only criterion for transient (retryable, suspendable) errors. Upload retry and the suspend gate share a single set,
+/// so the two cannot judge separately and contradict each other with "the retry layer says retry, the gate layer says fail".
 /// </summary>
 public static class TransientErrors
 {
     /// <param name="ct">
-    /// 调用方的取消令牌。取消是唯一需要上下文才能分辨的情况：同样是
-    /// <see cref="OperationCanceledException"/>，令牌已触发说明是**用户按了取消**（必须往上抛），
-    /// 没触发说明是 SDK 内部的网络超时（该重试）。判错这一条，取消按钮会静悄悄失效。
+    /// The caller's cancellation token. Cancellation is the only case that needs context to tell apart: for one and the same
+    /// <see cref="OperationCanceledException"/>, a token that has already fired means **the user pressed cancel** (must be rethrown),
+    /// while one that has not means an SDK-internal network timeout (should be retried). Get this one wrong and the cancel button quietly stops working.
     /// </param>
     public static bool IsTransient(Exception ex, CancellationToken ct = default) => ex switch
     {
@@ -21,8 +21,8 @@ public static class TransientErrors
         SocketException => true,
         TimeoutException => true,
         OperationCanceledException => !ct.IsCancellationRequested,
-        // Azure.Core 重试耗尽时抛的就是这个（内层一串 TaskCanceledException）。
-        // 从前这里漏判，导致我们自己那层 RetryPolicy 一次都没重试，直接把运行判死。
+        // This is exactly what Azure.Core throws once its own retries are exhausted (with a pile of TaskCanceledException inside).
+        // We used to miss it here, so our own RetryPolicy layer never retried even once and simply pronounced the run dead.
         AggregateException agg => agg.InnerExceptions.Count > 0
             && agg.InnerExceptions.All(inner => IsTransient(inner, ct)),
         _ => false,

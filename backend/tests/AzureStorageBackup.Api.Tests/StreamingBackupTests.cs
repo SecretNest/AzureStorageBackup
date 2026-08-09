@@ -8,9 +8,10 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 单文件 blob 改为一遍读（边读边算 hash 边压）之后的端到端验收（第 2 期）。
-/// 承重点：云端躺着的字节必须与源文件逐字节相同——加密、分卷、store-only、raw 直传四种组合都要对；
-/// 已经存在的内容仍然靠预筛整个跳过，不因为"压完才知道名字"而白压一遍。
+/// End-to-end acceptance after single-file blobs moved to a single read pass (hash and compress while reading), phase 2.
+/// What this carries: the bytes sitting in the cloud must be byte-for-byte identical to the source file — and that must hold for all
+/// four combinations of encryption, volume splitting, store-only and raw direct upload; content that already exists is still skipped
+/// wholesale by the pre-filter, never recompressed for nothing just because "the name is only known once compression is done".
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class StreamingBackupTests : IDisposable
@@ -62,8 +63,8 @@ public sealed class StreamingBackupTests : IDisposable
         return full;
     }
 
-    /// <summary>把某个索引条目的 blob 拉回本地、解出内容，与源文件逐字节比对。
-    /// 不比对 hash：hash 与索引来自同一遍读，拿它自证是循环论证。</summary>
+    /// <summary>Pull an index entry's blob back down, extract the content, and compare it byte for byte against the source file.
+    /// Deliberately not comparing hashes: the hash and the index come from the same read pass, so using it as proof would be circular.</summary>
     private async Task AssertBlobMatchesSourceAsync(
         BlobContainerClient container, IndexEntry entry, string? password)
     {
@@ -88,11 +89,11 @@ public sealed class StreamingBackupTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(null, null, false, false)] // 压缩，单卷
-    [InlineData("pw", null, false, false)] // 加密 + 头加密
-    [InlineData("pw", 64 * 1024L, false, false)] // 加密 + 分卷
-    [InlineData(null, null, true, true)]   // store-only + 无密码 + 不分卷 → raw 直传
-    [InlineData("pw", null, true, false)]  // store-only 但加了密 → 仍走 7z 封装
+    [InlineData(null, null, false, false)] // compressed, single volume
+    [InlineData("pw", null, false, false)] // encryption + header encryption
+    [InlineData("pw", 64 * 1024L, false, false)] // encryption + volume splitting
+    [InlineData(null, null, true, true)]   // store-only + no password + no splitting → raw direct upload
+    [InlineData("pw", null, true, false)]  // store-only but encrypted → still wrapped by 7z
     public async Task Stored_Bytes_Match_The_Source_File(
         string? password, long? volumeBytes, bool dontCompress, bool expectRaw)
     {
@@ -139,8 +140,8 @@ public sealed class StreamingBackupTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>数一数流式压缩被调了几次。压完才知道 blob 名，所以"已经存在的内容"要靠预筛
-    /// 提前拦下——拦不住的话，一个被改名的 4 GB 文件每次备份都要白压一遍。</summary>
+    /// <summary>Counts how many times streaming compression was invoked. The blob name is only known once compression is done, so
+    /// "content that already exists" has to be stopped up front by the pre-filter — fail to stop it and a renamed 4 GB file gets recompressed for nothing on every single backup.</summary>
     private sealed class CountingStreamCompressor(IFileCompressor inner) : IFileCompressor
     {
         private int _streamCompressions;
@@ -210,17 +211,17 @@ public sealed class StreamingBackupTests : IDisposable
             await orchestrator.RunAsync(Request());
             Assert.Equal(1, compressor.StreamCompressions);
 
-            // 改个名：内容一个字节都没变，diff 却把它看成新增。预筛必须在压之前就认出这份内容。
+            // Rename it: not one byte of the content changed, yet the diff sees a new file. The pre-filter has to recognize this content before compressing.
             File.Move(Path.Combine(_root, "big.bin"), Path.Combine(_root, "renamed.bin"));
             await orchestrator.RunAsync(Request());
 
-            Assert.Equal(1, compressor.StreamCompressions); // 一次都没有再压
+            Assert.Equal(1, compressor.StreamCompressions); // not compressed even one more time
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             var entry = Assert.Single(idx.Entries, e => e.Path == "renamed.bin");
             Assert.True(await VolumeBlobIO.ExistsAsync(container, entry.Storage!.Ref, CancellationToken.None));
 
-            // 去重的两条记录必须指向同一个 blob，而不是各存一份。
+            // The two deduplicated records must point at the same blob instead of each storing its own copy.
             var dataBlobs = new List<string>();
             await foreach (var b in container.GetBlobsAsync(
                 BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))

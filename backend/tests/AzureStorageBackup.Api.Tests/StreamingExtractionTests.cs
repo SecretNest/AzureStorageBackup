@@ -3,9 +3,9 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 流式解压（<see cref="IFileCompressor.ExtractToStreamAsync"/>）与保序列举。
-/// 检查器的免落盘校验建立在这两条 7z 行为上，所以它们必须被钉死：
-/// 列举顺序 = `x -so` 的拼接顺序；成员不存在时输出为空且**不报错**。
+/// Streaming extraction (<see cref="IFileCompressor.ExtractToStreamAsync"/>) and order-preserving listing.
+/// The checker's disk-free verification rests on these two 7z behaviors, so they have to be nailed down:
+/// listing order = the concatenation order of `x -so`; a member that does not exist yields empty output and **no error**.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class StreamingExtractionTests : IDisposable
@@ -47,7 +47,7 @@ public sealed class StreamingExtractionTests : IDisposable
         var compressor = new SevenZipCompressor();
         var archive = Path.Combine(_dir, "enc.7z");
 
-        // 加密 + 头加密 + 分卷：三者同时开着仍要能逐成员流式取出（这是本期的核心验收）。
+        // Encryption + header encryption + volume splitting: with all three on at once we must still stream out member by member (the core acceptance criterion of this phase).
         var result = await compressor.CompressAsync(new CompressionRequest(
             _src, ["a/b/one.bin", "c/two.bin"], archive, Password: "pw", VolumeBytes: 64 * 1024));
         Assert.True(result.VolumeFiles.Count > 1, "expected a split archive");
@@ -69,8 +69,8 @@ public sealed class StreamingExtractionTests : IDisposable
     {
         Skip.IfNot(SevenZip(), "7z not found");
 
-        // 条目名有意不按字典序给出，且掺一个空文件：归档内的排列由 7z 自己定，
-        // 我们只能相信"列举顺序 = 输出顺序"，所以这里就是钉住这条的用例。
+        // The entry names are deliberately not in lexicographic order, and an empty file is mixed in: 7z decides the
+        // layout inside the archive itself, so all we can lean on is "listing order = output order" — this case nails that down.
         var files = new[] { "z.bin", "a/b/one.bin", "empty.bin", "m/two.bin" };
         var sizes = new[] { 5_000, 300_000, 0, 77 };
         for (var i = 0; i < files.Length; i++)
@@ -116,8 +116,8 @@ public sealed class StreamingExtractionTests : IDisposable
 
         var hasher = new StreamingHasher(0, 0);
         await using var sink = new HashingStream(hasher);
-        // 这正是必须防的坑：7z 对不存在的成员**不报错**，只是什么都不输出。
-        // 所以这个断言不是"期望的好行为"，而是记录一个必须由调用方兜住的陷阱。
+        // This is exactly the pitfall to guard against: for a member that does not exist 7z reports **no error**, it simply outputs nothing.
+        // So this assertion is not "the nice behavior we want" but a record of a trap the caller has to catch itself.
         var written = await compressor.ExtractToStreamAsync(result.VolumeFiles[0], "absent.bin", null, sink);
 
         Assert.Equal(0, written);
@@ -125,10 +125,10 @@ public sealed class StreamingExtractionTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(null, null, false)]      // 纯压缩
-    [InlineData("pw", null, false)]      // 加密 + 头加密
-    [InlineData("pw", 64 * 1024L, false)] // 加密 + 分卷
-    [InlineData(null, null, true)]       // store-only（不压缩，仍走 7z 封装）
+    [InlineData(null, null, false)]      // plain compression
+    [InlineData("pw", null, false)]      // encryption + header encryption
+    [InlineData("pw", 64 * 1024L, false)] // encryption + volume splitting
+    [InlineData(null, null, true)]       // store-only (no compression, still wrapped by 7z)
     public async Task Streamed_Archive_Holds_Exactly_The_Bytes_That_Were_Fed(
         string? password, long? volumeBytes, bool storeOnly)
     {
@@ -150,7 +150,7 @@ public sealed class StreamingExtractionTests : IDisposable
                 return fed.Length;
             });
 
-        // 条目名保留完整相对路径——还原与检查定位成员的逻辑因此不必区分归档是怎么产出来的。
+        // The entry name keeps the full relative path — so the restore and check logic can locate a member without caring how the archive was produced.
         var entry = Assert.Single(
             await compressor.ListEntriesAsync(result.VolumeFiles[0], password), e => !e.IsDirectory);
         Assert.Equal("a/b/payload.bin", entry.Name);
@@ -178,7 +178,7 @@ public sealed class StreamingExtractionTests : IDisposable
             async (stdin, token) =>
             {
                 await stdin.WriteAsync(new byte[64 * 1024], token);
-                await Task.Delay(Timeout.Infinite, token); // 停在这里等取消打断
+                await Task.Delay(Timeout.Infinite, token); // park here and wait for cancellation to break in
                 return 0L;
             }, cts.Token);
 
@@ -186,7 +186,7 @@ public sealed class StreamingExtractionTests : IDisposable
         await cts.CancelAsync();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
-        // 半截的归档是合法的 7z 文件，留下来就会被暂存区当成产物收走并上传。
+        // A half-written archive is still a valid 7z file; leave it lying around and the staging area picks it up as an artifact and uploads it.
         Assert.Empty(Directory.EnumerateFiles(_dir, "half.7z*"));
     }
 

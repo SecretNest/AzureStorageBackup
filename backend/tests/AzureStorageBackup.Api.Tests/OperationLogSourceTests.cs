@@ -6,9 +6,9 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// §5.3：操作日志 source 须含 account 维度（"{op}:{accountId}/{container}"），便于按 account 过滤/删除。
-/// 用纯构造（无 Azurite）+ spy IOperationLog 断言：BackupChecker 在 store 早期失败前就已写入 CheckStart 日志，
-/// 其 source 携带 account.Id。
+/// §5.3: the operation log source must carry the account dimension ("{op}:{accountId}/{container}") so logs can be filtered/deleted per account.
+/// Asserted with pure construction (no Azurite) plus a spy IOperationLog: BackupChecker has already written its CheckStart log before the
+/// store fails early, and that source carries account.Id.
 /// </summary>
 public sealed class OperationLogSourceTests
 {
@@ -32,8 +32,8 @@ public sealed class OperationLogSourceTests
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
-    /// <summary>抛出而不做任何 I/O：CheckAsync 的 CheckStart 记录发生在 store 调用之前，
-    /// 故此 fake 只需保证一旦被调用就快速失败，不依赖网络/Azurite。</summary>
+    /// <summary>Throws without doing any I/O: CheckAsync writes its CheckStart record before it ever calls the store,
+    /// so this fake only has to fail fast the moment it is called, with no dependency on the network or Azurite.</summary>
     private sealed class ThrowingBackupInfoStore : IBackupInfoStore
     {
         public Task<BackupInfoFile?> ReadInfoAsync(Account account, string container, string? password, CancellationToken ct = default)
@@ -55,8 +55,8 @@ public sealed class OperationLogSourceTests
             => throw new NotImplementedException();
     }
 
-    /// <summary>返回一个带单个版本的最小 info（不做 I/O）：让 BackupRepairer.RepairAsync 越过其自身的
-    /// "no backup found" 早退检查、走到委派 checker.CheckAsync 那一步（checker 自己的 store 才是 Throwing 的）。</summary>
+    /// <summary>Returns a minimal info with a single version (no I/O): lets BackupRepairer.RepairAsync get past its own
+    /// "no backup found" early-exit check and reach the point where it delegates to checker.CheckAsync (it is the checker's own store that is the throwing one).</summary>
     private sealed class OneVersionBackupInfoStore : IBackupInfoStore
     {
         private static BackupInfoFile Info() => new()
@@ -84,7 +84,7 @@ public sealed class OperationLogSourceTests
             => throw new NotImplementedException();
     }
 
-    /// <summary>永不应被调用（ThrowingBackupInfoStore 在 CheckCoreAsync 使用 factory 之前就已抛出）。</summary>
+    /// <summary>Must never be called (ThrowingBackupInfoStore throws before CheckCoreAsync ever uses the factory).</summary>
     private sealed class UnusedBlobClientFactory : IBlobClientFactory
     {
         public BlobServiceClient CreateServiceClient(Account account) => throw new NotImplementedException();
@@ -105,11 +105,11 @@ public sealed class OperationLogSourceTests
         Assert.Contains(log.Entries, e => e.Source == "check:3/photos");
     }
 
-    /// <summary>Repairer 的第一步就是委派给 checker.CheckAsync（同一 account/container），
-    /// 其记录的 CheckStart source 已验证携带 account 维度；这里换一个 account id 复核，
-    /// 并确认失败传播路径不吞掉/篡改 source。BackupRepairer 自身的 "repair:{account.Id}/{container}"
-    /// 记录点（见 BackupRepairer.cs RepairAsync 末尾 + DeleteOrphansAsync）在到达前需要真实 Azure 交互
-    /// （factory.CreateServiceClient），已通过代码审查确认与本测试同一格式一致（§5.3 报告有逐处列表）。</summary>
+    /// <summary>The repairer's very first step is to delegate to checker.CheckAsync (same account/container),
+    /// whose CheckStart source is already verified to carry the account dimension; here we recheck with a different account id
+    /// and confirm the failure-propagation path neither swallows nor mangles the source. BackupRepairer's own
+    /// "repair:{account.Id}/{container}" logging points (see the end of RepairAsync in BackupRepairer.cs plus DeleteOrphansAsync)
+    /// need real Azure interaction (factory.CreateServiceClient) before they are reached; code review confirmed they use the same format as this test (the §5.3 report lists every site).</summary>
     [Fact]
     public async Task Checker_Invoked_By_Repairer_Logs_Source_With_Account_Id()
     {
@@ -119,7 +119,7 @@ public sealed class OperationLogSourceTests
         var repairer = new BackupRepairer(
             new UnusedBlobClientFactory(), new OneVersionBackupInfoStore(), compressor: null!, hasher: null!,
             uploader: null!, tempRoot: Path.GetTempPath(),
-            // 这个用例走不到压缩，暂存区只是为了构造得出来。
+            // This case never reaches compression; the staging area is only here so the object can be constructed at all.
             staging: new StagingArea(Path.GetTempPath(), Path.GetTempPath(), () => long.MaxValue),
             checker: checker);
         var account = new Account { Id = 7, Name = "acct7" };
