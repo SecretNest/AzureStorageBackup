@@ -443,8 +443,8 @@ export function BackupConfigsPage() {
 
   const startNew = () => {
     setEditing(null)
-    // 12 个可继承字段留 null（= 使用默认，PRD §3）。tier 创建后锁定、不可继承，
-    // 因此仍以全局默认预填，保存即固定。
+    // The twelve inheritable fields stay null (= use default, PRD §3). The tiers are locked after
+    // creation and not inheritable, so they are still prefilled from the global defaults and fixed on save.
     setForm({
       ...emptyForm,
       accountId: accounts[0]?.id ?? 0,
@@ -456,7 +456,7 @@ export function BackupConfigsPage() {
     setStep(1)
     setPasswordConfirm('')
     setError(null)
-    // 此标志位独立于 form，重置表单时不会自动清除；陈旧的 true 会导致容器选择器误开自由文本输入模式
+    // This flag is independent of form and is not cleared when the form resets; a stale true would wrongly put the container picker into free-text mode
     setNewContainer(false)
     setPickingScope(false)
     setShowForm(true)
@@ -495,25 +495,29 @@ export function BackupConfigsPage() {
     setShowForm(true)
   }
 
-  // 编辑时密码字段是锁死的，不参与比对。空密码（不加密）要求确认框同样为空，
-  // 这样「本想设密码却只填了一个框」也会被拦下。
+  // While editing, the password field is locked and takes no part in the comparison. An empty password
+  // (no encryption) requires the confirmation to be empty too, which also catches "meant to set a
+  // password but only filled one box".
   const passwordMismatch = !editing && (form.password ?? '') !== passwordConfirm
-  // 树要的是规则集，表单存的是文本。现算，不另存一份状态。
+  // The tree wants a rule set while the form stores text. Computed live rather than kept as a second copy of state.
   const scope = useMemo(() => parseScope(form.scopeRules), [form.scopeRules])
-  // 「全部」与「空规则集」在文本上都是 null，界面上却要分开：勾着复选框是前者，
-  // 取消勾选后从全选起步是后者。所以这个开关必须独立于 form。
+  // "Everything" and "an empty rule set" are both null as text, but the UI must tell them apart: the box
+  // ticked is the former, unticked and starting from everything selected is the latter. Hence this toggle
+  // has to be independent of form.
   const [pickingScope, setPickingScope] = useState(false)
 
   const save = async () => {
     if (passwordMismatch) return
-    // 范围收窄的警告。移出范围的文件在下次备份时会被当作删除处理——新版本不再包含它们
-    // （旧版本仍可还原，直到保留策略把旧版本清掉）。与改忽略规则的行为一致，但用户在树上
-    // 点几下就能收窄一大片，所以这里必须说出来。
+    // The narrowing warning. Files moved out of scope are treated as deleted by the next backup — new
+    // versions no longer contain them (old versions still restore, until retention removes them). Same
+    // behaviour as changing the ignore rules, but a few clicks on the tree can narrow a great deal, so it
+    // has to be said here.
     if (editing) {
       const before = parseScope(editing.scopeRules)
       const after = parseScope(form.scopeRules)
-      // 判断依据是新旧规则集的差异，不扫文件系统：只要两边任一条规则所指的路径从「在范围内」
-      // 变成了「不在」，就算收窄。规则所指的路径正是范围发生变化的那些边界点，因此够用。
+      // Judged by the difference between the old and new rule sets, without touching the filesystem: if
+      // any path named by either side's rules goes from in scope to out, that counts as narrowing. The
+      // paths the rules name are exactly the boundary points where scope changes, so that suffices.
       const boundaries = new Set<string>([...before.keys(), ...after.keys()])
       const narrowed = [...boundaries].some((p) => isInScope(before, p) && !isInScope(after, p))
       if (
@@ -532,7 +536,7 @@ export function BackupConfigsPage() {
       if (editing) {
         await backupConfigsApi.update(editing.id, form)
       } else {
-        // §4.6: 新建成功后不直接关闭，而是提示是否立即运行首次备份。
+        // §4.6: after a successful creation, do not just close — offer to run the first backup now.
         const created = await backupConfigsApi.create(form)
         setPostCreate(created)
       }
@@ -545,14 +549,15 @@ export function BackupConfigsPage() {
     }
   }
 
-  // 失败**不**在这里吞掉：错误要显示在删除弹窗内部（见 DeleteModal）。写进页面那条全局错误的话，
-  // 弹窗正盖在它上面，用户看到的就是"点了 Delete，什么都没发生"——后端拒绝删除正在运行的配置时
-  // （409）每次都是这个现象。
+  // Failures are **not** swallowed here: the error has to appear inside the delete dialog (see
+  // DeleteModal). Writing it to the page's global error puts it underneath the dialog, so what the user
+  // sees is "I pressed Delete and nothing happened" — which is exactly what the backend refusing to
+  // delete a running configuration (409) looked like every time.
   const remove = async (c: BackupConfig, deleteContainer: boolean) => {
     await backupConfigsApi.remove(c.id, deleteContainer)
     setDeleteModal(null)
-    // 删除是从这份配置的编辑表单里发起的：留着表单开着，用户面对的是一份已经不存在的配置，
-    // 再点一次 Save 只会撞上 404。
+    // The delete was started from this configuration's edit form: leaving that form open faces the user
+    // with a configuration that no longer exists, and pressing Save again only hits a 404.
     if (editing?.id === c.id) {
       setShowForm(false)
       setEditing(null)
@@ -569,14 +574,15 @@ export function BackupConfigsPage() {
     }
   }
 
-  // 只负责发起——轮询交给上面按 activity 派发的统一机制（服务端是唯一真相源）。
+  // Only starts it — polling is left to the unified activity-dispatched mechanism above (the server is the single source of truth).
   const run = async (c: BackupConfig) => {
     setError(null)
     try {
       const state = await backupConfigsApi.run(c.id)
       setRuns((r) => ({ ...r, [c.id]: state }))
-      // 上一次检查/修复的结论说的是「云端此刻的内容」，这次备份一上传就作废了：那行绿字
-      // 留在原地只会让人以为它还成立。以前得切到别的页面再回来（组件重挂载）才清得掉。
+      // The previous check/repair verdict describes "what is in the cloud right now", which this backup
+      // invalidates the moment it uploads: leaving that green line in place only suggests it still holds.
+      // It used to take navigating away and back (remounting the component) to clear it.
       setChecks((m) => without(m, c.id))
       setRepairs((m) => without(m, c.id))
       load()
@@ -585,11 +591,13 @@ export function BackupConfigsPage() {
     }
   }
 
-  // 停止一个正在跑的操作。在此之前，一次跑了几小时的备份唯一的停法是重启容器——而用户跑在
-  // NAS 上，那会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路堵上了。
-  // 逐操作停而不是一键停光：备份与还原可以并发，误停另一条同样是几小时的损失。
+  // Stop one running operation. Before this, the only way to stop a backup that had been running for
+  // hours was restarting the container — and the user runs on a NAS, where that takes other services down
+  // with it, while "no deleting a configuration while busy" closed off deletion as an escape too.
+  // Stopping per operation rather than all at once: a backup and a restore can run concurrently, and
+  // stopping the wrong one costs the same hours.
   const stopOp = async (c: BackupConfig, what: 'backup' | 'restore' | 'repair' | 'check', label: string) => {
-    // 备份要问清楚"正在传的文件是传完还是扔掉"，一句 confirm 说不清，走对话框。
+    // A backup has to ask whether the file currently uploading should be finished or dropped, which one confirm cannot express, so it opens a dialog.
     if (what === 'backup') {
       setStopping(c)
       return
@@ -599,8 +607,9 @@ export function BackupConfigsPage() {
     setError(null)
     try {
       await backupConfigsApi.cancel(c.id, what)
-      // 取消是异步的：信号发出后要等到下一个取消检查点才真的收尾，所以这里不动状态，
-      // 让统一轮询把真实的终态（Canceled）拉回来。
+      // Cancelling is asynchronous: after the signal, the run only winds down at the next cancellation
+      // checkpoint, so nothing is written here and the unified polling fetches the real terminal state
+      // (Canceled).
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -640,7 +649,7 @@ export function BackupConfigsPage() {
     }
   }
 
-  // 同上：只写入首个状态，后续进度由统一轮询接手。
+  // As above: write only the initial state; the unified polling takes over from there.
   const pollRestore = (id: number, state: RestoreRun) => {
     setRestores((r) => ({ ...r, [id]: state }))
     load()
@@ -672,7 +681,7 @@ export function BackupConfigsPage() {
             .join(', ')} could not be read. Those versions cannot be restored or checked.`,
         )
       }
-      // 检查已经在后台跑了，直接把面板端到用户面前——让他自己再去找一遍那个按钮没有道理。
+      // The check is already running in the background, so put the panel in front of the user — making them hunt for that button again makes no sense.
       if (result.checkStarted) setCheckModal(result.config)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -681,19 +690,22 @@ export function BackupConfigsPage() {
 
   const accountName = (id: number) => accounts.find((a) => a.id === id)?.name ?? `#${id}`
 
-  // editing 是点 Edit 那一刻的快照，而表单可能开着好几分钟——activity 得从每 5 秒刷新的
-  // configs 里取当下的值，否则删除按钮的禁用状态停在打开表单时的那一拍。
+  // editing is a snapshot from the moment Edit was pressed, and the form may stay open for minutes — so
+  // activity has to come from the configs refreshed every 5 seconds, or the delete button's disabled state
+  // freezes at the tick the form was opened.
   const editingLive = editing ? (configs.find((c) => c.id === editing.id) ?? editing) : null
 
-  // 两个步骤的操作栏共用一个：删除跟当前停在第几步无关，不该逼用户先 Back 回第 1 步。
-  // 后端本就拒绝删除正在运行的配置（409，见 BackupConfigEndpoints 的 DeriveActivity）；
-  // 这里跟着灰只是把按钮与那条既有护栏对齐——真正的保证仍在后端，因为 activity 每 5 秒才刷
-  // 一次，刚开跑的那几秒里按钮还是亮的（那时错误会显示在弹窗里，见 DeleteModal）。
+  // Both steps share one action bar: deleting has nothing to do with which step you are on, and should
+  // not force the user to go Back to step 1 first.
+  // The backend already refuses to delete a running configuration (409, see DeriveActivity in
+  // BackupConfigEndpoints); greying out here only aligns the button with that existing guard — the real
+  // guarantee stays on the backend, because activity refreshes only every 5 seconds and the button is
+  // still live for the first few seconds of a run (where the error surfaces in the dialog, see DeleteModal).
   const deleteButton = editingLive && (
     <button
       type="button"
       className="btn-danger"
-      // 推到操作栏另一端：不可逆的操作不该紧挨着 Save/Cancel 让人误点。
+      // Pushed to the far end of the action bar: an irreversible action should not sit next to Save/Cancel where it invites a misclick.
       style={{ marginLeft: 'auto' }}
       onClick={() => setDeleteModal(editingLive)}
       disabled={busy || editingLive.activity !== 'Idle'}
@@ -763,25 +775,30 @@ export function BackupConfigsPage() {
                 setImportForm((f) => ({ ...f, checkAfterImport: e.target.checked }))
               }
             />
-            {/* 导入抓的是账本；账本上写的东西还在不在，得问过云端才知道。只发 HEAD，不下载。 */}
+            {/* An import fetches the ledger; whether what the ledger lists still exists can only be answered by the cloud. HEAD only, no downloads. */}
             Check cloud data once the import finishes
           </label>
         </div>
       )}
       {accounts.length === 0 && <p className="text-muted">Add an account first.</p>}
-      {/* 表单开着的时候这条挪到表单里去（见下）：表单在表格下方，而这里是表格上方，
-          被服务端拒掉的保存会把原因显示在离按钮几屏远的地方，看着就是"点了没反应"。 */}
+      {/* While the form is open this moves inside it (below): the form sits under the table and this sits
+          above it, so a save rejected by the server would show its reason several screens away from the
+          button, which reads as "I pressed it and nothing happened". */}
       {!showForm && error && <p className="text-danger">{error}</p>}
 
-      {/* 兜底，不是主力：table-fluid 已经把表宽下限压到 ~656px，正常情况这层不会出现滚动条。
-          它接的是两种边角——窗口正好卡在 641~672px（卡片布局还没接手），以及用户把账户名或
-          容器名起得极长（那是没有分隔符的单个词，撑高的是下限本身）。有这层，最坏结果是表格
-          自己横滚，而不是整页跟着横滚。tabIndex 是给键盘用户滚它的（WCAG 2.1.1）。 */}
+      {/* A backstop, not the main mechanism: table-fluid already pushes the table's minimum width down to
+          ~656px, so normally no scrollbar appears here. It catches two corners — a window sitting exactly
+          between 641 and 672px (before the card layout takes over), and an extremely long account or
+          container name (a single word with no separators, which raises the minimum itself). With this
+          layer the worst case is the table scrolling horizontally rather than the whole page.
+          tabIndex is so keyboard users can scroll it (WCAG 2.1.1). */}
       <div className="table-scroll" tabIndex={0}>
-        {/* cards＝手机上塌成卡片；table-fluid＝桌面上宽度跟着窗口走（见 index.css 那一组注释）。 */}
+        {/* cards = collapse into cards on phones; table-fluid = follow the window width on desktop (see the corresponding notes in index.css). */}
         <table className="cards table-fluid">
-          {/* 只标要在窄屏定份额的那两列（见 index.css 的列宽建议），其余留空交给 auto 分。
-              用 colgroup 而不是给 th 挂类：列宽本来就是列的属性，写在这里加删列时不会漏改。 */}
+          {/* Only the two columns that need a fixed share on narrow screens are marked (see the column
+              width notes in index.css); the rest are left to auto. A colgroup rather than classes on th:
+              column width is a property of the column, and writing it here means adding or removing a
+              column cannot miss it. */}
           <colgroup>
             <col />
             <col />
@@ -809,8 +826,9 @@ export function BackupConfigsPage() {
               </tr>
             ) : (
               configs.map((c) => {
-                // 运行状态挪出操作列、单独占一行（见 index.css .ops-row）：操作列是 nowrap 的，
-                // 而正在处理的那个路径动辄几百字符，放在那里会把整张表撑到出屏。
+                // The run status is moved out of the action column onto its own row (see .ops-row in
+                // index.css): the action column is nowrap, and the path being processed is routinely
+                // hundreds of characters, which would stretch the whole table off screen.
                 const ops = [
                   runs[c.id] && (
                     <RunStatus
@@ -823,8 +841,8 @@ export function BackupConfigsPage() {
                       onDiscard={() => void discardInterrupted(c)}
                     />
                   ),
-                  // 内存里没有运行、盘上却有 journal＝程序重启前那一轮没跑完。摆出来等用户点，
-                  // 不替他决定要不要接着跑。
+                  // No run in memory but a journal on disk = the round before the restart did not finish.
+                  // Show it and wait for the user, rather than deciding for them whether to continue.
                   !runs[c.id] && interrupted[c.id]?.length > 0 && (
                     <InterruptedNotice
                       key="interrupted"
@@ -859,8 +877,9 @@ export function BackupConfigsPage() {
                   <td data-label="Account / Container">
                     {accountName(c.accountId)} / {c.containerName}
                   </td>
-                  {/* cell-path：允许从任意字符断开（见 index.css）。只给路径用——
-                      它没有单词边界可依，其余列断在词中间只会更难读。 */}
+                  {/* cell-path allows breaking at any character (see index.css). For paths only — they
+                      have no word boundaries to rely on, whereas breaking mid-word in other columns only
+                      makes them harder to read. */}
                   <td className="mono text-faint cell-path" data-label="Local Root">{c.localRoot}</td>
                   <td data-label="Encrypted">{c.hasPassword ? 'Yes' : 'No'}</td>
                   <td data-label="Status">
@@ -870,9 +889,10 @@ export function BackupConfigsPage() {
                       onShowError={() => setErrorModal(c)}
                     />
                   </td>
-                  {/* 对齐与折行都交给 .card-actions（index.css）。原先写成内联样式，
-                      而内联样式的特异度高于任何选择器——手机卡片布局里那条改左对齐的规则
-                      因此一直是哑的，按钮在手机上仍然靠右挤着。 */}
+                  {/* Alignment and wrapping are left to .card-actions (index.css). This used to be an
+                      inline style, and inline styles outrank any selector — so the rule switching to
+                      left alignment in the phone card layout was mute all along, and the buttons stayed
+                      crammed to the right on phones. */}
                   <td className="card-actions">
                     <button
                       type="button"
@@ -887,9 +907,11 @@ export function BackupConfigsPage() {
                       type="button"
                       className="btn-ghost"
                       onClick={() => setRestoreModal(c)}
-                      // 还原不因为其它 activity 被禁用：后端刻意允许还原与备份/检查/修复并发执行且
-                      // 不占忙碌锁（见 RestoreRunner.cs 顶部注释），只有真的已经有一个还原在跑
-                      // （Restoring）时这个按钮才该变灰——否则一整晚的计划备份期间它会灰一整夜。
+                      // Restore is not disabled by other activities: the backend deliberately allows a
+                      // restore to run alongside a backup, check or repair without taking the busy lock
+                      // (see the comment at the top of RestoreRunner.cs). Only an actual restore already
+                      // running (Restoring) should grey this out — otherwise it stays grey all night
+                      // during a scheduled backup.
                       disabled={keyringLost || c.activity === 'Restoring'}
                       title={keyringLostHint}
                     >
@@ -904,9 +926,11 @@ export function BackupConfigsPage() {
                     >
                       Check / Repair…
                     </button>{' '}
-                    {/* Delete 不在这一行：它藏在 Edit 里（见下方表单的 form-actions）。
-                        一行五个按钮时，不可逆的那个正好紧挨着最常用的 Backup/Restore，窄屏换行后
-                        位置还会漂；走一趟编辑表单既拉开了距离，也保证删之前先看清删的是哪一份。 */}
+                    {/* Delete is not on this row: it lives inside Edit (see the form's form-actions
+                        below). With five buttons in a row, the irreversible one sits right next to the
+                        most-used Backup/Restore, and its position drifts once a narrow screen wraps them.
+                        Going through the edit form both adds distance and guarantees you see which
+                        configuration you are deleting. */}
                     <button type="button" className="btn-ghost" onClick={() => startEdit(c)}>
                       Edit
                     </button>
@@ -984,10 +1008,11 @@ export function BackupConfigsPage() {
                     >
                       <option value="">— select —</option>
                       {containerList.map((c) => (
-                        // 已经被一条备份占着的 container 不给选：选了也会被服务端 409 挡下，
-                        // 而两条备份写同一个 container 会互相覆盖版本历史，各自的数据在对方的
-                        // 保留清理里被当成孤儿删掉。占用来自本地配置，备份跑到一半时同样成立
-                        // ——云端那个信息文件要等最后一步才写出来。
+                        // A container already held by a backup is not selectable: the server would
+                        // refuse it with 409 anyway, and two backups writing one container overwrite each
+                        // other's version history while each one's data is deleted as an orphan by the
+                        // other's retention cleanup. Occupancy comes from the local configuration, which
+                        // holds true mid-backup too — the cloud info file is only written by the last step.
                         <option key={c.name} value={c.name} disabled={!!c.inUseBy}>
                           {c.name}
                           {c.inUseBy
@@ -1031,7 +1056,7 @@ export function BackupConfigsPage() {
                   onChange={(e) => set('localRoot', e.target.value)}
                 />
                 {editing ? (
-                  // 常规编辑里根仍然锁着；换根走带校验的专用通道（挂载点搬家用）。
+                  // The root stays locked on the ordinary edit path; changing it goes through the dedicated validated channel (for when a mount point moves).
                   <button type="button" onClick={() => setChangingRoot(true)}>
                     Change…
                   </button>
@@ -1049,8 +1074,8 @@ export function BackupConfigsPage() {
                     disabled={!form.localRoot.trim()}
                     onChange={(e) => {
                       setPickingScope(!e.target.checked)
-                      // 两个方向都回到「全部」：勾回去是清空范围，取消勾选是从全选起步、
-                      // 由用户往下剔除（设计 §10）。
+                      // Both directions return to "everything": re-ticking clears the scope, unticking
+                      // starts from everything selected and lets the user remove from there (design §10).
                       set('scopeRules', null)
                     }}
                   />
@@ -1098,9 +1123,11 @@ export function BackupConfigsPage() {
                   onChange={(e) => set('password', e.target.value)}
                 />
               </Field>
-              {/* 只有新建才要二次输入。导入与密钥环恢复时输入的密码会被**验证**（错了当场失败），
-                  唯独这里是「设定」——没有任何东西能判断它对不对，而它此后不可更改、丢失无解。
-                  一个看不见的字符打错，要等到真正需要还原的那天才会发现。 */}
+              {/* Only creation asks twice. A password entered during import or keyring recovery is
+                  **verified** (a wrong one fails on the spot); this is the one place it is *set* — nothing
+                  can tell whether it is right, and afterwards it cannot be changed and losing it is
+                  unrecoverable. One mistyped invisible character surfaces only on the day a restore is
+                  actually needed. */}
               {!editing && (
                 <Field label="Confirm password">
                   <input
@@ -1162,9 +1189,10 @@ export function BackupConfigsPage() {
             </>
           ) : (
             <>
-              {/* 路径基准必须写在这里。规则匹配的是**相对于 Local Root** 的路径，不含 Local Root
-                  本身；不说的话很自然会照着自己看到的完整路径去写，写出来的规则一条都不命中，
-                  而且不命中是静默的——用户只能从"包数没变少"这种间接现象去猜。 */}
+              {/* The path basis has to be stated here. Rules match paths **relative to Local Root**,
+                  excluding Local Root itself; without saying so it is natural to write them against the
+                  full path on screen, and every rule then matches nothing — silently, leaving the user to
+                  infer it from something as indirect as "the pack count did not go down". */}
               <p className="text-muted" style={{ margin: '0 0 var(--sp-2)' }}>
                 All rule lists below use gitignore syntax and match paths <strong>relative to the local
                 root</strong>{form.localRoot.trim() && <> (<span className="mono">{form.localRoot}</span>)</>} —
@@ -1364,7 +1392,7 @@ export function BackupConfigsPage() {
                 }
                 effectiveText={(() => {
                   const bytes = editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0
-                  // 0 = 关闭分卷，是这轮工作特意引入的表示法；这里应该显示 "off" 而不是 "0 MB"。
+                  // 0 = volume splitting off, a representation deliberately introduced by that round of work; this should read "off" rather than "0 MB".
                   return bytes > 0 ? `${Math.round(bytes / MB)} MB` : 'off'
                 })()}
               >
@@ -1411,8 +1439,9 @@ export function BackupConfigsPage() {
           onClose={() => setChangingRoot(false)}
           onDone={(newRoot) => {
             setChangingRoot(false)
-            // load() 只刷新列表，不会碰这个正开着的编辑表单——不补上这两行，
-            // "Local Root (locked)" 会一直显示旧路径，直到用户关掉表单重开。
+            // load() only refreshes the list and never touches the edit form currently open — without
+            // these two lines, "Local Root (locked)" keeps showing the old path until the form is closed
+            // and reopened.
             setEditing((e) => (e ? { ...e, localRoot: newRoot } : e))
             set('localRoot', newRoot)
             load()
@@ -1484,9 +1513,10 @@ export function BackupConfigsPage() {
   )
 }
 
-// 停止按钮：只在运行中出现。停止是异步的（信号发出后要等到下一个取消检查点），所以点完
-// 这一行不会立刻变——文案里不作"已停止"的承诺。还原/修复/检查三支仍用这一个（没有 Suspend/
-// Retry now 的概念）；备份那一支改用下面的 RunButtons。
+// The stop button, shown only while running. Stopping is asynchronous (after the signal, the run winds
+// down at the next cancellation checkpoint), so pressing it does not change this row immediately — the
+// wording therefore promises nothing about "stopped". Restore, repair and check still use this one (they
+// have no Suspend or Retry now); backup uses RunButtons below.
 function StopButton({ onStop }: { onStop: () => void }) {
   return (
     <>
@@ -1498,9 +1528,10 @@ function StopButton({ onStop }: { onStop: () => void }) {
   )
 }
 
-// 运行中的按钮组，备份专用（多了 Suspend / Retry now，还原/修复/检查没有这两个概念）。
-// 停止是异步的（信号发出后要等到下一个取消检查点），所以点完这一行不会立刻变——
-// 文案里不作"已停止"的承诺。
+// The running button group, backup only (it adds Suspend and Retry now, which restore, repair and check
+// have no concept of).
+// Stopping is asynchronous (after the signal, the run winds down at the next cancellation checkpoint), so
+// pressing it does not change this row immediately — the wording promises nothing about "stopped".
 function RunButtons({
   onStop,
   onSuspend,
@@ -1530,7 +1561,7 @@ function RunButtons({
   )
 }
 
-// 中断现场：程序重启前那一轮没跑完，journal 还在盘上。
+// An interrupted run: the round before the restart did not finish and its journal is still on disk.
 function InterruptedNotice({
   runs,
   onResume,
@@ -1540,10 +1571,11 @@ function InterruptedNotice({
   onResume: () => void
   onDiscard: () => void
 }) {
-  // resumable 只在「journal 属于这份配置、且 local root 没变」时才成立。这个列表按
-  // (accountId, containerName) 摆，不按 config id——同一容器上**另一份**配置留下的 journal
-  // 也会被列进来，那种情况下 resumable=false：真正开卷时它会被判作废而不是被接上，
-  // 所以"已上传的块会被复用"这句话只对 resumable 的那些成立，不能算全部 runs 的块数。
+  // resumable holds only when the journal belongs to this configuration and the local root has not
+  // changed. This list is keyed by (accountId, containerName) rather than config id, so a journal left by
+  // **another** configuration on the same container is listed too — and there resumable is false: an
+  // actual run voids it rather than continuing it. So "the uploaded blocks will be reused" is true only
+  // of the resumable ones, and the block count must not be summed across all runs.
   const resumable = runs.filter((r) => r.resumable)
   const blocks = resumable.reduce((n, r) => n + r.blocks, 0)
   return (
@@ -1586,17 +1618,19 @@ function RunStatus({
   onResume: () => void
   onDiscard: () => void
 }) {
-  // 展开状态留在组件内：轮询每秒都在换 props，但 React 保留同一个实例，所以展开不会被刷掉。
+  // The expanded state stays inside the component: polling replaces props every second, but React keeps the same instance, so expansion is not reset.
   const [showDetail, setShowDetail] = useState(false)
 
   if (run.status === 'Failed')
     return <div className="text-danger">Failed: {run.error}</div>
-  // 停止既不是成功也不是失败：后端不会把它写成该备份的 Error 状态，这里也不用红色。
+  // Stopping is neither success nor failure: the backend does not write it as the backup's Error status, and this does not colour it red.
   if (run.status === 'Canceled')
     return <div className="text-warn">Backup stopped — nothing was recorded for this run</div>
-  // 挂起同理，而且比停止更进一步：现场保着，下次跑会从这里接上，所以按钮是 Resume 而不是 Run。
-  // 「Resume」调的其实就是 run()——恢复不是一种模式，每一轮开卷时都会去认还有效的 journal。
-  // 没有对应的 resume 端点（Task 12 没做），文案叫 Resume 只是因为对用户来说这确实是"接着跑"。
+  // Suspension is the same, and goes further than stopping: the scene is preserved and the next run picks
+  // up from here, so the button says Resume rather than Run.
+  // "Resume" actually calls run() — resuming is not a mode, since every run recognises any still-valid
+  // journal when it opens one. There is no separate resume endpoint; the label says Resume only because
+  // that is what it means to the user.
   if (run.status === 'Suspended')
     return (
       <div className="text-warn">
@@ -1616,9 +1650,9 @@ function RunStatus({
     return (
       <div className="text-ok">
         Completed — version {run.version}
-        {/* 起止时刻取自版本记录，与还原对话框读的是同一组数字。老后端不发这两个字段 → 只显示编号。 */}
+        {/* The start and end come from the version record, the same pair the restore dialog reads. An older backend does not send them → show the number only. */}
         {run.completedAt && ` (${formatVersionSpan(run.startedAt, run.completedAt)})`}
-        {/* 一次"成功"的备份可能跳过了文件——不写在这里，操作员只能靠可能被淹没的通知发现。 */}
+        {/* A "successful" backup may have skipped files — without saying so here, the operator can only find out from a notification that may well be drowned out. */}
         {!!run.unreadableFiles && (
           <span className="text-danger">
             {' '}— {run.unreadableFiles} file(s) could not be read; earlier content kept
@@ -1635,14 +1669,15 @@ function RunStatus({
       </div>
     )
 
-  // 流水线化之后 Diffing 与 Uploading 会同时在跑，明细因此可能有两条。老后端只发 detail，
-  // 所以两边都要认。
+  // Once pipelined, Diffing and Uploading run at the same time, so there can be two details. An older
+  // backend sends only detail, so both shapes must be accepted.
   const details = p.details?.length ? p.details : p.detail ? [p.detail] : []
   const diffing = details.find((d) => d.stage === 'Diffing')
   const uploading = details.find((d) => d.stage === 'Uploading')
 
-  // 顶行的进度。单条阶段用它自己的百分比：run.percent 衡量的是上传项完成比例，在扫描/差分阶段
-  // 恒为 0——照搬会出现顶上写 0%、下面细节写 3% 的自相矛盾。
+  // The headline progress. A single stage uses its own percentage: run.percent measures the proportion of
+  // uploaded items and is always 0 during scanning and diffing — copying it would produce the
+  // contradiction of 0% on top and 3% in the detail below.
   //
   // 两条并行时**不能只给一个数**。百分比只有 Diffing 拿得出（它的分母是扫描到的条目数，一开始
   // 就定了）；上传的分母还随 diff 边判边入队在涨，给不出可靠的百分比。原先顶行直接摆 Diffing
