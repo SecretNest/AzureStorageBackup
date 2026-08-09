@@ -69,7 +69,7 @@ public class KeyringRecoveryTests : IDisposable
         Assert.Equal(KeyringStatus.Healthy, _health.Status);
     }
 
-    /// <summary>三族密文之一：代理密码。回归覆盖——若查询被误删，本用例会拿掉才能捕获。</summary>
+    /// <summary>One of the three ciphertext families: the proxy password. Regression cover — if the query is deleted by mistake, only this case catches it.</summary>
     [Fact]
     public async Task Does_Not_Flip_While_A_Proxy_Password_Is_Still_Undecryptable()
     {
@@ -85,7 +85,7 @@ public class KeyringRecoveryTests : IDisposable
         Assert.Equal(KeyringStatus.Lost, _health.Status);
     }
 
-    /// <summary>三族密文之一：备份密码。回归覆盖——若查询被误删，本用例会拿掉才能捕获。</summary>
+    /// <summary>One of the three ciphertext families: the backup password. Regression cover — if the query is deleted by mistake, only this case catches it.</summary>
     [Fact]
     public async Task Does_Not_Flip_While_A_Backup_Password_Is_Still_Undecryptable()
     {

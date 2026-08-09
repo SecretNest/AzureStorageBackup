@@ -1,8 +1,8 @@
 namespace AzureStorageBackup.Api.Models;
 
 /// <summary>
-/// 密钥环健康哨兵（单行）。存已知常量明文的密文，**不经任何 ValueConverter**，
-/// 由 KeyringProbe 显式 Protect/Unprotect（设计 §3.2）。
+/// The key ring health canary (a single row). It stores the ciphertext of a known constant,
+/// **bypassing every ValueConverter**, with KeyringProbe calling Protect/Unprotect explicitly (design §3.2).
 /// </summary>
 public class KeyringCanary
 {

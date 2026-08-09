@@ -1,9 +1,11 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 单内容归档编解码：把一段字节压缩（可选加密）成一个归档 blob，及其逆过程。
-/// 用于信息记录文件与第二级索引的压缩/加密（M4 设计 §13.4）。
-/// password 为空 → 仅压缩；非空 → 7z AES-256 + 头加密（跨设备可用备份密码解开）。
+/// Single-content archive coding: compress (and optionally encrypt) a span of bytes into one archive blob,
+/// and the inverse.
+/// Used for the info file and the second-level indexes (M4 design §13.4).
+/// An empty password means compression only; a non-empty one means 7z AES-256 with header encryption
+/// (openable on another machine with the backup password).
 /// </summary>
 public interface IArchiveCodec
 {

@@ -47,7 +47,7 @@ public class AuthGateTests
     [Fact]
     public void Verify_Always_True_When_Not_Required()
     {
-        // 认证关闭时不该有任何东西被拒——调用方据此放行
+        // With authentication off nothing should be rejected — callers rely on this to allow through
         var sut = Create(null);
         Assert.True(sut.Verify(null));
         Assert.True(sut.Verify("anything"));

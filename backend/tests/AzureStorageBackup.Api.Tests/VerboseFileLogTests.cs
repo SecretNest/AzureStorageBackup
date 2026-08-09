@@ -44,8 +44,8 @@ public sealed class VerboseFileLogTests : IDisposable
     {
         var dir = Path.Combine(_root, "c");
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "20260101.log"), "old\n");   // 早于窗口
-        File.WriteAllText(Path.Combine(dir, "20260715.log"), "fresh\n"); // 窗口内
+        File.WriteAllText(Path.Combine(dir, "20260101.log"), "old\n");   // before the window
+        File.WriteAllText(Path.Combine(dir, "20260715.log"), "fresh\n"); // inside the window
 
         var now = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
         new VerboseFileLog(_root).Trim(maxAgeDays: 14, now); // cutoff = 2026-07-03

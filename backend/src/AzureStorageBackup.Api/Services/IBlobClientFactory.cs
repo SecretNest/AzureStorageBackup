@@ -3,10 +3,10 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>连通测试结果。</summary>
+/// <summary>The result of a connectivity test.</summary>
 public record ConnectionResult(bool Success, string? Error);
 
-/// <summary>按账户配置（凭据、分区、代理）构造 BlobServiceClient，并提供连通测试。</summary>
+/// <summary>Builds a BlobServiceClient from an account's configuration (credentials, region, proxy) and offers a connectivity test.</summary>
 public interface IBlobClientFactory
 {
     BlobServiceClient CreateServiceClient(Account account);

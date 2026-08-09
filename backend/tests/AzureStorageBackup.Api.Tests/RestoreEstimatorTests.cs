@@ -13,12 +13,12 @@ public class RestoreEstimatorTests
             Version = 1,
             Entries =
             [
-                // 两文件同 pack "1"（3 卷，尺寸 [100,100,50]）
+                // Two files in pack "1" (3 volumes, sizes [100,100,50])
                 new IndexEntry { Path = "a.txt", Kind = "file", Length = 40, Permissions = "0644",
                     Storage = new StorageRef { Kind = "pack", Ref = "1", EntryName = "a.txt" } },
                 new IndexEntry { Path = "b.txt", Kind = "file", Length = 60, Permissions = "0644",
                     Storage = new StorageRef { Kind = "pack", Ref = "1", EntryName = "b.txt" } },
-                // 两文件同 data blob（去重，卷尺寸 [30]）
+                // Two files sharing one data blob (deduplicated, volume size [30])
                 new IndexEntry { Path = "c.txt", Kind = "file", Length = 70, Permissions = "0644",
                     Storage = new StorageRef { Kind = "blob", Ref = "data/h", VolumeSizes = [30] } },
                 new IndexEntry { Path = "d.txt", Kind = "file", Length = 70, Permissions = "0644",
@@ -33,7 +33,7 @@ public class RestoreEstimatorTests
 
         var est = RestoreEstimator.Compute(index, info, ["a.txt", "b.txt", "c.txt", "d.txt"]);
 
-        Assert.Equal(250 + 30, est.DownloadBytes);   // pack 250（计一次）+ data 30（计一次）
+        Assert.Equal(250 + 30, est.DownloadBytes);   // pack 250 (counted once) + data 30 (counted once)
         Assert.Equal(40 + 60 + 70 + 70, est.UncompressedBytes);
         Assert.Equal(4, est.FileCount);
         Assert.Equal(2, est.DistinctObjects.Count);  // pack:1 + blob:data/h

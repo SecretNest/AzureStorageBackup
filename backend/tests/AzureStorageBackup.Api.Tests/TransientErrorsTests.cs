@@ -31,7 +31,7 @@ public class TransientErrorsTests
         Assert.True(TransientErrors.IsTransient(new TimeoutException("slow")));
     }
 
-    // 这条就是线上那次失败的形状：SDK 重试耗尽 -> AggregateException(TaskCanceledException...)
+    // This is the exact shape of the production failure: the SDK exhausts its retries -> AggregateException(TaskCanceledException...)
     [Fact]
     public void Aggregate_of_timeouts_is_transient()
     {
@@ -53,7 +53,7 @@ public class TransientErrorsTests
     public void Empty_aggregate_is_not_transient()
         => Assert.False(TransientErrors.IsTransient(new AggregateException()));
 
-    // 用户按了取消 -> 取消令牌已触发 -> 这不是"网络抖了一下"，不能当瞬时错误吞掉。
+    // The user pressed cancel -> the token is triggered -> this is not a network blip and must not be swallowed as transient.
     [Fact]
     public void Cancellation_by_user_is_not_transient()
     {
@@ -64,7 +64,7 @@ public class TransientErrorsTests
             new AggregateException(new TaskCanceledException()), cts.Token));
     }
 
-    // 取消令牌没触发的 OperationCanceledException = SDK 的网络超时，算瞬时。
+    // An OperationCanceledException with an untriggered token = the SDK's network timeout, which counts as transient.
     [Fact]
     public void Cancellation_without_user_request_is_transient()
         => Assert.True(TransientErrors.IsTransient(new OperationCanceledException(), CancellationToken.None));

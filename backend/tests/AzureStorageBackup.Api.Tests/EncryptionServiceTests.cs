@@ -8,8 +8,8 @@ public class EncryptionServiceTests
     private static EncryptionService CreateSut()
         => new(new EphemeralDataProtectionProvider());
 
-    // 注：曾有一条 Encrypt_Then_Decrypt_Returns_Original——生产侧的 Decrypt 移除后，
-    // 它只是绕 TestSecrets.Reveal 又跑了一遍 TryDecrypt，与下面那条完全重复，已删。
+    // Note: there used to be an Encrypt_Then_Decrypt_Returns_Original. Once the production Decrypt was
+    // removed it merely ran TryDecrypt again via TestSecrets.Reveal, duplicating the case below, so it was deleted.
 
     [Fact]
     public void Encrypt_Produces_Ciphertext_Different_From_Plaintext()
@@ -37,7 +37,7 @@ public class EncryptionServiceTests
     [Fact]
     public void TryDecrypt_Returns_False_When_Keyring_Cannot_Decrypt()
     {
-        // 另一个 provider = 另一套密钥环，等价于 /keys 丢失后重新生成
+        // A different provider = a different key ring, equivalent to /keys being lost and regenerated
         var written = new EncryptionService(new EphemeralDataProtectionProvider());
         var cipher = written.Encrypt("super-secret-key==");
         var sut = CreateSut();

@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>计划任务的增删改查（PRD 2.3）。仅管理配置；执行调度在 M6。</summary>
+/// <summary>CRUD for scheduled tasks (PRD 2.3). Configuration only; execution scheduling is M6.</summary>
 public interface IScheduledTaskService
 {
     Task<IReadOnlyList<ScheduledTask>> ListAsync(CancellationToken ct = default);
@@ -15,6 +15,6 @@ public interface IScheduledTaskService
 
     Task<bool> DeleteAsync(int id, CancellationToken ct = default);
 
-    /// <summary>记录上次触发时刻（调度器用）。</summary>
+    /// <summary>Record the last firing time (used by the scheduler).</summary>
     Task SetLastRunAsync(int id, DateTimeOffset when, CancellationToken ct = default);
 }

@@ -68,7 +68,7 @@ public sealed class RetryPolicyTests
         Assert.Equal(1, attempts);
     }
 
-    // --- 退避序列（PRD 4.1：5s、30s、90s、300s，之后每 300s，总上限 2h）---
+    // --- The backoff sequence (PRD 4.1: 5s, 30s, 90s, 300s, then every 300s, capped at 2h total) ---
 
     private static RetryOptions PrdBackoff() => new()
     {
@@ -107,7 +107,7 @@ public sealed class RetryPolicyTests
 
         var total = schedule.Aggregate(TimeSpan.Zero, (a, d) => a + d);
         Assert.True(total <= TimeSpan.FromHours(2), $"total {total} exceeds cap");
-        // 再加一个稳定间隔就会超过上限 → 序列已尽可能长。
+        // One more steady interval would exceed the cap, so the sequence is already as long as it can be.
         Assert.True(total + TimeSpan.FromSeconds(300) > TimeSpan.FromHours(2));
     }
 
@@ -117,7 +117,7 @@ public sealed class RetryPolicyTests
         var schedule = RetryPolicy.DelaySchedule(
             new RetryOptions { MaxAttempts = 5, BaseDelay = TimeSpan.FromMilliseconds(1) }).ToList();
 
-        // 5 次尝试 = 首次 + 4 次重试。
+        // Five attempts = the first plus four retries.
         Assert.Equal(4, schedule.Count);
     }
 }

@@ -3,13 +3,13 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>发送一次通知 HTTP 请求。</summary>
+/// <summary>Send one notification HTTP request.</summary>
 public interface INotificationSender
 {
     Task SendAsync(NotificationConfig config, string title, string body, CancellationToken ct = default);
 }
 
-/// <summary>按配置发送一次通知 HTTP 请求（PRD 4.2），支持代理。失败抛异常（由调用方决定吞或报）。</summary>
+/// <summary>Send one notification HTTP request per configuration (PRD 4.2), with proxy support. Failures throw, leaving the caller to swallow or report.</summary>
 public sealed class NotificationSender : INotificationSender
 {
     public async Task SendAsync(NotificationConfig config, string title, string body, CancellationToken ct = default)

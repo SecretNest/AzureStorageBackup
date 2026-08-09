@@ -15,8 +15,9 @@ namespace AzureStorageBackup.Api.Migrations
                 table: "GlobalSettings",
                 type: "INTEGER",
                 nullable: false,
-                // 既有行必须拿到 true：默认行为是重叠跑，而脚手架按 CLR 默认写的是 false，
-                // 那会让所有已经装好的实例在升级后**静默退回**串行执行。
+                // Existing rows must get true: the default behaviour is to overlap, while the scaffolding
+                // writes the CLR default of false — which would **silently revert** every already-installed
+                // instance to serial execution after an upgrade.
                 defaultValue: true);
         }
 

@@ -17,7 +17,7 @@ public sealed class CronScheduleTests
     [Fact]
     public void Not_Due_Before_Next_Occurrence()
     {
-        // 每天 09:00；上次今天 09:00，现在 08:59（今天还没到）→ 未到期
+        // Daily at 09:00; last run today at 09:00, now 08:59 (today has not arrived) → not due
         var due = CronSchedule.IsDue("0 9 * * *", lastRun: Utc(2026, 7, 17, 9, 0), now: Utc(2026, 7, 17, 8, 59), TimeZoneInfo.Utc);
         Assert.False(due);
     }
@@ -25,7 +25,7 @@ public sealed class CronScheduleTests
     [Fact]
     public void Due_When_Scheduled_Time_Reached()
     {
-        // 每天 09:00；上次昨天 09:00，现在今天 09:00 → 到期
+        // Daily at 09:00; last run yesterday at 09:00, now today at 09:00 → due
         var due = CronSchedule.IsDue("0 9 * * *", lastRun: Utc(2026, 7, 16, 9, 0), now: Utc(2026, 7, 17, 9, 0), TimeZoneInfo.Utc);
         Assert.True(due);
     }

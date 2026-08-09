@@ -4,12 +4,12 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>把通知配置 + Title/Body 构建成 HTTP 请求（PRD 4.2）。占位符大小写不敏感。</summary>
+/// <summary>Build an HTTP request from the notification configuration plus Title/Body (PRD 4.2). Placeholders are case-insensitive.</summary>
 public static class NotificationRequestBuilder
 {
     public static HttpRequestMessage Build(NotificationConfig config, string title, string body)
     {
-        // URL 中的占位符做 URL 编码
+        // Placeholders inside the URL are URL-encoded
         var url = Substitute(config.Url, title, body, urlEncode: true);
 
         if (config.Method == NotificationMethod.Get)

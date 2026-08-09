@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>全局通知配置端点（PRD 4.2）。单例配置：GET 读、PUT 存、test 用给定配置试发一条。</summary>
+/// <summary>The global notification configuration endpoints (PRD 4.2). A singleton configuration: GET reads, PUT stores, and test sends one using the supplied configuration.</summary>
 public static class NotificationEndpoints
 {
     public static IEndpointRouteBuilder MapNotificationEndpoints(this IEndpointRouteBuilder app)
@@ -16,7 +16,7 @@ public static class NotificationEndpoints
         group.MapPut("/", async (NotificationRequest req, INotificationConfigService svc, CancellationToken ct) =>
             Results.Ok(NotificationResponse.From(await svc.UpsertAsync(req.ToConfig(), ct))));
 
-        // 用给定（未保存）配置试发一条
+        // Send one using the supplied (unsaved) configuration
         group.MapPost("/test", async (NotificationRequest req, INotificationSender sender, CancellationToken ct) =>
         {
             try

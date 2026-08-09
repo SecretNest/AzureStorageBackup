@@ -10,7 +10,7 @@ public class GroupService(AppDbContext db) : IGroupService
         await db.Groups
             .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
             .AsNoTracking()
-            // NOCASE：SQLite 默认按码点比，大写字母会整体排在小写字母前面（见 BackupConfigService.ListAsync）。
+            // NOCASE: SQLite compares by code point by default, which sorts every uppercase letter before every lowercase one (see BackupConfigService.ListAsync).
             .OrderBy(g => EF.Functions.Collate(g.Name, "NOCASE")).ToListAsync(ct);
 
     public async Task<Group?> GetAsync(int id, CancellationToken ct = default) =>
@@ -54,7 +54,7 @@ public class GroupService(AppDbContext db) : IGroupService
         return group;
     }
 
-    /// <summary>组成员稳定排序：按 (AccountId, ContainerName)，避免插入序导致的 UI 抖动（§5.6）。</summary>
+    /// <summary>A stable order for group members: by (AccountId, ContainerName), so insertion order does not make the UI jump (§5.6).</summary>
     private static List<GroupMember> SortMembers(IEnumerable<GroupMember> members) =>
         members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName, StringComparer.Ordinal).ToList();
 

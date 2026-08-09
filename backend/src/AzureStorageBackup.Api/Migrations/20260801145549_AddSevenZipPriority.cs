@@ -15,8 +15,9 @@ namespace AzureStorageBackup.Api.Migrations
                 table: "GlobalSettings",
                 type: "INTEGER",
                 nullable: false,
-                // 0 == SevenZipCpuPriority.Lowest，也正是新库的默认值——枚举就是照着这一点排的，
-                // 所以这里不必像 AddOverlapDiffAndUpload 那样另给 defaultValue 去纠正脚手架。
+                // 0 == SevenZipCpuPriority.Lowest, which is also the default for a new database — the enum
+                // was ordered precisely for this, so unlike AddOverlapDiffAndUpload there is no need to
+                // supply a defaultValue to correct the scaffolding.
                 defaultValue: 0);
         }
 
