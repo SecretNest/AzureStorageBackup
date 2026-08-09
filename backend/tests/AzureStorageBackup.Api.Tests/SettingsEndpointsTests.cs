@@ -33,10 +33,12 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Equal(7, back.LogEphemeralMaxAgeDays);
         Assert.Equal(StorageTier.Cool, back.DefaultDataTier);
 
-        // 再存一次，这一次关掉自动接着跑。第二趟不是多余的：设置行**第一次** PUT 时可能是新建
-        // （UpsertAsync 的 Add 分支把整个对象原样落库），只有已经有行时才走逐字段赋值那条路，
-        // 而那正是这个开关会静默失效的地方——少写一行赋值，取消勾选照样显示保存成功，
-        // 而重启之后一轮没人要的备份自己跑起来。这是个会**主动开工**的开关，关不掉是它最坏的坏法。
+        // Save again, this time turning auto-resume off. The second pass is not redundant: the **first**
+        // PUT of the settings row may be an insert (UpsertAsync's Add branch stores the whole object as-is),
+        // and only an existing row takes the field-by-field assignment path — which is exactly where this
+        // switch fails silently. One missing assignment and unticking still reports a successful save, while
+        // after a restart an unwanted backup starts itself. This is a switch that **starts work on its own**,
+        // and being unable to turn it off is its worst failure mode.
         back.AutoResumeInterruptedRuns = false;
         (await _client.PutAsJsonAsync("/api/settings", back)).EnsureSuccessStatusCode();
 

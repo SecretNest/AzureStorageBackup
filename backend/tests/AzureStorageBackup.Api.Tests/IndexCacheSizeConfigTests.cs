@@ -9,9 +9,11 @@ using AzureStorageBackup.Api.Data;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// `Backup__IndexCacheSize` 是让小内存机器能把进程内索引缓存关掉的开关（README 有取值建议）。
-/// 光测 <see cref="VersionIndexMemoryCache"/> 这个类不够——真正会坏的是**配置绑定那一环**：
-/// 键名写错、解析失败静默变默认值，类本身再正确也没用。这里从 Program.cs 的实际装配里取实例来断言。
+/// `Backup__IndexCacheSize` is the switch that lets a low-memory machine turn the in-process index cache
+/// off (the README suggests values).
+/// Testing <see cref="VersionIndexMemoryCache"/> alone is not enough — what actually breaks is the
+/// **configuration binding**: a mistyped key, or a parse failure silently falling back to the default,
+/// leaves the class itself correct and useless. This takes the instance from Program.cs's real wiring.
 /// </summary>
 public sealed class IndexCacheSizeConfigTests
 {
@@ -54,7 +56,7 @@ public sealed class IndexCacheSizeConfigTests
     public void Unset_Defaults_To_Two_Favouring_Responsiveness()
         => Assert.Equal(2, CapacityFor(null));
 
-    /// <summary>小内存机器的适配值：0 = 完全关闭，行为回到加这层缓存之前。</summary>
+    /// <summary>The low-memory setting: 0 disables it entirely, restoring the behaviour from before this cache existed.</summary>
     [Fact]
     public void Zero_Disables_The_Cache()
     {
@@ -68,7 +70,7 @@ public sealed class IndexCacheSizeConfigTests
     public void One_Is_The_Half_Memory_Middle_Ground()
         => Assert.Equal(1, CapacityFor("1"));
 
-    /// <summary>无法解析或为负 → 回到默认值，而不是把缓存悄悄关掉（那会让人以为设置生效了）。</summary>
+    /// <summary>Unparseable or negative → fall back to the default rather than silently disabling the cache (which would look like the setting took effect).</summary>
     [Theory]
     [InlineData("abc")]
     [InlineData("")]

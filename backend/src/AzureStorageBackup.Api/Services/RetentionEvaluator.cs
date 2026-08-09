@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>超量判断方式（PRD 3.2）。</summary>
+/// <summary>How the two retention limits combine (PRD 3.2).</summary>
 public enum RetentionMode
 {
     VersionOnly,
@@ -19,15 +19,17 @@ public sealed record RetentionPolicy
 public sealed record VersionRef(int Version, DateTimeOffset CreatedAt);
 
 /// <summary>
-/// 版本保留评估（M4 设计 §10）：按最大版本数 + 最长时间 + 组合模式选出要删的版本号。
-/// 始终保留最新版本（避免清空备份）。删除数据 blob/pack 由编排器据剩余版本引用另算。
+/// Retention evaluation (M4 design §10): pick the version numbers to delete from the maximum count, the
+/// maximum age and the combination mode.
+/// The newest version is always kept (so a backup can never be emptied). Which data blobs and packs to
+/// delete is worked out separately by the orchestrator from what the remaining versions reference.
 /// </summary>
 public sealed class RetentionEvaluator
 {
     public IReadOnlyList<int> VersionsToDelete(
         IReadOnlyList<VersionRef> versions, RetentionPolicy policy, DateTimeOffset now)
     {
-        var ordered = versions.OrderBy(v => v.Version).ToList(); // 旧→新
+        var ordered = versions.OrderBy(v => v.Version).ToList(); // oldest → newest
         if (ordered.Count == 0)
             return [];
 
@@ -38,7 +40,7 @@ public sealed class RetentionEvaluator
         for (var i = 0; i < ordered.Count; i++)
         {
             var v = ordered[i];
-            var rankFromNewest = ordered.Count - i; // 最旧 = Count，最新 = 1
+            var rankFromNewest = ordered.Count - i; // oldest = Count, newest = 1
             var excess = rankFromNewest > policy.MaxVersions;
             var tooOld = v.CreatedAt < cutoff;
 

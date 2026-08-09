@@ -14,7 +14,7 @@ public class AccountServiceTests : IDisposable
 
     public AccountServiceTests()
     {
-        // in-memory SQLite：连接保持打开，库随连接存续
+        // In-memory SQLite: the connection stays open and the database lives as long as it does
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
 
@@ -52,22 +52,24 @@ public class AccountServiceTests : IDisposable
         var fetched = await _sut.GetAsync(created.Id);
 
         Assert.NotNull(fetched);
-        // 实体里始终是密文；明文只经 ISecretReader 取（设计 §3.1）。
+        // The entity always holds ciphertext; plaintext is only obtained through ISecretReader (design §3.1).
         Assert.NotEqual("the-secret-key==", fetched!.AccountKeyProtected);
         Assert.Equal("the-secret-key==", TestSecrets.Reader.RevealAccountKey(fetched));
         Assert.Equal("prod", fetched.Name);
     }
 
     /// <summary>
-    /// 钉住**列名**：实体属性叫 AccountKeyProtected，落库仍必须是历史列名 AccountKey（无 schema 变更）。
-    /// 这条不再证明「加密」——密文是本测试自己经 CreateAsync 写进去的，断言只能说明它不等于明文。
+    /// Pins the **column name**: the entity property is AccountKeyProtected while the stored column must
+    /// still be the historical AccountKey (no schema change).
+    /// This no longer proves "encryption" — the ciphertext was written by this test through CreateAsync, so
+    /// the assertion can only show it differs from the plaintext.
     /// </summary>
     [Fact]
     public async Task Create_Writes_To_The_Legacy_AccountKey_Column()
     {
         var created = await _sut.CreateAsync(SampleAccount());
 
-        // 直接读原始列（列名写错就查不到表/列，测试失败）
+        // Read the raw column directly (a wrong column name finds no table or column and fails the test)
         await using var cmd = _connection.CreateCommand();
         cmd.CommandText = "SELECT AccountKey FROM Accounts WHERE Id = $id";
         cmd.Parameters.AddWithValue("$id", created.Id);

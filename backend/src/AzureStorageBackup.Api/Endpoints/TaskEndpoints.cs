@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>计划任务管理端点（PRD 2.3）。调度执行在 M6。</summary>
+/// <summary>Scheduled task management endpoints (PRD 2.3). Execution scheduling is M6.</summary>
 public static class TaskEndpoints
 {
     public static IEndpointRouteBuilder MapTaskEndpoints(this IEndpointRouteBuilder app)
@@ -49,12 +49,14 @@ public static class TaskEndpoints
         group.MapDelete("/{id:int}", async (int id, IScheduledTaskService svc, CancellationToken ct) =>
             await svc.DeleteAsync(id, ct) ? Results.NoContent() : Results.NotFound());
 
-        // 立即执行一次（"Run now"；调度器复用同一 dispatcher）
+        // Run once immediately ("Run now"; the scheduler reuses the same dispatcher)
         group.MapPost("/{id:int}/run", async (int id, IScheduledTaskService svc, TaskDispatcher dispatcher, IKeyringHealth keyring, CancellationToken ct) =>
         {
-            // 手动触发计划的备份/检查/清理，与 /backup-configs/{id}/run 同性质，须同样闸门（设计 §3.3）。
-            // 缺了这道闸门时：dispatcher 内部解密备份密码抛出，被 DispatchAsync 的 catch 吞成一条日志，
-            // 端点照样推进 LastRunAt 并返回 200，UI 的「Run now」显示成功——什么都没做却报成功。
+            // Manually triggering a scheduled backup, check or cleanup is the same kind of action as
+            // /backup-configs/{id}/run and needs the same gate (design §3.3).
+            // Without it: decrypting the backup password inside the dispatcher throws, DispatchAsync's catch
+            // reduces it to a log line, the endpoint advances LastRunAt and returns 200 anyway, and the UI's
+            // "Run now" reports success — success for having done nothing at all.
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
             var task = await svc.GetAsync(id, ct);

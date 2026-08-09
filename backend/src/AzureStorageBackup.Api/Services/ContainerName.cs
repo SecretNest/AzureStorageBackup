@@ -1,15 +1,15 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// Azure Blob container 命名规则的本地校验。
+/// Local validation of Azure Blob container naming rules.
 ///
-/// 存在的理由是错误消息：Azure 对非法名返回的是 "The specifed resource name contains
-/// invalid characters."，既不指出是哪个字符、也不说明规则，用户看到只能瞎猜。在连云之前
-/// 自己判一次，就能给出可操作的说明。
+/// It exists for the error message: Azure answers an invalid name with "The specifed resource name contains
+/// invalid characters.", naming neither the character nor the rule, leaving the user to guess. Checking
+/// locally before reaching the cloud allows an actionable explanation instead.
 /// </summary>
 public static class ContainerName
 {
-    /// <summary>合法返回 <c>null</c>；非法返回一句英文说明（直接作为 API 的 error 文案）。</summary>
+    /// <summary>Returns <c>null</c> when valid, or a sentence of explanation when not (used directly as the API's error text).</summary>
     public static string? Validate(string? name)
     {
         if (string.IsNullOrEmpty(name) || name.Length is < 3 or > 63)

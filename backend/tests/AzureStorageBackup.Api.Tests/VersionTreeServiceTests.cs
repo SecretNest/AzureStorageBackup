@@ -30,12 +30,14 @@ public class VersionTreeServiceTests
 
         var a = VersionTreeService.Children(index, "a");
         Assert.Equal(new[] { "b", "d.txt", "empty" }, a.Select(n => n.Name).OrderBy(x => x).ToArray());
-        Assert.True(a.Single(n => n.Name == "empty").IsDir);           // 空目录也作可展开节点
+        Assert.True(a.Single(n => n.Name == "empty").IsDir);           // an empty directory is still an expandable node
         Assert.False(a.Single(n => n.Name == "d.txt").IsDir);
     }
 
-    /// <summary>还原树必须带出"这条记录沿用自更早版本"。选择还原内容的那一刻，是操作员最需要
-    /// 知道"还原这个版本拿到的不是这个版本时刻的内容"的时候——此前这个信息在索引里却到不了界面。</summary>
+    /// <summary>The restore tree has to surface "this entry was carried over from an earlier version". The
+    /// moment of choosing what to restore is when the operator most needs to know that restoring this
+    /// version does not give the content as of its timestamp — information that was in the index but never
+    /// reached the UI.</summary>
     [Fact]
     public void Children_Carries_The_Unreadable_Marker_To_File_Nodes()
     {
@@ -56,6 +58,6 @@ public class VersionTreeServiceTests
         var vault = VersionTreeService.Children(index, "vault");
 
         Assert.Equal(since, vault.Single(n => n.Name == "stale.txt").UnreadableAt);
-        Assert.Null(vault.Single(n => n.Name == "fresh.txt").UnreadableAt); // 正常条目不能被误标
+        Assert.Null(vault.Single(n => n.Name == "fresh.txt").UnreadableAt); // a normal entry must not be flagged by mistake
     }
 }

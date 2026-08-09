@@ -8,8 +8,8 @@ public class EncryptionService : IEncryptionService
     private readonly ILogger<EncryptionService>? _logger;
 
     /// <param name="logger">
-    /// 可空：DI 能解析出 <see cref="ILogger{TCategoryName}"/>（单例注册，见 Program.cs）；
-    /// 单元测试直接 new 时省略即可，不写日志。
+    /// Nullable: DI can resolve <see cref="ILogger{TCategoryName}"/> (registered as a singleton, see
+    /// Program.cs), while a unit test constructing this directly can omit it and get no logging.
     /// </param>
     public EncryptionService(IDataProtectionProvider provider, ILogger<EncryptionService>? logger = null)
     {
@@ -28,9 +28,11 @@ public class EncryptionService : IEncryptionService
         }
         catch (Exception ex)
         {
-            // 密钥环换过、密文被截断或根本不是密文——一律视为不可用。
-            // 这是 Lost 时逐条试解的热路径，正常也会命中，故只留 Debug 级痕迹：
-            // 默默返回 false 会让真实的密钥环故障一点线索都不留（F6）。
+            // A replaced key ring, truncated ciphertext, or something that was never ciphertext — all
+            // treated as unavailable.
+            // This is the hot path while Lost, probing record by record, and it is hit in normal operation
+            // too, so only a Debug-level trace is left: returning false silently would leave a genuine key
+            // ring failure with no clue at all.
             _logger?.LogDebug(ex, "Data protection could not decrypt a stored secret; treating it as unavailable.");
             plaintext = string.Empty;
             return false;

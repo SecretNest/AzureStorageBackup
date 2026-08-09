@@ -6,12 +6,13 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>账户凭据（key/代理密码）在此解密——云端调用的唯一咽喉（设计 §3.1）。</summary>
+/// <summary>Account credentials (the key and the proxy password) are decrypted here — the single chokepoint for every cloud call (design §3.1).</summary>
 public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
 {
     /// <summary>
-    /// 从 endpoint 解析账户名：host-style（account.blob.core.windows.net）取 host 首段；
-    /// path-style（Azurite 等，http://127.0.0.1:10000/account）取首个路径段。
+    /// Parse the account name out of the endpoint: host-style (account.blob.core.windows.net) takes the
+    /// first host segment; path-style (Azurite and similar, http://127.0.0.1:10000/account) takes the first
+    /// path segment.
     /// </summary>
     public static string ParseAccountName(Uri uri)
     {
@@ -50,7 +51,7 @@ public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
         }
     }
 
-    /// <summary>根据账户代理设置构造 HttpClientHandler（公开以便单元测试）。</summary>
+    /// <summary>Build an HttpClientHandler from the account's proxy settings (public so it can be unit-tested).</summary>
     public HttpClientHandler CreateProxyHandler(Account account)
     {
         var handler = new HttpClientHandler();
@@ -65,7 +66,7 @@ public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
 
         if (account.ProxyMode == ProxyMode.DockerEnv)
         {
-            // 继承 docker/系统环境变量（HTTP_PROXY / HTTPS_PROXY）
+            // Inherit from the docker/system environment variables (HTTP_PROXY / HTTPS_PROXY)
             handler.Proxy = HttpClient.DefaultProxy;
         }
         else

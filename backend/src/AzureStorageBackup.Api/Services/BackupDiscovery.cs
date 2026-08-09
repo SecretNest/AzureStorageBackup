@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>container 中备份信息文件的存在情况。</summary>
+/// <summary>Whether a container holds a backup info file.</summary>
 public enum BackupPresence
 {
     None,
@@ -9,9 +9,10 @@ public enum BackupPresence
 }
 
 /// <summary>
-/// 信息记录文件的约定与发现判定。
-/// 约定：container 中若存在索引文件，则视为本工具的备份 container（PRD 1.3）。
-/// 加密备份用不同文件名；两者都存在时用非加密（PRD 1.6）。
+/// The info file convention and the discovery rule.
+/// The convention: a container holding an index file is considered one of this tool's backup containers
+/// (PRD 1.3). Encrypted backups use a different filename, and when both exist the unencrypted one wins
+/// (PRD 1.6).
 /// </summary>
 public static class BackupDiscovery
 {
@@ -21,7 +22,7 @@ public static class BackupDiscovery
     public static BackupPresence Determine(bool hasPlainIndex, bool hasEncryptedIndex)
     {
         if (hasPlainIndex)
-            return BackupPresence.Plain; // 两者都在时优先非加密（PRD 1.6）
+            return BackupPresence.Plain; // with both present, the unencrypted one wins (PRD 1.6)
         if (hasEncryptedIndex)
             return BackupPresence.Encrypted;
         return BackupPresence.None;
