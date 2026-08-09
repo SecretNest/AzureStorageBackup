@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>扫描条目类型。symlink 仅当用户选择包含时出现（默认跳过）。</summary>
+/// <summary>Scanned entry kind. symlink only shows up when the user opts to include them (skipped by default).</summary>
 public enum EntryKind
 {
     File,
@@ -8,8 +8,8 @@ public enum EntryKind
 }
 
 /// <summary>
-/// 扫描出的单个条目（仅元数据，PRD 特别说明 A：path/kind/length/mtime/权限）。
-/// 哈希不在此计算——由 diff 引擎按需惰性计算（M4 设计 §4.2），避免每次备份重读全部文件。
+/// A single scanned entry (metadata only, PRD special note A: path/kind/length/mtime/permissions).
+/// Hashes are not computed here — the diff engine computes them lazily on demand (M4 design §4.2), so a backup does not re-read every file every time.
 /// </summary>
 public sealed record ScannedEntry(
     string Path,
@@ -20,31 +20,31 @@ public sealed record ScannedEntry(
     string? Target = null);
 
 /// <summary>
-/// 扫描时读不出来的路径。目录的分量比文件重得多：一个列不出内容的目录意味着**整棵子树**
-/// 本轮不可知，绝不能因为"没扫到"就被当成删除——那会把一整棵子树从索引里抹掉，
-/// 直到还原时才发现文件没了。
+/// A path that could not be read during the scan. Directories carry far more weight than files: a directory whose
+/// contents cannot be listed means the **entire subtree** is unknown this round, and it must never be treated as deleted
+/// just because it "wasn't scanned" — that would wipe a whole subtree out of the index, and you would only discover the files were gone at restore time.
 /// </summary>
 public sealed record UnreadablePath(string Path, bool IsDirectory, string Reason);
 
-/// <summary>扫描结果：条目 + 空文件夹（还原时需重建）+ 读不出来的路径。</summary>
+/// <summary>Scan result: entries + empty directories (which restore has to recreate) + unreadable paths.</summary>
 public sealed record ScanResult(
     IReadOnlyList<ScannedEntry> Entries,
     IReadOnlyList<string> EmptyDirs,
     IReadOnlyList<UnreadablePath> Unreadable);
 
-/// <summary>扫描选项。</summary>
+/// <summary>Scan options.</summary>
 public sealed record ScanOptions
 {
-    /// <summary>是否包含符号链接（默认跳过，M4 决策）。</summary>
+    /// <summary>Whether to include symlinks (skipped by default, M4 decision).</summary>
     public bool IncludeSymlinks { get; init; } = false;
 
-    /// <summary>备份范围（设计 docs/backup-scope-selection-design.md）。默认全部包含。</summary>
+    /// <summary>Backup scope (design docs/backup-scope-selection-design.md). Includes everything by default.</summary>
     public ScopeRuleSet Scope { get; init; } = ScopeRuleSet.All;
 }
 
 /// <summary>
-/// 本地文件扫描器：遍历本地根，应用 gitignore 忽略规则，产出条目（元数据）+ 空文件夹。
-/// symlink 默认跳过。哈希由 diff 阶段惰性计算。
+/// Local file scanner: walk the local root, apply the gitignore ignore rules, produce entries (metadata) + empty directories.
+/// symlinks are skipped by default. Hashes are computed lazily by the diff stage.
 /// </summary>
 public sealed class LocalFileScanner
 {
@@ -53,8 +53,8 @@ public sealed class LocalFileScanner
         IgnoreRuleSet ignore,
         ScanOptions? options = null,
         CancellationToken ct = default,
-        // 扫描一棵大目录树本身就要几分钟，期间界面上同样什么都看不到。
-        // 这里没有"总数"可言——总数正是扫描要算出来的——所以只报已扫条目数与当前目录。
+        // Scanning a large directory tree takes minutes on its own, and the UI shows nothing at all for that whole time.
+        // There is no "total" to speak of here — the total is exactly what the scan is computing — so we report only the number of entries scanned so far and the current directory.
         StageTracker? tracker = null)
     {
         options ??= new ScanOptions();
@@ -72,9 +72,9 @@ public sealed class LocalFileScanner
         return await Task.FromResult(new ScanResult(entries, emptyDirs, unreadable));
     }
 
-    /// <returns>这棵子树是否真的留下了东西（条目 / 空目录 / 读不出来的路径）。
-    /// 父目录据此决定要不要把自己算作「有保留的子项」——一个只是为了下降到深处某个
-    /// 重新包含的目录而被路过的目录，自身并没有留下任何东西，绝不能进 EmptyDirs。</returns>
+    /// <returns>Whether this subtree really left anything behind (entries / empty directories / unreadable paths).
+    /// The parent directory uses this to decide whether to count itself as having "kept children" — a directory that was
+    /// only passed through on the way down to some re-included directory deeper in has left nothing of its own behind, and must never enter EmptyDirs.</returns>
     private bool ScanDirectory(
         string dir,
         string root,
@@ -89,13 +89,15 @@ public sealed class LocalFileScanner
         var keptChildren = 0;
         tracker?.Touch(RelativePath(root, dir));
 
-        // 目录读不出来有**两个**失败点，都要接住，但都不能把循环体也圈进去（那就成了"catch 范围
-        // 圈住整个工作单元"，会把处理条目时的失败误判成"目录列不出来"）：
-        //   1) EnumerateFileSystemInfos() 本身——它在构造时就打开目录句柄，目录没有读/执行权限
-        //      时在这一步抛（不是等到 MoveNext）；
-        //   2) 迭代过程中的 MoveNext——目录在扫描途中被删、介质读错误等。
-        // 也**不能**图省事把整个目录物化成列表：一个目录下几十万个文件（日志/缓存/素材库）很常见，
-        // 那样每个 FileSystemInfo 都要常驻内存，容器里足以 OOM。所以手动驱动迭代器。
+        // Reading a directory has **two** failure points; both must be caught, and neither may enclose the loop body
+        // (that turns into "the catch spans the whole unit of work" and misreports a failure while handling an entry as
+        // "the directory can't be listed"):
+        //   1) EnumerateFileSystemInfos() itself — it opens the directory handle during construction, so a directory
+        //      with no read/execute permission throws right here (not later at MoveNext);
+        //   2) MoveNext during iteration — the directory deleted mid-scan, media read errors, and so on.
+        // Nor may we take the easy way out and materialize the whole directory into a list: hundreds of thousands of files
+        // in a single directory (logs/caches/asset libraries) is common, and that keeps every FileSystemInfo resident in
+        // memory — enough to OOM inside a container. So we drive the iterator by hand.
         IEnumerator<FileSystemInfo> found;
         try
         {
@@ -103,9 +105,9 @@ public sealed class LocalFileScanner
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // 列不出内容的目录：整棵子树本轮不可知。**绝不能落进 emptyDirs**——那会让还原
-            // 重建出一个空目录，其下的文件全部消失得无声无息；也不能什么都不记，
-            // 否则 diff 会因为"没扫到"把这些既有条目一律判成删除。
+            // A directory whose contents cannot be listed: the entire subtree is unknown this round. **It must never land
+            // in emptyDirs** — that would have restore recreate an empty directory with every file beneath it silently
+            // gone; and recording nothing is no good either, or diff would judge all those existing entries deleted because they "weren't scanned".
             unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
             return true;
         }
@@ -125,8 +127,8 @@ public sealed class LocalFileScanner
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // 迭代**中途**才失败：此前已扫到的条目照常留在 entries 里——它们是真读到的，
-                // 比沿用旧条目准确。diff 侧按路径登记，已扫到的不会被这条目录标记二次覆盖。
+                // Failure **partway** through iteration: the entries already scanned stay in entries as usual — they were
+                // genuinely read, which beats carrying over old ones. The diff side registers by path, so entries already scanned are not overwritten a second time by this directory's marker.
                 unreadable.Add(new UnreadablePath(RelativePath(root, dir), IsDirectory: true, ex.Message));
                 return true;
             }
@@ -141,13 +143,13 @@ public sealed class LocalFileScanner
 
             if (isDirectory && !isSymlink)
             {
-                // 目录被排除、且子树里也没有任何重新包含的规则 → 整棵剪掉，不下降。
-                // 只判 IsInScope 是不够的：被排除的目录下面可能还有 + 规则（设计 §2）。
+                // Directory excluded, and no re-including rule anywhere in the subtree → prune the whole thing, don't descend.
+                // Judging on IsInScope alone is not enough: an excluded directory may still have + rules beneath it (design §2).
                 if (!options.Scope.MayContainIncluded(relative))
                     continue;
 
-                // keptChildren 只在子树**真的**留下了东西时才 ++。路过的目录不算——
-                // 否则 `- docs` + `+ docs/2026` 会让 docs 被写成空目录，还原时凭空重建出来。
+                // keptChildren only increments when the subtree **actually** left something behind. Directories merely passed
+                // through don't count — otherwise `- docs` + `+ docs/2026` would record docs as an empty directory and restore would conjure it back out of nowhere.
                 if (ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker))
                     keptChildren++;
                 continue;
@@ -156,8 +158,8 @@ public sealed class LocalFileScanner
             if (!options.Scope.IsInScope(relative))
                 continue;
 
-            // 单个条目的元数据也可能读不出来（枚举之后被删掉、权限被收回）。同样不能默默跳过：
-            // 跳过等于让 diff 判它删除。记一条，让 diff 沿用上一版本的条目。
+            // A single entry's metadata can be unreadable too (deleted after enumeration, permissions revoked). Silently
+            // skipping is just as unacceptable: skipping is the same as telling diff it was deleted. Record one, and let diff carry over the previous version's entry.
             try
             {
                 if (isSymlink)
@@ -171,7 +173,7 @@ public sealed class LocalFileScanner
                         new DateTimeOffset(info.LastWriteTimeUtc),
                         ReadPermissions(info.FullName),
                         Target: info.LinkTarget));
-                    tracker?.Advance(0); // 扫描只读元数据，不读内容，故字节为 0
+                    tracker?.Advance(0); // Scanning reads metadata only, never content, so zero bytes
                     continue;
                 }
 
@@ -189,11 +191,11 @@ public sealed class LocalFileScanner
             }
         }
 
-        // 空文件夹：应用忽略与范围后既无保留文件也无保留子目录（根自身不记录）。
+        // Empty directory: after applying ignore and scope, no kept files and no kept subdirectories (the root itself is not recorded).
         var self = RelativePath(root, dir);
         if (keptChildren == 0 && !string.IsNullOrEmpty(self))
         {
-            // 自身不在范围内的目录（只是被路过）不算空目录，也不算「留下了东西」。
+            // A directory not itself in scope (merely passed through) is neither an empty directory nor "left something behind".
             if (!options.Scope.IsInScope(self))
                 return false;
             emptyDirs.Add(self);

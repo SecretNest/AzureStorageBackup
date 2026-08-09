@@ -148,7 +148,7 @@ public sealed class IndexSerializerTests
     [Fact]
     public void Binary_Index_Is_More_Compact_Than_Json()
     {
-        // 构造一个较多条目、真实 64-hex hash 的索引。
+        // Build an index with a fair number of entries and real 64-hex hashes.
         var entries = Enumerable.Range(0, 50).Select(i => new IndexEntry
         {
             Path = $"dir/file{i}.txt", Kind = "file", Length = i,
@@ -178,15 +178,15 @@ public sealed class IndexSerializerTests
         var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
         var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
 
-        Assert.Equal(4, backInfo.Packs["p0001"].Volumes);          // pack 分卷数（信息文件）
-        Assert.Equal(3, backIndex.Entries[0].Storage!.Volumes);    // 单文件 blob 分卷数（索引）
+        Assert.Equal(4, backInfo.Packs["p0001"].Volumes);          // Pack volume count (info file)
+        Assert.Equal(3, backIndex.Entries[0].Storage!.Volumes);    // Single-file blob volume count (index)
     }
 
     [Fact]
     public void Defaults_To_One_Volume()
     {
         var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
-        Assert.Equal(1, backIndex.Entries[0].Storage!.Volumes); // 未显式设置 → 1 卷
+        Assert.Equal(1, backIndex.Entries[0].Storage!.Volumes); // Not set explicitly → 1 volume
     }
 
     [Fact]
@@ -203,9 +203,9 @@ public sealed class IndexSerializerTests
         var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
         var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
 
-        Assert.Equal([100L, 200L, 50L], backInfo.Packs["p0001"].VolumeSizes);       // pack 分卷尺寸（信息文件）
-        Assert.Equal([4096L, 512L], backIndex.Entries[0].Storage!.VolumeSizes);     // 单文件 blob 分卷尺寸（索引）
-        Assert.Equal(["gone/a.txt", "changed/b.bin"], backIndex.UnrecoverablePaths); // 不可恢复标记
+        Assert.Equal([100L, 200L, 50L], backInfo.Packs["p0001"].VolumeSizes);       // Pack volume sizes (info file)
+        Assert.Equal([4096L, 512L], backIndex.Entries[0].Storage!.VolumeSizes);     // Single-file blob volume sizes (index)
+        Assert.Equal(["gone/a.txt", "changed/b.bin"], backIndex.UnrecoverablePaths); // Unrecoverable markers
     }
 
     [Fact]
@@ -237,8 +237,8 @@ public sealed class IndexSerializerTests
     }
 
     /// <summary>
-    /// 升级前写下的信息文件（format 2）版本条目里没有开始时刻。读出来必须是 null——而且
-    /// 不能错位：版本条目后面紧跟的是 pack 表，少读/多读一个字节，后面全是垃圾。
+    /// An info file written before the upgrade (format 2) has no start time in its version entries. It must read back as null — and
+    /// it must not slip out of alignment: the pack table follows immediately after the version entries, and reading one byte too few or too many turns everything after it into garbage.
     /// </summary>
     [Fact]
     public void Legacy_Format2_Info_Reads_StartedAt_As_Null()
@@ -250,12 +250,12 @@ public sealed class IndexSerializerTests
         Assert.Equal(new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero), v.CreatedAt);
         Assert.Equal("indexes/v1.bin.enc", v.IndexBlob);
         Assert.Equal(1200, v.Stats.Files);
-        Assert.Equal("packs/p0001.7z", back.Packs["p0001"].Blob);  // pack 表没被读错位
+        Assert.Equal("packs/p0001.7z", back.Packs["p0001"].Blob);  // The pack table was not read out of alignment
         Assert.Equal(900_000, back.Packs["p0001"].OriginalBytes);
     }
 
-    // InfoFormat 2 的字节布局（版本条目止于 stats，没有 StartedAt）。手写而非调用序列化器：
-    // 序列化器只会写当前格式，验不了向后兼容。
+    // The byte layout of InfoFormat 2 (version entries end at stats, no StartedAt). Hand-written rather than calling the serializer:
+    // the serializer only ever writes the current format, which proves nothing about backward compatibility.
     private static byte[] LegacyFormat2Info()
     {
         using var ms = new MemoryStream();
@@ -271,7 +271,7 @@ public sealed class IndexSerializerTests
         WriteLegacyNullableString(w, null);  // Settings
         w.Write(false);                 // KdfSalt = null
 
-        w.Write(1);                     // 版本数
+        w.Write(1);                     // Version count
         w.Write(1);                     // Version
         WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero));  // CreatedAt
         w.Write("indexes/v1.bin.enc");
@@ -280,14 +280,14 @@ public sealed class IndexSerializerTests
         w.Write(12L);                   // Stats.ChangedFiles
         w.Write(50_000_000L);           // Stats.ChangedBytes
 
-        w.Write(1);                     // pack 数
+        w.Write(1);                     // Pack count
         w.Write("p0001");
         w.Write("packs/p0001.7z");
-        w.Write(0);                     // 成员数
+        w.Write(0);                     // Member count
         w.Write(900_000L);              // OriginalBytes
         w.Write(0L);                    // DeadBytes
         w.Write(1);                     // Volumes
-        w.Write(0);                     // VolumeSizes 数（info format 2）
+        w.Write(0);                     // VolumeSizes count (info format 2)
 
         w.Flush();
         return ms.ToArray();
@@ -316,15 +316,15 @@ public sealed class IndexSerializerTests
 
         Assert.False(back.Packs["p0001"].StoreOnly);
         Assert.True(back.Packs["p0002"].StoreOnly);
-        // 紧跟其后的还有一个 pack 条目——错位的话它就读不出来了。
+        // There is another pack entry right after it — if alignment had slipped, that one would not read back.
         Assert.Equal("packs/p0002.7z", back.Packs["p0002"].Blob);
         Assert.Equal(900_000, back.Packs["p0002"].OriginalBytes);
     }
 
     /// <summary>
-    /// 升级前写下的信息文件（format 3）里，pack 条目止于 VolumeSizes，没有压法。读出来必须是
-    /// false——那恰好等于历史行为（那时候所有包都是压过的）。format 3 是**上一个生产格式**，
-    /// 用户手上的备份就是它，所以这一条比 format 2 那条更要紧。
+    /// In an info file written before the upgrade (format 3), pack entries end at VolumeSizes with no compression mode. It must read
+    /// back as false — which is exactly the historical behavior (back then every pack was compressed). format 3 is the **previous
+    /// production format**, the one the backups in users' hands are written in, which makes this case matter more than the format 2 one.
     /// </summary>
     [Fact]
     public void Legacy_Format3_Info_Reads_Pack_StoreOnly_As_False()
@@ -334,7 +334,7 @@ public sealed class IndexSerializerTests
         var v = Assert.Single(back.Versions);
         Assert.Equal(new DateTimeOffset(2026, 7, 16, 12, 30, 0, TimeSpan.Zero), v.StartedAt);
 
-        // 两个 pack：第一个读完不错位，第二个才读得出来。
+        // Two packs: only if the first one reads without slipping alignment does the second read back at all.
         Assert.False(back.Packs["p0001"].StoreOnly);
         Assert.False(back.Packs["p0002"].StoreOnly);
         Assert.Equal("packs/p0002.7z", back.Packs["p0002"].Blob);
@@ -342,8 +342,8 @@ public sealed class IndexSerializerTests
         Assert.Equal(900_000, back.Packs["p0002"].OriginalBytes);
     }
 
-    // InfoFormat 3 的字节布局（pack 条目止于 VolumeSizes，没有 StoreOnly）。手写而非调用序列化器：
-    // 序列化器只会写当前格式，验不了向后兼容。
+    // The byte layout of InfoFormat 3 (pack entries end at VolumeSizes, no StoreOnly). Hand-written rather than calling the serializer:
+    // the serializer only ever writes the current format, which proves nothing about backward compatibility.
     private static byte[] LegacyFormat3Info()
     {
         using var ms = new MemoryStream();
@@ -359,10 +359,10 @@ public sealed class IndexSerializerTests
         WriteLegacyNullableString(w, null);  // Settings
         w.Write(false);                 // KdfSalt = null
 
-        w.Write(1);                     // 版本数
+        w.Write(1);                     // Version count
         w.Write(1);                     // Version
         WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 5, 0, TimeSpan.Zero));   // CreatedAt
-        w.Write(true);                                                                 // StartedAt 非空（format 3）
+        w.Write(true);                                                                 // StartedAt not null (format 3)
         WriteLegacyDto(w, new DateTimeOffset(2026, 7, 16, 12, 30, 0, TimeSpan.Zero));  // StartedAt
         w.Write("indexes/v1.bin.enc");
         w.Write(1200L);                 // Stats.Files
@@ -370,7 +370,7 @@ public sealed class IndexSerializerTests
         w.Write(12L);                   // Stats.ChangedFiles
         w.Write(50_000_000L);           // Stats.ChangedBytes
 
-        w.Write(2);                     // pack 数
+        w.Write(2);                     // Pack count
         WriteLegacyFormat3Pack(w, "p0001", volumeSizes: [1_000L, 2_000L]);
         WriteLegacyFormat3Pack(w, "p0002", volumeSizes: []);
 
@@ -382,11 +382,11 @@ public sealed class IndexSerializerTests
     {
         w.Write(id);
         w.Write($"packs/{id}.7z");
-        w.Write(0);                     // 成员数
+        w.Write(0);                     // Member count
         w.Write(900_000L);              // OriginalBytes
         w.Write(0L);                    // DeadBytes
         w.Write(Math.Max(1, volumeSizes.Length));  // Volumes
-        w.Write(volumeSizes.Length);    // VolumeSizes 数（info format 2+）
+        w.Write(volumeSizes.Length);    // VolumeSizes count (info format 2+)
         foreach (var size in volumeSizes)
             w.Write(size);
     }

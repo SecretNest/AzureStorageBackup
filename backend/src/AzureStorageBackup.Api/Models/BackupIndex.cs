@@ -2,9 +2,9 @@ using System.Text.Json.Nodes;
 
 namespace AzureStorageBackup.Api.Models;
 
-// 信息记录文件（权威元数据 blob，PRD 1.5）与第二级版本索引的数据模型（M4 设计 §3）。
+// Data models for the info record file (the authoritative metadata blob, PRD 1.5) and the second-level version index (M4 design §3).
 
-/// <summary>信息记录文件（§3.1）：配置 + 版本列表 + 分组包元数据。跨设备恢复的唯一真相源。</summary>
+/// <summary>Info record file (§3.1): config + version list + pack metadata. The single source of truth for cross-device recovery.</summary>
 public sealed record BackupInfoFile
 {
     public int SchemaVersion { get; init; } = 1;
@@ -13,48 +13,48 @@ public sealed record BackupInfoFile
     public Dictionary<string, PackInfo> Packs { get; init; } = [];
 }
 
-/// <summary>备份配置快照（创建后不可改，除名字/描述）。</summary>
+/// <summary>Snapshot of the backup config (immutable after creation, apart from name/description).</summary>
 public sealed record BackupMeta
 {
     public required string Name { get; init; }
     public string? Description { get; init; }
 
-    /// <summary>源根路径提示，仅供参考；恢复时用户重新指定（§3.1）。</summary>
+    /// <summary>Source root path hint, for reference only; the user re-specifies it at recovery time (§3.1).</summary>
     public string? SourceRootHint { get; init; }
 
     public bool Encrypted { get; init; }
     public DateTimeOffset CreatedAt { get; init; }
 
-    /// <summary>本备份生效的设置（默认值解析结果快照）。schema 待 M4 设置页定稿，暂用开放对象。</summary>
+    /// <summary>The settings in effect for this backup (a snapshot of the resolved defaults). The schema waits on the M4 settings page being finalized, so an open object is used for now.</summary>
     public JsonObject? Settings { get; init; }
 
     /// <summary>
-    /// 加密备份的密钥派生盐（首次创建时随机生成）。用于 data blob 的密钥化寻址（防指纹识别）：
-    /// key = HKDF(password, KdfSalt)，blob 名 = data/{HMAC(key, fullHash)}。非加密备份为 null。
+    /// Key derivation salt for encrypted backups (generated randomly at first creation). Used for keyed addressing of data blobs (defeats fingerprinting):
+    /// key = HKDF(password, KdfSalt), blob name = data/{HMAC(key, fullHash)}. null for unencrypted backups.
     /// </summary>
     public byte[]? KdfSalt { get; init; }
 }
 
-/// <summary>一个不可变版本（§3.1 versions[]），引用其第二级索引。</summary>
+/// <summary>One immutable version (§3.1 versions[]), referencing its second-level index.</summary>
 public sealed record BackupVersion
 {
     public int Version { get; init; }
 
-    /// <summary>版本提交时刻（备份结束）。收尾清理在此之后还要跑一阵，不计入。</summary>
+    /// <summary>The moment the version was committed (end of the backup). The trailing cleanup runs for a while after this and is not counted.</summary>
     public DateTimeOffset CreatedAt { get; init; }
 
-    /// <summary>本次备份开始跑的时刻。info format 3 之前写下的版本没有这个信息 → null，
-    /// 无法回填（猜出来的数字比空着更坏）。</summary>
+    /// <summary>The moment this backup started running. Versions written before info format 3 don't carry it → null,
+    /// and it cannot be backfilled (a guessed number is worse than an empty one).</summary>
     public DateTimeOffset? StartedAt { get; init; }
 
     public required string IndexBlob { get; init; }
     public required VersionStats Stats { get; init; }
 }
 
-/// <summary>版本统计（进度/展示用；删除不计入 changed）。</summary>
+/// <summary>Version stats (for progress/display; deletions do not count toward changed).</summary>
 public sealed record VersionStats(long Files, long Bytes, long ChangedFiles, long ChangedBytes);
 
-/// <summary>分组包元数据（§6 死重压实跟踪）。</summary>
+/// <summary>Pack metadata (§6 dead-weight compaction tracking).</summary>
 public sealed record PackInfo
 {
     public required string Blob { get; init; }
@@ -62,45 +62,45 @@ public sealed record PackInfo
     public long OriginalBytes { get; init; }
     public long DeadBytes { get; init; }
 
-    /// <summary>pack 归档的分卷数（1=未分卷）。压实会改变，随 PackInfo 一并更新，供检查核验全部分卷存在（§7）。</summary>
+    /// <summary>Number of volumes in the pack archive (1 = not split). Compaction changes it, so it is updated along with PackInfo, letting a check verify that every volume exists (§7).</summary>
     public int Volumes { get; init; } = 1;
 
-    /// <summary>各分卷字节尺寸（按 .001..N 顺序）。供「存在+尺寸」级检查免下载发现截断/错包。旧信息文件可能为空（→仅验存在）。</summary>
+    /// <summary>Byte size of each volume (in .001..N order). Lets the "exists + size" level of check spot truncation/wrong packs without downloading. May be empty in older info files (→ existence check only).</summary>
     public List<long> VolumeSizes { get; init; } = [];
 
-    /// <summary>这一箱是只存不压（<c>-mx0</c>）的：全体成员都命中了配置的不压缩规则。
+    /// <summary>This box is store-only (<c>-mx0</c>): every one of its members hit the configured don't-compress rules.
     /// <para>
-    /// 必须记在包上，因为有两条路径会**重写同一个 packId 的归档**——死重压实与修复重压。
-    /// 它们手上只有存活成员和一个 packId，没有当初那份规则；不记的话，一个 store-only 包
-    /// 挨过一次版本退役就被重压成默认压法了，而这事没有任何征兆。
+    /// It has to be recorded on the pack, because two paths **rewrite the archive of an existing packId** — dead-weight
+    /// compaction and repair repacking. All they hold is the surviving members and a packId, not the rules from back
+    /// then; without this, a store-only pack that survives one version retirement gets repacked with the default compression, and nothing about it shows.
     /// </para>
     /// <para>
-    /// 也不改成「重写时重跑一遍规则推导」：那样规则一改，旧包会在下次压实时悄悄换压法，
-    /// 而记在包上的这个值是稳定的。旧信息文件读出 <c>false</c>，恰好等于历史行为（一律压缩）。
+    /// Nor do we switch to "re-derive from the rules at rewrite time": then a rule change would silently change the
+    /// compression of old packs at the next compaction, whereas this value recorded on the pack is stable. Older info files read back <c>false</c>, which is exactly the historical behavior (always compress).
     /// </para></summary>
     public bool StoreOnly { get; init; }
 }
 
-/// <summary>第二级版本索引（§3.2）：该版本全部文件清单 + 空文件夹。</summary>
+/// <summary>Second-level version index (§3.2): the full file manifest of that version + empty directories.</summary>
 public sealed record VersionIndex
 {
     public int Version { get; init; }
     public List<IndexEntry> Entries { get; init; } = [];
 
-    /// <summary>空文件夹（备份需包含，还原需创建）。</summary>
+    /// <summary>Empty directories (backup must include them, restore must create them).</summary>
     public List<string> EmptyDirs { get; init; } = [];
 
-    /// <summary>此版本中已无法恢复的文件路径（云端损坏且本地也无法修复）。由修复流程写入；
-    /// 还原时据此让用户逐个从其它版本替代。</summary>
+    /// <summary>File paths in this version that can no longer be recovered (damaged in the cloud and unrepairable from local
+    /// as well). Written by the repair flow; restore uses it to let the user substitute each one from another version.</summary>
     public List<string> UnrecoverablePaths { get; init; } = [];
 }
 
-/// <summary>索引条目：一个文件/符号链接及其存储位置。</summary>
+/// <summary>Index entry: one file/symlink and where it is stored.</summary>
 public sealed record IndexEntry
 {
     public required string Path { get; init; }
 
-    /// <summary>"file" | "symlink"。</summary>
+    /// <summary>"file" | "symlink".</summary>
     public required string Kind { get; init; }
 
     public long Length { get; init; }
@@ -109,46 +109,46 @@ public sealed record IndexEntry
 
     public string? HeadHash { get; init; }
 
-    /// <summary>文件末段 hash（§ 去重碰撞加固）。与 HeadHash/Length/FullHash 一起构成内容身份，
-    /// 使自建备份可纯本地（不读云端）判断去重/碰撞。旧索引可能为 null。</summary>
+    /// <summary>Hash of the file's tail segment (§ dedup collision hardening). Together with HeadHash/Length/FullHash it forms
+    /// the content identity, so a self-hosted backup can decide dedup/collision purely locally (without reading the cloud). May be null in older indexes.</summary>
     public string? TailHash { get; init; }
 
     public string? FullHash { get; init; }
 
-    /// <summary>symlink 目标（仅 kind=symlink）。</summary>
+    /// <summary>symlink target (only when kind=symlink).</summary>
     public string? Target { get; init; }
 
-    /// <summary>本轮未能重读该文件（被占用/无权限/读错误），条目内容沿用上一版本。
-    /// null = 本版本正常读取。值为发生时刻，便于操作员判断这份旧内容有多旧。</summary>
+    /// <summary>This round failed to re-read the file (locked/no permission/read error), so the entry's content is carried over
+    /// from the previous version. null = read normally in this version. The value is when it happened, so the operator can tell how old this stale content is.</summary>
     public DateTimeOffset? UnreadableAt { get; init; }
 
     public StorageRef? Storage { get; init; }
 }
 
-/// <summary>条目存储位置：单文件 blob 或分组 pack 内成员。</summary>
+/// <summary>Where an entry is stored: a single-file blob, or a member inside a grouped pack.</summary>
 public sealed record StorageRef
 {
-    /// <summary>"blob" | "pack"。</summary>
+    /// <summary>"blob" | "pack".</summary>
     public required string Kind { get; init; }
 
-    /// <summary>blob: data/{fullHash}；pack: packId。</summary>
+    /// <summary>blob: data/{fullHash}; pack: packId.</summary>
     public required string Ref { get; init; }
 
-    /// <summary>pack 内条目名（仅 kind=pack）。</summary>
+    /// <summary>Entry name inside the pack (only when kind=pack).</summary>
     public string? EntryName { get; init; }
 
     /// <summary>
-    /// 单文件 blob 的分卷数（1=未分卷，§7）。内容寻址不可变，故计数稳定，供检查核验全部分卷存在。
-    /// pack 成员此值无意义（pack 分卷数记在 <see cref="PackInfo.Volumes"/>，因压实会改变）。
+    /// Number of volumes for a single-file blob (1 = not split, §7). Content addressing is immutable, so the count is stable, letting a check verify every volume exists.
+    /// Meaningless for pack members (a pack's volume count lives in <see cref="PackInfo.Volumes"/>, because compaction changes it).
     /// </summary>
     public int Volumes { get; init; } = 1;
 
     /// <summary>
-    /// 该 blob 是**原始文件字节**而非 7z 归档（PRD 3.3.2：未压缩+未加密+无需分卷时直传原文件，省一次封装）。
-    /// 仅单文件 blob；还原/检查据此直接复制/哈希，不解压。
+    /// This blob holds the **raw file bytes** rather than a 7z archive (PRD 3.3.2: uncompressed + unencrypted + no splitting needed means the original file is uploaded directly, saving one wrapping step).
+    /// Single-file blobs only; restore/check copy/hash it directly instead of extracting.
     /// </summary>
     public bool Raw { get; init; }
 
-    /// <summary>各分卷字节尺寸（按 .001..N 顺序）。供「存在+尺寸」级检查免下载发现截断/错包。旧索引可能为空（→仅验存在）。</summary>
+    /// <summary>Byte size of each volume (in .001..N order). Lets the "exists + size" level of check spot truncation/wrong packs without downloading. May be empty in older indexes (→ existence check only).</summary>
     public List<long> VolumeSizes { get; init; } = [];
 }

@@ -3,14 +3,14 @@ using System.IO.Hashing;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 单遍流式三段 hash：head（前 N 字节）/ full（全部）/ tail（后 N 字节）。
+/// Single-pass streaming three-segment hash: head (first N bytes) / full (everything) / tail (last N bytes).
 /// <para>
-/// 产出的字符串与 <see cref="FileHasher"/> **逐字节一致**（XxHash128，"xxh128:" + 小写十六进制）：
-/// 同一份内容既可能由按路径读的 FileHasher 算出、也可能由这里算出，索引里两者混用，
-/// 差一点格式就等于全库比对失效。
+/// The strings it produces are **byte-for-byte identical** to <see cref="FileHasher"/> (XxHash128, "xxh128:" + lowercase hex):
+/// the same content may be hashed either by FileHasher reading by path or by this class, the index mixes the two, and being
+/// off by even a little in the format means comparison across the whole store stops working.
 /// </para>
 /// <para>
-/// tail 用环形缓冲：流不能回退，"最后 N 字节是哪些"要到 EOF 才知道，只能一路留着最近的 N 字节。
+/// tail uses a ring buffer: a stream cannot rewind, "which bytes are the last N" is not known until EOF, so the only option is to keep the most recent N bytes as you go.
 /// </para>
 /// </summary>
 public sealed class StreamingHasher(int headBytes, int tailBytes)
@@ -19,11 +19,11 @@ public sealed class StreamingHasher(int headBytes, int tailBytes)
     private readonly byte[] _head = new byte[Math.Max(0, headBytes)];
     private readonly byte[] _tail = new byte[Math.Max(0, tailBytes)];
     private int _headFilled;
-    private int _tailWritePos;   // 环形缓冲下一个写入位置
-    private int _tailFilled;     // 环形缓冲中的有效字节数
+    private int _tailWritePos;   // Next write position in the ring buffer
+    private int _tailFilled;     // Number of valid bytes in the ring buffer
 
-    /// <summary>迄今喂入的总字节数。流式读取**必须**核对它与索引记录的长度——
-    /// `7z x -so` 取一个不存在的成员时输出为空却退出码 0，只有长度和 hash 能识破。</summary>
+    /// <summary>Total bytes fed in so far. A streaming read **must** check this against the length recorded in the index —
+    /// `7z x -so` on a member that does not exist produces empty output yet exits 0, and only the length and the hash can catch that.</summary>
     public long Length { get; private set; }
 
     public void Append(ReadOnlySpan<byte> data)
@@ -49,7 +49,7 @@ public sealed class StreamingHasher(int headBytes, int tailBytes)
         if (_tail.Length == 0)
             return;
 
-        // 一次就写满整个缓冲：先前留着的都会被覆盖，直接取末尾一段即可。
+        // This single write fills the whole buffer: everything kept before is overwritten, so just take the trailing slice.
         if (data.Length >= _tail.Length)
         {
             data[^_tail.Length..].CopyTo(_tail);
@@ -91,8 +91,8 @@ public sealed class StreamingHasher(int headBytes, int tailBytes)
 }
 
 /// <summary>
-/// 只写流：把写入的字节喂给一个 <see cref="StreamingHasher"/>，可选同时转发给下游。
-/// 下游为 null＝只算 hash 不落盘（检查用）；给下游＝边写边算（还原/压缩用）。
+/// Write-only stream: feeds the written bytes to a <see cref="StreamingHasher"/>, optionally forwarding them downstream as well.
+/// A null downstream = hash only, nothing written to disk (used by check); a downstream given = hash while writing (used by restore/compression).
 /// </summary>
 public sealed class HashingStream(StreamingHasher hasher, Stream? inner = null) : Stream
 {
@@ -136,10 +136,10 @@ public sealed class HashingStream(StreamingHasher hasher, Stream? inner = null) 
 }
 
 /// <summary>
-/// 只写流：把写入的字节按事先给定的**段长序列**切开，逐段算 hash 并回调。
+/// Write-only stream: splits the written bytes by a **sequence of segment lengths** given up front, hashing each segment and invoking a callback.
 /// <para>
-/// 用来一次解压整个归档、按成员尺寸还原出每个成员的 hash：7z 归档是固实的，
-/// 逐成员各调一次 `x -so` 会让第 k 个成员把前 k-1 个也解一遍，退化成 O(N²)。
+/// Used to extract a whole archive in one go and recover each member's hash from the member sizes: 7z archives are solid, so
+/// calling `x -so` once per member makes the k-th member re-extract the preceding k-1 as well, degrading to O(N²).
 /// </para>
 /// </summary>
 public sealed class SegmentHashingStream(
@@ -150,11 +150,11 @@ public sealed class SegmentHashingStream(
     private long _consumed;
     private StreamingHasher? _current;
 
-    /// <summary>全部段都填满之后仍然收到的字节数。不为 0 说明归档实际内容比列举出来的多，
-    /// 切段的依据（列举顺序＝输出顺序）不成立——调用方据此放弃快路径。</summary>
+    /// <summary>Bytes still received after every segment has been filled. Nonzero means the archive holds more content than was
+    /// listed, so the premise for splitting (listing order = output order) does not hold — the caller drops the fast path on that basis.</summary>
     public long ExtraBytes { get; private set; }
 
-    /// <summary>已完整填满并已回调的段数。</summary>
+    /// <summary>Number of segments completely filled and already called back.</summary>
     public int CompletedSegments => _index;
 
     public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
@@ -180,7 +180,7 @@ public sealed class SegmentHashingStream(
             }
 
             if (_consumed < length)
-                return;  // 这一段还没满，等下一次写入
+                return;  // This segment isn't full yet, wait for the next write
 
             onSegment(name, _consumed, _current.FullHash);
             _index++;
@@ -201,9 +201,9 @@ public sealed class SegmentHashingStream(
     public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
         => WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
 
-    /// <summary>流结束后调用：把尾部那些长度为 0 的段（空文件）补上回调——
-    /// 它们不消耗任何字节，光靠 <see cref="Write"/> 永远推不动。
-    /// 未填满的段**不**回调，调用方查不到即视为不符。</summary>
+    /// <summary>Called after the stream ends: fire the callback for the trailing zero-length segments (empty files) —
+    /// they consume no bytes, so <see cref="Write"/> on its own can never move past them.
+    /// Segments that were not filled get **no** callback; the caller treats a lookup miss as a mismatch.</summary>
     public void Finish()
     {
         while (_index < segments.Count && segments[_index].Length == 0 && _consumed == 0)

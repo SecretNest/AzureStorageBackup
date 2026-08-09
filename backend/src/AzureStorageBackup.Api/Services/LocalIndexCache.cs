@@ -5,41 +5,41 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 本地版本索引缓存（设计 §3.3）。大的第二级版本索引平时从本地 SQLite 读，避免每次备份/清理都下载解压云端索引；
-/// 缓存未命中或身份不符时回落到云端并回填。云端信息文件仍为权威真相源，故不缓存。
+/// Local version index cache (design §3.3). The large second-level version indexes are normally read from local SQLite, which avoids downloading and extracting the cloud index on every backup/cleanup;
+/// on a cache miss or an identity mismatch it falls back to the cloud and backfills. The cloud info file remains the authoritative source of truth, so it is not cached.
 /// </summary>
 public interface ILocalIndexCache
 {
-    /// <summary>读取某版本索引：本地命中（且身份匹配）直接返回，否则下载云端并回填。</summary>
+    /// <summary>Read a version index: return it directly on a local hit (with matching identity), otherwise download from the cloud and backfill.</summary>
     Task<VersionIndex> ReadAsync(
         Account account, string container, int version, long identityTicks,
         string indexBlob, string? password, CancellationToken ct = default);
 
-    /// <summary>写入/更新某版本索引缓存（备份写完新版本后调用）。</summary>
+    /// <summary>Write/update the cache for a version index (called after a backup finishes writing a new version).</summary>
     Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default);
 
-    /// <summary>移除某版本缓存（版本被保留策略退役后调用）。</summary>
+    /// <summary>Remove the cache for a version (called after the retention policy retires it).</summary>
     Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default);
 
-    /// <summary>移除某 (账户,container) 的全部版本索引缓存（删除备份配置时调用），避免同 account+container
-    /// 重建备份后残留旧身份的缓存索引导致数据错配。</summary>
+    /// <summary>Remove every cached version index for a given (account, container) (called when a backup config is deleted), so that
+    /// rebuilding a backup on the same account+container leaves no cached index under the old identity behind to mismatch the data.</summary>
     Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default);
 }
 
 public sealed class LocalIndexCache(
     AppDbContext db, IBackupInfoStore store, VersionIndexMemoryCache? memory = null) : ILocalIndexCache
 {
-    // 省略即禁用进程内那一层：单测关注的是 SQLite 这一层，不该被跨请求缓存干扰。
-    // 生产由 DI 注入按 Backup__IndexCacheSize 配好的实例。
+    // Omitting it disables the in-process layer: unit tests care about the SQLite layer and should not be disturbed by a cross-request cache.
+    // In production DI injects an instance configured from Backup__IndexCacheSize.
     private readonly VersionIndexMemoryCache _memory = memory ?? new VersionIndexMemoryCache(0);
 
     public async Task<VersionIndex> ReadAsync(
         Account account, string container, int version, long identityTicks,
         string indexBlob, string? password, CancellationToken ct = default)
     {
-        // 行里存的是**序列化字节**，所以 SQLite 命中也仍要把整份索引重建成对象（50 万条目实测
-        // 约 0.9 s / 350 MB 分配）。还原对话框每展开一个目录都要走一遍，因此在其上再加一层
-        // 进程内对象缓存；容量为 0 时这一层整体旁路，行为与加它之前一致（VersionIndexMemoryCache）。
+        // The row holds **serialized bytes**, so even a SQLite hit still has to rebuild the entire index into objects (measured
+        // at roughly 0.9 s / 350 MB allocated for 500k entries). The restore dialog goes through it every time a directory is
+        // expanded, hence one more layer of in-process object cache on top; at capacity 0 that layer is bypassed entirely and the behavior matches what it was before (VersionIndexMemoryCache).
         if (_memory.TryGet(account.Id, container, version, identityTicks, out var cached))
             return cached;
 
@@ -53,7 +53,7 @@ public sealed class LocalIndexCache(
             return fromRow;
         }
 
-        // 未命中或 container 已重建（身份不符）→ 下载云端并回填。
+        // Miss, or the container has been rebuilt (identity mismatch) → download from the cloud and backfill.
         var index = await store.ReadIndexAsync(account, container, indexBlob, password, ct);
         await UpsertAsync(row, account.Id, container, version, identityTicks, index, ct);
         _memory.Set(account.Id, container, version, identityTicks, index);
@@ -66,9 +66,9 @@ public sealed class LocalIndexCache(
         var row = await db.CachedVersionIndexes
             .FirstOrDefaultAsync(x => x.AccountId == accountId && x.Container == container && x.Version == version, ct);
         await UpsertAsync(row, accountId, container, version, identityTicks, index, ct);
-        // 存字节、**不**把调用方的对象放进内存缓存：索引对象是可变的（BackupRepairer 就会往
-        // UnrecoverablePaths 里加东西），共享一个还在被调用方持有的实例迟早出事。失效的代价
-        // 只是下次读少一次命中。
+        // Store the bytes, and do **not** put the caller's object into the memory cache: index objects are mutable (BackupRepairer
+        // adds things to UnrecoverablePaths, for one), and sharing an instance the caller still holds will bite eventually. The
+        // price of invalidating is merely one fewer hit on the next read.
         _memory.Invalidate(accountId, container, version);
     }
 

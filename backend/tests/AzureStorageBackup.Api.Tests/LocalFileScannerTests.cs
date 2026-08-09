@@ -149,9 +149,9 @@ public sealed class LocalFileScannerTests : IDisposable
         Assert.Empty(result.EmptyDirs);
     }
 
-    /// <summary>一个列不出内容的目录此前会让整轮备份崩在扫描阶段。它必须被记下来而不是抛出——
-    /// 但**记成空目录是更糟的答案**：还原时会重建出一个空目录，其下的文件全部无声消失。
-    /// 同理也不能什么都不记：diff 会因为"没扫到"把整棵子树判成删除。</summary>
+    /// <summary>A directory whose contents cannot be listed used to crash the whole backup run in the scan stage. It has to be
+    /// recorded rather than thrown — but **recording it as an empty directory is the worse answer**: restore would recreate an empty
+    /// directory with every file beneath it silently gone. By the same token, recording nothing is no good either: diff would judge the whole subtree deleted because it "wasn't scanned".</summary>
     [SkippableFact]
     public async Task An_Unreadable_Directory_Is_Recorded_Instead_Of_Throwing()
     {
@@ -168,12 +168,12 @@ public sealed class LocalFileScannerTests : IDisposable
             var reported = Assert.Single(result.Unreadable);
             Assert.Equal("locked", reported.Path);
             Assert.True(reported.IsDirectory);
-            Assert.NotEmpty(reported.Reason); // 原因原文要带上，操作员据此判断是权限还是介质问题
+            Assert.NotEmpty(reported.Reason); // The verbatim reason has to come along, so the operator can tell a permission problem from a media one
 
-            // 绝不能被当成空目录——那会让还原重建一个空壳，掩盖掉里面的文件。
+            // It must never be treated as an empty directory — that would have restore recreate an empty shell, hiding the files inside it.
             Assert.DoesNotContain("locked", result.EmptyDirs);
 
-            // 其余部分照常扫描，不受牵连。
+            // The rest is scanned as usual, unaffected.
             Assert.Contains(result.Entries, e => e.Path == "ok/keep.txt");
             Assert.DoesNotContain(result.Entries, e => e.Path.StartsWith("locked/", StringComparison.Ordinal));
         }
@@ -203,7 +203,7 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("docs/2025/old.pdf", "x");
         WriteText("docs/2026/q1.pdf", "y");
 
-        // 只判 IsInScope 会在 docs 处就把整棵剪掉，2026 永远到不了。
+        // Judging on IsInScope alone would prune the whole tree at docs, and 2026 would never be reached.
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
         var result = await Scanner().ScanAsync(
             _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
@@ -217,8 +217,8 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("docs/2026/q1.pdf", "y");
         Directory.CreateDirectory(Path.Combine(_root, "docs", "scratch"));
 
-        // docs 自身被排除，只是为了下降到 docs/2026 才走进去。它绝不能进 EmptyDirs——
-        // 那会让还原凭空重建出一个用户明确排除掉的目录。docs/scratch 同理。
+        // docs itself is excluded and is only entered in order to descend to docs/2026. It must never enter EmptyDirs —
+        // that would have restore conjure up a directory the user explicitly excluded. Same for docs/scratch.
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
         var result = await Scanner().ScanAsync(
             _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
@@ -230,11 +230,11 @@ public sealed class LocalFileScannerTests : IDisposable
     [Fact]
     public async Task A_Directory_That_Ends_With_Zero_Kept_Children_And_Is_Itself_Out_Of_Scope_Is_Not_Recorded_As_Empty()
     {
-        // docs 下只有一个被排除的文件，没有 docs/2026——所以下降到 docs 之后，keptChildren
-        // 真的会停在 0（不像"路过"那个用例，那边靠 docs/2026/q1.pdf 撑住了 keptChildren）。
-        // 但 docs 仍然必须被下降，因为它下面挂着 `+ docs/2026` 规则（MayContainIncluded 为真）。
-        // 这才是真正走到 `if (keptChildren == 0 && !IsInScope(self))` 这一分支的场景：
-        // 删掉守卫两行也不会让上面那个用例失败，但会让这个用例失败。
+        // docs holds only one excluded file and no docs/2026 — so after descending into docs, keptChildren really does end at 0
+        // (unlike the "passed through" case, where docs/2026/q1.pdf propped keptChildren up).
+        // But docs still has to be descended into, because the `+ docs/2026` rule hangs beneath it (MayContainIncluded is true).
+        // This is the scenario that genuinely reaches the `if (keptChildren == 0 && !IsInScope(self))` branch:
+        // deleting the two guard lines would not fail the case above, but it would fail this one.
         WriteText("docs/other.txt", "x");
 
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
@@ -268,7 +268,7 @@ public sealed class LocalFileScannerTests : IDisposable
         var result = await Scanner().ScanAsync(
             _root, new IgnoreRuleSet(["*.log"]), new ScanOptions { Scope = scope });
 
-        // 范围留下 photos，忽略规则再从中剔掉 .log —— 两层串联，互不干扰。
+        // Scope keeps photos, then the ignore rules strip .log out of it — two layers in series, neither interfering with the other.
         Assert.Equal(["photos/a.jpg"], result.Entries.Select(e => e.Path));
     }
 }

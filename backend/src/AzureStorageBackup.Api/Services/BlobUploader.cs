@@ -4,22 +4,23 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>data/pack/索引 blob 的上传（M4 §5）：设置 Tier、重试退避、内容寻址幂等跳过、并发。</summary>
+/// <summary>Upload of data/pack/index blobs (M4 §5): setting the Tier, retry backoff, content-addressed idempotent skipping, concurrency.</summary>
 public interface IBlobUploader
 {
-    /// <summary>上传文件到 blob（带 Tier + 可选元数据）。blob 已存在则跳过并返回 false（内容寻址幂等）。</summary>
+    /// <summary>Upload a file to a blob (with Tier + optional metadata). If the blob already exists, skip it and return false (content-addressed idempotency).</summary>
     Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null);
 
     /// <summary>
-    /// 同上，外加**上传过程中**的字节回报（<paramref name="progress"/> 收到的是本次调用内的累计值）。
-    /// 没有它，界面上的速度只能按「一个 blob 传完」这个粒度跳变：传一个 100 MB 的包要几十秒，
-    /// 那几十秒里测速窗口是空的，读数归零。
+    /// Same as above, plus byte reporting **during** the upload (<paramref name="progress"/> receives a running total within this call).
+    /// Without it, the speed in the UI can only jump at the granularity of "one blob finished": uploading a 100 MB pack takes
+    /// dozens of seconds, and throughout those seconds the measurement window is empty and the reading drops to zero.
     /// <para>
-    /// 默认实现直接丢掉进度、转发到无进度版本——测试替身不必为此改一行。进度参数放在最后
-    /// **且不给默认值**：8 个实参唯一匹配上面那个重载，9 个唯一匹配这个，不存在歧义。
+    /// The default implementation simply drops the progress and forwards to the version without it — test doubles don't have to
+    /// change a line for this. The progress parameter goes last **and gets no default value**: 8 arguments uniquely match the
+    /// overload above, 9 uniquely match this one, so there is no ambiguity.
     /// </para>
     /// </summary>
     Task<bool> UploadIfMissingAsync(
@@ -28,8 +29,8 @@ public interface IBlobUploader
         IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
         => UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
 
-    /// <summary>覆盖上传文件到 blob（带 Tier + 可选元数据），**不做**存在性短路——目标存在也直接覆盖。
-    /// 原子替换用：先覆盖上传新卷、再删残留旧卷，使崩溃窗口从「整 blob 丢失」降为「新旧卷混合」（可修复）。</summary>
+    /// <summary>Upload a file to a blob, overwriting (with Tier + optional metadata), with **no** existence short-circuit — an existing target is overwritten anyway.
+    /// For atomic replacement: overwrite-upload the new volumes first, then delete the leftover old ones, which lowers the crash window from "the whole blob is lost" to "a mix of new and old volumes" (repairable).</summary>
     Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -56,8 +57,8 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         IReadOnlyDictionary<string, string>? metadata = null)
         => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata);
 
-    /// <summary>上传核心：overwrite=false 时若 blob 已存在则短路返回 false（if-missing 语义）；
-    /// overwrite=true 时直接覆盖上传。返回是否实际上传。</summary>
+    /// <summary>Upload core: with overwrite=false, short-circuit and return false if the blob already exists (if-missing semantics);
+    /// with overwrite=true, just overwrite-upload. Returns whether an upload actually happened.</summary>
     private async Task<bool> UploadCoreAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, bool overwrite, RetryOptions? retry, CancellationToken ct,
@@ -71,23 +72,25 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         if (metadata is not null)
             options.Metadata = metadata.ToDictionary(kv => kv.Key, kv => kv.Value);
 
-        // if-missing 语义交给**服务端**做，不再靠"先 Exists 再上传"。
+        // Let the **server** enforce the if-missing semantics, rather than relying on "Exists first, then upload".
         //
-        // 那样做有个不原子的缺口，而上传是会重试的：网络抖一下（NAS 上很常见），服务端其实已经
-        // 把 blob 写进去了、客户端只收到超时或 5xx，重试于是去覆盖一个已经存在的 blob。
-        // 数据层是 Archive 时这一下直接失败——归档 blob 不允许被覆盖（Put Block 更是连 tier 都
-        // 带不了），返回 409 BlobArchived，而它不在可重试之列，整轮备份就此倒掉。
-        // 同一个缺口也会被并发撞上：两个任务对同一个 blob 名先后走过存在性检查，都看到"不存在"。
+        // That approach has a non-atomic gap, and uploads do get retried: the network hiccups (very common on a NAS), the
+        // server has in fact already written the blob but the client only got a timeout or a 5xx, so the retry goes and
+        // overwrites a blob that already exists. When the data tier is Archive that fails outright — an archived blob may not
+        // be overwritten (Put Block can't even carry a tier) and it returns 409 BlobArchived, which is not on the retryable
+        // list, so the whole backup run goes down with it.
+        // The same gap gets hit by concurrency: two tasks pass the existence check for the same blob name one after the other, and both see "doesn't exist".
         //
-        // 条件请求没有这个窗口：服务端在写之前判条件，不满足就直接拒绝（412），一个字节都不写，
-        // 所以重试与并发都天然幂等，也就绝不会去动一个已归档的 blob。顺带还省掉那一次 HEAD。
+        // A conditional request has no such window: the server evaluates the condition before writing and rejects outright
+        // (412) without writing a single byte if it isn't satisfied, so retries and concurrency are idempotent by nature and
+        // an already-archived blob is never touched. It saves that one HEAD along the way, too.
         if (!overwrite)
             options.Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All };
 
         try
         {
-            // 将实际取消令牌转发给 TransientErrors.IsTransient，令其区分用户取消与网络超时。
-            // 不转发的话，OperationCanceledException 会被误判为瞬时错误而进入重试流程。
+            // Forward the real cancellation token to TransientErrors.IsTransient so it can distinguish a user cancel from a network timeout.
+            // Without forwarding it, OperationCanceledException would be misjudged as a transient error and enter the retry flow.
             await RetryPolicy.ExecuteAsync(async token =>
             {
                 await using var stream = File.OpenRead(filePath);
@@ -96,7 +99,7 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         }
         catch (RequestFailedException ex) when (!overwrite && IsAlreadyThere(ex))
         {
-            // 已经有了就是 if-missing 想要的结果，不是错误。
+            // Already there is exactly the outcome if-missing wants, not an error.
             return false;
         }
 
@@ -104,17 +107,17 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     }
 
     /// <summary>
-    /// 条件上传被"已经存在"挡下了。412 是 If-None-Match 不满足的正路；409 BlobAlreadyExists
-    /// 也一并收下——重试碰上自己刚写成功的那一份时，服务端两种都可能给。
+    /// A conditional upload was turned away by "already exists". 412 is the normal path for an unsatisfied If-None-Match;
+    /// 409 BlobAlreadyExists is accepted too — when a retry runs into the copy it just wrote successfully, the server may give either.
     /// <para>
-    /// **BlobArchived 也算**。条件请求救不了归档 blob：对已归档对象的写操作，服务端在判条件
-    /// **之前**就拒绝，于是拿不到 412，拿到的是 409 BlobArchived。而在 if-missing 语义下这条
-    /// 错误的含义是确定的——目标已经在那儿了，正是"不必再传"。Archive 数据层上跑备份时，
-    /// 每一个已经存过的对象都会走到这里。
+    /// **BlobArchived counts as well.** A conditional request cannot save an archived blob: for a write to an already-archived
+    /// object the server rejects **before** evaluating the condition, so what comes back is not a 412 but a 409 BlobArchived.
+    /// And under if-missing semantics the meaning of that error is unambiguous — the target is already there, which is exactly
+    /// "no need to upload it again". Running a backup on the Archive data tier, every already-stored object comes through here.
     /// </para>
     /// <para>
-    /// 只在 if-missing 那一侧收。<c>overwrite: true</c>（修复、死重压实）撞上 BlobArchived 是
-    /// 真的要覆盖归档数据，那种情况必须响亮地失败，不能静默当成功。
+    /// Only accepted on the if-missing side. <c>overwrite: true</c> (repair, dead-weight compaction) hitting BlobArchived
+    /// really does mean overwriting archived data, and that case must fail loudly, never silently count as success.
     /// </para>
     /// </summary>
     private static bool IsAlreadyThere(RequestFailedException ex) =>

@@ -3,32 +3,32 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 反序列化后的版本索引的**进程内**缓存（单例，跨请求共享）。
+/// An **in-process** cache of deserialized version indexes (singleton, shared across requests).
 /// <para>
-/// 为什么需要：<see cref="LocalIndexCache"/> 在 SQLite 里存的是**序列化字节**，所以每次读都要把
-/// 整份索引重建成对象。实测 50 万条目的索引：一次反序列化 + 一次 <see cref="VersionTreeService.Children"/>
-/// 全表扫描 = 939 ms / 分配 350 MB —— 而还原对话框每展开一个目录就要走一遍这个过程。
+/// Why it is needed: <see cref="LocalIndexCache"/> stores **serialized bytes** in SQLite, so every read has to rebuild the
+/// entire index into objects. Measured on a 500k-entry index: one deserialization + one full scan by
+/// <see cref="VersionTreeService.Children"/> = 939 ms / 350 MB allocated — and the restore dialog goes through that whole process every time a directory is expanded.
 /// </para>
 /// <para>
-/// 代价是常驻内存：一份 50 万条目的索引在堆上约 190 MB。所以容量可配，
-/// <c>Backup__IndexCacheSize=0</c> 时完全禁用（小内存机器），此时行为与加这层缓存之前完全一致。
+/// The price is resident memory: a 500k-entry index is roughly 190 MB on the heap. So the capacity is configurable, and
+/// <c>Backup__IndexCacheSize=0</c> disables it entirely (low-memory machines), in which case the behavior is exactly what it was before this cache layer existed.
 /// </para>
 /// <para>
-/// **契约：取出的实例是共享的，调用方不得修改它**（<see cref="VersionIndex.Entries"/> 等都是可变
-/// 集合）。目前唯一会改动索引对象的是 <see cref="BackupRepairer"/>，而它读的是云端 store 而非本层；
-/// 为了不把这个约定寄托在"以后没人改错"上，写入路径（<see cref="LocalIndexCache.PutAsync"/>）一律
-/// **失效**对应条目而不是把调用方的对象放进来 —— 代价只是下次少一次命中。
+/// **Contract: the instance handed out is shared, and the caller must not modify it** (<see cref="VersionIndex.Entries"/> and
+/// friends are all mutable collections). The only thing that currently mutates an index object is <see cref="BackupRepairer"/>,
+/// and it reads from the cloud store rather than this layer; so as not to rest this agreement on "nobody gets it wrong later",
+/// the write path (<see cref="LocalIndexCache.PutAsync"/>) always **invalidates** the matching entry instead of putting the caller's object in — the price is merely one fewer hit next time.
 /// </para>
 /// </summary>
 public sealed class VersionIndexMemoryCache(int capacity)
 {
     private readonly record struct Key(int AccountId, string Container, int Version, long IdentityTicks);
 
-    // 容量按项计（通常 1–2），用一个按最近使用排序的列表即可，不值得上专门的 LRU 结构。
+    // Capacity is counted in items (usually 1–2), so a list ordered by recency of use is enough; a dedicated LRU structure isn't worth it.
     private readonly List<(Key Key, VersionIndex Index)> _entries = [];
     private readonly Lock _gate = new();
 
-    /// <summary>缓存项数上限；0 = 禁用。</summary>
+    /// <summary>Upper bound on the number of cached items; 0 = disabled.</summary>
     public int Capacity { get; } = Math.Max(0, capacity);
 
     public bool Enabled => Capacity > 0;
@@ -48,7 +48,7 @@ public sealed class VersionIndexMemoryCache(int capacity)
 
             var hit = _entries[i];
             _entries.RemoveAt(i);
-            _entries.Add(hit); // 移到末尾＝最近使用
+            _entries.Add(hit); // Moved to the end = most recently used
             index = hit.Index;
             return true;
         }
@@ -67,12 +67,12 @@ public sealed class VersionIndexMemoryCache(int capacity)
                 _entries.RemoveAt(i);
             _entries.Add((key, index));
             while (_entries.Count > Capacity)
-                _entries.RemoveAt(0); // 最久未使用
+                _entries.RemoveAt(0); // Least recently used
         }
     }
 
-    /// <summary>某版本的索引已变化（备份写入新版本、修复改写、版本退役）→ 丢弃，绝不留陈旧副本。
-    /// identityTicks 不参与匹配：容器重建后旧身份的条目同样必须走人。</summary>
+    /// <summary>A version's index has changed (backup wrote a new version, repair rewrote it, version retired) → discard it, never keep a stale copy.
+    /// identityTicks takes no part in the match: after a container is rebuilt, entries under the old identity have to go as well.</summary>
     public void Invalidate(int accountId, string container, int version)
     {
         if (!Enabled)
@@ -82,7 +82,7 @@ public sealed class VersionIndexMemoryCache(int capacity)
                 && e.Key.Container == container && e.Key.Version == version);
     }
 
-    /// <summary>某 (账户, container) 的全部版本失效（删除备份配置 / 容器重建）。</summary>
+    /// <summary>Invalidate every version of a given (account, container) (backup config deleted / container rebuilt).</summary>
     public void InvalidateContainer(int accountId, string container)
     {
         if (!Enabled)

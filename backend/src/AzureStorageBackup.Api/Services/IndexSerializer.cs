@@ -5,18 +5,18 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 信息记录文件与第二级索引的紧凑二进制序列化（M4 §13.4 收敛：为减小体积改用二进制）。
-/// hash 存成 32 字节裸字节而非 72 字节 "sha256:"+hex 文本；枚举/时间/长度定宽编码。
-/// 压缩/加密（7z）由独立编解码层负责。公开 API 与之前一致。
+/// Compact binary serialization of the info record file and the second-level index (M4 §13.4 convergence: switched to binary to shrink the size).
+/// Hashes are stored as 32 raw bytes rather than 72 bytes of "sha256:"+hex text; enums/timestamps/lengths use fixed-width encoding.
+/// Compression/encryption (7z) is the job of a separate codec layer. The public API is unchanged.
 /// </summary>
 public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
-    // 未投产，格式可自由演进：含分卷数（§7）+ 加密备份密钥派生盐（密钥化寻址）。总是读写当前字段。
-    private const byte InfoFormat = 4;  // format 2: PackInfo.VolumeSizes（分卷尺寸，供存在+尺寸检查）；format 3: BackupVersion.StartedAt；format 4: PackInfo.StoreOnly
-    private const byte IndexFormat = 4;  // format 2: TailHash；format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths；format 4: IndexEntry.UnreadableAt
+    // Not in production yet, so the format is free to evolve: includes the volume count (§7) + the key derivation salt for encrypted backups (keyed addressing). Always reads and writes the current fields.
+    private const byte InfoFormat = 4;  // format 2: PackInfo.VolumeSizes (volume sizes, for the exists+size check); format 3: BackupVersion.StartedAt; format 4: PackInfo.StoreOnly
+    private const byte IndexFormat = 4;  // format 2: TailHash; format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths; format 4: IndexEntry.UnreadableAt
 
-    // ---- 信息记录文件 ----
+    // ---- Info record file ----
 
     public static byte[] SerializeInfoFile(BackupInfoFile info)
     {
@@ -98,7 +98,7 @@ public static class IndexSerializer
         {
             versions.Add(new BackupVersion
             {
-                // 初始化器按书写顺序求值 = 流里的字段顺序，与写侧一一对应，别重排。
+                // Initializers evaluate in written order = the field order in the stream, matching the write side one for one; don't reorder.
                 Version = r.ReadInt32(),
                 CreatedAt = ReadDto(r),
                 StartedAt = format >= 3 ? ReadNullableDto(r) : null, // format 3+
@@ -127,7 +127,7 @@ public static class IndexSerializer
                 DeadBytes = deadBytes,
                 Volumes = r.ReadInt32(),
                 VolumeSizes = format >= 2 ? ReadLongs(r) : [],
-                // format 4+。旧信息文件里的包全是压过的，读成 false 恰好等于历史行为。
+                // format 4+. Packs in older info files were all compressed, so reading back false is exactly the historical behavior.
                 StoreOnly = format >= 4 && r.ReadBoolean(),
             };
         }
@@ -141,7 +141,7 @@ public static class IndexSerializer
         };
     }
 
-    // ---- 第二级索引 ----
+    // ---- Second-level index ----
 
     public static byte[] SerializeIndex(VersionIndex index)
     {
@@ -271,7 +271,7 @@ public static class IndexSerializer
         };
     }
 
-    // ---- 编码原语 ----
+    // ---- Encoding primitives ----
 
     private static void WriteNullableString(BinaryWriter w, string? value)
     {
@@ -332,7 +332,7 @@ public static class IndexSerializer
 
     private static DateTimeOffset? ReadNullableDto(BinaryReader r) => r.ReadBoolean() ? ReadDto(r) : null;
 
-    // hash 编码：0=null；1=xxh128 的 16 字节裸字节；2=任意字符串（兜底）。
+    // Hash encoding: 0 = null; 1 = the 16 raw bytes of an xxh128; 2 = an arbitrary string (fallback).
     private const string HashPrefix = "xxh128:";
 
     private static void WriteHash(BinaryWriter w, string? hash)
@@ -350,7 +350,7 @@ public static class IndexSerializer
             if (hex.Length == 32)
             {
                 try { raw = Convert.FromHexString(hex); }
-                catch (FormatException) { /* 非 hex，走兜底 */ }
+                catch (FormatException) { /* Not hex, take the fallback */ }
             }
         }
 

@@ -4,8 +4,8 @@ using System.Text.RegularExpressions;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// gitignore 风格的规则集。支持否定(!)、仅目录(/后缀)、锚定(/前缀或含内部/)、
-/// * ** ? 通配。最后匹配的规则决定结果。三处复用：忽略/不压缩/不分组（PRD 3.3）。
+/// A gitignore-style rule set. Supports negation (!), directory-only (trailing /), anchoring (leading / or an internal /),
+/// and the * ** ? wildcards. The last matching rule decides the result. Reused in three places: ignore / don't-compress / don't-group (PRD 3.3).
 /// </summary>
 public sealed class IgnoreRuleSet
 {
@@ -68,8 +68,8 @@ public sealed class IgnoreRuleSet
         return decision ?? false;
     }
 
-    /// <summary>文件是否命中：自身以文件判定命中，或任一祖先目录以目录判定命中
-    /// （使 `logs/` 这类目录规则对其下文件生效，与忽略列表按目录遍历的行为一致）。</summary>
+    /// <summary>Whether a file matches: it matches when judged as a file itself, or any ancestor directory matches when judged as a directory
+    /// (which makes directory rules like `logs/` take effect on the files beneath them, matching how the ignore list behaves when walking by directory).</summary>
     public bool MatchesFileOrAncestorDir(string relativePath)
     {
         if (IsIgnored(relativePath, isDirectory: false))
@@ -77,7 +77,7 @@ public sealed class IgnoreRuleSet
 
         var parts = relativePath.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
         var prefix = "";
-        for (var i = 0; i < parts.Length - 1; i++) // 逐级祖先目录
+        for (var i = 0; i < parts.Length - 1; i++) // Ancestor directories, level by level
         {
             prefix = prefix.Length == 0 ? parts[i] : prefix + "/" + parts[i];
             if (IsIgnored(prefix, isDirectory: true))
@@ -90,7 +90,7 @@ public sealed class IgnoreRuleSet
     private static string GlobToRegex(string glob, bool anchored)
     {
         var sb = new StringBuilder();
-        // 锚定则从根匹配；否则允许任意层级前缀（gitignore：无内部斜杠的模式匹配任意深度）
+        // Anchored means match from the root; otherwise allow a prefix at any level (gitignore: a pattern with no internal slash matches at any depth)
         sb.Append(anchored ? "^" : "^(?:.*/)?");
 
         var i = 0;
@@ -104,17 +104,17 @@ public sealed class IgnoreRuleSet
                     i += 2;
                     if (i < glob.Length && glob[i] == '/')
                     {
-                        sb.Append("(?:.*/)?"); // **/ 跨零或多层目录
+                        sb.Append("(?:.*/)?"); // **/ spans zero or more directory levels
                         i++;
                     }
                     else
                     {
-                        sb.Append(".*"); // ** 跨目录
+                        sb.Append(".*"); // ** spans directories
                     }
                 }
                 else
                 {
-                    sb.Append("[^/]*"); // * 不跨目录
+                    sb.Append("[^/]*"); // * does not span directories
                     i++;
                 }
             }

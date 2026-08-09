@@ -4,8 +4,8 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 执行一个计划任务（M6）：解析目标（单备份或组成员），组内**依次**执行；
-/// 按类型分发到 备份/检查/清理。每个引擎调用在独立 scope 中解析 scoped 服务。
+/// Run one scheduled task (M6): resolve the targets (a single backup, or the members of a group), executing **sequentially** within a group;
+/// dispatch by type to backup/check/cleanup. Each engine call resolves its scoped services inside its own scope.
 /// </summary>
 public sealed class TaskDispatcher(
     IServiceScopeFactory scopes, ILogger<TaskDispatcher> logger, BackupBusyTracker busy, ISecretReader secrets, PathBoundary boundary)
@@ -19,7 +19,7 @@ public sealed class TaskDispatcher(
         {
             ct.ThrowIfCancellationRequested();
 
-            // 目标忙碌（正在备份/检查/还原/清理）→ 记报警并跳过，不打断在执行的任务（用户要求）。
+            // Target busy (backing up / checking / restoring / cleaning up) → log a warning and skip, never interrupt the operation already running (user requirement).
             var activity = task.TaskType switch
             {
                 ScheduledTaskType.Backup => "BackingUp",
@@ -78,16 +78,18 @@ public sealed class TaskDispatcher(
 
         if (!boundary.IsInside(config.LocalRoot))
         {
-            // 有意比上方忙碌跳过（LogWarning）高一级：忙碌是瞬态，下一轮调度大概率自愈；
-            // 根越界是一个持续到操作员改配置为止的站定问题，每一轮调度都会再跳过一次，
-            // 值得用 Error 让它在容器日志聚合/告警里更显眼，而不是被当成普通噪音过滤掉。
+            // Deliberately one level above the busy skip above (LogWarning): busy is transient and the next scheduling round
+            // will most likely heal itself; a root out of bounds is a standing problem that lasts until the operator changes
+            // the config, and every scheduling round skips again, so it deserves an Error to make it stand out in container
+            // log aggregation/alerting instead of being filtered away as ordinary noise.
             logger.LogError(
                 "Scheduled task skipped: local root '{Root}' is outside the configured Backup__Root.",
                 config.LocalRoot);
-            // 与忙碌跳过分支同形（上方 TryAcquire 失败处）：把「这个计划任务没跑」写进操作员能看见的
-            // 操作日志，而不是只留一条容器日志里的 LogError——单用户无人值守部署下没人会去翻它。
-            // 配置本身按设计保留、不删（越界即拒跑，直到操作员修正 LocalRoot 或 Backup__Root），
-            // 消息里带上违规的本地根与当前配置的根，让操作员一眼知道改哪个。
+            // Same shape as the busy-skip branch (the TryAcquire failure above): write "this scheduled task did not run" into
+            // the operation log the operator can actually see, rather than leaving only a LogError in the container log — in a
+            // single-user unattended deployment nobody goes digging through that.
+            // The config itself is kept by design, not deleted (out of bounds means refuse to run, until the operator fixes
+            // LocalRoot or Backup__Root), and the message carries both the offending local root and the currently configured root so the operator sees at a glance which one to change.
             await sp.GetRequiredService<IOperationLog>().AppendAsync(
                 OperationLogLevel.Error, $"schedule:{accountId}/{container}",
                 $"Skipped scheduled {task.TaskType}: local root '{config.LocalRoot}' is outside the configured root '{boundary.ConfiguredRoot}'",
@@ -101,26 +103,26 @@ public sealed class TaskDispatcher(
             switch (task.TaskType)
             {
                 case ScheduledTaskType.Backup:
-                    // 与界面按钮走同一条执行体，这样定时备份也有进度可查。
-                    // 用 RunTrackedAsync 而非 Start：DispatchAsync 已为该目标持有忙碌锁，
-                    // Start 会再抢一次并必然失败，把每一次定时备份都变成「busy」。
+                    // Same execution body as the UI button, so a scheduled backup has progress to inspect too.
+                    // RunTrackedAsync rather than Start: DispatchAsync already holds the busy lock for this target, and
+                    // Start would grab it a second time and inevitably fail, turning every scheduled backup into a "busy".
                     var backupState = await sp.GetRequiredService<BackupRunner>()
                         .RunTrackedAsync(config.Id, ct);
-                    // 执行体吞掉异常、只把失败写进 state，所以这里必须显式抛出，
-                    // 否则下方 catch 不会触发，失败会被 WriteStatusAsync(null) 记成成功。
-                    // 把原始异常挂作 InnerException（Fix 4）：外层 DispatchAsync 的
-                    // LogError(ex, …) 原本收到的是编排器的真实异常——Azure 失败时带着状态码、
-                    // 请求 id 和有用的堆栈；只传消息的话，容器日志里就只剩一个从这里 throw
-                    // 开始的空壳堆栈，对无人值守部署这是最后一道诊断线索，不该丢。
+                    // The execution body swallows exceptions and only writes the failure into state, so we have to throw
+                    // explicitly here, or the catch below never fires and WriteStatusAsync(null) records the failure as success.
+                    // Attach the original exception as InnerException (Fix 4): the outer DispatchAsync's
+                    // LogError(ex, …) used to receive the orchestrator's real exception — on an Azure failure that carries the
+                    // status code, request id and a useful stack; passing only the message would leave the container log with
+                    // nothing but a hollow stack starting at this throw, and for an unattended deployment that is the last diagnostic clue, not something to throw away.
                     if (backupState.Status == RunStatus.Failed)
                         throw new InvalidOperationException(backupState.Error ?? "Backup failed.", backupState.Failure);
-                    // 用户在界面上把这次定时备份停掉了（或进程正在关停）：不是失败，也不是一次
-                    // 成功的备份。直接返回，跳过下面那句「成功落库 Normal」——否则一次被叫停的
-                    // 备份会被记成跑成功了，还会把之前真实的 Error 状态一并抹掉。
+                    // The user stopped this scheduled backup from the UI (or the process is shutting down): that is neither a
+                    // failure nor a successful backup. Return outright and skip the "persist Normal on success" line below —
+                    // otherwise a backup that was called off gets recorded as having run fine, and the genuine earlier Error status gets wiped along with it.
                     if (backupState.Status == RunStatus.Canceled)
                         return;
-                    // 挂起不是失败：抛异常会给这次计划任务记一笔红色错误，而现场其实好端端保着，
-                    // 下一轮会接着跑。与 Canceled 同等处置：安静收场。
+                    // Suspension is not a failure: throwing would log a red error against this scheduled task, while the state
+                    // is in fact safely preserved and the next round picks it back up. Treated the same as Canceled: end quietly.
                     if (backupState.Status == RunStatus.Suspended)
                         return;
                     break;
@@ -131,7 +133,7 @@ public sealed class TaskDispatcher(
                     {
                         Cloud = task.CheckCloudLevel,
                         Local = task.CheckLocalLevel,
-                        // 显式转为 AccessTier?：见 BackupConfigEndpoints.cs /check 端点同处注释（真实生产 bug 修复）。
+                        // Explicit cast to AccessTier?: see the same comment at the /check endpoint in BackupConfigEndpoints.cs (a real production bug fix).
                         RehydrateTier = task.CheckRehydrateTier is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     };
                     var result = await sp.GetRequiredService<BackupChecker>()
@@ -145,20 +147,21 @@ public sealed class TaskDispatcher(
                 case ScheduledTaskType.Cleanup:
                 {
                     var cleanupSettings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);
-                    // 独立跑的清理自己取一个席位：它顺带做的死重压实会往同一块临时盘上写，
-                    // 额度得和正在跑的备份一起均分（备份收尾那条路传的是备份自己的席位）。
+                    // A standalone cleanup takes a seat of its own: the dead-weight compaction it does along the way writes to
+                    // the same temp disk, so the quota has to be shared evenly with any running backup (the backup-teardown path passes the backup's own seat).
                     using var cleanupLease = sp.GetRequiredService<StagingArea>().AcquireLease();
-                    // 独立跑的清理永远做孤儿扫描——它就是干这个的。取消/崩溃留下的块要是没被
-                    // 下一次备份复用掉，就只有这条路会来收。
+                    // A standalone cleanup always sweeps for orphans — that is what it is for. If the blocks left behind by a
+                    // cancel/crash are not reused by the next backup, this is the only path that will ever collect them.
                     var cleanup = await sp.GetRequiredService<RetentionCleaner>().CleanupAsync(
                         account, container, password,
                         BackupRequestMapper.CleanupOf(config, cleanupSettings), ct, cleanupLease,
                         sweepOrphans: true);
-                    // 备份收尾那次清理会把删掉的东西写进成功摘要；独立跑的这一次没有理由更沉默——
-                    // 无人值守部署下，操作日志是回头查"保留策略到底腾出了多少空间"的唯一地方。
-                    // 长存：这条记的是数据被删除，属于审计内容，不该随短存日志 14 天后消失。
-                    // 什么都没清掉时一个字都不写：每晚一条 "retired 0 version(s)" 会让这条信号变成
-                    // 背景噪音，而"任务确实跑过了"另有任务运行记录可查。
+                    // The cleanup at the end of a backup writes what it deleted into the success summary; there is no reason for
+                    // this standalone one to be quieter — in an unattended deployment the operation log is the only place to go
+                    // back and check "how much space did the retention policy actually free up".
+                    // Durable: this records data being deleted, which is audit material and should not disappear along with the ephemeral logs after 14 days.
+                    // Not a word when nothing was cleaned up: a nightly "retired 0 version(s)" would turn this signal into
+                    // background noise, and "the task really did run" can be checked in the task run records instead.
                     if (!cleanup.IsEmpty)
                         await sp.GetRequiredService<IOperationLog>().AppendAsync(
                             OperationLogLevel.Info, $"schedule:{accountId}/{container}",
@@ -169,13 +172,13 @@ public sealed class TaskDispatcher(
         }
         catch (Exception ex)
         {
-            // 落库 Error（决策 2），best-effort：写状态失败不应掩盖原始异常。
-            // 外层 DispatchAsync 的 catch 负责记日志，这里用 `throw;` 保留原始异常与调用栈。
+            // Persist Error (decision 2), best-effort: failing to write the status must not mask the original exception.
+            // The outer DispatchAsync catch does the logging; `throw;` here preserves the original exception and call stack.
             await configs.WriteStatusAsync(config.Id, ex.Message, logger, ct);
             throw;
         }
 
-        // 成功落库 Normal（决策 2），best-effort：写状态失败不应把已成功的运行误判为失败。
+        // Persist Normal on success (decision 2), best-effort: failing to write the status must not misjudge an already-successful run as failed.
         await configs.WriteStatusAsync(config.Id, error: null, logger, ct);
     }
 }

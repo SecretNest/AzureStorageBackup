@@ -3,8 +3,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 流式三段 hash 与分段切分。承重点：<see cref="StreamingHasher"/> 与 <see cref="FileHasher"/>
-/// 必须给出**同一个字符串**——索引里的 hash 两条路径都可能写入，差一点就等于全库比对失效。
+/// Streaming three-segment hashing and segment splitting. The load-bearing point: <see cref="StreamingHasher"/> and
+/// <see cref="FileHasher"/> must produce the **same string** — hashes in the index can be written by either path, and being off by even a little means comparison across the whole store stops working.
 /// </summary>
 public sealed class StreamingHashTests : IDisposable
 {
@@ -22,7 +22,7 @@ public sealed class StreamingHashTests : IDisposable
     }
 
     [Theory]
-    // 尺寸有意跨过 head/tail 段长（64）的两侧，并覆盖空文件与恰好等长的情形。
+    // The sizes deliberately straddle both sides of the head/tail segment length (64), and cover the empty file and exact-length cases.
     [InlineData(0, 64)]
     [InlineData(1, 64)]
     [InlineData(63, 64)]
@@ -42,7 +42,7 @@ public sealed class StreamingHashTests : IDisposable
         var expectedTail = await file.TailHashAsync(path, segmentBytes);
         var expectedFull = await file.FullHashAsync(path);
 
-        // 分块喂入，块长故意与段长不成整数倍，逼环形缓冲走上"跨越回绕"的分支。
+        // Fed in chunks whose lengths are deliberately not integer multiples of the segment length, to force the ring buffer down its "wraps around" branch.
         var streaming = new StreamingHasher(segmentBytes, segmentBytes);
         var offset = 0;
         var chunk = 7;
@@ -106,7 +106,7 @@ public sealed class StreamingHashTests : IDisposable
         var got = new Dictionary<string, (long Length, string Hash)>(StringComparer.Ordinal);
         var splitter = new SegmentHashingStream(segments, (n, l, h) => got[n] = (l, h));
         await using (var source = new MemoryStream(payload))
-            await source.CopyToAsync(splitter, bufferSize: 13); // 小块，故意与段界错开
+            await source.CopyToAsync(splitter, bufferSize: 13); // Small chunks, deliberately misaligned with the segment boundaries
         splitter.Finish();
 
         Assert.Equal(0, splitter.ExtraBytes);
@@ -142,7 +142,7 @@ public sealed class StreamingHashTests : IDisposable
             await source.CopyToAsync(splitter);
         splitter.Finish();
 
-        // "b" 只收到 6 字节，没填满就不该被当作已核对过 —— 调用方查不到即视为不符。
+        // "b" only received 6 bytes; unfilled, it must not count as verified — the caller treats a lookup miss as a mismatch.
         Assert.Equal(["a"], got);
         Assert.Equal(1, splitter.CompletedSegments);
     }

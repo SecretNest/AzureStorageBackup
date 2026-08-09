@@ -4,30 +4,31 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Models;
 
 /// <summary>
-/// 7z 进程的 CPU 优先级档位。
+/// CPU priority tiers for the 7z process.
 /// <para>
-/// <b>Lowest 必须是 0。</b>加列时 EF 给既有行填的就是 0，这样老库升级后天然落在"最低"上，
-/// 与新库的默认值一致。反面教材是 StagedLimitBytes / ProcessingMaxAttempts：它们的合法默认
-/// 不是 0，于是 <see cref="Services.GlobalSettingsService"/> 里至今留着一段"读到 0 就换回默认值"
-/// 的补丁。把 Lowest 定成 0 就不必再欠这笔账。
+/// <b>Lowest must be 0.</b> When the column was added, EF backfilled existing rows with 0, so an upgraded
+/// old database naturally lands on "lowest", matching a fresh database's default. The cautionary tale is
+/// StagedLimitBytes / ProcessingMaxAttempts: their legal defaults are not 0, so <see cref="Services.GlobalSettingsService"/>
+/// still carries a "read 0, swap back to the default" patch to this day. Pinning Lowest at 0 avoids that debt.
 /// </para>
-/// <para>不提供"高于正常"：Linux 上提升优先级要特权，而让压缩抢在 Web 界面前面，
-/// 对一个背景备份程序来说只有坏处。</para>
+/// <para>No "above normal" is offered: raising priority on Linux takes privileges, and letting compression
+/// cut ahead of the web UI has nothing but downsides for a background backup program.</para>
 /// </summary>
 public enum SevenZipCpuPriority
 {
-    /// <summary>Linux nice 19。只吃别人不要的那部分 CPU。</summary>
+    /// <summary>Linux nice 19. Eats only the CPU nobody else wants.</summary>
     Lowest = 0,
-    /// <summary>Linux nice 10。</summary>
+    /// <summary>Linux nice 10.</summary>
     BelowNormal = 1,
-    /// <summary>Linux nice 0，与其它进程平等争抢。</summary>
+    /// <summary>Linux nice 0, competing on equal terms with every other process.</summary>
     Normal = 2,
 }
 
 public static class SevenZipCpuPriorityExtensions
 {
-    /// <summary>映射到进程优先级。落到 default 的（数据库里存了个不认识的值）一律按最低走：
-    /// 认不出来时压慢一点是小事，把机器卡住不是。</summary>
+    /// <summary>Map to a process priority. Anything falling through to default (an unrecognized value stored in
+    /// the database) goes to lowest: compressing a bit slower when we can't tell is a small thing, wedging the
+    /// machine is not.</summary>
     public static ProcessPriorityClass ToProcessPriorityClass(this SevenZipCpuPriority priority) => priority switch
     {
         SevenZipCpuPriority.Normal => ProcessPriorityClass.Normal,
@@ -37,13 +38,13 @@ public static class SevenZipCpuPriorityExtensions
 }
 
 /// <summary>
-/// 全局设置（单例，Id=1）。新建备份的默认值（PRD §11「使用默认」）+ 全局项（日志保留、并发）。
+/// Global settings (singleton, Id=1). Defaults for new backups (PRD §11 "use default") + global items (log retention, concurrency).
 /// </summary>
 public class GlobalSettings
 {
     public int Id { get; set; }
 
-    // 新建备份默认
+    // Defaults for new backups
     public StorageTier DefaultIndexTier { get; set; } = StorageTier.Hot;
     public StorageTier DefaultDataTier { get; set; } = StorageTier.Archive;
     public int DefaultMaxVersions { get; set; } = 100;
@@ -52,17 +53,17 @@ public class GlobalSettings
     public long DefaultSingleFileThresholdBytes { get; set; } = 5 * 1024 * 1024;
     public long DefaultGroupCapBytes { get; set; } = 100 * 1024 * 1024;
 
-    /// <summary>目标包尺寸（默认 100M）作为压缩分卷大小（PRD 3.3.2.3）；0/null=不分卷。</summary>
+    /// <summary>The target pack size (default 100M) doubles as the compression volume size (PRD 3.3.2.3); 0/null = no splitting.</summary>
     public long? DefaultVolumeBytes { get; set; } = 100 * 1024 * 1024;
 
-    // 死重压实（仅分组 pack 用到）：按数据 tier 决定重 pack 时若本地缺失成员是否允许下载云端 pack 补齐。
-    // 优先用本地文件（内容一致者）；本地缺失且此开关为假则放弃该 pack 的重打包。Archive 默认 false（避免高成本取回/rehydrate）。
+    // Dead-weight compaction (grouped packs only): per data tier, decides whether a repack may download the cloud pack to fill in members missing locally.
+    // Local files (with matching content) are preferred; if a member is missing locally and this switch is false, the repack of that pack is abandoned. Archive defaults to false (avoids costly retrieval/rehydrate).
     public bool RepackDownloadHot { get; set; } = true;
     public bool RepackDownloadCool { get; set; } = true;
     public bool RepackDownloadCold { get; set; } = true;
     public bool RepackDownloadArchive { get; set; }
 
-    /// <summary>某数据 tier 在死重重 pack 时是否允许下载云端 pack 补齐本地缺失成员。</summary>
+    /// <summary>Whether a given data tier may download the cloud pack to fill in locally missing members during a dead-weight repack.</summary>
     public bool RepackDownloadAllowed(StorageTier tier) => tier switch
     {
         StorageTier.Cool => RepackDownloadCool,
@@ -75,59 +76,63 @@ public class GlobalSettings
     public string? DefaultDontCompressRules { get; set; }
     public string? DefaultDontGroupRules { get; set; }
 
-    /// <summary>跨路径打包规则的全局默认（gitignore 语法）。空 = 全部按目录打包。</summary>
+    /// <summary>Global default for cross-path grouping rules (gitignore syntax). Empty = group strictly by directory.</summary>
     public string? DefaultCrossDirGroupRules { get; set; }
 
-    // 全局
+    // Global
     public int UploadConcurrency { get; set; } = 5;
-    public int DownloadConcurrency { get; set; } = 5; // 还原/深度检查下载并发（PRD 3.4）
+    public int DownloadConcurrency { get; set; } = 5; // Download concurrency for restore / deep check (PRD 3.4)
 
-    /// <summary>短存(debug/info)日志保留天数（PRD 3.6，默认 14）。长存审计日志不受此限。</summary>
+    /// <summary>Retention in days for ephemeral (debug/info) logs (PRD 3.6, default 14). Durable audit logs are not subject to it.</summary>
     public int LogEphemeralMaxAgeDays { get; set; } = 14;
 
-    /// <summary>新建备份默认是否写 debug 级日志（含操作文件名）。默认关（可按备份单独开启）。</summary>
+    /// <summary>Whether new backups write debug-level logs (which include operated file names) by default. Off by default (can be turned on per backup).</summary>
     public bool DefaultVerboseLogging { get; set; }
 
-    // 网络重试退避（PRD 4.1）：逗号分隔的秒序列 + 总时长上限（分钟）。
-    // 默认 5s、30s、90s、300s，之后每 300s（= 序列最后一项），累计上限 2h。
+    // Network retry backoff (PRD 4.1): a comma-separated sequence of seconds + a total time cap (in minutes).
+    // Defaults to 5s, 30s, 90s, 300s, then every 300s (= the last entry of the sequence), capped at 2h in total.
     public string RetryBackoffSeconds { get; set; } = "5,30,90,300";
     public int RetryMaxTotalMinutes { get; set; } = 120;
 
-    // 死重压实阈值（PRD 3.3.3.4，M4 §6）：pack 死重比例超过此百分比时原地重压回收空间。
+    // Dead-weight compaction threshold (PRD 3.3.3.4, M4 §6): when a pack's dead-weight ratio exceeds this percentage, repack it in place to reclaim space.
     public int DeadWeightThresholdPercent { get; set; } = 30;
 
-    /// <summary>压缩临时区（staged-temp）字节上限，背压阈值（决策 4，可经 Settings 实时改）。默认 2GB。</summary>
+    /// <summary>Byte cap on the compression staging area (staged-temp), the backpressure threshold (decision 4, changeable live via Settings). Default 2GB.</summary>
     public long StagedLimitBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 
-    /// <summary>压缩后重校验中，同一个成员反复变化时的重处理次数上限（PRD §5.1，M4 §9，默认 5）。</summary>
+    /// <summary>Cap on reprocessing attempts when the same member keeps changing during post-compression re-verification (PRD §5.1, M4 §9, default 5).</summary>
     public int ProcessingMaxAttempts { get; set; } = 5;
 
     /// <summary>
-    /// 备份时差分与「压缩+上传」是否重叠跑（默认开）。开着时网络不必等哈希全部跑完；
-    /// 代价是差分的读与压缩的读同时压在一块盘上。机械盘的 NAS 上两股读可能互相拖慢到得不偿失，
-    /// 那种情况下关掉它，回到"先全部判完再传"。
+    /// Whether diffing and "compress + upload" overlap during a backup (on by default). With it on, the network
+    /// doesn't have to wait for all hashing to finish; the price is that diff reads and compression reads land on the
+    /// same disk at once. On a NAS with spinning disks the two read streams can drag each other down enough to not be
+    /// worth it — turn it off in that case and go back to "decide everything first, then upload".
     /// </summary>
     public bool OverlapDiffAndUpload { get; set; } = true;
 
     /// <summary>
-    /// 重启后自动接着跑上次被打断的备份（默认开）。为计划内重启与升级准备的：
-    /// 停机把运行挂起落盘，起来再自己接上，中间不需要人来点一下。
+    /// Automatically resume the last interrupted backup after a restart (on by default). Built for planned restarts
+    /// and upgrades: shutdown suspends the run to disk, startup picks it back up, nobody clicks anything in between.
     /// <para>
-    /// 判据窄得刻意：只有挂起标记写着 <see cref="SuspendReason.ShuttingDown"/> 的那种才自动接，
-    /// 因为只有它明确意味着"是这个进程自己计划内退出把它停在这儿的"。用户按的暂停、闸门降级、
-    /// 以及**没有标记**的那一大类（崩溃、被 kill、关机等落盘超时、操作员按的取消）一律不碰——
-    /// 没有标记说明不了"这是意外"，它同样可能是一次取消，而替用户重开他刚取消掉的运行，
-    /// 比不接着跑要糟得多。那几种都留着 Run 按钮等人来点。
+    /// The criterion is deliberately narrow: only a run whose suspend marker reads <see cref="SuspendReason.ShuttingDown"/>
+    /// is resumed automatically, because only that one unambiguously means "this process's own planned exit stopped it
+    /// here". A user-pressed pause, a gate downgrade, and the whole class with **no marker at all** (crash, killed,
+    /// shutdown flush timeout, operator-pressed cancel) are all left alone — the absence of a marker does not establish
+    /// "this was an accident", it could just as easily have been a cancel, and reopening a run the user just canceled is
+    /// far worse than not resuming it. All of those keep the Run button waiting for a human.
     /// </para>
     /// </summary>
     public bool AutoResumeInterruptedRuns { get; set; } = true;
 
     /// <summary>
-    /// 7z 进程的 CPU 优先级，默认最低。压缩与解压是这个程序唯一会把 CPU 吃满的动作，
-    /// 而它跑在一台还有别的东西在跑的机器上——备份慢一点没人会注意，机器卡住会。
+    /// CPU priority for the 7z process, lowest by default. Compression and decompression are the only things this
+    /// program does that will saturate a CPU, and it runs on a machine with other things running too — nobody notices a
+    /// slower backup, everybody notices the machine seizing up.
     /// <para>
-    /// 与 <c>Backup__SevenZipMethodArgs</c> 里的 <c>-mmt=N</c> 是两件事：限线程降的是并行度，
-    /// 这里降的是争抢时的排队权重。单线程满载一样能让界面卡顿，那种情况只有优先级救得了。
+    /// A different thing from <c>-mmt=N</c> in <c>Backup__SevenZipMethodArgs</c>: capping threads lowers parallelism,
+    /// this lowers the queueing weight under contention. A single saturated thread can still make the UI stutter, and
+    /// priority is the only thing that helps there.
     /// </para>
     /// </summary>
     public SevenZipCpuPriority SevenZipPriority { get; set; } = SevenZipCpuPriority.Lowest;

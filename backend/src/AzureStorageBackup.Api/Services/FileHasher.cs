@@ -5,36 +5,38 @@ using Microsoft.Win32.SafeHandles;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 文件两级哈希。用 XxHash128（非加密、极快、16 字节）——比 SHA-256 更快更短以减小索引体积；
-/// 128 位对个人备份规模的内容寻址去重碰撞概率可忽略（远优于 CRC）。
-/// headHash 覆盖文件头部一小段用于 diff 快速预筛；fullHash 覆盖整文件，兼作去重键。
+/// Two-level file hashing. Uses XxHash128 (non-cryptographic, extremely fast, 16 bytes) — faster and shorter than SHA-256, which keeps the index smaller;
+/// at 128 bits the content-addressed dedup collision probability is negligible at personal-backup scale (far better than CRC).
+/// headHash covers a small leading segment of the file for fast diff prefiltering; fullHash covers the whole file and doubles as the dedup key.
 /// </summary>
 public interface IFileHasher
 {
     Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default);
 
-    /// <summary>文件末段（最多 tailBytes 字节）的 hash。与 headHash 一起作为去重碰撞检测的强化元数据：
-    /// 内容不同却 fullHash+长度+头 全等的残余碰撞，若差异不在文件中段即可被尾部 hash 识破。</summary>
+    /// <summary>Hash of the file's tail segment (at most tailBytes bytes). Together with headHash it is the hardening metadata for dedup collision detection:
+    /// a residual collision where the content differs yet fullHash + length + head all match is caught by the tail hash, as long as the difference is not in the middle of the file.</summary>
     Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default);
 
     /// <param name="onRead">
-    /// 已读字节的回报（增量）。算一个大文件的全文 hash 要把它整个读一遍——NAS 上一个 10 GB 的
-    /// 文件就是十几秒，而差异检测**必须**读全（length 相同、mtime 变了时，只有全文 hash 能分辨
-    /// "内容真变了"和"只是被 touch 了一下"）。不报进度的话，界面上就是一个静止的文件名，
-    /// 与挂死一模一样。
+    /// Reporting of bytes read (incremental). Computing a large file's full hash means reading the whole thing — a 10 GB file
+    /// on a NAS is a dozen-odd seconds, and change detection **has to** read all of it (when the length is the same but mtime
+    /// changed, only the full hash can tell "the content really changed" from "it was just touched"). Without progress
+    /// reporting, the UI shows a motionless file name, indistinguishable from a hang.
     /// </param>
     Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null);
 
     /// <summary>
-    /// 一遍读算出完整的内容身份（三段 hash + 长度）。
+    /// Compute the complete content identity (three-segment hash + length) in a single read pass.
     /// <para>
-    /// 分三次各读一遍是白付两趟 IO：全文那一遍本来就路过了头和尾。差分阶段判一个变更文件
-    /// 从前要打开同一个文件三次，首次备份几十万个小文件就是几十万次多余的 open + seek——
-    /// 在机械盘的 NAS 上这不是小数。
+    /// Reading three separate times pays for two extra IO passes for nothing: the full-file pass already goes past the head
+    /// and the tail. Judging one changed file in the diff stage used to open the same file three times, so a first backup of
+    /// a few hundred thousand small files meant a few hundred thousand redundant open + seek calls — on a NAS with spinning
+    /// disks that is not a small number.
     /// </para>
     /// <para>
-    /// 默认实现照旧分三次调，好让测试里的假 hasher 不必各自重写一遍（它们靠拦截这三个方法
-    /// 来模拟"读不开"，语义必须原样保留）。真实现（<see cref="FileHasher"/>）覆写成一遍读。
+    /// The default implementation still makes three calls, so the fake hashers in the tests don't each have to override it
+    /// (they intercept these three methods to simulate "can't be opened", and that semantics must be preserved verbatim).
+    /// The real implementation (<see cref="FileHasher"/>) overrides it to a single read pass.
     /// </para>
     /// </summary>
     async Task<ContentIdentity> ContentIdentityAsync(
@@ -45,7 +47,7 @@ public interface IFileHasher
             new FileInfo(path).Length);
 }
 
-/// <summary>一遍读得到的内容身份：三段 hash + 长度。去重与碰撞判定的四项依据。</summary>
+/// <summary>The content identity obtained in a single read pass: three-segment hash + length. The four pieces of evidence behind dedup and collision decisions.</summary>
 public sealed record ContentIdentity(string FullHash, string HeadHash, string TailHash, long Length);
 
 public sealed class FileHasher : IFileHasher
@@ -94,12 +96,12 @@ public sealed class FileHasher : IFileHasher
         while ((read = await stream.ReadAsync(buffer, ct)) > 0)
         {
             hash.Append(buffer.AsSpan(0, read));
-            onRead?.Report(read);   // 增量：调用方按需累加，不必知道从哪一块开始
+            onRead?.Report(read);   // Incremental: the caller accumulates as it sees fit, without needing to know which chunk it started at
         }
         return Format(hash.GetCurrentHash());
     }
 
-    /// <summary>一遍读：字节同时喂进三段 hasher，头和尾都是这一趟顺路取的。</summary>
+    /// <summary>Single read pass: the bytes are fed into all three segment hashers at once, with head and tail picked up along the way.</summary>
     public async Task<ContentIdentity> ContentIdentityAsync(
         string path, int segmentBytes, CancellationToken ct = default)
     {
@@ -113,24 +115,25 @@ public sealed class FileHasher : IFileHasher
     }
 
     /// <summary>
-    /// 打开待哈希的文件。Unix 上**必须**用 O_NONBLOCK。
+    /// Open a file for hashing. On Unix, O_NONBLOCK is **mandatory**.
     /// <para>
-    /// 一个 FIFO（命名管道）会让常规的 <c>File.OpenRead</c> **永久阻塞**在 open() 里等待写入端。
-    /// 那是阻塞在系统调用中，<c>CancellationToken</c> 够不着：整轮备份就此挂死、无法取消，
-    /// 忙碌锁被永久占用，该配置此后拒绝一切操作、定时任务全部跳过，界面上只剩一个不动的百分比。
-    /// 而 .NET 在 Unix 上**无法**把它认出来——实测 FIFO 的 <c>FileAttributes</c> 同样是 Normal、
-    /// <c>Length</c> 同样是 0，与普通空文件毫无差别。
+    /// A FIFO (named pipe) makes an ordinary <c>File.OpenRead</c> **block forever** inside open(), waiting for a writer.
+    /// That block sits inside a syscall where <c>CancellationToken</c> cannot reach it: the whole backup run wedges and cannot
+    /// be canceled, the busy lock is held forever, that config then refuses every operation, all its scheduled tasks are
+    /// skipped, and the UI is left with a percentage that never moves. And .NET on Unix **cannot** recognize one — measured:
+    /// a FIFO's <c>FileAttributes</c> is likewise Normal and its <c>Length</c> is likewise 0, indistinguishable from an ordinary empty file.
     /// </para>
     /// <para>
-    /// 所以：非阻塞打开使 FIFO 立即返回而不是挂住，再用 <c>CanSeek</c> 把它与普通文件区分开
-    /// （普通文件——含空文件——恒为 true，FIFO/管道为 false；socket 更早一步，open 直接以 ENXIO 失败）。
-    /// 判为非普通文件就抛 IOException，落进既有的「读不开」处理：不进上传计划，
-    /// 因此 7z 也永远不会去打开它——7z 是独立进程、不带这个标志，一旦碰上会同样挂住。
-    /// O_NONBLOCK 对普通文件的读取语义没有影响（POSIX 保证），所以正常路径分毫不变。
+    /// So: a non-blocking open makes a FIFO return immediately instead of hanging, and <c>CanSeek</c> then tells it apart from
+    /// an ordinary file (ordinary files — empty ones included — are always true, FIFOs/pipes are false; sockets fail a step
+    /// earlier, with open failing outright as ENXIO). Anything judged not to be a regular file throws IOException and falls
+    /// into the existing "can't be opened" handling: it never enters the upload plan, and therefore 7z never opens it either —
+    /// 7z is a separate process without this flag, and would hang just the same if it ran into one.
+    /// O_NONBLOCK has no effect on read semantics for regular files (guaranteed by POSIX), so the normal path is untouched.
     /// </para>
     /// <para>
-    /// 公开出去（<see cref="OpenRead"/>）是因为流式备份也要读源文件：一条 FIFO 对它同样是死局，
-    /// 而"读源文件"这件事在项目里必须只有一种打开方式，否则这道保护迟早会被绕过去一次。
+    /// It is exposed publicly (<see cref="OpenRead"/>) because streaming backup reads the source files too: a FIFO is just as
+    /// fatal there, and "reading a source file" must have exactly one way of opening in this project, or this protection will get bypassed sooner or later.
     /// </para>
     /// </summary>
     public static FileStream OpenRead(string path) => Open(path);
@@ -149,7 +152,7 @@ public sealed class FileHasher : IFileHasher
         if (stream.CanSeek)
             return stream;
 
-        // 管道/FIFO 这类不可定位的东西：它没有「文件内容」可言，读它只会等一个可能永不到来的写入端。
+        // Non-seekable things like pipes/FIFOs: there is no "file content" to speak of, and reading one only waits for a writer that may never come.
         stream.Dispose();
         throw new IOException($"'{path}' is not a regular file (named pipe, device or similar).");
     }

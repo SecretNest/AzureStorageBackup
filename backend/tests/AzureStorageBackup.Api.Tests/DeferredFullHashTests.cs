@@ -5,10 +5,11 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 单文件 blob 的全文 hash 延后到压缩那一遍再算之后，索引里记下的必须仍然是**真正压进归档的那些
-/// 字节**的 hash。索引 hash 一旦错了不会当场报错：这一轮照样"成功"，直到下一轮 diff 拿它比对、
-/// 或者还原时按 <c>data/{hash}</c> 去取，才会发现指向的 blob 不存在。所以这里把三条压缩路径
-/// （正常压缩 / 不压缩直传 / 加密）和几种变更判定都跑一遍真备份，逐条核对索引 hash。
+/// Now that a single-file blob's full hash is deferred to the compression pass, what gets recorded in the index must still be the
+/// hash of **the bytes actually compressed into the archive**. A wrong index hash raises no error at the time: this run still
+/// "succeeds", and only when the next run's diff compares against it, or a restore fetches <c>data/{hash}</c>, does the blob it
+/// points at turn out not to exist. So this runs real backups over all three compression paths (normal compression / raw
+/// passthrough / encrypted) and several change verdicts, checking the index hashes one entry at a time.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class DeferredFullHashTests : IDisposable
@@ -78,7 +79,7 @@ public sealed class DeferredFullHashTests : IDisposable
             Options = options, Password = password,
         };
 
-    /// <summary>索引里每一条的 FullHash 都必须等于源文件此刻真实的 hash。</summary>
+    /// <summary>Every entry's FullHash in the index must equal the source file's real hash right now.</summary>
     private async Task AssertIndexHashesAreRealAsync(VersionIndex idx)
     {
         var hasher = new FileHasher();
@@ -92,9 +93,9 @@ public sealed class DeferredFullHashTests : IDisposable
     }
 
     /// <summary>
-    /// 三条压缩路径一次跑齐：正常 7z 压缩的单文件、命中不压缩列表因而原样直传（raw）的单文件、
-    /// 以及合并进 pack 的小文件。三条路都走 <c>StreamAndStageAsync</c> 那一遍读算 hash，
-    /// 但只有前两条属于"延后"的范围——pack 成员的 hash 装箱时就要写进成员表，没有第二次机会补算。
+    /// All three compression paths in one run: a single file compressed normally by 7z, a single file that hits the don't-compress
+    /// list and is therefore uploaded as-is (raw), and small files merged into a pack. All three go through the single read pass in
+    /// <c>StreamAndStageAsync</c> that computes the hash, but only the first two fall within the scope of the "deferral" — a pack member's hash has to be written into the member table at boxing time, with no second chance to fill it in later.
     /// </summary>
     [SkippableFact]
     public async Task Index_Hashes_Are_Real_Across_Compressed_Raw_And_Packed_Paths()
@@ -111,10 +112,10 @@ public sealed class DeferredFullHashTests : IDisposable
 
         try
         {
-            Write("big.bin", 40_000);              // 单文件 + 正常压缩
-            Write("raw/movie.mkv", 40_000);        // 单文件 + 不压缩直传
+            Write("big.bin", 40_000);              // Single file + normal compression
+            Write("raw/movie.mkv", 40_000);        // Single file + raw passthrough, no compression
             for (var i = 0; i < 4; i++)
-                Write($"docs/f{i}.txt", 2_000);    // 打包
+                Write($"docs/f{i}.txt", 2_000);    // Packed
 
             var options = new BackupEngineOptions
             {
@@ -126,7 +127,7 @@ public sealed class DeferredFullHashTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 先确认这份数据真的把三条路都走到了，否则下面的断言可能只是在验一条路。
+            // First confirm this data really did exercise all three paths, or the assertions below might be checking just one of them.
             var single = idx.Entries.Where(e => e.Storage!.Kind == "blob").ToList();
             Assert.Equal(["big.bin", "raw/movie.mkv"], single.Select(e => e.Path).Order(StringComparer.Ordinal));
             Assert.True(single.Single(e => e.Path == "raw/movie.mkv").Storage!.Raw, "raw passthrough expected");
@@ -135,7 +136,7 @@ public sealed class DeferredFullHashTests : IDisposable
 
             await AssertIndexHashesAreRealAsync(idx);
 
-            // 未加密时地址就是内容地址：hash 错了这里立刻穿帮，blob 也会指不到。
+            // Unencrypted, the address is the content address: a wrong hash gives itself away right here, and the blob won't resolve either.
             foreach (var e in single)
             {
                 Assert.Equal("data/" + e.FullHash, e.Storage!.Ref);
@@ -146,9 +147,9 @@ public sealed class DeferredFullHashTests : IDisposable
     }
 
     /// <summary>
-    /// 加密时 blob 名是 <c>HMAC(key, fullHash)</c>（防止拿公开文件的 hash 反推容器里有什么），
-    /// 于是"地址对不对"不再能直接看出 hash 对不对——索引里的 FullHash 是唯一的真相来源，
-    /// 下一轮 diff 和还原都靠它。这条路正是用户实际在跑的配置。
+    /// When encrypted, the blob name is <c>HMAC(key, fullHash)</c> (which stops anyone deducing the container's contents from the
+    /// hashes of publicly available files), so "is the address right" no longer tells you directly whether the hash is right — the
+    /// FullHash in the index is the only source of truth, and both the next run's diff and restore depend on it. This path is exactly the configuration the user actually runs.
     /// </summary>
     [SkippableFact]
     public async Task Index_Hashes_Are_Real_When_The_Backup_Is_Encrypted()
@@ -167,7 +168,7 @@ public sealed class DeferredFullHashTests : IDisposable
         try
         {
             Write("big.bin", 40_000);
-            Write("raw/movie.mkv", 40_000); // 加密时"不压缩"仍要过 7z——绝不能把明文直传上去
+            Write("raw/movie.mkv", 40_000); // When encrypted, "don't compress" still goes through 7z — plaintext must never be uploaded directly
             for (var i = 0; i < 3; i++)
                 Write($"docs/f{i}.txt", 2_000);
 
@@ -186,7 +187,7 @@ public sealed class DeferredFullHashTests : IDisposable
             foreach (var e in idx.Entries.Where(e => e.Storage!.Kind == "blob"))
             {
                 Assert.False(e.Storage!.Raw, "encrypted backups must never store plaintext raw");
-                Assert.NotEqual("data/" + e.FullHash, e.Storage.Ref); // 地址被 HMAC 打散了
+                Assert.NotEqual("data/" + e.FullHash, e.Storage.Ref); // The address has been scrambled by the HMAC
                 Assert.True(await container.GetBlobClient(e.Storage.Ref).ExistsAsync(), e.Storage.Ref);
             }
         }
@@ -194,9 +195,9 @@ public sealed class DeferredFullHashTests : IDisposable
     }
 
     /// <summary>
-    /// 第二轮：延后算出来的 hash 写进索引之后，必须能被下一轮 diff 当作可信基准用。
-    /// 这是索引 hash 出错时最先暴露、也最贵的地方——比对不上就把没变的文件整份重传一遍。
-    /// 四种判定各来一个：完全没动、只碰 mtime、同长度改内容、改长度。
+    /// Second run: once the deferred hashes are written into the index, the next run's diff has to be able to use them as a
+    /// trustworthy baseline. This is where a wrong index hash surfaces first and costs the most — a failed comparison re-uploads
+    /// unchanged files in full. One of each of the four verdicts: untouched, mtime only, same length with changed content, changed length.
     /// </summary>
     [SkippableFact]
     public async Task The_Next_Run_Can_Trust_The_Deferred_Hashes()
@@ -225,20 +226,20 @@ public sealed class DeferredFullHashTests : IDisposable
             var first = await Build(factory, store).RunAsync(Request(account, name, options));
             Assert.Equal(4, first.ChangedFiles);
 
-            // 什么都没动的那个：连打开都不该打开。
+            // The one nothing was done to: it should not even be opened.
             _ = untouched;
-            // 只把 mtime 往前推：内容一个字节没变 → 必须判成 MetadataOnly，不重传。
+            // Only push mtime forward: not one byte of content changed → must be judged MetadataOnly, no re-upload.
             File.SetLastWriteTimeUtc(touched, File.GetLastWriteTimeUtc(touched).AddMinutes(5));
-            // 同长度换内容：只有全文 hash 能发现。
+            // Same length, different content: only the full hash can catch it.
             var sameLength = new byte[40_000];
             Random.Shared.NextBytes(sameLength);
             File.WriteAllBytes(rewritten, sameLength);
-            // 长度变了：靠长度就能判，不必读全文。
+            // Length changed: the length alone decides it, no need to read the whole file.
             File.WriteAllBytes(grown, new byte[50_000]);
 
             var second = await Build(factory, store).RunAsync(Request(account, name, options));
 
-            // 只有后两个算变更。第一轮的 hash 若有一个不对，untouched/touched 会跟着一起被重传。
+            // Only the last two count as changed. If even one hash from the first run is wrong, untouched/touched get re-uploaded along with them.
             Assert.Equal(2, second.ChangedFiles);
 
             var info = await store.ReadInfoAsync(account, name, null);

@@ -67,12 +67,12 @@ public sealed class FileHasherTests : IDisposable
     }
 
     /// <summary>
-    /// 一个 FIFO 会让常规的 File.OpenRead **永久阻塞**在 open() 里等待写入端，而那是阻塞在系统调用中、
-    /// CancellationToken 够不着——整轮备份挂死且无法取消，忙碌锁被永久占用，界面只剩一个不动的百分比。
-    /// .NET 认不出它：FileAttributes 同样是 Normal、Length 同样是 0，与普通空文件毫无差别。
-    /// <para>必须以「读不开」失败，而不是挂住，也不能被当成空文件——当成空文件的话它会进上传计划，
-    /// 7z 再去打开它时同样会挂（那是独立进程，不带 O_NONBLOCK）。</para>
-    /// <para>测试自带超时：修复前这里会永久挂起，没有超时就会把整个测试套件一起拖死。</para>
+    /// A FIFO makes an ordinary File.OpenRead **block forever** inside open() waiting for a writer, and that block sits inside a
+    /// syscall out of CancellationToken's reach — the whole backup run wedges and cannot be canceled, the busy lock is held forever, and the UI is left with a percentage that never moves.
+    /// .NET cannot recognize one: FileAttributes is likewise Normal and Length is likewise 0, indistinguishable from an ordinary empty file.
+    /// <para>It has to fail as "can't be opened" rather than hang, and must not be treated as an empty file either — treated as an
+    /// empty file it would enter the upload plan, and 7z would hang just the same when it went to open it (a separate process, without O_NONBLOCK).</para>
+    /// <para>The test carries its own timeout: before the fix this hangs forever, and without a timeout it would drag the entire test suite down with it.</para>
     /// </summary>
     [SkippableFact]
     public async Task A_Named_Pipe_Fails_To_Read_Instead_Of_Hanging_Forever()
@@ -85,7 +85,7 @@ public sealed class FileHasherTests : IDisposable
             await mkfifo.WaitForExitAsync();
             Skip.If(mkfifo.ExitCode != 0, "mkfifo unavailable.");
         }
-        Assert.True(File.Exists(fifo)); // 对 .NET 来说它就是个「文件」——这正是问题所在
+        Assert.True(File.Exists(fifo)); // As far as .NET is concerned it is just a "file" — which is precisely the problem
 
         var hasher = new FileHasher();
         var attempt = Task.Run(() => hasher.FullHashAsync(fifo));
@@ -95,8 +95,8 @@ public sealed class FileHasherTests : IDisposable
         await Assert.ThrowsAnyAsync<IOException>(() => attempt);
     }
 
-    /// <summary>上一条的对照：空的**普通**文件与 FIFO 在 .NET 眼里长得一样（Normal、Length 0），
-    /// 所以修复必须靠 CanSeek 而不是靠长度——否则会把普通空文件一并判成读不开。</summary>
+    /// <summary>The control for the case above: an empty **regular** file and a FIFO look identical to .NET (Normal, Length 0),
+    /// so the fix has to rest on CanSeek rather than on length — otherwise ordinary empty files get judged unreadable along with it.</summary>
     [Fact]
     public async Task An_Empty_Regular_File_Still_Hashes_Normally()
     {

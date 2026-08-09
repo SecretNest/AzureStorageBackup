@@ -27,7 +27,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         _connection.Dispose();
     }
 
-    /// <summary>记录 ReadIndexAsync 调用次数、可返回指定索引的假 store。</summary>
+    /// <summary>A fake store that counts ReadIndexAsync calls and hands back a supplied index.</summary>
     private sealed class FakeStore(VersionIndex index) : IBackupInfoStore
     {
         public int Reads { get; private set; }
@@ -70,7 +70,7 @@ public sealed class LocalIndexCacheTests : IDisposable
 
         Assert.Equal("a.txt", first.Entries[0].Path);
         Assert.Equal("a.txt", second.Entries[0].Path);
-        Assert.Equal(1, store.Reads); // 第二次命中本地，不再下载
+        Assert.Equal(1, store.Reads); // The second read hits locally, no further download
     }
 
     [Fact]
@@ -83,7 +83,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         var got = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 100, "indexes/v1.bin", null);
 
         Assert.Equal("a.txt", got.Entries[0].Path);
-        Assert.Equal(0, store.Reads); // 完全没下载
+        Assert.Equal(0, store.Reads); // No download at all
     }
 
     [Fact]
@@ -92,13 +92,13 @@ public sealed class LocalIndexCacheTests : IDisposable
         var store = new FakeStore(Index(1, "cloud.txt"));
         var cache = new LocalIndexCache(_db, store);
 
-        await cache.PutAsync(1, "c", 1, identityTicks: 100, Index(1, "stale.txt")); // 旧身份
-        // container 重建 → 新身份 200：缓存失效，重新下载云端。
+        await cache.PutAsync(1, "c", 1, identityTicks: 100, Index(1, "stale.txt")); // Old identity
+        // Container rebuilt → new identity 200: the cache entry is stale, download from the cloud again.
         var got = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 200, "indexes/v1.bin", null);
 
         Assert.Equal("cloud.txt", got.Entries[0].Path);
         Assert.Equal(1, store.Reads);
-        // 覆盖后按新身份命中，不再下载。
+        // After the overwrite it hits under the new identity, no further download.
         var again = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 200, "indexes/v1.bin", null);
         Assert.Equal("cloud.txt", again.Entries[0].Path);
         Assert.Equal(1, store.Reads);
@@ -112,13 +112,13 @@ public sealed class LocalIndexCacheTests : IDisposable
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         await cache.RemoveAsync(1, "c", 1);
-        await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null); // 命中缺失 → 下载
+        await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null); // Entry gone → download
 
         Assert.Equal(1, store.Reads);
     }
 
-    /// <summary>删配置连带清本地版本索引缓存（P2T6 review follow-up）：按 (accountId, container) 精确清除
-    /// 全部版本，不同 account 或不同 container 的缓存不受影响（避免跨备份误删）。</summary>
+    /// <summary>Deleting a config also clears the local version index cache (P2T6 review follow-up): clear every version for exactly
+    /// that (accountId, container), leaving caches of a different account or a different container untouched (avoids deleting across backups).</summary>
     [Fact]
     public async Task RemoveForContainer_Evicts_All_Versions_But_Not_Other_Account_Or_Container()
     {
@@ -137,13 +137,13 @@ public sealed class LocalIndexCacheTests : IDisposable
         Assert.True(await _db.CachedVersionIndexes.AnyAsync(x => x.AccountId == 2 && x.Container == "c"));
     }
 
-    // ---- 进程内索引缓存（Backup__IndexCacheSize）----
+    // ---- In-process index cache (Backup__IndexCacheSize) ----
     //
-    // SQLite 里存的是序列化字节，命中也仍要重建整份索引（50 万条目实测约 0.9 s / 350 MB 分配），
-    // 而还原对话框每展开一个目录都会走一遍。这一层缓存反序列化后的对象。
-    // 判据统一用「把 SQLite 行删掉再读」：还能读到内容，就只可能来自进程内缓存。
+    // SQLite holds serialized bytes, so even a hit still has to rebuild the whole index (measured at roughly 0.9 s / 350 MB
+    // allocated for 500k entries), and the restore dialog goes through it every time a directory is expanded. This layer caches the deserialized objects.
+    // The test for it is always "delete the SQLite row, then read": if content still comes back, it can only have come from the in-process cache.
 
-    /// <summary>启用时：同一版本第二次读不再碰 SQLite，也不碰云端。</summary>
+    /// <summary>When enabled: a second read of the same version touches neither SQLite nor the cloud.</summary>
     [Fact]
     public async Task Memory_Cache_Serves_Repeat_Reads_Without_Touching_The_Row()
     {
@@ -153,17 +153,17 @@ public sealed class LocalIndexCacheTests : IDisposable
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         var first = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
 
-        // 釜底抽薪：把行删干净。之后还能读到 a.txt，就证明来自进程内缓存。
+        // Pull the rug out: delete the row entirely. If a.txt still reads back after that, it proves it came from the in-process cache.
         await _db.CachedVersionIndexes.ExecuteDeleteAsync();
 
         var second = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
 
         Assert.Equal("a.txt", first.Entries[0].Path);
         Assert.Equal("a.txt", second.Entries[0].Path);
-        Assert.Equal(0, store.Reads); // 全程没回落云端
+        Assert.Equal(0, store.Reads); // Never fell back to the cloud at any point
     }
 
-    /// <summary>容量 0（小内存机器）：这一层整体旁路，行为与加它之前完全一致。</summary>
+    /// <summary>Capacity 0 (low-memory machines): the layer is bypassed entirely, behaving exactly as it did before it existed.</summary>
     [Fact]
     public async Task Memory_Cache_Disabled_Falls_Back_To_The_Row_Every_Time()
     {
@@ -174,14 +174,14 @@ public sealed class LocalIndexCacheTests : IDisposable
         await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
         await _db.CachedVersionIndexes.ExecuteDeleteAsync();
 
-        // 没有进程内副本 → 只能回落云端。
+        // No in-process copy → falling back to the cloud is the only option.
         var second = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
 
         Assert.Equal("cloud.txt", second.Entries[0].Path);
         Assert.Equal(1, store.Reads);
     }
 
-    /// <summary>写入必须让进程内副本失效，否则修复改了索引、界面还在读改之前的那一份。</summary>
+    /// <summary>A write must invalidate the in-process copy, or repair changes the index while the UI is still reading the pre-change one.</summary>
     [Fact]
     public async Task Writing_A_Version_Invalidates_The_Memory_Copy()
     {
@@ -191,12 +191,12 @@ public sealed class LocalIndexCacheTests : IDisposable
         await cache.PutAsync(1, "c", 1, 100, Index(1, "before.txt"));
         Assert.Equal("before.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
 
-        await cache.PutAsync(1, "c", 1, 100, Index(1, "after.txt")); // 例如修复改写了索引
+        await cache.PutAsync(1, "c", 1, 100, Index(1, "after.txt")); // e.g. repair rewrote the index
 
         Assert.Equal("after.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
     }
 
-    /// <summary>退役某版本 / 删配置都要清掉进程内副本，不能留下已被删除版本的幽灵。</summary>
+    /// <summary>Retiring a version and deleting a config must both clear the in-process copy; no ghost of a deleted version may linger.</summary>
     [Fact]
     public async Task Removing_Evicts_The_Memory_Copy_Too()
     {
@@ -216,22 +216,22 @@ public sealed class LocalIndexCacheTests : IDisposable
         Assert.Equal("cloud.txt", (await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null)).Entries[0].Path);
     }
 
-    /// <summary>容量到顶时挤掉最久未使用的那份——这正是"小内存也能开一点"的依据。</summary>
+    /// <summary>At capacity, evict the least recently used one — this is exactly what makes "even a small memory budget can turn some on" hold.</summary>
     [Fact]
     public async Task Memory_Cache_Evicts_The_Least_Recently_Used_At_Capacity()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(1)); // 只留一份
+        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(1)); // Keep only one
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "v1.txt"));
         await cache.PutAsync(1, "c", 2, 100, Index(2, "v2.txt"));
 
-        await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null); // 进缓存
-        await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null); // 把 v1 挤出去
+        await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null); // Into the cache
+        await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null); // Evicts v1
 
         await _db.CachedVersionIndexes.ExecuteDeleteAsync();
 
-        // v2 仍在内存里；v1 已被挤出 → 回落云端。
+        // v2 is still in memory; v1 has been evicted → falls back to the cloud.
         Assert.Equal("v2.txt", (await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null)).Entries[0].Path);
         Assert.Equal("cloud.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
     }
