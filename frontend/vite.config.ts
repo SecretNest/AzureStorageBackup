@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // 开发时把 /api 转发到后端 dev server；生产由 nginx 反代。
+      // In development /api is forwarded to the backend dev server; in production nginx reverse-proxies it.
       '/api': {
         target: 'http://localhost:5122',
         changeOrigin: true,

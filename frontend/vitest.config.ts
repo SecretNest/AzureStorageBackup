@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitest/config'
 
-// 只跑纯逻辑测试（scopeRules），不需要 DOM 环境，因此不引 jsdom。
+// Only pure-logic tests (scopeRules) run here; they need no DOM environment, so jsdom is not pulled in.
 export default defineConfig({
   test: {
     environment: 'node',
