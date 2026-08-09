@@ -1679,57 +1679,68 @@ function RunStatus({
   // uploaded items and is always 0 during scanning and diffing — copying it would produce the
   // contradiction of 0% on top and 3% in the detail below.
   //
-  // 两条并行时**不能只给一个数**。百分比只有 Diffing 拿得出（它的分母是扫描到的条目数，一开始
-  // 就定了）；上传的分母还随 diff 边判边入队在涨，给不出可靠的百分比。原先顶行直接摆 Diffing
-  // 那个数，理由写的是"它才是决定整轮还要多久的那条"——而这恰恰在最要紧的时候反过来：diff 判得
-  // 比压缩上传快几个数量级，被有界队列挡住（waiting for upload to catch up）之后它就停在原地，
-  // 而上传其实一直在推进，顶行却看着像卡死了。
+  // With two running in parallel, **one number will not do**. Only Diffing can produce a percentage (its
+  // denominator is the entry count from the scan, settled from the start); the upload's denominator keeps
+  // growing as the diff enqueues work, so it has no reliable percentage. The headline used to show
+  // Diffing's number, justified as "that is what decides how much longer the round takes" — which inverts
+  // exactly when it matters most: the diff decides orders of magnitude faster than compression and upload,
+  // so once it is held by the bounded queue it sits still while uploading is in fact progressing, and the
+  // headline looks hung.
   //
-  // 所以标明那个百分比是 diff 的，再并上上传**已完成的绝对量**——没有可靠分母时，绝对量比一个
-  // 会回落的假百分比诚实。
-  // 完成度按**源端字节**算，不按件数。上传阶段件数百分比几乎没有意义：一件活可能是一个 6.8 GB
-  // 的单文件，也可能是一箱几百个 5 KB 的小文件，按件数等于把它们当成一样重——实测件数报 75% 时
-  // 源字节才 31%，顶行一路虚高，最后几件大的再把它按在 99% 上很久。"还剩多少件"由明细行那个
-  // 分数（2,003 / 2,661 objects）直说，比折成百分比清楚。
-  // 拿不到时（扫描/差分不申报字节工作量，上传阶段 diff 判完前分母还在长）才退回件数。
+  // So the percentage is labelled as the diff's, alongside the upload's **absolute** completed volume —
+  // with no reliable denominator, an absolute figure is more honest than a fake percentage that falls back.
+  // Completion is by **source bytes**, not item count. An item-count percentage during upload means very
+  // little: one item may be a 6.8 GB single file or a pack of several hundred 5 KB files, and counting
+  // them equally is what produced a measured 75% by count against 31% by source bytes — the headline runs
+  // high all the way, then the last few large items pin it at 99% for a long time. "How many items are
+  // left" is stated directly by the detail line's fraction (2,003 / 2,661 objects), which is clearer than
+  // folding it into a percentage.
+  // It falls back to the count only when bytes are unavailable (scanning and diffing report no byte
+  // workload, and during upload the denominator grows until the diff finishes).
   const singlePercent =
     (details[0]?.workPercent ?? details[0]?.percent) ??
     (p.stage >= BackupStage.Uploading ? p.percent : null)
-  // 速度和剩余时间取**上传**那条，没有上传时才退回头条明细。
+  // Speed and remaining time come from the **upload** detail, falling back to the headline only when there is no upload.
   //
-  // 两条并行时不能取 diff 的：diff 的 ETA 说的是"这一轮判完还要多久"，而它判完之后还剩一整个
-  // 上传要跑——把那个数摆在顶上，等于给出一个必然远小于真实剩余的承诺。上传那条则是自洽的：
-  // 它的分母（totalItems）要等 diff 收工才由 SetTotal 定下来，在那之前后端的 Eta() 直接返回 null
-  // （分母都没有，别猜），所以并行期间这一栏自然是空的——不显示，好过显示一个会回退的数。
+  // With both running, the diff's must not be used: the diff's ETA says "how much longer until this round
+  // finishes deciding", and after that an entire upload remains — putting that on top promises a figure
+  // necessarily far below the real remainder. The upload's is self-consistent: its denominator
+  // (totalItems) is only settled by SetTotal once the diff finishes, and before that the backend's Eta()
+  // returns null outright (no denominator, so do not guess), which is why this field is naturally empty
+  // while both run — showing nothing beats showing a number that goes backwards.
   const pace = uploading ?? details[0]
-  // 速度那一条的门槛与明细行一致：有在途的流就显示，哪怕这一瞬的读数是 0（刚起流、还没落账），
-  // 否则数字会在每条流的首尾一闪一闪。
+  // The speed field uses the same gate as the detail line: show it whenever a transfer is in flight, even
+  // if this instant reads 0 (a stream just started, nothing booked yet), or the number flickers at the
+  // start and end of every stream.
   const speed =
     pace && (pace.bytesPerSecond > 0 || pace.activeItems.length > 0)
       ? `${formatBytes(pace.bytesPerSecond)}/s`
       : null
-  // 从秒数算，不去切 estimatedRemaining 那个字符串——理由见 formatDuration。
+  // Computed from the seconds rather than slicing the estimatedRemaining string — see formatDuration for why.
   const eta = pace?.etaSeconds != null ? `~${formatDuration(pace.etaSeconds)} left` : null
 
   const headline = [
     diffing && uploading
       ? diffing.percent != null && `${diffing.percent}% diffed`
       : singlePercent != null && `${singlePercent}%`,
-    // 上传的绝对量在**两种**排布下都要出现。从前它只挂在并行那一支上，于是 diff 一收工、明细从
-    // 两条变回一条的那一瞬，已经传上去的十几个 GB 就从顶行消失了——只剩一个按源字节算的百分比，
-    // 而那个数在大备份的前期常年是 0%，看着就像整轮归零重来。绝对量是这里唯一不会回退的数。
+    // The upload's absolute volume must appear in **both** layouts. It used to hang off the parallel
+    // branch only, so the moment the diff finished and the detail went from two lines back to one, the
+    // tens of gigabytes already uploaded vanished from the headline — leaving a source-byte percentage
+    // that sits at 0% for a long time early in a large backup, which reads as the whole round starting
+    // over. The absolute figure is the one number here that never goes backwards.
     uploading && uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
     speed,
     eta,
   ]
     .filter(Boolean)
     .join(' · ')
-  // 变更数要等 diff 跑完才算得出来，在那之前写 "(0 changed)" 是在陈述一个还不成立的事实。
+  // The changed count only exists once the diff has run; writing "(0 changed)" before that states something not yet true.
   const changed = p.stage >= BackupStage.Uploading ? ` (${p.changedFiles} changed)` : ''
 
-  // 流水线化之后 diff 与上传是**同时**在跑的，而后端的 stage 要等 diff 收工才切到 Uploading。
-  // 照搬它，顶行就会在整轮里绝大部分时间写着 "Diffing"——首次备份的 diff 要把每个文件读完算
-  // hash，可以跑几小时，期间上传其实一直在传，界面上却看不出来。两条明细同时在动时照实说。
+  // Once pipelined, the diff and the upload run **at the same time**, while the backend's stage only
+  // switches to Uploading when the diff finishes. Copying it would leave the headline reading "Diffing"
+  // for most of the round — a first backup's diff reads every file to hash it and can run for hours, with
+  // uploading progressing throughout and nothing on screen showing it. When both details are moving, say so.
   const label = details.length > 1 ? 'Diffing + Uploading' : backupStageLabels[p.stage]
 
   return (
@@ -1744,8 +1755,9 @@ function RunStatus({
         </div>
       )}
       <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} />
-      {/* 细节收进展开区：正在处理的路径可以很长，摊在列表行里会把表格挤变形。
-          默认只留一行总进度，需要看的时候再展开。 */}
+      {/* Details are folded into an expandable area: the path being processed can be very long and would
+          distort the table if laid out in the row. One line of overall progress by default, expanded when
+          wanted. */}
       {details.length > 0 && (
         <>
           {' '}
@@ -1757,8 +1769,8 @@ function RunStatus({
           >
             {showDetail ? '▾ Details' : '▸ Details'}
           </button>
-          {/* 两条并行的明细上下叠放，不横着摊开——用户提过 details 会把表格撑宽，
-              多一条更要小心。 */}
+          {/* Two parallel details stack vertically rather than spreading horizontally — details widening
+              the table has been raised before, and a second one warrants more care. */}
           {showDetail && details.map((d) => <StageDetail key={d.stage} detail={d} />)}
         </>
       )}
@@ -1766,8 +1778,9 @@ function RunStatus({
   )
 }
 
-/// 阶段细节。在此之前，扫描和 diff 各自只在进入时上报一次——首次备份的 diff 要把每个文件
-/// 完整读一遍算 hash，可以跑几小时，界面上却只有一个一动不动的 0%，分不清是在干活还是挂死。
+/// Stage detail. Before this, scanning and diffing each reported once on entry — and a first backup's
+/// diff reads every file end to end to hash it, which can run for hours while the UI shows a motionless
+/// 0%, indistinguishable from a hang.
 
 function StageDetail({ detail }: { detail: StageProgress }) {
   const { counts, done, pipeline, speed, eta, inFlightPhrase } = stageLines(detail)
@@ -1779,18 +1792,21 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           {detail.currentItem}
         </div>
       )}
-      {/* 在途的每一条各占一行，带上尺寸与进度。从前这里挤的是内容寻址的 blob 名
-          （加密时还是 HMAC），既看不出在传哪个文件，也看不出传了多少。 */}
-      {/* 标题里点明"并发的传输流"：同时列出 2-3 个文件名会让人以为在并发压缩，
-          而压缩是全局串行的（一把锁，就是上面那个 N preparing），并发的是上传/下载。 */}
+      {/* Each transfer in flight gets its own line with its size and progress. This used to be crammed
+          with the content-addressed blob name (an HMAC when encrypted), which showed neither which file
+          was transferring nor how much of it. */}
+      {/* The heading says "in parallel" explicitly: listing two or three filenames at once suggests
+          parallel compression, whereas compression is globally serialised (one lock — that N preparing
+          above) and it is the transfers that run in parallel. */}
       {detail.activeItems.length > 0 && (
         <div className="text-faint">
           {`${inFlightPhrase} in parallel:`}
         </div>
       )}
-      {/* 全部列出，不再截到 3 条。在途条数有上界——它就是设置里的上传/下载并发数（默认 5），
-          闸门按**卷**发额度，所以不会因为队列长或文件大而涨。把其中几条折成 "+2 more" 反而
-          藏掉了最有用的东西：卡住的那条通常就在被折起来的那几条里。 */}
+      {/* All of them are listed, no longer truncated at three. The in-flight count is bounded — it is the
+          upload/download concurrency from settings (5 by default), and the gate issues slots per
+          **volume**, so it does not grow with queue length or file size. Folding a few into "+2 more"
+          hides the most useful thing: the stuck one is usually among those folded away. */}
       {detail.activeItems.map((a) => (
         <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
           {a.label}
@@ -1804,26 +1820,28 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         </div>
       ))}
       <div>
-        {/* 阶段名要写出来：两条明细并排时，光看两行数字分不清哪行是差分哪行是上传。 */}
+        {/* The stage name has to be spelled out: with two details side by side, two rows of numbers alone do not say which is the diff and which is the upload. */}
         <span className="text-faint">{detail.stage}: </span>
         {counts}
-        {/* 件数百分比只在按字节算不出来时（扫描/差分不申报字节工作量）才出现——那时它和
-            旁边那个分数本来就是同一个口径。按字节的完成度跟在自己那个分数后面。 */}
+        {/* The item-count percentage appears only when bytes cannot provide one (scanning and diffing
+            report no byte workload) — and there it shares a basis with the fraction beside it. The
+            byte-based completion follows its own fraction. */}
         {detail.workPercent == null && detail.percent != null && ` · ${detail.percent}%`}
         {done && ` · ${done}`}
         {speed}
         {eta}
       </div>
-      {/* 第二行整条是流水线，按逆时间轴排。前缀点明"这些都还没落定"——没有它，第一行的
-          "1.9 TB uploaded" 与第二行的 "+3.7 GB on the cloud" 摆在一起又成了一道谜题：
-          两个都是已经在云上的字节，凭什么分两行？答案是前者所属的活已经销账、不会再变，
-          后者所属的活还在跑，整件重来时那些卷就不算数了。 */}
+      {/* The second line is the whole pipeline, ordered backwards along the timeline. The prefix states
+          that none of it has settled — without it, "1.9 TB uploaded" on the first line and "+3.7 GB on
+          the cloud" on the second become a puzzle again: both are bytes already in the cloud, so why two
+          lines? Because the first belongs to items that have settled and will not change, while the
+          second belongs to items still running, whose volumes stop counting if the item starts over. */}
       {pipeline && <div className="text-faint">In flight: {pipeline}</div>}
     </div>
   )
 }
 
-// 状态徽标（§4.2 决策 2）：进行中（蓝，派生 activity）优先于持久 Error（红，tooltip + Reset）；否则不显示。
+// The status badge (§4.2, decision 2): in-progress (blue, from the derived activity) outranks a persistent Error (red, with tooltip and Reset); otherwise nothing is shown.
 function StatusBadge({
   config, onReset, onShowError,
 }: { config: BackupConfig; onReset: () => void; onShowError: () => void }) {
@@ -1833,9 +1851,10 @@ function StatusBadge({
   if (config.status === BackupStatus.Error) {
     return (
       <span className="row-inline">
-        {/* 徽章可点开看正文。从前错误只塞在 title（tooltip）里：那一大坨 Azure 异常在 tooltip
-            里根本读不了，而且没人想到去悬停——刷新界面之后就"只能在日志里找错误"了。
-            正文一直是持久化的（BackupConfig.LastError），缺的只是给它一个能读的地方。 */}
+        {/* The badge opens the full text. The error used to live only in the title attribute: a wall of
+            Azure exception text is unreadable in a tooltip, and nobody thinks to hover — so after a page
+            refresh it became "go find the error in the logs". The text was persisted all along
+            (BackupConfig.LastError); all it lacked was somewhere readable to put it. */}
         <button type="button" className="badge badge-danger" onClick={onShowError}>
           Error
         </button>
@@ -1848,7 +1867,7 @@ function StatusBadge({
   return <span className="text-faint">—</span>
 }
 
-/// 备份最近一次失败的完整正文。Azure 的异常又长又带 XML，必须给足空间、可滚动、可复制。
+/// The full text of the backup's last failure. Azure exceptions are long and carry XML, so this needs room, scrolling and copying.
 function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => void }) {
   const [copied, setCopied] = useState(false)
   const text = config.lastError ?? 'No error detail was recorded.'
@@ -1858,7 +1877,7 @@ function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => 
       await navigator.clipboard.writeText(text)
       setCopied(true)
     } catch {
-      // 剪贴板被浏览器策略挡住（非 https、无权限）——正文就在下面，用户还能自己选中复制。
+      // The clipboard was blocked by browser policy (not https, or no permission) — the text is right below and can still be selected manually.
     }
   }
 
@@ -1896,7 +1915,7 @@ function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => 
   )
 }
 
-// 与 RunStatus 同形的三态展示；RepairRun 没有 version/progress 字段（见 api/backupConfigs.ts），故没有对应显示。
+// The same three-state display as RunStatus; RepairRun has no version or progress field (see api/backupConfigs.ts), so neither is shown.
 function RepairStatus({ run, onStop }: { run: RepairRun; onStop: () => void }) {
   if (run.status === 'Failed')
     return <div className="text-danger">Repair failed: {run.error}</div>
@@ -1907,8 +1926,9 @@ function RepairStatus({ run, onStop }: { run: RepairRun; onStop: () => void }) {
   return <div className="text-faint">Repairing…<StopButton onStop={onStop} /></div>
 }
 
-// 检查的运行态。报告本身在 Check/Repair 对话框里看——这一行只回答「还在跑吗、跑到哪了」，
-// 因为一次内容级检查要把整个备份下载重算 hash，可以跑上几小时。
+// A check's run state. The report itself is read in the Check/Repair dialog — this row only answers "is
+// it still running, and how far" — because a content-level check downloads and re-hashes the entire
+// backup and can run for hours.
 function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
   const [showDetail, setShowDetail] = useState(false)
 
@@ -1953,7 +1973,7 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
 
 function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void }) {
   const [showDetail, setShowDetail] = useState(false)
-  // 跳过/失败的逐条记录。完成之后才是最该看它的时候——一个数字说不出是哪些文件、为什么。
+  // A record per skipped or failed file. It matters most after completion — a single number cannot say which files, or why.
   const events = run.events ?? []
   const toggle = events.length > 0 || run.detail ? (
     <>
@@ -1999,7 +2019,7 @@ function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void })
         {detailBlock}
       </div>
     )
-  // 还原是逐文件写出的，没有"回滚"这回事：已经落盘的那些文件停止后仍然留在目标目录里。
+  // A restore writes file by file and there is no such thing as a rollback: whatever already landed stays in the target directory after stopping.
   if (run.status === 'Canceled')
     return (
       <div className="text-warn">
@@ -2051,19 +2071,21 @@ function RuleBox({ value, onChange }: { value: string | null; onChange: (v: stri
   )
 }
 
-// 删除确认（§4.3）：默认只删本地配置/缓存/日志，云端 container 保留。勾选 deleteContainer 时二次
-// window.confirm 强调不可逆，避免误删整个 container。
+// Delete confirmation (§4.3): by default only the local configuration, cache and logs are removed and the
+// cloud container is kept. Ticking deleteContainer adds a second window.confirm stressing that it is
+// irreversible, so a whole container is not deleted by mistake.
 function DeleteModal({
   config, onClose, onConfirm,
 }: {
   config: BackupConfig
   onClose: () => void
-  /** 抛出即视为失败，错误显示在本弹窗内。成功由调用方关闭弹窗。 */
+  /** Throwing counts as failure and the error is shown inside this dialog. On success the caller closes it. */
   onConfirm: (deleteContainer: boolean) => Promise<void>
 }) {
   const [deleteContainer, setDeleteContainer] = useState(false)
-  // 失败原因必须显示在**弹窗内部**。从前是写到页面上那条全局错误里，而弹窗正盖在它上面——
-  // 后端拒绝删除正在运行的配置时（409），用户看到的就是"点了 Delete，什么都没发生"。
+  // The reason for failure must be shown **inside the dialog**. It used to go to the page's global error,
+  // which the dialog covers — so when the backend refused to delete a running configuration (409), what
+  // the user saw was "I pressed Delete and nothing happened".
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -2121,8 +2143,9 @@ function DeleteModal({
   )
 }
 
-// §4.6：新建配置成功后，提示是否立即运行首次备份。"Run now" 复用表格行同款 run+poll 逻辑
-// （进度显示在该配置所在行，无独立进度页）。
+// §4.6: after a configuration is created, offer to run the first backup now. "Run now" reuses the same
+// run-and-poll logic as the table row (progress appears in that configuration's row; there is no separate
+// progress page).
 function PostCreateModal({
   config, onRunNow, onNotNow,
 }: { config: BackupConfig; onRunNow: () => void; onNotNow: () => void }) {
@@ -2146,8 +2169,9 @@ function PostCreateModal({
   )
 }
 
-// 密钥环丢失恢复弹窗：重新录入原始备份密码。密码本身不提供更改功能——只能核对，核对通过
-// (解密云端 info 文件成功)才落库；错误以 400 携带 "Verification failed: ..." 返回，原样显示。
+// The keyring-loss recovery dialog: re-enter the original backup password. The password itself cannot be
+// changed — it can only be verified, and it is persisted only once verification succeeds (decrypting the
+// cloud info file). A failure returns 400 carrying "Verification failed: …", shown as-is.
 function ResetPasswordModal({
   config, busy, error, onSubmit, onClose,
 }: {
@@ -2196,7 +2220,7 @@ function ResetPasswordModal({
 function CheckModal({
   config, onClose, onError,
 }: { config: BackupConfig; onClose: () => void; onError: (e: string) => void }) {
-  // 与还原对话框同理：编号认不出"上周四那次"，整条留着以便显示起止时刻。
+  // As in the restore dialog: a number cannot identify "the one from last Thursday", so the whole record is kept to show the start and end times.
   const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [cloud, setCloud] = useState<number>(CloudCheckLevel.ExistenceSize)
@@ -2207,13 +2231,13 @@ function CheckModal({
   const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
-  // 轮询要在对话框关掉时停下，否则它会一直往一个已卸载的组件里写状态。
+  // Polling has to stop when the dialog closes, or it keeps writing state into an unmounted component.
   const aliveRef = useRef(true)
   useEffect(() => () => { aliveRef.current = false }, [])
 
   const report = checkRun?.report ?? null
 
-  // 检查现在是后台 job：POST 只拿到 202，结果与进度都靠轮询。
+  // Check is a background job now: the POST only returns 202, and both the result and the progress come from polling.
   const follow = async (initial: CheckRun) => {
     setRunning(true)
     try {
@@ -2222,7 +2246,7 @@ function CheckModal({
       while (run.status === 'Running') {
         await delay(1000)
         if (!aliveRef.current) return null
-        // 正在跑的检查一定有状态可报；真拿到空就停下轮询，别把 run 打成空值。
+        // A running check always has state to report; if it really comes back empty, stop polling rather than blanking the run.
         const next = await backupConfigsApi.checkStatus(config.id)
         if (!next) break
         run = next
@@ -2235,17 +2259,18 @@ function CheckModal({
     }
   }
 
-  // 走 ref 而不是把 follow 放进下面 effect 的依赖：follow 每次渲染都是新函数，
-  // 直接依赖会让这个「打开时读一次」的 effect 每渲染重跑一遍。
+  // A ref rather than putting follow in the effect's dependencies: follow is a new function every render,
+  // and depending on it directly would make this "read once on open" effect re-run every render.
   const followRef = useRef(follow)
   followRef.current = follow
 
   useEffect(() => {
     backupConfigsApi.versions(config.id).then(setVersions).catch(() => {})
-    // 服务端保留着最近一次检查的报告：关掉对话框再打开要能看回结果，而一次内容级检查
-    // 要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。空 = 从没查过。
-    // 仍在跑就接着轮询；已跑完则只把报告摆出来——不走 follow，免得把上一次的失败
-    // 当成这次的错误再弹一遍横幅。
+    // The server keeps the most recent check report: closing and reopening the dialog must bring the
+    // result back, and re-running a content-level check downloads and re-hashes the entire backup at real
+    // egress cost. Empty = never checked.
+    // Still running means keep polling; already finished means just display the report — not through
+    // follow, so that a previous failure is not raised again as if it were this run's error.
     backupConfigsApi
       .checkStatus(config.id)
       .then((s) => { if (!s) return; if (s.status === 'Running') void followRef.current(s); else setCheckRun(s) })
@@ -2254,8 +2279,9 @@ function CheckModal({
 
   const rehydrateArg = () => (cloud === CloudCheckLevel.Content ? rehydrate : null)
 
-  // 检查是后台 job，进度在列表那一行（Checking N% + Details）已经有了，这里再显示一份没有意义：
-  // 启动成功就直接关掉对话框，报告下次打开时从服务端读回来。
+  // Check is a background job and its progress is already in the table row (Checking N% plus Details), so
+  // duplicating it here means nothing: on a successful start the dialog just closes, and the report is
+  // read back from the server the next time it opens.
   const runCheck = async () => {
     setRepairReport(null)
     try {
@@ -2277,7 +2303,7 @@ function CheckModal({
   const runRepair = async () => {
     setRepairing(true)
     try {
-      // 修复是后台 job（持锁到完成）；轮询状态。
+      // Repair is a background job (holding the lock until it completes); poll for its state.
       let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans)
       setRepairReport(run)
       while (run.status === 'Running') {
@@ -2296,7 +2322,7 @@ function CheckModal({
   }
 
   const problems = report ? report.findings.filter((f) => f.cloud === CloudState.MissingOrBad) : []
-  // 内容沿用自更早版本的条目：云端 blob 本身通常没问题，所以不在 problems 里，但同样要报出来。
+  // Entries whose content was carried over from an earlier version: the cloud blob itself is usually fine, so they are not in problems, but they still have to be reported.
   const stale = report ? report.findings.filter((f) => f.unreadableAt) : []
 
   return (
@@ -2350,16 +2376,18 @@ function CheckModal({
         </Field>
       )}
       <Field label="Unreferenced blobs">
-        {/* 说明文字与勾选框同在外层 <label class="field"> 里——不再自己套一层 <label>：
-            标签不能嵌套，而且嵌套那层会让勾选框逃出 .field 的居中规则，看上去偏高。 */}
+        {/* The explanatory text and the checkbox share the outer <label class="field"> rather than
+            nesting another <label>: labels cannot nest, and the nested one let the checkbox escape
+            .field's centring rule, leaving it sitting too high. */}
         <span className="field-check">
           <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
           Detect unreferenced blobs (repair deletes them)
         </span>
       </Field>
 
-      {/* 进度不在这里重复一遍：检查在服务端后台跑，列表里那一行已经有阶段、百分比和 Details。
-          对话框只说明它正在跑（报告要等它结束才有），并留下 Stop。 */}
+      {/* Progress is not repeated here: the check runs in the background on the server and the table row
+          already has the stage, the percentage and Details. The dialog only states that it is running (the
+          report exists only once it finishes) and offers Stop. */}
       {running && (
         <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
           A check is running — progress is shown in the backup list. The report appears here when it finishes.
@@ -2406,8 +2434,9 @@ function CheckModal({
                 : `${report.orphanBlobs.length} unreferenced blob(s) — repair will delete: ${report.orphanBlobs.slice(0, 20).join(', ')}${report.orphanBlobs.length > 20 ? '…' : ''}`}
             </div>
           )}
-          {/* 沿用条目的云端 blob 通常是好的（cloud=Ok），所以它们不会出现在下面的问题表里——
-              但操作员必须知道这个版本里有内容是旧的，尤其因为它会让本地比对显示为 Changed。 */}
+          {/* A carried-over entry's cloud blob is usually fine (cloud=Ok), so they never appear in the
+              problem table below — but the operator has to know this version contains stale content,
+              especially since it makes the local comparison read as Changed. */}
           {stale.length > 0 && (
             <div className="text-warn" style={{ margin: '0.4rem 0' }}>
               {stale.length} file(s) hold content carried forward from an earlier backup — the
