@@ -93,7 +93,7 @@ const emptyForm: BackupConfigInput = {
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// 从「配置 id → 运行状态」的表里摘掉一条。没有这条时原样返回，免得白白重渲一次。
+// Drop one entry from the "config id → run state" map. Returns the original when absent, to avoid a pointless re-render.
 function without<T>(map: Record<number, T>, id: number): Record<number, T> {
   if (!(id in map)) return map
   const next = { ...map }
@@ -101,8 +101,10 @@ function without<T>(map: Record<number, T>, id: number): Record<number, T> {
   return next
 }
 
-// 下次重试还有多久。这个数每秒都在变，但整行本来就每秒重渲染一次（轮询），不额外起计时器。
-// 已经过点了就说 "now"，而不是显示一个负数——真正放行还要等当前这一拍走到闸门。
+// How long until the next retry. This changes every second, but the row already re-renders every second
+// (polling), so no extra timer is started.
+// Past due it says "now" rather than showing a negative — the actual release still waits for the current
+// tick to reach the gate.
 function formatRetryIn(at: string): string {
   const seconds = Math.round((new Date(at).getTime() - Date.now()) / 1000)
   return seconds <= 0 ? 'now' : `in ${formatDuration(seconds)}`
@@ -115,9 +117,9 @@ export function BackupConfigsPage() {
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checks, setChecks] = useState<Record<number, CheckRun>>({})
-  // 盘上留着的中断现场，按配置 id 存。程序重启后内存里什么都没有，只能从这里知道"有活儿没干完"。
+  // Interrupted runs left on disk, keyed by config id. After a restart nothing is in memory, so this is the only way to know work was left unfinished.
   const [interrupted, setInterrupted] = useState<Record<number, InterruptedRun[]>>({})
-  // 打开着的停止对话框对应的配置。
+  // The configuration whose stop dialog is open.
   const [stopping, setStopping] = useState<BackupConfig | null>(null)
   const [checkModal, setCheckModal] = useState<BackupConfig | null>(null)
   const [restoreModal, setRestoreModal] = useState<BackupConfig | null>(null)
@@ -129,7 +131,7 @@ export function BackupConfigsPage() {
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
-  // 独立于 form：它只用来比对，绝不能跟着 form 一起被 POST 出去。
+  // Kept separate from form: it exists only for comparison and must never be POSTed along with it.
   const [passwordConfirm, setPasswordConfirm] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -137,14 +139,16 @@ export function BackupConfigsPage() {
   const [resettingPassword, setResettingPassword] = useState<BackupConfig | null>(null)
   const keyring = useKeyringStatus()
 
-  // 按当前配置列表把「中断现场」重新拉一遍。单个配置失败不打断整页：拿不到就当没有，
-  // 下一轮再说。load() 之外，无人触发的 5 秒后台刷新也要走这条路——否则程序在页面开着的时候
-  // 重启，内存里的运行状态没了，interrupted 却只在挂载和用户动作时才更新，中断现场提示
-  // 永远冒不出来，只有整页刷新才能看到。
-  // 两个触发点（用户动作走的 load()、无人触发的 5 秒轮询）会让两轮请求同时在飞，而它们整份地
-  // 覆盖同一份状态。谁先回来不由发起顺序决定，所以要一道"只让最后发起的那次写"的闸门，
-  // 否则旧快照会盖掉新快照，界面上留着一条已经不存在的中断现场直到下一拍。为什么不是 cancelled
-  // 标志，见 latestWins 的说明。
+  // Re-fetch the interrupted runs for the current configuration list. One configuration failing does not
+  // interrupt the page: treat it as absent and try again next round. Besides load(), the unattended
+  // 5-second refresh must take this path too — otherwise, when the process restarts while the page is
+  // open, the in-memory run states are gone while interrupted is only updated on mount and on user
+  // action, so the interrupted-run notice never appears and only a full page reload reveals it.
+  // The two triggers (load() from a user action, and the unattended 5-second poll) leave two requests in
+  // flight, and both overwrite the same state wholesale. Which returns first is not decided by which
+  // started first, so a "only the latest may write" gate is required, or an old snapshot overwrites a new
+  // one and the UI keeps showing an interrupted run that no longer exists until the next tick. Why not a
+  // cancelled flag: see the note in latestWins.
   const interruptedGate = useRef(latestWins())
   const refreshInterrupted = (list: BackupConfig[]) => {
     const isLatest = interruptedGate.current.begin()
@@ -165,23 +169,26 @@ export function BackupConfigsPage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
-  // 选定账户后列举其容器（PRD 1.2 的接口，ContainersPage 已在用）。
-  // 列举要连云，失败不能挡住新建备份——降级为纯输入框。
+  // List the containers of the selected account (the PRD 1.2 endpoint, already used by ContainersPage).
+  // Listing needs the cloud, and a failure must not block creating a backup — degrade to a plain text field.
   const [containerList, setContainerList] = useState<ContainerInfo[] | null>(null)
   const [containerListError, setContainerListError] = useState<string | null>(null)
   const [newContainer, setNewContainer] = useState(false)
   useEffect(load, [])
 
-  // 供下面几个 effect 的 tick/cleanup 读取「当下最新」的 configs/restores，而不必把它们
-  // 放进依赖数组去触发 interval 重建——渲染期间直接赋值，提交后 effect 看到的必是最新值。
+  // Lets the ticks and cleanups of the effects below read the **latest** configs/restores without putting
+  // them in dependency arrays and rebuilding the interval — assigned during render, so after commit the
+  // effects necessarily see the current values.
   const configsRef = useRef(configs)
   configsRef.current = configs
   const restoresRef = useRef(restores)
   restoresRef.current = restores
 
-  // 列表每 5 秒刷一次：纯本地查询（配置行 + 内存中的 activity），不连云。
-  // 这是无人触发的后台刷新：一次网络抖动不该弹一条错误横幅——它可能盖掉用户正在看的
-  // 另一条错误，且用户对这次刷新没有可做的动作。下一拍会自然重试(Fix 7)。
+  // The list refreshes every 5 seconds: a purely local query (configuration rows plus in-memory
+  // activity), no cloud.
+  // This is an unattended background refresh, so one network blip must not raise an error banner — it
+  // could cover another error the user is reading, and there is nothing they can do about this refresh
+  // anyway. The next tick retries naturally.
   useEffect(() => {
     const refresh = () =>
       backupConfigsApi
@@ -192,8 +199,9 @@ export function BackupConfigsPage() {
         })
         .catch(() => {})
     const t = setInterval(refresh, 5000)
-    // 浏览器把后台标签页的定时器节流到分钟级，切回来那一瞬看到的还是上一拍的旧快照，
-    // 要再等一个周期才更新——长任务跑着时，那正是"看起来卡住了"的一半原因。
+    // Browsers throttle background-tab timers to minutes, so switching back shows the previous tick's
+    // stale snapshot and waits a full period to update — with a long job running, that is half the reason
+    // it "looks stuck".
     const onVisible = () => {
       if (document.visibilityState === 'visible') void refresh()
     }
@@ -204,12 +212,13 @@ export function BackupConfigsPage() {
     }
   }, [])
 
-  // 有活跃项时，只对活跃的那几份、且只拉该 activity 对应的那一个端点。
-  // 全空闲时不发这些请求。取代闭包里的循环：状态来自服务端，因此刷新页面、换标签页、
-  // 或备份由定时任务发起，看到的都一样。
-  // 配置列表每次 load() 返回时都用新数组引用替换，导致这个 effect 每 5 秒重建一次
-  // 及至更早的用户动作。改用派生的 activeKey（只包含活跃配置的 id 和 activity），
-  // 仅在实际有活动的配置改变时才重建 interval。
+  // While anything is active, poll only the active ones, and only the one endpoint matching that
+  // activity. With everything idle, none of these requests are sent. This replaces the loop that lived in
+  // a closure: the state comes from the server, so refreshing the page, switching tabs, or a backup
+  // started by a scheduled task all look the same.
+  // Every load() replaced the configuration list with a new array identity, which rebuilt this effect
+  // every 5 seconds. A derived activeKey (only the ids and activities of active configurations) rebuilds
+  // the interval only when the set of actually active configurations changes.
   const activeKey = configs
     .filter((c) => c.activity !== 'Idle')
     .map((c) => `${c.id}:${c.activity}`)
@@ -219,17 +228,19 @@ export function BackupConfigsPage() {
     if (!activeKey) return
 
     let cancelled = false
-    // 从 activeKey 字符串解析出 id 和 activity，避免依赖 configs 数组引用
+    // Parse id and activity out of the activeKey string, avoiding a dependency on the configs array identity
     const activeList = activeKey.split(',').map((item) => {
       const [id, activity] = item.split(':')
-      // 断言回 BackupActivity：不断言的话 activity 是 string，下面几处与字面量的比较
-      // 就不再受编译器检查，写错一个字母会静默地不轮询那一类，而不是编译失败。
+      // Assert back to BackupActivity: without it, activity is a string and the literal comparisons below
+      // stop being compiler-checked, so one mistyped letter silently stops polling that category instead
+      // of failing to compile.
       return { id: Number(id), activity: activity as BackupActivity }
     })
 
-    // tick 本身是 async 的：一拍还没跑完（比如状态请求撞上 7z 正在吃满 CPU 那阵、比 1 秒慢）
-    // 就不该再叠加下一拍——叠起来的请求会顶着浏览器同源并发上限排队，连 5 秒的列表刷新都会
-    // 被一起拖住，页面恰恰在最需要更新时停摆(Fix 6)。
+    // tick is itself async: while one has not finished (a status request landing while 7z is saturating
+    // the CPU can take longer than a second) the next must not stack on top — stacked requests queue
+    // against the browser's per-origin limit and drag the 5-second list refresh down with them, stalling
+    // the page exactly when it most needs to update.
     let inFlight = false
 
     const tick = async () => {
@@ -248,10 +259,12 @@ export function BackupConfigsPage() {
                       if (!cancelled) setRuns((r) => ({ ...r, [item.id]: s }))
                     })
                     .catch((e) => {
-                      // 404＝后端进程重启后内存里已经没有这个运行了，再显示旧进度就是在撒谎。
-                      // 清掉 runs[id]：下一拍 5 秒刷新会把它从 interrupted 里捞出来，界面自然
-                      // 换成中断现场提示。非 404（网络抖动等瞬时失败）不清，原样往外抛，交给
-                      // 下面按配置的 catch 静默吞掉、下一拍重试——不然一次抖动就会把这一行拍没。
+                      // 404 = the backend process restarted and no longer holds this run in memory, so
+                      // showing the old progress would be a lie. Clearing runs[id] lets the next 5-second
+                      // refresh pick it up from interrupted, and the row becomes the interrupted-run
+                      // notice on its own. Anything other than 404 (a blip or other transient failure) is
+                      // not cleared and is rethrown for the per-configuration catch below to swallow and
+                      // retry next tick — otherwise one blip would wipe this row out.
                       if (e instanceof ApiError && e.status === 404) {
                         if (!cancelled) setRuns((r) => without(r, item.id))
                         return
@@ -259,9 +272,11 @@ export function BackupConfigsPage() {
                       throw e
                     }),
                 )
-                // activity 是单值：并发还原时会被 BackingUp 盖住(见 RestoreRunner.cs 顶部注释——
-                // 还原不占忙碌锁，允许与备份并行)。本地若还记得这个配置的还原仍在跑，就不管
-                // activity 怎么说，独立地把还原状态也拉一次，否则并发结束时看不到还原的终态(Fix 2)。
+                // activity is a single value, so a concurrent restore is masked by BackingUp (see the
+                // comment at the top of RestoreRunner.cs — a restore does not take the busy lock and may
+                // run alongside a backup). If this configuration is locally remembered as still restoring,
+                // fetch the restore state independently regardless of what activity says, or the restore's
+                // terminal state is never seen when the two finish together.
                 if (restoresRef.current[item.id]?.status === 'Running') {
                   tasks.push(
                     backupConfigsApi.restoreStatus(item.id).then((s) => {
@@ -288,10 +303,10 @@ export function BackupConfigsPage() {
                   }),
                 )
               }
-              // CleaningUp 没有状态端点：只显示徽章，不拉进度。
+              // CleaningUp has no status endpoint: show the badge only, fetch no progress.
               await Promise.all(tasks)
             } catch {
-              // 单次轮询失败不值得打断整页，下一拍会重试。
+              // One failed poll is not worth interrupting the page; the next tick retries.
             }
           }),
         )
@@ -302,7 +317,7 @@ export function BackupConfigsPage() {
 
     const t = setInterval(tick, 1000)
     void tick()
-    // 同上：切回前台立刻补一拍，别让用户盯着一分钟前的快照。
+    // As above: on returning to the foreground, tick immediately rather than leaving the user staring at a minute-old snapshot.
     const onVisible = () => {
       if (document.visibilityState === 'visible') void tick()
     }
@@ -312,12 +327,14 @@ export function BackupConfigsPage() {
       clearInterval(t)
       document.removeEventListener('visibilitychange', onVisible)
 
-      // 这个 1 秒 tick 和上面 5 秒的列表刷新相位互相独立：如果恰好是后者把某配置的 activity
-      // 翻成 Idle、配置退出活跃集合，这个 cleanup 会先于下一拍跑到，状态就停在了最后一次
-      // 非终态上——按钮已经可点了，这一行却还显示着"Uploading 97%"。给每个真正离场
-      // （不再出现在最新 configs 里的活跃配置）的配置补一次收尾请求，而不是简单地取消了事(Fix 3)。
-      // 注意这里故意不检查 cancelled：那个标志只用来防止过期的周期性 tick 写状态，
-      // 收尾请求是离场处理本身，必须把结果写进去。
+      // This 1-second tick and the 5-second list refresh above are independent in phase: if the latter is
+      // what flipped a configuration's activity to Idle and dropped it out of the active set, this cleanup
+      // runs before the next tick and the state freezes on the last non-terminal reading — the buttons are
+      // clickable again while the row still says "Uploading 97%". So every configuration that genuinely
+      // leaves (an active one no longer present in the latest configs) gets one final request rather than
+      // simply being cancelled.
+      // Deliberately not checking cancelled here: that flag only stops a stale periodic tick from writing
+      // state, whereas this final request *is* the departure handling and must write its result.
       const stillActiveIds = new Set(configsRef.current.filter((c) => c.activity !== 'Idle').map((c) => c.id))
       activeList
         .filter((item) => !stillActiveIds.has(item.id))
@@ -327,9 +344,10 @@ export function BackupConfigsPage() {
               .runStatus(item.id)
               .then((s) => setRuns((r) => ({ ...r, [item.id]: s })))
               .catch((e) => {
-                // 同上：这里的「离场」本身就可能是后端重启造成的（configs 里读到的 activity
-                // 已经变回 Idle）。404 时把陈旧进度一并清掉，别的失败仍旧静默——收尾请求本就是
-                // 尽力而为，不该在这里弹错误打断整页。
+                // As above: this departure may itself have been caused by a backend restart (the activity
+                // read from configs is already back to Idle). On 404 the stale progress is cleared too;
+                // other failures stay silent — a final request is best-effort and must not raise an error
+                // that interrupts the page.
                 if (e instanceof ApiError && e.status === 404) setRuns((r) => without(r, item.id))
               })
             if (restoresRef.current[item.id]?.status === 'Running') {
@@ -363,7 +381,7 @@ export function BackupConfigsPage() {
     settingsApi.get().then(setDefaults).catch(() => {})
   }, [])
 
-  // 编辑模式下账户与容器都锁定，不必列举。
+  // In edit mode both account and container are locked, so there is nothing to list.
   useEffect(() => {
     if (editing || !showForm || !form.accountId) return
     let cancelled = false
@@ -382,12 +400,14 @@ export function BackupConfigsPage() {
     }
   }, [form.accountId, editing, showForm])
 
-  // 密钥环丢失恢复(设计 §3.5)：顺序依赖是真实的——验证备份密码需要连云，连云需要账户密钥先恢复。
-  // 账户仍有待重设项时禁用重设按钮，避免用户在账户没修好前白试一遍备份密码。
+  // Keyring-loss recovery (design §3.5): the ordering dependency is real — verifying a backup password
+  // needs the cloud, and reaching the cloud needs the account key restored first.
+  // While accounts still have pending resets, the reset button is disabled, so the user does not waste an
+  // attempt on a backup password before the accounts are fixed.
   const accountsStillPending = (keyring?.accountsPending ?? 0) > 0
 
-  // 恢复模式下备份/还原/检查/修复一律 409(设计 §3.3)：按钮直接禁用并说明原因，
-  // 而不是让用户点了以后看到一坨原始的 409 响应体。
+  // In recovery mode, backup/restore/check/repair all return 409 (design §3.3): the buttons are disabled
+  // with the reason stated, rather than letting the user click and meet a raw 409 body.
   const keyringLost = keyring?.status === 'Lost'
   const keyringLostHint = keyringLost
     ? 'Data protection keys were lost — re-enter credentials before running this action.'
