@@ -287,7 +287,7 @@ if (authGate.Required)
             .Build());
 }
 
-// --- CORS (for the frontend dev server connecting directly during development; production goes through the nginx reverse proxy same-origin and needs no CORS) ---
+// --- CORS (for the frontend dev server connecting directly during development; in production the backend serves the built SPA out of wwwroot, so it is same-origin and needs no CORS) ---
 // The dev-server origin is written only in appsettings.Development.json (the single source of truth); unconfigured means an empty list —
 // we are certainly not going to have production allow a credentialed cross-origin request from a localhost address by default.
 var configuredOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];

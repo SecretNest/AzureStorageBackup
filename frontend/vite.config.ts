@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // In development /api is forwarded to the backend dev server; in production nginx reverse-proxies it.
+      // In development /api is forwarded to the backend dev server; in production the backend serves the built SPA itself, so it is already same-origin.
       '/api': {
         target: 'http://localhost:5122',
         changeOrigin: true,
