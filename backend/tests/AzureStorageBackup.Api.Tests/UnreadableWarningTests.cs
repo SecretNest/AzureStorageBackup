@@ -6,10 +6,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 一个文件读不开不该悄无声息——操作员必须在操作日志里看到记录，且知道系统给出的原因原文
-/// （"被占用"「权限不足」「设备读错误」各自需要不同处理，压成一句「无法读取」等于没告诉操作员任何事）。
-/// 操作日志是 pull-only，单用户无人值守部署下没人会主动去看；因此还须复用 UnrecoverableError 通知事件
-/// 推送出去——这是本文件要覆盖的实际修复点，日志级别也随该事件映射为 Error（不再是 Warning）。
+/// A file that cannot be read must not pass in silence — the operator has to see a record in the operation log, and has to see the verbatim reason the system gave
+/// ("in use by another process", "permission denied" and "device read error" each call for different handling; flattening them into one "cannot read" tells the operator nothing).
+/// The operation log is pull-only, and in a single-user unattended deployment nobody goes looking at it; so it must also be pushed out by reusing the UnrecoverableError
+/// notification event — that is the actual fix this file covers, and the log level follows that event's mapping to Error (no longer Warning).
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadableWarningTests : IDisposable
@@ -58,7 +58,7 @@ public sealed class UnreadableWarningTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    /// <summary>指定路径的读取一律抛给定异常，其余文件照常算 hash（同 UnreadableIndexEntryTests 的做法）。</summary>
+    /// <summary>Reads of the given path always throw the given exception; every other file is hashed as usual (same approach as UnreadableIndexEntryTests).</summary>
     private sealed class ThrowingHasher(string lockedPath, Exception toThrow) : IFileHasher
     {
         public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
@@ -77,7 +77,7 @@ public sealed class UnreadableWarningTests : IDisposable
                 : Task.FromResult("full-" + Path.GetFileName(path));
     }
 
-    /// <summary>捕获 AppendAsync 调用（等级/来源/消息），供断言警告内容。</summary>
+    /// <summary>Captures AppendAsync calls (level/source/message) so we can assert on the warning's content.</summary>
     private sealed class CapturingLog : IOperationLog
     {
         public List<(OperationLogLevel Level, string Source, string Message)> Entries { get; } = [];
@@ -93,7 +93,7 @@ public sealed class UnreadableWarningTests : IDisposable
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
-    /// <summary>捕获 NotifyAsync 调用（事件/标题/正文），供断言"读不开的文件推送了通知"。</summary>
+    /// <summary>Captures NotifyAsync calls (event/title/body) so we can assert "an unreadable file pushed a notification".</summary>
     private sealed class CapturingNotifier : INotifier
     {
         public List<(NotificationEvents Event, string Title, string Body)> Notifications { get; } = [];
@@ -104,7 +104,7 @@ public sealed class UnreadableWarningTests : IDisposable
         }
     }
 
-    /// <summary>构造一个可运行的编排器；differ 缺省时用真实 hasher，传入自定义 differ 可模拟某文件读不开。</summary>
+    /// <summary>Builds a runnable orchestrator; with no differ it uses the real hasher, and passing a custom differ lets you simulate a file being unreadable.</summary>
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
         BackupDiffer? differ = null, IOperationLog? opLog = null, INotifier? notifier = null)
     {
@@ -155,18 +155,18 @@ public sealed class UnreadableWarningTests : IDisposable
             await orchestrator.RunAsync(Request(account, name));
 
             var expectedSource = $"backup:{account.Id}/{name}";
-            // 复用 UnrecoverableError 事件后，日志级别随事件映射变为 Error（不再是 Warning）——这是有意的
-            // 结果：读不开的文件现在与"处理中反复变化"同级上报。
+            // Now that the UnrecoverableError event is reused, the log level follows that event's mapping and becomes Error (no longer Warning) — a deliberate
+            // consequence: unreadable files are now reported at the same level as "kept changing during processing".
             var entry = Assert.Single(log.Entries, e => e.Level == OperationLogLevel.Error);
             Assert.Equal(expectedSource, entry.Source);
             Assert.Contains("locked.mdf", entry.Message);
-            Assert.Contains(reason, entry.Message); // 原因原文必须原样保留，不能被压成一句「无法读取」
+            Assert.Contains(reason, entry.Message); // the verbatim reason must survive as-is and must not be flattened into one "cannot read"
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>本次修复的核心断言：读不开的文件不再只落进 pull-only 的操作日志，还须走通知 webhook 推送出去
-    /// （复用既有 UnrecoverableError 事件，无需新增开关）——否则无人值守部署下永远没人知道。</summary>
+    /// <summary>The core assertion of this fix: an unreadable file no longer just lands in the pull-only operation log, it must also be pushed out through the notification webhook
+    /// (reusing the existing UnrecoverableError event, no new toggle needed) — otherwise in an unattended deployment nobody ever finds out.</summary>
     [SkippableFact]
     public async Task Each_Unreadable_File_Raises_An_UnrecoverableError_Notification()
     {
@@ -191,15 +191,15 @@ public sealed class UnreadableWarningTests : IDisposable
 
             var notification = Assert.Single(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError);
             Assert.Contains("locked.mdf", notification.Title);
-            Assert.Contains(reason, notification.Body); // 原因原文必须一并推送，不能被压平
+            Assert.Contains(reason, notification.Body); // the verbatim reason must be pushed along with it and must not be flattened
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>终审 Minor：UnreadableFiles 此前是只写字段，没有任何消费者。每个读不开的文件确实各推了
-    /// 一条告警，但那些告警会淹没在别的消息里，而"备份成功"这一条是操作员一定会看的——它却只字不提
-    /// 有文件被跳过，于是一次"成功"的备份可以完全掩盖掉本轮根本没存下来的文件。非零时必须写进摘要；
-    /// 为零时不得添噪，否则每一次正常备份都多带一句无意义的 "0 unreadable"。</summary>
+    /// <summary>Final-review Minor: UnreadableFiles used to be a write-only field with no consumer whatsoever. Each unreadable file did push
+    /// a warning of its own, but those warnings drown among the other messages, while "backup succeeded" is the one the operator definitely reads — and it said not
+    /// a word about any file being skipped, so a "successful" backup could completely mask files that were never stored this run. When it is non-zero it must go into the summary;
+    /// when it is zero it must not add noise, otherwise every normal backup drags along a meaningless "0 unreadable".</summary>
     [SkippableFact]
     public async Task The_Success_Notification_Reports_Skipped_Files_Only_When_There_Are_Any()
     {
@@ -208,7 +208,7 @@ public sealed class UnreadableWarningTests : IDisposable
 
         var account = AzuriteAccount();
 
-        // 其一：有文件读不开 → 成功通知的摘要必须带上计数。
+        // Case one: a file is unreadable → the success notification's summary must carry the count.
         var withUnreadable = new CapturingNotifier();
         var differ = new BackupDiffer(new ThrowingHasher("locked.mdf",
             new IOException("The process cannot access the file because it is being used by another process.")));
@@ -224,14 +224,14 @@ public sealed class UnreadableWarningTests : IDisposable
             await orchestrator.RunAsync(Request(account, name));
 
             var success = Assert.Single(withUnreadable.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
-            // 措辞随摘要改版换过（现在这条消息还带新增/变更/删除与字节数，排版见 BackupSummary），
-            // 但这个测试要钉的从来不是那句话本身，而是"跳过的文件数必须出现在成功摘要里"。
+            // The wording changed when the summary was reworked (the message now also carries added/changed/deleted counts and byte totals; see BackupSummary for the layout),
+            // but what this test nails has never been that sentence itself — it is that "the number of skipped files must appear in the success summary".
             Assert.Contains("1 unreadable", success.Body);
         }
         finally { await container.DeleteIfExistsAsync(); }
 
-        // 其二：全部可读 → 摘要不得出现 unreadable 字样。这个反向断言防的是矫枉过正：
-        // 给每一次正常备份都挂上一句 "0 unreadable file(s) skipped" 会让这条信号迅速变成背景噪音。
+        // Case two: everything readable → the word unreadable must not appear in the summary. This reverse assertion guards against overcorrection:
+        // tacking "0 unreadable file(s) skipped" onto every normal backup would turn this signal into background noise in no time.
         var allReadable = new CapturingNotifier();
         var (clean, _, factory2) = Build(notifier: allReadable);
         var name2 = RandomName("readsummary-");
@@ -269,13 +269,13 @@ public sealed class UnreadableWarningTests : IDisposable
             var result = await orchestrator.RunAsync(Request(account, name));
 
             Assert.Equal(1, result.UnreadableFiles);
-            Assert.Equal(1, result.Version); // 备份本身照常成功完成，产出新版本
+            Assert.Equal(1, result.Version); // the backup itself still completes successfully and produces a new version
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>决策 8：长期被占用的文件每轮都告警。这是有意的——它确实没被备起来。
-    /// 若第二轮静默，操作员会以为问题自己好了。</summary>
+    /// <summary>Decision 8: a file that stays in use long-term warns on every single run. That is deliberate — it really is not being backed up.
+    /// If the second run went silent, the operator would think the problem had fixed itself.</summary>
     [SkippableFact]
     public async Task Two_Consecutive_Runs_Each_Report_About_The_Same_File()
     {
@@ -295,16 +295,16 @@ public sealed class UnreadableWarningTests : IDisposable
         {
             WriteText("locked.mdf", "database content");
 
-            var r1 = await orchestrator.RunAsync(Request(account, name)); // 第一轮：产生一条 Warning
-            var r2 = await orchestrator.RunAsync(Request(account, name)); // 第二轮：文件仍锁着，须再产生一条，而非静默
+            var r1 = await orchestrator.RunAsync(Request(account, name)); // first run: produces one warning
+            var r2 = await orchestrator.RunAsync(Request(account, name)); // second run: the file is still locked, so it must produce another one rather than go silent
 
             Assert.Equal(1, r1.Version);
-            Assert.Equal(2, r2.Version); // 第二轮同样成功完成，不因文件一直读不开而失败
+            Assert.Equal(2, r2.Version); // the second run completes successfully too; a permanently unreadable file does not fail it
             Assert.Equal(1, r1.UnreadableFiles);
             Assert.Equal(1, r2.UnreadableFiles);
 
             var warnings = log.Entries.Where(e => e.Level == OperationLogLevel.Error && e.Message.Contains("locked.mdf")).ToList();
-            Assert.Equal(2, warnings.Count); // 两轮各一条，长期占用不能只报一次就沉默
+            Assert.Equal(2, warnings.Count); // one per run; a long-term lock must not report once and then fall silent
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

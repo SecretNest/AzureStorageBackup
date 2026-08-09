@@ -4,12 +4,14 @@ using System.Text;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 备份成功那条摘要的排版。这条消息同时进操作日志和 webhook 通知，是操作员一定会看的一条，
-/// 所以它得能独立回答几个问题：这轮动了哪些文件、云上多了多少数据、旧版本清掉了多少。
+/// Layout of the summary line for a successful backup. This message goes to both the operation log and the webhook
+/// notification, so it is the one line the operator is certain to read; it has to answer a few questions on its own:
+/// which files moved this round, how much data the cloud gained, how much the old versions freed up.
 /// <para>
-/// 摘成纯函数（而不是留在编排器里拼字符串）只有一个目的：让"零值整段消失"这条规则能被逐条测到。
-/// 每轮都挂着一串 0 的话，真正有信息的那次就淹没在噪音里了——尤其是 unreadable，
-/// 那一项恰恰是最需要被看见的。
+/// Pulling it out into a pure function (instead of concatenating strings inside the orchestrator) has exactly one
+/// purpose: to make the "a zero makes the whole segment disappear" rule testable item by item. If every round dragged
+/// a string of zeros along, the round that actually carries information would drown in the noise — especially
+/// unreadable, which is precisely the item that most needs to be seen.
 /// </para>
 /// </summary>
 public static class BackupSummary
@@ -26,15 +28,18 @@ public static class BackupSummary
             files.Add($"{r.ModifiedFiles} modified");
         if (r.DeletedFiles > 0)
             files.Add($"{r.DeletedFiles} deleted");
-        // 读不开的文件既不算变更也不算删除，索引会静默沿用旧条目——所以它必须自己占一项。
-        // 少了这一句，一次"成功"的备份就把本轮根本没存下来的文件掩盖过去了。
+        // An unreadable file counts as neither a change nor a deletion; the index silently carries the old entry
+        // forward — so it has to occupy an item of its own. Without this line, a "successful" backup papers over the
+        // files this round never actually stored.
         if (r.UnreadableFiles > 0)
             files.Add($"{r.UnreadableFiles} unreadable (skipped)");
 
         sb.Append("\nFiles: ").Append(files.Count > 0 ? string.Join(", ", files) : "no changes");
 
-        // 源侧变更量与实传量都为零才省略这行。只有实传为零时**不能**省——那正是去重全命中的那一轮，
-        // "改了 4.7 GB 却一个字节都没上传"是这两个口径分开报的全部意义所在。
+        // The line is dropped only when the source-side change volume and the uploaded volume are both zero. When
+        // only the uploaded volume is zero it must **not** be dropped — that is exactly the round where dedup hit on
+        // everything, and "changed 4.7 GB yet uploaded not a single byte" is the whole point of reporting these two
+        // figures separately.
         if (r.ChangedBytes > 0 || r.UploadedBytes > 0)
         {
             sb.Append(CultureInfo.InvariantCulture,
@@ -48,9 +53,10 @@ public static class BackupSummary
     }
 
     /// <summary>
-    /// 保留清理那一句。公开是因为定时清理任务（TaskDispatcher）单独跑时也要报同样的数字——
-    /// 同一件事在两个地方各写一遍措辞，迟早会漂成两种说法，而操作员得同时读这两条日志。
-    /// 调用方须自行跳过 <see cref="CleanupReport.IsEmpty"/>：什么都没清掉时这句不该出现。
+    /// The retention-cleanup line. It is public because the scheduled cleanup task (TaskDispatcher) has to report the
+    /// same numbers when it runs on its own — write the wording for one thing twice in two places and it will drift
+    /// into two different phrasings sooner or later, while the operator has to read both logs.
+    /// Callers must skip it themselves on <see cref="CleanupReport.IsEmpty"/>: when nothing was cleaned up, this line should not appear.
     /// </summary>
     public static string FormatRetention(CleanupReport c)
     {

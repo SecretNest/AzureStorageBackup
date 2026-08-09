@@ -3,14 +3,14 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一次修复运行的内存状态。</summary>
+/// <summary>In-memory state of one repair run.</summary>
 public sealed class RepairRunState
 {
     public RunStatus Status { get; set; } = RunStatus.Running;
     public RepairReport? Report { get; set; }
     public string? Error { get; set; }
 
-    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。</summary>
+    /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
@@ -23,9 +23,10 @@ public sealed record RepairRunResponse(
 }
 
 /// <summary>
-/// 后台修复运行器：跑 <see cref="BackupRepairer"/>，状态存内存供轮询。
-/// **持有 <see cref="BackupBusyTracker"/> 到完成**——修复改 blob/索引且涉及去重共享，必须独占，
-/// 期间该备份不能做备份/检查/其它修复（用户要求）。目标忙碌时直接失败。
+/// Background repair runner: runs <see cref="BackupRepairer"/> and keeps the state in memory for polling.
+/// It **holds <see cref="BackupBusyTracker"/> until completion** — a repair rewrites blobs/indexes and touches
+/// dedup-shared objects, so it must be exclusive: while it runs, that backup can do no backup, check or other repair
+/// (a user requirement). Fails outright when the target is busy.
 /// </summary>
 public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
@@ -52,8 +53,9 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
-    /// <summary>停止正在跑的那次修复。返回 false = 当前没有在跑的修复。
-    /// Cancel() 在当前线程同步跑回调，故取记录用锁、取消不用（见 BackupRunner.Cancel 同处注释）。</summary>
+    /// <summary>Stop the repair that is currently running. Returns false = nothing is running right now.
+    /// Cancel() runs its callbacks synchronously on the calling thread, so the lock covers looking the record up but
+    /// not the cancellation itself (see the same comment on BackupRunner.Cancel).</summary>
     public bool Cancel(int configId)
     {
         RepairRunState? state;
@@ -89,19 +91,22 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 var options = new CheckOptions
                 {
                     Cloud = cloud,
-                    // 显式转为 AccessTier?：见 BackupConfigEndpoints.cs /check 端点同处注释（真实生产 bug 修复）。
+                    // Explicit cast to AccessTier?: see the same comment on the /check endpoint in
+                    // BackupConfigEndpoints.cs (this fixed a real production bug).
                     RehydrateTier = rehydrate is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     ListOrphans = cleanupOrphans,
                 };
-                // 与备份路径走同一个解析器。此前这里回落到 settings.DefaultVolumeBytes，
-                // 而 BackupRequestMapper 回落到 null——同一份备份，修复写出的分卷布局
-                // 与新备份写出的不一致。解析器统一了两边。
+                // Goes through the same resolver as the backup path. This used to fall back to
+                // settings.DefaultVolumeBytes while BackupRequestMapper fell back to null — so for one and the same
+                // backup, the volume layout a repair wrote differed from the one a new backup wrote. The resolver
+                // unified the two sides.
                 var resolved = ResolvedBackupSettings.From(config, settings);
                 state.Report = await sp.GetRequiredService<BackupRepairer>().RepairAsync(
                     account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                     config.LocalRoot, version, options, BackupRequestMapper.MapTier(config.DataTier),
                     resolved.VolumeBytes is > 0 ? resolved.VolumeBytes : null,
-                    // 与 BackupRequestMapper.From 取同一份规则：修好的归档要和全新备份写出的压缩方式一致。
+                    // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
+                    // compression mode a fresh backup writes.
                     BackupRequestMapper.OptionalRules(resolved.DontCompressRules), state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
             }
@@ -113,14 +118,15 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         }
         catch (OperationCanceledException)
         {
-            // 用户按了停止：不是失败，不写 Error 状态（与 BackupRunner 同一约定）。
+            // The user pressed stop: not a failure, so no Error state is written (the same convention as BackupRunner).
             state.Status = RunStatus.Canceled;
         }
         catch (Exception ex)
         {
             state.Error = ex.Message;
             state.Status = RunStatus.Failed;
-            // 原 scope 可能已随异常释放（`using var scope` 在 try 块退出时释放）：另开一个写状态。
+            // The original scope may already have been disposed by the exception (`using var scope` disposes when
+            // the try block exits): open another one to write the status.
             using var scope = scopes.CreateScope();
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<RepairRunner>>());

@@ -6,10 +6,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// `IndexEntry.UnreadableAt` 曾是**纯只写字段**：写入方只有编排器，序列化占了索引 format 4，
-/// 读取方一个都没有。于是"这个版本里这份内容是旧的"这件事，操作员在任何界面上都看不到——
-/// 还原时静默拿到更早的内容，检查时看到 Changed 却以为是本地被改了。
-/// 本文件走 HTTP 端到端验证三个出口：运行结果计数、/unreadable 列表、还原树节点标注。
+/// `IndexEntry.UnreadableAt` used to be a **purely write-only field**: the only writer was the orchestrator, its serialization took up index format 4,
+/// and there were zero readers. So the fact "this content is stale in this version" was invisible to the operator on every screen —
+/// a restore would silently hand back older content, and a check would show Changed while the operator assumed the local file had been edited.
+/// This file verifies three outlets end to end over HTTP: the run result count, the /unreadable list, and the restore tree node annotation.
 /// </summary>
 [Trait("Category", "Integration")]
 public class UnreadableVisibilityTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>, IDisposable
@@ -44,7 +44,7 @@ public class UnreadableVisibilityTests(TestWebAppFactory factory) : IClassFixtur
     private sealed record RunState(string status, int? version, int? unreadableFiles, string? error);
     private sealed record Node(string name, string path, bool isDir, long? length, DateTimeOffset? unreadableAt);
 
-    /// <summary>触发一次备份并等它到达终态。</summary>
+    /// <summary>Kick off one backup and wait for it to reach a terminal state.</summary>
     private async Task<RunState> RunBackupAsync(int configId)
     {
         (await _client.PostAsync($"/api/backup-configs/{configId}/run", null)).EnsureSuccessStatusCode();
@@ -90,39 +90,39 @@ public class UnreadableVisibilityTests(TestWebAppFactory factory) : IClassFixtur
             DataTier = StorageTier.Hot,
         })).Content.ReadFromJsonAsync<BackupConfigResponse>();
 
-        // v1：两个文件都读得到。
+        // v1: both files are readable.
         var first = await RunBackupAsync(cfg!.Id);
         Assert.Equal("Completed", first.status);
         Assert.Equal(1, first.version);
-        Assert.Equal(0, first.unreadableFiles); // 全部读到 → 计数为 0，不能误报
+        Assert.Equal(0, first.unreadableFiles); // everything was read → the count is 0, no false positives
 
-        // v2：其中一个读不开了 → 索引沿用 v1 的条目并打上 UnreadableAt。
+        // v2: one of them became unreadable → the index carries v1's entry forward and stamps UnreadableAt on it.
         File.SetUnixFileMode(locked, UnixFileMode.None);
         var second = await RunBackupAsync(cfg.Id);
 
         Assert.Equal("Completed", second.status);
         Assert.Equal(2, second.version);
-        // 出口一：运行结果。此前只有 Version 进了状态，"这轮跳过了文件"在界面上完全看不到。
+        // Outlet one: the run result. Only Version used to make it into the status, so "this run skipped files" was completely invisible in the UI.
         Assert.Equal(1, second.unreadableFiles);
 
-        // 出口二：/unreadable 列表。此前没有任何端点能问出"哪些文件的内容是旧的"。
+        // Outlet two: the /unreadable list. There used to be no endpoint at all that could answer "which files' content is stale".
         var rows = await _client.GetFromJsonAsync<List<UnreadableRow>>(
             $"/api/backup-configs/{cfg.Id}/unreadable?version=2");
         var row = Assert.Single(rows!);
         Assert.Equal("locked.txt", row.path);
         Assert.NotEqual(default, row.unreadableAt);
 
-        // 读得到的文件绝不能被列进来。
+        // Files that were readable must never be listed here.
         Assert.DoesNotContain(rows!, r => r.path == "plain.txt");
 
-        // 出口三：还原树。选择还原内容的那一刻，标注必须就在文件旁边。
+        // Outlet three: the restore tree. At the moment you pick what to restore, the annotation has to be right next to the file.
         var tree = await _client.GetFromJsonAsync<List<Node>>(
             $"/api/backup-configs/{cfg.Id}/tree?version=2");
         Assert.NotNull(tree);
         Assert.Equal(row.unreadableAt, tree.Single(n => n.name == "locked.txt").unreadableAt);
         Assert.Null(tree.Single(n => n.name == "plain.txt").unreadableAt);
 
-        // v1 里这个文件是正常备份的，那一版的树/列表都不该带标注。
+        // In v1 this file was backed up normally, so neither that version's tree nor its list should carry the annotation.
         Assert.Empty((await _client.GetFromJsonAsync<List<UnreadableRow>>(
             $"/api/backup-configs/{cfg.Id}/unreadable?version=1"))!);
     }

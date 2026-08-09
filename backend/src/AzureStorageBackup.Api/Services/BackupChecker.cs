@@ -6,10 +6,11 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 备份完整性检查（M5、PRD 2.3），分级、双轴：
-/// 云端轴 <see cref="CloudCheckLevel"/>（不查 / 元数据比对 / 存在+尺寸 / 下载重算 hash）；
-/// 本地轴 <see cref="LocalCheckLevel"/>（不查 / 存在+尺寸+权限 / 内容 hash）。
-/// 本地内容一致（可修复）＝修复的判据；结果按文件给出云端/本地状态，供修复与还原替代。
+/// Backup integrity check (M5, PRD 2.3), tiered and two-axis:
+/// the cloud axis <see cref="CloudCheckLevel"/> (skip / metadata comparison / existence+size / download and rehash);
+/// the local axis <see cref="LocalCheckLevel"/> (skip / existence+size+permissions / content hash).
+/// "Local content matches" (repairable) is the criterion for repair; the result gives a cloud/local state per file,
+/// which feeds repair and restore-time substitution.
 /// </summary>
 public sealed class BackupChecker(
     IBlobClientFactory factory,
@@ -21,17 +22,20 @@ public sealed class BackupChecker(
     IOperationLog? opLog = null,
     TrackedInfoStore? trackedInfo = null)
 {
-    /// <summary>测试注入的毫秒时间源，原样转给内部经 <see cref="Track"/> 建的每一个
-    /// <see cref="StageTracker"/>（见其上同名字段的注释；与 <see cref="RestoreOrchestrator.Clock"/>
-    /// 是同一形状的镜像件）。生产为 null，走真实墙钟。用来让"下载结束就摘掉在途标记、
-    /// 解压/算 hash 期间不再算在途"这类时序断言摆脱 200ms 节流窗口——注入后每次查询时间都
-    /// 保证前进，节流因此永不生效，每一次状态变化都会被发布出来，断言不必赌真实时钟是否
-    /// 恰好跨过节流窗口。</summary>
+    /// <summary>Test-injected millisecond time source, handed through verbatim to every
+    /// <see cref="StageTracker"/> built internally via <see cref="Track"/> (see the comment on the field of the same
+    /// name there; it is a mirror of <see cref="RestoreOrchestrator.Clock"/>). Null in production, which uses the
+    /// real wall clock. It exists so timing assertions like "the in-flight marker comes off the moment the download
+    /// ends, and extraction / hashing no longer counts as in flight" can escape the 200ms throttle window — once
+    /// injected, every time query is guaranteed to move forward, so throttling never takes effect and every state
+    /// change gets published; the assertion no longer has to gamble on whether the real clock happened to cross a
+    /// throttle window.</summary>
     internal Func<long>? Clock { get; init; }
 
     /// <param name="onProgress">
-    /// 阶段进度回调（可空）。检查此前完全没有进度：内容级要把整个备份下载重算 hash，
-    /// 跑几小时是常态，界面上却只有一个转圈——分不清是在查还是挂死了。
+    /// Stage progress callback (nullable). A check used to have no progress at all: the content level downloads the
+    /// whole backup and rehashes it, running for hours is normal, and yet the UI showed nothing but a spinner — you
+    /// could not tell "still checking" from "wedged".
     /// </param>
     public async Task<CheckReport> CheckAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
@@ -66,9 +70,10 @@ public sealed class BackupChecker(
             await notifier.NotifyAsync(evt, title, body, ct);
     }
 
-    /// <summary>阶段跟踪器的构造捷径：没人要进度就一路传 null，不产生任何开销。</summary>
-    /// <param name="inFlight">这个阶段会不会登记在途项。只有会的（Verifying）才让测速时钟
-    /// 随流启停；不会的（本地/列举/元数据）必须走墙钟，否则虚拟时钟永不前进、速度恒为 0。</param>
+    /// <summary>Shortcut for building a stage tracker: when nobody asked for progress, null flows all the way through and costs nothing.</summary>
+    /// <param name="inFlight">Whether this stage registers in-flight items. Only the ones that do (Verifying) let the
+    /// speed clock start and stop with the stream; the ones that do not (local / listing / metadata) must use the wall
+    /// clock, otherwise the virtual clock never advances and the speed stays at 0 forever.</param>
     private StageTracker? Track(
         Action<StageProgress>? onProgress, string stage, int total, bool inFlight = false) =>
         onProgress is null ? null : new StageTracker(stage, total, onProgress, inFlight) { Clock = Clock };
@@ -77,7 +82,8 @@ public sealed class BackupChecker(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
         int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
-        // 索引里有多少条目，要读完索引才知道 → 总数给 0，界面显示「… so far」而不是一个假百分比。
+        // How many entries the index holds is only known once it has been read through → report a total of 0, so
+        // the UI shows "… so far" instead of a made-up percentage.
         var loading = Track(onProgress, "LoadingIndex", 0);
         loading?.Touch(container);
 
@@ -106,22 +112,22 @@ public sealed class BackupChecker(
 
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
 
-        // 云端状态（按文件）：只在 ExistenceSize/Content 级实际查数据 blob。
+        // Cloud state (per file): data blobs are only actually queried at the ExistenceSize/Content levels.
         var cloudBad = new HashSet<string>(StringComparer.Ordinal);
         if (options.Cloud >= CloudCheckLevel.ExistenceSize)
             cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, onProgress, ct);
 
-        // 本地轴：逐条目对源文件比对。Content 级要把每个文件完整读一遍算 hash，
-        // 和备份的 Diffing 一样慢，同样必须逐条报进度。
+        // Local axis: compare each entry against its source file. The Content level reads every file end to end to
+        // hash it — as slow as the backup's Diffing stage, so it likewise has to report progress entry by entry.
         var localTracker = Track(onProgress, "Local", index.Entries.Count);
         var findings = new List<FileFinding>(index.Entries.Count);
         foreach (var e in index.Entries)
         {
             localTracker?.Touch(e.Path);
             var refName = e.Storage is { } s ? BlobNameOf(s) : null;
-            // 零长度的普通文件在云端**本就不该有**对应对象（备份侧不给它产生存储引用，
-            // 见 BackupOrchestrator.IsEmptyFile）。报 NotChecked 会让一整列空文件看起来像是
-            // 检查漏掉了它们；它们的云端状态是确定的，就是没问题。
+            // A zero-length regular file **is not supposed to have** a cloud object at all (the backup side never
+            // produces a storage ref for it, see BackupOrchestrator.IsEmptyFile). Reporting NotChecked would make a
+            // whole column of empty files look like the check skipped them; their cloud state is settled — it is fine.
             var cloud = e.Storage is null && e.Kind == "file" && e.Length == 0
                 ? CloudState.Ok
                 : options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
@@ -129,7 +135,7 @@ public sealed class BackupChecker(
                     : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
             var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
             findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt });
-            // 字节只在真的读了文件时才算，否则 Attributes/None 级会报出一个天文数字的"速度"。
+            // Only count bytes when the file was really read, or the Attributes/None levels report an astronomical "speed".
             localTracker?.Advance(options.Local == LocalCheckLevel.Content ? e.Length : 0);
         }
         localTracker?.Complete();
@@ -142,8 +148,9 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// 云端列表检查（§4.8）：枚举 container 全部 blob 减去引用集 = 孤儿。构不出**完整**引用集
-    /// （缺版本索引且云端读失败）→ 放弃列举、记 Warning、返回空（绝不据不完整信息把被引用 blob 当孤儿）。
+    /// Cloud listing check (§4.8): every blob in the container minus the reference set = the orphans. If the
+    /// **complete** reference set cannot be built (a version index is missing and the cloud read fails) → give up on
+    /// listing, log a Warning, return empty (never call a referenced blob an orphan on incomplete information).
     /// </summary>
     private async Task<IReadOnlyList<string>> ListOrphansAsync(
         BlobContainerClient cc, Account account, string container, string? password, BackupInfoFile info,
@@ -162,7 +169,7 @@ public sealed class BackupChecker(
             return [];
         }
 
-        // 容器里有多少 blob 只能边列边知道 → 总数 0，报"已列举多少"。
+        // How many blobs the container holds is only learned while listing → total 0, report "how many listed so far".
         var listing = Track(onProgress, "Orphans", 0);
         var orphans = new List<string>();
         await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
@@ -177,8 +184,10 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// 构造全部保留版本引用的 blob 名集合：读全部版本的第二级索引（本地权威 store），再调纯函数
-    /// <see cref="ReferencedBlobNames"/>。任一版本索引读不到（本地缺且云端读失败）会抛出——调用方据此放弃删除。
+    /// Build the set of blob names referenced by every retained version: read the second-level index of every version
+    /// (through the local-authoritative store), then call the pure function <see cref="ReferencedBlobNames"/>. If any
+    /// version index cannot be read (missing locally and the cloud read fails) this throws — which is the caller's cue
+    /// to give up on deleting.
     /// </summary>
     public async Task<HashSet<string>> BuildReferencedSetAsync(
         Account account, string container, string? password, BackupInfoFile info, CancellationToken ct = default)
@@ -190,25 +199,27 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// **纯函数**：给定信息文件 + 全部保留版本索引，返回一切被引用的 blob 名（删除孤儿的承重安全依据）。涵盖：
-    /// 信息文件（明文 + 加密两种命名都保护）；每个版本的 <c>IndexBlob</c>；每个 <see cref="StorageRef"/> 的**全部分卷**
-    /// （单文件 blob 按 <see cref="StorageRef.Volumes"/>；pack 按 <see cref="PackInfo.Volumes"/>）——跨全部版本，
-    /// 含仅被旧版本引用者。pack 被引用却在 <c>info.Packs</c> 缺元数据 → 无法确定分卷数 → 抛错（迫使放弃删除）。
+    /// **Pure function**: given the info file + every retained version index, return every referenced blob name (the
+    /// load-bearing safety basis for deleting orphans). Covered: the info file (both the plaintext and the encrypted
+    /// name are protected); each version's <c>IndexBlob</c>; **every volume** of each <see cref="StorageRef"/>
+    /// (single-file blobs via <see cref="StorageRef.Volumes"/>, packs via <see cref="PackInfo.Volumes"/>) — across all
+    /// versions, including the ones only an older version references. A pack that is referenced but has no metadata in
+    /// <c>info.Packs</c> → its volume count cannot be determined → throw (forcing the caller to give up on deleting).
     /// </summary>
     public static HashSet<string> ReferencedBlobNames(BackupInfoFile info, IReadOnlyDictionary<int, VersionIndex> indexes)
     {
         var refs = new HashSet<string>(StringComparer.Ordinal)
         {
-            // 信息文件：两种命名都纳入引用集，任何情况下都不当孤儿删除。
+            // The info file: both names go into the reference set, so under no circumstances is it deleted as an orphan.
             BackupDiscovery.IndexBlobName,
             BackupDiscovery.EncryptedIndexBlobName,
         };
 
-        // 每个版本的第二级索引 blob（即便某版本索引未在 indexes 中提供，其名也须保护）。
+        // The second-level index blob of every version (its name must be protected even when that version's index was not supplied in indexes).
         foreach (var v in info.Versions)
             refs.Add(v.IndexBlob);
 
-        // 每个版本索引的每个存储引用的全部分卷。
+        // Every volume of every storage ref of every version index.
         foreach (var idx in indexes.Values)
             foreach (var e in idx.Entries)
             {
@@ -229,8 +240,9 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// 云端数据检查，返回**云端已坏的文件路径集**。ExistenceSize：每个 blob/分卷 HEAD 验存在+尺寸；
-    /// Content：在此基础上对可读 blob 下载重算 hash（Archive 未活化则跳过，不误判为坏）。
+    /// Cloud data check; returns the **set of file paths that are bad in the cloud**. ExistenceSize: HEAD every
+    /// blob/volume to verify existence + size. Content: on top of that, download every readable blob and recompute its
+    /// hash (a blob still in Archive without rehydration is skipped, not mistaken for corruption).
     /// </summary>
     private async Task<HashSet<string>> CloudCheckAsync(
         BlobContainerClient cc, BackupInfoFile info, VersionIndex index, CheckOptions options, string? password,
@@ -238,14 +250,15 @@ public sealed class BackupChecker(
     {
         var bad = new HashSet<string>(StringComparer.Ordinal);
 
-        // 按 blob 归组（blobName → 该 blob 的条目 + 期望分卷数/尺寸）。
+        // Group by blob (blobName → the entries in that blob + the expected volume count/sizes).
         var groups = index.Entries
             .Where(e => e.Storage is not null)
             .GroupBy(e => BlobNameOf(e.Storage!))
             .ToList();
 
-        // 数的是**存储对象**（包与单文件 blob），不是文件——一个包只查一次。
-        // 界面上的单位随之标为 objects，免得和文件数对不上被读成打包没生效。
+        // What gets counted are **storage objects** (packs and single-file blobs), not files — a pack is checked
+        // once. The UI unit is labelled objects to match, so the mismatch with the file count is not read as
+        // "packing didn't take effect".
         var tracker = Track(onProgress, "Cloud", groups.Count);
         var presentGroups = new List<IGrouping<string, IndexEntry>>();
         foreach (var g in groups)
@@ -263,7 +276,7 @@ public sealed class BackupChecker(
             {
                 presentGroups.Add(g);
             }
-            // HEAD 不下载内容：字节记 0，否则会报出一个与实际流量无关的"速度"。
+            // HEAD downloads no content: count 0 bytes, or the reported "speed" has nothing to do with actual traffic.
             tracker?.Advance(0);
         }
         tracker?.Complete();
@@ -283,10 +296,12 @@ public sealed class BackupChecker(
             ? info.Packs.TryGetValue(s.Ref, out var pi) ? (pi.Volumes, pi.VolumeSizes) : (1, [])
             : (s.Volumes, s.VolumeSizes);
 
-    /// <summary>深度校验：并发下载解压、重算 fullHash 与索引比对。仅内容不符计入损坏；
-    /// Archive 未活化（下载报 archived）不计损坏（无法验证，跳过）。</summary>
-    /// <param name="info">只为算出每个对象要拉多少字节（pack 的卷尺寸记在信息文件里，
-    /// 不在条目上——压实会改写它）。界面据此显示"传了多少 / 一共多大"。</param>
+    /// <summary>Deep verification: download and extract concurrently, recompute fullHash and compare it with the
+    /// index. Only a content mismatch counts as corruption; a blob still in Archive (the download reports archived)
+    /// does not — it cannot be verified, so it is skipped.</summary>
+    /// <param name="info">Used only to work out how many bytes each object will pull (a pack's volume sizes live in
+    /// the info file, not on the entry — compaction rewrites them). The UI uses this to show "how much transferred /
+    /// how much in total".</param>
     private async Task<IReadOnlyList<string>> DeepVerifyAsync(
         BlobContainerClient cc, BackupInfoFile info, List<IGrouping<string, IndexEntry>> presentGroups,
         CheckOptions options, string? password, int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
@@ -297,7 +312,7 @@ public sealed class BackupChecker(
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
         using var gate = new SemaphoreSlim(Math.Max(1, downloadConcurrency));
-        // 这是整个检查里唯一真正下载数据的阶段，也是唯一可能跑几小时的阶段。
+        // This is the only stage in the whole check that actually downloads data, and the only one that can run for hours.
         var tracker = Track(onProgress, "Verifying", presentGroups.Count, inFlight: true);
         try
         {
@@ -306,14 +321,14 @@ public sealed class BackupChecker(
                 try { return await VerifyGroupAsync(cc, info, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
                 finally
                 {
-                    tracker?.Advance(0); // 计数与在途分开：一个组恰好占一个槽位
+                    tracker?.Advance(0); // counting is separate from in-flight: one group takes exactly one slot
                 }
             }));
             return perGroup.SelectMany(x => x).ToList();
         }
         finally
         {
-            tracker?.Complete(); // 不强制产出终态，最后一组的字节会被节流压住再也发不出去
+            tracker?.Complete(); // without forcing a final publish, the last group's bytes stay pinned by the throttle and never come out
             try { Directory.Delete(work, recursive: true); } catch { /* best effort */ }
         }
     }
@@ -326,18 +341,21 @@ public sealed class BackupChecker(
         var groupDir = Path.Combine(work, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(groupDir);
         await gate.WaitAsync(ct);
-        // 在途标记要在**拿到闸门之后**才打：所有组的委托一开始就会被枚举执行到第一个真正的
-        // await，若在那之前标记，几千个包会一股脑全算"正在校验"（见 RestoreOrchestrator 同处注释）。
-        // 名字用**源文件路径**（pack 用包号+成员数），不是内容寻址的 blob 名——与上传/还原侧同一形状。
+        // The in-flight marker goes on **only after the gate is taken**: every group's delegate is enumerated up to
+        // its first real await right at the start, so marking before that would count thousands of packs as
+        // "verifying" all at once (see the same comment in RestoreOrchestrator).
+        // The name uses the **source file path** (packs use the pack id + member count), not the content-addressed
+        // blob name — the same shape as the upload/restore sides.
         tracker?.BeginItem(
             blobName,
             TransferLabel.For(members[0].Storage!, members),
             TransferLabel.DownloadBytesOf(members[0].Storage!, info));
         try
         {
-            // 工厂而不是单个 IProgress<long>：见 VolumeBlobIO.DownloadAsync 上的注释——
-            // 多卷共用一个实例会在"小卷后接大卷"时把大卷首次上报的基线算错，整卷漏计一段
-            // （上限是前一卷的大小），不是虚高。
+            // A factory rather than one IProgress<long>: see the comment on VolumeBlobIO.DownloadAsync — sharing a
+            // single instance across volumes miscomputes the baseline of a large volume's first report in the
+            // "small volume followed by a large one" case, leaving a stretch of that volume uncounted (bounded by the
+            // previous volume's size); it undercounts, it does not inflate.
             Func<IProgress<long>>? itemProgress = tracker is null ? null : () => tracker.ItemProgress(blobName);
 
             string firstVolume;
@@ -347,27 +365,31 @@ public sealed class BackupChecker(
             }
             finally
             {
-                // 下载一结束（成功或抛出）就摘在途标记：字节已经边传边计过了，测速窗口
-                // 不该被随后不占网线的解压、重算 hash 时间继续拖长。这个 finally 只包
-                // 下载本身——它不吞异常，下载失败照样穿透到下面两个 catch，两者看到的
-                // 异常集合与改动前完全一致。
+                // The moment the download ends (success or throw), take the in-flight marker off: the bytes were
+                // counted as they streamed, and the speed window must not keep stretching over the extraction and
+                // rehashing that follow, which use no network at all. This finally wraps the download only — it
+                // swallows nothing, a failed download still falls through to the two catches below, and the set of
+                // exceptions they see is exactly what it was before this change.
                 tracker?.EndItem(blobName, 0);
             }
 
-            // 下载已经摘出在途窗口，但解压/重算 hash 这段本地 CPU 工作不能就此从界面上消失——
-            // 内容级检查最慢的一步就是它，没有这一对，界面会冻在下载刚结束那一刻的快照上，
-            // 跟卡死一模一样（同 RestoreOrchestrator.RestoreGroupAsync 同处注释）。
+            // The download has left the in-flight window, but the local CPU work of extracting and rehashing must
+            // not vanish from the UI along with it — that is the slowest step of a content-level check, and without
+            // this pair the UI freezes on the snapshot taken the instant the download ended, which looks exactly like
+            // a hang (same comment in RestoreOrchestrator.RestoreGroupAsync).
             try
             {
-                // BeginPacking 挪进 try：它现在会在 _gate 下调用 publish(...)，非心跳路径故意让
-                // publish 抛出的异常继续往外传（见 StageProgress.cs 里 BeginPacking 的说明）。
-                // 留在 try 外面的话，一旦这里抛出，_inPacking 加了却没有配对的 EndPacking，
-                // preparing 会在余下的运行里卡在虚高的数字上；挪进来就有下面这个 finally 兜底。
+                // BeginPacking moved inside the try: it now calls publish(...) under _gate, and on the non-heartbeat
+                // path an exception from publish is deliberately allowed to propagate (see the notes on BeginPacking
+                // in StageProgress.cs). Left outside the try, a throw here would increment _inPacking with no matching
+                // EndPacking, and preparing would sit at an inflated number for the rest of the run; moved inside, the
+                // finally below backstops it.
                 tracker?.BeginPacking();
-                // 这段的共同契约是「解压/算 hash 发生在这一件已经退出 ActiveItems 之后」，
-                // 与 RestoreOrchestrator 同一形状；这里由 BackupCheckerTests 里同名的
-                // Extraction_Starts_After_Item_Is_Removed_From_ActiveItems 钉住（镜像还原侧
-                // 那条测试，但各自独立、互不代替），不再需要借还原侧的测试来兜底。
+                // The shared contract of this stretch is "extraction/hashing happens after this item has already
+                // left ActiveItems", the same shape as in RestoreOrchestrator; on this side it is pinned by the
+                // identically named Extraction_Starts_After_Item_Is_Removed_From_ActiveItems in BackupCheckerTests
+                // (a mirror of the restore-side test, but the two are independent and neither substitutes for the
+                // other), so the restore-side test is no longer borrowed as a backstop.
                 corrupted.AddRange(members[0].Storage!.Kind == "blob"
                     ? await VerifyBlobAsync(firstVolume, members, password, ct)
                     : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
@@ -379,28 +401,33 @@ public sealed class BackupChecker(
         }
         catch (RequestFailedException ex) when (IsArchived(ex))
         {
-            // Archive 未活化 → 无法下载验证；若指定活化 tier 则发起活化。不计为损坏。
+            // Still in Archive without rehydration → cannot be downloaded to verify; kick off rehydration if a tier
+            // was given. Not counted as corruption.
             if (options.RehydrateTier is { } tier)
                 await RehydrateAsync(cc, blobName, tier, ct);
         }
         catch
         {
-            corrupted.AddRange(members.Select(m => m.Path)); // 其它下载/解压失败 → 整组损坏
+            corrupted.AddRange(members.Select(m => m.Path)); // any other download/extract failure → the whole group is corrupt
         }
         finally
         {
-            // 先摘在途再放闸门：反过来的话，后一个组已经开始校验，界面上却还挂着上一个组。
-            // EndItem(blobName, 0) 是兜底而非正路：正常情况下载完成时已经在上面的 finally
-            // 里摘过一次，字节也已经在下载过程中边传边计完——这里只防 BeginItem 之后、
-            // 进下载 try 之前抛异常的边界情况。EndItem 本身不是幂等的（_bytes += bytes 与
-            // PublishIfDue 都在 TryRemove 之外无条件跑），这句在正常路径下不会把「解压+算 hash」
-            // 的字节再补一次进测速窗口，纯粹是因为它传的字节数是 0，不是因为 EndItem 本身安全重入。
+            // Clear in-flight first, then release the gate: the other way round, the next group has already started
+            // verifying while the UI still shows the previous one. EndItem(blobName, 0) is a backstop, not the normal
+            // path: normally the marker was already taken off in the finally above when the download completed, and
+            // the bytes were fully counted as they streamed — this only guards the edge case of a throw after
+            // BeginItem but before entering the download try. EndItem is not idempotent (_bytes += bytes and
+            // PublishIfDue both run unconditionally, outside TryRemove); the reason this call does not top the speed
+            // window up a second time with the "extract + hash" bytes on the normal path is purely that the byte count
+            // it passes is 0, not that EndItem is safe to re-enter.
             //
-            // 放闸门与删临时目录要各自躲在 EndItem 后面的 finally 里：EndItem 会调到调用方给的
-            // publish（写库、推 SSE 之类的外部代码），它可以抛，而这条路上的异常是**故意**往外传的。
-            // 三句排排站的写法下，第一句一抛就把后两句整个跳过——额度一去不回，下一个组永远等在
-            // 闸门上，整个检查再也回不来，界面上是一个转不完的圈。同一形状见 VolumeUploadScope.RunAsync
-            // 与 RestoreOrchestrator.RestoreGroupAsync。
+            // Releasing the gate and deleting the temp directory each have to hide in a finally behind EndItem:
+            // EndItem calls into the publish the caller supplied (external code that writes to the database, pushes
+            // SSE and the like), it can throw, and an exception on this path is **deliberately** propagated. Written
+            // as three statements in a row, a throw from the first skips the other two entirely — the permit is gone
+            // for good, the next group waits at the gate forever, the whole check never comes back, and the UI shows a
+            // spinner that never stops. The same shape appears in VolumeUploadScope.RunAsync and
+            // RestoreOrchestrator.RestoreGroupAsync.
             try
             {
                 tracker?.EndItem(blobName, 0);
@@ -415,12 +442,15 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// 单文件 blob 的内容校验，**不落盘**：raw 直传的 blob 就是文件本身；否则整个归档只有一个成员，
-    /// `x -so` 不带成员名的输出正是它的内容——因此不必先知道条目名。这一点很关键：去重之后，
-    /// 归档里的条目名来自**最先上传这份内容**的那个路径，未必等于当前索引条目的 Path。
+    /// Content verification of a single-file blob, **without touching disk**: a raw-uploaded blob is the file
+    /// itself; otherwise the archive holds exactly one member and the output of `x -so` with no member name is
+    /// precisely its content — so the entry name need not be known in advance. That matters: after dedup, the entry
+    /// name inside the archive comes from whichever path **uploaded this content first**, which need not equal the
+    /// current index entry's Path.
     /// <para>
-    /// 长度与 hash 都要核对。`x -so` 取不到内容时输出为空却退出码 0，光看"没抛异常"会把
-    /// 一个空归档判成通过——这正是本项目已经踩过一次的坑（7z 丢成员时退出 1 却静默通过）。
+    /// Both the length and the hash must be checked. When `x -so` cannot get the content it produces empty output yet
+    /// exits 0, so going by "nothing was thrown" alone would pass an empty archive — exactly the pitfall this project
+    /// has already fallen into once (7z exited 1 when it dropped a member, and it still passed silently).
     /// </para>
     /// </summary>
     private async Task<IReadOnlyList<string>> VerifyBlobAsync(
@@ -448,13 +478,16 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// pack 的内容校验，**不落盘**：一次 `x -so`（不带成员名）把整包流出来，按 `l -slt` 给出的
-    /// 成员顺序与尺寸切段，逐段算 hash。逐成员各调一次 7z 是不行的——归档是固实的，
-    /// 取第 k 个成员要连带把前面 k-1 个也解一遍，一个上千成员的包会退化成 O(N²)。
+    /// Content verification of a pack, **without touching disk**: one `x -so` (with no member name) streams the
+    /// whole pack out, which is then cut into segments following the member order and sizes reported by `l -slt`,
+    /// hashing each segment. Invoking 7z once per member is not an option — the archive is solid, so pulling the k-th
+    /// member re-extracts the preceding k-1 as well, and a pack with thousands of members degenerates into O(N²).
     /// <para>
-    /// 切段依赖"输出顺序 = 列举顺序"这条 7z 行为。它是对的（有测试钉住），但一旦哪个版本上不成立，
-    /// 后果是把好包报成坏包，而修复流程会据此重传。所以只要有一段对不上，就退回整包落盘解压
-    /// 逐个复核，由**它**给出最终结论：快路径只在正常情况下省事，绝不制造假警报。
+    /// The segmentation relies on the 7z behaviour "output order = listing order". That holds (a test pins it), but
+    /// the day some version breaks it, the consequence is reporting a good pack as bad — and the repair flow would
+    /// re-upload it on that basis. So the moment a single segment fails to line up, fall back to extracting the whole
+    /// pack to disk and re-checking member by member, and let **that** deliver the verdict: the fast path only saves
+    /// work in the normal case, it never raises a false alarm.
     /// </para>
     /// </summary>
     private async Task<IReadOnlyList<string>> VerifyPackAsync(
@@ -471,7 +504,8 @@ public sealed class BackupChecker(
             splitter.Finish();
         }
 
-        // 归档吐出的字节比列举出来的多，或有成员没填满 → 切段的前提不成立，别信这一轮的结果。
+        // The archive spat out more bytes than the listing accounts for, or some member was never filled → the
+        // premise of the segmentation does not hold, so do not trust this round's results.
         var splitTrustworthy = splitter.ExtraBytes == 0 && splitter.CompletedSegments == files.Count;
 
         var suspect = new List<IndexEntry>();
@@ -481,8 +515,10 @@ public sealed class BackupChecker(
             var entryName = SevenZipCli.NormalizeEntryName(e.Storage!.EntryName ?? e.Path);
             if (!actual.TryGetValue(entryName, out var got))
             {
-                // 索引说这个成员在包里，包里却根本没有它 —— 确凿的损坏，不必再验内容。
-                // （列举里没有 ≠ 快路径不可信：这是内容本身的问题，落盘重解也一样。）
+                // The index says this member is in the pack and the pack simply does not have it — definite
+                // corruption, no need to verify the content.
+                // (Absent from the listing ≠ the fast path is untrustworthy: this is a problem with the content
+                // itself, and extracting to disk would show the same.)
                 if (splitTrustworthy && !listing.Any(l => l.Name == entryName))
                     corrupted.Add(e.Path);
                 else
@@ -498,7 +534,7 @@ public sealed class BackupChecker(
         return corrupted;
     }
 
-    /// <summary>慢路径：把整包解到磁盘逐个复核。只在流式切段报出问题时才走，用来给出最终结论。</summary>
+    /// <summary>Slow path: extract the whole pack to disk and re-check member by member. Only taken when the streaming segmentation reports a problem, and it delivers the final verdict.</summary>
     private async Task<IReadOnlyList<string>> VerifyPackOnDiskAsync(
         string firstVolume, string groupDir, IReadOnlyList<IndexEntry> members, string? password, CancellationToken ct)
     {
@@ -510,8 +546,9 @@ public sealed class BackupChecker(
         {
             var entryName = e.Storage!.EntryName ?? e.Path;
             var path = Path.Combine(extractDir, entryName.Replace('/', Path.DirectorySeparatorChar));
-            // 条目名来自云端索引，/import 之后即攻击者可控（设计 §5）：`..` 能把探测点甩到解压目录
-            // 之外，变成一个"某个文件的内容是否等于某个 hash"的确认预言机。越界一律判损坏。
+            // The entry name comes from the cloud index, which after /import is attacker-controlled (design §5):
+            // `..` can fling the probe point outside the extraction directory, turning this into a confirmation
+            // oracle for "is the content of some file equal to some hash". Out of bounds is always ruled corruption.
             if (!PathBoundary.IsWithin(extractDir, path)
                 || !File.Exists(path)
                 || new FileInfo(path).Length != e.Length
@@ -525,10 +562,11 @@ public sealed class BackupChecker(
         ex.ErrorCode == "BlobArchived" || ex.Status == 409;
 
     private static Task RehydrateAsync(BlobContainerClient cc, string baseRef, AccessTier tier, CancellationToken ct) =>
-        // 对归档全部分卷发起活化（异步，几小时后需用户重跑检查）；忽略失败（best effort）。
+        // Start rehydration on every volume of the archived object (asynchronous; hours later the user has to re-run
+        // the check); failures are ignored (best effort).
         BlobRehydration.BeginAsync(cc, baseRef, tier, ct);
 
-    /// <summary>本地源文件状态。localRoot 缺失或本地轴关闭 → NotChecked。</summary>
+    /// <summary>State of the local source file. A missing localRoot or a disabled local axis → NotChecked.</summary>
     private async Task<LocalState> LocalCheckAsync(IndexEntry e, string? localRoot, LocalCheckLevel level, CancellationToken ct)
     {
         if (level == LocalCheckLevel.None || string.IsNullOrEmpty(localRoot))
@@ -536,10 +574,11 @@ public sealed class BackupChecker(
 
         var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
 
-        // e.Path 来自云端索引，/import 之后即攻击者可控（设计 §5）：`..` 或绝对路径能让
-        // Path.Combine 把探测点甩到 localRoot 之外，变成一个「文件是否存在 / 内容是否等于
-        // 某个 hash」的确认预言机。判越界一律当 Missing——本地拿不出可用副本，既不读它、
-        // 也不让它成为修复来源，与「本地文件不在」处置一致。
+        // e.Path comes from the cloud index, which after /import is attacker-controlled (design §5): `..` or an
+        // absolute path can make Path.Combine fling the probe point outside localRoot, turning this into a
+        // confirmation oracle for "does this file exist / is its content equal to some hash". Out of bounds is always
+        // treated as Missing — local cannot produce a usable copy, so it is neither read nor allowed to become a
+        // repair source, the same handling as "the local file is not there".
         if (!PathBoundary.IsWithin(localRoot, local))
             return LocalState.Missing;
 
@@ -554,10 +593,12 @@ public sealed class BackupChecker(
         if (!File.Exists(local))
             return LocalState.Missing;
 
-        // 本地文件存在却读不出来（被占用/权限被收回/介质读错误）：一律当 Missing——本地拿不出
-        // 可用副本，既不读它、也不让它成为修复来源，与上面「越界」「文件不在」的处置一致。
-        // 不加这层保护的话，一个读不开的文件会让**整轮检查**崩掉，而"有文件读不开"恰恰是
-        // 最需要跑检查的时候：备份刚跳过了它，操作员正想知道云端那份还在不在。
+        // The local file exists but cannot be read (locked / permissions revoked / media read error): always treated
+        // as Missing — local cannot produce a usable copy, so it is neither read nor allowed to become a repair
+        // source, the same handling as "out of bounds" and "not there" above.
+        // Without this guard one unreadable file takes down the **entire check run**, and "some file cannot be read"
+        // is precisely when the check is needed most: the backup just skipped it, and the operator wants to know
+        // whether the cloud copy is still there.
         try
         {
             if (level == LocalCheckLevel.Attributes)
@@ -566,7 +607,7 @@ public sealed class BackupChecker(
                 return new FileInfo(local).Length == e.Length && permOk ? LocalState.Ok : LocalState.Changed;
             }
 
-            // Content：hash 一致＝可从本地修复。
+            // Content: a matching hash = repairable from local.
             if (hasher is null)
                 return LocalState.NotChecked;
             var full = await hasher.FullHashAsync(local, ct);
@@ -596,12 +637,12 @@ public sealed class BackupChecker(
         return Convert.ToString(mode, 8).PadLeft(4, '0');
     }
 
-    /// <summary>元数据漂移检查：云端 info 与本地权威缓存比对（版本数 / 各版本 IndexBlob / CreatedAt）。</summary>
+    /// <summary>Metadata drift check: compare the cloud info file against the local-authoritative cache (version count / each version's IndexBlob / CreatedAt).</summary>
     private async Task<string?> CheckMetadataDriftAsync(
         Account account, string container, string? password, BackupInfoFile cloud, CancellationToken ct)
     {
         if (trackedInfo is null)
-            return null; // 无本地缓存可比对
+            return null; // no local cache to compare against
         if (!await trackedInfo.HasLocalAsync(account, container, ct))
             return "No local cache to compare against (backup not synced on this device).";
 

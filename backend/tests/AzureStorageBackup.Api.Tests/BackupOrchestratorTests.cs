@@ -79,10 +79,10 @@ public sealed class BackupOrchestratorTests : IDisposable
         return (orchestrator, store, factory);
     }
 
-    /// <summary>把目标文件篡改一次，模拟「文件在处理中变化」（§9、PRD 特别说明 D）。
-    /// 两条路径的时机不同：分组路径先 hash 后压，所以挂在 <c>CompressAsync</c> 之**后**（重校验据此
-    /// 发现内容变了）；单文件路径边读边压，改写必须发生在 7z 开始读之**前**，才谈得上
-    /// "压进去的和 diff 时看到的不是同一份"。</summary>
+    /// <summary>Tampers with the target file once, simulating "the file changed while it was being processed" (§9, PRD special note D).
+    /// The timing differs between the two paths: the grouping path hashes first and compresses second, so this hooks in **after**
+    /// <c>CompressAsync</c> (that is how re-verification notices the content changed); the single-file path compresses as it reads,
+    /// so the rewrite has to land **before** 7z starts reading for there to be any sense in which "what got compressed in is not the same copy the diff saw".</summary>
     private sealed class MutatingCompressor(
         IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
     {
@@ -124,7 +124,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>统计 ReadIndexAsync 调用次数的 store 装饰器（验证本地缓存命中）。</summary>
+    /// <summary>Store decorator that counts ReadIndexAsync calls (to verify local cache hits).</summary>
     private sealed class CountingStore(IBackupInfoStore inner) : IBackupInfoStore
     {
         public int IndexReads { get; private set; }
@@ -171,10 +171,10 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             WriteText("a.txt", "alpha");
-            await orchestrator.RunAsync(Request(account, name)); // v1：无上一版本，写完缓存 v1
-            await orchestrator.RunAsync(Request(account, name)); // v2：上一版本索引应命中本地缓存
+            await orchestrator.RunAsync(Request(account, name)); // v1: no previous version; caches v1 once it is written
+            await orchestrator.RunAsync(Request(account, name)); // v2: the previous version's index should hit the local cache
 
-            Assert.Equal(0, counting.IndexReads); // 从未下载云端第二级索引
+            Assert.Equal(0, counting.IndexReads); // never downloaded the cloud's second-level index
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -208,16 +208,16 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             WriteText("a.txt", "alpha");
-            await orchestrator.RunAsync(Request(account, name)); // v1：本地无 → 读云端一次(返回空→新建)
+            await orchestrator.RunAsync(Request(account, name)); // v1: nothing locally → one cloud read (comes back empty → create new)
             var readsAfterFirst = counting.InfoReads;
-            await orchestrator.RunAsync(Request(account, name)); // v2：本地权威 → 不应再读云端信息文件
+            await orchestrator.RunAsync(Request(account, name)); // v2: local is authoritative → must not read the cloud info file again
 
-            Assert.Equal(readsAfterFirst, counting.InfoReads); // 第二次备份零信息文件读
+            Assert.Equal(readsAfterFirst, counting.InfoReads); // zero info-file reads on the second backup
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>记录同时在飞的上传数，验证上传并发。</summary>
+    /// <summary>Records how many uploads are in flight at once, to verify upload concurrency.</summary>
     private sealed class ConcurrencyTrackingUploader(IBlobUploader inner) : IBlobUploader
     {
         private int _current;
@@ -233,9 +233,10 @@ public sealed class BackupOrchestratorTests : IDisposable
             lock (_l) { _current++; _max = Math.Max(_max, _current); }
             try
             {
-                // 让上传明显长于"压缩 + 校验归档内容"，并发窗口才稳定可观测。压缩是全局串行的，
-                // 所以两次上传能不能重叠，取决于一次上传是否比下一次压缩更久——这个延迟太接近
-                // 压缩耗时，测的就成了压缩快慢而不是并发上限。
+                // Make an upload clearly longer than "compress + verify archive contents" so the concurrency window
+                // is stably observable. Compression is globally serial, so whether two uploads can overlap comes down
+                // to whether one upload outlasts the next compression — set this delay too close to the compression
+                // time and what gets measured is compression speed, not the concurrency cap.
                 await Task.Delay(800, ct);
                 return await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
             }
@@ -249,7 +250,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
     }
 
-    /// <summary>统计 data/ blob 上传次数（验证去重不重复上传）。</summary>
+    /// <summary>Counts data/ blob uploads (to verify dedup does not upload twice).</summary>
     private sealed class CountingUploader(IBlobUploader inner) : IBlobUploader
     {
         private int _dataUploads;
@@ -312,14 +313,14 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             WriteText("x.txt", "identical payload");
-            WriteText("dir/y.txt", "identical payload"); // 同内容不同路径
+            WriteText("dir/y.txt", "identical payload"); // same content, different path
 
             await orchestrator.RunAsync(Request(account, name) with
             {
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            Assert.Equal(1, counting.DataUploads); // 两个同内容文件只上传一份 data blob
+            Assert.Equal(1, counting.DataUploads); // two files with identical content upload only one data blob
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -348,19 +349,19 @@ public sealed class BackupOrchestratorTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             }); // v1
 
-            // 删掉云端的 data blob：若备份靠云端 HEAD 判存在，v2 会发现缺失并重传；靠本地索引则仍去重。
+            // Delete the cloud data blob: if backup decided existence by a cloud HEAD, v2 would find it missing and re-upload; going by the local index it still dedups.
             await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
             counting.Reset();
 
-            WriteText("b.txt", "shared body"); // 新文件、与 a 同内容
+            WriteText("b.txt", "shared body"); // new file, same content as a
             var v2 = await orchestrator.RunAsync(Request(account, name) with
             {
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             }); // v2
 
             Assert.Equal(2, v2.Version);
-            Assert.Equal(0, counting.DataUploads); // 纯本地去重：未重传（证明未读云端存在性）
+            Assert.Equal(0, counting.DataUploads); // purely local dedup: nothing re-uploaded (proving cloud existence was never read)
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -394,19 +395,20 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             WriteText("a.txt", "alpha");
-            await orchestrator.RunAsync(Request(account, name)); // v1：成功，本地记录云端 ETag=E1
+            await orchestrator.RunAsync(Request(account, name)); // v1: succeeds; the local side records the cloud ETag=E1
 
-            // 模拟外部改动云端信息文件（另一台机器备份 / container 被重建）：绕过 tracked 直接
-            // 无条件改写云端，令云端 ETag 前进，而本地权威状态仍停留在旧 ETag（未同步）。
+            // Simulate an external change to the cloud info file (another machine backing up / the container being
+            // rebuilt): bypass tracked and overwrite the cloud unconditionally, advancing the cloud ETag while the
+            // local authoritative state still sits on the old ETag (not synced).
             var cloudInfo = await store.ReadInfoAsync(account, name, null);
             Assert.NotNull(cloudInfo);
             await store.WriteInfoAsync(account, name, cloudInfo!, null);
 
             WriteText("b.txt", "beta");
-            // v2：finalize 阶段 trackedInfo.WriteAsync 用陈旧本地 ETag 做 If-Match → 云端 412 → 包装异常抛出。
+            // v2: at finalize, trackedInfo.WriteAsync does an If-Match with the stale local ETag → cloud 412 → wrapped exception thrown.
             await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(Request(account, name)));
 
-            // 冲突后：本次未提交的版本 2 绝不能出现在本地索引缓存中（否则下次备份会把它当作已提交版本读取，产生幽灵 diff 基线）。
+            // After the conflict: the uncommitted version 2 must never show up in the local index cache (otherwise the next backup reads it as a committed version and gets a ghost diff baseline).
             var ghost = await db.CachedVersionIndexes
                 .FirstOrDefaultAsync(x => x.AccountId == account.Id && x.Container == name && x.Version == 2);
             Assert.Null(ghost);
@@ -428,8 +430,9 @@ public sealed class BackupOrchestratorTests : IDisposable
     {
         foreach (var e in index.Entries)
         {
-            // 按索引记的卷数**逐卷**查。只查首卷是不够的：各卷是并发上传的，谁先落地不作要求，
-            // 首卷在并不能说明整族齐全。
+            // Check **volume by volume** against the volume count the index recorded. Checking only the first volume
+            // is not enough: volumes are uploaded concurrently with no requirement on which lands first, so the first
+            // one being there says nothing about the whole family being complete.
             var baseRef = e.Storage!.Kind == "pack" ? $"packs/{e.Storage.Ref}.7z" : e.Storage.Ref;
             var (present, _) = await VolumeBlobIO.VerifyVolumesAsync(
                 container, baseRef, Math.Max(1, e.Storage.Volumes), [], CancellationToken.None);
@@ -515,7 +518,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             WriteText("f.txt", "v1"); await orchestrator.RunAsync(Req());
             var info1 = await store.ReadInfoAsync(account, name, null);
             var v1IndexBlob = info1!.Versions[0].IndexBlob;
-            // 包名从索引里读，不写死：pack 号带每轮随机前缀（跨运行唯一，见 RunState.NextPackId）。
+            // Read the pack name from the index instead of hard-coding it: pack ids carry a per-run random prefix (unique across runs, see RunState.NextPackId).
             var v1Pack = await OnlyPackIdAsync(store, account, name);
 
             WriteText("f.txt", "v2"); await orchestrator.RunAsync(Req());
@@ -548,7 +551,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
 
-        // 6MB 随机（不可压缩）文件 → 单文件 data blob，且 1MB 分卷 → 多卷 data/{hash}.001/.002...
+        // A 6MB random (incompressible) file → single-file data blob, and 1MB volumes → multi-volume data/{hash}.001/.002...
         var buf = new byte[6_000_000];
         new Random(42).NextBytes(buf);
         File.WriteAllBytes(Path.Combine(_root, "big.bin"), buf);
@@ -566,10 +569,10 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             await orchestrator.RunAsync(Req());        // v1
-            await orchestrator.RunAsync(Req());        // v2 → cleanup 退役 v1；big.bin 未变仍被 v2 引用
+            await orchestrator.RunAsync(Req());        // v2 → cleanup retires v1; big.bin is unchanged and still referenced by v2
 
             var hash = await new FileHasher().FullHashAsync(Path.Combine(_root, "big.bin"));
-            // 仍被 v2 引用的分卷 data blob 必须保留（修复前会被误删 → 数据丢失）。
+            // A volume-split data blob that v2 still references must be kept (before the fix it was wrongly deleted → data loss).
             Assert.True(await container.GetBlobClient($"data/{hash}.001").ExistsAsync(),
                 "referenced volume-split data blob was deleted by retention cleanup");
 
@@ -595,7 +598,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
 
-        // 同目录三个等大小文件 → 合并成一个 pack p0001（3 成员）。
+        // Three equally sized files in the same directory → merged into one pack p0001 (3 members).
         WriteText("d/a.txt", new string('a', 2000));
         WriteText("d/b.txt", new string('b', 2000));
         WriteText("d/c.txt", new string('c', 2000));
@@ -611,18 +614,18 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            await orchestrator.RunAsync(Req());        // v1: 一个包装着 {a,b,c}
-            // 包名从索引里读，不写死（pack 号带每轮随机前缀，见 RunState.NextPackId）。
+            await orchestrator.RunAsync(Req());        // v1: one pack holding {a,b,c}
+            // Read the pack name from the index instead of hard-coding it (pack ids carry a per-run random prefix, see RunState.NextPackId).
             var v1Pack = await OnlyPackIdAsync(store, account, name);
-            WriteText("d/a.txt", new string('A', 2000)); // 改 a（等长不同内容）
-            await orchestrator.RunAsync(Req());        // v2: a 进新包；退役 v1 → 老包里 a_old 死重(1/3>30%)→压实
+            WriteText("d/a.txt", new string('A', 2000)); // change a (same length, different content)
+            await orchestrator.RunAsync(Req());        // v2: a goes into a new pack; v1 retires → a_old is dead weight in the old pack (1/3>30%) → compaction
 
             var info = await store.ReadInfoAsync(account, name, null);
             var p1 = info!.Packs[v1Pack];
-            Assert.Equal(2, p1.Members.Count); // a_old 被丢弃，仅保留 b、c
+            Assert.Equal(2, p1.Members.Count); // a_old is dropped, only b and c are kept
             Assert.Equal(0, p1.DeadBytes);
 
-            // 压实后 pack 仍可用：v2 索引引用的对象都在，且还原 b/c 成功。
+            // The pack is still usable after compaction: everything the v2 index references is present, and b/c restore fine.
             var idx = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
             await AssertReferencedBlobsExist(container, idx);
         }
@@ -632,8 +635,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
-    /// <summary>从最新版本索引里读出唯一那个 pack 的号。pack 号带每轮随机前缀（跨运行唯一，
-    /// 见 <c>RunState.NextPackId</c>），所以测试不能写死 "p0001"。</summary>
+    /// <summary>Reads the id of the one and only pack out of the latest version index. Pack ids carry a per-run random
+    /// prefix (unique across runs, see <c>RunState.NextPackId</c>), so tests cannot hard-code "p0001".</summary>
     private static async Task<string> OnlyPackIdAsync(IBackupInfoStore store, Account account, string container)
     {
         var info = await store.ReadInfoAsync(account, container, null);
@@ -662,7 +665,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         try
         {
             WriteText("a.txt", "alpha");
-            WriteText("dir/b.txt", "bravo"); // 两个目录 → 2 个 pack
+            WriteText("dir/b.txt", "bravo"); // two directories → 2 packs
 
             var reports = new List<BackupProgress>();
             await orchestrator.RunAsync(Request(account, name), new SyncProgress(reports));
@@ -694,7 +697,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            // 4 个 > 阈值的单文件 blob（内容各异，避免去重跳过）。
+            // 4 single-file blobs above the threshold (each with different content, so dedup does not skip them).
             for (var i = 0; i < 4; i++)
             {
                 var bytes = new byte[6_000_000];
@@ -730,10 +733,11 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 单文件 blob 边读边压之后，hash 算的**就是压进归档的那些字节**——"内容在处理中变化"
-    /// 不再是一个需要重校验去追平的竞态：压进去的是什么，索引记的就是什么。
-    /// 本用例在 7z 开始读之前把文件换掉，然后把 blob 拉回来解出内容重算，断言索引条目、
-    /// blob 名与归档实际内容三者严丝合缝。
+    /// Now that a single-file blob is compressed as it is read, the hash is computed over **exactly the bytes that went
+    /// into the archive** — "the content changed mid-processing" is no longer a race that re-verification has to chase
+    /// down: whatever went in is what the index records.
+    /// This test swaps the file out before 7z starts reading, then pulls the blob back, extracts the content and
+    /// recomputes, asserting that the index entry, the blob name and the archive's actual content line up exactly.
     /// </summary>
     [SkippableFact]
     public async Task Single_File_Changed_Before_It_Is_Read_Is_Stored_As_What_Was_Actually_Read()
@@ -758,17 +762,17 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             await orchestrator.RunAsync(request);
 
-            var expected = await new FileHasher().FullHashAsync(Path.Combine(_root, "a.txt")); // 换上去的新内容
+            var expected = await new FileHasher().FullHashAsync(Path.Combine(_root, "a.txt")); // the new content that was swapped in
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             var entry = Assert.Single(idx.Entries);
 
-            Assert.Equal(expected, entry.FullHash);                 // 索引 fullHash = 实际压进去的内容
-            Assert.Equal("data/" + expected, entry.Storage!.Ref);   // blob 名同样由它决定
-            Assert.Equal("changed-content!!".Length, entry.Length); // 长度一并来自那一遍读
+            Assert.Equal(expected, entry.FullHash);                 // index fullHash = the content actually compressed in
+            Assert.Equal("data/" + expected, entry.Storage!.Ref);   // the blob name is decided by it too
+            Assert.Equal("changed-content!!".Length, entry.Length); // the length comes from that same read as well
             await AssertReferencedBlobsExist(container, idx);
 
-            // 承重断言：归档里躺着的字节确实就是索引描述的那份。
+            // The load-bearing assertion: the bytes lying in the archive really are the ones the index describes.
             var (length, hash) = await HashStoredBlobAsync(container, entry.Storage.Ref, password: null);
             Assert.Equal(entry.Length, length);
             Assert.Equal(entry.FullHash, hash);
@@ -779,7 +783,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
-    /// <summary>把单文件 blob 拉回本地、流式解出内容并重算长度与 hash。</summary>
+    /// <summary>Pulls a single-file blob back locally, streams the content out and recomputes its length and hash.</summary>
     private async Task<(long Length, string Hash)> HashStoredBlobAsync(
         BlobContainerClient container, string blobRef, string? password)
     {
@@ -808,22 +812,22 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            WriteText("d/x.txt", "xxxx"); // 同目录两小文件 → 增量分组
+            WriteText("d/x.txt", "xxxx"); // two small files in the same directory → incremental grouping
             WriteText("d/y.txt", "yyyy");
 
-            await orchestrator.RunAsync(Request(account, name)); // 默认 5M 阈值 → 分组
+            await orchestrator.RunAsync(Request(account, name)); // default 5M threshold → grouping
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             var x = idx.Entries.Single(e => e.Path == "d/x.txt");
             var y = idx.Entries.Single(e => e.Path == "d/y.txt");
 
-            Assert.Equal("pack", x.Storage!.Kind);                 // 未变成员在 pack
-            // 变更成员以新 hash 重新入队 → 进入下一组（仍是 pack），而非单文件。
+            Assert.Equal("pack", x.Storage!.Kind);                 // the unchanged member is in a pack
+            // The changed member is re-queued under its new hash → it joins the next group (still a pack), not a single file.
             Assert.Equal("pack", y.Storage!.Kind);
-            Assert.NotEqual(x.Storage.Ref, y.Storage.Ref);         // 落在不同的 pack
+            Assert.NotEqual(x.Storage.Ref, y.Storage.Ref);         // they land in different packs
             var expectedY = await new FileHasher().FullHashAsync(Path.Combine(_root, "d/y.txt"));
-            Assert.Equal(expectedY, y.FullHash);                   // fullHash 用稳定后的新内容
+            Assert.Equal(expectedY, y.FullHash);                   // fullHash uses the new content once it settled
             await AssertReferencedBlobsExist(container, idx);
         }
         finally
@@ -832,7 +836,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
-    /// <summary>检测 AppendAsync 是否被并发调用（模拟共享 DbContext）。</summary>
+    /// <summary>Detects whether AppendAsync gets called concurrently (standing in for a shared DbContext).</summary>
     private sealed class ConcurrencyProbeLog : IOperationLog
     {
         private int _active;
@@ -852,7 +856,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
-    /// <summary>捕获 AppendAsync 调用（等级/是否长存/消息）。</summary>
+    /// <summary>Captures AppendAsync calls (level / durable or not / message).</summary>
     private sealed class CapturingLog : IOperationLog
     {
         public List<(OperationLogLevel Level, bool? Durable, string Message)> Entries { get; } = [];
@@ -901,11 +905,11 @@ public sealed class BackupOrchestratorTests : IDisposable
             };
             await orchestrator.RunAsync(request);
 
-            // 逐文件日志落到按备份的文本文件（不再进 SQLite），含文件名。
+            // The per-file log lands in a per-backup text file (no longer in SQLite), and includes the file name.
             var vfile = Directory.EnumerateFiles(Path.Combine(vlogRoot, name), "*.log").Single();
             Assert.Contains("dir/note.txt", await File.ReadAllTextAsync(vfile));
-            Assert.DoesNotContain(log.Entries, e => e.Level == OperationLogLevel.Debug); // Debug 不再入库
-            // 起止事件仍是长存(durable=true)审计日志。
+            Assert.DoesNotContain(log.Entries, e => e.Level == OperationLogLevel.Debug); // Debug no longer goes into the database
+            // Start/finish events are still durable (durable=true) audit log entries.
             Assert.Contains(log.Entries, e => e.Durable == true && e.Message.Contains("succeeded"));
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -934,7 +938,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            // 4 个不同内容的单文件 blob，各预置一个元数据不符的 data/{hash} → 各触发一次碰撞 Record。
+            // 4 single-file blobs with different content, each pre-seeded with a data/{hash} whose metadata does not match → each triggers one collision Record.
             var hasher = new FileHasher();
             for (var i = 0; i < 4; i++)
             {
@@ -956,19 +960,22 @@ public sealed class BackupOrchestratorTests : IDisposable
             await orchestrator.RunAsync(request);
 
             Assert.True(log.MaxConcurrent >= 1);
-            Assert.Equal(1, log.MaxConcurrent); // Record 串行化，绝不并发访问共享 DbContext
+            Assert.Equal(1, log.MaxConcurrent); // Record is serialized; never concurrent access to the shared DbContext
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 上一次运行传了几卷就倒了，留下一批既不在索引、也不在本地状态里的卷。重跑同一个加密文件时
-    /// 这些残卷必须先被抹掉，不能靠 if-missing 跳过它们。
+    /// The previous run fell over a few volumes in, leaving behind a batch of volumes that are in neither the index nor
+    /// the local state. When the same encrypted file is run again those leftovers have to be wiped first; they cannot
+    /// be skipped by if-missing.
     /// <para>
-    /// 加密下 AES 每次换随机 salt/IV，同一个文件两次压出来的密文不同，而 blob 名是从**明文**内容
-    /// hash 派生的——两次跑落在同一个地址上。跳过残卷的话，.001 是上次的密文、后面几卷是这次的，
-    /// 拼起来解不开，那个文件就此还原不了。明文没有这个问题（压缩输出逐字节确定），所以清理只
-    /// 针对加密的多卷归档，见 BackupOrchestrator.ClearLeftoverVolumesAsync。
+    /// Under encryption AES draws a fresh random salt/IV every time, so compressing the same file twice yields different
+    /// ciphertext — yet the blob name is derived from the hash of the **plaintext** content, so both runs land at the
+    /// same address. Skip the leftovers and .001 is the previous run's ciphertext while the later volumes are this
+    /// run's; put together they will not decrypt, and that file can never be restored again. Plaintext does not have
+    /// this problem (compression output is byte-for-byte deterministic), so the cleanup targets encrypted multi-volume
+    /// archives only — see BackupOrchestrator.ClearLeftoverVolumesAsync.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -992,18 +999,20 @@ public sealed class BackupOrchestratorTests : IDisposable
                 Password = password,
                 Options = new BackupEngineOptions
                 {
-                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },  // 强制走单文件 blob 路径
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },  // force the single-file blob path
                     VolumeBytes = 64 * 1024,
                 },
             };
 
-            // v1：先立住信息文件。加密备份的 blob 地址是用 password + 信息文件里的 KdfSalt 派生的
-            // HMAC，盐一换地址就全变——所以"中断后重跑撞上自己的残卷"这件事只在信息文件还在时
-            // 才谈得上，而那正是真实的形状：写索引、写信息文件都是最后才做的收尾动作。
+            // v1: establish the info file first. An encrypted backup's blob addresses are an HMAC derived from the
+            // password plus the KdfSalt in the info file, and swapping the salt changes every address — so "restart
+            // after an interruption and collide with your own leftovers" only makes sense while the info file is still
+            // there, and that is exactly the real shape of things: writing the index and writing the info file are both
+            // wind-up actions done last.
             WriteText("small.txt", "seed");
             await orchestrator.RunAsync(request);
 
-            // v2：一个压不动的大文件（随机字节），按 64 KB 切成好几卷。传到第 4 卷时把它打断。
+            // v2: a big incompressible file (random bytes), cut into several 64 KB volumes. Break it on the 4th volume.
             var payload = new byte[400_000];
             Random.Shared.NextBytes(payload);
             await File.WriteAllBytesAsync(Path.Combine(_root, "big.bin"), payload);
@@ -1011,22 +1020,23 @@ public sealed class BackupOrchestratorTests : IDisposable
             await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(request));
 
             var leftovers = await ListAsync(container, "data/");
-            Assert.True(leftovers.Count > 1, $"这一轮该留下好几卷才对，实际 {leftovers.Count} 个 data blob");
+            Assert.True(leftovers.Count > 1, $"this round should have left several volumes behind, actual {leftovers.Count} data blob(s)");
             var leftoverBytes = new Dictionary<string, byte[]>();
             foreach (var b in leftovers)
                 leftoverBytes[b] = await ReadAllAsync(container, b);
 
-            // v2 重跑：同一个编排器（本地状态仍停在 v1——那一轮没能收尾，什么都没记下）。
+            // v2 re-run: the same orchestrator (local state is still sitting at v1 — that round never wound up and recorded nothing).
             breaker.Disarm();
             await orchestrator.RunAsync(request);
 
             var info = await store.ReadInfoAsync(account, name, password);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, password);
             var big = idx.Entries.Single(e => e.Path == "big.bin").Storage!;
-            Assert.True(big.Volumes > 1, $"这个用例需要多卷，实际只有 {big.Volumes} 卷");
+            Assert.True(big.Volumes > 1, $"this test needs multiple volumes, actual only {big.Volumes} volume(s)");
 
-            // 要害：那些残卷没有一个被原样留下来。留下任何一个都意味着这一族里混着上一轮的密文
-            // （AES 每次换随机 salt/IV，同一个文件两次压出来的字节必然不同），整族就解不开了。
+            // The crux: not one of those leftover volumes survived as it was. Leaving any of them means the family has
+            // the previous run's ciphertext mixed into it (AES draws a fresh random salt/IV each time, so compressing
+            // the same file twice necessarily produces different bytes), and then the whole family cannot be decrypted.
             foreach (var name2 in VolumeBlobIO.VolumeNames(big.Ref, big.Volumes))
             {
                 if (leftoverBytes.TryGetValue(name2, out var old))
@@ -1038,7 +1048,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>传满 N 卷之后就开始抛——模拟一次传到半路倒掉的运行。Arm 之前原样转发。</summary>
+    /// <summary>Starts throwing once N volumes have gone up — simulating a run that falls over partway through an upload. Before Arm it forwards everything unchanged.</summary>
     private sealed class FailAfterNVolumesUploader(IBlobUploader inner, int allowed) : IBlobUploader
     {
         private int _armed;
@@ -1062,7 +1072,7 @@ public sealed class BackupOrchestratorTests : IDisposable
                 && blobName.StartsWith("data/", StringComparison.Ordinal)
                 && Interlocked.Increment(ref _uploaded) > allowed)
             {
-                // 不可重试的错误，好让这一轮当场倒掉而不是退避重试到成功。
+                // A non-retryable error, so this round falls over on the spot instead of backing off and retrying until it succeeds.
                 throw new IOException("simulated failure partway through a multi-volume upload");
             }
             return inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
@@ -1109,7 +1119,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             {
                 Options = new BackupEngineOptions
                 {
-                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // 单文件 blob（不分组）
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 }, // single-file blob (no grouping)
                     DontCompress = new IgnoreRuleSet(["*"]),                 // store-only
                 },
             };
@@ -1119,9 +1129,9 @@ public sealed class BackupOrchestratorTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
             var e = Assert.Single(idx.Entries);
-            Assert.True(e.Storage!.Raw); // 标记为原始
+            Assert.True(e.Storage!.Raw); // marked as raw
 
-            // blob 内容就是原始文件字节（不是 7z 归档）。
+            // The blob content is the raw file bytes (not a 7z archive).
             var blob = await container.GetBlobClient(e.Storage.Ref).DownloadContentAsync();
             Assert.Equal("alpha-raw-content", blob.Value.Content.ToString());
         }
@@ -1142,20 +1152,20 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            WriteBytes("big.bin", 6_000_000); // > 5M → 单文件 data blob
+            WriteBytes("big.bin", 6_000_000); // > 5M → single-file data blob
             var request = Request(account, name) with { Password = "pw" };
 
             await orchestrator.RunAsync(request);
 
             var info = await store.ReadInfoAsync(account, name, "pw");
-            Assert.NotNull(info!.Backup.KdfSalt); // 加密备份生成了盐
+            Assert.NotNull(info!.Backup.KdfSalt); // the encrypted backup generated a salt
             var idx = await store.ReadIndexAsync(account, name, info.Versions[0].IndexBlob, "pw");
             var e = Assert.Single(idx.Entries);
 
-            // 存储名是密钥化地址，不含公开 fullHash；明文 data/{fullHash} 不存在（防指纹识别）。
+            // The storage name is a keyed address containing no public fullHash; the plaintext data/{fullHash} does not exist (anti-fingerprinting).
             Assert.DoesNotContain(e.FullHash!, e.Storage!.Ref);
             Assert.False(await container.GetBlobClient($"data/{e.FullHash}").ExistsAsync());
-            await AssertReferencedBlobsExist(container, idx); // 密钥化地址处的 blob 存在
+            await AssertReferencedBlobsExist(container, idx); // the blob at the keyed address does exist
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -1193,9 +1203,10 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     /// <summary>
-    /// 版本要同时记下开始与结束时刻，且结果里报出来的是**版本记录里的那两个**——不是运行器
-    /// 自己的时钟。收尾清理在版本提交之后还要跑一阵，各取各的时钟就会出现完成提示与还原
-    /// 下拉对同一次备份写出两个不同时间。
+    /// A version has to record both the start and the finish moment, and what the result reports must be **those two
+    /// from the version record** — not the runner's own clock. Retention cleanup still runs for a while after the
+    /// version is committed, so letting each side take its own clock makes the completion toast and the restore
+    /// dropdown write two different times for one and the same backup.
     /// </summary>
     [SkippableFact]
     public async Task Version_Records_Start_And_Finish_And_Result_Reports_The_Same_Pair()
@@ -1248,7 +1259,7 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             var request = Request(account, name) with
             {
-                // 全部排除，一个文件都不剩。
+                // Exclude everything, leaving not a single file.
                 Options = new BackupEngineOptions
                 {
                     Scan = new ScanOptions { Scope = ScopeRuleSet.Parse("-") },
@@ -1280,8 +1291,8 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         try
         {
-            // 没配范围时的空根是正常情况（比如刚建好还没往里放东西），不该被这条兜底拦下。
-            // _root 此刻是空的——这条用例刻意什么都不写进去。
+            // An empty root with no scope configured is a normal situation (just created and nothing put in yet, say),
+            // and should not be stopped by this backstop. _root is empty right now — this test deliberately writes nothing into it.
             var result = await orchestrator.RunAsync(Request(account, name));
 
             Assert.Equal(1, result.Version);
@@ -1292,12 +1303,14 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
     }
 
-    // 复现终审 Important：范围是 "-" + "+ photos"，而 photos 是个掉线的 SMB/NFS 挂载点——
-    // 这在出货的 NAS 上是常态，不是误操作。ScanDirectory 把它记进 Unreadable 并返回
-    // true，于是 Entries 和 EmptyDirs 都是空的，但那不是"范围选空了"，是"这棵子树本轮读不到"。
-    // 之前的守卫只看 Entries/EmptyDirs，会把这个误诊成范围配错，抛异常拦下整次备份；
-    // 更糟的是，若这不是首次备份，diff 引擎本该按"读不开 ≠ 删除"沿用上一版本的条目，
-    // 守卫却抢在 diff 之前就把整次运行连本地这条正确行为一起拦掉了。
+    // Reproduces the final-review Important: the scope is "-" + "+ photos", and photos is a dropped SMB/NFS mount
+    // point — which on a shipped NAS is the normal state of affairs, not a misoperation. ScanDirectory records it into
+    // Unreadable and returns true, so Entries and EmptyDirs are both empty, but that is not "the scope selected
+    // nothing", it is "this subtree could not be read this round".
+    // The old guard looked only at Entries/EmptyDirs and misdiagnosed this as a misconfigured scope, throwing and
+    // blocking the entire backup; worse, if this is not the first backup, the diff engine ought to be carrying the
+    // previous version's entries forward under "unreadable != deleted", yet the guard cut the whole run off — and that
+    // correct local behaviour along with it — before diff ever ran.
     [SkippableFact]
     public async Task An_Unreadable_Mount_Does_Not_Trigger_The_Empty_Scope_Guard()
     {
@@ -1306,14 +1319,15 @@ public sealed class BackupOrchestratorTests : IDisposable
 
         var photosDir = Path.Combine(_root, "photos");
         Directory.CreateDirectory(photosDir);
-        WriteText("photos/a.jpg", "x"); // 挂载点掉线前留在里面的东西——目录本身不是空的
+        WriteText("photos/a.jpg", "x"); // what was left inside before the mount dropped — the directory itself is not empty
 
-        // 收走读权限（保留 execute），模拟掉线的挂载点：opendir/readdir 拿不到内容。
+        // Take read permission away (keeping execute) to simulate a dropped mount point: opendir/readdir gets nothing.
         File.SetUnixFileMode(photosDir, UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        // root（以及任何有 CAP_DAC_OVERRIDE 的用户）不受目录权限位约束，chmod 在那种环境下
-        // 不是屏障——枚举照样成功，Unreadable 永远不会非空，断言会为错误的原因通过。
-        // 与其赌运行环境，不如实测一下这道 chmod 是否真的挡住了枚举，挡不住就如实 Skip。
+        // root (and anyone holding CAP_DAC_OVERRIDE) is not bound by directory permission bits, so chmod is no barrier
+        // in that environment — enumeration succeeds anyway, Unreadable is never non-empty, and the assertion passes
+        // for the wrong reason. Rather than bet on the runtime environment, measure whether this chmod really does
+        // block enumeration, and honestly Skip when it does not.
         var reallyUnreadable = false;
         try { new DirectoryInfo(photosDir).EnumerateFileSystemInfos().GetEnumerator().MoveNext(); }
         catch (UnauthorizedAccessException) { reallyUnreadable = true; }
@@ -1330,21 +1344,21 @@ public sealed class BackupOrchestratorTests : IDisposable
         {
             var request = Request(account, name) with
             {
-                // 排除一切，只重新包含 photos——与描述里的场景一致。
+                // Exclude everything and re-include only photos — matching the scenario in the description.
                 Options = new BackupEngineOptions
                 {
                     Scan = new ScanOptions { Scope = ScopeRuleSet.Parse("-\n+ photos") },
                 },
             };
 
-            // 不该抛"检查范围选择"的异常：范围本身没问题，是 photos 这棵子树读不到。
+            // It must not throw the "check your scope selection" exception: the scope itself is fine, it is the photos subtree that cannot be read.
             var result = await orchestrator.RunAsync(request);
 
             Assert.Equal(1, result.Version);
         }
         finally
         {
-            // 恢复权限，否则 Dispose() 里对 _root 的递归删除会在这个目录上失败。
+            // Restore the permissions, or the recursive delete of _root in Dispose() fails on this directory.
             File.SetUnixFileMode(photosDir,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             await container.DeleteIfExistsAsync();

@@ -6,9 +6,9 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 一个列不出内容的目录此前会让整轮备份崩在扫描阶段——但"加个 try 跳过"是**更糟**的答案：
-/// 其下整棵子树会因为没被扫到而被 diff 判成删除，于是一次权限故障就把一整棵子树从索引里抹掉，
-/// 直到还原时才发现文件没了。本文件盯住的正是这条不变量：读不开 ≠ 删除，整棵子树必须沿用旧条目。
+/// A directory whose contents cannot be listed used to crash the whole run in the scan stage — but "wrap it in a try and skip it" is an **even worse** answer:
+/// its entire subtree goes unscanned and the diff therefore classifies it all as deleted, so one permission failure wipes a whole subtree out of the index
+/// and nobody notices until a restore comes up short. What this file nails is exactly that invariant: unreadable ≠ deleted, and the whole subtree must carry its old entries forward.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadableDirectoryTests : IDisposable
@@ -30,7 +30,7 @@ public sealed class UnreadableDirectoryTests : IDisposable
 
     public void Dispose()
     {
-        // 先恢复权限，否则递归删除会被读不开的目录卡住。
+        // Restore permissions first, otherwise the recursive delete gets stuck on the unreadable directory.
         try
         {
             foreach (var d in Directory.EnumerateDirectories(_root, "*", SearchOption.AllDirectories))
@@ -65,7 +65,7 @@ public sealed class UnreadableDirectoryTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    /// <summary>捕获 NotifyAsync 调用，供断言通知粒度。</summary>
+    /// <summary>Captures NotifyAsync calls so we can assert on notification granularity.</summary>
     private sealed class CapturingNotifier : INotifier
     {
         public List<(NotificationEvents Event, string Title, string Body)> Notifications { get; } = [];
@@ -100,9 +100,9 @@ public sealed class UnreadableDirectoryTests : IDisposable
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
     };
 
-    /// <summary>核心不变量：v1 备份成功后目录变得列不出来，v2 必须把整棵子树的条目**沿用**下来
-    /// 并打上 UnreadableAt，而不是判成删除。判成删除的后果是：这些文件从新版本索引里消失，
-    /// 保留策略随后会把它们的数据 blob 当作无人引用而清掉——一次权限故障造成永久数据丢失。</summary>
+    /// <summary>Core invariant: after a successful v1 backup the directory becomes unlistable, and v2 must **carry forward** every entry of the subtree
+    /// and stamp UnreadableAt on them, rather than classify them as deleted. Classifying them as deleted means: those files vanish from the new version's index,
+    /// and retention then reclaims their data blobs as unreferenced — one permission failure causing permanent data loss.</summary>
     [SkippableFact]
     public async Task An_Unreadable_Directory_Carries_Its_Subtree_Forward_Instead_Of_Deleting_It()
     {
@@ -125,9 +125,9 @@ public sealed class UnreadableDirectoryTests : IDisposable
             WriteText("outside.txt", "not affected");
             WriteText("vault/a.txt", "secret a");
             WriteText("vault/b.txt", "secret b");
-            WriteText("vault/deep/c.txt", "secret c"); // 嵌套一层，验证覆盖的是整棵子树而不止直接子项
+            WriteText("vault/deep/c.txt", "secret c"); // one level of nesting, to verify the coverage is the whole subtree and not just direct children
 
-            // v1：全部可读，正常备份。
+            // v1: everything readable, a normal backup.
             var v1 = await Orchestrator(factory, store).RunAsync(Request(account, name));
             Assert.Equal(1, v1.Version);
 
@@ -136,31 +136,31 @@ public sealed class UnreadableDirectoryTests : IDisposable
             var storageBefore = idx1.Entries.ToDictionary(e => e.Path, e => e.Storage!.Ref, StringComparer.Ordinal);
             Assert.Equal(4, idx1.Entries.Count);
 
-            // v2：目录整个读不出来了。
+            // v2: the whole directory has become unreadable.
             File.SetUnixFileMode(lockedDir, UnixFileMode.None);
             var v2 = await Orchestrator(factory, store, notifier).RunAsync(Request(account, name));
 
-            Assert.Equal(2, v2.Version); // 没有崩在扫描阶段
-            Assert.Equal(3, v2.UnreadableFiles); // 子树里三个条目都算不可读
+            Assert.Equal(2, v2.Version); // did not crash in the scan stage
+            Assert.Equal(3, v2.UnreadableFiles); // all three entries in the subtree count as unreadable
 
             var info2 = await store.ReadInfoAsync(account, name, null);
             var idx2 = await store.ReadIndexAsync(account, name, info2!.Versions[1].IndexBlob, null);
 
-            // 整棵子树必须还在，且沿用原来的存储引用（没有重传，也没有被判成删除）。
+            // The whole subtree must still be there, carrying the original storage references (nothing re-uploaded, nothing classified as deleted).
             foreach (var path in new[] { "vault/a.txt", "vault/b.txt", "vault/deep/c.txt" })
             {
                 var entry = Assert.Single(idx2.Entries, e => e.Path == path);
                 Assert.NotNull(entry.UnreadableAt);
                 Assert.Equal(storageBefore[path], entry.Storage!.Ref);
                 Assert.True(await container.GetBlobClient(entry.Storage.Ref).ExistsAsync(),
-                    $"data blob for {path} must survive"); // 判成删除的话保留策略会把它清掉
+                    $"data blob for {path} must survive"); // if classified as deleted, retention would reclaim it
             }
 
-            // 目录外的文件完全不受影响。
+            // Files outside the directory are completely unaffected.
             Assert.Single(idx2.Entries, e => e.Path == "outside.txt");
 
-            // 通知按目录汇总成一条，而不是子树里每个文件各来一条——一个五千文件的目录
-            // 会变成五千条 webhook，既淹没操作员也会把备份卡在推送上。
+            // Notifications are aggregated into one per directory rather than one per file in the subtree — a directory with five thousand files
+            // would become five thousand webhooks, which both drowns the operator and stalls the backup on pushing them.
             var dirNotices = notifier.Notifications
                 .Where(n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("vault")).ToList();
             Assert.Single(dirNotices);
@@ -176,9 +176,9 @@ public sealed class UnreadableDirectoryTests : IDisposable
         }
     }
 
-    /// <summary>UnreadableAt 要回答的是"这份内容从什么时候起就没能再更新"。此前每轮都把它刷成
-    /// UtcNow，等于每轮把答案抹掉、只剩一句"刚才也没读到"——操作员再也问不出"这文件多久没备份上了"。
-    /// 连跑三轮：第三轮索引里的时间戳必须还是第二轮那一刻的。</summary>
+    /// <summary>The question UnreadableAt answers is "since when has this content stopped being updated". It used to be refreshed to
+    /// UtcNow every run, which erased the answer each time and left only "we could not read it just now" — the operator could no longer ask "how long has this file been missing from backups".
+    /// Three runs back to back: the timestamp in the third run's index must still be the one from the moment of the second run.</summary>
     [SkippableFact]
     public async Task The_Unreadable_Timestamp_Records_When_It_First_Went_Unread()
     {
@@ -198,24 +198,24 @@ public sealed class UnreadableDirectoryTests : IDisposable
         try
         {
             WriteText("vault/a.txt", "content");
-            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v1：可读
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v1: readable
 
             File.SetUnixFileMode(lockedDir, UnixFileMode.None);
-            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v2：首次读不开
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v2: unreadable for the first time
 
             var info2 = await store.ReadInfoAsync(account, name, null);
             var idx2 = await store.ReadIndexAsync(account, name, info2!.Versions[1].IndexBlob, null);
             var firstSeen = idx2.Entries.Single(e => e.Path == "vault/a.txt").UnreadableAt;
             Assert.NotNull(firstSeen);
 
-            await Task.Delay(1100); // 时间戳有秒级分辨率，确保"若被刷新"会是一个可分辨的新值
-            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v3：仍读不开
+            await Task.Delay(1100); // the timestamp has one-second resolution, so this guarantees that "if it were refreshed" it would be a distinguishably new value
+            await Orchestrator(factory, store).RunAsync(Request(account, name)); // v3: still unreadable
 
             var info3 = await store.ReadInfoAsync(account, name, null);
             var idx3 = await store.ReadIndexAsync(account, name, info3!.Versions[2].IndexBlob, null);
             var stillFirstSeen = idx3.Entries.Single(e => e.Path == "vault/a.txt").UnreadableAt;
 
-            Assert.Equal(firstSeen, stillFirstSeen); // 记的是"何时起"，不是"刚才"
+            Assert.Equal(firstSeen, stillFirstSeen); // it records "since when", not "just now"
         }
         finally
         {
@@ -225,8 +225,8 @@ public sealed class UnreadableDirectoryTests : IDisposable
         }
     }
 
-    /// <summary>读不开的目录里若有上一版本记录的空目录，也要一并带过来：直接用本轮扫描结果的话，
-    /// 这些空目录会从新版本消失，还原出来的目录结构就少了一块。</summary>
+    /// <summary>If an unreadable directory contains empty directories recorded by the previous version, those have to be carried across too: using this run's scan result directly
+    /// would make those empty directories vanish from the new version, leaving a hole in the restored directory structure.</summary>
     [SkippableFact]
     public async Task Empty_Directories_Under_An_Unreadable_Directory_Are_Carried_Forward()
     {
@@ -260,8 +260,8 @@ public sealed class UnreadableDirectoryTests : IDisposable
             var info2 = await store.ReadInfoAsync(account, name, null);
             var idx2 = await store.ReadIndexAsync(account, name, info2!.Versions[1].IndexBlob, null);
 
-            Assert.Contains("vault/placeholder", idx2.EmptyDirs); // 目录结构不能因为读不到就少一块
-            Assert.DoesNotContain("vault", idx2.EmptyDirs);       // 而读不开的目录本身绝不能被当成空目录
+            Assert.Contains("vault/placeholder", idx2.EmptyDirs); // the directory structure must not lose a piece just because it could not be read
+            Assert.DoesNotContain("vault", idx2.EmptyDirs);       // and the unreadable directory itself must never be treated as an empty directory
         }
         finally
         {

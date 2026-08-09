@@ -2,30 +2,30 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一个路径相对上一版本的变更分类。</summary>
+/// <summary>How one path changed relative to the previous version.</summary>
 public enum ChangeKind
 {
-    /// <summary>上一版本没有 → 新增。</summary>
+    /// <summary>Not present in the previous version → added.</summary>
     Added,
 
-    /// <summary>内容变了，需重新处理/上传。</summary>
+    /// <summary>Content changed; needs reprocessing/re-upload.</summary>
     Modified,
 
-    /// <summary>内容不变，仅 mtime/权限变 → 只更新索引元数据，不重传。</summary>
+    /// <summary>Content unchanged, only mtime/permissions changed → update index metadata only, no re-upload.</summary>
     MetadataOnly,
 
-    /// <summary>本轮读不开（被占用/无权限/读错误）。既不是变更也不是删除：
-    /// 索引沿用上一版本条目并打 UnreadableAt，绝不能被当成删除。</summary>
+    /// <summary>Could not be opened this run (in use / no permission / read error). Neither a change nor a deletion:
+    /// the index carries the previous version's entry forward and stamps UnreadableAt on it — it must never be treated as deleted.</summary>
     Unreadable,
 
-    /// <summary>完全未变（length+mtime+权限一致，未哈希）。</summary>
+    /// <summary>Completely unchanged (length+mtime+permissions all match, never hashed).</summary>
     Unchanged,
 
-    /// <summary>上一版本有、本次无 → 删除。</summary>
+    /// <summary>Present in the previous version, absent this time → deleted.</summary>
     Deleted,
 }
 
-/// <summary>单个路径的 diff 结果，携带构建新索引条目所需的已解析哈希/存储。</summary>
+/// <summary>The diff result for one path, carrying the resolved hashes/storage needed to build the new index entry.</summary>
 public sealed record FileChange(
     string Path,
     ChangeKind Kind,
@@ -34,39 +34,39 @@ public sealed record FileChange(
     string? HeadHash,
     string? FullHash,
     StorageRef? CarriedStorage,
-    /// <summary>读失败原因（ex.Message）。仅 Kind == Unreadable 时非空。</summary>
+    /// <summary>Why the read failed (ex.Message). Non-null only when Kind == Unreadable.</summary>
     string? UnreadableReason = null,
     /// <summary>
-    /// 尾部 hash。内容身份的第四项，与 fullHash + 长度 + head 一起用于去重与碰撞判定。
+    /// Tail hash. The fourth component of content identity, used together with fullHash + length + head for dedup and collision checks.
     /// <para>
-    /// 单文件 blob 那条路上它由压缩那一遍顺手算出（见编排器的 tailByPath），所以这里主要是为
-    /// **打包成员**准备的——它们从前一项都没有，于是只能按三项去重。既然判据在别处是四项，
-    /// 这里也该是四项，不该两条路各有一套标准。
+    /// On the single-file blob path it falls out of the compression pass for free (see the orchestrator's tailByPath), so what it is really here
+    /// for is **pack members** — they used to have none of it, so they could only dedup on three components. Since the criterion is four components
+    /// everywhere else, it should be four here too; the two paths should not each have their own standard.
     /// </para>
     /// <para>
-    /// **未变文件不补**：它本来一趟 IO 都不付，为这一项去读就是凭空多出来的随机读（NAS 的
-    /// 机械盘上 50 万小文件接近一小时），而换来的加固边际价值极小。老索引的打包成员因此会
-    /// 一直缺它，去重那边按"缺失即不参与判定"处理。
+    /// **Not backfilled for unchanged files**: such a file pays no IO at all, so reading it for this one component is a random read conjured out of
+    /// nothing (close to an hour for 500k small files on a NAS spinning disk), while the hardening it buys has vanishingly small marginal value. Pack
+    /// members in old indexes therefore stay missing it forever, and dedup treats it as "missing means it does not take part in the check".
     /// </para>
     /// </summary>
     string? TailHash = null);
 
 public sealed record DiffOptions
 {
-    /// <summary>headHash 覆盖的头部字节数（默认 4KB，M4 决策 §13.3）。</summary>
+    /// <summary>How many leading bytes headHash covers (4KB by default, M4 decision §13.3).</summary>
     public int HeadHashBytes { get; init; } = 4096;
 }
 
-/// <summary>diff 汇总。ChangedFiles/ChangedBytes 仅计 Added+Modified（未压缩、分组前，删除/仅元数据不计，§4）。</summary>
+/// <summary>Diff summary. ChangedFiles/ChangedBytes count Added+Modified only (uncompressed, before grouping; deletions/metadata-only excluded, §4).</summary>
 public sealed record DiffResult(
     IReadOnlyList<FileChange> Changes,
     int ChangedFiles,
     long ChangedBytes);
 
 /// <summary>
-/// 版本对比引擎（M4 设计 §4.2）：惰性两级哈希。
-/// 先靠 length+mtime+权限 判断；仅"length 同但 mtime/权限变"的文件才算 headHash，
-/// 再不同才算 fullHash。避免每次备份重读全部文件。
+/// Version comparison engine (M4 design §4.2): lazy two-level hashing.
+/// Decide on length+mtime+permissions first; only files with "same length but changed mtime/permissions" get a headHash,
+/// and only if that differs is fullHash computed. Avoids re-reading every file on every backup.
 /// </summary>
 public sealed class BackupDiffer(IFileHasher hasher)
 {
@@ -76,20 +76,20 @@ public sealed class BackupDiffer(IFileHasher hasher)
         VersionIndex? previous,
         DiffOptions? options = null,
         CancellationToken ct = default,
-        // 首次备份时这一步要把每个文件完整读一遍算 hash，可以跑几小时。没有它，界面上就是
-        // 一个一动不动的 0%，用户无从判断是在干活还是挂死了。
+        // On a first backup this step reads every file end to end to hash it, which can run for hours. Without it the UI is
+        // a 0% that never moves, and the user has no way to tell whether it is working or hung.
         StageTracker? tracker = null,
-        // 每判完一个**扫描到的**条目就回调一次，按扫描顺序（= ordinal 路径序）。
-        // 编排器据此边 diff 边把已定局的活推给压缩上传侧，不必等整轮 diff 跑完——首次备份的
-        // diff 要几小时，那几小时里网络本来一个字节都没在传。
-        // 尾部补出来的 Unreadable/Deleted 条目不回调：它们不产生任何要上传的东西。
+        // Invoked once per **scanned** entry as soon as it is classified, in scan order (= ordinal path order).
+        // The orchestrator uses this to push settled work to the compress/upload side while the diff is still running instead of waiting
+        // for the whole diff — a first backup's diff takes hours, and during those hours not one byte was going over the network.
+        // The Unreadable/Deleted entries synthesized at the end are not reported: they produce nothing to upload.
         Func<FileChange, CancellationToken, Task>? onChange = null,
-        // 哪些路径的全文 hash 可以不在这里算（编排器传"归类为单文件 blob 的"）。
-        // 那条路上 hash 是压缩那一遍读顺手算出来的，算完还会覆盖这里记的值——diff 再读一遍
-        // 等于把每个大文件从头到尾读两遍。一个 100 GB 的文件，省掉的就是整整 100 GB 的读。
-        // 只对"已经确定变了"的判定生效（Added、以及 length 变的 Modified）；
-        // "length 同、mtime 变"那条两级哈希路径**不受影响**——那里的 fullHash 正是用来判断
-        // 到底是 MetadataOnly 还是真 Modified 的，省掉它会把没变的文件全部重传一遍。
+        // Which paths may skip computing the full-content hash here (the orchestrator passes "everything classified as a single-file blob").
+        // On that path the hash falls out of the compression read for free and then overwrites the value recorded here — having the diff read it
+        // too means reading every large file end to end twice. For a 100 GB file, that saves a full 100 GB of reads.
+        // Only applies to classifications that are "already known to have changed" (Added, and Modified due to a length change);
+        // the two-level hashing path for "same length, changed mtime" is **unaffected** — the fullHash there is exactly what decides
+        // whether it is MetadataOnly or a real Modified, and skipping it would re-upload every unchanged file.
         Func<string, bool>? fullHashDeferred = null)
     {
         options ??= new DiffOptions();
@@ -105,7 +105,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
         {
             ct.ThrowIfCancellationRequested();
             seen.Add(entry.Path);
-            // 在**处理之前**就把当前路径亮出来：卡住时最需要知道的正是"卡在哪个文件上"。
+            // Publish the current path **before** processing it: when things hang, "which file is it stuck on" is exactly what you need to know.
             tracker?.Touch(entry.Path);
 
             var full = Path.Combine(root, entry.Path.Replace('/', Path.DirectorySeparatorChar));
@@ -123,10 +123,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 changedFiles++;
                 changedBytes += entry.Length;
             }
-            // 计入已读字节：只有实际读过内容的分类才算，未变的文件根本没打开过，
-            // 把它们算进去会让速度看起来虚高得离谱。全文 hash 被延后的（FullHash 为空）同理——
-            // 这里只摸了个文件头，一个 100 GB 的文件若按整份计，速度会瞬间冲到几十 GB/s，
-            // 剩余时间跟着变成一句笑话。FullHash 是否为空恰好就是"读没读全"的准确指示。
+            // Count bytes read: only classifications that actually read content count. Unchanged files were never opened at all,
+            // and counting them makes the throughput look absurdly inflated. Same for a deferred full hash (FullHash is null) —
+            // only the file's head was touched here; counting a 100 GB file in full would spike the speed to tens of GB/s in an instant
+            // and turn the remaining time into a joke. Whether FullHash is null is precisely the accurate signal for "was it read in full".
             tracker?.Advance(
                 change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly
                 && change.FullHash is not null
@@ -137,10 +137,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 await onChange(change, ct);
         }
 
-        // 扫描阶段就读不出来的路径，必须在"判删除"之前登记进 seen。
-        // 一个列不出内容的目录，其下**整棵子树**都没能被扫到——若不登记，接下来那段循环会把
-        // 这些既有条目一个不剩地判成删除，等于因为一次权限故障就把整棵子树从索引里抹掉，
-        // 直到还原时才发现文件没了。读不开 ≠ 删除，这里是这条原则最要紧的一处。
+        // Paths that were already unreadable during the scan must be registered in seen before the "classify as deleted" pass.
+        // For a directory whose contents cannot be listed, its **entire subtree** went unscanned — without registering them, the loop below
+        // would classify every one of those existing entries as deleted, i.e. one permission failure would wipe a whole subtree out of the index
+        // and nobody would notice until a restore came up short. Unreadable ≠ deleted, and this is the most critical place that rule applies.
         foreach (var u in current.Unreadable)
         {
             foreach (var prev in PreviousEntriesUnder(prevByPath, u))
@@ -149,8 +149,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
                     changes.Add(new FileChange(prev.Path, ChangeKind.Unreadable, null, prev, null, null, null, u.Reason));
             }
 
-            // 读不开的**文件**即使上一版本没有（全新且从头就读不开），也要记一条：
-            // 没有内容可指向、索引里不会有它，但操作员必须知道它本轮没被备份。
+            // An unreadable **file** gets an entry even when the previous version has none (brand new and unreadable from the start):
+            // there is no content to point at so it will not be in the index, but the operator has to know it was not backed up this run.
             if (!u.IsDirectory && !prevByPath.ContainsKey(u.Path) && seen.Add(u.Path))
                 changes.Add(new FileChange(u.Path, ChangeKind.Unreadable, null, null, null, null, null, u.Reason));
         }
@@ -164,14 +164,14 @@ public sealed class BackupDiffer(IFileHasher hasher)
         return new DiffResult(changes, changedFiles, changedBytes);
     }
 
-    /// <summary>某个读不出来的路径覆盖到的上一版本条目：目录取其整棵子树，文件取它自己。</summary>
+    /// <summary>The previous-version entries covered by an unreadable path: a directory takes its whole subtree, a file takes just itself.</summary>
     private static IEnumerable<IndexEntry> PreviousEntriesUnder(
         Dictionary<string, IndexEntry> prevByPath, UnreadablePath unreadable)
     {
         if (!unreadable.IsDirectory)
             return prevByPath.TryGetValue(unreadable.Path, out var one) ? [one] : [];
 
-        // 根自身读不开时 Path 为 "."（GetRelativePath 对根给出的结果），此时整份索引都在其下。
+        // When the root itself is unreadable, Path is "." (what GetRelativePath yields for the root); the entire index then falls under it.
         if (unreadable.Path is "" or ".")
             return prevByPath.Values;
 
@@ -183,7 +183,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
         ScannedEntry entry, IndexEntry prev, string full, string kind, DiffOptions options, bool deferFull,
         CancellationToken ct)
     {
-        // 类型变更（file<->symlink）视为内容变更。
+        // A type change (file<->symlink) counts as a content change.
         if (prev.Kind != kind)
             return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
 
@@ -192,28 +192,28 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 ? Unchanged(entry, prev)
                 : new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
-        // length 不同 → 直接变更，无需 head 预筛。
+        // Different length → changed outright, no head pre-screen needed.
         if (entry.Length != prev.Length)
             return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
 
-        // length 同、mtime 与权限都同 → 未变，完全跳过哈希。
+        // Same length, same mtime and same permissions → unchanged, skip hashing entirely.
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
             return Unchanged(entry, prev);
 
-        // length 同、mtime 或权限变 → 由便宜到昂贵地问：头 4KB → 尾 4KB → 全文。
-        // 全文那一趟是这里唯一昂贵的动作（100 GB 的文件就是 100 GB 的读），而只要头或尾对不上，
-        // "内容变了"就已经成立，那一趟根本不必付。
+        // Same length, changed mtime or permissions → ask from cheap to expensive: head 4KB → tail 4KB → whole file.
+        // The whole-file pass is the only expensive move here (a 100 GB file means 100 GB of reads), and as soon as the head or the tail
+        // disagrees, "the content changed" is already established and that pass never has to be paid for.
         return await TryReadAsync(async () =>
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
             if (head != prev.HeadHash)
                 return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, null, ct);
 
-            // 头一样，再问尾巴。只在**全文可以延后**时才问：那条路上的文件按定义超过单文件阈值
-            // （几 MB 到上百 GB），4KB 换掉的可能是整整一遍全文读，稳赚。
-            // 打包成员反过来——它们小，而且判成 Modified 之后 fullHash 仍要算了写进索引，
-            // 早退一步也省不下什么，白付一次 open + seek。
-            // prev.TailHash 为空是老索引的过渡态（见 UnchangedAsync 的补算），此时跳过这一问。
+            // Head matches, so ask the tail. Only ask when **the full hash can be deferred**: files on that path are by definition over the
+            // single-file threshold (a few MB up to hundreds of GB), so 4KB may buy out an entire full-file read — a sure win.
+            // Pack members are the other way round — they are small, and once classified Modified the fullHash still has to be computed and
+            // written into the index, so exiting early saves nothing and just wastes one open + seek.
+            // A null prev.TailHash is an old index's transitional state (see the backfill in UnchangedAsync); skip this probe then.
             if (deferFull && prev.TailHash is not null)
             {
                 var tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);
@@ -221,12 +221,12 @@ public sealed class BackupDiffer(IFileHasher hasher)
                     return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, tail, ct);
             }
 
-            // 头尾都一样：只有读全文才能分清"内容真变了"和"只是被 touch 了一下"。
-            // 这一趟**不能**因为 deferFull 而省——省掉就只能一律当作变更，等于每次 touch
-            // 都把文件重传一遍。
+            // Head and tail both match: only a full read can tell "the content really changed" from "it just got touched".
+            // This pass **must not** be skipped because of deferFull — skipping it means treating everything as changed, i.e. every
+            // touch re-uploads the file.
             //
-            // 既然反正要读全文，就一遍拿全三段：尾部因此是顺路捡的，不额外付 IO。
-            // 缺尾部的老条目走到这一支时也就顺带补齐了——但这是免费的，不是专程去补。
+            // Since the whole file is being read anyway, grab all three segments in one pass: the tail is picked up along the way, no extra IO.
+            // Old entries missing a tail get filled in when they land in this branch — but that is free, not a trip made on purpose.
             var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
             return id.FullHash == prev.FullHash
                 ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, id.HeadHash, id.FullHash,
@@ -237,15 +237,15 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     /// <summary>
-    /// 头或尾已经证明内容变了，接下来只是把条目填完整。
+    /// The head or the tail has already proven the content changed; all that is left is filling the entry in.
     /// <para>
-    /// 全文 hash 可延后时（单文件 blob）就**不算**——它由压缩那一遍顺手算出并覆盖，而"是不是
-    /// 变了"这个问题已经有答案了，不需要它来回答。这正是早退省下的那一趟：一个 100 GB 的文件
-    /// 头部或尾部动过，读 4KB 就定了案，从前要整整读一遍。
+    /// When the full hash can be deferred (single-file blob) it is **not computed** — the compression pass produces it for free and overwrites
+    /// this value, and the question "did it change" already has an answer that does not need it. This is exactly the pass the early exit saves:
+    /// a 100 GB file whose head or tail moved is settled by reading 4KB, where it used to cost a full read.
     /// </para>
     /// <para>
-    /// 不能延后时（打包成员）仍要算——索引条目需要它，下一轮 diff 也靠它比对。既然要读全文，
-    /// 就一遍读把三段一起拿到。
+    /// When it cannot be deferred (pack members) it still gets computed — the index entry needs it and the next diff compares against it. Since
+    /// the whole file has to be read, take all three segments in that one pass.
     /// </para>
     /// </summary>
     private async Task<FileChange> DecidedChangedAsync(
@@ -280,10 +280,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
 
-        // 记录完整的 headHash + fullHash（索引条目须含原文件哈希/尺寸/权限，供后续 diff 与还原比对）。
-        // 走到这里已经**确定**内容变了（类型换了，或 length 对不上），fullHash 在这里只剩两个用途：
-        // 生成 data/{hash} 地址、以及写进索引——而这两件事单文件 blob 那条路都会用压缩那一遍
-        // 算出来的值重做一次。所以延后是无损的。
+        // Record the complete headHash + fullHash (an index entry must carry the source file's hash/size/permissions for later diffs and restore comparison).
+        // By the time we get here the content is **known** to have changed (the type flipped, or the length does not match), so fullHash has only two uses left:
+        // generating the data/{hash} address, and being written into the index — and on the single-file blob path both of those get redone with the
+        // value the compression pass computes. So deferring is lossless.
         return await TryReadAsync(async () =>
         {
             var id = await IdentityAsync(entry, full, options, deferFull, ct);
@@ -293,26 +293,26 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     /// <summary>
-    /// 这一条的全文 hash 能不能真的延后。延后的意义是免掉"为算 hash 把文件再整个读一遍"，
-    /// 而 0 字节那一遍读是免费的——更要紧的是，编排器不会把空文件送进压缩，也就没有人回来
-    /// 补上这个值：延后会在索引里留下一个永远为 null 的 fullHash，下一轮 diff 拿它和新算的
-    /// 值比对必然不等，于是每一轮都把这个空文件重判成变更。
+    /// Whether this entry's full hash can really be deferred. The point of deferring is to avoid "reading the whole file again just to hash it",
+    /// and for 0 bytes that read is free — more importantly, the orchestrator never sends an empty file through compression, so nobody ever comes
+    /// back to fill the value in: deferring would leave a forever-null fullHash in the index, the next diff would compare it against a freshly
+    /// computed value and necessarily find them unequal, and so every single run would reclassify that empty file as changed.
     /// </summary>
     private static bool DeferrableFullHash(ScannedEntry entry, bool deferFull) => deferFull && entry.Length > 0;
 
     /// <summary>
-    /// 这一条完全没变——**一个字节都不读**，全部沿用上一版本的条目。
+    /// This entry did not change at all — **not one byte is read**, everything is carried over from the previous version's entry.
     /// <para>
-    /// 曾经在这里给缺尾部 hash 的老条目补算过一次，让旧备份自愈。撤掉了：未变文件本来一趟 IO
-    /// 都不付，补它就是凭空多出来的随机读——实测 SSD 上 0.033 ms/文件，而 NAS 的机械盘上一次
-    /// 随机 IO 是 5–10 ms，50 万个小文件就是接近一小时。换来的只是把打包成员的去重判据从三项
-    /// 补到四项，而真正的防线一直是 fullHash（xxh128 覆盖全文），那 4KB 的边际价值极小。
-    /// 这笔账不划算。
+    /// There used to be a backfill here computing the tail hash for old entries that lacked it, so old backups would self-heal. It was removed:
+    /// an unchanged file pays no IO at all, so backfilling it is a random read conjured out of nothing — measured at 0.033 ms/file on SSD, while
+    /// one random IO on a NAS spinning disk is 5-10 ms, which for 500k small files is close to an hour. All it buys is moving pack-member dedup
+    /// from a three-component criterion to a four-component one, while the real line of defense has always been fullHash (xxh128 over the whole
+    /// file), so those 4KB have vanishingly small marginal value. The trade does not pay.
     /// </para>
     /// <para>
-    /// 于是老索引的打包成员会一直缺这一项，去重那边按"缺失即不参与判定"处理（见
-    /// <see cref="LocalDedupResolver.TryFindPackMember"/>）。新写的条目都带着它，
-    /// 文件一旦被改动就自然补齐。
+    /// So pack members in old indexes stay missing this component forever, and dedup treats it as "missing means it does not take part in the
+    /// check" (see <see cref="LocalDedupResolver.TryFindPackMember"/>). Newly written entries all carry it, and any file
+    /// that gets modified fills it in naturally.
     /// </para>
     /// </summary>
     private static FileChange Unchanged(ScannedEntry entry, IndexEntry prev) =>
@@ -320,16 +320,17 @@ public sealed class BackupDiffer(IFileHasher hasher)
             TailHash: prev.TailHash);
 
     /// <summary>
-    /// 已确定变更的这一条要算哪些 hash。
+    /// Which hashes to compute for an entry already known to have changed.
     /// <para>
-    /// 要算全文时（打包成员）**一遍读拿全三段**：全文那一趟本来就路过头和尾，分别调三个方法
-    /// 等于把同一个文件打开三次。首次备份几十万个小文件，省下的就是几十万次多余的 open + seek。
+    /// When the full hash is needed (pack members), **take all three segments in one read**: the full-file pass already goes past the head and
+    /// the tail, so calling three separate methods opens the same file three times. On a first backup of a few hundred thousand small files, that
+    /// saves a few hundred thousand redundant open + seek pairs.
     /// </para>
     /// <para>
-    /// 全文被延后时（单文件 blob）只算 head——**尾部这里不算**：那条路的三段 hash 都由压缩
-    /// 那一遍顺手算出并覆盖此处的值（见编排器的 tailByPath 与 StreamAndStageAsync），
-    /// 在这里算等于白读一次。head 仍要算，它顺带回答了"这个文件此刻打得开吗"，
-    /// 读不开的在这里就被判成 Unreadable（沿用旧条目），而不是几小时后倒在压缩里。
+    /// When the full hash is deferred (single-file blob) only the head is computed — **the tail is not computed here**: on that path all three
+    /// hash segments fall out of the compression pass for free and overwrite the values from here (see the orchestrator's tailByPath and
+    /// StreamAndStageAsync), so computing it here is a wasted read. The head is still computed; it also answers "can this file be opened right now",
+    /// so an unreadable file is classified Unreadable here (carrying the old entry forward) instead of falling over inside compression hours later.
     /// </para>
     /// </summary>
     private async Task<(string? Head, string? Full, string? Tail)> IdentityAsync(
@@ -338,7 +339,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
         if (DeferrableFullHash(entry, deferFull))
             return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct), null, null);
 
-        // 符号链接与空文件没有内容可读，一趟都不必付。
+        // Symlinks and empty files have no content to read; not a single pass has to be paid for.
         if (entry.Kind != EntryKind.File || entry.Length == 0)
             return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct),
                 await hasher.FullHashAsync(full, ct), null);
@@ -348,9 +349,9 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     /// <summary>
-    /// 读失败（被占用/无权限/读到一半设备错误）不该终止整轮备份。
-    /// 精确捕获这两类，**不要**写成 catch(Exception)：OperationCanceledException 不派生自它们，
-    /// 写宽了会把取消也变成「跳过一个文件」，备份看起来成功、实际没跑完。
+    /// A read failure (in use / no permission / device error midway through) must not abort the whole backup run.
+    /// Catch exactly these two types, and **do not** write catch(Exception): OperationCanceledException does not derive from them,
+    /// and catching too broadly turns a cancellation into "skipped one file" — the backup looks successful while it never finished.
     /// </summary>
     private static async Task<FileChange> TryReadAsync(
         Func<Task<FileChange>> build, ScannedEntry entry, IndexEntry? prev)

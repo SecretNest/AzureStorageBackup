@@ -57,7 +57,7 @@ public sealed class GroupingPlannerTests
     [Fact]
     public void Group_Cap_Splits_Into_Multiple_Packs()
     {
-        // 同目录 3 个 40 字节文件，单组上限 100 → 拆成 2 个 pack（40+40 | 40）。
+        // Three 40-byte files in the same directory, per-group cap 100 → split into 2 packs (40+40 | 40).
         var plan = Plan(
             [F("d/a", 40), F("d/b", 40), F("d/c", 40)],
             new PlanOptions { GroupCapBytes = 100 });
@@ -78,13 +78,13 @@ public sealed class GroupingPlannerTests
         Assert.Equal("p0001", plan.Packs[0].PackId);
     }
 
-    // ---- 跨路径打包（散列分片目录）----
+    // ---- Cross-path packing (hash-sharded directory trees) ----
     //
-    // 用户实测发现的问题：Emby 元数据是 .../library/09/<guid>/poster.jpg 这种结构——目录极多、
-    // 每个目录一两个文件。按目录切分时包数逼近文件数，46,624 个文件产生上万个包，
-    // 每个包一次 7z 进程加一次计费的上传请求，分组打包（合并小文件、减少 blob 数）完全落空。
+    // A problem the user hit in the field: Emby metadata has the shape .../library/09/<guid>/poster.jpg — enormous numbers of directories,
+    // one or two files each. Splitting per directory drives the pack count toward the file count: 46,624 files produced tens of thousands of packs,
+    // one 7z process plus one billed upload request each, and grouped packing (merging small files, reducing blob count) fell through entirely.
 
-    /// <summary>命中跨路径规则的文件无视目录边界装箱：四个分处不同目录的小文件应当只成一个包。</summary>
+    /// <summary>Files matching the cross-path rule pack across directory boundaries: four small files sitting in four different directories should form only one pack.</summary>
     [Fact]
     public void Cross_Dir_Rule_Packs_Across_Directory_Boundaries()
     {
@@ -107,7 +107,7 @@ public sealed class GroupingPlannerTests
         Assert.Empty(plan.Blobs);
     }
 
-    /// <summary>默认（规则为空）必须与历史行为逐字节一致：仍按目录切分，一个目录一个包。</summary>
+    /// <summary>The default (empty rule) must be byte for byte identical to historical behavior: still split per directory, one pack per directory.</summary>
     [Fact]
     public void Without_The_Rule_Each_Directory_Still_Gets_Its_Own_Pack()
     {
@@ -117,11 +117,11 @@ public sealed class GroupingPlannerTests
             F("meta/09/bbb/poster.jpg", 100),
         ], new PlanOptions { GroupCapBytes = 10_000 });
 
-        Assert.Equal(2, plan.Packs.Count); // 不同目录 → 两个包，正是要解决的那个形态
+        Assert.Equal(2, plan.Packs.Count); // Different directories → two packs, exactly the shape being solved
     }
 
-    /// <summary>优先级：不分组 > 跨路径打包。「不分组」说的是"根本不该和别人合并"，
-    /// 不该被跨路径规则翻案。</summary>
+    /// <summary>Priority: don't-group > cross-path packing. "Don't group" says "should not be merged with anyone at all",
+    /// and the cross-path rule must not overturn it.</summary>
     [Fact]
     public void Dont_Group_Outranks_Cross_Dir_Grouping()
     {
@@ -133,19 +133,19 @@ public sealed class GroupingPlannerTests
 
         var plan = Plan([F("meta/a/x.iso", 100), F("meta/b/y.jpg", 100)], options);
 
-        Assert.Equal("meta/a/x.iso", Assert.Single(plan.Blobs).Path); // 不分组胜出
+        Assert.Equal("meta/a/x.iso", Assert.Single(plan.Blobs).Path); // don't-group wins
         Assert.Equal("meta/b/y.jpg", Assert.Single(Assert.Single(plan.Packs).Members).Path);
     }
 
-    /// <summary>跨路径的包各自带独立的 GroupKey：编排器按它建池，池间并发。
-    /// 若都用同一个键，成千上万个跨目录文件会被塞进同一个串行池里。</summary>
+    /// <summary>Cross-path packs each carry their own GroupKey: the orchestrator builds pools from it, and pools run concurrently.
+    /// If they all shared one key, tens of thousands of cross-directory files would be stuffed into a single serial pool.</summary>
     [Fact]
     public void Cross_Dir_Packs_Get_Distinct_Group_Keys_So_They_Stay_Parallel()
     {
         var options = new PlanOptions
         {
             CrossDirGroup = new IgnoreRuleSet(["meta/**"]),
-            GroupCapBytes = 150, // 每包最多一个文件
+            GroupCapBytes = 150, // at most one file per pack
         };
 
         var plan = Plan([F("meta/a/1.jpg", 100), F("meta/b/2.jpg", 100), F("meta/c/3.jpg", 100)], options);
@@ -154,7 +154,7 @@ public sealed class GroupingPlannerTests
         Assert.Equal(3, plan.Packs.Select(p => p.GroupKey).Distinct().Count());
     }
 
-    /// <summary>按目录打包时 GroupKey 就是目录，编排器据此把同目录的包归入一个池（历史行为）。</summary>
+    /// <summary>When packing per directory the GroupKey is the directory, and the orchestrator uses it to file same-directory packs into one pool (historical behavior).</summary>
     [Fact]
     public void By_Directory_Packs_Use_The_Directory_As_Group_Key()
     {
@@ -162,16 +162,16 @@ public sealed class GroupingPlannerTests
         [
             F("d/1.txt", 100),
             F("d/2.txt", 100),
-        ], new PlanOptions { GroupCapBytes = 150 }); // 拆成两个包，但同属一个目录池
+        ], new PlanOptions { GroupCapBytes = 150 }); // split into two packs, but both belong to the same directory pool
 
         Assert.Equal(2, plan.Packs.Count);
         Assert.Equal(["d"], plan.Packs.Select(p => p.GroupKey).Distinct());
     }
 
     /// <summary>
-    /// 单文件 blob 的全文 hash 可以延后到压缩那一遍再算（<see cref="PlannedFile.FullHash"/> 为空），
-    /// 而 <c>data/{hash}</c> 是内容地址——没有 hash 就没有地址。接错线时必须当场炸掉：
-    /// 拼出一个 <c>data/</c> 的空地址传上去，要到还原那天才会被发现指不到 blob。
+    /// A single-file blob's full-content hash may be deferred to the compression pass (<see cref="PlannedFile.FullHash"/> is null),
+    /// while <c>data/{hash}</c> is a content address — no hash means no address. Wiring it up wrong must blow up on the spot:
+    /// build an empty <c>data/</c> address and upload it, and it would only be discovered on restore day, pointing at no blob.
     /// </summary>
     [Fact]
     public void Addressing_A_File_Whose_Hash_Was_Deferred_Fails_Loudly()
@@ -183,9 +183,9 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 打包成员则**不**拒空：symlink 本来就没有内容 hash（差分对它一律返回 null），
-    /// 而 symlink 是可以被打进包的——7z 存的是链接本身。把拒空写宽一格，
-    /// 一个指向别处的软链接就能让整轮备份倒掉。
+    /// Pack members, by contrast, are **not** rejected for a null hash: a symlink has no content hash to begin with (the diff always returns null for one),
+    /// and symlinks can be packed — 7z stores the link itself. Widen the null rejection by one notch,
+    /// and a single symlink pointing elsewhere is enough to bring down an entire backup run.
     /// </summary>
     [Fact]
     public void A_Pack_Member_Without_A_Content_Hash_Is_Still_Packed()
@@ -197,32 +197,32 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 字节上限管不住成员数：文件越小，同样的字节额度装进去的成员越多。
-    /// 那一箱的成员表是**整件**拿在手上的（压缩要、重校验要、失败重试也要），
-    /// 实测 7z 光成员元数据就是约 1.3 KB/个。
+    /// The byte cap cannot hold the member count down: the smaller the files, the more members the same byte budget swallows.
+    /// That pack's member list is held **in its entirety** in memory (compression needs it, re-verification needs it, retry after failure needs it too),
+    /// and measured 7z member metadata alone is about 1.3 KB per member.
     /// </summary>
     [Fact]
     public void A_Pack_Is_Sealed_When_It_Hits_The_Member_Limit()
     {
-        // 10 个 1 字节的文件，字节上限给到天上——只有成员数这条界能把它切开。
+        // Ten 1-byte files with the byte cap set sky-high — only the member-count limit can split this.
         var plan = Plan(
             Enumerable.Range(0, 10).Select(i => F($"d/{i}.txt", 1)),
             new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackMembers = 4 });
 
         Assert.Equal([4, 4, 2], plan.Packs.Select(p => p.Members.Count));
-        // 切开归切开，一个成员都不能丢。
+        // Split it may be, but not one member may go missing.
         Assert.Equal(10, plan.Packs.Sum(p => p.Members.Count));
     }
 
     /// <summary>
-    /// 路径字节这条界治的是硬故障：成员路径逐个作为 argv 传给 7z，超了内核直接 E2BIG。
-    /// 必须按**字节**设界而不是按成员数——墙的位置随路径长度缩水，实测 1.73 MB 的 argv 额度
-    /// 在 52 字符的路径下能放三万多个，500 字符的只剩三千多。
+    /// The path-byte limit is about a hard failure: member paths are passed to 7z one by one as argv, and going over gets a flat E2BIG from the kernel.
+    /// The limit must be set in **bytes**, not member count — the wall moves as paths get longer: the measured 1.73 MB argv budget
+    /// fits thirty-odd thousand 52-character paths, but only three thousand-odd 500-character ones.
     /// </summary>
     [Fact]
     public void A_Pack_Is_Sealed_When_It_Hits_The_Path_Byte_Limit()
     {
-        // 每条路径 "d/xx.txt" = 8 字节 + NUL = 9；额度 30 → 每箱 3 条。
+        // Each path "d/xx.txt" = 8 bytes + NUL = 9; budget 30 → 3 per pack.
         var plan = Plan(
             Enumerable.Range(0, 7).Select(i => F($"d/{i:D2}.txt", 1)),
             new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackMembers = int.MaxValue, MaxPackPathBytes = 30 });
@@ -231,16 +231,16 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 路径按 UTF-8 字节算，不按字符数。中日韩路径一个字符最多三字节，按字符数记会低估两倍多，
-    /// 而低估的后果不是包变大，是 <c>E2BIG</c>：压缩当场失败。
+    /// Paths are counted in UTF-8 bytes, not characters. A CJK path takes up to three bytes per character, so counting characters underestimates by more than a factor of two,
+    /// and the consequence of underestimating is not a bigger pack, it is <c>E2BIG</c>: compression fails on the spot.
     /// </summary>
     [Fact]
     public void Path_Bytes_Are_Counted_As_Utf8_Not_Characters()
     {
-        // "照片/01.jpg"：中文 2 字 ×3 + "/01.jpg" 7 = 13 字节 + NUL = 14。按字符数记只有 10。
+        // "照片/01.jpg": 2 Chinese characters ×3 + "/01.jpg" 7 = 13 bytes + NUL = 14. Counting characters gives only 10.
         Assert.Equal(14, GroupingPlanner.EntryArgBytes("照片/01.jpg"));
 
-        // 额度 28 = 正好两条。按字符数记的话会以为塞得下第三条（33 > 28 才封箱）。
+        // Budget 28 = exactly two. Counting characters would make it look like a third fits (it only seals at 33 > 28).
         var plan = Plan(
             Enumerable.Range(0, 5).Select(i => F($"照片/{i:D2}.jpg", 1)),
             new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackPathBytes = 28 });
@@ -249,16 +249,16 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 两条新界对常规备份必须是**空操作**。默认下平均 ≥ 5 KB 的文件永远先撞 100 MB 那条，
-    /// 所以既有备份的装箱结果一个字节都不变——这是加这两条界的前提，不是附带效果。
+    /// The two new limits must be **a no-op** for ordinary backups. Under the defaults, files averaging 5 KB or more always hit the 100 MB one first,
+    /// so the packing result of existing backups does not change by a single byte — that is the precondition for adding these two limits, not a side effect.
     /// </summary>
     [Fact]
     public void The_New_Limits_Do_Not_Change_Grouping_For_Ordinary_Files()
     {
-        // 1000 个 200 KB 的文件（共 200 MB）＝ 默认下按 100 MB 切成两箱，各 500 个成员。
+        // 1000 files of 200 KB (200 MB in total) = under the defaults, split by 100 MB into two packs of 500 members each.
         var files = Enumerable.Range(0, 1000).Select(i => F($"d/{i:D4}.bin", 200 * 1024)).ToList();
 
-        var withLimits = Plan(files);                                    // 默认：2 万成员 / 1 MB 路径
+        var withLimits = Plan(files);                                    // defaults: 20,000 members / 1 MB of paths
         var withoutLimits = Plan(files, new PlanOptions
         {
             MaxPackMembers = int.MaxValue,
@@ -272,8 +272,8 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 单个成员本身就超过某条界时不能死循环、也不能把它丢掉：一件装不下也要单独成箱。
-    /// （字节那条界早有这个行为，新加的两条必须一致。）
+    /// When a single member exceeds a limit all by itself we must neither loop forever nor drop it: an item that does not fit still gets a pack of its own.
+    /// (The byte limit has behaved this way all along; the two new ones must match it.)
     /// </summary>
     [Fact]
     public void An_Item_That_Alone_Exceeds_A_Limit_Still_Gets_Its_Own_Pack()
@@ -283,14 +283,14 @@ public sealed class GroupingPlannerTests
             [F("d/a.txt", 1), F(longPath, 1), F("d/b.txt", 1)],
             new PlanOptions { GroupCapBytes = long.MaxValue, MaxPackPathBytes = 50 });
 
-        // 排序后是 a、b、超长路径：前两条凑一箱，超长那条自己撑爆额度 → 单独成箱。
+        // After sorting: a, b, then the over-long path — the first two share a pack, and the over-long one blows the budget on its own → a pack of its own.
         Assert.Equal(3, plan.Packs.Sum(p => p.Members.Count));
         Assert.Contains(plan.Packs, p => p.Members.Count == 1 && p.Members[0].Path == longPath);
     }
 
     /// <summary>
-    /// 一箱只能有一种压法，所以同一目录里可压与不可压的文件必须分开装。混装的话规则对被打包的
-    /// 文件就等于不存在——那正是这个功能之前的缺陷（整箱一律按配置的 -m… 压）。
+    /// A pack can hold only one compression mode, so compressible and non-compressible files in the same directory must be packed separately. Mixing them makes the rule
+    /// effectively nonexistent for the files that got packed — which was exactly this feature's earlier defect (the whole pack was compressed with the configured -m… regardless).
     /// </summary>
     [Fact]
     public void Same_Dir_Splits_Into_A_Compressed_Pack_And_A_Store_Only_Pack()
@@ -309,12 +309,12 @@ public sealed class GroupingPlannerTests
         var stored = Assert.Single(plan.Packs, p => p.StoreOnly);
         Assert.Equal(["d/a.jpg", "d/c.jpg"], stored.Members.Select(m => m.Path));
 
-        // 两箱同属一个目录，处理池的归属不该因为压法而分家。
+        // Both packs belong to the same directory; processing-pool membership must not split just because of compression mode.
         Assert.All(plan.Packs, p => Assert.Equal("d", p.GroupKey));
     }
 
-    /// <summary>「不分组」仍然是最强的意思表示：命中者走单文件 blob，压法由那条路自己按同一套规则推导，
-    /// 根本不参与分箱。</summary>
+    /// <summary>"Don't group" remains the strongest statement of intent: matches take the single-file blob route, where that route derives the compression mode itself from the same rules,
+    /// and they never take part in packing at all.</summary>
     [Fact]
     public void Dont_Group_Outranks_Dont_Compress()
     {
@@ -332,7 +332,7 @@ public sealed class GroupingPlannerTests
         Assert.Equal("d/y.jpg", Assert.Single(pack.Members).Path);
     }
 
-    /// <summary>跨路径打包同样要切：它无视的是目录边界，不是压法。</summary>
+    /// <summary>Cross-path packing gets split the same way: what it ignores is directory boundaries, not compression mode.</summary>
     [Fact]
     public void Cross_Dir_Grouping_Also_Splits_By_Compressibility()
     {
@@ -348,16 +348,16 @@ public sealed class GroupingPlannerTests
 
         Assert.Equal(2, plan.Packs.Count);
         Assert.Equal(["meta/b/2.txt"], Assert.Single(plan.Packs, p => !p.StoreOnly).Members.Select(m => m.Path));
-        // 跨目录合并照旧发生在同一侧内部：两个 jpg 分属不同目录，仍进同一箱。
+        // Cross-directory merging still happens within one lane: the two jpgs live in different directories yet still land in the same pack.
         Assert.Equal(
             ["meta/a/1.jpg", "meta/c/3.jpg"],
             Assert.Single(plan.Packs, p => p.StoreOnly).Members.Select(m => m.Path));
     }
 
     /// <summary>
-    /// 严格分箱，**不设最小成员数兜底**：哪怕某一侧只有一个成员也照样独立成箱。
-    /// 增量备份里一个目录本轮可能就变了两个文件，「两个各含一个成员的包」是接受的常态——
-    /// 这条把那个取舍钉死，免得日后有人顺手加一条"太小就并回去"的例外。
+    /// Strict splitting, with **no minimum-member fallback**: even a lane holding just one member still becomes its own pack.
+    /// In an incremental backup a directory may have just two changed files this round, and "two packs holding one member each" is an accepted normal case —
+    /// this test nails that trade-off down so nobody later casually adds a "too small, merge it back" exception.
     /// </summary>
     [Fact]
     public void A_Lone_Odd_File_Still_Gets_Its_Own_Pack()
@@ -371,8 +371,8 @@ public sealed class GroupingPlannerTests
     }
 
     /// <summary>
-    /// 规则**没命中任何文件**时，装箱结果必须与这条规则存在之前逐字节相同——尤其不能凭空多出
-    /// 一个空的第二箱。这是加分箱的前提，不是附带效果（同 The_New_Limits_… 那条的用意）。
+    /// When the rule **matches no file at all**, the packing result must be byte for byte identical to what it was before the rule existed — and in particular no
+    /// empty second pack may appear out of nowhere. That is the precondition for adding the split, not a side effect (same intent as the The_New_Limits_… test).
     /// </summary>
     [Fact]
     public void Dont_Compress_That_Matches_Nothing_Leaves_Grouping_Unchanged()

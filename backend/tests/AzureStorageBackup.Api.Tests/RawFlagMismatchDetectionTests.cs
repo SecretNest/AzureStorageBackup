@@ -5,14 +5,16 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 索引里的 <c>raw</c> 标志说的是"这个 blob 里躺着的是原始字节，还是一个 7z 归档"。它一旦与
-/// blob 的实际内容对不上，还原就会把归档本身当成文件内容写出来——一次看起来完全成功的还原，
-/// 产出的却是坏文件。
+/// The <c>raw</c> flag in the index says "what lies inside this blob: raw bytes, or a 7z archive". The moment it
+/// disagrees with the blob's actual content, restore writes the archive itself out as the file content — a restore
+/// that looks entirely successful, yet produces broken files.
 /// <para>
-/// 这类损坏曾经真实存在（同批同内容的两个文件被指派成不同存储形态、各自上传，见
-/// <see cref="EmptyFileRoundTripTests"/>），已经从产生端修掉。但**已经写下去的**备份修不回来，
-/// 所以这里要回答一个运维问题：手上一份来历不明的备份，能不能靠现成的检查功能查出它有没有这个毛病？
-/// 答案必须是确定的——否则用户只能靠"全部重做一遍"来求心安。
+/// Corruption of this kind really did happen (two files with identical content in the same batch were assigned
+/// different storage forms and uploaded separately, see <see cref="EmptyFileRoundTripTests"/>) and has been fixed at
+/// the producing end. But backups that were **already written** cannot be fixed retroactively, so this file answers
+/// an operational question: given a backup of unknown provenance, can the check feature we already ship tell whether
+/// it has this defect? The answer has to be definite — otherwise the only reassurance left to a user is "redo
+/// everything from scratch".
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -56,9 +58,9 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
     /// <summary>
-    /// 备份一个走 7z 单文件 blob 的文件（raw=false），然后把索引里那条的 raw 翻成 true——
-    /// 得到的正是那类损坏备份的形状：blob 里是归档，索引却声称它是原始字节。
-    /// 随后跑一次 Content 级检查，看它认不认得出来。
+    /// Back up a file that goes to a 7z single-file blob (raw=false), then flip the raw flag on that index entry to
+    /// true — what comes out is exactly the shape of those corrupt backups: an archive inside the blob while the
+    /// index claims it holds raw bytes. Then run a Content-level check and see whether it recognises the problem.
     /// </summary>
     [SkippableFact]
     public async Task Content_Level_Check_Catches_A_Raw_Flag_That_Lies()
@@ -84,7 +86,8 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
 
         try
         {
-            // 不可压缩的内容：归档字节与原始字节明显不同，翻标志之后的错配是实打实的。
+            // Incompressible content: the archive bytes differ clearly from the raw bytes, so flipping the flag
+            // produces a genuine mismatch.
             var payload = new byte[50_000];
             new Random(4242).NextBytes(payload);
             Directory.CreateDirectory(Path.Combine(_src, "solo"));
@@ -96,22 +99,22 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                 Container = name,
                 LocalRoot = _src,
                 Name = "rawflag",
-                // DontGroup 强制走单文件 blob；不加 DontCompress，所以它是 7z 归档（raw=false）。
+                // DontGroup forces a single-file blob; DontCompress is not set, so it is a 7z archive (raw=false).
                 Options = new BackupEngineOptions { DontGroup = new IgnoreRuleSet(["solo/**"]) },
             });
 
-            // 健康的备份先得是绿的，否则下面的断言证明不了任何事。
+            // The healthy backup has to be green first, or the assertions below prove nothing.
             var healthy = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
-            Assert.True(healthy.Ok, "健康备份的 Content 级检查本该通过");
+            Assert.True(healthy.Ok, "a healthy backup should pass the Content-level check");
 
-            // 把 raw 标志翻掉：blob 里仍是归档，索引却开始声称它是原始字节。
+            // Flip the raw flag: the blob still holds an archive while the index starts claiming it is raw bytes.
             var info = await store.ReadInfoAsync(account, name, null);
             var version = info!.Versions[^1];
             var index = await store.ReadIndexAsync(account, name, version.IndexBlob, null);
             var target = index.Entries.Single(e => e.Path == "solo/a.bin");
             Assert.NotNull(target.Storage);
-            Assert.False(target.Storage!.Raw, "前提：这一条本该是 7z 归档");
+            Assert.False(target.Storage!.Raw, "precondition: this entry should be a 7z archive");
 
             var tampered = new VersionIndex
             {
@@ -126,17 +129,18 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
 
-            // 这是本文件存在的全部意义：这类损坏必须能被现成的检查功能查出来，
-            // 而且要精确指到出问题的那个文件上，不能只给一句笼统的"有问题"。
-            Assert.False(report.Ok, "raw 标志与 blob 实际内容不符，Content 级检查必须报错");
+            // This is the entire reason this file exists: corruption of this kind must be detectable with the
+            // check feature we already ship, and it must point precisely at the offending file, not just say
+            // "something is wrong".
+            Assert.False(report.Ok, "the raw flag disagrees with the blob's actual content; the Content-level check must report it");
             Assert.Contains("solo/a.bin", report.CorruptedPaths);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 反方向同样要认得出来：blob 里是原始字节，索引却说它是归档。
-    /// 两个方向都覆盖，才敢对用户说"跑一次 Content 级检查就能知道"。
+    /// The other direction has to be caught just as well: raw bytes inside the blob while the index says archive.
+    /// Only with both directions covered can we tell a user "one Content-level check will tell you".
     /// </summary>
     [SkippableFact]
     public async Task Content_Level_Check_Catches_The_Mismatch_In_The_Other_Direction()
@@ -173,7 +177,7 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                 Container = name,
                 LocalRoot = _src,
                 Name = "rawflag2",
-                // DontGroup + DontCompress + 无密码 → raw 直传（blob 里就是原始字节）。
+                // DontGroup + DontCompress + no password → raw upload (the blob holds the raw bytes as-is).
                 Options = new BackupEngineOptions
                 {
                     DontGroup = new IgnoreRuleSet(["raw/**"]),
@@ -185,7 +189,7 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             var version = info!.Versions[^1];
             var index = await store.ReadIndexAsync(account, name, version.IndexBlob, null);
             var target = index.Entries.Single(e => e.Path == "raw/b.bin");
-            Assert.True(target.Storage!.Raw, "前提：这一条本该是 raw 直传");
+            Assert.True(target.Storage!.Raw, "precondition: this entry should be a raw upload");
 
             var tampered = new VersionIndex
             {
@@ -200,7 +204,7 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
 
-            Assert.False(report.Ok, "索引声称是归档、blob 里却是原始字节，Content 级检查必须报错");
+            Assert.False(report.Ok, "the index claims an archive while the blob holds raw bytes; the Content-level check must report it");
             Assert.Contains("raw/b.bin", report.CorruptedPaths);
         }
         finally { await container.DeleteIfExistsAsync(); }

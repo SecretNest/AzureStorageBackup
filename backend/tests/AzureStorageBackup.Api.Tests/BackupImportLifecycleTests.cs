@@ -12,11 +12,11 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 生命周期的最后一环：**从已有 storage 导入到全新环境**。
-/// 云端备份由一台「旧机器」（独立的本地数据库 + 编排器）建立；承载 HTTP 的宿主从未见过这个 container——
-/// 无 BackupConfig、无 CachedVersionIndex、无 LocalBackupState。经 <c>POST /api/backup-configs/import</c>
-/// 导入后，断言能列出全部版本、本地权威状态被回填，并能把任一版本逐字节还原出来。
-/// 加密与不加密都覆盖：两者的信息文件走不同的 blob 名（IndexBlobName vs EncryptedIndexBlobName）。
+/// The last link in the lifecycle: **importing from existing storage into a brand-new environment**.
+/// The cloud backup is created by an "old machine" (its own separate local database + orchestrator); the host serving HTTP has never seen this container —
+/// no BackupConfig, no CachedVersionIndex, no LocalBackupState. After importing through <c>POST /api/backup-configs/import</c>,
+/// assert that every version can be listed, that the local authoritative state was backfilled, and that any version restores byte for byte.
+/// Encrypted and unencrypted are both covered: their info files use different blob names (IndexBlobName vs EncryptedIndexBlobName).
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory>, IDisposable
@@ -59,7 +59,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    // ───────────────────────── 源树与快照 ─────────────────────────
+    // ───────────────────────── Source tree and snapshots ─────────────────────────
 
     private void Write(string rel, byte[] content)
     {
@@ -94,7 +94,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         var actual = Directory.EnumerateFiles(target, "*", SearchOption.AllDirectories)
             .ToDictionary(f => Rel(target, f), StringComparer.Ordinal);
 
-        Assert.Equal(expected.Keys.Order(), actual.Keys.Order()); // 目录结构一致
+        Assert.Equal(expected.Keys.Order(), actual.Keys.Order()); // directory structure matches
         foreach (var (rel, bytes) in expected)
         {
             var got = File.ReadAllBytes(actual[rel]);
@@ -103,11 +103,12 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         }
     }
 
-    // ───────────────────────── 「旧机器」：在云端造出一个多版本备份 ─────────────────────────
+    // ───────────────────────── The "old machine": build a multi-version backup in the cloud ─────────────────────────
 
     /// <summary>
-    /// 用**独立的**本地数据库跑真实编排器写出云端备份，随后丢弃该数据库——
-    /// 于是承载 HTTP 的宿主对这个 container 一无所知，导入面对的是真正的空环境。
+    /// Runs the real orchestrator against a **separate** local database to write the cloud backup, then throws that
+    /// database away — so the host serving HTTP knows nothing at all about this container, and the import faces a
+    /// genuinely empty environment.
     /// </summary>
     private async Task SeedCloudBackupAsync(string container, string? password, Action beforeSecondRun)
     {
@@ -156,10 +157,10 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         Assert.Equal(2, v2.Version);
     }
 
-    // ───────────────────────── 导入 → 列版本 → 还原 ─────────────────────────
+    // ───────────────────────── Import → list versions → restore ─────────────────────────
 
     [SkippableTheory]
-    [InlineData("import pass phrase")] // 加密：密码经请求体明文进来，落库必须是密文，还原时在咽喉处解密
+    [InlineData("import pass phrase")] // encrypted: the password arrives in the clear in the request body, must be stored as ciphertext, and is decrypted at the throat on restore
     [InlineData(null)]
     public async Task Import_Into_Empty_Environment_Lists_All_Versions_And_Restores_Them_Byte_For_Byte(string? password)
     {
@@ -178,28 +179,28 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
 
         try
         {
-            // 「旧机器」造出两个版本的云端备份。
+            // The "old machine" builds a two-version cloud backup.
             Write("docs/one.txt", Rand(3000, 31));
             Write("docs/two.txt", Rand(3000, 32));
-            Write("media/blob.bin", Rand(40_000, 33)); // ≥20K → 单文件 data blob
+            Write("media/blob.bin", Rand(40_000, 33)); // ≥20K → single-file data blob
             WriteText("top.txt", "first revision");
             var snap1 = Snapshot();
 
             Dictionary<string, byte[]>? snap2 = null;
             await SeedCloudBackupAsync(container, password, () =>
             {
-                Write("docs/two.txt", Rand(3000, 132));   // 改
-                WriteText("docs/three.txt", "brand new"); // 增
+                Write("docs/two.txt", Rand(3000, 132));   // modified
+                WriteText("docs/three.txt", "brand new"); // added
                 snap2 = Snapshot();
             });
             Assert.NotNull(snap2);
 
-            // 云端确实按加密/非加密写了不同的信息文件 blob 名。
+            // The cloud really did write different info-file blob names for the encrypted and unencrypted cases.
             Assert.True(await cc.GetBlobClient(password is null
                 ? BackupDiscovery.IndexBlobName
                 : BackupDiscovery.EncryptedIndexBlobName).ExistsAsync());
 
-            // ─── 空环境：宿主只知道账户，对该 container 一无所知 ───
+            // ─── Empty environment: the host knows only the account and nothing about this container ───
             var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
                 "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
                 false, ProxyMode.Independent, null, null, null, null)))
@@ -207,7 +208,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             Assert.NotNull(account);
             await AssertLocalEnvironmentEmptyAsync(account!.Id, container);
 
-            // ─── 导入 ───
+            // ─── Import ───
             var response = await _client.PostAsJsonAsync("/api/backup-configs/import",
                 new ImportRequest(account.Id, container, password));
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -215,28 +216,30 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             var result = await response.Content.ReadFromJsonAsync<ImportResponse>();
             Assert.NotNull(result);
             var imported = result!.Config;
-            Assert.Equal("imported-fixture", imported.Name);          // 配置从信息文件恢复
+            Assert.Equal("imported-fixture", imported.Name);          // the config is recovered from the info file
             Assert.Equal("created on another machine", imported.Description);
             Assert.Equal(container, imported.ContainerName);
             Assert.Equal(_src, imported.LocalRoot);                     // sourceRootHint
             Assert.Equal(password is not null, imported.HasPassword);
-            Assert.Empty(result.UnreadableVersions);                    // 两个版本的文件列表都读得出来
+            Assert.Empty(result.UnreadableVersions);                    // the file lists of both versions can be read
 
-            // 本地权威状态与全部版本索引都已回填（之后备份/还原平时不再下载云端索引）。
+            // The local authoritative state and every version index have been backfilled (from here on, backup/restore
+            // no longer downloads the cloud index in normal operation).
             await AssertLocalStateSeededAsync(account.Id, container, expectedVersions: 2);
 
-            // 云端核验自动跑起来了，用户不必自己再去点一次检查；跑完该是健康的。
+            // The cloud verification starts on its own, so the user need not go and click check again; it should come back healthy.
             Assert.True(result.CheckStarted);
             var check = await PollUntilDoneAsync<CheckRunResponse>(
                 $"/api/backup-configs/{imported.Id}/check", c => c.Status is not "Running");
             Assert.NotNull(check);
-            // 带上 Error 一起断言：这条曾在满负载的全量跑里偶发失败过一次，而当时屏幕上只有
-            // "Completed != something"，看不出检查自己抱怨了什么。下次再挂，原因就在消息里。
-            Assert.True(check!.Status is "Completed", $"检查以 {check.Status} 收场：{check.Error}");
+            // Assert with the Error included: this line failed once, intermittently, during a fully loaded complete run,
+            // and all the screen said was "Completed != something", with no sign of what the check itself was
+            // complaining about. Next time it breaks, the reason will be right there in the message.
+            Assert.True(check!.Status is "Completed", $"check ended as {check.Status}: {check.Error}");
             Assert.True(check.Report?.Ok,
-                $"导入后的自动检查报告不健康：{string.Join(", ", check.Report?.CorruptedPaths ?? [])}");
+                $"the automatic check after import reported unhealthy: {string.Join(", ", check.Report?.CorruptedPaths ?? [])}");
 
-            // ─── 列出全部版本（从新到旧，与还原/检查下拉里 Latest 之后的排列一致）───
+            // ─── List every version (newest first, matching the order after Latest in the restore/check dropdowns) ───
             var versions = await _client.GetFromJsonAsync<List<VersionRow>>(
                 $"/api/backup-configs/{imported.Id}/versions");
             Assert.NotNull(versions);
@@ -244,9 +247,9 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             Assert.Equal(snap2!.Count, versions[0].files);
             Assert.Equal(snap1.Count, versions[1].files);
 
-            // ─── 从导入的备份还原（两个版本都要逐字节正确）───
+            // ─── Restore from the imported backup (both versions must be byte-for-byte correct) ───
             await RestoreAndAssertAsync(imported.Id, version: 1, snap1, "v1");
-            await RestoreAndAssertAsync(imported.Id, version: null, snap2!, "latest"); // 缺省=最新
+            await RestoreAndAssertAsync(imported.Id, version: null, snap2!, "latest"); // default = latest
         }
         finally
         {
@@ -254,7 +257,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         }
     }
 
-    /// <summary>导入前：该 container 在宿主本地没有任何痕迹——这正是「空环境」的定义。</summary>
+    /// <summary>Before the import: this container leaves no trace whatsoever on the host locally — that is exactly the definition of an "empty environment".</summary>
     private async Task AssertLocalEnvironmentEmptyAsync(int accountId, string container)
     {
         using var scope = _factory.Services.CreateScope();
@@ -266,7 +269,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             .Where(s => s.AccountId == accountId && s.Container == container).ToListAsync());
     }
 
-    /// <summary>导入后：本地权威状态被云端信息文件回填，且每个版本的索引都进了本地缓存。</summary>
+    /// <summary>After the import: the local authoritative state is backfilled from the cloud info file, and every version's index has landed in the local cache.</summary>
     private async Task AssertLocalStateSeededAsync(int accountId, string container, int expectedVersions)
     {
         using var scope = _factory.Services.CreateScope();
@@ -276,7 +279,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             .SingleOrDefaultAsync(s => s.AccountId == accountId && s.Container == container);
         Assert.NotNull(state);
         Assert.NotEmpty(state!.InfoBytes);
-        Assert.NotEmpty(state.ETag); // 有 ETag 才能做后续的条件写
+        Assert.NotEmpty(state.ETag); // an ETag is what makes the later conditional writes possible
 
         var cached = await db.CachedVersionIndexes
             .Where(c => c.AccountId == accountId && c.Container == container)
@@ -284,7 +287,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         Assert.Equal(Enumerable.Range(1, expectedVersions), cached.Order());
     }
 
-    /// <summary>经 HTTP 还原到一个全新空目录，并与快照逐字节比对。</summary>
+    /// <summary>Restores over HTTP into a brand-new empty directory and compares it against the snapshot byte for byte.</summary>
     private async Task RestoreAndAssertAsync(int configId, int? version, Dictionary<string, byte[]> expected, string label)
     {
         var target = Path.Combine(_base, "restore", label);
@@ -307,7 +310,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
 
     private async Task<T?> PollUntilDoneAsync<T>(string url, Func<T, bool> done) where T : class
     {
-        for (var i = 0; i < 600; i++) // 宽松：并发集成测试在少核机器上会拖慢后台 job
+        for (var i = 0; i < 600; i++) // generous: concurrent integration tests slow the background jobs down on a machine with few cores
         {
             var s = await (await _client.GetAsync(url)).Content.ReadFromJsonAsync<T>();
             if (s is not null && done(s))
@@ -317,7 +320,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         return null;
     }
 
-    // 与后端 camelCase JSON 对应
+    // Mirrors the backend's camelCase JSON
     private sealed record VersionRow(int version, long files, long bytes, long changedFiles);
 
     private sealed record RestoreRunRow(string status, int? version, int? restoredFiles, int? skippedFiles, string? error);

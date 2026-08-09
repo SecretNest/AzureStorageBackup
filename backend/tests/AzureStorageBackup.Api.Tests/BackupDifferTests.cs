@@ -30,7 +30,7 @@ public sealed class BackupDifferTests : IDisposable
     private static Task<ScanResult> ScanAsync(string root) =>
         new LocalFileScanner().ScanAsync(root, new IgnoreRuleSet([]));
 
-    /// <summary>用 differ 自身（previous=null 全部 Added）产出一份"上一版本索引"快照。</summary>
+    /// <summary>Produce a "previous version index" snapshot using the differ itself (previous=null, so everything comes out Added).</summary>
     private async Task<VersionIndex> SnapshotAsync()
     {
         var scan = await ScanAsync(_root);
@@ -55,7 +55,7 @@ public sealed class BackupDifferTests : IDisposable
         return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = scan.EmptyDirs.ToList() };
     }
 
-    /// <summary>同 SnapshotAsync，但把尾部 hash 也记进条目——尾部早退要拿它当比对基准。</summary>
+    /// <summary>Same as SnapshotAsync but also records the tail hash in each entry — the tail early exit needs it as its comparison baseline.</summary>
     private async Task<VersionIndex> SnapshotWithTailAsync()
     {
         var snapshot = await SnapshotAsync();
@@ -106,16 +106,16 @@ public sealed class BackupDifferTests : IDisposable
     private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
 
     /// <summary>
-    /// 完全未变的文件**一趟 IO 都不付**，缺尾部也不补。曾经在这里补过一次让旧备份自愈，
-    /// 撤掉了：未变文件本来不读盘，为这一项去读就是凭空多出来的随机读（NAS 机械盘上
-    /// 50 万小文件接近一小时），而换来的加固边际价值极小。
-    /// 这条断言是**故意**的：谁要加回自愈，得先在这里解释那笔 IO 为什么值得。
+    /// A completely unchanged file **pays no IO at all**, and a missing tail is not backfilled. There used to be a backfill here so old backups
+    /// would self-heal; it was removed: an unchanged file never touches the disk, so reading it for this one component is a random read conjured
+    /// out of nothing (close to an hour for 500k small files on a NAS spinning disk), while the hardening it buys has vanishingly small marginal value.
+    /// This assertion is **deliberate**: whoever wants the self-healing back has to explain here first why that IO is worth it.
     /// </summary>
     [Fact]
     public async Task An_Unchanged_File_Costs_No_IO_Even_If_Its_Tail_Is_Missing()
     {
         Write("a.txt", "unchanged");
-        var previous = await SnapshotAsync();   // SnapshotAsync 不记 tail —— 正是老索引的样子
+        var previous = await SnapshotAsync();   // SnapshotAsync records no tail — exactly what an old index looks like
         Assert.Null(previous.Entries.Single(e => e.Path == "a.txt").TailHash);
 
         var counter = new CountingHasher(new FileHasher());
@@ -131,9 +131,9 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     /// <summary>
-    /// 长度没变、mtime 变了的大文件（全文可延后）：尾部对不上就该当场定案，**不读全文**。
-    /// 这是最贵的一趟——100 GB 的文件就是 100 GB 的读——而"内容变了"在读完 4KB 尾巴时
-    /// 已经成立。数据库文件、虚拟磁盘、被覆写的日志都是长度不变而尾部先动的典型。
+    /// A large file with unchanged length but changed mtime (full hash deferrable): a mismatching tail should settle it on the spot, **without reading the whole file**.
+    /// This is the most expensive pass — a 100 GB file means 100 GB of reads — and "the content changed" is already established by the time
+    /// the 4KB tail has been read. Database files, virtual disks and overwritten logs are all typical cases of the length staying put while the tail moves first.
     /// </summary>
     [Fact]
     public async Task A_Differing_Tail_Settles_It_Without_Reading_The_Whole_File()
@@ -141,7 +141,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("big.bin", new string('a', 8192) + "TAIL-ONE");
         var previous = await SnapshotWithTailAsync();
 
-        // 等长改写，只动尾巴。mtime 也要推进，否则走的是"完全未变"那条路。
+        // Rewrite at the same length, touching only the tail. mtime has to advance too, otherwise we take the "completely unchanged" path.
         File.WriteAllText(path, new string('a', 8192) + "TAIL-TWO");
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
 
@@ -151,15 +151,15 @@ public sealed class BackupDifferTests : IDisposable
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.Modified, c.Kind);
-        Assert.Equal(0, counter.FullCalls);      // 要害：全文那一趟没付
+        Assert.Equal(0, counter.FullCalls);      // the crux: the full-file pass was never paid for
         Assert.Equal(0, counter.IdentityCalls);
         Assert.Equal(1, counter.HeadCalls);
         Assert.Equal(1, counter.TailCalls);
     }
 
     /// <summary>
-    /// 头尾都一样时仍必须读全文——那是分清"内容真变了"和"只是被 touch 了一下"的唯一依据。
-    /// 省掉它就只能一律当作变更，等于每次 touch 都把文件重传一遍。
+    /// When head and tail both match the whole file must still be read — that is the only basis for telling "the content really changed" from "it just got touched".
+    /// Skipping it means treating everything as changed, i.e. every touch re-uploads the file.
     /// </summary>
     [Fact]
     public async Task Matching_Head_And_Tail_Still_Costs_The_Full_Read()
@@ -167,21 +167,21 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("big.bin", new string('a', 8192) + "SAME-TAIL");
         var previous = await SnapshotWithTailAsync();
 
-        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1)); // 只碰 mtime
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1)); // touch only the mtime
 
         var counter = new CountingHasher(new FileHasher());
         var diff = await new BackupDiffer(counter).DiffAsync(
             _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
 
         Assert.Equal(ChangeKind.MetadataOnly, Change(diff, "big.bin").Kind);
-        // 一遍读——既然反正要读全文，三段一起拿到，尾部是顺路捡的。
+        // One read — since the whole file is being read anyway, take all three segments, with the tail picked up along the way.
         Assert.Equal(1, counter.IdentityCalls);
         Assert.Equal(0, counter.FullCalls);
     }
 
     /// <summary>
-    /// 打包成员不做尾部早退：它们小，而且判成 Modified 之后 fullHash 仍要算了写进索引——
-    /// 早退一步省不下什么，白付一次 open + seek。
+    /// Pack members do not get the tail early exit: they are small, and once classified Modified the fullHash still has to be computed and written into the index —
+    /// exiting early saves nothing and just wastes one open + seek.
     /// </summary>
     [Fact]
     public async Task A_Packed_Member_Skips_The_Tail_Probe()
@@ -189,7 +189,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("small.txt", "0123456789");
         var previous = await SnapshotWithTailAsync();
 
-        File.WriteAllText(path, "0123456ABC"); // 等长、尾部不同
+        File.WriteAllText(path, "0123456ABC"); // same length, different tail
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
 
         var counter = new CountingHasher(new FileHasher());
@@ -197,13 +197,13 @@ public sealed class BackupDifferTests : IDisposable
             _root, await ScanAsync(_root), previous, fullHashDeferred: _ => false);
 
         Assert.Equal(ChangeKind.Modified, Change(diff, "small.txt").Kind);
-        Assert.Equal(0, counter.TailCalls);     // 没有多问那一次
-        Assert.Equal(1, counter.IdentityCalls); // 一遍读拿全三段
+        Assert.Equal(0, counter.TailCalls);     // that extra probe was never made
+        Assert.Equal(1, counter.IdentityCalls); // one read, all three segments
     }
 
     /// <summary>
-    /// 一个确定变更的文件只读**一遍**。三段 hash 从前是分三次各开一次文件算的，而全文那一趟
-    /// 本来就路过头和尾——首次备份几十万个小文件，那就是几十万次多余的 open + seek。
+    /// A file known to have changed is read **once**. The three hash segments used to be computed by opening the file three separate times, even though
+    /// the full-file pass already goes past the head and the tail — on a first backup of a few hundred thousand small files, that is a few hundred thousand redundant open + seek pairs.
     /// </summary>
     [Fact]
     public async Task A_Changed_File_Is_Read_Once_Not_Three_Times()
@@ -223,8 +223,8 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     /// <summary>
-    /// 全文 hash 被延后时（单文件 blob）只读头 4KB。**尾部一趟都不必付**——那条路的三段
-    /// 都由压缩那一遍顺手算出并覆盖，在这里算等于白读一次。
+    /// When the full hash is deferred (single-file blob) only the leading 4KB is read. **The tail costs not a single pass** — all three segments on that path
+    /// fall out of the compression pass for free and overwrite these values, so computing it here is a wasted read.
     /// </summary>
     [Fact]
     public async Task A_Deferred_Full_Hash_Costs_Only_The_Head_Read()
@@ -269,9 +269,9 @@ public sealed class BackupDifferTests : IDisposable
 
         Assert.All(diff.Changes, c => Assert.Equal(ChangeKind.Unchanged, c.Kind));
         Assert.Equal(0, diff.ChangedFiles);
-        Assert.Equal(0, counter.HeadCalls); // length+mtime+perms 相同 → 完全跳过哈希
+        Assert.Equal(0, counter.HeadCalls); // length+mtime+perms all match → skip hashing entirely
         Assert.Equal(0, counter.FullCalls);
-        // 未变条目沿用上一版本的哈希与存储
+        // Unchanged entries carry the previous version's hashes and storage forward
         Assert.Equal(previous.Entries.Single(e => e.Path == "a.txt").FullHash, Change(diff, "a.txt").FullHash);
         Assert.NotNull(Change(diff, "a.txt").CarriedStorage);
     }
@@ -282,7 +282,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("a.txt", "hello");
         var previous = await SnapshotAsync();
 
-        File.WriteAllText(path, "world"); // 同长度不同内容
+        File.WriteAllText(path, "world"); // same length, different content
         File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(5));
 
         var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous);
@@ -299,17 +299,17 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("a.txt", "hello");
         var previous = await SnapshotAsync();
 
-        File.WriteAllText(path, "hello world!"); // 长度变
+        File.WriteAllText(path, "hello world!"); // length changed
 
         var counter = new CountingHasher(new FileHasher());
         var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.Modified, c.Kind);
-        // 索引条目须含完整哈希：headHash + fullHash 都记录
+        // An index entry must carry the complete hashes: both headHash and fullHash are recorded
         Assert.NotNull(c.HeadHash);
         Assert.NotNull(c.FullHash);
-        // 两个 hash 都在，但只读了**一遍**：它们连同尾部一起来自同一趟读，不再各开一次文件。
+        // Both hashes are there, but the file was read **once**: they come from the same pass along with the tail, no longer one file open each.
         Assert.Equal(1, counter.IdentityCalls);
         Assert.Equal(0, counter.HeadCalls);
         Assert.Equal(0, counter.FullCalls);
@@ -321,7 +321,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("a.txt", "same content");
         var previous = await SnapshotAsync();
 
-        // 内容不变，仅改 mtime（触发两级哈希，但都相同）
+        // Content unchanged, only mtime touched (triggers the two-level hashing, but both levels match)
         File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30));
 
         var counter = new CountingHasher(new FileHasher());
@@ -329,19 +329,19 @@ public sealed class BackupDifferTests : IDisposable
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
-        Assert.Equal(1, counter.HeadCalls);   // 头先问，一样才往下走
-        // 头一样之后就得读全文才能分清"真变了"和"被 touch 了"——一遍读，三段一起拿到。
+        Assert.Equal(1, counter.HeadCalls);   // ask the head first; only go further when it matches
+        // Once the head matches the whole file has to be read to tell "really changed" from "just touched" — one read, all three segments.
         Assert.Equal(1, counter.IdentityCalls);
         Assert.Equal(0, counter.FullCalls);
         Assert.Equal(previous.Entries.Single(e => e.Path == "a.txt").FullHash, c.FullHash);
-        Assert.NotNull(c.CarriedStorage);            // 复用旧存储，不重传
-        Assert.Equal(0, diff.ChangedFiles);          // 仅元数据不计入变更
+        Assert.NotNull(c.CarriedStorage);            // reuse the old storage, no re-upload
+        Assert.Equal(0, diff.ChangedFiles);          // metadata-only does not count as a change
     }
 
     /// <summary>
-    /// 单文件 blob 的全文 hash 由压缩那一遍读顺手算出，还会覆盖 diff 记的值——diff 再读一遍
-    /// 就是把每个大文件从头到尾读了两遍。用户实测：一个接近 100 GB 的文件，diff 阶段光是为了
-    /// 算这个用不上的 hash 就要读满 100 GB，而那段时间网络上一个字节都没在传。
+    /// A single-file blob's full hash falls out of the compression read for free and then overwrites whatever the diff recorded — so having the diff
+    /// read it too means reading every large file end to end twice. Measured by the user: for a file close to 100 GB, the diff stage reads a full
+    /// 100 GB purely to compute a hash nobody uses, and during all that time not one byte is going over the network.
     /// </summary>
     [Fact]
     public async Task Deferred_Paths_Are_Not_Read_Whole_When_They_Are_New()
@@ -355,18 +355,18 @@ public sealed class BackupDifferTests : IDisposable
 
         var big = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.Added, big.Kind);
-        Assert.Null(big.FullHash);      // 延后：压缩那一遍会算出来并写进索引
-        Assert.NotNull(big.HeadHash);   // 4KB 的头照读——顺带把"此刻打得开吗"问清楚了
+        Assert.Null(big.FullHash);      // deferred: the compression pass computes it and writes it into the index
+        Assert.NotNull(big.HeadHash);   // the 4KB head is still read — which also settles "can it be opened right now"
 
-        // 打包的那些不受影响：它们的 hash 是装箱时就要写进 pack 成员的，没有第二次机会补算。
+        // The packed ones are unaffected: their hash has to be written into the pack member at boxing time, with no second chance to backfill it.
         Assert.NotNull(Change(diff, "small.txt").FullHash);
-        // 延后的那个只付了一趟 4KB 的头读——尾部也不算（压缩那一遍会连三段一起给出来）。
+        // The deferred one paid only a single 4KB head read — no tail either (the compression pass hands back all three segments together).
         Assert.Equal(1, counter.HeadCalls);
         Assert.Equal(0, counter.FullCalls);
-        // 要算全文的那个走一遍读，三段一起拿到。
+        // The one that needs the full hash takes one read and gets all three segments.
         Assert.Equal(1, counter.IdentityCalls);
 
-        // 变更统计只看长度，不受影响——界面上的 "N changed" 不能因为这个优化少数几个。
+        // The change statistics look only at length and are unaffected — the "N changed" in the UI must not lose a few entries to this optimization.
         Assert.Equal(2, diff.ChangedFiles);
     }
 
@@ -376,7 +376,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("big.bin", "hello");
         var previous = await SnapshotAsync();
 
-        File.WriteAllText(path, "hello world!"); // 长度变 → 已经确定内容变了，hash 只剩生成地址一个用途
+        File.WriteAllText(path, "hello world!"); // length changed → the content is already known to have changed, so the hash has only one use left: generating the address
 
         var counter = new CountingHasher(new FileHasher());
         var diff = await new BackupDiffer(counter).DiffAsync(
@@ -389,9 +389,9 @@ public sealed class BackupDifferTests : IDisposable
     }
 
     /// <summary>
-    /// 这一条是整个优化的边界，也是省错了就会静默烧钱的地方：length 没变、只有 mtime 或权限被碰过时，
-    /// fullHash 是区分「只是 touch 了一下」（MetadataOnly，不重传）与「内容真的变了」（Modified）
-    /// 的**唯一**依据。在这条路上也省掉它，就只能一律当成变更——每次 touch 都把文件重传一遍。
+    /// This case is the boundary of the whole optimization, and the place where skipping the wrong read silently burns money: when the length has not changed
+    /// and only mtime or permissions were touched, fullHash is the **only** basis for distinguishing "it just got touched" (MetadataOnly, no re-upload) from
+    /// "the content really changed" (Modified). Skipping it on this path too means treating everything as changed — every touch re-uploads the file.
     /// </summary>
     [Fact]
     public async Task A_Touched_File_Is_Still_Hashed_In_Full_Even_When_Deferral_Is_On()
@@ -399,7 +399,7 @@ public sealed class BackupDifferTests : IDisposable
         var path = Write("big.bin", "same content");
         var previous = await SnapshotAsync();
 
-        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30)); // 内容没动
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30)); // content untouched
 
         var counter = new CountingHasher(new FileHasher());
         var diff = await new BackupDiffer(counter).DiffAsync(
@@ -407,17 +407,17 @@ public sealed class BackupDifferTests : IDisposable
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
-        // 延后只免掉"已确定变更"那一支的全文读；这一支要判的正是变没变，全文非读不可。
+        // Deferral only spares the full read on the "already known to have changed" branch; this branch is deciding whether it changed at all, so the full read is mandatory.
         Assert.Equal(1, counter.IdentityCalls);
         Assert.Equal(0, counter.FullCalls);
         Assert.NotNull(c.FullHash);
-        Assert.NotNull(c.CarriedStorage);   // 沿用旧存储 = 一个字节都不重传
+        Assert.NotNull(c.CarriedStorage);   // carrying the old storage forward = not one byte re-uploaded
         Assert.Equal(0, diff.ChangedFiles);
     }
 
     /// <summary>
-    /// 省掉的读也要从进度里省掉。按整份文件计，一个 100 GB 的延后条目会在一瞬间被记成 100 GB 已读，
-    /// diff 的速度读数冲到几十 GB/s，剩余时间跟着变成一句笑话。
+    /// A read that was skipped has to be skipped in the progress too. Counted as a whole file, a 100 GB deferred entry would be recorded as 100 GB read in an instant,
+    /// the diff's throughput reading would spike to tens of GB/s, and the remaining time would turn into a joke.
     /// </summary>
     [Fact]
     public async Task Deferred_Files_Do_Not_Inflate_The_Read_Byte_Count()
@@ -432,8 +432,8 @@ public sealed class BackupDifferTests : IDisposable
             fullHashDeferred: p => p == "big.bin");
         tracker.Complete();
 
-        Assert.Equal(100, seen[^1].Bytes); // 只有真读全了的那个算数
-        Assert.Equal(2, seen[^1].Processed); // 条目数照常推进，进度条不受影响
+        Assert.Equal(100, seen[^1].Bytes); // only the one that really was read in full counts
+        Assert.Equal(2, seen[^1].Processed); // the entry count advances as usual; the progress bar is unaffected
     }
 
     [Fact]

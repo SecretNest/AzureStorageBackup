@@ -44,11 +44,13 @@ public sealed class BackupCheckerTests : IDisposable
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    /// <param name="checkCompressor">检查侧注入的压缩器，默认 null 时用真的 <see cref="SevenZipCompressor"/>。
-    /// 这个口子只为了让某些测试在**解压/算 hash**这一步接一个假的（例如探测"这一刻在途标记是否
-    /// 已经摘掉"，见 <see cref="RestoreOrchestratorTests"/> 里同形状的口子），不影响打包过程本身。</param>
-    /// <param name="checkerClock">检查侧注入给内部 <see cref="StageTracker"/> 的时间源，见
-    /// <see cref="BackupChecker.Clock"/> 上的注释——只为让节流窗口失效，不影响下载/解压本身。</param>
+    /// <param name="checkCompressor">Compressor injected on the check side; when left null the real
+    /// <see cref="SevenZipCompressor"/> is used. This hook exists only so that some tests can splice a fake into the
+    /// **extract/hash** step (for instance to probe "has the in-flight marker come off by this moment", see the
+    /// identically shaped hook in <see cref="RestoreOrchestratorTests"/>); it does not affect packing itself.</param>
+    /// <param name="checkerClock">Time source injected on the check side into the internal <see cref="StageTracker"/>,
+    /// see the comment on <see cref="BackupChecker.Clock"/> — it only defeats the throttle window, it does not affect
+    /// the download/extraction themselves.</param>
     private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory) Build(
         IFileCompressor? checkCompressor = null, Func<long>? checkerClock = null)
     {
@@ -75,8 +77,8 @@ public sealed class BackupCheckerTests : IDisposable
             checker: checker);
     }
 
-    /// <summary>从最新版本索引里读出唯一那个 pack 的号。pack 号带每轮随机前缀（跨运行唯一，
-    /// 见 <c>RunState.NextPackId</c>），所以测试不能写死 "p0001"。</summary>
+    /// <summary>Read the id of the one and only pack out of the latest version index. Pack ids carry a per-run
+    /// random prefix (unique across runs, see <c>RunState.NextPackId</c>), so a test cannot hardcode "p0001".</summary>
     private static async Task<string> OnlyPackIdAsync(BlobClientFactory factory, Account account, string container)
     {
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -138,16 +140,17 @@ public sealed class BackupCheckerTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            // blob 仍在但被改成不同尺寸（模拟截断/错包）——本地文件未动。
+            // The blob is still there but has been rewritten to a different size (simulating truncation / a wrong
+            // package) — the local file is untouched.
             await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).UploadAsync(BinaryData.FromString("x"), overwrite: true);
 
             var report = await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src);
 
             var f = report.Findings.Single(x => x.Path == "a.txt");
-            Assert.Equal(CloudState.MissingOrBad, f.Cloud); // 尺寸不符 → 云端坏
-            Assert.Equal(LocalState.Ok, f.Local);           // 本地内容一致
-            Assert.True(f.Repairable);                       // 可从本地修复
+            Assert.Equal(CloudState.MissingOrBad, f.Cloud); // size mismatch → bad in the cloud
+            Assert.Equal(LocalState.Ok, f.Local);           // local content matches
+            Assert.True(f.Repairable);                       // repairable from local
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -169,9 +172,9 @@ public sealed class BackupCheckerTests : IDisposable
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "original");
             await backup.RunAsync(Req(account, name));
 
-            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "locally edited"); // 本地改动
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "locally edited"); // local edit
 
-            // 只查本地内容（云端不查）。
+            // Check the local content only (skip the cloud).
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.None, Local = LocalCheckLevel.Content }, _src);
 
@@ -182,9 +185,11 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>本地文件存在却读不出来时，整轮检查此前会崩掉——而"有文件读不开"恰恰是最需要跑检查
-    /// 的时候：备份刚跳过了它，操作员正想知道云端那份还在不在。读不开一律当 Missing（本地拿不出
-    /// 可用副本，也不能当修复来源），与"越界""文件不在"的既有处置一致，且检查必须跑完。</summary>
+    /// <summary>When a local file exists but cannot be read, the whole check run used to crash — and "some file
+    /// cannot be read" is precisely when the check is needed most: the backup just skipped it, and the operator wants
+    /// to know whether the cloud copy is still there. Unreadable is always treated as Missing (local cannot produce a
+    /// usable copy, and it must not become a repair source either), the same as the existing handling of "out of
+    /// bounds" and "not there", and the check must run to completion.</summary>
     [SkippableFact]
     public async Task An_Unreadable_Local_File_Is_Missing_Rather_Than_Failing_The_Check()
     {
@@ -208,17 +213,17 @@ public sealed class BackupCheckerTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            File.SetUnixFileMode(locked, UnixFileMode.None); // 备份之后才读不开
+            File.SetUnixFileMode(locked, UnixFileMode.None); // only becomes unreadable after the backup
 
             var report = await checker.CheckAsync(
                 account, name, null, null,
                 new CheckOptions { Cloud = CloudCheckLevel.None, Local = LocalCheckLevel.Content }, _src);
 
             var f = report.Findings.Single(x => x.Path == "locked.txt");
-            Assert.Equal(LocalState.Missing, f.Local); // 读不开 == 本地拿不出可用副本
-            Assert.False(f.Repairable);                 // 更不能拿它去"修复"云端
+            Assert.Equal(LocalState.Missing, f.Local); // unreadable == local cannot produce a usable copy
+            Assert.False(f.Repairable);                 // let alone be used to "repair" the cloud
 
-            // 关键：检查跑完了，同一轮里其余文件照常得到结论。
+            // The key point: the check ran to completion, and the other files in the same run still got verdicts.
             Assert.Equal(LocalState.Ok, report.Findings.Single(x => x.Path == "plain.txt").Local);
         }
         finally
@@ -249,7 +254,7 @@ public sealed class BackupCheckerTests : IDisposable
             });
 
             await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
-                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // 云端 blob 丢失
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // the cloud blob is gone
 
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
@@ -258,7 +263,7 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.Contains("a.txt", report.Repaired);
             Assert.Empty(report.Unrecoverable);
 
-            // 修复后内容检查通过。
+            // The content check passes after the repair.
             var after = await checker.CheckAsync(account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src);
             Assert.True(after.Ok);
         }
@@ -287,8 +292,8 @@ public sealed class BackupCheckerTests : IDisposable
             });
 
             await foreach (var b in container.GetBlobsAsync(Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
-                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // 云端丢失
-            File.Delete(Path.Combine(_src, "a.txt"));                        // 本地也没了 → 无法修复
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync(); // gone from the cloud
+            File.Delete(Path.Combine(_src, "a.txt"));                        // gone locally too → cannot be repaired
 
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
@@ -297,7 +302,7 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.Contains("a.txt", report.Unrecoverable);
             Assert.Empty(report.Repaired);
 
-            // 版本索引里标记为不可恢复。
+            // Marked unrecoverable in the version index.
             var info = await store.ReadInfoAsync(account, name, null);
             var index = await store.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null);
             Assert.Contains("a.txt", index.UnrecoverablePaths);
@@ -322,8 +327,9 @@ public sealed class BackupCheckerTests : IDisposable
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
             await backup.RunAsync(Req(account, name));
 
-            // 删除被引用的那个 pack（小文件 a.txt 进了它）。包名从索引里读，不写死——
-            // pack 号带每轮随机前缀（跨运行唯一，见 RunState.NextPackId），没有固定值可猜。
+            // Delete the pack that is referenced (the small file a.txt went into it). The pack name is read from
+            // the index rather than hardcoded — pack ids carry a per-run random prefix (unique across runs, see
+            // RunState.NextPackId), so there is no fixed value to guess.
             var packBlob = $"packs/{await OnlyPackIdAsync(factory, account, name)}.7z";
             await container.GetBlobClient(packBlob).DeleteIfExistsAsync();
 
@@ -349,7 +355,7 @@ public sealed class BackupCheckerTests : IDisposable
 
         try
         {
-            // 6MB 随机文件 → 单文件 data blob，1MB 分卷 → 多卷 data/{hash}.001/.002...
+            // A 6MB random file → a single-file data blob; 1MB volumes → multi-volume data/{hash}.001/.002...
             var buf = new byte[6_000_000];
             new Random(7).NextBytes(buf);
             await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
@@ -364,10 +370,11 @@ public sealed class BackupCheckerTests : IDisposable
             await backup.RunAsync(req);
 
             var hash = await new FileHasher().FullHashAsync(Path.Combine(_src, "big.bin"));
-            // 完整时通过。
+            // Passes while intact.
             Assert.True((await checker.CheckAsync(account, name, null, null, new CheckOptions())).Ok);
 
-            // 删一个中间分卷 → 按索引记录的分卷数核验应报缺失（旧 base-or-.001 检查会漏报）。
+            // Delete one of the middle volumes → verifying against the volume count recorded in the index must
+            // report it missing (the old base-or-.001 check missed this).
             await container.GetBlobClient($"data/{hash}.002").DeleteIfExistsAsync();
             var result = await checker.CheckAsync(account, name, null, null, new CheckOptions());
 
@@ -391,7 +398,7 @@ public sealed class BackupCheckerTests : IDisposable
 
         try
         {
-            // v1：小文件 a.txt → pack p0001（引用），大文件 big.bin → 多卷 data blob（引用）。
+            // v1: the small file a.txt → pack p0001 (referenced), the large file big.bin → a multi-volume data blob (referenced).
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
             var buf = new byte[6_000_000];
             new Random(11).NextBytes(buf);
@@ -407,16 +414,17 @@ public sealed class BackupCheckerTests : IDisposable
 
             var hash = await new FileHasher().FullHashAsync(Path.Combine(_src, "big.bin"));
 
-            // 包名从索引里读，不写死（pack 号带每轮随机前缀，见 RunState.NextPackId）。
+            // The pack name is read from the index rather than hardcoded (pack ids carry a per-run random prefix, see RunState.NextPackId).
             var packId = await OnlyPackIdAsync(factory, account, name);
             var stalePackVolume = $"packs/{packId}.7z.099";
 
-            // 手动往 container 塞真孤儿 + 残余旧卷（模拟非原子替换/失败上传遗留）。
+            // Manually stuff the container with real orphans + leftover old volumes (simulating a non-atomic
+            // replacement / the residue of a failed upload).
             await container.GetBlobClient("data/ZZZ").UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
             await container.GetBlobClient(stalePackVolume).UploadAsync(BinaryData.FromString("stale pack volume"), overwrite: true);
             await container.GetBlobClient($"data/{hash}.099").UploadAsync(BinaryData.FromString("stale data volume"), overwrite: true);
 
-            // 列表检查：报告恰好这些孤儿；被引用/信息/索引不在孤儿中。
+            // Listing check: reports exactly these orphans; referenced blobs / the info file / the indexes are not among them.
             var check = await checker.CheckAsync(account, name, null, null, new CheckOptions { ListOrphans = true }, _src);
             Assert.Contains("data/ZZZ", check.OrphanBlobs);
             Assert.Contains(stalePackVolume, check.OrphanBlobs);
@@ -424,9 +432,9 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.DoesNotContain($"packs/{packId}.7z", check.OrphanBlobs);
             Assert.DoesNotContain($"data/{hash}.001", check.OrphanBlobs);
             Assert.DoesNotContain(BackupDiscovery.IndexBlobName, check.OrphanBlobs);
-            Assert.True(check.Ok); // 孤儿不影响 Ok
+            Assert.True(check.Ok); // orphans do not affect Ok
 
-            // 修复删孤儿（cleanupOrphans）：即便无坏 blob 也执行删除。
+            // Repair deletes the orphans (cleanupOrphans): the deletion runs even when no blob is broken.
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null,
                 new CheckOptions { ListOrphans = true }, Azure.Storage.Blobs.Models.AccessTier.Hot, null,
@@ -436,16 +444,16 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.Contains(stalePackVolume, report.DeletedOrphans);
             Assert.Contains($"data/{hash}.099", report.DeletedOrphans);
 
-            // 孤儿已删。
+            // The orphans are gone.
             Assert.False((await container.GetBlobClient("data/ZZZ").ExistsAsync()).Value);
             Assert.False((await container.GetBlobClient(stalePackVolume).ExistsAsync()).Value);
             Assert.False((await container.GetBlobClient($"data/{hash}.099").ExistsAsync()).Value);
-            // 被引用 blob + 信息文件仍在。
+            // The referenced blobs + the info file are still there.
             Assert.True((await container.GetBlobClient($"packs/{packId}.7z").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient($"data/{hash}.001").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync()).Value);
 
-            // 修复后备份仍完好。
+            // The backup is still intact after the repair.
             Assert.True((await checker.CheckAsync(account, name, null, null, new CheckOptions())).Ok);
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -493,7 +501,7 @@ public sealed class BackupCheckerTests : IDisposable
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
             await backup.RunAsync(Req(account, name));
 
-            // 用垃圾覆盖 pack blob（存在但解不开）→ 深度校验报损坏
+            // Overwrite the pack blob with garbage (it exists but cannot be extracted) → deep verification reports corruption
             await container.GetBlobClient($"packs/{await OnlyPackIdAsync(factory, account, name)}.7z")
                 .UploadAsync(BinaryData.FromString("garbage"), overwrite: true);
 
@@ -505,8 +513,9 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>检查的进度上报。改成后台 job 之后这是界面上唯一能看到的东西——一次内容级
-    /// 检查要把整个备份下载重算 hash，可以跑几小时，没有进度就与卡死无从区分。</summary>
+    /// <summary>Progress reporting for the check. Since it became a background job this is the only thing visible in
+    /// the UI — one content-level check downloads the whole backup and rehashes it, can run for hours, and without
+    /// progress it is indistinguishable from a hang.</summary>
     [SkippableFact]
     public async Task Check_Reports_What_Stage_It_Is_In_And_What_It_Is_Working_On()
     {
@@ -534,42 +543,46 @@ public sealed class BackupCheckerTests : IDisposable
 
             Assert.True(result.Ok);
 
-            // 每个阶段都要露面：改之前一个都没有，界面上只有一个不动的 "Checking" 徽章。
+            // Every stage has to show up: before this change there were none, and the UI had nothing but a motionless "Checking" badge.
             var stages = reports.Select(r => r.Stage).Distinct().ToList();
             Assert.Contains("LoadingIndex", stages);
             Assert.Contains("Cloud", stages);
             Assert.Contains("Verifying", stages);
             Assert.Contains("Local", stages);
 
-            // 本地阶段总数已知（就是索引里的条目数）→ 必须走到 100%，且报得出在查哪个文件。
+            // The local stage's total is known (it is the entry count in the index) → it must reach 100% and be able to say which file it is checking.
             var local = reports.Where(r => r.Stage == "Local").ToList();
             Assert.Equal(12, local[^1].Total);
             Assert.Equal(12, local[^1].Processed);
             Assert.Equal(100, local[^1].Percent);
             Assert.Contains(local, r => !string.IsNullOrEmpty(r.CurrentItem));
 
-            // 深度校验现在按**下载**的字节边传边计（VolumeBlobIO.DownloadAsync 挂了
-            // ProgressHandler）：在途窗口只覆盖下载，解压、重算 hash 都在窗口之外，
-            // 所以这里只断言字节确实在累计，具体"下载字节≠成员原始大小"由下面
-            // Deep_Verify_Credits_Downloaded_Compressed_Bytes_Not_Uncompressed_Member_Sizes 测试钉死。
+            // Deep verification now counts the **downloaded** bytes as they stream (VolumeBlobIO.DownloadAsync has
+            // a ProgressHandler attached): the in-flight window covers the download only, with extraction and
+            // rehashing outside it, so all this asserts is that bytes really do accumulate; the specific
+            // "downloaded bytes ≠ raw member size" point is pinned below by
+            // Deep_Verify_Credits_Downloaded_Compressed_Bytes_Not_Uncompressed_Member_Sizes.
             var verifying = reports.Where(r => r.Stage == "Verifying").ToList();
             Assert.NotEmpty(verifying);
             Assert.True(verifying[^1].Bytes > 0, "verified bytes should accumulate for the speed readout");
 
-            // 槽位计数恰好一次：在途项的起止不得参与计数（否则会越过 total）。
+            // A slot counts exactly once: starting/ending an in-flight item must not contribute to the count (or it would run past total).
             Assert.All(verifying, r => Assert.True(r.Processed <= r.Total));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 用户实际会看到的症状（修复前）：校验一个体积很小但压缩率极高的归档（比如整段重复字符的
-    /// 大文件）时，速度读数会先按"成员未压缩大小 / 10s"报出一个远超真实网速的数字，随后又跌回 0——
-    /// 因为 EndItem 收尾时把整组成员的**原始**字节一次性入账，而真正花在网线上的时间其实很短。
+    /// The symptom a user actually saw (before the fix): verifying a physically tiny but extremely compressible
+    /// archive (say a large file of one repeated character), the speed readout first showed a number far above the
+    /// real link speed, computed as "uncompressed member size / 10s", and then dropped back to 0 — because EndItem
+    /// booked the whole group's **raw** member bytes in one go at the end, while the time actually spent on the wire
+    /// was very short.
     /// <para>
-    /// 这里直接钉死"最终字节数"这一个更硬的不变量：它必须等于云端归档的真实（压缩后）大小，
-    /// 而不是原始文件的大小——高压缩比让两者差出两个数量级，任何一处退回"按成员大小计"
-    /// 都会让这个断言当场炸掉，比断言"大于 0"更能防回归。
+    /// This pins a harder invariant instead, the final byte count: it must equal the real (compressed) size of the
+    /// cloud archive, not the size of the original file — the high compression ratio puts two orders of magnitude
+    /// between them, so any regression back to "count by member size" blows this assertion up on the spot, which
+    /// guards far better than asserting "greater than 0".
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -586,8 +599,9 @@ public sealed class BackupCheckerTests : IDisposable
 
         try
         {
-            // 同一字符重复两百万次：7z 压缩比极高，压缩后的归档比原始内容小至少一个数量级，
-            // 足以把"下载字节"和"成员原始字节"两个数字撑出肉眼可见（也是断言可辨）的差距。
+            // The same character repeated two million times: 7z compresses it enormously, leaving an archive at
+            // least an order of magnitude smaller than the original content — enough to open a gap between
+            // "downloaded bytes" and "raw member bytes" that is visible to the eye (and to an assertion).
             var big = new string('a', 2_000_000);
             await File.WriteAllTextAsync(Path.Combine(_src, "big.txt"), big);
             await backup.RunAsync(Req(account, name) with
@@ -595,8 +609,8 @@ public sealed class BackupCheckerTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            // 云端归档的真实大小——下载时真正传过网线的字节数，即本次改动之后 Verifying 阶段
-            // 应该累计到的数字。
+            // The real size of the cloud archive — the bytes that actually cross the wire during the download,
+            // which is the number the Verifying stage should accumulate to after this change.
             long archivedBytes = 0;
             await foreach (var b in container.GetBlobsAsync(
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
@@ -621,19 +635,21 @@ public sealed class BackupCheckerTests : IDisposable
     }
 
     /// <summary>
-    /// 钉住 VerifyGroupAsync 里那对内层 try/finally：下载一结束就把 <c>EndItem</c> 摘掉，
-    /// 解压/算 hash 这段本地 CPU 工作不该继续算"在途"。与
-    /// <see cref="RestoreOrchestratorTests.Extraction_Starts_After_Item_Is_Removed_From_ActiveItems"/>
-    /// 同一形状的镜像件——两处结构几乎一致（都是"BeginItem 之后拿闸门、下载、EndItem、再解压"），
-    /// 此前只有还原侧有测试守着，检查侧被判定"结构相同、不值得再测一遍"；这条补齐它，
-    /// 检查侧从此有自己的锚，不必再借还原侧的测试当担保。
+    /// Pins the inner try/finally pair in VerifyGroupAsync: <c>EndItem</c> comes off the moment the download ends,
+    /// and the local CPU work of extracting/hashing must not keep counting as "in flight". A mirror of
+    /// <see cref="RestoreOrchestratorTests.Extraction_Starts_After_Item_Is_Removed_From_ActiveItems"/> — the two
+    /// structures are nearly identical (both are "BeginItem, then take the gate, download, EndItem, then extract");
+    /// previously only the restore side had a test guarding this while the check side was written off as "same
+    /// structure, not worth testing twice". This one fills that in, so the check side now has its own anchor and no
+    /// longer borrows the restore-side test as a guarantee.
     /// <para>
-    /// 直接读 onProgress 收到的"最近一次发布"同样靠不住（原因见还原侧那条测试上的详细说明）：
-    /// 发布有 200ms 节流，真实时钟下载一个几十字节的测试包全程往往就几十毫秒，EndItem 触发的
-    /// 发布多半被同一个节流窗口吞掉，无论 fix 还是 mutant 都可能读到"下载中"的旧快照。
-    /// 用注入的假时钟绕开它：每查一次时间就往前跳一大步，节流条件永远不成立，每一次状态变化
-    /// 都会被发布——不涉及 Thread.Sleep/Task.Delay，下载/解压仍是对 Azurite 的真实调用，
-    /// 只是"现在几点"这一件事被接管了。
+    /// Simply reading the "most recent publication" delivered to onProgress is just as unreliable (the reasons are
+    /// spelled out in detail on the restore-side test): publication is throttled at 200ms, on a real clock the whole
+    /// download of a test pack of a few dozen bytes often takes a few dozen milliseconds, so the publication EndItem
+    /// triggers is usually swallowed by that same throttle window, and both the fix and a mutant could read the stale
+    /// "downloading" snapshot. An injected fake clock sidesteps it: every time query jumps a long way forward, the
+    /// throttle condition never holds, and every state change gets published — no Thread.Sleep/Task.Delay involved,
+    /// the download/extraction are still real calls against Azurite, only "what time is it" has been taken over.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -652,7 +668,7 @@ public sealed class BackupCheckerTests : IDisposable
 
         try
         {
-            // 三个小文件同目录 → 单个 pack、单个组：只有一件在途项，断言不必按名字过滤。
+            // Three small files in one directory → a single pack, a single group: only one in-flight item, so the assertions need not filter by name.
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
             await File.WriteAllTextAsync(Path.Combine(_src, "b.txt"), "bravo");
             await File.WriteAllTextAsync(Path.Combine(_src, "c.txt"), "charlie");
@@ -665,9 +681,11 @@ public sealed class BackupCheckerTests : IDisposable
 
             Assert.True(result.Ok);
             Assert.True(probe.ExtractCallCount > 0, "fake compressor's ExtractToStreamAsync should have been invoked");
-            // 解压这一刻，假时钟已经保证了下载结束时那次 EndItem 触发的发布没被节流吞掉——
-            // 拿到的就是解压开始那一瞬间真正的在途集合，不是碰运气捞到的一张旧快照。
-            // 没抓到快照本身就是失败——原先靠塞一个非空哨兵集合来表达，现在直接断言非空，意思一样但更直白。
+            // At the moment of extraction the fake clock has already guaranteed that the publication EndItem
+            // triggered when the download finished was not swallowed by the throttle — what we hold is the genuine
+            // in-flight set at the instant extraction began, not a stale snapshot scooped up by luck.
+            // Catching no snapshot at all is itself a failure — that used to be expressed by seeding a non-empty
+            // sentinel set; now it simply asserts non-null, which means the same thing but says it more plainly.
             Assert.NotNull(probe.ActiveItemsAtExtractCall);
             Assert.Empty(probe.ActiveItemsAtExtractCall);
         }
@@ -675,17 +693,20 @@ public sealed class BackupCheckerTests : IDisposable
     }
 
     /// <summary>
-    /// 进度回调坏掉时，内容级检查不能就此挂死。
+    /// When the progress callback breaks, the content-level check must not wedge.
     /// <para>
-    /// <c>EndItem</c> 会直接调到调用方给的 publish（写库、推 SSE 之类的外部代码），它可以抛，
-    /// 而且这条路上的异常是**故意**往外传的。从前 <c>gate.Release()</c> 跟它排在同一个
-    /// <c>finally</c> 里的后一句，前一句抛出就把它整个跳过去——下载额度一去不回。这里只有
-    /// 一份额度，第一组吞掉它，第二组就永远等在闸门上，整个检查再也回不来（界面上是一个
-    /// 转不完的圈，跟卡死无从分辨）。所以**超时本身就是失败**，抛什么异常出来倒无所谓。
+    /// <c>EndItem</c> calls straight into the publish the caller supplied (external code that writes to the database,
+    /// pushes SSE and the like), it can throw, and an exception on this path is **deliberately** propagated. It used
+    /// to be that <c>gate.Release()</c> sat as the next statement in the same <c>finally</c>, so a throw from the one
+    /// before it skipped it entirely — and the download permit was gone for good. There is only one permit here: the
+    /// first group swallows it, the second waits at the gate forever, and the whole check never comes back (the UI
+    /// shows a spinner that never stops, indistinguishable from a hang). So **a timeout is itself the failure**;
+    /// which exception comes out does not matter.
     /// </para>
     /// <para>
-    /// 假时钟让每次发布都越过 200ms 的节流窗口：否则第二次 <c>EndItem</c>（finally 里那次兜底）
-    /// 会不会真的发布得看下载耗时的脸色，这条测试就成了看运气。
+    /// The fake clock makes every publication clear the 200ms throttle window: otherwise whether the second
+    /// <c>EndItem</c> (the backstop in the finally) actually publishes depends on how long the download happened to
+    /// take, and this test becomes a coin flip.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -703,8 +724,9 @@ public sealed class BackupCheckerTests : IDisposable
 
         try
         {
-            // 两个目录各一个文件 → 两个 pack，就是两个校验组。闸门只发一份额度（并发 1），
-            // 它们必须一个接一个地来——第一组把额度吞了，第二组就再也开不了工。
+            // One file in each of two directories → two packs, which is two verification groups. The gate hands out
+            // a single permit (concurrency 1), so they have to come one after the other — if the first group swallows
+            // the permit, the second can never start work.
             Directory.CreateDirectory(Path.Combine(_src, "d1"));
             Directory.CreateDirectory(Path.Combine(_src, "d2"));
             await File.WriteAllTextAsync(Path.Combine(_src, "d1", "a.txt"), "alpha");
@@ -714,8 +736,9 @@ public sealed class BackupCheckerTests : IDisposable
             var check = checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src,
                 CancellationToken.None, downloadConcurrency: 1,
-                // 只坏在下载校验这一段。整条 sink 都坏的话，检查在前面的列举/元数据阶段就炸了，
-                // 根本走不到闸门那儿——那测的是别的东西。
+                // Break only during the download-verification stretch. If the whole sink broke, the check would blow
+                // up back in the listing/metadata stages and never reach the gate at all — that would be testing
+                // something else.
                 onProgress: d =>
                 {
                     if (d.Stage == "Verifying")
@@ -724,17 +747,18 @@ public sealed class BackupCheckerTests : IDisposable
 
             var ex = await Xunit.Record.ExceptionAsync(() => check.WaitAsync(TimeSpan.FromSeconds(20)));
 
-            Assert.IsNotType<TimeoutException>(ex); // 挂住了＝额度被吞了
+            Assert.IsNotType<TimeoutException>(ex); // wedged = the permit was swallowed
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>包一层真压缩器，只在 <c>ExtractToStreamAsync</c> 这一步截住，记下调用那一刻
-    /// 最近一次发布的 <see cref="StageProgress.ActiveItems"/>——解压本身仍然照常委托给内层真的
-    /// <see cref="SevenZipCompressor"/> 完成，被测的只是"调用顺序"，不是解压结果。检查侧的深度
-    /// 校验走 <c>ExtractToStreamAsync</c>（不落盘的流式路径），与
-    /// <see cref="RestoreOrchestratorTests.ActiveItemsProbeCompressor"/> 探的 <c>ExtractAsync</c>
-    /// 不是同一个方法——两边各探各自真正会调用的那一个。</summary>
+    /// <summary>Wraps a real compressor, intercepting only the <c>ExtractToStreamAsync</c> step to record the
+    /// <see cref="StageProgress.ActiveItems"/> of the most recent publication at the moment of the call — extraction
+    /// itself is still delegated as usual to the real inner <see cref="SevenZipCompressor"/>, since what is under test
+    /// is the "call order", not the extraction result. The check side's deep verification goes through
+    /// <c>ExtractToStreamAsync</c> (the streaming path that never touches disk), which is not the same method as the
+    /// <c>ExtractAsync</c> probed by <see cref="RestoreOrchestratorTests.ActiveItemsProbeCompressor"/> — each side
+    /// probes the one it really calls.</summary>
     private sealed class ActiveItemsProbeCompressor(IFileCompressor inner) : IFileCompressor
     {
         public StageProgress? LatestPublished { get; set; }

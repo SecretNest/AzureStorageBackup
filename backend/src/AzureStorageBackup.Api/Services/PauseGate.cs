@@ -1,26 +1,29 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>挂起中的现场，给前端看的。</summary>
-/// <param name="Reason">触发挂起的那条错误消息。</param>
-/// <param name="Since">这一轮挂起是什么时候开始的。</param>
-/// <param name="NextRetryAt">自愈计时器下一次放行的时刻。</param>
-/// <param name="Failures">连续第几次出事（成功一次即清零）。</param>
+/// <summary>The pause currently in effect, for the frontend to look at.</summary>
+/// <param name="Reason">The error message that triggered the pause.</param>
+/// <param name="Since">When this round of pausing started.</param>
+/// <param name="NextRetryAt">The instant the self-heal timer will next let waiters through.</param>
+/// <param name="Failures">How many consecutive failures so far (one success resets it to zero).</param>
 public sealed record PauseInfo(string Reason, DateTimeOffset Since, DateTimeOffset? NextRetryAt, int Failures);
 
 /// <summary>
-/// 瞬时错误的挂起闸门。撞上网络/云端抖动的工作者在这里原地等，而不是把整轮备份判死。
+/// The pause gate for transient errors. A worker that hits network/cloud flakiness waits here in place, instead of
+/// condemning the whole backup round.
 /// <para>
-/// 第一个出事的工作者开闸门并起自愈计时器；后到的一起等同一个信号。计时器到点、
-/// 或用户点 <c>Retry now</c>，所有等待者一起放行重试。
+/// The first worker to hit trouble opens the gate and starts the self-heal timer; later arrivals all wait on the same
+/// signal. When the timer fires, or the user clicks <c>Retry now</c>, every waiter is released to retry together.
 /// </para>
 /// <para>
-/// <see cref="ReportSuccess"/> 是关键的一味：只要还有工作者在正常干活，网络就是通的，
-/// 失败计数与耐心计时一并清零。否则一个始终传不上去的倒霉文件会把整轮好端端的备份拖去降级。
+/// <see cref="ReportSuccess"/> is the crucial ingredient: as long as some worker is still getting work done, the
+/// network is up, so the failure count and the patience clock both reset. Otherwise one unlucky file that never
+/// uploads would drag a perfectly healthy round into a downgrade.
 /// </para>
 /// <para>
-/// 耐心用尽则降级：<see cref="WaitAsync"/> 返回 false，调用方据此走"挂起退出"——
-/// 落盘 journal、放掉暂存席位与产出锁。不这么做，一个挂起的运行会一直占着全局暂存额度，
-/// 把并行的其它备份**完全**卡死（StagingArea 的额度闸门是全局的，不分席位）。
+/// Patience running out means downgrade: <see cref="WaitAsync"/> returns false and the caller takes the "suspend and
+/// exit" path — flush the journal, release the staging seat and the production lock. Without that, a suspended run
+/// sits on the global staging quota forever and blocks every parallel backup **completely** (StagingArea's quota gate
+/// is global, it does not go per-seat).
 /// </para>
 /// </summary>
 public sealed class PauseGate : IDisposable
@@ -33,13 +36,13 @@ public sealed class PauseGate : IDisposable
     private readonly TimeSpan _patience;
     private readonly Lock _lock = new();
 
-    /// <summary>整个闸门的寿命。挂着的 5 分钟 Task.Delay 绝不能比运行活得还久。</summary>
+    /// <summary>The lifetime of the whole gate. A pending 5-minute Task.Delay must never outlive the run.</summary>
     private readonly CancellationTokenSource _life = new();
 
-    private TaskCompletionSource<bool>? _release;   // 非 null = 此刻正挂着
+    private TaskCompletionSource<bool>? _release;   // non-null = paused right now
     private CancellationTokenSource? _timer;
     private int _failures;
-    private DateTimeOffset? _troubleSince;          // null = 眼下没在出事（成功清零）
+    private DateTimeOffset? _troubleSince;          // null = no trouble at the moment (a success clears it)
     private PauseInfo? _current;
     private bool _downgraded;
 
@@ -51,20 +54,20 @@ public sealed class PauseGate : IDisposable
         _patience = patience ?? TimeSpan.FromMinutes(10);
     }
 
-    /// <summary>此刻的挂起现场；没挂着就是 null。</summary>
+    /// <summary>The pause in effect right now; null when nothing is paused.</summary>
     public PauseInfo? Current { get { lock (_lock) return _current; } }
 
     public bool IsDowngraded { get { lock (_lock) return _downgraded; } }
 
     /// <summary>
-    /// 在闸门前等。
+    /// Wait at the gate.
     /// </summary>
-    /// <returns>true = 放行，去重试；false = 已降级，调用方该走挂起退出了。</returns>
-    /// <exception cref="OperationCanceledException">用户取消了运行。取消永远赢。</exception>
+    /// <returns>true = released, go retry; false = already downgraded, the caller should take the suspend-and-exit path.</returns>
+    /// <exception cref="OperationCanceledException">The user canceled the run. Cancellation always wins.</exception>
     public async Task<bool> WaitAsync(Exception cause, CancellationToken ct)
     {
-        // 取消检查必须在最前面：正在离场的工作者不该开闸、也不该加入别人的等待——
-        // 哪怕只是短暂地把幻影般的暂停现场发布给 UI 和其它工作者看。
+        // The cancellation check has to come first: a worker on its way out must not open the gate, nor join
+        // someone else's wait — not even briefly publishing a phantom pause state for the UI and the other workers to see.
         ct.ThrowIfCancellationRequested();
 
         Task<bool> release;
@@ -77,7 +80,7 @@ public sealed class PauseGate : IDisposable
         return await release.WaitAsync(ct);
     }
 
-    /// <summary>用户点了 <c>Retry now</c>：不等计时器，现在就放，并当作重新开始（退避与耐心一并归零）。</summary>
+    /// <summary>The user clicked <c>Retry now</c>: don't wait for the timer, release now, and treat it as a fresh start (backoff and patience both reset).</summary>
     public void ReleaseNow()
     {
         lock (_lock)
@@ -88,7 +91,7 @@ public sealed class PauseGate : IDisposable
         }
     }
 
-    /// <summary>有工作者干成了一件活。网络是通的，把失败计数与耐心计时清零。</summary>
+    /// <summary>Some worker got a piece of work done. The network is up, so reset the failure count and the patience clock.</summary>
     public void ReportSuccess()
     {
         lock (_lock)
@@ -98,7 +101,7 @@ public sealed class PauseGate : IDisposable
         }
     }
 
-    /// <summary>降级：用户点了 Suspend，或耐心用尽。所有等待者收到 false。</summary>
+    /// <summary>Downgrade: the user clicked Suspend, or patience ran out. Every waiter gets false.</summary>
     public void Downgrade()
     {
         lock (_lock)
@@ -126,11 +129,11 @@ public sealed class PauseGate : IDisposable
         _ = Task.Run(async () =>
         {
             try { await Task.Delay(delay, token); }
-            catch (OperationCanceledException) { return; }   // 提前放行 / 降级 / 闸门没了
+            catch (OperationCanceledException) { return; }   // early release / downgrade / gate gone
             lock (_lock)
             {
-                // 到点了先问一句：这一轮麻烦持续得是不是已经超过耐心了？
-                // 只在开闸时判是不够的——最后一次退避可能长达 5 分钟。
+                // The timer fired, so ask first: has this round of trouble already outlasted our patience?
+                // Checking only when the gate opens is not enough — the last backoff can be as long as 5 minutes.
                 if (_troubleSince is { } since && DateTimeOffset.UtcNow - since >= _patience)
                     DowngradeLocked();
                 else
@@ -141,7 +144,7 @@ public sealed class PauseGate : IDisposable
         return _release.Task;
     }
 
-    /// <summary>退避表用完之后按固定间隔继续，别无限翻倍成几个小时。</summary>
+    /// <summary>Once the backoff schedule is used up, keep going at a fixed interval instead of doubling forever into hours.</summary>
     private TimeSpan DelayFor(int failures)
         => failures <= _schedule.Count ? _schedule[failures - 1] : _steady;
 

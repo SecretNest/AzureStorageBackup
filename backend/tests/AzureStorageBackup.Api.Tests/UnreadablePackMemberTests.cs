@@ -6,8 +6,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 不变量：绝不把一个含有已知不可读成员的包留下来上传。分组成员压缩后重校验时若读不开
-/// （占用/权限被收回等瞬时故障），效果等同于「内容变了」——排除出当前归档，其余成员照常成包。
+/// Invariant: never keep and upload a pack that contains a known-unreadable member. If a grouped member turns out unreadable during the
+/// post-compression re-verification (a transient failure such as being in use or having permissions revoked), the effect is the same as "the content changed" — exclude it from the current archive, and the remaining members form the pack as usual.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadablePackMemberTests : IDisposable
@@ -66,8 +66,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 } },
     };
 
-    /// <summary>压缩后仅触碰目标文件的 mtime（内容不动）：模拟"元数据抖动、此刻恰好读不开"——
-    /// 触发重校验去重新读一次内容，而不是像 <c>MutatingCompressor</c> 那样真的改内容。</summary>
+    /// <summary>After compression, touch only the target file's mtime (content untouched): simulates "metadata jitter, and it happens to be unreadable right now" —
+    /// this makes the re-verification go read the content again, rather than actually changing the content the way <c>MutatingCompressor</c> does.</summary>
     private sealed class TouchAfterCompressCompressor(IFileCompressor inner, string relPath) : IFileCompressor
     {
         private int _fired;
@@ -99,8 +99,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
             => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>指定路径的 <c>FullHashAsync</c> 只在第一次调用时抛出（模拟压缩后重校验瞬间读不开），
-    /// 此后（成员被排除、重新入队参与下一组时）恢复正常——验证读失败被当成"需排除"而非让整轮备份崩溃。</summary>
+    /// <summary><c>FullHashAsync</c> for the given path throws only on the first call (simulating being unreadable at the instant of the post-compression re-verification),
+    /// and behaves normally afterwards (once the member is excluded and requeued for the next group) — verifies a read failure is treated as "must be excluded" rather than crashing the whole run.</summary>
     private sealed class FlakyOnceHasher(IFileHasher inner, string relPath, Exception toThrow) : IFileHasher
     {
         private int _thrown;
@@ -130,7 +130,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
         }
     }
 
-    /// <summary>下载指定 pack blob 并用 7z 解出实际归档条目名（不是从索引推断，而是查归档本身）。</summary>
+    /// <summary>Download the given pack blob and use 7z to extract the actual archive entry names (not inferred from the index — read out of the archive itself).</summary>
     private async Task<List<string>> PackEntriesAsync(BlobContainerClient container, string packId)
     {
         var work = Path.Combine(_temp, "verify-" + Guid.NewGuid().ToString("N"));
@@ -143,7 +143,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
             .OrderBy(x => x, StringComparer.Ordinal).ToList();
     }
 
-    /// <summary>不变量：绝不上传一个内含已知不可读成员的包。</summary>
+    /// <summary>Invariant: never upload a pack that contains a known-unreadable member.</summary>
     [SkippableFact]
     public async Task A_Member_That_Becomes_Unreadable_Is_Excluded_And_The_Pack_Is_Recompressed()
     {
@@ -158,7 +158,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
             staging);
 
-        // d/y.txt 压缩后重校验时读不开一次；orchestrator 自身的 hasher（分组重校验用）被替换成会抛的版本。
+        // d/y.txt is unreadable once during the post-compression re-verification; the orchestrator's own hasher (the one used for group re-verification) is swapped for a throwing version.
         var flaky = new FlakyOnceHasher(new FileHasher(), "d/y.txt", new IOException("The process cannot access the file 'y.txt' because it is being used by another process."));
         var touching = new TouchAfterCompressCompressor(new SevenZipCompressor(), "d/y.txt");
 
@@ -175,10 +175,10 @@ public sealed class UnreadablePackMemberTests : IDisposable
 
         try
         {
-            WriteText("d/x.txt", "xxxx"); // 同目录两小文件 → 增量分组，首个 pack 含两者
+            WriteText("d/x.txt", "xxxx"); // two small files in one directory → incremental grouping, so the first pack holds both
             WriteText("d/y.txt", "yyyy");
 
-            await orchestrator.RunAsync(Request(account, name)); // 未抛异常 == 读失败被吞并转化为"排除"，而非让整轮崩溃
+            await orchestrator.RunAsync(Request(account, name)); // no exception thrown == the read failure was absorbed and turned into an "exclude", instead of crashing the whole run
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
@@ -187,19 +187,19 @@ public sealed class UnreadablePackMemberTests : IDisposable
 
             Assert.Equal("pack", x.Storage!.Kind);
             Assert.Equal("pack", y.Storage!.Kind);
-            Assert.NotEqual(x.Storage.Ref, y.Storage.Ref); // 不同的 pack —— y 没能留在 x 所在的第一个包里
+            Assert.NotEqual(x.Storage.Ref, y.Storage.Ref); // different packs — y did not get to stay in the first pack, the one x is in
 
-            // 核心断言：直接查第一个包（x 所在）的实际归档内容，证明其中确实不含 y —— 不是从索引推断。
+            // Core assertion: read the actual archive contents of the first pack (x's) to prove it really does not contain y — not inferred from the index.
             var firstPackEntries = await PackEntriesAsync(container, x.Storage.Ref);
             Assert.Contains("d/x.txt", firstPackEntries);
             Assert.DoesNotContain("d/y.txt", firstPackEntries);
 
-            // y 最终仍然被正常打包上传、可还原（在它自己落脚的那个包里）。
+            // y still ends up packed, uploaded and restorable in the end (in whichever pack it landed in).
             var secondPackEntries = await PackEntriesAsync(container, y.Storage.Ref);
             Assert.Contains("d/y.txt", secondPackEntries);
 
             var expectedY = await new FileHasher().FullHashAsync(Path.Combine(_root, "d/y.txt"));
-            Assert.Equal(expectedY, y.FullHash); // 内容其实没变——只是重校验那一刻读不开
+            Assert.Equal(expectedY, y.FullHash); // the content never actually changed — it was just unreadable at the moment of re-verification
 
             await AssertReferencedBlobsExist(container, idx);
         }
@@ -209,10 +209,10 @@ public sealed class UnreadablePackMemberTests : IDisposable
         }
     }
 
-    /// <summary>只在 7z **正在压缩的那一瞬**锁住成员，压缩返回前就把权限恢复回去。
-    /// 这样 7z 读不到它、静默丢掉它（退出码 1，归档照样有效），而压缩后的重校验去看元数据时
-    /// mtime/length/权限位全都和压缩前一模一样——比对会说"这个成员没变"。
-    /// 这正是元数据比对**看不见**的那个洞：不验收归档实际内容就无从发现。</summary>
+    /// <summary>Lock the member only for **the instant 7z is compressing**, restoring the permissions before the compression call returns.
+    /// That way 7z cannot read it and silently drops it (exit code 1, and the archive is still valid), while the post-compression re-verification looking at metadata sees
+    /// mtime/length/permission bits all exactly as they were before compression — the comparison says "this member did not change".
+    /// This is precisely the hole a metadata comparison **cannot see**: nothing short of inspecting the archive's actual contents will find it.</summary>
     private sealed class LockDuringCompressCompressor(IFileCompressor inner, string rootPath, string relPath) : IFileCompressor
     {
         private int _fired;
@@ -252,10 +252,10 @@ public sealed class UnreadablePackMemberTests : IDisposable
             => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>核心不变量：**索引声称在包里的成员，必须真的在那个包里**。
-    /// 7z 对读不了的成员只报警告（退出码 1）、静默丢掉它、仍产出有效归档，而此前只有退出码 >= 2
-    /// 才算失败——于是一个缺成员的包被当作正常产物上传，索引却记着它在里面。成员在压缩那一瞬
-    /// 被锁、压缩后立即恢复，使压缩后的元数据重校验完全看不出异样，只有验收归档内容才能发现。</summary>
+    /// <summary>Core invariant: **a member the index claims is in a pack must really be in that pack**.
+    /// For a member it cannot read, 7z only emits a warning (exit code 1), silently drops it and still produces a valid archive, while we used to count only exit code >= 2
+    /// as a failure — so a pack missing a member got uploaded as a normal artifact while the index recorded it as being inside. The member is locked for the instant
+    /// of compression and restored immediately after, so the post-compression metadata re-verification sees nothing wrong at all; only inspecting the archive contents finds it.</summary>
     [SkippableFact]
     public async Task The_Index_Never_Claims_A_Member_The_Archiver_Dropped()
     {
@@ -276,7 +276,7 @@ public sealed class UnreadablePackMemberTests : IDisposable
         try
         {
             WriteText("d/x.txt", "xxxx");
-            WriteText("d/y.txt", "yyyy"); // 这个在压缩那一瞬读不开
+            WriteText("d/y.txt", "yyyy"); // this is the one that is unreadable for the instant of compression
             WriteText("d/z.txt", "zzzz");
 
             var compressor = new LockDuringCompressCompressor(new SevenZipCompressor(), _root, "d/y.txt");
@@ -291,15 +291,15 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 逐个把索引的说法拿到归档里去对：每个声称打在包里的条目，都必须真的能从那个包里解出来。
-            // 修复前，d/y.txt 会被记在第一个包里，而那个包的归档里根本没有它。
+            // Check the index's claims against the archives one by one: every entry that claims to be packed must really be extractable from that pack.
+            // Before the fix, d/y.txt would be recorded in the first pack while that pack's archive did not contain it at all.
             foreach (var e in idx.Entries.Where(e => e.Storage!.Kind == "pack"))
             {
                 var actual = await PackEntriesAsync(container, e.Storage!.Ref);
                 Assert.Contains(e.Path, actual);
             }
 
-            // 三个文件一个都不能少：锁只持续到压缩返回，之后完全可读，重试必须把它存下来。
+            // All three files must be there: the lock only lasts until compression returns, after which it is fully readable, so the retry has to store it.
             Assert.Contains(idx.Entries, e => e.Path == "d/x.txt");
             Assert.Contains(idx.Entries, e => e.Path == "d/y.txt");
             Assert.Contains(idx.Entries, e => e.Path == "d/z.txt");
@@ -309,9 +309,9 @@ public sealed class UnreadablePackMemberTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>diff 读完目标文件之后立刻把它锁住。文件必须在 diff 时可读——否则它会被判成
-    /// "读不开"而根本进不了打包计划，测试就空转了（这个陷阱是真踩过的：从头锁住的写法在修复前
-    /// 也能通过）。锁在 diff 之后，它才会作为正常成员进入 pack，再被 7z 丢掉。</summary>
+    /// <summary>Lock the target file the instant the diff finishes reading it. The file has to be readable at diff time — otherwise it gets classified
+    /// as "unreadable" and never enters the pack plan at all, leaving the test spinning its wheels (a trap we actually fell into: a version that locked it from
+    /// the start also passed before the fix). Locking after the diff is what lets it enter the pack as a normal member and then get dropped by 7z.</summary>
     private sealed class LockAfterDiffHasher(IFileHasher inner, string relPath) : IFileHasher
     {
         private int _locked;
@@ -332,8 +332,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
         }
     }
 
-    /// <summary>成员在 diff 之后才被锁住——它确实进了打包计划，然后一直读不开：7z 丢掉它、
-    /// 压缩后的重校验也读不到它。此前这条路径把缺成员的包直接传上去，索引照样认领它。</summary>
+    /// <summary>The member is locked only after the diff — it really does enter the pack plan and then stays unreadable: 7z drops it and
+    /// the post-compression re-verification cannot read it either. This path used to upload the member-less pack straight up, with the index claiming it anyway.</summary>
     [SkippableFact]
     public async Task A_Member_Locked_After_Diff_Is_Not_Claimed_By_The_Index()
     {
@@ -368,15 +368,15 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 索引说在包里的，必须真的在包里。修复前 d/y.txt 会被记进这个包，而归档里没有它。
+            // Whatever the index says is in the pack must really be in the pack. Before the fix, d/y.txt would be recorded in this pack while the archive did not have it.
             foreach (var e in idx.Entries.Where(e => e.Storage!.Kind == "pack"))
                 Assert.Contains(e.Path, await PackEntriesAsync(container, e.Storage!.Ref));
 
-            // y 是全新文件、本轮没能存下来 → 整条缺席（没有旧条目可沿用），并计入不可读。
+            // y is a brand new file that could not be stored this run → absent entirely (no old entry to carry forward), and counted as unreadable.
             Assert.DoesNotContain(idx.Entries, e => e.Path == "d/y.txt");
             Assert.Equal(1, result.UnreadableFiles);
 
-            // x 照常入包。
+            // x goes into the pack as usual.
             var x = Assert.Single(idx.Entries, e => e.Path == "d/x.txt");
             Assert.Equal("pack", x.Storage!.Kind);
 

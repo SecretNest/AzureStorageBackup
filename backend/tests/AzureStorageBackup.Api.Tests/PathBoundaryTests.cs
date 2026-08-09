@@ -4,8 +4,8 @@ using Microsoft.Extensions.Configuration;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 符号链接相关用例一律在临时目录里构造**真实**软链——本功能的全部意义就是处理
-/// 文件系统的真实行为，mock 掉就等于什么都没测。
+/// Every symlink-related case builds **real** symlinks in a temp directory — the entire point of this feature is handling
+/// the filesystem's real behavior, and mocking it out would be testing nothing at all.
 /// </summary>
 public class PathBoundaryTests : IDisposable
 {
@@ -15,10 +15,10 @@ public class PathBoundaryTests : IDisposable
     {
         var raw = Path.Combine(Path.GetTempPath(), "asb-boundary-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(raw);
-        // Path.GetTempPath() 本身可能含软链（如 macOS 的 /tmp -> /private/tmp，
-        // 或被重定向的 TMPDIR）。测试里凡是拿 _base 手工拼 Path.Combine 去比对
-        // ResolveReal/Root 的输出，比的都必须是解析后的真实路径，否则在这类主机上
-        // 会假失败——而假失败最危险的后果是有人为了让它「过」去削弱 Critical 复现断言。
+        // Path.GetTempPath() may itself contain symlinks (macOS's /tmp -> /private/tmp, say,
+        // or a redirected TMPDIR). Anywhere a test hand-builds a Path.Combine off _base to compare against
+        // the output of ResolveReal/Root, what it compares must be the resolved real path, otherwise it would
+        // fail spuriously on hosts like those — and the most dangerous consequence of a spurious failure is someone weakening a Critical reproduction assertion to make it "pass".
         _base = PathBoundary.ResolveReal(raw)!;
     }
 
@@ -75,7 +75,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_A_Sibling_Sharing_The_Root_Name_Prefix()
     {
-        // /nasty 不得因为字符串前缀匹配 /nas 而通过
+        // /nasty must not pass merely because it matches /nas as a string prefix
         var root = Dir("nas");
         Dir("nasty");
         var sut = Boundary(root);
@@ -97,7 +97,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Accepts_Paths_Under_A_Root_That_Is_Itself_A_Symlink()
     {
-        // 根自身是软链时，必须先把根解析成真实路径，否则一切合法路径都会被误拒
+        // When the root itself is a symlink it must be resolved to a real path first, otherwise every legitimate path gets wrongly rejected
         var real = Dir("real-storage");
         var link = Path.Combine(_base, "nas-link");
         Directory.CreateSymbolicLink(link, real);
@@ -122,8 +122,8 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_When_A_MIDDLE_Segment_Is_A_Symlink_Pointing_Outside()
     {
-        // ResolveLinkTarget 单独使用会漏掉这一条：a.jpg 自身不是链接，
-        // 但它的父目录 escape 是，逐段展开才能发现越界。
+        // ResolveLinkTarget used on its own would miss this one: a.jpg is not a link itself,
+        // but its parent directory escape is, and only segment-by-segment expansion finds the escape.
         var root = Dir("nas");
         var outside = Dir("outside");
         Directory.CreateDirectory(Path.Combine(outside, "photos"));
@@ -137,7 +137,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Accepts_A_Symlink_That_Stays_Inside_The_Root()
     {
-        // 「用软链把散落各处的目录聚到一处」是本功能面向的正当用法
+        // "use symlinks to gather scattered directories into one place" is a legitimate use this feature is meant to serve
         var root = Dir("nas");
         var real = Path.Combine(root, "real");
         Directory.CreateDirectory(real);
@@ -164,7 +164,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Accepts_A_Path_That_Does_Not_Exist_Yet_Inside_The_Root()
     {
-        // 还原目标常常是尚未创建的目录，不能因为「还不存在」就拒绝
+        // A restore target is often a directory that has not been created yet, and must not be rejected just because it "does not exist yet".
         var root = Dir("nas");
         var sut = Boundary(root);
 
@@ -186,9 +186,9 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_Dot_Dot_Applied_After_An_Escaping_Symlink()
     {
-        // POSIX 里 `..` 在软链展开**之后**才结算：先词法折叠 `..` 会把
-        // `<root>/escape/../secret` 变成 `<root>/secret`，从而放行一个实际落在
-        // `<base>/secret` 的路径。内核 realpath 给出的是 `<base>/secret`。
+        // On POSIX, `..` is settled **after** symlink expansion: folding `..` lexically first would turn
+        // `<root>/escape/../secret` into `<root>/secret` and thereby let through a path that actually lands at
+        // `<base>/secret`. The kernel's realpath gives `<base>/secret`.
         var root = Dir("nas");
         var outside = Dir("outside");
         Directory.CreateDirectory(Path.Combine(_base, "secret"));
@@ -203,9 +203,9 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_A_Symlink_Whose_Target_Passes_Through_Another_Escaping_Symlink()
     {
-        // 软链目标必须被**重新逐段展开**，不能整体替换后就跳过：
-        // b -> <base>/outside（越界），a -> <root>/b/c（字面看在界内）。
-        // 只有重走 b 才能发现 a 实际落在 <base>/outside/c。
+        // A symlink target must be **re-expanded segment by segment**, not substituted wholesale and then skipped:
+        // b -> <base>/outside (out of bounds), a -> <root>/b/c (looks inside, taken literally).
+        // Only re-walking b reveals that a actually lands at <base>/outside/c.
         var root = Dir("nas");
         var outside = Dir("outside");
         Directory.CreateDirectory(Path.Combine(outside, "c"));
@@ -221,7 +221,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Accepts_A_Deep_Path_With_No_Symlinks_At_All()
     {
-        // 深度上限只该数**软链展开次数**；普通深目录不能因为段数多就被拒。
+        // The depth cap should only count **symlink expansions**; an ordinary deep directory must not be rejected for having many segments.
         var root = Dir("nas");
         var deep = root;
         for (var i = 0; i < 60; i++)
@@ -234,7 +234,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Throws_When_The_Configured_Root_Cannot_Be_Resolved()
     {
-        // 根解析不出来时必须在启动期炸掉：静默退化成「无边界」等于边界消失。
+        // When the root cannot be resolved it must blow up at startup: silently degrading to "no boundary" means the boundary is gone.
         var a = Path.Combine(_base, "cyclic-a");
         var b = Path.Combine(_base, "cyclic-b");
         Directory.CreateSymbolicLink(a, b);
@@ -259,9 +259,9 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void ConfiguredRoot_Keeps_What_The_Operator_Typed_Not_The_Resolved_Target()
     {
-        // M1：当配置的根本身是软链时，ConfiguredRoot 必须原样保留操作员敲过的
-        // 那个字符串（用于错误消息/未来 UI），RealRoot 才是解析后的真实路径——
-        // 两者在软链根上必须真的不同，否则这条用例什么都没证明。
+        // M1: when the configured root is itself a symlink, ConfiguredRoot must keep the exact string
+        // the operator typed (for error messages / future UI), while RealRoot is the resolved real path —
+        // on a symlinked root the two must genuinely differ, otherwise this case proves nothing.
         var real = Dir("real-storage");
         var link = Path.Combine(_base, "nas-link");
         Directory.CreateSymbolicLink(link, real);
@@ -275,9 +275,9 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void A_Rejection_Can_Be_Reported_Against_The_Configured_Root_Not_The_Resolved_One()
     {
-        // M1 的核心断言：调用方拼错误消息时，应该用 ConfiguredRoot（操作员敲的
-        // /nas-link），而不是 RealRoot（内部真正指向的 real-storage）——否则
-        // 拒绝消息里出现的路径操作员从没打过、也认不出来。
+        // M1's core assertion: when a caller builds an error message it should use ConfiguredRoot (the
+        // /nas-link the operator typed), not RealRoot (the real-storage it internally points to) — otherwise
+        // the path appearing in the rejection message is one the operator never typed and would not recognize.
         var real = Dir("real-storage");
         var link = Path.Combine(_base, "nas-link");
         Directory.CreateSymbolicLink(link, real);
@@ -295,7 +295,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_A_Relative_Symlink_Target_Pointing_Outside()
     {
-        // 相对目标分支此前完全没有用例覆盖
+        // The relative-target branch previously had no case covering it at all
         var root = Dir("nas");
         Dir("outside");
         Directory.CreateSymbolicLink(Path.Combine(root, "escape"), Path.Combine("..", "outside"));
@@ -319,10 +319,10 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void Rejects_A_Relative_Symlink_Whose_Target_Passes_Through_Another_Escaping_Relative_Symlink()
     {
-        // 绝对目标那条 Critical 复现（见上面 Rejects_A_Symlink_Whose_Target_Passes_
-        // Through_Another_Escaping_Symlink）的相对版本：x -> ../outside（相对，越界），
-        // y -> x/z（相对，字面看在界内）。旧的整串替换实现会把 y 判成 <root>/x/z（界内）；
-        // 只有重走 x 才能发现 y 实际落在 <base>/outside/z（界外）。
+        // The relative version of the Critical reproduction for absolute targets (see Rejects_A_Symlink_Whose_Target_Passes_
+        // Through_Another_Escaping_Symlink above): x -> ../outside (relative, out of bounds),
+        // y -> x/z (relative, looks inside taken literally). The old whole-string substitution implementation judged y as <root>/x/z (inside);
+        // only re-walking x reveals that y actually lands at <base>/outside/z (outside).
         var root = Dir("nas");
         var outside = Dir("outside");
         Directory.CreateDirectory(Path.Combine(outside, "z"));
@@ -347,7 +347,7 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void IsWithin_Compares_On_Segment_Boundaries_Without_Resolving_Links()
     {
-        // 还原写入用这个纯词法版本：它防的是索引数据里的 ..，不解析本地软链
+        // Restore writes use this purely lexical version: what it guards against is .. in index data, and it does not resolve local symlinks
         Assert.True(PathBoundary.IsWithin("/target", "/target"));
         Assert.True(PathBoundary.IsWithin("/target", "/target/a/b.txt"));
         Assert.False(PathBoundary.IsWithin("/target", "/targetx/b.txt"));
@@ -362,7 +362,7 @@ public class PathBoundaryTests : IDisposable
         Assert.True(PathBoundary.IsWithin("/target/", "/target/a/"));
         Assert.False(PathBoundary.IsWithin("/target/", "/targetx/"));
 
-        // 根为 "/" 时一切绝对路径都在界内，且不能因 TrimEnd 把根削成空串而误判
+        // With "/" as the root every absolute path is inside, and TrimEnd must not shave the root down to an empty string and cause a misjudgment
         Assert.True(PathBoundary.IsWithin("/", "/"));
         Assert.True(PathBoundary.IsWithin("/", "/anything/at/all"));
     }
@@ -370,10 +370,10 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void IsWithin_Returns_False_Instead_Of_Throwing_On_A_Null_Character()
     {
-        // F1：IsWithin 的输入是索引供数据（restore-write 按设计要用它检查
-        // Path.Combine(targetRoot, entryPath)），entryPath 来自云端、可能是恶意或
-        // 损坏数据。Path.GetFullPath 对含 \0 的路径会抛 ArgumentException——
-        // root/candidate 任一位置都必须得到干净的 false，而不是把 500 甩给调用方。
+        // F1: IsWithin's input is data supplied by the index (restore-write is designed to use it to check
+        // Path.Combine(targetRoot, entryPath)), and entryPath comes from the cloud and may be malicious or
+        // corrupted data. Path.GetFullPath throws ArgumentException on a path containing \0 —
+        // either of root/candidate must yield a clean false, not dump a 500 on the caller.
         Assert.False(PathBoundary.IsWithin("/target\0x", "/target/a"));
         Assert.False(PathBoundary.IsWithin("/target", "/target/a\0b"));
     }
@@ -381,8 +381,8 @@ public class PathBoundaryTests : IDisposable
     [Fact]
     public void IsWithin_Returns_False_Instead_Of_Throwing_On_An_Empty_String()
     {
-        // F1：Path.GetFullPath("") 抛 ArgumentException（"The value cannot be an
-        // empty string"）；root/candidate 任一位置为空串都必须判定越界而不是抛异常。
+        // F1: Path.GetFullPath("") throws ArgumentException ("The value cannot be an
+        // empty string"); an empty string in either of root/candidate must be judged out of bounds rather than throwing.
         Assert.False(PathBoundary.IsWithin("", "/target/a"));
         Assert.False(PathBoundary.IsWithin("/target", ""));
     }
@@ -406,10 +406,10 @@ public class PathBoundaryTests : IDisposable
         Assert.Equal("/anywhere/at/all", sut.ToDisplayPath("/anywhere/at/all"));
     }
 
-    // B4: 调用方必须先用 IsInside 确认过才能调传本方法——这里传一个真正落在 RealRoot
-    // 之外的真实路径，模拟违反契约的调用方。旧实现会原样返回这个字符串（对携带
-    // RealRoot 前缀的场景，等于把主机真实路径悄悄递给调用方，一路传到响应里就是泄漏）；
-    // 现在必须炸在这里，而不是悄悄放行。
+    // B4: a caller must have confirmed with IsInside before calling this method — here we pass a real path that genuinely lands
+    // outside RealRoot, simulating a caller violating the contract. The old implementation returned that string unchanged (in the case where it
+    // carries the RealRoot prefix, that quietly hands the host's real path to the caller, and letting it travel into a response is a leak);
+    // now it must blow up here rather than quietly letting it through.
     [Fact]
     public void ToDisplayPath_Throws_When_The_Real_Path_Is_Not_Under_The_Real_Root()
     {

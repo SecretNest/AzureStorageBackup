@@ -6,71 +6,76 @@ public enum RunStatus
     Completed,
     Failed,
 
-    /// <summary>用户按了停止。既不算失败也不算成功：**不写 Error 状态**（否则这份备份此后一直
-    /// 挂着一条红色 Error，还要手动 Reset 才消），也不记成一次成功的运行。</summary>
+    /// <summary>The user pressed stop. Neither a failure nor a success: **no Error status is written** (otherwise this
+    /// backup would carry a red Error from then on, clearable only by a manual Reset), and it is not recorded as a successful run.</summary>
     Canceled,
 
     /// <summary>
-    /// 现场保住了，活没干完。与 Failed 的区别很实在：journal 还在盘上，下一轮（用户点 Resume
-    /// 或下次计划任务）会把已经传上去的内容原样认下来，不重传。
+    /// The scene was preserved, the work was not finished. The difference from Failed is concrete: the journal is
+    /// still on disk, and the next round (the user clicking Resume, or the next scheduled task) accepts what was
+    /// already uploaded as it stands and does not re-upload it.
     /// <para>
-    /// 注意这**只**用于运行真的退出了的时刻。瞬时错误等待重试期间状态仍是 Running（见
-    /// <see cref="BackupRunState.Pause"/>）——那时 Task 还活着、席位还占着，报成终态会让调度器
-    /// 以为这轮完了，再起一轮把它顶掉。
+    /// Note this is used **only** at the moment the run has genuinely exited. While waiting to retry a transient
+    /// error the status is still Running (see <see cref="BackupRunState.Pause"/>) — the Task is alive and the seat is
+    /// still taken there, so reporting a terminal state would make the scheduler think this round is over and start
+    /// another one that displaces it.
     /// </para>
     /// </summary>
     Suspended,
 }
 
-/// <summary>一次备份运行的内存状态（前端轮询用）。</summary>
+/// <summary>In-memory state of one backup run (polled by the frontend).</summary>
 public sealed class BackupRunState
 {
     public RunStatus Status { get; set; } = RunStatus.Running;
     public BackupProgress? Progress { get; set; }
     public int? Version { get; set; }
 
-    /// <summary>本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来，
-    /// 界面上不显示这个数字，操作员就只能靠通知——而通知会被别的消息淹没。</summary>
+    /// <summary>Number of files this round could not read and therefore carried the old index entry forward for. A
+    /// "successful" backup may have stored nothing at all; leave this number off the UI and the operator has only the
+    /// notification to go on — and notifications drown in other messages.</summary>
     public int? UnreadableFiles { get; set; }
 
     public string? Error { get; set; }
 
-    /// <summary>本次备份的起止时刻，取自版本记录（见 <see cref="BackupRunResult.CompletedAt"/>）。
-    /// 完成前为 null。</summary>
+    /// <summary>Start and finish moments of this backup, taken from the version record (see <see cref="BackupRunResult.CompletedAt"/>).
+    /// Null until it completes.</summary>
     public DateTimeOffset? StartedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
 
-    /// <summary>这一次运行的标识。journal 文件名就是它，恢复时按它对上号。</summary>
+    /// <summary>Identifier of this run. The journal file is named after it, and resume matches on it.</summary>
     public string RunId { get; init; } = Guid.NewGuid().ToString("N")[..12];
 
-    /// <summary>挂起（Suspended）的缘由；没挂起就是 null。</summary>
+    /// <summary>Why the run was suspended; null when it is not suspended.</summary>
     public SuspendReason? SuspendReason { get; set; }
 
-    /// <summary>内部机制，不进 HTTP 契约：这次运行的把手，Suspend / Retry now 要靠它够到闸门。</summary>
+    /// <summary>Internal machinery, not part of the HTTP contract: the handle on this run — Suspend / Retry now reach the gate through it.</summary>
     internal BackupRunControl? Control { get; set; }
 
     /// <summary>
-    /// 眼下是不是卡在瞬时错误上等重试。**这不是一个状态值**：Status 仍是 Running，
-    /// 因为 Task 还活着、席位还占着，报成终态会让调度器再起一轮把它顶掉。
+    /// Whether it is currently stuck on a transient error waiting to retry. **This is not a status value**: Status is
+    /// still Running, because the Task is alive and the seat is still taken; reporting a terminal state would make
+    /// the scheduler start another round that displaces it.
     /// </summary>
     public PauseInfo? Pause => Control?.Gate.Current;
 
     /// <summary>
-    /// 内部机制，不进 HTTP 契约：失败时的原始异常。RunCoreAsync 的 catch 里连 Error 一起设置，
-    /// 供 TaskDispatcher 在向上抛出时挂作 InnerException——容器日志因此保留 Azure 异常自带的
-    /// 状态码、请求 id 与真实堆栈，而不是只剩一句消息和从 throw 处开始的栈(Fix 4)。
+    /// Internal machinery, not part of the HTTP contract: the original exception on failure. Set alongside Error in
+    /// RunCoreAsync's catch so TaskDispatcher can attach it as the InnerException when it rethrows — the container log
+    /// therefore keeps the status code, request id and real stack that the Azure exception carries, instead of being
+    /// left with just a one-line message and a stack that starts at the throw site (Fix 4).
     /// </summary>
     internal Exception? Failure { get; set; }
 
     /// <summary>
-    /// 内部机制，不进 HTTP 契约：该次运行到达终态（Completed/Failed/Canceled）时触发一次。
-    /// 供 RunTrackedAsync 的短路分支等待，不给前端轮询用。
+    /// Internal machinery, not part of the HTTP contract: fires once when this run reaches a terminal state
+    /// (Completed/Failed/Canceled). Awaited by RunTrackedAsync's short-circuit branch; not for frontend polling.
     /// </summary>
     internal TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。
-    /// 在此之前，一次跑了几小时的备份唯一的停法是重启容器——而用户跑在 NAS 上，
-    /// 那会连带停掉别的服务；「正忙时不许删配置」又把删除这条退路也堵上了。</summary>
+    /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.
+    /// Before it existed, the only way to stop a backup that had been running for hours was to restart the container — and
+    /// the user runs on a NAS, where that takes other services down with it; "no deleting a config while it is busy" closed off the delete escape hatch too.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
@@ -85,8 +90,8 @@ public sealed record BackupRunResponse(
 }
 
 /// <summary>
-/// 后台备份运行器：按配置 id 在后台跑 BackupOrchestrator，进度存内存供轮询。
-/// 同一配置正在运行时不重复启动。压缩全局非并发由单例 StagingArea 保证。
+/// Background backup runner: runs BackupOrchestrator in the background for a config id, keeping progress in memory for polling.
+/// A config that is already running is not started a second time. Globally non-concurrent compression is guaranteed by the singleton StagingArea.
 /// </summary>
 public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
@@ -94,8 +99,9 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Lock _lock = new();
 
     /// <summary>
-    /// 界面用：解析配置 → 抢忙碌锁 → 登记 → 后台跑。同一配置已在运行则返回现有状态。
-    /// 解析配置需要异步 I/O，故本方法整体是 async：必须先拿到锁再登记进 _runs（见下）。
+    /// For the UI: resolve the config → grab the busy lock → register → run in the background. Returns the existing
+    /// state when the same config is already running. Resolving the config needs async I/O, so the whole method is
+    /// async: the lock must be in hand before registering into _runs (see below).
     /// </summary>
     public async Task<BackupRunState> StartAsync(int configId)
     {
@@ -122,7 +128,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return failed;
         }
 
-        // 标记该备份忙碌（供计划任务检测），已忙碌则拒绝并发操作。
+        // Mark this backup busy (so scheduled tasks can detect it); if it is already busy, refuse the concurrent operation.
         if (!busy.TryAcquire(accountId, container, "BackingUp"))
         {
             var failed = new BackupRunState { Error = "This backup is busy with another operation.", Status = RunStatus.Failed };
@@ -130,14 +136,15 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return failed;
         }
 
-        // _runs 只在已经拿到忙碌锁之后才写入：旧实现是先登记、后抢锁，两者之间有一个
-        // 窗口——_runs 里已经出现一条 Running 记录，但没有锁在保护它。调度器
-        // （TaskDispatcher.DispatchAsync）恰好会在这个窗口里抢到本该被这里持有的锁，
-        // 随后 RunTrackedAsync 看到这条“Running”记录就把这一轮调度当成“已有一次真正
-        // 在跑的备份”而转去等它，自己什么也不执行；而这边随后的 TryAcquire 必然落空，
-        // 把这个共享 state 标记成 Failed——于是整轮调度什么都没跑，却被记成了出错。
-        // 现在锁必须先到手，_runs 才会写入，一条 Running 记录就永远意味着真的有一次
-        // 运行持有着锁，这个窗口也就不存在了。
+        // _runs is written only after the busy lock is in hand: the old implementation registered first and grabbed
+        // the lock second, leaving a window between the two — a Running entry already visible in _runs with no lock
+        // protecting it. The scheduler (TaskDispatcher.DispatchAsync) would grab, inside exactly that window, the
+        // lock this call was supposed to hold; RunTrackedAsync then saw that "Running" entry, took this dispatch
+        // round to mean "a real backup is already running" and went off to wait for it without executing anything
+        // itself; meanwhile the TryAcquire here was bound to come up empty and marked that shared state Failed — so
+        // the whole dispatch round ran nothing at all, yet was recorded as an error. Now the lock has to be in hand
+        // before _runs is written, so a Running entry always means a run really does hold the lock, and the window
+        // no longer exists.
         var state = new BackupRunState();
         lock (_lock)
             _runs[configId] = state;
@@ -158,12 +165,13 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     }
 
     /// <summary>
-    /// 调度器用：调用方**已持有**该 (account, container) 的忙碌锁
-    /// （TaskDispatcher.DispatchAsync 在进入执行前就抢了）。本方法不抢也不释放，
-    /// 只负责执行并把状态登记进 _runs 供 GET 端点轮询。
+    /// For the scheduler: the caller **already holds** the busy lock for this (account, container)
+    /// (TaskDispatcher.DispatchAsync grabs it before entering execution). This method neither acquires nor releases
+    /// it; it only executes and registers the state into _runs for the GET endpoint to poll.
     ///
-    /// 锁的归属由「调用哪个方法」表达，而不是由一个布尔参数表达：布尔值传错一次，
-    /// 不是每次定时备份都拒跑，就是锁根本没人持有，而两种都不会在编译期暴露。
+    /// Ownership of the lock is expressed by which method you call, not by a boolean parameter: get that boolean
+    /// wrong once and either every scheduled backup refuses to run, or nobody holds the lock at all — and neither of
+    /// those shows up at compile time.
     /// </summary>
     public async Task<BackupRunState> RunTrackedAsync(int configId, CancellationToken ct)
     {
@@ -186,18 +194,21 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
         if (alreadyRunning)
         {
-            // 调用方约定本方法只返回终态：若原样返回这个仍是 Running 的 state，
-            // 调度器「Status == Failed 才算失败」的判断会把这次根本没跑的备份
-            // 当成静默成功。等它跑到终态（Completed/Failed）再返回。
-            // 在锁先于登记的顺序下这个分支目前不可达，纯属防御性保留；但如果它以后又
-            // 变得可达，不带取消令牌的 await 会让调度器永远占着忙碌锁挂起，关机也无法
-            // 打断它——带上 ct，让它至少能跟着关机一起收尾(Fix 5)。
+            // The contract with callers is that this method only ever returns a terminal state: hand this still-
+            // Running state back as it stands and the scheduler's "only Status == Failed counts as a failure" test
+            // treats a backup that never ran as a silent success. Wait for it to reach a terminal state
+            // (Completed/Failed), then return.
+            // With the lock-before-register ordering this branch is currently unreachable and kept purely as
+            // defence; but should it become reachable again, an await without a cancellation token would leave the
+            // scheduler hanging on the busy lock forever, uninterruptible even by shutdown — pass ct so it can at
+            // least wind down along with the shutdown (Fix 5).
             await state.Completion.Task.WaitAsync(ct);
             return state;
         }
 
-        // 调度器的 ct（关机）与本次运行自己的取消源（用户按停止）二选一先到即算取消：
-        // 定时备份同样能在界面上停掉——它跑的是同一条执行体，也一样可能跑上一整夜。
+        // Either the scheduler's ct (shutdown) or this run's own cancellation source (the user pressing stop),
+        // whichever arrives first, counts as cancellation: a scheduled backup can be stopped from the UI too — it
+        // runs the same execution body and can just as easily run all night.
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, state.Cancellation.Token);
         await RunCoreAsync(configId, state, linked.Token);
         return state;
@@ -209,35 +220,37 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return _runs.GetValueOrDefault(configId);
     }
 
-    /// <summary>下达停止意愿。返回被叫停的运行，没有在跑则返回 null。</summary>
+    /// <summary>Issue the intent to stop. Returns the run that was told to stop, or null when nothing is running.</summary>
     private BackupRunState? RequestStop(
         int configId, StopKind kind, SuspendReason reason = SuspendReason.UserRequested)
     {
         BackupRunState? state;
-        // Cancel()/RequestStop() 会在**当前线程**同步执行已注册的回调；放在 _lock 里的话，
-        // 任一回调只要回头碰到这个 runner 就会自锁。锁只用来取那一条记录。
+        // Cancel()/RequestStop() run the registered callbacks synchronously on **the current thread**; do that inside
+        // _lock and any callback that reaches back into this runner deadlocks on itself. The lock is only there to
+        // fetch that one entry.
         lock (_lock)
             state = _runs.GetValueOrDefault(configId);
         if (state is not { Status: RunStatus.Running })
             return null;
         if (state.Control is { } control)
         {
-            // 状态改成终态之前 control 就已经释放了（`await using` 先于 catch 块生效）。
-            // 那一瞬间进来的停止请求什么也做不了——这一轮反正已经在收尾了，当作"没在跑"。
+            // control is already disposed before the status flips to terminal (`await using` takes effect ahead of
+            // the catch blocks). A stop request arriving in that instant can do nothing — this round is winding down
+            // anyway, so treat it as "not running".
             try { control.RequestStop(kind, reason); }
             catch (ObjectDisposedException) { return null; }
         }
         else
-            state.Cancellation.Cancel();   // 还没跑到建 control 那一步（解析配置阶段）
+            state.Cancellation.Cancel();   // hasn't reached the point where control gets built yet (config resolution stage)
         return state;
     }
 
-    /// <summary>立刻停（不等落盘）。保留给共用的 /cancel 端点与其它运行器同形。</summary>
+    /// <summary>Stop right now (without waiting for the flush to disk). Kept so the shared /cancel endpoint has the same shape as the other runners.</summary>
     public bool Cancel(int configId) => RequestStop(configId, StopKind.StopNow) is not null;
 
-    /// <summary>主动暂停：做完手上这件活，落盘，退出成 Suspended。等落盘完成才返回。</summary>
-    /// <param name="reason">写进盘上标记的挂起理由。界面上按的暂停用默认值，关机路径传
-    /// <see cref="SuspendReason.ShuttingDown"/>。</param>
+    /// <summary>Deliberate suspend: finish the item in hand, flush to disk, exit as Suspended. Returns only once the flush is done.</summary>
+    /// <param name="reason">The suspend reason written into the on-disk marker. A suspend pressed in the UI uses the
+    /// default; the shutdown path passes <see cref="SuspendReason.ShuttingDown"/>.</param>
     public async Task<bool> SuspendAsync(
         int configId, SuspendReason reason = SuspendReason.UserRequested, CancellationToken ct = default)
     {
@@ -248,52 +261,59 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     }
 
     /// <summary>
-    /// 关机时等所有运行落盘的上限。三个数字是一串的，动其中一个就得回头看另外两个：
+    /// Cap on how long shutdown waits for every run to flush to disk. The three numbers form one chain; move one and
+    /// you have to go back and look at the other two:
     /// <code>
-    /// docker-compose stop_grace_period 45s  &gt;  HostOptions.ShutdownTimeout 30s  &gt;  这里的 20s
+    /// docker-compose stop_grace_period 45s  &gt;  HostOptions.ShutdownTimeout 30s  &gt;  the 20s here
     /// </code>
-    /// 45 &gt; 30：docker 的宽限期一到就是 SIGKILL，必须让 .NET 自己的超时先到，才还有机会把日志写出来。
-    /// 30 &gt; 20：宿主等 <c>StopAsync</c> 也是有超时的，超了它不等、直接往下拆服务——那时连"谁没停下来"
-    /// 都没人记得下。留出的这 10 秒是给下面那条警告日志和其余宿主服务收尾用的。
+    /// 45 &gt; 30: once docker's grace period expires it is SIGKILL, so .NET's own timeout has to fire first for there to be any chance of getting the log out.
+    /// 30 &gt; 20: the host's wait on <c>StopAsync</c> has a timeout too, and when it expires the host does not wait — it goes
+    /// straight on to tearing services down, and by then nobody is left to write down "who failed to stop". The 10 seconds
+    /// of headroom are there for the warning log below and for the remaining host services to wind down.
     /// <para>
-    /// <c>internal</c> 而非 <c>private</c>：同 <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/>
-    /// 的先例——测试项目靠 <c>InternalsVisibleTo</c>（见 AssemblyInfo.cs）把 20 秒调成毫秒级，才测得起
-    /// "到点还没落盘"那条分支，不用真的等 20 秒。跟那个先例一样，它是**进程内共享的可变静态字段**，
-    /// 安全性靠两条没有代码强制的约定撑着：(1) xUnit 同一个类里的 <c>[Fact]</c> 顺序执行，改字段的
-    /// 用例把它放进 try/finally 复原，不会和同类里的别的用例打架；(2) 类与类之间是并行的，而
-    /// **每一次 TestWebAppFactory 释放都会走 GracefulSuspendService.StopAsync，也就是都会调
-    /// <c>SuspendAllAsync</c>** —— 所以真正撑着的那条并不是"只有一个文件碰它"，而是"字段被调低的
-    /// 那一百来毫秒里，并行跑着的用例都没有在跑的备份"。眼下确实如此，而且就算撞上，后果也只是那
-    /// 一次关机少等一会儿，不是错误的结果。
-    /// 生产环境永远是 20 秒。
+    /// <c>internal</c> rather than <c>private</c>: the same precedent as <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/>
+    /// — the test project uses <c>InternalsVisibleTo</c> (see AssemblyInfo.cs) to turn the 20 seconds into milliseconds, which
+    /// is the only way to afford testing the "still not flushed when the deadline hit" branch without really waiting 20 seconds.
+    /// Like that precedent, it is a **process-wide shared mutable static field**, and its safety rests on two conventions that
+    /// no code enforces: (1) xUnit runs the <c>[Fact]</c>s inside one class sequentially, and the test that changes the field
+    /// restores it in a try/finally, so it cannot fight the other tests in its own class; (2) classes do run in parallel with
+    /// each other, and **every TestWebAppFactory disposal goes through GracefulSuspendService.StopAsync, i.e. every one of them
+    /// calls <c>SuspendAllAsync</c>** — so what actually holds this up is not "only one file touches it" but "during the
+    /// hundred-odd milliseconds the field is turned down, none of the tests running in parallel has a backup in flight". That
+    /// happens to be true today, and even on a collision the consequence is only that one shutdown waits a little less, not a
+    /// wrong result.
+    /// Production is always 20 seconds.
     /// </para>
     /// </summary>
     internal static TimeSpan SuspendWaitCap = TimeSpan.FromSeconds(20);
 
     /// <summary>
-    /// 让**所有**在跑的运行挂起，并等它们把 journal 落盘。返回真的停成
-    /// <see cref="RunStatus.Suspended"/> 的运行数。
+    /// Suspend **every** run in flight and wait for them to flush their journals to disk. Returns the number of runs
+    /// that really came to rest as <see cref="RunStatus.Suspended"/>.
     /// <para>
-    /// 关机路径专用，而且要如实说清它做不到什么：<see cref="StopKind.Suspend"/> 有意不碰 AbortToken，
-    /// 消费循环也是在**下一件**活开始前才退出的，所以手上这件——可能是一个几 GB 的上传——会被放着跑完。
-    /// 因此这里的等待是**有上限**的（<see cref="SuspendWaitCap"/>）：到点还没落盘的运行就丢在半路，
-    /// 下次启动时它是一次**没有标记**的中断运行，得操作员自己按 Resume，不会被自动接着跑。
+    /// Shutdown path only, and it has to be honest about what it cannot do: <see cref="StopKind.Suspend"/> deliberately
+    /// does not touch the AbortToken, and the consumer loop only exits before starting the **next** item, so the item in
+    /// hand — possibly a multi-GB upload — is left to run to completion. The wait here is therefore **capped**
+    /// (<see cref="SuspendWaitCap"/>): a run that has not flushed by the deadline is abandoned mid-flight, and at the next
+    /// start it is an interrupted run **with no marker**, which the operator has to Resume by hand; it is not picked up automatically.
     /// </para>
     /// </summary>
     public async Task<int> SuspendAllAsync(SuspendReason reason, CancellationToken ct)
     {
-        // 先在锁里把 id 抄一份出来。_runs 是把普通 Dictionary，不加锁地枚举它，一边有人登记新运行
-        // 就会当场 InvalidOperationException——而这一下正落在关机路径上，没有第二次机会。
-        // 抄完就放锁：RequestStop 会在**当前线程**同步跑取消回调，攥着锁进去必然自锁
-        //（同 RequestStop 处的说明）。
+        // Copy the ids out under the lock first. _runs is a plain Dictionary; enumerate it without the lock while
+        // someone is registering a new run and you get an InvalidOperationException on the spot — and that lands right
+        // on the shutdown path, where there is no second chance. Release the lock as soon as the copy is made:
+        // RequestStop runs the cancellation callbacks synchronously on **the current thread**, and walking in there
+        // still clutching the lock is a guaranteed self-deadlock (same note as at RequestStop).
         List<int> running;
         lock (_lock)
             running = [.. _runs.Where(kv => kv.Value.Status == RunStatus.Running).Select(kv => kv.Key)];
 
-        // 分两趟：**先**把停止意愿发给每一个运行，**再**统一等它们落盘。
-        // 合成一趟（发一个、等一个）在并发备份下是致命的：排头那个若正压着一个几 GB 的上传，
-        // 它一个人就吃掉整个关机预算，后面的运行连 RequestStop 都收不到——没落盘、没标记、直接挨砍。
-        // 发信号本身只是几次赋值加同步回调，一瞬间就能全发完。
+        // Two passes: **first** send the stop intent to every run, **then** wait for all of them to flush.
+        // Folding it into one pass (send one, wait for it) is fatal with concurrent backups: if the one at the head is
+        // sitting on a multi-GB upload it eats the entire shutdown budget by itself, and the runs behind it never even
+        // receive RequestStop — nothing flushed, no marker, straight to the axe.
+        // Signalling itself is only a few assignments plus synchronous callbacks; it all goes out in an instant.
         var pending = new List<(int ConfigId, BackupRunState State)>();
         foreach (var configId in running)
         {
@@ -304,9 +324,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             }
             catch (Exception ex)
             {
-                // 一个运行下达失败不能挡住别的运行——关机路径上没有第二次机会。
-                // 日志按本类既有做法临时开一个 scope 取（这个类没有注入的 logger），
-                // 而且只在出事那一次才开：正常关机一个 scope 都不必建。
+                // One run failing to take the order must not block the others — there is no second chance on the
+                // shutdown path. The logger is fetched by opening a temporary scope, the way this class already does
+                // it (it has no injected logger), and only on the occasion something went wrong: a normal shutdown
+                // does not build a single scope.
                 using var scope = scopes.CreateScope();
                 scope.ServiceProvider.GetService<ILogger<BackupRunner>>()?
                     .LogWarning(ex, "Failed to suspend backup {ConfigId} during shutdown", configId);
@@ -317,9 +338,11 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
         using var capped = CancellationTokenSource.CreateLinkedTokenSource(ct);
         capped.CancelAfter(SuspendWaitCap);
-        // 实测等了多久。两条分支都要报它：光说"是哪个截止时间到了"还不够，读日志的人真正要判断的是
-        // "差一点就够了，还是从头就没戏"——而归因本身有一道窄缝（cap 先到、宿主令牌随后也断，
-        // 下面那个 if 就会走中立分支），实测时长不受这道缝影响，是唯一永远说得准的那个数。
+        // How long we actually waited. Both branches have to report it: naming "which deadline expired" is not enough,
+        // because what the person reading the log really has to judge is "was it nearly enough, or hopeless from the
+        // start" — and the attribution itself has a narrow crack (the cap fires first and the host token then trips
+        // too, sending the if below down the neutral branch), whereas the measured duration is immune to that crack
+        // and is the one number that is always right.
         var waited = System.Diagnostics.Stopwatch.StartNew();
         try
         {
@@ -327,14 +350,15 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         }
         catch (OperationCanceledException)
         {
-            // 超时（或调用方的 ct 先断）不往上抛：抛出去就没人写下面这条日志了，而事后想弄明白
-            // "这一卷为什么没有标记"，就只剩这条日志能说清。但这条日志本身不能认错超时是谁的——
-            // 同一个 catch 既接得住这里自己的 SuspendWaitCap（20s），也接得住调用方 ct 先断
-            // （宿主的 ShutdownTimeout，30s）。两者的证据价值一样大，名字却不能张冠李戴：
-            // 真到了排查"为什么没有标记"的时候，一条指错了截止时间的日志比没有日志更误导人。
+            // A timeout (or the caller's ct tripping first) is not rethrown: throw and nobody writes the log below,
+            // and when someone later tries to work out "why does this run have no marker", that log is the only thing
+            // that can explain it. But the log itself must not misattribute the timeout — the same catch catches both
+            // our own SuspendWaitCap (20s) and the caller's ct tripping first (the host's ShutdownTimeout, 30s).
+            // The two are equally valuable as evidence, but their names must not be swapped: when it really comes to
+            // diagnosing "why is there no marker", a log that names the wrong deadline misleads worse than no log.
             //
-            // 点名 runId 而不只是 configId：事后第一句要问的永远是"那是盘上哪一卷 journal"，
-            // 而 journal 文件名就是 runId，写上它就省掉一次翻查。
+            // Naming the runId and not just the configId: the first question afterwards is always "which journal on
+            // disk is that", and the journal file is named after the runId, so writing it down saves a lookup.
             var stuck = pending
                 .Where(p => !p.State.Completion.Task.IsCompleted)
                 .Select(p => $"{p.ConfigId} (run {p.State.RunId})");
@@ -342,7 +366,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             var logger = scope.ServiceProvider.GetService<ILogger<BackupRunner>>();
             if (capped.IsCancellationRequested && !ct.IsCancellationRequested)
             {
-                // 是我们自己的 SuspendWaitCap 到点了：可以点名具体秒数。
+                // Our own SuspendWaitCap expired: we can name the exact number of seconds.
                 logger?.LogWarning(
                     "Gave up after {Elapsed:0.0}s (cap {Seconds}s) waiting for backup(s) {ConfigIds} to "
                     + "suspend; they are left mid-flight and will come back as interrupted runs to be "
@@ -351,8 +375,9 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             }
             else
             {
-                // 调用方的令牌先断了，不是我们的 20 秒。措辞要说清是**宿主的关机截止时间到了**，
-                // 而不是"关机被取消了"——后者会把人引去找"谁中止了这次关机"，根本没有这么个人。
+                // The caller's token tripped first, not our 20 seconds. The wording has to make clear that **the
+                // host's shutdown deadline expired**, not that "the shutdown was cancelled" — the latter sends people
+                // looking for "who aborted this shutdown", and there is no such person.
                 logger?.LogWarning(
                     "Gave up after {Elapsed:0.0}s waiting for backup(s) {ConfigIds} to suspend because the "
                     + "host's shutdown deadline (HostOptions.ShutdownTimeout) expired first; they are left "
@@ -361,13 +386,14 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             }
         }
 
-        // 只数真的停成 Suspended 的。等超时的、以及被同时到达的 Stop now 抢先按成 Canceled 的，
-        // 盘上都没有标记——把它们算进来，关机日志就在说大话。
+        // Count only the ones that really came to rest as Suspended. The ones we timed out on, and the ones a
+        // concurrently arriving Stop now beat us to and pressed into Canceled, have no marker on disk — count them in
+        // and the shutdown log is bragging.
         return pending.Count(p => p.State.Status == RunStatus.Suspended);
     }
 
-    /// <summary>取消。<paramref name="finishCurrentFiles"/> 为 true 时等在途文件（含其全部分卷）传完。
-    /// 用户要求"Cancel 要等落盘成功再返回"，所以这里一定要等到终态。</summary>
+    /// <summary>Cancel. When <paramref name="finishCurrentFiles"/> is true, wait for the in-flight files (including all their volumes) to finish uploading.
+    /// The user asked for "Cancel must not return until the flush has succeeded", so this has to wait for a terminal state.</summary>
     public async Task<bool> CancelAsync(int configId, bool finishCurrentFiles, CancellationToken ct = default)
     {
         var kind = finishCurrentFiles ? StopKind.FinishCurrentFiles : StopKind.StopNow;
@@ -377,7 +403,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
-    /// <summary>用户点了 <c>Retry now</c>：不等自愈计时器，立刻放行重试。</summary>
+    /// <summary>The user clicked <c>Retry now</c>: don't wait for the self-healing timer, let the retry through immediately.</summary>
     public bool RetryNow(int configId)
     {
         BackupRunState? state;
@@ -389,7 +415,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
-    /// <summary>两个入口共用的执行体。**不碰忙碌锁**——锁由调用方负责。</summary>
+    /// <summary>The execution body shared by both entry points. **Does not touch the busy lock** — the lock is the caller's job.</summary>
     private async Task RunCoreAsync(int configId, BackupRunState state, CancellationToken ct)
     {
         try
@@ -422,17 +448,18 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         }
         catch (BackupSuspendedException ex)
         {
-            // 不是失败：journal 还在盘上，Error 也不写（否则这份备份此后一直挂着红字，
-            // 还要手动 Reset 才消），下一轮会把已传的内容原样认下来。
+            // Not a failure: the journal is still on disk and no Error is written (otherwise this backup would carry
+            // red text from then on, clearable only by a manual Reset); the next round accepts what was already
+            // uploaded as it stands.
             state.Status = RunStatus.Suspended;
             state.SuspendReason = ex.Reason;
-            // 和其它三个终态分支一样要放行等待者，否则 RunTrackedAsync 会一直挂在 Completion 上。
+            // Like the other three terminal branches, release the waiters, or RunTrackedAsync hangs on Completion forever.
             state.Completion.TrySetResult();
         }
         catch (OperationCanceledException)
         {
-            // 用户按了停止（或进程正在关停）：不是失败。既不写 Error 状态，也不写 Normal——
-            // 这一轮什么结论都没有，落库的持久状态保持原样。
+            // The user pressed stop (or the process is shutting down): not a failure. Neither an Error status nor a
+            // Normal one is written — this round reached no conclusion at all, so the persisted state stays as it was.
             state.Status = RunStatus.Canceled;
             state.Completion.TrySetResult();
         }
@@ -441,7 +468,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.Error = ex.Message;
             state.Failure = ex;
             state.Status = RunStatus.Failed;
-            // 原 scope 可能已随异常释放（`using var scope` 在 try 块退出时释放）：另开一个写状态。
+            // The original scope may already be disposed along with the exception (`using var scope` releases when the try block exits): open another one to write the status.
             using var scope = scopes.CreateScope();
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<BackupRunner>>());

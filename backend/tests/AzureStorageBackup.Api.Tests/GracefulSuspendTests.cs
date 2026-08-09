@@ -41,7 +41,7 @@ public class GracefulSuspendTests : IDisposable
         Assert.Equal(SuspendReason.ShuttingDown, store.ReadSuspendMark(1, "c", "run-1"));
     }
 
-    // 用户主动暂停的那一条必须能与"关机顺手挂起的"分开——Task 15 靠这个决定要不要自动接着跑。
+    // A user-initiated pause has to be distinguishable from "suspended along the way at shutdown" — Task 15 uses this to decide whether to auto-resume.
     [Fact]
     public void User_requested_is_distinguishable_from_shutting_down()
     {
@@ -53,11 +53,11 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 标记不能被当成 journal 列出来，也**不能**是 journal 里的一条记录。
+    /// The mark must not be listed as a journal, and must **not** be a record inside the journal either.
     /// <para>
-    /// 后半句是这条用例真正守着的东西：<c>LoadActiveRefsAsync</c> 是
-    /// <c>r.Kind == "pack" ? packs : blobs</c> 的二分，多出来的第三种 Kind 会被静默丢进 blobs 桶，
-    /// 于是清理器的"别删我"名单里凭空多出一个叫 <c>ShuttingDown</c> 的 blob 名。
+    /// The second half is what this case really guards: <c>LoadActiveRefsAsync</c> is a two-way split on
+    /// <c>r.Kind == "pack" ? packs : blobs</c>, and any extra third Kind gets silently dropped into the blobs bucket,
+    /// so the cleaner's "don't delete me" list grows a blob name called <c>ShuttingDown</c> out of thin air.
     /// </para>
     /// </summary>
     [Fact]
@@ -76,7 +76,7 @@ public class GracefulSuspendTests : IDisposable
         Assert.Empty(refs.Packs);
     }
 
-    // 删这一卷 journal 时标记也得跟着走，否则下次同名 runId 会读到上一次的理由。
+    // Deleting this journal volume has to take the mark with it, otherwise the next runId with the same name reads the previous round's reason.
     [Fact]
     public async Task Delete_takes_the_mark_with_it()
     {
@@ -90,7 +90,7 @@ public class GracefulSuspendTests : IDisposable
         Assert.Empty(await store.ListAsync(1, "c", default));
     }
 
-    // 标记文件被写坏（半截、手改）时按"没有标记"处理：宁可多跑一轮，不要在启动路径上抛。
+    // A mark file written badly (truncated, hand-edited) is treated as "no mark": better to run one extra round than to throw on the startup path.
     [Fact]
     public void Garbage_mark_reads_as_none()
     {
@@ -101,9 +101,9 @@ public class GracefulSuspendTests : IDisposable
         Assert.Null(store.ReadSuspendMark(1, "c", "run-1"));
     }
 
-    // --- 理由怎么从"下达停止"的那一端走到写标记的那一端 ---
+    // --- How the reason travels from the "issue a stop" end to the "write the mark" end ---
 
-    /// <summary>不指定理由 = 用户按的暂停，与本任务之前的行为一致。</summary>
+    /// <summary>No reason specified = the user pressed pause, matching the behavior from before this task.</summary>
     [Fact]
     public async Task Suspend_without_a_reason_is_user_requested()
     {
@@ -121,8 +121,8 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 用户先按了 Suspend，关机随后也来一次 → 理由仍是 UserRequested。
-    /// 反了的话 Task 15 会在下次启动时替他把一次**他自己按停的**备份重新开跑。
+    /// The user pressed Suspend first and a shutdown follows with another one → the reason stays UserRequested.
+    /// The other way round, Task 15 would restart a backup **he stopped himself** for him at the next startup.
     /// </summary>
     [Fact]
     public async Task The_first_reason_wins_when_shutdown_lands_on_an_already_suspending_run()
@@ -133,8 +133,8 @@ public class GracefulSuspendTests : IDisposable
         Assert.Equal(SuspendReason.UserRequested, c.SuspendReason);
     }
 
-    /// <summary>还没开卷就挂起的运行盘上什么都没留，标记只会变成一个指向不存在 journal 的孤儿——
-    /// 而 Task 15 会照着它去找一卷根本不在的 journal。</summary>
+    /// <summary>A run suspended before the journal was opened leaves nothing on disk, so the mark would only become an
+    /// orphan pointing at a journal that does not exist — and Task 15 would follow it looking for a journal volume that isn't there.</summary>
     [Fact]
     public async Task No_journal_no_mark()
     {
@@ -145,9 +145,9 @@ public class GracefulSuspendTests : IDisposable
         Assert.False(Directory.Exists(_dir));
     }
 
-    // --- 关机路径 ---
+    // --- The shutdown path ---
 
-    /// <summary>没有在跑的运行时，关机钩子什么也不做、也不抛。</summary>
+    /// <summary>With no run in progress, the shutdown hook does nothing and throws nothing.</summary>
     [Fact]
     public async Task Suspend_all_with_nothing_running_stops_nothing()
     {
@@ -158,15 +158,16 @@ public class GracefulSuspendTests : IDisposable
 
         var service = new GracefulSuspendService(runner, NullLogger<GracefulSuspendService>.Instance);
         await service.StartAsync(default);
-        await service.StopAsync(default);   // 不抛就是过
+        await service.StopAsync(default);   // not throwing is passing
     }
 
     /// <summary>
-    /// <c>_runs</c> 是把普通 <c>Dictionary</c>：不加锁地枚举它，一边有人登记新运行就会当场
-    /// <c>InvalidOperationException</c>——而这一下正好落在关机路径上，那是没有第二次机会的地方。
+    /// <c>_runs</c> is a plain <c>Dictionary</c>: enumerate it without a lock while someone registers a new run and you
+    /// get an <c>InvalidOperationException</c> on the spot — and that lands right on the shutdown path, which is where
+    /// there is no second chance.
     /// <para>
-    /// 拿 <c>RunTrackedAsync</c> 制造登记：它先把状态写进 <c>_runs</c> 再去解析配置，配置不存在时
-    /// 立刻失败，于是每一轮都是一次干净的字典插入。
+    /// <c>RunTrackedAsync</c> is used to manufacture registrations: it writes the state into <c>_runs</c> before it
+    /// resolves the config, and a nonexistent config fails immediately, so every iteration is one clean dictionary insert.
     /// </para>
     /// </summary>
     [Fact]
@@ -188,21 +189,21 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// F3：没有任何测试真的把 <see cref="BackupRunner.SuspendWaitCap"/> 撑爆过——删掉
-    /// <c>capped.CancelAfter(SuspendWaitCap)</c> 那一行，整套照样全绿，这条上限形同虚设。
+    /// F3: no test ever actually blew past <see cref="BackupRunner.SuspendWaitCap"/> — delete the
+    /// <c>capped.CancelAfter(SuspendWaitCap)</c> line and the whole suite stays green, which makes that cap a fiction.
     /// <para>
-    /// 用反射直接往 <c>_runs</c> 里塞一条"停不下来"的运行：<c>Status = Running</c> 但没有
-    /// <c>Control</c>，于是 <c>RequestStop</c> 走的是 <c>state.Cancellation.Cancel()</c> 那条分支——
-    /// 意愿发出去了，但没人把 <c>Completion</c> 落定，模拟一次卡在落盘路上、迟迟不退出的运行。
-    /// 把 <see cref="BackupRunner.SuspendWaitCap"/> 从生产环境的 20 秒调到 100 毫秒（就近抄
-    /// <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/> 那几条测试的手法），断言：
+    /// Reflection is used to stuff a run that "cannot be stopped" straight into <c>_runs</c>: <c>Status = Running</c>
+    /// but no <c>Control</c>, so <c>RequestStop</c> takes the <c>state.Cancellation.Cancel()</c> branch — the intent
+    /// goes out, but nobody ever settles <c>Completion</c>, simulating a run stuck on the flush path that will not exit.
+    /// <see cref="BackupRunner.SuspendWaitCap"/> is dialed from production's 20 seconds down to 100 milliseconds
+    /// (copying the technique from the <see cref="Endpoints.BackupConfigEndpoints.StopWaitCap"/> tests next door), then asserts:
     /// <list type="bullet">
-    /// <item>到点**不抛**——<c>SuspendAllAsync</c> 正常返回，而不是把 <c>OperationCanceledException</c>
-    /// 甩给关机钩子；</item>
-    /// <item>返回的计数里**不算**这一个——它没有落地成 <see cref="RunStatus.Suspended"/>，盘上没有标记，
-    /// 算进去关机日志就在说大话；</item>
-    /// <item>日志留下"谁没停下来"这条线索，而且点名的是我们自己的 <c>SuspendWaitCap</c>，不是
-    /// 调用方的 <c>ct</c>（F2）。</item>
+    /// <item>hitting the cap does **not** throw — <c>SuspendAllAsync</c> returns normally instead of tossing an
+    /// <c>OperationCanceledException</c> at the shutdown hook;</item>
+    /// <item>the returned count does **not** include this one — it never landed as <see cref="RunStatus.Suspended"/> and
+    /// left no mark on disk, so counting it would have the shutdown log talking big;</item>
+    /// <item>the log leaves the "who didn't stop" clue, and names our own <c>SuspendWaitCap</c> rather than the
+    /// caller's <c>ct</c> (F2).</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -213,24 +214,26 @@ public class GracefulSuspendTests : IDisposable
         using var factory = new LoggedFactory(log);
         var runner = factory.Services.GetRequiredService<BackupRunner>();
 
-        var stuck = new BackupRunState { Status = RunStatus.Running };   // Completion 永不落定
+        var stuck = new BackupRunState { Status = RunStatus.Running };   // Completion never settles
         InjectRun(runner, 900_777, stuck);
 
         var original = BackupRunner.SuspendWaitCap;
         BackupRunner.SuspendWaitCap = TimeSpan.FromMilliseconds(100);
         try
         {
-            // 外面再套一层 5 秒的硬上限。这条测试要抓的变异就是"删掉 capped.CancelAfter"，
-            // 而那一删的直接后果是这里永远等下去——不加这层，变异的表现是整套测试挂死、连哪一条卡住
-            // 都不知道，比一条有名有姓的失败糟得多。
+            // One more hard 5-second cap wrapped around the outside. The mutation this test is meant to catch is
+            // "delete capped.CancelAfter", and the direct consequence of that deletion is waiting here forever — without
+            // this layer the mutation shows up as the whole suite hanging with no idea which case is stuck, which is far
+            // worse than one failure with a name attached.
             var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default)
                 .WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.Equal(0, stopped);
-            Assert.Equal(RunStatus.Running, stuck.Status);   // 没有落地：不是 Suspended
-            Assert.True(stuck.Cancellation.IsCancellationRequested);   // 但意愿确实发出去了
-            // 点名的必须是我们自己的 cap，不是调用方的 ct：两条分支现在都以 "Gave up after" 开头
-            //（都报实测时长），把它们分开的是 "(cap …s)" 这一段，只有 cap 那条分支写得出来。
+            Assert.Equal(RunStatus.Running, stuck.Status);   // never landed: not Suspended
+            Assert.True(stuck.Cancellation.IsCancellationRequested);   // but the intent really did go out
+            // It has to name our own cap, not the caller's ct: both branches now start with "Gave up after"
+            // (both report the measured duration), and what tells them apart is the "(cap …s)" segment, which only the
+            // cap branch can produce.
             Assert.Contains(log.Messages, m =>
                 m.Contains("Gave up after", StringComparison.Ordinal)
                 && m.Contains("(cap ", StringComparison.Ordinal)
@@ -256,7 +259,7 @@ public class GracefulSuspendTests : IDisposable
     private static void RemoveRun(BackupRunner runner, int configId) =>
         RunsOf(runner).Remove(configId);
 
-    /// <summary>捕获所有类别的日志，不挑category——只有 SuspendAllAsync 那条 warning 会在这个测试里响。</summary>
+    /// <summary>Captures logs from every category, no category filter — only SuspendAllAsync's warning fires in this test.</summary>
     private sealed class CapturingLoggerProvider : ILoggerProvider
     {
         public List<string> Messages { get; } = [];
@@ -286,14 +289,15 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 宿主按注册的**逆序**停服务，所以关机挂起必须注册在调度器**之后**才能先于它停下来——
-    /// 不然调度器可能在挂起进行到一半时又起一轮备份，而那一轮永远等不到关机钩子了。
+    /// The host stops services in **reverse** registration order, so graceful suspend has to be registered **after**
+    /// the scheduler to stop before it does — otherwise the scheduler could start another backup halfway through the
+    /// suspend, and that round would never get a shutdown hook at all.
     /// </summary>
     [Fact]
     public void Graceful_suspend_stops_before_the_scheduler()
     {
         using var factory = new SchedulerOnFactory();
-        _ = factory.Services;   // 触发建主机，宿主注册这时才全
+        _ = factory.Services;   // forces the host to be built; only then is the registration list complete
 
         var hosted = factory.Captured!
             .Where(d => d.ServiceType == typeof(IHostedService))
@@ -309,14 +313,17 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 关机超时要同时满足两头：
+    /// The shutdown timeout has to satisfy both ends at once:
     /// <list type="bullet">
-    /// <item>够长——默认的 5 秒不够，挂起本身只写几十字节，但要先等每个工作者从当前这步退出来；</item>
-    /// <item>够短——必须**小于** docker-compose 的 <c>stop_grace_period</c>。宽限期一到就是 SIGKILL；
-    /// 只有 .NET 自己的超时先到，才还剩一段时间把"谁没停下来"写进日志。</item>
+    /// <item>long enough — the default 5 seconds is not, since the suspend itself only writes a few dozen bytes but has
+    /// to wait for every worker to back out of its current step first;</item>
+    /// <item>short enough — it must be **less than** docker-compose's <c>stop_grace_period</c>. The moment the grace
+    /// period expires it is SIGKILL; only if .NET's own timeout fires first is there any time left to write "who didn't
+    /// stop" into the log.</item>
     /// </list>
-    /// 下界单独立着没用：把 ShutdownTimeout 调到 60s 一样满足它，而那正好把 SIGKILL 请了回来。
-    /// 所以上界直接去 compose 文件里读那个数——两处哪一处被改了，这条都会响。
+    /// The lower bound standing alone is useless: dialing ShutdownTimeout up to 60s satisfies it just as well, and that
+    /// invites SIGKILL right back in. So the upper bound reads that number straight out of the compose file — change
+    /// either of the two places and this one fires.
     /// </summary>
     [Fact]
     public void Shutdown_timeout_fits_inside_the_container_grace_period()
@@ -334,19 +341,21 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 从仓库里的 docker-compose.yml 读出 <c>stop_grace_period</c>。读不到就让用例失败：
-    /// 这条用例守的就是两个数之间的关系，其中一个不见了，"通过"是没有意义的。
+    /// Reads <c>stop_grace_period</c> out of the repo's docker-compose.yml. If it cannot be read, the case fails:
+    /// what this case guards is the relationship between two numbers, and with one of them gone, "passing" is meaningless.
     /// <para>
-    /// 正则只认整数秒（<c>45s</c>），这是有意的窄：写成 <c>1m30s</c>、加了引号、或者行尾跟一句
-    /// <c>\# comment</c> 都会让这条用例读不到数、直接失败，而不是悄悄按错误的数字通过。
-    /// 这是应该失败的一侧——docker compose 的 <c>stop_grace_period</c> 支持好几种写法，这里没有
-    /// 打算做一个通用解析器，读不出预期形状就如实报错，让人去核对，好过猜一个可能错的值。
+    /// The regex only accepts whole seconds (<c>45s</c>), and that narrowness is deliberate: writing <c>1m30s</c>,
+    /// adding quotes, or trailing the line with a <c>\# comment</c> all make this case fail to read the number and fail
+    /// outright, rather than quietly passing on a wrong one. That is the correct side to fail on — docker compose's
+    /// <c>stop_grace_period</c> supports several notations, and there is no intent to build a general parser here;
+    /// reporting honestly when the expected shape is not there and making someone go check beats guessing a value that
+    /// may be wrong.
     /// </para>
     /// <para>
-    /// 另外这条用例的视野也就到这为止：它只看得见提交进仓库的这份 docker-compose.yml。真跑起来时
-    /// 如果用了 override 文件（<c>docker-compose.override.yml</c>）或者 <c>docker compose -f</c>
-    /// 指了别的文件覆盖这个值，这条用例是看不见的——它守的是"仓库里写的这份配置内部自洽"，
-    /// 不是"部署时实际生效的那个数字"。
+    /// This case's field of view also stops right there: it only sees the docker-compose.yml committed to the repo. If
+    /// the real run uses an override file (<c>docker-compose.override.yml</c>) or <c>docker compose -f</c> points at
+    /// another file that overrides this value, this case cannot see it — what it guards is "the config written in the
+    /// repo is internally consistent", not "the number actually in effect at deployment".
     /// </para>
     /// </summary>
     private static TimeSpan ComposeStopGracePeriod()
@@ -363,23 +372,27 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 并发备份下，关机必须**先给每一个运行下达停止**，再统一等落盘。
+    /// With concurrent backups, shutdown must **issue the stop to every run first** and only then wait for the flushes.
     /// <para>
-    /// 逐个"发一个、等一个"的写法在这里是致命的：排头那个若压着一个几 GB 的上传，它一个人就吃掉整个
-    /// 关机预算，后面的运行连停止请求都收不到——没落盘、没标记、直接挨砍。
+    /// A "send one, wait for one" loop is fatal here: if the one at the front is sitting on a multi-GB upload it eats
+    /// the entire shutdown budget by itself, and the runs behind it never even receive a stop request — no flush, no
+    /// mark, straight to the axe.
     /// </para>
     /// <para>
-    /// 早先这条用例给两个运行配了不同的落地时延（"慢的"先处理、"快的"后处理），靠的是
-    /// <c>Dictionary</c> 恰好按插入顺序枚举——这不是契约，只是这个运行时的实现细节。复审把这个洞
-    /// 坐实了：把 <c>SuspendAllAsync</c> 退回串行发信号+等（同一个 I1 回归），同时把内部枚举顺序反过来
-    /// （<c>Enumerable.Reverse</c>），旧版用例照样通过。现在两个运行给**同样**的落地时延，不区分谁慢
-    /// 谁快，直接记录每次信号到达的时刻与"第一个真正落地"的时刻，断言"两次信号都发生在第一次落地
-    /// 之前"——这个说法不依赖谁先谁后，在两种枚举顺序下对串行实现都成立（串行版无论先处理哪一个，
-    /// 处理第二个之前都必然已经等到第一个落地）。
+    /// This case used to give the two runs different settle delays (the "slow" one processed first, the "fast" one
+    /// second), which relied on <c>Dictionary</c> happening to enumerate in insertion order — that is not a contract,
+    /// just an implementation detail of this runtime. Review nailed the hole down: revert <c>SuspendAllAsync</c> to
+    /// serial signal+wait (the same I1 regression) while also reversing the internal enumeration order
+    /// (<c>Enumerable.Reverse</c>), and the old case still passed. Now both runs get **the same** settle delay, with no
+    /// slow/fast distinction; it simply records the instant each signal arrives and the instant "the first one actually
+    /// settles", and asserts "both signals happened before the first settle" — a statement that does not depend on who
+    /// goes first, and that holds for a serial implementation under either enumeration order (whichever one the serial
+    /// version processes first, it necessarily waited for that one to settle before processing the second).
     /// </para>
     /// <para>
-    /// 顺带钉住返回的条数：这两个运行都还没走到建 control 那一步，停下来是 Canceled、盘上没有标记，
-    /// 所以"挂起了几个"必须是 0。数成 2 的话，关机日志会宣称保住了两个根本没保住的现场。
+    /// It pins down the returned count along the way: neither run has reached the point of building a control, so
+    /// stopping them is Canceled with no mark on disk, and "how many were suspended" must be 0. Counting 2 would have
+    /// the shutdown log claim it saved two states that were never saved at all.
     /// </para>
     /// </summary>
     [Fact]
@@ -411,12 +424,13 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 两个卡在配置查询上的运行：<c>RunTrackedAsync</c> 先把状态登记进 <c>_runs</c> 再来查配置，
-    /// 所以在这里赖着不返回，就得到两个货真价实的 Running。停止请求会取消传进来的 ct（这两个运行
-    /// 还没有 control，走的是取消源那条），于是这里也就看得见"谁是什么时候被通知到的"。
+    /// Two runs stalled on the config lookup: <c>RunTrackedAsync</c> registers the state into <c>_runs</c> before it
+    /// looks the config up, so refusing to return here yields two genuine Running entries. A stop request cancels the ct
+    /// passed in (these two runs have no control yet, so they take the cancellation-source branch), which is how this
+    /// class also gets to see "who was notified when".
     /// <para>
-    /// 两个运行给**同样**的 <paramref name="settleDelay"/>：不区分"慢的"和"快的"，避免测试本身
-    /// 又踩进"靠某种固定顺序才成立"的坑（见类上的方法注释）。
+    /// Both runs get **the same** <paramref name="settleDelay"/>: no "slow" and "fast" distinction, so the test itself
+    /// does not fall back into the "only holds thanks to some fixed ordering" trap (see the comment on the test method above).
     /// </para>
     /// </summary>
     private sealed class StallingConfigs(TimeSpan settleDelay) : IBackupConfigService
@@ -427,13 +441,13 @@ public class GracefulSuspendTests : IDisposable
         private readonly TaskCompletionSource _bothStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _started;
 
-        /// <summary>每次 ct 被取消时（= 每个运行被通知到时）记的时刻，来自共享的单调时钟。</summary>
+        /// <summary>The instant recorded each time the ct is canceled (= each time a run is notified), from a shared monotonic clock.</summary>
         public IReadOnlyList<long> SignalledAt { get { lock (_signalledAt) return [.. _signalledAt]; } }
 
-        /// <summary>第一个运行落地（settleDelay 之后）的时刻；还没有任何运行落地则是 -1。</summary>
+        /// <summary>The instant the first run settles (after settleDelay); -1 while no run has settled yet.</summary>
         public long FirstSettledAt => Interlocked.Read(ref _firstSettledAt);
 
-        /// <summary>等到两个运行都真的挂在这里，再动手关机——否则测的是启动竞速，不是关机顺序。</summary>
+        /// <summary>Wait until both runs are really parked here before starting the shutdown — otherwise what gets measured is a startup race, not shutdown ordering.</summary>
         public Task BothRunningAsync() => _bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         public async Task<BackupConfig?> GetAsync(int id, CancellationToken ct = default)
@@ -444,28 +458,28 @@ public class GracefulSuspendTests : IDisposable
             var stopped = new TaskCompletionSource();
             await using (ct.Register(() =>
             {
-                // 信号到达的那一刻记时刻，就在回调里记——不要等到方法后面才补记，
-                // 补记会把"通知到了"和"轮到我处理了"这两个不同的时刻混成一个。
+                // Record the instant the signal arrives, right here in the callback — don't record it later on in the
+                // method, which would conflate two different instants: "I was notified" and "my turn to be processed came".
                 lock (_signalledAt) _signalledAt.Add(_clock.ElapsedTicks);
                 stopped.TrySetResult();
             }))
                 await stopped.Task;
 
-            await Task.Delay(settleDelay, CancellationToken.None);   // 两个运行同样磨蹭这么久才落地
-            // 只有第一个到达的写得进去：sentinel -1 保证"第一次落地的时刻"不会被第二个运行的落地覆盖。
+            await Task.Delay(settleDelay, CancellationToken.None);   // both runs dawdle exactly this long before settling
+            // Only the first arrival gets written: the -1 sentinel guarantees "the instant of the first settle" is not overwritten by the second run's settle.
             Interlocked.CompareExchange(ref _firstSettledAt, _clock.ElapsedTicks, -1);
 
             ct.ThrowIfCancellationRequested();
             return null;
         }
 
-        // 只读的那几个给个空答案：主机起来时别处也会碰它们，在那里抛只会把测试的失败点搬到无关的地方。
+        // The read-only ones get an empty answer: other code touches them while the host starts up, and throwing there would just move the test's failure point somewhere irrelevant.
         public Task<IReadOnlyList<BackupConfig>> ListAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<BackupConfig>>([]);
         public Task<BackupConfig?> FindAsync(int accountId, string containerName, CancellationToken ct = default)
             => Task.FromResult<BackupConfig?>(null);
 
-        // 写的那几个关机路径一句都用不到，留成"叫到就是写错了"。
+        // The writing ones are not used by a single line on the shutdown path, so they stay as "if this gets called, something was written wrong".
         public Task<BackupConfig> CreateAsync(BackupConfig config, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<BackupConfig?> UpdateAsync(int id, BackupConfig update, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<BackupConfig?> ChangeLocalRootAsync(int id, string newRoot, CancellationToken ct = default) => throw new NotSupportedException();
@@ -511,13 +525,13 @@ public class GracefulSuspendTests : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            // 这一条正是要看的分支：调度器开着的时候两者的先后。
+            // This is exactly the branch under examination: the order of the two when the scheduler is enabled.
             builder.UseSetting("Scheduler:Enabled", "true");
             builder.ConfigureServices(services => Captured = services);
         }
     }
 
-    // --- 真跑一轮：挂起收尾时理由要落到盘上 ---
+    // --- A real round: when a suspend settles, the reason has to land on disk ---
 
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
@@ -538,8 +552,9 @@ public class GracefulSuspendTests : IDisposable
     }
 
     /// <summary>
-    /// 一次真的被叫停的运行，收尾时必须把理由写在 journal 旁边：Task 15 只认盘上这一份，
-    /// 内存里那份随进程一起没了——而"进程没了"恰恰是它要处理的那种情形。
+    /// A run that really was stopped must write the reason next to the journal when it settles: Task 15 only trusts
+    /// the copy on disk, and the in-memory copy dies with the process — and "the process is gone" is exactly the case
+    /// it has to handle.
     /// </summary>
     [SkippableTheory]
     [InlineData(SuspendReason.UserRequested)]
@@ -586,7 +601,7 @@ public class GracefulSuspendTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>第 1 次上传之后叫停，然后照常放行——要的是"停在半路"，不是"上传失败"。</summary>
+    /// <summary>Issue the stop after the 1st upload, then let it through as usual — what we want is "stopped midway", not "upload failed".</summary>
     private sealed class StopAfterFirst(IBlobUploader inner, Action stop) : IBlobUploader
     {
         private int _count;

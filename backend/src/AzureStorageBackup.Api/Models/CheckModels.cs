@@ -2,90 +2,93 @@ using Azure.Storage.Blobs.Models;
 
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>云端检查深度（分级，用户逐次选择；PRD 检查）。</summary>
+/// <summary>Cloud check depth (tiered; the user picks one per run; PRD check).</summary>
 public enum CloudCheckLevel
 {
-    /// <summary>不检查云端。</summary>
+    /// <summary>Do not check the cloud side at all.</summary>
     None = 0,
 
-    /// <summary>只读云端信息/版本文件并与本地缓存比对，报告漂移（不查数据 blob）。</summary>
+    /// <summary>Read only the cloud info/version files and compare them with the local cache, reporting drift (data blobs are never touched).</summary>
     Metadata = 1,
 
-    /// <summary>数据 blob/分卷「存在 + 尺寸」（HEAD，不下载；尺寸缺失则仅验存在）。默认。</summary>
+    /// <summary>Data blob/volume "exists + size" (HEAD, no download; when the size is unknown only existence is verified). Default.</summary>
     ExistenceSize = 2,
 
-    /// <summary>下载并重算 hash 校验内容（Archive 需活化）。</summary>
+    /// <summary>Download and recompute the hash to verify the content (Archive must be rehydrated first).</summary>
     Content = 3,
 }
 
-/// <summary>本地源文件检查深度（分级）。</summary>
+/// <summary>Local source file check depth (tiered).</summary>
 public enum LocalCheckLevel
 {
-    /// <summary>不检查本地。</summary>
+    /// <summary>Do not check the local side at all.</summary>
     None = 0,
 
-    /// <summary>存在 + 尺寸 + 权限。</summary>
+    /// <summary>Exists + size + permissions.</summary>
     Attributes = 1,
 
-    /// <summary>内容 hash（＝可从本地修复的判据）。默认。</summary>
+    /// <summary>Content hash (= the criterion for "repairable from local"). Default.</summary>
     Content = 2,
 }
 
-/// <summary>一次检查的选项：云端/本地两条独立深度轴 + Archive 活化 tier。</summary>
+/// <summary>Options for one check run: two independent depth axes (cloud/local) + the Archive rehydration tier.</summary>
 public sealed record CheckOptions
 {
     public CloudCheckLevel Cloud { get; init; } = CloudCheckLevel.ExistenceSize;
     public LocalCheckLevel Local { get; init; } = LocalCheckLevel.Content;
 
-    /// <summary>Content 级遇 Archive blob 时的活化目标 tier（null=不活化，遇 Archive 记为待活化）。</summary>
+    /// <summary>Tier to rehydrate to when a Content-level check hits an Archive blob (null = do not rehydrate; an Archive blob is then recorded as pending rehydration).</summary>
     public AccessTier? RehydrateTier { get; init; }
 
     /// <summary>
-    /// 云端列表检查（§4.8）：枚举 container 全部 blob，报告未被任何保留版本引用的孤儿（陈旧卷/失败上传残留/
-    /// ETag 冲突遗留的孤儿索引等）。仅**报告**；删除只在显式修复时发生。默认 false。
+    /// Cloud listing check (§4.8): enumerate every blob in the container and report the orphans that no retained
+    /// version references (stale volumes, leftovers from failed uploads, orphan indexes left behind by an ETag
+    /// conflict, and so on). Report **only**; deletion happens solely during an explicit repair. Default false.
     /// </summary>
     public bool ListOrphans { get; init; }
 }
 
-/// <summary>某文件的云端状态。</summary>
+/// <summary>Cloud-side state of one file.</summary>
 public enum CloudState { NotChecked = 0, Ok = 1, MissingOrBad = 2 }
 
-/// <summary>某文件的本地状态。</summary>
+/// <summary>Local-side state of one file.</summary>
 public enum LocalState { NotChecked = 0, Ok = 1, Missing = 2, Changed = 3 }
 
-/// <summary>单个文件的检查结论。</summary>
+/// <summary>Check verdict for a single file.</summary>
 public sealed record FileFinding(string Path, string? Ref, CloudState Cloud, LocalState Local)
 {
-    /// <summary>云端已坏且本地内容一致 → 可从本地修复。</summary>
+    /// <summary>The cloud copy is bad and the local content matches → repairable from local.</summary>
     public bool Repairable => Cloud == CloudState.MissingOrBad && Local == LocalState.Ok;
 
-    /// <summary>非空＝云端这份内容是从更早的版本沿用来的（备份一直没能读到源文件），值为自何时起。
-    /// 没有这条信息时，<see cref="LocalState.Changed"/> 会被读成"本地文件被改了"，
-    /// 而真实原因是"备份从未成功更新过云端这一份"——两者的处置完全不同。</summary>
+    /// <summary>Non-null = this cloud copy was carried over from an earlier version (backup has never managed to
+    /// read the source file), and the value says since when. Without this information,
+    /// <see cref="LocalState.Changed"/> reads as "the local file was edited", when the real reason is "backup never
+    /// successfully updated this cloud copy" — and the two call for completely different action.</summary>
     public DateTimeOffset? UnreadableAt { get; init; }
 }
 
-/// <summary>检查报告：按文件结论 + 可选元数据漂移说明。</summary>
+/// <summary>Check report: per-file verdicts + an optional metadata drift note.</summary>
 public sealed record CheckReport(int Version, IReadOnlyList<FileFinding> Findings, string? MetadataIssue = null)
 {
     public bool Ok => MetadataIssue is null && Findings.All(f => f.Cloud != CloudState.MissingOrBad);
 
     /// <summary>
-    /// 云端列表检查（§4.8）发现的未被引用 blob 名（孤儿/垃圾）。仅在 <see cref="CheckOptions.ListOrphans"/> 时填充。
-    /// 孤儿**不影响** <see cref="Ok"/>（它们不是数据损坏，只是可回收的多余占用）。默认空。
+    /// Unreferenced blob names (orphans/garbage) found by the cloud listing check (§4.8). Populated only when
+    /// <see cref="CheckOptions.ListOrphans"/> is set. Orphans do **not** affect <see cref="Ok"/> (they are not data
+    /// corruption, just reclaimable wasted space). Empty by default.
     /// </summary>
     public IReadOnlyList<string> OrphanBlobs { get; init; } = [];
 
-    /// <summary>坏掉的 blob 名（去重，兼容旧前端）。</summary>
+    /// <summary>Names of the broken blobs (deduplicated; kept for the old frontend).</summary>
     public IReadOnlyList<string> MissingRefs =>
         Findings.Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToList();
 
-    /// <summary>坏掉的文件路径（兼容旧前端）。</summary>
+    /// <summary>Paths of the broken files (kept for the old frontend).</summary>
     public IReadOnlyList<string> CorruptedPaths =>
         Findings.Where(f => f.Cloud == CloudState.MissingOrBad).Select(f => f.Path).ToList();
 
-    /// <summary>可从本地修复的文件路径。</summary>
+    /// <summary>Paths of the files that can be repaired from local.</summary>
     public IReadOnlyList<string> RepairablePaths =>
         Findings.Where(f => f.Repairable).Select(f => f.Path).ToList();
 }

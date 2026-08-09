@@ -1,15 +1,15 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 本地路径边界（设计 §3）。根来自 <c>Backup:Root</c>，**只做准入过滤**：
-/// 不改写、不截断路径，也不作为相对路径基准。未配置时无边界，全部放行。
-/// 单例：构造时解析一次真实根，之后不再变。
+/// Local path boundary (design §3). The root comes from <c>Backup:Root</c> and is **an admission filter only**:
+/// it never rewrites or truncates a path, and never serves as the base for relative paths. Unconfigured = no boundary, everything passes.
+/// Singleton: the real root is resolved once in the constructor and never changes afterwards.
 /// </summary>
 public sealed class PathBoundary
 {
     /// <summary>
-    /// 符号链接**展开次数**上限（与 Linux 的 40 次一致）。只数展开，不数普通路径段，
-    /// 否则一个没有任何软链的深目录也会被误判。超限判定为越界，而不是抛异常或死循环。
+    /// Cap on the number of symlink **expansions** (matching Linux's 40). It counts expansions only, not ordinary path segments,
+    /// otherwise a deep directory with no symlinks at all would be misjudged. Exceeding the cap counts as out of bounds, rather than throwing or looping forever.
     /// </summary>
     private const int MaxLinkDepth = 40;
 
@@ -21,29 +21,29 @@ public sealed class PathBoundary
         var configured = config["Backup:Root"];
         if (string.IsNullOrWhiteSpace(configured))
         {
-            // 未配置 = 无边界，全部放行（既有约定）。
+            // Unconfigured = no boundary, everything passes (the existing convention).
             _configuredRoot = null;
             _realRoot = null;
             return;
         }
 
-        // 根自身可能是软链：必须先解析成真实路径，否则后续比较全部基于一个假地址，
-        // 会把所有合法路径都误拒。
-        // 配了根却解析不出来（成环）必须**炸在启动期**：若沿用 null，
-        // Enabled 会变成 false，边界静默消失、一切放行——配置错误伪装成「没配置」，
-        // 是这里最坏的结果。
-        // 注：「组件不可读」不是这里的成因——.NET 的 Unix ReadLink 会吞掉 EACCES，
-        // chmod 000 的目录在 LinkTarget 上仍返回 null，被当成普通段处理，不会导致解析失败。
-        // 相对根在这里一次性拼成绝对路径，之后 ConfiguredRoot 恒为绝对路径。
-        // 原因是 ConfiguredRoot 不只是给人看的：浏览端点用它做展示前缀（ToDisplayPath）
-        // 发给前端，前端再把同一串字符串原样当 `?path=` / `localRoot` 送回来，而 IsInside
-        // **只接受绝对输入**。保留相对形式，这条回路的每一跳都会被自己的边界拒成 409——
-        // 点进子目录、点「上一级」、点「Use this folder」全部不可用（各处单独看都正确，
-        // 组合起来才断）。在唯一的入口归一化，比让每个下游各自打补丁可靠。
-        // 拼接方式与 ResolveReal 对相对输入的处理完全一致：只拼进程当前工作目录，
-        // **绝不折叠 `..`**（理由见 ResolveReal 文档），保证两边解析到同一个真实位置。
-        // 这一步**不是**符号链接解析——拼 CWD 不跟随任何链接，ConfiguredRoot 依旧不等于
-        // 也不泄漏 RealRoot（根自身是软链时二者仍然不同）。
+        // The root itself may be a symlink: it must be resolved to a real path first, otherwise every later comparison
+        // is based on a fake address and would wrongly reject all legitimate paths.
+        // A root that is configured but cannot be resolved (a cycle) must **blow up at startup**: keeping null,
+        // Enabled would become false, the boundary would silently vanish and everything would pass — a misconfiguration
+        // disguised as "not configured" is the worst possible outcome here.
+        // Note: "a component is unreadable" is not a cause here — .NET's Unix ReadLink swallows EACCES, so a
+        // chmod 000 directory still returns null from LinkTarget, is treated as an ordinary segment, and does not fail resolution.
+        // A relative root is joined into an absolute path once, right here; from then on ConfiguredRoot is always absolute.
+        // The reason is that ConfiguredRoot is not just for humans to read: the browse endpoint uses it as the display prefix (ToDisplayPath)
+        // sent to the frontend, and the frontend hands that same string straight back as `?path=` / `localRoot`, while IsInside
+        // **only accepts absolute input**. Keep the relative form and every hop of that round trip gets rejected by our own boundary with 409 —
+        // clicking into a subdirectory, clicking "up one level", clicking "Use this folder" all stop working (every piece looks correct
+        // on its own; only the combination breaks). Normalizing at the single entry point is more reliable than patching every downstream site.
+        // The join is done exactly the way ResolveReal handles relative input: join the process's current working directory only,
+        // and **never fold `..`** (see the ResolveReal docs for why), so both sides resolve to the same real location.
+        // This step is **not** symlink resolution — joining the CWD follows no link, so ConfiguredRoot still neither equals
+        // nor leaks RealRoot (when the root itself is a symlink the two still differ).
         _configuredRoot = Path.IsPathRooted(configured)
             ? configured
             : Path.Join(Directory.GetCurrentDirectory(), configured);
@@ -53,38 +53,39 @@ public sealed class PathBoundary
                 "(symlink cycle). Fix Backup__Root or the filesystem.");
     }
 
-    /// <summary>是否启用边界。未配置根时为 false，一切放行。</summary>
+    /// <summary>Whether the boundary is enabled. False when no root is configured, and everything passes.</summary>
     public bool Enabled => _realRoot is not null;
 
     /// <summary>
-    /// 操作员在 <c>Backup:Root</c> 里配的路径，**未经符号链接解析**（相对配置会在构造时
-    /// 拼上进程当前工作目录，除此之外原样保留）。
-    /// 面向操作员的场合——拒绝消息、越界提示、目录浏览响应里的展示路径——
-    /// 一律用这个：拒绝时应该说操作员敲过的那个路径，而不是主机内部真正指向
-    /// 的地方（例如配的是 <c>/nas</c>，实际指向 <c>/mnt/disk1</c>，操作员大概率
-    /// 认不出后者）。未启用边界时为 null。
-    /// <para>启用时**恒为绝对路径**（见构造函数），因此它自己一定能通过
-    /// <see cref="IsInside"/>，可以安全地回传给前端再送回来。</para>
+    /// The path the operator configured in <c>Backup:Root</c>, **without symlink resolution** (a relative setting gets the
+    /// process's current working directory joined onto it at construction; otherwise it is kept verbatim).
+    /// Everything operator-facing — rejection messages, out-of-bounds warnings, the display path in directory browse responses —
+    /// uses this one: a rejection should name the path the operator typed, not the place it really points
+    /// to inside the host (configured as <c>/nas</c> but actually pointing at <c>/mnt/disk1</c>, say; the operator
+    /// most likely would not recognize the latter). Null when the boundary is not enabled.
+    /// <para>When enabled it is **always an absolute path** (see the constructor), so it is guaranteed to pass
+    /// <see cref="IsInside"/> itself and can safely be handed to the frontend and sent back.</para>
     /// </summary>
     public string? ConfiguredRoot => _configuredRoot;
 
     /// <summary>
-    /// 解析后的真实根（符号链接已展开）。**只用于路径比较**，不面向操作员展示——
-    /// 拿它拼错误消息只会让人看见一个自己从没打过的路径。未启用边界时为 null。
+    /// The resolved real root (symlinks expanded). **For path comparison only**, never shown to the operator —
+    /// building an error message out of it only shows them a path they never typed. Null when the boundary is not enabled.
     /// </summary>
     public string? RealRoot => _realRoot;
 
     /// <summary>
-    /// 路径是否在边界之内。未启用边界时恒为 true。
+    /// Whether a path lies inside the boundary. Always true when the boundary is not enabled.
     /// <para>
-    /// **只接受绝对路径**：相对路径一律拒绝，而不是像 <see cref="IsWithin"/> 那样接受
-    /// 后用文档提醒调用方注意基准。原因是本方法是端点、调度器、目录浏览 API 的公共
-    /// 入口，调用方众多且分散；若放行相对路径，底层 <see cref="ResolveReal"/> 会按**进程
-    /// 当前工作目录**把它变成绝对路径再判定，一旦调用方后续真正的文件操作用了别的基准
-    /// （例如某个显式指定的目录），判定结果和实际落盘位置就会不一致，且没有任何报错
-    /// 提示这一点。与其把这条风险写进文档指望每个调用方都读到，不如在入口直接堵死这类
-    /// 输入——这里的根**只做安全过滤**，从不作为相对路径基准，拒绝相对输入是这条原则
-    /// 最直接的落地。
+    /// **Absolute paths only**: relative paths are always rejected, rather than accepted with a doc comment
+    /// reminding the caller to mind the base the way <see cref="IsWithin"/> does. The reason is that this method is the shared
+    /// entry point for the endpoints, the scheduler and the directory browse API; its callers are many and scattered.
+    /// If relative paths were let through, the underlying <see cref="ResolveReal"/> would make them absolute against the **process's
+    /// current working directory** before judging, and the moment the caller's actual file operations used a different base
+    /// (some explicitly specified directory, say), the verdict and the place the bytes actually land would disagree, with nothing
+    /// reporting it. Rather than writing that risk into the docs and hoping every caller reads it, we shut this class of
+    /// input out at the entrance — the root here **only filters for safety** and is never a base for relative paths, and rejecting
+    /// relative input is the most direct expression of that principle.
     /// </para>
     /// </summary>
     public bool IsInside(string path)
@@ -101,17 +102,17 @@ public sealed class PathBoundary
     }
 
     /// <summary>
-    /// 把一个已确认落在边界内的真实路径（<see cref="RealRoot"/> 为前缀）翻译成操作员
-    /// 可见的形式：用 <see cref="ConfiguredRoot"/> 替换掉 <see cref="RealRoot"/> 前缀。
-    /// 调用方必须先用 <see cref="IsInside"/> 确认该真实路径确实落在边界内——本方法不做
-    /// 校验，传一个界外真实路径进来会抛 <see cref="InvalidOperationException"/>，而不是悄悄
-    /// 原样返回一个带着 <see cref="RealRoot"/> 前缀的字符串（那个字符串一旦流到响应里就是
-    /// 主机真实路径泄漏）。未启用边界时原样返回。
+    /// Translates a real path already confirmed to be inside the boundary (prefixed by <see cref="RealRoot"/>) into the form
+    /// the operator sees: replace the <see cref="RealRoot"/> prefix with <see cref="ConfiguredRoot"/>.
+    /// The caller must first confirm with <see cref="IsInside"/> that the real path really does lie inside the boundary — this method does
+    /// no validation, and passing an out-of-bounds real path in throws <see cref="InvalidOperationException"/> instead of quietly
+    /// returning a string that still carries the <see cref="RealRoot"/> prefix (once that string reaches a response it is a
+    /// leak of the host's real path). Returned unchanged when the boundary is not enabled.
     /// <para>
-    /// 用途：像「上级目录」这类需要基于真实路径（跟随符号链接）计算、又要展示给用户
-    /// 的场合——不能直接展示 <see cref="RealRoot"/>（配的是 <c>/nas</c>、实际指向
-    /// <c>/mnt/disk1</c> 时，操作员不认识后者），但也不能图省事改用词法折叠去算上级
-    /// （<see cref="ResolveReal"/> 文档里那个跟着软链走会算错的洞）。
+    /// Use case: things like "parent directory" that must be computed from the real path (following symlinks) yet shown to the
+    /// user — we cannot show <see cref="RealRoot"/> directly (configured as <c>/nas</c> but actually pointing at
+    /// <c>/mnt/disk1</c>, the operator does not recognize the latter), but we also cannot take the shortcut of computing the parent
+    /// by lexical folding (that hole in the <see cref="ResolveReal"/> docs where following a symlink gets the answer wrong).
     /// </para>
     /// </summary>
     public string ToDisplayPath(string real)
@@ -125,61 +126,61 @@ public sealed class PathBoundary
         if (real.StartsWith(_realRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
             return _configuredRoot + real[_realRoot.Length..];
 
-        // B4：这里本该到不了——调用方的契约是先用 IsInside 确认过。静默原样返回等于把一个
-        // 不带 RealRoot 前缀信号的字符串交还给调用方，对方毫无察觉地把主机真实路径（例如
-        // /mnt/disk1，而不是操作员认识的 /nas）继续往下传，最坏情况传进 HTTP 响应。炸在这里，
-        // 比在生产环境悄悄泄漏主机路径好得多。
+        // B4: this should be unreachable — the caller's contract is to have confirmed with IsInside first. Silently returning the
+        // input hands the caller back a string with no signal that it carries the RealRoot prefix, and they unknowingly keep passing
+        // the host's real path (/mnt/disk1, say, rather than the /nas the operator knows) further down, worst case into an HTTP response.
+        // Blowing up here is far better than silently leaking host paths in production.
         throw new InvalidOperationException(
             "PathBoundary.ToDisplayPath received a real path outside RealRoot; " +
             $"the caller must verify IsInside(real) before calling this method. real='{real}'.");
     }
 
     /// <summary>
-    /// 真正的 realpath：从文件系统根出发逐段前进，得到完全解析后的真实路径。
-    /// 软链展开次数超过 <see cref="MaxLinkDepth"/>（成环）时返回 null。
+    /// A real realpath: walk segment by segment from the filesystem root to arrive at the fully resolved real path.
+    /// Returns null when symlink expansions exceed <see cref="MaxLinkDepth"/> (a cycle).
     /// <para>
-    /// 算法：维护一个**待处理段**栈和一个**已完全解析**的前缀 <c>resolved</c>，每次弹出一段：
+    /// Algorithm: keep a stack of **pending segments** and a **fully resolved** prefix <c>resolved</c>, popping one segment at a time:
     /// <list type="bullet">
-    /// <item><c>.</c> 跳过；</item>
-    /// <item><c>..</c> 砍掉 <c>resolved</c> 的最后一段（不越过文件系统根）；</item>
-    /// <item>其余先拼到 <c>resolved</c>，再看这个新路径是不是软链——是的话把**目标的各段
-    /// 压回待处理栈**（目标为绝对路径时同时把 <c>resolved</c> 重置回文件系统根），
-    /// 让目标本身也被逐段重走。</item>
+    /// <item><c>.</c> is skipped;</item>
+    /// <item><c>..</c> chops the last segment off <c>resolved</c> (never past the filesystem root);</item>
+    /// <item>everything else is first joined onto <c>resolved</c>, then that new path is checked for being a symlink — if it is, **the
+    /// target's segments are pushed back onto the pending stack** (and when the target is absolute, <c>resolved</c> is reset to the filesystem root
+    /// at the same time), so the target itself is re-walked segment by segment too.</item>
     /// </list>
     /// </para>
     /// <para>
-    /// 两处关键性质，缺一个就是可越界的洞：
+    /// Two crucial properties; missing either one is an escapable hole:
     /// </para>
     /// <para>
-    /// 1) **绝不预先用 <c>Path.GetFullPath</c> 折叠 <c>..</c>**。GetFullPath 是**词法**折叠，
-    /// 而 POSIX 的 <c>..</c> 在软链展开**之后**才结算，两者只在跟着软链走时不一致——
-    /// 而那正是攻击面：<c>&lt;root&gt;/escape/../secret</c> 词法折叠成 <c>&lt;root&gt;/secret</c>（界内），
-    /// 实际却落在 <c>escape</c> 目标的父目录里（界外）。这里 <c>..</c> 作用在已解析前缀上，
-    /// 顺序与内核一致。相对**输入**仍需变成绝对路径，但只做拼接，不折叠。
+    /// 1) **Never pre-fold <c>..</c> with <c>Path.GetFullPath</c>**. GetFullPath folds **lexically**,
+    /// while POSIX settles <c>..</c> **after** symlink expansion; the two disagree only when following a symlink —
+    /// and that is exactly the attack surface: <c>&lt;root&gt;/escape/../secret</c> folds lexically to <c>&lt;root&gt;/secret</c> (inside),
+    /// while it actually lands in the parent directory of <c>escape</c>'s target (outside). Here <c>..</c> acts on the already-resolved prefix,
+    /// in the same order as the kernel. Relative **input** still has to become absolute, but by joining only, never folding.
     /// </para>
     /// <para>
-    /// 2) **软链目标必须重走，不能整体替换**。若把 <c>resolved</c> 直接换成目标的未解析字符串，
-    /// 目标里位于末段之前的组件就永远不会被检查：<c>b -&gt; &lt;界外&gt;</c>、<c>a -&gt; &lt;root&gt;/b/c</c> 时
-    /// <c>a</c> 会被判成 <c>&lt;root&gt;/b/c</c>（界内），实际是 <c>&lt;界外&gt;/c</c>。
+    /// 2) **A symlink target must be re-walked, not substituted wholesale**. If <c>resolved</c> were simply replaced with the target's unresolved string,
+    /// the components before the target's last segment would never be checked: with <c>b -&gt; &lt;outside&gt;</c> and <c>a -&gt; &lt;root&gt;/b/c</c>,
+    /// <c>a</c> would be judged as <c>&lt;root&gt;/b/c</c> (inside) when it really is <c>&lt;outside&gt;/c</c>.
     /// </para>
     /// <para>
-    /// 不能用 <c>Directory.ResolveLinkTarget(p, returnFinalTarget: true)</c> 代替：它只展开
-    /// **最后一段**。若 <c>/nas/link</c> 是指向 <c>/etc</c> 的软链，查询 <c>/nas/link/passwd</c>
-    /// 时它返回 null（passwd 自身不是链接），中间段的越界就被漏掉了。
+    /// <c>Directory.ResolveLinkTarget(p, returnFinalTarget: true)</c> cannot stand in for this: it only expands
+    /// **the last segment**. If <c>/nas/link</c> is a symlink pointing at <c>/etc</c>, querying <c>/nas/link/passwd</c>
+    /// returns null (passwd itself is not a link), and the escape in the middle segment is missed.
     /// </para>
     /// <para>
-    /// 路径不存在的段不是链接，直接拼接即可——这自然实现了「按最近已存在祖先判定」，
-    /// 使尚未创建的还原目标可以通过。
+    /// A segment that does not exist is not a link and is simply joined on — which naturally gives "judge by the nearest existing ancestor",
+    /// letting a restore target that has not been created yet pass.
     /// </para>
     /// </summary>
     public static string? ResolveReal(string path)
     {
-        // Path/FileInfo 遇到 \0 会抛 ArgumentException；这里当成不可解析，
-        // 让调用方（IsInside）得到一次干净的拒绝而不是未处理异常。
+        // Path/FileInfo throws ArgumentException on \0; treat that as unresolvable here
+        // so the caller (IsInside) gets a clean rejection instead of an unhandled exception.
         if (string.IsNullOrEmpty(path) || path.Contains('\0'))
             return null;
 
-        // 相对输入按当前工作目录变成绝对路径——只拼接，不做任何 `..` 折叠。
+        // Relative input becomes absolute against the current working directory — joining only, no `..` folding whatsoever.
         var absolute = Path.IsPathRooted(path)
             ? path
             : Path.Join(Directory.GetCurrentDirectory(), path);
@@ -203,7 +204,7 @@ public sealed class PathBoundary
 
             if (segment is "..")
             {
-                // resolved 此刻已完全解析，所以这一步与内核的求值顺序一致。
+                // resolved is fully resolved at this point, so this step matches the kernel's evaluation order.
                 var parent = Path.GetDirectoryName(resolved);
                 resolved = string.IsNullOrEmpty(parent) ? fsRoot : parent;
                 continue;
@@ -211,8 +212,8 @@ public sealed class PathBoundary
 
             var candidate = Path.Combine(resolved, segment);
 
-            // FileSystemInfo.LinkTarget 底层是 lstat，不关心目标是文件还是目录；
-            // 路径不存在时返回 null，正是我们要的（不存在的段不是链接）。
+            // FileSystemInfo.LinkTarget is lstat underneath and does not care whether the target is a file or a directory;
+            // it returns null when the path does not exist, which is exactly what we want (a nonexistent segment is not a link).
             var target = new FileInfo(candidate).LinkTarget;
             if (target is null)
             {
@@ -225,28 +226,28 @@ public sealed class PathBoundary
 
             if (Path.IsPathFullyQualified(target))
             {
-                // 用 IsPathFullyQualified 而不是 IsPathRooted：在 Windows 上
-                // "C:foo" 满足 IsPathRooted 但不满足 IsPathFullyQualified——
-                // 它是「盘符相对」路径，真正的锚点是该盘符当时的当前目录，
-                // 边界组件没有资格替调用方猜。POSIX 下二者永远等价，这条分支
-                // 的语义在 Linux/Docker 部署目标上不变。
+                // IsPathFullyQualified rather than IsPathRooted: on Windows
+                // "C:foo" satisfies IsPathRooted but not IsPathFullyQualified —
+                // it is a "drive-relative" path whose real anchor is that drive's current directory at the time,
+                // and a boundary component has no business guessing that for the caller. On POSIX the two are always
+                // equivalent, so this branch's semantics do not change on the Linux/Docker deployment target.
                 var targetRoot = Path.GetPathRoot(target);
                 if (string.IsNullOrEmpty(targetRoot))
                     return null;
                 PushSegments(pending, target[targetRoot.Length..]);
-                resolved = targetRoot; // 绝对目标：从文件系统根重新走
+                resolved = targetRoot; // Absolute target: start over from the filesystem root
             }
             else if (Path.IsPathRooted(target))
             {
-                // 有根但不完全限定（如 Windows 的 "C:foo"、"\foo"）：目标锚点
-                // 依赖进程当前盘符/当前工作目录，不是一个确定的目录。宁可判
-                // 定解析失败（IsInside 会把它当越界拒绝），也不要猜一个锚点
-                // 继续走——猜错了就是一个悄悄放行的洞。仅在 Windows 上可达。
+                // Rooted but not fully qualified (Windows' "C:foo", "\foo"): the target's anchor
+                // depends on the process's current drive / current working directory and is not a definite
+                // directory. Better to declare resolution failed (IsInside rejects it as out of bounds) than to
+                // guess an anchor and keep walking — guessing wrong is a hole that silently lets things through. Reachable on Windows only.
                 return null;
             }
             else
             {
-                // 相对目标以链接自身所在目录为基准，也就是当前的 resolved，不动它。
+                // A relative target is based on the directory holding the link itself, i.e. the current resolved; leave it alone.
                 PushSegments(pending, target);
             }
         }
@@ -254,7 +255,7 @@ public sealed class PathBoundary
         return resolved;
     }
 
-    /// <summary>把一段路径拆成各段，倒序压栈，使弹出顺序等于从左到右。</summary>
+    /// <summary>Splits a path into segments and pushes them in reverse, so that popping yields left-to-right order.</summary>
     private static void PushSegments(Stack<string> pending, string path)
     {
         var parts = path.Split(
@@ -265,21 +266,21 @@ public sealed class PathBoundary
     }
 
     /// <summary>
-    /// 纯词法的包含判定：规范化后按**路径段边界**比较，不解析符号链接。
-    /// <c>/target</c> 不包含 <c>/targetx</c>。还原写入用它防索引数据里的 <c>..</c>。
+    /// Purely lexical containment check: normalize, then compare on **path segment boundaries**, without resolving symlinks.
+    /// <c>/target</c> does not contain <c>/targetx</c>. Restore writes use it to guard against <c>..</c> in index data.
     /// <para>
-    /// **相对路径注意**：本方法只做词法处理，不碰文件系统（所以 <see cref="ResolveReal"/>
-    /// 的软链问题与它无关），但 <c>root</c>/<c>candidate</c> 若是**相对**路径，会被
-    /// <c>Path.GetFullPath</c> 按**进程当前工作目录**规范化——那几乎肯定不是调用方想要的基准。
-    /// 还原写入必须**先把索引里的相对路径拼到目标根上**再调用本方法，例如
-    /// <c>IsWithin(targetRoot, Path.Combine(targetRoot, entryPath))</c>，
-    /// 不要把 <c>entryPath</c> 直接传进来。
+    /// **Note on relative paths**: this method is purely lexical and never touches the filesystem (so the symlink problem in
+    /// <see cref="ResolveReal"/> does not apply to it), but if <c>root</c>/<c>candidate</c> are **relative**, they get
+    /// normalized by <c>Path.GetFullPath</c> against the **process's current working directory** — almost certainly not the base the caller intended.
+    /// Restore writes must **first join the index's relative path onto the target root** before calling this method, e.g.
+    /// <c>IsWithin(targetRoot, Path.Combine(targetRoot, entryPath))</c>;
+    /// do not pass <c>entryPath</c> in directly.
     /// </para>
     /// <para>
-    /// **不抛异常**：<c>root</c>/<c>candidate</c> 可能来自云端索引——恶意或损坏的数据。
-    /// <c>Path.GetFullPath</c> 对含 <c>\0</c> 的路径和空字符串会抛 <see cref="ArgumentException"/>，
-    /// 这里一律转成「无法规范化 = 判定越界」返回 <c>false</c>，不能让一条脏索引记录
-    /// 变成未处理异常（500）。
+    /// **Never throws**: <c>root</c>/<c>candidate</c> may come from a cloud index — malicious or corrupted data.
+    /// <c>Path.GetFullPath</c> throws <see cref="ArgumentException"/> on paths containing <c>\0</c> and on the empty string;
+    /// all of those are turned into "cannot normalize = judged out of bounds" returning <c>false</c>, because one dirty index record
+    /// must not become an unhandled exception (500).
     /// </para>
     /// </summary>
     public static bool IsWithin(string root, string candidate)
@@ -294,8 +295,8 @@ public sealed class PathBoundary
     }
 
     /// <summary>
-    /// <c>Path.GetFullPath</c> 的不抛异常版本：\0、空字符串，以及底层可能抛出的其他
-    /// <see cref="ArgumentException"/>，一律当成「无法规范化」返回 false。
+    /// A non-throwing version of <c>Path.GetFullPath</c>: \0, the empty string, and any other
+    /// <see cref="ArgumentException"/> the underlying call may throw are all treated as "cannot normalize" and return false.
     /// </summary>
     private static bool TryGetFullPath(string path, out string fullPath)
     {

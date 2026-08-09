@@ -9,8 +9,9 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 回归：修复(§3.2)必须经本地权威状态机(TrackedInfoStore + ILocalIndexCache)写信息文件/版本索引，
-/// 否则本地缓存的 ETag 与云端脱节，下一次备份的条件写会 412 一次。
+/// Regression: a repair (§3.2) must write the info file / version indexes through the local-authoritative state
+/// machine (TrackedInfoStore + ILocalIndexCache), otherwise the locally cached ETag falls out of step with the cloud
+/// and the next backup's conditional write hits a 412 once.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupRepairerTests : IDisposable
@@ -63,7 +64,7 @@ public sealed class BackupRepairerTests : IDisposable
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    /// <summary>只记录写入内容的 IOperationLog spy（用于断言修复器留下的审计痕迹）。</summary>
+    /// <summary>An IOperationLog spy that only records what was written (used to assert the audit trail the repairer leaves behind).</summary>
     private sealed class RecordingOperationLog : IOperationLog
     {
         public List<(OperationLogLevel Level, string Source, string Message)> Entries { get; } = [];
@@ -132,11 +133,11 @@ public sealed class BackupRepairerTests : IDisposable
 
         try
         {
-            // v1：一个 data blob（走本地权威状态机——回填本地 ETag/索引缓存）。
+            // v1: one data blob (through the local-authoritative state machine — backfilling the local ETag / index cache).
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "repair me please, local-authoritative");
             await backup.RunAsync(Req(account, name));
 
-            // 云端该 blob 丢失；本地文件仍在（可从本地修复）。
+            // That blob is gone from the cloud; the local file is still there (repairable from local).
             await foreach (var b in container.GetBlobsAsync(
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
@@ -147,7 +148,8 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Contains("a.txt", report.Repaired);
             Assert.Empty(report.Unrecoverable);
 
-            // 修复必须经本地权威状态机：索引缓存里的版本 1 应已刷新（identity 匹配本次信息文件）。
+            // The repair must go through the local-authoritative state machine: version 1 in the index cache should
+            // have been refreshed (its identity matching this info file).
             var info = await tracked.LoadAsync(account, name, null);
             Assert.NotNull(info);
             var v1 = info!.Versions.Single(x => x.Version == 1);
@@ -155,7 +157,7 @@ public sealed class BackupRepairerTests : IDisposable
             var cachedIndex = await indexCache.ReadAsync(account, name, 1, identity, v1.IndexBlob, null);
             Assert.NotNull(cachedIndex);
 
-            // 下一次备份 finalize 的信息写（经 tracked ETag 条件写）不应因修复绕过本地缓存而 412。
+            // The next backup's finalize info write (a tracked ETag conditional write) must not hit a 412 because the repair bypassed the local cache.
             var ex = await Record.ExceptionAsync(() =>
                 tracked.WriteAsync(account, name, info, null, Azure.Storage.Blobs.Models.AccessTier.Hot));
             Assert.Null(ex);
@@ -164,14 +166,16 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// F7：修复重压单文件 blob 时，StoreOnly 必须与全新备份对同一路径的推导一致（按配置的 DontCompress 规则），
-    /// 而不是硬编码 false。修好的归档才和全新备份写出的是同一种东西。
+    /// F7: when a repair recompresses a single-file blob, StoreOnly must be derived exactly as a fresh backup derives
+    /// it for the same path (from the configured DontCompress rules), not hardcoded to false. Only then is the
+    /// repaired archive the same kind of thing a fresh backup writes.
     /// <para>
-    /// 两个方向一起验，防止「一律只存」蒙混过关：logs/big.log 命中规则（应只存 → 归档≈原文件大小），
-    /// data/big.bin 不命中（应压缩 → 归档远小于原文件）。两个文件内容都高度可压缩，故两种模式的
-    /// 归档尺寸相差一个数量级以上，断言不靠微小差异。
+    /// Both directions are verified together so that "store everything" cannot slip through: logs/big.log matches the
+    /// rules (should be stored → archive roughly the size of the original file), data/big.bin does not (should be
+    /// compressed → archive far smaller than the original). Both files hold highly compressible content, so the two
+    /// modes differ in archive size by more than an order of magnitude and the assertions do not rest on a hair.
     /// </para>
-    /// <para>修复前（硬编码 StoreOnly: false）：logs/big.log 被重压成 -mx9 的小归档，其尺寸断言失败。</para>
+    /// <para>Before the fix (hardcoded StoreOnly: false): logs/big.log was recompressed into a small -mx9 archive and its size assertion failed.</para>
     /// </summary>
     [SkippableFact]
     public async Task Repair_Derives_StoreOnly_From_The_DontCompress_Rules_Like_A_Fresh_Backup_Does()
@@ -179,8 +183,9 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        // 必须是**加密**备份：未加密的 store-only 文件走原始直传（CopyRawAsync），根本不过 7z，
-        // StoreOnly 参数对它没有作用。加密时 store-only 仍要过 7z（-mx0 + 密码），正是被测的那条路径。
+        // It has to be an **encrypted** backup: an unencrypted store-only file takes the raw upload path
+        // (CopyRawAsync) and never goes through 7z at all, so the StoreOnly parameter has no effect on it. When
+        // encrypted, store-only still goes through 7z (-mx0 + password), which is exactly the path under test.
         const string password = "repair-store-only-pw";
         var rules = new IgnoreRuleSet(["*.log"]);
         var (backup, _, repairer, _, _, factory) = Build();
@@ -192,8 +197,9 @@ public sealed class BackupRepairerTests : IDisposable
 
         try
         {
-            // 高度可压缩的内容：-mx0 与 -mx9 的归档尺寸差一个数量级，断言不会卡在边界上。
-            // 两个文件内容必须不同——内容寻址会把同内容去重成一个 blob，那样就只剩一条路径可验了。
+            // Highly compressible content: the archive sizes for -mx0 and -mx9 differ by an order of magnitude, so
+            // the assertions do not sit on a boundary. The two files must differ in content — content addressing
+            // would dedup identical content into one blob, leaving only one path to verify.
             Directory.CreateDirectory(Path.Combine(_src, "logs"));
             Directory.CreateDirectory(Path.Combine(_src, "data"));
             await File.WriteAllTextAsync(Path.Combine(_src, "logs", "big.log"), new string('a', 200_000));
@@ -205,14 +211,14 @@ public sealed class BackupRepairerTests : IDisposable
             var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, password);
             var logRef = idx.Entries.Single(e => e.Path == "logs/big.log").Storage!.Ref;
             var binRef = idx.Entries.Single(e => e.Path == "data/big.bin").Storage!.Ref;
-            Assert.NotEqual(logRef, binRef); // 内容不同 → 两个独立的 blob，两条路径各自走各自的推导
+            Assert.NotEqual(logRef, binRef); // different content → two independent blobs, each path running its own derivation
 
             async Task<long> SizeOf(string blobRef) =>
                 (await container.GetBlobClient(blobRef).GetPropertiesAsync()).Value.ContentLength;
 
             var freshLog = await SizeOf(logRef);
             var freshBin = await SizeOf(binRef);
-            // 先确认全新备份自己确实按规则分了道：只存的那个远大于压缩的那个。
+            // First confirm the fresh backup itself really did split by the rules: the stored one is far larger than the compressed one.
             Assert.True(freshLog > freshBin * 10, $"fresh backup did not honour the rules: log={freshLog} bin={freshBin}");
 
             await container.GetBlobClient(logRef).DeleteIfExistsAsync();
@@ -223,7 +229,7 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Contains("logs/big.log", report.Repaired);
             Assert.Contains("data/big.bin", report.Repaired);
 
-            // 修好的归档尺寸与全新备份写出的一致（同内容 + 同 StoreOnly → 同一个 7z 命令）。
+            // The repaired archive's size matches what a fresh backup wrote (same content + same StoreOnly → the same 7z command).
             var repairedLog = await SizeOf(logRef);
             var repairedBin = await SizeOf(binRef);
             Assert.InRange(repairedLog, (long)(freshLog * 0.9), (long)(freshLog * 1.1));
@@ -232,8 +238,8 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>把某版本索引里指定路径的条目改成「老索引条目」（缺 head/tail），并写回云端。
-    /// 返回被改条目引用的 data blob 名。</summary>
+    /// <summary>Turn the entry for a given path in a given version index into a "legacy index entry" (no head/tail)
+    /// and write it back to the cloud. Returns the name of the data blob that entry references.</summary>
     private static async Task<string> StripHashesAsync(
         BackupInfoStore store, Account account, string container, int version, string indexBlob, string path)
     {
@@ -247,18 +253,20 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// A1：refs 跨全部引用版本，其先后取决于字典枚举顺序——这是未文档化的 BCL 实现细节，正是
-    /// 生产代码（见 BackupRepairer.cs 的注释）自己点明「不可靠」的那个属性，测试不能反过来依赖它。
-    /// 故用 [Theory] 覆盖两个方向：一次抹掉 v1 的 head/tail（v2 齐全），一次抹掉 v2 的（v1 齐全）。
-    /// 字典的插入顺序在两次运行里相同，只是「哪个版本齐全」互换，所以无论实际枚举顺序是 [v1,v2]
-    /// 还是 [v2,v1]，两个方向里必有一个「缺 head/tail 的条目」落在 refs[0] 的位置——只要生产代码退回
-    /// entry0，该方向就必定失败，不依赖猜测枚举顺序。
-    /// <para>修复前（用 refs[0]）：至少一个方向里 refs[0] 恰是被抹掉的条目，写出的元数据只有 len，
-    /// 该方向的 head/tail 断言失败。</para>
+    /// A1: refs spans every referencing version, and their order depends on dictionary enumeration order — an
+    /// undocumented BCL implementation detail, and precisely the property the production code (see the comment in
+    /// BackupRepairer.cs) itself calls out as "unreliable", so a test must not turn around and depend on it.
+    /// Hence a [Theory] covering both directions: once stripping v1's head/tail (v2 intact), once stripping v2's
+    /// (v1 intact). The dictionary insertion order is the same across both runs, only "which version is intact"
+    /// swaps, so whether the actual enumeration order is [v1,v2] or [v2,v1], one of the two directions is bound to
+    /// land the "entry missing head/tail" at refs[0] — and if the production code falls back to entry0, that
+    /// direction fails for certain, with no guessing about enumeration order.
+    /// <para>Before the fix (using refs[0]): in at least one direction refs[0] happened to be the stripped entry, the
+    /// metadata written out carried only len, and that direction's head/tail assertions failed.</para>
     /// </summary>
     [SkippableTheory]
-    [InlineData(1)] // 抹掉 v1（v2 齐全）——覆盖「坏条目排在枚举前面」的方向
-    [InlineData(2)] // 抹掉 v2（v1 齐全）——覆盖相反方向，使断言不再依赖具体枚举顺序
+    [InlineData(1)] // strip v1 (v2 intact) — covers the direction where the bad entry comes first in enumeration
+    [InlineData(2)] // strip v2 (v1 intact) — covers the opposite direction, so the assertions no longer depend on the exact order
     public async Task Repair_Prefers_A_Reference_That_Still_Has_Head_And_Tail_Hashes(int stripVersion)
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
@@ -273,7 +281,7 @@ public sealed class BackupRepairerTests : IDisposable
 
         try
         {
-            // v1 与 v2 都引用同一个 data blob（a.txt 内容未变）。
+            // Both v1 and v2 reference the same data blob (a.txt's content did not change).
             await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "two versions reference me");
             await backup.RunAsync(Req(account, name));
             await File.WriteAllTextAsync(Path.Combine(_src, "b.txt"), "just to create a second version");
@@ -287,13 +295,13 @@ public sealed class BackupRepairerTests : IDisposable
             var stripTarget = stripVersion == 1 ? v1 : v2;
             var goodVersion = stripVersion == 1 ? v2 : v1;
 
-            // 保留版本（未被抹掉的那个）的条目两项齐全——这就是修复应当拿来写元数据的那条。
+            // The entry in the version left alone (the one not stripped) has both fields — that is the one the repair should take its metadata from.
             var goodIndex = await store.ReadIndexAsync(account, name, goodVersion.IndexBlob, null);
             var goodEntry = goodIndex.Entries.Single(e => e.Path == "a.txt");
             Assert.NotNull(goodEntry.HeadHash);
             Assert.NotNull(goodEntry.TailHash);
 
-            // 另一版本的同一条目退化成「老索引条目」。
+            // The same entry in the other version is degraded into a "legacy index entry".
             var blobRef = await StripHashesAsync(store, account, name, stripVersion, stripTarget.IndexBlob, "a.txt");
             Assert.Equal(goodEntry.Storage!.Ref, blobRef);
 
@@ -311,9 +319,10 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// A2：一条引用都凑不出 head/tail 时，省略元数据是正确处置（写空串更糟），但那意味着该对象
-    /// 的碰撞防护被削弱（密钥化时等于没有），不留痕就是不可见的退化。必须记一条可审计的日志。
-    /// <para>修复前：没有任何日志，本测试的 Single 断言失败。</para>
+    /// A2: when not a single reference can supply head/tail, omitting the metadata is the correct handling (writing
+    /// empty strings would be worse), but it means this object's collision protection is weakened (in keyed mode,
+    /// gone entirely), and leaving no trace makes the degradation invisible. An auditable log entry is mandatory.
+    /// <para>Before the fix: there was no log at all, and this test's Single assertion failed.</para>
     /// </summary>
     [SkippableFact]
     public async Task Repair_Records_A_Warning_When_Collision_Metadata_Must_Be_Omitted()
@@ -343,12 +352,12 @@ public sealed class BackupRepairerTests : IDisposable
                 account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
             Assert.Contains("a.txt", report.Repaired);
 
-            // 退化确实发生了：写出的对象不带 head/tail。
+            // The degradation really did happen: the object written out carries no head/tail.
             var meta = (await container.GetBlobClient(blobRef).GetPropertiesAsync()).Value.Metadata;
             Assert.False(meta.ContainsKey("head"));
             Assert.False(meta.ContainsKey("tail"));
 
-            // 而且留下了恰好一条可审计的痕迹（不噪：每个受影响对象一条）。
+            // And it left exactly one auditable trace (not noisy: one per affected object).
             var degraded = Assert.Single(opLog.Entries, e => e.Message.Contains("Collision guard degraded"));
             Assert.Equal(OperationLogLevel.Warning, degraded.Level);
             Assert.Contains(blobRef, degraded.Message);
@@ -359,15 +368,19 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// 修复要从本地找一份内容一致的文件当修复源，此前那次读取毫无保护。而外层逐个 blob 的循环
-    /// 也没有兜底，于是一个读不开的本地文件会让**整个修复操作**中途失败——已经修好的 blob 早已
-    /// 上传，但它们的索引改动统一在循环之后才写回，那部分成果一并丢失。
+    /// A repair has to find a local file with matching content to use as the repair source, and that read previously
+    /// had no protection at all. The outer per-blob loop has no backstop either, so one unreadable local file failed
+    /// the **whole repair operation** midway — the already-repaired blobs had long since been uploaded, but their
+    /// index changes are all written back only after the loop, so that part of the work was lost along with it.
     /// <para>
-    /// 触发条件一点都不罕见：修复恰恰是在检查报出问题之后跑的。检查器现在会把读不开的本地文件
-    /// 报成 Missing 并跑完全程（上一轮修的），用户看完报告就来点修复——然后修复倒在同一个文件上。
+    /// The trigger is not rare in the slightest: a repair runs precisely after a check reported problems. The checker
+    /// now reports an unreadable local file as Missing and runs the whole way through (fixed in the previous round),
+    /// the user goes straight from reading the report to clicking repair — and then the repair falls over on that
+    /// very same file.
     /// </para>
-    /// <para>本测试让两个文件的云端 blob 都损坏，其中一个的本地副本读不开：另一个必须照常修好，
-    /// 读不开的那个走既有的「本地取不到 → 标记不可恢复」路径，而不是让整轮修复抛出。</para>
+    /// <para>This test corrupts the cloud blobs of two files, one of which has an unreadable local copy: the other
+    /// must still be repaired as usual, and the unreadable one takes the existing "not obtainable from local → mark
+    /// unrecoverable" path rather than making the whole repair throw.</para>
     /// </summary>
     [SkippableFact]
     public async Task An_Unreadable_Local_File_Does_Not_Abort_The_Whole_Repair()
@@ -387,27 +400,28 @@ public sealed class BackupRepairerTests : IDisposable
         {
             await File.WriteAllTextAsync(locked, "readable at backup time, locked before the repair");
             await File.WriteAllTextAsync(Path.Combine(_src, "fine.txt"), "stays readable throughout");
-            await backup.RunAsync(Req(account, name)); // 阈值为 1 → 两个各自成 data blob
+            await backup.RunAsync(Req(account, name)); // a threshold of 1 → each becomes its own data blob
 
-            // 两份云端数据都没了；修复要靠本地。
+            // Both cloud copies are gone; the repair has to rely on local.
             await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
 
-            File.SetUnixFileMode(locked, UnixFileMode.None); // 备份之后、修复之前变得读不开
+            File.SetUnixFileMode(locked, UnixFileMode.None); // becomes unreadable after the backup and before the repair
 
             var report = await repairer.RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
 
-            // 读得到的那个照常修好——修复前，整轮会在 locked.txt 上抛出，这一条根本走不到。
+            // The readable one is repaired as usual — before the fix, the whole run threw on locked.txt and this line was never reached.
             Assert.Contains("fine.txt", report.Repaired);
 
             var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions.Single().IndexBlob, null);
             var fineRef = idx.Entries.Single(e => e.Path == "fine.txt").Storage!.Ref;
-            Assert.True(await container.GetBlobClient(fineRef).ExistsAsync()); // 数据真的回到了云端
+            Assert.True(await container.GetBlobClient(fineRef).ExistsAsync()); // the data really is back in the cloud
 
-            // 读不开的那个走既有处置：本地拿不出可用副本 → 标记不可恢复，而不是拿它去覆盖云端。
+            // The unreadable one takes the existing handling: local cannot produce a usable copy → mark it
+            // unrecoverable, rather than using it to overwrite the cloud.
             Assert.Contains("locked.txt", report.Unrecoverable);
             Assert.DoesNotContain("locked.txt", report.Repaired);
         }
@@ -419,13 +433,15 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// 修复 pack 是**原地重写**同一个 packId 的归档，压法必须从 <see cref="PackInfo.StoreOnly"/> 取回来。
+    /// Repairing a pack **rewrites in place** the archive of the same packId, so the compression mode has to be
+    /// fetched back out of <see cref="PackInfo.StoreOnly"/>.
     /// <para>
-    /// 与单文件那条路刻意不同：那里逐路径重跑不压缩规则（<c>dontCompress</c> 参数），而一箱的压法
-    /// 在装箱时就已经定死并记进了包——这里连规则都不传（<c>dontCompress: null</c>），修出来的包
-    /// 照样得是只存不压的。
+    /// Deliberately different from the single-file path: there the don't-compress rules are re-run per path (the
+    /// <c>dontCompress</c> parameter), whereas a pack's compression mode was fixed at packing time and recorded on
+    /// the pack — here the rules are not even passed in (<c>dontCompress: null</c>) and the repaired pack must still
+    /// come out store-only.
     /// </para>
-    /// <para>修复前（硬编码 <c>StoreOnly: false</c>）：修好的包被重压成 -mx9 的小归档，尺寸断言失败。</para>
+    /// <para>Before the fix (hardcoded <c>StoreOnly: false</c>): the repaired pack was recompressed into a small -mx9 archive and the size assertion failed.</para>
     /// </summary>
     [SkippableFact]
     public async Task Repair_Keeps_A_Store_Only_Pack_Store_Only()
@@ -433,7 +449,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        // 高度可压：只存 ≈ 40 万字节，-mx9 只剩一两 KB，尺寸断言不会卡在边界上。
+        // Highly compressible: store-only is ≈ 400,000 bytes, -mx9 leaves one or two KB, so the size assertions do not sit on a boundary.
         const int filler = 200_000;
         var (backup, _, repairer, _, _, factory) = Build();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -444,7 +460,7 @@ public sealed class BackupRepairerTests : IDisposable
 
         try
         {
-            // 两个成员内容不同：同内容会被成员去重合成一份，那样这一箱就只剩一个成员了。
+            // The two members differ in content: identical content would be deduplicated into a single member, leaving this pack with only one.
             Directory.CreateDirectory(Path.Combine(_src, "logs"));
             await File.WriteAllTextAsync(Path.Combine(_src, "logs", "one.log"), new string('a', filler));
             await File.WriteAllTextAsync(Path.Combine(_src, "logs", "two.log"), new string('b', filler));
@@ -457,7 +473,7 @@ public sealed class BackupRepairerTests : IDisposable
                 Name = "photos",
                 Options = new BackupEngineOptions
                 {
-                    // 阈值抬高，让这两个文件走分组打包而不是单文件 blob。
+                    // Raise the threshold so these two files go through grouped packing rather than single-file blobs.
                     Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
                     DontCompress = new IgnoreRuleSet(["*.log"]),
                 },
@@ -473,7 +489,7 @@ public sealed class BackupRepairerTests : IDisposable
             var fresh = await SizeOfPackAsync();
             Assert.True(fresh > filler * 1.8, $"the fresh pack should be uncompressed, was {fresh}");
 
-            // 抹掉整个包 = 云端损坏。两个成员在本地都还在，修复应当从本地重建它。
+            // Wipe the whole pack = cloud-side corruption. Both members are still present locally, so the repair should rebuild it from local.
             await container.GetBlobClient(pack.Value.Blob).DeleteIfExistsAsync();
 
             var report = await repairer.RepairAsync(

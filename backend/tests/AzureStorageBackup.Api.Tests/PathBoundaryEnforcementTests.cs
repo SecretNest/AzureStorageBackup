@@ -35,9 +35,9 @@ public class PathBoundaryEnforcementTests
     private sealed record PathOutsideRootError(string error, string code);
 
     /// <summary>
-    /// 用 IBackupConfigService.CreateAsync（服务层，不经过带闸门的端点）直接写入一条越界配置，
-    /// 模拟「设置根之前就存在的旧配置」——四个端点闸门（/run、/restore、/repair、/check）与
-    /// 调度器闸门要防的正是这同一场景，绕过端点上的 create 闸门是唯一能造出这种数据的办法。
+    /// Writes one out-of-bounds config directly through IBackupConfigService.CreateAsync (the service layer, bypassing the guarded endpoint),
+    /// simulating "a legacy config that already existed before the root was set" — that is exactly the scenario the four endpoint guards
+    /// (/run, /restore, /repair, /check) and the scheduler guard exist to stop, and bypassing the create guard on the endpoint is the only way to produce such data.
     /// </summary>
     private static async Task<int> CreateOutOfRootConfigAsync(
         TestWebAppFactory factory, int accountId, string container, string name)
@@ -55,11 +55,11 @@ public class PathBoundaryEnforcementTests
     }
 
     /// <summary>
-    /// 与 <see cref="CreateOutOfRootConfigAsync"/> 对称的正向夹具：本地根落在 <c>Backup__Root</c>
-    /// **之内**的配置。用服务层而不是端点建，是为了让被测的四个闸门成为该请求路径上唯一
-    /// 一道边界检查——否则创建端点上的闸门先过一遍，正向用例会变成在测创建闸门。
-    /// <para><paramref name="accountId"/> 允许传一个不存在的账户：四个闸门都在账户查找之前，
-    /// 让账户缺失来终止请求，能拿到一个快速、确定、不碰网络的非 409 结果。</para>
+    /// The positive-direction fixture symmetric to <see cref="CreateOutOfRootConfigAsync"/>: a config whose local root lies
+    /// **inside** <c>Backup__Root</c>. It is built through the service layer rather than the endpoint so that the four guards under test are the only
+    /// boundary check on that request path — otherwise the guard on the create endpoint would run first and the positive cases would end up testing the create guard.
+    /// <para><paramref name="accountId"/> may be a nonexistent account: all four guards sit before the account lookup,
+    /// so letting the missing account terminate the request yields a fast, deterministic, network-free non-409 result.</para>
     /// </summary>
     private static async Task<int> CreateInRootConfigAsync(
         TestWebAppFactory factory, int accountId, string container, string name, string root)
@@ -137,11 +137,11 @@ public class PathBoundaryEnforcementTests
     }
 
     /// <summary>
-    /// TaskDispatcher 不经过端点：直接把一个「本地根落在配置的 Backup__Root 之外」的
-    /// 计划任务喂给调度器，确认它被跳过而不是尝试执行后失败——否则闸门只挡住了手动操作，
-    /// 无人看管运行的计划任务反而绕过了边界（设计要点）。
-    /// 用 IBackupConfigService.CreateAsync（服务层，不经过带闸门的端点）直接写入越界配置，
-    /// 模拟「设置根之前就存在的旧配置」这一被设计明确保留（而非删除）的场景。
+    /// TaskDispatcher does not go through the endpoints: feed the scheduler a scheduled task whose local root lies
+    /// outside the configured Backup__Root directly, and confirm it is skipped rather than attempted and then failing — otherwise the guards
+    /// would only block manual operations while the scheduled tasks running unattended slipped past the boundary (a design point).
+    /// The out-of-bounds config is written directly through IBackupConfigService.CreateAsync (the service layer, bypassing the guarded endpoint),
+    /// simulating "a legacy config that already existed before the root was set", a scenario the design explicitly preserves (rather than deletes).
     /// </summary>
     [Fact]
     public async Task Scheduled_Task_For_A_Config_Outside_The_Root_Is_Skipped_Not_Attempted()
@@ -185,23 +185,23 @@ public class PathBoundaryEnforcementTests
         {
             var configs = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
             var reloaded = await configs.GetAsync(configId, CancellationToken.None);
-            // 若边界检查缺失，调度器会真去跑一次备份，拿假账户信息必然失败，落库 Error。
-            // 停在 Normal/无错误证明它在触碰真实执行之前就被拦下了。
+            // Without the boundary check the scheduler would really run a backup, inevitably fail on the fake account credentials, and persist Error.
+            // Stopping at Normal with no error proves it was intercepted before touching real execution.
             Assert.Equal(BackupStatus.Normal, reloaded!.Status);
             Assert.Null(reloaded.LastError);
         }
 
-        // 忙碌锁必须已释放（正常 finally 路径），而不是卡死在「跳过」这条分支里。
+        // The busy lock must have been released (the normal finally path), not left stuck in the "skipped" branch.
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
         Assert.True(busy.TryAcquire(acct.Id, container));
         busy.Release(acct.Id, container);
     }
 
     /// <summary>
-    /// F1：调度器边界跳过必须留下操作员能在 UI 看到的痕迹（与忙碌跳过分支同形），
-    /// 不能只是一条容器日志里的 LogError——单用户无人值守部署下没人会翻它。
-    /// 断言写入的是 Error 级别、source 带 account+container 维度、消息同时点名违规的
-    /// 本地根与当前配置的根，二者缺一不可才「actionable」。
+    /// F1: a scheduler boundary skip must leave a trace the operator can see in the UI (the same shape as the busy-skip branch),
+    /// not just a LogError in the container log — in a single-user unattended deployment nobody is ever going to dig through that.
+    /// The assertions cover: the entry is written at Error level, the source carries the account+container dimensions, and the message names both the offending
+    /// local root and the currently configured root — it is only "actionable" with both.
     /// </summary>
     [Fact]
     public async Task Scheduled_Task_Skip_For_Config_Outside_The_Root_Writes_An_Operation_Log_Entry()
@@ -239,8 +239,8 @@ public class PathBoundaryEnforcementTests
             e.Message.Contains(root, StringComparison.Ordinal));
     }
 
-    /// <summary>F2：/run 的边界闸门（BackupConfigEndpoints.cs :179）目前没有任何回归测试——
-    /// 删掉那一行不会让任何测试变红。</summary>
+    /// <summary>F2: the boundary guard on /run (BackupConfigEndpoints.cs :179) currently has no regression test at all —
+    /// deleting that line would turn no test red.</summary>
     [Fact]
     public async Task Run_Endpoint_Rejects_A_Config_Outside_The_Root()
     {
@@ -260,8 +260,8 @@ public class PathBoundaryEnforcementTests
         Assert.Equal("path_outside_root", body!.code);
     }
 
-    /// <summary>F2：/restore 的边界闸门（BackupConfigEndpoints.cs :202）目前没有任何回归测试。
-    /// TargetRoot 留空 → 端点落回 config.LocalRoot（越界值），闸门必须照样拦下。</summary>
+    /// <summary>F2: the boundary guard on /restore (BackupConfigEndpoints.cs :202) currently has no regression test at all.
+    /// Leaving TargetRoot empty → the endpoint falls back to config.LocalRoot (the out-of-bounds value), and the guard must stop it all the same.</summary>
     [Fact]
     public async Task Restore_Endpoint_Rejects_A_Config_Outside_The_Root()
     {
@@ -282,7 +282,7 @@ public class PathBoundaryEnforcementTests
         Assert.Equal("path_outside_root", body!.code);
     }
 
-    /// <summary>F2：/repair 的边界闸门（BackupConfigEndpoints.cs :372）目前没有任何回归测试。</summary>
+    /// <summary>F2: the boundary guard on /repair (BackupConfigEndpoints.cs :372) currently has no regression test at all.</summary>
     [Fact]
     public async Task Repair_Endpoint_Rejects_A_Config_Outside_The_Root()
     {
@@ -302,7 +302,7 @@ public class PathBoundaryEnforcementTests
         Assert.Equal("path_outside_root", body!.code);
     }
 
-    /// <summary>F2：/check 的边界闸门（BackupConfigEndpoints.cs :422）目前没有任何回归测试。</summary>
+    /// <summary>F2: the boundary guard on /check (BackupConfigEndpoints.cs :422) currently has no regression test at all.</summary>
     [Fact]
     public async Task Check_Endpoint_Rejects_A_Config_Outside_The_Root()
     {
@@ -323,12 +323,12 @@ public class PathBoundaryEnforcementTests
     }
 
     /// <summary>
-    /// 迁移设计文档（docs/change-local-root-design.md「测试」）列的「越界路径 → 409 +
-    /// code: path_outside_root」在 preview 端点这一行此前没有任何测试兜住——闸门就在
-    /// PrepareLocalRootAsync 里（BackupConfigEndpoints.cs :844），删掉那一行不会让任何
-    /// 测试变红。目标根越不越界，跟被迁移配置自己的 LocalRoot 在界内界外是两件事：
-    /// 这里用 CreateInRootConfigAsync 造一条干净的界内配置，只让「新根越界」单独触发闸门，
-    /// 不与配置自身越界的闸门（上面几条 F2 用例测的是那个）混在一起。
+    /// The "out-of-bounds path → 409 + code: path_outside_root" row listed in the migration design doc
+    /// (docs/change-local-root-design.md, "Tests") had nothing covering it on the preview endpoint — the guard sits right inside
+    /// PrepareLocalRootAsync (BackupConfigEndpoints.cs :844), and deleting that line would turn no
+    /// test red. Whether the target root is out of bounds and whether the migrated config's own LocalRoot is in or out of bounds are two different things:
+    /// here CreateInRootConfigAsync builds a clean in-bounds config so that only "the new root is out of bounds" trips the guard,
+    /// without mixing in the guard for a config that is itself out of bounds (which is what the F2 cases above test).
     /// </summary>
     [Fact]
     public async Task LocalRoot_Preview_Endpoint_Rejects_A_New_Root_Outside_The_Root()
@@ -352,10 +352,10 @@ public class PathBoundaryEnforcementTests
     }
 
     /// <summary>
-    /// 与上面对称：apply 端点（/local-root，不带 /preview）复用同一个 PrepareLocalRootAsync，
-    /// 闸门必须先于「落库」执行。目标根越界时，除了断言 409 + path_outside_root 之外，还要
-    /// 断言配置在库里的 LocalRoot 原封不动——闸门若被绕过或摆错了位置（例如摆到
-    /// ChangeLocalRootAsync 之后），最先暴露出来的就是「越界请求居然真的写进了库」。
+    /// Symmetric to the one above: the apply endpoint (/local-root, without /preview) reuses the same PrepareLocalRootAsync,
+    /// and the guard must run before anything is persisted. When the target root is out of bounds, besides asserting 409 + path_outside_root we also
+    /// assert that the config's LocalRoot in the database is untouched — if the guard were bypassed or placed wrong (say, after
+    /// ChangeLocalRootAsync), the first thing to surface would be "an out-of-bounds request actually got written to the database".
     /// </summary>
     [Fact]
     public async Task LocalRoot_Apply_Endpoint_Rejects_A_New_Root_Outside_The_Root_And_Does_Not_Write()
@@ -384,12 +384,12 @@ public class PathBoundaryEnforcementTests
         Assert.Equal(originalRoot, reloaded!.LocalRoot);
     }
 
-    // ---- F3（终审）：四个闸门的**放行**方向 ----
-    // 上面五条只钉住拒绝方向。少了放行方向，任何一个闸门把参数传错——例如
-    // `PathBoundaryGuard.Blocked(boundary, config.ContainerName)`——全部 510 条测试仍会绿：
-    // 容器名不是绝对路径，IsInside 直接返回 false，拒绝用例照样 409。
-    // 下面每个端点各一条：本地根在根内 → 必须走过闸门，拿到该端点自己的后续结果。
-    // 用一个不存在的账户 id，好让请求在闸门之后、任何网络动作之前就确定性地终止。
+    // ---- F3 (final review): the **pass-through** direction of the four guards ----
+    // The five cases above only nail down the rejection direction. Without the pass-through direction, any guard passing the wrong argument — say
+    // `PathBoundaryGuard.Blocked(boundary, config.ContainerName)` — would leave all 510 tests green:
+    // a container name is not an absolute path, IsInside simply returns false, and the rejection cases still get their 409.
+    // One case per endpoint below: local root inside the root → it must get past the guard and reach that endpoint's own subsequent result.
+    // A nonexistent account id is used so the request terminates deterministically after the guard and before any network activity.
 
     private const int MissingAccountId = 999999;
 
@@ -418,7 +418,7 @@ public class PathBoundaryEnforcementTests
         var configId = await CreateInRootConfigAsync(
             factory, MissingAccountId, "restore-pass-test-container", "inside-root-restore", root);
 
-        // TargetRoot 留空 → 端点落回 config.LocalRoot（根内），与拒绝用例走的是同一条取值分支。
+        // Leaving TargetRoot empty → the endpoint falls back to config.LocalRoot (inside the root), the same value branch the rejection case takes.
         var res = await client.PostAsJsonAsync(
             $"/api/backup-configs/{configId}/restore", new RestoreRequestBody(null, null));
 
@@ -452,15 +452,15 @@ public class PathBoundaryEnforcementTests
 
         var res = await client.PostAsync($"/api/backup-configs/{configId}/check", null);
 
-        // 检查改成后台 job 之后与 /repair 同形：越界会在闸门处拿到 400/409，拿到 202
-        // 就证明这一步已经走过去了（账户不存在的失败此后体现在运行态里，不在响应码上）。
+        // Since check became a background job it has the same shape as /repair: out of bounds gets 400/409 at the guard, so getting 202
+        // proves this step has already been passed (the nonexistent-account failure shows up later in the run state, not in the status code).
         Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
     }
 
     /// <summary>
-    /// F1（终审）：picker 的「Use this folder」回路。浏览端点返回的 <c>path</c> 会被前端原样
-    /// 当作 <c>localRoot</c> POST 回来——配了**相对**根时，这个值必须仍然能过创建端点的闸门。
-    /// 之前它是操作员敲的相对字符串，IsInside 只认绝对输入，于是选中根目录本身必然 409。
+    /// F1 (final review): the picker's "Use this folder" round trip. The <c>path</c> the browse endpoint returns gets POSTed back
+    /// verbatim by the frontend as <c>localRoot</c> — with a **relative** root configured, that value must still get past the create endpoint's guard.
+    /// It used to be the relative string the operator typed, and since IsInside only accepts absolute input, picking the root directory itself was guaranteed to 409.
     /// </summary>
     [Fact]
     public async Task The_Browse_Default_Path_Can_Be_Used_As_A_Local_Root_When_The_Root_Is_Relative()

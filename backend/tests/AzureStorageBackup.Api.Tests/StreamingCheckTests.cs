@@ -5,9 +5,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 内容级检查改为流式比对之后的验收（第 1 期）。三个承重点：
-/// 加密 + 分卷的归档能逐成员流式核对通过；归档里少了成员必须报**损坏**而不是通过
-/// （`x -so` 对不存在的成员输出为空却退出码 0）；读到的字节数与索引记录的长度不符同样判失败。
+/// Acceptance for the content-level check after it moved to streaming comparison (phase 1). Three load-bearing
+/// points: an encrypted + multi-volume archive passes member-by-member streaming verification; a member missing from
+/// the archive must be reported as **corruption** rather than passing (`x -so` produces empty output yet exits 0 for
+/// a member that does not exist); and a byte count that disagrees with the length recorded in the index also fails.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class StreamingCheckTests : IDisposable
@@ -87,7 +88,8 @@ public sealed class StreamingCheckTests : IDisposable
 
         try
         {
-            // 一个大文件走单文件 blob（会分卷），几个小文件走 pack；空文件也放一个。
+            // One large file goes to a single-file blob (which gets split), a few small ones go into a pack; throw
+            // in an empty file too.
             await WriteSourceAsync("big.bin", 400_000);
             await WriteSourceAsync("dir/small-a.bin", 3_000);
             await WriteSourceAsync("dir/small-b.bin", 7_000);
@@ -139,8 +141,9 @@ public sealed class StreamingCheckTests : IDisposable
                 ?? throw new InvalidOperationException("no info file");
             var packId = Assert.Single(info.Packs.Keys);
 
-            // 把包换成一个**少了 dir/lost.bin** 的归档，并把信息文件里的分卷尺寸同步改掉——
-            // 否则「存在+尺寸」那一级就先把它拦下了，内容级根本轮不到，测的就不是本期的改动。
+            // Swap the pack for an archive that is **missing dir/lost.bin**, and update the volume sizes in the
+            // info file to match — otherwise the "existence + size" level catches it first, the content level never
+            // gets a turn, and the test would not be exercising this phase's change at all.
             var forged = Path.Combine(_temp, "forged.7z");
             Directory.CreateDirectory(_temp);
             await new SevenZipCompressor().CompressAsync(
@@ -187,8 +190,9 @@ public sealed class StreamingCheckTests : IDisposable
                 Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
             });
 
-            // 老索引可能没有 FullHash（字段可空）。此时长度是唯一的把关手段——把它抹掉、
-            // 长度改错一个字节，检查仍必须报损坏；否则"空输出 + 退出码 0"就能一路通过。
+            // A legacy index may have no FullHash (the field is nullable). Length is then the only line of defence
+            // — strip the hash, put the length off by one byte, and the check must still report corruption;
+            // otherwise "empty output + exit code 0" sails straight through.
             var info = await store.ReadInfoAsync(account, name, null)!
                 ?? throw new InvalidOperationException("no info file");
             var version = info.Versions[^1];
@@ -233,7 +237,8 @@ public sealed class StreamingCheckTests : IDisposable
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
             Assert.True(report.Ok);
 
-            // 校验工作区整个被清掉：流式之后连"解出来的成员"这一步都不该在磁盘上出现过。
+            // The verification workspace is wiped entirely: now that it is streaming, not even "the extracted
+            // member" step should ever have appeared on disk.
             var checkTemp = Path.Combine(_temp, "check");
             Assert.True(!Directory.Exists(checkTemp)
                 || !Directory.EnumerateFileSystemEntries(checkTemp, "*", SearchOption.AllDirectories).Any());

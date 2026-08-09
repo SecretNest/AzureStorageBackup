@@ -11,10 +11,10 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 备份生命周期端到端链（真实 Azurite + 真实 7-Zip，不 mock）：
-/// 全新备份 → 增量（实测去重）→ 死重压实 → 只读检查 → 人为破坏云端 → 从本地修复 → 逐字节还原。
-/// 一棵真实文件树按顺序走完整条链，每一阶段断言可观察的业务结果；终点比对还原字节与最初写入完全一致。
-/// 加密与不加密各跑一遍——密文入库 + 咽喉解密重构后，加密路径风险最高。
+/// The end-to-end backup lifecycle chain (real Azurite + real 7-Zip, nothing mocked):
+/// fresh backup → incremental (dedup measured for real) → dead-weight compaction → read-only check → deliberate cloud damage → repair from local → byte-for-byte restore.
+/// One real file tree walks the whole chain in order, each stage asserting an observable business result; at the far end the restored bytes are compared against what was originally written.
+/// Encrypted and unencrypted each get a run — after the "ciphertext into the database + decrypt at the throat" rework, the encrypted path carries the most risk.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupLifecycleTests : IDisposable
@@ -22,7 +22,7 @@ public sealed class BackupLifecycleTests : IDisposable
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-    /// <summary>源文件的基准 mtime：每次写入递增一分钟，保证「等长改写」也一定被差异检测识别为变更。</summary>
+    /// <summary>Baseline mtime for the source files: every write advances it by a minute, so even a "same-length rewrite" is guaranteed to be recognised as a change by the differ.</summary>
     private static readonly DateTime MtimeBase = new(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
     private readonly string _base;
@@ -73,7 +73,7 @@ public sealed class BackupLifecycleTests : IDisposable
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
-    /// <summary>记录每一次 data/pack 对象上传的 blob 名——增量阶段据此实测「未改动文件没有重传」。</summary>
+    /// <summary>Records the blob name of every data/pack object upload — the incremental stage uses it to actually measure that "unchanged files were not re-uploaded".</summary>
     private sealed class RecordingUploader(IBlobUploader inner) : IBlobUploader
     {
         private readonly List<string> _names = [];
@@ -111,7 +111,7 @@ public sealed class BackupLifecycleTests : IDisposable
         IBackupInfoStore Store,
         BlobClientFactory Factory);
 
-    /// <summary>按生产接线组装整条链：本地权威状态机（TrackedInfoStore + LocalIndexCache）贯穿备份/清理/压实/修复。</summary>
+    /// <summary>Wires up the whole chain the way production does: the local authoritative state machine (TrackedInfoStore + LocalIndexCache) runs through backup/cleanup/compaction/repair.</summary>
     private Rig Build()
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
@@ -149,15 +149,15 @@ public sealed class BackupLifecycleTests : IDisposable
         Password = password,
         Options = new BackupEngineOptions
         {
-            // 20K 阈值：docs/ 的小文件成组进 pack，media/ 的大文件走单文件 data blob——两条存储路径都覆盖。
+            // 20K threshold: the small files under docs/ group into a pack while the big ones under media/ take the single-file data blob path — both storage paths covered.
             Plan = new PlanOptions { SingleFileThresholdBytes = 20_000 },
             Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = maxVersions },
         },
     };
 
-    // ───────────────────────── 源树与快照 ─────────────────────────
+    // ───────────────────────── Source tree and snapshots ─────────────────────────
 
-    /// <summary>写文件并赋予唯一递增的 mtime。等长改写若不动 mtime 会被差异检测判为未变，故必须显式推进。</summary>
+    /// <summary>Writes a file and gives it a unique, increasing mtime. A same-length rewrite that leaves the mtime alone is judged unchanged by the differ, so it has to be advanced explicitly.</summary>
     private void Write(string rel, byte[] content)
     {
         var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
@@ -168,7 +168,7 @@ public sealed class BackupLifecycleTests : IDisposable
 
     private void WriteText(string rel, string text) => Write(rel, Encoding.UTF8.GetBytes(text));
 
-    /// <summary>确定性的不可压缩内容——使 pack/blob 体积与成员数成正比，压实的体积回收才可观测。</summary>
+    /// <summary>Deterministic incompressible content — it keeps pack/blob size proportional to member count, which is what makes compaction's size reclamation observable at all.</summary>
     private static byte[] Rand(int size, int seed)
     {
         var buf = new byte[size];
@@ -176,7 +176,7 @@ public sealed class BackupLifecycleTests : IDisposable
         return buf;
     }
 
-    /// <summary>当前源树快照：相对路径 → (内容字节, mtime)。还原后据此逐字节比对。</summary>
+    /// <summary>Snapshot of the current source tree: relative path → (content bytes, mtime). The byte-for-byte comparison after a restore goes against this.</summary>
     private Dictionary<string, (byte[] Bytes, DateTime Mtime)> Snapshot()
     {
         var map = new Dictionary<string, (byte[], DateTime)>(StringComparer.Ordinal);
@@ -188,14 +188,14 @@ public sealed class BackupLifecycleTests : IDisposable
     private static string Rel(string root, string full) =>
         Path.GetRelativePath(root, full).Replace(Path.DirectorySeparatorChar, '/');
 
-    /// <summary>还原树必须与快照完全一致：文件集合相同、每个文件逐字节相同、mtime 由索引元数据复原。</summary>
+    /// <summary>The restored tree must match the snapshot exactly: the same set of files, every file byte for byte identical, mtime restored from the index metadata.</summary>
     private static void AssertTreeEquals(
         Dictionary<string, (byte[] Bytes, DateTime Mtime)> expected, string target, string label)
     {
         var actual = Directory.EnumerateFiles(target, "*", SearchOption.AllDirectories)
             .ToDictionary(f => Rel(target, f), StringComparer.Ordinal);
 
-        // 目录结构一致：多一个文件或少一个文件都失败。
+        // Directory structure matches: one file too many or one too few and it fails.
         Assert.Equal(expected.Keys.Order(), actual.Keys.Order());
 
         foreach (var (rel, exp) in expected)
@@ -207,7 +207,7 @@ public sealed class BackupLifecycleTests : IDisposable
         }
     }
 
-    /// <summary>还原某版本到全新空目录并全量比对。FailedFiles 必须为 0——组下载/解压失败只计数不抛异常。</summary>
+    /// <summary>Restores a version into a brand-new empty directory and compares everything. FailedFiles must be 0 — a group download/extract failure is only counted, never thrown.</summary>
     private async Task<string> RestoreAndAssertAsync(
         Rig rig, Account account, string container, string? password, int version,
         Dictionary<string, (byte[] Bytes, DateTime Mtime)> expected, string label)
@@ -225,14 +225,14 @@ public sealed class BackupLifecycleTests : IDisposable
         });
 
         Assert.Equal(version, result.Version);
-        Assert.Equal(0, result.FailedFiles);   // 失败被吞成计数，不断言就等于没断言
-        Assert.Equal(0, result.SkippedFiles);  // 目标是空目录，不该有跳过
+        Assert.Equal(0, result.FailedFiles);   // failures are swallowed into a count, so not asserting is the same as not testing
+        Assert.Equal(0, result.SkippedFiles);  // the target is an empty directory, nothing should be skipped
         Assert.Equal(expected.Count, result.RestoredFiles);
         AssertTreeEquals(expected, target, label);
         return target;
     }
 
-    // ───────────────────────── 云端探针与破坏手段 ─────────────────────────
+    // ───────────────────────── Cloud probes and damage tools ─────────────────────────
 
     private static StorageRef StorageOf(VersionIndex index, string path) =>
         index.Entries.Single(e => e.Path == path).Storage
@@ -248,7 +248,7 @@ public sealed class BackupLifecycleTests : IDisposable
                 $"missing blob {BlobNameOf(e.Storage!)} for {e.Path}");
     }
 
-    /// <summary>容器全量快照（名字 → 长度 + ETag）：用于断言「不带修复的检查是只读的」。</summary>
+    /// <summary>Full snapshot of the container (name → length + ETag): used to assert that "a check without repair is read-only".</summary>
     private static async Task<Dictionary<string, (long Length, string ETag)>> BlobFingerprintAsync(BlobContainerClient cc)
     {
         var map = new Dictionary<string, (long, string)>(StringComparer.Ordinal);
@@ -257,7 +257,7 @@ public sealed class BackupLifecycleTests : IDisposable
         return map;
     }
 
-    /// <summary>破坏手段一：整块删除某归档的全部分卷（模拟对象被误删/生命周期策略清掉）。</summary>
+    /// <summary>Damage tool one: delete every volume of an archive outright (simulating an object wrongly deleted, or swept away by a lifecycle policy).</summary>
     private static async Task DeleteArchiveAsync(BlobContainerClient cc, string baseRef)
     {
         var deleted = 0;
@@ -271,7 +271,7 @@ public sealed class BackupLifecycleTests : IDisposable
         Assert.True(deleted > 0, $"nothing deleted for {baseRef} — the damage step itself is broken");
     }
 
-    /// <summary>破坏手段二：**等长**改写内容（位腐）。体积不变故 HEAD 级检查看不见，只有下载重算 hash 才能发现。</summary>
+    /// <summary>Damage tool two: rewrite the content **at the same length** (bit rot). The size does not change, so a HEAD-level check cannot see it; only downloading and recomputing the hash finds it.</summary>
     private static async Task CorruptInPlaceAsync(BlobContainerClient cc, string blobName)
     {
         var blob = cc.GetBlobClient(blobName);
@@ -282,10 +282,10 @@ public sealed class BackupLifecycleTests : IDisposable
             new BlobUploadOptions { Metadata = new Dictionary<string, string>(props.Metadata) });
 
         var after = (await blob.GetPropertiesAsync()).Value.ContentLength;
-        Assert.Equal(props.ContentLength, after); // 破坏必须不改变体积，否则这一步没有区分度
+        Assert.Equal(props.ContentLength, after); // the damage must not change the size, or this step has no discriminating power
     }
 
-    /// <summary>断言某归档确实是加密归档：不给密码解不开、给密码能解开。</summary>
+    /// <summary>Asserts an archive really is an encrypted one: it will not open without the password, and does open with it.</summary>
     private async Task AssertArchiveIsEncryptedAsync(BlobContainerClient cc, string baseRef, string password)
     {
         var dir = Path.Combine(_temp, "encprobe", Guid.NewGuid().ToString("N"));
@@ -298,11 +298,11 @@ public sealed class BackupLifecycleTests : IDisposable
         await codec.ExtractAsync(first, Path.Combine(dir, "withpw"), password);
     }
 
-    // ───────────────────────── 生命周期主链 ─────────────────────────
+    // ───────────────────────── The lifecycle main chain ─────────────────────────
 
     [SkippableTheory]
-    [InlineData("correct horse battery staple")] // 加密：本轮改动风险最高的路径，必须走完整条链
-    [InlineData(null)]                           // 不加密
+    [InlineData("correct horse battery staple")] // encrypted: the highest-risk path in this round of changes, it has to walk the whole chain
+    [InlineData(null)]                           // unencrypted
     public async Task Full_Lifecycle_From_First_Backup_Through_Compaction_Damage_Repair_And_Restore(string? password)
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
@@ -316,51 +316,51 @@ public sealed class BackupLifecycleTests : IDisposable
 
         try
         {
-            // ═══ 阶段 1：全新备份 ═══
-            Write("docs/a.txt", Rand(4000, 11));   // 同目录 5 个小文件 → 合成一个 pack
+            // ═══ Stage 1: fresh backup ═══
+            Write("docs/a.txt", Rand(4000, 11));   // 5 small files in the same directory → merged into one pack
             Write("docs/b.txt", Rand(4000, 12));
             Write("docs/c.txt", Rand(4000, 13));
             Write("docs/d.txt", Rand(4000, 14));
             Write("docs/e.txt", Rand(4000, 15));
-            Write("media/photo.bin", Rand(40_000, 21)); // ≥20K 阈值 → 单文件 data blob
+            Write("media/photo.bin", Rand(40_000, 21)); // ≥20K threshold → single-file data blob
             Write("media/clip.bin", Rand(30_000, 22));
             WriteText("notes/deep/readme.txt", "nested note, first revision");
             WriteText("top.txt", "root level file, first revision");
-            Directory.CreateDirectory(Path.Combine(_root, "empty")); // 空目录须入索引并在还原时重建
+            Directory.CreateDirectory(Path.Combine(_root, "empty")); // an empty directory has to enter the index and be recreated on restore
 
             var snap1 = Snapshot();
             var r1 = await rig.Backup.RunAsync(Request(account, name, password, maxVersions: 2));
 
             Assert.Equal(1, r1.Version);
-            Assert.Equal(snap1.Count, r1.ChangedFiles); // 首次备份全部文件皆为变更
+            Assert.Equal(snap1.Count, r1.ChangedFiles); // on a first backup every file counts as changed
 
             var info1 = await rig.Store.ReadInfoAsync(account, name, password);
             Assert.NotNull(info1);
             Assert.Equal(password is not null, info1!.Backup.Encrypted);
             Assert.Single(info1.Versions);
-            // 加密/非加密走不同的信息文件 blob 名。
+            // Encrypted and unencrypted use different info-file blob names.
             Assert.True(await cc.GetBlobClient(password is null
                 ? BackupDiscovery.IndexBlobName
                 : BackupDiscovery.EncryptedIndexBlobName).ExistsAsync());
 
             var idx1 = await rig.Store.ReadIndexAsync(account, name, info1.Versions[0].IndexBlob, password);
-            Assert.Equal(snap1.Count, idx1.Entries.Count);                             // 条目数 == 本地文件数
-            Assert.Equal(snap1.Keys.Order(), idx1.Entries.Select(e => e.Path).Order()); // 且逐一对应
+            Assert.Equal(snap1.Count, idx1.Entries.Count);                             // entry count == local file count
+            Assert.Equal(snap1.Keys.Order(), idx1.Entries.Select(e => e.Path).Order()); // and they correspond one for one
             Assert.Contains("empty", idx1.EmptyDirs);
             await AssertReferencedBlobsExistAsync(cc, idx1);
 
             var docsPack = StorageOf(idx1, "docs/a.txt");
             Assert.Equal("pack", docsPack.Kind);
             foreach (var p in new[] { "docs/b.txt", "docs/c.txt", "docs/d.txt", "docs/e.txt" })
-                Assert.Equal(docsPack.Ref, StorageOf(idx1, p).Ref); // 5 个成员同属一个 pack
+                Assert.Equal(docsPack.Ref, StorageOf(idx1, p).Ref); // all 5 members belong to the same pack
             var clip1 = StorageOf(idx1, "media/clip.bin");
             Assert.Equal("blob", clip1.Kind);
 
-            // 全新备份写入的碰撞检测元数据基线（len/head/tail，或加密时的不透明 v）——修复后须与此完全一致。
+            // Baseline of the collision-detection metadata a fresh backup writes (len/head/tail, or the opaque v when encrypted) — after a repair it must match this exactly.
             var clipMetaBaseline = (await cc.GetBlobClient(clip1.Ref).GetPropertiesAsync()).Value.Metadata;
             Assert.NotEmpty(clipMetaBaseline);
 
-            // 加密备份的数据对象是密钥化地址，明文 data/{fullHash} 不得存在（防指纹识别）。
+            // An encrypted backup's data objects live at keyed addresses; the plaintext data/{fullHash} must not exist (anti-fingerprinting).
             if (password is not null)
             {
                 var clipHash = idx1.Entries.Single(e => e.Path == "media/clip.bin").FullHash!;
@@ -368,35 +368,35 @@ public sealed class BackupLifecycleTests : IDisposable
                 Assert.False(await cc.GetBlobClient($"data/{clipHash}").ExistsAsync());
             }
 
-            // ═══ 阶段 2：增量备份（改 3 个、增 1 个、删 1 棵子树）═══
+            // ═══ Stage 2: incremental backup (3 modified, 1 added, 1 subtree deleted) ═══
             _uploader.Reset();
-            Write("docs/a.txt", Rand(4000, 111)); // 等长不同内容
+            Write("docs/a.txt", Rand(4000, 111)); // same length, different content
             Write("docs/b.txt", Rand(4000, 112));
             Write("docs/c.txt", Rand(4000, 113));
             Write("media/photo.bin", Rand(40_000, 121));
-            Write("media/copy.bin", snap1["media/clip.bin"].Bytes); // 新增，内容与 clip.bin 完全相同
+            Write("media/copy.bin", snap1["media/clip.bin"].Bytes); // newly added, content exactly the same as clip.bin
             Directory.Delete(Path.Combine(_root, "notes"), recursive: true);
 
             var snap2 = Snapshot();
             var r2 = await rig.Backup.RunAsync(Request(account, name, password, maxVersions: 2));
 
             Assert.Equal(2, r2.Version);
-            Assert.Equal(5, r2.ChangedFiles); // a/b/c/photo 改 + copy 增；删除不计入变更
+            Assert.Equal(5, r2.ChangedFiles); // a/b/c/photo modified + copy added; deletions do not count as changes
 
             var info2 = await rig.Store.ReadInfoAsync(account, name, password);
             Assert.Equal([1, 2], info2!.Versions.Select(v => v.Version));
             var idx2 = await rig.Store.ReadIndexAsync(account, name, info2.Versions[^1].IndexBlob, password);
-            Assert.Equal(snap2.Keys.Order(), idx2.Entries.Select(e => e.Path).Order()); // 删掉的文件已不在索引
+            Assert.Equal(snap2.Keys.Order(), idx2.Entries.Select(e => e.Path).Order()); // the deleted files are gone from the index
             await AssertReferencedBlobsExistAsync(cc, idx2);
 
-            // 去重实测（增量的核心价值）：未改动文件仍指向 v1 的同一存储对象……
+            // Dedup measured for real (the core value of an incremental): unchanged files still point at the very same v1 storage object...
             foreach (var p in new[] { "docs/d.txt", "docs/e.txt" })
                 Assert.Equal(docsPack.Ref, StorageOf(idx2, p).Ref);
             Assert.Equal(clip1.Ref, StorageOf(idx2, "media/clip.bin").Ref);
-            // ……新增的同内容文件也命中既有对象（跨版本内容寻址去重）……
+            // ...a newly added file with identical content hits the existing object too (cross-version content-addressed dedup)...
             Assert.Equal(clip1.Ref, StorageOf(idx2, "media/copy.bin").Ref);
 
-            // ……而且本轮上传的对象**恰好只有**变更内容产生的新对象：任何一次多余重传都会让这条断言失败。
+            // ...and the objects uploaded this round are **exactly and only** the new ones produced by changed content: a single redundant re-upload fails this assertion.
             var docsPack2 = StorageOf(idx2, "docs/a.txt");
             var photo2 = StorageOf(idx2, "media/photo.bin");
             Assert.NotEqual(docsPack.Ref, docsPack2.Ref);
@@ -404,17 +404,17 @@ public sealed class BackupLifecycleTests : IDisposable
                 new[] { $"packs/{docsPack2.Ref}.7z", photo2.Ref }.Order(),
                 _uploader.Uploads.Order());
 
-            // ═══ 阶段 6a：还原版本 1 与版本 2 ═══
-            // 版本 1 稍后会被保留策略退役，故在此先验证它可逐字节还原。
+            // ═══ Stage 6a: restore version 1 and version 2 ═══
+            // Version 1 gets retired by the retention policy shortly, so verify here first that it restores byte for byte.
             var v1Dir = await RestoreAndAssertAsync(rig, account, name, password, 1, snap1, "v1");
             Assert.True(Directory.Exists(Path.Combine(v1Dir, "empty")), "empty directory was not recreated");
             await RestoreAndAssertAsync(rig, account, name, password, 2, snap2, "v2");
 
-            // ═══ 阶段 3：死重压实 ═══
-            // docsPack 有 5 个成员；a/b/c 自 v2 起改到新 pack，d 在 v3 再改。v1 退役后 docsPack 仅剩
-            // d（v2 引用）与 e（v2/v3 引用）有效 → 死重 3/5 = 60% > 30% 阈值 → 原地重压。
-            // 注意 d 的本地文件此时已是 v3 内容，与 pack 内的 v1 内容不符 → 压实必须下载旧 pack 解压补齐
-            // （加密备份即在此走「下载 + 用密码解压」路径）。
+            // ═══ Stage 3: dead-weight compaction ═══
+            // docsPack has 5 members; a/b/c moved to a new pack from v2 on, and d changes again in v3. Once v1 retires,
+            // only d (referenced by v2) and e (referenced by v2/v3) are still live in docsPack → dead weight 3/5 = 60% > the 30% threshold → repack in place.
+            // Note that d's local file is the v3 content by now, which does not match the v1 content inside the pack → compaction has to download the old pack and extract to fill the gap
+            // (this is exactly where an encrypted backup takes the "download + extract with the password" path).
             var packBlob = $"packs/{docsPack.Ref}.7z";
             var packSizeBefore = (await cc.GetBlobClient(packBlob).GetPropertiesAsync()).Value.ContentLength;
 
@@ -425,23 +425,23 @@ public sealed class BackupLifecycleTests : IDisposable
             Assert.Equal(3, r3.Version);
 
             var info3 = await rig.Store.ReadInfoAsync(account, name, password);
-            Assert.Equal([2, 3], info3!.Versions.Select(v => v.Version)); // v1 已退役
+            Assert.Equal([2, 3], info3!.Versions.Select(v => v.Version)); // v1 has retired
 
             var compacted = info3.Packs[docsPack.Ref];
-            Assert.Equal(2, compacted.Members.Count);   // 死重成员 a/b/c 被丢弃，只留 d、e
+            Assert.Equal(2, compacted.Members.Count);   // the dead-weight members a/b/c are dropped, only d and e remain
             Assert.Equal(0, compacted.DeadBytes);
             Assert.Equal(8000L, compacted.OriginalBytes);
 
             var packSizeAfter = (await cc.GetBlobClient(packBlob).GetPropertiesAsync()).Value.ContentLength;
             Assert.True(packSizeAfter < packSizeBefore,
                 $"dead weight was not physically reclaimed: {packSizeBefore} → {packSizeAfter} bytes");
-            Assert.Equal(packSizeAfter, compacted.VolumeSizes[0]); // 信息文件记录的尺寸与云端实际一致
+            Assert.Equal(packSizeAfter, compacted.VolumeSizes[0]); // the size recorded in the info file matches what is actually in the cloud
 
-            // 压实最危险的失败模式是回收掉**仍被引用**的数据：把两个保留版本整棵还原并逐字节比对。
+            // Compaction's most dangerous failure mode is reclaiming data that is **still referenced**: restore both retained versions in full and compare byte for byte.
             await RestoreAndAssertAsync(rig, account, name, password, 2, snap2, "v2-after-compaction");
             await RestoreAndAssertAsync(rig, account, name, password, 3, snap3, "v3-after-compaction");
 
-            // ═══ 阶段 4：检查（不带修复）═══
+            // ═══ Stage 4: check (without repair) ═══
             var deep = new CheckOptions
             {
                 Cloud = CloudCheckLevel.Content,
@@ -454,52 +454,52 @@ public sealed class BackupLifecycleTests : IDisposable
             Assert.Null(healthy.MetadataIssue);
             Assert.Equal(snap3.Count, healthy.Findings.Count);
             Assert.All(healthy.Findings, f => Assert.Equal(CloudState.Ok, f.Cloud));
-            Assert.All(healthy.Findings, f => Assert.Equal(LocalState.Ok, f.Local)); // 本地树与 v3 完全一致
-            Assert.Empty(healthy.OrphanBlobs);                                        // 退役 + 压实后无残留
+            Assert.All(healthy.Findings, f => Assert.Equal(LocalState.Ok, f.Local)); // the local tree matches v3 exactly
+            Assert.Empty(healthy.OrphanBlobs);                                        // nothing left over after retirement + compaction
 
-            // 人为破坏云端：① 整块删除 clip 的 data blob；② 等长改写 docs/a·b·c 所在的 pack。
+            // Damage the cloud on purpose: (1) delete clip's data blob outright; (2) rewrite the pack holding docs/a, b and c at the same length.
             var idx3 = await rig.Store.ReadIndexAsync(account, name, info3.Versions[^1].IndexBlob, password);
             var clip3 = StorageOf(idx3, "media/clip.bin");
             var abcPack = StorageOf(idx3, "docs/a.txt");
-            Assert.Equal(docsPack2.Ref, abcPack.Ref); // v3 未改 a/b/c，仍沿用 v2 的 pack
-            Assert.Equal(clip1.Ref, clip3.Ref); // media/clip.bin 内容全程未变，地址稳定，可拿 v1 元数据基线做比对
+            Assert.Equal(docsPack2.Ref, abcPack.Ref); // v3 did not touch a/b/c, so it still uses v2's pack
+            Assert.Equal(clip1.Ref, clip3.Ref); // media/clip.bin's content never changed, so its address is stable and the v1 metadata baseline can be compared against
 
             await DeleteArchiveAsync(cc, clip3.Ref);
             await CorruptInPlaceAsync(cc, $"packs/{abcPack.Ref}.7z");
 
             var fingerprintBefore = await BlobFingerprintAsync(cc);
 
-            // 「存在+尺寸」级只看得见被删的那个：等长位腐体积未变，这一级按设计发现不了。
+            // The "existence + size" level sees only the deleted one: same-length bit rot leaves the size untouched, and this level is designed not to catch it.
             var shallow = await rig.Checker.CheckAsync(account, name, password, null,
                 new CheckOptions { Cloud = CloudCheckLevel.ExistenceSize, Local = LocalCheckLevel.Content }, _root);
             Assert.False(shallow.Ok);
             Assert.Equal(
                 new[] { "media/clip.bin", "media/copy.bin" }.Order(),
-                shallow.CorruptedPaths.Order()); // 共享同一 data blob 的两条路径都被如实报告
+                shallow.CorruptedPaths.Order()); // both paths sharing the same data blob are reported faithfully
 
-            // 「内容」级下载解压重算 hash，把等长位腐也揪出来。
+            // The "content" level downloads, extracts and recomputes the hash, dragging same-length bit rot out too.
             var damaged = await rig.Checker.CheckAsync(account, name, password, null, deep, _root);
             Assert.False(damaged.Ok);
             Assert.Equal(
                 new[] { "docs/a.txt", "docs/b.txt", "docs/c.txt", "media/clip.bin", "media/copy.bin" }.Order(),
                 damaged.CorruptedPaths.Order());
-            // 本地源文件都还在且内容一致 → 全部可从本地修复。
+            // The local source files are all present and their content matches → every one of them is repairable from local.
             Assert.Equal(damaged.CorruptedPaths.Order(), damaged.RepairablePaths.Order());
 
-            // 不带修复的检查必须是**只读**的：两轮检查（含下载解压）后，云端每个 blob 的长度与 ETag 都没变。
+            // A check without repair must be **read-only**: after two rounds of checking (downloads and extracts included), every cloud blob's length and ETag is unchanged.
             Assert.Equal(fingerprintBefore, await BlobFingerprintAsync(cc));
 
-            // ═══ 阶段 5：检查 + 修复 ═══
+            // ═══ Stage 5: check + repair ═══
             var repair = await rig.Repairer.RepairAsync(
                 account, name, password, _root, version: null,
                 deep with { ListOrphans = true }, AccessTier.Hot, volumeBytes: null, dontCompress: null);
 
             Assert.Equal(damaged.CorruptedPaths.Order(), repair.Repaired.Order());
             Assert.Empty(repair.Unrecoverable);
-            Assert.Empty(repair.DeletedOrphans); // 修复只替换内容，不该造出或回收孤儿
+            Assert.Empty(repair.DeletedOrphans); // repair only replaces content; it should neither create nor reclaim orphans
 
-            // 修复重造的碰撞检测元数据必须与全新备份逐键相等——不是「存在就行」，值不同会让去重误判碰撞
-            // （defect 2：以前修复会整个丢掉 len/head/tail，静默关闭碰撞防护）。
+            // The collision-detection metadata that repair rebuilds has to equal the fresh backup's key for key — "present is good enough" is not the bar, since differing values make dedup misjudge a collision
+            // (defect 2: repair used to drop len/head/tail entirely, silently switching collision protection off).
             var clipMetaAfterRepair = (await cc.GetBlobClient(clip3.Ref).GetPropertiesAsync()).Value.Metadata;
             Assert.Equal(
                 clipMetaBaseline.OrderBy(kv => kv.Key, StringComparer.Ordinal),
@@ -510,8 +510,8 @@ public sealed class BackupLifecycleTests : IDisposable
             Assert.All(afterRepair.Findings, f => Assert.Equal(CloudState.Ok, f.Cloud));
             Assert.Empty(afterRepair.OrphanBlobs);
 
-            // ═══ 阶段 6b：还原（受损版本与共享对象的旧版本）═══
-            // 「修好了」的判据不是文件存在，而是内容逐字节等于当初写入的内容。
+            // ═══ Stage 6b: restore (the damaged version, and the older version that shares objects with it) ═══
+            // The criterion for "fixed" is not that the file exists, but that its content is byte for byte what was originally written.
             await RestoreAndAssertAsync(rig, account, name, password, 3, snap3, "v3-after-repair");
             await RestoreAndAssertAsync(rig, account, name, password, 2, snap2, "v2-after-repair");
         }
@@ -522,14 +522,15 @@ public sealed class BackupLifecycleTests : IDisposable
     }
 
     /// <summary>
-    /// 加密备份的机密性必须跨越修复：从本地重造并替换一个单文件 data blob 之后，
-    /// 云端对象仍须是**加密**归档。
+    /// An encrypted backup's confidentiality has to survive a repair: after rebuilding a single-file data blob from
+    /// local and replacing it, the cloud object must still be an **encrypted** archive.
     /// <para>
-    /// 回归背景：<see cref="BackupRepairer"/> 的 <c>ReplaceBlobAsync</c> 曾把
-    /// <c>CompressionRequest.Password</c> 硬编码为 <c>null</c>（同类的 <c>RepairPackAsync</c>
-    /// 却正确传了密码），于是加密备份一经修复，该 data blob 就以明文 7z 落到云端。
-    /// 该缺陷**功能上毫无症状**——7z 对未加密归档忽略 <c>-p</c>，检查与还原照样通过——
-    /// 所以只能在存储层探测，不能靠「还原得出来」来判定。本用例即为此守护。
+    /// Regression background: <c>ReplaceBlobAsync</c> in <see cref="BackupRepairer"/> once hard-coded
+    /// <c>CompressionRequest.Password</c> to <c>null</c> (while <c>RepairPackAsync</c> in the same class did pass the
+    /// password correctly), so the moment an encrypted backup was repaired, that data blob landed in the cloud as a
+    /// plaintext 7z. The defect is **functionally symptomless** — 7z ignores <c>-p</c> on an unencrypted archive, so
+    /// check and restore both pass — which means it can only be probed at the storage layer and cannot be judged by
+    /// "it restores fine". This test is the guard for exactly that.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -547,24 +548,24 @@ public sealed class BackupLifecycleTests : IDisposable
 
         try
         {
-            Write("media/clip.bin", Rand(30_000, 22)); // ≥20K → 单文件 data blob
+            Write("media/clip.bin", Rand(30_000, 22)); // ≥20K → single-file data blob
             await rig.Backup.RunAsync(Request(account, name, password, maxVersions: 5));
 
             var info = await rig.Store.ReadInfoAsync(account, name, password);
             var idx = await rig.Store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, password);
             var clip = StorageOf(idx, "media/clip.bin");
 
-            // 基线：备份路径写出的对象确实是加密归档（同时证明这个探针有区分度）。
+            // Baseline: the object the backup path writes really is an encrypted archive (which also proves this probe discriminates).
             await AssertArchiveIsEncryptedAsync(cc, clip.Ref, password);
 
-            // 云端对象丢失 → 从仍在的本地源文件修复。
+            // The cloud object is gone → repair from the local source file, which is still there.
             await DeleteArchiveAsync(cc, clip.Ref);
             var repair = await rig.Repairer.RepairAsync(
                 account, name, password, _root, version: null,
                 new CheckOptions { Cloud = CloudCheckLevel.ExistenceSize }, AccessTier.Hot, volumeBytes: null, dontCompress: null);
             Assert.Equal(["media/clip.bin"], repair.Repaired);
 
-            // 修复写回的对象仍须加密。
+            // The object repair writes back must still be encrypted.
             await AssertArchiveIsEncryptedAsync(cc, clip.Ref, password);
         }
         finally

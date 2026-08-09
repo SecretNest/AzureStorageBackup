@@ -4,8 +4,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 一个文件读不开，不该让其余几万个文件的备份一起作废。
-/// diff 阶段就把读失败收敛成 Unreadable，后续阶段不必各自 try/catch。
+/// One unreadable file must not void the backup of the other tens of thousands of files along with it.
+/// The diff stage funnels read failures into Unreadable so that later stages do not each need their own try/catch.
 /// </summary>
 public sealed class BackupDifferUnreadableTests : IDisposable
 {
@@ -33,7 +33,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     private static Task<ScanResult> ScanAsync(string root) =>
         new LocalFileScanner().ScanAsync(root, new IgnoreRuleSet([]));
 
-    /// <summary>用 differ 自身（previous=null 全部 Added）产出一份"上一版本索引"快照。</summary>
+    /// <summary>Produce a "previous version index" snapshot using the differ itself (previous=null, so everything comes out Added).</summary>
     private async Task<VersionIndex> SnapshotAsync()
     {
         var scan = await ScanAsync(_root);
@@ -60,7 +60,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
 
     private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
 
-    /// <summary>指定路径抛给定异常，其余照常算 hash。</summary>
+    /// <summary>The given path throws the given exception; everything else is hashed as usual.</summary>
     private sealed class ThrowingHasher(string lockedPath, Exception toThrow) : IFileHasher
     {
         public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
@@ -80,7 +80,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     [Fact]
     public async Task An_Unreadable_New_File_Is_Classified_Unreadable_And_Others_Still_Diff()
     {
-        // 期望：locked.mdf 分类为 Unreadable，其余文件照常得到 Added；整个 diff 不抛。
+        // Expected: locked.mdf is classified Unreadable, the other files still come out Added, and the diff as a whole does not throw.
         Write("locked.mdf", "database content");
         Write("plain.txt", "ordinary file");
 
@@ -91,24 +91,24 @@ public sealed class BackupDifferUnreadableTests : IDisposable
 
         var locked = Change(diff, "locked.mdf");
         Assert.Equal(ChangeKind.Unreadable, locked.Kind);
-        Assert.NotNull(locked.Current);   // 扫描到的条目要保留，供后续沿用上一版本/打标记
-        Assert.Null(locked.Previous);     // 新文件，没有上一版本条目
+        Assert.NotNull(locked.Current);   // keep the scanned entry so later stages can carry the previous version forward / stamp the marker
+        Assert.Null(locked.Previous);     // a new file, so there is no previous-version entry
         Assert.Null(locked.HeadHash);
         Assert.Null(locked.FullHash);
         Assert.Null(locked.CarriedStorage);
 
-        // 其余文件不受影响，照常分类
+        // The other files are unaffected and classified as usual
         Assert.Equal(ChangeKind.Added, Change(diff, "plain.txt").Kind);
     }
 
     [Fact]
     public async Task An_Unreadable_Modified_File_Keeps_Its_Previous_Entry_Reference()
     {
-        // 期望：Kind == Unreadable 且 Previous 指向上一版本条目（供索引沿用）。
+        // Expected: Kind == Unreadable, and Previous points at the previous-version entry (for the index to carry forward).
         var path = Write("locked.mdf", "hello");
         var previous = await SnapshotAsync();
 
-        File.WriteAllText(path, "hello world!"); // 长度变 → 触发重新哈希路径
+        File.WriteAllText(path, "hello world!"); // length changed → triggers the re-hashing path
 
         var hasher = new ThrowingHasher("locked.mdf",
             new IOException("The process cannot access the file because it is being used by another process."));
@@ -126,12 +126,12 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     [Fact]
     public async Task An_Unreadable_File_With_Unchanged_Length_But_Changed_Mtime_Is_Classified_Unreadable()
     {
-        // 期望：length 不变但 mtime 变 → 走"两级哈希"分支（先 headHash 再视情况 fullHash）。
-        // 这条分支此前只在正常路径下被覆盖，读失败时从未有测试真正跑到这里。
+        // Expected: unchanged length but changed mtime → takes the "two-level hashing" branch (headHash first, then fullHash if warranted).
+        // That branch used to be covered only on the happy path; no test ever actually reached it with a read failure.
         var path = Write("locked.mdf", "hello");
         var previous = await SnapshotAsync();
 
-        // 不改内容（length 不变），只改 mtime，确保落入 length 同、mtime 不同的分支。
+        // Leave the content alone (length unchanged) and change only the mtime, to make sure we land in the same-length, different-mtime branch.
         File.SetLastWriteTimeUtc(path, previous.Entries.Single(e => e.Path == "locked.mdf").Mtime.UtcDateTime.AddHours(1));
 
         var hasher = new ThrowingHasher("locked.mdf",
@@ -150,7 +150,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     [Fact]
     public async Task UnauthorizedAccess_Is_Treated_The_Same_As_IOException()
     {
-        // 期望：与上一条同样分类为 Unreadable。
+        // Expected: classified Unreadable just like the previous case.
         Write("locked.mdf", "database content");
 
         var hasher = new ThrowingHasher("locked.mdf", new UnauthorizedAccessException("Access to the path is denied."));
@@ -167,8 +167,8 @@ public sealed class BackupDifferUnreadableTests : IDisposable
     [Fact]
     public async Task Cancellation_Still_Aborts_The_Diff()
     {
-        // 期望：hasher 抛 OperationCanceledException 时 diff 照常上抛，不被当成 Unreadable。
-        // 这条是护栏：捕获写宽成 catch(Exception) 会让取消变成「跳过一个文件」。
+        // Expected: when the hasher throws OperationCanceledException the diff rethrows it as usual and does not treat it as Unreadable.
+        // This is a guardrail: widening the catch to catch(Exception) would turn a cancellation into "skipped one file".
         Write("locked.mdf", "database content");
         var scan = await ScanAsync(_root);
 

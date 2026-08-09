@@ -5,14 +5,14 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// F4（终审）：索引不可信这条威胁模型此前只落在**还原写入**上，本地**读取**侧没有落地。
-/// <c>/import</c> 让任何人都能把一个自造的 container 变成本地索引数据（设计 §5），于是
-/// <c>Path.Combine(localRoot, &lt;索引里的路径&gt;)</c> 这种拼接就成了越出 <c>Backup__Root</c> 的入口：
-/// 多数点有 hash 门，只是「某文件存在且内容等于 X」的确认预言机；死重压实里那两处更糟——
-/// 一处是无 hash 门的纯存在性探测，另一处 <c>CopyInto</c> 是把 pack 里的内容写到 compose
-/// 目录之外的**任意写**。
-/// <para>这些用例全部用假件，不需要 Azurite / 7z：断言的是「一步都没走出去」，
-/// 真去压缩上传反而会把判定点淹掉。</para>
+/// F4 (final review): the "the index is untrusted" threat model previously landed only on **restore writes**; the local **read** side was never covered.
+/// <c>/import</c> lets anyone turn a container they fabricated into local index data (design §5), which makes a join like
+/// <c>Path.Combine(localRoot, &lt;the path from the index&gt;)</c> an entry point for escaping <c>Backup__Root</c>:
+/// most of the sites have a hash gate and are merely a confirmation oracle for "some file exists and its content equals X"; the two inside dead-weight compaction are worse —
+/// one is a pure existence probe with no hash gate, and the other, <c>CopyInto</c>, is an **arbitrary write** of pack content outside the compose
+/// directory.
+/// <para>These cases all use fakes and need neither Azurite nor 7z: what they assert is "not one step was taken outside",
+/// and actually compressing and uploading would only drown out the decision points.</para>
 /// </summary>
 public sealed class UntrustedIndexPathTests : IDisposable
 {
@@ -34,7 +34,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
         try { Directory.Delete(_base, recursive: true); } catch { /* best effort */ }
     }
 
-    /// <summary>记录每一次被要求 hash 的路径——用来证明根外的文件连读都没读过。</summary>
+    /// <summary>Records every path it is asked to hash — used to prove that files outside the root were never even read.</summary>
     private sealed class RecordingHasher : IFileHasher
     {
         public List<string> Hashed { get; } = [];
@@ -51,7 +51,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
         private Task<string> Record(string path)
         {
             lock (Hashed) Hashed.Add(path);
-            // 返回一个不可能匹配的值：万一守卫失效，也不该因为「hash 恰好对不上」而蒙混过关。
+            // Return a value that cannot possibly match: should the guard ever fail, the test must not slip through because "the hash happened not to line up".
             return Task.FromResult("recording-hasher");
         }
     }
@@ -109,18 +109,18 @@ public sealed class UntrustedIndexPathTests : IDisposable
     }
 
     /// <summary>
-    /// 死重压实：一个成员名越出 compose 目录 → 整包放弃压实。
+    /// Dead-weight compaction: one member name escaping the compose directory → compaction of the whole pack is abandoned.
     /// <para>
-    /// 断言分三层，对应被堵住的三个洞：
-    /// 一、根外文件**一次都没被读过**（<c>LocalPath</c> 的存在性探测 + hash 确认预言机）；
-    /// 二、压缩器从未被调用，也就是 <c>CopyInto</c> 从未执行 → compose 目录外没有发生任何写；
-    /// 三、pack 本身原封不动，只记下死重——放弃是安全空操作，不是数据损失。
+    /// The assertions come in three layers, matching the three holes that were plugged:
+    /// one, the file outside the root was **never read even once** (<c>LocalPath</c>'s existence probe + the hash confirmation oracle);
+    /// two, the compressor was never called, meaning <c>CopyInto</c> never ran → no write happened outside the compose directory;
+    /// three, the pack itself is untouched and only the dead weight is recorded — abandoning is a safe no-op, not data loss.
     /// </para>
     /// </summary>
     [Fact]
     public async Task Compaction_Is_Abandoned_When_A_Members_Entry_Name_Escapes_The_Compose_Directory()
     {
-        // 根外的「秘密」：只要它被 stat 或 hash 过一次，预言机就成立了。
+        // The "secret" outside the root: the oracle exists the moment it gets stat'ed or hashed even once.
         var secret = Path.Combine(_base, "secret.txt");
         await File.WriteAllTextAsync(secret, "outside the root");
         await File.WriteAllTextAsync(Path.Combine(_local, "b.txt"), new string('b', 2000));
@@ -140,14 +140,14 @@ public sealed class UntrustedIndexPathTests : IDisposable
             },
         };
 
-        // 存活成员 4000 字节 / 原始 6000 → 死重 1/3 > 阈值 0.3，必定进入重压路径。
+        // Live members 4000 bytes / original 6000 → dead weight 1/3 > threshold 0.3, so the recompression path is certain to be entered.
         var live = new Dictionary<string, Dictionary<string, LivePackMember>>
         {
             ["p0001"] = new(StringComparer.Ordinal)
             {
                 ["b.txt"] = new LivePackMember("b.txt", 2000, "hash-b"),
-                // `../secret.txt`：相对 localRoot 指向 _base/secret.txt（读），
-                // 相对 composeDir 指向 compose 的上一级（写）。
+                // `../secret.txt`: relative to localRoot it points at _base/secret.txt (read),
+                // relative to composeDir it points one level above compose (write).
                 ["../secret.txt"] = new LivePackMember("../secret.txt", 2000, "hash-escape"),
             },
         };
@@ -180,9 +180,9 @@ public sealed class UntrustedIndexPathTests : IDisposable
     }
 
     /// <summary>
-    /// 检查器的本地轴：索引条目的路径越出本地根 → 判 Missing，且**不读**那个文件。
-    /// 越界条目原本会变成「某路径存在且内容 hash 等于 X」的确认预言机（Content 级）
-    /// 或「存在 + 尺寸 + 权限」（Attributes 级）。
+    /// The checker's local axis: an index entry whose path escapes the local root → judged Missing, and the file is **not read**.
+    /// An out-of-bounds entry would otherwise become a confirmation oracle for "some path exists and its content hash equals X" (Content level)
+    /// or for "exists + size + permissions" (Attributes level).
     /// </summary>
     [Fact]
     public async Task Local_Check_Treats_An_Entry_Escaping_The_Local_Root_As_Missing_Without_Reading_It()
@@ -209,8 +209,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
         Assert.Empty(hasher.Hashed);
     }
 
-    /// <summary>对照组：同一条路径落在根内时，本地轴照常工作（读文件、比 hash）——
-    /// 证明上面那条 Missing 来自边界判定，而不是本地轴整个失灵。</summary>
+    /// <summary>Control group: when the same path lands inside the root the local axis works as usual (reads the file, compares the hash) —
+    /// proving the Missing above came from the boundary decision, not from the local axis being broken outright.</summary>
     [Fact]
     public async Task Local_Check_Still_Reads_An_Entry_Inside_The_Local_Root()
     {
@@ -236,15 +236,15 @@ public sealed class UntrustedIndexPathTests : IDisposable
     }
 
     /// <summary>
-    /// 修复单文件 blob：索引条目的路径越出本地根 → 该候选来源直接跳过，本地无可用来源，
-    /// 条目标记不可恢复。原本它是「本地某处存在内容 hash 等于 X 的文件」的确认预言机，
-    /// 而且探中之后还会把根外文件的内容压缩上传到云端。
+    /// Repairing a single-file blob: an index entry whose path escapes the local root → that candidate source is skipped outright, no usable local source remains,
+    /// and the entry is marked unrecoverable. It was otherwise a confirmation oracle for "somewhere locally there is a file whose content hash equals X",
+    /// and on a hit it would go on to compress and upload the content of that out-of-root file to the cloud.
     /// </summary>
     [Fact]
     public async Task Repairing_A_Blob_Skips_A_Source_Path_That_Escapes_The_Local_Root()
     {
-        // hash 故意与 RecordingHasher 的返回值一致：守卫失效时这条路径就会被当成可用来源，
-        // 于是断言失败的原因是「越界被采用了」，而不是「hash 恰好没对上」。
+        // The hash deliberately matches RecordingHasher's return value: if the guard fails, this path would be taken as a usable source,
+        // so the assertion fails for the reason "the out-of-bounds path was accepted", not "the hash happened not to line up".
         await File.WriteAllTextAsync(Path.Combine(_base, "secret.txt"), "outside the root");
 
         var index = new VersionIndex
@@ -272,8 +272,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
             new List<string>(), unrecoverable, new HashSet<int>(),
-            // 修复的压缩产出现在经暂存区（全局压缩锁 + 预算），故多一个席位参数。
-            // 这个用例在触碰暂存区之前就该被越界判定挡下，席位只是为了调得通。
+            // Repair's compression output now goes through the staging area (global compression lock + budget), hence the extra lease parameter.
+            // This case should be stopped by the boundary decision before it ever touches the staging area; the lease is only there to make the call go through.
             StagingLease(), CancellationToken.None,
         ]);
 
@@ -284,9 +284,9 @@ public sealed class UntrustedIndexPathTests : IDisposable
     }
 
     /// <summary>
-    /// 修复 pack：成员名越出本地根 → 该成员按「本地取不到」处置（标记不可恢复），既不读根外文件，
-    /// 也不会把它 <c>File.Copy</c> 到 compose 目录之外（<c>dest</c> 与 <c>local</c> 拼的是同一段字符串）。
-    /// 全部成员都取不到 → 整个 pack 从信息文件里移除，与既有语义一致。
+    /// Repairing a pack: a member name escaping the local root → that member is handled as "not obtainable locally" (marked unrecoverable), neither reading the out-of-root file
+    /// nor <c>File.Copy</c>ing it outside the compose directory (<c>dest</c> and <c>local</c> are built from the same piece of string).
+    /// All members unobtainable → the whole pack is removed from the info file, consistent with the existing semantics.
     /// </summary>
     [Fact]
     public async Task Repairing_A_Pack_Skips_A_Member_Whose_Entry_Name_Escapes_The_Local_Root()
@@ -356,9 +356,9 @@ public sealed class UntrustedIndexPathTests : IDisposable
     }
 
     /// <summary>
-    /// 本地轴与两个修复分支都是 private（对外入口分别需要真实 container 和一次完整检查）。
-    /// 用反射直接驱动，是在不拉起 Azurite / 7z 的前提下把这三个判定点单独钉住的最短路径；
-    /// 方法改名会得到一条明确的失败信息，而不是静默失效。
+    /// The local axis and both repair branches are private (their public entry points require a real container and a full check run respectively).
+    /// Driving them directly through reflection is the shortest path to nailing down these three decision points in isolation without bringing up Azurite or 7z;
+    /// renaming a method yields an explicit failure message rather than silently going dead.
     /// </summary>
     private async Task<LocalState> LocalCheckAsync(BackupChecker checker, IndexEntry entry)
     {
@@ -372,7 +372,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
         return await task;
     }
 
-    /// <summary>一次性的暂存席位：这两个用例都在触碰暂存区之前就被越界判定挡下，席位只为调得通签名。</summary>
+    /// <summary>A throwaway staging lease: both cases are stopped by the boundary decision before ever touching the staging area, so the lease exists only to satisfy the signature.</summary>
     private StagingArea.StagingLease StagingLease() =>
         new StagingArea(Path.Combine(_temp, "lc"), Path.Combine(_temp, "ls"), () => 200_000_000).AcquireLease();
 

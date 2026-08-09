@@ -3,9 +3,11 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 备份成功那条摘要是操作员一定会看的一条（它同时进操作日志和 webhook 通知）。把它的排版
-/// 从编排器里摘成纯函数，就是为了能在这里逐条钉死：哪些数字必须出现、哪些为零时必须**整段消失**。
-/// 零值不省略的话，一次日常的增量备份会带出三行全是 0 的噪音，真正有信息的那次就淹没在里面了。
+/// The summary line for a successful backup is the one line the operator is certain to read (it goes to both the
+/// operation log and the webhook notification). Pulling its layout out of the orchestrator into a pure function is
+/// exactly what lets it be pinned down here item by item: which numbers must appear, and which must make **the whole
+/// segment disappear** when they are zero.
+/// Without omitting zeros, a routine incremental backup drags along three lines of all-zero noise, and the round that actually carries information drowns in it.
 /// </summary>
 public class BackupSummaryTests
 {
@@ -31,8 +33,9 @@ public class BackupSummaryTests
         Assert.Contains("128 new", text);
         Assert.Contains("212 modified", text);
         Assert.Contains("35 deleted", text);
-        // 两个口径都要在，且分得清哪个是哪个：源侧变更量回答"我改了多少东西"，
-        // 实传量回答"云上这个月要多付多少钱"。只报一个就答不全。
+        // Both figures have to be there and be distinguishable: the source-side change volume answers "how much did I
+        // change", the uploaded volume answers "how much more do I pay the cloud this month". Report only one and the
+        // question is only half answered.
         Assert.Contains("4.7 GB", text);
         Assert.Contains("1.2 GB", text);
     }
@@ -56,7 +59,7 @@ public class BackupSummaryTests
         Assert.Contains("5.2 GB", text);
     }
 
-    /// <summary>读不开的文件为零时不提——每轮都挂一句 "0 unreadable" 会让真的有文件读不开时无人察觉。</summary>
+    /// <summary>Say nothing when the unreadable count is zero — hanging a "0 unreadable" off every round means nobody notices the round where files really were unreadable.</summary>
     [Fact]
     public void Mentions_Unreadable_Only_When_Nonzero()
     {
@@ -72,13 +75,14 @@ public class BackupSummaryTests
 
         Assert.Contains("Version 12", text);
         Assert.Contains("no changes", text);
-        // 一个字节都没动时，"0 B changed at source → 0 B uploaded" 是纯噪音。
+        // When not a single byte moved, "0 B changed at source → 0 B uploaded" is pure noise.
         Assert.DoesNotContain("uploaded", text);
     }
 
     /// <summary>
-    /// 去重命中的那一轮：源侧确实改了很多，但云端一个字节都没涨。这正是这两个口径分开报的意义，
-    /// 所以实传为零时 Data 行**不能**消失——消失了就看不出"改了 4.7 GB 却没上传"这件事。
+    /// The round where dedup hits: the source side really did change a lot, but the cloud did not grow by a single
+    /// byte. That is precisely the point of reporting these two figures separately, so the Data line must **not**
+    /// disappear when the uploaded volume is zero — if it does, "changed 4.7 GB yet uploaded nothing" is invisible.
     /// </summary>
     [Fact]
     public void Keeps_Data_Line_When_Everything_Deduplicated()
@@ -90,9 +94,10 @@ public class BackupSummaryTests
     }
 
     /// <summary>
-    /// added + modified 必须恒等于 ChangedFiles。这条恒等式是刻意维持的：post-diff 才发现读不开的
-    /// 文件不从这两项里扣除，否则日志上会出现 "340 changed" 但 "128 + 209 ≠ 340" 这种要人对着
-    /// 源码才能理解的账。不可读的数字单独成项，谁都能自己把账算平。
+    /// added + modified must be identically equal to ChangedFiles. The identity is maintained deliberately: files found
+    /// unreadable only post-diff are not subtracted from those two items, because otherwise the log would show
+    /// "340 changed" next to "128 + 209 != 340" — books that only make sense with the source code open. Keeping the
+    /// unreadable number as an item of its own lets anyone balance the books for themselves.
     /// </summary>
     [Fact]
     public void New_Plus_Modified_Adds_Up_To_Changed()

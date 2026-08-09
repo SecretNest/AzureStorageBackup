@@ -2,24 +2,24 @@ using System.Collections.Concurrent;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>怎么个停法。</summary>
+/// <summary>How to stop.</summary>
 public enum StopKind
 {
     None,
 
-    /// <summary>主动暂停：做完手上这件，落盘，退出成 Suspended。</summary>
+    /// <summary>Deliberate pause: finish the item in hand, flush to disk, exit as Suspended.</summary>
     Suspend,
 
-    /// <summary>取消，但把正在上传的文件（含它的全部分卷）做完再停。</summary>
+    /// <summary>Cancel, but finish the file currently uploading (including all of its volumes) before stopping.</summary>
     FinishCurrentFiles,
 
-    /// <summary>取消，立刻中断在途上传，并删掉它留下的残留卷。</summary>
+    /// <summary>Cancel, interrupt the in-flight upload immediately, and delete the residual volumes it left behind.</summary>
     StopNow,
 }
 
 /// <summary>
-/// 一次备份运行的"外部把手"：编排器不认识运行注册表，也不该认识；它只认这一个对象。
-/// 装着 journal 与挂起闸门，后续任务会再往里加停止意图。
+/// The "external handle" on one backup run: the orchestrator does not know about the run registry, and should not;
+/// it only knows about this one object. Holds the journal and the pause gate; later tasks add stop intent to it.
 /// </summary>
 public sealed class BackupRunControl(
     BackupJournalStore store, int configId, string runId, PauseGate? gate = null) : IAsyncDisposable
@@ -28,40 +28,40 @@ public sealed class BackupRunControl(
     private int _accountId;
     private string _container = "";
 
-    /// <summary>被本轮采纳的旧 journal 的 runId。本轮成功提交索引时，它们和自己那卷一起删。</summary>
+    /// <summary>The runIds of old journals adopted by this round. When this round commits its index successfully, they are deleted along with our own volume.</summary>
     private readonly List<string> _adopted = [];
 
-    /// <summary>上一轮（或上几轮）已经确认传上去的东西。没有可采纳的卷时是空表。</summary>
+    /// <summary>What the previous round (or rounds) already confirmed as uploaded. Empty when there is no volume to adopt.</summary>
     public JournalResume Resume { get; private set; } = JournalResume.Empty;
 
-    /// <summary>开卷时采纳过或作废过旧卷、或这是这个配置在这个容器上的第一轮 → 容器里多半躺着
-    /// 孤儿块，收尾清理该做一次扫描（Task 11）。</summary>
+    /// <summary>We adopted or voided an old volume when opening the journal, or this is this config's first round on
+    /// this container → the container most likely holds orphan blocks, so the closing cleanup should sweep once (Task 11).</summary>
     public bool SweepNeeded { get; private set; }
 
-    /// <summary>瞬时错误的挂起闸门。默认 30s/1m/5m/每 5m 自愈，10 分钟不见好就降级。</summary>
+    /// <summary>The pause gate for transient errors. Self-heals at 30s/1m/5m/every 5m by default, and downgrades if it has not recovered in 10 minutes.</summary>
     public PauseGate Gate { get; } = gate ?? new PauseGate();
 
     public string RunId => runId;
 
-    /// <summary>任何停法都会触发：叫停 diff（继续读盘没有意义）。</summary>
+    /// <summary>Fired by every stop kind: stops the diff (there is no point in reading more from disk).</summary>
     private readonly CancellationTokenSource _stop = new();
 
-    /// <summary>**只有** Stop now 会触发：打断在途上传。
-    /// Suspend 与 Finish current files 绝不能碰它，否则"做完当前这件再停"就是句空话。</summary>
+    /// <summary>Fired by Stop now **only**: interrupts the in-flight upload.
+    /// Suspend and Finish current files must never touch it, or "finish the current item, then stop" is an empty promise.</summary>
     private readonly CancellationTokenSource _abort = new();
 
     private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.Ordinal);
 
     private int _stopKind;
 
-    /// <summary>-1 = 还没人下达过 Suspend。用哨兵而不是默认值，是为了让"首次下达说了算"这句话
-    /// 能用一次 CAS 表达（见 <see cref="RequestStop"/>）。</summary>
+    /// <summary>-1 = nobody has issued a Suspend yet. A sentinel rather than a default value, so that "the first
+    /// request wins" can be expressed as a single CAS (see <see cref="RequestStop"/>).</summary>
     private int _suspendReason = -1;
 
     public StopKind Stop => (StopKind)Volatile.Read(ref _stopKind);
 
-    /// <summary>这次挂起是为什么。没人下达过 Suspend 时按 UserRequested 报——挂起本来就只有
-    /// 被下达过才成立，这个取值只是让读它的地方不必先判一次"有没有"。</summary>
+    /// <summary>Why this suspension happened. Reports UserRequested when nobody ever issued a Suspend — a suspension
+    /// only exists if one was issued anyway, and this value just spares every reader from first checking "is there one".</summary>
     public SuspendReason SuspendReason
     {
         get
@@ -74,36 +74,42 @@ public sealed class BackupRunControl(
     public CancellationToken StopToken => _stop.Token;
     public CancellationToken AbortToken => _abort.Token;
 
-    /// <summary>登记/销账"正在上传的这块内容"。Stop now 收尾时按它删残留卷。</summary>
+    /// <summary>Register/clear "this block of content is currently uploading". Stop now uses it to delete residual volumes when it settles.</summary>
     public void TrackInFlight(string blobRef) => _inFlight[blobRef] = 1;
     public void ClearInFlight(string blobRef) => _inFlight.TryRemove(blobRef, out _);
     public IReadOnlyCollection<string> InFlight => _inFlight.Keys.ToList();
 
     /// <summary>
-    /// 下达停止意愿。**只升不降**：更强的停法覆盖更弱的，更弱或相同的一律忽略。
+    /// Issue a stop intent. **Escalate only, never de-escalate**: a stronger stop kind overrides a weaker one, and a
+    /// weaker or identical one is ignored outright.
     /// <para>
-    /// 两个方向不对称，所以不能写成"只认第一次"。Stop now 之后再点 Suspend 确实没有意义——
-    /// 已经打断、已经删掉的残留卷不可能因为一次更温和的下达而复活。但反过来是用户在**升级**：
-    /// 他点了 Suspend，发现卡在一个几十 GB 的多卷文件后面动不了，于是改点 Stop now。
-    /// 首次优先会把这次升级静静丢掉，而 <see cref="BackupRunner.CancelAsync"/> 等到终态之后
-    /// 照样返回 true——API 报告成功，实际生效的却是另一种停法。
+    /// The two directions are asymmetric, so this cannot be written as "only the first one counts". Clicking Suspend
+    /// after Stop now really is meaningless — residual volumes already interrupted and already deleted cannot come back
+    /// to life because of a gentler request. But the other direction is the user **escalating**: he clicked Suspend,
+    /// found himself stuck behind a multi-volume file of tens of GB, and switched to Stop now.
+    /// First-request-wins would silently drop that escalation, while <see cref="BackupRunner.CancelAsync"/> still
+    /// returns true once the terminal state arrives — the API reports success, but a different stop kind is what
+    /// actually took effect.
     /// </para>
     /// <para>
-    /// 升级只会**收紧**，因此不可能让已经放弃的活复活：<see cref="StopKind"/> 的成员按强度排序，
-    /// 判定就是比大小；CAS 循环保证并发下达时留下的是最强的那一个，而点火由**赢下 CAS 的那个
-    /// 线程**负责，所以升级到 Stop now 时 <see cref="AbortToken"/> 一定会被点着——哪怕
-    /// <see cref="StopToken"/> 早就为上一次较弱的下达点过了（<c>Cancel()</c> 幂等，重复调用无副作用）。
+    /// Escalation only ever **tightens**, so it can never revive work already given up on: <see cref="StopKind"/>'s
+    /// members are ordered by strength, and the decision is a plain comparison; the CAS loop guarantees the strongest
+    /// one survives concurrent requests, and firing is the job of **the thread that wins the CAS**, so escalating to
+    /// Stop now is guaranteed to fire <see cref="AbortToken"/> — even if <see cref="StopToken"/> was already fired long
+    /// ago for the earlier, weaker request (<c>Cancel()</c> is idempotent, repeat calls have no side effects).
     /// </para>
     /// </summary>
     /// <param name="reason">
-    /// 只对 <see cref="StopKind.Suspend"/> 有意义：这一卷被记在盘上的挂起理由（关机路径传
-    /// <see cref="SuspendReason.ShuttingDown"/>）。
+    /// Only meaningful for <see cref="StopKind.Suspend"/>: the suspend reason recorded on disk next to this volume
+    /// (the shutdown path passes <see cref="SuspendReason.ShuttingDown"/>).
     /// <para>
-    /// 它**不**参与上面那套升级判定，而是另走一次 CAS：**首次**下达 Suspend 的那个理由说了算。
-    /// 一次已经在为"用户按了暂停"收尾的运行，不该因为随后到来的关机被改写成 ShuttingDown——
-    /// 那一位正是下次启动用来决定"要不要替他重新开跑"的依据，改错了等于替用户撤销他按下的暂停。
-    /// 反过来，理由在停法落定**之前**就写好，所以任何看见 <c>Stop == Suspend</c> 的线程都读得到
-    /// 配套的理由，不存在"停法到了、理由还没到"的窗口。
+    /// It does **not** take part in the escalation rule above; it goes through a separate CAS instead: the reason of
+    /// the **first** Suspend request wins. A run already settling for "the user pressed pause" must not be rewritten to
+    /// ShuttingDown by a shutdown that arrives afterwards — that value is exactly what the next startup uses to decide
+    /// "should we restart this one for him", and getting it wrong means revoking the pause the user pressed for him.
+    /// Conversely, the reason is written **before** the stop kind lands, so any thread that sees
+    /// <c>Stop == Suspend</c> can also read the matching reason; there is no window where the stop kind has arrived and
+    /// the reason has not.
     /// </para>
     /// </param>
     public void RequestStop(StopKind kind, SuspendReason reason = SuspendReason.UserRequested)
@@ -116,18 +122,21 @@ public sealed class BackupRunControl(
         {
             var current = Volatile.Read(ref _stopKind);
             if ((int)kind <= current)
-                return;     // 更弱或相同：忽略
+                return;     // weaker or identical: ignore
             if (Interlocked.CompareExchange(ref _stopKind, (int)kind, current) == current)
                 break;
         }
-        // 正卡在闸门上等重试的工作者要被叫醒，否则它们会一直等到下一次自愈计时器到点。
+        // Workers stuck at the gate waiting to retry have to be woken up, otherwise they sit there until the next
+        // self-heal timer fires.
         //
-        // 这一句对 Suspend / Finish current files 同样会触发，于是一件**正卡在闸门上等自愈**的活
-        // 会就此被放弃，而不是"做完当前这件"。这是有意的取舍：不叫醒它，用户按下的停止最长要等
-        // 5 分钟（自愈计时器的最后一档）才有反应，而那件活本来就正卡在一个还没好的瞬时错误上，
-        // 等下去多半也是白等。最终抛出的异常仍由编排器的 SettleStopAsync 按停法纠正，
-        // 所以对外的行为（Suspended / Canceled、journal 落盘、残留清理）都是对的——
-        // 不成立的只是"做完当前这件"这句话对闸门上那件活的字面含义。
+        // This line fires for Suspend / Finish current files too, so a piece of work **stuck at the gate waiting to
+        // self-heal** gets given up on right here rather than "finishing the current item". That is a deliberate
+        // trade-off: without waking it, the stop the user pressed takes up to 5 minutes (the last step of the self-heal
+        // timer) to have any effect, and that piece of work was stuck on a transient error that has not cleared anyway,
+        // so waiting is most likely waiting for nothing. The exception finally thrown is still corrected by the
+        // orchestrator's SettleStopAsync according to the stop kind, so the externally visible behavior (Suspended /
+        // Canceled, journal flushed, residue cleaned) is all correct — the only thing that does not hold is the literal
+        // meaning of "finish the current item" for the piece of work sitting at the gate.
         Gate.Downgrade();
         _stop.Cancel();
         if (kind == StopKind.StopNow)
@@ -135,12 +144,14 @@ public sealed class BackupRunControl(
     }
 
     /// <summary>
-    /// 开卷。必须等编排器算出基线版本与寻址身份之后再调——这两样是恢复的前置条件，
-    /// 写不进头里，这卷 journal 就没法安全复用。
+    /// Open the journal volume. Must not be called until the orchestrator has worked out the baseline version and the
+    /// addressing identity — those two are preconditions for resuming; if they cannot go into the header, this journal
+    /// volume cannot be safely reused.
     /// </summary>
     /// <param name="firstRun">
-    /// 本地权威状态还没建立 = 这是这个配置在这个容器上的第一轮（新建，或**删了配置又重建**）。
-    /// 它同样要触发一次孤儿扫描，原委见下方 <see cref="SweepNeeded"/> 的赋值处。
+    /// No local authoritative state established yet = this is this config's first round on this container (newly
+    /// created, or **the config was deleted and recreated**). It has to trigger an orphan sweep just the same; the
+    /// reasoning is at the assignment to <see cref="SweepNeeded"/> below.
     /// </param>
     public async Task OpenJournalAsync(
         int accountId, string container, int baselineVersion, string localRoot, string encryptionIdentity,
@@ -149,23 +160,25 @@ public sealed class BackupRunControl(
         _accountId = accountId;
         _container = container;
 
-        // 对得上号的采纳，对不上的当场删。
+        // Adopt the ones that match; delete the ones that don't on the spot.
         //
-        // configId 不同也照删：(AccountId, ContainerName) 在 AppDbContext 里是唯一索引，
-        // 一个容器至多一个配置——所以那只可能是"配置删了又在同一个容器上重建"留下的陈迹。
-        // 留着它会永远保住那批块不被清理（清理判据认 journal，不认 configId）。
-        // 哪天允许多个配置共用一个容器了，这一条必须改回"不是我们的就完全不碰"，
-        // 否则会把别人正挂起着的运行的成果变成孤儿。
+        // A different configId gets deleted too: (AccountId, ContainerName) is a unique index in AppDbContext, so one
+        // container has at most one config — meaning that can only be a leftover from "the config was deleted and
+        // recreated on the same container". Keeping it would protect those blocks from cleanup forever (the cleanup
+        // criterion looks at the journal, not at configId).
+        // The day several configs are allowed to share one container, this has to go back to "if it isn't ours, don't
+        // touch it at all", or we would turn the work of someone else's currently suspended run into orphans.
         var voided = false;
-        // 采纳到的那一卷正是本轮自己那卷（runId 重名）→ 接着往它后面写，绝不新开一卷盖上去。
+        // The volume we adopted is this round's own volume (same runId) → append to it, never open a new one over it.
         var reopenMine = false;
         var adopted = new List<JournalContent>();
         var myPath = store.PathFor(accountId, container, runId);
         foreach (var (oldRunId, content) in await store.ListAsync(accountId, container, ct))
         {
             var h = content.Header;
-            // 比的是**落到盘上的那个路径**而不是两个 runId 字符串：文件名经过 BackupJournalStore.Safe
-            // 扁平化，两个不同的 runId 完全可能落在同一个文件上——那时它们就是同一卷。
+            // What is compared is **the path it lands on**, not the two runId strings: file names are flattened
+            // through BackupJournalStore.Safe, and two different runIds can perfectly well land on the same file — at
+            // which point they are the same volume.
             var mine = string.Equals(
                 store.PathFor(accountId, container, oldRunId), myPath, StringComparison.Ordinal);
             if (h.ConfigId == configId
@@ -174,7 +187,7 @@ public sealed class BackupRunControl(
                 && string.Equals(h.EncryptionIdentity, encryptionIdentity, StringComparison.Ordinal))
             {
                 adopted.Add(content);
-                // 重名的那一卷**不**进 _adopted：它就是本轮自己那卷，CompleteAsync 已经按 runId 删过它。
+                // The same-name volume does **not** go into _adopted: it is this round's own volume, and CompleteAsync already deletes it by runId.
                 if (mine)
                 {
                     reopenMine = true;
@@ -182,64 +195,78 @@ public sealed class BackupRunControl(
                 else
                 {
                     _adopted.Add(oldRunId);
-                    // 采纳的同时把旧卷的挂起标记抹掉：那个标记说的是**已经被顶替掉的那一轮**为什么停下，
-                    // 而"这一卷现在归本轮管"正是让它作废的那个事件——操作员按了 Run，或者启动时自动接了一轮。
+                    // Adopting also wipes the old volume's suspend mark: that mark says why **the round that has now
+                    // been superseded** stopped, and "this volume now belongs to the current round" is precisely the
+                    // event that voids it — the operator pressed Run, or startup auto-resumed a round.
                     //
-                    // 不抹的话它会一直粘着，直到某一轮真的跑成功为止（旧卷只在 CompleteAsync 里删）。
-                    // 后果落在自动接着跑的判据上：那条判据要求这个配置底下**每一卷**都写着 ShuttingDown，
-                    // 于是一卷陈年的 AutoSuspended / UserRequested 就能一票否决掉后面每一次计划内重启，
-                    // 而越是长跑、越是不容易跑完一整轮的配置，越容易卡在这个状态里——恰恰是这个功能要救的那些。
+                    // Without wiping, it sticks around until some round really succeeds (old volumes are only deleted
+                    // in CompleteAsync). The fallout lands on the auto-resume criterion: that criterion requires
+                    // **every** volume under this config to say ShuttingDown, so one stale AutoSuspended /
+                    // UserRequested can veto every subsequent planned restart — and the longer-running a config is,
+                    // the less likely it is to ever finish a whole round, the more easily it gets stuck in this state —
+                    // exactly the configs this feature is meant to rescue.
                     //
-                    // 抹掉之后这一卷不是就此没有标记了：本轮真挂起时会连它一起重新写上本轮的理由
-                    //（见 MarkSuspended）。所以"这个配置停在什么状态"始终由**当前这一轮**说了算。
+                    // Wiping does not leave this volume without a mark from then on: when the current round really
+                    // suspends, it rewrites this round's reason onto it as well (see MarkSuspended). So "what state
+                    // this config stopped in" is always decided by **the current round**.
                     //
-                    // 这一句在多数路径上是被 MarkSuspended 那半边盖住的冗余防线——本轮挂起时反正
-                    // 会把陈年理由覆盖掉，删掉它只有一条机制级测试会红。**别当脚手架删掉**：它守的是
-                    // 领养之后、本轮还没来得及挂起之前那个窗口（本轮被 SIGKILL / 撑爆关机上限），
-                    // 那时没有任何人会去覆盖这一卷，陈年的 AutoSuspended 就会留在盘上继续一票否决。
+                    // On most paths this line is a redundant defense covered by the MarkSuspended half — this round's
+                    // suspend overwrites the stale reason anyway, and deleting it turns only one mechanism-level test
+                    // red. **Don't delete it as scaffolding**: it guards the window after adoption but before this
+                    // round gets a chance to suspend (this round is SIGKILLed / blows past the shutdown cap), when
+                    // nobody would overwrite this volume and the stale AutoSuspended would stay on disk and keep
+                    // vetoing.
                     store.ClearSuspendMark(accountId, container, oldRunId);
                 }
             }
             else
             {
-                // 重名但判据对不上，照删不误：它按本轮的判据已经作废，而下面新开的那一卷本来
-                // 就要落在这个路径上（FileMode.Create），删与不删结果一样。
+                // Same name but the criteria don't match, delete it all the same: by this round's criteria it is void,
+                // and the new volume opened below was going to land on this very path anyway (FileMode.Create), so
+                // deleting or not makes no difference.
                 store.Delete(accountId, container, oldRunId);
                 voided = true;
             }
         }
-        // 采纳过、或作废过 → 这个容器里多半躺着"云上有、索引里没有"的块。
-        // 收尾清理据此决定要不要做一次孤儿扫描（见 Task 11）。
+        // Adopted something, or voided something → this container most likely holds blocks that "exist in the cloud
+        // but not in the index". The closing cleanup uses this to decide whether to run an orphan sweep (see Task 11).
         //
-        // 第一轮也扫，而且这一条不是顺手加的：删配置（保留容器）会把这个容器的 journal 全部丢掉，
-        // 那批块从此失去保护，而删配置端点承诺的正是"等这个容器上再有配置时，第一次清理会把真孤儿
-        // 扫掉"。少了这一条，那句承诺是空的——重建配置后的第一次清理是**备份收尾**那次，而那时
-        // journal 目录刚被删空，既没采纳也没作废，上面两项全是 false；只有独立跑的 Cleanup 计划任务
-        // 才会扫，而用户完全可能一个清理计划都没配。
+        // The first round sweeps too, and that clause is not an afterthought: deleting a config (keeping the container)
+        // throws away all of that container's journals, so those blocks lose their protection from then on, and what
+        // the delete-config endpoint promises is exactly "once this container has a config again, the first cleanup
+        // will sweep the real orphans away". Without this clause that promise is empty — the first cleanup after
+        // recreating the config is the **backup's own closing** one, and at that point the journal directory has just
+        // been emptied, nothing was adopted and nothing was voided, so both of the above are false; only a standalone
+        // scheduled Cleanup job would sweep, and the user may well have no cleanup schedule configured at all.
         //
-        // 代价可控：这是每个配置在每个容器上**只发生一次**的两趟 LIST（data/ 与 packs/），
-        // 而新建备份的容器本来就是空的；真正大的那种容器恰恰是"删了配置又重建"的情形，
-        // 也正是非扫不可的那一种。
+        // The cost is bounded: this is two LISTs (data/ and packs/) that happen **exactly once** per config per
+        // container, and the container of a brand new backup is empty anyway; the genuinely large containers are
+        // precisely the "config deleted and recreated" case — precisely the one that has to be swept.
         SweepNeeded = voided || adopted.Count > 0 || firstRun;
-        // 采纳是**只读**的：本轮仍新开自己那一卷，旧卷原样留着。这样就不必把复用来的记录再抄一遍，
-        // 也不会出现"抄到一半又崩了"的半截状态。旧卷等本轮成功提交索引时一起删。
+        // Adoption is **read-only**: this round still opens its own volume and leaves the old ones exactly as they
+        // are. That way the reused records don't have to be copied over again, and there is no "crashed halfway through
+        // copying" half-state. The old volumes get deleted once this round commits its index successfully.
         Resume = JournalResume.FromVolumes(adopted);
 
-        // runId 与刚采纳的那一卷重名时**接着写**，不能新开：CreateAsync 是 FileMode.Create，
-        // 会把刚刚采纳的那一卷当场截断。
+        // When the runId collides with the volume just adopted, **append**; do not open a new one: CreateAsync is
+        // FileMode.Create and would truncate the volume just adopted on the spot.
         //
-        // 今天撞不上，而且**今天没有任何调用方会撞上**：runId 一律取自 BackupRunState.RunId，
-        // 那是每轮新生成的 GUID 前缀，没有哪条路径会沿用上一轮的。启动时自动接着跑（AutoResumeService）
-        // 也不例外——它走的是上面的**采纳**分支（_adopted），新开自己那一卷。
-        // 这段分支是给"哪天真有人让某一轮沿用旧 runId"准备的：譬如为了让界面上的运行身份跨挂起保持不变。
-        // 截断之后本轮内存里的 Resume 仍然是全的（上面已经读进来了），所以当轮跑下去不出错；
-        // 坏掉的是**盘上**那份担保：再挂起一次，新卷不为那批块作保，下一轮把它们全部重传，
-        // 而按 journal 判"这块有没有人认领"的清理/孤儿扫描会直接把它们当垃圾删掉。
+        // It cannot happen today, and **no caller today can make it happen**: runId always comes from
+        // BackupRunState.RunId, a freshly generated GUID prefix per round, and no path reuses the previous round's.
+        // Auto-resume at startup (AutoResumeService) is no exception — it goes through the **adoption** branch above
+        // (_adopted) and opens its own volume.
+        // This branch is here for the day someone really does make a round reuse an old runId: to keep the run identity
+        // shown in the UI stable across a suspension, say.
+        // After truncation this round's in-memory Resume is still complete (it was read in above), so the round itself
+        // runs on without error; what breaks is the guarantee **on disk**: suspend once more and the new volume vouches
+        // for none of those blocks, so the next round re-uploads all of them, and the cleanup/orphan sweep that decides
+        // "is this block claimed by anyone" from the journal deletes them outright as garbage.
         //
-        // 接着写时头一行**不**重写（见 BackupJournal.OpenForAppendAsync）：判"是我"用的是落到盘上
-        // 那个路径而不是 runId 字符串（上面 mine 的算法），两个不同的 runId 完全可能落在同一个文件
-        // 上——盘上那份头记的因此可能是**更早**那个 runId 和它的 StartedAt。今天没人读这两个字段，
-        // 但往后谁要读 Header.RunId / Header.StartedAt 指望拿到本轮的值，读到的会是陈迹。
+        // When appending, the header line is **not** rewritten (see BackupJournal.OpenForAppendAsync): deciding "this
+        // is mine" uses the path it lands on rather than the runId string (the `mine` computation above), and two
+        // different runIds can perfectly well land on the same file — so the header on disk may record **the earlier**
+        // runId and its StartedAt. Nobody reads those two fields today, but anyone later reading Header.RunId /
+        // Header.StartedAt expecting this round's values would get a leftover.
         _journal = reopenMine
             ? await store.AppendAsync(accountId, container, runId, ct)
             : await store.CreateAsync(accountId, container, runId, new JournalHeader
@@ -253,7 +280,7 @@ public sealed class BackupRunControl(
             }, ct);
     }
 
-    /// <summary>记一个单文件 blob。**只能**在上传确认返回之后调。</summary>
+    /// <summary>Record a single-file blob. **Only** call this after the upload confirmation has returned.</summary>
     public async Task RecordBlobAsync(
         string path, string blobRef, string fullHash, string headHash, string tailHash, long length,
         int volumes, bool raw, IReadOnlyList<long> volumeSizes, CancellationToken ct)
@@ -267,7 +294,7 @@ public sealed class BackupRunControl(
         }, ct);
     }
 
-    /// <summary>记一个 pack。同样**只能**在上传确认返回之后调。</summary>
+    /// <summary>Record a pack. Likewise, **only** call this after the upload confirmation has returned.</summary>
     public async Task RecordPackAsync(
         string packId, IReadOnlyList<JournalMember> members, IReadOnlyList<long> volumeSizes, bool storeOnly,
         CancellationToken ct)
@@ -282,18 +309,21 @@ public sealed class BackupRunControl(
     }
 
     /// <summary>
-    /// 把"这一卷为什么停下"写在 journal 旁边。内存里那份理由随进程一起没了，而"进程没了"
-    /// 恰恰是下次启动要判断的那种情形，所以必须落一份到盘上。
+    /// Write "why this volume stopped" next to the journal. The in-memory copy of the reason dies with the process,
+    /// and "the process is gone" is exactly the case the next startup has to judge, so a copy must land on disk.
     /// <para>
-    /// 还没开卷就挂起的（扫描阶段被叫停）什么都不写：盘上根本没有这一卷 journal，
-    /// 标记只会变成一个指向不存在 journal 的孤儿，反倒要让读它的人多一处判空。
+    /// A run suspended before the journal was even opened (stopped during the scan) writes nothing: there is no journal
+    /// volume on disk at all, so the mark would only become an orphan pointing at a journal that does not exist, and
+    /// would force everyone who reads it to add one more null check.
     /// </para>
     /// <para>
-    /// 写的是**本轮名下每一卷**：自己那卷，加上开卷时采纳来的所有旧卷。理由是标记按卷记、判据按卷读
-    /// （<see cref="AutoResumeService.PickResumableAsync"/> 要求每一卷都写着 ShuttingDown），
-    /// 而采纳之后这几卷就是同一轮运行的现场，一起停下、一起接着跑，没有哪一卷可以停在别的理由上。
-    /// 只写自己那卷的话，采纳来的旧卷会停在"开卷时被抹掉的那个空标记"上，于是**从第二次重启起**
-    /// 判据就再也凑不齐——一次计划内重启接上了，第二次就悄没声地不接了。
+    /// What gets written is **every volume under this round's name**: our own, plus every old volume adopted when the
+    /// journal was opened. The reason is that marks are recorded per volume and the criterion is read per volume
+    /// (<see cref="AutoResumeService.PickResumableAsync"/> requires every volume to say ShuttingDown), and after
+    /// adoption these volumes are the working state of one and the same run — they stop together and resume together,
+    /// and no single volume may stop for a different reason. Writing only our own volume would leave the adopted old
+    /// ones on "the empty mark that was wiped when the journal was opened", so **from the second restart onward** the
+    /// criterion can never be met again — one planned restart resumes, the second silently does not.
     /// </para>
     /// </summary>
     public void MarkSuspended(SuspendReason reason)
@@ -312,9 +342,10 @@ public sealed class BackupRunControl(
     }
 
     /// <summary>
-    /// 运行成功收尾：索引已提交，journal 就没用了。
-    /// 必须在信息文件提交**之后**、保留清理**之前**删——顺序反了，
-    /// 清理会看到"既不被索引引用、也不被 journal 引用"的空档，把刚传上去的内容删掉。
+    /// Successful end of a run: the index is committed, so the journal is of no more use.
+    /// It has to be deleted **after** the info file is committed and **before** retention cleanup — get the order wrong
+    /// and cleanup sees a gap where content is "referenced neither by the index nor by the journal", and deletes what
+    /// was just uploaded.
     /// </summary>
     public async Task CompleteAsync()
     {
@@ -323,7 +354,7 @@ public sealed class BackupRunControl(
         await _journal.DisposeAsync();
         _journal = null;
         store.Delete(_accountId, _container, runId);
-        // 采纳来的旧卷同样功成身退——它们记的内容此刻已经全在提交好的索引里了。
+        // The adopted old volumes retire too — everything they recorded is now in the committed index.
         foreach (var old in _adopted)
             store.Delete(_accountId, _container, old);
         _adopted.Clear();

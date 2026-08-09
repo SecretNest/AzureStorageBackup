@@ -6,8 +6,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 决策 5：一个文件本轮读不开（被占用/无权限），索引不能把它当成删除处理，也不能编造一条
-/// 内容指向为空的坏条目——应沿用它上一版本的条目并打 UnreadableAt。
+/// Decision 5: when a file cannot be read this run (in use / no permission), the index must not treat it as deleted, and must not fabricate a broken
+/// entry whose content reference is empty — it should carry the file's previous-version entry forward and stamp UnreadableAt on it.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadableIndexEntryTests : IDisposable
@@ -56,7 +56,7 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    /// <summary>指定路径的读取一律抛给定异常，其余文件照常算 hash（同 BackupDifferUnreadableTests 的做法）。</summary>
+    /// <summary>Reads of the given path always throw the given exception; every other file is hashed as usual (same approach as BackupDifferUnreadableTests).</summary>
     private sealed class ThrowingHasher(string lockedPath, Exception toThrow) : IFileHasher
     {
         public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
@@ -75,7 +75,7 @@ public sealed class UnreadableIndexEntryTests : IDisposable
                 : Task.FromResult("full-" + Path.GetFileName(path));
     }
 
-    /// <summary>构造一个可运行的编排器；differ 缺省时用真实 hasher，传入自定义 differ 可模拟某文件读不开。</summary>
+    /// <summary>Builds a runnable orchestrator; with no differ it uses the real hasher, and passing a custom differ lets you simulate a file being unreadable.</summary>
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(BackupDiffer? differ = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
@@ -100,7 +100,7 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         Password = null,
         Options = new BackupEngineOptions
         {
-            // 单文件阈值压到 1：每个文件各自成一个 data/{hash} blob，便于直接按 hash 断言 blob 是否被清理。
+            // Single-file threshold dropped to 1: every file becomes its own data/{hash} blob, which makes it easy to assert by hash whether a blob got reclaimed.
             Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
             Retention = retention ?? new RetentionPolicy(),
         },
@@ -121,34 +121,34 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         try
         {
             WriteText("a.txt", "hello");
-            await orchestrator1.RunAsync(Request(account, name)); // v1：正常备份
+            await orchestrator1.RunAsync(Request(account, name)); // v1: a normal backup
 
             var info1 = await store.ReadInfoAsync(account, name, null);
             var idx1 = await store.ReadIndexAsync(account, name, info1!.Versions[0].IndexBlob, null);
             var prevEntry = Assert.Single(idx1.Entries);
 
-            // v2：注入对 a.txt 抛异常的 hasher，模拟本轮读不开；同时改变文件长度，确保不会被 length+mtime
-            // 判定为 Unchanged 而根本不去读它——必须真正走到哈希阶段才会触发 Unreadable。
+            // v2: inject a hasher that throws for a.txt to simulate it being unreadable this run; also change the file's length so that length+mtime
+            // cannot classify it Unchanged and skip reading it altogether — Unreadable is only triggered by actually reaching the hashing stage.
             var (orchestrator2, _, _) = Build(new BackupDiffer(new ThrowingHasher("a.txt",
                 new IOException("The process cannot access the file 'a.txt' because it is being used by another process."))));
             File.WriteAllText(Path.Combine(_root, "a.txt"), "hello world!");
-            await orchestrator2.RunAsync(Request(account, name)); // v2：读不开
+            await orchestrator2.RunAsync(Request(account, name)); // v2: unreadable
 
             var info2 = await store.ReadInfoAsync(account, name, null);
             var idx2 = await store.ReadIndexAsync(account, name, info2!.Versions[^1].IndexBlob, null);
             var entry = Assert.Single(idx2.Entries);
 
             Assert.NotNull(entry.UnreadableAt);
-            // 新条目指向与旧条目完全相同的已上传内容——沿用旧值，而不是拿本轮扫描到的新长度/新内容瞎编。
+            // The new entry points at exactly the same already-uploaded content as the old one — carrying the old values forward, not making something up out of this run's newly scanned length/content.
             Assert.Equal(prevEntry.Storage!.Ref, entry.Storage!.Ref);
             Assert.Equal(prevEntry.FullHash, entry.FullHash);
-            Assert.Equal(prevEntry.Length, entry.Length); // 5（"hello"），不是本轮的 12（"hello world!"）
+            Assert.Equal(prevEntry.Length, entry.Length); // 5 ("hello"), not this run's 12 ("hello world!")
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>决策 5 的护栏。不可读被当成删除的话，保留策略滚过几轮就会
-    /// 把一个仅是长期被占用的文件从所有版本里抹掉——每轮告警看起来都只是「跳过一个文件」。</summary>
+    /// <summary>The guardrail for decision 5. If unreadable were treated as deleted, a few rounds of retention would
+    /// wipe a file that is merely in use long-term out of every version — while each run's warning looks like nothing more than "skipped one file".</summary>
     [SkippableFact]
     public async Task An_Unreadable_File_Is_Never_Recorded_As_Deleted()
     {
@@ -165,14 +165,14 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         try
         {
             WriteText("a.txt", "hello");
-            await orchestrator1.RunAsync(Request(account, name, retention)); // v1：正常备份，上传 data/{hash}
+            await orchestrator1.RunAsync(Request(account, name, retention)); // v1: a normal backup, uploads data/{hash}
 
             var info1 = await store.ReadInfoAsync(account, name, null);
             var idx1 = await store.ReadIndexAsync(account, name, info1!.Versions[0].IndexBlob, null);
             var hash = Assert.Single(idx1.Entries).FullHash!;
 
-            // 连续三轮 a.txt 都读不开。MaxVersions=2 会在这几轮里退役 v1——若 a.txt 被当成删除，
-            // 后续版本都不再引用 data/{hash}，v1 退役时它就会被当成「独占数据」一并清理，文件永久丢失。
+            // Three runs in a row where a.txt is unreadable. MaxVersions=2 retires v1 somewhere in those runs — and if a.txt were treated as deleted,
+            // no later version would reference data/{hash} any more, so retiring v1 would reclaim it as "exclusively owned data" and the file would be lost forever.
             var (orchestrator2, _, _) = Build(new BackupDiffer(new ThrowingHasher("a.txt",
                 new IOException("locked by another process"))));
             for (var i = 0; i < 3; i++)
@@ -181,10 +181,10 @@ public sealed class UnreadableIndexEntryTests : IDisposable
             var infoFinal = await store.ReadInfoAsync(account, name, null);
             var idxFinal = await store.ReadIndexAsync(account, name, infoFinal!.Versions[^1].IndexBlob, null);
 
-            // 仍出现在最新版本索引里——没有被当成已删除而从条目里消失。
+            // Still present in the newest version's index — it did not vanish from the entries as if it had been deleted.
             Assert.Contains(idxFinal.Entries, e => e.Path == "a.txt");
-            // 且它引用的数据 blob 仍然存在：证明每一轮都持续被「在保留的版本」引用，
-            // 而不是被退役版本独占后随之清理掉（那正是被当成删除时会发生的事）。
+            // And the data blob it references still exists: proof that every run kept it referenced by a version that is being retained,
+            // rather than leaving it exclusively owned by a retired version and reclaimed along with it (which is exactly what happens when it is treated as deleted).
             Assert.True(await container.GetBlobClient("data/" + hash).ExistsAsync(),
                 "unreadable file's data blob was reclaimed by retention as if the file had been deleted");
         }
@@ -207,12 +207,12 @@ public sealed class UnreadableIndexEntryTests : IDisposable
         try
         {
             WriteText("new.txt", "content nobody has ever successfully read");
-            await orchestrator.RunAsync(Request(account, name)); // v1：从未成功读过一次，没有旧条目可沿用
+            await orchestrator.RunAsync(Request(account, name)); // v1: never once read successfully, so there is no old entry to carry forward
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            Assert.DoesNotContain(idx.Entries, e => e.Path == "new.txt"); // 没内容可指向，编造条目是撒谎
+            Assert.DoesNotContain(idx.Entries, e => e.Path == "new.txt"); // no content to point at, and fabricating an entry would be a lie
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

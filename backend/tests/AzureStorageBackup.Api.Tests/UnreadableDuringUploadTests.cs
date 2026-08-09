@@ -6,11 +6,11 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// diff 通过之后，源文件还会被再次打开——7z 压缩打包成员时、原样存储单文件上传时。
-/// 一个在 diff 时可读、随后被锁住（占用/权限收回）的文件，此前会让 hasher.FullHashAsync
-/// 在分组重校验的"已排除成员"处理里第二次抛出且无人接住，从而让整轮备份崩溃。
-/// 本文件验证：diff 之后才发生的读失败，与 diff 时就读不开一样，被当作"读不开"处理——
-/// 不产生 blob、索引沿用旧条目（无则缺席）、记一条告警、计入 UnreadableFiles，绝不让整轮备份失败。
+/// Once the diff has passed, the source files get opened again — when 7z compresses pack members, and when a single file is stored as-is and uploaded.
+/// A file that was readable at diff time and then got locked (in use / permissions revoked) used to make hasher.FullHashAsync
+/// throw a second time inside the "excluded member" handling of the group re-verification, with nobody catching it, crashing the whole run.
+/// This file verifies: a read failure that only happens after the diff is handled exactly like one at diff time, as "unreadable" —
+/// no blob is produced, the index carries the old entry forward (absent if there is none), one warning is recorded, it counts toward UnreadableFiles, and the run never fails.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class UnreadableDuringUploadTests : IDisposable
@@ -32,7 +32,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
     public void Dispose()
     {
-        // 恢复权限，否则某些平台上递归删除会因子文件不可读而失败。
+        // Restore permissions, otherwise on some platforms the recursive delete fails because a child file is unreadable.
         try
         {
             foreach (var f in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
@@ -67,17 +67,17 @@ public sealed class UnreadableDuringUploadTests : IDisposable
     }
 
     /// <summary>
-    /// 模拟"diff 时能读、随后立刻被锁住"：包一层真实 hasher，diff 对目标路径算完 hash
-    /// （也就是 diff 认定该文件可读、可分类为 Added/Modified 的那一刻）之后，立刻把该文件的
-    /// Unix 权限位清零。此后 orchestrator 自己的（同样是真实的）hasher/7z 再去读它，
-    /// 会撞上真正的操作系统权限拒绝——不是靠假异常模拟，是真的读不开。
-    /// 之所以不用假抛异常的替身：本进程不是 root（chmod 000 在这台机器上真实生效），
-    /// 用真权限验证的是"生产环境下的操作系统调用是否真被正确捕获"，比替身更贴近真实故障。
+    /// Simulates "readable at diff time, locked immediately afterwards": wrap a real hasher so that right after the diff finishes hashing the
+    /// target path (that is, the moment the diff decides the file is readable and can be classified Added/Modified), that file's
+    /// Unix permission bits are zeroed. From then on the orchestrator's own (equally real) hasher/7z that go read it
+    /// hit a genuine operating-system permission denial — not simulated with a fake exception, actually unreadable.
+    /// Why not a stub that throws a fake exception: this process is not root (chmod 000 really does take effect on this machine),
+    /// and using real permissions verifies "are the operating-system calls in production really caught correctly", which is closer to the real failure than a stub.
     /// <para>
-    /// 触发点挂在 <c>HeadHashAsync</c> 上：本测试把单文件阈值压到 1，目标文件因此归类为单文件
-    /// blob，而单文件 blob 的全文 hash 已经延后到压缩那一遍再算——diff 压根不会调
-    /// <c>FullHashAsync</c>，挂在那里的话锁永远不会落下，"diff 之后才读不开"这个场景就凭空消失了。
-    /// 头部 hash 则是无论走哪条路、每个文件都恰好调一次，而且是 diff 对该文件的最后一次读。
+    /// The trigger hangs off <c>HeadHashAsync</c>: this test drops the single-file threshold to 1, so the target file is classified as a single-file
+    /// blob, and a single-file blob's full hash is already deferred to the compression pass — the diff never calls
+    /// <c>FullHashAsync</c> at all, so hooking there would mean the lock never drops and the "unreadable only after the diff" scenario simply vanishes.
+    /// The head hash, by contrast, is called exactly once per file whichever path it takes, and it is the diff's last read of that file.
     /// </para>
     /// </summary>
     private sealed class LockAfterDiffHasher(IFileHasher inner, string relPath) : IFileHasher
@@ -89,7 +89,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var hash = await inner.HeadHashAsync(path, headBytes, ct);
             if (path.EndsWith(relPath.Replace('/', Path.DirectorySeparatorChar), StringComparison.Ordinal)
                 && Interlocked.Exchange(ref _locked, 1) == 0)
-                File.SetUnixFileMode(path, UnixFileMode.None); // diff 之后立即锁住——模拟"随后被占用/权限收回"
+                File.SetUnixFileMode(path, UnixFileMode.None); // lock it right after the diff — simulates "then taken/permissions revoked"
             return hash;
         }
 
@@ -100,9 +100,9 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             inner.FullHashAsync(path, ct);
     }
 
-    /// <summary>diff 读完某个文件之后，立刻删掉**另一个**文件——用来构造"待打包的成员在被装箱之前
-    /// 就已经消失"。触发点挂在 diff 上而不是上传上：流水线化之后单文件与分组是并发跑的，
-    /// "第一个单文件传完了"不再意味着分组还没开始，靠它定时序就成了掷骰子。</summary>
+    /// <summary>Right after the diff finishes reading one file, delete **another** one — used to construct "a pending pack member disappeared
+    /// before it was boxed up". The trigger hangs off the diff rather than the upload: after pipelining, single files and groups run concurrently,
+    /// so "the first single file finished uploading" no longer means grouping has not started, and relying on it for ordering becomes a dice roll.</summary>
     private sealed class DeleteAfterHashHasher(IFileHasher inner, string triggerRelPath, string victimFullPath)
         : IFileHasher
     {
@@ -124,9 +124,9 @@ public sealed class UnreadableDuringUploadTests : IDisposable
         }
     }
 
-    /// <summary>把一组文件（分组打包成员）压缩一次之后立刻整批锁住——模拟"整个目录忽然读不开"：
-    /// 分组重校验会发现每个成员的权限位都变了，逐一重算 hash 全部失败，"已排除成员"处理必须
-    /// 在第一个成员就吞下失败、继续处理其余成员，而不是抛出未接住的异常让整轮备份崩溃。</summary>
+    /// <summary>Lock a whole batch of files (pack members) right after they have been compressed once — simulates "the entire directory suddenly went unreadable":
+    /// the group re-verification finds every member's permission bits changed and every re-hash fails, so the "excluded member" handling must
+    /// swallow the failure on the very first member and keep processing the rest, rather than throwing an uncaught exception that crashes the whole run.</summary>
     private sealed class LockAllAfterFirstCompressCompressor(
         IFileCompressor inner, string rootPath, IReadOnlyList<string> relPaths) : IFileCompressor
     {
@@ -164,9 +164,9 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>压缩一次之后立刻改写其中一个成员的内容——模拟"分组重校验发现内容在压缩期间变了"
-    /// （而非读不开）：该成员会被排除出本次归档、以新内容重新处理，走 foreach(changed) 里"内容变化"
-    /// 而非"读不开"的分支，为 Finding 1 的回归测试构造"源读取已经全部成功"的前提。</summary>
+    /// <summary>Rewrite one member's content right after a compression pass — simulates "the group re-verification finds the content changed during compression"
+    /// (as opposed to unreadable): that member is excluded from this archive and reprocessed with the new content, taking the "content changed"
+    /// branch of foreach(changed) rather than the "unreadable" one, which sets up the "all source reads already succeeded" premise for the Finding 1 regression test.</summary>
     private sealed class MutateAfterFirstCompressCompressor(
         IFileCompressor inner, string rootPath, string relPath, string newContent) : IFileCompressor
     {
@@ -201,9 +201,9 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>7z 开始读之前把内容换掉（于是存下去的 hash ≠ diff 时的 hash，走的正是需要写索引
-    /// 覆盖条目的那条路径），读完之后立刻把文件锁死——单文件路径此后**不该再打开它一次**。
-    /// 流式之前，覆盖条目要重读源文件取长度与头部 hash，正好撞上这里的权限拒绝而让整轮备份崩掉。</summary>
+    /// <summary>Swap the content before 7z starts reading (so the stored hash ≠ the hash seen at diff time, which is exactly the path that has to write
+    /// an index override entry), then lock the file dead the instant the read finishes — after that the single-file path **must not open it even once**.
+    /// Before streaming, an override entry had to re-read the source file for its length and head hash, hitting exactly this permission denial and crashing the whole run.</summary>
     private sealed class MutateThenLockCompressor(
         IFileCompressor inner, string fullPath, string newContent) : IFileCompressor
     {
@@ -233,10 +233,10 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>上传接缝处注入网络故障：所有 data/pack blob 上传都以 IOException 失败——这正是
-    /// 真实 NAS/网络中断在重试预算耗尽之后逃出 <see cref="BlobUploader"/> 时的形状（IsTransient 把
-    /// IOException 列为可重试的网络错误，重试用尽后原样抛出）。故障注在**上传**上，源文件自始至终
-    /// 完全可读，因此把它归类为"文件不可读"一定是误判。</summary>
+    /// <summary>Inject a network failure at the upload seam: every data/pack blob upload fails with IOException — which is exactly the shape
+    /// a real NAS/network outage has when it escapes <see cref="BlobUploader"/> after the retry budget is exhausted (IsTransient lists
+    /// IOException as a retryable network error and rethrows it as-is once retries run out). The failure is injected at the **upload**, while the source file stays
+    /// perfectly readable from start to finish, so classifying it as "file unreadable" is necessarily a misdiagnosis.</summary>
     private sealed class NetworkFailingUploader : IBlobUploader
     {
         public Task<bool> UploadIfMissingAsync(
@@ -252,7 +252,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             throw new IOException("Unable to write data to the transport connection: Network is unreachable.");
     }
 
-    /// <summary>捕获 NotifyAsync 调用，供断言"读不开的文件推送了通知"。</summary>
+    /// <summary>Captures NotifyAsync calls so we can assert "an unreadable file pushed a notification".</summary>
     private sealed class CapturingNotifier : INotifier
     {
         public List<(NotificationEvents Event, string Title, string Body)> Notifications { get; } = [];
@@ -263,7 +263,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
         }
     }
 
-    /// <summary>捕获每次 progress?.Report 调用，供断言"完工时进度确实到了 100%"（Finding 2）。</summary>
+    /// <summary>Captures every progress?.Report call so we can assert "progress really does reach 100% on completion" (Finding 2).</summary>
     private sealed class CapturingProgress : IProgress<BackupProgress>
     {
         public List<BackupProgress> Reports { get; } = [];
@@ -280,8 +280,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = singleFileThresholdBytes } },
     };
 
-    /// <summary>本次修复的核心断言：diff 之后才发生的读失败（压缩/上传阶段再次打开源文件时撞上）
-    /// 不能让整轮备份崩溃——必须完工，该文件按"读不开"降级处理，其余文件正常上传。</summary>
+    /// <summary>The core assertion of this fix: a read failure that only happens after the diff (hit when the compress/upload stage reopens the source file)
+    /// must not crash the whole run — the run must finish, that file degrades to "unreadable", and the rest upload normally.</summary>
     [SkippableFact]
     public async Task A_File_Locked_After_The_Diff_Does_Not_Abort_The_Run()
     {
@@ -294,8 +294,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var notifier = new CapturingNotifier();
 
-        // 单文件阈值压到 1：locked.bin 与 plain.txt 各自成一个 data/{hash} blob（单文件路径，
-        // 即 HandleBlobAsync/ProcessAsync），而不是走分组打包——本测试专盯"原样单文件"这条路径。
+        // Single-file threshold dropped to 1: locked.bin and plain.txt each become their own data/{hash} blob (the single-file path,
+        // i.e. HandleBlobAsync/ProcessAsync) instead of going through pack grouping — this test targets the "as-is single file" path specifically.
         var account = AzuriteAccount();
         var name = RandomName("unreadupl-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -306,8 +306,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             WriteText("locked.bin", "will be locked right after diff reads it");
             WriteText("plain.txt", "ordinary file, uploads fine");
 
-            // differ 用会在读完之后锁文件的 hasher；orchestrator 自身用真实 hasher/真实 7z——
-            // 它们撞上的是货真价实的操作系统权限拒绝，不是替身抛出的假异常。
+            // The differ gets the hasher that locks the file after reading it; the orchestrator itself gets a real hasher and a real 7z —
+            // what they hit is a bona fide operating-system permission denial, not a fake exception thrown by a stub.
             var differ = new BackupDiffer(new LockAfterDiffHasher(new FileHasher(), "locked.bin"));
             var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
@@ -318,30 +318,30 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
 
-            Assert.Equal(1, result.Version); // 备份完工，产出新版本——没有因这一个文件崩掉整轮
-            Assert.Equal(1, result.UnreadableFiles); // 复用既有计数
+            Assert.Equal(1, result.Version); // the backup finished and produced a new version — one file did not crash the whole run
+            Assert.Equal(1, result.UnreadableFiles); // reuses the existing counter
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // locked.bin 是全新文件、从未成功备份过——没有旧条目可沿用，编造一条是撒谎，须整条缺席。
+            // locked.bin is brand new and has never been backed up successfully — there is no old entry to carry forward, and fabricating one would be a lie, so it must be absent entirely.
             Assert.DoesNotContain(idx.Entries, e => e.Path == "locked.bin");
 
-            // plain.txt 完全不受影响，正常上传、正常出现在索引里。
+            // plain.txt is completely unaffected: it uploads normally and shows up in the index normally.
             var plain = Assert.Single(idx.Entries, e => e.Path == "plain.txt");
             Assert.Equal("blob", plain.Storage!.Kind);
             Assert.True(await container.GetBlobClient(plain.Storage.Ref).ExistsAsync());
 
-            // 复用既有的 UnrecoverableError 通知通道，而非另起一套。
+            // Reuses the existing UnrecoverableError notification channel rather than inventing another one.
             var notification = Assert.Single(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError);
             Assert.Contains("locked.bin", notification.Title);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>诊断报告点名的最坏情形：整个目录的成员一起变得读不开。分组重校验会把它们
-    /// 全部判定为"已排除"，此前"changed"成员处理里对第一个成员重算 hash 会再次抛出且无人接住，
-    /// 于是在同目录的其余成员被处理之前就让整轮备份崩溃。验证这条路径现在能扛住并全须全尾地完工。</summary>
+    /// <summary>The worst case the diagnostic report called out: every member of a directory goes unreadable at once. The group re-verification marks
+    /// them all as "excluded", and the old "changed" member handling would re-hash the first member, throw again with nobody catching it,
+    /// and crash the whole run before the remaining members of that directory were even processed. Verifies this path now holds up and finishes intact.</summary>
     [SkippableFact]
     public async Task A_Whole_Directory_Locked_After_The_Diff_Does_Not_Abort_The_Run()
     {
@@ -361,7 +361,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         try
         {
-            // 同目录两个小文件 → 默认分组阈值下会被规划进同一个 pack。
+            // Two small files in the same directory → planned into the same pack under the default grouping threshold.
             WriteText("d/x.txt", "xxxx");
             WriteText("d/y.txt", "yyyy");
 
@@ -376,31 +376,31 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
-                Request(account, name, singleFileThresholdBytes: 5_000_000)); // 走分组打包，不走单文件路径
+                Request(account, name, singleFileThresholdBytes: 5_000_000)); // go through pack grouping, not the single-file path
 
-            Assert.Equal(1, result.Version); // 备份完工——两个成员一起读不开也不能让整轮崩溃
-            Assert.Equal(2, result.UnreadableFiles); // 两个都计入
+            Assert.Equal(1, result.Version); // the run finished — both members going unreadable together must not crash it
+            Assert.Equal(2, result.UnreadableFiles); // both are counted
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 两个都是全新文件，没有旧条目可沿用，整条缺席。
+            // Both are brand new files with no old entry to carry forward, so both are absent entirely.
             Assert.DoesNotContain(idx.Entries, e => e.Path == "d/x.txt");
             Assert.DoesNotContain(idx.Entries, e => e.Path == "d/y.txt");
 
-            // 两个各有一条告警，都复用既有通知通道。
+            // One warning each, both reusing the existing notification channel.
             Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/x.txt"));
             Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/y.txt"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>Finding 2：一整个 pack 的成员全部在 diff 之后读不开时（stable.Count == 0），
-    /// 此前 HandleBlobAsync 的 catch 会 onItem()，但 ProcessDirectoryAsync 里 foreach(changed) 的
-    /// 姊妹 catch 不会——而 stable.Count == 0 时 "if (stable.Count > 0)" 这唯一的另一个 onItem()
-    /// 调用点也被跳过，于是这个在 total 里占了一个槽位的 pack，整轮下来 onItem() 被调用零次。
-    /// uploaded 从此永远比 total 少 1，完工时进度报告也到不了 100%——即使备份其实已经跑完。
-    /// 本测试直接盯着 progress 上报：备份完工后最后一次上报必须是 Stage=Completed 且 Percent=100。</summary>
+    /// <summary>Finding 2: when every member of an entire pack goes unreadable after the diff (stable.Count == 0),
+    /// HandleBlobAsync's catch used to call onItem(), but the sibling catch in ProcessDirectoryAsync's foreach(changed)
+    /// did not — and with stable.Count == 0 the one other onItem() call site, "if (stable.Count > 0)",
+    /// is skipped too, so this pack, which occupies a slot in total, gets onItem() called zero times for the entire run.
+    /// uploaded is then forever 1 short of total, and the progress report on completion never reaches 100% — even though the backup actually finished.
+    /// This test watches the progress reports directly: the last report after the run finishes must be Stage=Completed with Percent=100.</summary>
     [SkippableFact]
     public async Task A_Whole_Pack_Unreadable_After_The_Diff_Still_Reports_Full_Progress()
     {
@@ -421,7 +421,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         try
         {
-            // 同目录两个小文件 → 规划成同一个 pack，占 total 里的一个槽位。
+            // Two small files in the same directory → planned into the same pack, occupying one slot in total.
             WriteText("d/x.txt", "xxxx");
             WriteText("d/y.txt", "yyyy");
 
@@ -436,31 +436,31 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
-                Request(account, name, singleFileThresholdBytes: 5_000_000), progress); // 走分组打包
+                Request(account, name, singleFileThresholdBytes: 5_000_000), progress); // go through pack grouping
 
             Assert.Equal(1, result.Version);
-            Assert.Equal(2, result.UnreadableFiles); // 两个成员都读不开——这个 pack 整包失败
+            Assert.Equal(2, result.UnreadableFiles); // both members unreadable — the whole pack fails
 
             var completed = Assert.Single(progress.Reports, p => p.Stage == BackupStage.Completed);
-            Assert.Equal(completed.TotalItems, completed.UploadedItems); // uploaded 追上了 total
-            Assert.Equal(100, completed.Percent); // 完工必须显示 100%，不能永远差一
+            Assert.Equal(completed.TotalItems, completed.UploadedItems); // uploaded caught up with total
+            Assert.Equal(100, completed.Percent); // completion must show 100%, not be forever one short
 
-            // 反过来也要确认没有矫枉过正到重复计数：整个运行过程中任何一次上报都不该超过 total。
+            // Confirm the other direction too, that there is no overcorrection into double counting: no report during the whole run may exceed total.
             Assert.All(progress.Reports, p => Assert.True(p.UploadedItems <= p.TotalItems));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>Finding 1 回归测试：修复前，ProcessDirectoryAsync 的 foreach(changed) 用一个 try
-    /// 圈住了整个 HandleBlobAsync(...) 调用——而该方法自己的处理早已成功把内容上传到云端之后，
-    /// 还会做与源读取无关的下游工作（这里用 verbose logging 真实触发磁盘 IOException 来还原：
-    /// 令 VerboseFileLog 的日志根目录路径中有一段是文件而非目录，Directory.CreateDirectory 在这种
-    /// 路径下必然抛 IOException——不是靠假抛异常的替身模拟，是真实的文件系统调用失败）。
-    /// 修复前，这个下游失败会被那层过宽的 try 接住，文件被误判成"读不开"、已经成功上传的
-    /// blob 在索引里凭空消失，备份本身却"成功"收尾——这才是最坏的情形：数据丢失但无人报警。
-    /// 修复后，foreach(changed) 的 try 只圈住了 hasher/BuildOverrideAsync 这段真正的源读取；
-    /// HandleBlobAsync 自己也没有再把这段下游工作纳入它自己的 catch。于是这个下游失败必须
-    /// 如实地从 RunAsync 抛出来——响亮地失败，而不是悄悄把一个已经传成功的文件当作读不开。</summary>
+    /// <summary>Finding 1 regression test: before the fix, ProcessDirectoryAsync's foreach(changed) wrapped the entire
+    /// HandleBlobAsync(...) call in one try — and that method, long after its own processing has successfully uploaded the content to the cloud,
+    /// still does downstream work unrelated to reading the source (reproduced here by making verbose logging raise a genuine disk IOException:
+    /// point VerboseFileLog's log root at a path where one segment is a file rather than a directory, so that Directory.CreateDirectory under such
+    /// a path necessarily throws IOException — not simulated with a stub that throws a fake exception, a real filesystem call failure).
+    /// Before the fix that downstream failure got caught by the overly wide try, the file was misdiagnosed as "unreadable", the already
+    /// successfully uploaded blob vanished from the index, and the backup itself wrapped up as a "success" — which is the worst case of all: data loss with nobody alerted.
+    /// After the fix, foreach(changed)'s try wraps only the hasher/BuildOverrideAsync section that really reads the source;
+    /// HandleBlobAsync no longer pulls that downstream work into its own catch either. So this downstream failure must
+    /// propagate faithfully out of RunAsync — fail loudly, instead of quietly treating an already successfully uploaded file as unreadable.</summary>
     [SkippableFact]
     public async Task A_Downstream_Failure_After_Successful_Upload_Is_Not_Misreported_As_Unreadable()
     {
@@ -473,8 +473,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var notifier = new CapturingNotifier();
 
-        // verbose 日志根目录里有一段路径其实是个普通文件——Directory.CreateDirectory 在这种路径下
-        // 必然报 ENOTDIR（IOException），这是货真价实的文件系统失败，不是替身抛的假异常。
+        // One segment of the verbose log root path is actually an ordinary file — Directory.CreateDirectory under such a path
+        // necessarily reports ENOTDIR (IOException), which is a bona fide filesystem failure, not a fake exception from a stub.
         var logBlockerFile = Path.Combine(_temp, "log-root-blocker");
         await File.WriteAllTextAsync(logBlockerFile, "not a directory");
         var verboseLog = new VerboseFileLog(Path.Combine(logBlockerFile, "logs"));
@@ -486,21 +486,21 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         try
         {
-            // 目录 d 下只有这一个小文件（长度 22 字节 < 30 字节阈值）→ 规划阶段单独成一个只有
-            // 1 个成员的 pack（GroupingPlanner 按目录分组，目录内哪怕只有一个可分组文件也会
-            // 成一个 pack）。故意只放一个文件：如果还有其它"稳定"成员，它们会先被
-            // ProcessDirectoryAsync 里 "if (stable.Count > 0)" 分支的 LogFileAsync 撞上同一个坏
-            // 日志目录，抢先失败，测试就测不到 foreach(changed) 这条路径了。
-            // x.txt 会在首次压缩后被改写成一段超过阈值长度的新内容（模拟"处理中变化"，而非
-            // 读不开)。分组重校验发现它变化后排除出归档（此时 stable.Count == 0，不产生任何
-            // LogFileAsync 调用），foreach(changed) 见其新长度 ≥ 阈值 → 走"超阈值→单文件"分支，
-            // 递归调用 HandleBlobAsync 走单文件上传路径——这正是 Finding 1 命中的那条调用路径
-            // （调用方 try 曾经圈住这整个调用，包括调用内部成功上传之后的 LogFileAsync）。
-            WriteText("d/x.txt", "original content of x"); // 22 字节，< 30，规划时入 pack
+            // Directory d holds only this one small file (22 bytes < the 30-byte threshold) → planning gives it its own pack with exactly
+            // 1 member (GroupingPlanner groups by directory, and a directory forms a pack even with only a single groupable file
+            // inside). Deliberately only one file: if there were other "stable" members, they would first hit the same broken
+            // log directory through LogFileAsync in the "if (stable.Count > 0)" branch of ProcessDirectoryAsync and fail
+            // ahead of us, and the test would never reach the foreach(changed) path.
+            // x.txt gets rewritten after the first compression into new content longer than the threshold (simulating "changed during processing",
+            // not unreadable). The group re-verification sees the change and excludes it from the archive (at which point stable.Count == 0 and no
+            // LogFileAsync call is made at all); foreach(changed) sees the new length ≥ the threshold → takes the "over threshold → single file" branch
+            // and recursively calls HandleBlobAsync down the single-file upload path — which is exactly the call path Finding 1 hit
+            // (the caller's try used to wrap this entire call, including the LogFileAsync after the successful upload inside it).
+            WriteText("d/x.txt", "original content of x"); // 22 bytes, < 30, goes into a pack at planning time
 
             var compressor = new MutateAfterFirstCompressCompressor(
                 new SevenZipCompressor(), _root, "d/x.txt",
-                "mutated content of x, now much longer than the 30-byte threshold"); // > 30 字节
+                "mutated content of x, now much longer than the 30-byte threshold"); // > 30 bytes
 
             var authority = new TestLocalAuthority(store);
             var orchestrator = new BackupOrchestrator(
@@ -518,26 +518,26 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 },
             };
 
-            // 内容已经成功压缩、上传到云端之后，verbose 日志写入才失败——这个失败必须如实抛出来，
-            // 绝不能被悄悄吞掉、把 x.txt 误判成"读不开"（那样的话数据在云端却在索引里凭空消失，
-            // 而且备份还会"成功"收尾，是比崩溃更糟的静默数据丢失）。DirectoryNotFoundException
-            // 是 IOException 的子类，用 ThrowsAnyAsync 兼容 .NET 对 ENOTDIR 的具体映射类型。
+            // The verbose log write only fails after the content has been successfully compressed and uploaded to the cloud — that failure must be thrown faithfully
+            // and must never be quietly swallowed with x.txt misdiagnosed as "unreadable" (that would leave the data in the cloud but gone from the index,
+            // with the backup still wrapping up as a "success" — silent data loss, which is worse than a crash). DirectoryNotFoundException
+            // is a subclass of IOException; ThrowsAnyAsync keeps us compatible with whichever concrete type .NET maps ENOTDIR to.
             await Assert.ThrowsAnyAsync<IOException>(() => orchestrator.RunAsync(request));
 
-            // 修复前的错误处置会先写一条"读不开"告警再吞掉异常；修复后异常真实向外传播，
-            // 不会有任何文件被误判成"读不开"进而通知。
+            // The pre-fix mishandling would first write an "unreadable" warning and then swallow the exception; after the fix the exception really propagates out,
+            // and no file gets misdiagnosed as "unreadable" and notified about.
             Assert.DoesNotContain(notifier.Notifications, n => n.Title.Contains("d/x.txt"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>终审 Important 1：HandleBlobAsync 的 catch 圈住的不只是源文件读取，还有压缩、暂存
-    /// 和上传。BlobUploader.IsTransient 把 IOException 列为可重试的网络错误，重试预算耗尽后它原样
-    /// 抛出——形状与"文件读不开"完全一致。仅凭异常类型收下它，网络中断就会被逐个文件记成
-    /// "unreadable，沿用旧条目"，整轮备份照常提交新版本并报告成功：NAS 断网一小时，操作员收到的是
-    /// "Backup succeeded, 0 changed files"，是比崩溃糟糕得多的静默失败。
-    /// 本测试把故障注在上传接缝处（源文件全程可读），断言这个 IOException 如实向外传播、
-    /// 没有任何文件被误判为不可读、也没有产生任何"成功"的版本。</summary>
+    /// <summary>Final-review Important 1: HandleBlobAsync's catch wraps not just the source file read but compression, staging
+    /// and upload as well. BlobUploader.IsTransient lists IOException as a retryable network error and rethrows it as-is once the retry
+    /// budget is exhausted — a shape identical to "the file is unreadable". Accepting it on exception type alone means a network outage gets recorded file by file as
+    /// "unreadable, carry the old entry forward" while the run happily commits a new version and reports success: an hour of NAS network outage, and what the operator receives is
+    /// "Backup succeeded, 0 changed files" — a silent failure far worse than a crash.
+    /// This test injects the failure at the upload seam (the source file is readable throughout) and asserts that this IOException propagates faithfully,
+    /// that no file is misdiagnosed as unreadable, and that no "successful" version is produced.</summary>
     [SkippableFact]
     public async Task An_Upload_Network_Failure_Is_Not_Misreported_As_An_Unreadable_File()
     {
@@ -557,7 +557,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         try
         {
-            // 阈值压到 1 → 走单文件路径（HandleBlobAsync/ProcessAsync），也就是那个过宽 catch 所在处。
+            // Threshold dropped to 1 → the single-file path (HandleBlobAsync/ProcessAsync), which is where that overly wide catch lives.
             WriteText("reachable.bin", "this file is perfectly readable the whole time");
 
             var authority = new TestLocalAuthority(store);
@@ -567,28 +567,28 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
-            // 上传失败必须让整轮备份失败，而不是被当成"这个文件读不开"悄悄跳过。
+            // An upload failure must fail the whole run, not be quietly skipped as "this file is unreadable".
             await Assert.ThrowsAnyAsync<IOException>(() =>
                 orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1)));
 
-            // 源文件全程可读，任何一条"unreadable"告警都是误判。
+            // The source file is readable throughout, so any "unreadable" warning is a misdiagnosis.
             Assert.DoesNotContain(notifier.Notifications, n => n.Title.Contains("unreadable"));
-            // 失败要走失败通道，不能混进成功通知里。
+            // A failure must go down the failure channel and must not sneak into the success notifications.
             Assert.Contains(notifier.Notifications, n => n.Event == NotificationEvents.BackupFailure);
             Assert.DoesNotContain(notifier.Notifications, n => n.Event == NotificationEvents.BackupSuccess);
 
-            // 也不能留下一个"成功"的版本：修复前会以旧条目提交 v1 并把它当作正常备份。
+            // Nor may it leave a "successful" version behind: before the fix it would commit v1 from the old entries and treat it as a normal backup.
             var info = await store.ReadInfoAsync(account, name, null);
             Assert.True(info is null || info.Versions.Count == 0);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>终审 Important 2：分组重校验前的 <c>before</c> 元数据快照落在所有 try 之外，而它对一个
-    /// 已经消失的成员会抛 FileNotFoundException。diff 判完一个文件、到它所在的那一箱被压缩，
-    /// 对一次大备份中间可能隔了很久——一个被删掉的构建产物就足以让整轮备份倒在与本分支所修
-    /// 完全相同的形状上。本测试在 diff 读完同目录最后一个文件的那一刻删掉某个待打包成员
-    /// （封箱正是这一刻定的），断言备份照常完工、该成员按"读不开"降级、同组的兄弟不受牵连。</summary>
+    /// <summary>Final-review Important 2: the <c>before</c> metadata snapshot taken ahead of the group re-verification sits outside every try, and for a
+    /// member that has already disappeared it throws FileNotFoundException. Between the diff classifying a file and the box it lives in being compressed,
+    /// a large backup can leave a very long gap — a single deleted build artifact is enough to make the whole run fall over in exactly
+    /// the same shape this branch fixes. This test deletes one pending pack member at the moment the diff finishes reading the last file in that directory
+    /// (which is precisely when the box gets sealed), and asserts the backup still finishes, that member degrades to "unreadable", and its siblings in the group are untouched.</summary>
     [SkippableFact]
     public async Task A_Pack_Member_Deleted_Before_The_Metadata_Snapshot_Does_Not_Abort_The_Run()
     {
@@ -608,14 +608,14 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
         try
         {
-            // big.bin 超过阈值 → 单文件 blob，先上传；d/ 下两个小文件 → 同一个 pack，后处理。
-            // 这个先后顺序正是缺口存在的原因，所以测试必须同时有这两类文件。
+            // big.bin is over the threshold → a single-file blob, uploaded first; the two small files under d/ → one pack, processed afterwards.
+            // That ordering is exactly why the gap exists, so the test has to have both kinds of file.
             WriteText("big.bin", new string('b', 400));
             WriteText("d/x.txt", "xxxx");
             WriteText("d/y.txt", "yyyy");
 
-            // 扫描按 ordinal 路径序推进 → d/y.txt 是这个目录最后一个被 diff 的成员，
-            // 它一判完这一箱就封箱。在那一刻删掉 d/x.txt，快照必然撞上一个已经不在的文件。
+            // The scan advances in ordinal path order → d/y.txt is the last member of this directory to be diffed,
+            // and the box is sealed the moment it is classified. Deleting d/x.txt at that moment guarantees the snapshot hits a file that is already gone.
             var victim = Path.Combine(_root, "d", "x.txt");
             var differ = new BackupDiffer(new DeleteAfterHashHasher(new FileHasher(), "d/y.txt", victim));
 
@@ -628,36 +628,36 @@ public sealed class UnreadableDuringUploadTests : IDisposable
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 100));
 
-            Assert.Equal(1, result.Version);         // 完工——没有倒在快照那一行
-            Assert.Equal(1, result.UnreadableFiles); // 消失的成员计入既有计数
+            Assert.Equal(1, result.Version);         // finished — did not fall over on the snapshot line
+            Assert.Equal(1, result.UnreadableFiles); // the vanished member counts toward the existing counter
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 全新文件、从未成功备份过 → 没有旧条目可沿用，整条缺席。
+            // Brand new file, never successfully backed up → no old entry to carry forward, absent entirely.
             Assert.DoesNotContain(idx.Entries, e => e.Path == "d/x.txt");
 
-            // 同组的兄弟不受牵连：照常打包上传，pack blob 真的在云端。
+            // Siblings in the same group are untouched: packed and uploaded as usual, and the pack blob really is in the cloud.
             var sibling = Assert.Single(idx.Entries, e => e.Path == "d/y.txt");
             Assert.Equal("pack", sibling.Storage!.Kind);
             Assert.True(await container.GetBlobClient($"packs/{sibling.Storage.Ref}.7z").ExistsAsync());
 
-            // 先行上传的单文件同样不受影响。
+            // The single file uploaded earlier is likewise unaffected.
             var big = Assert.Single(idx.Entries, e => e.Path == "big.bin");
             Assert.Equal("blob", big.Storage!.Kind);
             Assert.True(await container.GetBlobClient(big.Storage.Ref).ExistsAsync());
 
-            // 消失的成员走既有告警通道，操作员会知道它本轮没被存下来。
+            // The vanished member goes down the existing warning channel, so the operator knows it was not stored this run.
             Assert.Contains(notifier.Notifications,
                 n => n.Event == NotificationEvents.UnrecoverableError && n.Title.Contains("d/x.txt"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>"内容在处理中变化、随后又被锁住"这个组合，此前会在单文件路径上崩掉整轮备份：
-    /// 写索引覆盖条目要重读源文件取长度与头部 hash，而那时文件已经读不开了。
-    /// 流式之后这次重读整个消失——长度、头尾 hash 全部来自压缩时的那一遍读。本测试就钉这一点：
-    /// 文件在被读完的下一刻锁死，备份照常完工，条目里记的是**实际存下去**的那份内容。</summary>
+    /// <summary>The combination "content changes during processing and then gets locked" used to crash the whole run on the single-file path:
+    /// writing the index override entry required re-reading the source file for its length and head hash, and by then the file was unreadable.
+    /// After streaming, that re-read disappears entirely — the length and the head/tail hashes all come from the single compression read. This test nails exactly that:
+    /// the file is locked dead the instant after it is read, the backup still finishes, and the entry records the content that was **actually stored**.</summary>
     [SkippableFact]
     public async Task A_File_Locked_Right_After_Being_Read_Still_Records_What_Was_Stored()
     {
@@ -690,11 +690,11 @@ public sealed class UnreadableDuringUploadTests : IDisposable
                 new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
                 notifier: notifier);
 
-            // 阈值压到 1 → 单文件路径（HandleBlobAsync），也就是从前保护缺失的那一条。
+            // Threshold dropped to 1 → the single-file path (HandleBlobAsync), the one that used to have no protection.
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
 
             Assert.Equal(1, result.Version);
-            Assert.Equal(0, result.UnreadableFiles); // 内容已经完整读到并存下去了，没有任何东西"读不开"
+            Assert.Equal(0, result.UnreadableFiles); // the content was read in full and stored, so nothing is "unreadable"
             Assert.DoesNotContain(
                 notifier.Notifications, n => n.Event == NotificationEvents.UnrecoverableError);
 
@@ -703,7 +703,7 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var entry = Assert.Single(idx.Entries, e => e.Path == "churn.bin");
 
             var rewritten = "content rewritten while the backup was compressing it";
-            Assert.Equal(rewritten.Length, entry.Length);   // 记的是压进去的那份，不是 diff 时看到的那份
+            Assert.Equal(rewritten.Length, entry.Length);   // records what got compressed in, not what the diff saw
             Assert.True(await VolumeBlobIO.ExistsAsync(container, entry.Storage!.Ref, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }

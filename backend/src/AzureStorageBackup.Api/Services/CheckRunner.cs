@@ -2,21 +2,22 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一次检查运行的内存状态。</summary>
+/// <summary>In-memory state of one check run.</summary>
 public sealed class CheckRunState
 {
     public RunStatus Status { get; set; } = RunStatus.Running;
 
-    /// <summary>最近一次跑完的报告。**跑完之后仍然留着**：用户关掉对话框再打开要能看回结果，
-    /// 而一次内容级检查要把整个备份下载重算一遍 hash，重跑的代价是实打实的出站流量。</summary>
+    /// <summary>The report of the most recent completed run. **Kept around after the run finishes**: the user must
+    /// be able to close the dialog, open it again and see the result, and re-running a content-level check means
+    /// downloading the whole backup and rehashing it — the price is real egress traffic.</summary>
     public CheckReport? Report { get; set; }
 
     public string? Error { get; set; }
 
-    /// <summary>当前阶段在做什么（在查哪个对象、已查多少、多快）。</summary>
+    /// <summary>What the current stage is doing (which object it is checking, how many so far, how fast).</summary>
     public StageProgress? Detail { get; set; }
 
-    /// <summary>内部机制，不进 HTTP 契约：本次运行的取消源，供 /cancel 端点用。</summary>
+    /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
@@ -26,14 +27,16 @@ public sealed record CheckRunResponse(string Status, CheckReport? Report, string
 }
 
 /// <summary>
-/// 后台检查运行器：跑 <see cref="BackupChecker"/>，状态存内存供轮询。
+/// Background check runner: runs <see cref="BackupChecker"/> and keeps the state in memory for polling.
 /// <para>
-/// 检查此前是**同步端点**：请求一直挂到检查结束。内容级检查要下载全部数据重算 hash，
-/// 几百 GB 的备份要跑几小时——浏览器和反向代理都会先超时，请求断了检查也就白跑了，
-/// 而且全程没有任何进度可看。改成后台运行 + 轮询之后，这两件事一起解决。
+/// A check used to be a **synchronous endpoint**: the request hung until the check was done. A content-level check
+/// downloads all the data and recomputes hashes, and a few hundred GB of backup takes hours — the browser and the
+/// reverse proxy both time out first, and once the request is dropped the check ran for nothing; on top of that
+/// there was no progress to look at the whole time. Moving to a background run + polling solves both at once.
 /// </para>
-/// 与 <see cref="RepairRunner"/> 同形：**持有 <see cref="BackupBusyTracker"/> 到完成**
-/// （检查也是对该备份的操作，期间计划任务应当跳过），目标忙碌时直接失败。
+/// Same shape as <see cref="RepairRunner"/>: it **holds <see cref="BackupBusyTracker"/> until completion** (a check
+/// is an operation on that backup too, and scheduled tasks should skip it meanwhile), and fails outright when the
+/// target is busy.
 /// </summary>
 public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
@@ -60,8 +63,9 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             return _runs.GetValueOrDefault(configId);
     }
 
-    /// <summary>停止正在跑的那次检查。返回 false = 当前没有在跑的检查。
-    /// Cancel() 在当前线程同步跑回调，故取记录用锁、取消不用（见 BackupRunner.Cancel 同处注释）。</summary>
+    /// <summary>Stop the check that is currently running. Returns false = nothing is running right now.
+    /// Cancel() runs its callbacks synchronously on the calling thread, so the lock covers looking the record up but
+    /// not the cancellation itself (see the same comment on BackupRunner.Cancel).</summary>
     public bool Cancel(int configId)
     {
         CheckRunState? state;
@@ -105,20 +109,22 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             {
                 busy.Release(account.Id, config.ContainerName);
             }
-            // 检查跑完（无论是否发现问题）算成功；只有异常才置 Error（决策 2）。
+            // A check that ran to completion counts as success, whether or not it found problems; only an
+            // exception sets Error (decision 2).
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<CheckRunner>>());
         }
         catch (OperationCanceledException)
         {
-            // 用户按了停止：不是失败，不写 Error 状态（与 BackupRunner 同一约定，也与旧的
-            // 同步 /check 端点「取消不写 Error」保持一致）。
+            // The user pressed stop: not a failure, so no Error state is written (the same convention as
+            // BackupRunner, and consistent with the old synchronous /check endpoint's "cancel writes no Error").
             state.Status = RunStatus.Canceled;
         }
         catch (Exception ex)
         {
             state.Error = ex.Message;
             state.Status = RunStatus.Failed;
-            // 原 scope 可能已随异常释放（`using var scope` 在 try 块退出时释放）：另开一个写状态。
+            // The original scope may already have been disposed by the exception (`using var scope` disposes when
+            // the try block exits): open another one to write the status.
             using var scope = scopes.CreateScope();
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
                 .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<CheckRunner>>());

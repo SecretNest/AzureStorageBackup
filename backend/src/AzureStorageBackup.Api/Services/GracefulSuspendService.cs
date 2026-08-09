@@ -1,14 +1,16 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 进程正常退出时（<c>docker stop</c>、升级重启）把在跑的备份挂起落盘。
+/// On a clean process exit (<c>docker stop</c>, upgrade restart), suspend the running backups and flush them to disk.
 /// <para>
-/// 用 <see cref="IHostedService.StopAsync"/> 而不是 <c>ApplicationStopping</c> 的回调：
-/// 前者是 await 得到的，宿主会等它返回才继续拆服务；后者是同步事件，等不住异步落盘。
+/// Uses <see cref="IHostedService.StopAsync"/> instead of the <c>ApplicationStopping</c> callback:
+/// the former is awaited, so the host waits for it to return before tearing more services down; the latter is a
+/// synchronous event and cannot wait for an async flush.
 /// </para>
 /// <para>
-/// 注册顺序有意义：宿主按注册的**逆序**停服务，所以这个要注册在 <c>SchedulerService</c> **之后**，
-/// 才能先于调度器停下来——不然调度器可能在挂起进行到一半时又起一轮，而那一轮再没有人来挂起它。
+/// Registration order matters: the host stops services in **reverse** registration order, so this one has to be
+/// registered **after** <c>SchedulerService</c> in order to stop before the scheduler does — otherwise the scheduler
+/// could start another run halfway through the suspend, and there would be nobody left to suspend that one.
 /// </para>
 /// </summary>
 public sealed class GracefulSuspendService(BackupRunner runner, ILogger<GracefulSuspendService> logger)
@@ -20,16 +22,18 @@ public sealed class GracefulSuspendService(BackupRunner runner, ILogger<Graceful
     {
         try
         {
-            // 这个数是"真的停成 Suspended、盘上留下了标记"的条数，不是"发出去几条停止请求"——
-            // 等超时的、以及被同时到达的 Stop now 抢先按成 Canceled 的都不算。日志说的话必须与
-            // 盘上的东西对得上，否则事后按这条日志去找标记只会找空。
+            // This number counts runs that really settled as Suspended and left a mark on disk, not stop requests
+            // sent — ones that timed out, and ones a concurrently arriving Stop now beat into Canceled, don't count.
+            // What the log claims has to match what is on disk, otherwise going looking for a mark on the strength
+            // of this log line later turns up nothing.
             var stopped = await runner.SuspendAllAsync(SuspendReason.ShuttingDown, ct);
             if (stopped > 0)
                 logger.LogInformation("Suspended {Count} running backup(s) for shutdown", stopped);
         }
         catch (Exception ex)
         {
-            // 关机路径上抛出去只会变成一条谁也看不见的宿主错误，还可能盖掉别的服务的收尾。
+            // Throwing on the shutdown path just becomes a host error nobody ever sees, and can bury other
+            // services' cleanup.
             logger.LogError(ex, "Failed to suspend running backups during shutdown");
         }
     }

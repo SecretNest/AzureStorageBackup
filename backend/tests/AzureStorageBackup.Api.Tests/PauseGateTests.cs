@@ -25,7 +25,7 @@ public class PauseGateTests
             patience: TimeSpan.FromMinutes(10));
         var waiting = gate.WaitAsync(new IOException("network down"), default);
 
-        // 等它把状态立起来（开闸是同步做的，但等待者还没跑到 await）
+        // Wait for it to publish the state (opening the gate is synchronous, but the waiter has not reached the await yet)
         for (var i = 0; i < 200 && gate.Current is null; i++)
             await Task.Delay(5);
 
@@ -58,7 +58,7 @@ public class PauseGateTests
         Assert.Equal(new[] { true, true, true }, await Task.WhenAll(a, b, c));
     }
 
-    // 耐心用尽 -> 降级。调用方据此走挂起退出，而不是继续傻等。
+    // Patience runs out -> downgrade. The caller takes the suspend-and-exit path instead of dumbly waiting on.
     [Fact]
     public async Task Downgrades_when_patience_runs_out()
     {
@@ -75,7 +75,7 @@ public class PauseGateTests
         Assert.False(await gate.WaitAsync(new IOException("blip"), default));
     }
 
-    // 别的工作者干成了活 -> 网络显然是通的 -> 失败计数清零，退避从头来，耐心也重新计时。
+    // Another worker got work done -> the network is obviously up -> failure count resets, backoff starts over, patience restarts too.
     [Fact]
     public async Task Success_resets_the_failure_count()
     {
@@ -85,12 +85,13 @@ public class PauseGateTests
 
         gate.ReportSuccess();
 
-        // 开闸（OpenLocked）是同步做的：调用 WaitAsync 时会在第一个真正把它挂起的
-        // await 之前跑完，这里读 Current 跟调用之间没有任何 await 缝隙——
-        // 10ms 的自愈计时器压根来不及跑到，不用靠拉长退避去赌观测窗口。
+        // Opening the gate (OpenLocked) is synchronous: calling WaitAsync runs it to completion before the first
+        // await that actually suspends, so there is no await gap between that call and reading Current here —
+        // the 10ms self-heal timer cannot possibly get there in time, no need to stretch the backoff to bet on an
+        // observation window.
         var waiting = gate.WaitAsync(new IOException("blip"), default);
 
-        // 计数清零之后这一次算"第一次出事"——不留 disjunction 逃生口。
+        // After the reset this one counts as "the first failure" — no disjunction escape hatch.
         Assert.NotNull(gate.Current);
         Assert.Equal(1, gate.Current!.Failures);
 
@@ -98,7 +99,7 @@ public class PauseGateTests
         Assert.True(await waiting);
     }
 
-    // 用户按了取消：取消永远赢，闸门不能把它吞掉。
+    // The user pressed cancel: cancellation always wins, the gate must not swallow it.
     [Fact]
     public async Task User_cancellation_wins_over_waiting()
     {
@@ -111,7 +112,7 @@ public class PauseGateTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiting);
     }
 
-    // 走在取消路上的工作者不该顺手开闸，哪怕只是短暂地把幻影现场发给别人看。
+    // A worker already on its way out via cancellation must not open the gate on the way, not even briefly publishing a phantom state for others to see.
     [Fact]
     public async Task Already_cancelled_token_throws_without_opening_the_gate()
     {
@@ -124,7 +125,7 @@ public class PauseGateTests
         Assert.Null(gate.Current);
     }
 
-    // 5 分钟的定时器不能比运行活得还久。
+    // A 5-minute timer must not outlive the run.
     [Fact]
     public async Task Dispose_kills_the_pending_timer()
     {
@@ -134,9 +135,9 @@ public class PauseGateTests
         var waiting = gate.WaitAsync(new IOException("blip"), default);
         gate.Dispose();
 
-        // 只看 IsDowngraded 抓不住"定时器没拆干净"——那个标志位 DowngradeLocked 自己就会置。
-        // 真正能证明 Dispose 把挂着的 5 分钟计时器连锅端掉的，是被晾在那儿的等待者：
-        // 它必须马上收到降级结果，而不是被晾在 5 分钟的 Task.Delay 上等到天荒地老。
+        // Just looking at IsDowngraded cannot catch "the timer was not torn down" — DowngradeLocked sets that flag by itself.
+        // What really proves Dispose took the pending 5-minute timer down with it is the waiter left hanging there:
+        // it has to get the downgrade result immediately, not be left on a 5-minute Task.Delay until the end of time.
         var completed = await Task.WhenAny(waiting, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.Same(waiting, completed);
         Assert.False(await waiting);
