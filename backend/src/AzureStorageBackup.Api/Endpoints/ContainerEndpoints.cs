@@ -6,32 +6,33 @@ namespace AzureStorageBackup.Api.Endpoints;
 public record CreateContainerRequest(string Name);
 
 /// <summary>
-/// 账户下的 container 管理端点（PRD 1.2）。
-/// 注：Azure Blob 不支持 container 重命名，故只有列举/创建/删除。
+/// Container management endpoints under an account (PRD 1.2).
+/// Note: Azure Blob does not support renaming a container, hence list/create/delete only.
 /// </summary>
 public static class ContainerEndpoints
 {
     /// <summary>
-    /// 把 Azure 的失败翻译成客户端能用的响应。
+    /// Translate Azure failures into responses a client can use.
     ///
-    /// 逐端点捕获而非注册全局 handler：全局 handler 会一并接管本轮范围之外的所有未处理
-    /// 异常，改变既有失败语义（见 KeyringGuard.cs 的同类说明）。
+    /// Caught per endpoint rather than registered as a global handler: a global handler would also take over every unhandled
+    /// exception outside the scope of this change, altering existing failure semantics (see the same note in KeyringGuard.cs).
     /// </summary>
     private static IResult MapAzureFailure(RequestFailedException ex)
     {
-        // 4xx 是调用方能修的（名字非法、无权限、已被他人占用），原样透传状态码——
-        // 但排除 401：Azure 存储账户返回的 401 说的是「这次到存储账户的请求没有认证成功」，
-        // 不是「这个操作员的登录会话失效」。用 StorageSharedKeyCredential 时 Azure 本身认证失败会给
-        // 403,401 的现实来源是中间代理（本项目的中国区/美国政府云正是靠代理落地）。
-        // 如果把它原样透传，前端 client.ts 的 401 处理器会把操作员直接踢回登录页，
-        // 所以这里改走 502，和其他不可操作的失败归到一类。
+        // A 4xx is something the caller can fix (invalid name, no permission, already taken by someone else), so pass the
+        // status code straight through — except 401: a 401 from an Azure storage account means "this request to the storage
+        // account was not authenticated", not "this operator's login session expired". With StorageSharedKeyCredential an
+        // authentication failure in Azure itself gives 403; in reality a 401 comes from an intermediate proxy (this project's
+        // China / US Government cloud regions land through exactly such a proxy).
+        // Passed straight through, the 401 handler in the frontend's client.ts would kick the operator back to the login page,
+        // so we turn it into a 502 here, in the same class as the other failures nobody can act on.
         if (ex.Status is >= 400 and < 500 and not StatusCodes.Status401Unauthorized)
             return Results.Json(
                 new { error = string.IsNullOrEmpty(ex.ErrorCode) ? ex.Message : $"{ex.ErrorCode}: {ex.Message}" },
                 statusCode: ex.Status);
 
-        // Status 0 表示请求没能拿到响应（DNS/代理/网络）；401 同理归到这里——
-        // 都是上游的问题，不是本服务的问题，也不是用户会话的问题。用 502 说清楚责任在哪一侧。
+        // Status 0 means the request never got a response (DNS/proxy/network); 401 lands here for the same reason —
+        // both are the upstream's problem, not this service's problem and not the user's session's problem. A 502 says which side is at fault.
         return Results.Json(
             new { error = "The storage account could not be reached. Check the endpoint, proxy, and network." },
             statusCode: StatusCodes.Status502BadGateway);
@@ -41,8 +42,8 @@ public static class ContainerEndpoints
     {
         var group = app.MapGroup("/api/accounts/{accountId:int}/containers").WithTags("Containers");
 
-        // 列/建/删 container 都要连云（设计 §3.1 明列「列容器」为需要凭据的动作），
-        // 密钥环丢失时必须在入口 409，而不是让 SecretReader 在深处抛异常。
+        // List/create/delete container all go to the cloud (design §3.1 explicitly lists "list containers" as an action that
+        // needs credentials), so when the keyring is lost we must 409 at the entrance rather than let SecretReader throw somewhere deep inside.
         group.MapGet("/", async (
             int accountId, IAccountService accounts, IContainerService containers, IBackupConfigService configs,
             IKeyringHealth keyring, CancellationToken ct) =>
@@ -57,10 +58,11 @@ public static class ContainerEndpoints
             {
                 var list = await containers.ListContainersAsync(account, ct);
 
-                // 云端那个 presence 只说得出「信息文件在不在」，而它是备份最后一步才写的：首次备份
-                // 跑到一半的 container 里已经躺着这一轮上传的数据，云端却还什么标记都没有，列表于是
-                // 把它报成空容器——用户照着这份列表把同一个 container 又配给了第二条备份，两边各写
-                // 各的索引互相覆盖。占用的权威在本地：库里那条配置从创建的那一刻起就在，不必等云端。
+                // The cloud-side presence can only say "is the info file there", and that file is written by the very last step
+                // of a backup: a container halfway through its first backup already holds this run's uploaded data while the cloud
+                // still carries no marker at all, so the listing reports it as an empty container — the user goes by that listing,
+                // hands the same container to a second backup, and the two write their own indexes over each other. The authority
+                // on occupancy is local: the config row is in the database from the moment it was created, with nothing to wait on in the cloud.
                 var held = new Dictionary<string, string>(StringComparer.Ordinal);
                 foreach (var c in await configs.ListAsync(ct))
                     if (c.AccountId == accountId)
@@ -82,8 +84,8 @@ public static class ContainerEndpoints
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
-            // 连云之前先判：Azure 对非法名只回一句「contains invalid characters」，
-            // 不说是哪个字符也不说规则，照搬给用户等于没说。
+            // Validate before going to the cloud: for an invalid name Azure only says "contains invalid characters",
+            // naming neither the offending character nor the rule, so relaying that to the user says nothing at all.
             if (ContainerName.Validate(req.Name) is { } invalid)
                 return Results.BadRequest(new { error = invalid });
 
@@ -114,14 +116,15 @@ public static class ContainerEndpoints
             if (account is null)
                 return Results.NotFound();
 
-            // 这个 container 上还挂着一条备份配置 → 不许从这里删。删掉云端而把配置留在库里，
-            // 备份列表会继续显示一个后面什么都没有的备份，点进去的每个操作都会以各种形状失败。
-            // 删备份那条路（DELETE /api/backups/{id}?deleteContainer=true）才是正道：它连本地
-            // 索引缓存、备份状态与操作日志一并清掉，还挡得住"正在跑操作时删除"。这里只负责把
-            // 绕过它的近路堵上，并把用户指回去。
-            // 判定必须在**触云之前**：先删了再报错，数据已经没了，报什么都晚了。
-            // 按 (account, container) 精确限定——BackupConfig 在这两列上有唯一索引，不同账户下
-            // 可以有同名 container，按名字一刀切会让一个账户的备份挡住另一个账户里同名的空 container。
+            // A backup config still hangs off this container → deleting from here is not allowed. Wiping the cloud side while
+            // leaving the config in the database keeps a backup listed with nothing behind it, and every operation the user
+            // clicks into fails in some shape or another. The delete-the-backup path
+            // (DELETE /api/backups/{id}?deleteContainer=true) is the right one: it clears the local index cache, backup state
+            // and operation log along with it, and it also blocks "delete while an operation is running". All this does is
+            // close the shortcut around it and point the user back there.
+            // The check must happen **before touching the cloud**: delete first and report afterwards and the data is already gone; nothing you report then helps.
+            // Scoped exactly by (account, container) — BackupConfig has a unique index on those two columns, different accounts
+            // may hold containers of the same name, and matching by name alone would let one account's backup block an empty container of the same name in another.
             if (await configs.FindAsync(accountId, name, ct) is { } config)
             {
                 return Results.Conflict(new

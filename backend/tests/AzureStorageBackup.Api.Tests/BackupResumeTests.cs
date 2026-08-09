@@ -54,13 +54,13 @@ public sealed class BackupResumeTests : IDisposable
         var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
         var bytes = new byte[size];
-        // 每个文件的内容必须互不相同，否则三个文件会去重成一个 blob，上传次数就说明不了问题。
+        // Each file's content has to differ from the others, otherwise the three files would dedup into one blob and the upload count would prove nothing.
         for (var i = 0; i < bytes.Length; i += 4096) bytes[i] = (byte)rel.Length;
         File.WriteAllBytes(full, bytes);
     }
 
-    /// <summary>写不可压缩的内容（定种子，可复现）。装箱那条路要的是"每个成员各不相同"，
-    /// 全零的小文件会被本地去重收敛成同一份，箱与箱之间就分不出上传次数了。</summary>
+    /// <summary>Writes incompressible content (fixed seed, reproducible). The packing path needs "every member different";
+    /// all-zero small files get collapsed into one by local dedup, and then one pack cannot be told from another by upload count.</summary>
     private void WriteIncompressible(string rel, int size, int seed)
     {
         var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
@@ -70,11 +70,11 @@ public sealed class BackupResumeTests : IDisposable
         File.WriteAllBytes(full, bytes);
     }
 
-    /// <summary>数一数真正发起了多少次内容上传，顺带支持"第 N 次之后叫停"。
+    /// <summary>Counts how many content uploads were actually issued, and supports "stop after the Nth" along the way.
     /// <para>
-    /// 两个 UploadIfMissing 重载都要接、都要过计数器：带 progress 的那个在接口上**有默认实现**，
-    /// 而备份主路径（VolumeUploadScope 一直在场）走的恰恰是它。只接不带 progress 的那个，
-    /// 这个替身一次都拦不到备份的上传，<see cref="Uploads"/> 会恒等于 0——断言就成了空话。
+    /// Both UploadIfMissing overloads have to be taken over and both have to pass through the counter: the one with progress **has a default implementation** on the interface,
+    /// and the main backup path (VolumeUploadScope is always present) goes through exactly that one. Take over only the overload without progress and
+    /// this stand-in intercepts not a single backup upload, <see cref="Uploads"/> stays permanently 0 — and the assertions become empty words.
     /// </para></summary>
     private sealed class CountingUploader(IBlobUploader inner, int stopAt = 0, Func<StopKind>? stop = null)
         : IBlobUploader
@@ -147,16 +147,16 @@ public sealed class BackupResumeTests : IDisposable
         Password = password,
         Options = new BackupEngineOptions
         {
-            // 上传额度 1＝任一时刻只有一卷在传，所以"第 1 次上传之后叫停"这个**下达时刻**是准的。
-            // 但它并不保证停下来时只做完了一件：编排器起的是 Math.Max(2, UploadConcurrency + 1) 个
-            // 工作者，第二件完全可能已经在半路上（详见下面用例里那段说明）。
+            // An upload budget of 1 = only one volume in flight at any moment, so the **moment** at which "stop after the 1st upload" is issued is accurate.
+            // But it does not guarantee that only one item was done when it stopped: the orchestrator starts Math.Max(2, UploadConcurrency + 1)
+            // workers, and the second item may perfectly well already be underway (see the note in the test below for details).
             UploadConcurrency = 1,
             VolumeBytes = volumeBytes,
             Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
         },
     };
 
-    /// <summary>某个 ref 名下现存的分卷：名字 + ETag。重传过一遍的话两样都会变。</summary>
+    /// <summary>The volumes currently living under a given ref: name + ETag. A re-upload changes both.</summary>
     private static async Task<List<(string Name, string ETag)>> VolumesOfAsync(
         BlobContainerClient container, string blobRef)
     {
@@ -184,7 +184,7 @@ public sealed class BackupResumeTests : IDisposable
             WriteBytes("b.bin", 6_000_001);
             WriteBytes("c.bin", 6_000_002);
 
-            // 第一轮：传完一个就挂起。
+            // First run: suspend once one item has been uploaded.
             BackupRunControl? first = null;
             var stopping = new CountingUploader(
                 new BlobUploader(factory0), stopAt: 1,
@@ -196,14 +196,14 @@ public sealed class BackupResumeTests : IDisposable
                 await Assert.ThrowsAsync<BackupSuspendedException>(
                     () => o1.RunAsync(Request(account, name), null, default, c));
             }
-            // 挂起时到底做完了几件，不由这条用例说了算：编排器起的是 UploadConcurrency + 1 个
-            // 工作者（最少 2 个），停止意愿落下的那一刻，第二件完全可能已经在半路上。所以不写死
-            // 数字——做完了几件，第二轮就该正好少传几件，这才是这条用例真正要钉的东西。
+            // How many items were actually done at suspension time is not for this test to decide: the orchestrator starts UploadConcurrency + 1
+            // workers (at least 2), and at the moment the stop intent lands the second item may perfectly well already be underway. So no hardcoded
+            // number — however many were done, the second run should upload exactly that many fewer, and that is what this test is really pinning down.
             var done = (await _journals.ListAsync(account.Id, name, default))[0].Content.Records;
             Assert.NotEmpty(done);
             Assert.True(done.Count < 3, $"the first run was supposed to be interrupted, it did all {done.Count}");
 
-            // 第二轮：同一个配置、同样的钥匙和根目录 → 采纳旧卷，只补剩下的。
+            // Second run: same config, same key and same root → adopt the old volume and only fill in the rest.
             var resuming = new CountingUploader(new BlobUploader(factory0));
             var (o2, store2, _) = Build(resuming);
             await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
@@ -211,26 +211,26 @@ public sealed class BackupResumeTests : IDisposable
                 var result = await o2.RunAsync(Request(account, name), null, default, c2);
                 Assert.Equal(1, result.Version);
             }
-            Assert.Equal(3 - done.Count, resuming.Uploads);   // 复用来的那些一个字节都没重传
+            Assert.Equal(3 - done.Count, resuming.Uploads);   // not one byte of the reused ones was re-uploaded
 
-            // 索引三条齐全，且复用来的那几条指的正是上一轮传上去的那个 blob。
+            // All three index entries are present, and the reused ones point at exactly the blob the previous run uploaded.
             var info = await store2.ReadInfoAsync(account, name, null, default);
             var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
             Assert.Equal(3, index.Entries.Count(e => e.Storage is not null));
             foreach (var r in done)
                 Assert.Equal(r.Ref, index.Entries.Single(e => e.Path == r.Path).Storage!.Ref);
 
-            // journal 全都功成身退了——自己那卷和采纳来的那卷一起。
+            // Every journal has retired — its own volume together with the adopted one.
             Assert.Empty(await _journals.ListAsync(account.Id, name, default));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// pack 那条路——恢复里最容易出错的一段，上面两条一个字都没碰到它。
+    /// The pack path — the part of resume most prone to going wrong, which the two cases above do not touch with a single word.
     /// <para>
-    /// 命中的一箱仍然要走 <c>RecordPackAsync</c>（只是不上传）：<c>info.Packs</c> 要有这个包，
-    /// 每个成员的索引条目要指回箱里的 <c>entryName</c>。跳过这一步，索引里这一箱就整个不见了。
+    /// A pack that hits still has to go through <c>RecordPackAsync</c> (it just does not upload): <c>info.Packs</c> has to contain this pack,
+    /// and each member's index entry has to point back at the <c>entryName</c> inside it. Skip that step and this whole pack vanishes from the index.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -245,7 +245,7 @@ public sealed class BackupResumeTests : IDisposable
         var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
-            // 一目录一箱（不跨目录装箱），每箱两个小文件；内容各不相同，免得被本地去重收敛掉。
+            // One pack per directory (packing never crosses directories), two small files per pack; the contents all differ so local dedup does not collapse them.
             for (var d = 1; d <= 3; d++)
             {
                 WriteIncompressible($"d{d}/x.bin", 2000, seed: d * 10);
@@ -274,14 +274,14 @@ public sealed class BackupResumeTests : IDisposable
             await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
                 Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
 
-            Assert.Equal(3 - done.Count, resuming.Uploads);   // 复用来的那几箱一箱都没重压重传
+            Assert.Equal(3 - done.Count, resuming.Uploads);   // not one of the reused packs was recompressed or re-uploaded
 
             var info = await store2.ReadInfoAsync(account, name, null, default);
             var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
             Assert.Equal(6, index.Entries.Count(e => e.Storage is not null));
             foreach (var r in done)
             {
-                // RecordPackAsync 真的跑过：info.Packs 里有这一箱，成员表也是原样那一份。
+                // RecordPackAsync really did run: info.Packs contains this pack, and the member table is the same one as before.
                 Assert.True(info.Packs.ContainsKey(r.Ref), $"pack {r.Ref} missing from the info file");
                 foreach (var m in r.Members)
                 {
@@ -297,20 +297,20 @@ public sealed class BackupResumeTests : IDisposable
     }
 
     /// <summary>
-    /// 同内容不同路径：上一轮传完了 a.bin 就挂起，本轮多出一个与它逐字节相同的 b.bin。
-    /// b.bin 绝不能把 a.bin 那几卷删了重传一遍。
+    /// Same content, different path: the previous run finished uploading a.bin and then suspended, and this run has an extra b.bin that is byte for byte identical to it.
+    /// b.bin must never delete a.bin's volumes and upload them all over again.
     /// <para>
-    /// 恢复是按**路径**认账的，b.bin 在 journal 里查无此人。它重压之后拿到的却是**同一个**
-    /// 地址（内容寻址，同内容必同址），而多卷上传前那一步 <c>ClearLeftoverVolumesAsync</c>
-    /// 会无条件把该地址名下的分卷全删掉再传（7z 的 <c>-si</c> 不是逐字节确定的，新旧卷混在一起
-    /// 拼不出归档）。删了再传的这个窗口里被 Stop now 打断或进程崩掉，云上就只剩半套卷；
-    /// 下一轮采纳同一卷 journal，a.bin 照样复用、照样提交索引，指向的却是一份缺卷的内容——
-    /// 错要到还原或检查时才看得见。
+    /// Resume recognizes things by **path**, and b.bin appears nowhere in the journal. Yet recompressing it yields the **same**
+    /// address (content addressing: identical content, identical address), and the step before a multi-volume upload, <c>ClearLeftoverVolumesAsync</c>,
+    /// unconditionally deletes every volume under that address before uploading (7z's <c>-si</c> is not byte-for-byte deterministic, and old and new volumes
+    /// mixed together do not reassemble into an archive). Get interrupted by Stop now, or have the process crash, inside that delete-then-upload window, and the cloud is left with half a set of volumes;
+    /// the next run adopts the same journal volume, reuses a.bin as usual and commits it to the index as usual, pointing at content that is missing volumes —
+    /// an error that only becomes visible at restore or check time.
     /// </para>
     /// <para>
-    /// 所以采纳来的块要一并喂进本地去重表（<c>LocalDedupResolver.Build</c> 的 confirmed 参数），
-    /// 让 b.bin 走跨版本去重那条路：不压、不传，那几卷根本没有被碰的机会。
-    /// 这条用例钉的正是"没被碰过"——分卷的名字与 ETag 一个都不许变。
+    /// So the adopted blocks have to be fed into the local dedup table as well (the confirmed parameter of <c>LocalDedupResolver.Build</c>),
+    /// putting b.bin on the cross-version dedup path: no compression, no upload, and those volumes never get a chance to be touched at all.
+    /// What this test pins down is exactly that "never touched" — not one volume's name or ETag may change.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -325,11 +325,11 @@ public sealed class BackupResumeTests : IDisposable
         var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
-            // 不可压缩 + 2 MB 一卷 → 稳定压出多卷。单卷不清残留，这条用例就不成立了。
+            // Incompressible + 2 MB per volume → reliably compresses into multiple volumes. A single volume clears no leftovers, and then this test would not hold.
             WriteIncompressible("a.bin", 6_000_000, seed: 7);
 
-            // 第一轮只有 a.bin：Suspend 不打断在途上传（只有 Stop now 才碰 AbortToken），
-            // 所以它的全部分卷都会传完、journal 也会记上，然后整轮以 Suspended 收场。
+            // The first run has only a.bin: Suspend does not interrupt an in-flight upload (only Stop now touches AbortToken),
+            // so all of its volumes finish uploading and get recorded in the journal, and then the whole run ends as Suspended.
             BackupRunControl? first = null;
             var stopping = new CountingUploader(
                 new BlobUploader(factory0), stopAt: 1,
@@ -349,7 +349,7 @@ public sealed class BackupResumeTests : IDisposable
             var before = await VolumesOfAsync(container, record.Ref);
             Assert.Equal(record.Volumes, before.Count);
 
-            // 第二轮多一个与 a.bin 逐字节相同的 b.bin。
+            // The second run adds a b.bin that is byte for byte identical to a.bin.
             File.Copy(Path.Combine(_root, "a.bin"), Path.Combine(_root, "b.bin"));
 
             var resuming = new CountingUploader(new BlobUploader(factory0));
@@ -358,9 +358,9 @@ public sealed class BackupResumeTests : IDisposable
                 Assert.Equal(1, (await o2.RunAsync(
                     Request(account, name, volumeBytes: 2_000_000), null, default, c2)).Version);
 
-            // 那几卷原封未动：删了再传的话名字（7z 卷号）和 ETag 都会变。这是本条用例的正题。
+            // Those volumes are untouched: had they been deleted and re-uploaded, both the names (7z volume numbers) and the ETags would have changed. This is the test's actual subject.
             Assert.Equal(before, await VolumesOfAsync(container, record.Ref));
-            // a.bin 从 journal 复用，b.bin 从去重表复用 → 一个字节都没再传。
+            // a.bin is reused from the journal and b.bin from the dedup table → not one byte was uploaded again.
             Assert.Equal(0, resuming.Uploads);
 
             var info = await store2.ReadInfoAsync(account, name, null, default);
@@ -377,13 +377,13 @@ public sealed class BackupResumeTests : IDisposable
     }
 
     /// <summary>
-    /// 预筛放行、内容判据挡下：文件在两轮之间被改了尾巴，长度和头一个字节都没动。
+    /// Passed by the prescreen, stopped by the content criteria: the file had its tail changed between the two runs, with the length and the leading bytes untouched.
     /// <para>
-    /// 预筛只问（路径 + 长度 + head hash），这三样全对得上，于是它放行。挡下这个文件的是
-    /// <c>FindBlob</c> 里预筛**没问过**的那两项（全文 hash 与 tail）。让 <c>FindBlob</c> 只认
-    /// 预筛问过的那三样——"都走到这一步了，还能是别的文件么"——它就会被当成"上一轮已经传过了"
-    /// 直接跳过，索引记下的是**旧内容**的 hash、指向**旧内容**的 blob：新写进去的那一段从此
-    /// 再也不在备份里，而界面上一切正常。恢复这条路上唯一能发现这件事的关卡就在这里。
+    /// The prescreen only asks (path + length + head hash), all three of which agree, so it lets the file through. What stops this file is
+    /// the two items in <c>FindBlob</c> that the prescreen **never asked about** (the full-content hash and the tail). Let <c>FindBlob</c> trust only
+    /// the three things the prescreen asked — "we got this far, what else could it be" — and the file gets treated as "already uploaded last run"
+    /// and skipped, with the index recording the **old content's** hash and pointing at the **old content's** blob: the newly written stretch would from then on
+    /// no longer be in the backup at all, while the UI looks perfectly fine. This is the only checkpoint on the resume path that can catch it.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -418,8 +418,8 @@ public sealed class BackupResumeTests : IDisposable
             Assert.NotEmpty(done);
             Assert.True(done.Count < 3, $"the first run was supposed to be interrupted, it did all {done.Count}");
 
-            // 挑一个**已经传上去了**的文件，只改它的最后一个字节：长度不变、头不变，
-            // 于是预筛照样放行，只有尾部 hash（和全文 hash）能看出它变了。
+            // Pick a file that has **already been uploaded** and change only its last byte: the length is unchanged, the head is unchanged,
+            // so the prescreen lets it through as before, and only the tail hash (and the full-content hash) can tell that it changed.
             var changed = done[0].Path!;
             var full = Path.Combine(_root, changed.Replace('/', Path.DirectorySeparatorChar));
             using (var fs = new FileStream(full, FileMode.Open, FileAccess.Write))
@@ -429,7 +429,7 @@ public sealed class BackupResumeTests : IDisposable
             }
             var hasher = new FileHasher();
             var rewritten = await hasher.FullHashAsync(full);
-            Assert.Equal(new FileInfo(full).Length, done[0].Length);   // 长度确实没变
+            Assert.Equal(new FileInfo(full).Length, done[0].Length);   // the length really did not change
             Assert.NotEqual(done[0].FullHash, rewritten);
 
             var resuming = new CountingUploader(new BlobUploader(factory0));
@@ -437,14 +437,14 @@ public sealed class BackupResumeTests : IDisposable
             await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
                 Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
 
-            // 没做过的那几件 + 被改过尾巴的这一件。复用的只有其余那些原样没动的。
+            // The items that were never done + the one whose tail was changed. The only reused ones are the rest, which are untouched.
             Assert.Equal(3 - done.Count + 1, resuming.Uploads);
 
             var info = await store2.ReadInfoAsync(account, name, null, default);
             var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
             var entry = index.Entries.Single(e => e.Path == changed);
-            Assert.Equal(rewritten, entry.FullHash);            // 记的是**新**内容
-            Assert.NotEqual(done[0].Ref, entry.Storage!.Ref);   // 也不再指着旧内容那个 blob
+            Assert.Equal(rewritten, entry.FullHash);            // records the **new** content
+            Assert.NotEqual(done[0].Ref, entry.Storage!.Ref);   // and no longer points at the old content's blob
             Assert.Empty(await _journals.ListAsync(account.Id, name, default));
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -478,7 +478,7 @@ public sealed class BackupResumeTests : IDisposable
                     () => o1.RunAsync(Request(account, name), null, default, c));
             }
 
-            // 换了密码 → 寻址身份变了 → 旧卷里的引用全对不上号，必须整卷作废，三个文件全部重传。
+            // Password changed → the addressing identity changed → every ref in the old volume misses, so the whole volume must be voided and all three files re-uploaded.
             var again = new CountingUploader(new BlobUploader(factory0));
             var (o2, _, _) = Build(again);
             await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))

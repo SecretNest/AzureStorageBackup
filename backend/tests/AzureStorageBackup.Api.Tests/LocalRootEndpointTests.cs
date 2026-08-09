@@ -36,24 +36,25 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return account!.Id;
     }
 
-    // Azurite 的 well-known 账户与密钥（与 BackupConfigEndpointsTests 一致）。
+    // Azurite's well-known account and key (same as BackupConfigEndpointsTests).
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
     private const string AzuriteEndpoint = "http://127.0.0.1:10000/devstoreaccount1";
 
-    // 与全仓其余 Azurite 测试一致：起不来就跳过，而不是把整个套件染红（CI 里 Azurite 是
-    // 起着的，见 .github/workflows/ci.yml，所以跳过只发生在本地）。
+    // Same as every other Azurite test in the repo: if it will not come up, skip instead of painting the whole
+    // suite red (CI does run Azurite, see .github/workflows/ci.yml, so skipping only ever happens locally).
     private static bool AzuriteReachable()
     {
         try { using var c = new TcpClient(); c.Connect("127.0.0.1", 10000); return true; }
         catch { return false; }
     }
 
-    /// <summary>凡是会真正走到 LoadBaselineAsync 的「确实没有基线」测试，都必须用这个而不是
-    /// CreateAccountAsync：那个用的是个解析不到的假域名，TrackedInfoStore.LoadAsync 在没有本地状态时
-    /// 会落到云端回填，假域名下这一步是真的网络异常（几十秒超时），会被新代码识别成
-    /// BaselineUnreadable 而不是 NoBaseline —— 这不是本次要测的东西。Azurite 上 container
-    /// 确实不存在时，ExistsAsync 干净地返回 false，无本地状态、无云端信息文件，是真正的「没有」。</summary>
+    /// <summary>Any "there really is no baseline" test that actually reaches LoadBaselineAsync must use this rather than
+    /// CreateAccountAsync: that one uses a fake domain that does not resolve, and with no local state
+    /// TrackedInfoStore.LoadAsync falls back to the cloud to backfill; under a fake domain that step is a genuine network
+    /// failure (tens of seconds of timeout), which the new code classifies as BaselineUnreadable rather than NoBaseline —
+    /// not what we are testing here. When the container really does not exist on Azurite, ExistsAsync returns false
+    /// cleanly: no local state, no cloud info file, a real "nothing".</summary>
     private async Task<int> CreateAzuriteAccountAsync()
     {
         var req = new AccountRequest(
@@ -66,7 +67,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return account!.Id;
     }
 
-    /// <summary>建一条配置，直接落库（绕开创建端点对本地根存在性的校验）。</summary>
+    /// <summary>Create a config straight in the database (bypassing the create endpoint's check that the local root exists).</summary>
     private async Task<int> CreateConfigAsync(int accountId, string localRoot)
     {
         using var scope = _services.CreateScope();
@@ -90,8 +91,8 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return (await svc.GetAsync(configId))!.ContainerName;
     }
 
-    /// <summary>这条备份在操作日志里的来源键。全仓形如 "{op}:{accountId}/{container}"
-    /// （OperationLogService.cs:91-96）——测试自己也照这个形状拼，才能盯住端点没写成别的。</summary>
+    /// <summary>This backup's source key in the operation log. Repo-wide it has the shape "{op}:{accountId}/{container}"
+    /// (OperationLogService.cs:91-96) — the test builds that shape itself, which is the only way to pin that the endpoint did not write something else.</summary>
     private async Task<string> SourceKeyOfAsync(int configId)
     {
         using var scope = _services.CreateScope();
@@ -114,8 +115,8 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return (await svc.GetAsync(configId))!.LocalRoot;
     }
 
-    /// <summary>直接写本地权威信息文件（TrackedInfoStore.LoadAsync 命中本地则不读云端），
-    /// 与 BackupConfigEndpointsTests.SeedLocalInfo 同一条路数。返回 identityTicks，供 SeedIndex 用。</summary>
+    /// <summary>Write the local authoritative info file directly (TrackedInfoStore.LoadAsync never reads the cloud once it hits locally),
+    /// the same trick as BackupConfigEndpointsTests.SeedLocalInfo. Returns identityTicks for SeedIndex to use.</summary>
     private long SeedLocalInfo(int accountId, string container, List<BackupVersion> versions)
     {
         var createdAt = DateTimeOffset.UtcNow;
@@ -135,10 +136,10 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return createdAt.UtcTicks;
     }
 
-    /// <summary>本地信息文件写成一段合法性检不过的字节——format 字节 99 大于当前支持的最新 format，
-    /// IndexSerializer.DeserializeInfoFile 会在读完第一个字节后立刻抛 NotSupportedException。
-    /// 用来在测试里稳定复现「有历史但索引读不出来」（BaselineUnreadable），不依赖加密/云端失败这些
-    /// 更难摆布的失败面。</summary>
+    /// <summary>Write the local info file as bytes that fail validation — format byte 99 is greater than the newest format
+    /// currently supported, so IndexSerializer.DeserializeInfoFile throws NotSupportedException right after reading the first byte.
+    /// Used to reproduce "there is history but the index cannot be read" (BaselineUnreadable) deterministically in tests, without
+    /// depending on encryption or cloud failures, which are far harder to stage.</summary>
     private void SeedCorruptLocalInfo(int accountId, string container)
     {
         using var scope = _services.CreateScope();
@@ -163,10 +164,10 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         db.SaveChanges();
     }
 
-    /// <summary>建一条「基线与新根完全对不上」的配置：新根是个空目录，基线索引里唯一的文件在那儿
-    /// 一个都找不到，抽样匹配率 0% → Rejected，需要 force 才能写。供 force 闸门测试复用。
-    /// <paramref name="localRoot"/> 传 null 表示用 _dir 当当前根；传 "" 则模拟导入时没拿到
-    /// SourceRootHint 的那种配置。</summary>
+    /// <summary>Create a config whose baseline does not match the new root at all: the new root is an empty directory, so
+    /// the single file in the baseline index is nowhere to be found, sample match rate 0% → Rejected, which needs force to
+    /// write. Reused by the force-gate tests. Passing null for <paramref name="localRoot"/> means use _dir as the current
+    /// root; passing "" simulates the kind of config an import left behind when it had no SourceRootHint.</summary>
     private async Task<(int Id, string Target)> SeedMismatchingBaselineAsync(string? localRoot = null)
     {
         Directory.CreateDirectory(_dir);
@@ -200,7 +201,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         return (id, target);
     }
 
-    /// <summary>建一条「有历史但索引读不出来」的配置（见 SeedCorruptLocalInfo）。</summary>
+    /// <summary>Create a config with "history exists but the index cannot be read" (see SeedCorruptLocalInfo).</summary>
     private async Task<(int Id, string Target)> SeedUnreadableBaselineAsync()
     {
         Directory.CreateDirectory(_dir);
@@ -285,7 +286,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.NotNull(body.Reason);
     }
 
-    /// <summary>preview 是纯查询：跑完之后配置必须一字未动。</summary>
+    /// <summary>preview is a pure query: once it has run, the config must be unchanged down to the byte.</summary>
     [Fact]
     public async Task Preview_Does_Not_Change_Anything()
     {
@@ -320,10 +321,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.Equal(target, body!.LocalRoot);
     }
 
-    /// <summary>导入时没拿到 SourceRootHint 的配置，根是空串——它必须能被补上。
-    /// 这条走的是「云端还没有任何版本」那条路（`NoBaseline`），因此它真正守住的是
-    /// <c>oldRoot == ""</c> 时写审计行不会炸（渲染成 <c>(none)</c>）；空根**有**基线可比的
-    /// 那条路由 <c>An_Imported_Backup_With_No_Root_Is_Still_Checked_Against_Its_Index</c> 覆盖。</summary>
+    /// <summary>A config imported without a SourceRootHint has an empty-string root — and it has to be fillable.
+    /// This one takes the "the cloud has no versions yet" path (`NoBaseline`), so what it really guards is that
+    /// writing the audit line with <c>oldRoot == ""</c> does not blow up (it renders as <c>(none)</c>); the path where an
+    /// empty root **does** have a baseline to compare against is covered by
+    /// <c>An_Imported_Backup_With_No_Root_Is_Still_Checked_Against_Its_Index</c>.</summary>
     [SkippableFact]
     public async Task Apply_Fills_In_An_Empty_Root_Left_Behind_By_Import()
     {
@@ -367,7 +369,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
 
             using var scope = _services.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<IBackupConfigService>();
-            Assert.Equal(_dir, (await svc.GetAsync(id))!.LocalRoot);   // 未落库
+            Assert.Equal(_dir, (await svc.GetAsync(id))!.LocalRoot);   // not persisted
         }
         finally
         {
@@ -375,9 +377,9 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         }
     }
 
-    /// <summary>force 闸门是这整个功能的安全依据：NeedsConfirm/Rejected 不带 force 必须被拒、
-    /// 库里的 LocalRoot 必须一字未动。之前 10 个测试全走 NoBaseline 分支（needsForce 恒为 false），
-    /// 这条闸门从未被真正执行过——写反一个布尔值也会全绿。</summary>
+    /// <summary>The force gate is what makes this whole feature safe: NeedsConfirm/Rejected without force must be refused,
+    /// and the LocalRoot in the database must be unchanged down to the byte. The previous 10 tests all went down the
+    /// NoBaseline branch (needsForce always false), so this gate was never actually executed — invert a boolean and it would still be all green.</summary>
     [Fact]
     public async Task Apply_Refuses_A_Mismatching_Baseline_Without_Force()
     {
@@ -393,10 +395,10 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
             nameof(LocalRootVerdict.Rejected),
             doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
 
-        Assert.Equal(_dir, await LocalRootOfAsync(id));   // 未落库
+        Assert.Equal(_dir, await LocalRootOfAsync(id));   // not persisted
     }
 
-    /// <summary>同一个不匹配的基线，这次带 force:true —— 必须真的写进去，闸门的另一半。</summary>
+    /// <summary>The same mismatching baseline, this time with force:true — it must really be written. The other half of the gate.</summary>
     [Fact]
     public async Task Apply_Writes_A_Mismatching_Baseline_When_Forced()
     {
@@ -412,10 +414,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     }
 
     /// <summary>
-    /// 导入时没拿到 SourceRootHint 的配置根是空串，可它的版本索引在导入当下就整批落进了
-    /// 本地缓存（BackupConfigEndpoints.cs:110-127）。从前"当前根为空"会把整段比对短路成
-    /// NoBaseline 免检放行——偏偏这正是用户最可能在猜挂载点的场合，最不该免检。
-    /// 现在能不能比对只看基线在不在：填错目录照样要被拦下。
+    /// A config imported without a SourceRootHint has an empty-string root, yet its version indexes all landed in the
+    /// local cache at import time (BackupConfigEndpoints.cs:110-127). "The current root is empty" used to short-circuit the
+    /// whole comparison into NoBaseline and wave it through — precisely the case where the user is most likely guessing at
+    /// a mount point, and the last one that should get a free pass.
+    /// Whether we can compare now depends only on whether a baseline exists: point it at the wrong directory and you are still stopped.
     /// </summary>
     [Fact]
     public async Task An_Imported_Backup_With_No_Root_Is_Still_Checked_Against_Its_Index()
@@ -431,11 +434,11 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
             nameof(LocalRootVerdict.Rejected),
             doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
 
-        Assert.Equal("", await LocalRootOfAsync(id));   // 未落库
+        Assert.Equal("", await LocalRootOfAsync(id));   // not persisted
     }
 
-    /// <summary>索引读不出来（Finding 1）：preview 必须报 BaselineUnreadable，而不是伪装成
-    /// NoBaseline 直接放行——Reason 里要能看到底层异常消息，NAS 用户没有命令行，这是唯一的诊断。</summary>
+    /// <summary>The index cannot be read (Finding 1): preview must report BaselineUnreadable rather than disguising it as
+    /// NoBaseline and waving it through — Reason has to carry the underlying exception message; the NAS user has no command line, and this is the only diagnostic there is.</summary>
     [Fact]
     public async Task Preview_Reports_BaselineUnreadable_When_The_Local_Index_Is_Corrupt()
     {
@@ -448,10 +451,10 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         var body = await res.Content.ReadFromJsonAsync<LocalRootPreviewResponse>();
         Assert.Equal(nameof(LocalRootVerdict.BaselineUnreadable), body!.Verdict);
         Assert.Contains("could not be read", body.Reason);
-        Assert.Contains("newer than supported", body.Reason);   // 底层异常消息确实透传出来了
+        Assert.Contains("newer than supported", body.Reason);   // the underlying exception message really is passed through
     }
 
-    /// <summary>BaselineUnreadable 也走 force 闸门：不带 force 必须被拒、库里未落地。</summary>
+    /// <summary>BaselineUnreadable goes through the force gate too: without force it must be refused and nothing persisted.</summary>
     [Fact]
     public async Task Apply_Refuses_An_Unreadable_Baseline_Without_Force()
     {
@@ -467,10 +470,10 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
             nameof(LocalRootVerdict.BaselineUnreadable),
             doc.RootElement.GetProperty("preview").GetProperty("verdict").GetString());
 
-        Assert.Equal(_dir, await LocalRootOfAsync(id));   // 未落库
+        Assert.Equal(_dir, await LocalRootOfAsync(id));   // not persisted
     }
 
-    /// <summary>...带 force:true 则必须真的写进去。</summary>
+    /// <summary>...and with force:true it must really be written.</summary>
     [Fact]
     public async Task Apply_Writes_Through_An_Unreadable_Baseline_When_Forced()
     {
@@ -486,13 +489,14 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
     }
 
     /// <summary>
-    /// 审计日志必须挂在 "backup:{accountId}/{container}" 这个来源上。写成裸 "backup" 的后果有两条，
-    /// 都不会有人当场发现：DeleteForContainerAsync 按 ":{accountId}/{container}" 后缀清理，
-    /// 于是这条 Warning 级（长存）记录在备份被删之后仍然赖在库里；QueryAsync 按来源精确相等过滤，
-    /// 于是"这个备份都发生过什么"的日志视图里，换根这件大事根本看不见。
+    /// The audit entry must hang off the source "backup:{accountId}/{container}". Writing a bare "backup" has two
+    /// consequences, neither of which anyone spots on the spot: DeleteForContainerAsync cleans up by the
+    /// ":{accountId}/{container}" suffix, so this Warning-level (long-lived) record stays behind in the database after the
+    /// backup is deleted; and QueryAsync filters on exact source equality, so in the "what has happened to this backup"
+    /// log view, changing the root — a big deal — is simply invisible.
     ///
-    /// 顺带钉住无基线时的措辞：一条都没抽样，就不能渲染成 "0/0 sampled entries matched"
-    /// ——那读起来像"全都对不上"，恰恰是相反的意思。
+    /// While we are here, pin the wording for the no-baseline case: with nothing sampled it must not render as
+    /// "0/0 sampled entries matched" — that reads like "nothing matched at all", which is exactly the opposite meaning.
     /// </summary>
     [SkippableFact]
     public async Task Apply_Logs_An_Audit_Entry_Under_This_Backups_Source_Key()
@@ -511,16 +515,16 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
 
         var entry = Assert.Single(LogsOf(source));
         Assert.Equal(OperationLogLevel.Warning, entry.Level);
-        Assert.False(entry.Ephemeral);              // 审计：长存，保留至删除备份
+        Assert.False(entry.Ephemeral);              // audit: long-lived, kept until the backup is deleted
         Assert.Contains(target, entry.Message);
         Assert.Contains(nameof(LocalRootVerdict.NoBaseline), entry.Message);
         Assert.DoesNotContain("sampled", entry.Message);
-        // 没抽样时，位置让给 reason —— BaselineUnreadable 那档的 reason 是底层异常原文，
-        // 也是 NAS 上那位用户唯一的诊断，不能只活在他随手关掉的那个响应里。
+        // With nothing sampled, that slot goes to reason instead — for the BaselineUnreadable tier the reason is the
+        // verbatim underlying exception, the only diagnostic that NAS user gets, and it must not live only in the response he casually dismissed.
         Assert.Contains("no version index", entry.Message);
     }
 
-    /// <summary>真抽过样的那条路径，样本计数照旧要写进日志；强制过的也要留痕。</summary>
+    /// <summary>On the path where sampling actually ran, the sample counts still have to reach the log; a forced change must leave a trace too.</summary>
     [Fact]
     public async Task Apply_Logs_The_Sample_Counts_When_A_Comparison_Actually_Ran()
     {

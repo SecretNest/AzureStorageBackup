@@ -13,26 +13,27 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 两个「先查存在、再连云验证、最后写库」的重设端点（F2/F3）。验证要连云，检查与写库之间窗口不短：
-/// 行在这期间被删掉时必须回 404（与全仓一致），而不是 FirstAsync 抛出的 500；
-/// 取消（客户端断开 / 进程关停）必须原样上抛，而不是被包成「验证失败」的 400（约定见 a3ac967）。
+/// The two reset endpoints that "check existence, verify against the cloud, then write to the database" (F2/F3). Verification
+/// goes to the cloud, so the window between the check and the write is not short: if the row is deleted in the meantime it must
+/// come back 404 (as everywhere else in the repo), not the 500 FirstAsync throws; cancellation (client disconnect / process
+/// shutdown) must propagate as-is instead of being wrapped into a "verification failed" 400 (convention set in a3ac967).
 /// <para>
-/// 这里把云端那一步换成桩：删行 / 抛取消都在桩里发生，正好落在那个窗口内，不需要 Azurite。
+/// Here the cloud step is replaced by a stub: deleting the row / throwing cancellation happens inside the stub, landing exactly inside that window, and no Azurite is needed.
 /// </para>
 /// </summary>
 public sealed class EndpointWritePathRaceTests
 {
-    /// <summary>在基础测试宿主上再替换若干服务（桩件）。</summary>
+    /// <summary>Replace a few more services (stubs) on top of the base test host.</summary>
     private sealed class StubbedFactory(Action<IServiceCollection> configure) : TestWebAppFactory
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            builder.ConfigureServices(configure); // 在 Program.cs 的注册之后执行，故能覆盖
+            builder.ConfigureServices(configure); // runs after Program.cs's registrations, so it can override them
         }
     }
 
-    /// <summary>一被要求建客户端就抛取消——用来把 OperationCanceledException 送进 BackupChecker 的云端调用里。</summary>
+    /// <summary>Throws cancellation the moment it is asked to create a client — used to inject OperationCanceledException into BackupChecker's cloud call.</summary>
     private sealed class CancelsOnCreateServiceClient : IBlobClientFactory
     {
         public BlobServiceClient CreateServiceClient(Account account) => throw new OperationCanceledException();
@@ -41,7 +42,7 @@ public sealed class EndpointWritePathRaceTests
             => throw new OperationCanceledException();
     }
 
-    /// <summary>连通测试「通过」，但在返回前把该账户行删掉——精确模拟验证成功到写库之间的删除竞争。</summary>
+    /// <summary>The connectivity test "passes", but deletes the account row before returning — an exact reproduction of the delete race between successful verification and the write.</summary>
     private sealed class DeletesAccountOnTestConnection(IServiceScopeFactory scopes) : IBlobClientFactory
     {
         public BlobServiceClient CreateServiceClient(Account account) => throw new NotSupportedException();
@@ -55,7 +56,7 @@ public sealed class EndpointWritePathRaceTests
         }
     }
 
-    /// <summary>只桩 <see cref="IBackupInfoStore.ReadInfoWithETagAsync"/>（reset-password 唯一用到的方法）。</summary>
+    /// <summary>Stubs only <see cref="IBackupInfoStore.ReadInfoWithETagAsync"/> (the one method reset-password uses).</summary>
     private sealed class StubInfoStore(Func<(BackupInfoFile Info, string ETag)?> onRead) : IBackupInfoStore
     {
         public Task<BackupInfoFile?> ReadInfoAsync(Account account, string container, string? password, CancellationToken ct = default)
@@ -78,7 +79,7 @@ public sealed class EndpointWritePathRaceTests
             => throw new NotSupportedException();
     }
 
-    /// <summary>删配置善后步骤里的第二步：一被调用就抛取消。其余方法不该被这些用例走到。</summary>
+    /// <summary>The second of the delete-config cleanup steps: throws cancellation the moment it is called. These cases should not reach the other methods.</summary>
     private sealed class CancelsOnEvictIndexCache : ILocalIndexCache
     {
         public Task<VersionIndex> ReadAsync(
@@ -95,7 +96,7 @@ public sealed class EndpointWritePathRaceTests
             => throw new OperationCanceledException();
     }
 
-    /// <summary>删配置善后步骤里的第三步：只记录自己有没有被调用过。</summary>
+    /// <summary>The third of the delete-config cleanup steps: only records whether it was called.</summary>
     private sealed class RecordingStateStore : ILocalBackupStateStore
     {
         public bool Removed { get; private set; }
@@ -142,7 +143,7 @@ public sealed class EndpointWritePathRaceTests
         100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000);
 
     /// <summary>
-    /// F2：POST /api/accounts/{id}/reset-secrets。验证通过之后账户行被删 → 404，而不是 FirstAsync 的 500。
+    /// F2: POST /api/accounts/{id}/reset-secrets. The account row is deleted after verification passes → 404, not FirstAsync's 500.
     /// </summary>
     [Fact]
     public async Task ResetSecrets_Returns_404_When_The_Account_Is_Deleted_After_Verification()
@@ -166,7 +167,7 @@ public sealed class EndpointWritePathRaceTests
     }
 
     /// <summary>
-    /// F2：POST /api/backup-configs/{id}/reset-password。验证通过之后配置行被删 → 404。
+    /// F2: POST /api/backup-configs/{id}/reset-password. The config row is deleted after verification passes → 404.
     /// </summary>
     [Fact]
     public async Task ResetPassword_Returns_404_When_The_Config_Is_Deleted_After_Verification()
@@ -178,7 +179,7 @@ public sealed class EndpointWritePathRaceTests
             services.RemoveAll<IBackupInfoStore>();
             services.AddScoped<IBackupInfoStore>(_ => new StubInfoStore(() =>
             {
-                // 验证「成功」的同时，把配置行删掉——正落在检查与写库之间的窗口里。
+                // Delete the config row at the very moment verification "succeeds" — right inside the window between the check and the write.
                 using var scope = scopes!.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 db.BackupConfigs.Where(c => c.Id == configId).ExecuteDelete();
@@ -202,8 +203,8 @@ public sealed class EndpointWritePathRaceTests
     }
 
     /// <summary>
-    /// F3：验证过程中的取消（客户端断开 / 进程关停）不是「密码不对」。
-    /// 修复前 catch (Exception) 会把它变成 400 "Verification failed: The operation was canceled."。
+    /// F3: cancellation during verification (client disconnect / process shutdown) is not "wrong password".
+    /// Before the fix, catch (Exception) turned it into a 400 "Verification failed: The operation was canceled.".
     /// </summary>
     [Fact]
     public async Task ResetPassword_Does_Not_Swallow_Cancellation_As_A_Verification_Failure()
@@ -226,14 +227,14 @@ public sealed class EndpointWritePathRaceTests
             $"/api/backup-configs/{config!.Id}/reset-password", new ResetBackupPasswordRequest("the-real-password"));
         var body = await res.Content.ReadAsStringAsync();
 
-        // 取消一路上抛，而不是被伪装成用户的密码错误。修复前这里是
-        // 400 + "Verification failed: The operation was canceled."。
-        // 刻意不断言响应体里出现异常类型名——那只在开发者异常页在管道里时成立
-        // （ASPNETCORE_ENVIRONMENT=Production 下就没有），与被测行为无关。
+        // Cancellation propagates all the way up instead of being disguised as the user getting the password wrong. Before
+        // the fix this was 400 + "Verification failed: The operation was canceled.".
+        // Deliberately not asserting that the exception type name shows up in the body — that only holds while the developer
+        // exception page is in the pipeline (it is absent under ASPNETCORE_ENVIRONMENT=Production) and is unrelated to the behavior under test.
         Assert.NotEqual(HttpStatusCode.BadRequest, res.StatusCode);
         Assert.DoesNotContain("Verification failed", body);
 
-        // 密文原封不动：既没落库，也没被当成「验证通过」。
+        // The ciphertext is untouched: nothing was persisted, and nothing was treated as "verification passed".
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
@@ -242,10 +243,10 @@ public sealed class EndpointWritePathRaceTests
     }
 
     /// <summary>
-    /// F3 的另一处、也是唯一有**持久化副作用**的一处：POST /api/backup-configs/{id}/check 的
-    /// catch 会把异常消息写成该备份的 Error 状态。取消（客户端断开 / 进程关停）不是「检查失败」，
-    /// 修复前它会在配置行上留下 Status=Error + LastError="The operation was canceled."，
-    /// 用户界面从此显示一个不存在的故障，直到手动 reset。
+    /// The other F3 site, and the only one with a **persistent side effect**: the catch in POST /api/backup-configs/{id}/check
+    /// writes the exception message as that backup's Error status. Cancellation (client disconnect / process shutdown) is not
+    /// "the check failed"; before the fix it left Status=Error + LastError="The operation was canceled." on the config row,
+    /// and from then on the UI showed a failure that never happened, until someone reset it by hand.
     /// </summary>
     [Fact]
     public async Task Check_Does_Not_Persist_Cancellation_As_An_Error_Status()
@@ -265,9 +266,10 @@ public sealed class EndpointWritePathRaceTests
 
         var res = await client.PostAsJsonAsync($"/api/backup-configs/{config!.Id}/check", new { });
 
-        // 检查改成后台 job 之后，取消不再体现在响应码上（这里拿到的是 202「已受理」），
-        // 而体现在运行态里。所以必须等这次运行真的收尾再看配置行——POST 一返回就读库是在
-        // 和后台任务赛跑：读得快就什么都还没写，测试碰巧绿，掩盖住真正要防的那次写入。
+        // Now that check runs as a background job, cancellation no longer shows up in the status code (what we get here is
+        // 202 "accepted") but in the run state. So we have to wait for this run to actually finish before looking at the config
+        // row — reading the database the moment POST returns is racing the background task: read fast enough and nothing has
+        // been written yet, the test goes green by accident, and it hides the very write we are guarding against.
         Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
 
         CheckRunResponse? run = null;
@@ -278,7 +280,7 @@ public sealed class EndpointWritePathRaceTests
             if (run!.Status != "Running") break;
             await Task.Delay(25);
         }
-        // 取消就是取消：既不是「检查完成」，也不是「检查失败」。
+        // Canceled is canceled: neither "check completed" nor "check failed".
         Assert.Equal("Canceled", run!.Status);
         Assert.Null(run.Report);
 
@@ -292,9 +294,9 @@ public sealed class EndpointWritePathRaceTests
     }
 
     /// <summary>
-    /// F3 的第三处：POST /api/backup-configs/import 的 catch 把「读信息文件失败」一律报成
-    /// 400「密码不对？」。取消（客户端断开 / 进程关停）不是密码错——把它伪装成用户错误，用户会去
-    /// 反复重输一个本来就正确的密码。修复前 catch (Exception) 会吞掉它。
+    /// The third F3 site: the catch in POST /api/backup-configs/import reports every "could not read the info file" as a
+    /// 400 "wrong password?". Cancellation (client disconnect / process shutdown) is not a wrong password — disguise it as a
+    /// user error and the user will keep re-typing a password that was correct all along. Before the fix, catch (Exception) swallowed it.
     /// </summary>
     [Fact]
     public async Task Import_Does_Not_Swallow_Cancellation_As_A_Wrong_Password()
@@ -315,27 +317,30 @@ public sealed class EndpointWritePathRaceTests
             "/api/backup-configs/import", new ImportRequest(account!.Id, "import-container", "the-real-password"));
         var body = await res.Content.ReadAsStringAsync();
 
-        // 取消一路上抛（宿主渲染成 500），不是被端点的某个 catch 接住、包成任何一种「处理过」的响应
-        // （本端点所有 Results.XXX 分支——400/404/201——都回 application/json）。只断言
-        // NotEqual(BadRequest) 不够：换个分支把取消吞成别的非 400 状态（比如误判 404）一样能溜过去。
-        // 用 Content-Type 而非状态码/正文文本做判据：不管宿主把未处理异常渲染成什么（开发者异常页只在
-        // Development 下才有——ASPNETCORE_ENVIRONMENT=Production 下没有该中间件），只要它不是本端点
-        // 自己写出的 application/json，就足以证明取消没被当成「已处理」的请求结果。
+        // Cancellation propagates all the way up (the host renders it as a 500) instead of being caught by one of the
+        // endpoint's catches and wrapped into any kind of "handled" response (every Results.XXX branch of this endpoint —
+        // 400/404/201 — returns application/json). Asserting NotEqual(BadRequest) alone is not enough: another branch
+        // swallowing cancellation into some other non-400 status (a bogus 404, say) would slip through just as easily.
+        // The criterion is Content-Type rather than the status code or body text: whatever the host renders an unhandled
+        // exception as (the developer exception page only exists under Development — that middleware is absent under
+        // ASPNETCORE_ENVIRONMENT=Production), as long as it is not the application/json this endpoint writes itself, that is
+        // proof enough that cancellation was not turned into a "handled" request result.
         Assert.NotEqual(HttpStatusCode.BadRequest, res.StatusCode);
         Assert.NotEqual("application/json", res.Content.Headers.ContentType?.MediaType);
         Assert.DoesNotContain("wrong password", body, StringComparison.OrdinalIgnoreCase);
 
-        // 也没有半路建出配置行来。
+        // And no config row was created halfway through either.
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         Assert.False(await db.BackupConfigs.AsNoTracking().AnyAsync(c => c.ContainerName == "import-container"));
     }
 
     /// <summary>
-    /// F3 的第四处：DELETE /api/backup-configs/{id} 的善后步骤走 BestEffort（吞异常记 Warning，
-    /// 一步失败不阻断其余）。取消是例外——它不是「这一步失败了」，而是整条请求该停下；吞掉会给
-    /// 每个剩余步骤各记一条误导性 Warning，还把一次被取消的请求报成 204 成功。
-    /// <para>修复前（catch (Exception) 不排除取消）：第二步被吞掉，第三步照常执行，端点回 204。</para>
+    /// The fourth F3 site: the cleanup steps of DELETE /api/backup-configs/{id} run BestEffort (swallow the exception, log a
+    /// Warning, one failed step does not block the rest). Cancellation is the exception — it does not mean "this step failed"
+    /// but "the whole request should stop"; swallowing it logs one misleading Warning per remaining step and reports a
+    /// canceled request as a 204 success.
+    /// <para>Before the fix (catch (Exception) not excluding cancellation): step two was swallowed, step three ran as usual, and the endpoint returned 204.</para>
     /// </summary>
     [Fact]
     public async Task Delete_Does_Not_Swallow_Cancellation_In_The_Best_Effort_Cleanup()
@@ -358,10 +363,10 @@ public sealed class EndpointWritePathRaceTests
 
         var res = await client.DeleteAsync($"/api/backup-configs/{config!.Id}");
 
-        // 取消原样上抛（宿主渲染成 500），不是 204「删干净了」。
+        // Cancellation propagates as-is (the host renders it as a 500), not a 204 "deleted cleanly".
         Assert.NotEqual(HttpStatusCode.NoContent, res.StatusCode);
-        // 而且**后续步骤没有继续跑**——这正是「吞掉取消」与「放行取消」的可观测分界：
-        // 吞掉的话第三步（清本地权威状态）会照常执行。
+        // And **the later steps did not keep running** — that is precisely the observable line between "swallow cancellation"
+        // and "let cancellation through": if it were swallowed, step three (clearing the local authoritative state) would have run as usual.
         Assert.False(stateStore.Removed);
     }
 }

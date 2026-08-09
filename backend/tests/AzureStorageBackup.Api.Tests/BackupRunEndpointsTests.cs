@@ -36,19 +36,19 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        // 本地根 + 文件
+        // Local root + a file
         Directory.CreateDirectory(_localRoot);
         await File.WriteAllTextAsync(Path.Combine(_localRoot, "a.txt"), "alpha");
 
         var containerName = "run-" + Guid.NewGuid().ToString("N")[..8];
 
-        // 建账户（Azurite）
+        // Create the account (Azurite)
         var accountReq = new AccountRequest("azurite", null, AzuriteEndpoint, AzureRegion.Global,
             AzuriteKey, false, ProxyMode.Independent, null, null, null, null);
         var account = await (await _client.PostAsJsonAsync("/api/accounts", accountReq))
             .Content.ReadFromJsonAsync<AccountResponse>();
 
-        // 建备份配置
+        // Create the backup config
         var configReq = new BackupConfigRequest(account!.Id, containerName, "photos", null, _localRoot,
             null, StorageTier.Hot, StorageTier.Hot, null, null, null, false,
             100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000);
@@ -61,13 +61,13 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
 
         try
         {
-            // 启动
+            // Start it
             var start = await _client.PostAsync($"/api/backup-configs/{config!.Id}/run", null);
             Assert.Equal(HttpStatusCode.Accepted, start.StatusCode);
 
-            // 轮询到完成
+            // Poll until it finishes
             BackupRunResponse? status = null;
-            for (var i = 0; i < 600; i++) // 宽松：并发集成测试在少核机器上会拖慢后台 job
+            for (var i = 0; i < 600; i++) // Generous: concurrent integration tests slow the background job down on low-core machines
             {
                 status = await (await _client.GetAsync($"/api/backup-configs/{config.Id}/run"))
                     .Content.ReadFromJsonAsync<BackupRunResponse>();
@@ -81,7 +81,7 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
             Assert.Equal(1, status.Version);
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 
-            // 完成提示要显示起止时刻，而且必须与还原对话框读的 /versions 是同一组数字。
+            // The completion notice shows start and end times, and they have to be the same numbers /versions gives the restore dialog.
             Assert.NotNull(status.StartedAt);
             Assert.NotNull(status.CompletedAt);
             Assert.True(status.StartedAt <= status.CompletedAt);
@@ -91,7 +91,7 @@ public sealed class BackupRunEndpointsTests(TestWebAppFactory factory)
             Assert.Equal(v.startedAt, status.StartedAt);
             Assert.Equal(v.createdAt, status.CompletedAt);
 
-            // 操作日志已记录本次备份（M8 接线验证）
+            // The operation log has recorded this backup (M8 wiring check)
             var logs = await _client.GetFromJsonAsync<LogRow[]>($"/api/logs?source=backup:{account.Id}/{containerName}");
             Assert.Contains(logs!, l => l.message.Contains("Backup succeeded"));
         }

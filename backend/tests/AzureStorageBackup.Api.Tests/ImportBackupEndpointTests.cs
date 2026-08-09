@@ -58,7 +58,7 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
 
         try
         {
-            // 跑一次备份写出信息文件
+            // Run a backup once to write the info file
             await _client.PostAsync($"/api/backup-configs/{config!.Id}/run", null);
             for (var i = 0; i < 600; i++)
             {
@@ -67,10 +67,10 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
                 await Task.Delay(200);
             }
 
-            // 删掉本地配置，模拟"新设备/丢配置"
+            // Delete the local config, simulating "new device / lost config"
             await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
 
-            // 导入：从信息文件恢复配置
+            // Import: restore the config from the info file
             var res = await _client.PostAsJsonAsync("/api/backup-configs/import",
                 new ImportRequest(account.Id, containerName, null, CheckAfterImport: false));
             Assert.Equal(HttpStatusCode.Created, res.StatusCode);
@@ -86,8 +86,9 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         }
     }
 
-    // 导入加密备份：请求体里的密码是明文，落库必须是密文（设计 §3.1）。存错了的话
-    // /versions（经 ISecretReader 取密码再读信息文件）会抛 SecretUnavailableException 或解不开信息文件。
+    // Importing an encrypted backup: the password in the request body is plaintext and must be persisted as ciphertext
+    // (design §3.1). Store it wrong and /versions (which fetches the password via ISecretReader before reading the info
+    // file) throws SecretUnavailableException or fails to decrypt the info file.
     [SkippableFact]
     public async Task Import_Encrypted_Backup_Stores_Password_So_Versions_Still_Readable()
     {
@@ -192,11 +193,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
 
         try
         {
-            // 手工写一份没有 SourceRootHint 的信息文件——模拟旧版本产物/手工改库，
-            // 而不是经本应用的备份流程（那条路径总会填 SourceRootHint = config.LocalRoot）。
-            // 用独立的 BackupInfoStore（配 TestSecrets.Reader，与上面手工加密 azurite.AccountKeyProtected
-            // 用的是同一套密钥）直接写，绕开 DI 容器里那个用真实 keyring 的 ISecretReader——
-            // 后者解不开这里手工构造的密文。
+            // Hand-write an info file with no SourceRootHint — simulating an artifact from an older version / a hand-edited
+            // database, rather than going through this app's backup flow (that path always fills in SourceRootHint = config.LocalRoot).
+            // Write it directly with a standalone BackupInfoStore (wired to TestSecrets.Reader, the same key material used to
+            // hand-encrypt azurite.AccountKeyProtected above), bypassing the DI container's ISecretReader that uses the real
+            // keyring — that one cannot decrypt the ciphertext constructed by hand here.
             var infoStore = new BackupInfoStore(factoryClient, new SevenZipArchiveCodec());
             await infoStore.WriteInfoAsync(azurite, containerName, new BackupInfoFile
             {

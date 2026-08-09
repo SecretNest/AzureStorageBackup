@@ -15,7 +15,7 @@ public sealed class BlobAddressSchemeTests
         var s = new BlobAddressScheme(null, null);
 
         Assert.False(s.Keyed);
-        Assert.Equal("data/" + Hash, s.DataAddress(Hash)); // 明文寻址
+        Assert.Equal("data/" + Hash, s.DataAddress(Hash)); // plaintext addressing
         var meta = s.Metadata(Hash, 42, "xxh128:aa", "xxh128:zz");
         Assert.Equal("42", meta["len"]);
         Assert.Equal("xxh128:aa", meta["head"]);
@@ -30,13 +30,13 @@ public sealed class BlobAddressSchemeTests
         Assert.True(s.Keyed);
         var addr = s.DataAddress(Hash);
         Assert.StartsWith("data/", addr);
-        Assert.NotEqual("data/" + Hash, addr);              // 不是明文 hash
-        Assert.DoesNotContain(Hash, addr);                  // 公开 hash 不出现在地址里
+        Assert.NotEqual("data/" + Hash, addr);              // not the plaintext hash
+        Assert.DoesNotContain(Hash, addr);                  // the public hash does not appear in the address
         var meta = s.Metadata(Hash, 42, "xxh128:aa", "xxh128:zz");
-        Assert.False(meta.ContainsKey("len"));              // 不泄露长度
-        Assert.False(meta.ContainsKey("head"));             // 不泄露头部指纹
-        Assert.False(meta.ContainsKey("tail"));             // 不泄露尾部指纹
-        Assert.True(meta.ContainsKey("v"));                 // 只有不透明校验值
+        Assert.False(meta.ContainsKey("len"));              // no length leaked
+        Assert.False(meta.ContainsKey("head"));             // no head fingerprint leaked
+        Assert.False(meta.ContainsKey("tail"));             // no tail fingerprint leaked
+        Assert.True(meta.ContainsKey("v"));                 // only the opaque verifier
     }
 
     [Fact]
@@ -47,9 +47,9 @@ public sealed class BlobAddressSchemeTests
         var otherSalt = new BlobAddressScheme("pw", RandomNumberGenerator.GetBytes(16)).DataAddress(Hash);
         var otherPw = new BlobAddressScheme("pw2", Salt).DataAddress(Hash);
 
-        Assert.Equal(a, again);        // 同 (密码,盐,hash) → 同地址（去重可用）
-        Assert.NotEqual(a, otherSalt); // 盐不同 → 地址不同
-        Assert.NotEqual(a, otherPw);   // 密码不同 → 地址不同
+        Assert.Equal(a, again);        // same (password, salt, hash) → same address (usable for dedup)
+        Assert.NotEqual(a, otherSalt); // different salt → different address
+        Assert.NotEqual(a, otherPw);   // different password → different address
     }
 
     [Fact]
@@ -58,10 +58,10 @@ public sealed class BlobAddressSchemeTests
         foreach (var s in new[] { new BlobAddressScheme(null, null), new BlobAddressScheme("pw", Salt) })
         {
             var meta = new Dictionary<string, string>(s.Metadata(Hash, 100, "xxh128:bb", "xxh128:dd"));
-            Assert.True(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:dd"));   // 同内容
-            Assert.False(s.MetadataMatches(meta, Hash, 101, "xxh128:bb", "xxh128:dd"));  // 长度不同 → 碰撞
-            Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:cc", "xxh128:dd"));  // 头部不同 → 碰撞
-            Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:ee"));  // 尾部不同 → 碰撞
+            Assert.True(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:dd"));   // same content
+            Assert.False(s.MetadataMatches(meta, Hash, 101, "xxh128:bb", "xxh128:dd"));  // different length → collision
+            Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:cc", "xxh128:dd"));  // different head → collision
+            Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:ee"));  // different tail → collision
         }
     }
 
@@ -73,9 +73,9 @@ public sealed class BlobAddressSchemeTests
     }
 
     /// <summary>
-    /// F4：老索引条目缺 head/tail 时（修复器会把 null 原样传进来），必须**省略**对应的键，
-    /// 而不是写空串。<see cref="BlobAddressScheme.MetadataMatches"/> 把「键缺失」当不参与判定、
-    /// 把「键存在但值不同」当碰撞——写空串会让同内容被判成碰撞。
+    /// F4: when an old index entry is missing head/tail (the repairer passes the nulls straight through), the corresponding key must be **omitted**
+    /// rather than written as an empty string. <see cref="BlobAddressScheme.MetadataMatches"/> treats "key absent" as not taking part in the decision and
+    /// "key present but different" as a collision — an empty string would make identical content look like a collision.
     /// </summary>
     [Fact]
     public void Unknown_Head_Or_Tail_Is_Omitted_Not_Blanked()
@@ -85,7 +85,7 @@ public sealed class BlobAddressSchemeTests
         var noTail = s.Metadata(Hash, 42, "xxh128:aa", null);
         Assert.Equal("42", noTail["len"]);
         Assert.Equal("xxh128:aa", noTail["head"]);
-        Assert.False(noTail.ContainsKey("tail")); // 空串会让下面的判定变成「碰撞」
+        Assert.False(noTail.ContainsKey("tail")); // an empty string would turn the check below into a "collision"
 
         var noHead = s.Metadata(Hash, 42, null, "xxh128:zz");
         Assert.False(noHead.ContainsKey("head"));
@@ -93,8 +93,8 @@ public sealed class BlobAddressSchemeTests
     }
 
     /// <summary>
-    /// F4 的实际后果：以缺 tail 的元数据写出的 blob，后续以真实 tail 去重时必须判为同内容。
-    /// 若 Metadata 写的是 tail=""，这里会返回 false，同内容被改写到 ~N 备用地址并误报「已避让碰撞」。
+    /// The practical consequence of F4: a blob written with metadata missing tail must later be judged identical content when dedup comes back with the real tail.
+    /// Had Metadata written tail="", this would return false, and the identical content would be rewritten to a ~N fallback address with a false report of "collision avoided".
     /// </summary>
     [Fact]
     public void Omitted_Tail_Does_Not_Look_Like_A_Collision()
@@ -102,18 +102,18 @@ public sealed class BlobAddressSchemeTests
         var s = new BlobAddressScheme(null, null);
         var written = new Dictionary<string, string>(s.Metadata(Hash, 42, "xxh128:aa", null));
 
-        Assert.True(s.MetadataMatches(written, Hash, 42, "xxh128:aa", "xxh128:real-tail")); // 同内容
-        Assert.False(s.MetadataMatches(written, Hash, 43, "xxh128:aa", "xxh128:real-tail")); // 长度仍然管用
+        Assert.True(s.MetadataMatches(written, Hash, 42, "xxh128:aa", "xxh128:real-tail")); // same content
+        Assert.False(s.MetadataMatches(written, Hash, 43, "xxh128:aa", "xxh128:real-tail")); // length still works
 
         var noHead = new Dictionary<string, string>(s.Metadata(Hash, 42, null, "xxh128:zz"));
         Assert.True(s.MetadataMatches(noHead, Hash, 42, "xxh128:real-head", "xxh128:zz"));
-        Assert.False(s.MetadataMatches(noHead, Hash, 42, "xxh128:real-head", "xxh128:other")); // tail 仍然管用
+        Assert.False(s.MetadataMatches(noHead, Hash, 42, "xxh128:real-head", "xxh128:other")); // tail still works
     }
 
     /// <summary>
-    /// 密钥化时 v 是四项合一的不透明值，省不掉其中一项：任一项未知就不写 v，改写只覆盖
-    /// fullHash+长度 的窄校验值 v1。绝不写出 head/tail/len 明文（那正是密钥化要防的长度指纹）。
-    /// <para>修复前：这里返回空字典，该对象一点碰撞防护都不剩。</para>
+    /// When keyed, v is one opaque value fusing all four items and none of them can be dropped: if any item is unknown, no v is written, and instead
+    /// the narrow verifier v1 covering only fullHash+length goes out. Plaintext head/tail/len are never written (that length fingerprint is exactly what keying defends against).
+    /// <para>Before the fix: this returned an empty dictionary, leaving the object with not one bit of collision protection.</para>
     /// </summary>
     [Fact]
     public void Keyed_Falls_Back_To_A_Narrow_Verifier_When_Head_Or_Tail_Unknown()
@@ -122,22 +122,22 @@ public sealed class BlobAddressSchemeTests
 
         foreach (var meta in new[] { s.Metadata(Hash, 42, "xxh128:aa", null), s.Metadata(Hash, 42, null, "xxh128:zz") })
         {
-            Assert.Equal(new[] { "v1" }, meta.Keys.Order());  // 只有窄校验值，没有 v，也没有任何明文项
+            Assert.Equal(new[] { "v1" }, meta.Keys.Order());  // only the narrow verifier: no v, and no plaintext item either
             Assert.NotEmpty(meta["v1"]);
         }
-        // 两项都未知时同样发 v1（缺的是哪一项不影响它覆盖的范围）。
+        // With both items unknown it still sends v1 (which item is missing does not change what it covers).
         Assert.Equal(new[] { "v1" }, s.Metadata(Hash, 42, null, null).Keys.Order());
     }
 
     /// <summary>
-    /// 全新备份（四项齐全）写出的密钥化元数据必须一字不变：只有 v，且值与本改动前逐字节相同。
-    /// 期望值是按 v 的定义 HMAC(key, "fullHash|len|head|tail") 独立算出来的——不是从被测代码里抄的，
-    /// 故 <see cref="BlobAddressScheme.Metadata"/> 一旦改了 v 的输入串（会使既有对象全部失配）这里就红。
+    /// The keyed metadata a fresh backup writes (all four items present) must be unchanged to the letter: v only, with a value byte for byte identical to before this change.
+    /// The expected value is computed independently from v's definition, HMAC(key, "fullHash|len|head|tail") — it is not copied out of the code under test,
+    /// so the moment <see cref="BlobAddressScheme.Metadata"/> changes v's input string (which would make every existing object mismatch) this goes red.
     /// </summary>
     [Fact]
     public void Keyed_Fresh_Backup_Metadata_Is_Byte_For_Byte_Unchanged()
     {
-        var salt = new byte[16]; // 固定盐 → 固定 key → 期望值可复算
+        var salt = new byte[16]; // fixed salt → fixed key → the expected value can be recomputed
         var s = new BlobAddressScheme("pw", salt);
         var key = HKDF.DeriveKey(
             HashAlgorithmName.SHA256, Encoding.UTF8.GetBytes("pw"), outputLength: 32,
@@ -147,25 +147,25 @@ public sealed class BlobAddressSchemeTests
 
         var meta = s.Metadata(Hash, 42, "xxh128:aa", "xxh128:zz");
 
-        Assert.Equal(new[] { "v" }, meta.Keys.Order()); // 一个键都没多（尤其没有 v1）
+        Assert.Equal(new[] { "v" }, meta.Keys.Order()); // not one extra key (no v1 above all)
         Assert.Equal(expected, meta["v"]);
     }
 
     /// <summary>
-    /// 向后兼容：已带 v 的既有对象仍**只**按 v 判定——v1 的引入不改变它们的任何判定结果。
-    /// 手工塞一个 v1（既有对象不会有，但要证明 v 存在时它一眼都不看）。
+    /// Backward compatibility: existing objects that already carry v are still decided by v **alone** — introducing v1 changes none of their verdicts.
+    /// A v1 is stuffed in by hand (existing objects will not have one, but this proves that when v is present it is not even glanced at).
     /// </summary>
     [Fact]
     public void Keyed_Existing_Verifier_Still_Wins_Over_The_Narrow_One()
     {
         var s = new BlobAddressScheme("pw", Salt);
         var meta = new Dictionary<string, string>(s.Metadata(Hash, 100, "xxh128:bb", "xxh128:dd"));
-        meta["v1"] = "deadbeef"; // 一个必然对不上的窄校验值
+        meta["v1"] = "deadbeef"; // a narrow verifier that is bound to mismatch
 
-        Assert.True(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:dd"));  // v 说同内容 → 放行
-        Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:ee")); // v 说碰撞 → 否决
+        Assert.True(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:dd"));  // v says same content → let through
+        Assert.False(s.MetadataMatches(meta, Hash, 100, "xxh128:bb", "xxh128:ee")); // v says collision → reject
 
-        // 反向：v 对不上但 v1 对得上，也必须以 v 为准（否则 v1 会成为绕过四项校验的后门）。
+        // The reverse: v mismatching while v1 matches must still be decided by v (otherwise v1 becomes a back door around the four-item check).
         var forged = new Dictionary<string, string>
         {
             ["v"] = "deadbeef",
@@ -175,7 +175,7 @@ public sealed class BlobAddressSchemeTests
     }
 
     /// <summary>
-    /// 向后兼容：既无 v 也无 v1 的真·老 blob 仍按「无元数据 → 不参与判定」放行，不新增拒绝面。
+    /// Backward compatibility: a genuinely old blob with neither v nor v1 is still let through as "no metadata → does not take part in the decision", adding no new rejection surface.
     /// </summary>
     [Fact]
     public void Keyed_Legacy_Object_With_Neither_Verifier_Still_Participates_As_Before()
@@ -183,14 +183,14 @@ public sealed class BlobAddressSchemeTests
         var s = new BlobAddressScheme("pw", Salt);
 
         Assert.True(s.MetadataMatches(new Dictionary<string, string>(), Hash, 1, "xxh128:aa", "xxh128:bb"));
-        // 只带无关键（如 raw 标记）的老对象同样放行。
+        // An old object carrying only irrelevant keys (such as the raw marker) is let through as well.
         Assert.True(s.MetadataMatches(
             new Dictionary<string, string> { ["raw"] = "1" }, Hash, 1, "xxh128:aa", "xxh128:bb"));
     }
 
     /// <summary>
-    /// v1 的实际作用：以缺 head/tail 的元数据写出的对象，长度仍参与判定。
-    /// <para>修复前这里写的是空字典，长度不同也一律返回 true——碰撞防护塌成只剩 fullHash。</para>
+    /// What v1 actually buys: for an object written with metadata missing head/tail, the length still takes part in the decision.
+    /// <para>Before the fix this wrote an empty dictionary and returned true even for a different length — collision protection collapsed to fullHash alone.</para>
     /// </summary>
     [Fact]
     public void Keyed_Narrow_Verifier_Keeps_Length_In_The_Decision()
@@ -198,25 +198,25 @@ public sealed class BlobAddressSchemeTests
         var s = new BlobAddressScheme("pw", Salt);
         var written = new Dictionary<string, string>(s.Metadata(Hash, 42, "xxh128:aa", null));
 
-        // head/tail 不参与（本就未知），同内容照旧放行——不会把同内容误判成碰撞。
+        // head/tail do not take part (they were unknown anyway), so identical content is let through as before — identical content is never misjudged as a collision.
         Assert.True(s.MetadataMatches(written, Hash, 42, "xxh128:aa", "xxh128:real-tail"));
         Assert.True(s.MetadataMatches(written, Hash, 42, "xxh128:whatever", "xxh128:anything"));
-        // 长度不同 = 内容必然不同 → 碰撞，必须否决。
+        // A different length means the content is necessarily different → a collision, and must be rejected.
         Assert.False(s.MetadataMatches(written, Hash, 43, "xxh128:aa", "xxh128:real-tail"));
-        // fullHash 不同也否决（v1 覆盖 fullHash+长度两项）。
+        // A different fullHash is rejected too (v1 covers the two items fullHash+length).
         Assert.False(s.MetadataMatches(written, "xxh128:ffffffffffffffffffffffffffffffff", 42, "xxh128:aa", "xxh128:zz"));
     }
 
     /// <summary>
-    /// v1 是密钥化的：换密码/换盐算出的 v1 对不上，与 v 的性质一致（不是可被旁观者复算的明文长度）。
+    /// v1 is keyed: a v1 computed with a different password or a different salt does not match, exactly like v (it is not a plaintext length a bystander can recompute).
     /// </summary>
     [Fact]
     public void Keyed_Narrow_Verifier_Is_Key_Bound_And_Not_A_Plaintext_Length()
     {
         var written = new Dictionary<string, string>(new BlobAddressScheme("pw", Salt).Metadata(Hash, 42, null, null));
 
-        // 是个定长 HMAC-SHA256 摘要，不是可被旁观者直接读出的长度/hash。
-        // （刻意不写 DoesNotContain("42")：摘要是随机十六进制，偶尔真会含 "42" 子串，那种断言会随机变红。）
+        // It is a fixed-length HMAC-SHA256 digest, not a length/hash a bystander can read straight off.
+        // (Deliberately no DoesNotContain("42"): the digest is random hex and will occasionally really contain the substring "42", so that assertion would go red at random.)
         Assert.Equal(64, written["v1"].Length);
         Assert.True(written["v1"].All(char.IsAsciiHexDigitLower));
         Assert.DoesNotContain(Hash, written["v1"], StringComparison.Ordinal);
@@ -229,7 +229,7 @@ public sealed class BlobAddressSchemeTests
                 new BlobAddressScheme("pw", RandomNumberGenerator.GetBytes(16)).Metadata(Hash, 42, null, null))["v1"]);
     }
 
-    /// <summary>全新备份写出的元数据不受 F4 影响：head/tail 齐全时三个键一个不少。</summary>
+    /// <summary>The metadata a fresh backup writes is untouched by F4: with head/tail present, all three keys are there.</summary>
     [Fact]
     public void Fresh_Backup_Metadata_Is_Unchanged()
     {

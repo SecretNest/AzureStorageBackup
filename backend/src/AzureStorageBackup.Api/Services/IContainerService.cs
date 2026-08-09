@@ -2,21 +2,22 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一个 container 及其备份存在情况。</summary>
+/// <summary>A container and whether a backup is present in it.</summary>
 public record ContainerInfo(string Name, BackupPresence Backup)
 {
     /// <summary>
-    /// 本地库里占着这个 container 的那条备份配置的名字；没人占着则为 null。
+    /// The name of the backup config in the local database that holds this container; null when nobody holds it.
     /// <para>
-    /// <see cref="Backup"/> 只说得出「云端信息文件在不在」，而那个文件是备份的最后一步才写的：
-    /// 首次备份跑到一半的 container 里已经躺着这一轮的数据，云端却还什么标记都没有。占用的权威
-    /// 在本地——库里那条配置从创建的那一刻就存在，不必等任何云端产物（<c>ContainerEndpoints</c> 填入）。
+    /// <see cref="Backup"/> can only say "is the cloud info file there", and that file is written by the very last step of a
+    /// backup: a container halfway through its first backup already holds this run's data while the cloud still carries no
+    /// marker at all. The authority on occupancy is local — the config row is in the database from the moment it was
+    /// created, with nothing to wait on in the cloud (filled in by <c>ContainerEndpoints</c>).
     /// </para>
     /// </summary>
     public string? InUseBy { get; init; }
 }
 
-/// <summary>账户下的 container 管理（列举/创建/删除）与备份发现。</summary>
+/// <summary>Container management under an account (list/create/delete) plus backup discovery.</summary>
 public interface IContainerService
 {
     Task<IReadOnlyList<ContainerInfo>> ListContainersAsync(Account account, CancellationToken ct = default);

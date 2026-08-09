@@ -7,11 +7,11 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Endpoints;
 
 /// <summary>
-/// 系统信息端点：路径（PRD 第 6 章，供用户做 docker 卷映射）与版本（第 7 章）。
+/// System information endpoints: paths (PRD chapter 6, so the user can set up docker volume mappings) and version (chapter 7).
 /// </summary>
 public static class SystemEndpoints
 {
-    /// <summary>单次浏览返回的条目上限。超出即截断并在响应里标明，不静默少给。</summary>
+    /// <summary>Cap on the entries a single browse returns. Beyond it we truncate and say so in the response — never silently hand back fewer.</summary>
     private const int MaxBrowseEntries = 2000;
 
     private const int DefaultPageSize = 500;
@@ -27,7 +27,7 @@ public static class SystemEndpoints
 
             var dataPath = ParseDataSource(config.GetConnectionString("Sqlite")) ?? "data/app.db";
 
-            // 备份引擎实际使用的临时区（供 docker 卷映射，PRD 6）。
+            // The temp area the backup engine actually uses (for docker volume mapping, PRD 6).
             var tempPath = config["Backup:TempPath"];
             if (string.IsNullOrWhiteSpace(tempPath))
                 tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
@@ -52,7 +52,7 @@ public static class SystemEndpoints
         })
         .WithTags("System");
 
-        // 密钥环状态与待重设计数（设计 §3.3），供顶部横幅与恢复清单使用。
+        // Keyring status and the pending-reset counts (design §3.3), used by the top banner and the recovery checklist.
         app.MapGet("/api/system/keyring", async (
             IKeyringHealth keyring, AppDbContext db, IEncryptionService encryption, CancellationToken ct) =>
         {
@@ -64,9 +64,10 @@ public static class SystemEndpoints
                     backupConfigsPending = 0,
                 });
 
-            // 必须逐条试解，不能按全局状态一刀切：恢复流程会经过「账户已全部重设、备份密码仍是旧密文」
-            // 的中间态，此时状态仍是 Lost，但 accountsPending 必须归零，否则前端的顺序依赖
-            // （账户未清零则禁用备份密码重设）会把恢复流程锁死（见 SecretAvailability）。
+            // Every secret has to be probed one by one; the global status cannot be applied wholesale: the recovery flow passes
+            // through an intermediate state of "all accounts reset, backup passwords still the old ciphertext" where the status
+            // is still Lost but accountsPending must drop to zero, or the frontend's ordering dependency (backup password reset
+            // stays disabled while accounts are non-zero) deadlocks the recovery flow (see SecretAvailability).
             var accounts = await db.Accounts.AsNoTracking()
                 .Select(a => new { a.AccountKeyProtected, a.ProxyPasswordProtected }).ToListAsync(ct);
             var backupPasswords = await db.BackupConfigs.AsNoTracking()
@@ -84,7 +85,7 @@ public static class SystemEndpoints
         })
         .WithTags("System");
 
-        // 本地目录浏览（设计 §6）。懒加载，只返回直接子项。
+        // Local directory browsing (design §6). Lazy: only the immediate children are returned.
         app.MapGet("/api/system/browse", (string? path, int? offset, int? limit, PathBoundary boundary) =>
         {
             var start = string.IsNullOrWhiteSpace(path) ? DefaultBrowseStart(boundary) : path!;
@@ -95,16 +96,17 @@ public static class SystemEndpoints
             if (!Directory.Exists(start))
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
 
-            // 分页请求（传了 offset 或 limit）与老的一次性请求走同一段代码，区别只在切片。
-            // 老调用方（PathBrowser）不传这两个参数，行为与从前完全一致：最多 MaxBrowseEntries 项，
-            // 超出则 Truncated。
+            // Paged requests (offset or limit passed) share the same code as the old one-shot request; the only difference is the slice.
+            // Old callers (PathBrowser) pass neither parameter and behave exactly as before: at most MaxBrowseEntries entries,
+            // Truncated beyond that.
             var paged = offset is not null || limit is not null;
             var skip = Math.Max(0, offset ?? 0);
             var take = paged ? Math.Clamp(limit ?? DefaultPageSize, 1, MaxPageSize) : MaxBrowseEntries;
 
-            // 目录与文件分开枚举：isDir 因此免费得到，不必对每一项 stat。名字先全部收上来
-            // （20 万个字符串是可以接受的），排完序再只对**当前页**取属性——原先那版先收集
-            // 再排序，截断发生在收集阶段，于是截断之后的顺序是随机的，也就没法分页。
+            // Directories and files are enumerated separately: isDir comes for free that way, with no stat per entry. Collect all
+            // the names first (200,000 strings is acceptable), sort them, and only then read attributes for the **current page** —
+            // the earlier version collected first and sorted afterwards, with truncation happening during collection, so the order
+            // after truncation was random and paging was impossible.
             List<string> dirs;
             List<string> files;
             try
@@ -112,16 +114,16 @@ public static class SystemEndpoints
                 dirs = Directory.EnumerateDirectories(start).ToList();
                 files = Directory.EnumerateFiles(start).ToList();
             }
-            // DirectoryNotFoundException 派生自 IOException，必须先于更宽的分支单独捕获，
-            // 否则 Directory.Exists 与这里之间的 TOCTOU 窗口里目录被删会报成 403 而不是 404。
+            // DirectoryNotFoundException derives from IOException and must be caught separately, ahead of the broader branch,
+            // or a directory deleted in the TOCTOU window between Directory.Exists and here gets reported as 403 instead of 404.
             catch (DirectoryNotFoundException)
             {
                 return Results.NotFound(new { error = $"Directory '{start}' does not exist." });
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
             {
-                // 目录不可读（权限不足）或读取失败（挂载点掉线）：docker 卷挂载场景下是常态，
-                // 给一个干净的 403 而不是裸 500。
+                // The directory is unreadable (not enough permissions) or the read failed (mount point dropped out): both are
+                // routine with docker volume mounts, so give a clean 403 rather than a bare 500.
                 return Results.Json(
                     new { error = $"Directory '{start}' could not be read." },
                     statusCode: StatusCodes.Status403Forbidden);
@@ -148,30 +150,30 @@ public static class SystemEndpoints
                     var info = new FileInfo(full);
                     entries.Add(new BrowseEntry(
                         Path.GetFileName(full),
-                        // 绝对路径，原样可作为下一次 `?path=` 或 localRoot 送回。
+                        // Absolute path, usable as-is as the next `?path=` or as a localRoot.
                         full,
                         isDir,
-                        // 软链的 Length 是 lstat 值（链接自身的字节数），不是目标文件的大小。
+                        // A symlink's Length is the lstat value (the bytes of the link itself), not the size of the target file.
                         isDir ? null : info.Length,
                         info.LastWriteTimeUtc,
-                        // 软链可能指向根外：返回但标记，前端灰显不可点。
+                        // A symlink may point outside the root: return it but mark it, and the frontend greys it out as unclickable.
                         !boundary.IsInside(full)));
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
                 {
-                    // 单项 stat 失败（目录 mode 为 r--：可 readdir、不可 stat 子项）跳过该项，
-                    // 但要计数并随响应返回——静默跳过会让这种目录渲染成「空目录」，用户看不出差别。
+                    // A per-entry stat failure (directory mode r--: readdir works, stat on the children does not) skips that entry,
+                    // but it has to be counted and returned with the response — skipping silently renders such a directory as "empty" and the user cannot tell the difference.
                     skipped++;
                 }
             }
 
-            // 上级到根为止。不能用 Path.GetFullPath 词法折叠 `..`——PathBoundary 也刻意
-            // 避开这一点（见 PathBoundary.ResolveReal 的文档）：若 start 途经符号链接，
-            // 词法折叠算出的上级和真实文件系统上级会不一致，把用户悄悄传送到错误的目录
-            // （<root>/link -> <root>/a/b 时，词法折叠给出 <root>，真实上级是 <root>/a）。
-            // ResolveReal 才是与 IsInside 一致的真实路径来源；但真实路径可能带着 RealRoot
-            // 前缀（根自身是软链时），不能直接展示给用户，所以算出真实上级后要经
-            // ToDisplayPath 换回 ConfiguredRoot 视角，绝不把 RealRoot 泄漏到响应里。
+            // The parent stops at the root. Path.GetFullPath must not be used to fold `..` lexically — PathBoundary
+            // deliberately avoids that too (see PathBoundary.ResolveReal's docs): if start goes through a symlink, the
+            // lexically folded parent and the real filesystem parent disagree, quietly teleporting the user into the wrong
+            // directory (with <root>/link -> <root>/a/b, lexical folding gives <root>, while the real parent is <root>/a).
+            // ResolveReal is the source of real paths that agrees with IsInside; but a real path may carry the RealRoot
+            // prefix (when the root itself is a symlink) and must not be shown to the user directly, so once the real parent
+            // is computed, run it through ToDisplayPath to get back to the ConfiguredRoot view — never leak RealRoot into the response.
             var real = PathBoundary.ResolveReal(start);
             var realParent = real is null
                 ? null
@@ -188,10 +190,10 @@ public static class SystemEndpoints
     }
 
     /// <summary>
-    /// 未传 <c>path</c> 时的默认起点：配了根就从根开始，否则从文件系统根开始。
-    /// <see cref="PathBoundary.ConfiguredRoot"/> 恒为绝对路径（相对配置在
-    /// <see cref="PathBoundary"/> 构造时就已归一化），所以可以直接当 start 用，
-    /// 不会撞上 <see cref="PathBoundary.IsInside"/> 只认绝对输入这条规则。
+    /// The default start when no <c>path</c> is passed: begin at the root if one is configured, otherwise at the filesystem root.
+    /// <see cref="PathBoundary.ConfiguredRoot"/> is always absolute (a relative configuration is normalised in the
+    /// <see cref="PathBoundary"/> constructor), so it can be used as start directly without running into
+    /// <see cref="PathBoundary.IsInside"/>'s rule that only absolute input is accepted.
     /// </summary>
     private static string DefaultBrowseStart(PathBoundary boundary) =>
         boundary.ConfiguredRoot ?? Path.GetPathRoot(Path.GetFullPath("/")) ?? "/";
@@ -212,23 +214,23 @@ public static class SystemEndpoints
 }
 
 /// <summary>
-/// 浏览结果。Parent 为 null 表示已在根（或边界）处，不能再往上。
-/// <para><c>Skipped</c>：读不出属性因而未列出的子项数（典型成因是目录 mode 为 <c>r--</c>——
-/// 可 readdir、不可 stat 子项）。与 <c>Truncated</c> 同一用途：少给了东西必须说出来。</para>
-/// <para><c>Total</c>：该目录的子项总数（不受分页影响）；<c>Offset</c>：本页起始位置。
-/// 分页请求恒不置 <c>Truncated</c>——它的意思是「还有东西但拿不到了」，而分页拿得到。</para>
+/// The browse result. A null Parent means we are already at the root (or the boundary) and cannot go up any further.
+/// <para><c>Skipped</c>: the number of children left out because their attributes could not be read (the typical cause is a
+/// directory with mode <c>r--</c> — readdir works, stat on the children does not). Same purpose as <c>Truncated</c>: if we handed back less, we have to say so.</para>
+/// <para><c>Total</c>: the total number of children in the directory (unaffected by paging); <c>Offset</c>: where this page starts.
+/// A paged request never sets <c>Truncated</c> — that means "there is more but you cannot get at it", and paging can get at it.</para>
 /// </summary>
 public record BrowseResponse(
     string Path, string? Parent, bool Truncated, int Skipped, int Total, int Offset,
     IReadOnlyList<BrowseEntry> Entries);
 
 /// <summary>
-/// OutsideRoot=true 表示该项（通常是指向根外的软链）不可选，但仍列出以免用户困惑。
+/// OutsideRoot=true means the entry (usually a symlink pointing outside the root) cannot be selected, but it is still listed so the user is not left puzzled.
 /// <para>
-/// F8（给 picker UI 任务的实现者）：<see cref="Length"/> 底层是 <c>FileInfo.Length</c>，
-/// 对符号链接是 lstat 值——链接自身存的目标路径字符串长度（通常几十字节），不是目标
-/// 文件的真实大小。一个指向 4 GB 文件的软链会报 ~30 字节。方向是安全的（不会把目标
-/// 内容大小泄漏出去），但 UI 不能把这个字段当成目标文件的真实大小来显示/排序。
+/// F8 (for whoever implements the picker UI task): <see cref="Length"/> is <c>FileInfo.Length</c> underneath, which for a
+/// symlink is the lstat value — the length of the target path string stored in the link itself (usually a few dozen bytes),
+/// not the real size of the target file. A symlink pointing at a 4 GB file reports ~30 bytes. The direction is safe (it does
+/// not leak the size of the target's contents), but the UI must not display or sort this field as the target file's real size.
 /// </para>
 /// </summary>
 public record BrowseEntry(

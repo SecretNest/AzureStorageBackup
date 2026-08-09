@@ -51,7 +51,7 @@ public class BrowseEndpointTests : IDisposable
         Assert.NotNull(body);
         Assert.Contains(body!.Entries, e => e.Name == "photos" && e.IsDirectory);
         Assert.Contains(body.Entries, e => e.Name == "readme.txt" && !e.IsDirectory);
-        // 完整路径，不因为设了根就截断
+        // Full paths; configuring a root does not truncate them
         Assert.Contains(body.Entries, e => e.FullPath == Path.Combine(_root, "photos"));
     }
 
@@ -97,9 +97,9 @@ public class BrowseEndpointTests : IDisposable
         Assert.Null(body!.Parent);
     }
 
-    // F3: Parent_Stops_At_The_Root 也会在 Parent 被写死成 null 的情况下通过——
-    // 没有任何测试真的浏览一个子目录，断言 Parent 指回它的真实上级。这里补上，
-    // 证明「往上一级」这条路径本身是走通的，不只是「到根为止」这一端点。
+    // F3: Parent_Stops_At_The_Root would pass just as well with Parent hard-coded to null —
+    // no test ever browsed an actual subdirectory and asserted that Parent points back at its real parent. This fills
+    // that in, proving the "go up one level" path works at all, not just the "stop at the root" end of it.
     [Fact]
     public async Task Parent_Points_Back_To_The_Actual_Parent_Directory()
     {
@@ -112,10 +112,10 @@ public class BrowseEndpointTests : IDisposable
         Assert.Equal(_root, body!.Parent);
     }
 
-    // F4: Parent 之前用 Path.GetFullPath 词法折叠 `..`，跟着符号链接走时会算错——
-    // <root>/link -> <root>/a/b 时词法折叠给出 <root>，真实上级其实是 <root>/a。
-    // PathBoundary.ResolveReal 的文档专门讲了这个坑（跟 IsInside 用的是同一套算法），
-    // Parent 的计算必须跟组件的其余部分一致，否则用户会被静默传送到错误的目录。
+    // F4: Parent used to fold `..` lexically with Path.GetFullPath, which gets the wrong answer once symlinks are involved —
+    // with <root>/link -> <root>/a/b, lexical folding gives <root>, while the real parent is <root>/a.
+    // PathBoundary.ResolveReal's docs cover exactly this pitfall (it is the same algorithm IsInside uses);
+    // Parent must be computed the same way as the rest of the component, or the user gets silently teleported into the wrong directory.
     [Fact]
     public async Task Parent_Of_A_Symlinked_Directory_Follows_The_Real_Path_Not_The_Lexical_One()
     {
@@ -148,7 +148,7 @@ public class BrowseEndpointTests : IDisposable
             var body = await client.GetFromJsonAsync<BrowseDto>(
                 $"/api/system/browse?path={Uri.EscapeDataString(_root)}");
 
-            // 返回而不是过滤掉——否则用户会困惑「目录里明明有这个东西」
+            // Return it rather than filtering it out — otherwise the user is left puzzled: "that thing is clearly in the directory"
             var escape = Assert.Single(body!.Entries, e => e.Name == "escape");
             Assert.True(escape.OutsideRoot);
         }
@@ -188,9 +188,9 @@ public class BrowseEndpointTests : IDisposable
         Assert.False(photos.OutsideRoot);
     }
 
-    // F5: Backup:Root 允许配成相对路径（PathBoundary.ResolveReal 按进程 CWD 解析），
-    // 但旧的默认起点直接把 ConfiguredRoot 原样当 start 传给 IsInside——后者只认绝对
-    // 输入，相对根一律拒绝，于是不传 path 浏览自己的根都会 409，picker 直接瘫痪。
+    // F5: Backup:Root is allowed to be a relative path (PathBoundary.ResolveReal resolves it against the process CWD),
+    // but the old default start handed ConfiguredRoot straight to IsInside as start — and that only accepts absolute
+    // input, rejecting any relative root, so browsing your own root without a path 409s and the picker is dead on arrival.
     [Fact]
     public async Task Defaults_To_The_Configured_Root_Even_When_The_Root_Is_Relative()
     {
@@ -226,9 +226,9 @@ public class BrowseEndpointTests : IDisposable
         Assert.True(Path.IsPathRooted(body!.Path));
         var photos = Assert.Single(body.Entries, e => e.Name == "photos");
         Assert.True(Path.IsPathRooted(photos.FullPath));
-        // 归一化**只拼 CWD、不折叠 `..`**（折叠是词法的，CWD 自身经软链时会算到别的目录去——
-        // 正是 PathBoundary.ResolveReal 文档里那个坑），所以字符串里会留着拼接痕迹。
-        // 断言看的是它指向哪儿，不是它长什么样。
+        // Normalisation **only prepends the CWD, it does not fold `..`** (folding is lexical, and when the CWD itself goes
+        // through a symlink it lands in a different directory — exactly the pitfall in PathBoundary.ResolveReal's docs), so
+        // the string keeps visible traces of the concatenation. The assertion looks at where it points, not what it looks like.
         Assert.Equal(
             Path.GetFullPath(Path.Combine(_root, "photos")), Path.GetFullPath(photos.FullPath));
     }
@@ -249,13 +249,13 @@ public class BrowseEndpointTests : IDisposable
         var start = await client.GetFromJsonAsync<BrowseDto>("/api/system/browse");
         var photos = Assert.Single(start!.Entries, e => e.Name == "photos");
 
-        // 1) 点进子目录：把列表给出的 fullPath 一字不改地当 ?path= 送回去。
+        // 1) Click into a subdirectory: send the fullPath the listing gave back as ?path=, unchanged down to the byte.
         var downRes = await client.GetAsync(
             $"/api/system/browse?path={Uri.EscapeDataString(photos.FullPath)}");
         Assert.Equal(HttpStatusCode.OK, downRes.StatusCode);
         var down = await downRes.Content.ReadFromJsonAsync<BrowseDto>();
 
-        // 2) 点「.. (up)」：把它返回的 parent 一字不改地送回去，应当回到根的列表。
+        // 2) Click ".. (up)": send back the parent it returned, unchanged down to the byte, and we should land on the root listing.
         Assert.NotNull(down!.Parent);
         var upRes = await client.GetAsync(
             $"/api/system/browse?path={Uri.EscapeDataString(down.Parent!)}");
@@ -264,8 +264,8 @@ public class BrowseEndpointTests : IDisposable
         Assert.Contains(up!.Entries, e => e.Name == "photos");
     }
 
-    // F6a: 未配根、也不传 path 的默认起点此前完全没有测试覆盖——所有既有用例要么显式
-    // 传 path，要么配了根。
+    // F6a: the default start with no root configured and no path passed had no test coverage at all — every existing case
+    // either passes an explicit path or configures a root.
     [Fact]
     public async Task Without_A_Root_The_Default_Browse_Succeeds_From_The_Filesystem_Root()
     {
@@ -277,10 +277,10 @@ public class BrowseEndpointTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
     }
 
-    // F6b/c: 截断逻辑（entries.Count >= MaxBrowseEntries 在 Add 之前判断）此前只靠代码
-    // 阅读验证过。刚好 2000 项不该截断；2001 项必须截断且仍只返回 2000 项——后者能
-    // 抓住把 `>=` 误写成 `>` 的回归：那样 2001 项时判断在 count==2000 时仍是 false，
-    // 会多塞进第 2001 项且 Truncated 保持 false。
+    // F6b/c: the truncation logic (entries.Count >= MaxBrowseEntries, evaluated before the Add) had only ever been verified
+    // by reading the code. Exactly 2000 entries must not truncate; 2001 must truncate and still return only 2000 — the latter
+    // catches the regression of writing `>=` as `>`: with 2001 entries the test would still be false at count==2000,
+    // squeezing in a 2001st entry with Truncated staying false.
     [Fact]
     public async Task Exactly_The_Entry_Cap_Is_Not_Truncated()
     {
@@ -329,15 +329,15 @@ public class BrowseEndpointTests : IDisposable
         }
     }
 
-    // F1: Directory.Exists 为 true 不代表目录可读——Directory.EnumerateFileSystemEntries
-    // 的第一次 MoveNext 在 foreach 头部，落在原来那层只包住单项处理的 try 之外，会让
-    // UnauthorizedAccessException 直接冲出 handler，变成裸 500（Production 空 body，
-    // Development 带堆栈）。这条路径是 picker 的「前几次点击」就会撞见的——不设根时从
-    // / 开始，点开 /root 或任何别的 uid 拥有的卷挂载子目录都会触发。
-    // mode 000 只在非 root 进程下才是真正的屏障：CI（ubuntu-latest 的 runner 用户）和
-    // 本机沙箱都以非特权用户运行，但用 Environment.IsPrivilegedProcess 防一手，root 下
-    // chmod 000 不挡任何东西，断言在那种环境里没有意义，宁可 Skip 也不要产出一个
-    // 为错误原因通过的绿灯。
+    // F1: Directory.Exists returning true does not mean the directory is readable — the first MoveNext of
+    // Directory.EnumerateFileSystemEntries happens in the foreach header, outside the old try that only wrapped
+    // per-entry processing, so UnauthorizedAccessException escapes the handler and becomes a bare 500 (empty body in
+    // Production, stack trace in Development). The picker hits this path within its "first few clicks" — with no root
+    // configured it starts at /, and opening /root or any volume-mount subdirectory owned by another uid triggers it.
+    // mode 000 is only a real barrier for a non-root process: CI (ubuntu-latest's runner user) and the local sandbox both
+    // run as unprivileged users, but guard with Environment.IsPrivilegedProcess anyway — as root, chmod 000 blocks
+    // nothing, the assertion is meaningless in that environment, and a Skip beats producing a green light earned
+    // for entirely the wrong reason.
     [SkippableFact]
     public async Task An_Unreadable_Directory_Returns_A_Clean_Error_Not_A_Bare_500()
     {
@@ -361,20 +361,21 @@ public class BrowseEndpointTests : IDisposable
         }
         finally
         {
-            // 恢复权限，好让 Dispose() 里的递归删除（需要能打开 locked 本身列目录）能成功
+            // Restore the permissions so the recursive delete in Dispose() (which has to open locked itself to list it) can succeed
             File.SetUnixFileMode(locked,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 #pragma warning restore CA1416
     }
 
-    // F2 (final review): 单项 catch 分支此前被判定为「无法确定性构造」——mode 000 在**枚举**
-    // 就失败（走的是上面那条 403），悬空软链和非法 UTF-8 名字也都不触发。漏掉的是 mode `r--`：
-    // 可读但**不可执行**的目录 readdir 拿得到名字，对子项 stat 却被拒，而 FileInfo.Attributes
-    // 在这种目录下是**抛** UnauthorizedAccessException，不是返回 -1 哨兵值。于是枚举成功、
-    // 每一项都落进单项 catch：200 + 空列表 + Skipped == 子项数。
-    // 与上面的 403 用例同样的理由：root 下 mode 位不是屏障，两个子项都会被正常列出，
-    // 断言会为完全错误的原因变绿——那种环境下宁可 Skip。
+    // F2 (final review): the per-entry catch branch was previously judged "impossible to construct deterministically" —
+    // mode 000 fails at **enumeration** (that is the 403 case above), and dangling symlinks and invalid UTF-8 names do not
+    // trigger it either. What was missed is mode `r--`: a readable but **non-executable** directory lets readdir return the
+    // names while stat on the children is refused, and in such a directory FileInfo.Attributes **throws**
+    // UnauthorizedAccessException instead of returning the -1 sentinel. So enumeration succeeds and every entry lands in
+    // the per-entry catch: 200 + empty list + Skipped == the number of children.
+    // Same reasoning as the 403 case above: as root the mode bits are not a barrier, both children would be listed
+    // normally, and the assertion would go green for entirely the wrong reason — in that environment, prefer a Skip.
     [SkippableFact]
     public async Task Entries_Whose_Attributes_Cannot_Be_Read_Are_Skipped_And_Counted()
     {
@@ -384,7 +385,7 @@ public class BrowseEndpointTests : IDisposable
         Directory.CreateDirectory(Path.Combine(listable, "child-dir"));
         File.WriteAllText(Path.Combine(listable, "child-file.txt"), "x");
 #pragma warning disable CA1416 // tests run on Linux only
-        // r-- ：可 readdir（拿得到名字），不可 stat 子项（缺 x 位）。
+        // r--: readdir works (the names come back), stat on the children does not (no x bit).
         File.SetUnixFileMode(listable, UnixFileMode.UserRead);
         try
         {
@@ -397,7 +398,7 @@ public class BrowseEndpointTests : IDisposable
             Assert.Equal(HttpStatusCode.OK, res.StatusCode);
             var body = await res.Content.ReadFromJsonAsync<BrowseDto>();
             Assert.Empty(body!.Entries);
-            // 空列表本身还不够：Skipped 才把「跳过了两项」与「真的是空目录」区分开。
+            // The empty list alone is not enough: only Skipped tells "two entries were skipped" apart from "the directory really is empty".
             Assert.Equal(2, body.Skipped);
             Assert.False(body.Truncated);
         }
@@ -423,13 +424,13 @@ public class BrowseEndpointTests : IDisposable
         var second = await client.GetFromJsonAsync<BrowseDto>(
             $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=5&limit=5");
 
-        // 2 个目录（photos/docs，来自构造函数）+ 13 个文件（readme.txt + f00..f11）
+        // 2 directories (photos/docs, from the constructor) + 13 files (readme.txt + f00..f11)
         Assert.Equal(15, first!.Total);
         Assert.Equal(5, first.Entries.Count);
         Assert.Equal(0, first.Offset);
         Assert.Equal(5, second!.Offset);
 
-        // 目录在前，之后按名称排序；两页不重叠、不漏项。
+        // Directories first, then sorted by name; the two pages neither overlap nor drop an entry.
         Assert.Equal(["docs", "photos"], first.Entries.Take(2).Select(e => e.Name));
         Assert.Empty(first.Entries.Select(e => e.Name).Intersect(second.Entries.Select(e => e.Name)));
     }
@@ -443,7 +444,7 @@ public class BrowseEndpointTests : IDisposable
         var body = await client.GetFromJsonAsync<BrowseDto>(
             $"/api/system/browse?path={Uri.EscapeDataString(_root)}&offset=0&limit=1");
 
-        // Truncated 的意思是「还有东西但拿不到了」。分页请求拿得到，Total 已经说明了全貌。
+        // Truncated means "there is more but you cannot get at it". A paged request can get at it, and Total already tells the whole story.
         Assert.False(body!.Truncated);
         Assert.Equal(3, body.Total);
     }

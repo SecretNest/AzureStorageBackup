@@ -7,20 +7,20 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 从 Account → Containers 那个页面删掉一个还挂着备份的 container，会让云端数据消失而本地那条
-/// <see cref="BackupConfig"/> 原封不动：备份列表里于是继续显示一个后面什么都没有的备份，
-/// 而点进去的每一个操作都会以各种形状失败。这是用户实际踩到的。
+/// Deleting a container that still holds a backup from the Account → Containers page makes the cloud data vanish while the
+/// local <see cref="BackupConfig"/> row stays untouched: the backup list then keeps showing a backup with nothing behind it,
+/// and every operation the user clicks into fails in some shape or another. This is something a user actually hit.
 /// <para>
-/// 删备份那条路（<c>DELETE /api/backups/{id}?deleteContainer=true</c>）本来就做对了：它连本地
-/// 索引缓存、备份状态、操作日志一并清掉，还挡住"正在跑操作时删除"。所以这里不是补一套新的清理
-/// 逻辑，而是把这条绕过它的近路堵上、并把用户指回正道。
+/// The delete-the-backup path (<c>DELETE /api/backups/{id}?deleteContainer=true</c>) already gets it right: it clears the
+/// local index cache, backup state and operation log along with it, and it blocks "delete while an operation is running".
+/// So this is not a second cleanup implementation, it just closes the shortcut around that path and points the user back to the right one.
 /// </para>
 /// </summary>
 public class ContainerDeleteGuardTests
 {
     private sealed record ErrorBody(string error);
 
-    /// <summary>记录删除调用，好断言"云端根本没被碰过"。</summary>
+    /// <summary>Records delete calls so we can assert "the cloud was never touched at all".</summary>
     private sealed class RecordingContainerService : IContainerService
     {
         public List<string> Deleted { get; } = [];
@@ -88,12 +88,12 @@ public class ContainerDeleteGuardTests
         var res = await client.DeleteAsync($"/api/accounts/{accountId}/containers/{container}");
 
         Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
-        // 要害：护栏必须在**触云之前**生效。先删了再报错，数据已经没了，报什么都晚了。
+        // The crux: the guard has to take effect **before touching the cloud**. Delete first and report afterwards and the data is already gone; nothing you report then helps.
         Assert.Empty(containers.Deleted);
 
         var body = await res.Content.ReadFromJsonAsync<ErrorBody>();
         Assert.NotNull(body);
-        // 错误信息得点名是哪个备份挡着，并指出正道——否则用户只知道"不让删"，不知道下一步该做什么。
+        // The error has to name which backup is in the way and point at the right path — otherwise the user only learns "not allowed" and has no idea what to do next.
         Assert.Contains("Photos", body!.error);
         Assert.Contains("backup", body.error, StringComparison.OrdinalIgnoreCase);
     }
@@ -113,8 +113,8 @@ public class ContainerDeleteGuardTests
     }
 
     /// <summary>
-    /// 护栏按 (account, container) 精确限定。<see cref="BackupConfig"/> 在这两列上有唯一索引，
-    /// 不同账户下可以有同名 container——按名字一刀切会让 A 账户的备份挡住 B 账户里同名的空 container。
+    /// The guard is scoped exactly by (account, container). <see cref="BackupConfig"/> has a unique index on those two
+    /// columns, and different accounts may hold containers of the same name — matching by name alone would let account A's backup block an empty container of the same name in account B.
     /// </summary>
     [Fact]
     public async Task A_Backup_In_One_Account_Does_Not_Guard_The_Same_Name_In_Another()

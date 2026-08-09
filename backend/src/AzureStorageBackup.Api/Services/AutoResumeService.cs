@@ -4,10 +4,10 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 启动后把上次被**计划内退出**打断的备份接着跑（受 <c>GlobalSettings.AutoResumeInterruptedRuns</c> 控制）。
+/// After startup, continues the backups that a **planned exit** interrupted last time (governed by <c>GlobalSettings.AutoResumeInterruptedRuns</c>).
 /// <para>
-/// 前提是盘上还留着 journal —— 跑完的运行会删掉自己那卷，所以留着就等于"没跑完"。
-/// 但"没跑完"远不足以构成"该替他重开"，判据见 <see cref="PickResumableAsync"/>。
+/// The precondition is that a journal is still on disk — a run that finished deletes its own volume, so one still lying there means "did not finish".
+/// But "did not finish" falls far short of "we should restart it on his behalf"; for the criteria see <see cref="PickResumableAsync"/>.
 /// </para>
 /// </summary>
 public sealed class AutoResumeService(
@@ -15,58 +15,58 @@ public sealed class AutoResumeService(
     ILogger<AutoResumeService> logger) : BackgroundService
 {
     /// <summary>
-    /// 开工前先等这么久：让 Web 端口先起来、调度器先跑第一拍，再去抢产出锁。
+    /// Wait this long before starting work: let the web port come up and the scheduler take its first tick before going after the output lock.
     /// <para>
-    /// 可写（而不是 <c>const</c>/<c>readonly</c>）纯粹为了测试：等 15 秒的用例没人愿意跑，而这个 if
-    /// （"设置关掉时真的不开工"）恰恰是这个功能最该被钉住的一句话——它坏掉的样子是**静默**的：
-    /// 操作员取消勾选，界面照样显示保存成功，直到某天重启后一轮他不想要的备份自己跑起来。
-    /// 先例是 <see cref="BackupRunner.SuspendWaitCap"/>。
+    /// Writable (rather than <c>const</c>/<c>readonly</c>) purely for the tests: nobody is willing to run a test that waits 15 seconds, and this if
+    /// ("with the setting off, really start nothing") is exactly the one sentence about this feature that most needs pinning down — the way it breaks is **silent**:
+    /// the operator unticks the box, the UI still reports saved successfully, and then one day after a restart a backup he did not want starts by itself.
+    /// The precedent is <see cref="BackupRunner.SuspendWaitCap"/>.
     /// </para>
     /// <para>
-    /// 之所以敢开成可写的静态字段，靠的**不是**"测试里没有第二个实例"——那句话是错的：
-    /// AutoResumeTests 和 GracefulSuspendTests 各自的 SchedulerOnFactory 都把
-    /// <c>Scheduler:Enabled</c> 打成 true 并真的起了这个服务，而 xUnit 是允许这些类并行跑的。
-    /// 真正撑着的是另一条：<see cref="TestWebAppFactory"/> 每个主机都用自己的 SQLite 文件，那两个
-    /// 主机的 BackupConfigs 表是空的，<see cref="PickResumableAsync"/> 拿到的是空列表，于是它们
-    /// 读到 50 毫秒还是 15 秒都不改变任何行为。
-    /// 所以这个前提是"并行跑着的测试主机里没有备份配置"，不是"没有别的实例"。哪天有测试主机开始
-    /// 带着配置起这个服务，这个字段就必须换成注入的选项——那时两个并行用例，一个把它改成 50 毫秒、
-    /// 一个正等着它别开工，后者会被前者的值捅穿。
+    /// What makes a writable static field safe here is **not** "there is no second instance in the tests" — that statement is false:
+    /// the SchedulerOnFactory in AutoResumeTests and the one in GracefulSuspendTests both set
+    /// <c>Scheduler:Enabled</c> to true and really do start this service, and xUnit is allowed to run those classes in parallel.
+    /// What actually holds it up is something else: every <see cref="TestWebAppFactory"/> host uses its own SQLite file, the BackupConfigs table on those two
+    /// hosts is empty, <see cref="PickResumableAsync"/> gets back an empty list, and so it changes no behavior at all whether they
+    /// read 50 milliseconds or 15 seconds.
+    /// So the premise is "the test hosts running in parallel have no backup configs", not "there is no other instance". The day a test host starts
+    /// this service with configs in place, this field has to become an injected option — at that point, of two parallel tests, one setting it to 50 milliseconds
+    /// and one waiting for it not to start work, the latter gets skewered by the former's value.
     /// </para>
     /// </summary>
     internal static TimeSpan Delay = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// 从盘上挑出该自动接着跑的 configId。纯函数（只读盘），单测直接调它。
+    /// Picks from disk the configIds that should be resumed automatically. A pure function (disk reads only), so unit tests call it directly.
     /// <para>
-    /// 判据只有一条：这个配置**至少留了一卷** journal，而且**每一卷**旁边的标记都写着
-    /// <see cref="SuspendReason.ShuttingDown"/>。别的一概不动，逐一说清为什么：
+    /// There is exactly one criterion: this config left **at least one** journal volume, and the mark beside **every** volume reads
+    /// <see cref="SuspendReason.ShuttingDown"/>. Nothing else is touched; here is why, case by case:
     /// </para>
     /// <list type="bullet">
-    /// <item><b>ShuttingDown</b> —— 一次计划内的进程退出把它停在这儿的，落盘走的是
-    /// <c>SettleStopAsync</c>（journal 先 fsync 再写标记）。这是唯一一种"这个进程自己造成的中断、
-    /// 而且现场是好的"，所以也是唯一一种可以不问自取接着跑的。</item>
-    /// <item><b>UserRequested</b> —— 操作员亲手按的暂停。替他重开等于把他按那一下的意图擦掉。</item>
-    /// <item><b>AutoSuspended</b> —— 闸门耐心耗尽降级停的。那个瞬时错误多半还在（网线还没插上、
-    /// 对端还在 503），马上接着跑只会立刻再撞一次墙、再挂起一次，白烧一轮。</item>
-    /// <item><b>没有标记</b> —— 说不清。崩了、被 kill、关机等落盘超时被丢在半路、操作员按了 Cancel
-    /// （两种取消都照样落盘，都有意不写标记）、或者就是那次写标记本身失败了，长在盘上一模一样。
-    /// 其中至少有一种（Cancel）是用户明确表达过"别跑了"的，所以这一大类整个不碰。</item>
+    /// <item><b>ShuttingDown</b> — a planned process exit stopped it here, and it was flushed through
+    /// <c>SettleStopAsync</c> (journal fsync first, mark afterwards). This is the only kind of interruption "caused by this process itself
+    /// with the scene left intact", and therefore the only kind we may resume without asking.</item>
+    /// <item><b>UserRequested</b> — a pause the operator pressed himself. Restarting it for him erases the intent behind that press.</item>
+    /// <item><b>AutoSuspended</b> — the gate ran out of patience and stepped down. That transient error is most likely still there (the cable is still unplugged,
+    /// the far end is still returning 503), so resuming right away would just hit the same wall and suspend again, burning a run for nothing.</item>
+    /// <item><b>No mark</b> — indeterminate. A crash, a kill, a shutdown flush that timed out and left it halfway, the operator pressing Cancel
+    /// (both kinds of cancel still flush, and both deliberately write no mark), or the mark write itself having failed — on disk they all look exactly the same.
+    /// At least one of them (Cancel) is the user having said "stop" in so many words, so this whole class is left untouched.</item>
     /// </list>
     /// <para>
-    /// 要求**每一卷**都是 ShuttingDown，而不是挑最新那卷说了算：标记是按卷记的，一个配置底下
-    /// 完全可能出现取值打架的几卷（按暂停 → 又点 Run → 新一轮采纳了旧卷 → 一次关机把新一轮停成
-    /// ShuttingDown）。而接着跑那一轮开卷时会把所有还作数的卷一起认下来，所以只要有一卷是不该动的，
-    /// 动了就等于连它一起动了。要求全票通过，就不必再发明一套"哪卷更新说了算"的仲裁。
+    /// Requiring **every** volume to be ShuttingDown, rather than letting the newest volume decide: marks are recorded per volume, and one config can perfectly well
+    /// end up with several volumes whose values disagree (pause pressed → Run pressed again → the new run adopts the old volume → a shutdown stops the new run as
+    /// ShuttingDown). And the resuming run adopts every still-valid volume when it opens its own, so if one volume should have been left alone,
+    /// touching anything means touching that one too. A unanimous vote saves us from inventing an arbitration scheme for "which volume is newer and gets the say".
     /// </para>
-    /// <para>同一个备份留了几卷都只算一次：接着跑是**一轮新的运行**，它会自己去认所有卷。</para>
+    /// <para>However many volumes one backup left, it counts once: resuming is **a new run**, and it adopts all the volumes itself.</para>
     /// </summary>
     /// <param name="logger">
-    /// 给被**否掉**的配置各记一句。可选，纯函数的单测不用传。
+    /// Logs one line for each config that was **declined**. Optional; the pure-function unit tests do not pass it.
     /// <para>
-    /// 这一句不是可有可无的排场：这个部署形态是 NAS 上的成品机，操作员既没有 shell 也没有任何看标记
-    /// 文件的工具。少了它，"重启之后我的备份怎么没接上"这个问题在他那边是**完全没有线索**的——
-    /// 界面上开关是开的，日志里一个字都没有，而真正的原因（某一卷停在别的理由上）只长在盘上。
+    /// That line is not decorative: the deployment shape here is an appliance on a NAS, and the operator has neither a shell nor any tool for looking at mark
+    /// files. Without it, the question "why was my backup not picked up after the restart" leaves him with **no lead whatsoever** —
+    /// the switch in the UI is on, the log says not a word, and the real reason (some volume stopped for a different reason) exists only on disk.
     /// </para>
     /// </param>
     public static async Task<IReadOnlyList<int>> PickResumableAsync(
@@ -78,15 +78,15 @@ public sealed class AutoResumeService(
         var picked = new List<int>();
         foreach (var (configId, accountId, container) in configs)
         {
-            // 用 PeekAsync 而不是 ListAsync：这里只要每一卷的 runId，而 ListAsync 会把每一卷的
-            // **每一条记录**都反序列化一遍。停在半路的那一卷恰恰可能有几十万条（本仓库实测过 20 万
-            // 条目的扫描），而这段代码跑在启动路径上——为了拿一串文件名去解析几百 MB JSON，
-            // 代价与它买到的东西完全不成比例。PeekAsync 只读头一行、剩下的数行数。
+            // PeekAsync rather than ListAsync: all we want here is each volume's runId, whereas ListAsync deserializes
+            // **every single record** of every volume. The volume that stopped halfway may well hold hundreds of thousands of them (this repo has measured
+            // a scan of 200k entries), and this code runs on the startup path — parsing hundreds of MB of JSON to obtain a list of file names
+            // is wildly out of proportion to what it buys. PeekAsync reads only the first line and counts the rest.
             var volumes = await journals.PeekAsync(accountId, container, ct);
             if (volumes.Count == 0)
                 continue;
 
-            // 第一卷不合格的就足以否掉整个配置，也正好是日志里该点名的那一卷。
+            // The first disqualifying volume is enough to decline the whole config, and it is exactly the one the log should name.
             var blocker = volumes.FirstOrDefault(x =>
                 journals.ReadSuspendMark(accountId, container, x.RunId) != SuspendReason.ShuttingDown);
             if (blocker is null)
@@ -117,7 +117,7 @@ public sealed class AutoResumeService(
             if (!(await settings.GetAsync(stoppingToken)).AutoResumeInterruptedRuns)
                 return;
 
-            // 每个配置都是候选：BackupConfig 上没有"启用/停用"这回事，一个配置存在就是要备份的。
+            // Every config is a candidate: BackupConfig has no such thing as enabled/disabled — a config existing means it is meant to be backed up.
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var configs = await db.BackupConfigs.AsNoTracking()
                 .Select(c => new { c.Id, c.AccountId, c.ContainerName })
@@ -129,20 +129,20 @@ public sealed class AutoResumeService(
                 stoppingToken,
                 logger);
 
-            // 逐个起，**并且等前一个跑完再起下一个**：产出锁是全局的，一起冲上去只会互相排队，
-            // 还看不出是谁在等谁（并发备份反而更慢，这一条本仓库实测过）。
+            // Start them one at a time, **and wait for the previous one to finish before starting the next**: the output lock is global, so rushing in together only queues up,
+            // with no way to see who is waiting on whom (concurrent backups are in fact slower, which this repo has measured).
             //
-            // 光写个 foreach 是不够的：StartAsync 把活丢进 Task.Run 就返回了，连着调几次的效果
-            // 就是几轮同时在跑。真正让它串起来的是下面那个 await Completion。
+            // A bare foreach is not enough: StartAsync throws the work into Task.Run and returns, so calling it several times in a row
+            // means several runs going at once. What actually serializes them is the await Completion below.
             foreach (var configId in resumable)
             {
                 if (stoppingToken.IsCancellationRequested)
                     return;
                 var state = await runner.StartAsync(configId);
 
-                // StartAsync 有两条**当场就返回终态**的短路（配置查不到、忙碌锁在别人手里），
-                // 那时压根没有哪一轮运行开起来，state.RunId 指的是一次不存在的运行。
-                // 那两种都不该报成"已经接着跑了"，否则日志会拿一个查无此运行的 RunId 骗人。
+                // StartAsync has two short circuits that **return a terminal state on the spot** (config not found, busy lock held by someone else),
+                // and in those cases no run was started at all, so state.RunId names a run that does not exist.
+                // Neither should be reported as "already resumed", or the log would lie to you with a RunId no run answers to.
                 if (state.Status != RunStatus.Running)
                 {
                     logger.LogWarning(
@@ -154,18 +154,18 @@ public sealed class AutoResumeService(
                 logger.LogInformation(
                     "Auto-resuming interrupted backup {ConfigId} (run {RunId})", configId, state.RunId);
 
-                // 等它到终态。关机时这一等不会拖住宿主：GracefulSuspendService 注册在本服务之后、
-                // 因而停在本服务之前，它会把这一轮挂起落盘，这里的等待随之结束。
+                // Wait for it to reach a terminal state. At shutdown this wait does not hold the host up: GracefulSuspendService is registered after this service
+                // and therefore stops before it, and it suspends and flushes this run, which ends the wait here.
                 //
-                // 这一等**有意不设上限**：串行是必须的（见上），设了上限就等于在超时之后放并发进来。
-                // 但代价要说清：卡在 PauseGate 上等瞬时错误自愈的运行按设计仍然是 Running（席位还占着，
-                // 报成终态会让调度器再起一轮把它顶掉），它的 Completion 因此可以很久很久都不落定——
-                // 闸门最长会耐着性子等 10 分钟才降级，而排在它后面的每一个可接着跑的配置就一直排着。
-                // 这不是死锁（闸门总会降级或成功，两条路都通向终态），是一段可能很长的队。
+                // This wait **deliberately has no cap**: serialization is mandatory (see above), and a cap would simply let concurrency in once it expires.
+                // But the cost has to be stated: a run parked on PauseGate waiting for a transient error to heal is by design still Running (it keeps its seat;
+                // reporting a terminal state would let the scheduler start another run and displace it), so its Completion can stay unsettled for a very long time —
+                // the gate patiently waits up to 10 minutes before stepping down, and every resumable config behind it queues the whole while.
+                // This is not a deadlock (the gate either steps down or succeeds, and both roads lead to a terminal state); it is a queue that can be long.
                 await state.Completion.Task.WaitAsync(stoppingToken);
 
-                // 失败的自动恢复要比成功的显眼一档：它是"系统自己决定开的一轮"，没人守在旁边看结果，
-                // 记成 Information 就等于埋进正常流水里。
+                // A failed auto-resume has to be one notch louder than a successful one: it is "a run the system decided to start by itself" with nobody watching the outcome,
+                // and logging it as Information would bury it in the normal stream.
                 if (state.Status == RunStatus.Failed)
                     logger.LogWarning(
                         "Auto-resumed backup {ConfigId} failed: {Error}", configId, state.Error);
@@ -177,7 +177,7 @@ public sealed class AutoResumeService(
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            // 自动恢复失败不能让进程起不来：用户还可以自己去点一下。
+            // A failed auto-resume must not stop the process from coming up: the user can still go and press the button himself.
             logger.LogError(ex, "Auto-resume of interrupted backups failed");
         }
     }

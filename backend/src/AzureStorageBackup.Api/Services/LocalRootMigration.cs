@@ -3,38 +3,39 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 迁移本地根路径的判定逻辑（设计 docs/change-local-root-design.md）。
+/// The verdict logic for migrating the local root path (design docs/change-local-root-design.md).
 ///
-/// **静态、无依赖**是刻意的：它只做纯计算加只读文件系统访问，不碰数据库、不连云、不解密。
-/// 取索引要用的账户/密码/云端信息由端点备好后把 baseline 传进来。这样整套分档逻辑
-/// 能脱离 HTTP、EF 与 Azure 单测——喂一个假索引加一个临时目录就验得完。
+/// **Static and dependency-free** on purpose: it does pure computation plus read-only filesystem access, and never touches
+/// the database, the cloud, or decryption. The account/password/cloud info needed to fetch the index is prepared by the
+/// endpoint, which then hands the baseline in. That way the whole tiering logic can be unit-tested away from HTTP, EF and
+/// Azure — feed it a fake index and a temp directory and you are done.
 /// </summary>
 public static class LocalRootMigration
 {
-    /// <summary>抽样上限。200 条足够把「填错目录」摁住，又不至于让一次 preview 变成全量扫描。</summary>
+    /// <summary>Sampling cap. 200 entries is enough to pin down "the wrong directory was typed in" without turning a preview into a full scan.</summary>
     public const int DefaultSampleSize = 200;
 
     private const long SmallCeiling = 1L * 1024 * 1024;          // <1MB
     private const long MediumCeiling = 100L * 1024 * 1024;       // 1–100MB
 
-    /// <summary>报告里最多列几条不匹配的样例路径。</summary>
+    /// <summary>How many mismatching example paths the report lists at most.</summary>
     public const int MaxExamples = 10;
 
     private const double OkThreshold = 0.95;
     private const double RejectThreshold = 0.05;
 
     /// <summary>
-    /// 比对新根与基线索引，给出判定。**纯查询**：只读文件系统，不改任何东西，可安全重入
-    /// ——apply 正是靠再跑一遍它来兜住 preview 与 apply 之间的竞态。
+    /// Compare the new root against the baseline index and return a verdict. **Pure query**: read-only filesystem access,
+    /// changes nothing, safely re-entrant — apply relies on running it a second time to cover the race between preview and apply.
     ///
-    /// 调用方负责在此之前做完路径校验（存在/是目录/边界内）与忙检查。
+    /// The caller is responsible for having done the path validation (exists / is a directory / inside the boundary) and the busy check first.
     ///
-    /// 能不能比对，**只看基线在不在**，与配置当前的根是什么、是不是空的一概无关：导入时没拿到
-    /// SourceRootHint 的配置根是空串，可它的版本索引在导入当下就整批落进了本地缓存
-    /// （BackupConfigEndpoints.cs:110-127）——而这恰恰是用户最可能在猜挂载点的场合，
-    /// 最不该被"没记过旧根"这个理由免检放行。
+    /// Whether a comparison is possible depends **only on whether a baseline exists**, and has nothing to do with what the
+    /// config's current root is or whether it is empty: a config imported without a SourceRootHint has an empty-string root,
+    /// yet its version indexes all landed in the local cache at import time (BackupConfigEndpoints.cs:110-127) — and that is
+    /// exactly the case where the user is most likely guessing at a mount point, the last one deserving a free pass on the grounds of "we never recorded an old root".
     /// </summary>
-    /// <param name="baseline">最新版本的索引；取不到（无版本/缓存缺失）时传 null。</param>
+    /// <param name="baseline">The index of the latest version; pass null when it cannot be fetched (no versions / cache miss).</param>
     public static LocalRootPreviewResponse Inspect(string newRoot, VersionIndex? baseline)
     {
         if (baseline is null)
@@ -71,7 +72,7 @@ public static class LocalRootMigration
         }
 
         var rate = (double)matched / sample.Count;
-        // 区间左闭右开，边界值归入更宽松的一档。
+        // Half-open intervals: a boundary value falls into the more permissive tier.
         var verdict = rate >= OkThreshold
             ? LocalRootVerdict.Ok
             : rate >= RejectThreshold
@@ -86,19 +87,19 @@ public static class LocalRootMigration
     private enum Outcome { Matched, Missing, SizeMismatch }
 
     /// <summary>
-    /// 单条比对。判定只看「存在 + size」；mtime 单独计数但**不影响结果**
-    /// ——跨文件系统搬迁时它经常整体偏移，让它参与判定会把一次完全正确的迁移判成失败。
+    /// A single entry comparison. The verdict looks only at "exists + size"; mtime is counted separately but **does not affect
+    /// the result** — moving across filesystems often shifts it wholesale, and letting it into the verdict would fail a perfectly correct migration.
     /// </summary>
     private static Outcome Compare(IndexEntry entry, string fullPath, ref int mtimeDiffers)
     {
-        // symlink 的 IndexEntry.Length 恒为 0（LocalFileScanner.cs:170），比 size 毫无意义，
-        // 只确认这个位置上还是个链接。
+        // A symlink's IndexEntry.Length is always 0 (LocalFileScanner.cs:170), so comparing size is meaningless;
+        // all we confirm is that there is still a link at this position.
         //
-        // **不许再加 Exists**：FileInfo.Exists 对**指向目录**的链接答 false（它问的是"这是不是个
-        // 文件"，而链接解析过去是目录），可扫描侧登记 symlink 只看 LinkTarget 非空
-        // （LocalFileScanner.cs:136），目录链接一样在索引里。加上这一项，每一个完好的目录链接
-        // 都被判 Missing，把一次完全正确的迁移的匹配率生生压下去、逼进 force 那条路。
-        // LinkTarget 非空本身已经说明"这儿确实躺着一个符号链接"，路径不存在时它是 null。
+        // **Do not add Exists back**: FileInfo.Exists answers false for a link pointing **at a directory** (it asks "is this a
+        // file", and the link resolves to a directory), while the scanning side registers a symlink purely on LinkTarget being
+        // non-null (LocalFileScanner.cs:136), so directory links are in the index too. Add that check and every intact directory
+        // link is judged Missing, dragging the match rate of a perfectly correct migration down and forcing it onto the force path.
+        // A non-null LinkTarget already says "there really is a symlink lying here"; it is null when the path does not exist.
         if (string.Equals(entry.Kind, "symlink", StringComparison.Ordinal))
         {
             var link = new FileInfo(fullPath);
@@ -109,7 +110,7 @@ public static class LocalRootMigration
         if (!info.Exists)
             return Outcome.Missing;
 
-        // mtime 只在文件确实存在时才有得比；秒级容差吸收文件系统的时间戳粒度差异。
+        // mtime is only comparable once the file actually exists; a one-second tolerance absorbs filesystem timestamp granularity differences.
         if (Math.Abs((info.LastWriteTimeUtc - entry.Mtime.UtcDateTime).TotalSeconds) > 1)
             mtimeDiffers++;
 
@@ -121,12 +122,12 @@ public static class LocalRootMigration
         SizeMismatch: 0, MtimeDiffers: 0, MatchRate: 0, Reason: reason, Examples: []);
 
     /// <summary>
-    /// 从索引条目里分层抽样。按 Length 分四档（0 / &lt;1MB / 1–100MB / &gt;100MB），
-    /// 每档按档内条目数占比分名额，**档内等距取样**而非取头部——索引顺序近似目录序，
-    /// 取头部会把样本全压在第一个子目录里，那样「只挂上了其中一个子目录」这种半对半错的
-    /// 迁移就恰好检不出来。
+    /// Stratified sampling over the index entries. Four buckets by Length (0 / &lt;1MB / 1–100MB / &gt;100MB), each bucket
+    /// getting a quota proportional to its share of the entries, and **sampled evenly within the bucket** rather than taken
+    /// from the head — index order approximates directory order, so taking the head piles the whole sample into the first
+    /// subdirectory, and a half-right migration like "only one of the subdirectories got mounted" is exactly what slips through.
     ///
-    /// 带 UnreadableAt 的条目排除在外：它们的 size/mtime 沿用上一版本，本就不保证与磁盘一致。
+    /// Entries carrying UnreadableAt are excluded: their size/mtime are carried over from the previous version and were never guaranteed to match the disk.
     /// </summary>
     public static IReadOnlyList<IndexEntry> Sample(IReadOnlyList<IndexEntry> entries, int max = DefaultSampleSize)
     {
@@ -139,12 +140,12 @@ public static class LocalRootMigration
         foreach (var e in pool)
             buckets[BucketOf(e.Length)].Add(e);
 
-        // 按占比分名额，然后把空档/不足档的余额还给还装得下的档，避免样本白白浪费。
+        // Hand out quotas by share, then give the leftovers from empty/underfilled buckets back to the buckets that can still take more, so no sample budget is wasted.
         //
-        // **非空档保底 1 个**：纯按占比算，一个「500 个小文件 + 1 个大文件」的索引里，
-        // 大文件那档四舍五入下来是 0 个名额，于是唯一那个大文件永远抽不到——而大文件恰恰是
-        // 最值得看一眼的（挂错盘时它们往往就是缺的那批）。四档最多占用 4 个保底名额，
-        // 对 200 的上限无足轻重。
+        // **A non-empty bucket is guaranteed 1**: on pure proportion, in an index of "500 small files + 1 large file" the
+        // large bucket rounds down to a quota of 0, so that one large file is never sampled — and large files are exactly the
+        // ones worth a look (when the wrong disk is mounted they are often precisely the batch that is missing). Four buckets
+        // consume at most 4 guaranteed slots, which is negligible against a cap of 200.
         var quota = new int[buckets.Length];
         for (var i = 0; i < buckets.Length; i++)
             quota[i] = buckets[i].Count == 0
@@ -153,14 +154,14 @@ public static class LocalRootMigration
 
         var assigned = quota.Sum();
 
-        // 保底可能把总额顶过上限（max 小于非空档数时）。从名额最多的档往回收，
-        // 保底的那 1 个不动——收成 0 就等于把整档丢掉，正是保底要防的事。
+        // The guarantee can push the total past the cap (when max is smaller than the number of non-empty buckets). Claw back
+        // from the fattest bucket, leaving that guaranteed 1 alone — clawing it to 0 drops the whole bucket, which is exactly what the guarantee prevents.
         while (assigned > max)
         {
             var fattest = -1;
             for (var i = 0; i < buckets.Length; i++)
                 if (quota[i] > 1 && (fattest < 0 || quota[i] > quota[fattest])) fattest = i;
-            if (fattest < 0) break;   // 各档都只剩保底，收无可收
+            if (fattest < 0) break;   // every bucket is down to its guaranteed slot; nothing left to claw back
             quota[fattest]--;
             assigned--;
         }
@@ -175,7 +176,7 @@ public static class LocalRootMigration
                 assigned++;
                 grew = true;
             }
-            if (!grew) break;   // 全部档都装满了（pool.Count > max 时不会发生，保险起见）
+            if (!grew) break;   // every bucket is full (cannot happen while pool.Count > max; belt and braces)
         }
 
         var result = new List<IndexEntry>(max);
@@ -192,7 +193,7 @@ public static class LocalRootMigration
         _ => 3,
     };
 
-    /// <summary>档内等距取样：把 count 个位置均匀铺在整个列表上，而不是取前 count 个。</summary>
+    /// <summary>Evenly spaced sampling within a bucket: spread count positions across the whole list instead of taking the first count.</summary>
     private static IEnumerable<IndexEntry> TakeEvenly(List<IndexEntry> items, int count)
     {
         if (count <= 0) yield break;

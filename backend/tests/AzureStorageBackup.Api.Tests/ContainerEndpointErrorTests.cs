@@ -9,7 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>用假 IContainerService 抛出指定异常，验证端点的错误映射，不需要 Azurite。</summary>
+/// <summary>A fake IContainerService that throws the given exception, to verify the endpoint's error mapping without needing Azurite.</summary>
 file sealed class ThrowingContainerService(Exception toThrow) : IContainerService
 {
     public Task<IReadOnlyList<ContainerInfo>> ListContainersAsync(Account a, CancellationToken ct = default) =>
@@ -30,8 +30,8 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
             s.AddSingleton<IContainerService>(new ThrowingContainerService(ex));
         })).CreateClient();
 
-    // 复用 ContainerEndpointsTests 里已验证过的请求形状。建账户不连云，
-    // 所以这里不需要 Azurite——这正是本组测试与那组的区别。
+    // Reuses the request shape already verified in ContainerEndpointsTests. Creating an account does not go to the cloud,
+    // so no Azurite is needed here — which is exactly what sets this group of tests apart from that one.
     private static async Task<int> CreateAccountAsync(HttpClient client)
     {
         var res = await client.PostAsJsonAsync("/api/accounts", new AccountRequest(
@@ -54,7 +54,7 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
     [Fact]
     public async Task Invalid_Name_Returns_400_Without_Calling_Azure()
     {
-        // 服务一被调用就抛，所以能拿到 400 就证明校验发生在连云之前。
+        // The service throws the moment it is called, so getting a 400 proves the validation happened before going to the cloud.
         var client = ClientThrowing(new InvalidOperationException("must not be called"));
         var id = await CreateAccountAsync(client);
 
@@ -81,8 +81,8 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
     [Fact]
     public async Task Azure_409_Is_Also_Passed_Through_Generically()
     {
-        // 和上面的 403 用例一起证明：透传是按状态码区间做的通用规则，
-        // 不是针对某个具体状态码特判的——409（容器已存在）是另一个真实会发生的例子。
+        // Together with the 403 case above this proves pass-through is a general rule over a status code range,
+        // not a special case for one particular status code — 409 (container already exists) is another one that really happens.
         var client = ClientThrowing(new RequestFailedException(409, "The specified container already exists.", "ContainerAlreadyExists", null));
         var id = await CreateAccountAsync(client);
 
@@ -96,9 +96,9 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
     [Fact]
     public async Task Azure_401_Does_Not_Pass_Through_As_401()
     {
-        // Azure 存储账户的 401 说的是「这次到存储账户的请求没认证成功」（现实里多半是代理捣的鬼），
-        // 不是「操作员的登录会话失效」。若原样透传成 401，前端会把这当成会话过期，
-        // 把操作员直接踢回登录页——这里钉住它必须变成 502。
+        // A 401 from an Azure storage account means "this request to the storage account was not authenticated" (in reality
+        // usually a proxy playing tricks), not "the operator's login session expired". Passed straight through as a 401 the
+        // frontend would read it as an expired session and kick the operator back to the login page — this pins that it must become a 502.
         var client = ClientThrowing(new RequestFailedException(401, "Server failed to authenticate the request.", "InvalidAuthenticationInfo", null));
         var id = await CreateAccountAsync(client);
 
@@ -113,7 +113,7 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
     [Fact]
     public async Task Unreachable_Storage_Account_Becomes_502()
     {
-        // Status 0 是 SDK 表示「请求根本没发出去/没拿到响应」的方式。
+        // Status 0 is how the SDK says "the request never went out / never got a response".
         var client = ClientThrowing(new RequestFailedException(0, "No such host is known."));
         var id = await CreateAccountAsync(client);
 

@@ -50,7 +50,7 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             StorageTier.Hot, StorageTier.Hot, null, null, null, false,
             100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000));
 
-        // 计划任务：备份目标 (account, container)
+        // Scheduled task: backup target (account, container)
         var task = await (await _client.PostAsJsonAsync("/api/tasks", new TaskRequest(
             TaskTargetKind.Backup, account.Id, containerName, null,
             ScheduledTaskType.Backup, "0 3 * * *", true)))
@@ -65,7 +65,7 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null);
             res.EnsureSuccessStatusCode();
 
-            // dispatcher 已 await 完成整个备份
+            // The dispatcher has awaited the whole backup to completion
             Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 
             var after = await res.Content.ReadFromJsonAsync<TaskResponse>();
@@ -105,7 +105,7 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
         var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
         var container = factoryClient.CreateServiceClient(azurite).GetBlobContainerClient(containerName);
 
-        // 预先把该备份标记为忙碌（模拟另一操作正在执行）。
+        // Mark this backup busy up front (simulating another operation already running).
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
         Assert.True(busy.TryAcquire(account.Id, containerName));
         try
@@ -113,10 +113,10 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null);
             res.EnsureSuccessStatusCode();
 
-            // 忙碌 → 跳过：不应产生任何备份（信息文件不存在）。
+            // Busy → skipped: no backup should be produced (the info file does not exist).
             Assert.False(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
 
-            // 记录了一条 Warning 报警。
+            // A Warning was logged.
             var logs = await _client.GetFromJsonAsync<List<LogRow>>("/api/logs?minLevel=1&limit=20");
             Assert.Contains(logs!, l => l.message.Contains("busy", StringComparison.OrdinalIgnoreCase));
         }
@@ -127,7 +127,7 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
         }
     }
 
-    // 后端 camelCase JSON 子集
+    // Subset of the backend's camelCase JSON
     private sealed record TaskResponse(int id, DateTimeOffset? lastRunAt);
     private sealed record LogRow(int level, string message);
 }
