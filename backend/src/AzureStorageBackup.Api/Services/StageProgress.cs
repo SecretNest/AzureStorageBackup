@@ -17,8 +17,8 @@ public sealed record ActiveTransfer(string Label, long Sent, long Total)
 }
 
 /// <summary>
-/// Where a work item can stall after it is packed but before its bytes actually hit the wire. The three are handled
-/// completely differently, so they must be reported apart: one vague "waiting" fuses three ailments into a single symptom.
+/// Where a work item can stall after it is packed but before its bytes actually hit the wire. The two are handled
+/// completely differently, so they must be reported apart: one vague "waiting" fuses distinct ailments into a single symptom.
 /// </summary>
 public enum UploadWait
 {
@@ -28,7 +28,6 @@ public enum UploadWait
 
     /// <summary>Waiting for a slot in the global upload gate. Only appears when other volumes have taken every slot; when the gate is free you grab one instantly and nothing is reported.</summary>
     Slot,
-
 }
 
 /// <summary>
@@ -128,7 +127,7 @@ public sealed record StageProgress(
     /// <summary>Of those, the items stuck on a same-batch reservation (<see cref="UploadWait.Peer"/>).</summary>
     int WaitingOnPeer = 0,
     /// <summary>Of those, the **volumes** stuck on the global upload gate (<see cref="UploadWait.Slot"/>).
-    /// The gate queues per volume, so this one number's unit differs from the other two.</summary>
+    /// The gate queues per volume, so this one number's unit differs from <see cref="WaitingOnPeer"/>'s.</summary>
     int WaitingOnSlot = 0,
     /// <summary>
     /// Of those, the items **reading from disk to check**, pushing no bytes and waiting on nothing: single-file dedup pre-screening reads the whole file
@@ -302,7 +301,7 @@ public sealed class StageTracker(
     // backpressure ledger the moment it is packed (that ledger wants "how much is on disk right now"), but it still has to pass the re-verify before it may travel, and if the re-verify
     // finds a member changed this archive gets thrown away whole and repacked. Subtracted out of staged, given its own column.
     private long _checkingBytes;
-    // Current occupancy of each wait phase, indexed by the UploadWait ordinal. An array rather than three fields: callers index by the enum,
+    // Current occupancy of each wait phase, indexed by the UploadWait ordinal. An array rather than one field per phase: callers index by the enum,
     // so adding a wait phase takes only one more enum member and the publish end needs no extra line per phase.
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
     // The "workload" used for remaining time. A different thing from _bytes: the latter is bytes that actually crossed the wire (post-compression, 0 on a dedup hit),
@@ -440,10 +439,10 @@ public sealed class StageTracker(
 
     /// <summary>One item queued. Called single-threaded by the producer side (diff), but concurrently with the consumer side, hence Interlocked.
     /// Do **not** use it to touch <c>_total</c>: that denominator keeps growing until diff wraps up, and a percentage off it races to 100 and falls back.</summary>
-    /// <param name="work">This item's workload (original bytes), accumulated into the stage's total workload.
+    /// <param name="work">This item's workload — its **source-side** bytes, before compression — accumulated into the stage's
+    /// total workload, which is what completion and remaining time extrapolate from.
     /// It keeps growing until diff wraps up, so the ETA gates on <c>_total &gt; 0</c> just like the percentage does —
     /// extrapolate from a still-growing denominator and the remaining time shrinks to almost nothing and then springs back.</param>
-    /// <param name="work">This item's **source-side** bytes (before compression) — completion and remaining time extrapolate from it.</param>
     /// <param name="transfer">Bytes this item has to push over the wire (after compression). Only the download side can supply it, see
     /// <see cref="StageProgress.TransferTotal"/>.</param>
     public void Enqueue(long work = 0, long transfer = 0)

@@ -227,7 +227,7 @@ public sealed class BackupResumeTests : IDisposable
     }
 
     /// <summary>
-    /// The pack path — the part of resume most prone to going wrong, which the two cases above do not touch with a single word.
+    /// The pack path — the part of resume most prone to going wrong, which the case above does not touch with a single word.
     /// <para>
     /// A pack that hits still has to go through <c>RecordPackAsync</c> (it just does not upload): <c>info.Packs</c> has to contain this pack,
     /// and each member's index entry has to point back at the <c>entryName</c> inside it. Skip that step and this whole pack vanishes from the index.

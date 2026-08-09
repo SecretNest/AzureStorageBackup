@@ -144,10 +144,8 @@ public sealed class LocalDedupResolver
                     {
                         // Several retained versions may each hold a member with the same content. The **reference**
                         // takes the first one encountered (versions are passed in oldest to newest): references pile
-                        // onto the old pack, where dead-weight compaction is less likely to rewrite it.
-                        // Take the first one encountered (versions passed in oldest to newest): references pile onto the
-                        // old pack, where dead-weight compaction is less likely to rewrite it. Newer-version entries
-                        // with the same content point at the same content anyway, so any of them will do.
+                        // onto the old pack, where dead-weight compaction is less likely to rewrite it. Newer-version
+                        // entries with the same content point at the same content anyway, so any of them will do.
                         packMembers.TryAdd(
                             PackMemberKey(e.FullHash, e.Length, e.HeadHash),
                             new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));

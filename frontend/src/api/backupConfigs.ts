@@ -238,7 +238,7 @@ export interface StageProgress {
   // found by lining up several screenshots and doing subtraction.
   uploading: number
   waitingOnPeer: number // Of those, items waiting for the first uploader of identical content to finish
-  waitingOnSlot: number // Of those, **volumes** queuing on the global upload gate (the gate queues per volume, a different unit from the other two)
+  waitingOnSlot: number // Of those, **volumes** queuing on the global upload gate (the gate queues per volume, a different unit from waitingOnPeer)
   // Of those, items doing disk checking: pushing no bytes and waiting on nothing. A single file's dedup
   // pre-check reads the whole file for three hashes; a pack stats every member before and after
   // compression (re-hashing the ones that changed); a multi-volume upload lists leftover cloud volumes
