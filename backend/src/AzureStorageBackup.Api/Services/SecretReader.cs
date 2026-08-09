@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>无状态，注册为单例（<see cref="IEncryptionService"/> 同为单例）。</summary>
+/// <summary>Stateless, registered as a singleton (as is <see cref="IEncryptionService"/>).</summary>
 public sealed class SecretReader(IEncryptionService encryption) : ISecretReader
 {
     public string RevealAccountKey(Account account) =>

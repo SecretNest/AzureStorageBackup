@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>计划任务是否到期（M6）。启用且自上次运行起已到达一次 cron 触发时刻。</summary>
+/// <summary>Whether a scheduled task is due (M6): enabled, and a cron firing time has been reached since the last run.</summary>
 public static class SchedulerPlanner
 {
     public static bool IsDue(ScheduledTask task, DateTimeOffset now, TimeZoneInfo tz)

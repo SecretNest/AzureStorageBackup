@@ -7,7 +7,7 @@ namespace AzureStorageBackup.Api.Tests;
 [Trait("Category", "Integration")]
 public class ContainerServiceTests
 {
-    // Azurite 的 well-known 账户与密钥
+    // Azurite's well-known account and key
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 

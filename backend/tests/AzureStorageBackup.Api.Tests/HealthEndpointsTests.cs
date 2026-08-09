@@ -5,8 +5,8 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// Smoke 测试：验证应用能启动、DI 管道成立、存活/就绪探针行为符合预期。
-/// 业务测试随需求逐步补充。
+/// Smoke tests: the app starts, the DI pipeline holds together, and the liveness and readiness probes
+/// behave as expected. Behavioural tests are added alongside the features.
 /// </summary>
 public class HealthEndpointsTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
@@ -25,7 +25,7 @@ public class HealthEndpointsTests(TestWebAppFactory factory) : IClassFixture<Tes
     [Fact]
     public async Task Ready_Returns_Ok_Without_Any_Cloud_Configuration()
     {
-        // 就绪探针必须是纯本地的：无任何 Azure 连接串时依然 200（设计决策 10）
+        // The readiness probe must be purely local: still 200 with no Azure connection string at all (design decision 10)
         using var factory = new TestWebAppFactory();
         var client = factory.CreateClient();
 
@@ -37,7 +37,7 @@ public class HealthEndpointsTests(TestWebAppFactory factory) : IClassFixture<Tes
     [Fact]
     public async Task Ready_Returns_ServiceUnavailable_When_Keyring_Lost()
     {
-        // 密钥环丢失时就绪探针必须报 503：判定全程本地（IKeyringHealth 缓存值），不访问云端。
+        // With the key ring lost the readiness probe must report 503, judged entirely locally (the cached IKeyringHealth value) without touching the cloud.
         Keyring.Set(KeyringStatus.Lost);
         try
         {

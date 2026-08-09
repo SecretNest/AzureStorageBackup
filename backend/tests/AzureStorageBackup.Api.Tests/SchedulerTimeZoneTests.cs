@@ -22,6 +22,6 @@ public sealed class SchedulerTimeZoneTests
     {
         var tz = SchedulerService.ResolveTimeZone("America/New_York");
         Assert.NotEqual(TimeZoneInfo.Utc, tz);
-        Assert.NotEqual(TimeSpan.Zero, tz.BaseUtcOffset); // 非零基准偏移
+        Assert.NotEqual(TimeSpan.Zero, tz.BaseUtcOffset); // a non-zero base offset
     }
 }

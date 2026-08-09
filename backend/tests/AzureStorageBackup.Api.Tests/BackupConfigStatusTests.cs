@@ -6,7 +6,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>持久 Status（Normal/Error）：失败置 Error，下次成功自清 Normal，手动 reset 清错（§4.2 决策 2）。</summary>
+/// <summary>The persistent status (Normal/Error): failure sets Error, the next success clears it back to Normal, and a manual reset clears it (§4.2, decision 2).</summary>
 public sealed class BackupConfigStatusTests : IDisposable
 {
     private readonly SqliteConnection _connection;
@@ -61,14 +61,14 @@ public sealed class BackupConfigStatusTests : IDisposable
         Assert.Equal("boom", c1.LastError);
         Assert.NotNull(c1.LastErrorAt);
 
-        await _sut.SetNormalAsync(id); // 成功自清（决策 2）
+        await _sut.SetNormalAsync(id); // success clears it (decision 2)
         var c2 = await _sut.GetAsync(id);
         Assert.Equal(BackupStatus.Normal, c2!.Status);
         Assert.Null(c2.LastError);
         Assert.Null(c2.LastErrorAt);
 
         await _sut.SetErrorAsync(id, "again");
-        await _sut.ResetStatusAsync(id); // 手动 reset
+        await _sut.ResetStatusAsync(id); // manual reset
         var c3 = await _sut.GetAsync(id);
         Assert.Equal(BackupStatus.Normal, c3!.Status);
         Assert.Null(c3.LastError);
@@ -78,7 +78,7 @@ public sealed class BackupConfigStatusTests : IDisposable
     [Fact]
     public async Task SetError_On_Missing_Config_Is_NoOp()
     {
-        // 不存在的 id 不应抛异常（写状态点可能在 config 已被删除后仍回写）。
+        // A non-existent id must not throw (a status write can still fire after the config has been deleted).
         await _sut.SetErrorAsync(999, "boom");
         await _sut.SetNormalAsync(999);
         await _sut.ResetStatusAsync(999);

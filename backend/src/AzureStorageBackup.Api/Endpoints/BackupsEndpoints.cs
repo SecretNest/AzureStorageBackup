@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>已发现备份的列表端点（PRD 2.1）。手动触发，不自动刷新。</summary>
+/// <summary>The listing endpoint for discovered backups (PRD 2.1). Triggered manually, never refreshed automatically.</summary>
 public static class BackupsEndpoints
 {
     public static IEndpointRouteBuilder MapBackupsEndpoints(this IEndpointRouteBuilder app)

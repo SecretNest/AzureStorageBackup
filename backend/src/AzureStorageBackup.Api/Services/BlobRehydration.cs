@@ -3,19 +3,19 @@ using Azure.Storage.Blobs.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>Archive 活化助手：对某归档（含全部分卷）发起活化。checker 与 restore 共用，避免只活化首卷。</summary>
+/// <summary>The Archive rehydration helper: starts rehydration for an archive including all of its volumes. Shared by check and restore so that only the first volume is never rehydrated alone.</summary>
 public static class BlobRehydration
 {
-    /// <summary>从（卷名, AccessTier, ArchiveStatus）快照中选出需发起活化的卷：仍是 Archive 且尚未在活化中。</summary>
+    /// <summary>From a snapshot of (volume name, AccessTier, ArchiveStatus), pick the volumes needing rehydration: still Archive and not already rehydrating.</summary>
     public static IReadOnlyList<string> SelectToBegin(
         IEnumerable<(string Name, string? AccessTier, string? ArchiveStatus)> volumes) =>
         volumes.Where(v => v.AccessTier == "Archive" && string.IsNullOrEmpty(v.ArchiveStatus))
                .Select(v => v.Name).ToList();
 
-    /// <summary>枚举 baseRef 前缀全部分卷，对需活化者发起 SetAccessTier（best effort）。</summary>
+    /// <summary>Enumerate every volume under the baseRef prefix and call SetAccessTier on those needing it (best effort).</summary>
     public static async Task BeginAsync(BlobContainerClient container, string baseRef, AccessTier tier, CancellationToken ct)
     {
-        // AccessTier/ArchiveStatus 已随 List Blobs 返回，直接读列表项，免每卷再发一次 GetProperties。
+        // AccessTier and ArchiveStatus already come back with List Blobs, so read them from the listing rather than issuing a GetProperties per volume.
         var snapshot = new List<(string, string?, string?)>();
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
             snapshot.Add((b.Name, b.Properties.AccessTier?.ToString(), b.Properties.ArchiveStatus?.ToString()));

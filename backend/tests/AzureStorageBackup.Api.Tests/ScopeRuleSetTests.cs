@@ -4,8 +4,8 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 规则集的判定与写入。用例来自 shared/scope-rule-cases.json——前端 scopeRules.ts 的测试
-/// 读的是同一份文件，两份实现行为分叉时两边同时红。
+/// The rule set's decisions and writes. The cases come from shared/scope-rule-cases.json — the frontend's
+/// scopeRules.ts tests read the same file, so a behavioural divergence turns both red at once.
 /// </summary>
 public sealed class ScopeRuleSetTests
 {
@@ -90,8 +90,8 @@ public sealed class ScopeRuleSetTests
     [Fact]
     public void Parse_Then_ToString_Drops_Redundant_Rules()
     {
-        // 手工编辑出来的冗余规则（与最近祖先判定相同）在解析时就被清掉，
-        // 否则 IsPartial 会把一个实际上全同的子树报成灰选。
+        // A redundant rule produced by hand editing (agreeing with its nearest ancestor) is cleared during
+        // parsing, or IsPartial would report a subtree that is in fact uniform as indeterminate.
         var set = ScopeRuleSet.Parse("-\n- music\n+ photos");
 
         Assert.Equal("-\n+ photos", set.ToString());

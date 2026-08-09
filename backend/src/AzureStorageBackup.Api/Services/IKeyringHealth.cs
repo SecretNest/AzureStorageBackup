@@ -6,7 +6,7 @@ public enum KeyringStatus
     Lost = 1,
 }
 
-/// <summary>进程级密钥环状态。启动时判定一次并缓存；重设流程完成时显式翻转（设计 §3.2）。</summary>
+/// <summary>Process-wide key ring status. Judged once at startup and cached; flipped explicitly when the reset flow completes (design §3.2).</summary>
 public interface IKeyringHealth
 {
     KeyringStatus Status { get; }

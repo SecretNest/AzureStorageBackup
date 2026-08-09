@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>单例。写入极少（启动一次 + 恢复完成一次），读取频繁，用 volatile 字段即可。</summary>
+/// <summary>A singleton. Written very rarely (once at startup, once when recovery completes) and read often, so a volatile field suffices.</summary>
 public sealed class KeyringHealth : IKeyringHealth
 {
     private volatile int _status = (int)KeyringStatus.Healthy;

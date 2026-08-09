@@ -16,7 +16,7 @@ public class BackupRunStateTests
         Assert.Null(response.SuspendReason);
     }
 
-    // 挂起等待时状态仍是 Running（子状态），否则调度器会以为这轮结束了，再起一轮把它顶掉。
+    // While paused the status is still Running (a sub-state), or the scheduler would conclude the round had ended and start another one on top of it.
     [Fact]
     public async Task Paused_run_is_still_reported_as_running()
     {

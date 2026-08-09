@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore.Design;
 namespace AzureStorageBackup.Api.Data;
 
 /// <summary>
-/// 设计时（`dotnet ef migrations`）构造 <see cref="AppDbContext"/>：仅用于生成迁移的 schema，不跑 Web 主机。
+/// Design-time construction of <see cref="AppDbContext"/> (for `dotnet ef migrations`): used only to produce the migration schema, never to run the web host.
 /// </summary>
 public sealed class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
 {

@@ -2,13 +2,15 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>还原下载量/解压量估算结果（§4.1b，需求 A）。DistinctObjects 为存储键（"pack:{Ref}" / "blob:{Ref}"），
-/// 供端点对各自首卷发起 HEAD 判定活化状态（决策 5）。</summary>
+/// <summary>The estimated download and extraction volume for a restore (§4.1b, requirement A).
+/// DistinctObjects holds storage keys ("pack:{Ref}" / "blob:{Ref}") so the endpoint can HEAD each one's
+/// first volume to determine its rehydration state (decision 5).</summary>
 public sealed record RestoreEstimate(long DownloadBytes, long UncompressedBytes, int FileCount, IReadOnlyList<string> DistinctObjects);
 
 /// <summary>
-/// 还原量估算（纯逻辑、不触网）：选中路径 → 索引条目 → 按存储对象去重（共享 pack/去重 blob 只计一次）
-/// 合计下载量（各卷尺寸）与解压量（文件 Length 合计）。
+/// Estimating a restore (pure logic, no network): selected paths → index entries → deduplicated by stored
+/// object (a shared pack or a deduplicated blob counts once), summing the download size (volume sizes) and
+/// the extracted size (the files' lengths).
 /// </summary>
 public static class RestoreEstimator
 {

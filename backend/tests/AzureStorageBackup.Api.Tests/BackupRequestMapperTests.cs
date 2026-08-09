@@ -35,7 +35,7 @@ public sealed class BackupRequestMapperTests
         var schedule = RetryPolicy.DelaySchedule(request.Options.Upload).ToList();
         Assert.Equal(TimeSpan.FromSeconds(5), schedule[0]);
         Assert.Equal(TimeSpan.FromSeconds(300), schedule[3]);
-        Assert.Equal(TimeSpan.FromSeconds(300), schedule[4]); // 之后每 300s
+        Assert.Equal(TimeSpan.FromSeconds(300), schedule[4]); // then every 300s
         var total = schedule.Aggregate(TimeSpan.Zero, (a, d) => a + d);
         Assert.True(total <= TimeSpan.FromHours(2));
     }
@@ -55,7 +55,7 @@ public sealed class BackupRequestMapperTests
 
         var request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
 
-        // 空序列 → 计数模式（Backoff 为空），DelaySchedule 产出 MaxAttempts-1 项。
+        // An empty sequence → count mode (Backoff empty), and DelaySchedule produces MaxAttempts-1 entries.
         Assert.Null(request.Options.Upload.Backoff);
     }
 
@@ -74,8 +74,9 @@ public sealed class BackupRequestMapperTests
     [Fact]
     public void Scope_Rules_Are_Not_Inheritable_So_Null_Means_Everything()
     {
-        // 其它规则字段的 null = 「继承全局默认」，这个字段的 null = 「全部包含」。
-        // 这处不同是故意的（设计 §1），别顺手把它塞进 ResolvedBackupSettings。
+        // For the other rule fields null means "inherit the global default"; for this one it means
+        // "include everything". That difference is deliberate (design §1) — do not fold it into
+        // ResolvedBackupSettings out of habit.
         var config = Config();
         config.ScopeRules = null;
 

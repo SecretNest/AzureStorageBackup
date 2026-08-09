@@ -32,7 +32,7 @@ public sealed class RestoreEndpointsTests(TestWebAppFactory factory)
 
     private async Task<T?> PollUntilDone<T>(string url, Func<T, bool> done) where T : class
     {
-        for (var i = 0; i < 600; i++) // 宽松：并发集成测试在少核机器上会拖慢后台 job
+        for (var i = 0; i < 600; i++) // Generous: concurrent integration tests slow the background job down on a machine with few cores
         {
             var s = await (await _client.GetAsync(url)).Content.ReadFromJsonAsync<T>();
             if (s is not null && done(s))
@@ -72,13 +72,13 @@ public sealed class RestoreEndpointsTests(TestWebAppFactory factory)
 
         try
         {
-            // 备份
+            // back up
             await _client.PostAsync($"/api/backup-configs/{config!.Id}/run", null);
             var backup = await PollUntilDone<BackupRunResponse>(
                 $"/api/backup-configs/{config.Id}/run", s => s.status != "Running");
             Assert.Equal("Completed", backup!.status);
 
-            // 还原到新目录
+            // restore into a new directory
             var start = await _client.PostAsJsonAsync(
                 $"/api/backup-configs/{config.Id}/restore", new RestoreRequestBody(dst, null));
             Assert.Equal(HttpStatusCode.Accepted, start.StatusCode);
@@ -96,7 +96,7 @@ public sealed class RestoreEndpointsTests(TestWebAppFactory factory)
         }
     }
 
-    // 与后端 camelCase JSON 对应
+    // Mirrors the backend's camelCase JSON
     private sealed record BackupRunResponse(string status);
     private sealed record RestoreRunResponse(string status, int? version, int? restoredFiles, int? skippedFiles, string? error);
 }

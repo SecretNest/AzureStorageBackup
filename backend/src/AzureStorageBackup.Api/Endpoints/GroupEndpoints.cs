@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>备份分组管理端点（PRD 2.2）。</summary>
+/// <summary>Backup group management endpoints (PRD 2.2).</summary>
 public static class GroupEndpoints
 {
     public static IEndpointRouteBuilder MapGroupEndpoints(this IEndpointRouteBuilder app)

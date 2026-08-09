@@ -4,9 +4,10 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 进程内的密钥环状态位（单例）。此前只被端点/恢复流程间接覆盖，
-/// 而它恰恰是「默认必须是 Healthy」的唯一持有者：默认若是 Lost，全新安装会开机即锁死
-/// （/api/health/ready 恒 503、调度器全跳过、一切动作 409）。
+/// The in-process key ring status flag (a singleton). It used to be covered only indirectly through the
+/// endpoints and the recovery flow, yet it is the sole holder of "the default must be Healthy": were the
+/// default Lost, a fresh installation would lock itself at first boot (/api/health/ready permanently 503,
+/// the scheduler skipping everything, every action 409).
 /// </summary>
 public class KeyringHealthTests
 {
@@ -28,7 +29,7 @@ public class KeyringHealthTests
         Assert.Equal(KeyringStatus.Healthy, sut.Status);
     }
 
-    /// <summary>写极少、读频繁，实现用 volatile int 承载枚举——多次写后读到的必须是最后一次写入的值。</summary>
+    /// <summary>Rarely written and often read, the implementation carries the enum in a volatile int — after several writes, a read must see the last one.</summary>
     [Fact]
     public void Last_Write_Wins()
     {

@@ -11,7 +11,7 @@ public class BackupsEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     [Fact]
     public async Task Backups_Empty_When_No_Accounts()
     {
-        // 该 fixture 的库无账户，聚合应返回空且不触及 Azure
+        // This fixture's database has no accounts, so the aggregate should return empty without touching Azure
         var res = await _client.GetAsync("/api/backups");
 
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);

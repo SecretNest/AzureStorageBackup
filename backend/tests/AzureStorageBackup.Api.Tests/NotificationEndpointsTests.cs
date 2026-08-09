@@ -10,7 +10,7 @@ public class NotificationEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     [Fact]
     public async Task Get_Returns_A_Config()
     {
-        // 单例配置：未保存时服务返回默认对象（不 404）
+        // A singleton configuration: before anything is saved the service returns a default object rather than 404
         var res = await _client.GetAsync("/api/notifications");
         res.EnsureSuccessStatusCode();
         Assert.NotNull(await res.Content.ReadFromJsonAsync<NotificationResponse>());

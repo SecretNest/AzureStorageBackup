@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>备份分组管理（PRD 2.2）。组须含至少一个备份。</summary>
+/// <summary>Backup group management (PRD 2.2). A group must hold at least one backup.</summary>
 public interface IGroupService
 {
     Task<IReadOnlyList<Group>> ListAsync(CancellationToken ct = default);

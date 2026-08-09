@@ -90,7 +90,7 @@ public sealed class BlobUploaderTests : IDisposable
             var again = await uploader.UploadIfMissingAsync(
                 account, name, "data/x", WriteFile("new.bin", "different"), AccessTier.Hot);
 
-            Assert.False(again); // 已存在 → 跳过
+            Assert.False(again); // Already present → skipped
             var content = (await container.GetBlobClient("data/x").DownloadContentAsync()).Value.Content.ToString();
             Assert.Equal("original", content);
         }

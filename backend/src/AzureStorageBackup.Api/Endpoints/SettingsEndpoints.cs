@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>全局设置端点（PRD 3/4）：新建备份默认值 + 日志保留/并发。单例。</summary>
+/// <summary>Global settings endpoints (PRD 3/4): defaults for new backups, plus log retention and concurrency. A singleton.</summary>
 public static class SettingsEndpoints
 {
     public static IEndpointRouteBuilder MapSettingsEndpoints(this IEndpointRouteBuilder app)

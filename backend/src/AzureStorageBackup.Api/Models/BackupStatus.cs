@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>备份配置的持久状态（决策 2）。瞬时态（备份中/还原中/检查中/修复中…）由 runner 派生，不落库。</summary>
+/// <summary>A backup configuration's persistent status (decision 2). Transient states (backing up, restoring, checking, repairing…) are derived by the runners and never stored.</summary>
 public enum BackupStatus
 {
     Normal = 0,

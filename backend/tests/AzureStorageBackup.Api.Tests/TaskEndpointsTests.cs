@@ -38,7 +38,7 @@ public class TaskEndpointsTests(TestWebAppFactory factory) : IClassFixture<TestW
     {
         var req = new TaskRequest(
             TaskTargetKind.Group, null, null, null,
-            ScheduledTaskType.Check, "0 3 * * 0", true); // GroupId 缺失
+            ScheduledTaskType.Check, "0 3 * * 0", true); // GroupId missing
         var post = await _client.PostAsJsonAsync("/api/tasks", req);
         Assert.Equal(HttpStatusCode.BadRequest, post.StatusCode);
     }

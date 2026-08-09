@@ -4,7 +4,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>本地权威信息文件状态（序列化的信息文件 + 云端 ETag）的读写（设计 §3.3）。</summary>
+/// <summary>Reads and writes the locally authoritative info-file state (the serialised info file plus the cloud ETag) (design §3.3).</summary>
 public interface ILocalBackupStateStore
 {
     Task<(byte[] InfoBytes, string ETag)?> TryGetAsync(int accountId, string container, CancellationToken ct = default);

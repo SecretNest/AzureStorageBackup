@@ -78,7 +78,7 @@ public sealed class NotificationServiceTests
             new FakeConfigService(new NotificationConfig { Enabled = true, Url = "https://h/x", Events = NotificationEvents.BackupSuccess }),
             throwing, NullLogger<NotificationService>.Instance);
 
-        // 不抛出（通知失败不得影响备份）
+        // Does not throw (a failed notification must not affect the backup)
         await svc.NotifyAsync(NotificationEvents.BackupSuccess, "T", "B");
     }
 

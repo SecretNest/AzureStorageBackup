@@ -40,7 +40,7 @@ public sealed class SchedulerPlannerTests
     [Fact]
     public void Null_LastRun_Uses_CreatedAt()
     {
-        // 从未运行；CreatedAt 07-16 00:00，cron 每天 09:00，现在 07-17 10:00 → 有过去的触发点 → 到期
+        // Never run; CreatedAt 07-16 00:00, cron daily at 09:00, now 07-17 10:00 → a firing time has passed → due
         var task = Task("0 9 * * *", lastRun: null);
         Assert.True(SchedulerPlanner.IsDue(task, Utc(2026, 7, 17, 10, 0), TimeZoneInfo.Utc));
     }

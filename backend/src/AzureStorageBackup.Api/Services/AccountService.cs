@@ -7,7 +7,7 @@ namespace AzureStorageBackup.Api.Services;
 public class AccountService(AppDbContext db) : IAccountService
 {
     public async Task<IReadOnlyList<Account>> ListAsync(CancellationToken ct = default) =>
-        // NOCASE：SQLite 默认按码点比，大写字母会整体排在小写字母前面（见 BackupConfigService.ListAsync）。
+        // NOCASE: SQLite compares by code point by default, sorting every uppercase letter before every lowercase one (see BackupConfigService.ListAsync).
         await db.Accounts.AsNoTracking()
             .OrderBy(a => EF.Functions.Collate(a.Name, "NOCASE")).ToListAsync(ct);
 
@@ -60,8 +60,9 @@ public class AccountService(AppDbContext db) : IAccountService
     public async Task<IReadOnlyDictionary<int, IReadOnlyList<string>>> GetBackupUsageAsync(
         CancellationToken ct = default)
     {
-        // 一次取回全部再在内存里分组：列表页要的是**所有**账户的占用情况，逐个账户查就是 N+1。
-        // 个人备份的规模（账户个位数、备份几十条）下这一趟的代价可以忽略。
+        // Fetch everything once and group in memory: the list page wants occupancy for **every** account,
+        // and querying per account would be N+1. At personal-backup scale (single-digit accounts, a few
+        // dozen backups) this single pass costs nothing worth measuring.
         var rows = await db.BackupConfigs.AsNoTracking()
             .Select(c => new { c.AccountId, c.Name })
             .ToListAsync(ct);
@@ -70,7 +71,7 @@ public class AccountService(AppDbContext db) : IAccountService
             .GroupBy(r => r.AccountId)
             .ToDictionary(
                 g => g.Key,
-                // 按名字排序：这串要原样进界面的悬浮提示，顺序不稳定会让同一个页面每次刷新都换个样。
+                // Sorted by name: this string goes into a UI tooltip as-is, and an unstable order would make the same page look different on every refresh.
                 g => (IReadOnlyList<string>)[.. g.Select(r => r.Name)
                     .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)]);
     }

@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>操作日志端点（PRD 5）：按等级/来源/时间过滤查询，可清空。</summary>
+/// <summary>Operation log endpoints (PRD 5): query with level, source and time filters, and clear.</summary>
 public static class LogEndpoints
 {
     public static IEndpointRouteBuilder MapLogEndpoints(this IEndpointRouteBuilder app)
@@ -23,7 +23,7 @@ public static class LogEndpoints
             return Results.Ok(entries.Select(e => new LogEntryResponse(e.Id, e.Timestamp, e.Level, e.Source, e.Message)));
         });
 
-        // before 指定则删除早于该时间的全部日志（含长存审计，PRD 3.6 手工清理）；否则清空全部。
+        // With `before` given, delete every log older than that time (durable audit entries included, the manual cleanup of PRD 3.6); otherwise clear everything.
         group.MapDelete("/", async (IOperationLog log, DateTimeOffset? before, CancellationToken ct) =>
         {
             if (before is { } cutoff)

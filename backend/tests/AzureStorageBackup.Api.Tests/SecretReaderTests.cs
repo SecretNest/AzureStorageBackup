@@ -33,9 +33,10 @@ public class SecretReaderTests
     }
 
     /// <summary>
-    /// 账户密钥是必填项，没有「未设置即 null」的语义（与代理密码/备份密码相反）：
-    /// 空串（新建实体的默认值、或历史遗留的空行）必须同样抛出，**不得**回退成空密钥去连云——
-    /// 那会拿一个空的 SharedKey 去签名，失败在 Azure 侧、消息与真实原因无关。
+    /// The account key is required and has no "unset means null" semantics (unlike the proxy password and
+    /// the backup password): an empty string (a new entity's default, or a legacy blank row) must throw
+    /// just the same and must **not** fall back to an empty key against the cloud — that would sign with an
+    /// empty SharedKey and fail on the Azure side with a message unrelated to the real cause.
     /// </summary>
     [Fact]
     public void RevealAccountKey_Throws_When_Not_Set()
@@ -43,7 +44,7 @@ public class SecretReaderTests
         var (sut, _) = Create();
 
         Assert.Throws<SecretUnavailableException>(
-            () => sut.RevealAccountKey(new Account { Id = 5, Name = "no-key" }));       // 默认值（空串）
+            () => sut.RevealAccountKey(new Account { Id = 5, Name = "no-key" }));       // the default (an empty string)
         Assert.Throws<SecretUnavailableException>(
             () => sut.RevealAccountKey(new Account { Id = 5, Name = "no-key", AccountKeyProtected = "" }));
     }
