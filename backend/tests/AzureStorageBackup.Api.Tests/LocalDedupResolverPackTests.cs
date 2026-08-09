@@ -4,10 +4,12 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 打包成员去重映射的建法。多个保留版本各有一条同内容成员时，两件事要分开定：
-/// **指向**取最旧那条（引用聚到老包上，不易被死重压实重写），**尾部 hash** 取能拿到的最强值
-/// （老索引一项都没有，备份跑一轮就补进新版本的索引——只认最旧那条的话，补上的值要等老版本
-/// 退役才生效，判定白白多按三项走好几轮）。
+/// How the pack-member dedup map is built. When several retained versions each hold a member with the same
+/// content, two things get decided separately: the **reference** takes the oldest one (references pile onto the
+/// old pack, where dead-weight compaction is less likely to rewrite it); the **tail hash** takes the strongest
+/// value obtainable (old indexes have none at all, and one backup run fills it into the newer version's index —
+/// honour only the oldest entry and the filled-in value stays inert until the old version retires, making the
+/// match run on three fields for several more rounds for nothing).
 /// </summary>
 public class LocalDedupResolverPackTests
 {
@@ -24,7 +26,7 @@ public class LocalDedupResolverPackTests
     private static LocalDedupResolver Build(params VersionIndex[] indexes) =>
         LocalDedupResolver.Build(new BlobAddressScheme(null, null), indexes);
 
-    /// <summary>指向老包——那是它不易被压实重写的地方。</summary>
+    /// <summary>Point at the old pack — that is where compaction is least likely to rewrite it.</summary>
     [Fact]
     public void The_Reference_Points_At_The_Oldest_Version()
     {
@@ -37,7 +39,7 @@ public class LocalDedupResolverPackTests
         Assert.Equal("a.txt", hit.EntryName);
     }
 
-    /// <summary>尾部对不上就不命中——四项是**严格**相等。</summary>
+    /// <summary>A mismatched tail is a miss — the four fields are **strictly** equal.</summary>
     [Fact]
     public void A_Differing_Tail_Misses()
     {
@@ -48,22 +50,23 @@ public class LocalDedupResolverPackTests
     }
 
     /// <summary>
-    /// **缺失也算不等**。老索引里的打包成员没有尾部，它们就不参与去重——代价只是那份内容
-    /// 被再存一次。曾经放宽成"两边都有才比"，撤掉了：判据要么是四项要么不是，
-    /// 为兼容开个口子等于在"这份内容是不是同一份"这个问题上留一档说不清的语义。
+    /// **Missing counts as unequal too.** Pack members in old indexes have no tail, so they simply do not take
+    /// part in dedup — the price is only that their content gets stored one more time. This was once relaxed to
+    /// "only compare when both sides have one"; that is gone: the criterion is either all four fields or it is not,
+    /// and opening a compatibility loophole leaves a fuzzy semantic on the question "is this the same content".
     /// </summary>
     [Fact]
     public void A_Missing_Tail_On_Either_Side_Also_Misses()
     {
         var oldIndex = Build(Index(1, Member("a.txt", "p1", null)));
-        Assert.Null(oldIndex.TryFindPackMember("full-x", 100, "head-x", "tail-x"));   // 老条目缺
-        Assert.NotNull(oldIndex.TryFindPackMember("full-x", 100, "head-x", null));    // 两边都缺才算等
+        Assert.Null(oldIndex.TryFindPackMember("full-x", 100, "head-x", "tail-x"));   // the old entry has none
+        Assert.NotNull(oldIndex.TryFindPackMember("full-x", 100, "head-x", null));    // equal only when both sides have none
 
         var newIndex = Build(Index(1, Member("a.txt", "p1", "tail-x")));
-        Assert.Null(newIndex.TryFindPackMember("full-x", 100, "head-x", null));       // 来问的缺
+        Assert.Null(newIndex.TryFindPackMember("full-x", 100, "head-x", null));       // the querying side has none
     }
 
-    /// <summary>三项里任何一项不同都不该命中。</summary>
+    /// <summary>Any one of the three parts differing must not match.</summary>
     [Fact]
     public void Any_Differing_Part_Misses()
     {

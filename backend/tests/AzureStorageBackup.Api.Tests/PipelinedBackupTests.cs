@@ -6,10 +6,12 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 差分与「压缩 + 上传」流水线化之后的验收（第 3 期）。三个承重点：
-/// 产出必须与"先 diff 完再上传"时代一致（每个文件的落位与 hash 一一对应，pack 编号可以不同）；
-/// 两条流真的在同时跑（diff 还没完就已经在传了）；
-/// 一侧出事时另一侧要收得干净——上传失败要把原始异常抛出去，取消要让两条流都停下。
+/// Acceptance for pipelining the diff with "compress + upload" (phase 3). Three load-bearing points:
+/// the output must match the "finish the diff, then upload" era (every file lands in the same place with the same
+/// hash, though pack numbers may differ);
+/// the two streams really do run at the same time (uploading is already happening before the diff is done);
+/// and when one side blows up the other winds down cleanly — an upload failure must surface the original exception,
+/// and a cancellation must stop both streams.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class PipelinedBackupTests : IDisposable
@@ -81,9 +83,10 @@ public sealed class PipelinedBackupTests : IDisposable
     };
 
     /// <summary>
-    /// 装箱结果必须与"等 diff 全部跑完再一次装箱"完全一致。这里不去复刻旧代码，而是拿装箱那个
-    /// **纯函数**当基准：同一批变更文件喂给 <see cref="GroupingPlanner.Plan"/>，得到的成员集合
-    /// 必须与流水线实际产出的 pack 成员集合逐一对应（编号可以不同，成员分组不行）。
+    /// The packing result must be exactly what "wait for the whole diff, then pack once" would give. Rather than
+    /// reproducing the old code, this takes the packing **pure function** as the baseline: feed the same set of
+    /// changed files to <see cref="GroupingPlanner.Plan"/> and the resulting member sets must match the pack members
+    /// the pipeline actually produced, one for one (numbers may differ, member grouping may not).
     /// </summary>
     [SkippableFact]
     public async Task Packing_Matches_What_The_Planner_Would_Have_Produced()
@@ -100,8 +103,9 @@ public sealed class PipelinedBackupTests : IDisposable
 
         try
         {
-            // 三类都要有：超阈值的单文件、按目录合并的小文件（跨越封箱上限，会切成多箱）、
-            // 以及命中跨目录规则、散落在很多目录里的小文件。
+            // All three kinds must be present: single files over the threshold, small files merged per directory
+            // (past the pack cap, so they get cut into several packs), and small files that hit the cross-directory
+            // rule and are scattered across many directories.
             WriteFile("big.bin", 40_000);
             WriteFile("also/big2.bin", 40_000);
             foreach (var dir in new[] { "docs", "docs/deep", "notes" })
@@ -116,7 +120,7 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions
                 {
                     SingleFileThresholdBytes = 10_000,
-                    GroupCapBytes = 9_000, // 故意小：每个目录会被切成多箱
+                    GroupCapBytes = 9_000, // deliberately small: each directory gets cut into several packs
                 },
             };
             await Build(factory, store).RunAsync(Request(account, name, options));
@@ -124,14 +128,14 @@ public sealed class PipelinedBackupTests : IDisposable
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
 
-            // 基准：把本轮全部条目按索引记录的长度/hash 喂给纯函数装箱。
+            // Baseline: feed every entry of this run, with the length/hash the index recorded, to the pure packing function.
             var expected = new GroupingPlanner().Plan(
                 [.. idx.Entries
                     .OrderBy(e => e.Path, StringComparer.Ordinal)
                     .Select(e => new PlannedFile(e.Path, e.Length, e.FullHash!))],
                 options.Plan with { CrossDirGroup = options.CrossDirGroup });
 
-            // 先确认这份数据真的把三条路都走到了，否则下面的相等断言可能只是"两边都只有一箱"。
+            // First confirm this data really exercised all three paths, otherwise the equality assertions below may just be "one pack on each side".
             Assert.Equal(2, expected.Blobs.Count);
             Assert.True(expected.Packs.Count >= 6, $"expected several packs, got {expected.Packs.Count}");
 
@@ -140,7 +144,7 @@ public sealed class PipelinedBackupTests : IDisposable
                 idx.Entries.Where(e => e.Storage!.Kind == "blob").Select(e => e.Path)
                     .OrderBy(p => p, StringComparer.Ordinal));
 
-            // pack 编号可以不同，成员的分组不行：把两边都归一化成"成员路径集合的集合"再比。
+            // Pack numbers may differ, member grouping may not: normalise both sides into a "set of sets of member paths" before comparing.
             static IEnumerable<string> Signature(IEnumerable<IEnumerable<string>> packs) =>
                 packs.Select(m => string.Join('\n', m.OrderBy(p => p, StringComparer.Ordinal)))
                     .OrderBy(s => s, StringComparer.Ordinal);
@@ -158,10 +162,11 @@ public sealed class PipelinedBackupTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>diff 每判完一个文件就慢一下，并数一数已经判完几个。
-    /// 数的是 <c>HeadHashAsync</c>：首次备份里差分对每个文件恰好调它一次，无论走哪条路。
-    /// **不能**数 <c>FullHashAsync</c>——归类为单文件 blob 的条目压根不调它（全文 hash 延后到
-    /// 压缩那一遍算），那样计数会永远停在 0，"diff 还在跑吗"这个判据就废了。</summary>
+    /// <summary>Slow down each time the diff finishes judging a file, and count how many it has judged.
+    /// The count is on <c>HeadHashAsync</c>: in a first backup the diff calls it exactly once per file, whichever
+    /// path it takes. It must **not** count <c>FullHashAsync</c> — entries classified as single-file blobs never
+    /// call it at all (the full-content hash is deferred to the compression pass), so the count would sit at 0
+    /// forever and the "is the diff still running" test would be worthless.</summary>
     private sealed class SlowHasher(IFileHasher inner, int delayMs) : IFileHasher
     {
         private int _judged;
@@ -182,7 +187,7 @@ public sealed class PipelinedBackupTests : IDisposable
             inner.FullHashAsync(path, ct);
     }
 
-    /// <summary>记下每次上传发生时"diff 是否还在跑"。</summary>
+    /// <summary>Records, for each upload, whether the diff was still running.</summary>
     private sealed class OverlapWatchingUploader(IBlobUploader inner, Func<bool> diffRunning) : IBlobUploader
     {
         public int UploadsWhileDiffing { get; private set; }
@@ -204,8 +209,9 @@ public sealed class PipelinedBackupTests : IDisposable
             => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
     }
 
-    /// <summary>这一期的全部意义所在：diff 还在读盘的时候，网络就已经在传了。
-    /// 从前 Plan 是一道全局屏障，首次备份要等每个文件都哈希完才发出第一个字节。</summary>
+    /// <summary>The whole point of this phase: the network is already uploading while the diff is still reading the
+    /// disk. Plan used to be a global barrier — a first backup waited for every file to be hashed before it sent the
+    /// first byte.</summary>
     [SkippableFact]
     public async Task Uploading_Starts_While_The_Diff_Is_Still_Running()
     {
@@ -221,7 +227,7 @@ public sealed class PipelinedBackupTests : IDisposable
 
         try
         {
-            // 全是超阈值的单文件：判定一出来就该立刻上传，不必等任何组。
+            // All single files over the threshold: each should be uploaded the moment it is judged, without waiting for any group.
             for (var i = 0; i < 8; i++)
                 WriteFile($"f{i:D2}.bin", 20_000);
 
@@ -245,8 +251,9 @@ public sealed class PipelinedBackupTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>关掉重叠：回到"先全部判完再传"。给的是一条退路——机械盘的 NAS 上两股读
-    /// 互相拖慢时，用户在界面上就能把它关掉，不需要任何诊断。产出必须与开着时一模一样。</summary>
+    /// <summary>Turn the overlap off: back to "judge everything first, then upload". It is an escape hatch — when
+    /// two read streams drag each other down on a spinning-disk NAS, the user can switch it off from the UI without
+    /// any diagnostics at all. The output must be identical to running with it on.</summary>
     [SkippableFact]
     public async Task Overlap_Can_Be_Turned_Off_Without_Changing_The_Result()
     {
@@ -277,7 +284,7 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions { SingleFileThresholdBytes = 10_000 },
             }));
 
-            Assert.Equal(0, uploader.UploadsWhileDiffing); // 一个字节都没有在 diff 期间传出去
+            Assert.Equal(0, uploader.UploadsWhileDiffing); // not a single byte went out during the diff
 
             var info = await store.ReadInfoAsync(account, name, null);
             var idx = await store.ReadIndexAsync(account, name, info!.Versions[0].IndexBlob, null);
@@ -304,9 +311,10 @@ public sealed class PipelinedBackupTests : IDisposable
             throw new InvalidOperationException("upload refused by the test");
     }
 
-    /// <summary>上传在 diff 还没跑完时就失败：这是流水线化才有的状态组合。
-    /// 必须把**上传那边的原始异常**抛出去（而不是 diff 被叫停后看到的那个取消），
-    /// 而且不能留下一个新版本——否则一次什么都没传成功的备份会被记成一次成功。</summary>
+    /// <summary>An upload fails while the diff is still running: a state combination only pipelining can produce.
+    /// It must surface **the original exception from the upload side** (not the cancellation the diff sees once it
+    /// is stopped), and it must not leave a new version behind — otherwise a backup that uploaded nothing
+    /// successfully gets recorded as a success.</summary>
     [SkippableFact]
     public async Task An_Upload_Failure_While_Diffing_Surfaces_The_Real_Error()
     {
@@ -335,13 +343,14 @@ public sealed class PipelinedBackupTests : IDisposable
                 })));
 
             Assert.Contains("upload refused by the test", ex.Message);
-            Assert.Null(await store.ReadInfoAsync(account, name, null)); // 没有留下版本
+            Assert.Null(await store.ReadInfoAsync(account, name, null)); // no version left behind
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>用户按下停止：两条流都要收尾，RunAsync 才返回。它一返回，调用方就会释放忙碌锁——
-    /// 早一步返回等于把一堆压缩/上传丢在锁外面继续跑。</summary>
+    /// <summary>The user hits stop: RunAsync only returns once both streams have wound down. The moment it returns
+    /// the caller releases the busy lock — returning one step early means leaving a pile of compression/upload work
+    /// running outside the lock.</summary>
     [SkippableFact]
     public async Task Canceling_Mid_Run_Stops_Both_Streams()
     {
@@ -371,13 +380,13 @@ public sealed class PipelinedBackupTests : IDisposable
             await cts.CancelAsync();
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
-            Assert.True(run.IsCompleted); // 返回即已收尾，不留后台余波
+            Assert.True(run.IsCompleted); // returning means it has wound down, no background aftershocks
             Assert.Null(await store.ReadInfoAsync(account, name, null));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>进度：两条流同时在跑的时候，明细必须同时给出两条——只报一条，界面上另一行就死住了。</summary>
+    /// <summary>Progress: while both streams run at once the details must carry both — report only one and the other row freezes in the UI.</summary>
     [SkippableFact]
     public async Task Progress_Carries_Both_Stages_While_They_Overlap()
     {
@@ -410,7 +419,7 @@ public sealed class PipelinedBackupTests : IDisposable
                     r.Details.Count == 2
                     && r.Details.Any(d => d.Stage == "Diffing")
                     && r.Details.Any(d => d.Stage == "Uploading"));
-                // 单值字段仍然可用（只看一条的调用方不必先判断有没有第二条）。
+                // The single-value field still works (a caller that only looks at one need not first check whether there is a second).
                 Assert.Contains(reports, r => r.Detail is not null);
             }
         }
@@ -418,9 +427,11 @@ public sealed class PipelinedBackupTests : IDisposable
     }
 
     /// <summary>
-    /// 内存界卡到最小、逼着几乎每一件活都过一遍磁盘，产出必须与全程走内存那一轮**逐条相同**。
-    /// 这是溢出落盘唯一需要证明的事：它是一条运输通道，不是一条会改写内容的通道。
-    /// 顺带盯两件收尾：落盘这件事要在界面上报得出来，临时文件要在运行结束后消失。
+    /// Squeeze the memory limits to the minimum, forcing almost every item through a round trip to disk; the output
+    /// must be **identical entry for entry** to a run that stayed in memory throughout.
+    /// That is the only thing spilling has to prove: it is a transport channel, not a channel that rewrites content.
+    /// Two cleanup points ride along: spilling must be reportable in the UI, and the temp file must be gone once the
+    /// run ends.
     /// </summary>
     [SkippableFact]
     public async Task Spilling_The_Work_Queue_To_Disk_Produces_An_Identical_Backup()
@@ -442,7 +453,7 @@ public sealed class PipelinedBackupTests : IDisposable
 
         try
         {
-            // 三条路都要走到：单文件 blob、按目录成箱、跨目录成箱。
+            // All three paths must be exercised: single-file blob, per-directory pack, cross-directory pack.
             WriteFile("big.bin", 40_000);
             WriteFile("also/big2.bin", 40_000);
             foreach (var dir in new[] { "docs", "docs/deep", "notes" })
@@ -457,7 +468,7 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions { SingleFileThresholdBytes = 10_000, GroupCapBytes = 9_000 },
             };
 
-            // r 段只装一件、w 段攒够一件就刷盘：除了头一件，全部真的过一遍磁盘。
+            // r holds one item and w flushes as soon as it has one: apart from the very first item, everything really goes through the disk.
             var tiny = new DiffWorkQueueFactory(spillDir, new DiffQueueLimits(
                 MaxCachedItems: 1, MaxCachedBytes: long.MaxValue,
                 WriteBatchItems: 1, WriteBatchBytes: long.MaxValue,
@@ -471,14 +482,14 @@ public sealed class PipelinedBackupTests : IDisposable
             var spilledIndex = await ReadOnlyIndexAsync(store, account, spilledName);
             var memoryIndex = await ReadOnlyIndexAsync(store, account, memoryName);
 
-            // 逐条相同：路径、长度、全文 hash。落盘只是搬运，一个字节都不该变。
+            // Identical entry for entry: path, length, full-content hash. Spilling is only haulage; not one byte should change.
             Assert.Equal(
                 memoryIndex.Entries.OrderBy(e => e.Path, StringComparer.Ordinal)
                     .Select(e => (e.Path, e.Length, e.FullHash)),
                 spilledIndex.Entries.OrderBy(e => e.Path, StringComparer.Ordinal)
                     .Select(e => (e.Path, e.Length, e.FullHash)));
 
-            // 装箱分组也必须一致（pack 编号可以不同，成员怎么分不行）。
+            // The packing grouping must match too (pack numbers may differ, how members are split may not).
             static IEnumerable<string> PackSignature(VersionIndex idx) =>
                 idx.Entries.Where(e => e.Storage!.Kind == "pack")
                     .GroupBy(e => e.Storage!.Ref, StringComparer.Ordinal)
@@ -486,16 +497,16 @@ public sealed class PipelinedBackupTests : IDisposable
                     .OrderBy(s => s, StringComparer.Ordinal);
             Assert.Equal(PackSignature(memoryIndex), PackSignature(spilledIndex));
 
-            // 这一轮真的落过盘——否则上面那些相等断言只是"两轮都走了内存"。
+            // This run really did spill — otherwise the equality assertions above only say "both runs stayed in memory".
             lock (reports)
             {
                 Assert.Contains(reports, r => r.Details.Any(d => d.Stage == "Diffing" && d.SpilledItems > 0));
             }
 
-            // 运行结束后不留垃圾：正常收尾各删各的溢出文件（非正常退出那一路由 ClearStale 兜底）。
+            // No garbage left after the run: a normal shutdown deletes its own spill file (the abnormal-exit path is covered by ClearStale).
             Assert.True(
                 !Directory.Exists(spillDir) || Directory.GetFiles(spillDir, "*.spill").Length == 0,
-                "运行结束后不该还留着溢出文件");
+                "no spill file should still be around after the run ends");
         }
         finally
         {
@@ -505,10 +516,12 @@ public sealed class PipelinedBackupTests : IDisposable
     }
 
     /// <summary>
-    /// 成员数与路径字节这两条界必须在**三处**装箱点上口径一致：规划器那个纯函数、编排器里边 diff
-    /// 边填的跨目录累加、以及压缩前 <c>ProcessPackAsync</c> 的重新切分。任何一处漏掉，实际产出就与
-    /// 规划器分道扬镳，而最先出事的是按成员分组认包的去重与保留清理。
-    /// 这里仍然拿纯函数当基准——它是唯一一份"应该长什么样"的定义。
+    /// The member-count and path-bytes limits must read the same way at **all three** packing sites: the planner's
+    /// pure function, the orchestrator's cross-directory accumulator that fills up while the diff runs, and
+    /// <c>ProcessPackAsync</c>'s re-split just before compression. Miss any one of them and the real output parts
+    /// ways with the planner, and the first things to break are dedup and retention cleanup, which identify packs by
+    /// their member grouping.
+    /// The pure function is still the baseline here — it is the one and only definition of what the result should look like.
     /// </summary>
     [SkippableFact]
     public async Task Member_And_Path_Limits_Apply_At_Every_Packing_Site()
@@ -525,7 +538,7 @@ public sealed class PipelinedBackupTests : IDisposable
 
         try
         {
-            // 全是小文件：字节上限永远撞不到，只有成员数那条界能把箱子切开。
+            // All small files: the byte cap is never reached, so only the member-count limit can cut a pack.
             foreach (var dir in new[] { "docs", "notes" })
                 for (var i = 0; i < 25; i++)
                     WriteFile($"{dir}/f{i:D2}.txt", 40);
@@ -538,8 +551,8 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions
                 {
                     SingleFileThresholdBytes = 10_000,
-                    GroupCapBytes = 100 * 1024 * 1024, // 故意给足：不让字节那条界参与
-                    MaxPackMembers = 7,                // 只有这条能切
+                    GroupCapBytes = 100 * 1024 * 1024, // deliberately generous: keep the byte limit out of it
+                    MaxPackMembers = 7,                // only this one can cut
                 },
             };
             await Build(factory, store).RunAsync(Request(account, name, options));
@@ -553,9 +566,9 @@ public sealed class PipelinedBackupTests : IDisposable
                     .Select(e => new PlannedFile(e.Path, e.Length, e.FullHash!))],
                 options.Plan with { CrossDirGroup = options.CrossDirGroup });
 
-            // 先确认这批数据真的被成员数那条界切开了，否则下面的相等断言可能只是"两边都一箱"。
+            // First confirm this data really was cut by the member-count limit, otherwise the equality assertions below may just be "one pack on each side".
             Assert.True(expected.Packs.Count >= 12, $"expected many small packs, got {expected.Packs.Count}");
-            Assert.All(expected.Packs, p => Assert.True(p.Members.Count <= 7, $"planner 自己就超界了：{p.Members.Count}"));
+            Assert.All(expected.Packs, p => Assert.True(p.Members.Count <= 7, $"the planner itself went over the limit: {p.Members.Count}"));
 
             static IEnumerable<string> Signature(IEnumerable<IEnumerable<string>> packs) =>
                 packs.Select(m => string.Join('\n', m.OrderBy(p => p, StringComparer.Ordinal)))
@@ -566,15 +579,16 @@ public sealed class PipelinedBackupTests : IDisposable
                 .Select(g => g.Select(e => e.Path))
                 .ToList();
 
-            // 实际产出的每一箱都不超界——这一条直接守住 7z 那边的内存与 argv。
-            Assert.All(actualPacks, m => Assert.True(m.Count() <= 7, $"实际产出超界：{m.Count()}"));
+            // Every pack actually produced stays within the limit — this directly guards 7z's memory and argv.
+            Assert.All(actualPacks, m => Assert.True(m.Count() <= 7, $"actual output over the limit: {m.Count()}"));
             Assert.Equal(Signature(expected.Packs.Select(p => p.Members.Select(m => m.Path))), Signature(actualPacks));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>记下 pack 的上传发生时 diff 还在不在跑。只认 <c>packs/</c> 前缀——
-    /// 这一轮里其余条目全是单文件 blob（<c>data/</c>），认前缀就够把那一箱挑出来。</summary>
+    /// <summary>Records whether the diff was still running when a pack upload happened. It only looks at the
+    /// <c>packs/</c> prefix — every other entry in this run is a single-file blob (<c>data/</c>), so the prefix is
+    /// enough to pick that one pack out.</summary>
     private sealed class PackUploadWatcher(IBlobUploader inner, Func<bool> diffRunning) : IBlobUploader
     {
         private int _whileDiffing;
@@ -598,12 +612,15 @@ public sealed class PipelinedBackupTests : IDisposable
     }
 
     /// <summary>
-    /// 跨目录的一箱装满了就该进队列，不该挂在那儿等**下一个**跨目录文件来把它推出去。
+    /// A full cross-directory pack should go into the queue right away, not hang there waiting for the **next**
+    /// cross-directory file to push it out.
     /// <para>
-    /// 封箱判据 <see cref="GroupingPlanner.GroupIsFull"/> 问的是"再加这一个会不会超"，所以它要有
-    /// 下一个文件才答得出来。可其中成员数与路径字节两条与下一个文件无关——箱子在装满的那一刻
-    /// 就已经定局。等下去的代价按扫描顺序算：后面若长期没有跨目录候选（这里之后全是走单文件的
-    /// 大文件），这一箱就一路挂到 diff 收尾才被兜底封上，白等整个差分。
+    /// The sealing test <see cref="GroupingPlanner.GroupIsFull"/> asks "would adding this one go over", so it needs
+    /// the next file before it can answer. But two of its limits, member count and path bytes, have nothing to do
+    /// with the next file — the pack's fate is already settled the moment it fills up. The cost of waiting is
+    /// measured in scan order: if no cross-directory candidate turns up for a long stretch afterwards (everything
+    /// past this point here is a large file taking the single-file path), the pack hangs all the way to the end of
+    /// the diff before the fallback seals it, waiting out the entire diff for nothing.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -621,11 +638,12 @@ public sealed class PipelinedBackupTests : IDisposable
 
         try
         {
-            // 跨目录的三个小文件正好把一箱装满（MaxPackMembers = 3），此后再没有第四个跨目录候选。
+            // Three cross-directory small files fill one pack exactly (MaxPackMembers = 3), and there is no fourth cross-directory candidate after that.
             for (var i = 0; i < 3; i++)
                 WriteFile($"a-shard/{i:D2}/blob.dat", 2_500);
-            // 之后这一批全是超阈值的单文件，只用来把 diff 拖住：它们一个都进不了那口箱子。
-            // 名字排在后面（ordinal 序），扫描顺序保证三个 shard 先判完。
+            // The batch after that is all single files over the threshold, purely to drag the diff out: not one of
+            // them can go into that pack. Their names sort later (ordinal order), so the scan order guarantees the
+            // three shard files are judged first.
             for (var i = 0; i < 8; i++)
                 WriteFile($"z-big/f{i:D2}.bin", 20_000);
 
@@ -639,16 +657,16 @@ public sealed class PipelinedBackupTests : IDisposable
                 Plan = new PlanOptions
                 {
                     SingleFileThresholdBytes = 10_000,
-                    GroupCapBytes = 100 * 1024 * 1024, // 字节那条界够不着
-                    MaxPackMembers = 3,                // 只有成员数这条能封箱
+                    GroupCapBytes = 100 * 1024 * 1024, // the byte limit is out of reach
+                    MaxPackMembers = 3,                // only the member count can seal a pack
                 },
             };
             await Build(factory, store, hasher, uploader).RunAsync(Request(account, name, options));
 
             Assert.True(uploader.PackUploadsWhileDiffing > 0,
-                "装满的那一箱一直挂到 diff 收尾才封 —— 它在等下一个跨目录文件");
+                "the full pack hung until the end of the diff before being sealed — it was waiting for the next cross-directory file");
 
-            // 提前封箱**不改变装箱结果**：三个成员仍旧同在一箱里。
+            // Sealing early **does not change the packing result**: the three members are still in one pack.
             var idx = await ReadOnlyIndexAsync(store, account, name);
             var packed = idx.Entries.Where(e => e.Storage!.Kind == "pack").ToList();
             Assert.Equal(3, packed.Count);

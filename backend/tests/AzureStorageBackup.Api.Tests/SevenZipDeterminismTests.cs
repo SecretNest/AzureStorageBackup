@@ -3,17 +3,19 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 「同样的输入配同样的参数，7z 压出来的卷逐字节相同」——这条断言不是趣味考据，它是
-/// <see cref="BackupOrchestrator.ClearLeftoverVolumesAsync"/> 明文路径敢于早退的**唯一**依据。
+/// "Same input, same switches, and the volumes 7z produces are byte-for-byte identical" — this assertion is not idle
+/// trivia, it is the **only** grounds on which the plaintext path of
+/// <see cref="BackupOrchestrator.ClearLeftoverVolumesAsync"/> dares to bail out early.
 /// <para>
-/// 逐卷上传是 if-missing 的：重试一次多卷归档时，第 1 次尝试已经落地的卷会被跳过，缺口由
-/// 第 2 次压缩的产物填上。两次压缩若不逐字节相同，云上那一族卷就是**两次压缩的混合体**——
-/// 解不开，而索引却声称它好好的。这是静默的数据损坏，不是性能问题。
+/// Per-volume upload is if-missing: retrying a multi-volume archive skips the volumes the first attempt already
+/// landed, and the gaps are filled by the output of the second compression. If the two compressions are not
+/// byte-for-byte identical, that family of volumes in the cloud is a **mixture of two compressions** — it cannot be
+/// opened, while the index claims it is perfectly fine. That is silent data corruption, not a performance issue.
 /// </para>
 /// <para>
-/// 挂起闸门（Task 7）把这条路从"要整轮运行崩一次才踩得到"变成"每次抖动重试都要走一遍"，
-/// 所以这里把它钉死：换 7z 版本、动 -m 参数、改词典推算，任何一处让产出不再确定，
-/// 这个测试必须先红，而不是等某个用户的还原失败。
+/// The suspend gate (Task 7) turned this path from "you need a whole run to crash once to hit it" into "every flaky
+/// retry walks it", so it is nailed down here: change the 7z version, touch the -m switches, alter the dictionary
+/// computation — the moment any one of those makes the output non-deterministic, this test must go red first, rather than waiting for some user's restore to fail.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -40,9 +42,10 @@ public sealed class SevenZipDeterminismTests : IDisposable
     }
 
     /// <summary>
-    /// 可压缩、但压不没的内容：前一半是定种子伪随机字节（压不动），后一半照抄前一半（LZMA 一句
-    /// 匹配就吃掉）。压缩率因此稳定在 2:1 上下——全 0 会压成几 KB，根本切不出多卷，而这个测试
-    /// 要问的恰恰是**多卷**产出确不确定。
+    /// Content that compresses, but does not compress away: the first half is fixed-seed pseudo-random bytes
+    /// (incompressible), the second half is a straight copy of the first (LZMA eats it with a single match). The ratio
+    /// therefore stays steady around 2:1 — all zeros would compress down to a few KB and never split into multiple
+    /// volumes at all, and what this test asks about is precisely whether **multi-volume** output is deterministic.
     /// </summary>
     private static byte[] Payload(int size, int seed = 20260807)
     {
@@ -67,7 +70,7 @@ public sealed class SevenZipDeterminismTests : IDisposable
         }
     }
 
-    // pack 路径：ProcessPackAsync → CompressPackAsync → CompressAsync（按文件名压，走 argv）。
+    // The pack path: ProcessPackAsync → CompressPackAsync → CompressAsync (compressing by file name, through argv).
     [SkippableFact]
     public async Task Pack_compression_is_byte_identical_across_two_runs()
     {
@@ -91,19 +94,19 @@ public sealed class SevenZipDeterminismTests : IDisposable
     }
 
     /// <summary>
-    /// 单文件 blob 路径（HandleBlobAsync → CompressStreamAsync，<c>-si</c> 从管道读）**不**确定，
-    /// 而且混起来的一族卷根本打不开。这一条是 <see cref="BackupOrchestrator.ClearLeftoverVolumesAsync"/>
-    /// 明文多卷也必须清残留的实测依据。
+    /// The single-file blob path (HandleBlobAsync → CompressStreamAsync, <c>-si</c> reading from a pipe) is **not**
+    /// deterministic, and a mixed family of volumes simply cannot be opened. This is the measured basis for
+    /// <see cref="BackupOrchestrator.ClearLeftoverVolumesAsync"/> having to clear leftovers for plaintext multi-volume output too.
     /// <para>
-    /// 实测（7-Zip 26.00）：stdin 是管道时 7z 拿不到源文件的 mtime，就把**压缩的那一刻**写进成员的
-    /// kMTime。归档尾部的头存在最后一卷里，而它的 CRC 又记在第 1 卷的签名头里——于是两次压缩的
-    /// 第 1 卷和最后一卷都不同。把第 1 卷取自上一次尝试、其余取自这一次，就是逐卷 if-missing 上传
-    /// 重试时云上真会出现的那族卷。
+    /// Measured (7-Zip 26.00): when stdin is a pipe, 7z cannot get the source file's mtime, so it writes **the moment
+    /// of compression** into the member's kMTime. The trailing header lives in the last volume, and its CRC is
+    /// recorded in the signature header of volume 1 — so between two compressions both volume 1 and the last volume
+    /// differ. Taking volume 1 from the previous attempt and the rest from this one is exactly the family of volumes that really shows up in the cloud when a per-volume if-missing upload is retried.
     /// </para>
     /// <para>
-    /// 若某天换了个 7z 让这条路也确定了，这个测试会红——那是好消息，不是回归：改成
-    /// <see cref="AssertVolumesIdentical"/> 即可，清残留那一笔仍然是对的（它同时挡着跨轮残留，
-    /// 那一层跟确不确定无关）。
+    /// If some day a different 7z makes this path deterministic too, this test will go red — that is good news, not a
+    /// regression: switch it to <see cref="AssertVolumesIdentical"/> and the leftover-clearing stays correct (it also
+    /// guards against leftovers across runs, a layer that has nothing to do with determinism).
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -127,7 +130,7 @@ public sealed class SevenZipDeterminismTests : IDisposable
             return r.VolumeFiles;
         }
 
-        // 两次之间隔开一秒：时间戳若进了归档，1 秒的分辨率足以让它露出来。
+        // A second between the two runs: if a timestamp made it into the archive, one-second resolution is enough to expose it.
         var first = await Once("blob1");
         await Task.Delay(1100);
         var second = await Once("blob2");
@@ -138,13 +141,13 @@ public sealed class SevenZipDeterminismTests : IDisposable
         var differing = Enumerable.Range(0, first.Count)
             .Where(i => !File.ReadAllBytes(first[i]).AsSpan().SequenceEqual(File.ReadAllBytes(second[i])))
             .ToList();
-        Assert.NotEmpty(differing);   // 不确定：这正是不能早退的理由
+        Assert.NotEmpty(differing);   // non-deterministic: precisely why we cannot bail out early
 
-        // 两族卷各自都是好的——坏的只是把它们混起来。
+        // Each family of volumes is fine on its own — what is broken is mixing them.
         Assert.Equal(payload.Length, await ExtractedLength(compressor, first[0]));
         Assert.Equal(payload.Length, await ExtractedLength(compressor, second[0]));
 
-        // 混装：第 1 卷来自上一次尝试，其余来自这一次（if-missing 重传时云上就是这样）。
+        // Mixed set: volume 1 from the previous attempt, the rest from this one (exactly what the cloud holds on an if-missing retry).
         var mixed = Path.Combine(_dir, "mixed");
         Directory.CreateDirectory(mixed);
         for (var i = 0; i < first.Count; i++)
@@ -152,7 +155,7 @@ public sealed class SevenZipDeterminismTests : IDisposable
 
         var boom = await Record.ExceptionAsync(() =>
             ExtractedLength(compressor, Path.Combine(mixed, Path.GetFileName(first[0]))));
-        Assert.NotNull(boom); // 索引会说它好好的，7z 说打不开——这就是静默的数据损坏
+        Assert.NotNull(boom); // the index says it is perfectly fine, 7z says it cannot be opened — this is silent data corruption
     }
 
     private static async Task<long> ExtractedLength(SevenZipCompressor compressor, string firstVolume)

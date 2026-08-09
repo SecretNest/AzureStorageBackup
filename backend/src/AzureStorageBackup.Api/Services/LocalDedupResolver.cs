@@ -3,50 +3,55 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>已存在的单文件 data blob：实际存储名 + 是否原始字节 + 分卷数 + 各分卷尺寸。</summary>
+/// <summary>An existing single-file data blob: actual storage name + whether it is raw bytes + volume count + each volume's size.</summary>
 public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
 
 /// <summary>
-/// 一份"云上已经确认存在、但还没进任何版本索引"的内容：内容身份 + 它落在哪。
+/// A piece of content that is "already confirmed to exist in the cloud but not yet in any version index": its content
+/// identity plus where it landed.
 /// <para>
-/// 来源只有一个——上一轮（或上几轮）留下、本轮采纳的 journal。这些块与既有版本索引里的块
-/// 处境完全相同（云端确认过、地址已占用），差别只在于记着它们的是 journal 而不是索引，
-/// 所以要一并喂进 <see cref="LocalDedupResolver.Build"/>，让去重、碰撞避让、预筛三处
-/// 都看得见它们。看不见的后果不是"多传一遍"那么轻——见 Build 上的说明。
+/// There is exactly one source — a journal left by the previous run (or a few runs back) and adopted by this one.
+/// These blocks are in exactly the same situation as blocks in an existing version index (confirmed in the cloud,
+/// address already taken); the only difference is that it is a journal recording them rather than an index,
+/// so they must be fed into <see cref="LocalDedupResolver.Build"/> as well, so that dedup, collision avoidance and the
+/// prescreen can all three see them. The consequence of not seeing them is nowhere near as mild as "upload it again" — see the notes on Build.
 /// </para>
 /// </summary>
 public sealed record ConfirmedBlob(
     string FullHash, long Length, string HeadHash, string TailHash, ResolvedBlob Blob);
 
 /// <summary>
-/// 某个既有 pack 里的一个成员。新条目指向它即完成去重——不压、不传、不装箱。
+/// One member inside some existing pack. A new entry pointing at it completes dedup — no compression, no upload, no packing.
 /// <para>
-/// <paramref name="EntryName"/> 是**最初存进去时**那个路径（归档内的成员名），与现在引用它的
-/// 路径可以不同：内容一样、路径不同，正是要去重的那种情形。还原按这个名字从归档里取成员，
-/// 写到索引条目自己的 Path 上。
+/// <paramref name="EntryName"/> is the path **as it was first stored** (the member name inside the archive), which may
+/// differ from the path referencing it now: same content, different path, which is exactly the case dedup exists for.
+/// Restore pulls the member out of the archive by this name and writes it to the index entry's own Path.
 /// </para>
 /// </summary>
 public sealed record PackMemberRef(string PackId, string EntryName, string? TailHash);
 
 /// <summary>
-/// 纯本地的单文件 blob 去重/碰撞解析（不读云端）。自建备份的本地缓存索引已含每个 blob 的
-/// 内容身份（fullHash+长度+head+tail）与存储信息，故去重、碰撞避让、分卷数、raw 均可从本地判定。
+/// Purely local single-file blob dedup / collision resolution (no cloud reads). The self-hosted backup's local cache
+/// index already holds every blob's content identity (fullHash + length + head + tail) and its storage info, so dedup,
+/// collision avoidance, volume count and raw can all be decided locally.
 /// <para>
-/// 跨版本：查保留版本索引建的「内容身份 → 既有 blob」映射。
-/// 同一次备份内：用运行内预约表（每个 ref 一个 <see cref="TaskCompletionSource{T}"/>）协调——
-/// 同内容的后到者等首个上传者完成后拿到同一 (ref, raw, 分卷数)，不同内容撞同址则避让到 …~N。
+/// Across versions: look up the "content identity → existing blob" map built from the retained version indexes.
+/// Within one backup run: coordinate through the in-run reservation table (one
+/// <see cref="TaskCompletionSource{T}"/> per ref) — a latecomer with the same content waits for the first uploader to
+/// finish and gets the same (ref, raw, volume count); different content landing on the same address steps aside to …~N.
 /// </para>
-/// 信任本地索引＝云端真相（与"尽量不读云端"设计一致）；云端被外部改动由检查(Check)负责发现。
+/// Trusting the local index = the cloud truth (consistent with the "read the cloud as little as possible" design);
+/// external modification of the cloud is for Check to discover.
 /// </summary>
 public sealed class LocalDedupResolver
 {
     private readonly BlobAddressScheme _addressing;
-    private readonly IReadOnlyDictionary<string, ResolvedBlob> _priorByContent; // 内容身份 → 既有 blob（跨版本）
-    private readonly IReadOnlyDictionary<string, string> _priorRefs;            // 已占用 ref → 其内容身份（碰撞避让）
+    private readonly IReadOnlyDictionary<string, ResolvedBlob> _priorByContent; // content identity → existing blob (across versions)
+    private readonly IReadOnlyDictionary<string, string> _priorRefs;            // ref already taken → its content identity (collision avoidance)
     private readonly ConcurrentDictionary<string, Reservation> _run = new(StringComparer.Ordinal);
-    private readonly IReadOnlySet<string> _priorHeads;                                  // 预筛：既有内容的 "长度\nhead"
-    private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // 预筛：本轮已开工的
-    // 打包成员的内容身份（三项）→ 它躺在哪个包的哪个成员上。见 TryFindPackMember 上的说明。
+    private readonly IReadOnlySet<string> _priorHeads;                                  // prescreen: existing content's "length\nhead"
+    private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // prescreen: what this run has started on
+    // A pack member's content identity (three fields) → which member of which pack it sits on. See the notes on TryFindPackMember.
     private readonly IReadOnlyDictionary<string, PackMemberRef> _packMembers;
 
     private LocalDedupResolver(
@@ -64,11 +69,13 @@ public sealed class LocalDedupResolver
     }
 
     /// <summary>
-    /// 本轮**可能**存在同内容的既有 blob 吗？只看长度 + head hash，因此不必读完整个文件就能回答。
+    /// Might there **possibly** be an existing blob with the same content this round? It only looks at length + head
+    /// hash, so it can answer without reading the whole file.
     /// <para>
-    /// 流式压缩要压完才知道全文 hash，"先算全文 hash 再判去重"等于把文件多读一遍。这个预筛让
-    /// 首次备份（一个候选都没有）直接走一遍读的快路径，只有真有候选时才付那一遍。
-    /// 宁可误报也绝不漏报：误报只是多读一遍，漏报会让一份本可以整个跳过的内容被白压一遍。
+    /// Streaming compression only knows the full-content hash once compression is done, so "compute the full hash
+    /// first, then decide on dedup" means reading the file one extra time. This prescreen lets a first backup (not one
+    /// candidate anywhere) take the single-read fast path, and only pays for that extra pass when candidates really exist.
+    /// Better a false positive than a miss: a false positive only costs one extra read, whereas a miss makes content that could have been skipped entirely get compressed for nothing.
     /// </para>
     /// </summary>
     public bool MayDeduplicate(long length, string headHash)
@@ -77,34 +84,38 @@ public sealed class LocalDedupResolver
         return _priorHeads.Contains(key) || _runHeads.ContainsKey(key);
     }
 
-    /// <summary>登记本轮已开工的内容（长度 + head）：后到的同内容文件据此走预筛慢路径，
-    /// 先查一次而不是白压一遍。</summary>
+    /// <summary>Registers content this run has already started on (length + head): on the strength of this, a later
+    /// file with the same content takes the prescreen's slow path, looking it up once rather than compressing it for nothing.</summary>
     public void NoteInFlight(long length, string headHash) => _runHeads.TryAdd(HeadKey(length, headHash), 0);
 
-    /// <summary>只查跨版本映射，**不**占用 ref、不产生预约。给"先探一次、命中就完全不压"的预筛路径用；
-    /// 真要上传时仍须走 <see cref="ResolveAsync"/> 拿预约。</summary>
+    /// <summary>Only consults the cross-version map; it does **not** take a ref and creates no reservation. For the
+    /// prescreen path of "probe once, and on a hit skip compression entirely"; an actual upload must still go through <see cref="ResolveAsync"/> to get a reservation.</summary>
     public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
         _priorByContent.GetValueOrDefault(ContentKey(fullHash, length, headHash, tailHash));
 
     private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
     /// <summary>
-    /// 从保留版本的第二级索引构建映射（单文件 blob 走内容寻址；pack 成员另建一张表，见下）。
+    /// Builds the maps from the retained versions' second-level indexes (single-file blobs use content addressing;
+    /// pack members get a separate table, see below).
     /// </summary>
     /// <param name="confirmed">
-    /// 采纳来的 journal 里那些"云上确认过、索引里还没有"的块（<see cref="ConfirmedBlob"/>）。
+    /// The blocks in an adopted journal that are "confirmed in the cloud but not yet in the index" (<see cref="ConfirmedBlob"/>).
     /// <para>
-    /// **必须喂进来**，否则不只是多传一遍那么轻。恢复是按**路径**认账的：上一轮传完了 A 就挂起，
-    /// 还没走到与 A 同内容的 B。本轮 A 直接复用不再上传，B 却认不出自己已经有了，于是重压一遍，
-    /// 再 ResolveAsync 拿到**同一个** ref（内容寻址，同内容必同址），接着
-    /// <c>UploadStagedBlobAsync</c> 先调 <c>ClearLeftoverVolumesAsync</c> 把那个 ref 名下的分卷
-    /// 全删掉再重传——而 A 的索引条目正指着它们。这个删了再传的窗口里一旦被 Stop now 打断或
-    /// 进程崩掉，云上就只剩半套分卷，下一轮采纳 journal 时 A 照样复用、照样提交索引，
-    /// 指向的却是一份缺卷的内容。错要到还原或检查时才看得见。
+    /// **They must be fed in**, and not merely to avoid one extra upload. Resume accounts by **path**: the previous run
+    /// finished uploading A and then suspended, before it reached B, which has the same content as A. This run reuses A
+    /// directly without uploading, but B does not recognise that it already exists, so it recompresses, then
+    /// ResolveAsync hands it the **same** ref (content addressing: same content, same address), and then
+    /// <c>UploadStagedBlobAsync</c> first calls <c>ClearLeftoverVolumesAsync</c> to delete every volume under that ref
+    /// before re-uploading — and A's index entry is pointing at exactly those. If that delete-then-upload window is
+    /// interrupted by Stop now or by a process crash, only half a set of volumes is left in the cloud, and the next run
+    /// adopting the journal reuses A as usual and commits the index as usual,
+    /// pointing at content that is missing volumes. The error only becomes visible at restore or check time.
     /// </para>
     /// <para>
-    /// 喂进来之后 B 走的是跨版本去重那条路：既不重压也不重传，那批分卷根本没有被碰的机会。
-    /// 一并进 <c>refs</c>（不同内容撞上这个地址时照常避让到 …~N）和预筛集。
+    /// Once they are fed in, B takes the cross-version dedup path: neither recompressed nor re-uploaded, and that set
+    /// of volumes never gets the chance to be touched. They also go into <c>refs</c> (different content landing on this
+    /// address still steps aside to …~N) and into the prescreen set.
     /// </para>
     /// </param>
     public static LocalDedupResolver Build(
@@ -122,17 +133,21 @@ public sealed class LocalDedupResolver
                 if (e.FullHash is null)
                     continue;
 
-                // 打包成员：内容已经躺在某个既有 pack 里，新文件同内容时直接指过去，不必再装一箱。
-                // 同一箱内的重复本来就被 7z 的 solid 归档消掉了（字典跨成员匹配），真正省下来的是
-                // **跨箱、跨版本**那部分——不同箱之间压缩不共享字典，同一份内容会实打实地存两遍。
+                // Pack member: the content already sits inside some existing pack, so a new file with the same content
+                // points straight at it instead of packing another box. Duplicates within one pack are already
+                // eliminated by 7z's solid archive (the dictionary matches across members); what this really saves is
+                // the **cross-pack, cross-version** part — separate packs do not share a compression dictionary, so the
+                // same content really would be stored twice.
                 if (e.Storage is { Kind: "pack" } p)
                 {
                     if (e.HeadHash is not null)
                     {
-                        // 多个保留版本可能各有一条同内容成员。**指向**取最先遇到的（版本从旧到新
-                        // 传入）：引用聚到老包上，它就更不容易在死重压实里被重写。
-                        // 取最先遇到的（版本从旧到新传入）：引用聚到老包上，它就更不容易在
-                        // 死重压实里被重写。同内容的更新版本条目指向的是同一份内容，谁都行。
+                        // Several retained versions may each hold a member with the same content. The **reference**
+                        // takes the first one encountered (versions are passed in oldest to newest): references pile
+                        // onto the old pack, where dead-weight compaction is less likely to rewrite it.
+                        // Take the first one encountered (versions passed in oldest to newest): references pile onto the
+                        // old pack, where dead-weight compaction is less likely to rewrite it. Newer-version entries
+                        // with the same content point at the same content anyway, so any of them will do.
                         packMembers.TryAdd(
                             PackMemberKey(e.FullHash, e.Length, e.HeadHash),
                             new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));
@@ -145,16 +160,17 @@ public sealed class LocalDedupResolver
                 var ck = ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
                 byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
                 refs[s.Ref] = ck;
-                // HeadHash 为 null 的老条目不进预筛集：它们的内容身份里 head 也是 null，
-                // 和任何一个算得出 head 的新文件都对不上，本来就不可能命中去重。
+                // Old entries whose HeadHash is null do not join the prescreen set: head is null in their content
+                // identity too, so they match no new file that can compute a head, and could never have hit dedup anyway.
                 if (e.HeadHash is not null)
                     heads.Add(HeadKey(e.Length, e.HeadHash));
             }
         }
         foreach (var c in confirmed ?? [])
         {
-            // TryAdd 而不是覆盖：已经提交进版本索引的那份说了算。两边真撞上（同内容身份）时
-            // 记的本来就是同一个 ref，谁赢都一样；不一样的只可能是索引更权威的那种情形。
+            // TryAdd rather than overwrite: the copy already committed to a version index has the last word. When the
+            // two really do collide (same content identity) they record the same ref anyway, so it makes no difference
+            // who wins; the only way they differ is the case where the index is the more authoritative one.
             var ck = ContentKey(c.FullHash, c.Length, c.HeadHash, c.TailHash);
             byContent.TryAdd(ck, c.Blob);
             refs.TryAdd(c.Blob.Ref, ck);
@@ -164,17 +180,20 @@ public sealed class LocalDedupResolver
     }
 
     /// <summary>
-    /// 这份内容是不是已经在某个既有 pack 里。命中即可让新条目直接指过去——不压、不传、不装箱。
+    /// Whether this content is already inside some existing pack. A hit lets a new entry point straight at it — no
+    /// compression, no upload, no packing.
     /// <para>
-    /// 判据与单文件 blob 那条路**一致**：fullHash + 长度 + head + tail 四项全等。两条路各有一套
-    /// 标准是说不通的——同样是"这份内容已经有了"的判断，同样是判错就让索引指向别人的内容、
-    /// 还原时出来错误数据。
+    /// The criterion is **the same** as on the single-file blob path: fullHash + length + head + tail, all four equal.
+    /// Two different standards on the two paths would make no sense — both are the judgement "this content already
+    /// exists", and getting either wrong points the index at somebody else's content and produces wrong data at restore
+    /// time.
     /// </para>
     /// <para>
-    /// 四项**严格**相等，缺失也算不等。曾经放宽成"两边都有才比"，为的是让老索引里那些没有尾部
-    /// 的打包成员也能参与去重；那个放宽已经撤掉——判据要么是四项要么不是，为兼容开个口子，
-    /// 等于在最不该含糊的地方（"这份内容是不是同一份"）留了一档说不清的语义。
-    /// 新写的条目都带着尾部，老条目不参与去重而已，代价只是它们那份内容会被再存一次。
+    /// All four **strictly** equal; missing counts as unequal too. This was once relaxed to "only compare when both
+    /// sides have one", so that pack members in old indexes without a tail could take part in dedup too; that
+    /// relaxation is gone — the criterion is either all four fields or it is not, and opening a compatibility loophole
+    /// leaves a fuzzy semantic in the very place that must least of all be fuzzy ("is this the same content").
+    /// Newly written entries all carry a tail; old entries merely do not take part in dedup, and the price is only that their content gets stored one more time.
     /// </para>
     /// </summary>
     public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
@@ -186,16 +205,17 @@ public sealed class LocalDedupResolver
     private static string PackMemberKey(string fullHash, long length, string head) =>
         $"{fullHash}\n{length}\n{head}";
 
-    /// <summary>解析某内容：命中既有 → 去重；否则占一个空 ref 由调用方上传，完成后回填 (raw, 分卷数)。</summary>
-    /// <param name="tracker">可选的进度记账。同批同内容时后到者要等首个上传者**整件**传完——
-    /// 那可能是几分钟，而这段等待发生在压缩之后、上传之前，屏幕上既没有流在传也没有件在压。
-    /// 不标出来的话，界面上就是一片纹丝不动，连"在等谁"都无从说起。</param>
+    /// <summary>Resolves a piece of content: a hit on something existing → dedup; otherwise claim a free ref for the caller to upload, and fill in (raw, volume count) once done.</summary>
+    /// <param name="tracker">Optional progress bookkeeping. Within one run, a latecomer with the same content has to
+    /// wait for the first uploader to finish the **whole item** — that can be minutes, and the wait falls after
+    /// compression and before upload, with neither a stream uploading nor an item compressing on screen.
+    /// Without marking it, the UI is simply frozen solid, with no way even to say who is being waited on.</param>
     public async Task<Resolution> ResolveAsync(
         string fullHash, long length, string headHash, string tailHash, StageTracker? tracker = null)
     {
         var ck = ContentKey(fullHash, length, headHash, tailHash);
         if (_priorByContent.TryGetValue(ck, out var prior))
-            return Resolution.ForExisting(prior, collision: false); // 跨版本去重
+            return Resolution.ForExisting(prior, collision: false); // cross-version dedup
 
         var baseAddr = _addressing.DataAddress(fullHash);
         for (var n = 0; ; n++)
@@ -206,39 +226,43 @@ public sealed class LocalDedupResolver
             if (_priorRefs.TryGetValue(refName, out var priorCk))
             {
                 if (priorCk != ck)
-                    continue;                                     // 旧版本不同内容占此址 → 避让
-                return Resolution.ForExisting(                     // 理论上已被 _priorByContent 命中，稳妥兜底
+                    continue;                                     // an older version's different content holds this address → step aside
+                return Resolution.ForExisting(                     // in theory _priorByContent already hit; a safe backstop
                     new ResolvedBlob(refName, false, 1, []), collision);
             }
 
-            // 同一个地址上可能要试不止一次，所以这里再套一层循环——原委见下面 TryGetValue 落空那一支。
+            // The same address may need more than one attempt, hence the extra loop here — the reason is in the TryGetValue-misses branch below.
             while (true)
             {
-                // 占位失败后要能把这个 ref 让出来（见 Reservation.Fail）：Task 7 的闸门会把上传失败的
-                // 活原样重试，重试时还是同一个内容身份，会再走到这里——占位若不撤，重试者会撞上
-                // 这个已经失败的占位，`held.ContentKey == ck` 命中后直接等一个永远失败的 Completion，
-                // 原样重放同一个异常，永远等不到真正的第二次上传尝试。
+                // A failed claim has to be able to give this ref back (see Reservation.Fail): Task 7's gate retries a
+                // failed upload as the same work item, and the retry still carries the same content identity, so it
+                // comes back here — if the claim were not withdrawn, the retrier would run into this already-failed
+                // claim, match on `held.ContentKey == ck` and wait on a Completion that never succeeds, replaying the
+                // same exception forever and never reaching a real second upload attempt.
                 Reservation? mine = null;
                 mine = new Reservation(ck, () =>
                     ((ICollection<KeyValuePair<string, Reservation>>)_run)
                         .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
                 if (_run.TryAdd(refName, mine))
-                    return Resolution.ForClaim(refName, collision, mine); // 由我上传
+                    return Resolution.ForClaim(refName, collision, mine); // I will do the upload
 
-                // 这里**不能**用索引器 `_run[refName]`。从前它是全的：预约一旦落表就永不移除。
-                // 而"上传失败让出 ref"正是本功能刚加的一笔（见上），于是从上面 TryAdd 判失败到
-                // 这一句之间，持有者完全可能已经在**另一个线程**上失败并把这条记录撤走——索引器
-                // 就此抛 KeyNotFoundException。它不在 TransientErrors 的瞬时判据里，闸门接不住，
-                // 整轮备份直接判死；而它偏偏只在失败风暴里出现（多个工作者、同一份内容、失败与
-                // 查表挤在一起），也就是闸门最该起作用的那一刻。
+                // The indexer `_run[refName]` **must not** be used here. It used to be total: once a reservation landed
+                // in the table it was never removed. But "give the ref back on upload failure" is exactly what this
+                // feature just added (see above), so between the failed TryAdd above and this line the holder may well
+                // have failed on **another thread** and pulled that record — at which point the indexer throws
+                // KeyNotFoundException. It is not among TransientErrors' transient criteria, the gate cannot catch it,
+                // and the whole backup run is declared dead; and it shows up only in a failure storm (several workers,
+                // the same content, failures and table lookups crowded together), which is exactly the moment the gate
+                // is most needed.
                 if (!_run.TryGetValue(refName, out var held))
-                    continue;   // 持有者刚撤了占位 → **原地**重抢这同一个地址
+                    continue;   // the holder just withdrew its claim → re-contend for this same address **in place**
 
-                // 落空时绝不能 continue 到外层（换下一个候选地址 …~N）：那不是碰撞，
-                // 却会照碰撞报一条 "Hash collision avoided"，还白占一个避让地址。
+                // On a miss it must never continue to the outer loop (moving to the next candidate address …~N): that
+                // is not a collision, yet it would report a "Hash collision avoided" as if it were, and burn a
+                // step-aside address for nothing.
                 if (held.ContentKey == ck)
                 {
-                    // 同批同内容 → 等首个上传者。等的是它**整件**传完，不是一卷。
+                    // Same content in the same run → wait for the first uploader. Wait for its **whole item** to finish, not one volume.
                     tracker?.BeginWait(UploadWait.Peer);
                     try
                     {
@@ -249,18 +273,18 @@ public sealed class LocalDedupResolver
                         tracker?.EndWait(UploadWait.Peer);
                     }
                 }
-                break; // 同批不同内容占此址 → 避让到下一个
+                break; // different content in the same run holds this address → step aside to the next one
             }
         }
     }
 
-    /// <summary>内容身份的拼法：fullHash + 长度 + head + tail 四项。
-    /// 公开是为了让本轮内的打包成员去重（<see cref="PackAliasTable"/>）用**同一个**拼法——
-    /// 两条路各拼各的，迟早会在某一次改动里悄悄走岔，而走岔的后果是索引指向别人的内容。</summary>
+    /// <summary>How a content identity is composed: fullHash + length + head + tail, all four.
+    /// It is public so that in-run pack member dedup (<see cref="PackAliasTable"/>) uses the **same** composition —
+    /// let the two paths each compose their own and sooner or later some change makes them quietly diverge, and diverging means the index points at somebody else's content.</summary>
     public static string ContentKey(string fullHash, long length, string? head, string? tail) =>
         $"{fullHash}\n{length}\n{head}\n{tail}";
 
-    /// <summary>运行内某 ref 的预约：内容身份 + 上传完成信号。</summary>
+    /// <summary>An in-run reservation for a ref: content identity + upload-completion signal.</summary>
     internal sealed class Reservation(string contentKey, Action release)
     {
         private readonly TaskCompletionSource<ResolvedBlob> _tcs =
@@ -271,10 +295,12 @@ public sealed class LocalDedupResolver
         public void Complete(string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
             _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes, volumeSizes));
 
-        /// <summary>上传失败：先唤醒已经在等的同批同内容后到者（他们绝不该去重到一个没传成功的 blob，
-        /// 这一半行为不变），再把这个 ref 的占位从预约表撤掉——让接下来同内容身份的新一轮
-        /// ResolveAsync（不论是 Task 7 闸门发起的整件重试，还是巧合的下一个同内容文件）能重新
-        /// 占坑、真正再传一次，而不是撞上一个已经判死的占位、原样重放这同一个异常。</summary>
+        /// <summary>Upload failed: first wake the latecomers already waiting on the same content in this run (they must
+        /// never dedup onto a blob that was not uploaded successfully — that half of the behaviour is unchanged), then
+        /// withdraw this ref's claim from the reservation table, so that the next round of ResolveAsync for the same
+        /// content identity (whether a whole-item retry driven by Task 7's gate, or just the next same-content file by
+        /// coincidence) can claim it afresh and really upload a second time, instead of running into an already-dead
+        /// claim and replaying this very same exception.</summary>
         public void Fail(Exception ex)
         {
             _tcs.TrySetException(ex);
@@ -282,7 +308,7 @@ public sealed class LocalDedupResolver
         }
     }
 
-    /// <summary>解析结果：去重命中(Exists) 或 需上传的占位(Claim)。</summary>
+    /// <summary>The resolution result: a dedup hit (Exists) or a claim that needs uploading (Claim).</summary>
     public sealed class Resolution
     {
         private readonly Reservation? _reservation;
@@ -307,11 +333,11 @@ public sealed class LocalDedupResolver
         internal static Resolution ForClaim(string @ref, bool collision, Reservation reservation) =>
             new(@ref, collision, exists: false, null, reservation);
 
-        /// <summary>上传成功后调用，供同批同内容的后到者拿到相同存储信息。</summary>
+        /// <summary>Called after a successful upload, so latecomers with the same content in this run get the same storage info.</summary>
         public void Complete(bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
             _reservation?.Complete(Ref, raw, volumes, volumeSizes);
 
-        /// <summary>上传失败时调用，令等待的后到者一并失败（不会错误去重到不存在的 blob）。</summary>
+        /// <summary>Called when the upload fails, making the waiting latecomers fail with it (so they never wrongly dedup onto a blob that does not exist).</summary>
         public void Fail(Exception ex) => _reservation?.Fail(ex);
     }
 }

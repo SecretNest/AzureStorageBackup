@@ -3,13 +3,15 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 归档里的权限位可能是 0。7-Zip 23.01（Debian 的 p7zip 同样）从 stdin 压缩（<c>-si</c>）时
-/// 把属性写成 0，解出来的文件是 <c>----------</c>——单文件 blob 走的正是这条路，于是还原、
-/// 深度检查、重打包全都读不了自己刚解出来的东西，而备份当时一切正常、检查（流式比对，不落盘）
-/// 也报绿：只有还原才暴露。
+/// The permission bits inside an archive can be 0. 7-Zip 23.01 (and Debian's p7zip just the same) writes the
+/// attributes as 0 when compressing from stdin (<c>-si</c>), so the extracted file comes out <c>----------</c> — and
+/// the single-file blob path is exactly this one, so restore, deep check and repack all fail to read what they just
+/// extracted themselves, while the backup looked fine at the time and the check (streaming comparison, never touching
+/// disk) reported green as well: only a restore exposes it.
 /// <para>
-/// 属性写死在归档里，换新版 7z 解压救不回来（23.01 建的归档由 26.00 解压依然是 000），
-/// 所以用一个 23.01 产出的归档做固件把这件事钉死——本机装的是哪个 7z 版本都不影响这组测试。
+/// The attributes are baked into the archive, and extracting with a newer 7z does not rescue them (an archive built by
+/// 23.01 still comes out 000 when extracted by 26.00), so an archive produced by 23.01 is used as a fixture to nail
+/// this down — whichever 7z version is installed on this machine makes no difference to these tests.
 /// </para>
 /// </summary>
 public sealed class ZeroAttributeArchiveTests : IDisposable
@@ -18,7 +20,7 @@ public sealed class ZeroAttributeArchiveTests : IDisposable
 
     public void Dispose()
     {
-        // 解压出来的东西可能没有权限位，先补回来再删，否则连清理都做不了。
+        // What was extracted may carry no permission bits, so patch them back before deleting, or even the cleanup cannot run.
         if (!OperatingSystem.IsWindows() && Directory.Exists(_dir))
         {
             foreach (var p in Directory.EnumerateFileSystemEntries(_dir, "*", SearchOption.AllDirectories))
@@ -42,7 +44,7 @@ public sealed class ZeroAttributeArchiveTests : IDisposable
 
         var extracted = Path.Combine(_dir, "deep", "dir", "payload.txt");
         Assert.True(File.Exists(extracted));
-        // 修复之前这一行抛 UnauthorizedAccessException——归档里的属性是 0，7z 忠实照搬。
+        // Before the fix this line threw UnauthorizedAccessException — the attributes in the archive are 0, and 7z faithfully copies them over.
         Assert.Equal("zero-attribute payload", File.ReadAllText(extracted));
     }
 
@@ -55,7 +57,7 @@ public sealed class ZeroAttributeArchiveTests : IDisposable
         var compressor = new SevenZipCompressor();
         await compressor.ExtractAsync(Fixture("zero-attr-si.7z"), _dir, password: null);
 
-        // 补的是"我自己读得了"，不是"谁都读得了"：解压区里可能躺着别人的私有文件。
+        // What is granted is "I can read it myself", not "anyone can read it": someone else's private files may be lying in the extraction area.
         var mode = File.GetUnixFileMode(Path.Combine(_dir, "deep", "dir", "payload.txt"));
         Assert.Equal(UnixFileMode.UserRead, mode & UnixFileMode.UserRead);
         Assert.Equal(UnixFileMode.None, mode & (UnixFileMode.GroupRead | UnixFileMode.OtherRead));

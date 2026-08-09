@@ -9,9 +9,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// `Backup__SevenZipMethodArgs` 让运维按自己机器的 CPU/内存换压缩算法、缩字典、限线程。
-/// 光测 <see cref="SevenZipCompressor"/> 这个类不够——真正会坏的是**配置绑定那一环**：
-/// 键名写错就静默回到 -mx9，设置看着生效其实没有。这里从 Program.cs 的实际装配里取实例来断言。
+/// `Backup__SevenZipMethodArgs` lets an operator change the compression algorithm, shrink the dictionary and cap threads to suit their own machine's CPU/memory.
+/// Testing the <see cref="SevenZipCompressor"/> class alone is not enough — the link that actually breaks is **configuration binding**:
+/// misspell the key and it silently falls back to -mx9, so the setting looks like it took effect when it did not. Here the instance is taken from Program.cs's real wiring to assert on.
 /// </summary>
 public sealed class SevenZipMethodArgsConfigTests
 {
@@ -66,14 +66,14 @@ public sealed class SevenZipMethodArgsConfigTests
     }
 
     /// <summary>
-    /// 写错的值必须**在启动时**就把应用打下来。DI 工厂是懒的，若拖到第一次备份才炸，
-    /// 用户看到的是「装好了、能用」，直到某天夜里的计划备份失败——而这台机器在 NAS 上，
-    /// 用户拿不到命令行去看是哪儿错了。
+    /// A malformed value must bring the application down **at startup**. The DI factory is lazy, and if this were put
+    /// off until the first backup blew up, what the user sees is "installed and working" until some night's scheduled
+    /// backup fails — and this machine is a NAS, where the user has no command line to go and find out what went wrong.
     /// </summary>
     [SkippableTheory]
-    [InlineData("-o/tmp/evil")] // 不是方法开关：会改写解压输出位置
-    [InlineData("-mx9 -y")]     // 混进了非 -m 开关
-    [InlineData("-m")]          // 光一个 -m，没有内容
+    [InlineData("-o/tmp/evil")] // not a method switch: it would rewrite the extraction output location
+    [InlineData("-mx9 -y")]     // a non -m switch mixed in
+    [InlineData("-m")]          // just -m, with nothing after it
     public void A_Bad_Value_Fails_At_Startup_Not_Mid_Backup(string bad)
     {
         Skip.IfNot(SevenZipCli.TryResolveExecutable() is not null, "7z not found");

@@ -5,29 +5,30 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>清理选项：保留策略 + 死重压实所需的数据 tier / 分卷 / 阈值。</summary>
+/// <summary>Cleanup options: the retention policy plus the data tier / volume size / threshold that dead-weight compaction needs.</summary>
 public sealed record CleanupOptions
 {
     public required RetentionPolicy Retention { get; init; }
     public AccessTier DataTier { get; init; } = AccessTier.Hot;
     public long? VolumeBytes { get; init; }
 
-    /// <summary>死重压实阈值（默认 30%，M4 §6）。</summary>
+    /// <summary>Dead-weight compaction threshold (30% by default, M4 §6).</summary>
     public double DeadWeightThreshold { get; init; } = 0.30;
 
-    /// <summary>本地源根：死重重 pack 时优先用本地文件补齐成员。</summary>
+    /// <summary>Local source root: when repacking for dead weight, members are filled in from local files first.</summary>
     public string? LocalRoot { get; init; }
 
-    /// <summary>本地缺失成员时是否允许下载云端 pack 补齐（按数据 tier 的开关，Archive 默认 false）。</summary>
+    /// <summary>Whether downloading the cloud pack is allowed to fill in members that are missing locally (a per-data-tier switch; false by default for Archive).</summary>
     public bool AllowRepackDownload { get; init; } = true;
 }
 
 /// <summary>
-/// 一次保留清理实际删掉了什么。清理从前是只做不说的：删了几个版本、腾出多少空间，做完就没人知道了。
+/// What a retention cleanup actually deleted. Cleanup used to do its work in silence: how many versions were retired and how much space was freed, nobody knew once it was over.
 /// <para>
-/// pack 与 data blob 分开计数，因为它们是两种不同的存储形态（一箱小文件 vs 单个大文件），
-/// 合成一个数字就看不出是哪一边在流转。两者都按**去重后的基名**计：一个分了卷的包在容器里是
-/// <c>packs/{id}.7z.001…NNN</c> 好几个对象，按对象数报会把一个包说成几十个。
+/// Packs and data blobs are counted separately, because they are two different storage shapes (a crate of small
+/// files vs. a single large file), and merging them into one number hides which side is churning. Both are counted
+/// by **deduplicated base name**: a split pack is several objects in the container,
+/// <c>packs/{id}.7z.001…NNN</c>, and reporting object counts would turn one pack into dozens.
 /// </para>
 /// </summary>
 public sealed record CleanupReport(int RetiredVersions, int DeletedPacks, int DeletedBlobs, long FreedBytes)
@@ -38,16 +39,17 @@ public sealed record CleanupReport(int RetiredVersions, int DeletedPacks, int De
 }
 
 /// <summary>
-/// 版本保留清理（M4 §10）：退役超期版本，删其第二级索引及不再被任何有效版本引用的 data blob/pack；
-/// 随后对仍存活但死重超阈值的 pack 做原地压实（§6，经 <see cref="DeadWeightCompactor"/>）。
-/// 编排器备份完成时与调度器的 Cleanup 任务共用。
+/// Version retention cleanup (M4 §10): retires expired versions and deletes their second-level indexes plus every
+/// data blob/pack no longer referenced by a live version; then compacts in place the still-live packs whose dead
+/// weight exceeds the threshold (§6, via <see cref="DeadWeightCompactor"/>).
+/// Shared by the orchestrator when a backup finishes and by the scheduler's Cleanup job.
 /// </summary>
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
     DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null,
     BackupJournalStore? journals = null)
 {
-    /// <summary>独立清理：自行读取信息文件（优先本地权威副本）。</summary>
+    /// <summary>Standalone cleanup: reads the info file itself (preferring the locally authoritative copy).</summary>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default,
         StagingArea.StagingLease? lease = null, bool sweepOrphans = false)
@@ -55,22 +57,24 @@ public sealed class RetentionCleaner(
         var info = trackedInfo is not null
             ? await trackedInfo.LoadAsync(account, container, password, ct)
             : await store.ReadInfoAsync(account, container, password, ct);
-        // 一个版本都没提交过的容器（第一轮备份被取消：data/ 里已经有块、还没有任何版本索引）
-        // 在这里直接返回，**即便调用方要求扫描**。判据的一半是"保留版本引用了什么"，而这半边
-        // 此刻根本读不出来：info 为 null 时连信息文件都没有，Versions 为空时无从证明列出来的块
-        // 是孤儿——把整个 data/ 当孤儿删掉，删的是用户真有的东西。
-        // 这批块另有两条正当归宿，都不经过这里：journal 还在时它保着（判据认 journal）；
-        // 而"配置删了又重建"那一支由**第一轮运行必扫**兜住（见 BackupRunControl.OpenJournalAsync），
-        // 那条路走的是下面那个重载——没有这道闸门，且跑在本轮版本提交之后，判据的两半都齐了。
+        // A container that has never committed a version (the first backup was cancelled: blocks already in data/,
+        // but not a single version index yet) returns right here, **even when the caller asked for a sweep**. Half of
+        // the criterion is "what the retained versions reference", and that half simply cannot be read at this
+        // moment: when info is null there is not even an info file, and when Versions is empty there is no way to
+        // prove the listed blocks are orphans — deleting all of data/ as orphans deletes something the user really has.
+        // These blocks have two other legitimate fates, neither of which comes through here: while the journal is
+        // still there it protects them (the criterion honours the journal); and the "config deleted and recreated"
+        // branch is caught by **the first run always sweeps** (see BackupRunControl.OpenJournalAsync), which takes
+        // the overload below — no gate like this one, and it runs after this round's version is committed, so both halves of the criterion are present.
         return info is not null && info.Versions.Count > 0
             ? await CleanupAsync(account, container, password, options, info, ct, lease, sweepOrphans)
             : CleanupReport.Empty;
     }
 
-    /// <summary>已持有信息文件时清理（编排器备份完成后调用）。</summary>
+    /// <summary>Cleanup when the info file is already in hand (called by the orchestrator after a backup finishes).</summary>
     /// <param name="lease">
-    /// 调用方的暂存席位，透传给死重压实。备份收尾顺带清理时要传**备份自己的**席位——
-    /// 另取一个会让均分的分母虚高，把并行的其它备份额度算小。
+    /// The caller's staging seat, passed straight through to dead-weight compaction. When a backup cleans up as it
+    /// wraps up it must pass **its own** seat — taking another one inflates the denominator of the even split and shrinks the quota computed for the other backups running in parallel.
     /// </param>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options,
@@ -80,10 +84,11 @@ public sealed class RetentionCleaner(
         var toDelete = retention.VersionsToDelete(
             info.Versions.Select(v => new VersionRef(v.Version, v.CreatedAt)).ToList(),
             options.Retention, DateTimeOffset.UtcNow);
-        // 从前这里是「没有版本退役 → 直接返回」。取消和挂起打破了这个前提：容器里会留下
-        // 「云上已有、索引里还没有」的完整块，而那种情形一个版本都不会退役。
-        // 但也不能无条件全扫——孤儿扫描要把 data/ 与 packs/ 两个前缀整个列一遍，
-        // 几十万对象的容器上这不是白干的，而绝大多数备份根本没有孤儿。
+        // This used to read "no version retired → return immediately". Cancellation and suspension broke that
+        // premise: the container can be left with complete blocks that are "already in the cloud, not yet in the
+        // index", and in that situation not a single version retires.
+        // But we cannot sweep unconditionally either — an orphan sweep lists both the data/ and packs/ prefixes in
+        // full, which on a container of hundreds of thousands of objects is not free work, and the vast majority of backups have no orphans at all.
         if (toDelete.Count == 0 && !sweepOrphans)
             return CleanupReport.Empty;
 
@@ -93,13 +98,14 @@ public sealed class RetentionCleaner(
         var identity = info.Backup.CreatedAt.UtcTicks;
         long freedBytes = 0;
 
-        // 删除退役版本的第二级索引（云端 + 本地缓存），并从信息文件移除。
+        // Delete the second-level index of each retired version (cloud + local cache) and remove it from the info file.
         foreach (var v in info.Versions.Where(v => deleted.Contains(v.Version)))
         {
             var indexBlob = container_.GetBlobClient(v.IndexBlob);
-            // 删之前先问一次尺寸。索引不是可以忽略不计的小东西——几十万条目的版本索引压出来能有
-            // 几十 MB，漏掉它会让"释放了多少空间"明显偏小。每个退役版本一次 HEAD，而退役版本
-            // 通常只有个位数，代价可以忽略。
+            // Ask for the size once before deleting. An index is not a negligibly small thing — a version index of a
+            // few hundred thousand entries can be tens of MB compressed, and missing it makes "how much space was
+            // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
+            // digit, so the cost is negligible.
             var indexBytes = await TrySizeOfAsync(indexBlob, ct);
             if ((await indexBlob.DeleteIfExistsAsync(cancellationToken: ct)).Value)
                 freedBytes += indexBytes;
@@ -108,14 +114,15 @@ public sealed class RetentionCleaner(
         }
         info.Versions.RemoveAll(v => deleted.Contains(v.Version));
 
-        // 收集剩余版本仍引用的 data blob、pack，以及每个 pack 仍有效的成员（供死重压实）。
+        // Collect the data blobs and packs the remaining versions still reference, plus the still-live members of each pack (for dead-weight compaction).
         //
-        // 这一段**每个保留版本各读一次索引**，孤儿扫描离不开它：不知道保留版本引用了什么，
-        // 就没法判断列出来的对象是不是孤儿。但代价要说实话——读的是本地权威副本
-        // （ILocalIndexCache，零云端流量），可 SQLite 里存的是序列化字节，命中也要把整份索引
-        // 重建成对象：本仓库实测 50 万条目的索引一次约 0.9 s / 350 MB 分配，而它上面那层
-        // 进程内 LRU（VersionIndexMemoryCache）默认只放 2 份。于是一份留着十几个版本的大备份，
-        // 每晚一次「独立清理」就要付十几秒 CPU 加几 GB 的临时分配——这是每晚扫一遍孤儿的真实价钱。
+        // This section **reads one index per retained version**, and the orphan sweep cannot do without it: without
+        // knowing what the retained versions reference there is no way to judge whether a listed object is an orphan.
+        // But be honest about the cost — what is read is the locally authoritative copy (ILocalIndexCache, zero cloud
+        // traffic), except SQLite stores serialized bytes, so even a hit has to rebuild the whole index back into
+        // objects: measured in this repo, a 500,000-entry index costs about 0.9 s / 350 MB of allocation per read,
+        // while the in-process LRU above it (VersionIndexMemoryCache) holds only 2 by default. So a large backup
+        // keeping a dozen-odd versions pays a dozen-odd seconds of CPU plus several GB of transient allocation for one nightly "standalone cleanup" — that is the real price of sweeping for orphans every night.
         var referencedBlobs = new HashSet<string>(StringComparer.Ordinal);
         var referencedPacks = new HashSet<string>(StringComparer.Ordinal);
         var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
@@ -136,7 +143,7 @@ public sealed class RetentionCleaner(
                         var members = liveByPack.TryGetValue(e.Storage.Ref, out var m)
                             ? m
                             : liveByPack[e.Storage.Ref] = new Dictionary<string, LivePackMember>(StringComparer.Ordinal);
-                        // 按 entryName 归组（pack 内唯一）：同内容不同路径去重成同 fullHash 但仍是两个成员，不可用 hash 作 key。
+                        // Group by entryName (unique within a pack): identical content at different paths dedups to the same fullHash but is still two members, so hash cannot be the key.
                         var entryName = e.Storage.EntryName ?? e.Path;
                         members[entryName] = new LivePackMember(entryName, e.Length, e.FullHash);
                     }
@@ -148,15 +155,15 @@ public sealed class RetentionCleaner(
             }
         }
 
-        // 判据的另一半：活动 journal 引用着的内容。它们云上有、索引里还没有，只有 journal
-        // 记着它们存在——删了就等于让下一轮恢复白跑，用户点 Resume 会发现要从头再传一遍。
+        // The other half of the criterion: content referenced by an active journal. It exists in the cloud but not yet
+        // in any index, and only the journal records that it exists — deleting it wastes the next resume, and the user who clicks Resume finds it all has to be uploaded again from scratch.
         var active = journals is not null
             ? await journals.LoadActiveRefsAsync(account.Id, container, ct)
             : ActiveJournalRefs.Empty;
 
-        // 删除不再被任何保留版本引用的 pack（含分卷 packs/{id}.7z.NNN，也清孤儿 pack）。枚举 packs/ 前缀按 packId 归组，
-        // 避免仅删基名漏删分卷（§7）；判据用「未被保留版本引用」，与 data blob 侧对称。
-        // 计数按基名去重（一个分了卷的包/blob 在容器里是好几个对象），释放字节则按对象逐个累加。
+        // Delete packs no longer referenced by any retained version (including volumes packs/{id}.7z.NNN, and orphan packs too). Enumerate the packs/ prefix grouped by packId,
+        // so deleting only the base name does not leave volumes behind (§7); the criterion is "not referenced by a retained version", symmetric with the data blob side.
+        // Counting deduplicates by base name (a split pack/blob is several objects in the container), while freed bytes are accumulated object by object.
         var deletedPacks = new HashSet<string>(StringComparer.Ordinal);
         var deletedBlobs = new HashSet<string>(StringComparer.Ordinal);
 
@@ -176,8 +183,8 @@ public sealed class RetentionCleaner(
         foreach (var packId in prunedFromInfo)
             info.Packs.Remove(packId);
 
-        // 删除不再被引用的 data blob（枚举 data/ 前缀）。分卷名 data/{hash}.NNN 归一化回基名后再比对，
-        // 避免误删仍被引用的分卷（§7、否则数据丢失）。
+        // Delete data blobs that are no longer referenced (enumerating the data/ prefix). Volume names data/{hash}.NNN are normalized back to the base name before comparing,
+        // so a still-referenced volume is not deleted by mistake (§7; otherwise data loss).
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", ct))
         {
             var baseRef = BaseRef(blob.Name);
@@ -190,32 +197,37 @@ public sealed class RetentionCleaner(
             }
         }
 
-        // 死重压实（§6）：对仍存活但死重超阈值的 pack 原地重压。**仅在真有版本退役时**才检查——
-        // 死重是"某个成员不再被任何保留版本引用"堆出来的，只有退役会让它增加。
+        // Dead-weight compaction (§6): recompress in place the still-live packs whose dead weight exceeds the
+        // threshold. Checked **only when a version really retired** — dead weight is piled up by "a member is no
+        // longer referenced by any retained version", and only retirement makes it grow.
         //
-        // 光是孤儿扫描（sweepOrphans 为真、却一个版本都没退役）绝不能把它带起来：压实失败或放弃时
-        // DeadWeightCompactor 只是把同一个 DeadBytes 写回去（见其 catch 与"本地缺失成员"分支），
-        // 下一轮的判断因此一模一样。挂在每晚一次的定时清理上，就是同一批包每晚下载、重压、重传一遍，
-        // 永远如此——而在此之前，这件事只在一次退役之后发生一次。
+        // An orphan sweep on its own (sweepOrphans true, yet not a single version retired) must never drag it along:
+        // when compaction fails or gives up, DeadWeightCompactor just writes the same DeadBytes back (see its catch
+        // and the "member missing locally" branch), so the next round's judgement comes out identical. Hung off a
+        // nightly scheduled cleanup, that means the same packs get downloaded, recompressed and re-uploaded every
+        // night, forever — whereas before this, it happened once after one retirement.
         if (compactor is not null && toDelete.Count > 0)
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
                 options.LocalRoot, options.AllowRepackDownload, ct, lease);
 
-        // 信息文件只在内容真的变了时才重写。变法只有两种：退役删掉了版本，或孤儿扫描从 info.Packs
-        // 里剔掉了包（压实也会改 info.Packs，但它只在有退役时才跑，已被第一项覆盖）。
+        // The info file is rewritten only when its content really changed. There are only two ways it can change:
+        // retirement removed versions, or the orphan sweep dropped packs out of info.Packs (compaction also edits
+        // info.Packs, but it only runs when something retired, which the first case already covers).
         //
-        // **上面那半句是这个判据的一部分，不是顺口一提**：压实会改写 info.Packs 里的
-        // Members / OriginalBytes / DeadBytes / VolumeSizes，而它一个字都不进这里的判据。今天不漏，
-        // 全靠 :200 那行的 `toDelete.Count > 0`——压实只可能在有退役时跑，于是第一项必为真。
-        // 谁要是放宽 :200 的门（譬如"孤儿扫描也顺手压一次"、"定时任务单独跑压实"），这里必须同时
-        // 跟着改，否则压实的成果**只活在内存里**：云上的 pack 已经被重写成更小的一箱了，信息文件
-        // 却还记着老的成员表和 OriginalBytes。下一轮清理据此再算一次死重，得出同样超阈值的比例，
-        // 于是同一批包每次都重压一遍；更糟的是记在案的成员表与归档里的实际内容对不上，
-        // 还原时解不出文件、检查时报缺失。
-        // 判据不能写成"删了云端对象就重写"——删掉的孤儿本来就不在 info 里，那样写等于每次扫描
-        // 都白付一次信息文件写入，而这条路上的写是带 If-Match 的条件写：白写一次就白换一次 ETag。
+        // **That last clause is part of this criterion, not an aside**: compaction rewrites
+        // Members / OriginalBytes / DeadBytes / VolumeSizes inside info.Packs, and not one word of that enters the
+        // criterion here. The only reason nothing is missed today is the `toDelete.Count > 0` on line :200 —
+        // compaction can only run when something retired, so the first case is necessarily true. Anyone who loosens
+        // the gate at :200 (say "let the orphan sweep compact along the way", or "run compaction as its own
+        // scheduled job") must change this at the same time, or compaction's results **live only in memory**: the
+        // pack in the cloud has already been rewritten into a smaller crate while the info file still records the old
+        // member list and OriginalBytes. The next cleanup recomputes dead weight from that, arrives at the same
+        // over-threshold ratio, and so the same packs get recompressed every single time; worse, the recorded member
+        // list no longer matches what is actually in the archive, so restore cannot extract the file and check reports it missing.
+        // The criterion must not be written as "rewrite whenever a cloud object was deleted" — a deleted orphan was
+        // never in info to begin with, so writing it that way means paying for a pointless info-file write on every sweep, and the write on this path is a conditional write with If-Match: one pointless write burns one ETag for nothing.
         if (toDelete.Count > 0 || prunedFromInfo.Count > 0)
         {
             if (trackedInfo is not null)
@@ -224,12 +236,12 @@ public sealed class RetentionCleaner(
                 await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
         }
 
-        // 死重压实是把 pack **重写**得更紧，不是删除，故不计入这里——把它算成"删掉了 N 个包"
-        // 会让操作员以为有数据被退役了。
+        // Dead-weight compaction **rewrites** a pack more tightly, it does not delete, so it is not counted here —
+        // reporting it as "deleted N packs" would make the operator think data had been retired.
         return new CleanupReport(toDelete.Count, deletedPacks.Count, deletedBlobs.Count, freedBytes);
     }
 
-    /// <summary>删除前问一次尺寸。blob 已经不在（并发清理、上一轮删到一半）时算 0，不让它中断清理。</summary>
+    /// <summary>Ask for the size once before deleting. When the blob is already gone (concurrent cleanup, a previous round that died half-way) it counts as 0 rather than aborting the cleanup.</summary>
     private static async Task<long> TrySizeOfAsync(BlobClient blob, CancellationToken ct)
     {
         try
@@ -242,7 +254,7 @@ public sealed class RetentionCleaner(
         }
     }
 
-    /// <summary>把分卷名 baseRef.NNN（3 位数字后缀）归一化回基名；非分卷名原样返回（§7）。</summary>
+    /// <summary>Normalizes a volume name baseRef.NNN (3-digit numeric suffix) back to its base name; a non-volume name is returned unchanged (§7).</summary>
     private static string BaseRef(string blobName)
     {
         var dot = blobName.LastIndexOf('.');
@@ -255,7 +267,7 @@ public sealed class RetentionCleaner(
         return blobName;
     }
 
-    /// <summary>从 pack blob 名（packs/{id}.7z 或 packs/{id}.7z.NNN）提取 packId。</summary>
+    /// <summary>Extracts the packId from a pack blob name (packs/{id}.7z or packs/{id}.7z.NNN).</summary>
     private static string PackIdOf(string blobName)
     {
         var rest = blobName["packs/".Length..];

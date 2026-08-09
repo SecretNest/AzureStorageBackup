@@ -12,8 +12,8 @@ public sealed class DeadWeightCompactorTests : IDisposable
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
     private readonly string _base;
-    private readonly string _packSrc; // pack 原始成员来源（用于建 pack blob）
-    private readonly string _local;   // 死重压实的本地源根
+    private readonly string _packSrc; // where the pack's original members come from (used to build the pack blob)
+    private readonly string _local;   // local source root for dead-weight compaction
     private readonly string _temp;
 
     public DeadWeightCompactorTests()
@@ -56,7 +56,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    // 建 pack blob packs/p0001.7z（成员 a/b/c）+ info + liveByPack（b/c 有效，a 死重）。
+    // Builds pack blob packs/p0001.7z (members a/b/c) + info + liveByPack (b/c live, a dead weight).
     private async Task<(BackupInfoFile Info, Dictionary<string, Dictionary<string, LivePackMember>> Live,
         Azure.Storage.Blobs.BlobContainerClient Container, Account Account)> SetupAsync(string name)
     {
@@ -94,7 +94,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
                 },
             },
         };
-        // b、c 仍被有效版本引用；a 死重（1/3 > 30%）。liveByPack 按 entryName 归组。
+        // b and c are still referenced by a live version; a is dead weight (1/3 > 30%). liveByPack is grouped by entryName.
         var live = new Dictionary<string, Dictionary<string, LivePackMember>>
         {
             ["p0001"] = new(StringComparer.Ordinal)
@@ -110,7 +110,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
         new(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), new SevenZipCompressor(), new FileHasher(),
             Path.Combine(_temp, "compact"), Staging());
 
-    /// <summary>压实的压缩产出现在经暂存区（全局压缩锁 + 预算），所以每处构造都得给一个。</summary>
+    /// <summary>Compaction's compression output now goes through the staging area (global compression lock + budget), so every construction site has to supply one.</summary>
     private StagingArea Staging() =>
         new(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
 
@@ -135,17 +135,17 @@ public sealed class DeadWeightCompactorTests : IDisposable
         var (info, live, container, account) = await SetupAsync(name);
         try
         {
-            // 本地有与 pack 一致的 b、c → 即便禁止下载也能从本地压实（Archive 场景）。
+            // b and c exist locally and match the pack → compaction works from local files even with downloads forbidden (the Archive scenario).
             Write(_local, "b.txt", new string('b', 2000));
             Write(_local, "c.txt", new string('c', 2000));
 
-            // allowDownload:false → 只能从本地取成员；能压实即证明用了本地文件（Archive 场景亦然）。
+            // allowDownload:false → members can only come from local files; that compaction succeeds proves local files were used (the Archive scenario likewise).
             await Compactor().CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
 
             Assert.Equal(2, info.Packs["p0001"].Members.Count);
             Assert.Equal(0, info.Packs["p0001"].DeadBytes);
-            Assert.Equal(["b.txt", "c.txt"], await PackEntriesAsync(container)); // a 已丢弃
+            Assert.Equal(["b.txt", "c.txt"], await PackEntriesAsync(container)); // a has been dropped
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -160,15 +160,15 @@ public sealed class DeadWeightCompactorTests : IDisposable
         var (info, live, container, account) = await SetupAsync(name);
         try
         {
-            // 本地只有 b，缺 c，且禁止下载 → 放弃重打包，成员不变、记录死重。
+            // Only b is local, c is missing, and downloads are forbidden → give up on repacking, members unchanged, dead weight recorded.
             Write(_local, "b.txt", new string('b', 2000));
 
             await Compactor().CompactAsync(account, container, null, info, live,
                 AccessTier.Archive, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
 
-            Assert.Equal(3, info.Packs["p0001"].Members.Count); // 未压实
-            Assert.Equal(2000, info.Packs["p0001"].DeadBytes);  // 死重被记录
-            Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container)); // pack 原样
+            Assert.Equal(3, info.Packs["p0001"].Members.Count); // not compacted
+            Assert.Equal(2000, info.Packs["p0001"].DeadBytes);  // dead weight recorded
+            Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container)); // pack untouched
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -186,10 +186,10 @@ public sealed class DeadWeightCompactorTests : IDisposable
         await container.CreateIfNotExistsAsync();
         try
         {
-            // pack 含 a(死重) + b、d 两个**内容相同**的成员（去重后同 fullHash，但仍是两条独立成员）。
+            // The pack holds a (dead weight) + b and d, two members with **identical content** (the same fullHash after dedup, but still two independent members).
             Write(_packSrc, "a.txt", new string('a', 2000));
             Write(_packSrc, "b.txt", new string('s', 2000));
-            Write(_packSrc, "d.txt", new string('s', 2000)); // 与 b 内容一致
+            Write(_packSrc, "d.txt", new string('s', 2000)); // same content as b
 
             var hasher = new FileHasher();
             var hashA = await hasher.FullHashAsync(Path.Combine(_packSrc, "a.txt"));
@@ -207,7 +207,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
                 Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },
                 Packs = { ["p0001"] = new PackInfo { Blob = "packs/p0001.7z", Members = [hashA, hashDup, hashDup], OriginalBytes = 6000 } },
             };
-            // b、d 都有效（同 hash 但不同 entryName）；a 死重。若按 hash 归组会把 b、d 折叠成一个 → 丢数据。
+            // b and d are both live (same hash, different entryName); a is dead weight. Grouping by hash would fold b and d into one → data loss.
             var live = new Dictionary<string, Dictionary<string, LivePackMember>>
             {
                 ["p0001"] = new(StringComparer.Ordinal)
@@ -222,7 +222,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             await Compactor().CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
 
-            // 关键：两个同内容成员都必须保留（含各自 entryName），否则索引仍引用却已丢失 → 数据丢失。
+            // The crux: both members with identical content must be kept (each with its own entryName), or the index still references something that is already gone → data loss.
             Assert.Equal(["b.txt", "d.txt"], await PackEntriesAsync(container));
             Assert.Equal(2, info.Packs["p0001"].Members.Count);
         }
@@ -230,16 +230,16 @@ public sealed class DeadWeightCompactorTests : IDisposable
     }
 
     /// <summary>
-    /// T5 的真正防线：<see cref="RetentionCleaner"/> 扫描保留版本索引、按 EntryName 给每个 pack 归组
-    /// 存活成员（liveByPack），DeadWeightCompactor 只是消费这张表决定重压后留下哪些成员。
-    /// 上面 <see cref="Keeps_Both_Members_That_Share_Identical_Content"/> 只验证了 DeadWeightCompactor
-    /// 拿到"正确"liveByPack 之后的行为——那条用例的 liveByPack 是测试手工拼好直接喂给 CompactAsync 的，
-    /// 从没真正跑过 RetentionCleaner 里的归组代码，所以哪怕归组代码本身写错了它也测不出来。
-    /// 如果归组改成按 fullHash 作 key（RetentionCleaner.cs 那行注释明确写着"不可用 hash 作 key"，
-    /// 正说明它曾经/可能被改错），两个不同 EntryName、同 fullHash 的存活成员会在这张表里合并成一条，
-    /// 重压后归档就少一个成员，而版本索引仍声称它在——静默丢数据，且这条链路上此前没有任何测试
-    /// 能抓住。这里让 CleanupAsync 真正跑一遍（真实 DeadWeightCompactor，不传 null），钉住的是
-    /// 归组代码本身，而不是绕过它。
+    /// The real line of defence for T5: <see cref="RetentionCleaner"/> scans the retained versions' indexes and groups
+    /// each pack's live members by EntryName (liveByPack), while DeadWeightCompactor merely consumes that table to decide which members survive the recompression.
+    /// <see cref="Keeps_Both_Members_That_Share_Identical_Content"/> above only verifies DeadWeightCompactor's
+    /// behaviour once it has been handed a "correct" liveByPack — that case's liveByPack is assembled by hand in the test and fed straight to CompactAsync,
+    /// so the grouping code inside RetentionCleaner never actually runs and the case would notice nothing even if that grouping code were itself wrong.
+    /// If the grouping were changed to key on fullHash (the comment in RetentionCleaner.cs says explicitly "hash cannot be the key",
+    /// which is precisely a sign it has been / could be changed wrongly), two live members with different EntryNames and the same fullHash would merge into one row in that table,
+    /// the recompressed archive would be one member short while the version index still claims it is there — silent data loss, with no test
+    /// on this chain able to catch it before. Here CleanupAsync really runs end to end (a real DeadWeightCompactor, not null), so what is pinned down is
+    /// the grouping code itself, rather than a way around it.
     /// </summary>
     [SkippableFact]
     public async Task Retention_Cleanup_Preserves_Two_Live_Members_That_Share_A_Hash()
@@ -254,8 +254,8 @@ public sealed class DeadWeightCompactorTests : IDisposable
         await container.CreateIfNotExistsAsync();
         try
         {
-            // pack 含 a(将随 v1 退役变成死重) + b、d 两个内容相同(同 fullHash)但 EntryName 不同的成员——
-            // 这是本特性上线前就已存在的历史包形状(同内容不同路径,7z 不跨成员共享字典)。
+            // The pack holds a (which turns into dead weight when v1 retires) + b and d, two members with identical content (same fullHash) but different EntryNames —
+            // a historical pack shape that already existed before this feature shipped (same content at different paths; 7z does not share a dictionary across members).
             Write(_packSrc, "a.txt", new string('a', 2000));
             Write(_packSrc, "b.txt", new string('s', 2000));
             Write(_packSrc, "d.txt", new string('s', 2000));
@@ -273,10 +273,10 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
             var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
 
-            // v1:唯一目的是退役腾出"死重"——它的索引内容与本用例的判据无关,留空即可。
+            // v1: its only purpose is to retire and thereby free up "dead weight" — its index content is irrelevant to this case's criterion, so leaving it empty is fine.
             var v1Blob = await store.WriteIndexAsync(account, name, 1, new VersionIndex { Version = 1 }, null);
 
-            // v2(保留的那个版本):两条条目指向同一个 pack、同 fullHash、不同 EntryName。
+            // v2 (the retained version): two entries pointing at the same pack, same fullHash, different EntryNames.
             var v2Index = new VersionIndex
             {
                 Version = 2,
@@ -320,8 +320,8 @@ public sealed class DeadWeightCompactorTests : IDisposable
             Write(_local, "b.txt", new string('s', 2000));
             Write(_local, "d.txt", new string('s', 2000));
 
-            // 真实 compactor(非 null):CleanupAsync 内部真正跑一遍归组代码,而不是像上面那条用例
-            // 一样把 liveByPack 手工拼好直接喂给 CompactAsync。
+            // A real compactor (not null): CleanupAsync really runs the grouping code internally, instead of
+            // hand-assembling liveByPack and feeding it straight to CompactAsync the way the case above does.
             var cleaner = new RetentionCleaner(factory, store, new RetentionEvaluator(), Compactor());
             var options = new CleanupOptions
             {
@@ -334,16 +334,16 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
             var report = await cleaner.CleanupAsync(account, name, null, options, info, CancellationToken.None);
 
-            Assert.Equal(1, report.RetiredVersions); // v1 退役,死重才因此出现(30%阈值否则不会触发重压)
-            // 关键:两个同 fullHash、不同 EntryName 的存活成员必须都留在归档里;按 hash 归组会把它们
-            // 合并成一条,重压后归档就只剩一个,v2 索引里另一条却仍声称它在——数据丢失且无迹可寻。
+            Assert.Equal(1, report.RetiredVersions); // v1 retires, which is what creates the dead weight (otherwise the 30% threshold never triggers a recompression)
+            // The crux: both live members with the same fullHash and different EntryNames must stay in the archive;
+            // grouping by hash merges them into one row, the recompressed archive keeps only one, and the other entry in the v2 index still claims it is there — data loss with no trace.
             Assert.Equal(["b.txt", "d.txt"], await PackEntriesAsync(container));
             Assert.Equal(2, info.Packs["p0001"].Members.Count);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>装饰 uploader：上传（if-missing 与 overwrite 皆然）一律抛异常，模拟"传新阶段"崩溃。</summary>
+    /// <summary>A decorating uploader: every upload (if-missing and overwrite alike) throws, simulating a crash during the "upload the new one" phase.</summary>
     private sealed class FailingUploader : IBlobUploader
     {
         public Task<bool> UploadIfMissingAsync(
@@ -359,7 +359,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             => throw new IOException("injected upload failure");
     }
 
-    /// <summary>记录 overwrite 上传顺序、并真正委托 inner 上传（供 ReplaceAsync 残留删除生效）。</summary>
+    /// <summary>Records the order of overwrite uploads and really delegates the upload to inner (so ReplaceAsync's residual deletion takes effect).</summary>
     private sealed class RecordingUploader(IBlobUploader inner) : IBlobUploader
     {
         public List<string> OverwriteOrder { get; } = [];
@@ -380,7 +380,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
         }
     }
 
-    // 传新阶段崩溃：旧 pack 分卷仍完整存在（此前 delete-first 会导致这里被删空 → 整 blob 丢失）。
+    // A crash during the upload-the-new-one phase: the old pack's volumes are still fully present (the earlier delete-first order emptied this → the whole blob was lost).
     [SkippableFact]
     public async Task Recompact_Failure_During_Upload_Leaves_Old_Volumes_Intact()
     {
@@ -394,7 +394,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             Write(_local, "b.txt", new string('b', 2000));
             Write(_local, "c.txt", new string('c', 2000));
 
-            // 用「上传即抛」的装饰 uploader；CompactAsync 逐 pack 吞掉异常，关键是旧数据须在失败后仍在。
+            // Use the decorating "throw on upload" uploader; CompactAsync swallows the exception per pack, and the point is that the old data must still be there after the failure.
             var compactor = new DeadWeightCompactor(
                 new FailingUploader(),
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact-fail"), Staging());
@@ -406,17 +406,17 @@ public sealed class DeadWeightCompactorTests : IDisposable
             await foreach (var b in container.GetBlobsAsync(
                 BlobTraits.None, BlobStates.None, "packs/p0001.7z", CancellationToken.None))
                 remaining.Add(b.Name);
-            Assert.NotEmpty(remaining); // delete-first 会让这里为空
+            Assert.NotEmpty(remaining); // delete-first would leave this empty
 
-            // 旧 pack 内容未被破坏，仍是原 3 成员。
+            // The old pack's content is undamaged, still the original 3 members.
             Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container));
-            // 死重被记录、成员未变（本次压实放弃）。
+            // Dead weight recorded, members unchanged (this round of compaction gave up).
             Assert.Equal(3, info.Packs["p0001"].Members.Count);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>压缩那一瞬锁住 compose 目录里的某个成员：7z 读不到它、静默丢掉、仍产出有效归档。</summary>
+    /// <summary>Locks one member in the compose directory at the very moment of compression: 7z cannot read it, silently drops it, and still produces a valid archive.</summary>
     private sealed class LockMemberDuringCompressCompressor(IFileCompressor inner, string entryName) : IFileCompressor
     {
         public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
@@ -454,10 +454,11 @@ public sealed class DeadWeightCompactorTests : IDisposable
             => inner.CompressStreamAsync(request, writeSource, ct);
     }
 
-    /// <summary>重打包是**覆盖式**的（ReplaceAsync 直接改写 packs/p0001.7z），所以 7z 在这条路径上
-    /// 丢掉一个成员的后果比备份时严重得多：那个成员仍被有效版本引用，旧 pack 一旦被缺它的新 pack
-    /// 覆盖，数据就永久没了，而索引照旧声称它在里面。压缩器验收归档内容之后，这一轮压实会失败并
-    /// 被逐 pack 的兜底接住——宁可放弃一次空间优化，也不能覆盖出一个缺成员的包。</summary>
+    /// <summary>Repacking is **overwrite-based** (ReplaceAsync rewrites packs/p0001.7z directly), so 7z dropping a
+    /// member on this path is far worse than during a backup: that member is still referenced by a live version, and once
+    /// the old pack is overwritten by a new one that lacks it the data is gone for good, while the index goes on claiming
+    /// it is in there. Now that the compressor verifies the archive's contents, this round of compaction fails and is
+    /// caught by the per-pack fallback — better to forgo one space optimization than to overwrite with a pack missing a member.</summary>
     [SkippableFact]
     public async Task Recompact_Never_Overwrites_A_Good_Pack_With_One_Missing_A_Member()
     {
@@ -480,14 +481,14 @@ public sealed class DeadWeightCompactorTests : IDisposable
             await compactor.CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None);
 
-            // 旧 pack 原封不动：修复前这里会变成只剩 c.txt——b.txt 仍被引用却已从云端消失。
+            // The old pack is untouched: before the fix this came back with only c.txt — b.txt still referenced yet gone from the cloud.
             Assert.Equal(["a.txt", "b.txt", "c.txt"], await PackEntriesAsync(container));
-            Assert.Equal(3, info.Packs["p0001"].Members.Count); // 本次压实放弃，成员表不变
+            Assert.Equal(3, info.Packs["p0001"].Members.Count); // this round of compaction gave up, member list unchanged
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    // ReplaceAsync：覆盖上传新卷 + 删除残留旧卷（新卷数 < 旧卷数的尾部）。
+    // ReplaceAsync: overwrite-upload the new volumes + delete the residual old ones (the tail left when there are fewer new volumes than old).
     [SkippableFact]
     public async Task ReplaceAsync_Overwrites_New_And_Deletes_Residual_Volumes()
     {
@@ -501,25 +502,25 @@ public sealed class DeadWeightCompactorTests : IDisposable
         try
         {
             const string baseRef = "data/x.7z";
-            // 旧：3 卷。
+            // Old: 3 volumes.
             await cc.GetBlobClient(baseRef + ".001").UploadAsync(BinaryData.FromString("OLD1"), overwrite: true);
             await cc.GetBlobClient(baseRef + ".002").UploadAsync(BinaryData.FromString("OLD2"), overwrite: true);
             await cc.GetBlobClient(baseRef + ".003").UploadAsync(BinaryData.FromString("OLD3"), overwrite: true);
 
-            // 新：2 卷。
+            // New: 2 volumes.
             var f1 = Path.Combine(_temp, "n1"); File.WriteAllText(f1, "NEW1");
             var f2 = Path.Combine(_temp, "n2"); File.WriteAllText(f2, "NEW2");
 
             var rec = new RecordingUploader(new BlobUploader(factory));
             await VolumeBlobIO.ReplaceAsync(rec, account, cc, baseRef, [f1, f2], AccessTier.Hot, retry: null, CancellationToken.None);
 
-            // 每一卷都写了。顺序不再有讲究——首卷曾是「整族齐全」的提交标记，那个语义已随
-            // 云端存在性去重一并删除。
+            // Every volume was written. The order no longer matters — the first volume used to be the commit marker
+            // for "the whole family is complete", and that semantics was deleted along with cloud-existence dedup.
             Assert.Equal([baseRef + ".001", baseRef + ".002"], rec.OverwriteOrder);
-            // 新内容覆盖旧卷。
+            // The new content overwrites the old volumes.
             Assert.Equal("NEW1", (await cc.GetBlobClient(baseRef + ".001").DownloadContentAsync()).Value.Content.ToString());
             Assert.Equal("NEW2", (await cc.GetBlobClient(baseRef + ".002").DownloadContentAsync()).Value.Content.ToString());
-            // 残留旧卷 .003 已删。
+            // The residual old volume .003 has been deleted.
             Assert.False((await cc.GetBlobClient(baseRef + ".003").ExistsAsync()).Value);
         }
         finally { await cc.DeleteIfExistsAsync(); }
@@ -535,7 +536,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
         var (info, live, container, account) = await SetupAsync(name);
         try
         {
-            // 本地全缺，但允许下载 → 下载旧 pack 解压补齐 b、c 后压实。
+            // Nothing is available locally, but downloads are allowed → download the old pack, extract it to fill in b and c, then compact.
             await Compactor().CompactAsync(account, container, null, info, live,
                 AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: true, CancellationToken.None);
 

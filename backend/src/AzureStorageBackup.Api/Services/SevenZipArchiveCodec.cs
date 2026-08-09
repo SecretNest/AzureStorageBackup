@@ -3,9 +3,9 @@ using System.Diagnostics;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 用官方 7-Zip 二进制实现的归档编解码（M4 决策 §13.1）。
-/// 归档内固定单条目名 "content"。password 非空时 AES-256 + 头加密(-mhe=on)。
-/// 通过 ArgumentList 传参（不经 shell），密码含空格/特殊字符也安全。
+/// Archive codec implemented with the official 7-Zip binary (M4 decision §13.1).
+/// The archive always holds a single entry named "content". When password is non-empty: AES-256 + header encryption (-mhe=on).
+/// Arguments go through ArgumentList (never a shell), so a password containing spaces/special characters is safe too.
 /// </summary>
 public sealed class SevenZipArchiveCodec : IArchiveCodec
 {
@@ -15,8 +15,8 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
     private readonly string _tempRoot;
     private readonly Func<ProcessPriorityClass>? _priority;
 
-    /// <param name="priority">每个 7z 进程的 CPU 优先级，取委托以便设置改完立即生效
-    /// （见 <see cref="SevenZipCompressor"/> 的同名参数）。null＝不动优先级。</param>
+    /// <param name="priority">CPU priority for each 7z process, taken as a delegate so that a changed setting takes effect immediately
+    /// (see the parameter of the same name on <see cref="SevenZipCompressor"/>). null = leave the priority alone.</param>
     public SevenZipArchiveCodec(
         string? executable = null, string? tempRoot = null, Func<ProcessPriorityClass>? priority = null)
     {
@@ -26,7 +26,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
         _priority = priority;
     }
 
-    /// <summary>在 PATH 上探测 7-Zip 可执行文件（7zz→7z→7za），找不到返回 null。</summary>
+    /// <summary>Probes PATH for the 7-Zip executable (7zz→7z→7za); returns null when none is found.</summary>
     public static string? TryResolveExecutable() => SevenZipCli.TryResolveExecutable();
 
     public async Task<byte[]> EncodeAsync(byte[] content, string? password, CancellationToken ct = default)
@@ -38,7 +38,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             var archive = Path.Combine(work, "out.7z");
             await File.WriteAllBytesAsync(input, content, ct);
 
-            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // 最大压缩（PRD 3.3.2.1）
+            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // maximum compression (PRD 3.3.2.1)
             if (!string.IsNullOrEmpty(password))
             {
                 args.Add("-p" + password);
@@ -47,9 +47,9 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             args.Add(archive);
             args.Add(input);
 
-            // 与 SevenZipCompressor 同样的验收：退出码 1 时 7z 可能已经把唯一的条目静默丢掉，
-            // 留下一个有效但空的归档。这里的输入是刚写出的临时文件，撞上的机会极小，
-            // 但索引/信息文件丢内容的后果是整个备份不可读，不值得为省一次列举去赌。
+            // The same verification as SevenZipCompressor: on exit code 1, 7z may already have silently dropped the
+            // only entry and left behind a valid but empty archive. The input here is a temp file we just wrote, so
+            // the odds of hitting it are tiny, but an index/info file losing its content makes the whole backup unreadable, which is not worth gambling to save one listing.
             var run = await RunAsync(args, ct);
             if (run.ExitCode == 1
                 && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))

@@ -3,10 +3,13 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// diff→上传那条队列（三段：r 在内存等消费 / f 在临时文件 / w 在内存等成批写盘）。
-/// 它存在的理由是「写侧永不阻塞」——diff 必须能一路跑到底，上传阶段的剩余时间才有分母
-/// （见 <c>StageProgress.Eta</c> 开头那个 <c>_total &lt;= 0</c>）。
-/// 所以这里每一条断言最终都在守同一件事：不管额度多小、活多大，写侧都不会停，而且一件不丢不乱。
+/// The diff→upload queue (three segments: r in memory waiting to be consumed / f in the temp file / w in memory
+/// waiting to be written out in a batch).
+/// It exists for one reason — the write side never blocks. The diff has to be able to run straight through, or the
+/// upload stage's remaining time has no denominator (see the <c>_total &lt;= 0</c> at the top of
+/// <c>StageProgress.Eta</c>).
+/// So every assertion here ultimately guards the same thing: no matter how small the limits or how big an item, the
+/// write side never stalls, and not one item is lost or reordered.
 /// </summary>
 public sealed class DiffWorkQueueTests : IDisposable
 {
@@ -17,7 +20,7 @@ public sealed class DiffWorkQueueTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_dir, recursive: true); } catch { /* 测试清理，尽力而为 */ }
+        try { Directory.Delete(_dir, recursive: true); } catch { /* test cleanup, best effort */ }
     }
 
     private string SpillPath(string name = "q") => Path.Combine(_dir, $"{name}.spill");
@@ -28,13 +31,13 @@ public sealed class DiffWorkQueueTests : IDisposable
     private static WorkItem Pack(params string[] paths) =>
         new(null, [.. paths.Select(p => new PlannedFile(p, 10, new string('b', 64)))]);
 
-    /// <summary>按件数设界、字节给足（测件数那条界时不想被字节那条抢先触发）。</summary>
+    /// <summary>Bound by item count, with bytes set generously (when testing the item-count limit we do not want the byte one firing first).</summary>
     private static DiffQueueLimits ByItems(int maxItems, int writeBatch = 4, int refillBatch = 4) =>
         new(MaxCachedItems: maxItems, MaxCachedBytes: long.MaxValue,
             WriteBatchItems: writeBatch, WriteBatchBytes: long.MaxValue,
             RefillBatchItems: refillBatch);
 
-    /// <summary>按字节设界、件数给足。</summary>
+    /// <summary>Bound by bytes, with item count set generously.</summary>
     private static DiffQueueLimits ByBytes(long maxBytes, long writeBatchBytes = long.MaxValue) =>
         new(MaxCachedItems: int.MaxValue, MaxCachedBytes: maxBytes,
             WriteBatchItems: int.MaxValue, WriteBatchBytes: writeBatchBytes,
@@ -48,7 +51,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         return got;
     }
 
-    /// <summary>没超额就一件都不碰盘——正常规模下这条队列应当完全不产生文件。</summary>
+    /// <summary>Nothing goes over the limits, so nothing touches the disk — at normal scale this queue should produce no file at all.</summary>
     [Fact]
     public async Task Stays_In_Memory_While_Under_The_Limits()
     {
@@ -62,12 +65,12 @@ public sealed class DiffWorkQueueTests : IDisposable
 
         Assert.Equal(20, got.Count);
         Assert.Equal(0, queue.SpilledItems);
-        Assert.False(File.Exists(SpillPath()), "一件都没超额，不该建出溢出文件");
+        Assert.False(File.Exists(SpillPath()), "not one item went over the limits, no spill file should have been created");
     }
 
     /// <summary>
-    /// 件数是主旋钮：额度 10 件、灌 30 件不消费，前 10 件留在 r，其余 20 件必须走 w→f。
-    /// 这个数是精确的，不是"大概"。
+    /// Item count is the main knob: a limit of 10 items, push in 30 without consuming, and the first 10 stay in r
+    /// while the other 20 must go w→f. That number is exact, not "roughly".
     /// </summary>
     [Fact]
     public void Bounds_The_Cache_By_Item_Count()
@@ -79,13 +82,14 @@ public sealed class DiffWorkQueueTests : IDisposable
 
         var (items, _, pendingWrite) = queue.Cached;
         Assert.Equal(10, items);
-        Assert.Equal(0, pendingWrite);      // writeBatch=1，w 不留货
+        Assert.Equal(0, pendingWrite);      // writeBatch=1, so w holds nothing back
         Assert.Equal(20, queue.SpilledItems);
     }
 
     /// <summary>
-    /// 光有件数管不住内存——这正是"小文件极多"那一格。件数给到天上、只卡字节：
-    /// 一箱 40 个成员的活，额度只够两箱，第三箱起必须落盘。
+    /// Item count alone cannot hold memory down — this is exactly the "enormous numbers of small files" case. Item
+    /// count set sky-high, bytes the only bound: with items of 40 members per pack, the limit fits two packs, so
+    /// from the third pack on it must spill to disk.
     /// </summary>
     [Fact]
     public void Bounds_The_Cache_By_Bytes_When_Items_Are_Fat()
@@ -97,24 +101,25 @@ public sealed class DiffWorkQueueTests : IDisposable
             queue.Enqueue(fat);
 
         var (items, bytes, pendingWrite) = queue.Cached;
-        Assert.Equal(2, items);                                  // 件数没设界，是字节把它按住的
-        Assert.True(bytes <= fat.EstimatedBytes * 2, $"r 段超额：{bytes}");
-        // 这个用例里 w 段被故意开到无界（要隔离出 r 那条界），所以多出来的 8 件停在 w，
-        // 一件都没写到盘上——SpilledItems 数的是**真正落过盘**的，不是"没进 r 的"。
-        // w 自己那条界由下一条用例守。
+        Assert.Equal(2, items);                                  // item count is unbounded here; bytes is what held it down
+        Assert.True(bytes <= fat.EstimatedBytes * 2, $"r segment over the limit: {bytes}");
+        // This case deliberately leaves the w segment unbounded (to isolate r's limit), so the extra 8 items sit in
+        // w and not one was written to disk — SpilledItems counts what **really hit the disk**, not "what did not
+        // make it into r". w's own limit is guarded by the next case.
         Assert.Equal(8, pendingWrite);
         Assert.Equal(0, queue.SpilledItems);
     }
 
     /// <summary>
-    /// w 段也在内存里，也必须有字节界。只按件数限制 w 的话，小文件场景下几百个满员的箱子
-    /// 就是好几个 GB——给 r 段设的额度会从这个后门被绕过去。
+    /// The w segment is in memory too, so it must have a byte limit as well. Bound w by item count alone and, in
+    /// the small-file case, a few hundred full packs are several GB — the limit set for the r segment gets bypassed
+    /// through this back door.
     /// </summary>
     [Fact]
     public void Bounds_The_Write_Buffer_By_Bytes_Too()
     {
         var fat = Pack([.. Enumerable.Range(0, 40).Select(i => $"dir/small{i:D3}.dat")]);
-        // r 只装一件；w 的件数界给到天上，只留字节界＝两件的量。
+        // r holds one item only; w's item-count limit is sky-high, leaving only the byte limit = two items' worth.
         using var queue = new DiffWorkQueue(SpillPath(), new DiffQueueLimits(
             MaxCachedItems: 1, MaxCachedBytes: long.MaxValue,
             WriteBatchItems: int.MaxValue, WriteBatchBytes: fat.EstimatedBytes * 2,
@@ -124,13 +129,14 @@ public sealed class DiffWorkQueueTests : IDisposable
             queue.Enqueue(fat);
 
         var (_, _, pendingWrite) = queue.Cached;
-        Assert.True(pendingWrite <= 2, $"w 段超额：压着 {pendingWrite} 件");
-        Assert.True(queue.SpilledItems >= 16, $"字节界没触发刷盘，只落了 {queue.SpilledItems} 件");
+        Assert.True(pendingWrite <= 2, $"w segment over the limit: holding {pendingWrite} items");
+        Assert.True(queue.SpilledItems >= 16, $"the byte limit did not trigger a flush, only {queue.SpilledItems} items spilled");
     }
 
     /// <summary>
-    /// 一箱的成员数可以大于整个额度（1 字节的文件装满 100 MB 的箱子就是上亿个成员）。
-    /// r 段空着时必须无条件收下它，否则那种活永远进不了内存，写读两侧一起停在原地。
+    /// One pack can hold more members than the entire limit (fill a 100 MB pack with 1-byte files and that is
+    /// hundreds of millions of members). When the r segment is empty it must be admitted unconditionally, otherwise
+    /// such an item can never get into memory and the write and read sides stall in place together.
     /// </summary>
     [Fact]
     public async Task Admits_An_Oversized_Item_When_The_Cache_Is_Empty()
@@ -138,12 +144,12 @@ public sealed class DiffWorkQueueTests : IDisposable
         using var queue = new DiffWorkQueue(SpillPath(), ByBytes(maxBytes: 200));
 
         var huge = Pack("a", "b", "c", "d", "e", "f", "g", "h", "i", "j");
-        Assert.True(huge.EstimatedBytes > 200, "这一件本身就该超过整个额度，否则这条测试没测到东西");
+        Assert.True(huge.EstimatedBytes > 200, "this single item is supposed to exceed the whole limit by itself, otherwise this test tests nothing");
 
-        queue.Enqueue(huge);                 // r 空 → 无条件收下
+        queue.Enqueue(huge);                 // r is empty → admitted unconditionally
         Assert.Equal(0, queue.SpilledItems);
 
-        queue.Enqueue(Single("later"));      // r 已有货且超额 → 走 w
+        queue.Enqueue(Single("later"));      // r already holds something and is over the limit → goes through w
         queue.CompleteAdding();
 
         var got = await DrainAsync(queue);
@@ -153,17 +159,18 @@ public sealed class DiffWorkQueueTests : IDisposable
     }
 
     /// <summary>
-    /// 超大件**落盘之后**同样要回得来。只在写侧留"至少备好一件"的例外是不够的：
-    /// 回读侧没有同一条例外的话，它会被额度永远挡在文件里，泵和消费者一起停住。
+    /// An oversized item must also come back **after it has spilled to disk**. Keeping the "at least one item
+    /// ready" exception on the write side alone is not enough: without the same exception on the read-back side the
+    /// limit blocks it inside the file forever, and the pump and the consumers stall together.
     /// </summary>
     [Fact]
     public async Task Reads_Back_An_Oversized_Item_From_Disk()
     {
         using var queue = new DiffWorkQueue(SpillPath(), ByBytes(maxBytes: 200, writeBatchBytes: 1));
 
-        queue.Enqueue(Single("first"));      // 占住 r
+        queue.Enqueue(Single("first"));      // takes up r
         var huge = Pack([.. Enumerable.Range(0, 60).Select(i => $"m{i:D2}")]);
-        queue.Enqueue(huge);                 // 超额 → 落盘
+        queue.Enqueue(huge);                 // over the limit → spills to disk
         queue.CompleteAdding();
 
         Assert.True(queue.SpilledItems >= 1);
@@ -175,8 +182,9 @@ public sealed class DiffWorkQueueTests : IDisposable
     }
 
     /// <summary>
-    /// FIFO 跨三段整体成立。这一条盯的是最容易写错的地方：f 或 w 非空时，新来的活也必须进 w——
-    /// 直接塞 r 的话它会插到前面那些活之前。
+    /// FIFO holds across all three segments. This one watches the spot that is easiest to get wrong: when f or w is
+    /// non-empty, a newly arriving item must go into w as well — push it straight into r and it jumps ahead of
+    /// everything queued before it.
     /// </summary>
     [Fact]
     public async Task Preserves_Fifo_Across_All_Three_Segments()
@@ -192,7 +200,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.Equal(expected, got.Select(w => w.Single!.Path).ToList());
     }
 
-    /// <summary>边写边读也不能乱序：消费者一边取，生产者一边灌，中间会反复跨越三段的边界。</summary>
+    /// <summary>Order must hold while writing and reading at once: consumers take while the producer pushes, crossing the three segments' boundaries over and over.</summary>
     [Fact]
     public async Task Preserves_Fifo_While_Producing_And_Consuming_Concurrently()
     {
@@ -205,7 +213,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         {
             queue.Enqueue(Single(path));
             if (path.EndsWith('7'))
-                await Task.Yield(); // 让消费者插进来，制造跨边界的时机
+                await Task.Yield(); // let a consumer cut in, to manufacture boundary-crossing moments
         }
         queue.CompleteAdding();
 
@@ -213,7 +221,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.Equal(expected, got.Select(w => w.Single!.Path).ToList());
     }
 
-    /// <summary>多消费者并发：一件不丢、一件不重。</summary>
+    /// <summary>Concurrent consumers: not one item lost, not one duplicated.</summary>
     [Fact]
     public async Task Multiple_Consumers_Lose_Nothing_And_Duplicate_Nothing()
     {
@@ -227,18 +235,19 @@ public sealed class DiffWorkQueueTests : IDisposable
         var consumers = Enumerable.Range(0, 6).Select(_ => Task.Run(() => DrainAsync(queue))).ToArray();
         var all = (await Task.WhenAll(consumers)).SelectMany(x => x).Select(w => w.Single!.Path).ToList();
 
-        Assert.Equal(expected.Count, all.Count);          // 不重
-        Assert.Equal(expected, all.ToHashSet());          // 不丢
+        Assert.Equal(expected.Count, all.Count);          // no duplicates
+        Assert.Equal(expected, all.ToHashSet());          // nothing lost
     }
 
     /// <summary>
-    /// f 空、w 里还压着货时，那些活要**直接进 r**，不必写下去再读回来。
-    /// diff 收尾时那半批尤其明显——不走这条捷径就是纯粹白跑一趟盘。
+    /// When f is empty and w still holds items, those items must go **straight into r** rather than be written out
+    /// and read back. The half-batch at the end of the diff is the most obvious case — skipping this shortcut is a
+    /// pure round trip to disk for nothing.
     /// </summary>
     [Fact]
     public async Task Pending_Writes_Go_Straight_To_The_Cache_When_Nothing_Is_On_Disk()
     {
-        // r 只装 1 件；w 的两条界都给到天上 → 永远不会主动刷盘。
+        // r holds 1 item only; both of w's limits are sky-high → it never flushes to disk on its own.
         using var queue = new DiffWorkQueue(SpillPath(), new DiffQueueLimits(
             MaxCachedItems: 1, MaxCachedBytes: long.MaxValue,
             WriteBatchItems: int.MaxValue, WriteBatchBytes: long.MaxValue,
@@ -252,12 +261,13 @@ public sealed class DiffWorkQueueTests : IDisposable
 
         Assert.Equal(20, got.Count);
         Assert.Equal(0, queue.SpilledItems);
-        Assert.False(File.Exists(SpillPath()), "f 一直是空的，一个字节都不该写到盘上");
+        Assert.False(File.Exists(SpillPath()), "f was empty the whole time, not one byte should have been written to disk");
     }
 
     /// <summary>
-    /// CompleteAdding 之后 f 与 w 里剩的必须全部送到，读侧才收到 null。
-    /// 早一步关闸就是把已经判完的活默默扔掉——备份少传文件，而且没人会发现。
+    /// After CompleteAdding, everything left in f and w must be delivered before the read side gets null.
+    /// Closing the gate one step early silently throws away work that was already judged — the backup uploads fewer
+    /// files, and nobody will notice.
     /// </summary>
     [Fact]
     public async Task Drains_Disk_And_Write_Buffer_Before_Signalling_Completion()
@@ -270,12 +280,13 @@ public sealed class DiffWorkQueueTests : IDisposable
 
         var got = await DrainAsync(queue);
         Assert.Equal(100, got.Count);
-        Assert.True(queue.SpilledItems > 0, "这个额度下必然落过盘，否则这条测试没测到回读");
+        Assert.True(queue.SpilledItems > 0, "at this limit it must have spilled, otherwise this test never exercised the read-back");
     }
 
     /// <summary>
-    /// 路径按长度前缀的二进制存取，不是按行。Linux 路径里可以有换行、制表、任何非 NUL 字节——
-    /// 按行切一定会在某个用户的目录上切错，而切错的表现是备份少传文件，不是报错。
+    /// Paths are stored and read as length-prefixed binary, not line by line. A Linux path may contain newlines,
+    /// tabs, any non-NUL byte — splitting on lines is bound to split wrong on some user's directory, and the symptom
+    /// of splitting wrong is a backup that uploads fewer files, not an error.
     /// </summary>
     [Fact]
     public async Task Round_Trips_Paths_Containing_Newlines_And_Unicode()
@@ -300,7 +311,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.All(got, w => Assert.Equal(7, w.Single!.Length));
     }
 
-    /// <summary>成员的三个字段都要原样回来，FullHash 为 null 的也是。</summary>
+    /// <summary>All three member fields must come back unchanged, including when FullHash is null.</summary>
     [Fact]
     public async Task Round_Trips_Pack_Members_Including_Null_Hashes()
     {
@@ -322,7 +333,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.Null(got[2].Single!.FullHash);
     }
 
-    /// <summary>不给溢出路径＝纯内存无界。写侧同样不阻塞，只是不碰盘。</summary>
+    /// <summary>No spill path = pure unbounded memory. The write side still does not block, it just never touches the disk.</summary>
     [Fact]
     public async Task Memory_Only_Mode_Never_Spills()
     {
@@ -337,7 +348,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.Equal(0, queue.SpilledItems);
     }
 
-    /// <summary>正常收尾要把自己的溢出文件删掉，不给下一次留垃圾。</summary>
+    /// <summary>A normal shutdown deletes its own spill file, leaving no garbage for next time.</summary>
     [Fact]
     public async Task Dispose_Deletes_Its_Own_Spill_File()
     {
@@ -347,14 +358,14 @@ public sealed class DiffWorkQueueTests : IDisposable
             queue.Enqueue(Single($"f{i}"));
         queue.CompleteAdding();
         await DrainAsync(queue);
-        Assert.True(File.Exists(path), "落过盘就该有文件");
+        Assert.True(File.Exists(path), "it spilled, so the file should exist");
 
         queue.Dispose();
 
         Assert.False(File.Exists(path));
     }
 
-    /// <summary>中途 Dispose（备份被取消/抛异常）不能挂住：泵要退得出去，句柄要放得掉。</summary>
+    /// <summary>Dispose mid-run (backup cancelled / threw) must not hang: the pump has to be able to exit and the handles have to be released.</summary>
     [Fact]
     public void Dispose_While_The_Queue_Is_Still_Full_Does_Not_Hang()
     {
@@ -362,15 +373,16 @@ public sealed class DiffWorkQueueTests : IDisposable
         var queue = new DiffWorkQueue(path, ByItems(maxItems: 1, writeBatch: 2, refillBatch: 2));
         for (var i = 0; i < 500; i++)
             queue.Enqueue(Single($"f{i:D3}"));
-        // 一件都不消费就中止。
+        // Abort without consuming a single item.
         queue.Dispose();
 
         Assert.False(File.Exists(path));
     }
 
     /// <summary>
-    /// 进程被 kill 之后留下的溢出文件由启动时的 ClearStale 兜底。
-    /// 只清 *.spill：这个目录万一被指到别处，也不该把别人的东西一起端了。
+    /// Spill files left behind after the process is killed are covered by ClearStale at startup.
+    /// It clears only *.spill: should this directory ever get pointed somewhere else, it must not carry off somebody
+    /// else's files along with ours.
     /// </summary>
     [Fact]
     public void ClearStale_Removes_Leftovers_But_Only_Spill_Files()
@@ -386,7 +398,7 @@ public sealed class DiffWorkQueueTests : IDisposable
         Assert.True(File.Exists(innocent));
     }
 
-    /// <summary>目录还不存在时 ClearStale 要负责建出来，而不是抛。</summary>
+    /// <summary>When the directory does not exist yet, ClearStale is responsible for creating it rather than throwing.</summary>
     [Fact]
     public void ClearStale_Creates_The_Directory_When_Missing()
     {

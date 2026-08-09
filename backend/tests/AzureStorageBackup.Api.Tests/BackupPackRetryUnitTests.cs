@@ -6,17 +6,19 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 闸门重试 pack 时，重试的**单位**必须是一组，不是一整个池。
+/// When the gate retries a pack, the **unit** of the retry must be one group, not a whole pool.
 /// <para>
-/// 一件 pack 活是一个池，<c>ProcessPackAsync</c> 按 GroupIsFull 把它切成若干组，每组各领一个包号。
-/// 整件重试就等于第 9 组的一次抖动把前 8 组全部推倒重来，而且重来时领的是**新**包号：前 8 组
-/// 已经传上去的归档从此没有任何索引引用得到，只在容器里占着地方（保留清理要到下一轮才收），
-/// info.Packs 里还各留一条指向孤儿的记录，进度也跟着多销几笔。
+/// One pack work item is a pool; <c>ProcessPackAsync</c> cuts it into groups by GroupIsFull, and each group draws
+/// its own pack number. Retrying the whole item means one blip on group 9 tears down all 8 groups before it, and
+/// the redo draws **new** pack numbers: the archives those 8 groups already uploaded can no longer be reached from
+/// any index and merely take up room in the container (retention cleanup only collects them next run),
+/// info.Packs keeps one record per orphan, and progress writes off a few extra items on top.
 /// </para>
 /// <para>
-/// 这里的池靠"压缩期间成员变了"切成两组——这是编排器自己就有的那条路（变化成员以新 hash 重新
-/// 入队，自然进入下一组），不是为测试造的机关：装箱在 diff 那侧按同样的三条界封箱，所以正常
-/// 情况下一个池就是一组，多组只可能这么来。
+/// The pool here is cut into two groups by "a member changed during compression" — that is a path the orchestrator
+/// already has (a changed member is re-queued with its new hash and naturally lands in the next group), not a
+/// contraption built for the test: packing on the diff side seals by the same three limits, so normally one pool is
+/// one group, and multiple groups can only arise this way.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -64,7 +66,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
 
     private const string TargetLeaf = "m3.bin";
 
-    /// <summary>一个目录、6 个小文件：按三条界这是**一个**池、一组。</summary>
+    /// <summary>One directory, 6 small files: by the three limits this is **one** pool and one group.</summary>
     private void WritePool()
     {
         Directory.CreateDirectory(Path.Combine(_root, "d"));
@@ -73,16 +75,18 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     }
 
     /// <summary>
-    /// 压 6 个成员那一下（也只有那一下）把其中一个成员改掉：编排器的压缩后重校验会把它排除出
-    /// 归档、以新 hash 重新入队，于是同一个池被切成两组——**不改动被测代码**就得到多组现场。
-    /// 顺带把每个包号被压了几次记下来，用来回答"已经传好的那组有没有被重压"。
+    /// On the compression of all 6 members (and only then), mutate one of them: the orchestrator's post-compression
+    /// re-verification excludes it from the archive and re-queues it with a new hash, so the same pool gets cut into
+    /// two groups — a multi-group scene **without touching the code under test**.
+    /// It also records how many times each pack number was compressed, to answer "did the group that had already
+    /// uploaded get recompressed".
     /// </summary>
     private sealed class MutatingCompressor(IFileCompressor inner, string root) : IFileCompressor
     {
         private readonly List<string> _compressed = [];
         private int _mutations;
 
-        /// <summary>按调用顺序记下每次压缩的包号（同一个包号可以出现多次）。</summary>
+        /// <summary>Records the pack number of every compression in call order (the same number may appear more than once).</summary>
         public IReadOnlyList<string> Compressed
         {
             get { lock (_compressed) return [.. _compressed]; }
@@ -93,15 +97,19 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var packId = Path.GetFileNameWithoutExtension(request.OutputArchivePath);
             lock (_compressed) _compressed.Add(packId);
 
-            // 只在"整组一起压"那一下动手：剔除变化成员后的重压只剩 5 个成员、后面那一组只剩 1 个，
-            // 都不含目标，于是不会没完没了地"又变了"（那会一路撞到 ProcessingMaxAttempts 降级成单文件）。
+            // Only act on the "compress the whole group at once" call: after the changed member is dropped the
+            // recompression has 5 members left and the following group has just 1, neither containing the target, so
+            // there is no endless "changed again" (which would run all the way into ProcessingMaxAttempts and
+            // degrade to single files).
             var target = request.Entries.FirstOrDefault(
                 e => e.EndsWith(TargetLeaf, StringComparison.Ordinal));
             if (request.Entries.Count > 1 && target is not null)
             {
-                // 每次改成**不同的长度**。压缩后重校验的第一道是元数据比对，只改内容不改长度的话，
-                // 同一秒内重写会得到相同的 (mtime, length)，比对就说"这个成员没变"——那样整件重试
-                // 的旧行为会伪装成正确的（一次抖动之后只剩一组），测试就失去了鉴别力。
+                // Change it to a **different length** every time. The first stage of post-compression re-verification
+                // is a metadata comparison; change only the content and not the length and a rewrite within the same
+                // second yields the same (mtime, length), so the comparison says "this member did not change" — and
+                // then the old whole-item retry behaviour would masquerade as correct (only one group left after a
+                // blip), and the test would lose all its discriminating power.
                 var n = Interlocked.Increment(ref _mutations);
                 File.WriteAllBytes(
                     Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)),
@@ -129,7 +137,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>第 N 个**包**的第一次上传抖一下（只抖一次）。N=2 就是"前面那组已经传好了才出事"。</summary>
+    /// <summary>Blip on the Nth **pack**'s first upload (once only). N=2 means "the earlier group had already finished uploading when things went wrong".</summary>
     private sealed class FlakyOnNthPack(IBlobUploader inner, int nth) : IBlobUploader
     {
         private readonly HashSet<string> _packs = new(StringComparer.Ordinal);
@@ -171,7 +179,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             });
     }
 
-    /// <summary>每一个**包**的第一次上传各抖一下：两次抖动之间必定夹着一次成功。</summary>
+    /// <summary>Blip once on every **pack**'s first upload: there is always a success sandwiched between the two blips.</summary>
     private sealed class FlakyOnEveryPackOnce(IBlobUploader inner) : IBlobUploader
     {
         private readonly HashSet<string> _packs = new(StringComparer.Ordinal);
@@ -215,7 +223,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             });
     }
 
-    /// <summary>只记下每次压缩用的包号,不改动内容、不改动行为——用来数"这一组被压了几次"。</summary>
+    /// <summary>Records only the pack number each compression used, changing neither content nor behaviour — used to count "how many times was this group compressed".</summary>
     private sealed class CountingCompressor(IFileCompressor inner) : IFileCompressor
     {
         private readonly List<string> _compressed = [];
@@ -250,7 +258,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>取消令牌一按就抛 OperationCanceledException 的上传器：用来验证取消没有被闸门吞掉。</summary>
+    /// <summary>An uploader that trips the cancellation token and throws OperationCanceledException: used to verify the gate does not swallow a cancellation.</summary>
     private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
     {
         private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
@@ -258,7 +266,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             if (blobName.StartsWith("packs/", StringComparison.Ordinal))
             {
                 cts.Cancel();
-                // 形状与"传到一半被取消"一模一样：真实的取消就是从这里抛出来的。
+                // Exactly the same shape as "cancelled halfway through an upload": a real cancellation is thrown from right here.
                 throw new OperationCanceledException(cts.Token);
             }
             return call();
@@ -315,7 +323,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 } },
     };
 
-    /// <summary>容器里的 pack 归档（.7z 基名），与索引真正引用到的那些。两者必须相等。</summary>
+    /// <summary>The pack archives in the container (.7z base names) and the ones the index actually references. The two must be equal.</summary>
     private static async Task<(HashSet<string> InContainer, HashSet<string> Referenced)> PacksAsync(
         Azure.Storage.Blobs.BlobContainerClient cc, IBackupInfoStore store, Account account, string container)
     {
@@ -333,7 +341,8 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     }
 
     /// <summary>
-    /// 第 2 组上传抖一次：只有第 2 组重来，第 1 组既不重压也不重传，包号不变，容器里不留孤儿。
+    /// One blip on the second group's upload: only the second group is redone; the first is neither recompressed nor
+    /// re-uploaded, its pack number is unchanged, and no orphan is left in the container.
     /// </summary>
     [SkippableFact]
     public async Task A_blip_in_the_second_group_reruns_only_that_group()
@@ -359,25 +368,27 @@ public sealed class BackupPackRetryUnitTests : IDisposable
 
             var compressed = compressor.Compressed;
             var packs = compressed.Distinct(StringComparer.Ordinal).ToList();
-            // 这个现场的前提：池确实被切成了两组。切不出来的话下面几条断言都是空转。
+            // Precondition for this scene: the pool really was cut into two groups. Without the cut, the assertions below spin idle.
             Assert.Equal(2, packs.Count);
 
-            // 第 1 组：整组压一次 + 剔掉变化成员后重压一次，就这两次。第 2 组抖完重来时若把整个池
-            // 推倒重来，这里会冒出第 3 次（而且是挂在一个**新**包号上）。
+            // Group 1: compressed once for the whole group + once more after the changed member was dropped, and
+            // that is all. If the second group's redo tore down the whole pool, a third compression would show up
+            // here (and hanging off a **new** pack number at that).
             Assert.Equal(2, compressed.Count(p => p == packs[0]));
-            // 第 2 组：抖了一次，压了两次——**同一个包号**。号变了就等于在云上多留一份没人引用的归档。
+            // Group 2: one blip, two compressions — on the **same pack number**. A changed number means one more unreferenced archive left in the cloud.
             Assert.Equal(2, compressed.Count(p => p == packs[1]));
 
             var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
-            Assert.Equal(referenced, inContainer);   // 容器里没有索引引用不到的孤儿包
+            Assert.Equal(referenced, inContainer);   // no orphan pack in the container that the index cannot reach
             Assert.Equal(2, referenced.Count);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 进度销账每组恰好一次，与抖了几次无关。整件重试会让已经销过账的那一组再销一次，
-    /// uploaded 就此虚高（越过 total 之后速度与剩余时间一起失真）。
+    /// Progress is written off exactly once per group, however many blips there were. A whole-item retry writes off
+    /// a group that was already written off a second time, and uploaded is inflated from then on (once it passes
+    /// total, the speed and the remaining time both go wrong).
     /// </summary>
     [SkippableFact]
     public async Task Each_group_reports_progress_exactly_once_however_many_retries()
@@ -402,13 +413,13 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var progress = new Progress<BackupProgress>(p => peak = Math.Max(peak, p.UploadedItems));
             await orchestrator.RunAsync(Request(account, name), progress, default, control);
 
-            // 两组 → 恰好两笔。整件重试时第 1 组会被再销一次，这里就成了 3。
+            // Two groups → exactly two write-offs. With a whole-item retry group 1 gets written off again and this becomes 3.
             Assert.Equal(2, peak);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>用户按的取消不是"网络抖了一下"：必须原样上抛，不能被闸门等成挂起。</summary>
+    /// <summary>A cancellation the user pressed is not "the network hiccupped": it must propagate as-is, and must not be waited out by the gate into a suspend.</summary>
     [SkippableFact]
     public async Task User_cancellation_still_propagates_through_the_group_retry()
     {
@@ -431,16 +442,18 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             await Assert.ThrowsAnyAsync<OperationCanceledException>(
                 () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
 
-            // 光看异常类型不够：真正要守的是"取消根本没进过闸门"。瞬时判据若拿到的不是运行本身
-            // 那个令牌，取消就会被当成抖动，在闸门前一等再等，直到耐心耗尽把这轮判成挂起——
-            // 那时用户按的是取消，界面上出现的却是"已挂起，稍后自动接着跑"。
-            Assert.False(control.Gate.IsDowngraded, "取消被闸门吞成了自动挂起。");
+            // The exception type alone is not enough: what really has to hold is "the cancellation never entered the
+            // gate at all". If the transient test is handed a token other than the run's own, a cancellation gets
+            // taken for a blip and waits at the gate again and again until patience runs out and the run is declared
+            // suspended — at which point the user pressed cancel but the UI says "suspended, will resume
+            // automatically later".
+            Assert.False(control.Gate.IsDowngraded, "the gate swallowed the cancellation and turned it into an automatic suspend.");
             Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>没有 control 的运行（定时任务之外的老路径）行为不变：照样两组、照样不留孤儿。</summary>
+    /// <summary>Runs without a control (the old path outside scheduled jobs) behave unchanged: still two groups, still no orphans.</summary>
     [SkippableFact]
     public async Task Runs_without_a_control_behave_exactly_as_before()
     {
@@ -468,18 +481,22 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     }
 
     /// <summary>
-    /// 上传已确认之后才撞上的瞬时错误（journal append / oplog 那一步）不再拖着整组重来一遍。
+    /// A transient error hit only after the upload was confirmed (the journal append / oplog step) no longer drags
+    /// the whole group through a redo.
     /// <para>
-    /// 用一把独占文件锁常驻卡住当天的 verbose 日志文件：<c>LogFileAsync</c> 一写就撞
-    /// <see cref="IOException"/>（真实的共享冲突，<see cref="TransientErrors"/> 判它为瞬时）。锁全程
-    /// 不放，逼出"重不重试"的差异——重试的话每次撞锁都会先把整组重新压缩、重新上传一遍，压缩
-    /// 次数会跟着撞锁次数一起涨；不重试的话，压缩只可能发生在成功上传的那一次，之后这一步
-    /// 自己撞上的错误原样往外抛，压缩次数永远停在 1。
+    /// An exclusive file lock is parked on today's verbose log file for the duration: every <c>LogFileAsync</c> write
+    /// runs straight into an <see cref="IOException"/> (a genuine sharing conflict, which
+    /// <see cref="TransientErrors"/> judges transient). The lock is never released, which forces out the difference
+    /// between retrying and not — with a retry, every collision with the lock first recompresses and re-uploads the
+    /// whole group, so the compression count climbs along with the number of collisions; without one, compression
+    /// can only happen on the one successful upload, after which this step's own error propagates as-is and the
+    /// compression count stays at 1 forever.
     /// </para>
     /// <para>
-    /// 压缩次数正是「上传字节」的账本：<c>state.AddUploaded</c> 与每一次成功的
-    /// <c>UploadStagedPackAsync</c> 一一对应，而后者又与每一次压缩一一对应。压缩只跑一次，
-    /// 上传字节就只可能记一次——这正是本组要守住的"不双计"。
+    /// The compression count is precisely the ledger for "uploaded bytes": <c>state.AddUploaded</c> corresponds
+    /// one-to-one with each successful <c>UploadStagedPackAsync</c>, which in turn corresponds one-to-one with each
+    /// compression. Compress once and the uploaded bytes can only be counted once — which is exactly the "no double
+    /// counting" this group of tests guards.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -498,11 +515,12 @@ public sealed class BackupPackRetryUnitTests : IDisposable
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
-            WritePool();   // 一个池、一组（见类注释）
+            WritePool();   // one pool, one group (see the class comment)
 
-            // 提前把今天这份 verbose 日志文件锁死：独占打开之后，AppendAsync 内部的
-            // File.AppendAllTextAsync 一开就撞共享冲突，抛出裸 IOException。锁在 using 里，
-            // 直到这个测试方法结束才放开——不给重试留任何"这次就成了"的窗口。
+            // Lock today's verbose log file up front: once it is open exclusively, the File.AppendAllTextAsync inside
+            // AppendAsync hits a sharing conflict the moment it opens and throws a bare IOException. The lock lives
+            // in a using and is not released until this test method ends — leaving a retry no "this time it worked"
+            // window at all.
             var logDir = Path.Combine(verboseRoot, name);
             Directory.CreateDirectory(logDir);
             var logFile = Path.Combine(logDir, DateTimeOffset.UtcNow.ToString("yyyyMMdd") + ".log");
@@ -522,31 +540,36 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
                 patience: TimeSpan.FromSeconds(2)));
 
-            // 记账阶段的失败现在原样往外抛：不再经过挂起闸门那套"等一等再来"。
+            // A failure in the bookkeeping stage now propagates as-is: it no longer goes through the suspend gate's "wait a bit and come back".
             await Assert.ThrowsAnyAsync<IOException>(
                 () => orchestrator.RunAsync(request, null, default, control));
 
-            // 压缩只跑了一次——上传已经确认过的那一组没有被重新压、重新传。大于 1 就说明记账阶段
-            // 的失败仍然拖着整组重试，state.AddUploaded 会跟着多算一遍（本组要守的双计 bug）。
+            // Compression ran exactly once — the group whose upload was already confirmed was not recompressed or
+            // re-uploaded. More than 1 means a bookkeeping-stage failure still drags the whole group into a retry and
+            // state.AddUploaded counts it a second time (the double-count bug this group of tests guards).
             Assert.Single(compressor.Compressed);
-            // 记账阶段的失败不该经过闸门：它已经在重试范围之外了，闸门连一次连败都不该记到。
-            Assert.False(control.Gate.IsDowngraded, "记账阶段的失败被闸门当成了瞬时抖动去等。");
+            // A bookkeeping-stage failure should not go through the gate at all: it is already outside the retry
+            // scope, and the gate should not even record one consecutive failure for it.
+            Assert.False(control.Gate.IsDowngraded, "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
             Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 干成一段活就把闸门的连败清零。<c>ReportSuccess</c> 从前没有任何测试守着——把那一行删掉，
-    /// 上面几个测试照样全绿。
+    /// Getting a piece of work done resets the gate's consecutive-failure count. <c>ReportSuccess</c> used to have
+    /// no test guarding it at all — delete that line and every test above still goes green.
     /// <para>
-    /// 它守的是这件事：闸门的耐心是"从第一次不顺算起还没好过"。中间成功过却不清零的话，一天里
-    /// 零星抖几下就会攒够耐心，把一轮从头到尾都在正常传的备份判成自动挂起——而且抖得越久越像
-    /// 网络坏了，其实每一次都当场自愈了。
+    /// What it guards is this: the gate's patience means "nothing has gone right since the first hiccup". If a
+    /// success in between does not reset it, a handful of scattered blips over a day are enough to use up the
+    /// patience and declare a backup that uploaded normally from start to finish automatically suspended — and the
+    /// longer the blips go on, the more it looks like the network is broken, when in fact every one of them healed
+    /// itself on the spot.
     /// </para>
     /// <para>
-    /// 现场用的是**同一个池里的两组**，不是两件并发的活：一个池由一个消费者顺序处理，所以
-    /// "第 1 组重试成功 → 清零 → 第 2 组才出事"这个次序由程序顺序保证，不靠等待时间去碰运气。
+    /// The scene uses **two groups within the same pool**, not two concurrent work items: one pool is processed
+    /// sequentially by one consumer, so the order "group 1 retries successfully → reset → only then does group 2 go
+    /// wrong" is guaranteed by program order, not left to the luck of wait timings.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -564,8 +587,8 @@ public sealed class BackupPackRetryUnitTests : IDisposable
         try
         {
             WritePool();
-            // 退避 400ms：挂起现场要在闸门上挂足够久，下面 10ms 一次的取样才看得见它的连败数。
-            // 耐心给足，这个测试问的不是"耐心会不会用尽"。
+            // 400ms backoff: the suspend scene has to hang on the gate long enough for the 10ms sampling below to see
+            // its consecutive-failure count. Patience is set generously — this test is not asking "will patience run out".
             await using var control = new BackupRunControl(_journals, 5, "run-reset", new PauseGate(
                 schedule: [TimeSpan.FromMilliseconds(400)], steady: TimeSpan.FromMilliseconds(400),
                 patience: TimeSpan.FromSeconds(30)));
@@ -580,8 +603,8 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var result = await run;
 
             Assert.Equal(1, result.Version);
-            Assert.Equal(2, flaky.Thrown);   // 确实抖了两次，中间夹着一次成功
-            // 第 2 次抖动开闸时的连败数：清零了就还是 1，没清零就是 2。
+            Assert.Equal(2, flaky.Thrown);   // two blips really happened, with a success sandwiched between them
+            // The consecutive-failure count when the second blip opens the gate: 1 if it was reset, 2 if it was not.
             Assert.Equal(1, peak);
         }
         finally { await cc.DeleteIfExistsAsync(); }

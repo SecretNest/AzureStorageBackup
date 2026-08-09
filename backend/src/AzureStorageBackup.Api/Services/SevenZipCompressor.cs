@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>一次压缩请求。Entries 为相对 SourceDirectory 的条目名（决定归档内的条目名）。</summary>
+/// <summary>One compression request. Entries are names relative to SourceDirectory (they decide the entry names inside the archive).</summary>
 public sealed record CompressionRequest(
     string SourceDirectory,
     IReadOnlyList<string> Entries,
@@ -11,30 +11,31 @@ public sealed record CompressionRequest(
     long? VolumeBytes = null,
     bool StoreOnly = false);
 
-/// <summary>压缩结果：产出的卷文件（按名排序；单卷时仅一个）。</summary>
+/// <summary>Compression result: the volume files produced (sorted by name; just one when the archive is not split).</summary>
 public sealed record CompressionResult(IReadOnlyList<string> VolumeFiles);
 
 /// <summary>
-/// 归档里少了本该在里面的成员。7z 对读不了的成员只报**警告**（退出码 1）：它把成员静默丢掉，
-/// 仍产出一个完全有效的归档——三次真实 chmod 000 探针证实过，连"全部成员都读不了"时它也照样
-/// 产出一个 59 字节的空归档并返回 1。不验收就会上传一个缺成员的包，而索引声称该成员在里面，
-/// 只有还原或深度检查时才暴露。
-/// 继承 IOException：这确实是一次源文件读失败，只不过失败发生在 7z 进程内部，
-/// 我们只能事后从归档实际内容反推出来。
+/// The archive is missing a member that should have been in it. For a member it cannot read, 7z only raises a
+/// **warning** (exit code 1): it silently drops the member and still produces a perfectly valid archive — three
+/// real chmod 000 probes confirmed it, and even when "not a single member is readable" it still produces a
+/// 59-byte empty archive and returns 1. Without verification we would upload a pack that is missing a member
+/// while the index claims that member is in there, exposed only by a restore or a deep check.
+/// It inherits IOException: this really is a source-file read failure, it just happened inside the 7z process,
+/// so all we can do is infer it after the fact from what actually ended up in the archive.
 /// </summary>
 public sealed class ArchiveMembersMissingException(IReadOnlyList<string> missingEntries, string message)
     : IOException(message)
 {
-    /// <summary>确认不在归档里的条目名（与 <see cref="CompressionRequest.Entries"/> 同名字空间）。</summary>
+    /// <summary>Entry names confirmed absent from the archive (same namespace as <see cref="CompressionRequest.Entries"/>).</summary>
     public IReadOnlyList<string> MissingEntries { get; } = missingEntries;
 }
 
-/// <summary>归档内的一个条目。Size 为**解压后**的字节数；Name 分隔符已归一化为 '/'。</summary>
+/// <summary>One entry inside an archive. Size is the **uncompressed** byte count; the separators in Name are normalized to '/'.</summary>
 public sealed record ArchiveEntry(string Name, long Size, bool IsDirectory);
 
 /// <summary>
-/// 一次流式压缩请求：内容由调用方写进 7z 的 stdin，归档里只有 <paramref name="EntryName"/> 一个成员。
-/// 条目名保留完整相对路径（与按文件压缩时一致），因此还原与检查定位成员的逻辑不必区分两种产出。
+/// One streaming compression request: the caller writes the content into 7z's stdin, and the archive holds exactly one member, <paramref name="EntryName"/>.
+/// The entry name keeps the full relative path (same as when compressing by file), so restore and check do not need to tell the two kinds of output apart when locating a member.
 /// </summary>
 public sealed record StreamCompressionRequest(
     string EntryName,
@@ -44,36 +45,39 @@ public sealed record StreamCompressionRequest(
     bool StoreOnly = false,
     long? ExpectedBytes = null);
 
-/// <summary>把文件压缩成 7z 归档（可加密/分卷）及解压。用于数据 blob 与分组 pack（M4 §6、§13.1）。</summary>
+/// <summary>Compresses files into 7z archives (optionally encrypted/split) and extracts them again. Used for data blobs and grouped packs (M4 §6, §13.1).</summary>
 public interface IFileCompressor
 {
     Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default);
     Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default);
 
     /// <summary>
-    /// 流式压缩：<paramref name="writeSource"/> 把内容写进给它的流（7z 的 stdin），返回写了多少字节。
-    /// 源文件因此只被读一遍——调用方可以在同一遍里顺便算 hash，不必压完再读一次。
+    /// Streaming compression: <paramref name="writeSource"/> writes the content into the stream handed to it
+    /// (7z's stdin) and returns how many bytes it wrote.
+    /// The source file is therefore read only once — the caller can hash it in that same pass instead of reading it again after compressing.
     /// <para>
-    /// 写入侧的异常（源文件读失败、取消）必须原样传出，绝不能被当成"压完了"：半截的归档
-    /// 是有效的 7z 文件，光看退出码分辨不出来。实现须在失败时删掉已产出的卷。
+    /// Exceptions from the writing side (source read failure, cancellation) must propagate unchanged and must never
+    /// be taken for "compression finished": a half-written archive is a valid 7z file, and the exit code alone
+    /// cannot tell them apart. The implementation must delete the volumes it already produced when it fails.
     /// </para>
     /// </summary>
-    /// <returns>产出的卷文件（按名排序）。</returns>
+    /// <returns>The volume files produced (sorted by name).</returns>
     Task<CompressionResult> CompressStreamAsync(
         StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
         CancellationToken ct = default);
 
-    /// <summary>列出归档成员，保持归档内顺序并带尺寸（见 <see cref="SevenZipCli.ListEntryDetailsAsync"/>）。</summary>
+    /// <summary>Lists archive members, keeping the in-archive order and carrying sizes (see <see cref="SevenZipCli.ListEntryDetailsAsync"/>).</summary>
     Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
         string firstVolumePath, string? password, CancellationToken ct = default);
 
     /// <summary>
-    /// 流式解压到 <paramref name="destination"/>，不落磁盘。<paramref name="entryName"/> 为 null 时
-    /// 取出**全部**成员（按归档内顺序首尾相接）。返回写出的字节数。
+    /// Streaming extraction into <paramref name="destination"/>, never touching disk. When
+    /// <paramref name="entryName"/> is null it pulls out **every** member (concatenated in archive order). Returns the number of bytes written.
     /// <para>
-    /// 警告：成员不存在时 7z 输出为空且**退出码 0**，这里也照样返回 0 而不报错——
-    /// 与项目已经踩过的「丢成员却退出 1 静默通过」是同一类坑。调用方**必须**自行核对
-    /// 字节数与 hash，不得以"没抛异常"作为通过依据。
+    /// Warning: when the member does not exist, 7z writes no output and **exits 0**, and this method likewise
+    /// returns 0 instead of failing — the same class of trap as the "member dropped, exit 1, silently passes" one
+    /// this project already walked into. The caller **must** check the byte count and hash itself, and may not
+    /// treat "no exception was thrown" as grounds for passing.
     /// </para>
     /// </summary>
     Task<long> ExtractToStreamAsync(
@@ -88,19 +92,21 @@ public sealed class SevenZipCompressor : IFileCompressor
     private readonly Func<ProcessPriorityClass>? _priority;
 
     /// <param name="methodArgs">
-    /// 覆盖压缩方法参数（<c>-m…</c>），默认 <c>-mx9</c>（PRD 3.3.2.1 要求最大压缩）。
-    /// 换算法、调字典、限线程都从这里走，例如 <c>-mx7 -m0=lzma2 -md=32m -mmt=2</c>。
+    /// Overrides the compression method switches (<c>-m…</c>); defaults to <c>-mx9</c> (PRD 3.3.2.1 requires maximum compression).
+    /// Changing the algorithm, tuning the dictionary and capping threads all go through here, e.g. <c>-mx7 -m0=lzma2 -md=32m -mmt=2</c>.
     /// <para>
-    /// 只收 <c>-m</c> 开头的参数：其余开关决定的是我们怎么和 7z 对话（<c>-y</c> 自动应答、
-    /// <c>-bso0/-bsp0</c> 静音、<c>-si</c> 走 stdin、<c>-t7z</c> 归档格式），让它们可配等于
-    /// 让一次手滑毁掉输出解析或产出还原不了的归档。加密（<c>-p</c>/<c>-mhe=on</c>）与分卷
-    /// （<c>-v</c>）按备份配置走，同样不从这里来。
+    /// Only switches starting with <c>-m</c> are accepted: the rest decide how we talk to 7z (<c>-y</c> auto-answer,
+    /// <c>-bso0/-bsp0</c> silence, <c>-si</c> read from stdin, <c>-t7z</c> archive format), and making those
+    /// configurable means one slip of the finger can wreck output parsing or produce an archive we cannot restore.
+    /// Encryption (<c>-p</c>/<c>-mhe=on</c>) and splitting (<c>-v</c>) follow the backup configuration and likewise
+    /// do not come from here.
     /// </para>
-    /// <para>写错了在构造时就抛——启动即失败，好过备份跑到一半才炸。</para>
+    /// <para>A malformed value throws at construction time — failing at startup beats blowing up halfway through a backup.</para>
     /// </param>
     /// <param name="priority">
-    /// 每个 7z 进程的 CPU 优先级。传委托而非值：全局设置在界面上改完保存后，下一个进程就该按新档跑，
-    /// 不该等重启容器（与 <see cref="StagingArea"/> 的上限同一个道理）。null＝不动优先级。
+    /// CPU priority for each 7z process. A delegate rather than a value: once the global setting is changed and saved
+    /// in the UI, the next process should already run at the new level instead of waiting for a container restart
+    /// (the same reasoning as the cap in <see cref="StagingArea"/>). null = leave the priority alone.
     /// </param>
     public SevenZipCompressor(
         string? executable = null, string? methodArgs = null, Func<ProcessPriorityClass>? priority = null)
@@ -111,14 +117,15 @@ public sealed class SevenZipCompressor : IFileCompressor
         _priority = priority;
     }
 
-    /// <summary>本实例实际会用的 <c>-m…</c> 参数（StoreOnly 除外，见 <see cref="MethodArgs"/>）。
-    /// 用于断言配置确实绑到了这里——真正会坏的是配置绑定那一环，键名写错的话类本身再正确也没用。</summary>
+    /// <summary>The <c>-m…</c> switches this instance will actually use (StoreOnly aside, see <see cref="MethodArgs"/>).
+    /// Used to assert that the configuration really bound to here — the link that actually breaks is configuration binding, and a perfectly correct class is worthless if the key name is misspelled.</summary>
     public IReadOnlyList<string> ConfiguredMethodArgs => _methodArgs;
 
     /// <summary>
-    /// 校验一串方法参数，配置写错就抛。给启动期用：DI 工厂是懒的，不在这里先验一次的话，
-    /// 一个写错的 <c>Backup__SevenZipMethodArgs</c> 要等到第一次备份跑起来才炸——
-    /// 那时用户已经以为一切正常了。<paramref name="methodArgs"/> 为空＝用默认值，合法。
+    /// Validates a string of method switches and throws when the configuration is malformed. For use at startup: the
+    /// DI factory is lazy, so without checking once here, a malformed <c>Backup__SevenZipMethodArgs</c> would only
+    /// blow up when the first backup runs — by which time the user already believes everything is fine.
+    /// An empty <paramref name="methodArgs"/> = use the default, which is valid.
     /// </summary>
     public static void ValidateMethodArgs(string? methodArgs) => ParseMethodArgs(methodArgs);
 
@@ -137,8 +144,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         return parsed;
     }
 
-    /// <summary>本次压缩实际要用的 <c>-m…</c> 参数。StoreOnly（不压缩列表）恒为 <c>-mx0</c>：
-    /// 那是"这类文件压了也白压"的判断结果，不是可调的偏好。</summary>
+    /// <summary>The <c>-m…</c> switches this particular compression will use. StoreOnly (the do-not-compress list) is always <c>-mx0</c>:
+    /// that is the conclusion of "compressing this kind of file is wasted effort", not a tunable preference.</summary>
     private IEnumerable<string> MethodArgs(bool storeOnly) => storeOnly ? ["-mx0"] : _methodArgs;
 
     public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
@@ -161,14 +168,15 @@ public sealed class SevenZipCompressor : IFileCompressor
         var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
         var volumes = CollectVolumes(request.OutputArchivePath);
 
-        // 退出码 0 的归档必然齐全，所以这次额外的列举只在 1 时付出——而 1 恰恰是 7z 丢掉
-        // 读不了的成员时给出的退出码（也用于其它无害警告，故必须比对内容而不是见 1 就报错）。
+        // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1 is
+        // exactly the exit code 7z gives when it drops a member it could not read (it also covers other harmless
+        // warnings, so we must compare contents rather than fail on sight of a 1).
         if (run.ExitCode == 1)
         {
             var missing = await FindMissingEntriesAsync(volumes, request, ct);
             if (missing.Count > 0)
             {
-                // 不把这个残缺归档留在压缩临时区：它不可用，留着只会占磁盘并可能被误当成产物。
+                // Do not leave the mutilated archive in the compression temp area: it is unusable, and keeping it only eats disk and risks being mistaken for a product.
                 foreach (var v in volumes)
                 {
                     try { File.Delete(v); } catch { /* best effort */ }
@@ -181,12 +189,12 @@ public sealed class SevenZipCompressor : IFileCompressor
         return new CompressionResult(volumes);
     }
 
-    /// <summary>比对归档实际内容与请求的条目，返回**确认缺席**的条目名。
-    /// 用子集判定而非集合相等：7z 可能额外写入路径中间的目录条目，多出来的条目无害。</summary>
+    /// <summary>Compares what is actually in the archive against the requested entries and returns the names **confirmed absent**.
+    /// Uses a subset test rather than set equality: 7z may additionally write directory entries for intermediate path components, and extra entries are harmless.</summary>
     private async Task<IReadOnlyList<string>> FindMissingEntriesAsync(
         IReadOnlyList<string> volumes, CompressionRequest request, CancellationToken ct)
     {
-        // 归档压根没产出 → 一个成员都没进去。
+        // No archive was produced at all → not a single member made it in.
         if (volumes.Count == 0)
             return [.. request.Entries];
 
@@ -201,16 +209,18 @@ public sealed class SevenZipCompressor : IFileCompressor
         var outDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputArchivePath))!;
         Directory.CreateDirectory(outDir);
 
-        // -si{name} 让 7z 从 stdin 读内容、以 name 作为归档内的条目名。加密/头加密/分卷与它完全兼容。
+        // -si{name} makes 7z read the content from stdin and use name as the entry name inside the archive. Encryption/header encryption/splitting are fully compatible with it.
         var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
         var method = MethodArgs(request.StoreOnly).ToList();
         args.AddRange(method);
         args.Add("-si" + request.EntryName);
-        // 词典大小必须自己给。压缩一个**文件**时 7z 会把词典缩到输入大小；从 stdin 读它不知道会来多少，
-        // 于是每次都照 -mx9 的 64 MB 分配——一个 6 MB 的文件因此凭空多付近一秒（实测 0.10s → 0.30s），
-        // 而这条路径上跑的正是成千上万个刚过 5 MB 阈值的文件。按压之前 stat 到的长度取 2 的幂并封顶
-        // 64 MB，与 7z 自己对同尺寸文件的选择一致：产出逐字节相同，只是不再白等那次分配。
-        // 配置里显式给了 -md 就照配置来：那是运维按自己机器的内存定的，比这里的自动推算权威。
+        // We must supply the dictionary size ourselves. When compressing a **file**, 7z shrinks the dictionary down to
+        // the input size; reading from stdin it has no idea how much is coming, so it allocates -mx9's 64 MB every
+        // time — a 6 MB file therefore pays nearly an extra second for nothing (measured 0.10s → 0.30s), and this
+        // path is exactly where the thousands of files that just cleared the 5 MB threshold run. Take the power of
+        // two at or above the length we stat'ed before compressing and cap it at 64 MB, matching what 7z picks
+        // itself for a file of that size: byte-for-byte identical output, only without the pointless wait on that allocation.
+        // If the configuration gives -md explicitly, follow the configuration: the operator set that against their own machine's memory, which outranks the guess made here.
         if (!request.StoreOnly && request.ExpectedBytes is { } expected
             && !method.Any(a => a.StartsWith("-md", StringComparison.Ordinal)))
         {
@@ -234,7 +244,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         }
         catch
         {
-            // 半截的归档一个字节都不能留：调用方（StagingArea）会把 compress-temp 里的东西当作产物收走。
+            // Not one byte of a half-written archive may survive: the caller (StagingArea) collects whatever is in compress-temp as the product.
             foreach (var v in CollectVolumes(request.OutputArchivePath))
             {
                 try { File.Delete(v); } catch { /* best effort */ }
@@ -244,9 +254,10 @@ public sealed class SevenZipCompressor : IFileCompressor
 
         var volumes = CollectVolumes(request.OutputArchivePath);
 
-        // 归档里必须真的有这个条目，且解压后尺寸等于我们喂进去的字节数。喂进去的字节又正是
-        // 算 hash 的那些字节，所以这一条查过之后，"索引记的内容"与"归档里的内容"就再无缝隙。
-        // 一次列举的代价只是读一遍归档头，和压缩本身比可以忽略。
+        // The entry must really be in the archive, and its uncompressed size must equal the byte count we fed in.
+        // Those fed bytes are exactly the bytes we hashed, so once this check passes there is no gap left between
+        // "what the index records" and "what is in the archive".
+        // One listing costs a single read of the archive header, negligible next to the compression itself.
         var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct, _priority))
             .FirstOrDefault(e => e.Name == SevenZipCli.NormalizeEntryName(request.EntryName));
         if (volumes.Count == 0 || entry is null || entry.Size != written)
@@ -264,8 +275,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         return new CompressionResult(volumes);
     }
 
-    /// <summary>-mx9 的默认词典（64 MB）与最小词典（1 MB）之间，取不小于输入长度的 2 的幂。
-    /// 比输入大的词典只是白占内存与分配时间，比输入小才会损失压缩率——所以只往上取整、只封顶。</summary>
+    /// <summary>Between -mx9's default dictionary (64 MB) and the smallest one (1 MB), take the power of two that is not below the input length.
+    /// A dictionary bigger than the input only wastes memory and allocation time; one smaller than the input is what costs compression ratio — hence round up only, and cap only.</summary>
     private static long DictionaryBytes(long expectedBytes)
     {
         const long min = 1L << 20;
@@ -284,7 +295,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         string firstVolumePath, string? entryName, string? password, Stream destination,
         CancellationToken ct = default)
     {
-        // -so 把成员内容送到 stdout，7z 的消息随之自动改走 stderr；-bso0/-bsp0 再压掉进度噪音。
+        // -so sends the member content to stdout, whereupon 7z automatically moves its own messages to stderr; -bso0/-bsp0 then silence the progress noise.
         var args = new List<string> { "x", "-so", "-y", "-bso0", "-bsp0" };
         if (!string.IsNullOrEmpty(password))
             args.Add("-p" + password);
@@ -319,17 +330,19 @@ public sealed class SevenZipCompressor : IFileCompressor
     }
 
     /// <summary>
-    /// 把解压产物补成"当前用户读得了"。
+    /// Patches the extraction output up to "the current user can read it".
     /// <para>
-    /// 归档里的权限位不一定能用：7-Zip 23.01（以及 Debian 的 p7zip）从 stdin 压缩（<c>-si</c>）时
-    /// 把属性写成 0，解出来的文件就是 <c>----------</c>——我们随后连自己刚解出来的东西都打不开。
-    /// 属性是压缩时写死进归档里的，换个版本解压也救不回来（实测 23.01 建的归档由 26.00 解压
-    /// 依然是 000），所以只能在解压之后补。
+    /// The permission bits in the archive are not necessarily usable: 7-Zip 23.01 (and Debian's p7zip) writes the
+    /// attributes as 0 when compressing from stdin (<c>-si</c>), so the extracted file comes out as <c>----------</c>
+    /// — and we then cannot even open what we just extracted ourselves. The attributes are baked into the archive at
+    /// compression time and extracting with another version does not rescue them (measured: an archive built by
+    /// 23.01 still comes out 000 when extracted by 26.00), so the only place to fix it is after extraction.
     /// </para>
     /// <para>
-    /// 只补"当前用户能读、目录能进"，其余位一律不动：解压区的权限本就不代表任何东西——
-    /// 还原写到目标后会按索引里的 Permissions 重设，检查与重打包只是把内容读一遍。
-    /// 符号链接整个跳过：chmod 会跟随到链接目标上去，而归档可以是导入进来的、不可信的。
+    /// We only grant "the current user can read it, and can enter directories" and touch no other bit: the
+    /// permissions in the extraction area never meant anything anyway — restore resets them from the index's
+    /// Permissions once it writes to the target, and check and repack merely read the content once.
+    /// Symlinks are skipped entirely: chmod would follow through to the link target, and an archive may be one that was imported and is not trustworthy.
     /// </para>
     /// </summary>
     private static void EnsureReadable(string dir)
@@ -343,7 +356,7 @@ public sealed class SevenZipCompressor : IFileCompressor
 
         Grant(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        // 先把本级目录补好再枚举：没有 x 位的目录连列都列不出来。
+        // Fix up this level's directory before enumerating: a directory without the x bit cannot even be listed.
         foreach (var sub in info.EnumerateDirectories())
             EnsureReadable(sub.FullName);
         foreach (var file in info.EnumerateFiles())
@@ -363,12 +376,12 @@ public sealed class SevenZipCompressor : IFileCompressor
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // 补不上就让后续的读失败去报错：那条路径上的错误信息带着文件名，比这里更有用。
+            // If we cannot patch it, let the subsequent read failure do the reporting: the error on that path carries the file name, which is more useful than anything here.
         }
     }
 
     /// <summary>
-    /// 收集产出的卷文件。分卷时 7z 产出 out.7z.001/.002...；不分卷时产出 out.7z。
+    /// Collects the volume files produced. When splitting, 7z produces out.7z.001/.002...; when not, out.7z.
     /// </summary>
     private static IReadOnlyList<string> CollectVolumes(string archivePath)
     {

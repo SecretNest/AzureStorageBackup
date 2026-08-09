@@ -2,10 +2,10 @@ using System.Diagnostics;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>官方 7-Zip 二进制的共享调用层：PATH 探测 + 进程运行（不经 shell）。</summary>
+/// <summary>Shared invocation layer for the official 7-Zip binary: PATH discovery + process execution (never through a shell).</summary>
 internal static class SevenZipCli
 {
-    /// <summary>在 PATH 上探测 7-Zip 可执行文件（7zz→7z→7za），找不到返回 null。</summary>
+    /// <summary>Probes PATH for the 7-Zip executable (7zz→7z→7za); returns null when none is found.</summary>
     public static string? TryResolveExecutable()
     {
         var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
@@ -22,9 +22,9 @@ internal static class SevenZipCli
         return null;
     }
 
-    /// <summary>运行 7z，参数经 ArgumentList 传递（密码含特殊字符也安全）。退出码 >=2 视为失败抛异常。
-    /// 返回退出码供调用方自行验收：**1 不是"没事"**——7z 用它表示警告，而"读不了的成员被静默丢掉、
-    /// 归档照样有效产出"正是这个退出码，只有比对归档实际内容才能发现。</summary>
+    /// <summary>Runs 7z with the arguments passed through ArgumentList (safe even when the password contains special characters). An exit code >=2 counts as failure and throws.
+    /// The exit code is returned so the caller can verify for itself: **1 does not mean "nothing happened"** — 7z uses it for warnings, and "a member that could not be read was silently
+    /// dropped while a valid archive was produced all the same" is exactly this exit code, discoverable only by comparing what actually ended up in the archive.</summary>
     public static async Task<SevenZipRun> RunAsync(
         string exe, IReadOnlyList<string> args, CancellationToken ct, string? workingDirectory = null,
         Func<ProcessPriorityClass>? priority = null)
@@ -47,7 +47,7 @@ internal static class SevenZipCli
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
         ApplyPriority(proc, priority);
 
-        // 关闭 stdin：若归档加密而未提供密码，7z 会等待输入 —— 给它 EOF 使其失败而非挂起。
+        // Close stdin: if the archive is encrypted and no password was given, 7z waits for input — give it EOF so it fails instead of hanging.
         proc.StandardInput.Close();
 
         var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
@@ -58,12 +58,13 @@ internal static class SevenZipCli
         }
         catch (OperationCanceledException)
         {
-            // 取消 WaitForExitAsync 只是「不再等」——7z 不会因此停下，Process.Dispose 也不杀它。
-            // 用户在界面上按了 Stop，压缩进程却还在 NAS 上啃着几十 GB、继续往临时目录写分卷：
-            // CPU/IO 一直被占，而调用方紧接着要删的正是那个目录，会撞上一个仍在被写的文件。
-            // 所以取消时显式把整棵进程树杀掉——7z 会 fork 出子进程，只杀父进程留得下孤儿。
+            // Cancelling WaitForExitAsync only means "stop waiting" — 7z does not stop because of it, and
+            // Process.Dispose does not kill it either. The user pressed Stop in the UI while the compression process
+            // is still chewing through tens of GB on the NAS and writing volumes into the temp directory:
+            // CPU/IO stay occupied, and the directory the caller deletes next is exactly that one, so it runs into a file that is still being written.
+            // So on cancellation kill the whole process tree explicitly — 7z forks children, and killing only the parent leaves orphans behind.
             KillTree(proc);
-            // 不带 ct 地等它真收尾：带上就又被立刻取消，清理还是会撞上活着的进程。
+            // Wait for it to really finish without a ct: pass one and the wait is cancelled immediately again, and cleanup still runs into a live process.
             await proc.WaitForExitAsync(CancellationToken.None);
             await ObserveAsync(stdoutTask, stderrTask);
             throw;
@@ -71,7 +72,7 @@ internal static class SevenZipCli
         var stderr = await stderrTask;
         var stdout = await stdoutTask;
 
-        // 7z 退出码：0=OK，1=警告，>=2=错误（含密码错误）。
+        // 7z exit codes: 0=OK, 1=warning, >=2=error (including a wrong password).
         if (proc.ExitCode >= 2)
             throw new InvalidOperationException($"7-Zip failed (exit {proc.ExitCode}): {stderr.Trim()}");
 
@@ -79,16 +80,18 @@ internal static class SevenZipCli
     }
 
     /// <summary>
-    /// 运行 7z，把 stdin/stdout **原样**交给调用方处理，不缓冲成字符串。
+    /// Runs 7z and hands stdin/stdout to the caller **as they are**, without buffering them into strings.
     /// <para>
-    /// <see cref="RunAsync"/> 用 <c>ReadToEndAsync</c> 收 stdout，对 `x -so` 是灾难：那条流上跑的
-    /// 是成员内容本身，一个几十 GB 的单文件 blob 会被整个读进内存——比先落盘再读还糟。
-    /// 反方向的 `a -si` 同理：源文件的字节要一路喂进 stdin，中间不能有一个"先攒起来"的环节。
+    /// <see cref="RunAsync"/> collects stdout with <c>ReadToEndAsync</c>, which is a disaster for `x -so`: what runs
+    /// on that stream is the member content itself, so a single-file blob of tens of GB gets read entirely into
+    /// memory — worse than staging it to disk and reading it back.
+    /// The opposite direction, `a -si`, is the same: the source file's bytes have to be fed straight into stdin, with no "pile it up first" step in between.
     /// </para>
     /// <para>
-    /// 三条管道都必须有人管。stdout 由调用方读，读完（或提前不读了）剩下的由这里排空；
-    /// 排空动作和写 stdin 并发进行——真让 7z 在写 stdout 上把管道塞满而我们正卡在写 stdin，
-    /// 两边就一起死等。stderr 照旧整读（消息量小，不读同样会把管道写满）。
+    /// All three pipes need someone tending them. stdout is read by the caller, and whatever is left once it is done
+    /// (or stops reading early) is drained here; the draining runs concurrently with writing stdin — let 7z really
+    /// fill the pipe writing stdout while we are stuck writing stdin, and both sides wait forever.
+    /// stderr is still read in full (little traffic, and not reading it fills that pipe just as well).
     /// </para>
     /// </summary>
     public static async Task<SevenZipRun> RunStreamingAsync(
@@ -126,21 +129,22 @@ internal static class SevenZipCli
 
         try
         {
-            // 不喂 stdin 就立刻给 EOF：与 RunAsync 同理，缺密码时让它失败而非挂起等输入。
+            // With nothing to feed stdin, give EOF immediately: same reasoning as RunAsync, so a missing password makes it fail instead of hanging on input.
             if (writeStdin is not null)
                 await writeStdin(proc.StandardInput.BaseStream, ct);
-            proc.StandardInput.Close();   // 关闭＝告诉 7z"内容到此为止"，必须在写完之后
+            proc.StandardInput.Close();   // closing = telling 7z "that is the end of the content", and it must come after the write
             await stdoutTask;
             await proc.WaitForExitAsync(ct);
         }
         catch
         {
-            // 取消、读写失败、调用方自己抛——结局都一样：这个 7z 进程还在啃磁盘，而调用方
-            // 紧接着要删的正是它在写/读的临时目录。整棵树杀掉再让异常继续往上走（同 RunAsync）。
-            // 尤其是喂 stdin 时读源文件失败：这里绝不能吞，否则一次半截的压缩会被当成成功。
+            // Cancellation, a read/write failure, the caller throwing on its own — the outcome is the same: this 7z
+            // process is still chewing the disk, while the temp directory the caller deletes next is exactly the one
+            // it is writing to/reading from. Kill the whole tree, then let the exception keep going up (as in RunAsync).
+            // Especially a source-file read failure while feeding stdin: it must never be swallowed here, or a half-finished compression gets taken for a success.
             KillTree(proc);
             await proc.WaitForExitAsync(CancellationToken.None);
-            try { proc.StandardInput.Close(); } catch { /* 已随进程一起没了 */ }
+            try { proc.StandardInput.Close(); } catch { /* already gone along with the process */ }
             await ObserveAsync(stdoutTask, stderrTask);
             throw;
         }
@@ -149,22 +153,24 @@ internal static class SevenZipCli
         if (proc.ExitCode >= 2)
             throw new InvalidOperationException($"7-Zip failed (exit {proc.ExitCode}): {stderr.Trim()}");
 
-        // stdout 已经交给调用方，这里没有可回填的内容。
+        // stdout was already handed to the caller, so there is nothing to fill in here.
         return new SevenZipRun(proc.ExitCode, "", stderr);
     }
 
     /// <summary>
-    /// 把优先级设到刚起来的 7z 进程上。<paramref name="priority"/> 为 null＝不动（保持继承自本进程的值）。
+    /// Applies the priority to the 7z process that has just started. <paramref name="priority"/> null = leave it alone (keep the value inherited from this process).
     /// <para>
-    /// <b>失败一律吞掉。</b>进程可能在这几微秒里就已经退出（<see cref="InvalidOperationException"/>），
-    /// 系统也可能拒绝（<see cref="System.ComponentModel.Win32Exception"/>）。优先级调不动不是压缩失败——
-    /// 让一次备份因为一个性能偏好设置炸掉，比它跑得快一点糟得多。
+    /// <b>Failures are always swallowed.</b> The process may already have exited within those few microseconds
+    /// (<see cref="InvalidOperationException"/>), and the system may refuse
+    /// (<see cref="System.ComponentModel.Win32Exception"/>). Failing to change the priority is not a compression
+    /// failure — letting a backup blow up over a performance preference is far worse than it running a little faster.
     /// </para>
     /// <para>
-    /// <b>Linux 上 nice 是每线程属性。</b><c>setpriority(PRIO_PROCESS, pid)</c> 只落在主线程上，
-    /// 7z 的 LZMA 工作线程继承的是**创建它们的那个线程**当时的 nice 值。这里紧贴 Process.Start 设置，
-    /// 那一刻 7z 还在动态链接、解析参数，工作线程尚未创建，所以实践上全部继承得到。
-    /// 最坏情况（输掉这个竞态）也只是有几个线程没降下来：效果打折，不影响正确性。
+    /// <b>On Linux, nice is a per-thread attribute.</b> <c>setpriority(PRIO_PROCESS, pid)</c> only lands on the main
+    /// thread, and 7z's LZMA worker threads inherit the nice value **of the thread that created them** at that
+    /// moment. We set it right up against Process.Start, when 7z is still doing dynamic linking and parsing arguments
+    /// and the worker threads do not exist yet, so in practice they all inherit it.
+    /// The worst case (losing this race) is just a few threads that were not lowered: reduced effect, no impact on correctness.
     /// </para>
     /// </summary>
     private static void ApplyPriority(Process proc, Func<ProcessPriorityClass>? priority)
@@ -179,8 +185,8 @@ internal static class SevenZipCli
         }
         catch
         {
-            // 取值失败＝读设置失败（数据库不可用之类）。那与这次压缩没有一点关系，
-            // 不该由它决定这次备份的成败——保持继承来的优先级接着跑。
+            // Failing to get the value = failing to read the setting (database unavailable or the like). That has
+            // nothing whatsoever to do with this compression and must not decide whether this backup succeeds — keep the inherited priority and carry on.
             return;
         }
 
@@ -188,25 +194,25 @@ internal static class SevenZipCli
         {
             proc.PriorityClass = wanted;
         }
-        catch (InvalidOperationException) { }                    // 设之前它自己退出了
-        catch (System.ComponentModel.Win32Exception) { }         // 系统拒绝（权限/已回收）
-        catch (PlatformNotSupportedException) { }                // 该平台不支持调优先级
+        catch (InvalidOperationException) { }                    // it exited on its own before we could set it
+        catch (System.ComponentModel.Win32Exception) { }         // the system refused (permissions/already reaped)
+        catch (PlatformNotSupportedException) { }                // this platform does not support changing priority
     }
 
-    /// <summary>杀掉进程及其子进程。已经退出（竞态）或杀不动都不算错——取消本身已经在往外抛了，
-    /// 不能让收尾动作再盖一个不相干的异常上去。</summary>
+    /// <summary>Kills the process and its children. Already exited (a race) or refusing to die are both fine — cancellation is already propagating outwards,
+    /// and the cleanup step must not paper over it with an unrelated exception.</summary>
     private static void KillTree(Process proc)
     {
         try
         {
             proc.Kill(entireProcessTree: true);
         }
-        catch (InvalidOperationException) { } // 在 Kill 之前它自己退出了
-        catch (System.ComponentModel.Win32Exception) { } // 系统拒绝（权限/已回收）：只能作罢
+        catch (InvalidOperationException) { } // it exited on its own before the Kill
+        catch (System.ComponentModel.Win32Exception) { } // the system refused (permissions/already reaped): nothing to do but let it go
     }
 
-    /// <summary>观察掉两个读取任务的结局。进程被杀后它们要么随 ct 取消，要么因管道关闭而报错；
-    /// 不 await 就成了未观察的任务异常。这里只吞这两种预期结局，别的照抛。</summary>
+    /// <summary>Observes the outcome of the two reader tasks. Once the process is killed they either cancel along with the ct or fail because the pipe closed;
+    /// not awaiting them turns those into unobserved task exceptions. Only these two expected outcomes are swallowed here, anything else is rethrown.</summary>
     private static async Task ObserveAsync(params Task[] tasks)
     {
         foreach (var t in tasks)
@@ -220,18 +226,19 @@ internal static class SevenZipCli
         }
     }
 
-    /// <summary>列出归档内的条目名（`l -slt`），分隔符归一化为 '/'。
-    /// 加密备份用 -mhe=on（头也加密），不给密码连条目名都列不出来，所以密码必须一并传入。
-    /// 分卷归档传首卷（.001），7z 自行找齐后续卷。</summary>
+    /// <summary>Lists the entry names inside an archive (`l -slt`), with separators normalized to '/'.
+    /// Encrypted backups use -mhe=on (the header is encrypted too), so without the password not even the entry names can be listed, which is why the password must be passed along.
+    /// For a split archive pass the first volume (.001) and 7z finds the remaining volumes itself.</summary>
     public static async Task<HashSet<string>> ListEntriesAsync(
         string exe, string firstVolumePath, string? password, CancellationToken ct,
         Func<ProcessPriorityClass>? priority = null)
         => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct, priority)).Select(e => e.Name)];
 
     /// <summary>
-    /// 列出归档成员，**保持归档内顺序**并带上尺寸与目录标记。
-    /// 顺序是承重的：`x -so` 不带成员名时，各成员的内容正是按这个顺序首尾相接输出的，
-    /// 按尺寸切段才能还原出每个成员。注意这个顺序未必等于当初压缩时给出的参数顺序。
+    /// Lists archive members **keeping the in-archive order**, carrying sizes and a directory flag.
+    /// The order is load-bearing: with no member name given, `x -so` outputs the members' contents concatenated in
+    /// exactly this order, and cutting the stream by size is the only way to recover each member.
+    /// Note that this order is not necessarily the order of the arguments given at compression time.
     /// </summary>
     public static async Task<IReadOnlyList<ArchiveEntry>> ListEntryDetailsAsync(
         string exe, string firstVolumePath, string? password, CancellationToken ct,
@@ -246,9 +253,9 @@ internal static class SevenZipCli
         return ParseEntryDetails(run.StdOut);
     }
 
-    /// <summary>解析 `l -slt` 的输出。归档**自身**的信息块也有一行 "Path = &lt;归档文件名&gt;"，
-    /// 成员块则统一排在第一道 "----------" 分隔线之后——所以必须先跳到那道线，
-    /// 否则归档文件名会被当成一个成员混进来。每遇到一行 "Path = " 就开一个新成员块。</summary>
+    /// <summary>Parses the output of `l -slt`. The information block for the archive **itself** also has a line "Path = &lt;archive file name&gt;",
+    /// while the member blocks all come after the first "----------" separator line — so we must skip forward to that line first,
+    /// otherwise the archive's own file name slips in as a member. Every "Path = " line opens a new member block.</summary>
     private static IReadOnlyList<ArchiveEntry> ParseEntryDetails(string listing)
     {
         const string pathPrefix = "Path = ";
@@ -292,22 +299,22 @@ internal static class SevenZipCli
             }
             else if (line.StartsWith(attrPrefix, StringComparison.Ordinal))
             {
-                // 目录的属性串以 'D' 打头（Unix: "D drwxr-xr-x"，Windows: "D...."）。
+                // A directory's attribute string starts with 'D' (Unix: "D drwxr-xr-x", Windows: "D....").
                 var attr = line[attrPrefix.Length..].Trim();
                 isDir |= attr.StartsWith('D');
             }
             else if (line.StartsWith(folderPrefix, StringComparison.Ordinal))
             {
-                isDir |= line[folderPrefix.Length..].Trim() == "+"; // 部分 7z 版本用这个字段
+                isDir |= line[folderPrefix.Length..].Trim() == "+"; // some 7z versions use this field
             }
         }
         FlushPending();
         return entries;
     }
 
-    /// <summary>Windows 上 7z 用 '\' 列出条目名，而调用方给的条目名用 '/'。</summary>
+    /// <summary>On Windows 7z lists entry names with '\', while the entry names callers hand in use '/'.</summary>
     public static string NormalizeEntryName(string entry) => entry.Trim().Replace('\\', '/');
 }
 
-/// <summary>一次 7z 调用的结果。</summary>
+/// <summary>The result of one 7z invocation.</summary>
 internal sealed record SevenZipRun(int ExitCode, string StdOut, string StdErr);
