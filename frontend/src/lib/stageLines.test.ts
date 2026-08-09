@@ -38,11 +38,12 @@ function progress(over: Partial<StageProgress> = {}): StageProgress {
 
 describe('stageLines', () => {
   /**
-   * 这是整段重排的理由。从前件数一行、字节一行，两行各自排各自的，于是屏幕上没有任何东西
-   * 说得出 "+2.0 GB unfinished" 与 "100 MB ready to upload" 的先后——真有人拿这两个数
-   * 追问了很久："既然卷与卷之间不会卡住，为什么它们同时非零却什么都没在传？"
-   * 答案是它们根本不在时间轴的同一点上：前者的字节已经在云上，后者还没上路。
-   * 把整条流水线按逆时间轴摆开，这个问题就不会再被问出来。
+   * This is the reason for the whole reordering. With counts on one line and bytes on another, each
+   * ordered by its own logic, nothing on screen could say whether "+2.0 GB unfinished" came before
+   * or after "100 MB ready to upload" — and that really was asked, at length: "if volumes never
+   * stall between one another, why are both non-zero with nothing transferring?" The answer is that
+   * they are not at the same point of the timeline at all: the first is already in the cloud, the
+   * second has not left. Laying the whole pipeline out backwards stops the question arising.
    */
   test('orders the whole pipeline from nearly-done back to queued', () => {
     const { pipeline } = stageLines(
@@ -79,16 +80,17 @@ describe('stageLines', () => {
     ])
   })
 
-  /** 为零的段整段消失——没有"0 objects queued"这种噪声。 */
+  /** Empty segments disappear entirely — no "0 objects queued" noise. */
   test('drops every empty segment', () => {
     const { pipeline } = stageLines(progress({ queued: 7 }))
     expect(pipeline).toBe('7 objects queued')
   })
 
   /**
-   * 压完但还没核对完的那段，件数与字节各占一项且**互不重叠**：后端已经把 checkingBytes
-   * 从 stagedBytes 里减出去了，前端只要不再把两者相加就行。同时出现时读起来是
-   * "1 件在核对、那 95.4 MB 就是它的；另有 2.6 GB 已经核对完在等上路"。
+   * For the stretch that is compressed but not yet checked, the count and the bytes are separate
+   * entries that **do not overlap**: the backend already subtracts checkingBytes from stagedBytes,
+   * so the frontend only has to stop adding them together. Together they read as "one object is
+   * being checked and those 95.4 MB are its; another 2.6 GB is checked and waiting to go up".
    */
   test('keeps bytes being checked out of ready to upload', () => {
     const { pipeline } = stageLines(
@@ -98,15 +100,16 @@ describe('stageLines', () => {
   })
 
   /**
-   * 一条流都没在传、手上却有活在压：这一刻速度是 0、在途列表空着，界面上看跟卡死一模一样。
-   * 必须有一句话说出原因，而且它占的是 uploading 那个位置（时间轴上同一点）。
+   * Nothing on the wire while something is compressing: speed is 0 and the in-flight list is empty,
+   * which looks exactly like a hang. Something has to say why, and it occupies uploading's slot
+   * (the same point on the timeline).
    */
   test('says why the wire is idle instead of just dropping the segment', () => {
     const { pipeline } = stageLines(progress({ preparing: 1, queued: 3 }))
     expect(pipeline).toBe('nothing on the wire right now · 1 object preparing · 3 objects queued')
   })
 
-  /** 第一行只留已经落定的：完成度分数与真正传上去的量，在途的一律不进来。 */
+  /** The first line carries only what has settled: the completion fraction and what was really uploaded. Nothing in flight gets in. */
   test('the done line carries only settled bytes', () => {
     const { done } = stageLines(
       progress({
@@ -122,8 +125,9 @@ describe('stageLines', () => {
   })
 
   /**
-   * 下载是另一个方向（拉下来 → 写出去），措辞不能跟上传共用；而且它的总量事先就知道
-   * （索引里记着各卷尺寸）。还没恢复的那部分属于时间轴最靠前的一头，归第二行。
+   * Downloading is the other direction (pull down, then write out), so the wording cannot be shared
+   * with uploading; and its total is known up front (volume sizes are in the index). What has not
+   * been restored yet belongs at the far end of the timeline, on the second line.
    */
   test('restoring reads in the download direction', () => {
     const { done, pipeline } = stageLines(

@@ -13,20 +13,21 @@ import { Modal } from '../components/Modal'
 import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
-/// 新建时预填的模板。给的是**实际值**而不是 placeholder：这个 URL 只有一段需要改，
-/// 摆成可编辑的文本比摆成灰字提示更省事——用户把 <endpoint> 换掉就完事了。
-/// 漏改的那一半由 isValidEndpoint 兜着（见那里的注释）。
+/// The template prefilled when creating. It is a **real value** rather than a placeholder: only one
+/// part of this URL needs changing, and editable text is less work than grey hint text — replace
+/// <endpoint> and you are done. A half-edited one is caught by isValidEndpoint (see its comment).
 const endpointTemplate = 'https://<endpoint>.blob.core.windows.net/'
 
 /**
- * Blob endpoint 必须是一个合法的 http(s) URL。
+ * A blob endpoint must be a valid http(s) URL.
  *
- * 不特判上面那个模板：`<` `>` 是 WHATWG 的 forbidden host code point，出现在**主机名**里会让
- * `new URL()` 直接抛——而占位符恰好就在主机名那一段，所以通用的 URL 校验顺手就把没改完的
- * 模板挡下了，还连带挡住了所有手滑输入。（放在 path 里的 `<>` 反倒是合法的，会被百分号编码，
- * 这也正是"检查是不是合法 URL"比"找占位符"更对的地方。）
+ * The template above is not special-cased: `<` and `>` are WHATWG forbidden host code points, so
+ * appearing in the **host** makes `new URL()` throw — and the placeholder sits exactly in the host,
+ * so generic URL validation catches a half-edited template for free, along with every typo.
+ * (`<>` inside the path is legal and gets percent-encoded, which is precisely why "is this a valid
+ * URL" is the better question than "is there a placeholder".)
  *
- * 协议那一条是额外加的：`new URL()` 对 `ftp://` 之类同样放行。
+ * The scheme check is additional: `new URL()` accepts `ftp://` and the like just as happily.
  */
 const isValidEndpoint = (s: string) => {
   try {
@@ -51,9 +52,10 @@ const emptyForm: AccountInput = {
   proxyPassword: '',
 }
 
-/// Accounts 现在是 Settings 里的一个区域（<see cref="SettingsPage"/>），不再是独立页面：
-/// 账户是"配一次就不再碰"的东西，常驻一个顶级导航项名不副实。展开某个账户看 container 时
-/// 仍然整片替换成 ContainersPage——那是一段有返回的下钻，嵌在区域里照旧成立。
+/// Accounts is now a section inside Settings rather than a page of its own: accounts are configured
+/// once and never touched again, so a permanent top-level nav entry misrepresents them. Expanding one
+/// to see its containers still replaces the whole area with ContainersPage — that is a drill-down with
+/// a way back, which works just as well nested in a section.
 export function AccountsSection() {
   const [accounts, setAccounts] = useState<Account[]>([])
   const [editing, setEditing] = useState<Account | null>(null)
@@ -99,15 +101,16 @@ export function AccountsSection() {
   }
 
   const save = async () => {
-    // 先挡非法 endpoint，再进忙碌态：后端建账户时只校验 Key 非空、不看 URL，
-    // 放进去的话要等到第一次连云才会以一个面目全非的错误暴露出来。
+    // Reject an invalid endpoint before entering the busy state: the backend only checks that the Key
+    // is non-empty when creating an account and never looks at the URL, so letting it through means it
+    // surfaces at the first cloud call as an unrecognisable error.
     if (!isValidEndpoint(form.blobEndpoint)) {
       setError('Blob Endpoint must be a valid http(s) URL.')
       return
     }
     setBusy(true)
     setError(null)
-    // 非 Global 分区仅代理下有效（PRD 1.1）：未启用代理则强制 Global。
+    // Non-Global regions only work behind a proxy (PRD 1.1): without one, force Global.
     const payload = form.useProxy ? form : { ...form, region: AzureRegion.Global }
     try {
       if (editing) {
@@ -118,7 +121,7 @@ export function AccountsSection() {
         const created = await accountsApi.create(payload)
         setShowForm(false)
         load()
-        // 新账户创建后直接进入 container 列举界面（PRD 1.4）
+        // A newly created account goes straight to container listing (PRD 1.4)
         setViewing(created)
       }
     } catch (e) {
@@ -143,9 +146,9 @@ export function AccountsSection() {
     setBusy(true)
     setTestResult(null)
     try {
-      // 编辑态走带 id 的那个端点：Key 框此时是空的（"Leave blank to keep current"），
-      // 不带 id 的端点会因为空 Key 直接 400——而"改了 endpoint 或代理，想先测一下现有 key
-      // 还连不连得上"恰恰是编辑时最该能做的事。
+    // Editing uses the endpoint that takes an id: the Key box is empty here ("Leave blank to keep
+    // current"), and the id-less endpoint returns 400 for an empty Key — while "I changed the endpoint
+    // or the proxy and want to check the existing key still connects" is exactly what editing is for.
       setTestResult(
         editing
           ? await accountsApi.testConnectionFor(editing.id, form)
@@ -161,7 +164,7 @@ export function AccountsSection() {
   const set = <K extends keyof AccountInput>(k: K, v: AccountInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
 
-  // 密钥环丢失恢复(设计 §3.5)：重新录入账户密钥/代理密码，后端会连云验证后才落库。
+  // Keyring-loss recovery (design §3.5): re-enter the account key and proxy password; the backend verifies against the cloud before persisting.
   const startReset = (a: Account) => {
     setResetting(a)
     setError(null)
@@ -179,8 +182,8 @@ export function AccountsSection() {
       await accountsApi.resetSecrets(resetting.id, accountKey, proxyPassword || null)
       setResetting(null)
       load()
-      // 顶部横幅与备份页的顺序依赖都读同一份状态：重设成功后必须立刻刷新，
-      // 否则横幅会一直挂着已经过期的告警(设计 §3.5)。
+      // The top banner and the backups page's ordering dependency read the same state: it has to be
+      // refreshed immediately after a successful reset, or the banner keeps showing a stale warning (design §3.5).
       void refreshKeyringStatus()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -284,7 +287,7 @@ export function AccountsSection() {
             />
           </Field>
           <Field label="Region">
-            {/* 非 Global 分区仅在启用代理时可选（PRD 1.1）。 */}
+            {/* Non-Global regions are selectable only with a proxy enabled (PRD 1.1). */}
             <select
               value={form.useProxy ? form.region : AzureRegion.Global}
               disabled={!form.useProxy}
@@ -377,10 +380,12 @@ export function AccountsSection() {
               Cancel
             </button>
 
-            {/* 删除收在编辑表单里，不再摆在列表每一行上：它是这个页面上唯一不可撤销的操作，
-                摆在行尾等于让它和 Containers/Edit 一样近，而那两个都是随手点的。
-                title 挂在外层 span 而不是按钮上——禁用的按钮在多数浏览器里收不到指针事件，
-                提示会跟着一起失效，而这里恰恰是禁用时最需要说明原因。 */}
+            {/* Delete lives inside the edit form rather than on every list row: it is the only
+                irreversible action on this page, and putting it at the end of a row makes it as close
+                to hand as Containers and Edit, which are both clicked casually.
+                The title sits on the outer span rather than the button — a disabled button receives no
+                pointer events in most browsers, which would kill the tooltip exactly when the reason
+                for being disabled most needs explaining. */}
             {editing && (
               <span
                 style={{ marginLeft: 'auto' }}
@@ -427,8 +432,9 @@ export function AccountsSection() {
   )
 }
 
-// 密钥环丢失恢复弹窗：重新录入账户密钥(必填)与代理密码(仅代理账户需要)。后端会用它连云验证，
-// 验证通过才落库；验证失败以 400 携带 "Verification failed: ..." 返回，原样显示。
+// The keyring-loss recovery dialog: re-enter the account key (required) and the proxy password (only
+// for proxied accounts). The backend verifies them against the cloud and persists only on success;
+// a failure returns 400 carrying "Verification failed: …", shown as-is.
 function ResetSecretsModal({
   account, busy, error, onSubmit, onClose,
 }: {

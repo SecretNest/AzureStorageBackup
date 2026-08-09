@@ -22,43 +22,46 @@ const rehydratePriorityLabels: Record<number, string> = {
   [RestoreRehydratePriority.High]: 'High (faster, more expensive)',
 }
 
-// 还原对话框（§4.1a-d）：选版本 → 懒加载树浏览 + 勾选 → 防抖估算 → 冲突模式/活化优先级 → 目标根路径 → 开始还原。
-// 同时保留原有的"不可恢复文件按版本替代"能力（§4.1，需求 unrecoverable substitution）。
+// The restore dialog (§4.1a-d): pick a version → browse the lazy tree and tick → debounced estimate
+// → conflict mode and rehydrate priority → target root → start. It also keeps the existing
+// "substitute an unrecoverable file from another version" capability (§4.1).
 export function RestoreDialog({
   config, onClose, onError, onStarted,
 }: { config: BackupConfig; onClose: () => void; onError: (e: string) => void; onStarted: (s: RestoreRun) => void }) {
-  // 光有编号选不出"上周四那次"——起止时刻才是操作员认版本的依据，整条留着。
+  // A number alone cannot pick out "the one from last Thursday" — the start and end times are how an operator recognises a version, so both are kept.
   const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [target, setTarget] = useState(config.localRoot)
   const [browsing, setBrowsing] = useState(false)
 
-  // 不可恢复文件的按版本替代（沿用既有能力）
+  // Per-version substitution for unrecoverable files (existing capability)
   const [unrecoverable, setUnrecoverable] = useState<string[]>([])
-  // 内容沿用自更早版本的文件：不需要"替代"（内容是有效的，只是旧），但还原前必须知道。
+  // Files whose content was carried over from an earlier version: no substitution needed (the content is valid, just old), but it must be known before restoring.
   const [stale, setStale] = useState<UnreadableEntry[]>([])
   const [options, setOptions] = useState<Record<string, FileVersionOption[]>>({})
   const [choices, setChoices] = useState<Record<string, number>>({})
   const [subsLoading, setSubsLoading] = useState(false)
 
-  // 懒加载树浏览 + 勾选选择（§4.1a/d）
+  // Lazily loaded tree browsing and selection (§4.1a/d)
   const [treeCache, setTreeCache] = useState<Record<string, TreeNode[]>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set())
   const [cascading, setCascading] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
 
-  // 估算 + 冲突模式 + 活化优先级（§4.1b/c/d）
+  // Estimate, conflict mode and rehydrate priority (§4.1b/c/d)
   const [estimate, setEstimate] = useState<RestoreEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
   const [conflict, setConflict] = useState<number>(RestoreConflictMode.OverwriteIfChanged)
   const [rehydratePriority, setRehydratePriority] = useState<number>(RestoreRehydratePriority.Standard)
   const [starting, setStarting] = useState(false)
 
-  // onError 是父组件在渲染里现写的箭头函数，每渲染一次就换一个引用。它一旦进了下面这些
-  // effect 的依赖数组，备份列表每隔几秒的例行刷新就会把 effect 重跑一遍——什么都不点，
-  // 对话框也会自己闪：Loading… 冒出来又消失，替代表和沿用提示跟着重排，看着就像刚切了版本。
-  // 用 ref 拿最新的回调，依赖里只留真正决定要重取什么的 config.id 与 version。
+  // onError is an arrow function the parent writes inline in render, so its identity changes every
+  // render. Once it is in the dependency arrays below, the backup list's routine refresh every few
+  // seconds re-runs the effects — the dialog flickers on its own with nothing clicked: Loading…
+  // appears and vanishes, the substitution table and carried-over notice re-lay out, and it looks
+  // like the version was just switched. A ref holds the latest callback, leaving only config.id and
+  // version — what genuinely decides what to refetch — in the dependencies.
   const onErrorRef = useRef(onError)
   onErrorRef.current = onError
 
@@ -95,7 +98,7 @@ export function RestoreDialog({
     return () => { cancelled = true }
   }, [config.id, version])
 
-  // 版本切换时重置树浏览状态并加载根目录（本地权威索引读，快，不触云）。
+  // Switching version resets the browse state and loads the root (a read of the locally authoritative index: fast, no cloud).
   useEffect(() => {
     setTreeCache({})
     setExpanded(new Set())
@@ -122,7 +125,7 @@ export function RestoreDialog({
     return () => { cancelled = true }
   }, [config.id, version])
 
-  // 勾选变化防抖 ~400ms 调 restoreEstimate；未选中任何项时视为"还原整版本"，不展示估算。
+  // Selection changes debounce ~400 ms before calling restoreEstimate; with nothing selected it means "restore the whole version" and no estimate is shown.
   useEffect(() => {
     if (selected.size === 0) {
       setEstimate(null)
@@ -175,7 +178,7 @@ export function RestoreDialog({
     }
   }
 
-  // 递归拉取整棵子树的全部文件路径（本地索引读，快）。同时把沿途目录塞进 children 缓存供浏览复用。
+  // Fetch every file path in a subtree recursively (a local index read, fast). Directories passed through on the way go into the children cache for browsing to reuse.
   const fetchAllFiles = async (dirPath: string): Promise<string[]> => {
     const kids = await backupConfigsApi.tree(config.id, version, dirPath || null)
     setTreeCache((c) => ({ ...c, [dirPath]: kids }))
@@ -188,7 +191,7 @@ export function RestoreDialog({
     return nested.flat()
   }
 
-  // 文件夹勾选级联全选/取消整棵子树（递归抓取，非仅已加载节点，避免"漏选未展开子目录"的坑）。
+  // Ticking a folder cascades over the whole subtree (fetched recursively, not just the loaded nodes, which avoids the "unexpanded subdirectory silently unselected" trap).
   const toggleFolder = async (node: TreeNode) => {
     setCascading((s) => new Set(s).add(node.path))
     try {
@@ -222,8 +225,10 @@ export function RestoreDialog({
     })
   }
 
-  // 文件夹勾选态（checked/indeterminate/unchecked）仅基于已加载（缓存中）的后代文件——尚未展开的
-  // 子目录不计入。这与 toggleFolder 的即时递归抓取不同：抓取完成后缓存已补齐，态会立即反映最新选择。
+  // A folder's tick state (checked/indeterminate/unchecked) is based only on descendants already
+  // loaded into the cache — unexpanded subdirectories do not count. This differs from toggleFolder,
+  // which fetches recursively straight away: once that completes the cache is filled in and the state
+  // reflects the latest selection immediately.
   const collectLoadedFiles = (dirPath: string): string[] => {
     const kids = treeCache[dirPath]
     if (!kids) return []
@@ -242,10 +247,11 @@ export function RestoreDialog({
     return n === files.length ? 'checked' : 'indeterminate'
   }
 
-  // 与选中集的交集：选择性还原时，替代表只对"实际会被还原"的不可恢复路径有意义
-  // （后端按 SelectedPaths 过滤生效集，替代路径若未被勾选则替代是空操作）。未选中任何项 = 还原整版本，全部展示。
-  const relevantUnrecoverable = selected.size === 0 ? unrecoverable : unrecoverable.filter((p) => selected.has(p))
-  // 同理：选择性还原时，只提示实际会被还原的那些沿用条目。
+  // Intersected with the selection: during a selective restore, substitutions only matter for the
+  // unrecoverable paths that will actually be restored (the backend filters the effective set by
+  // SelectedPaths, so substituting an unselected path is a no-op). Nothing selected = restore the
+  // whole version, so everything is shown.
+  // Likewise: during a selective restore, only flag the carried-over entries that will be restored.
   const relevantStale = selected.size === 0 ? stale : stale.filter((e) => selected.has(e.path))
 
   const setAllNearest = () => {
@@ -312,8 +318,9 @@ export function RestoreDialog({
       </Field>
 
       {subsLoading && <div className="text-faint">Loading…</div>}
-      {/* 沿用的内容是**有效**数据，就是这个版本能给出的最好结果——所以不提供"按版本替代"，
-          那会暗示存在更好的选项。但操作员必须知道：还原这个版本，这些文件拿到的是更早的内容。 */}
+      {/* Carried-over content is **valid** data and is the best this version can give, so no
+          "substitute by version" is offered — that would imply a better option exists. But the
+          operator must know: restoring this version gives older content for these files. */}
       {!subsLoading && relevantStale.length > 0 && (
         <div className="text-warn" style={{ margin: '0.6rem 0' }}>
           {relevantStale.length} file(s) in this version hold content from an earlier backup —
@@ -483,7 +490,7 @@ function TreeBrowser({
                   <input type="checkbox" checked={selected.has(node.path)} onChange={() => onToggleFile(node.path)} />
                   <span>{node.name}</span>
                   {node.length != null && <span className="text-muted" style={{ marginLeft: 6 }}>{formatBytes(node.length)}</span>}
-                  {/* 选择还原内容的这一刻，正是最需要知道"这份内容不是这个版本时刻的"的时候。 */}
+                  {/* The moment of choosing what to restore is exactly when it matters most to know that this content is not from this version's timestamp. */}
                   {node.unreadableAt && (
                     <span className="text-warn" style={{ marginLeft: 6 }}>
                       older content (unread since {new Date(node.unreadableAt).toLocaleDateString()})

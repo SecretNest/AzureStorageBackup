@@ -7,9 +7,10 @@ import { NotificationsSection } from './NotificationsPage'
 
 const MB = 1024 * 1024
 
-/// Settings 是几个区域的外壳。Accounts 排在**最前面**并且**不等全局设置加载完**：
-/// 没有配过账户时用户会被直接带到这一页（见 App.tsx 里挑默认标签那段），第一眼就该看到它——
-/// 让它排在下面、或者压在 "Loading…" 后面，挡住的恰恰是新用户唯一能做的那件事。
+/// Settings is a shell around several sections. Accounts comes **first** and does **not** wait for
+/// global settings to load: a user with no accounts configured lands straight here (see the
+/// default-tab logic in App.tsx) and should see it immediately — putting it lower, or behind a
+/// "Loading…", hides the one thing a new user can actually do.
 export function SettingsPage({
   authRequired,
   onLogout,
@@ -25,8 +26,8 @@ export function SettingsPage({
       <AccountsSection />
       <BackupDefaults />
       <NotificationsSection />
-      {/* 登出从侧栏搬到这里：手机上底部栏只有四格，塞不下第五个入口。
-          桌面端也一并搬过来——同一个功能摆两个位置，是后续最容易忘记同步的那种东西。 */}
+      {/* Log out moved here from the sidebar: the phone tier's bottom bar has four slots and no room
+          for a fifth. Desktop moved too — one function in two places is what later maintenance forgets to sync. */}
       {authRequired && onLogout && (
         <>
           <h2>Session</h2>
@@ -110,7 +111,7 @@ function BackupDefaults() {
       <Field label="Include symlinks">
         <input type="checkbox" checked={s.defaultIncludeSymlinks} onChange={(e) => set('defaultIncludeSymlinks', e.target.checked)} />
       </Field>
-      {/* 与新建备份表单同一句提示：规则的路径基准是各备份的 Local Root，不是主机上的完整路径。 */}
+      {/* The same note as on the new-backup form: rule paths are relative to each backup's Local Root, not to a full path on the host. */}
       <p className="text-muted">
         The rule lists below use gitignore syntax and match paths <strong>relative to each backup's local
         root</strong> — write <span className="mono">/Backup/</span>, not the full host path. A trailing{' '}
@@ -221,9 +222,10 @@ function TierSelect({ value, onChange, archive }: { value: number; onChange: (v:
 }
 
 function Num({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  // 输入框本地维护原始文本，而不是直接受控于 value：这样清空输入框时，界面上
-  // 显示的是空白（而非被 value 立刻拉回原数字），但父状态仍保留上一个数值，
-  // 不会把 Number('') === 0 悄悄写进去。只有用户真正键入了一个数字才回写。
+  // The input keeps its own raw text rather than being controlled by value directly: clearing the box
+  // then shows blank (instead of value snapping it back to the old number) while the parent state
+  // keeps the previous number, so Number('') === 0 is never written silently. It writes back only
+  // once the user has actually typed a number.
   const [text, setText] = useState(String(value))
   useEffect(() => setText(String(value)), [value])
 
@@ -239,9 +241,9 @@ function Num({ value, onChange }: { value: number; onChange: (v: number) => void
         const n = Number(raw)
         if (!Number.isNaN(n)) onChange(n)
       }}
-      // 离开输入框时把空白拉回真实值。否则清空后不再键入就保存，value 从未改变，
-      // 上面那个 useEffect 也就不会重跑，输入框会一直显示空白——屏幕说这项是空的，
-      // 实际存的却还是原来的数字。
+      // Restore the real value on blur. Otherwise, clearing the box and saving without typing again
+      // never changes value, so the effect above never re-runs and the box stays blank — the screen
+      // says the field is empty while the stored value is still the old number.
       onBlur={() => setText(String(value))}
     />
   )

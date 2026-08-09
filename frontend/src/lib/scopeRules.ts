@@ -1,17 +1,18 @@
 /**
- * 备份范围的边界规则集 —— 后端 ScopeRuleSet.cs 的镜像实现。
+ * The backup scope rule set — a mirror of the backend's ScopeRuleSet.cs.
  *
- * 为什么要重复一遍：走 API 意味着每点一个复选框就要一次往返，一棵树点几十下就是几十次
- * 请求。代价是两份实现必须行为一致 —— 由 shared/scope-rule-cases.json 这份共享夹具钉住，
- * 两边的测试读同一个文件。**改这里的行为就要同时改后端**，反之亦然。
+ * Why duplicate it: going through the API would mean a round trip per checkbox, and clicking through
+ * a tree means dozens of them. The cost is that the two implementations must agree — pinned by the
+ * shared fixture shared/scope-rule-cases.json, which both sides' tests read.
+ * **Changing behaviour here means changing the backend too**, and vice versa.
  *
- * 规则语义：每条是「路径 → 包含/排除」，判定取最长匹配前缀那一条；一条都不匹配则包含。
- * 两条写入不变式让规则集永远最小：
- *   1) 每条规则的判定必须与最近祖先相反，相同即冗余、不落盘；
- *   2) 写入一条规则时删除所有以它为严格前缀的更深规则。
+ * Rule semantics: each rule is "path → included/excluded", decided by the longest matching prefix;
+ * with no match at all, included. Two write invariants keep the set permanently minimal:
+ *   1) each rule must disagree with its nearest ancestor — an agreeing one is redundant and is not persisted;
+ *   2) writing a rule deletes every deeper rule having it as a strict prefix.
  */
 
-/** 不可变。所有操作都返回新值，React 靠引用变化触发重渲。 */
+/** Immutable. Every operation returns a new value; React re-renders on the identity change. */
 export type ScopeRules = ReadonlyMap<string, boolean>
 
 const normalize = (path: string): string =>
@@ -22,17 +23,17 @@ const normalize = (path: string): string =>
     .filter((s) => s.length > 0)
     .join('/')
 
-/** 该目录下所有后代共有的前缀（根为空串，其余为 "dir/"）。 */
+/** The prefix shared by every descendant of a directory (empty string for the root, otherwise "dir/"). */
 const under = (dirPath: string): string => {
   const p = normalize(dirPath)
   return p.length === 0 ? '' : `${p}/`
 }
 
-/** key 是否严格位于 prefix 之下（不含 prefix 所指的目录本身）。 */
+/** Whether key lies strictly beneath prefix (excluding the directory prefix itself names). */
 const isUnder = (key: string, prefix: string): boolean =>
   key.length > prefix.length && key.startsWith(prefix)
 
-/** Ordinal 序：祖先必排在后代之前（严格前缀恒小于其扩展），规范化因此一遍即可。 */
+/** Ordinal order: an ancestor always sorts before its descendants (a strict prefix compares less than any extension), so normalisation takes one pass. */
 const ordinal = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)
 
 const sorted = (rules: Map<string, boolean>): Map<string, boolean> =>
@@ -43,13 +44,13 @@ const lookup = (rules: ReadonlyMap<string, boolean>, path: string): boolean => {
   for (;;) {
     const hit = rules.get(p)
     if (hit !== undefined) return hit
-    if (p.length === 0) return true // 连根规则都没有 → 默认包含
+    if (p.length === 0) return true // not even a root rule → include by default
     const slash = p.lastIndexOf('/')
     p = slash < 0 ? '' : p.slice(0, slash)
   }
 }
 
-/** 就地清掉冗余规则（判定与最近祖先相同者）。 */
+/** Drop redundant rules in place (those agreeing with their nearest ancestor). */
 const dropRedundant = (rules: Map<string, boolean>): Map<string, boolean> => {
   for (const key of [...rules.keys()].sort(ordinal)) {
     const self = rules.get(key)!
@@ -59,7 +60,7 @@ const dropRedundant = (rules: Map<string, boolean>): Map<string, boolean> => {
   return sorted(rules)
 }
 
-/** 解析规则文本。null/空 → 全部包含。无法识别的行跳过而不抛。 */
+/** Parse rule text. null/empty → include everything. Unrecognised lines are skipped, never thrown. */
 export function parseScope(text: string | null | undefined): ScopeRules {
   const rules = new Map<string, boolean>()
   for (const raw of (text ?? '').split('\n')) {
@@ -70,7 +71,7 @@ export function parseScope(text: string | null | undefined): ScopeRules {
     if (included === null) continue
 
     const path = normalize(line.slice(1))
-    // `..` 段命中不了任何真实相对路径，留着只会让人以为它有意义。
+    // A `..` segment can never match a real relative path; keeping it would only suggest it means something.
     if (path.split('/').some((seg) => seg === '..' || seg === '.')) continue
 
     rules.set(path, included)
@@ -78,18 +79,21 @@ export function parseScope(text: string | null | undefined): ScopeRules {
   return dropRedundant(rules)
 }
 
-/** 是否「全部包含」（没有任何规则）。 */
+/** Whether this is "include everything" (no rules at all). */
 export const isAll = (rules: ScopeRules): boolean => rules.size === 0
 
-/** 某路径是否在范围内：最长前缀匹配。 */
+/** Whether a path is in scope: longest prefix wins. */
 export const isInScope = (rules: ScopeRules, path: string): boolean => lookup(rules, path)
 
 /**
- * 三态里的「灰选」：存在以这个目录为严格前缀的规则，说明子树内部有分歧。
+ * The indeterminate third state: a rule exists strictly beneath this directory, so the subtree is
+ * divided.
  *
- * 这是单向的：`- docs` + `+ docs/a` + `+ docs/b` 而 docs 下恰好只有 a、b 时，实际是全选，
- * 这里仍报灰选。不加载子节点就无从知道两条规则是否穷尽了目录 —— 懒加载的固有代价。
- * 灰选是保守且诚实的一侧，备份结果不受影响，只是显示。
+ * This is one-directional: with `- docs`, `+ docs/a` and `+ docs/b`, where docs contains only a and
+ * b, everything is in fact selected and this still reports indeterminate. Without loading children
+ * there is no way to know whether those two rules exhaust the directory — the inherent cost of lazy
+ * loading. Indeterminate is the conservative and honest side; the backup result is unaffected, only
+ * the display.
  */
 export function isPartial(rules: ScopeRules, dirPath: string): boolean {
   const prefix = under(dirPath)
@@ -97,30 +101,30 @@ export function isPartial(rules: ScopeRules, dirPath: string): boolean {
   return false
 }
 
-/** 复选框的三态。**从规则集现算，不存** —— 因此没有父子传播回路，不可能死循环。 */
+/** The checkbox's tri-state. **Computed from the rule set, never stored** — hence no parent/child propagation loop and no possibility of an infinite one. */
 export const scopeState = (
   rules: ScopeRules,
   path: string,
 ): 'checked' | 'indeterminate' | 'unchecked' =>
   isPartial(rules, path) ? 'indeterminate' : isInScope(rules, path) ? 'checked' : 'unchecked'
 
-/** 写入一条规则，维护两条不变式，返回新值。 */
+/** Write one rule, maintaining both invariants, and return a new value. */
 export function withRule(rules: ScopeRules, path: string, included: boolean): ScopeRules {
   const key = normalize(path)
   const next = new Map(rules)
 
-  // 不变式 2：清掉被这条覆盖的更深规则。
+  // Invariant 2: clear the deeper rules this one now covers.
   const prefix = under(key)
   for (const deeper of [...next.keys()]) if (isUnder(deeper, prefix)) next.delete(deeper)
 
-  // 不变式 1：与最近祖先判定相同则不落盘。先摘掉自身，剩下的最近匹配就是祖先判定。
+  // Invariant 1: do not persist a rule that agrees with its nearest ancestor. Remove self first, and the nearest remaining match is the ancestor's decision.
   next.delete(key)
   if (lookup(next, key) !== included) next.set(key, included)
 
   return sorted(next)
 }
 
-/** 规范化文本，每行一条。空规则集 → 空串（存库时即 null，表示「全部」）。 */
+/** Serialise back to text, one rule per line. An empty set → an empty string (stored as null, meaning "everything"). */
 export const scopeToText = (rules: ScopeRules): string =>
   [...rules.entries()]
     .map(([key, included]) => (key.length === 0 ? (included ? '+' : '-') : `${included ? '+' : '-'} ${key}`))

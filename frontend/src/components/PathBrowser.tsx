@@ -4,8 +4,9 @@ import { ApiError } from '../api/client'
 import { Modal } from './Modal'
 
 /**
- * 本地目录选择器（设计 §7）。只有目录可选；文件列出但不可选，
- * 以便确认选对了位置。越界项（通常是指向根外的软链）灰显不可点。
+ * The local directory picker (design §7). Only directories are selectable; files are listed but not
+ * selectable, so the user can confirm they picked the right place. Out-of-bounds entries (usually a
+ * symlink pointing outside the root) are greyed out and unclickable.
  */
 export function PathBrowser({
   initialPath,
@@ -20,13 +21,14 @@ export function PathBrowser({
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [path, setPath] = useState<string | undefined>(initialPath)
-  // 只在「一次都还没列出来过」时才回落，且至多一次。用 ref 而不是 data：进过目录之后
-  // 某个目录消失，正确的表现是报错并把用户留在原地，而不是把他弹回根目录。
+  // Fall back only when nothing has ever been listed, and at most once. A ref rather than state:
+  // if a directory disappears after the user has navigated into it, the right behaviour is to report
+  // the error and leave them where they are, not to bounce them back to the root.
   const listedOnce = useRef(false)
 
   useEffect(() => {
-    // 目录快速切换时，取消上一个还没返回的请求，防止慢响应后到达
-    // 覆盖了新目录的数据（乱序响应）。
+    // When directories are switched quickly, cancel the previous request so a slow response cannot
+    // arrive late and overwrite the new directory's data.
     const controller = new AbortController()
     setError(null)
     browseApi
@@ -37,11 +39,13 @@ export function PathBrowser({
       })
       .catch((e) => {
         if (controller.signal.aborted) return
-        // 起始目录用不了时不能就停在这条错误上：调用方给的是唯一入口，用户在 NAS 上没有
-        // 命令行，界面里就再也走不到任何目录了。改成不带 path 重来一次——后端会拿
-        // Backup:Root 当起点——并把回落这件事说出来。
-        // 404 = 目录已不存在（原根被删、挂载点没起来）；409 = 落在配置的根之外（根改过了）。
-        // 两种都只是「起点选得不好」，不是「浏览不能用」；403（读不出来）不回落，那是真问题。
+        // An unusable starting directory must not be a dead end: the caller supplies the only entry
+        // point, and the user has no command line on a NAS, so the UI would become unable to reach any
+        // directory at all. Retry without a path — the backend then starts from Backup:Root — and say
+        // that the fallback happened.
+        // 404 = the directory is gone (the old root deleted, a mount that did not come up); 409 = it
+        // is outside the configured root (the root was changed). Both mean "a poor starting point",
+        // not "browsing is broken". 403 (unreadable) does not fall back — that is a real problem.
         const startUnusable = e instanceof ApiError && (e.status === 404 || e.status === 409)
         if (!listedOnce.current && path !== undefined && startUnusable) {
           setNotice(`${e.message} Showing the configured root instead.`)
@@ -53,7 +57,7 @@ export function PathBrowser({
     return () => controller.abort()
   }, [path])
 
-  // 用户自己点进某个目录后，那句回落说明就过期了。
+  // Once the user navigates into a directory themselves, that fallback notice is stale.
   function go(next: string) {
     setNotice(null)
     setPath(next)
@@ -110,7 +114,7 @@ export function PathBrowser({
         {data?.truncated && (
           <p className="text-warn">Too many entries — this listing was truncated.</p>
         )}
-        {/* 少给了东西就必须说出来：不可 stat 的子项被跳过时，目录看上去和空目录一模一样。 */}
+        {/* Anything omitted has to be stated: with unstattable children skipped, a directory looks exactly like an empty one. */}
         {!!data?.skipped && (
           <p className="text-warn">
             {data.skipped} item(s) could not be read and are not listed.
