@@ -7,29 +7,32 @@ const PAGE_SIZE = 500
 interface Loaded {
   entries: BrowseEntry[]
   total: number
-  // 服务端在 stat 之前的全量列表上分页，不是在 entries 上分页：一页里可能有几项因读不出
-  // 属性而被跳过（不进 entries，但仍消耗一个位置）。下一页的 offset 必须算上它们，
-  // 否则会把被跳过的那几项重新请求一遍——重复的行、重复的 React key，Load more 也会
-  // 因为「以为只吃了 entries.length 项」而多按了几次才消失。
+  // The server pages over the full listing taken before stat, not over entries: a page can contain
+  // items skipped because their attributes could not be read (absent from entries, but still
+  // consuming a position). The next page's offset must account for them, or the skipped items get
+  // requested again — duplicate rows, duplicate React keys, and a Load more that takes several extra
+  // presses to disappear because it believes only entries.length was consumed.
   consumed: number
-  // 累计有多少项因读不出属性而未列出（例如目录 mode 为 r--：可 readdir、不可 stat 子项）。
-  // 少给了东西必须说出来（同 PathBrowser 的 skipped 提示），否则这些项从列表里凭空消失，
-  // 用户会把「读不出来」误当成「本来就没有」。
+  // Cumulative count of children not listed because their attributes could not be read (e.g. a
+  // directory with mode r--: readdir works, stat on children does not).
+  // Anything omitted has to be stated (as with PathBrowser's skipped notice), or these entries vanish
+  // from the list and the user reads "unreadable" as "not there in the first place".
   skipped: number
   loading: boolean
   error: string | null
 }
 
 /**
- * 备份范围选择树（设计 docs/backup-scope-selection-design.md §8）。
+ * The backup scope selection tree (design docs/backup-scope-selection-design.md §8).
  *
- * 刻意**不复用** RestoreDialog 那棵树：那棵的数据源是云端版本索引（有限已知全集，三态靠
- * 数已加载的后代文件算），这棵是活的文件系统（无限、会变，三态靠规则集算）。两者只有外观
- * 像，内核相反，合并只会让两边都变脆。
+ * Deliberately **not** a reuse of RestoreDialog's tree: that one's source is the cloud version index
+ * (a finite known set, with tri-state computed from loaded descendants), while this one's is a live
+ * filesystem (unbounded, changing, with tri-state computed from the rule set). They only look alike;
+ * their cores are opposites, and merging them would make both fragile.
  *
- * 状态只有三份，真相只有一份：rules 是唯一真相，children/expanded 纯展示。
- * 节点的勾选状态**永远从 rules 现算、不存** —— 因此点击只写一条规则就结束，没有
- * 「子改父 → 父改子」的传播回路，不可能死循环。
+ * Three pieces of state, one source of truth: rules is the truth, children/expanded are presentation.
+ * A node's tick state is **always computed from rules and never stored** — so a click writes one rule
+ * and stops, there is no "child updates parent updates child" loop, and an infinite one is impossible.
  */
 export function ScopeTree({
   localRoot,
@@ -42,7 +45,7 @@ export function ScopeTree({
   onChange: (next: ScopeRules) => void
   ignoreRules: string
 }) {
-  // key 是**相对 localRoot** 的路径（根为空串），与规则集同一套坐标。
+  // The key is the path **relative to localRoot** (empty string for the root), the same coordinates the rule set uses.
   const [children, setChildren] = useState<Record<string, Loaded>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['']))
 
@@ -64,14 +67,14 @@ export function ScopeTree({
     try {
       const page = await browseApi.list(absolute(relative), undefined, { offset, limit: PAGE_SIZE })
       setChildren((c) => {
-        // offset === 0 是一次替换性的（首次加载或 Retry）：连累计的 consumed/skipped 也要
-        // 跟着重新起算，否则 Retry 之后这两个数会把上一次失败前的旧值也算进去。
+        // offset === 0 is a replacing load (first load, or Retry), so the cumulative consumed/skipped
+        // counters restart with it — otherwise Retry would fold in the stale values from before the failure.
         const prevConsumed = offset === 0 ? 0 : (c[relative]?.consumed ?? 0)
         const prevSkipped = offset === 0 ? 0 : (c[relative]?.skipped ?? 0)
         return {
           ...c,
           [relative]: {
-            // 追加而不是替换：Load more 不能把已经看到的项抖掉。
+            // Append rather than replace: Load more must not shake off the entries already on screen.
             entries: offset === 0 ? page.entries : [...(c[relative]?.entries ?? []), ...page.entries],
             total: page.total,
             consumed: prevConsumed + page.entries.length + page.skipped,
@@ -96,26 +99,28 @@ export function ScopeTree({
     }
   }
 
-  // load 每渲染都是新引用；若直接进依赖数组，effect 会在每次 children 变化（也就是每次
-  // 加载完成）后又跑一遍，与"只在 localRoot 出现时加载一次根目录"的本意不符——用 ref 拿
-  // 最新版本，依赖里只留真正决定要不要重新加载的 localRoot（做法同 RestoreDialog 的 onErrorRef）。
+  // load is a new identity every render; putting it in the dependency array directly would re-run the
+  // effect after every children change (that is, after every completed load), contradicting "load the
+  // root once, when localRoot appears". A ref holds the latest version, leaving only localRoot — what
+  // genuinely decides whether to reload — in the dependencies (same approach as RestoreDialog's onErrorRef).
   const loadRef = useRef(load)
   loadRef.current = load
 
-  // 根目录一进来就展开：第一层只有一个节点，就是本地根自己。
+  // The root expands as soon as it appears: the first level holds exactly one node, the local root itself.
   useEffect(() => {
     if (localRoot) void loadRef.current('', 0)
-    // localRoot 创建后锁定，实际不会变；列出来是为了让依赖诚实。
+    // localRoot is locked after creation and cannot actually change; it is listed to keep the dependencies honest.
   }, [localRoot])
 
   const toggleExpand = (relative: string) => {
-    // 是否要发起加载，从本次渲染已有的 children 现算，不放进 setExpanded 的
-    // 更新函数里判断——StrictMode 下更新函数会被调用两次（一次探测一次生效），
-    // 若在里面调 load 会在开发环境里并发打两次同一个目录的 GET。
+    // Whether to start a load is computed from the children this render already has, rather than
+    // inside setExpanded's updater — under StrictMode the updater runs twice (once probing, once for
+    // real), and calling load in there fires two concurrent GETs for the same directory in development.
     const isExpanding = !expanded.has(relative)
-    // 没有 children[relative]，或者上次加载失败（entry.error 非空且从未成功过），
-    // 都算「还没有可用数据」，都要发起加载——否则一次失败就把这个目录锁死，
-    // 用户再也点不动它（失败也会写入 children，之前的判断把它当成"已加载"）。
+    // No children[relative], or a previous load that failed (entry.error set and never succeeded),
+    // both count as "no usable data yet" and both trigger a load — otherwise one failure locks the
+    // directory permanently and the user can no longer open it (a failure is written into children
+    // too, and the earlier check treated that as "already loaded").
     const needsLoad = isExpanding && (!children[relative] || children[relative].error !== null)
 
     setExpanded((prev) => {
@@ -205,9 +210,10 @@ function Level({
       </div>
     )
   }
-  // total 是服务端 stat 之前的全量子项数：真空目录时它恒为 0（skipped 也必然是 0，
-  // 无项可跳过）。一页恰好把能读的都跳过、下一页还有更多要拉的情形，靠这个条件
-  // 与"Empty"分开——那种情况下面的分支会照常渲染 skipped 提示与 Load more。
+  // total is the child count before the server stats anything: for a genuinely empty directory it is
+  // always 0 (and skipped is necessarily 0 too, since there is nothing to skip). This condition is
+  // what separates that from a page where everything readable was skipped and more remains — in that
+  // case the branch below still renders the skipped notice and Load more.
   if (!state.loading && state.total === 0) {
     return (
       <div className="text-faint text-sm" style={pad}>
@@ -251,8 +257,8 @@ function Level({
           </div>
         )
       })}
-      {/* 少给了东西必须说出来（同 PathBrowser 的 skipped 提示）：这些子项因属性读不出来
-          而没有出现在上面的列表里，不代表它们不存在。 */}
+      {/* Anything omitted has to be stated (as with PathBrowser's skipped notice): these children are
+          missing from the list above because their attributes could not be read, not because they do not exist. */}
       {state.skipped > 0 && (
         <div className="text-warn text-sm" style={pad}>
           {state.skipped} item(s) could not be read and are not listed.
@@ -264,8 +270,9 @@ function Level({
             type="button"
             className="text-sm"
             disabled={state.loading}
-            // 服务端在 stat 之前的全量列表上分页：下一页要从"这一页真正消耗掉的位置"续，
-            // 那包含被跳过的项，不只是成功 stat 出来的 entries.length。
+            // The server pages over the full listing taken before stat, so the next page continues
+            // from what this page actually consumed — which includes the skipped items, not just the
+            // entries that were stattable.
             onClick={() => onLoadMore(relative, state.consumed)}
           >
             {state.loading
@@ -303,7 +310,7 @@ function Row({
   outsideRoot: boolean
   length: number | null
 }) {
-  // 三态现算。这一行就是「不会死循环」的全部理由：读规则集，不读也不写任何兄弟/父子状态。
+  // Tri-state, computed live. This line is the entire reason there is no infinite loop: it reads the rule set and neither reads nor writes any sibling or parent state.
   const state = isDir ? scopeState(rules, relative) : isInScope(rules, relative) ? 'checked' : 'unchecked'
 
   return (
@@ -327,7 +334,7 @@ function Row({
           if (el) el.indeterminate = state === 'indeterminate'
         }}
         disabled={outsideRoot}
-        // 点击只做一件事：写一条规则。父子状态在下一次渲染时各自现算。
+        // A click does one thing: write one rule. Parent and child states are each recomputed on the next render.
         onChange={() => onChange(withRule(rules, relative, state !== 'checked'))}
       />
       <span>
@@ -369,10 +376,10 @@ const formatBytes = (n: number): string => {
 }
 
 /**
- * 仅用于给行打 `ignored` 徽标 —— 是提示，不是判定。真正的忽略在备份时由后端的
- * IgnoreRuleSet 执行；这里只支持最常见的几种写法（目录后缀 /、`*.ext`、精确路径），
- * 不追求与后端逐字节一致。看不出 gitignore 全部语义是可以接受的，误报/漏报徽标不影响
- * 任何备份结果。
+ * Used only to put an `ignored` badge on a row — a hint, not a decision. Actual ignoring happens at
+ * backup time in the backend's IgnoreRuleSet; this supports only the most common forms (a trailing
+ * /, `*.ext`, an exact path) and does not aim to be byte-identical with the backend. Not
+ * understanding all of gitignore's semantics is acceptable: a wrong badge affects no backup result.
  */
 function matchesIgnore(relative: string, isDir: boolean, ignoreRules: string): boolean {
   const name = relative.slice(relative.lastIndexOf('/') + 1)
