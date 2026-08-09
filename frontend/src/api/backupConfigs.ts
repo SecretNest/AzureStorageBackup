@@ -1,7 +1,7 @@
 import { api } from './client'
 import type { LocalRootPreview } from '../lib/localRootVerdict'
 
-// 与后端 enum 对应（System.Text.Json 默认序列化为数字）
+// Mirrors the backend enum (System.Text.Json serialises it as a number by default)
 export const StorageTier = { Hot: 0, Cool: 1, Cold: 2, Archive: 3 } as const
 export const RetentionMode = {
   VersionOnly: 0,
@@ -24,7 +24,7 @@ export const retentionModeLabels: Record<number, string> = {
   3: 'Both required',
 }
 
-// 备份管线阶段
+// Stages of the backup pipeline
 export const BackupStage = {
   Scanning: 0,
   Diffing: 1,
@@ -45,10 +45,10 @@ export const backupStageLabels: Record<number, string> = {
   [BackupStage.Completed]: 'Completed',
 }
 
-// 持久状态（§4.2 决策 2）：仅 Normal/Error。瞬时态见 BackupActivity（派生，不落库）。
+// Persistent status (§4.2, decision 2): Normal/Error only. Transient states are in BackupActivity (derived, never stored).
 export const BackupStatus = { Normal: 0, Error: 1 } as const
 
-// 还原冲突模式（§4.1c 决策 3，与后端 enum 数值对应）
+// Restore conflict mode (§4.1c, decision 3; values match the backend enum)
 export const RestoreConflictMode = { OverwriteIfChanged: 0, Skip: 1, RenameKeep: 2 } as const
 export const restoreConflictModeLabels: Record<number, string> = {
   0: 'Overwrite if changed',
@@ -56,11 +56,11 @@ export const restoreConflictModeLabels: Record<number, string> = {
   2: 'Keep existing (rename)',
 }
 
-// Archive 活化优先级（与后端 enum 数值对应）
+// Archive rehydrate priority (values match the backend enum)
 export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
 export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing' | 'CleaningUp'
 
-/** 读得通的形式，用在句子里（"Currently backing up — …"）。后端 Humanize 的对应物。 */
+/** The readable form, used inside a sentence ("Currently backing up — …"). The counterpart of the backend's Humanize. */
 export const activityLabels: Record<BackupActivity, string> = {
   Idle: 'idle',
   BackingUp: 'backing up',
@@ -71,9 +71,10 @@ export const activityLabels: Record<BackupActivity, string> = {
 }
 
 /**
- * 徽标里单独站着的形式。不能复用 activityLabels：那一组是为句子中间准备的小写形式，
- * 摆进徽标就成了半截句子；也不能直接打 activity 本身——那是后端的 enum 名，
- * "BackingUp" / "CleaningUp" 这种驼峰直接糊到屏幕上是漏出来的实现细节，不是文案。
+ * The standalone form used on a badge. activityLabels cannot be reused: that set is lowercase for
+ * mid-sentence use and reads as half a sentence on a badge. Nor can the activity itself be printed —
+ * that is the backend's enum name, and camel case like "BackingUp" / "CleaningUp" on screen is an
+ * implementation detail leaking out, not copy.
  */
 export const activityBadgeLabels: Record<BackupActivity, string> = {
   Idle: 'Idle',
@@ -84,12 +85,12 @@ export const activityBadgeLabels: Record<BackupActivity, string> = {
   CleaningUp: 'Cleaning Up',
 }
 
-/** 后端解析后的生效值（null 字段已用全局设置填充）。只读，仅供显示。 */
+/** The effective values after backend resolution (null fields filled in from the global settings). Read-only, for display. */
 export interface EffectiveBackupSettings {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
-  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
   includeSymlinks: boolean
   maxVersions: number
@@ -114,9 +115,9 @@ export interface BackupConfig {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
-  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
-  /** 备份范围。null = 根下全部内容。不可继承，因此不出现在 EffectiveBackupSettings 里。 */
+  /** Backup scope. null = everything under the root. Not inheritable, so it does not appear in EffectiveBackupSettings. */
   scopeRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
@@ -147,9 +148,9 @@ export interface BackupConfigInput {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
-  // 命中者允许跨目录装箱。空 = 全部按目录打包（历史行为）。
+  // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
-  /** 备份范围。null = 根下全部内容。不可继承，因此不出现在 EffectiveBackupSettings 里。 */
+  /** Backup scope. null = everything under the root. Not inheritable, so it does not appear in EffectiveBackupSettings. */
   scopeRules: string | null
   includeSymlinks: boolean | null
   maxVersions: number | null
@@ -161,74 +162,91 @@ export interface BackupConfigInput {
   verboseLogging: boolean | null
 }
 
-// 迁移本地根路径的校验报告（后端 LocalRootPreviewResponse）。
-// 形状定义在 lib/localRootVerdict.ts，与判定逻辑放一起，这里只做转出。
+// The validation report for a local-root migration (the backend's LocalRootPreviewResponse).
+// The shape is declared in lib/localRootVerdict.ts next to the decision logic; this only re-exports it.
 export type { LocalRootPreview } from '../lib/localRootVerdict'
 
-// 某个阶段正在做什么。上传之外的阶段此前完全没有进度——扫描和 diff 各自只在进入时报一次，
-// 而首次备份的 diff 要把每个文件完整读一遍算 hash，可以跑几小时。
-/** 一条正在传的流。label 是**源文件路径**（上传）或包的描述，不是内容寻址的 blob 名。 */
+// What a stage is currently doing. Stages other than upload used to have no progress at all — scanning
+// and diffing each reported once on entry, and a first backup's diff reads every file end to end to
+// hash it, which can run for hours.
+/** One transfer in flight. label is the **source file path** (upload) or a pack's description, never the content-addressed blob name. */
 export interface ActiveTransfer {
   label: string
   sent: number
-  total: number // 0 = 未知（下载在拿到响应头前不知道）
+  total: number // 0 = unknown (a download does not know until the response headers arrive)
   percent: number | null
 }
 
 export interface StageProgress {
   stage: string
   processed: number
-  total: number // 0 = 总数未知（扫描还没走完）
-  bytes: number // 边传边加，**含在途**——测速用的那个
+  total: number // 0 = total unknown (the scan has not finished)
+  bytes: number // Accumulated as it transfers, **including in flight** — the one used for speed
   currentItem: string | null
   activeItems: ActiveTransfer[]
   bytesPerSecond: number
-  preparing: number // 正占着全局归档锁产出卷文件的（可以持续几十秒）——按锁的定义只会是 0 或 1
-  queued: number // 还没被领走的——只数队列里的（排归档锁的见 waitingOnArchive）
-  // 已领走、正排在**归档锁**后面干等的件数。那把锁是全局的（StagingArea 是单例，产出跨备份也不
-  // 并发），所以一个备份的线程可以整段排在**另一个备份**手里的锁后面——那时本备份 preparing=0，
-  // 合进 queued 的话屏幕上就只剩一万条 "queued"，说不出"它被别人挡着"。
-  // 拆开之后判别是免费的：preparing=1 + 有人在等 = 锁在自己手里；preparing=0 + 有人在等 = 在别人手里。
+  preparing: number // Holding the global archive lock and producing volume files (can last tens of seconds) — by the lock's definition, only ever 0 or 1
+  queued: number // Not yet picked up — the queue only (those waiting on the archive lock are in waitingOnArchive)
+  // Items picked up by a worker and queuing behind the **archive lock**. That lock is global
+  // (StagingArea is a singleton, so production does not run concurrently across backups either), so one
+  // backup's threads can sit entirely behind a lock held by **another backup** — and then this backup's
+  // preparing is 0. Folded into queued, the screen would show ten thousand "queued" and nothing able to
+  // say "it is blocked by someone else".
+  // Split out, the diagnosis is free: preparing=1 with waiters means the lock is your own;
+  // preparing=0 with waiters means someone else holds it.
   waitingOnArchive: number
   percent: number | null
-  etaSeconds: number | null // 后端按全程平均进度外推的剩余秒数；estimatedRemaining 由它派生
-  estimatedRemaining: string | null // .NET TimeSpan 序列化为 "hh:mm:ss"
-  // 字节明细。各段互不重叠：workRemaining（还没处理的源字节）、stagedBytes（已压好没送出去的）、
-  // transferredBytes（已落云且整件已完成的）、unfinishedItemBytes（已落云但整件还没完成的）。
-  // workDone/workTotal 是压缩前口径，用于算真实完成度。
-  workTotal: number // 源端字节总量（压缩前）。上传阶段在 diff 判完前还会往上长
-  workDone: number // 其中已彻底完工的（不含在途）
+  etaSeconds: number | null // Seconds remaining, extrapolated by the backend from the whole-run average; estimatedRemaining derives from it
+  estimatedRemaining: string | null // A .NET TimeSpan serialised as "hh:mm:ss"
+  // The byte breakdown. The segments never overlap: workRemaining (source bytes not yet processed),
+  // stagedBytes (compressed but not sent), transferredBytes (in the cloud with the item complete) and
+  // unfinishedItemBytes (in the cloud with the item unfinished).
+  // workDone/workTotal are pre-compression, and give the real completion figure.
+  workTotal: number // Total source bytes (pre-compression). During upload it keeps growing until the diff finishes
+  workDone: number // Of those, the ones fully finished (excluding in flight)
   workRemaining: number
-  transferredBytes: number // 已完工的项真正推上网线的字节（压缩后，不含在途）
-  // 已落云、但所属那件活还没完成的字节（压缩后）。一件大活切成许多卷，前几卷传完时那些字节
-  // 确实到了云上，可整件没完成，既进不了 transferredBytes（那本账按件记，才对得上按件销账的
-  // workDone），也已不在 stagedBytes 里（池子逐卷释放）。整件完成时并入前者并归零。
+  transferredBytes: number // Bytes that finished items actually pushed over the wire (post-compression, excluding in flight)
+  // Bytes in the cloud whose item has not finished (post-compression). A large item is split into many
+  // volumes, and when the first few complete those bytes really are in the cloud — but the item is not
+  // done, so they cannot enter transferredBytes (which is kept per item, to line up with the per-item
+  // workDone) and they are no longer in stagedBytes either (the pool releases per volume). They fold
+  // into the former and reset to zero when the item completes.
   unfinishedItemBytes: number
-  stagedBytes: number // 已压好、**且已核对过**、就等上路的（压缩后）；正在核对的见 checkingBytes
-  // 已压好落盘、但还卡在核对里没资格上路的字节（checking 的字节侧，已从 stagedBytes 里减出去）。
-  // 产出一压完就进背压的账（那笔账要的是"盘上此刻占了多少"，晚记一秒就可能撑爆临时盘），
-  // 可它还要过压缩后重校验——而重校验判出成员在压缩期间变了的话，这份归档会被**整个丢掉重压**，
-  // 一个字节都传不出去。管这段叫 "ready to upload" 是过度承诺，所以单列一栏。
+  stagedBytes: number // Compressed, **checked**, and waiting to go (post-compression); what is still being checked is in checkingBytes
+  // Bytes compressed onto disk but still in checking and not cleared to upload (the byte side of
+  // checking, already subtracted from stagedBytes).
+  // Output is booked against backpressure the moment compression ends (that ledger needs "how much is on
+  // the disk right now", and booking it a second later risks blowing the temp disk), but it still has to
+  // pass the post-compression recheck — and if that finds a member changed during compression, the whole
+  // archive is **discarded and recompressed**, sending not one byte. Calling that stretch "ready to
+  // upload" over-promises, hence its own entry.
   checkingBytes: number
-  transferTotal: number // 这一阶段一共要过多少网线字节；0 = 未知（上传侧压完才知道，恒为 0）
-  workPercent: number | null // 按源字节算的完成度；总量未定时为 null
-  // 差分判得比压缩上传快几个数量级，必然跑到上传前面去；多出来的活攒到磁盘上（累计件数，只增）。
-  // 从前这里是一个 boolean「被队列挡住了」——写侧现在不再阻塞，diff 一路跑到底，
-  // 上传的剩余时间才有分母（总数只有 diff 收工才确定）。这个数是那件事的量化读数。
+  transferTotal: number // How many bytes this stage will send in total; 0 = unknown (the upload side only learns it after compressing, so it is always 0)
+  workPercent: number | null // Completion by source bytes; null until the total is settled
+  // The diff decides orders of magnitude faster than compression and upload can consume, so it always
+  // runs ahead; the surplus is buffered to disk (cumulative for the run, only ever growing).
+  // This used to be a boolean "blocked by the queue" — the write side no longer blocks, the diff runs to
+  // completion, and only then does the upload's remaining time have a denominator (the total is settled
+  // only when the diff finishes). This number quantifies that.
   spilledItems: number
-  // 已经离开压缩/暂存段的**件**数：压缩早已完成，此后要么有卷在飞，要么正卡在下面那三段之一。
-  // 与 activeItems 是两个口径——那里装的是**卷**，一件活可以同时有好几卷在飞，也可以一卷都没有。
-  // processed + preparing + queued + uploading ≡ total 是个恒等式，屏幕上的数必须凑得出它：
-  // 从前凑不出，一件卡在这一段的活谁也不算，只能靠把几屏截图排在一起做减法才发现得了。
+  // **Items** past the compression and staging stage: compression finished long ago, and from here they
+  // either have volumes in flight or are stuck in one of the three tiers below.
+  // A different basis from activeItems — that holds **volumes**, and one item can have several in flight
+  // or none at all.
+  // processed + preparing + queued + uploading ≡ total is an identity, and the numbers on screen have to
+  // add up to it. They did not: an item stuck in this stretch was counted by nothing, and could only be
+  // found by lining up several screenshots and doing subtraction.
   uploading: number
-  waitingOnPeer: number // 其中在等同批同内容的首个上传者传完的件数
-  waitingOnSlot: number // 其中在排全局上传闸门的**卷**数（闸门按卷排队，单位与另外两个不同）
-  // 其中正在读盘核对、既不推字节也不在等任何东西的件数：单文件去重预筛整读算三段 hash、
-  // 一箱 pack 压缩前后各逐成员 stat（变了的还要整读重算 hash）、加密多卷上传前列举云端残留卷。
-  // 这几段在 NAS 上都能跑几十秒，而且一个进度事件都不发——从前屏幕上是一动不动的
-  // "1 object starting upload"，既没在 starting 也没在 upload。
-  // 它是 uploading 的**细分**（都发生在出了暂存段、还没登记在途卷的时候），所以算 starting upload
-  // 时必须把它减掉，否则同一件活会被报两栏，屏幕上的数就凑不出那条恒等式了。
+  waitingOnPeer: number // Of those, items waiting for the first uploader of identical content to finish
+  waitingOnSlot: number // Of those, **volumes** queuing on the global upload gate (the gate queues per volume, a different unit from the other two)
+  // Of those, items doing disk checking: pushing no bytes and waiting on nothing. A single file's dedup
+  // pre-check reads the whole file for three hashes; a pack stats every member before and after
+  // compression (re-hashing the ones that changed); a multi-volume upload lists leftover cloud volumes
+  // first. Each can run for tens of seconds on a NAS while emitting not one progress event — the screen
+  // used to show a motionless "1 object starting upload", which is neither starting nor uploading.
+  // It is a **subset** of uploading (all of it happens after leaving staging and before any volume is
+  // registered in flight), so it must be subtracted when computing starting upload, or one item is
+  // reported in two columns and the numbers no longer add up to that identity.
   checking: number
 }
 
@@ -239,37 +257,41 @@ export interface BackupProgress {
   uploadedItems: number
   totalItems: number
   percent: number
-  // 流水线化之后 Diffing 与 Uploading 是同时在跑的，所以明细是一个列表。
+  // Once pipelined, Diffing and Uploading run at the same time, so the detail is a list.
   details: StageProgress[]
-  // 头条明细（= details[0]）。串行阶段只有一条，就是它。
+  // The headline detail (= details[0]). A serial stage has exactly one, and this is it.
   detail: StageProgress | null
 }
 
-// 后台运行的终态。Canceled = 用户按了停止：既不是成功也不是失败，后端因此不会把它写成
-// 该备份的 Error 状态（否则停一次就要手动 Reset 一次）。
-// Suspended = 现场安全保存后停下的，语义上离 Canceled 更近而不是 Failed：下次跑会原样接上。
+// Terminal states of a background run. Canceled = the user pressed stop: neither success nor failure,
+// so the backend does not write it as the backup's Error status (otherwise every stop would need a
+// manual Reset).
+// Suspended = stopped after saving the scene safely, semantically closer to Canceled than to Failed:
+// the next run picks up exactly where it left off.
 export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspended'
 
-// 卡在瞬时错误上等自愈重试。**这不是一种状态**：status 仍然是 Running，因为后台那个 Task
-// 还活着、暂存席位也还占着。写成状态会让停止按钮消失，而卡住的时候恰恰是最想停的时候。
+// Stuck on a transient error, waiting for the self-healing retry. **This is not a status**: status is
+// still Running, because the background task is alive and the staging lease is still held. Making it a
+// status would hide the stop button — and being stuck is exactly when stopping is most wanted.
 export interface PauseInfo {
   reason: string
   since: string
-  // 下次自动重试的时刻（UTC）。已经在重试路上时为 null。
+  // When the next automatic retry is due (UTC). null while a retry is already under way.
   nextRetryAt: string | null
-  // 连续失败次数。涨到阈值就自动转挂起。
+  // Consecutive failures. Reaching the threshold degrades automatically to suspended.
   failures: number
 }
 
-// 盘上留着的一次中途停下的运行（程序重启后内存里什么都没有，只能从这里知道）。
+// A run left half-finished on disk. After a restart nothing is in memory, so this is the only way to know.
 export interface InterruptedRun {
   runId: string
   startedAt: string
-  // journal 里已确认在云上的块数。接着跑能省下的，大致就是这么多。
+  // Blocks the journal confirms are in the cloud. Roughly what continuing would save.
   blocks: number
   journalBytes: number
-  // 便宜的那几项前置校验的预览，**不是承诺**：基线版本与加密身份要读索引和密码才能核，
-  // 那要等真正开卷时才做。这里为 true 而开卷时仍被判作废是可能的。
+  // A preview of the cheap preconditions, **not a promise**: the baseline version and the encryption
+  // identity need the index and the password to verify, which only happens when a run actually opens the
+  // journal. True here and voided there is possible.
   resumable: boolean
 }
 
@@ -277,18 +299,18 @@ export interface BackupRun {
   status: RunStatus
   progress: BackupProgress | null
   version: number | null
-  // 本轮读不开、因而沿用了旧索引条目的文件数。一次"成功"的备份可能什么都没存下来。
+  // Files this round could not read, whose old index entries were carried forward. A "successful" backup may have stored nothing at all.
   unreadableFiles: number | null
   error: string | null
-  // 本次备份的起止时刻（UTC），取自版本记录——与 /versions 给还原对话框的是同一组数字。
-  // 运行中、以及未带这两个字段的老后端，为 null。
+  // This backup's start and end (UTC), taken from the version record — the same pair /versions gives the
+  // restore dialog. null while running, and against an older backend that does not send them.
   startedAt: string | null
   completedAt: string | null
-  // 本次运行的标识，与盘上的 journal 文件同名。
+  // This run's identifier, matching the journal filename on disk.
   runId: string
-  // 非 null＝正卡在瞬时错误上等重试。status 仍是 'Running'。
+  // Non-null = stuck on a transient error awaiting retry. status is still 'Running'.
   pause: PauseInfo | null
-  // status === 'Suspended' 时的缘由：UserRequested / AutoSuspended。
+  // Why, when status === 'Suspended': UserRequested / AutoSuspended.
   suspendReason: string | null
 }
 
@@ -299,8 +321,8 @@ export interface RestoreRun {
   skippedFiles: number | null
   failedFiles: number | null
   detail: StageProgress | null
-  // 跳过/失败的逐条记录。此前只有 phase 一个单值字段，后一条覆盖前一条，
-  // 跑完只剩最后一条，其余仅体现为 failedFiles 那个数字。
+  // A record per skipped or failed file. There used to be a single phase field, each entry overwriting
+  // the last, so only the final one survived the run and the rest showed up only as the failedFiles count.
   events: string[] | null
   error: string | null
   phase: string | null
@@ -308,17 +330,17 @@ export interface RestoreRun {
 
 export interface BackupVersionInfo {
   version: number
-  /** 版本提交时刻（备份结束）。UTC，显示时转本地时区。 */
+  /** When the version was committed (the backup's end). UTC, rendered in local time. */
   createdAt: string
-  /** 备份开始跑的时刻。UTC。此字段问世前写下的版本为 null。 */
+  /** When the backup started running. UTC. null for versions written before this field existed. */
   startedAt: string | null
   files: number
   bytes: number
   changedFiles: number
 }
 
-// 分级检查（枚举按数值序列化，与后端一致）。CloudCheckLevel/LocalCheckLevel 与 api/tasks.ts
-// 共用同一份定义，见 constants/labels.ts（§5.7 合并重复 label 字典）。
+// Graduated check (enums serialise as numbers, matching the backend). CloudCheckLevel/LocalCheckLevel
+// share one definition with api/tasks.ts; see constants/labels.ts.
 export { CloudCheckLevel, LocalCheckLevel } from '../constants/labels'
 export const CloudState = { NotChecked: 0, Ok: 1, MissingOrBad: 2 } as const
 export const LocalState = { NotChecked: 0, Ok: 1, Missing: 2, Changed: 3 } as const
@@ -329,8 +351,9 @@ export interface FileFinding {
   cloud: number // CloudState
   local: number // LocalState
   repairable: boolean
-  // 非空＝云端这份是从更早版本沿用来的（备份一直读不到源文件）。没有它，local=Changed
-  // 会被读成"本地被改了"，而真实原因是备份从未成功更新过云端这一份。
+  // Non-null = the cloud copy was carried over from an earlier version (the backup could never read the
+  // source). Without it, local=Changed reads as "the local file was modified", when the real cause is
+  // that the backup never managed to update the cloud copy.
   unreadableAt: string | null
 }
 
@@ -359,8 +382,9 @@ export interface RepairRun {
   error: string | null
 }
 
-// 检查现在是后台 job（202 + 轮询）：内容级要把整个备份下载重算一遍 hash，同步端点时代
-// 请求会先被浏览器/反向代理超时掐断。报告跑完仍留在服务端，关掉对话框再打开还能看回结果。
+// Check is now a background job (202 plus polling): a content-level check downloads and re-hashes the
+// entire backup, and as a synchronous endpoint the request was cut off by browser or reverse-proxy
+// timeouts first. The finished report stays on the server, so closing and reopening the dialog gets it back.
 export interface CheckRun {
   status: RunStatus
   report: CheckReport | null
@@ -374,7 +398,7 @@ export interface FileVersionOption {
   length: number
 }
 
-// 还原树浏览节点（§4.1a）：目录的直接子节点，懒加载展开用。
+// A node in the restore browse tree (§4.1a): a directory's direct children, for lazy expansion.
 export interface TreeNode {
   name: string
   path: string
@@ -384,18 +408,19 @@ export interface TreeNode {
   mtime: string | null
   storageKind: string | null
   storageRef: string | null
-  // 非空＝这条记录沿用自更早的版本，值为自何时起没能再更新。还原选择时必须看得到：
-  // 还原这个版本，拿到的不是这个版本时刻的内容。
+  // Non-null = this entry was carried over from an earlier version, and the value is since when it could
+  // not be updated. It has to be visible while choosing what to restore: restoring this version does not
+  // give the content as of this version's timestamp.
   unreadableAt: string | null
 }
 
-// 某版本里内容为沿用的文件（备份那几轮读不开源文件）。与 unrecoverable 不同：内容有效，只是旧。
+// Files in a version whose content was carried over (the backup could not read the source in those rounds). Unlike unrecoverable: the content is valid, just old.
 export interface UnreadableEntry {
   path: string
   unreadableAt: string
 }
 
-// 还原量估算（§4.1b）：本地纯算下载量/解压量/文件数，再对去重存储对象 HEAD 查活化状态。
+// The restore estimate (§4.1b): download size, extracted size and file count computed locally, then one HEAD per deduplicated stored object to check rehydration state.
 export interface RestoreEstimate {
   downloadBytes: number
   uncompressedBytes: number
@@ -404,12 +429,12 @@ export interface RestoreEstimate {
   rehydratePending: number
 }
 
-/** 一次导入的结果：建好的配置，加上导入自己发现的两件事。 */
+/** The result of an import: the configuration created, plus two things the import itself discovered. */
 export interface ImportResult {
   config: BackupConfig
-  /** 云端核验已经在后台跑起来了——直接把检查面板打开，别让用户再去找那个按钮。 */
+  /** The cloud verification is already running in the background — open the check panel directly rather than making the user find that button. */
   checkStarted: boolean
-  /** 文件列表读不出来的版本号。这些版本还原不了也检查不了，其余版本不受影响。 */
+  /** Version numbers whose file list could not be read. Those versions can neither be restored nor checked; the rest are unaffected. */
   unreadableVersions: number[]
 }
 
@@ -434,7 +459,7 @@ export const backupConfigsApi = {
   remove: (id: number, deleteContainer = false) =>
     api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`),
   resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
-  // 迁移本地根路径。preview 是纯查询，可反复试；changeLocalRoot 才真的改。
+  // Migrating the local root. preview is a pure query and can be retried freely; only changeLocalRoot mutates.
   previewLocalRoot: (id: number, newRoot: string) =>
     api.post<LocalRootPreview>(`/backup-configs/${id}/local-root/preview`, { newRoot }),
   changeLocalRoot: (id: number, newRoot: string, force: boolean) =>
@@ -454,10 +479,10 @@ export const backupConfigsApi = {
     targetRoot: string | null,
     version: number | null,
     substitutions?: Record<string, number>,
-    // 选择性还原（需求 B）：为空则还原整版本；非空则只还原恰好这些路径（pack 只下一次、只写选中成员）。
+    // Selective restore (requirement B): empty restores the whole version; non-empty restores exactly these paths (a pack is downloaded once and only the selected members are written).
     selectedPaths?: string[] | null,
-    conflict: number = RestoreConflictMode.OverwriteIfChanged, // 冲突模式（决策 3）
-    rehydratePriority: number = RestoreRehydratePriority.Standard, // Archive 活化优先级
+    conflict: number = RestoreConflictMode.OverwriteIfChanged, // Conflict mode (decision 3)
+    rehydratePriority: number = RestoreRehydratePriority.Standard, // Archive rehydrate priority
   ) =>
     api.post<RestoreRun>(`/backup-configs/${id}/restore`, {
       targetRoot,
@@ -481,10 +506,10 @@ export const backupConfigsApi = {
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (listOrphans) p.set('listOrphans', 'true')
-    // 202：只是把检查跑起来，结果要靠 checkStatus 轮询。
+    // 202: this only starts the check; the result comes from polling checkStatus.
     return api.post<CheckRun>(`/backup-configs/${id}/check?${p.toString()}`, {})
   },
-  // 从没查过这个备份时后端答 204（不是 404：那会在浏览器控制台留下红色报错），这里拿到的是空。
+  // When this backup has never been checked the backend answers 204 (not 404, which would leave a red error in the browser console), so this comes back empty.
   checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
   repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false) => {
     const p = new URLSearchParams()
@@ -495,14 +520,15 @@ export const backupConfigsApi = {
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
-  // 停止正在跑的操作。what 省略＝停掉这个配置上所有在跑的操作。
+  // Stop whatever is running. Omitting `what` stops every running operation on this configuration.
   //
-  // 备份这一支后端是**等落盘再答**的，所以这个 Promise resolve 就意味着现场已经安全了——
-  // 除非 stopping 为 true：那表示后端等了 20 秒还没收尾（正在传的大文件还没传完），
-  // 运行仍会走到终态，界面继续轮询即可。
+  // On the backup path the backend **waits for the flush before answering**, so this promise resolving
+  // means the scene is already safe — unless stopping is true, which means the backend waited 20 seconds
+  // without the run winding down (a large file still uploading). The run still reaches a terminal state;
+  // the UI just keeps polling.
   //
-  // finishCurrentFiles=true：正在传的文件（含它所有分卷）传完再停，这部分算数；
-  // false：立刻停，半截的分卷和在途的块都删掉，不留没法用的残渣。
+  // finishCurrentFiles=true: let the file currently uploading finish (all of its volumes) and count it;
+  // false: stop immediately, deleting half-written volumes and in-flight blocks so no unusable remains are left.
   cancel: (id: number, what?: 'backup' | 'restore' | 'repair' | 'check', finishCurrentFiles = false) => {
     const p = new URLSearchParams()
     if (what) p.set('what', what)
@@ -511,10 +537,10 @@ export const backupConfigsApi = {
     return api.post<{ canceled: string[]; stopping?: boolean }>(
       `/backup-configs/${id}/cancel${q ? `?${q}` : ''}`, {})
   },
-  // 挂起：安全落盘后停下。**没有对应的 resume**——恢复不是一种模式，每一轮备份开卷时都会去认
-  // 还有效的 journal，所以"继续"就是再调一次 run()。
+  // Suspend: stop after flushing safely. **There is no matching resume** — resuming is not a mode, since
+  // every run recognises any still-valid journal when it opens one, so "continue" is just calling run() again.
   suspend: (id: number) => api.post<void>(`/backup-configs/${id}/suspend`, {}),
-  // 不等自愈计时器，立刻放行一次重试。
+  // Release one retry immediately, without waiting for the self-healing timer.
   retryNow: (id: number) => api.post<void>(`/backup-configs/${id}/retry-now`, {}),
   interrupted: (id: number) => api.get<InterruptedRun[]>(`/backup-configs/${id}/interrupted`),
   discardInterrupted: (id: number) => api.del(`/backup-configs/${id}/interrupted`),
