@@ -11,13 +11,13 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 孤儿扫描是**谁**要求的：两个调用点各自那一个布尔值。
+/// **Who** asks for an orphan sweep: the one boolean at each of the two call sites.
 /// <para>
-/// <see cref="RetentionCleaner"/> 自己的判据另有 <c>RetentionCleanerJournalTests</c> 逐项钉着，
-/// 而那些用例一律直接把 <c>sweepOrphans: true</c> 递进去——于是"生产里到底有没有人递真"这件事
-/// 一个字都没被钉住：把 <see cref="TaskDispatcher"/> 那句改成 <c>false</c>、把编排器收尾那句
-/// 改成常量，全套用例照样绿，而线上的表现是取消/崩溃留下的块永远无人收。
-/// 这几条用例走的都是真调用点，不碰 <c>sweepOrphans</c> 这个参数本身。
+/// <see cref="RetentionCleaner"/>'s own tests are pinned term by term over in <c>RetentionCleanerJournalTests</c>,
+/// and those cases all hand it <c>sweepOrphans: true</c> directly — so "does anything in production ever pass true" was not
+/// pinned down by a single word: flip the <see cref="TaskDispatcher"/> line to <c>false</c>, turn the orchestrator's tail line
+/// into a constant, and the whole suite stays green while in the field the blocks left by a cancel/crash are never collected.
+/// These cases all go through the real call sites and never touch the <c>sweepOrphans</c> parameter itself.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -72,7 +72,7 @@ public sealed class JournalSweepTriggerTests : IDisposable
         File.WriteAllText(full, content);
     }
 
-    /// <summary>造一个谁都不引用的 data blob——取消/崩溃在容器里留下的正是这种东西。</summary>
+    /// <summary>Plant a data blob nobody references — exactly the kind of thing a cancel/crash leaves behind in a container.</summary>
     private static async Task PlantOrphanAsync(BlobContainerClient container)
         => await container.GetBlobClient("data/orphan").UploadAsync(
             new MemoryStream(Encoding.UTF8.GetBytes("nobody references me")), overwrite: true);
@@ -81,8 +81,8 @@ public sealed class JournalSweepTriggerTests : IDisposable
         => (await container.GetBlobClient("data/orphan").ExistsAsync()).Value;
 
     /// <summary>
-    /// 一台编排器。<paramref name="authority"/> 由调用方持有，好让同一份"本地权威状态"跨轮沿用——
-    /// 每轮各造一份的话，每一轮都会被当成第一轮（见 <see cref="A_first_run_sweeps_what_the_deleted_config_left_behind"/>）。
+    /// One orchestrator. <paramref name="authority"/> is held by the caller so that one and the same "local authoritative state"
+    /// carries across runs — build a fresh one per run and every run gets treated as the first (see <see cref="A_first_run_sweeps_what_the_deleted_config_left_behind"/>).
     /// </summary>
     private BackupOrchestrator BuildOrchestrator(TestLocalAuthority authority, BackupInfoStore store)
     {
@@ -103,8 +103,8 @@ public sealed class JournalSweepTriggerTests : IDisposable
         Container = container,
         LocalRoot = _root,
         Name = "sweep-trigger",
-        // 默认保留策略（100 版 / 180 天）：这几轮备份一个版本都不会退役，所以清理器
-        // 只剩"有没有人要求扫"这一个理由能动手——正是这几条用例要测的东西。
+        // Default retention policy (100 versions / 180 days): none of these runs retires a single version, so the only reason
+        // left for the cleaner to act is "did anybody ask for a sweep" — precisely what these cases are testing.
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 20_000 } },
     };
 
@@ -118,8 +118,8 @@ public sealed class JournalSweepTriggerTests : IDisposable
     }
 
     /// <summary>
-    /// 定时 Cleanup 任务永远扫孤儿。这条路是那批块**唯一**的兜底：备份自己那次收尾清理只在
-    /// 采纳/作废/第一轮时才扫，用户若一直不再动那份备份，就只剩这里会来收。
+    /// The scheduled Cleanup task always sweeps orphans. This path is the **only** backstop for those blocks: the backup's own
+    /// tail cleanup sweeps only on adoption/voiding/a first run, so if the user never touches that backup again this is the only thing left to collect them.
     /// </summary>
     [SkippableFact]
     public async Task The_scheduled_cleanup_task_always_sweeps()
@@ -154,7 +154,7 @@ public sealed class JournalSweepTriggerTests : IDisposable
                 });
             }
 
-            // 先有一个版本：没有任何已提交版本的容器，独立清理那条路会直接返回（判据的一半读不出来）。
+            // Get one version in first: on a container with no committed version at all, the standalone cleanup path returns straight away (half of its test cannot even be read).
             var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
             Write("big.bin", new string('a', 60_000));
             await BuildOrchestrator(new TestLocalAuthority(store), store)
@@ -174,18 +174,18 @@ public sealed class JournalSweepTriggerTests : IDisposable
             };
             await app.Services.GetRequiredService<TaskDispatcher>().DispatchAsync(task, CancellationToken.None);
 
-            // 一个版本都没退役（默认保留策略），孤儿仍然被收走了。
+            // Not a single version retired (default retention policy), and the orphan was still collected.
             Assert.False(await OrphanExistsAsync(container), "the scheduled cleanup must sweep orphans");
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
     /// <summary>
-    /// 备份收尾那次清理照 <see cref="BackupRunControl.SweepNeeded"/> 办事——两个方向都要钉：
-    /// 有作废的 journal 就扫，什么都没发生就不扫。
+    /// The backup's tail cleanup does what <see cref="BackupRunControl.SweepNeeded"/> says — both directions have to be pinned:
+    /// sweep when a journal was voided, do not sweep when nothing happened.
     /// <para>
-    /// 只钉"该扫时扫了"是不够的：把那句改成常量 <c>true</c> 同样能过，而那意味着每一轮备份
-    /// 收尾都多列两遍 data/ 与 packs/ 前缀，几十万对象的容器上这是每次备份都要付的账。
+    /// Pinning only "it swept when it should have" is not enough: turning that line into the constant <c>true</c> passes just as
+    /// well, and that means every backup's tail lists the data/ and packs/ prefixes twice more, a bill paid on every single backup on a container with hundreds of thousands of objects.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -200,7 +200,7 @@ public sealed class JournalSweepTriggerTests : IDisposable
         var container = blobFactory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
 
-        // 同一份本地权威状态贯穿三轮：第二、三轮因此都不是"第一轮"，SweepNeeded 只会由 journal 决定。
+        // One local authoritative state runs through all three rounds: rounds two and three are therefore not "the first run", and SweepNeeded is decided by the journal alone.
         var authority = new TestLocalAuthority(store);
         try
         {
@@ -208,8 +208,8 @@ public sealed class JournalSweepTriggerTests : IDisposable
             await using (var c1 = new BackupRunControl(_journals, ConfigId, "run-1"))
                 await BuildOrchestrator(authority, store).RunAsync(Request(account, name), null, default, c1);
 
-            // 第二轮：盘上放一卷判据对不上的 journal（configId 不同 = 配置删了又建的陈迹）→
-            // 开卷时作废 → SweepNeeded。
+            // Round two: plant a journal on disk whose terms do not match (a different configId = residue of a config deleted
+            // and recreated) → voided when opened → SweepNeeded.
             await PlantOrphanAsync(container);
             await PlantStaleJournalAsync(account.Id, name);
             Write("big.bin", new string('b', 60_000));
@@ -220,7 +220,7 @@ public sealed class JournalSweepTriggerTests : IDisposable
             }
             Assert.False(await OrphanExistsAsync(container), "a voided journal must trigger the tail sweep");
 
-            // 第三轮：什么都没发生（既没采纳也没作废，也不是第一轮）→ 不扫。
+            // Round three: nothing happened (nothing adopted, nothing voided, and not a first run) → no sweep.
             await PlantOrphanAsync(container);
             Write("big.bin", new string('c', 60_000));
             await using (var c3 = new BackupRunControl(_journals, ConfigId, "run-3"))
@@ -236,16 +236,17 @@ public sealed class JournalSweepTriggerTests : IDisposable
     }
 
     /// <summary>
-    /// 删配置（保留容器）后又在同一个容器上重建：第一轮备份收尾必须把旧配置留下的孤儿收走。
+    /// Delete the config (keeping the container) and then recreate it on the same container: the first backup's tail must collect the orphans the old config left behind.
     /// <para>
-    /// 删配置那一步会把这个容器的 journal 全部丢掉（<c>BackupConfigEndpoints</c>），那批
-    /// "云上有、索引里还没有"的块从此失去保护；端点写下的承诺是"等这个容器上再有配置时，
-    /// 第一次清理会用完整判据把真孤儿扫掉"。而重建后的第一次清理正是**备份收尾**那次：
-    /// 那时 journal 目录刚被删空，既没采纳也没作废——没有"第一轮必扫"这一条，这句承诺就是空的。
+    /// Deleting the config throws away every journal for this container (<c>BackupConfigEndpoints</c>), and from then on those
+    /// "in the cloud but not yet in the index" blocks have no protection; the promise the endpoint writes down is "once this
+    /// container has a config again, the first cleanup will use the full test to sweep the real orphans away". And the first
+    /// cleanup after recreation is precisely the **backup tail** one: at that point the journal directory has just been emptied,
+    /// so nothing was adopted and nothing voided — without the "a first run always sweeps" term, that promise is empty.
     /// </para>
     /// <para>
-    /// 这里用"换一份本地权威状态"来模拟删配置：删配置端点删的正是这份本地状态
-    /// （<c>localState.RemoveAsync</c>），而编排器判"是不是第一轮"看的也正是它。
+    /// Here "swap in a different local authoritative state" stands in for deleting the config: the delete-config endpoint deletes
+    /// exactly that local state (<c>localState.RemoveAsync</c>), and it is exactly what the orchestrator looks at to decide "is this a first run".
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -266,11 +267,11 @@ public sealed class JournalSweepTriggerTests : IDisposable
                 await BuildOrchestrator(new TestLocalAuthority(store), store)
                     .RunAsync(Request(account, name), null, default, c1);
 
-            // 配置删了：本地状态没了、journal 也没了，容器和这个块还在。
+            // Config deleted: local state gone, journals gone, the container and this block still there.
             await PlantOrphanAsync(container);
             _journals.DeleteAll(account.Id, name);
 
-            // 重建配置后的第一轮。盘上一卷 journal 都没有，所以扫这件事只能由"第一轮"这一项要求。
+            // The first run after the config is recreated. Not one journal volume on disk, so the sweep can only be demanded by the "first run" term.
             Write("big.bin", new string('b', 60_000));
             await using (var c2 = new BackupRunControl(_journals, ConfigId, "run-2"))
             {
@@ -286,13 +287,13 @@ public sealed class JournalSweepTriggerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>盘上放一卷判据对不上的 journal：开卷时它会被当场作废删掉。</summary>
+    /// <summary>Plant a journal on disk whose terms do not match: opening it voids and deletes it on the spot.</summary>
     private async Task PlantStaleJournalAsync(int accountId, string container)
     {
         await using var j = await _journals.CreateAsync(accountId, container, "run-stale", new JournalHeader
         {
             RunId = "run-stale",
-            ConfigId = ConfigId + 1,          // 另一个配置留下的陈迹 → 作废
+            ConfigId = ConfigId + 1,          // residue left by another config → voided
             StartedAt = DateTimeOffset.UnixEpoch,
             BaselineVersion = 0,
             LocalRoot = _root,

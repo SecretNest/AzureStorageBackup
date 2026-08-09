@@ -76,9 +76,9 @@ public class BackupJournalStoreTests : IDisposable
     }
 
     /// <summary>
-    /// 头读不通的那一卷整卷作废：既不出现在列表里，也不许把它的记录混进"别删我"的名单。
-    /// 后半句才是要害——名单是清理器的删除判据的另一半，多一条不该有的，就是本该退役的块永远删不掉；
-    /// 而这一卷的头都解不出来，它记的东西属于哪一轮、哪个基线，根本无从谈起。
+    /// A volume whose header does not read is void as a whole: it shows up in no listing, and its records must not be mixed into the "don't delete me" list.
+    /// The second half is the crux — that list is the other half of the cleaner's delete test, and one entry too many means a block
+    /// that should have retired can never be deleted; and when a volume's header will not even parse, which run and which baseline its records belong to is unanswerable.
     /// </summary>
     [Fact]
     public async Task A_volume_with_an_unreadable_header_is_skipped_whole()
@@ -86,7 +86,7 @@ public class BackupJournalStoreTests : IDisposable
         await WriteRunAsync("run-good",
             new JournalRecord { Kind = "blob", Ref = "data/good", Path = "p1", FullHash = "good" });
         await WriteRunAsync("run-torn");
-        // 头一行不是 JSON，后面却跟着一条形状完好的记录：作废必须是整卷的事，不是"跳过坏的那一行"。
+        // The first line is not JSON, yet a perfectly well-formed record follows it: voiding must be a whole-volume affair, not "skip the bad line".
         await File.WriteAllTextAsync(
             _store.PathFor(9, "cont", "run-torn"),
             "not json at all\n{\"Kind\":\"blob\",\"Ref\":\"data/ghost\",\"Path\":\"p2\",\"FullHash\":\"ghost\"}\n");
@@ -100,8 +100,8 @@ public class BackupJournalStoreTests : IDisposable
     }
 
     /// <summary>
-    /// 同一卷没变过就不许再走一遍。界面开着时这个方法每 5 秒被每个配置各调一次，而一卷 journal
-    /// 能长到几百 MB——重走一遍就是每分钟几百 MB 的读，抢的还是备份自己在读的那块盘。
+    /// An unchanged volume must not be walked again. With the UI open this method is called once every 5 seconds for every config,
+    /// and one journal can grow to hundreds of MB — rewalking means hundreds of MB of reads per minute, contending for the very disk the backup itself is reading.
     /// </summary>
     [Fact]
     public async Task Peeking_an_unchanged_journal_reads_nothing_the_second_time()
@@ -115,10 +115,10 @@ public class BackupJournalStoreTests : IDisposable
 
         var second = await _store.PeekAsync(9, "cont", default);
         Assert.Equal(5, second[0].Records);
-        Assert.Equal(afterFirst, _store.BytesScanned);   // 一个字节都没再读
+        Assert.Equal(afterFirst, _store.BytesScanned);   // not one further byte read
     }
 
-    /// <summary>又追加了几条：只数新增的那一段，且数出来的必须是新的总数。</summary>
+    /// <summary>A few more records appended: count only the new stretch, and the number that comes out must be the new total.</summary>
     [Fact]
     public async Task Peeking_a_grown_journal_counts_only_the_new_bytes()
     {
@@ -138,27 +138,27 @@ public class BackupJournalStoreTests : IDisposable
     }
 
     /// <summary>
-    /// 半行也不许多算。这个文件不逐条 fsync，快照完全可能正落在一行中间；从文件末尾接着数，
-    /// 那半行的后半截会被再当成一行算一遍，于是界面上的条数越刷越大。
+    /// A half line must not be counted twice either. This file is not fsynced per record, so a snapshot can easily land mid-line;
+    /// resume counting from the end of the file and the second half of that partial line gets counted as a line all over again, so the count on screen grows with every refresh.
     /// </summary>
     [Fact]
     public async Task A_line_that_was_only_half_written_is_not_counted_twice()
     {
         await WriteRunAsync("run-a", Records(2));
         var path = _store.PathFor(9, "cont", "run-a");
-        // 半条记录，没有换行——崩在写一半上就长这样。
+        // Half a record, no newline — this is what crashing mid-write looks like.
         await File.AppendAllTextAsync(path, "{\"Kind\":\"blob\",\"Ref\":\"data/hal");
-        Assert.Equal(3, (await _store.PeekAsync(9, "cont", default))[0].Records);   // 残行照 ReadLine 的老规矩算一行
+        Assert.Equal(3, (await _store.PeekAsync(9, "cont", default))[0].Records);   // the partial line counts as a line, per ReadLine's old rule
 
-        // 后半截补上，再多写一条完整的。
+        // Complete the second half, then write one more whole record.
         await File.AppendAllTextAsync(path, "f\",\"Path\":\"h\",\"FullHash\":\"h\"}\n");
         await File.AppendAllTextAsync(path, "{\"Kind\":\"blob\",\"Ref\":\"data/z\",\"Path\":\"z\",\"FullHash\":\"z\"}\n");
         Assert.Equal(4, (await _store.PeekAsync(9, "cont", default))[0].Records);
     }
 
     /// <summary>
-    /// 同一个路径换了一卷（另起一轮把它重写了）：旧的行数一条都不作数，必须从头数。
-    /// 判据落在头里的 StartedAt 上而不是长度上——重写出来的长度完全可能比旧的还长。
+    /// The same path now holds a different volume (another run rewrote it): not one line of the old count still holds, it must be counted from scratch.
+    /// The test rests on StartedAt in the header rather than on length — the rewritten file can easily be longer than the old one.
     /// </summary>
     [Fact]
     public async Task A_journal_replaced_by_another_run_is_counted_from_scratch()
@@ -166,8 +166,8 @@ public class BackupJournalStoreTests : IDisposable
         await WriteRunAsync("run-a", Records(2, pad: 4000));
         Assert.Equal(2, (await _store.PeekAsync(9, "cont", default))[0].Records);
 
-        // 同名同路径，另一轮（StartedAt 不同），字节数**更长**而条数不同：只看长度、把长了就当追加的
-        // 备忘，会从上一卷数到的偏移接着数，把两卷的行数拼成一个谁也不是的数。
+        // Same name, same path, another run (a different StartedAt), **more** bytes but a different record count: a memo that looks
+        // only at length and treats "longer" as appended would resume from the previous volume's offset and splice the two volumes' line counts into a number belonging to neither.
         await using (var j = await _store.CreateAsync(
             9, "cont", "run-a", Header("run-a") with { StartedAt = DateTimeOffset.UnixEpoch.AddDays(1) }, default))
             foreach (var r in Records(5, pad: 1800))
@@ -175,15 +175,15 @@ public class BackupJournalStoreTests : IDisposable
 
         Assert.Equal(5, (await _store.PeekAsync(9, "cont", default))[0].Records);
 
-        // 反过来：换上一卷更短的，同样不许交出旧的数。
+        // The other way round: swap in a shorter volume, and it must not hand back the old number either.
         await using (var j = await _store.CreateAsync(
             9, "cont", "run-a", Header("run-a") with { StartedAt = DateTimeOffset.UnixEpoch.AddDays(2) }, default))
             await j.AppendAsync(Records(1)[0], default);
         Assert.Equal(1, (await _store.PeekAsync(9, "cont", default))[0].Records);
     }
 
-    /// <param name="pad">把每条记录撑到多长。默认 0（短记录）；两卷记录长度不同，才谈得上
-    /// "从上一卷的偏移接着数"会数出个错的数来——长度一样的两卷会让那个错误恰好抵消掉。</param>
+    /// <param name="pad">How long to pad each record out to. Default 0 (short records); only when the two volumes' records differ in
+    /// length does "resuming from the previous volume's offset" produce a wrong number — two volumes of equal length make that error cancel out exactly.</param>
     private static JournalRecord[] Records(int n, int pad = 0) =>
         [.. Enumerable.Range(0, n).Select(i => new JournalRecord
         {
@@ -192,7 +192,7 @@ public class BackupJournalStoreTests : IDisposable
             HeadHash = "hh", TailHash = "tt", Length = 1000 + i,
         })];
 
-    // 容器名带斜杠这种事不该把 journal 写到目录树外面去。
+    // A container name with a slash in it must not get the journal written outside the directory tree.
     [Fact]
     public void PathFor_flattens_container_names()
     {

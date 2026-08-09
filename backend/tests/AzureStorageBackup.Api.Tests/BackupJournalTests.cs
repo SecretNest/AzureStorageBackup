@@ -51,7 +51,7 @@ public class BackupJournalTests : IDisposable
         Assert.Equal("0001_a.txt", content.Records[1].Members[0].EntryName);
     }
 
-    // 不 fsync 的代价：崩溃时最后一行可能是半截的。读取端必须扛得住。
+    // The cost of not fsyncing: on a crash the last line may be a half-written stub. The read side has to survive it.
     [Fact]
     public async Task Truncated_last_line_is_skipped()
     {
@@ -67,12 +67,12 @@ public class BackupJournalTests : IDisposable
     }
 
     /// <summary>
-    /// 接着往一卷"最后一行是半截"的 journal 后面写：新记的那一条必须还读得出来。
+    /// Appending to a journal whose "last line is a half-written stub": the newly recorded line must still read back.
     /// <para>
-    /// 这是 <see cref="BackupJournal.OpenForAppendAsync"/> 先补一个换行的全部理由。不补的话，
-    /// 半截行和新写的这一条会粘成一行，于是**新的这条**也跟着解析不出来——而它记的是本轮刚刚
-    /// 确认上传的内容，丢了就是下一轮把那块白传一遍，且盘上没有任何人再为它作保。
-    /// 而"最后一行是半截"恰恰是崩溃留下的常态：这个文件不逐条 fsync。
+    /// This is the entire reason <see cref="BackupJournal.OpenForAppendAsync"/> emits a newline first. Without it, the stub and
+    /// the newly written line glue into one, so **the new one** fails to parse as well — and it records content this run just
+    /// confirmed uploaded, so losing it means the next run uploads that block for nothing, with nothing on disk vouching for it any more.
+    /// And "the last line is a half-written stub" is exactly the normal state a crash leaves behind: this file is not fsynced per record.
     /// </para>
     /// </summary>
     [Fact]
@@ -82,7 +82,7 @@ public class BackupJournalTests : IDisposable
         await using (var j = await BackupJournal.CreateAsync(file, Header(), default))
             await j.AppendAsync(
                 new JournalRecord { Kind = "blob", Ref = "data/aaa", Path = "p", FullHash = "aaa" }, default);
-        await File.AppendAllTextAsync(file, "{\"Kind\":\"blob\",\"Ref\":\"data/hal");   // 崩在写一半上
+        await File.AppendAllTextAsync(file, "{\"Kind\":\"blob\",\"Ref\":\"data/hal");   // crashed mid-write
 
         await using (var j = await BackupJournal.OpenForAppendAsync(file, default))
             await j.AppendAsync(
@@ -125,14 +125,15 @@ public class BackupJournalTests : IDisposable
         Assert.Single(content!.Records);
     }
 
-    // 每追加一条就刷到 OS，为的是**进程死掉**：被 kill、OOM、容器停机时，进程缓冲里的字节
-    // 随进程一起没了，页缓存里的不会。而"云上有、索引里还没有"的块正是这么来的——进程没能走到
-    // 提交索引那一步。少刷这一下，下一轮读到的就是一卷少了最后几行的 journal：那几行记的块
-    // 没人认领，于是重传一遍，而清理判据（认 journal）也不会再保它们。
+    // Flushing to the OS on every append is about **the process dying**: on a kill, an OOM, or a container stop, the bytes in
+    // the process buffer go with the process while the ones in the page cache do not. And "in the cloud, not yet in the index"
+    // blocks are born exactly that way — the process never reached the index commit. Skip this flush and the next run reads a
+    // journal missing its last few lines: the blocks those lines recorded are unclaimed, so they get re-uploaded, and the
+    // cleanup test (which honours the journal) no longer protects them either.
     //
-    // 不是为了防"清理器正读着、备份正写着"：BackupBusyTracker.TryAcquire 已经把同一个
-    // (account, container) 上的备份与清理串起来了（TaskDispatcher / BackupRunner），
-    // 而那两处是 CleanupAsync 仅有的生产调用方。
+    // It is not about "the cleaner reading while the backup is writing": BackupBusyTracker.TryAcquire already serializes backup
+    // and cleanup on the same (account, container) (TaskDispatcher / BackupRunner),
+    // and those two are CleanupAsync's only production callers.
     [Fact]
     public async Task Append_is_visible_to_another_reader_without_an_explicit_flush()
     {

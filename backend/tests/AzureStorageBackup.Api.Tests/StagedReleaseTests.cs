@@ -5,18 +5,19 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 暂存区的账必须**在任何路径上**归还，包括抛出的那一条。
+/// The staging area's account must be handed back **on every path**, including the one that throws.
 /// <para>
-/// <see cref="StagingArea"/> 是 DI 单例、跨备份共享，它那个字节数是进程内内存计数——漏掉一次
-/// 就永远挂在那里，只有重启才清。而它同时是压缩/打包的背压闸门（<c>HasRoom</c>）：账虚高到上限，
-/// 所有运行的产出都会被卡在 <c>WaitForRoomAsync</c> 上，整条流水线退化成"一件传完才放行下一件"。
-/// 界面上还看不出来——那一栏显示的是本次运行**席位**的占用，不是全局账。
+/// <see cref="StagingArea"/> is a DI singleton shared across backups, and its byte count is an in-process memory counter — leak
+/// it once and it hangs there forever, cleared only by a restart. It is at the same time the backpressure gate on
+/// compression/packing (<c>HasRoom</c>): inflate the account to the ceiling and every run's output gets stuck on
+/// <c>WaitForRoomAsync</c>, degrading the whole pipeline into "one item uploads before the next is let through".
+/// And you cannot see it in the UI — that column shows this run's **seat** usage, not the global account.
 /// </para>
 /// <para>
-/// <c>ProcessPackAsync</c> 里从拿到 <c>staged</c> 到用完它之间那一段（压缩后逐成员重校验）从前
-/// 没有 <c>finally</c> 兜着：那里的 <c>catch</c> 只收 <c>IOException</c> / <c>UnauthorizedAccessException</c>，
-/// 别的异常（取消最典型）一穿出去，这一箱的字节和临时文件就都留下了。单文件那条路一直有
-/// （<c>HandleBlobAsync</c> 的 finally），只有 pack 漏。
+/// The stretch in <c>ProcessPackAsync</c> between getting <c>staged</c> and being done with it (the per-member recheck after
+/// compression) used to have no <c>finally</c> covering it: the <c>catch</c> there only collects <c>IOException</c> / <c>UnauthorizedAccessException</c>,
+/// so any other exception (cancellation being the classic) escaping leaves this pack's bytes and temp files behind. The
+/// single-file path always had one (<c>HandleBlobAsync</c>'s finally); only pack was missing it.
 /// </para>
 /// </summary>
 [Trait("Category", "Integration")]
@@ -74,9 +75,9 @@ public sealed class StagedReleaseTests : IDisposable
 
         try
         {
-            // 一箱小文件。目标成员在压缩之后被"改过"（mtime 变），于是重校验会去重算它的 hash——
-            // 而那一次重算抛的是 InvalidOperationException：不在那层 catch 的收集范围里，
-            // 一路穿出 ProcessPackAsync，正是取消（OperationCanceledException）走的同一条路。
+            // A pack of small files. The target member is "modified" after compression (its mtime changes), so the recheck
+            // recomputes its hash — and that recomputation throws InvalidOperationException: outside what that catch collects,
+            // it escapes all the way out of ProcessPackAsync, which is exactly the path cancellation (OperationCanceledException) takes.
             var dir = Path.Combine(_root, "pack");
             Directory.CreateDirectory(dir);
             for (var i = 0; i < 6; i++)
@@ -84,8 +85,8 @@ public sealed class StagedReleaseTests : IDisposable
             var target = Path.Combine(dir, "m3.txt");
 
             var authority = new TestLocalAuthority(store);
-            // 门闩用"这一箱压完了"而不是调用次数：diff 阶段对同一个文件算几次 full hash 不是这条
-            // 测试该知道的事，绑上去它就会随 diff 的实现漂移。
+            // The latch keys off "this pack has finished compressing" rather than a call count: how many times the diff stage
+            // computes a full hash for the same file is none of this test's business, and binding to it makes the test drift with diff's implementation.
             var packed = new PackedGate();
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
@@ -100,20 +101,20 @@ public sealed class StagedReleaseTests : IDisposable
                 Account = account, Container = name, LocalRoot = _root, Name = "staged-test",
             }));
 
-            // 修复前这里是那一箱的字节，而且此后永不归还——单例活多久它就挂多久。
+            // Before the fix this held that pack's bytes, and they were never handed back — hanging there for as long as the singleton lives.
             Assert.Equal(0, staging.StagedBytes);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>「这一箱已经压完了」的门闩，把两个替身串起来。</summary>
+    /// <summary>The "this pack has finished compressing" latch, wiring the two test doubles together.</summary>
     private sealed class PackedGate
     {
         private volatile bool _packed;
         public bool Packed { get => _packed; set => _packed = value; }
     }
 
-    /// <summary>压完一箱就把指定成员的 mtime 往后拨，让压缩后重校验认定"它在压缩期间变过"。</summary>
+    /// <summary>Once a pack is compressed, push the named member's mtime forward so the post-compression recheck decides "it changed while we were compressing".</summary>
     private sealed class TouchesAMemberAfterPacking(IFileCompressor inner, string target, PackedGate gate) : IFileCompressor
     {
         public async Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
@@ -140,7 +141,7 @@ public sealed class StagedReleaseTests : IDisposable
             CancellationToken ct = default) => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>这一箱压完之后，对指定文件的全文 hash 抛出——也就是压缩后重校验那一次。</summary>
+    /// <summary>After this pack is compressed, throw on the full hash of the named file — that is, on the post-compression recheck.</summary>
     private sealed class ThrowsOnTheRecheckHash(IFileHasher inner, string target, PackedGate gate, Exception toThrow) : IFileHasher
     {
         public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)

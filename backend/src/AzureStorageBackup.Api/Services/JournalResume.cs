@@ -1,17 +1,17 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 从若干卷还作数的 journal 里建起来的查找表：回答"这份内容上一轮是不是已经传上去了"。
+/// A lookup table built from however many journal volumes still count, answering "was this content already uploaded last run".
 /// <para>
-/// 判据一律是**路径 + 内容双对**。光凭路径不行——中断之后文件完全可能被改过；光凭内容 hash
-/// 也不行——journal 是按路径记的，同内容不同路径在索引里是两条不同的条目。
+/// The test is always **path plus content, both matching**. Path alone will not do — the file may well have been modified after
+/// the interruption; content hash alone will not do either — the journal records by path, and identical content at a different path is a separate entry in the index.
 /// </para>
 /// <para>
-/// 多卷之间同一条路径重复时新的胜，判据见 <see cref="FromVolumes"/>。
+/// When the same path shows up in several volumes the newer one wins; for the rule see <see cref="FromVolumes"/>.
 /// </para>
 /// <para>
-/// 纯内存、纯本地，不读云端。记录能进 journal 的前提就是"上传已经确认返回"，所以这里不需要
-/// （也不应该）再去云上核对一次——那会违反"备份期间零云读"这条底线。
+/// Pure memory, purely local, no cloud reads. A record only enters the journal once "the upload has been confirmed returned", so
+/// there is no need (and no business) checking against the cloud again here — that would violate the "zero cloud reads during a backup" bottom line.
 /// </para>
 /// </summary>
 public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
@@ -19,15 +19,16 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     public static readonly JournalResume Empty = new([]);
 
     /// <summary>
-    /// 从若干卷 journal 建表。**按开跑时刻从新到旧**把记录串起来，让下面的"先命中者胜"落成"新的胜"。
+    /// Build the table from however many journal volumes. Records are chained **newest to oldest by start time**, so that the "first hit wins" below lands as "the newer one wins".
     /// <para>
-    /// 不排的话顺序来自 <see cref="BackupJournalStore.ListAsync"/>，那是按文件名的序数序，而文件名是
-    /// runId——每轮新生成的 GUID 前缀。于是"同一条路径在两卷里记着不同内容"（两次挂起之间文件被改过）
-    /// 时谁胜是掷骰子。掷输了不会漏传：被盖住的那条记录从 <see cref="FindBlob"/> 和
-    /// <see cref="ConfirmedBlobs"/> 都够不着，四项内容判据对不上就当没有，照传不误；
-    /// 而清理器那边 <c>LoadActiveRefsAsync</c> 是逐条过所有记录的，被盖住的块照样受保护。
-    /// 代价只是"明明上一轮传过的那一版，这一轮又传一遍"，且随运行不同时有时无——这种不确定性
-    /// 本身就不该留在恢复路径上。
+    /// Without that ordering the order comes from <see cref="BackupJournalStore.ListAsync"/>, which is ordinal by file name, and
+    /// the file name is the runId — a freshly generated GUID prefix each run. So when "the same path is recorded with different
+    /// content in two volumes" (the file was modified between two suspends), who wins is a dice roll. Losing the roll loses no
+    /// upload: the shadowed record is out of reach from both <see cref="FindBlob"/> and
+    /// <see cref="ConfirmedBlobs"/>, and if the four content tests do not match we treat it as absent and upload it anyway;
+    /// while over in the cleaner <c>LoadActiveRefsAsync</c> walks every record one by one, so the shadowed block stays protected.
+    /// The cost is only "re-uploading the very version last run already uploaded", and it comes and goes from run to run — that
+    /// kind of nondeterminism has no business on the resume path.
     /// </para>
     /// </summary>
     public static JournalResume FromVolumes(IReadOnlyList<JournalContent> volumes)
@@ -36,11 +37,11 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
             : new JournalResume([..
                 volumes.OrderByDescending(v => v.Header.StartedAt).SelectMany(v => v.Records)]);
 
-    /// <summary>按路径索引的单文件 blob 记录。重复路径先命中者胜；调用方
-    /// （<see cref="FromVolumes"/>）已把各卷按开跑时刻从新到旧排好，所以胜出的是最新那一卷记的。</summary>
+    /// <summary>Single-file blob records indexed by path. On a duplicate path the first hit wins; the caller
+    /// (<see cref="FromVolumes"/>) has already sorted the volumes newest to oldest by start time, so the winner is whatever the newest volume recorded.</summary>
     private readonly Dictionary<string, JournalRecord> _blobs = BuildBlobs(records);
 
-    /// <summary>按成员集合的规范化键索引的 pack 记录。</summary>
+    /// <summary>Pack records indexed by the canonical key of their member set.</summary>
     private readonly Dictionary<string, JournalRecord> _packs = BuildPacks(records);
 
     public bool IsEmpty => _blobs.Count == 0 && _packs.Count == 0;
@@ -66,23 +67,23 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     }
 
     /// <summary>
-    /// 成员集合的规范化键：按序拼 路径 + 全文 hash + 长度。
+    /// Canonical key of a member set: path + full hash + length, joined in order.
     /// <para>
-    /// **故意不含 <see cref="JournalMember.EntryName"/>**。在本仓库里它恒等于成员自己的路径
-    /// （<c>new PackEntry(f.Path, f.Path, …)</c>，见 <c>BackupOrchestrator.ProcessPackAsync</c>；
-    /// <c>RestoreOrchestrator</c> 里那段"按 EntryName 而不是 Path 取"说的是**跨版本去重**时
-    /// 一个新路径指向老包里的老成员名，不是装箱时会另起一套编号），因此把它拼进键里除了让
-    /// 同一份内容多算一遍路径之外没有任何区分力。
+    /// **Deliberately excludes <see cref="JournalMember.EntryName"/>**. In this repo it is always identical to the member's own
+    /// path (<c>new PackEntry(f.Path, f.Path, …)</c>, see <c>BackupOrchestrator.ProcessPackAsync</c>; the passage in
+    /// <c>RestoreOrchestrator</c> about "fetching by EntryName rather than Path" is about **cross-version dedup**, where a new
+    /// path points at an old member name in an old pack — it is not that packing invents a separate numbering scheme), so
+    /// folding it into the key has no discriminating power at all beyond counting the same content's path a second time.
     /// </para>
     /// <para>
-    /// 顺序也算数：<c>PackInfo.Members</c> 是一串按序排下来的成员 hash，键不认顺序就会让
-    /// 同一组成员的两种排法互相命中，而记进信息文件的那串顺序与归档里的实际内容对不上。
+    /// Order counts too: <c>PackInfo.Members</c> is a run of member hashes in order, and a key blind to order would let two
+    /// orderings of the same member set hit each other, leaving the order recorded in the info file at odds with the archive's actual contents.
     /// </para>
     /// </summary>
     private static string MemberKey(IReadOnlyList<JournalMember> members)
         => string.Join('\n', members.Select(m => $"{m.Path}\0{m.FullHash}\0{m.Length}"));
 
-    /// <summary>精确匹配一个单文件 blob。四项内容判据全对上才认。</summary>
+    /// <summary>Exact match for one single-file blob. Only accepted when all four content tests match.</summary>
     public JournalRecord? FindBlob(string path, string fullHash, long length, string headHash, string tailHash)
         => _blobs.TryGetValue(path, out var r)
             && string.Equals(r.FullHash, fullHash, StringComparison.Ordinal)
@@ -93,14 +94,15 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
             : null;
 
     /// <summary>
-    /// 把这些单文件记录按**内容身份**交出去，喂给 <see cref="LocalDedupResolver.Build"/>。
+    /// Hand these single-file records over keyed by **content identity**, to feed <see cref="LocalDedupResolver.Build"/>.
     /// <para>
-    /// 恢复本身是按路径认账的（见类注释），但这些块在云上的处境和索引里的块一模一样：
-    /// 传完了、地址占着。不告诉去重表的话，一个**同内容不同路径**的文件会认不出它，
-    /// 重压之后 ResolveAsync 给回同一个地址，上传前那一步清残卷就会把上一轮的成果删掉再传一遍。
-    /// 详见 <c>LocalDedupResolver.Build</c> 的 <c>confirmed</c> 参数说明。
+    /// Resume itself accounts by path (see the class remarks), but in the cloud these blocks are in exactly the same position as
+    /// blocks in the index: uploaded, address taken. Without telling the dedup table, a file with **the same content at a
+    /// different path** would not be recognised as it; after recompressing, ResolveAsync hands back the same address, and the
+    /// stale-volume cleanup just before upload deletes last run's work and uploads it all over again.
+    /// See the notes on the <c>confirmed</c> parameter of <c>LocalDedupResolver.Build</c>.
     /// </para>
-    /// <para>四项内容判据缺一不可，缺的记录直接跳过——身份不全就不该参与去重。</para>
+    /// <para>All four content tests are required; records missing any are skipped — an incomplete identity has no business taking part in dedup.</para>
     /// </summary>
     public IReadOnlyList<ConfirmedBlob> ConfirmedBlobs()
     {
@@ -114,18 +116,18 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     }
 
     /// <summary>
-    /// 精确匹配一箱 pack。成员集合必须逐一相同，宽松不得。
+    /// Exact match for one pack. The member sets must be identical item for item; no leniency.
     /// <para>
-    /// 理由不在名字上（归档里的成员名就是成员自己的路径，见 <see cref="MemberKey"/>），
-    /// 而在**记账与归档必须严丝合缝**：命中之后走的 <c>RecordPackAsync</c> 会拿**本轮这一组**
-    /// 的成员表去写 <c>PackInfo.Members</c> / <c>OriginalBytes</c>，并给每个成员写一条指向
-    /// 这个包的索引条目。允许部分匹配（本轮这组是上一轮那箱的超集）就等于宣称归档里有一些
-    /// 它根本没有的成员：还原时解不出文件、检查时报缺失，而索引一口咬定它在。
-    /// 子集同样不行——<c>OriginalBytes</c> 会算少，死重压实据此判断这箱还剩多少活肉。
+    /// The reason is not about names (a member's name in the archive is just the member's own path, see <see cref="MemberKey"/>)
+    /// but that **the accounting and the archive must line up exactly**: on a hit, <c>RecordPackAsync</c> takes **this run's**
+    /// member list to write <c>PackInfo.Members</c> / <c>OriginalBytes</c>, and writes an index entry pointing at
+    /// this pack for every member. Allowing a partial match (this run's group being a superset of last run's pack) amounts to
+    /// claiming the archive holds members it simply does not: restore cannot extract the file, check reports it missing, and the index insists it is there.
+    /// A subset is no good either — <c>OriginalBytes</c> comes out short, and dead-weight compaction uses it to judge how much live flesh is left in this pack.
     /// </para>
     /// <para>
-    /// 分组本身是确定性的（同样的基线、同样的源、同样的界），所以严格相等在实际中命中率并不低；
-    /// 对不上就重压——一箱都是小文件，重压很便宜。
+    /// Grouping itself is deterministic (same baseline, same source, same bounds), so strict equality hits often enough in practice;
+    /// and when it does not match we recompress — a pack is all small files, so recompressing is cheap.
     /// </para>
     /// </summary>
     public JournalRecord? FindPack(IReadOnlyList<JournalMember> members)

@@ -4,16 +4,16 @@ using System.Text.Json;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 一卷 journal 的概览。<b>不解析记录体</b>：只反序列化头一行，剩下的只数行数。
-/// 界面列"有哪些中途停下的运行"会反复调它，而一卷 journal 可能有几十万行——
-/// 逐行 JSON 反序列化只为显示一个数字，代价不值。
+/// Overview of one journal volume. <b>Does not parse record bodies</b>: only the first line is deserialized, the rest are merely counted.
+/// The UI's "which runs stopped partway" list calls this over and over, and one journal can hold hundreds of thousands of lines —
+/// deserializing every line as JSON just to show a single number is not worth the cost.
 /// </summary>
 public sealed record JournalSummary(string RunId, JournalHeader Header, int Records, long SizeBytes);
 
 /// <summary>
-/// 某个容器上所有**活动** journal 引用到的 blob 基名与 packId。
-/// 清理器拿它当"别删我"的名单：这些内容云上有、索引里还没有，
-/// 只有 journal 记着它们存在，删了就等于让恢复白跑。
+/// The blob base names and packIds referenced by every **active** journal on a container.
+/// The cleaner uses it as the "don't delete me" list: this content exists in the cloud but not yet in the index,
+/// and only the journal records that it exists — deleting it makes the resume run for nothing.
 /// </summary>
 public sealed record ActiveJournalRefs(IReadOnlySet<string> Blobs, IReadOnlySet<string> Packs)
 {
@@ -22,21 +22,21 @@ public sealed record ActiveJournalRefs(IReadOnlySet<string> Blobs, IReadOnlySet<
 }
 
 /// <summary>
-/// journal 的目录：<c>{root}/{accountId}/{container}/{runId}.jsonl</c>。
+/// Journal layout on disk: <c>{root}/{accountId}/{container}/{runId}.jsonl</c>.
 /// <para>
-/// 按 (accountId, container) 分目录而不是按 configId——清理器就是按这两样定位容器的，
-/// 手上根本没有 configId。configId 记在 journal 头里，需要时从头读。
+/// Directories keyed by (accountId, container) rather than by configId — the cleaner locates a container by exactly those two
+/// and does not have a configId at all. The configId is recorded in the journal header and read from there when needed.
 /// </para>
 /// </summary>
 public sealed class BackupJournalStore(string rootDir)
 {
     /// <summary>
-    /// 容器名理论上不含斜杠，但别把这条当保证：拼路径前一律做一次扁平化。
+    /// Container names are not supposed to contain slashes, but do not treat that as a guarantee: always flatten before joining a path.
     /// <para>
-    /// 全是点的名字（<c>.</c>、<c>..</c>）也一并换掉。它们不含任何非法字符，却是路径段而不是名字，
-    /// 拼出来会往上跳一层——而 <see cref="DeleteAll"/> 是 <c>Directory.Delete(recursive: true)</c>，
-    /// 跳错一层删掉的就是别的容器的恢复点。今天到不了这里（Azure 容器名根本不许有点，runId 是自己
-    /// 生成的），这一条纯粹是不指望上游永远守规矩。
+    /// All-dot names (<c>.</c>, <c>..</c>) get replaced too. They contain no invalid character at all, yet they are path segments
+    /// rather than names, and joining them walks up a level — while <see cref="DeleteAll"/> is <c>Directory.Delete(recursive: true)</c>,
+    /// so walking up one level too far deletes another container's restore points. Nothing can reach this today (Azure container
+    /// names may not contain dots at all, and runIds we generate ourselves); this line exists purely because we do not count on upstream behaving forever.
     /// </para>
     /// </summary>
     private static string Safe(string name)
@@ -55,32 +55,32 @@ public sealed class BackupJournalStore(string rootDir)
     public string PathFor(int accountId, string container, string runId)
         => Path.Combine(DirFor(accountId, container), Safe(runId) + ".jsonl");
 
-    /// <summary>挂起标记：与 journal 同名同目录，只多一个后缀。<c>ListAsync</c>/<c>PeekAsync</c>
-    /// 只枚举 <c>*.jsonl</c>，所以它天然不会被当成一卷 journal 去解析。</summary>
+    /// <summary>Suspend marker: same name and same directory as the journal, just one extra suffix. <c>ListAsync</c>/<c>PeekAsync</c>
+    /// only enumerate <c>*.jsonl</c>, so by construction it can never be mistaken for a journal volume and parsed.</summary>
     private string MarkPathFor(int accountId, string container, string runId)
         => PathFor(accountId, container, runId) + ".suspend";
 
     /// <summary>
-    /// 记下这一卷是**为什么**停的。自动恢复只认其中一种：读出
-    /// <see cref="SuspendReason.ShuttingDown"/> 才可以不问自取地接着跑（那是一次计划内的重启或升级），
-    /// 别的一律等操作员按 Resume。
+    /// Record **why** this volume stopped. Automatic resume honours exactly one of them: only on reading
+    /// <see cref="SuspendReason.ShuttingDown"/> may we pick the run back up unasked (that was a planned restart or upgrade);
+    /// everything else waits for an operator to press Resume.
     /// <para>
-    /// 标记**不在**的含义要说准，它不等于"被 kill"：可能是被 kill、可能是进程崩了、可能是关机等
-    /// 落盘超时后这一卷被丢在半路、可能是操作员自己按了 Cancel（取消路径照样落盘，但不写标记）、
-    /// 也可能就是这次写文件本身失败了。这几种谁也不该被自动重开——所以判据是"只在读到
-    /// ShuttingDown 时才动手"，而不是"没有标记就当它是崩溃"。
+    /// Be precise about what an **absent** marker means — it does not equal "killed": it could be a kill, a crashed process, a
+    /// shutdown whose flush-to-disk timed out leaving this volume stranded, an operator pressing Cancel themselves (the cancel
+    /// path still flushes, but writes no marker), or simply this file write itself failing. None of those should be restarted
+    /// automatically — hence the test is "act only when we read ShuttingDown", not "no marker means it crashed".
     /// </para>
     /// <para>
-    /// 耐久性上还有一层不对称，别指望它：<c>SettleStopAsync</c> 那条路上标记是在 journal
-    /// fsync **之后**写的，所以标记不会比它描述的记录更"新"；但闸门降级（
-    /// <see cref="SuspendReason.AutoSuspended"/>）那条是从流水线深处直接抛上来的，标记先落、journal
-    /// 随 control 释放才关，而这里用的是 <c>File.WriteAllText</c>，没有 fsync。崩溃安全，掉电不安全：
-    /// 最坏情况是标记活下来、它描述的那几条记录没有，代价是下一轮多传一个文件。
+    /// There is one more asymmetry in durability; do not lean on it. On the <c>SettleStopAsync</c> path the marker is written
+    /// **after** the journal fsync, so the marker can never be "newer" than the records it describes; but the gate downgrade
+    /// (<see cref="SuspendReason.AutoSuspended"/>) path is thrown straight up from deep in the pipeline, so the marker lands
+    /// first and the journal is only closed when control is released — and this uses <c>File.WriteAllText</c>, with no fsync.
+    /// Crash-safe, not power-cut-safe: worst case the marker survives and the records it describes do not, costing one extra file upload next run.
     /// </para>
     /// <para>
-    /// 单开一个文件而不是往 journal 里加一条记录：journal 是只追加的记录流，而
-    /// <see cref="LoadActiveRefsAsync"/> 是 <c>r.Kind == "pack" ? packs : blobs</c> 的二分——
-    /// 多出来的第三种 Kind 会被静默丢进 blobs 桶，污染清理器的"别删我"名单。
+    /// A separate file rather than one more record in the journal: the journal is an append-only record stream, and
+    /// <see cref="LoadActiveRefsAsync"/> is the binary split <c>r.Kind == "pack" ? packs : blobs</c> —
+    /// a third Kind would be silently dumped into the blobs bucket, polluting the cleaner's "don't delete me" list.
     /// </para>
     /// </summary>
     public void MarkSuspended(int accountId, string container, string runId, SuspendReason reason)
@@ -91,25 +91,25 @@ public sealed class BackupJournalStore(string rootDir)
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, reason.ToString());
         }
-        catch { /* 写不下就当没标记：后果是多跑一轮，不是丢数据 */ }
+        catch { /* can't write it, so treat it as unmarked: the cost is one extra run, not lost data */ }
     }
 
     /// <summary>
-    /// 抹掉这一卷的挂起标记。给"这一卷换了主人"用：标记描述的是**某一轮运行**为什么停下，
-    /// 而一卷 journal 被新一轮采纳之后，写下那个理由的那一轮已经被顶替了，它的理由随之作废。
+    /// Wipe this volume's suspend marker. For the "this volume changed hands" case: the marker describes why **one particular
+    /// run** stopped, and once a journal volume is adopted by a new run, the run that wrote that reason has been superseded and its reason is void with it.
     /// <para>
-    /// 与 <see cref="Delete"/> 的差别是 journal 本身还留着：采纳是只读的，旧卷要一直等到新一轮
-    /// 成功提交索引才删（<see cref="BackupRunControl.CompleteAsync"/>）。中间这段时间里，
-    /// 它的标记该由**接手的那一轮**重新写（见 <see cref="BackupRunControl.MarkSuspended"/>），
-    /// 而不是继续拿着上一轮的旧值。
+    /// The difference from <see cref="Delete"/> is that the journal itself stays: adoption is read-only, and the old volume is
+    /// not deleted until the new run successfully commits its index (<see cref="BackupRunControl.CompleteAsync"/>). In the
+    /// meantime its marker should be rewritten by **the run that took it over** (see <see cref="BackupRunControl.MarkSuspended"/>),
+    /// rather than left carrying the previous run's stale value.
     /// </para>
     /// </summary>
     public void ClearSuspendMark(int accountId, string container, string runId)
     {
-        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* 删不掉下次再说 */ }
+        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* can't delete it; try again next time */ }
     }
 
-    /// <summary>读挂起理由。文件不在、读不动、或内容不认识都返回 null（= 当没标记）。</summary>
+    /// <summary>Read the suspend reason. Missing file, unreadable file, or contents we do not recognise all return null (= treat as unmarked).</summary>
     public SuspendReason? ReadSuspendMark(int accountId, string container, string runId)
     {
         try
@@ -124,12 +124,12 @@ public sealed class BackupJournalStore(string rootDir)
         int accountId, string container, string runId, JournalHeader header, CancellationToken ct)
         => BackupJournal.CreateAsync(PathFor(accountId, container, runId), header, ct);
 
-    /// <summary>接着往一卷已经存在的 journal 后面写。只在"本轮 runId 与盘上那卷重名"时用，
-    /// 原委见 <see cref="BackupRunControl.OpenJournalAsync"/>。</summary>
+    /// <summary>Append to a journal volume that already exists. Used only when "this run's runId collides with the volume on disk";
+    /// for the reasoning see <see cref="BackupRunControl.OpenJournalAsync"/>.</summary>
     public Task<BackupJournal> AppendAsync(int accountId, string container, string runId, CancellationToken ct)
         => BackupJournal.OpenForAppendAsync(PathFor(accountId, container, runId), ct);
 
-    /// <summary>列出该容器上所有能读通的 journal。读不通的（头坏了）直接当不存在。</summary>
+    /// <summary>List every journal on this container that reads cleanly. The ones that do not (broken header) are simply treated as absent.</summary>
     public async Task<IReadOnlyList<(string RunId, JournalContent Content)>> ListAsync(
         int accountId, string container, CancellationToken ct)
     {
@@ -148,41 +148,41 @@ public sealed class BackupJournalStore(string rootDir)
     }
 
     /// <summary>
-    /// 一卷 journal 已经数过的行数。<see cref="PeekAsync"/> 靠它避免每次轮询都把整卷重走一遍。
+    /// The line count already tallied for one journal volume. <see cref="PeekAsync"/> relies on it to avoid rewalking the whole volume on every poll.
     /// </summary>
-    /// <param name="StartedAt">数这一份时那卷的头里写的开跑时刻。见 <see cref="PeekAsync"/> 里的作废判据。</param>
-    /// <param name="Length">数完时的文件长度。</param>
-    /// <param name="SafeOffset">最后一个换行符之后的偏移。只有它之前的行才算数完了。</param>
-    /// <param name="CompleteLines">SafeOffset 之前的非空行数（含头一行）。</param>
-    /// <param name="TotalLines">连同末尾那截没换行的残行一起算的非空行数（含头一行）。</param>
+    /// <param name="StartedAt">The start time written in that volume's header when this tally was taken. See the invalidation rules in <see cref="PeekAsync"/>.</param>
+    /// <param name="Length">The file length when the tally finished.</param>
+    /// <param name="SafeOffset">The offset just past the last newline. Only lines before it count as fully tallied.</param>
+    /// <param name="CompleteLines">Non-empty lines before SafeOffset (including the header line).</param>
+    /// <param name="TotalLines">Non-empty lines counting the trailing unterminated partial line as well (including the header line).</param>
     private sealed record LineMemo(
         DateTimeOffset StartedAt, long Length, long SafeOffset, int CompleteLines, int TotalLines);
 
     private readonly Dictionary<string, LineMemo> _lineMemos = new(StringComparer.Ordinal);
     private readonly Lock _memoLock = new();
 
-    /// <summary>测试用：这个实例至今为了数行数真正读过的字节数。备忘生不生效，只有数出来才算钉住。
-    /// 挂在实例上而不是静态字段上：测试类之间是并行跑的，静态计数会被别的类的 <see cref="PeekAsync"/> 搅浑。</summary>
+    /// <summary>For tests: how many bytes this instance has actually read so far in order to count lines. Whether the memo works can only be pinned down by measuring.
+    /// It hangs off the instance rather than a static field: test classes run in parallel, and a static counter would be muddied by another class's <see cref="PeekAsync"/>.</summary>
     internal long BytesScanned;
 
     /// <summary>
-    /// 列出该容器上每卷 journal 的概览。头读不通的直接跳过（= 这卷作废）。
+    /// List an overview of every journal volume on this container. Volumes whose header does not read are skipped (= that volume is void).
     /// <para>
-    /// 行数是**增量**数出来的，不是每次重走一遍。界面开着的时候这个端点每 5 秒被每个配置各调一次，
-    /// 而一卷 journal 在一次二十万文件的运行里能长到几百 MB——重走一遍就是每分钟几百 MB 的读，
-    /// 抢的还是备份自己正在读的那块盘；挂起的那一卷停在盘上不动，这份开销还永远不会停。
+    /// Line counts are tallied **incrementally**, not rewalked every time. With the UI open this endpoint is called once every 5
+    /// seconds for every config, and one journal can grow to hundreds of MB over a run of two hundred thousand files — rewalking
+    /// means hundreds of MB of reads per minute, contending for the very disk the backup is reading; and a suspended volume just sits there on disk, so that cost would never stop.
     /// </para>
     /// <para>
-    /// 备忘作废判据（journal 是只追加的，这三条合起来就够）：
+    /// Memo invalidation rules (the journal is append-only, so these three together are enough):
     /// <list type="bullet">
-    /// <item>头里的 <see cref="JournalHeader.StartedAt"/> 变了 → 这卷被<b>另起一轮重写</b>过
-    /// （<see cref="BackupJournal.CreateAsync"/> 是 <c>FileMode.Create</c>，会截断），旧计数全不作数，从头数。
-    /// 单看长度挡不住这一条：重写出来的长度完全可能与旧的相等或更长。</item>
-    /// <item>文件比记下的短 → 同样是被换过，从头数。</item>
-    /// <item>长度没变且 StartedAt 没变 → 只追加的文件长度不变就是内容不变，直接交出上次的数。</item>
+    /// <item>The header's <see cref="JournalHeader.StartedAt"/> changed → this volume was <b>rewritten by another run</b>
+    /// (<see cref="BackupJournal.CreateAsync"/> uses <c>FileMode.Create</c>, which truncates); the old count is worthless, recount from scratch.
+    /// Length alone does not catch this one: the rewritten file can easily be the same length as the old one, or longer.</item>
+    /// <item>The file is shorter than recorded → likewise replaced, recount from scratch.</item>
+    /// <item>Length unchanged and StartedAt unchanged → for an append-only file, unchanged length means unchanged content, so hand back last time's number.</item>
     /// </list>
-    /// 长了就只数新增的那一段，且只从**上一次数到的最后一个换行符**接着数：这个文件不逐条 fsync，
-    /// 快照可能正落在半行中间，从文件末尾接着数会把那半行的后半截再当成一行算一遍。
+    /// If it grew, count only the new stretch, and resume from **the last newline we counted to** and no further: this file is
+    /// not fsynced per record, the snapshot may land mid-line, and resuming from the end of the file would count the second half of that partial line as a line all over again.
     /// </para>
     /// </summary>
     public async Task<IReadOnlyList<JournalSummary>> PeekAsync(int accountId, string container, CancellationToken ct)
@@ -210,23 +210,23 @@ public sealed class BackupJournalStore(string rootDir)
                 if (header is null)
                     continue;
 
-                // 长度从已经打开的这个句柄上取，不另开 FileInfo：数行数与记长度必须是**同一个**快照，
-                // 两次取样之间那卷可能又长了一截，记下的备忘就会声称"这个长度我数到过这么多行"。
+                // Take the length from the handle we already have open rather than a separate FileInfo: counting lines and recording
+                // the length must be the **same** snapshot — between two samples the volume may have grown, and the memo we store would then claim "at this length I counted this many lines".
                 length = stream.Length;
                 lines = await CountLinesAsync(file, stream, header, length, ct);
             }
             catch (IOException)
             {
-                continue;   // 正在被写的那一卷偶尔读不开；下次轮询再说
+                continue;   // the volume being written is occasionally not openable; leave it to the next poll
             }
-            // 头一行不是记录，从总行数里扣掉。
+            // The header line is not a record, so subtract it from the total.
             result.Add(new JournalSummary(
                 Path.GetFileNameWithoutExtension(file), header, Math.Max(0, lines - 1), length));
         }
         return result;
     }
 
-    /// <summary>数出这一卷到 <paramref name="length"/> 为止的非空行数（含头一行），能接着上次数就接着数。</summary>
+    /// <summary>Count the non-empty lines of this volume up to <paramref name="length"/> (including the header line), resuming from last time's tally wherever possible.</summary>
     private async Task<int> CountLinesAsync(
         string file, FileStream stream, JournalHeader header, long length, CancellationToken ct)
     {
@@ -253,9 +253,9 @@ public sealed class BackupJournalStore(string rootDir)
             var n = await stream.ReadAsync(buffer.AsMemory(0, want), ct);
             if (n <= 0)
                 break;
-            // 行尾按字节找。UTF-8 里 0x0A 不可能出现在多字节字符的续字节上，所以按字节扫与按字符扫
-            // 结果相同，而不必为了数一个数字把几百 MB 解码成字符串。IndexOf 走的是向量化的那条路，
-            // 逐字节自己比要慢好几倍——而这段代码要吃的正是几百 MB。
+            // Find line ends by byte. In UTF-8 0x0A can never appear as a continuation byte of a multi-byte character, so scanning
+            // by byte gives the same result as scanning by character, without decoding hundreds of MB into strings just to produce
+            // one number. IndexOf takes the vectorized path; comparing byte by byte ourselves is several times slower — and hundreds of MB is exactly what this code has to chew through.
             var rest = buffer.AsSpan(0, n);
             var consumed = 0;
             while (true)
@@ -277,8 +277,8 @@ public sealed class BackupJournalStore(string rootDir)
         }
         Interlocked.Add(ref BytesScanned, scanned);
 
-        // 末尾那截没换行的残行照 StreamReader.ReadLine 的老规矩算一行，但**不进备忘**：
-        // 它随时可能被后面的字节补全成一整行，记下来下次就会连着新行重复算。
+        // The trailing unterminated partial line counts as a line, per StreamReader.ReadLine's old rule, but it does **not** go into the memo:
+        // later bytes may complete it into a whole line at any moment, and having recorded it we would then count it again along with the new line.
         var total = completeBefore + complete + (segmentHasContent ? 1 : 0);
         lock (_memoLock)
         {
@@ -291,10 +291,10 @@ public sealed class BackupJournalStore(string rootDir)
         return total;
     }
 
-    /// <summary>这一段里有没有正文。空行不算一行，只有 <c>\r</c> 的也不算（<c>ReadLine</c> 把 CRLF 当一个行尾）。</summary>
+    /// <summary>Whether this segment has any body. An empty line is not a line, and neither is one holding only <c>\r</c> (<c>ReadLine</c> treats CRLF as a single line ending).</summary>
     private static bool HasContent(ReadOnlySpan<byte> segment) => segment.IndexOfAnyExcept((byte)'\r') >= 0;
 
-    /// <summary>汇总该容器上所有活动 journal 引用到的内容。清理判据的一半。</summary>
+    /// <summary>Gather everything referenced by every active journal on this container. Half of the cleanup test.</summary>
     public async Task<ActiveJournalRefs> LoadActiveRefsAsync(int accountId, string container, CancellationToken ct)
     {
         var blobs = new HashSet<string>(StringComparer.Ordinal);
@@ -307,12 +307,12 @@ public sealed class BackupJournalStore(string rootDir)
 
     public void Delete(int accountId, string container, string runId)
     {
-        try { File.Delete(PathFor(accountId, container, runId)); } catch { /* 删不掉下次再说 */ }
-        // 标记跟着 journal 一起走：留着它，下一轮撞上同名 runId 会读到上一次的理由。
-        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* 同上 */ }
+        try { File.Delete(PathFor(accountId, container, runId)); } catch { /* can't delete it; try again next time */ }
+        // The marker goes with the journal: leave it behind and a later run colliding on the same runId would read the previous reason.
+        try { File.Delete(MarkPathFor(accountId, container, runId)); } catch { /* same as above */ }
     }
 
-    /// <summary>删配置兜底用：这个容器的 journal 全不要了。</summary>
+    /// <summary>Backstop for config deletion: throw away every journal for this container.</summary>
     public void DeleteAll(int accountId, string container)
     {
         try
@@ -321,6 +321,6 @@ public sealed class BackupJournalStore(string rootDir)
             if (Directory.Exists(dir))
                 Directory.Delete(dir, recursive: true);
         }
-        catch { /* 同上 */ }
+        catch { /* same as above */ }
     }
 }

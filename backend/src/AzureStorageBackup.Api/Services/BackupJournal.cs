@@ -3,43 +3,43 @@ using System.Text.Json;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>journal 读写共用的序列化设置。读端不止 <see cref="BackupJournal"/> 一个（还有目录的概览），
-/// 两边设置必须是同一份，否则同一行字节在两处解出不同结果。</summary>
+/// <summary>Serialization settings shared by journal reads and writes. The read side is not just <see cref="BackupJournal"/> (there is also the directory overview),
+/// and both sides must use one and the same set, or the same line of bytes decodes to different results in the two places.</summary>
 internal static class JournalJson
 {
     public static readonly JsonSerializerOptions Options = new() { WriteIndented = false };
 }
 
-/// <summary>journal 的头一行：恢复前置校验要用的一切都在这。</summary>
+/// <summary>The journal's first line: everything the resume preflight checks need is in here.</summary>
 public sealed record JournalHeader
 {
     public required string RunId { get; init; }
     public required int ConfigId { get; init; }
     public required DateTimeOffset StartedAt { get; init; }
 
-    /// <summary>本次运行差异比对的基线版本号。基线变了（别人跑完了一轮），这卷 journal 作废。</summary>
+    /// <summary>The baseline version this run diffs against. If the baseline changed (somebody else completed a run), this journal volume is void.</summary>
     public required int BaselineVersion { get; init; }
 
-    /// <summary>本地源根。改过根目录，路径含义就变了，作废。</summary>
+    /// <summary>The local source root. Change the root directory and the meaning of the paths changes, so it is void.</summary>
     public required string LocalRoot { get; init; }
 
-    /// <summary>加密身份指纹（<see cref="BlobAddressScheme.Identity"/>）。换了密码，地址空间就变了，作废。</summary>
+    /// <summary>Encryption identity fingerprint (<see cref="BlobAddressScheme.Identity"/>). Change the password and the address space changes, so it is void.</summary>
     public required string EncryptionIdentity { get; init; }
 }
 
-/// <summary>pack 里的一个成员。恢复时要靠它重建 <c>PackInfo</c> 与每个成员的 StorageRef。</summary>
+/// <summary>One member of a pack. Resume relies on it to rebuild <c>PackInfo</c> and each member's StorageRef.</summary>
 public sealed record JournalMember(string Path, string EntryName, string FullHash, long Length);
 
-/// <summary>一条"这块内容已经在云上确认了"。</summary>
+/// <summary>One "this block of content has been confirmed in the cloud".</summary>
 public sealed record JournalRecord
 {
-    /// <summary>"blob" 或 "pack"。</summary>
+    /// <summary>"blob" or "pack".</summary>
     public required string Kind { get; init; }
 
-    /// <summary>blob：data blob 的基名（如 <c>data/abc</c>）；pack：packId。</summary>
+    /// <summary>blob: the data blob's base name (e.g. <c>data/abc</c>); pack: the packId.</summary>
     public required string Ref { get; init; }
 
-    // 以下 blob 用
+    // blob only, below
     public string? Path { get; init; }
     public string? FullHash { get; init; }
     public string? HeadHash { get; init; }
@@ -47,7 +47,7 @@ public sealed record JournalRecord
     public long Length { get; init; }
     public bool Raw { get; init; }
 
-    // 以下 pack 用
+    // pack only, below
     public bool StoreOnly { get; init; }
     public IReadOnlyList<JournalMember> Members { get; init; } = [];
 
@@ -55,20 +55,20 @@ public sealed record JournalRecord
     public IReadOnlyList<long> VolumeSizes { get; init; } = [];
 }
 
-/// <summary>读出来的整卷 journal。</summary>
+/// <summary>A whole journal volume as read back.</summary>
 public sealed record JournalContent(JournalHeader Header, IReadOnlyList<JournalRecord> Records);
 
 /// <summary>
-/// 一次备份运行的恢复日志：append-only 的 JSONL，头一行是 <see cref="JournalHeader"/>，
-/// 后面每行一条 <see cref="JournalRecord"/>。
+/// The resume log of one backup run: append-only JSONL whose first line is a <see cref="JournalHeader"/>,
+/// with one <see cref="JournalRecord"/> per line after it.
 /// <para>
-/// **时序是这个文件的全部意义**：压缩 → 上传 → 上传确认返回 → 才追加一行。
-/// 顺序反了就会记下一块其实不在云上的内容，下次恢复直接跳过它 —— 数据丢失。
+/// **The ordering is this file's entire reason for existing**: compress → upload → upload confirmed returned → only then append a line.
+/// Get the order backwards and we record a block that is not actually in the cloud, and the next resume skips straight over it — data loss.
 /// </para>
 /// <para>
-/// **不逐条 fsync**：代价不对称。少记一条 = 下次多传一个文件；每条都 fsync = 每个文件
-/// 多一次磁盘同步。所以崩溃后最后一行可能是半截的，<see cref="ReadAsync"/> 跳过解析不了的行。
-/// 只有主动挂起收尾时才真 fsync（那一刻我们承诺"落盘成功再返回"）。
+/// **No fsync per record**: the costs are asymmetric. One record missing = one extra file uploaded next time; fsync on every
+/// record = one extra disk sync per file. So after a crash the last line may be a half-written stub, and <see cref="ReadAsync"/> skips lines it cannot parse.
+/// Only the deliberate-suspend tail really fsyncs (that is the moment we promise "flushed to disk before returning").
 /// </para>
 /// </summary>
 public sealed class BackupJournal : IAsyncDisposable
@@ -78,7 +78,7 @@ public sealed class BackupJournal : IAsyncDisposable
 
     private BackupJournal(FileStream stream) => _stream = stream;
 
-    /// <summary>建一卷新 journal 并写下头一行。父目录不存在会自动建。</summary>
+    /// <summary>Create a new journal volume and write its first line. The parent directory is created if it does not exist.</summary>
     public static async Task<BackupJournal> CreateAsync(string path, JournalHeader header, CancellationToken ct)
     {
         var dir = System.IO.Path.GetDirectoryName(path);
@@ -87,16 +87,16 @@ public sealed class BackupJournal : IAsyncDisposable
         var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
         var journal = new BackupJournal(stream);
         await journal.WriteLineAsync(JsonSerializer.Serialize(header, JournalJson.Options), ct);
-        await journal.FlushAsync(fsync: true, ct);   // 头写不下去，后面全是白搭，这一次同步值得
+        await journal.FlushAsync(fsync: true, ct);   // if the header does not land, everything after it is pointless; this one sync is worth it
         return journal;
     }
 
     /// <summary>
-    /// 接着往一卷**已经存在**的 journal 后面写。
+    /// Append to a journal volume that **already exists**.
     /// <para>
-    /// 头一行不重写：调用方已经逐项核对过它还作数（见 <see cref="BackupRunControl.OpenJournalAsync"/>），
-    /// 重写等于把 append-only 变成可改写。用它而不是 <see cref="CreateAsync"/> 的唯一场合，
-    /// 就是本轮的 runId 与盘上那一卷重名——那里必须接着写，见调用点的说明。
+    /// The header line is not rewritten: the caller has already checked term by term that it still counts (see
+    /// <see cref="BackupRunControl.OpenJournalAsync"/>), and rewriting it would turn append-only into rewritable. The only
+    /// occasion for using this instead of <see cref="CreateAsync"/> is this run's runId colliding with the volume on disk — there we must append; see the notes at the call site.
     /// </para>
     /// </summary>
     public static async Task<BackupJournal> OpenForAppendAsync(string path, CancellationToken ct)
@@ -105,18 +105,19 @@ public sealed class BackupJournal : IAsyncDisposable
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
         var journal = new BackupJournal(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read));
-        // 先补一个换行。这个文件不逐条 fsync，崩溃后最后一行可能是半截的（见类注释）；直接接着写
-        // 会把那半截和新记的一条粘成一行，于是**新的这条**也跟着解析不出来——而它记的是本轮刚
-        // 确认上传的内容，丢了就是下一轮白传一遍。空行 ReadAsync 一律跳过，多写这一个字节无害。
+        // Emit a newline first. This file is not fsynced per record, so after a crash the last line may be a half-written stub
+        // (see the class remarks); appending straight on would glue that stub and the newly recorded line into one, so **the new
+        // one** fails to parse as well — and it records content this run just confirmed uploaded, so losing it means uploading
+        // that block for nothing next run. ReadAsync always skips blank lines, so this one extra byte is harmless.
         await journal.WriteLineAsync("", ct);
         return journal;
     }
 
-    /// <summary>追加一条。调用点必须在**上传确认返回之后**。</summary>
+    /// <summary>Append one record. The call site must be **after the upload has been confirmed returned**.</summary>
     public async Task AppendAsync(JournalRecord record, CancellationToken ct)
         => await WriteLineAsync(JsonSerializer.Serialize(record, JournalJson.Options), ct);
 
-    /// <param name="fsync">true 时连同操作系统缓冲一起刷到盘上（主动挂起收尾用）。</param>
+    /// <param name="fsync">When true, flush the operating system buffers to disk as well (used by the deliberate-suspend tail).</param>
     public async Task FlushAsync(bool fsync, CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct);
@@ -136,20 +137,20 @@ public sealed class BackupJournal : IAsyncDisposable
         try
         {
             await _stream.WriteAsync(bytes, ct);
-            await _stream.FlushAsync(ct);   // 只刷到 OS，不落盘；见类注释
+            await _stream.FlushAsync(ct);   // only flush to the OS, not to disk; see the class remarks
         }
         finally { _writeLock.Release(); }
     }
 
-    /// <summary>读整卷。文件不在、空的、或头坏了都返回 null（= 这卷作废，当没有恢复点）。</summary>
+    /// <summary>Read the whole volume. Missing file, empty file, or a broken header all return null (= this volume is void, treat it as no resume point).</summary>
     public static async Task<JournalContent?> ReadAsync(string path, CancellationToken ct)
     {
         JournalHeader? header = null;
         var records = new List<JournalRecord>();
 
-        // 不先 File.Exists 再打开——那两步之间有个真实的缺口：清理器在扫某个容器的活动 journal 时，
-        // 另一轮备份可能正好跑完并删掉自己那卷。缺口里删掉就会抛 FileNotFoundException，把整轮清理
-        // 掀掉。直接开、接住"不在了"，与"本来就不在"归到同一个答案：这卷作废。
+        // No File.Exists before opening — there is a real gap between those two steps: while the cleaner scans one container's
+        // active journals, another backup run may finish and delete its own volume. A delete inside that gap throws
+        // FileNotFoundException and takes the whole cleanup run down. Just open, catch "it is gone", and fold it into the same answer as "it was never there": this volume is void.
         FileStream stream;
         try
         {
@@ -168,7 +169,7 @@ public sealed class BackupJournal : IAsyncDisposable
             if (header is null)
             {
                 try { header = JsonSerializer.Deserialize<JournalHeader>(line, JournalJson.Options); }
-                catch (JsonException) { return null; }   // 头坏了，整卷作废
+                catch (JsonException) { return null; }   // broken header, the whole volume is void
                 if (header is null)
                     return null;
                 continue;
@@ -180,8 +181,8 @@ public sealed class BackupJournal : IAsyncDisposable
             }
             catch (JsonException)
             {
-                // 崩溃留下的半截行。正常只可能出现在最后一行；真出现在中间也只是少认几条，
-                // 后果是多传几个文件，不是数据丢失。继续读完。
+                // A half-written line left by a crash. Normally it can only be the last line; if one really does show up in the
+                // middle we merely recognise a few records fewer, costing a few extra file uploads, not data loss. Keep reading to the end.
             }
         }
 
@@ -190,7 +191,7 @@ public sealed class BackupJournal : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        try { await _stream.FlushAsync(); } catch { /* 关的时候刷不动就算了 */ }
+        try { await _stream.FlushAsync(); } catch { /* can't flush on close; never mind */ }
         await _stream.DisposeAsync();
         _writeLock.Dispose();
     }

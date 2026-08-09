@@ -24,11 +24,11 @@ public class JournalResumeTests
         records);
 
     /// <summary>
-    /// 同一条路径在两卷里记着不同内容（两次挂起之间文件被改过）时，胜出的必须是**新的那一卷**，
-    /// 而且与两卷送进来的先后无关。
+    /// When the same path is recorded with different content in two volumes (the file was modified between two suspends), the
+    /// winner must be **the newer volume**, regardless of the order the two are handed in.
     /// <para>
-    /// 不定序不会漏传（内容判据对不上就当没有，照传不误），但会让"上一轮传过的那一版这轮还算不算数"
-    /// 随运行掷骰子——同样的输入两次跑出不同的重传量，这种事不该留在恢复路径上。
+    /// Leaving it unordered loses no upload (if the content tests do not match we treat it as absent and upload anyway), but it
+    /// makes "does the version uploaded last run still count this run" a dice roll per run — the same input producing different re-upload volumes on two runs has no business on the resume path.
     /// </para>
     /// </summary>
     [Fact]
@@ -63,9 +63,9 @@ public class JournalResumeTests
     {
         var r = new JournalResume([Blob("a.bin", "aaa")]);
         Assert.Equal("data/aaa", r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
-        // 中断之后文件被改过：路径还在，内容不是那一份了，绝不能复用。
+        // The file was modified after the interruption: the path is still there, the content is not that one any more, and it must never be reused.
         Assert.Null(r.FindBlob("a.bin", "zzz", 100, "hzzz", "tzzz"));
-        // 同内容不同路径：journal 是按路径记的，索引里这是两条条目。
+        // Same content at a different path: the journal records by path, and in the index these are two separate entries.
         Assert.Null(r.FindBlob("copy.bin", "aaa", 100, "haaa", "taaa"));
     }
 
@@ -77,17 +77,17 @@ public class JournalResumeTests
         var r = new JournalResume([Pack("p000000010001", m1, m2)]);
 
         Assert.Equal("p000000010001", r.FindPack([m1, m2])!.Ref);
-        Assert.Null(r.FindPack([m1]));                                            // 少一个成员
-        Assert.Null(r.FindPack([m1, m2, new JournalMember("c.txt", "0003_c.txt", "hc", 9)]));  // 多一个
-        Assert.Null(r.FindPack([m1, m2 with { FullHash = "changed" }]));           // 成员内容变了
-        Assert.Null(r.FindPack([m1, m2 with { Length = 8 }]));                     // 成员长度变了
-        Assert.Null(r.FindPack([m2, m1]));                                         // 同一组成员，顺序变了
+        Assert.Null(r.FindPack([m1]));                                            // one member short
+        Assert.Null(r.FindPack([m1, m2, new JournalMember("c.txt", "0003_c.txt", "hc", 9)]));  // one member too many
+        Assert.Null(r.FindPack([m1, m2 with { FullHash = "changed" }]));           // a member's content changed
+        Assert.Null(r.FindPack([m1, m2 with { Length = 8 }]));                     // a member's length changed
+        Assert.Null(r.FindPack([m2, m1]));                                         // the same member set, in a different order
     }
 
     [Fact]
     public void Duplicate_records_across_journals_take_the_first()
     {
-        // 反复挂起/恢复会攒下多卷 journal，同一条路径可能被记过不止一次。
+        // Repeated suspend/resume piles up several journal volumes, and the same path may have been recorded more than once.
         var r = new JournalResume([Blob("a.bin", "aaa"), Blob("a.bin", "aaa")]);
         Assert.Equal(1, r.RecordCount);
         Assert.Equal("data/aaa", r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
@@ -96,7 +96,7 @@ public class JournalResumeTests
     [Fact]
     public void Records_without_a_path_are_ignored()
     {
-        // 头坏一半、字段缺失的行不该把查找表带崩。
+        // A half-broken line with missing fields must not bring the lookup table down.
         var r = new JournalResume([new JournalRecord { Kind = "blob", Ref = "data/x" }]);
         Assert.Null(r.FindBlob("x", "x", 1, "x", "x"));
     }

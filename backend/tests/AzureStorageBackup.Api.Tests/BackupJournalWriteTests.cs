@@ -90,7 +90,7 @@ public sealed class BackupJournalWriteTests : IDisposable
         Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 } },
     };
 
-    /// <summary>第 N 次上传起一律抛永久错误，用来把运行卡死在半路。</summary>
+    /// <summary>From the Nth upload on, always throw a permanent error — used to wedge a run halfway through.</summary>
     private sealed class FailAfter(IBlobUploader inner, int allowed) : IBlobUploader
     {
         private int _count;
@@ -126,8 +126,8 @@ public sealed class BackupJournalWriteTests : IDisposable
         }
     }
 
-    /// <summary>卡住每一次上传，直到测试放行——用来在运行"进行到一半"这个真实存在的时间窗口里
-    /// 窥探 journal 文件是否已经在磁盘上，从而把"从没建过"和"建过又删了"这两种情况分开。</summary>
+    /// <summary>Stall every upload until the test lets it go — used to peek at whether the journal file is already on disk during
+    /// the real time window where a run is "halfway through", which separates "never created" from "created and then deleted".</summary>
     private sealed class GatedUploader(IBlobUploader inner, TaskCompletionSource ready, TaskCompletionSource proceed)
         : IBlobUploader
     {
@@ -162,9 +162,9 @@ public sealed class BackupJournalWriteTests : IDisposable
         }
     }
 
-    /// <summary>只放行地址等于 <paramref name="keepRef"/> 的上传，其余一律拒绝——用来在同一次运行里
-    /// 逼一个不相关的文件失败（好让运行整体失败、journal 不被收尾删掉），同时让目标内容
-    /// （一个真传、一个 if-missing 命中，两者地址相同）安然走完全程。</summary>
+    /// <summary>Let through only uploads whose address equals <paramref name="keepRef"/>, refusing everything else — used within one
+    /// run to force an unrelated file to fail (so the run fails as a whole and the tail does not delete the journal) while the
+    /// target content (one real upload, one if-missing hit, both at the same address) makes it safely all the way through.</summary>
     private sealed class FailExceptRef(IBlobUploader inner, string keepRef) : IBlobUploader
     {
         private static void Gate(string blobName, string keepRef)
@@ -198,8 +198,8 @@ public sealed class BackupJournalWriteTests : IDisposable
         }
     }
 
-    /// <summary>只拒绝单文件 blob（"data/" 前缀），放行 pack（"packs/" 前缀）——逼一个不相关的
-    /// 大文件失败（运行因此整体失败，journal 不被收尾删掉），同时让 pack 安然传完、被记进 journal。</summary>
+    /// <summary>Refuse only single-file blobs (the "data/" prefix) and let packs through (the "packs/" prefix) — forcing an unrelated
+    /// big file to fail (so the run fails as a whole and the tail does not delete the journal) while the pack uploads safely and gets recorded in the journal.</summary>
     private sealed class FailDataBlobs(IBlobUploader inner) : IBlobUploader
     {
         private static void Gate(string blobName)
@@ -253,9 +253,9 @@ public sealed class BackupJournalWriteTests : IDisposable
             var journalPath = _journals.PathFor(account.Id, name, "run-ok");
             var runTask = orchestrator.RunAsync(Request(account, name), null, default, control);
 
-            // 卡在第一次上传前面：开卷发生在扫描分组之后、上传之前，此刻这一卷必然已经落盘。
-            // 不看这一眼的话，下面 "journal 不在了" 这句话「从没建过」和「建过又删了」结果一样，
-            // 测试分辨不出两者，也就抓不住"提前删了"这种回归。
+            // Stalled just before the first upload: opening the volume happens after scanning and grouping but before uploading,
+            // so at this moment the volume must already be on disk. Without this one look, the "journal is gone" assertion below
+            // reads the same for "never created" as for "created and then deleted", the test cannot tell the two apart, and so it cannot catch a "deleted too early" regression.
             await ready.Task;
             Assert.True(File.Exists(journalPath), "journal file should exist while the run is in progress");
             proceed.SetResult();
@@ -278,11 +278,11 @@ public sealed class BackupJournalWriteTests : IDisposable
         var name = RandomName("jw");
 
         WriteBytes("orig.bin", 6_000_000);
-        WriteBytes("dup.bin", 6_000_000);      // 与 orig.bin 字节全同（都是全零）→ 同一个地址
-        WriteBytes("trigger.bin", 6_000_001);  // 长度不同 → 内容不同 → 独立地址，被 wrapper 永久拒绝
+        WriteBytes("dup.bin", 6_000_000);      // byte-identical to orig.bin (both all zeros) → the same address
+        WriteBytes("trigger.bin", 6_000_001);  // different length → different content → its own address, permanently refused by the wrapper
 
-        // 明文寻址就是 "data/" + fullHash（BlobAddressScheme.DataAddress），Password 为 null，
-        // 所以这里能照抄同一套 hash 逻辑，提前把 orig/dup 共享的目标地址算出来。
+        // Plaintext addressing is just "data/" + fullHash (BlobAddressScheme.DataAddress) and Password is null,
+        // so we can copy the same hash logic here and work out up front the target address orig/dup share.
         var expectedRef = "data/" + await new FileHasher().FullHashAsync(Path.Combine(_root, "orig.bin"), default);
 
         var factoryOnly = new BlobClientFactory(TestSecrets.Reader);
@@ -296,9 +296,9 @@ public sealed class BackupJournalWriteTests : IDisposable
 
             var listed = await _journals.ListAsync(account.Id, name, default);
             var journal = Assert.Single(listed);
-            // orig.bin 与 dup.bin 内容、地址全同：不管谁先抢到那次条件写，另一个必然拿到
-            // if-missing 命中（UploadIfMissingAsync 返回 false）——brief 明确要求这也要记一行，
-            // 不管抢赢的是谁，两条记录都必须在。
+            // orig.bin and dup.bin have identical content and identical addresses: whoever wins the conditional write first, the
+            // other necessarily gets an if-missing hit (UploadIfMissingAsync returns false) — the brief explicitly requires that to
+            // be journalled too, so no matter who won the race, both records must be there.
             var records = journal.Content.Records.Where(r => r.Kind == "blob" && r.Ref == expectedRef).ToList();
             Assert.Equal(2, records.Count);
             Assert.Equal(
@@ -321,8 +321,8 @@ public sealed class BackupJournalWriteTests : IDisposable
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
-            // 同目录三个小文件 → 合并成一个 pack；big.bin 走单文件通道，被 FailDataBlobs 永久拒绝，
-            // 逼整轮运行失败，journal 才不会在收尾时被删掉，好让我们检查它。
+            // Three small files in one directory → merged into a single pack; big.bin takes the single-file path and is permanently
+            // refused by FailDataBlobs, forcing the whole run to fail so the tail does not delete the journal and we can inspect it.
             WriteText("d/a.txt", new string('a', 2000));
             WriteText("d/b.txt", new string('b', 2000));
             WriteText("d/c.txt", new string('c', 2000));
@@ -363,7 +363,7 @@ public sealed class BackupJournalWriteTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("jw");
         var factoryOnly = new BlobClientFactory(TestSecrets.Reader);
-        // 两个大文件 → 各走单文件 blob 通道；第一个允许传，第二个起就拒。
+        // Two big files → each takes the single-file blob path; the first is allowed through, everything from the second on is refused.
         var (orchestrator, factory) = Build(new FailAfter(new BlobUploader(factoryOnly), allowed: 1));
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
@@ -382,7 +382,7 @@ public sealed class BackupJournalWriteTests : IDisposable
             Assert.Equal(3, journal.Content.Header.ConfigId);
             Assert.Equal(0, journal.Content.Header.BaselineVersion);
             Assert.Equal(_root, journal.Content.Header.LocalRoot);
-            // 只记下确实传完的那一个；被拒的那个绝不能出现在里面。
+            // Only the one that really finished uploading is recorded; the refused one must never show up in there.
             var record = Assert.Single(journal.Content.Records);
             Assert.Equal("blob", record.Kind);
             Assert.False(string.IsNullOrEmpty(record.FullHash));

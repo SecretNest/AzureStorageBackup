@@ -26,7 +26,7 @@ public sealed class StagingAreaTests : IDisposable
 
     private StagingArea AreaP(Func<long> limit) => new(_compressTemp, _stagedTemp, limit);
 
-    /// <summary>假压缩：在 compress-temp 写一个 size 字节的卷文件。</summary>
+    /// <summary>Fake compression: write one volume file of size bytes into compress-temp.</summary>
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> Produce(string name, int size)
         => async (dir, ct) =>
         {
@@ -44,7 +44,7 @@ public sealed class StagingAreaTests : IDisposable
 
         Assert.Empty(Directory.GetFiles(_compressTemp));               // moved out of compress-temp
         var staged = Assert.Single(item.Files);
-        // 现在暂存文件在 staged-temp 的 GUID 子目录里（跨备份隔离，防同名覆盖）。
+        // Staged files now live in a GUID subdirectory of staged-temp (isolation across backups, so identical names cannot overwrite).
         Assert.Equal(_stagedTemp, Path.GetDirectoryName(Path.GetDirectoryName(staged)));
         Assert.True(File.Exists(staged));
         Assert.Equal(500, item.Bytes);
@@ -56,22 +56,22 @@ public sealed class StagingAreaTests : IDisposable
     {
         using var area = Area(limit: 1_000_000);
 
-        // 两次暂存产出「同名」文件（模拟不同 container 都从 p0001.7z 起）。
-        // 压缩串行，但两份必须落在不同子目录、内容各自完整。
+        // Two stagings produce files with "the same name" (simulating different containers both starting at p0001.7z).
+        // Compression is serial, but the two must land in different subdirectories, each with its content intact.
         var item1 = await area.StageAsync(Produce("p0001.7z", 100));
         var item2 = await area.StageAsync(Produce("p0001.7z", 200));
 
         var f1 = Assert.Single(item1.Files);
         var f2 = Assert.Single(item2.Files);
-        Assert.NotEqual(f1, f2);                       // 不同路径
+        Assert.NotEqual(f1, f2);                       // different paths
         Assert.True(File.Exists(f1) && File.Exists(f2));
-        Assert.Equal(100, new FileInfo(f1).Length);    // 各自内容完整、未被覆盖
+        Assert.Equal(100, new FileInfo(f1).Length);    // each intact, neither overwritten
         Assert.Equal(200, new FileInfo(f2).Length);
         Assert.Equal(300, area.StagedBytes);
 
         area.Release(item1);
         Assert.False(File.Exists(f1));
-        Assert.False(Directory.Exists(Path.GetDirectoryName(f1)));  // 空子目录一并清除
+        Assert.False(Directory.Exists(Path.GetDirectoryName(f1)));  // the emptied subdirectory is removed too
         Assert.True(File.Exists(f2));
     }
 
@@ -102,18 +102,18 @@ public sealed class StagingAreaTests : IDisposable
     }
 
     /// <summary>
-    /// 进度上的"在准备"只算真正拿到归档锁的那一件；排在它后面的既不算"在准备"，也不算"排队中"，
-    /// 而是单列一栏（<see cref="StageProgress.WaitingOnArchive"/>）。
+    /// "Preparing" in the progress report counts only the item that actually holds the archive lock; whatever queues behind it
+    /// is neither "preparing" nor "queued", but a column of its own (<see cref="StageProgress.WaitingOnArchive"/>).
     /// <para>
-    /// 工作线程池比归档锁大得多（<c>UploadConcurrency + 1</c>），多出来的线程是为了让产出完的活
-    /// 各自去占一条上传流。从前进度用「手上件数 - 在上传件数」反推"在准备"，把这些干等锁的线程
-    /// 全算了进去：默认配置下界面显示 5 preparing，读起来像五件活在并行推进，实际是一件在产出、
-    /// 四个在闲等——恰恰是产出就是瓶颈的时候，界面看起来最忙。
+    /// The worker pool is far larger than the archive lock (<c>UploadConcurrency + 1</c>); the extra threads exist so that items
+    /// done producing can each grab an upload stream. Progress used to derive "preparing" from "items in hand - items uploading",
+    /// which swept all those threads idling on the lock into it: with the default config the UI showed 5 preparing, reading like
+    /// five items advancing in parallel when in truth one was producing and four idling — precisely when producing is the bottleneck, the UI looked busiest.
     /// </para>
     /// <para>
-    /// 后来它们被并进了 <c>queued</c>，那同样不对：这把锁是全局的，并发跑两个备份时可以整段
-    /// 落在**另一个备份**手里，此时本备份 <c>preparing</c> 是 0，屏幕上只剩一堆 "queued"，
-    /// 说不出"被别人挡着"。所以现在它们自己一栏——见 <c>StageProgressTests</c> 里那两条。
+    /// They were then folded into <c>queued</c>, which is just as wrong: this lock is global, and when two backups run
+    /// concurrently it can sit entirely in **the other backup's** hands, at which point this backup's <c>preparing</c> is 0 and
+    /// the screen shows nothing but a pile of "queued", unable to say "somebody else is blocking us". Hence a column of their own — see the two cases in <c>StageProgressTests</c>.
     /// </para>
     /// </summary>
     [Fact]
@@ -125,7 +125,7 @@ public sealed class StagingAreaTests : IDisposable
         for (var i = 0; i < 3; i++)
         {
             tracker.Enqueue();
-            tracker.BeginWork();   // 三件全被工作线程领走，队列里一件不剩
+            tracker.BeginWork();   // all three picked up by worker threads, nothing left in the queue
         }
 
         var hold = new TaskCompletionSource();
@@ -140,26 +140,26 @@ public sealed class StagingAreaTests : IDisposable
         }, ct);
 
         var first = area.StageAsync(Blocking, tracker: tracker);
-        await holding.Task;                                        // 第一件确实拿到了锁、正在产出
+        await holding.Task;                                        // the first item really has the lock and is producing
         var second = area.StageAsync(Produce("v2", 10), tracker: tracker);
         var third = area.StageAsync(Produce("v3", 10), tracker: tracker);
 
-        tracker.Complete();   // 强制越过节流，取一张当下的快照
+        tracker.Complete();   // force past the throttle to grab a snapshot of right now
         var s = seen[^1];
-        Assert.Equal(1, s.Preparing);        // 产出是串行的，无论后面排了多少
-        Assert.Equal(2, s.WaitingOnArchive); // 干等锁的两件
-        Assert.Equal(0, s.Queued);           // 队列里确实一件不剩——它们不再被混报成"排队中"
+        Assert.Equal(1, s.Preparing);        // producing is serial, no matter how many queue up behind
+        Assert.Equal(2, s.WaitingOnArchive); // the two idling on the lock
+        Assert.Equal(0, s.Queued);           // the queue really is empty — they are no longer misreported as "queued"
 
         hold.SetResult();
         await Task.WhenAll(first, second, third);
         tracker.Complete();
-        Assert.Equal(0, seen[^1].Preparing); // 全部交还，不留悬挂
+        Assert.Equal(0, seen[^1].Preparing); // all handed back, nothing left dangling
         Assert.Equal(0, seen[^1].WaitingOnArchive);
         Assert.Equal(0, seen[^1].Queued);
     }
 
-    /// <summary>产出中途抛异常也必须把两个计数都交还——漏了 finally，界面会永远挂着
-    /// "1 preparing"，而那时候什么都没在跑。</summary>
+    /// <summary>A throw partway through producing must still hand back both counters — miss the finally and the UI hangs forever at
+    /// "1 preparing" while nothing at all is running.</summary>
     [Fact]
     public async Task A_Failed_Compression_Still_Gives_Back_Its_Progress_Slots()
     {
@@ -183,7 +183,7 @@ public sealed class StagingAreaTests : IDisposable
     {
         using var area = Area(limit: 100);
 
-        // 从 0 起步允许超限：150 > 100，仍执行。
+        // Starting from 0 is allowed to overshoot: 150 > 100, and it still runs.
         var first = await area.StageAsync(Produce("v1", 150));
         Assert.Equal(150, area.StagedBytes);
 
@@ -195,10 +195,10 @@ public sealed class StagingAreaTests : IDisposable
         });
 
         await Task.Delay(150);
-        Assert.False(secondStarted);     // 背压：超限时下一个压缩不启动
+        Assert.False(secondStarted);     // backpressure: over the ceiling, the next compression does not start
         Assert.False(second.IsCompleted);
 
-        area.Release(first);             // 上传完成腾出空间
+        area.Release(first);             // upload finished, space freed
 
         var item = await second.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(secondStarted);
@@ -208,19 +208,19 @@ public sealed class StagingAreaTests : IDisposable
     [Fact]
     public async Task Backpressure_Reads_Limit_Live_From_Provider()
     {
-        long limit = 100;                      // 初始极小上限
+        long limit = 100;                      // a tiny ceiling to start with
         using var area = AreaP(() => limit);
 
-        // 首个结果允许临时超限（从上限以下起步）。
+        // The first result may overshoot temporarily (it started below the ceiling).
         var first = await area.StageAsync(Produce("a", 500));
-        Assert.Equal(500, area.StagedBytes);   // 已超过 100
+        Assert.Equal(500, area.StagedBytes);   // already past 100
 
-        // 第二个压缩应被背压阻塞（StagedBytes 500 >= limit 100）。
+        // The second compression should be blocked by backpressure (StagedBytes 500 >= limit 100).
         var blocked = area.StageAsync(Produce("b", 10));
         Assert.False(blocked.IsCompleted);
 
-        // 调大上限 → 唤醒需要一次 Release 触发信号；这里改为先 Release 首个腾出空间。
-        area.Release(first);                   // StagedBytes -> 0，唤醒
+        // Raising the ceiling → waking still needs a Release to fire the signal; so instead Release the first one to free space.
+        area.Release(first);                   // StagedBytes -> 0, wakes it
         var second = await blocked;
         Assert.Equal(10, area.StagedBytes);
     }
@@ -237,7 +237,7 @@ public sealed class StagingAreaTests : IDisposable
         Assert.False(File.Exists(path));
     }
 
-    /// <summary>假压缩：一次产出多卷（v.001..v.00N），每卷 size 字节。</summary>
+    /// <summary>Fake compression: produce several volumes at once (v.001..v.00N), size bytes each.</summary>
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> ProduceVolumes(
         string name, int count, int size)
         => async (dir, ct) =>
@@ -253,10 +253,10 @@ public sealed class StagingAreaTests : IDisposable
         };
 
     /// <summary>
-    /// 传完一卷就得删一卷，水位跟着一卷一卷往下走。
+    /// Every volume that finishes uploading has to be deleted, with the watermark stepping down volume by volume.
     /// <para>
-    /// 整族传完才删的话，临时盘峰值等于**整个归档**——一个 100 GB 的文件就要 100 GB 临时空间
-    /// （这条已经把一次真实备份撞失败过），而且水位整段贴在上限上，后面的压缩被背压一直堵着。
+    /// Deleting only once the whole family is uploaded makes the temp disk's peak equal **the entire archive** — a 100 GB file
+    /// needs 100 GB of temp space (this has already crashed a real backup), and the watermark sits pinned at the ceiling the whole time, with later compressions jammed behind backpressure.
     /// </para>
     /// </summary>
     [Fact]
@@ -273,13 +273,13 @@ public sealed class StagingAreaTests : IDisposable
             Assert.Equal(100 - 25 * (i + 1), area.StagedBytes);
         }
 
-        area.Release(item);                                  // 收尾兜底：只剩删空目录
+        area.Release(item);                                  // tail backstop: only the emptied directory is left to delete
         Assert.Equal(0, area.StagedBytes);
         Assert.Empty(Directory.GetDirectories(_stagedTemp));
     }
 
-    /// <summary>逐卷释放必须幂等：上传路径逐卷释放过之后，收尾的整族 Release 还会再走一遍。
-    /// 重复扣账会把水位记成负的，此后背压永远挡不住压缩——临时盘就再没有上限了。</summary>
+    /// <summary>Per-volume release must be idempotent: after the upload path has released each volume, the whole-family Release at the tail walks them again.
+    /// Double-debiting drives the watermark negative, and from then on backpressure never blocks compression — the temp disk has no ceiling at all any more.</summary>
     [Fact]
     public async Task Releasing_The_Same_Volume_Twice_Does_Not_Go_Negative()
     {
@@ -288,16 +288,16 @@ public sealed class StagingAreaTests : IDisposable
         var b = await area.StageAsync(Produce("b", 30));
 
         area.ReleaseFile(a.Files[0]);
-        area.ReleaseFile(a.Files[0]);   // 重复
-        area.Release(a);                // 整族兜底：另一卷才是真正要删的
-        area.Release(a);                // 再来一次
+        area.ReleaseFile(a.Files[0]);   // duplicate
+        area.Release(a);                // whole-family backstop: the other volume is the one really being deleted
+        area.Release(a);                // once more
 
-        Assert.Equal(30, area.StagedBytes);   // 只剩 b
+        Assert.Equal(30, area.StagedBytes);   // only b left
         area.Release(b);
         Assert.Equal(0, area.StagedBytes);
     }
 
-    /// <summary>逐卷释放同样要能解除背压——否则压缩要等到整族传完才动，逐卷删就白删了。</summary>
+    /// <summary>Per-volume release must lift backpressure too — otherwise compression waits for the whole family to finish uploading and deleting volume by volume was pointless.</summary>
     [Fact]
     public async Task Releasing_A_Single_Volume_Wakes_The_Blocked_Compression()
     {
@@ -307,13 +307,13 @@ public sealed class StagingAreaTests : IDisposable
         var next = area.StageAsync(Produce("w", 10));
 
         await Task.Delay(150);
-        Assert.False(next.IsCompleted);          // 背压挡着
+        Assert.False(next.IsCompleted);          // held back by backpressure
 
-        area.ReleaseFile(first.Files[0]);        // 只放掉一卷：150 → 100，还在线上
+        area.ReleaseFile(first.Files[0]);        // release just one volume: 150 → 100, still right on the ceiling
         await Task.Delay(150);
         Assert.False(next.IsCompleted);
 
-        area.ReleaseFile(first.Files[1]);        // 再放一卷：100 → 50，跌破上限
+        area.ReleaseFile(first.Files[1]);        // release another: 100 → 50, dropping below the ceiling
         var item = await next.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(10, item.Bytes);
 
@@ -330,7 +330,7 @@ public sealed class StagingAreaTests : IDisposable
         Assert.Empty(item.Files);
         Assert.Equal(0, item.Bytes);
         Assert.Equal(0, area.StagedBytes);
-        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // 不留空 GUID 子目录
+        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // no empty GUID subdirectory left behind
     }
 
     [Fact]
@@ -338,7 +338,7 @@ public sealed class StagingAreaTests : IDisposable
     {
         using var area = Area(limit: 1_000_000);
 
-        // 产出两个路径：第一个真实存在，第二个不存在 → 第二次 File.Move 抛（源缺失）。
+        // Produce two paths: the first really exists, the second does not → the second File.Move throws (source missing).
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (dir, ct) =>
         {
             var ok = Path.Combine(dir, "ok.7z");
@@ -348,7 +348,7 @@ public sealed class StagingAreaTests : IDisposable
 
         await Assert.ThrowsAnyAsync<Exception>(() => area.StageAsync(produce));
 
-        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // 已移动文件 + 子目录被清理，不泄漏
-        Assert.Equal(0, area.StagedBytes);                    // 异常路径不错记字节
+        Assert.Empty(Directory.GetDirectories(_stagedTemp)); // moved files + subdirectory cleaned up, nothing leaked
+        Assert.Equal(0, area.StagedBytes);                    // the exception path does not miscredit bytes
     }
 }

@@ -3,13 +3,13 @@ using AzureStorageBackup.Api.Services;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 暂存区在**多个备份同时跑**时的配额与并发。两件事一起才有意义：
+/// The staging area's quota and concurrency when **several backups run at once**. The two only mean anything together:
 /// <list type="number">
-/// <item>配额按当前在跑的运行数均分（存量的非活动备份不占席位）；</item>
-/// <item>等空间时**不能**占着那把全局压缩锁——否则给谁加配额都没用：被自己配额挡住的那个
-/// 运行照样卡在锁上，别人一样压不了，只是换了个理由卡死。</item>
+/// <item>the quota is split evenly across the runs currently in flight (configured-but-idle backups hold no seat);</item>
+/// <item>waiting for space **must not** hold the global compression lock — otherwise handing anyone more quota is useless: the
+/// run blocked by its own quota still sits stuck on the lock, nobody else can compress either, and it just deadlocks for a different reason.</item>
 /// </list>
-/// 全局上限继续生效，因为暂存盘是**物理**磁盘：配额管的是公平，全局上限管的是不写满盘。
+/// The global ceiling stays in force because the staging disk is a **physical** disk: the quota is about fairness, the global ceiling is about not filling the disk.
 /// </summary>
 public sealed class StagingQuotaTests : IDisposable
 {
@@ -44,35 +44,35 @@ public sealed class StagingQuotaTests : IDisposable
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(10);
 
     /// <summary>
-    /// 这是整个改造的验收点。改造前背压是**持着压缩锁**等的，于是 A 一旦被暂存挡住，B 连压缩都
-    /// 开始不了——加配额只会让 A 更早开始占着锁干等，B 的处境分毫未变。
+    /// This is the acceptance point of the whole rework. Before it, backpressure waited **while holding the compression lock**, so
+    /// the moment A was blocked by staging, B could not even start compressing — adding quota only made A start idling on the lock sooner, leaving B's position unchanged.
     /// </summary>
     [Fact]
     public async Task A_Run_Blocked_By_Its_Own_Quota_Releases_The_Compression_Lock()
     {
-        using var area = Area(limit: 1000);   // 两个席位 → 各 500
+        using var area = Area(limit: 1000);   // two seats → 500 each
         using var a = area.AcquireLease();
         using var b = area.AcquireLease();
 
         var itemA = await area.StageAsync(Produce("a1", 500), a);
         Assert.Equal(500, area.StagedBytes);
 
-        // A 已经占满自己那一半，下一件必须被挡住。
+        // A has already filled its own half, so the next item must be blocked.
         var blockedA = area.StageAsync(Produce("a2", 100), a);
         await Task.Delay(200);
-        Assert.False(blockedA.IsCompleted, "A 占满了自己的配额，这一件本该被挡住");
+        Assert.False(blockedA.IsCompleted, "A has filled its own quota, this item should have been blocked");
 
-        // 而 B 必须照样压得动——A 在等空间，但它不该占着那把全局压缩锁。
+        // And B must still be able to compress — A is waiting for space, but it must not be holding the global compression lock.
         var itemB = await area.StageAsync(Produce("b1", 400), b).WaitAsync(Patience);
         Assert.Equal(400, itemB.Bytes);
 
-        // A 的占用一还回来，被挡住的那件立刻继续。
+        // The moment A's usage is handed back, the blocked item continues immediately.
         area.Release(itemA);
         var resumed = await blockedA.WaitAsync(Patience);
         Assert.Equal(100, resumed.Bytes);
     }
 
-    /// <summary>配额是公平，全局上限是磁盘安全——后者必须继续拦得住，否则并行时会把盘写满。</summary>
+    /// <summary>The quota is fairness, the global ceiling is disk safety — the latter must keep holding the line, or running in parallel fills the disk.</summary>
     [Fact]
     public async Task The_Global_Limit_Still_Caps_The_Sum_Across_Runs()
     {
@@ -80,17 +80,17 @@ public sealed class StagingQuotaTests : IDisposable
         using var a = area.AcquireLease();
         using var b = area.AcquireLease();
 
-        // 两边各占满自己的一半，总量正好到顶。
+        // Both sides fill their own half; the total lands exactly on the ceiling.
         var itemA = await area.StageAsync(Produce("a1", 500), a);
         var itemB = await area.StageAsync(Produce("b1", 500), b);
         Assert.Equal(1000, area.StagedBytes);
 
-        // 此时谁都不该再进得去。
+        // At this point nobody should get in any more.
         var moreA = area.StageAsync(Produce("a2", 10), a);
         var moreB = area.StageAsync(Produce("b2", 10), b);
         await Task.Delay(200);
-        Assert.False(moreA.IsCompleted, "全局已到上限，A 不该再压");
-        Assert.False(moreB.IsCompleted, "全局已到上限，B 不该再压");
+        Assert.False(moreA.IsCompleted, "the global ceiling is reached, A must not compress any more");
+        Assert.False(moreB.IsCompleted, "the global ceiling is reached, B must not compress any more");
 
         area.Release(itemA);
         area.Release(itemB);
@@ -98,8 +98,8 @@ public sealed class StagingQuotaTests : IDisposable
     }
 
     /// <summary>
-    /// 只有一个备份在跑时，它就该拿到**全部**额度。存量的非活动备份不占席位——
-    /// 否则配了十个备份、只跑一个，那一个也只能用十分之一的暂存盘。
+    /// With only one backup running, it should get the **whole** allowance. Configured-but-idle backups hold no seat —
+    /// otherwise with ten backups configured and only one running, that one would only get a tenth of the staging disk.
     /// </summary>
     [Fact]
     public async Task A_Single_Active_Run_Gets_The_Whole_Limit()
@@ -109,12 +109,12 @@ public sealed class StagingQuotaTests : IDisposable
 
         var first = await area.StageAsync(Produce("s1", 600), only).WaitAsync(Patience);
         Assert.Equal(600, first.Bytes);
-        // 600 已经超过"两个席位时的一半"，独占时却必须放行。
+        // 600 is already past "half of a two-seat split", yet with the disk to itself it must be let through.
         var second = await area.StageAsync(Produce("s2", 300), only).WaitAsync(Patience);
         Assert.Equal(300, second.Bytes);
     }
 
-    /// <summary>席位是随运行来去的：一个备份跑完，剩下的那个应当立刻拿到更大的额度。</summary>
+    /// <summary>Seats come and go with runs: when one backup finishes, whoever is left should get a bigger allowance immediately.</summary>
     [Fact]
     public async Task Finishing_A_Run_Hands_Its_Share_To_Whoever_Is_Left()
     {
@@ -122,22 +122,22 @@ public sealed class StagingQuotaTests : IDisposable
         var a = area.AcquireLease();
         using var b = area.AcquireLease();
 
-        // 两个席位时 B 的额度是 500。占**满**它才会被挡下一件——判据是"当前占用低于额度就放行"
-        // （与 An_Item_Larger_Than_The_Quota_Still_Gets_Through 同一条语义），占 400 是拦不住的。
+        // With two seats B's allowance is 500. Only **filling** it blocks the next item — the test is "let it through while current
+        // usage is below the allowance" (the same semantics as An_Item_Larger_Than_The_Quota_Still_Gets_Through), so holding 400 blocks nothing.
         await area.StageAsync(Produce("b1", 500), b);
         var blocked = area.StageAsync(Produce("b2", 200), b);
         await Task.Delay(200);
-        Assert.False(blocked.IsCompleted, "两个席位时 B 只有一半额度");
+        Assert.False(blocked.IsCompleted, "with two seats B only has half the allowance");
 
-        // A 收工交还席位 → B 独占全部额度，那一件就该放行。
+        // A finishes and hands its seat back → B has the whole allowance to itself, so that item should be let through.
         a.Dispose();
         var resumed = await blocked.WaitAsync(Patience);
         Assert.Equal(200, resumed.Bytes);
     }
 
     /// <summary>
-    /// 一件活比整个配额还大时必须放行，否则它永远压不出来。沿用既有语义：
-    /// 只要**当前**占用在额度以下就开压，允许这一件的产物临时超出。
+    /// An item bigger than the whole quota must still be let through, or it could never be compressed at all. Keeping the existing
+    /// semantics: as long as **current** usage is below the allowance we start compressing, letting this item's output overshoot temporarily.
     /// </summary>
     [Fact]
     public async Task An_Item_Larger_Than_The_Quota_Still_Gets_Through()
@@ -146,12 +146,12 @@ public sealed class StagingQuotaTests : IDisposable
         using var a = area.AcquireLease();
         using var b = area.AcquireLease();
 
-        // 席位额度 500，产物 900——从零起步，必须放行。
+        // Seat allowance 500, output 900 — starting from zero, it must be let through.
         var item = await area.StageAsync(Produce("big", 900), a).WaitAsync(Patience);
         Assert.Equal(900, item.Bytes);
     }
 
-    /// <summary>不带席位的调用方（不关心公平的路径、既有测试）只受全局上限约束，行为与从前一致。</summary>
+    /// <summary>Callers without a seat (paths that do not care about fairness, plus the pre-existing tests) are bounded only by the global ceiling, behaving exactly as before.</summary>
     [Fact]
     public async Task Callers_Without_A_Lease_Are_Bounded_By_The_Global_Limit_Only()
     {
