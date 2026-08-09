@@ -2,6 +2,7 @@
 // reverse proxy in production).
 //
 // App remounts the login page when the session expires (design §6).
+const BASE = '/api'
 let onUnauthorized: (() => void) | null = null
 
 export function setUnauthorizedHandler(handler: () => void) {

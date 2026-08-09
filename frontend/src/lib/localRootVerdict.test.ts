@@ -67,7 +67,7 @@ describe('localRootDecision', () => {
     expect(d.canApply).toBe(false)
     expect(d.needsForce).toBe(true)
     // "There is history but it cannot be read" must never be waved through as "there is no history".
-
+    expect(d.headline).toContain('bad decrypt')
     // Nothing was actually compared here (Sampled and Matched are both 0), so it must not claim
     // "recorded as deleted and re-uploaded" — true for NeedsConfirm/Rejected, invented for this one.
     expect(d.confirmBody).not.toContain('record every file that no longer matches as deleted')

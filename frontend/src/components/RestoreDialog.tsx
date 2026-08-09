@@ -251,6 +251,7 @@ export function RestoreDialog({
   // unrecoverable paths that will actually be restored (the backend filters the effective set by
   // SelectedPaths, so substituting an unselected path is a no-op). Nothing selected = restore the
   // whole version, so everything is shown.
+  const relevantUnrecoverable = selected.size === 0 ? unrecoverable : unrecoverable.filter((p) => selected.has(p))
   // Likewise: during a selective restore, only flag the carried-over entries that will be restored.
   const relevantStale = selected.size === 0 ? stale : stale.filter((e) => selected.has(e.path))
 
