@@ -10,9 +10,10 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 备份密码重设端点（设计 §3.4）。验证依据是加密备份的信息文件本身——它就是用该密码加密的 7z，
-/// 容器内最小的加密对象，解得开即证明密码正确。这里直接向真实 Azurite 写一个加密信息文件
-/// （不经完整编排器，无需真实数据文件），再打 HTTP 端点验证「对密码落库、错密码不落库」。
+/// Backup password reset endpoint (design §3.4). Verification rests on the encrypted backup's info file itself — a 7z
+/// encrypted with that very password, the smallest encrypted object in the container, so decrypting it proves the password is right.
+/// This writes an encrypted info file straight to a real Azurite (no full orchestrator, no real data files needed), then hits the
+/// HTTP endpoint to check that the right password is persisted and a wrong one is not.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
@@ -52,8 +53,8 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         ],
     };
 
-    /// <summary>直接用一个独立的 BackupInfoStore（不经宿主 HTTP）向真实 Azurite 写加密信息文件——
-    /// 这就是端点要拿去验证密码的「金标准」制品。</summary>
+    /// <summary>Write the encrypted info file to a real Azurite through a standalone BackupInfoStore (bypassing the host's HTTP) —
+    /// this is the gold-standard artifact the endpoint will use to verify the password.</summary>
     private static async Task SeedEncryptedInfoAsync(string container, string password)
     {
         var blobFactory = new BlobClientFactory(TestSecrets.Reader);
@@ -69,9 +70,9 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         await store.WriteInfoAsync(account, container, SampleInfo(), password);
     }
 
-    /// <summary>Finding 1 回归夹具：容器里放一份*未加密*的信息文件（用 password: null 写到未加密 blob 名），
-    /// 模拟本地配置认为已加密、但云端实际是明文对象的错配场景。ReadInfoWithETagAsync 优先探测未加密 blob 名，
-    /// 若不核对 Backup.Encrypted，端点会把提交的任意字符串当密码落库而根本没验证过。</summary>
+    /// <summary>Finding 1 regression fixture: put an *unencrypted* info file in the container (written with password: null under the unencrypted blob name),
+    /// simulating the mismatch where the local config believes the backup is encrypted while the cloud object is actually plaintext. ReadInfoWithETagAsync probes the unencrypted blob name first,
+    /// so without checking Backup.Encrypted the endpoint would persist whatever string was submitted as the password, having verified nothing.</summary>
     private static async Task SeedPlaintextInfoAsync(string container)
     {
         var blobFactory = new BlobClientFactory(TestSecrets.Reader);
@@ -118,11 +119,11 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
     }
 
     /// <summary>
-    /// 用例自己的收尾。三个用例共用同一个宿主（<c>IClassFixture</c>），今天靠随机 container 名互不干扰，
-    /// 所以只删容器也算正确；但留在夹具库里的 Account / BackupConfig 行，以及重设成功时
-    /// <see cref="KeyringRecovery"/> 重写的哨兵与翻回的状态位，都是跨用例可见的残留——
-    /// 夹具一旦改成跨测试类共享，邻居用例那套「逐条试解」的待重设计数就会被这些行悄悄改写，
-    /// 且失败现场与真正的成因隔着一个测试类。故用完即还原。
+    /// Per-test cleanup. The three tests share one host (<c>IClassFixture</c>) and today stay out of each other's way through random container names,
+    /// so deleting only the container would technically be correct; but the Account / BackupConfig rows left in the fixture database, plus the canary
+    /// <see cref="KeyringRecovery"/> rewrites and the status bit it flips back on a successful reset, are residue visible to every other test —
+    /// the moment the fixture becomes shared across test classes, those rows quietly rewrite the neighbouring tests' per-record pending counts,
+    /// and the failure shows up one test class away from its actual cause. So restore everything as soon as we are done.
     /// </summary>
     private async Task CleanUpAsync(string container, int accountId, int configId, KeyringSnapshot before)
     {
@@ -136,7 +137,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
         await db.BackupConfigs.Where(c => c.Id == configId).ExecuteDeleteAsync();
         await db.Accounts.Where(a => a.Id == accountId).ExecuteDeleteAsync();
 
-        // 哨兵按内容还原（Id 交给库重新生成——判定只看「最小 Id 那一行的密文」，不看具体 Id）。
+        // Restore the canary by content (letting the database reassign Ids — the verdict looks only at the ciphertext of the lowest-Id row, never at the Id itself).
         await db.KeyringCanaries.ExecuteDeleteAsync();
         db.KeyringCanaries.AddRange(before.Canaries.Select(
             k => new KeyringCanary { Ciphertext = k.Ciphertext, CreatedAt = k.CreatedAt }));
@@ -145,8 +146,8 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
     }
 
     /// <summary>
-    /// 对密码：验证通过、新密文落库，且验证路径没有回填任何本地权威状态
-    /// （用的是纯读 ReadInfoWithETagAsync，不是会 seed 的 TrackedInfoStore.SeedFromCloudAsync）。
+    /// Right password: verification passes, the new ciphertext is persisted, and the verification path back-fills no local authoritative state
+    /// (it uses the read-only ReadInfoWithETagAsync, not the seeding TrackedInfoStore.SeedFromCloudAsync).
     /// </summary>
     [SkippableFact]
     public async Task Correct_Password_Verifies_And_Is_Persisted_Without_Seeding_Local_State()
@@ -174,7 +175,7 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
             var row = await db.BackupConfigs.AsNoTracking().FirstAsync(c => c.Id == config.Id);
             Assert.Equal(correctPassword, TestSecrets.Reveal(encryption, row.PasswordProtected!));
 
-            // 验证是纯读：不应该在本地权威状态里留下任何痕迹。
+            // Verification is read-only: it must leave no trace in the local authoritative state.
             Assert.Empty(await db.LocalBackupStates
                 .Where(s => s.AccountId == account.Id && s.Container == container).ToListAsync());
             Assert.Empty(await db.CachedVersionIndexes
@@ -187,8 +188,8 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
     }
 
     /// <summary>
-    /// 错密码：必须是「不落库」而不是「落库了错误值」。断言 400 且原密文原封不动，
-    /// 且同样不留下本地权威状态的痕迹。
+    /// Wrong password: the outcome must be "nothing persisted", not "a wrong value persisted". Assert a 400 with the stored ciphertext untouched,
+    /// and no trace left in the local authoritative state either.
     /// </summary>
     [SkippableFact]
     public async Task Wrong_Password_Is_Rejected_And_Leaves_Stored_Ciphertext_And_Local_State_Untouched()
@@ -228,10 +229,10 @@ public sealed class BackupPasswordResetTests(TestWebAppFactory factory) : IClass
     }
 
     /// <summary>
-    /// 回归 Finding 1：本地配置认为已加密（PasswordProtected 非空），但云端容器里放的其实是
-    /// *未加密*的信息文件。ReadInfoWithETagAsync 优先探测未加密 blob 名，会用 password: null
-    /// 读回成功——如果端点不核对返回内容确实来自加密对象，就会把提交的任意字符串当密码落库，
-    /// 而真密码从未被验证过。必须拒绝，且原密文原封不动。
+    /// Regression for Finding 1: the local config believes the backup is encrypted (PasswordProtected is non-empty), but what
+    /// actually sits in the cloud container is an *unencrypted* info file. ReadInfoWithETagAsync probes the unencrypted blob
+    /// name first and reads it back successfully with password: null — so unless the endpoint checks that what came back really
+    /// came from an encrypted object, it persists whatever string was submitted as the password, having never verified the real one. It must reject, leaving the stored ciphertext untouched.
     /// </summary>
     [SkippableFact]
     public async Task Plaintext_Info_Blob_In_Encrypted_Config_Container_Is_Rejected_Without_Using_Password()

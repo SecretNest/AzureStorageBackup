@@ -14,12 +14,12 @@ namespace AzureStorageBackup.Api.Tests;
 
 public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
-    // Azurite 默认账户密钥（devstoreaccount1），与 BackupOrchestratorTests 一致。
+    // Azurite's default account key (devstoreaccount1), same as in BackupOrchestratorTests.
     private const string AzuriteKey =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
-    // 格式合法（base64、同长度）但不是 Azurite 真实密钥——用于触发"验证失败"路径，
-    // 而不是"格式错误"路径。
+    // Well-formed (base64, same length) but not Azurite's real key — used to take the "verification failed" path
+    // rather than the "malformed input" path.
     private const string WrongButValidKey =
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
@@ -31,8 +31,8 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         catch { return false; }
     }
 
-    /// <summary>连通验证恒通过的桩：把「要连云」那一步跨过去，专注断言代理密码的清空语义
-    /// （真连云的两条用例在下面，各自打真实 Azurite）。</summary>
+    /// <summary>Stub whose connectivity check always passes: it steps over the "must reach the cloud" part so the test can focus on the clearing semantics of the proxy password
+    /// (the two tests that really do reach the cloud are below, each hitting a real Azurite).</summary>
     private sealed class AlwaysConnects : IBlobClientFactory
     {
         public BlobServiceClient CreateServiceClient(Account account) => throw new NotSupportedException();
@@ -46,7 +46,7 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            builder.ConfigureServices(configure); // 在 Program.cs 的注册之后执行，故能覆盖
+            builder.ConfigureServices(configure); // runs after Program.cs's registrations, so it can override them
         }
     }
 
@@ -82,10 +82,10 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
     }
 
     /// <summary>
-    /// 设计决策 5：新凭据必须先连云验证通过才落库。这里对真实 Azurite 发起验证，
-    /// 断言密文确实被替换，并且新密文用应用的加密服务能解出真实密钥——
-    /// 如果实现跳过验证直接写入，这条测试依然会通过（因为凭据本来就对），
-    /// 所以配合下面"验证失败"的用例一起才能证明验证真的挡在写库之前。
+    /// Design decision 5: new credentials must pass cloud verification before they are persisted. This verifies against a real Azurite,
+    /// asserting that the ciphertext really was replaced and that the new ciphertext decrypts back to the real key through the app's encryption service —
+    /// an implementation that skipped verification and wrote straight through would still pass this test (the credentials are correct to begin with),
+    /// so only together with the "verification fails" test below does it prove verification really stands in front of the write.
     /// </summary>
     [SkippableFact]
     [Trait("Category", "Integration")]
@@ -113,8 +113,8 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
     }
 
     /// <summary>
-    /// 验证失败必须是"不落库"，而不是"落库了错误值"。用一个格式合法但错误的密钥
-    /// 打真实 Azurite，断言 400 且原密文原封不动（仍能解出创建时的值）。
+    /// A failed verification must mean "nothing persisted", not "a wrong value persisted". Hit a real Azurite with a
+    /// well-formed but incorrect key and assert a 400 with the stored ciphertext untouched (still decrypting to the value it was created with).
     /// </summary>
     [SkippableFact]
     [Trait("Category", "Integration")]
@@ -142,11 +142,11 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
     }
 
     /// <summary>
-    /// 重设时代理密码留空 = **清空**（端点里 `string.IsNullOrEmpty(req.ProxyPassword) ? null : Encrypt(...)`），
-    /// 而 UseProxy 与 ProxyUsername 是从原账户搬过来的、不受影响。于是会留下「用代理 + 有用户名 + 无密码」
-    /// 这一组合——它必须是可用状态：解密咽喉处 RevealProxyPassword 对空密文返回 null（而不是抛
-    /// SecretUnavailableException），代理凭据退化成空密码而不是让整个账户从此连不上云。
-    /// 这条组合此前无人覆盖：现有代理用例走的是「压根没有用户名」那条分支。
+    /// Leaving the proxy password blank during a reset means **clear it** (the endpoint does `string.IsNullOrEmpty(req.ProxyPassword) ? null : Encrypt(...)`),
+    /// while UseProxy and ProxyUsername are copied over from the original account and are unaffected. That leaves the combination "proxy on + username + no password" —
+    /// and it must be a usable state: at the decryption choke point RevealProxyPassword returns null for empty ciphertext (instead of throwing
+    /// SecretUnavailableException), so the proxy credentials degrade to an empty password rather than cutting the whole account off from the cloud for good.
+    /// Nothing covered this combination before: the existing proxy tests take the "no username at all" branch.
     /// </summary>
     [Fact]
     public async Task Reset_With_Blank_Proxy_Password_Clears_It_And_Leaves_The_Proxied_Account_Usable()
@@ -183,11 +183,11 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         var row = await db.Accounts.AsNoTracking().FirstAsync(a => a.Id == created.Id);
 
         Assert.Equal("dGVzdGtleTI=", TestSecrets.Reveal(encryption, row.AccountKeyProtected));
-        Assert.True(string.IsNullOrEmpty(row.ProxyPasswordProtected)); // 清空，不是保留旧值
-        Assert.True(row.UseProxy);                                     // 代理设置本身没被动
+        Assert.True(string.IsNullOrEmpty(row.ProxyPasswordProtected)); // cleared, not kept at the old value
+        Assert.True(row.UseProxy);                                     // the proxy settings themselves were untouched
         Assert.Equal("u", row.ProxyUsername);
 
-        // 关键：清空后该账户仍能构出 HTTP 管道——空密码，而不是一路抛到 409 keyring_lost。
+        // The crux: after clearing, the account can still build its HTTP pipeline — with an empty password, instead of throwing all the way out to 409 keyring_lost.
         var handler = new BlobClientFactory(new SecretReader(encryption)).CreateProxyHandler(row);
         var proxy = Assert.IsType<System.Net.WebProxy>(handler.Proxy);
         var cred = Assert.IsType<NetworkCredential>(proxy.Credentials);

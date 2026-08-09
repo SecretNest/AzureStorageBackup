@@ -63,9 +63,9 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     }
 
     /// <summary>
-    /// F5：/test-connection 缺了 POST / 的空 key 校验。空 key → AccountKeyProtected = ""，
-    /// 到解密咽喉处抛 SecretUnavailableException，被深度防御映射成 409 keyring_lost——
-    /// 用户看到的是「密钥环解不开」，而真实原因只是没填 key。必须是 400 + 明确文案。
+    /// F5: /test-connection was missing the empty-key check that POST / has. An empty key → AccountKeyProtected = "",
+    /// which throws SecretUnavailableException at the decryption choke point and gets mapped by defence in depth to 409 keyring_lost —
+    /// the user is told "the keyring cannot decrypt" when the real reason is simply that no key was entered. It must be a 400 with explicit wording.
     /// </summary>
     [Fact]
     public async Task TestConnection_Rejects_Empty_Key_Instead_Of_Blaming_The_Keyring()
@@ -103,10 +103,10 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     }
 
     /// <summary>
-    /// 还被备份占用的账户不能删。库里 <c>BackupConfig.AccountId</c> 没有外键约束，删了不会报错，
-    /// 只会留下一批指向空号的孤儿配置——而它们要到下次真跑起来才炸（<c>BackupRunner</c>/
-    /// <c>CheckRunner</c>/<c>RestoreRunner</c> 三处的 "Account {id} not found"）。定时任务的话
-    /// 就是半夜失败、第二天才看见；还原那条更糟，等到真要恢复数据时才发现配置是坏的。
+    /// An account still used by a backup must not be deletable. <c>BackupConfig.AccountId</c> has no foreign key constraint in the
+    /// database, so deleting raises no error; it just leaves a pile of orphan configs pointing at nothing — and they only blow up
+    /// on the next real run (the "Account {id} not found" in <c>BackupRunner</c>/<c>CheckRunner</c>/<c>RestoreRunner</c>). For a
+    /// scheduled task that means failing at 3am and noticing the next day; restore is worse — you find out the config is broken exactly when you need the data back.
     /// </summary>
     [Fact]
     public async Task Delete_Is_Refused_While_A_Backup_Still_Uses_The_Account()
@@ -131,30 +131,30 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         var del = await _client.DeleteAsync($"/api/accounts/{created!.Id}");
         Assert.Equal(HttpStatusCode.Conflict, del.StatusCode);
 
-        // 占用者的名字要说出来——只说"删不了"，用户还得自己一个个翻备份去找是谁占着。
+        // Name the backups holding it — a bare "cannot delete" leaves the user trawling through backups one by one to find the culprit.
         var body = await del.Content.ReadAsStringAsync();
         Assert.Contains("Documents", body);
         Assert.Contains("Photos", body);
 
-        // 而且真的没删。
+        // And it really was not deleted.
         var get = await _client.GetAsync($"/api/accounts/{created.Id}");
         Assert.Equal(HttpStatusCode.OK, get.StatusCode);
     }
 
-    /// <summary>占用信息要随账户一起下发，界面才能在渲染那一刻就把删除按钮禁掉并说明原因。</summary>
+    /// <summary>Usage info must ship with the account, so the UI can disable the delete button and explain why at the moment it renders.</summary>
     [Fact]
     public async Task Get_Reports_Which_Backups_Use_The_Account()
     {
         var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("usage-report"));
         var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
 
-        // 刚建出来的账户没人用。
+        // A freshly created account is used by nobody.
         Assert.Empty(created!.UsedByBackups);
 
         using (var scope = factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            // 故意按倒序插入：响应里必须是排好序的，否则同一个页面每刷新一次悬浮提示就换个样。
+            // Inserted in reverse order on purpose: the response must come back sorted, otherwise the tooltip on the very same page reshuffles on every refresh.
             db.BackupConfigs.Add(new BackupConfig
             {
                 AccountId = created.Id, ContainerName = "z", Name = "Zeta", LocalRoot = "/data/z",
@@ -170,15 +170,15 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         var fetched = await get.Content.ReadFromJsonAsync<AccountResponse>();
         Assert.Equal(["Alpha", "Zeta"], fetched!.UsedByBackups);
 
-        // 列表页走的是另一条（批量）路径，同样要带上。
+        // The list page goes through the other (batched) path and must carry it too.
         var list = await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts");
         Assert.Equal(["Alpha", "Zeta"], list!.Single(a => a.Id == created.Id).UsedByBackups);
     }
 
     /// <summary>
-    /// 编辑态的连通测试：Key 框留空表示"沿用现有凭据"，此时不能像不带 id 的那个端点一样
-    /// 甩一个 400 回来——"改了 endpoint 或代理，想先测一下现有 key 还连不连得上"正是编辑时
-    /// 最该能做的事。
+    /// Connectivity test in edit mode: a blank Key box means "reuse the existing credentials", so this must not throw
+    /// back a 400 the way the id-less endpoint does — "I changed the endpoint or the proxy and want to check the
+    /// existing key still connects" is exactly what you most need to be able to do while editing.
     /// </summary>
     [Fact]
     public async Task TestConnection_For_An_Existing_Account_Accepts_A_Blank_Key()
@@ -189,8 +189,8 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         var res = await _client.PostAsJsonAsync(
             $"/api/accounts/{created!.Id}/test-connection", SampleRequest("test-conn-by-id") with { AccountKey = "" });
 
-        // 连不连得上取决于这个假 endpoint（连不上是必然的），但**不能**是"你没填 key"那种拒绝：
-        // 走到这一步就说明库里的密文被正确地搬了过来。
+        // Whether it connects depends on this fake endpoint (it certainly will not), but it must **not** be the
+        // "you did not enter a key" kind of rejection: getting this far proves the stored ciphertext was copied across correctly.
         Assert.Equal(HttpStatusCode.OK, res.StatusCode);
         var body = await res.Content.ReadAsStringAsync();
         Assert.DoesNotContain("AccountKey is required.", body);
@@ -210,7 +210,7 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("before"));
         var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
 
-        var update = SampleRequest("after") with { AccountKey = null }; // 不改 key
+        var update = SampleRequest("after") with { AccountKey = null }; // key unchanged
         var put = await _client.PutAsJsonAsync($"/api/accounts/{created!.Id}", update);
         Assert.Equal(HttpStatusCode.OK, put.StatusCode);
 
@@ -220,9 +220,9 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     }
 
     /// <summary>
-    /// 密钥环丢失时 PUT 一个不改 AccountKey 的账户，会走"保留原密文"分支——
-    /// 而那份密文恰恰是密钥环丢失时解不开的。响应必须如实标 SecretsUnavailable=true，
-    /// 否则 UI 会看起来一切正常，而 /api/system/keyring 却同时把它计入待处理，自相矛盾。
+    /// PUTting an account without changing AccountKey while the keyring is lost takes the "keep the old ciphertext" branch —
+    /// and that ciphertext is precisely the one a lost keyring cannot decrypt. The response must honestly flag SecretsUnavailable=true,
+    /// otherwise the UI looks perfectly fine while /api/system/keyring simultaneously counts it as pending, contradicting itself.
     /// </summary>
     [Fact]
     public async Task Put_While_Keyring_Lost_Reports_SecretsUnavailable_True()
@@ -230,8 +230,8 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         var post = await _client.PostAsJsonAsync("/api/accounts", SampleRequest("keyring-lost-put"));
         var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
 
-        // /keys 丢失：库里的密文换成另一套密钥环的产物。标记按逐条实际可解性判定（设计 §3.3），
-        // 只翻转 IKeyringHealth 而不动密文，是「密钥环还在、状态被误设」而非真的丢失。
+        // /keys lost: replace the stored ciphertext with the output of a different keyring. The flag is decided by
+        // per-record decryptability (design §3.3); flipping IKeyringHealth alone without touching the ciphertext is "keyring intact, status misconfigured" rather than a real loss.
         using (var scope = factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -242,7 +242,7 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
         Keyring.Set(KeyringStatus.Lost);
         try
         {
-            var update = SampleRequest("keyring-lost-put-renamed") with { AccountKey = null }; // 留空，触发保留原密文分支
+            var update = SampleRequest("keyring-lost-put-renamed") with { AccountKey = null }; // blank, to take the keep-the-old-ciphertext branch
             var put = await _client.PutAsJsonAsync($"/api/accounts/{created!.Id}", update);
             Assert.Equal(HttpStatusCode.OK, put.StatusCode);
 

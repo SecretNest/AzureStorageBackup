@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>账户响应体。刻意不含 AccountKey/ProxyPassword，避免敏感信息外泄。</summary>
+/// <summary>Account response body. Deliberately carries no AccountKey/ProxyPassword, so nothing sensitive leaks out.</summary>
 public record AccountResponse(
     int Id,
     string Name,
@@ -16,17 +16,17 @@ public record AccountResponse(
     string? ProxyUsername,
     DateTimeOffset CreatedAt,
     bool SecretsUnavailable,
-    /// <summary>占用这个账户的备份名（按名字排序）。非空即不可删——界面据此禁用删除并说明原因。</summary>
+    /// <summary>Names of the backups using this account (sorted by name). Non-empty means it cannot be deleted — the UI disables delete and explains why.</summary>
     IReadOnlyList<string> UsedByBackups)
 {
     /// <summary>
-    /// <paramref name="secretsUnavailable"/> 必须按该账户密文的实际可解性传入
-    /// （见 <see cref="SecretAvailability"/>），不能直接传全局 Lost 状态——恢复中间态里
-    /// 已重设成功的账户必须停止显示「待重设」。
+    /// <paramref name="secretsUnavailable"/> must be passed according to whether this account's ciphertext actually decrypts
+    /// (see <see cref="SecretAvailability"/>), never as the global Lost status — in the middle of a recovery, an account that
+    /// has already been reset must stop showing as "needs re-entry".
     /// </summary>
     /// <param name="usedByBackups">
-    /// 占用这个账户的备份名。默认空＝没有占用；调用方拿不到占用信息时**不要**用默认值蒙混，
-    /// 那会让界面把一个不可删的账户显示成可删的。
+    /// Names of the backups using this account. Empty by default = nothing is using it; if the caller could not obtain the usage
+    /// info, do **not** paper over it with the default, because that makes the UI show an undeletable account as deletable.
     /// </param>
     public static AccountResponse From(
         Account a, bool secretsUnavailable = false, IReadOnlyList<string>? usedByBackups = null) => new(
@@ -35,7 +35,7 @@ public record AccountResponse(
         secretsUnavailable, usedByBackups ?? []);
 }
 
-/// <summary>创建/更新账户请求体。更新时 AccountKey/ProxyPassword 为空表示保留原值。</summary>
+/// <summary>Create/update account request body. On update, a blank AccountKey/ProxyPassword means keep the existing value.</summary>
 public record AccountRequest(
     string Name,
     string? Description,
@@ -49,7 +49,7 @@ public record AccountRequest(
     string? ProxyUsername,
     string? ProxyPassword)
 {
-    /// <summary>请求体里的凭据是明文；落到实体上时立即加密（设计 §3.1：实体只持密文）。空值保持空值，不加密。</summary>
+    /// <summary>Credentials arrive in the request body as plaintext and are encrypted the moment they land on the entity (design §3.1: entities only ever hold ciphertext). Empty stays empty and is not encrypted.</summary>
     public Account ToAccount(IEncryptionService encryption) => new()
     {
         Name = Name,
@@ -66,5 +66,5 @@ public record AccountRequest(
     };
 }
 
-/// <summary>凭据重设请求。AccountKey 必填；ProxyPassword 为空表示清空代理密码。</summary>
+/// <summary>Credential reset request. AccountKey is required; a blank ProxyPassword means clear the proxy password.</summary>
 public record ResetAccountSecretsRequest(string AccountKey, string? ProxyPassword);

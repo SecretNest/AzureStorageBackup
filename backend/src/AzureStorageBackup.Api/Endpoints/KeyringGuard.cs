@@ -2,12 +2,12 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Endpoints;
 
-/// <summary>409 的响应体。闸门与深度防御的映射共用同一形状，前端只需认一个 code。</summary>
+/// <summary>Response body for the 409. The gate and the defence-in-depth mapping share one shape, so the frontend only has to recognize a single code.</summary>
 public sealed record KeyringLostError(string error, string code);
 
 /// <summary>
-/// 恢复模式闸门（设计 §3.3）：密钥环丢失时，所有需要凭据的动作在入口即 409 失败，
-/// 不进入编排层——避免用解不开的密码发起云操作。
+/// Recovery-mode gate (design §3.3): while the keyring is lost, every action that needs credentials fails with a 409 at the entrance
+/// and never reaches the orchestration layer — so no cloud operation is ever started with a password that cannot be decrypted.
 /// </summary>
 public static class KeyringGuard
 {
@@ -22,14 +22,14 @@ public static class KeyringGuard
 }
 
 /// <summary>
-/// 深度防御（设计 §3.1）：闸门被新代码路径绕过、或密钥环在进程运行期间被换掉（canary 尚未
-/// 重新判定）时，咽喉处的 <see cref="SecretUnavailableException"/> 会一路冒泡。若无人接管，
-/// 客户端拿到的是裸 500，前端无从与「密钥环丢失」关联。这里统一映射成 409 + keyring_lost，
-/// 与 <see cref="KeyringGuard"/> 同形。
+/// Defence in depth (design §3.1): when a new code path bypasses the gate, or the keyring is swapped out while the process
+/// is running (the canary not yet re-evaluated), the <see cref="SecretUnavailableException"/> from the choke point bubbles all
+/// the way up. With nobody catching it the client gets a bare 500, which the frontend has no way to connect to "the keyring was
+/// lost". Here it is mapped uniformly to 409 + keyring_lost, the same shape as <see cref="KeyringGuard"/>.
 ///
-/// 刻意不用 UseExceptionHandler/IExceptionHandler：那条路要么注册兜底 handler、要么注册
-/// ProblemDetails，两者都会把**全部**未处理异常一并接管，改变本次修复范围之外的失败语义
-/// （包括让集成测试里本应抛出的异常悄悄变成 500 响应）。这里只认这一种异常，其余原样上抛。
+/// Deliberately not UseExceptionHandler/IExceptionHandler: that route means registering either a catch-all handler or
+/// ProblemDetails, and both take over **every** unhandled exception, changing failure semantics well outside the scope of this fix
+/// (including quietly turning exceptions that integration tests expect to be thrown into 500 responses). This recognizes only this one exception and rethrows the rest untouched.
 /// </summary>
 public static class SecretUnavailableMapping
 {
@@ -42,7 +42,7 @@ public static class SecretUnavailableMapping
             }
             catch (SecretUnavailableException)
             {
-                // 响应已经开始（例如流式下载中途）时改不了状态码，只能让异常继续上抛。
+                // Once the response has started (mid stream download, say) the status code cannot be changed, so let the exception keep bubbling.
                 if (context.Response.HasStarted)
                     throw;
 

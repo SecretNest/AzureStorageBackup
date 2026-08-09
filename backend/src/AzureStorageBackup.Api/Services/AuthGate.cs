@@ -4,9 +4,9 @@ using System.Text;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 预置密码判定（设计 §2、§4.3）。密码来自环境变量明文，**不经 Data Protection**——
-/// 因此密钥环丢失时仍能登录，进而走密钥环恢复流程（设计 §5）。
-/// 单例：构造时读一次配置，之后不再变（改密码需改环境变量并重启）。
+/// Preset-password check (design §2, §4.3). The password comes from an environment variable in plaintext and **never goes
+/// through Data Protection** — which is why you can still log in, and therefore run the keyring recovery flow, while the keyring is lost (design §5).
+/// Singleton: the configuration is read once at construction and never changes afterwards (changing the password means changing the environment variable and restarting).
 /// </summary>
 public sealed class AuthGate
 {
@@ -18,12 +18,12 @@ public sealed class AuthGate
         _expected = string.IsNullOrEmpty(password) ? null : Encoding.UTF8.GetBytes(password);
     }
 
-    /// <summary>是否启用认证。未配置密码时为 false，全部放行。</summary>
+    /// <summary>Whether authentication is enabled. False when no password is configured, in which case everything is let through.</summary>
     public bool Required => _expected is not null;
 
     /// <summary>
-    /// 校验密码。未启用认证时恒为 true。
-    /// 用恒定时间比较防时序侧信道；长度不同直接失败（长度差异本就无法隐藏）。
+    /// Verify the password. Always true when authentication is not enabled.
+    /// Uses a constant-time comparison against timing side channels; a different length fails outright (a length difference cannot be hidden anyway).
     /// </summary>
     public bool Verify(string? candidate)
     {

@@ -9,13 +9,13 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 全分支复审 Finding 1：恢复流程的**中间态**。整套用例集此前只覆盖两端
-/// （全丢 / 全恢复），恰好跨过了唯一会死锁的那一步。
+/// All-branch review Finding 1: the **intermediate state** of the recovery flow. The whole suite previously covered only the
+/// two ends (everything lost / everything recovered), stepping right over the one step that can deadlock.
 ///
-/// 规范安装（≥1 账户 + ≥1 加密备份配置）下 /keys 丢失后：账户全部重设成功、备份密码仍是旧密文。
-/// 此时全局状态必须仍是 Lost（备份密码没修好），而 accountsPending 必须已归零、
-/// 账户行不再标记 secretsUnavailable——否则前端的顺序依赖（账户未清零 → 禁用备份密码
-/// 「Re-enter」按钮）会把恢复流程彻底锁死：按钮永不可用 → 密码永不能重设 → 状态永不翻转。
+/// A standard install (≥1 account + ≥1 encrypted backup config) after /keys is lost: every account has been reset successfully, the backup password is still old ciphertext.
+/// At that point the global status must still be Lost (the backup password is not fixed), while accountsPending must already be zero and
+/// account rows must no longer be flagged secretsUnavailable — otherwise the frontend's ordering dependency (accounts not yet at zero → the backup password
+/// "Re-enter" button stays disabled) locks the recovery flow solid: button never enabled → password never reset → status never flips.
 /// </summary>
 public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
@@ -66,7 +66,7 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
                 SampleConfig(account.Id, "recovery-flow-encrypted", "s3cret")))
             .Content.ReadFromJsonAsync<BackupConfigResponse>())!;
 
-        // /keys 丢失：账户密钥与备份密码都变成当前密钥环解不开的旧密文。
+        // /keys lost: both the account key and the backup password become old ciphertext the current keyring cannot decrypt.
         using (var scope = factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -84,7 +84,7 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
             Assert.Equal(1, before.AccountsPending);
             Assert.Equal(1, before.BackupConfigsPending);
 
-            // 账户重设成功（等价于 reset-secrets 验证通过后落库 + 尝试收尾），备份密码还没轮到。
+            // The account reset succeeds (equivalent to reset-secrets persisting after verification, then trying to finish recovery); the backup password's turn has not come yet.
             using (var scope = factory.Services.CreateScope())
             {
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -92,14 +92,14 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
                 (await db.Accounts.FirstAsync(a => a.Id == account.Id)).AccountKeyProtected = encryption.Encrypt("dGVzdGtleQ==");
                 await db.SaveChangesAsync();
 
-                // 备份密码仍解不开 → 收尾判定必须拒绝翻转。
+                // The backup password still will not decrypt → the completion check must refuse to flip.
                 Assert.False(await scope.ServiceProvider.GetRequiredService<KeyringRecovery>().TryCompleteAsync());
             }
 
             var after = await (await _client.GetAsync("/api/system/keyring"))
                 .Content.ReadFromJsonAsync<KeyringStatusResponse>();
-            Assert.Equal("Lost", after!.Status);          // 备份密码还没修好，全局状态不许翻转
-            Assert.Equal(0, after.AccountsPending);       // 但账户已经全部修好，计数必须归零
+            Assert.Equal("Lost", after!.Status);          // the backup password is not fixed yet, so the global status must not flip
+            Assert.Equal(0, after.AccountsPending);       // but every account is fixed, so the count must be zero
             Assert.Equal(1, after.BackupConfigsPending);
 
             var accounts = await (await _client.GetAsync("/api/accounts"))
@@ -117,10 +117,10 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
     }
 
     /// <summary>
-    /// 补审 Finding 1：TryCompleteAsync 此前只挂在 reset-secrets 上。用户放弃恢复、直接把
-    /// 唯一那条解不开的账户删掉时，若删除端点不收尾，进程会卡在「Lost 且待重设数为 0」——
-    /// KeyringProbe 的重启期兜底原本正是为消灭这个状态而写，运行期却仍会被删除路径撞见，
-    /// 必须等到下次重启才翻回 Healthy。删除必须立刻触发收尾。
+    /// Follow-up review Finding 1: TryCompleteAsync used to hang off reset-secrets only. When the user gives up on recovery and simply
+    /// deletes the one account that will not decrypt, a delete endpoint that does not finish recovery leaves the process stuck at "Lost with 0 pending" —
+    /// the very state KeyringProbe's restart-time fallback was written to eliminate, yet the delete path still walks into it at runtime,
+    /// with no way back to Healthy until the next restart. Deleting must trigger completion immediately.
     /// </summary>
     [Fact]
     public async Task Deleting_The_Last_Stale_Account_Releases_Lost_Without_Restart()
@@ -157,7 +157,7 @@ public class KeyringRecoveryFlowTests(TestWebAppFactory factory) : IClassFixture
         }
     }
 
-    /// <summary>同上，另一端点：本地删除备份配置（不删云端 container，决策 6 的唯一出口）。</summary>
+    /// <summary>Same as above, other endpoint: deleting a backup config locally (leaving the cloud container alone — decision 6's only way out).</summary>
     [Fact]
     public async Task Deleting_The_Last_Stale_Backup_Config_Releases_Lost_Without_Restart()
     {

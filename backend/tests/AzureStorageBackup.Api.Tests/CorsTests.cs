@@ -4,8 +4,8 @@ using Microsoft.AspNetCore.Hosting;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 生产环境不该默认放行任何跨域来源——AllowCredentials() 已开启，
-/// 放行 dev-server 地址就是让攻击者的页面能带着活会话读接口（复审 Finding 3）。
+/// Production must not allow any cross-origin source by default — AllowCredentials() is on, so allowing the
+/// dev-server address means an attacker's page can read the API carrying a live session (review Finding 3).
 /// </summary>
 public class CorsTests
 {
@@ -32,9 +32,9 @@ public class CorsTests
     }
 
     /// <summary>
-    /// 通配来源 + AllowCredentials() 是 CORS 协议禁止的组合，策略惰性构建，
-    /// 于是启动不报错、第一个带 Origin 的跨域请求直接 500。
-    /// "*" 在本轮加 AllowCredentials() 之前是合法配置，绝不能因此把老部署炸掉。
+    /// A wildcard origin plus AllowCredentials() is a combination the CORS spec forbids, and the policy is built lazily,
+    /// so startup succeeds and the first cross-origin request carrying an Origin blows up with a 500.
+    /// "*" was a legal configuration before AllowCredentials() was added this round, and existing deployments must not be broken because of it.
     /// </summary>
     private sealed class WildcardOriginWebAppFactory : TestWebAppFactory
     {
@@ -46,7 +46,7 @@ public class CorsTests
         }
     }
 
-    /// <summary>"*" 与显式来源并存：修复不能把整张白名单一起丢掉。</summary>
+    /// <summary>"*" alongside explicit origins: the fix must not throw away the whole allowlist with it.</summary>
     private sealed class WildcardPlusExplicitOriginWebAppFactory : TestWebAppFactory
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -69,7 +69,7 @@ public class CorsTests
         var response = await client.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        // 丢弃通配后该来源不再被放行——但请求本身照常完成，而不是 500
+        // With the wildcard dropped this origin is no longer allowed — but the request itself completes as usual instead of 500ing
         Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
     }
 

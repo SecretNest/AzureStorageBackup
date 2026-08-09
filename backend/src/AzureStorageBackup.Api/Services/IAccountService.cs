@@ -2,7 +2,7 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>Azure Storage Account 的增删改查。敏感字段加解密对调用方透明。</summary>
+/// <summary>CRUD for Azure Storage Accounts. Encryption and decryption of the sensitive fields is transparent to callers.</summary>
 public interface IAccountService
 {
     Task<IReadOnlyList<Account>> ListAsync(CancellationToken ct = default);
@@ -11,21 +11,21 @@ public interface IAccountService
 
     Task<Account> CreateAsync(Account account, CancellationToken ct = default);
 
-    /// <summary>更新账户；不存在返回 null。</summary>
+    /// <summary>Update an account; returns null if it does not exist.</summary>
     Task<Account?> UpdateAsync(int id, Account update, CancellationToken ct = default);
 
-    /// <summary>删除账户；不存在返回 false。</summary>
+    /// <summary>Delete an account; returns false if it does not exist.</summary>
     Task<bool> DeleteAsync(int id, CancellationToken ct = default);
 
     /// <summary>
-    /// 每个账户被哪些备份配置占用（账户 id → 备份名，按名字排序）。**只**含真有占用的账户。
+    /// Which backup configs use each account (account id → backup names, sorted by name). Contains **only** accounts that really are in use.
     /// <para>
-    /// 库里 <c>BackupConfig.AccountId</c> 只是个 int——既没有导航属性，也没有外键约束，所以
-    /// 删账户在数据库那一层是拦不住的，删完只会留下一批 AccountId 指向空号的孤儿配置。它们
-    /// 一直到下次真跑起来才炸（<c>BackupRunner</c>/<c>CheckRunner</c>/<c>RestoreRunner</c> 那三处
-    /// <c>?? throw new InvalidOperationException($"Account {id} not found.")</c>），定时任务的话
-    /// 就是半夜失败、第二天才看见，还原更是等到真要恢复数据时才发现配置是坏的。
-    /// 这个查询就是那道拦截的依据。
+    /// <c>BackupConfig.AccountId</c> is just an int in the database — no navigation property, no foreign key constraint, so
+    /// deleting an account cannot be stopped at the database layer; all it leaves behind is a pile of orphan configs whose
+    /// AccountId points at nothing. They only blow up on the next real run (those three
+    /// <c>?? throw new InvalidOperationException($"Account {id} not found.")</c> sites in <c>BackupRunner</c>/<c>CheckRunner</c>/<c>RestoreRunner</c>);
+    /// for a scheduled task that means failing at 3am and noticing the next day, and restore is worse still — you find out the config is broken exactly when you need the data back.
+    /// This query is what that refusal is based on.
     /// </para>
     /// </summary>
     Task<IReadOnlyDictionary<int, IReadOnlyList<string>>> GetBackupUsageAsync(CancellationToken ct = default);

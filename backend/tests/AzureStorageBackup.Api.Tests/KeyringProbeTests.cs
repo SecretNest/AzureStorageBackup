@@ -20,7 +20,7 @@ public class KeyringProbeTests : IDisposable
         _connection.Open();
         var options = new DbContextOptionsBuilder<AppDbContext>()
             .UseSqlite(_connection)
-            // 记录生成的 SQL，供 Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql 断言用。
+            // Capture the generated SQL for Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql to assert on.
             .LogTo(_sqlLog.Add, LogLevel.Information)
             .Options;
         _db = new AppDbContext(options);
@@ -64,21 +64,22 @@ public class KeyringProbeTests : IDisposable
     {
         var old = NewKeyring();
         await new KeyringProbe(_db, old).EvaluateAsync();
-        // 库里必须还留着解不开的密文——那才是「有东西要重设」的真实丢失场景。
+        // The database must still hold undecryptable ciphertext — that is the real loss scenario, the one where something actually needs re-entering.
         _db.Accounts.Add(AddAccount(old, 1, "prod"));
         await _db.SaveChangesAsync();
         _db.ChangeTracker.Clear();
 
-        // 新密钥环 = /keys 丢失后重新生成
+        // A new keyring = /keys was lost and regenerated
         Assert.Equal(KeyringStatus.Lost, await new KeyringProbe(_db, NewKeyring()).EvaluateAsync());
     }
 
     /// <summary>
-    /// 全分支复审 Finding 3：哨兵陈旧、但库里已经没有任何解不开的密文（用户放弃恢复、
-    /// 把账户与加密备份配置删光）。此前 EvaluateAsync 只在哨兵**缺失**时才重写它，于是
-    /// 陈旧哨兵把进程永久钉在 Lost：/api/health/ready 恒 503、调度器全跳过、一切动作 409，
-    /// 而横幅只写「0 credentials need to be re-entered」——没有任何出口。
-    /// 必须重建哨兵并回到 Healthy。
+    /// All-branch review Finding 3: the canary is stale, but the database no longer holds any undecryptable ciphertext
+    /// (the user gave up on recovery and deleted every account and every encrypted backup config). EvaluateAsync used
+    /// to rewrite the canary only when it was **missing**, so a stale canary pinned the process in Lost forever:
+    /// /api/health/ready stuck at 503, the scheduler skipping everything, every action 409, while the banner said only
+    /// "0 credentials need to be re-entered" — with no way out.
+    /// It must rebuild the canary and go back to Healthy.
     /// </summary>
     [Fact]
     public async Task Stale_Canary_With_No_Remaining_Secrets_Rebuilds_Canary_And_Is_Healthy()
@@ -87,7 +88,7 @@ public class KeyringProbeTests : IDisposable
         _db.ChangeTracker.Clear();
         var stale = await _db.KeyringCanaries.AsNoTracking().SingleAsync();
 
-        var current = NewKeyring(); // /keys 丢失后重新生成的密钥环
+        var current = NewKeyring(); // the keyring regenerated after /keys was lost
         Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, current).EvaluateAsync());
 
         var rebuilt = await _db.KeyringCanaries.AsNoTracking().SingleAsync();
@@ -96,8 +97,8 @@ public class KeyringProbeTests : IDisposable
         Assert.Equal(KeyringProbe.CanaryPlaintext, plain);
     }
 
-    /// <summary>陈旧哨兵 + 仍有解不开的备份密码（账户已删光）：仍须判 Lost，否则
-    /// 上面那条放行分支会把「还有东西要重设」的真实丢失也一起放过去。</summary>
+    /// <summary>Stale canary + a backup password that still will not decrypt (all accounts deleted): must still be Lost, otherwise
+    /// the pass-through branch above would wave through a real loss where something genuinely needs re-entering.</summary>
     [Fact]
     public async Task Stale_Canary_With_A_Remaining_Backup_Password_Is_Still_Lost()
     {
@@ -140,21 +141,21 @@ public class KeyringProbeTests : IDisposable
     public async Task Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql()
     {
         var good = NewKeyring();
-        // Id 2 用另一套密钥环写入；判定必须只看 Id 最小的那条（Id 1），故为 Healthy
+        // Id 2 is written with a different keyring; the verdict must look only at the lowest Id (Id 1), hence Healthy
         _db.Accounts.Add(AddAccount(good, 1, "first"));
         _db.Accounts.Add(AddAccount(NewKeyring(), 2, "second"));
         await _db.SaveChangesAsync();
         _db.ChangeTracker.Clear();
-        // 只关心探测查询本身产生的 SQL，清掉建表/插入产生的噪音。
+        // Only the SQL from the probe query itself matters; clear the noise from table creation and inserts.
         _sqlLog.Clear();
 
         Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, good).EvaluateAsync());
 
-        // SQLite 的 INTEGER PRIMARY KEY 就是 rowid，无 ORDER BY 的全表扫描也会按 rowid(=Id)
-        // 升序返回结果——仅靠上面的 Healthy 断言无法区分"探测是否显式排序"（设计 §决策4
-        // 要求确定性）：即使把 KeyringProbe.cs 里的 OrderBy 全删掉，这条断言也会照样通过。
-        // 因此直接断言生成的 SQL 带 ORDER BY：删掉对应的 OrderBy 会让这条断言失败，
-        // 而不会被 SQLite 的物理存储顺序悄悄掩盖。
+        // SQLite's INTEGER PRIMARY KEY is the rowid, so even a full scan without ORDER BY returns rows in ascending
+        // rowid(=Id) order — the Healthy assertion above alone cannot tell whether "the probe sorts explicitly"
+        // (design §decision 4 demands determinism): strip every OrderBy out of KeyringProbe.cs and it still passes.
+        // So assert directly that the generated SQL carries ORDER BY: removing the matching OrderBy then fails this
+        // assertion instead of being quietly masked by SQLite's physical storage order.
         var accountsQuery = Assert.Single(_sqlLog, s => s.Contains("FROM \"Accounts\""));
         Assert.Contains("ORDER BY", accountsQuery);
     }
@@ -174,9 +175,9 @@ public class KeyringProbeTests : IDisposable
     }
 
     /// <summary>
-    /// 回退分支的另一侧：老库、无账户、只有一个加密备份配置，且密文**解得开**。
-    /// 只覆盖 Lost 那侧的话，一个恒判 Lost 的回退实现也照样通过——而那会让「只用备份配置、
-    /// 不建账户」的老库升级后开机即锁死。必须 Healthy 且补写哨兵。
+    /// The other side of the fallback branch: an old database, no accounts, a single encrypted backup config, and its ciphertext **does** decrypt.
+    /// Covering only the Lost side would let a fallback implementation that always returns Lost pass too — and that would
+    /// lock up at first boot after the upgrade every old database that used backup configs without ever creating an account. Must be Healthy, and must backfill the canary.
     /// </summary>
     [Fact]
     public async Task Falls_Back_To_Backup_Config_And_Is_Healthy_When_It_Decrypts()
@@ -195,15 +196,15 @@ public class KeyringProbeTests : IDisposable
     }
 
     /// <summary>
-    /// 与 <see cref="Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql"/> 同一理由（设计 §决策4 的确定性），
-    /// 补上另外两条探测查询。SQLite 的 INTEGER PRIMARY KEY 就是 rowid，无 ORDER BY 也会碰巧按 Id 升序，
-    /// 故只能直接断言生成的 SQL——否则删掉 OrderBy 不会被任何断言发现。
+    /// Same reasoning as <see cref="Probe_Query_For_Account_Is_Ordered_By_Id_In_Sql"/> (the determinism of design §decision 4),
+    /// covering the other two probe queries. SQLite's INTEGER PRIMARY KEY is the rowid, so even without ORDER BY the rows happen to come back in ascending Id order,
+    /// which leaves asserting on the generated SQL as the only option — otherwise removing an OrderBy would trip no assertion at all.
     /// </summary>
     [Fact]
     public async Task Canary_Query_Is_Ordered_By_Id_In_Sql()
     {
         var good = NewKeyring();
-        // Id 2 是另一套密钥环的哨兵；判定必须只看 Id 最小的那条（Id 1），故为 Healthy。
+        // Id 2 is a canary from a different keyring; the verdict must look only at the lowest Id (Id 1), hence Healthy.
         _db.KeyringCanaries.Add(new KeyringCanary
         { Id = 1, Ciphertext = good.Encrypt(KeyringProbe.CanaryPlaintext), CreatedAt = DateTimeOffset.UtcNow });
         _db.KeyringCanaries.Add(new KeyringCanary
@@ -212,7 +213,7 @@ public class KeyringProbeTests : IDisposable
         _db.ChangeTracker.Clear();
         _sqlLog.Clear();
 
-        // 哨兵解得开 → 直接 Healthy 返回，不会再走 WriteCanaryAsync（那会多产生一条无序查询）。
+        // The canary decrypts → return Healthy immediately, never reaching WriteCanaryAsync (which would emit one more unordered query).
         Assert.Equal(KeyringStatus.Healthy, await new KeyringProbe(_db, good).EvaluateAsync());
 
         var canaryQuery = Assert.Single(_sqlLog, s => s.Contains("FROM \"KeyringCanaries\""));
@@ -222,8 +223,8 @@ public class KeyringProbeTests : IDisposable
     [Fact]
     public async Task Backup_Config_Fallback_Query_Is_Ordered_By_Id_In_Sql()
     {
-        // 无账户 → 走备份配置回退。Id 1 用另一套密钥环，Id 2 用当前的：
-        // 只有确实取 Id 最小的那条，结果才是 Lost。
+        // No accounts → take the backup-config fallback. Id 1 uses a different keyring, Id 2 the current one:
+        // the result is Lost only if the lowest Id really is the one picked.
         var current = NewKeyring();
         _db.BackupConfigs.Add(new BackupConfig
         {

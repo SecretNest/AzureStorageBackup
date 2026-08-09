@@ -25,7 +25,7 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
         var body = await res.Content.ReadFromJsonAsync<KeyringStatusResponse>();
         Assert.Equal("Healthy", body!.Status);
         Assert.Equal(0, body.AccountsPending);
-        // 两个计数都必须是 0——只断言其一，备份侧的计数写错也照样通过。
+        // Both counts must be 0 — assert only one and a bug in the backup-side count still passes.
         Assert.Equal(0, body.BackupConfigsPending);
     }
 
@@ -62,11 +62,11 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
         GroupCapBytes: 100_000_000);
 
     /// <summary>
-    /// 验证计数/标记规则不对称的两条边：账户密钥必填 → 全计全标；
-    /// 备份密码可空 → 只有真正带密码的记录才计数/标记，未加密的备份即便密钥环 Lost 也不受影响。
-    /// 若计数规则被反转（比如漏过滤未加密配置、或漏计全部账户），此测试应当失败。
-    /// 注意：必须把库里的密文换成另一套密钥环的产物，仅翻转 IKeyringHealth 是不够的——
-    /// 计数按逐条实际可解性判定（设计 §3.3）。
+    /// Covers both asymmetric sides of the counting/flagging rules: the account key is mandatory → every account is counted and flagged;
+    /// the backup password is optional → only records that really carry a password are counted and flagged, and an unencrypted backup is unaffected even while the keyring is Lost.
+    /// If the counting rule gets inverted (forgetting to filter out unencrypted configs, say, or forgetting to count all accounts), this test should fail.
+    /// Note: the stored ciphertext must be replaced with the output of a different keyring; flipping IKeyringHealth alone is not enough —
+    /// the counts are decided by per-record decryptability (design §3.3).
     /// </summary>
     [Fact]
     public async Task Reports_Lost_With_Correct_Counts_And_Per_Record_Flags()
@@ -88,7 +88,7 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
         Assert.All(accountsBefore!, a => Assert.False(a.SecretsUnavailable));
         Assert.All(configsBefore!, c => Assert.False(c.SecretsUnavailable));
 
-        // 模拟 /keys 丢失：库里全部密文换成另一套密钥环的产物。
+        // Simulate /keys being lost: replace every stored ciphertext with the output of a different keyring.
         using (var scope = factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -106,7 +106,7 @@ public class KeyringStatusEndpointTests(TestWebAppFactory factory) : IClassFixtu
                 .Content.ReadFromJsonAsync<KeyringStatusResponse>();
             Assert.Equal("Lost", status!.Status);
             Assert.Equal(accountsBefore!.Count, status.AccountsPending);
-            // 只有加密配置计数：明文配置没有密文可丢，不应计入。
+            // Only encrypted configs count: a plaintext config has no ciphertext to lose and must not be included.
             Assert.Equal(1, status.BackupConfigsPending);
 
             var accounts = await (await _client.GetAsync("/api/accounts"))

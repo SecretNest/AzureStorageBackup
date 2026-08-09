@@ -7,7 +7,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Tests;
 
-/// <summary>密文入库：EF 层不再解密，列表查询在密钥环丢失时依然可用（设计 §3.1）。</summary>
+/// <summary>Ciphertext at rest: the EF layer no longer decrypts, so list queries still work while the keyring is lost (design §3.1).</summary>
 public class CiphertextAtRestTests : IDisposable
 {
     private readonly SqliteConnection _connection;
@@ -51,7 +51,7 @@ public class CiphertextAtRestTests : IDisposable
     [Fact]
     public async Task Listing_Succeeds_When_Keyring_Is_Lost()
     {
-        // 用一套密钥环写入，再用另一套读——等价于 /keys 丢失后重启
+        // Write with one keyring and read with another — equivalent to restarting after /keys was lost
         var written = new EncryptionService(new EphemeralDataProtectionProvider());
         _db.Accounts.Add(new Account
         {
@@ -69,7 +69,7 @@ public class CiphertextAtRestTests : IDisposable
         await _db.SaveChangesAsync();
         _db.ChangeTracker.Clear();
 
-        // 关键回归：这两个查询以前会抛 CryptographicException
+        // The key regression: these two queries used to throw CryptographicException
         var accounts = await _db.Accounts.AsNoTracking().ToListAsync();
         var configs = await _db.BackupConfigs.AsNoTracking().ToListAsync();
 
@@ -78,7 +78,7 @@ public class CiphertextAtRestTests : IDisposable
         Assert.Single(configs);
         Assert.Equal("docs", configs[0].Name);
 
-        // 但真正取用时必须明确失败
+        // But actually consuming the value must fail explicitly
         var reader = new SecretReader(new EncryptionService(new EphemeralDataProtectionProvider()));
         Assert.Throws<SecretUnavailableException>(() => reader.RevealAccountKey(accounts[0]));
     }
@@ -94,7 +94,7 @@ public class CiphertextAtRestTests : IDisposable
         return columns;
     }
 
-    /// <summary>实体属性改名成 *Protected，但**不得**产生 schema 变更：列名必须还是历史那几个。</summary>
+    /// <summary>Entity properties were renamed to *Protected, but that must **not** produce a schema change: the column names must stay exactly as they were.</summary>
     [Fact]
     public async Task Column_Names_Are_Unchanged()
     {
@@ -105,7 +105,7 @@ public class CiphertextAtRestTests : IDisposable
         Assert.DoesNotContain("AccountKeyProtected", accounts);
         Assert.DoesNotContain("ProxyPasswordProtected", accounts);
 
-        // 备份密码同样只是改了属性名（PasswordProtected），列名仍是 Password。
+        // The backup password likewise only had its property renamed (PasswordProtected); the column is still Password.
         var configs = await ColumnNamesAsync("BackupConfigs");
 
         Assert.Contains("Password", configs);

@@ -1,6 +1,6 @@
 namespace AzureStorageBackup.Api.Models;
 
-/// <summary>Azure 分区，决定 endpoint 后缀。</summary>
+/// <summary>Azure partition; decides the endpoint suffix.</summary>
 public enum AzureRegion
 {
     Global = 0,
@@ -8,7 +8,7 @@ public enum AzureRegion
     UsGov = 2
 }
 
-/// <summary>代理来源：自定义独立代理 / 继承 docker 环境变量。</summary>
+/// <summary>Where the proxy comes from: a custom standalone proxy, or inherited from the docker environment variables.</summary>
 public enum ProxyMode
 {
     Independent = 0,
@@ -16,8 +16,8 @@ public enum ProxyMode
 }
 
 /// <summary>
-/// 一个 Azure Storage Account 配置。敏感字段（AccountKeyProtected、ProxyPasswordProtected）
-/// 在应用层与库中**均为密文**，解密只经 ISecretReader（设计 §3.1）。
+/// One Azure Storage Account configuration. The sensitive fields (AccountKeyProtected, ProxyPasswordProtected)
+/// are **ciphertext in both the application layer and the database**; decryption goes only through ISecretReader (design §3.1).
 /// </summary>
 public class Account
 {
@@ -29,17 +29,17 @@ public class Account
     public string BlobEndpoint { get; set; } = string.Empty;
     public AzureRegion Region { get; set; } = AzureRegion.Global;
 
-    /// <summary>账户密钥密文。取明文用 ISecretReader.RevealAccountKey。</summary>
+    /// <summary>Account key ciphertext. Use ISecretReader.RevealAccountKey to get the plaintext.</summary>
     public string AccountKeyProtected { get; set; } = string.Empty;
 
-    // 代理
+    // Proxy
     public bool UseProxy { get; set; }
     public ProxyMode ProxyMode { get; set; } = ProxyMode.Independent;
     public string? ProxyHost { get; set; }
     public int? ProxyPort { get; set; }
     public string? ProxyUsername { get; set; }
 
-    /// <summary>代理密码密文。取明文用 ISecretReader.RevealProxyPassword。</summary>
+    /// <summary>Proxy password ciphertext. Use ISecretReader.RevealProxyPassword to get the plaintext.</summary>
     public string? ProxyPasswordProtected { get; set; }
 
     public DateTimeOffset CreatedAt { get; set; }

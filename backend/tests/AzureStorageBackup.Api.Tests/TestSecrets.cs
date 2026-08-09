@@ -4,9 +4,9 @@ using Microsoft.AspNetCore.DataProtection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 测试用的共享密钥环。实体里的凭据字段一律是密文（设计 §3.1），测试构造样本时用
-/// <see cref="Protect"/> 加密，被测代码经 <see cref="Reader"/> 取明文——与生产同一条路径。
-/// 无状态且线程安全，可被并行的测试类共用。
+/// Shared keyring for tests. Credential fields on entities are always ciphertext (design §3.1), so tests build their samples
+/// through <see cref="Protect"/> and the code under test gets the plaintext via <see cref="Reader"/> — the same path as production.
+/// Stateless and thread-safe, so parallel test classes can share it.
 /// </summary>
 internal static class TestSecrets
 {
@@ -18,11 +18,11 @@ internal static class TestSecrets
     public static string Protect(string plaintext) => Encryption.Encrypt(plaintext);
 
     /// <summary>
-    /// 断言用的解密助手：解得开就返回明文，解不开直接判测试失败。
+    /// Decryption helper for assertions: returns the plaintext if it decrypts, fails the test outright if it does not.
     /// <para>
-    /// 生产侧刻意只保留 <see cref="IEncryptionService.TryDecrypt"/>——「解密失败必须收口成
-    /// <see cref="SecretUnavailableException"/>」是项目约束，会裸抛 CryptographicException 的
-    /// Decrypt 是一条旁路，不该为了测试断言而让它继续活着（F1）。
+    /// Production deliberately keeps only <see cref="IEncryptionService.TryDecrypt"/> — "a failed decryption must funnel into
+    /// <see cref="SecretUnavailableException"/>" is a project constraint, and a Decrypt that throws a bare CryptographicException
+    /// is a bypass around it that should not be kept alive just for the sake of test assertions (F1).
     /// </para>
     /// </summary>
     public static string Reveal(IEncryptionService encryption, string ciphertext)
@@ -33,9 +33,9 @@ internal static class TestSecrets
     }
 
     /// <summary>
-    /// 用一套一次性的、与被测宿主无关的密钥环加密：模拟 <c>/keys</c> 丢失后遗留在库里、
-    /// 当前密钥环解不开的旧密文。仅翻转 <see cref="IKeyringHealth"/> 并不能制造这种密文——
-    /// 那样库里的值仍然解得开，逐条试解的判定会（正确地）报告「无需重设」。
+    /// Encrypt with a throwaway keyring unrelated to the host under test: this simulates the old ciphertext left in the database
+    /// after <c>/keys</c> is lost, which the current keyring cannot decrypt. Flipping <see cref="IKeyringHealth"/> alone cannot
+    /// produce such ciphertext — the stored values would still decrypt, and the per-record trial decryption would (correctly) report that nothing needs re-entering.
     /// </summary>
     public static string Stale(string plaintext) =>
         new EncryptionService(new EphemeralDataProtectionProvider()).Encrypt(plaintext);

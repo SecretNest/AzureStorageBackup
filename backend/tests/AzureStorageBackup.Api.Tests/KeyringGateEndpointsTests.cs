@@ -9,10 +9,10 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// Task 5 复审 Finding 1/3：密钥环丢失时，真正状态变更/依赖凭据的三个触发点
-/// （/run、/restore、/repair）必须在入口即 409，而只读的列表端点仍须可达
-/// （否则整个「恢复模式」功能失去意义）。KeyringGuardTests 只测了静态方法本身，
-/// 这里驱动真实 HTTP 请求，防止有人漏挂闸门却测试仍然全绿。
+/// Task 5 review Finding 1/3: while the keyring is lost, the three triggers that really change state or depend on credentials
+/// (/run, /restore, /repair) must 409 right at the entrance, while the read-only list endpoints must stay reachable
+/// (otherwise the whole "recovery mode" feature is pointless). KeyringGuardTests only exercises the static method itself;
+/// this drives real HTTP requests, so forgetting to wire up the gate cannot leave the suite green.
 /// </summary>
 public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixture<TestWebAppFactory>
 {
@@ -39,7 +39,7 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
         SingleFileThresholdBytes: 5_000_000,
         GroupCapBytes: 100_000_000);
 
-    /// <summary>建一个真实账户，供需要通过「Account not found.」闸门的配置创建使用。</summary>
+    /// <summary>Create a real account, for config creation that has to get past the "Account not found." gate.</summary>
     private async Task<int> CreateAccountAsync(string name)
     {
         var req = new AccountRequest(
@@ -91,10 +91,10 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
     }
 
     /// <summary>
-    /// 全分支复审 Finding 2：计划任务的手动触发（"Run now"）是备份/检查/清理的入口之一，
-    /// 与 /backup-configs/{id}/run 同性质。缺闸门时 dispatcher 内解密备份密码抛出、被吞成日志，
-    /// 端点仍推进 LastRunAt 并返回 200——UI 显示成功而实际什么都没做。
-    /// 必须 409，且 LastRunAt 必须保持未推进。
+    /// All-branch review Finding 2: manually triggering a scheduled task ("Run now") is one of the entrances to backup/check/cleanup,
+    /// exactly like /backup-configs/{id}/run. Without a gate, decrypting the backup password inside the dispatcher throws, the throw is swallowed into a log line,
+    /// and the endpoint still advances LastRunAt and returns 200 — the UI shows success while nothing whatsoever happened.
+    /// It must be 409, and LastRunAt must stay where it was.
     /// </summary>
     [Fact]
     public async Task Manual_Task_Run_Returns_409_KeyringLost_And_Does_Not_Advance_LastRunAt()
@@ -123,9 +123,9 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
     }
 
     /// <summary>
-    /// 全分支复审 Finding 4/5：列容器在设计 §3.1 里就被点名为「需要凭据的动作」，
-    /// 而连删云端 container 的删除分支同样需要账户密钥。二者此前都没有闸门，密钥环丢失时
-    /// 一路走到 SecretReader 抛异常，客户端拿到裸 500。必须 409 keyring_lost。
+    /// All-branch review Finding 4/5: listing containers is named in design §3.1 as an action that needs credentials,
+    /// and the delete branch that also drops the cloud container needs the account key just the same. Neither had a gate, so with the keyring lost
+    /// both ran all the way down to SecretReader throwing, and the client got a bare 500. Both must be 409 keyring_lost.
     /// </summary>
     [Fact]
     public async Task Container_Listing_And_Cloud_Deleting_Delete_Return_409_KeyringLost()
@@ -153,7 +153,7 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
             Assert.Equal(HttpStatusCode.Conflict, dropCloud.StatusCode);
             Assert.Equal("keyring_lost", (await dropCloud.Content.ReadFromJsonAsync<KeyringLostError>())!.code);
 
-            // 纯本地删除必须仍然放行：决策 6 下这是「想不起备份密码」的唯一出口。
+            // Local-only delete must still be allowed: under decision 6 it is the only way out when you cannot remember the backup password.
             var dropLocal = await _client.DeleteAsync($"/api/backup-configs/{config.Id}");
             Assert.Equal(HttpStatusCode.NoContent, dropLocal.StatusCode);
         }
@@ -164,10 +164,10 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
     }
 
     /// <summary>
-    /// 深度防御（设计 §3.1）：密钥环在进程运行期间被换掉，canary 还没重新判定，
-    /// 于是全局状态仍是 Healthy、闸门放行，解密在咽喉处才失败。没有映射时客户端拿到裸 500
-    /// （Program.cs 未注册任何异常处理中间件）。必须仍是 409 keyring_lost。
-    /// 这条同时把闸门与映射区分开：状态是 Healthy，KeyringGuard 根本不会触发。
+    /// Defence in depth (design §3.1): the keyring is swapped out while the process is running and the canary has not been re-evaluated,
+    /// so the global status is still Healthy, the gate lets the request through, and decryption only fails at the choke point. Without the mapping the client gets a bare 500
+    /// (Program.cs registers no exception-handling middleware at all). It must still be 409 keyring_lost.
+    /// This also separates the gate from the mapping: the status is Healthy, so KeyringGuard never fires.
     /// </summary>
     [Fact]
     public async Task Undecryptable_Secret_Maps_To_409_Even_While_Status_Is_Healthy()
@@ -192,9 +192,9 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
     }
 
     /// <summary>
-    /// 全分支复审 Finding 5：/import 的宽泛 catch 把「读不了账户密钥」说成
-    /// "Could not read info file (wrong password?)"，把密钥环问题赖到用户输的密码头上。
-    /// 必须给出指向账户凭据的提示。
+    /// All-branch review Finding 5: the broad catch in /import reports "cannot read the account key" as
+    /// "Could not read info file (wrong password?)", blaming a keyring problem on the password the user typed.
+    /// The message must instead point at the account credentials.
     /// </summary>
     [Fact]
     public async Task Import_Blames_Account_Credentials_Not_The_Password_When_The_Key_Is_Undecryptable()
@@ -219,7 +219,7 @@ public class KeyringGateEndpointsTests(TestWebAppFactory factory) : IClassFixtur
         Assert.Equal("Re-enter this account's credentials first.", body!["error"]);
     }
 
-    /// <summary>整个恢复模式的存在意义：即便密钥环丢失，只读列表端点也不能跟着一起 409。</summary>
+    /// <summary>The entire point of recovery mode: even with the keyring lost, read-only list endpoints must not 409 along with everything else.</summary>
     [Fact]
     public async Task List_Endpoint_Still_Returns_200_When_Keyring_Is_Lost()
     {

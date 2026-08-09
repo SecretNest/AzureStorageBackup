@@ -13,7 +13,7 @@ public class AuthEndpointsTests
 {
     private sealed record AuthStatus(bool Required, bool Authenticated);
 
-    /// <summary>启用认证的测试主机；password 为 null 表示不设密码。</summary>
+    /// <summary>Test host with authentication enabled; a null password means no password is configured.</summary>
     private static TestWebAppFactory Factory(string? password) =>
         password is null
             ? new TestWebAppFactory()
@@ -28,7 +28,7 @@ public class AuthEndpointsTests
         }
     }
 
-    /// <summary>保留 cookie（跨请求自动携带）的客户端；重定向策略用 HttpClient 默认值（跟随）。</summary>
+    /// <summary>Client that keeps cookies (carried automatically across requests); redirect policy stays at the HttpClient default (follow).</summary>
     private static HttpClient Client(WebApplicationFactory<Program> f) =>
         f.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = true });
 
@@ -48,8 +48,8 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Without_A_Password_Login_Is_A_No_Op()
     {
-        // 认证关闭时没有注册任何 scheme；:20-21 的 gate.Required 短路要是被删掉，
-        // SignInAsync 会抛 InvalidOperationException 变成 500。
+        // With authentication off no scheme is registered; delete the gate.Required short-circuit at :20-21 and
+        // SignInAsync throws InvalidOperationException, which surfaces as a 500.
         using var factory = Factory(null);
         var client = Client(factory);
 
@@ -61,7 +61,7 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Without_A_Password_Logout_Is_A_No_Op()
     {
-        // 同上，:41 的 gate.Required 短路守着 SignOutAsync。
+        // Same as above; the gate.Required short-circuit at :41 guards SignOutAsync.
         using var factory = Factory(null);
         var client = Client(factory);
 
@@ -98,7 +98,7 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Health_Probes_Stay_Open_When_A_Password_Is_Set()
     {
-        // 探针被挡住会让 docker healthcheck 判定容器不健康并反复重启
+        // Blocking the probes makes the docker healthcheck declare the container unhealthy and restart it over and over
         using var factory = Factory("s3cret");
         var client = Client(factory);
 
@@ -109,7 +109,7 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Spa_Fallback_Stays_Open_When_A_Password_Is_Set()
     {
-        // 挡住 index.html 会让登录页根本渲染不出来——「要登录得先登录」
+        // Blocking index.html means the login page never renders at all — "to log in, first log in"
         using var factory = Factory("s3cret");
         var client = Client(factory);
 
@@ -137,11 +137,11 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Correct_Password_Issues_A_Persistent_Cookie()
     {
-        // 设计 §1 决策 7/§3：30 天滑动会话。Program.cs 的 ExpireTimeSpan/SlidingExpiration
-        // 只管服务端票据；没有 IsPersistent=true，Set-Cookie 就不带 Max-Age/Expires，
-        // 浏览器关闭即丢 cookie——配置在骗人。
+        // Design §1 decision 7/§3: a 30-day sliding session. The ExpireTimeSpan/SlidingExpiration in Program.cs
+        // only govern the server-side ticket; without IsPersistent=true the Set-Cookie carries no Max-Age/Expires,
+        // so the cookie dies when the browser closes — the configuration is lying.
         using var factory = Factory("s3cret");
-        // 不用 HandleCookies 客户端：那样看不到原始 Set-Cookie 头。
+        // Not the HandleCookies client: that one hides the raw Set-Cookie header.
         var client = factory.CreateClient();
 
         var login = await client.PostAsJsonAsync("/api/auth/login", new { password = "s3cret" });
@@ -185,8 +185,8 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Login_Works_While_The_Keyring_Is_Lost()
     {
-        // 设计 §5：密码比对读环境变量明文、不经密钥环，所以密钥环丢失时仍能登录，
-        // 进而走恢复流程。若登录反过来依赖密钥环，就成了「要恢复得先登录，要登录得先恢复」。
+        // Design §5: the password comparison reads the environment variable in plaintext and never touches the keyring, so you
+        // can still log in — and therefore run the recovery flow — while the keyring is lost. If login depended on the keyring instead, you would get "to recover you must log in, to log in you must first recover".
         using var factory = Factory("s3cret");
         var client = Client(factory);
         factory.Services.GetRequiredService<IKeyringHealth>().Set(KeyringStatus.Lost);
@@ -194,7 +194,7 @@ public class AuthEndpointsTests
         var login = await client.PostAsJsonAsync("/api/auth/login", new { password = "s3cret" });
 
         Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
-        // 登录成功后应当能看到恢复所需的状态端点
+        // Once logged in, the status endpoint the recovery flow needs must be visible
         var keyring = await client.GetAsync("/api/system/keyring");
         Assert.Equal(HttpStatusCode.OK, keyring.StatusCode);
     }
@@ -202,9 +202,9 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Concurrent_Failed_Logins_Are_Serialized()
     {
-        // 「失败后睡 1 秒」逐请求生效时挡不住并发爆破：N 个请求同时在飞，
-        // 摊到每次尝试的代价接近 0，设计 §4.3 说的「让在线爆破不划算」并没有兑现。
-        // 失败路径全局串行后，3 次并发失败必须花掉约 3 秒真实时间。
+        // A per-request "sleep 1 second after a failure" does not stop concurrent brute force: with N requests in flight
+        // at once the cost per attempt approaches 0, and design §4.3's "make online brute force not worth it" is not delivered.
+        // With the failure path serialized globally, 3 concurrent failures must burn about 3 seconds of wall clock.
         const int attempts = 3;
         using var factory = Factory("s3cret");
         var client = Client(factory);
@@ -215,7 +215,7 @@ public class AuthEndpointsTests
         sw.Stop();
 
         Assert.All(responses, r => Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode));
-        // 串行 = 每次失败各占满 1 秒；留 0.5 秒余量吸收调度抖动。
+        // Serialized = each failure takes its own full second; 0.5 s of slack absorbs scheduling jitter.
         Assert.True(
             sw.Elapsed >= TimeSpan.FromMilliseconds(1000 * attempts - 500),
             $"{attempts} concurrent failed logins took {sw.ElapsedMilliseconds} ms; "
@@ -225,12 +225,12 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Ready_Probe_Hides_Component_Detail_From_Anonymous_Callers()
     {
-        // 探针必须匿名可达，但匿名调用者不该借它读出「这台正处于密钥环恢复模式」。
+        // The probe must be reachable anonymously, but an anonymous caller must not be able to read "this box is in keyring recovery mode" out of it.
         using var factory = Factory("s3cret");
         var client = Client(factory);
 
         var anonymous = await client.GetAsync("/api/health/ready");
-        Assert.Equal(HttpStatusCode.OK, anonymous.StatusCode); // 状态码是探针唯一消费的东西，不能变
+        Assert.Equal(HttpStatusCode.OK, anonymous.StatusCode); // the status code is the only thing probes consume; it must not change
         var anonymousBody = JsonDocument.Parse(await anonymous.Content.ReadAsStringAsync()).RootElement;
         Assert.Equal("ready", anonymousBody.GetProperty("status").GetString());
         Assert.False(anonymousBody.TryGetProperty("database", out _));
@@ -248,7 +248,7 @@ public class AuthEndpointsTests
     [Fact]
     public async Task Ready_Probe_Keeps_Its_Detail_When_Authentication_Is_Disabled()
     {
-        // 未设密码时行为必须与本轮之前完全一致
+        // With no password set, the behaviour must be exactly what it was before this round of changes
         using var factory = Factory(null);
         var client = Client(factory);
 

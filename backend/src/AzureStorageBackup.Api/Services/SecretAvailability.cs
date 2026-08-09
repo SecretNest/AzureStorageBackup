@@ -3,26 +3,27 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// 单条记录的密文可解性（设计 §3.3）。
+/// Per-record ciphertext decryptability (design §3.3).
 ///
-/// 恢复流程必然经过中间态：全局状态仍是 <c>Lost</c>（还有别的密文没重设），但部分记录
-/// 已经重设成功。若待重设计数与逐条标记沿用全局状态，已修好的记录会永远显示待重设，
-/// 而顺序依赖（账户先于备份密码）又依赖该计数放行下一步——恢复流程就此死锁。
-/// 因此 <c>Lost</c> 期间必须逐条试解。记录数很少，与 <see cref="KeyringProbe"/> 的完成判定同量级。
+/// The recovery flow inevitably passes through an intermediate state: the global status is still <c>Lost</c> (other ciphertext
+/// has not been reset yet) while some records have already been reset successfully. If the pending count and the per-record flags
+/// simply followed the global status, records that are already fixed would show as pending forever, while the ordering dependency
+/// (accounts before backup passwords) relies on that count to release the next step — deadlocking the recovery flow.
+/// So during <c>Lost</c> each record must be trial-decrypted. There are very few records, on the same order as <see cref="KeyringProbe"/>'s completion check.
 /// </summary>
 public static class SecretAvailability
 {
-    /// <summary>密文非空且当前密钥环解不开 → 需要重设。空密文没有密钥可丢，不算。</summary>
+    /// <summary>Non-empty ciphertext that the current keyring cannot decrypt → needs re-entry. Empty ciphertext has no key to lose, so it does not count.</summary>
     public static bool Unreadable(IEncryptionService encryption, string? ciphertext) =>
         !string.IsNullOrEmpty(ciphertext) && !encryption.TryDecrypt(ciphertext, out _);
 
-    /// <summary>账户：密钥或代理密码任一解不开即需重设——reset-secrets 一次性重设两者，
-    /// 且完成判定（<see cref="KeyringProbe.AllStoredSecretsReadableAsync"/>）两者都查。</summary>
+    /// <summary>Account: needs re-entry if either the key or the proxy password fails to decrypt — reset-secrets resets both in one go,
+    /// and the completion check (<see cref="KeyringProbe.AllStoredSecretsReadableAsync"/>) inspects both.</summary>
     public static bool Unreadable(IEncryptionService encryption, Account account) =>
         Unreadable(encryption, account.AccountKeyProtected)
         || Unreadable(encryption, account.ProxyPasswordProtected);
 
-    /// <summary>备份配置：只有加密备份才有密文可丢。</summary>
+    /// <summary>Backup config: only encrypted backups have ciphertext to lose.</summary>
     public static bool Unreadable(IEncryptionService encryption, BackupConfig config) =>
         Unreadable(encryption, config.PasswordProtected);
 }

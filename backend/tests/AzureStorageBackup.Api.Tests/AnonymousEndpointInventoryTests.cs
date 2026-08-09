@@ -7,14 +7,14 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// 默认全保护（FallbackPolicy）下，唯一的开口是显式 <c>AllowAnonymous()</c>。
-/// 这份清单把开口集合钉死：将来任何一处多写一个 <c>.AllowAnonymous()</c>，
-/// 这个测试就会红，并直接报出是哪条路由被打开了。
-/// 没有它，一条被误开的业务路由会在 CI 全绿的情况下溜过去——默认拒绝的设计就白做了。
+/// With everything protected by default (FallbackPolicy), the only openings are explicit <c>AllowAnonymous()</c> calls.
+/// This inventory pins that set of openings down: add one more <c>.AllowAnonymous()</c> anywhere in the future and
+/// this test goes red, naming exactly which route was opened.
+/// Without it, an accidentally opened business route slips through with CI fully green — and the deny-by-default design was for nothing.
 /// </summary>
 public class AnonymousEndpointInventoryTests
 {
-    /// <summary>允许匿名的完整清单：3 个 auth 端点 + 2 个健康探针 + SPA 回退。</summary>
+    /// <summary>The complete anonymous allowlist: 3 auth endpoints + 2 health probes + the SPA fallback.</summary>
     private static readonly string[] Expected =
     [
         "GET /api/auth/status",
@@ -38,7 +38,7 @@ public class AnonymousEndpointInventoryTests
     public void Only_The_Six_Documented_Endpoints_Are_Anonymous()
     {
         using var factory = new AuthEnabledFactory();
-        _ = factory.CreateClient(); // WebApplicationFactory 惰性建主机，先逼它建起来
+        _ = factory.CreateClient(); // WebApplicationFactory builds the host lazily; force it up first
 
         var actual = factory.Services.GetRequiredService<EndpointDataSource>().Endpoints
             .Where(e => e.Metadata.OfType<IAllowAnonymous>().Any())
@@ -63,7 +63,7 @@ public class AnonymousEndpointInventoryTests
                 + "\n  Full actual set: " + string.Join(", ", actual));
     }
 
-    /// <summary>稳定标识：HTTP 方法 + 路由模板原文，与端点的注册顺序、显示名无关。</summary>
+    /// <summary>Stable identity: HTTP methods + the raw route pattern, independent of endpoint registration order and display name.</summary>
     private static string Describe(Endpoint endpoint)
     {
         var methods = endpoint.Metadata.GetMetadata<HttpMethodMetadata>()?.HttpMethods;
