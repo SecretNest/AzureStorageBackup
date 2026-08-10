@@ -496,20 +496,68 @@ public sealed class VolumeBlobIOTests
     /// files off the temp disk — while the layer above, having received the exception, is about to release the
     /// staging area.
     /// </summary>
+    /// <summary>
+    /// Ordering is pinned rather than hoped for. This assertion used to read <c>Order.Count &lt; files.Count</c>
+    /// against volumes that all completed instantly, and it went red on CI roughly one run in ten: the loop only
+    /// creates tasks, so under an unlucky schedule it can start every volume before the doomed one has run far
+    /// enough to fault, and nothing is left to notice. Widening the window the loop checks does not fix that —
+    /// a failure that has not happened yet cannot be observed.
+    /// <para>
+    /// So the double makes the failure happen first and hold everything else behind it: volume 4 throws the moment
+    /// it is entered, and volumes 1-3 only return once it has. By the first changeover the fault is therefore a
+    /// fact, and both routes out of the loop are exercised — whether WhenAny hands back the faulted task or one of
+    /// the successes, the loop must stop. The gate is sized to admit all four so nothing queues behind a slot.
+    /// </para>
+    /// </summary>
     [Fact]
     public async Task A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running()
     {
-        var up = new FailingVolume("data/h.004");
-        var gate = new VolumeUploadGate(3);
+        var up = new FailsBeforeTheOthersFinish("data/h.004");
+        var gate = new VolumeUploadGate(4);
         var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
 
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
 
-        // It dies on volume 4, so the ones after it must not take off — all 8 cannot possibly have run.
-        Assert.True(up.Order.Count < files.Count, $"new volumes still started after the failure: {up.Order.Count} volumes ran");
+        // The window is MaxParallelPerItem + 1 = 4, so volumes 1-4 start unconditionally and the fifth is the
+        // first one the loop is free to refuse. It dies on the fourth, so exactly four ever ran.
+        Assert.Equal(4, up.Order.Count);
         // Every gate slot returned = no volume is still holding one. If anything were still running at the throw, this would come up short.
-        Assert.Equal(3, gate.Free);
+        Assert.Equal(4, gate.Free);
+    }
+
+    /// <summary>
+    /// Throws on the named volume the instant it is entered, and keeps every other volume from completing until
+    /// that has happened — which makes "the failure is already a fact at the first changeover" true by
+    /// construction instead of by scheduling luck.
+    /// </summary>
+    private sealed class FailsBeforeTheOthersFinish(string bad) : IBlobUploader
+    {
+        private readonly TaskCompletionSource _failed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<string> Order { get; } = [];
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            lock (Order) Order.Add(blobName);
+            if (blobName == bad)
+            {
+                _failed.SetResult();
+                throw new IOException("volume died");
+            }
+
+            await _failed.Task;
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new NotSupportedException();
     }
 
     /// <summary>
