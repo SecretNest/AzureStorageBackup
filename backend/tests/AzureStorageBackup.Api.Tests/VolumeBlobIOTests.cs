@@ -400,6 +400,71 @@ public sealed class VolumeBlobIOTests
     }
 
     /// <summary>One volume dies.</summary>
+    /// <summary>
+    /// Volume 1 succeeds first; volume 4 only fails <b>after</b> it, so both are complete by the time the loop
+    /// reaches its first <c>WhenAny</c> — and <c>WhenAny</c> hands back the one that finished first, the success.
+    /// That is precisely the arrangement under which a check that only inspects the returned task never sees the
+    /// failure at all.
+    /// </summary>
+    private sealed class FailsAfterAnotherSucceeds : IBlobUploader
+    {
+        private readonly TaskCompletionSource _firstFinished =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<string> Order { get; } = [];
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            lock (Order) Order.Add(blobName);
+            if (blobName == "data/h.004")
+            {
+                await _firstFinished.Task;
+                throw new IOException("volume died");
+            }
+
+            await Task.Yield();
+            if (blobName == "data/h.001")
+                _firstFinished.SetResult();
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// "Once a volume dies, no new ones start" has to hold whichever task WhenAny happens to return.
+    /// <para>
+    /// It returns <b>one</b> of the tasks that completed, and when several land together which one is unspecified.
+    /// So a volume could fail while the loop was looking at a sibling that succeeded, and the loop would carry on
+    /// starting volumes over a dead upload. In production every volume takes seconds to minutes, so the faulted one
+    /// was nearly always the one WhenAny returned and the gap never showed; it surfaced on CI, where the doubles
+    /// complete instantly and the ordering is arbitrary, as an intermittent red on
+    /// <see cref="A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running"/>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_failure_stops_new_volumes_even_when_a_sibling_completes_first()
+    {
+        var up = new FailsAfterAnotherSucceeds();
+        var gate = new VolumeUploadGate(3);
+        var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
+
+        await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
+
+        // The window is MaxParallelPerItem + 1 = 4, so volumes 1-4 start unconditionally. Volume 4 is dead by the
+        // first changeover, so the fifth must never be reached.
+        Assert.Equal(4, up.Order.Count);
+        Assert.Equal(3, gate.Free);
+    }
+
     private sealed class FailingVolume(string bad) : IBlobUploader
     {
         public List<string> Order { get; } = [];

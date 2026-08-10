@@ -348,6 +348,15 @@ public static class VolumeBlobIO
                 if (done.IsFaulted || done.IsCanceled)
                     break;
             }
+            // WhenAny hands back **one** of the tasks that finished, and when several land together which one is
+            // unspecified — so a volume can fail while the loop is looking at a sibling that succeeded, and the
+            // check above misses it. Sweeping what is still in flight closes that gap and makes "once a volume
+            // dies, no new ones start" true as written rather than true when the scheduler cooperates.
+            // In production every volume takes seconds to minutes, so the faulted one was almost always the one
+            // WhenAny returned and the difference never showed; with instant uploads the ordering is arbitrary and
+            // the loop would run to the end. Cheap to check: `running` never exceeds the window (a handful).
+            if (running.Exists(t => t.IsFaulted || t.IsCanceled))
+                break;
             var one = One(VolumeName(baseRef, i + 1), volumeFiles[i], i);
             started.Add(one);
             running.Add(one);
