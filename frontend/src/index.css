@@ -171,6 +171,15 @@ hr {
 button {
   font: inherit;
   height: var(--control-h);
+  /* Not inherited: a button of fixed height holds one line of text, and Chrome lays that line out from the top of the
+     content box rather than centering it, so any container with a tall line-height pushes the label down inside the
+     button and - because an inline-block aligns on its own baseline - drags the whole button box up out of the line.
+     Measured in the Backups actions column, whose td carries line-height: 40px for wrap spacing: the label sat 5px
+     below the middle of the button and the box had 8.5px of room above it against 17.5px below. normal makes the
+     button's line box its own business, and the hover border lands centered again.
+     The pairing to keep in mind when adding a variant: whoever resets height must reset this too (see .icon-btn,
+     .nav-item and .browse-row) - their height comes from the text, so they need the inherited line-height back. */
+  line-height: normal;
   padding: 0 var(--sp-3);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
@@ -192,6 +201,7 @@ button:disabled {
    triangle, say), so reset height, width, padding and border and let it lay out on the glyph's own line height. */
 .icon-btn {
   height: auto;
+  line-height: inherit; /* Height comes from the line box now, so take back the line-height the global button rule pinned */
   width: auto;
   padding: 0;
   border: none;
@@ -430,6 +440,7 @@ tbody tr.ops-row:hover {
 /* Nav items are <button>, so the button's default appearance has to be wiped out entirely and repainted. */
 .nav-item {
   height: auto;
+  line-height: inherit; /* See the note on the global button rule: height follows the text here, so the line-height has to come back */
   padding: var(--sp-2) var(--sp-3);
   border: none;
   border-left: 2px solid transparent;
@@ -745,6 +756,9 @@ tbody tr.ops-row:hover {
   width: 100%;
   min-height: var(--control-h);
   height: auto;
+  /* A long path wraps here (white-space: normal below), and the rows of it need the document's line spacing, not the
+     tight one the global button rule pins for single-line buttons. */
+  line-height: inherit;
   padding: var(--sp-2) var(--sp-3);
   border: none;
   border-radius: var(--r-md);
