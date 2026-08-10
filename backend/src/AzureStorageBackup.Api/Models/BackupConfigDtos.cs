@@ -36,7 +36,13 @@ public record BackupConfigResponse(
     bool SecretsUnavailable,
     ResolvedBackupSettings Effective,
     string? CrossDirGroupRules = null,
-    string? ScopeRules = null)
+    string? ScopeRules = null,
+    // The case-insensitive half of each list. Appended rather than paired next to its sibling so the positional
+    // arguments already in use keep their meaning.
+    string? IgnoreRulesCaseInsensitive = null,
+    string? DontCompressRulesCaseInsensitive = null,
+    string? DontGroupRulesCaseInsensitive = null,
+    string? CrossDirGroupRulesCaseInsensitive = null)
 {
     /// <summary>
     /// <paramref name="secretsUnavailable"/> must be passed according to whether this config's ciphertext can actually be
@@ -56,7 +62,9 @@ public record BackupConfigResponse(
         c.SingleFileThresholdBytes, c.GroupCapBytes, c.VolumeBytes, c.VerboseLogging, c.CreatedAt,
         c.Status, c.LastError, c.LastErrorAt, activity,
         secretsUnavailable && !string.IsNullOrEmpty(c.PasswordProtected),
-        ResolvedBackupSettings.From(c, settings), c.CrossDirGroupRules, c.ScopeRules);
+        ResolvedBackupSettings.From(c, settings), c.CrossDirGroupRules, c.ScopeRules,
+        c.IgnoreRulesCaseInsensitive, c.DontCompressRulesCaseInsensitive,
+        c.DontGroupRulesCaseInsensitive, c.CrossDirGroupRulesCaseInsensitive);
 }
 
 /// <summary>Restore request body. An empty TargetRoot means the config's local root; an empty Version means the latest version.
@@ -114,7 +122,11 @@ public record BackupConfigRequest(
     long? VolumeBytes = null,
     bool? VerboseLogging = null,
     string? CrossDirGroupRules = null,
-    string? ScopeRules = null)
+    string? ScopeRules = null,
+    string? IgnoreRulesCaseInsensitive = null,
+    string? DontCompressRulesCaseInsensitive = null,
+    string? DontGroupRulesCaseInsensitive = null,
+    string? CrossDirGroupRulesCaseInsensitive = null)
 {
     /// <summary>The Password in the request body is plaintext; it is encrypted the moment it lands on the entity (design §3.1: the entity holds ciphertext only).</summary>
     public BackupConfig ToConfig(IEncryptionService encryption) => new()
@@ -134,6 +146,10 @@ public record BackupConfigRequest(
         DontGroupRules = DontGroupRules,
         CrossDirGroupRules = CrossDirGroupRules,
         ScopeRules = ScopeRules,
+        IgnoreRulesCaseInsensitive = IgnoreRulesCaseInsensitive,
+        DontCompressRulesCaseInsensitive = DontCompressRulesCaseInsensitive,
+        DontGroupRulesCaseInsensitive = DontGroupRulesCaseInsensitive,
+        CrossDirGroupRulesCaseInsensitive = CrossDirGroupRulesCaseInsensitive,
         IncludeSymlinks = IncludeSymlinks,
         MaxVersions = MaxVersions,
         MaxAgeDays = MaxAgeDays,

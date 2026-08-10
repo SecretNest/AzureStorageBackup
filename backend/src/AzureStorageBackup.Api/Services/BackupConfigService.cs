@@ -64,6 +64,10 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.DontCompressRules = update.DontCompressRules;
         existing.DontGroupRules = update.DontGroupRules;
         existing.CrossDirGroupRules = update.CrossDirGroupRules;
+        existing.IgnoreRulesCaseInsensitive = update.IgnoreRulesCaseInsensitive;
+        existing.DontCompressRulesCaseInsensitive = update.DontCompressRulesCaseInsensitive;
+        existing.DontGroupRulesCaseInsensitive = update.DontGroupRulesCaseInsensitive;
+        existing.CrossDirGroupRulesCaseInsensitive = update.CrossDirGroupRulesCaseInsensitive;
         // Scope is editable (it is not one of the locked base fields); a change takes effect on the next backup.
         existing.ScopeRules = update.ScopeRules;
         existing.IncludeSymlinks = update.IncludeSymlinks;

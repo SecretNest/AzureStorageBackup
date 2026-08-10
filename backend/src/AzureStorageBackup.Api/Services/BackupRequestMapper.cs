@@ -41,10 +41,10 @@ public static class BackupRequestMapper
             DataTier = MapTier(config.DataTier),
             Options = new BackupEngineOptions
             {
-                Ignore = new IgnoreRuleSet(SplitLines(r.IgnoreRules)),
-                DontCompress = OptionalRules(r.DontCompressRules),
-                DontGroup = OptionalRules(r.DontGroupRules),
-                CrossDirGroup = OptionalRules(r.CrossDirGroupRules),
+                Ignore = Rules(r.IgnoreRules, r.IgnoreRulesCaseInsensitive) ?? new IgnoreRuleSet([]),
+                DontCompress = Rules(r.DontCompressRules, r.DontCompressRulesCaseInsensitive),
+                DontGroup = Rules(r.DontGroupRules, r.DontGroupRulesCaseInsensitive),
+                CrossDirGroup = Rules(r.CrossDirGroupRules, r.CrossDirGroupRulesCaseInsensitive),
                 // ScopeRules is not inheritable, so take it straight from config rather than from r (ResolvedBackupSettings).
                 Scan = new ScanOptions
                 {
@@ -140,6 +140,25 @@ public static class BackupRequestMapper
     /// otherwise a repaired archive ends up compressed differently from what a fresh backup writes.</summary>
     public static IgnoreRuleSet? OptionalRules(string? text) =>
         string.IsNullOrWhiteSpace(text) ? null : new IgnoreRuleSet(SplitLines(text));
+
+    /// <summary>
+    /// Joins a list's two halves into one rule set: the case-sensitive rules first, the case-insensitive ones
+    /// after. Both empty → null, i.e. "no rules at all".
+    /// <para>
+    /// One set rather than two consulted in turn, because gitignore's "the last matching rule decides" has to keep
+    /// holding across the pair — with two sets OR-ed together, a `!keep.mp4` in either half could never override a
+    /// match in the other, and the negation would silently do nothing. Sensitive first is the arbitrary half of
+    /// the choice; what matters is that the order is fixed and documented, so a negation can be written knowing
+    /// what it overrides.
+    /// </para>
+    /// </summary>
+    public static IgnoreRuleSet? Rules(string? sensitive, string? insensitive)
+    {
+        var tagged = SplitLines(sensitive).Select(p => (p, false))
+            .Concat(SplitLines(insensitive).Select(p => (p, true)))
+            .ToList();
+        return tagged.Count == 0 ? null : IgnoreRuleSet.FromTagged(tagged);
+    }
 
     private static IEnumerable<string> SplitLines(string? text) =>
         (text ?? "").Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);

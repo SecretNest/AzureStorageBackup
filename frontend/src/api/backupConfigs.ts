@@ -90,6 +90,11 @@ export interface EffectiveBackupSettings {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // The case-insensitive half of each list: `*.mp4` there also matches .MP4/.Mp4, while paths stay literal.
+  ignoreRulesCaseInsensitive: string | null
+  dontCompressRulesCaseInsensitive: string | null
+  dontGroupRulesCaseInsensitive: string | null
+  crossDirGroupRulesCaseInsensitive: string | null
   // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
   includeSymlinks: boolean
@@ -115,6 +120,11 @@ export interface BackupConfig {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // The case-insensitive half of each list: `*.mp4` there also matches .MP4/.Mp4, while paths stay literal.
+  ignoreRulesCaseInsensitive: string | null
+  dontCompressRulesCaseInsensitive: string | null
+  dontGroupRulesCaseInsensitive: string | null
+  crossDirGroupRulesCaseInsensitive: string | null
   // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
   /** Backup scope. null = everything under the root. Not inheritable, so it does not appear in EffectiveBackupSettings. */
@@ -148,6 +158,11 @@ export interface BackupConfigInput {
   ignoreRules: string | null
   dontCompressRules: string | null
   dontGroupRules: string | null
+  // The case-insensitive half of each list: `*.mp4` there also matches .MP4/.Mp4, while paths stay literal.
+  ignoreRulesCaseInsensitive: string | null
+  dontCompressRulesCaseInsensitive: string | null
+  dontGroupRulesCaseInsensitive: string | null
+  crossDirGroupRulesCaseInsensitive: string | null
   // Matching paths may be packed across directory boundaries. Empty = pack strictly by directory (the historical behaviour).
   crossDirGroupRules: string | null
   /** Backup scope. null = everything under the root. Not inheritable, so it does not appear in EffectiveBackupSettings. */

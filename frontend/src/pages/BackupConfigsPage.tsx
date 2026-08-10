@@ -78,6 +78,10 @@ const emptyForm: BackupConfigInput = {
   dataTier: StorageTier.Hot,
   ignoreRules: null,
   dontCompressRules: null,
+  ignoreRulesCaseInsensitive: null,
+  dontCompressRulesCaseInsensitive: null,
+  dontGroupRulesCaseInsensitive: null,
+  crossDirGroupRulesCaseInsensitive: null,
   dontGroupRules: null,
   crossDirGroupRules: null,
   scopeRules: null,
@@ -490,6 +494,10 @@ export function BackupConfigsPage() {
       dataTier: c.dataTier,
       ignoreRules: c.ignoreRules,
       dontCompressRules: c.dontCompressRules,
+      ignoreRulesCaseInsensitive: c.ignoreRulesCaseInsensitive,
+      dontCompressRulesCaseInsensitive: c.dontCompressRulesCaseInsensitive,
+      dontGroupRulesCaseInsensitive: c.dontGroupRulesCaseInsensitive,
+      crossDirGroupRulesCaseInsensitive: c.crossDirGroupRulesCaseInsensitive,
       dontGroupRules: c.dontGroupRules,
       crossDirGroupRules: c.crossDirGroupRules,
       scopeRules: c.scopeRules,
@@ -1232,6 +1240,10 @@ export function BackupConfigsPage() {
                 effectiveText={(editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules) || '(none)'}
               >
                 <RuleBox value={form.ignoreRules} onChange={(v) => set('ignoreRules', v)} />
+                <CaseInsensitiveHalf
+                  value={form.ignoreRulesCaseInsensitive}
+                  onChange={(v) => set('ignoreRulesCaseInsensitive', v)}
+                />
               </DefaultableField>
               <DefaultableField
                 label="Don't compress"
@@ -1248,6 +1260,10 @@ export function BackupConfigsPage() {
                   value={form.dontCompressRules}
                   onChange={(v) => set('dontCompressRules', v)}
                 />
+                <CaseInsensitiveHalf
+                  value={form.dontCompressRulesCaseInsensitive}
+                  onChange={(v) => set('dontCompressRulesCaseInsensitive', v)}
+                />
               </DefaultableField>
               <DefaultableField
                 label="Don't group"
@@ -1261,6 +1277,10 @@ export function BackupConfigsPage() {
                 effectiveText={(editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules) || '(none)'}
               >
                 <RuleBox value={form.dontGroupRules} onChange={(v) => set('dontGroupRules', v)} />
+                <CaseInsensitiveHalf
+                  value={form.dontGroupRulesCaseInsensitive}
+                  onChange={(v) => set('dontGroupRulesCaseInsensitive', v)}
+                />
               </DefaultableField>
               <DefaultableField
                 label="Pack across directories"
@@ -1274,6 +1294,10 @@ export function BackupConfigsPage() {
                 effectiveText={(editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules) || '(none)'}
               >
                 <RuleBox value={form.crossDirGroupRules} onChange={(v) => set('crossDirGroupRules', v)} />
+                <CaseInsensitiveHalf
+                  value={form.crossDirGroupRulesCaseInsensitive}
+                  onChange={(v) => set('crossDirGroupRulesCaseInsensitive', v)}
+                />
               </DefaultableField>
               <DefaultableField
                 label="Include symlinks"
@@ -1551,6 +1575,28 @@ function StopButton({ onStop }: { onStop: () => void }) {
         Stop
       </button>
     </>
+  )
+}
+
+/**
+ * The case-insensitive half of a rule list, shown under its sensitive sibling.
+ *
+ * Two boxes rather than one, because the two halves genuinely want different matching and no rule shape reliably
+ * says which: `*.mp4` names a kind of file and every casing of it is that kind, while `Temp/` names a directory
+ * that on Linux is not `temp/`. Guessing from the pattern would be wrong in both directions.
+ *
+ * Empty is the common case and costs nothing, so the box is always shown rather than hidden behind a toggle —
+ * a hidden setting is one nobody discovers until the day they wonder why `*.mp4` missed every `.MP4`.
+ */
+function CaseInsensitiveHalf({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
+  return (
+    <div style={{ marginTop: 'var(--sp-2)' }}>
+      <p className="text-muted" style={{ margin: '0 0 var(--sp-1)' }}>
+        Ignoring case — <span className="mono">*.mp4</span> here also matches{' '}
+        <span className="mono">.MP4</span> and <span className="mono">.Mp4</span>. Put extensions here and paths above.
+      </p>
+      <RuleBox value={value} onChange={onChange} />
+    </div>
   )
 }
 

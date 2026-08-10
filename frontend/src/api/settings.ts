@@ -26,6 +26,10 @@ export interface GlobalSettings {
   defaultIncludeSymlinks: boolean
   defaultIgnoreRules: string | null
   defaultDontCompressRules: string | null
+  defaultIgnoreRulesCaseInsensitive: string | null
+  defaultDontCompressRulesCaseInsensitive: string | null
+  defaultDontGroupRulesCaseInsensitive: string | null
+  defaultCrossDirGroupRulesCaseInsensitive: string | null
   defaultDontGroupRules: string | null
   defaultCrossDirGroupRules: string | null
   uploadConcurrency: number

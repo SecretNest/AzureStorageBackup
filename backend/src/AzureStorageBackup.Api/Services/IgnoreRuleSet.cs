@@ -6,6 +6,17 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>
 /// A gitignore-style rule set. Supports negation (!), directory-only (trailing /), anchoring (leading / or an internal /),
 /// and the * ** ? wildcards. The last matching rule decides the result. Reused in three places: ignore / don't-compress / don't-group (PRD 3.3).
+/// <para>
+/// Case sensitivity is <b>per rule</b>, not per set. Every rule list comes in a sensitive and an insensitive
+/// half, and the two are concatenated into one set here — because "the last matching rule decides" has to keep
+/// holding across the pair, or a negation in one half could never override a match in the other. Two independent
+/// sets OR-ed together would silently break exactly that.
+/// </para>
+/// <para>
+/// There is no character-class support (<c>[wW]</c>): everything that is not <c>*</c> or <c>?</c> goes through
+/// <see cref="Regex.Escape(string)"/>, so brackets match themselves. Insensitivity is therefore something the
+/// caller has to ask for; it cannot be spelled out in the pattern.
+/// </para>
 /// </summary>
 public sealed class IgnoreRuleSet
 {
@@ -13,9 +24,24 @@ public sealed class IgnoreRuleSet
 
     private readonly List<Rule> _rules = [];
 
-    public IgnoreRuleSet(IEnumerable<string> patterns)
+    /// <summary>All patterns matched case-sensitively, which is what a path on Linux means literally.</summary>
+    public IgnoreRuleSet(IEnumerable<string> patterns) : this(patterns.Select(p => (p, false)), tagged: true) { }
+
+    /// <summary>
+    /// Patterns paired with whether each is matched ignoring case. Order matters: the caller concatenates its
+    /// sensitive list before its insensitive one, and the last rule that matches still wins.
+    /// <para>
+    /// A factory rather than a second constructor: an empty collection literal cannot choose between
+    /// <c>IEnumerable&lt;string&gt;</c> and <c>IEnumerable&lt;(string, bool)&gt;</c>, and existing callers pass one.
+    /// </para>
+    /// </summary>
+    public static IgnoreRuleSet FromTagged(IEnumerable<(string Pattern, bool IgnoreCase)> patterns)
+        => new(patterns, tagged: true);
+
+    private IgnoreRuleSet(IEnumerable<(string Pattern, bool IgnoreCase)> patterns, bool tagged)
     {
-        foreach (var raw in patterns)
+        _ = tagged;
+        foreach (var (raw, ignoreCase) in patterns)
         {
             if (string.IsNullOrWhiteSpace(raw) || raw.TrimStart().StartsWith('#'))
                 continue;
@@ -48,7 +74,8 @@ public sealed class IgnoreRuleSet
             if (p.Length == 0)
                 continue;
 
-            _rules.Add(new Rule(new Regex(GlobToRegex(p, anchored), RegexOptions.Compiled), negate, dirOnly));
+            var opts = ignoreCase ? RegexOptions.Compiled | RegexOptions.IgnoreCase : RegexOptions.Compiled;
+            _rules.Add(new Rule(new Regex(GlobToRegex(p, anchored), opts), negate, dirOnly));
         }
     }
 

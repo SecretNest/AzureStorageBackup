@@ -228,6 +228,44 @@ On the next start, **Resume interrupted backups on startup** (Settings page, on 
 
 **Only runs carrying the planned-shutdown marker are resumed automatically**, and only when *every* journal left for that backup carries it. Everything else waits for you to press Run: a run you suspended by hand (resuming it would erase the intent behind the button), one that downgraded itself after network trouble (the outage is probably still there, so it would just hit the wall again), and one that died without writing a marker at all. That last group is deliberately broad — a `SIGKILL`, a power cut, a shutdown that timed out, and a cancel all look identical on disk, and at least one of them is you saying *stop*. When a backup is skipped for this reason the log says which journal blocked it and why. The Backups page lists interrupted runs it finds either way, so you can Resume or Discard them yourself.
 
+## Rule lists, and why each one has two boxes
+
+Four settings take a list of patterns — **Ignore**, **Don't compress**, **Don't group**, **Pack across
+directories** — in gitignore syntax, one per line, matched against paths *relative to the backup's local root*.
+`!` negates, a trailing `/` restricts a rule to directories, and the **last matching rule decides**.
+
+Each of them is two boxes, and the difference is case:
+
+| Box | Matches | Put here |
+|---|---|---|
+| the first | exactly | paths — `Photos/2024/`, `Temp/` |
+| the second | ignoring case | extensions — `*.mp4`, `*.wmv`, `*.zip` |
+
+The split exists because the two genuinely want different treatment and nothing about a pattern reliably says
+which it is. `*.mp4` names a *kind of file*, and a camera writing `.MP4` or an old Windows box writing `.WMV`
+produces the same kind — so a rule that only matched lower case would silently miss most of them. A path is the
+opposite: on Linux `Temp/` and `temp/` are two different directories, and folding case would quietly widen every
+path rule ever written.
+
+Both boxes feed one rule set — the exact ones first, then the case-insensitive ones — so `!` still works across
+the pair. One thing it cannot do is re-include a file underneath an excluded directory; that is gitignore's own
+rule, not a limitation of the split.
+
+> **There is no character class.** `[wW]` matches those three characters literally: everything that is not `*`,
+> `**` or `?` is taken as text. Case-insensitivity is what the second box is for; it cannot be written into a
+> pattern.
+
+### Why this matters most for *Don't compress*
+
+Video, audio and already-compressed archives do not get smaller — a real 412 GB run uploaded 47.5 GB out of
+48.9 GB of source, a saving of 3%. Compressing them anyway costs more than the wasted CPU: compression is
+**globally serial** (one lock across all backups), so every large incompressible file holds that lock while the
+upload pipeline sits idle with nothing to send. On that run the in-flight line read *"nothing on the wire right
+now · 1 object preparing · 4 objects waiting for the archive slot"* — the network was doing nothing at all.
+
+Listing those extensions under *Don't compress* stores them as-is, and when the backup is unencrypted and the
+file fits in one volume it skips the 7-Zip wrapper entirely and uploads the original bytes.
+
 ## Docker
 
 The image is self-contained: the backend hosts the API and the compiled SPA on **one** HTTP port (`8080`). Rehydration of Archive-tier blobs, 7-Zip compression, restore and repair all run inside this container, so the host directories you want to back up (and restore into) must be mounted.

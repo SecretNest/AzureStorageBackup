@@ -17,6 +17,12 @@ public sealed record ResolvedBackupSettings(
     string? DontCompressRules,
     string? DontGroupRules,
     string? CrossDirGroupRules,
+    // Each list's case-insensitive half inherits on its own: overriding "the mp4 rules" for one backup should not
+    // silently drag the global path rules along with it, nor the other way round.
+    string? IgnoreRulesCaseInsensitive,
+    string? DontCompressRulesCaseInsensitive,
+    string? DontGroupRulesCaseInsensitive,
+    string? CrossDirGroupRulesCaseInsensitive,
     bool IncludeSymlinks,
     int MaxVersions,
     int MaxAgeDays,
@@ -36,6 +42,10 @@ public sealed record ResolvedBackupSettings(
             config.DontCompressRules ?? s.DefaultDontCompressRules,
             config.DontGroupRules ?? s.DefaultDontGroupRules,
             config.CrossDirGroupRules ?? s.DefaultCrossDirGroupRules,
+            config.IgnoreRulesCaseInsensitive ?? s.DefaultIgnoreRulesCaseInsensitive,
+            config.DontCompressRulesCaseInsensitive ?? s.DefaultDontCompressRulesCaseInsensitive,
+            config.DontGroupRulesCaseInsensitive ?? s.DefaultDontGroupRulesCaseInsensitive,
+            config.CrossDirGroupRulesCaseInsensitive ?? s.DefaultCrossDirGroupRulesCaseInsensitive,
             config.IncludeSymlinks ?? s.DefaultIncludeSymlinks,
             config.MaxVersions ?? s.DefaultMaxVersions,
             config.MaxAgeDays ?? s.DefaultMaxAgeDays,

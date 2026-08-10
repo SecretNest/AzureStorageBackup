@@ -79,6 +79,13 @@ public class GlobalSettings
     /// <summary>Global default for cross-path grouping rules (gitignore syntax). Empty = group strictly by directory.</summary>
     public string? DefaultCrossDirGroupRules { get; set; }
 
+    // Case-insensitive halves, matching the split on BackupConfig — see the note there for why extensions and
+    // paths cannot share one sensitivity.
+    public string? DefaultIgnoreRulesCaseInsensitive { get; set; }
+    public string? DefaultDontCompressRulesCaseInsensitive { get; set; }
+    public string? DefaultDontGroupRulesCaseInsensitive { get; set; }
+    public string? DefaultCrossDirGroupRulesCaseInsensitive { get; set; }
+
     // Global
     public int UploadConcurrency { get; set; } = 5;
     public int DownloadConcurrency { get; set; } = 5; // Download concurrency for restore / deep check (PRD 3.4)

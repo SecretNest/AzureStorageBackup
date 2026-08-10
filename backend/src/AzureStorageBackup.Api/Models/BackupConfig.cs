@@ -46,6 +46,16 @@ public class BackupConfig
     /// <summary>Matches are allowed to be packed across directories; null = use the global default.</summary>
     public string? CrossDirGroupRules { get; set; }
 
+    // The case-insensitive half of each list above. Extensions are the reason these exist: `*.mp4` is meant as a
+    // kind of file, and a camera writing `.MP4` or `.MOV` is the same kind — but a path is a path, and on Linux
+    // `Temp/` and `temp/` really are two directories, so folding case for everything would be wrong. Splitting the
+    // lists lets each rule say which it is, instead of the engine guessing from the shape of the pattern.
+    // Concatenated after the sensitive half into a single rule set, so `!` still overrides across the pair.
+    public string? IgnoreRulesCaseInsensitive { get; set; }
+    public string? DontCompressRulesCaseInsensitive { get; set; }
+    public string? DontGroupRulesCaseInsensitive { get; set; }
+    public string? CrossDirGroupRulesCaseInsensitive { get; set; }
+
     /// <summary>
     /// Backup scope (design docs/backup-scope-selection-design.md): one `+ path` / `- path` per line,
     /// decided by longest-prefix match. null/empty = **everything** under the root.
