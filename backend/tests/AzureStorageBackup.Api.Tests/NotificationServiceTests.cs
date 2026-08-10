@@ -30,6 +30,52 @@ public sealed class NotificationServiceTests
         return (new NotificationService(new FakeConfigService(config), sender, NullLogger<NotificationService>.Instance), sender);
     }
 
+    private sealed class RecordingLog : IOperationLog
+    {
+        public List<(OperationLogLevel Level, string Source, string Message)> Entries { get; } = [];
+
+        public Task AppendAsync(OperationLogLevel level, string source, string message, CancellationToken ct = default, bool? durable = null)
+        {
+            Entries.Add((level, source, message));
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(
+            OperationLogLevel? minLevel, string? source, DateTimeOffset? from, DateTimeOffset? to, int limit,
+            CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A rejected notification has to leave a trace the operator can actually see. It used to go only to the
+    /// container log — and on a NAS nobody has a shell for that — so "the receiver refused it every time" and
+    /// "it was never sent" looked exactly alike from the UI. That is what made a broken JSON payload present
+    /// itself as "the success notification does not work".
+    /// </summary>
+    [Fact]
+    public async Task A_rejected_notification_is_recorded_where_the_operator_can_see_it()
+    {
+        var log = new RecordingLog();
+        var svc = new NotificationService(
+            new FakeConfigService(new NotificationConfig
+            {
+                Enabled = true, Url = "https://h/x", Events = NotificationEvents.BackupSuccess,
+            }),
+            new ThrowingSender(), NullLogger<NotificationService>.Instance, log);
+
+        // Still must not throw: a notification problem cannot be allowed to fail the backup that triggered it.
+        await svc.NotifyAsync(NotificationEvents.BackupSuccess, "T", "B");
+
+        var entry = Assert.Single(log.Entries);
+        Assert.Equal(OperationLogLevel.Warning, entry.Level);
+        Assert.Contains("BackupSuccess", entry.Message, StringComparison.Ordinal);
+        Assert.Contains("boom", entry.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Sends_When_Enabled_And_Subscribed()
     {
