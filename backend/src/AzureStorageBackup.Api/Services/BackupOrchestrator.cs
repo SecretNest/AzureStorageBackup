@@ -87,6 +87,14 @@ public sealed record BackupRunResult(int Version, int ChangedFiles, long Changed
     /// <summary>What the retention cleanup at the end of the backup deleted (<see cref="CleanupReport.Empty"/> when cleanup did not run).</summary>
     public CleanupReport Cleanup { get; init; } = CleanupReport.Empty;
 
+    /// <summary>
+    /// Why the retention cleanup was skipped, or null when it ran. Set when cleanup could not reach the cloud: the
+    /// version is committed by then, so the run is a success, but an empty <see cref="Cleanup"/> would otherwise be
+    /// indistinguishable from "there was nothing to clean up" — and those two want opposite reactions from whoever
+    /// reads the summary.
+    /// </summary>
+    public string? CleanupSkipped { get; init; }
+
     /// <summary>The moment this backup started running; the same value written into the version record's <see cref="BackupVersion.StartedAt"/>.</summary>
     public DateTimeOffset StartedAt { get; init; }
 
@@ -1157,6 +1165,10 @@ public sealed class BackupOrchestrator(
         // run's cleaner, which walks every version anyway, so nothing is permanently left uncleaned or uncompacted.
         // Do not remove this "skip" as an optional optimization — it is the entire reason this section exists.
         CleanupReport cleanup;
+        // Non-null when cleanup was skipped because it could not reach the cloud. Carried out on the result so the
+        // run summary can say so: a "success" that quietly stopped applying the retention policy is a success the
+        // operator would rather hear about while the container is still small.
+        Exception? cleanupError = null;
         if (control is { Stop: not StopKind.None })
         {
             cleanup = CleanupReport.Empty;
@@ -1189,6 +1201,37 @@ public sealed class BackupOrchestrator(
                 // the branches at the top of RunAsync would treat it as Suspended/Canceled and claw back a
                 // successful backup. What was skipped is left for the next run's cleaner.
                 cleanup = CleanupReport.Empty;
+            }
+            // The same reasoning as the branch above, for the case nobody asked for: the cloud went away.
+            //
+            // It used to be that only a *cancellation* was recognised as "the version is already committed, this is
+            // still a success". Anything else — a timeout, a 5xx, a dropped connection — walked past it into the
+            // catch-all at the top of RunAsync and condemned the whole run. That is how a three-day 3 TB backup
+            // came back as "Backup failed: Retry failed after 6 tries. (…exceeded the configured timeout of
+            // 0:01:40.)": the data was already sitting in the cloud, the info file already listed the version, and
+            // the only thing that had actually failed was the housekeeping tacked onto the end.
+            //
+            // And it struck at the end *because* of what cleanup is: the one stretch whose work grows with the size
+            // of the backup — listing data/ and packs/ in full, deleting what retired versions exclusively own,
+            // downloading and repacking archives for dead-weight compaction — while having none of the volume
+            // splitting or per-item retry that carries the upload path through a bad patch of network. The bigger
+            // the backup, the longer that stretch runs and the more certain it is to meet one.
+            //
+            // ct is left out of the filter on purpose: if the process itself is shutting down, the run really is
+            // over and the suspend/cancel branches upstream must still get their exception.
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                cleanup = CleanupReport.Empty;
+                cleanupError = ex;
+                // Warning, not Error: nothing was lost and nothing needs doing by hand — the next run's cleaner
+                // walks every version anyway. Silence would be worse though: a container quietly growing past its
+                // retention policy, with compaction never running, has to be explainable from the log alone.
+                // CancellationToken.None for the same reason the cancel branch uses it: this line is the only
+                // record that the housekeeping was skipped, and it must not be lost to a token firing mid-write.
+                await Record(NotificationEvents.BackupFailure, $"backup:{request.Account.Id}/{request.Container}",
+                    $"Backup succeeded, cleanup did not: {request.Name}",
+                    $"Version {version} is committed and restorable; retention cleanup and dead-weight compaction were skipped and will be retried by the next run. {ex.Message}",
+                    CancellationToken.None, OperationLogLevel.Warning);
             }
         }
 
@@ -1224,6 +1267,7 @@ public sealed class BackupOrchestrator(
             DeletedFiles = deletedFiles,
             UploadedBytes = state.UploadedBytes,
             Cleanup = cleanup,
+            CleanupSkipped = cleanupError?.Message,
             StartedAt = startedAt,
             CompletedAt = completedAt,
         };

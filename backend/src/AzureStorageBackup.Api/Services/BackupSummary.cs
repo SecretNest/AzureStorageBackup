@@ -49,6 +49,12 @@ public static class BackupSummary
         if (!r.Cleanup.IsEmpty)
             sb.Append('\n').Append(FormatRetention(r.Cleanup));
 
+        // Said out loud rather than left as an empty cleanup line: the backup is complete either way, but nothing
+        // was retired this round, so the container keeps growing until a later run manages to reach the cloud.
+        // Whoever reads this summary is the only one in a position to notice that early.
+        if (r.CleanupSkipped is { Length: > 0 } why)
+            sb.Append(CultureInfo.InvariantCulture, $"\nCleanup: skipped, will retry next run ({why})");
+
         return sb.ToString();
     }
 
