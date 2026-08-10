@@ -572,6 +572,18 @@ tbody tr.ops-row:hover {
   color: var(--text);
 }
 
+/* A ghost button that keeps its border. Suspend sits immediately left of Stop, and Stop carries .btn-danger's
+   red border — so a borderless Suspend reads as plain text next to a real button, and the operator reaches for
+   the destructive one because it is the only one that looks clickable. The safe action has to look at least as
+   much like a button as the dangerous one.
+   Placed here, between .btn-ghost and .btn-danger, for the reason spelled out above .btn-ghost: these variants
+   all have the same specificity, so source order decides. After .btn-ghost, or its transparent border wins and
+   this rule does nothing; before .btn-danger, or it would strip the red border off Stop. */
+.btn-outline {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
 .btn-danger {
   color: var(--danger);
   border-color: var(--danger-border);

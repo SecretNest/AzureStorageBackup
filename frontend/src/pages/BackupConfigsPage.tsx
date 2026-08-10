@@ -114,6 +114,10 @@ export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
+  // Which runs have been asked to wind down, and how. Stopping is asynchronous — the signal only takes effect
+  // at the next cancellation checkpoint, and the row refreshes on a 5-second poll — so without this the UI says
+  // nothing at all between the click and the run actually settling, which reads as "the button is broken".
+  const [windingDown, setWindingDown] = useState<Record<number, 'suspend' | 'stop'>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checks, setChecks] = useState<Record<number, CheckRun>>({})
@@ -174,6 +178,17 @@ export function BackupConfigsPage() {
   const [containerList, setContainerList] = useState<ContainerInfo[] | null>(null)
   const [containerListError, setContainerListError] = useState<string | null>(null)
   const [newContainer, setNewContainer] = useState(false)
+  // Clear the marker once the backend agrees the run is over. Keyed off the polled status rather than a timer:
+  // a run can take a while to reach its checkpoint, and guessing a duration would either flicker back to
+  // "Suspend" while it is still winding down, or sit on "Suspending…" after it has finished.
+  useEffect(() => {
+    setWindingDown((m) => {
+      const next = Object.fromEntries(
+        Object.entries(m).filter(([id]) => runs[Number(id)]?.status === 'Running'))
+      return Object.keys(next).length === Object.keys(m).length ? m : next
+    })
+  }, [runs])
+
   useEffect(load, [])
 
   // Lets the ticks and cleanups of the effects below read the **latest** configs/restores without putting
@@ -618,10 +633,17 @@ export function BackupConfigsPage() {
 
   const suspendBackup = async (c: BackupConfig) => {
     setError(null)
+    // Mark it before the request, not after: the whole complaint is that pressing Suspend looks like nothing
+    // happened, and the request itself is the part that has already returned by the time anyone notices.
+    setWindingDown((m) => ({ ...m, [c.id]: 'suspend' }))
     try {
       await backupConfigsApi.suspend(c.id)
       load()
     } catch (e) {
+      setWindingDown((m) => {
+        const { [c.id]: _dropped, ...rest } = m
+        return rest
+      })
       setError(e instanceof Error ? e.message : String(e))
     }
   }
@@ -837,6 +859,7 @@ export function BackupConfigsPage() {
                       onStop={() => stopOp(c, 'backup', 'backup')}
                       onSuspend={() => void suspendBackup(c)}
                       onRetryNow={() => void retryNow(c)}
+                      stopping={windingDown[c.id]}
                       onResume={() => void run(c)}
                       onDiscard={() => void discardInterrupted(c)}
                     />
@@ -1499,6 +1522,9 @@ export function BackupConfigsPage() {
           name={stopping.name}
           onStop={async (finishCurrentFiles) => {
             setError(null)
+            // Marked here rather than on the button: Stop opens a confirmation dialog first, and an operator who
+            // backs out of it must not be left looking at a row that claims to be stopping.
+            setWindingDown((m) => ({ ...m, [stopping.id]: 'stop' }))
             try {
               await backupConfigsApi.cancel(stopping.id, 'backup', finishCurrentFiles)
               load()
@@ -1536,11 +1562,16 @@ function RunButtons({
   onStop,
   onSuspend,
   onRetryNow,
+  stopping,
 }: {
   onStop: () => void
   onSuspend: () => void
   onRetryNow?: () => void
+  stopping?: 'suspend' | 'stop'
 }) {
+  // Both buttons go disabled once either has been pressed: the run is winding down and asking it to wind down
+  // a second, different way only produces a race nobody can predict the outcome of.
+  const pending = stopping !== undefined
   return (
     <>
       {onRetryNow && (
@@ -1551,11 +1582,25 @@ function RunButtons({
           </button>
         </>
       )}{' '}
-      <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onSuspend}>
-        Suspend
+      {/* btn-outline, not a bare btn-ghost: next to Stop's red border a borderless Suspend does not read as a
+          button at all, and it is the *safe* one of the pair — the one a hesitant operator should find first. */}
+      <button
+        type="button"
+        className="btn-ghost btn-outline"
+        style={{ padding: '0 0.3rem' }}
+        onClick={onSuspend}
+        disabled={pending}
+      >
+        {stopping === 'suspend' ? 'Suspending…' : 'Suspend'}
       </button>{' '}
-      <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onStop}>
-        Stop
+      <button
+        type="button"
+        className="btn-ghost btn-danger"
+        style={{ padding: '0 0.3rem' }}
+        onClick={onStop}
+        disabled={pending}
+      >
+        {stopping === 'stop' ? 'Stopping…' : 'Stop'}
       </button>
     </>
   )
@@ -1610,6 +1655,7 @@ function RunStatus({
   onRetryNow,
   onResume,
   onDiscard,
+  stopping,
 }: {
   run: BackupRun
   onStop: () => void
@@ -1617,6 +1663,8 @@ function RunStatus({
   onRetryNow: () => void
   onResume: () => void
   onDiscard: () => void
+  /// Set once this run has been asked to wind down, so the buttons can say so while it does.
+  stopping?: 'suspend' | 'stop'
 }) {
   // The expanded state stays inside the component: polling replaces props every second, but React keeps the same instance, so expansion is not reset.
   const [showDetail, setShowDetail] = useState(false)
@@ -1665,7 +1713,7 @@ function RunStatus({
     return (
       <div className="text-faint">
         Starting…
-        <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} />
+        <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} stopping={stopping} />
       </div>
     )
 
@@ -1754,7 +1802,7 @@ function RunStatus({
           {run.pause.nextRetryAt && `; retrying ${formatRetryIn(run.pause.nextRetryAt)}`}
         </div>
       )}
-      <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} />
+      <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} stopping={stopping} />
       {/* Details are folded into an expandable area: the path being processed can be very long and would
           distort the table if laid out in the row. One line of overall progress by default, expanded when
           wanted. */}
