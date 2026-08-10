@@ -288,6 +288,14 @@ public sealed class BackupOrchestrator(
         // Take the start timestamp before any I/O: this is the moment the operator thinks of as "when this backup started".
         var startedAt = DateTimeOffset.UtcNow;
         var source = $"backup:{request.Account.Id}/{request.Container}";
+        // Remembers the last stage reported, so a failure can say where it happened.
+        //
+        // Until now the failure record carried ex.Message and nothing else, and an Azure message names no stage: the
+        // 3 TB incident was pinned to cleanup only because the operator noticed it always struck at the end, and
+        // that is not a diagnostic anyone should have to rely on twice. Wrapping the progress sink rather than
+        // touching each of the twelve Report call sites keeps this from going stale when a stage is added.
+        var cursor = new StageCursor();
+        progress = cursor.Wrap(progress);
         await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
         try
         {
@@ -350,8 +358,36 @@ public sealed class BackupOrchestrator(
         }
         catch (Exception ex)
         {
-            await Record(NotificationEvents.BackupFailure, source, $"Backup failed: {request.Name}", ex.Message, ct);
+            // The stage goes in the body rather than the title: the title is what notification rules and the UI's
+            // failure list match on, and it has to stay stable across runs.
+            await Record(NotificationEvents.BackupFailure, source, $"Backup failed: {request.Name}",
+                $"Failed during {cursor.Stage}. {ex.Message}", ct);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Tracks the last stage reported through the progress sink, so the failure record can name it. Deliberately not
+    /// a field on the orchestrator: it is registered as scoped, and "each run's own bookkeeping lives on that run"
+    /// should follow from the code rather than from how the type happens to be registered.
+    /// </summary>
+    private sealed class StageCursor
+    {
+        private int _stage = (int)BackupStage.Scanning;
+
+        /// <summary>The last stage reported. Volatile because the pipeline reports from worker threads.</summary>
+        public BackupStage Stage => (BackupStage)Volatile.Read(ref _stage);
+
+        /// <summary>Wraps the caller's sink; a null sink still needs wrapping, since the stage matters even when nobody is watching the progress.</summary>
+        public IProgress<BackupProgress> Wrap(IProgress<BackupProgress>? inner) => new Sink(this, inner);
+
+        private sealed class Sink(StageCursor owner, IProgress<BackupProgress>? inner) : IProgress<BackupProgress>
+        {
+            public void Report(BackupProgress value)
+            {
+                Volatile.Write(ref owner._stage, (int)value.Stage);
+                inner?.Report(value);
+            }
         }
     }
 

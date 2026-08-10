@@ -110,7 +110,28 @@ public sealed class CleanupFailureTests : IDisposable
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
-    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, FailsWhenArmed Cleaner) Build(IOperationLog opLog)
+    /// <summary>
+    /// Fails every upload with an error that is *not* transient, so it is neither retried nor parked on the pause
+    /// gate — the run has to die where it stands, which is what makes the stage in the failure record meaningful.
+    /// </summary>
+    private sealed class AlwaysFailsUploader : IBlobUploader
+    {
+        private static Exception Boom() => new InvalidOperationException("upload refused by the test double");
+
+        // Only the two required members; the progress-carrying overload has a default implementation that routes here.
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, Azure.Storage.Blobs.Models.AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => throw Boom();
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, Azure.Storage.Blobs.Models.AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => throw Boom();
+    }
+
+    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, FailsWhenArmed Cleaner) Build(
+        IOperationLog opLog, IBlobUploader? uploader = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -124,7 +145,7 @@ public sealed class CleanupFailureTests : IDisposable
         var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
+            new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(cleanerFactory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
             new FileHasher(), authority.IndexCache, authority.Tracked,
@@ -201,6 +222,44 @@ public sealed class CleanupFailureTests : IDisposable
             Assert.DoesNotContain(log.Entries, e =>
                 e.Level == OperationLogLevel.Error &&
                 e.Message.Contains("Backup failed", StringComparison.OrdinalIgnoreCase));
+
+            // The summary has to distinguish "nothing needed cleaning up" from "cleanup could not run" — an empty
+            // cleanup line reads identically for both, and only one of them wants the operator's attention.
+            Assert.Contains("Cleanup: skipped", BackupSummary.Format(result), StringComparison.Ordinal);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// A failure that really is a failure must name the stage it died in. The 3 TB incident was traced to cleanup
+    /// only because it always struck at the end — the record itself carried nothing but the Azure message, which
+    /// names no stage at all.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_genuine_failure_records_the_stage_it_died_in()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("stagefail");
+        var log = new RecordingOperationLog();
+        var (orchestrator, factory, _) = Build(log, new AlwaysFailsUploader());
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            Write("a/one.bin", 1_000_000);
+            await container.CreateIfNotExistsAsync();
+            // Every upload is refused, so the run dies in the upload stage and the record has to name it.
+            await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(Request(account, name)));
+
+            var failure = Assert.Single(log.Entries, e =>
+                e.Level == OperationLogLevel.Error &&
+                e.Message.Contains("Backup failed", StringComparison.Ordinal));
+            Assert.Contains("Failed during ", failure.Message, StringComparison.Ordinal);
         }
         finally
         {

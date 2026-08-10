@@ -29,13 +29,49 @@ public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
         var accountName = ParseAccountName(uri);
         var credential = new StorageSharedKeyCredential(accountName, secrets.RevealAccountKey(account));
 
-        var options = new BlobClientOptions
-        {
-            Transport = new HttpClientTransport(new HttpClient(CreateProxyHandler(account)))
-        };
-
-        return new BlobServiceClient(uri, credential, options);
+        return new BlobServiceClient(uri, credential, CreateOptions(CreateProxyHandler(account)));
     }
+
+    /// <summary>
+    /// How long one attempt at a single request may take before the SDK abandons it and retries.
+    /// <para>
+    /// The default is 100 seconds, and it is meant for the request sizes a web app makes, not for a backup pushing
+    /// volumes up a home uplink. This project measured 4-6 MB/s as the ceiling of one TCP connection to Azure, so
+    /// the default volume of 100 MB already spends 17-25 seconds of that budget on a *good* day; an evening where
+    /// the line drops to a quarter of that is enough to run a perfectly healthy upload into the timeout, and every
+    /// retry then hits the same wall, since a Put Blob starts from zero each time. Five minutes carries a 100 MB
+    /// volume down to roughly 0.33 MB/s before it gives up.
+    /// </para>
+    /// <para>
+    /// It is not set higher than that on purpose: this timeout is also the only thing that notices a connection
+    /// which has gone silent without being closed, and the retry above it cannot start until this one fires.
+    /// </para>
+    /// </summary>
+    internal static readonly TimeSpan NetworkTimeout = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Builds the client options. Separate from <see cref="CreateServiceClient"/> so the settings can be asserted
+    /// without a live account — they are invisible from a constructed <c>BlobServiceClient</c>, so a test that went
+    /// through the public API could only observe them by timing out for real.
+    /// </summary>
+    internal static BlobClientOptions CreateOptions(HttpMessageHandler handler)
+    {
+        var options = new BlobClientOptions { Transport = new HttpClientTransport(CreateHttpClient(handler)) };
+        options.Retry.NetworkTimeout = NetworkTimeout;
+        return options;
+    }
+
+    /// <summary>
+    /// The transport's own timeout is disabled so that <see cref="NetworkTimeout"/> is the only one in force.
+    /// <para>
+    /// <see cref="HttpClient.Timeout"/> covers a whole request and knows nothing about the SDK's retries, so
+    /// whichever of the two is smaller silently becomes the real limit. Left at its 100-second default it would make
+    /// the setting above pure decoration — the SDK would never get to apply it, and the failure would keep arriving
+    /// as a TaskCanceledException naming a timeout nobody in this codebase had chosen.
+    /// </para>
+    /// </summary>
+    internal static HttpClient CreateHttpClient(HttpMessageHandler handler)
+        => new(handler) { Timeout = Timeout.InfiniteTimeSpan };
 
     public async Task<ConnectionResult> TestConnectionAsync(Account account, CancellationToken ct = default)
     {
