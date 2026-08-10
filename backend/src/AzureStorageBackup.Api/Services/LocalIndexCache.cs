@@ -10,10 +10,11 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public interface ILocalIndexCache
 {
-    /// <summary>Read a version index: return it directly on a local hit (with matching identity), otherwise download from the cloud and backfill.</summary>
+    /// <summary>Read a version index: return it directly on a local hit (with matching identity), otherwise download from the cloud and backfill.
+    /// <paramref name="indexVolumes"/> is only consulted on a miss; it comes from <see cref="BackupVersion.IndexVolumes"/>.</summary>
     Task<VersionIndex> ReadAsync(
         Account account, string container, int version, long identityTicks,
-        string indexBlob, string? password, CancellationToken ct = default);
+        string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default);
 
     /// <summary>Write/update the cache for a version index (called after a backup finishes writing a new version).</summary>
     Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default);
@@ -35,7 +36,7 @@ public sealed class LocalIndexCache(
 
     public async Task<VersionIndex> ReadAsync(
         Account account, string container, int version, long identityTicks,
-        string indexBlob, string? password, CancellationToken ct = default)
+        string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default)
     {
         // The row holds **serialized bytes**, so even a SQLite hit still has to rebuild the entire index into objects (measured
         // at roughly 0.9 s / 350 MB allocated for 500k entries). The restore dialog goes through it every time a directory is
@@ -54,7 +55,7 @@ public sealed class LocalIndexCache(
         }
 
         // Miss, or the container has been rebuilt (identity mismatch) → download from the cloud and backfill.
-        var index = await store.ReadIndexAsync(account, container, indexBlob, password, ct);
+        var index = await store.ReadIndexAsync(account, container, indexBlob, password, indexVolumes, ct);
         await UpsertAsync(row, account.Id, container, version, identityTicks, index, ct);
         _memory.Set(account.Id, container, version, identityTicks, index);
         return index;

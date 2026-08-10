@@ -48,6 +48,25 @@ public sealed record BackupVersion
     public DateTimeOffset? StartedAt { get; init; }
 
     public required string IndexBlob { get; init; }
+
+    /// <summary>
+    /// How many volumes the second-level index was split into (1 = a single blob under <see cref="IndexBlob"/>).
+    /// <para>
+    /// The index is the one blob in a backup whose size nobody can bound in advance: it grows with the file count,
+    /// measured here at 161 bytes per entry, and the file count is not knowable before the scan. A million files
+    /// puts it past the SDK's single-shot threshold and well past what one request can carry up a home uplink.
+    /// Volumes are named exactly like a data blob's (<c>name.001</c>…), so <see cref="Services.VolumeBlobIO.VolumeNames"/>
+    /// and <see cref="Services.VolumeBlobIO.IsVolumeOf"/> apply unchanged.
+    /// </para>
+    /// <para>
+    /// Recorded here rather than probed for: an info file written before this field reads back 1 and keeps taking
+    /// the single-blob path, so every existing backup stays readable without a single extra request. Probing would
+    /// have meant a 404 round trip on every index read, and — worse — would make a genuinely missing index
+    /// indistinguishable from an old single-blob one.
+    /// </para>
+    /// </summary>
+    public int IndexVolumes { get; init; } = 1;
+
     public required VersionStats Stats { get; init; }
 }
 

@@ -274,7 +274,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
             var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
 
             // v1: its only purpose is to retire and thereby free up "dead weight" — its index content is irrelevant to this case's criterion, so leaving it empty is fine.
-            var v1Blob = await store.WriteIndexAsync(account, name, 1, new VersionIndex { Version = 1 }, null);
+            var (v1Blob, _) = await store.WriteIndexAsync(account, name, 1, new VersionIndex { Version = 1 }, null);
 
             // v2 (the retained version): two entries pointing at the same pack, same fullHash, different EntryNames.
             var v2Index = new VersionIndex
@@ -296,7 +296,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
                     },
                 ],
             };
-            var v2Blob = await store.WriteIndexAsync(account, name, 2, v2Index, null);
+            var (v2Blob, _) = await store.WriteIndexAsync(account, name, 2, v2Index, null);
 
             var info = new BackupInfoFile
             {

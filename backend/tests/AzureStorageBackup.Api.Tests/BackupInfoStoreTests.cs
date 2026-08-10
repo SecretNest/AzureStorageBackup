@@ -187,7 +187,7 @@ public sealed class BackupInfoStoreTests
                 EmptyDirs = ["empty"],
             };
 
-            var blobName = await store.WriteIndexAsync(account, name, 3, index, password: null);
+            var (blobName, _) = await store.WriteIndexAsync(account, name, 3, index, password: null);
 
             Assert.Equal("indexes/v3.json", blobName);
             var back = await store.ReadIndexAsync(account, name, blobName, password: null);

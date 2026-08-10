@@ -113,7 +113,7 @@ public static class BackupConfigEndpoints
             {
                 try
                 {
-                    await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, ct);
+                    await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, v.IndexVolumes, ct);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -401,7 +401,7 @@ public static class BackupConfigEndpoints
             var fvIdentity = info?.Backup.CreatedAt.UtcTicks ?? 0;
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
             {
-                var idx = await indexCache.ReadAsync(account, config.ContainerName, v.Version, fvIdentity, v.IndexBlob, password, ct);
+                var idx = await indexCache.ReadAsync(account, config.ContainerName, v.Version, fvIdentity, v.IndexBlob, password, v.IndexVolumes, ct);
                 if (idx.UnrecoverablePaths.Contains(path))
                     continue;
                 var e = idx.Entries.FirstOrDefault(x => x.Path == path && x.Storage is not null);
@@ -431,7 +431,7 @@ public static class BackupConfigEndpoints
             if (ver is null)
                 return Results.Ok(Array.Empty<string>());
             var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ct);
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
@@ -457,7 +457,7 @@ public static class BackupConfigEndpoints
             if (ver is null)
                 return Results.Ok(Array.Empty<object>());
             var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ct);
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
             return Results.Ok(idx.Entries
                 .Where(e => e.UnreadableAt is not null)
                 .Select(e => new { path = e.Path, unreadableAt = e.UnreadableAt })
@@ -488,7 +488,7 @@ public static class BackupConfigEndpoints
                 return Results.Ok(Array.Empty<TreeNode>()); // the requested version does not exist → empty result, same as /unrecoverable and /file-versions
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
+            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ver.IndexVolumes, ct);
             return Results.Ok(VersionTreeService.Children(idx, path));
         });
 
@@ -516,7 +516,7 @@ public static class BackupConfigEndpoints
                 return Results.NotFound(new { error = "Version not found." });
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ct);
+            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ver.IndexVolumes, ct);
             var estimate = RestoreEstimator.Compute(idx, info, body.Paths ?? []);
 
             // First-volume blob name + volume count for each deduplicated storage object (packs use PackInfo.Volumes; blobs use StorageRef.Volumes from the first entry with that Ref).
@@ -1038,7 +1038,7 @@ public static class BackupConfigEndpoints
 
             var index = await indexCache.ReadAsync(
                 account, config.ContainerName, latest.Version,
-                info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, ct);
+                info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, latest.IndexVolumes, ct);
             return new BaselineLoad(index, null);
         }
         // Cancellation is not a "failure", it means the whole request should stop — as always, do not intercept it.

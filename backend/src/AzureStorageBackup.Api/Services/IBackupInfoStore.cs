@@ -25,9 +25,17 @@ public interface IBackupInfoStore
     /// </summary>
     Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default);
 
-    /// <summary>Reads the second-level index at the given blob name.</summary>
-    Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, CancellationToken ct = default);
+    /// <summary>
+    /// Reads the second-level index at the given blob name. <paramref name="volumes"/> comes from
+    /// <see cref="BackupVersion.IndexVolumes"/>; 1 (the default, and what every info file older than format 5 reads
+    /// back) is the single-blob layout.
+    /// </summary>
+    Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default);
 
-    /// <summary>Writes the second-level index of a version and returns its blob name (recorded in the info file's versions[].indexBlob). An empty tier means the default.</summary>
-    Task<string> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default);
+    /// <summary>
+    /// Writes the second-level index of a version and returns its blob name (recorded in the info file's
+    /// versions[].indexBlob) together with the number of volumes it was split into (versions[].indexVolumes). An
+    /// empty tier means the default.
+    /// </summary>
+    Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default);
 }

@@ -84,7 +84,7 @@ public sealed class BackupRepairer(
             // are synced / paths marked unrecoverable).
             var indexes = new Dictionary<int, VersionIndex>();
             foreach (var ver in info.Versions)
-                indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+                indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
 
             var changedVersions = new HashSet<int>();
             foreach (var badRef in badBlobs)

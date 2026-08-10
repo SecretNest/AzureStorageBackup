@@ -516,11 +516,11 @@ public sealed class BackupCancelModesTests : IDisposable
 
         public async Task<VersionIndex> ReadAsync(
             Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, CancellationToken ct = default)
+            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default)
         {
             Reading.TrySetResult();
             await Task.Delay(Timeout.Infinite, ct);   // only the token can save it
-            return await inner.ReadAsync(account, container, version, identityTicks, indexBlob, password, ct);
+            return await inner.ReadAsync(account, container, version, identityTicks, indexBlob, password, indexVolumes, ct);
         }
 
         public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index,

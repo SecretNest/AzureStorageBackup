@@ -110,7 +110,7 @@ public sealed class RestoreOrchestrator(
               ?? throw new InvalidOperationException($"Version {v} not found.")
             : info.Versions[^1];
 
-        var index = await store.ReadIndexAsync(request.Account, request.Container, version.IndexBlob, request.Password, ct);
+        var index = await store.ReadIndexAsync(request.Account, request.Container, version.IndexBlob, request.Password, version.IndexVolumes, ct);
 
         Directory.CreateDirectory(request.TargetRoot);
         var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -134,7 +134,7 @@ public sealed class RestoreOrchestrator(
             var sv = info.Versions.FirstOrDefault(x => x.Version == grp.Key);
             if (sv is null)
                 continue; // the substitute version was deleted by retention cleanup → the whole group falls back to being skipped
-            var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, ct);
+            var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, sv.IndexVolumes, ct);
             // The substitute source version's index also comes from the cloud and can equally well contain duplicate Paths; a substitution path that can't be resolved
             // falls back to the existing "intent declared but the substitute isn't available" skip semantics (the TryGetValue below simply doesn't find it).
             var srcByPath = IndexByPath(srcIndex.Entries, phase, out _);

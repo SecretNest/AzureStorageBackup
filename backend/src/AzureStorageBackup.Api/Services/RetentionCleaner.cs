@@ -101,14 +101,20 @@ public sealed class RetentionCleaner(
         // Delete the second-level index of each retired version (cloud + local cache) and remove it from the info file.
         foreach (var v in info.Versions.Where(v => deleted.Contains(v.Version)))
         {
-            var indexBlob = container_.GetBlobClient(v.IndexBlob);
-            // Ask for the size once before deleting. An index is not a negligibly small thing — a version index of a
-            // few hundred thousand entries can be tens of MB compressed, and missing it makes "how much space was
-            // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
-            // digit, so the cost is negligible.
-            var indexBytes = await TrySizeOfAsync(indexBlob, ct);
-            if ((await indexBlob.DeleteIfExistsAsync(cancellationToken: ct)).Value)
-                freedBytes += indexBytes;
+            // Every volume, not just the base name: deleting only the first one of a split index would leave the
+            // rest behind as objects nothing references — invisible to the retention report, and reclaimed only if
+            // somebody later runs a sweep.
+            foreach (var n in VolumeBlobIO.VolumeNames(v.IndexBlob, v.IndexVolumes))
+            {
+                var indexBlob = container_.GetBlobClient(n);
+                // Ask for the size once before deleting. An index is not a negligibly small thing — a version index of a
+                // few hundred thousand entries can be tens of MB compressed, and missing it makes "how much space was
+                // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
+                // digit, so the cost is negligible.
+                var indexBytes = await TrySizeOfAsync(indexBlob, ct);
+                if ((await indexBlob.DeleteIfExistsAsync(cancellationToken: ct)).Value)
+                    freedBytes += indexBytes;
+            }
             if (indexCache is not null)
                 await indexCache.RemoveAsync(account.Id, container, v.Version, ct);
         }
@@ -129,8 +135,8 @@ public sealed class RetentionCleaner(
         foreach (var v in info.Versions)
         {
             var vi = indexCache is not null
-                ? await indexCache.ReadAsync(account, container, v.Version, identity, v.IndexBlob, password, ct)
-                : await store.ReadIndexAsync(account, container, v.IndexBlob, password, ct);
+                ? await indexCache.ReadAsync(account, container, v.Version, identity, v.IndexBlob, password, v.IndexVolumes, ct)
+                : await store.ReadIndexAsync(account, container, v.IndexBlob, password, v.IndexVolumes, ct);
             foreach (var e in vi.Entries)
             {
                 if (e.Storage is null)

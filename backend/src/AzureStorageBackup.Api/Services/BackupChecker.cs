@@ -97,7 +97,7 @@ public sealed class BackupChecker(
               ?? throw new InvalidOperationException($"Version {v} not found.")
             : info.Versions[^1];
 
-        var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+        var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
         loading?.Advance(0);
         loading?.Complete();
 
@@ -194,7 +194,7 @@ public sealed class BackupChecker(
     {
         var indexes = new Dictionary<int, VersionIndex>();
         foreach (var ver in info.Versions)
-            indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ct);
+            indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
         return ReferencedBlobNames(info, indexes);
     }
 
@@ -216,8 +216,11 @@ public sealed class BackupChecker(
         };
 
         // The second-level index blob of every version (its name must be protected even when that version's index was not supplied in indexes).
+        // Every volume of it, not just the base name: a split index whose .002 onwards were left out of this set
+        // would have them swept as orphans, and the version would stop being readable at all.
         foreach (var v in info.Versions)
-            refs.Add(v.IndexBlob);
+            foreach (var n in VolumeBlobIO.VolumeNames(v.IndexBlob, v.IndexVolumes))
+                refs.Add(n);
 
         // Every volume of every storage ref of every version index.
         foreach (var idx in indexes.Values)

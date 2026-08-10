@@ -13,7 +13,7 @@ public static class IndexSerializer
 {
     public const int CurrentSchemaVersion = 1;
     // Not in production yet, so the format is free to evolve: includes the volume count (§7) + the key derivation salt for encrypted backups (keyed addressing). Always reads and writes the current fields.
-    private const byte InfoFormat = 4;  // format 2: PackInfo.VolumeSizes (volume sizes, for the exists+size check); format 3: BackupVersion.StartedAt; format 4: PackInfo.StoreOnly
+    private const byte InfoFormat = 5;  // format 2: PackInfo.VolumeSizes (volume sizes, for the exists+size check); format 3: BackupVersion.StartedAt; format 4: PackInfo.StoreOnly; format 5: BackupVersion.IndexVolumes
     private const byte IndexFormat = 4;  // format 2: TailHash; format 3: StorageRef.VolumeSizes + VersionIndex.UnrecoverablePaths; format 4: IndexEntry.UnreadableAt
 
     // ---- Info record file ----
@@ -42,6 +42,7 @@ public static class IndexSerializer
             WriteDto(w, v.CreatedAt);
             WriteNullableDto(w, v.StartedAt); // info format 3
             w.Write(v.IndexBlob);
+            w.Write(v.IndexVolumes); // info format 5
             w.Write(v.Stats.Files);
             w.Write(v.Stats.Bytes);
             w.Write(v.Stats.ChangedFiles);
@@ -103,6 +104,9 @@ public static class IndexSerializer
                 CreatedAt = ReadDto(r),
                 StartedAt = format >= 3 ? ReadNullableDto(r) : null, // format 3+
                 IndexBlob = r.ReadString(),
+                // format 5+. Anything written earlier is a single blob by definition, so 1 is the historical
+                // behaviour rather than a guess — an old info file keeps reading exactly as it always did.
+                IndexVolumes = format >= 5 ? r.ReadInt32() : 1,
                 Stats = new VersionStats(r.ReadInt64(), r.ReadInt64(), r.ReadInt64(), r.ReadInt64()),
             });
         }

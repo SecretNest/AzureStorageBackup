@@ -551,7 +551,7 @@ public sealed class BackupOrchestrator(
         {
             var last = info.Versions[^1];
             previous = await BeforeUploadAsync(t => indexCache.ReadAsync(
-                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, t));
+                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, last.IndexVolumes, t));
         }
 
         // Data blob addressing scheme: encrypted backups use keyed addresses to prevent fingerprinting (the key is derived from the password + the salt in the info file).
@@ -573,7 +573,7 @@ public sealed class BackupOrchestrator(
             indexes.Add(previous is not null && v.Version == lastVer
                 ? previous
                 : await BeforeUploadAsync(t => indexCache.ReadAsync(
-                    request.Account, request.Container, v.Version, identity, v.IndexBlob, password, t)));
+                    request.Account, request.Container, v.Version, identity, v.IndexBlob, password, v.IndexVolumes, t)));
 
         // Open the journal: the baseline version and the addressing identity are only complete at this point. Recovery uses those two to decide whether a journal still counts.
         if (control is not null)
@@ -1152,7 +1152,7 @@ public sealed class BackupOrchestrator(
 
         // 7. WriteIndex (upload the second-level index first)
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        var indexBlob = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
+        var (indexBlob, indexVolumes) = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
         // The local index cache Put is deferred until the info file commits successfully (see below), so that a write conflict on the info file does not leave a ghost cache entry for an uncommitted version.
 
         // 8/9. Finalize (atomically update the info file)
@@ -1164,6 +1164,7 @@ public sealed class BackupOrchestrator(
             CreatedAt = completedAt,
             StartedAt = startedAt,
             IndexBlob = indexBlob,
+            IndexVolumes = indexVolumes,
             Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
         });
         if (trackedInfo is not null)

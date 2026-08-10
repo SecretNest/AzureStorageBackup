@@ -291,7 +291,7 @@ public sealed class RetentionCleanerJournalTests : IDisposable
 
             // Version 1 references only a single 1-byte member inside p1, while the crate records 1000 bytes of
             // original size → 99.9% dead weight, far past the default 30% threshold. If compaction is ever invoked, it will certainly touch this crate.
-            var indexBlob = await store.WriteIndexAsync(account, name, 1, new VersionIndex
+            var (indexBlob, _) = await store.WriteIndexAsync(account, name, 1, new VersionIndex
             {
                 Version = 1,
                 Entries =

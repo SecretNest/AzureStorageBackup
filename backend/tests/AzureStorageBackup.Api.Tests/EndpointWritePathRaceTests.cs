@@ -72,10 +72,10 @@ public sealed class EndpointWritePathRaceTests
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, CancellationToken ct = default)
+        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task<string> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default)
+        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default)
             => throw new NotSupportedException();
     }
 
@@ -84,7 +84,7 @@ public sealed class EndpointWritePathRaceTests
     {
         public Task<VersionIndex> ReadAsync(
             Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, CancellationToken ct = default) => throw new NotSupportedException();
+            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default) => throw new NotSupportedException();
 
         public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default)
             => throw new NotSupportedException();
