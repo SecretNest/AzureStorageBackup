@@ -70,6 +70,18 @@ export function NotificationsSection() {
       <h2 style={{ marginTop: '2rem' }}>Notifications</h2>
       {error && <p className="text-danger">{error}</p>}
 
+      <p className="text-muted">
+        <span className="mono">{'{Title}'}</span> and <span className="mono">{'{Body}'}</span> are substituted into
+        the URL and the body template. In a URL they are percent-encoded; in a body they are escaped to suit the
+        Content-Type — for <span className="mono">application/json</span> that means quotes and newlines are made
+        safe, so a multi-line message (a backup summary is several lines) cannot break the payload.
+      </p>
+      <p className="text-muted">
+        Use <span className="mono">{'{TitleRaw}'}</span> / <span className="mono">{'{BodyRaw}'}</span> only where the
+        value must be inserted <em>unescaped</em> — for instance when it already is a fragment of JSON. In an ordinary
+        JSON string these would produce an invalid payload the receiver rejects.
+      </p>
+
       <Field label="Enabled">
         <input type="checkbox" checked={cfg.enabled} onChange={(e) => set('enabled', e.target.checked)} />
       </Field>
@@ -94,7 +106,7 @@ export function NotificationsSection() {
             <textarea
               rows={3}
               className="w-lg"
-              placeholder="{Title} and {Body} placeholders"
+              placeholder={'{"title":"{Title}","body":"{Body}"}'}
               value={cfg.bodyTemplate ?? ''}
               onChange={(e) => set('bodyTemplate', e.target.value)}
             />

@@ -228,6 +228,49 @@ On the next start, **Resume interrupted backups on startup** (Settings page, on 
 
 **Only runs carrying the planned-shutdown marker are resumed automatically**, and only when *every* journal left for that backup carries it. Everything else waits for you to press Run: a run you suspended by hand (resuming it would erase the intent behind the button), one that downgraded itself after network trouble (the outage is probably still there, so it would just hit the wall again), and one that died without writing a marker at all. That last group is deliberately broad — a `SIGKILL`, a power cut, a shutdown that timed out, and a cancel all look identical on disk, and at least one of them is you saying *stop*. When a backup is skipped for this reason the log says which journal blocked it and why. The Backups page lists interrupted runs it finds either way, so you can Resume or Discard them yourself.
 
+## Notifications
+
+One HTTP request per event, to a URL you supply. Which events fire is a set of checkboxes; the request itself is
+either a `GET` with the values in the URL, or a `POST` with a body template.
+
+Four placeholders are substituted, case-insensitively:
+
+| Placeholder | Substituted as |
+|---|---|
+| `{Title}` | escaped for where it lands — percent-encoded in a URL, JSON-escaped in a JSON body |
+| `{Body}` | the same |
+| `{TitleRaw}` | verbatim, no escaping |
+| `{BodyRaw}` | the same |
+
+**Use `{Title}` and `{Body}`.** The escaping is what makes a template survive real messages: a backup's closing
+notification carries the run summary, which is several lines, and a newline inside a JSON string literal is a
+control character that JSON forbids. Substituted raw it produces a payload the receiver answers `4xx` to — and
+since the opening notification carries only a container name, which happens to be JSON-safe, the symptom is the
+confusing one: *the start notification arrives, the finish notification never does*. A quote in a backup name does
+the same thing sooner.
+
+Escaping follows the configured **Content-Type**: `application/json` gets JSON escaping, anything else is left
+alone (escaping `text/plain` would put a literal `\n` into the message where a line break belongs). Non-ASCII is
+never escaped, so arrows and non-Latin text arrive readable rather than as `\uXXXX`.
+
+The `Raw` pair exists for the one case escaping would break: a template where the placeholder *is* a piece of JSON
+structure rather than a value inside a string. Inside an ordinary JSON string it produces exactly the invalid
+payload described above.
+
+A working POST template:
+
+```json
+{"title":"NASBackup - {Title}","body":"{Body}"}
+```
+
+with Content-Type `application/json`. For GET, put the placeholders in the query string
+(`https://hook.example/notify?t={Title}&b={Body}`) — they are percent-encoded, so a multi-line body is safe there
+too, though some receivers cap URL length.
+
+> A notification that fails is never allowed to fail the backup that triggered it. It is recorded in the
+> **operation log** at Warning level with the error, so a receiver rejecting the payload is visible from the UI
+> rather than only in the container log.
+
 ## Rule lists, and why each one has two boxes
 
 Four settings take a list of patterns — **Ignore**, **Don't compress**, **Don't group**, **Pack across
