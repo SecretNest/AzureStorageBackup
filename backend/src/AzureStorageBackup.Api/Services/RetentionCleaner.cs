@@ -112,7 +112,7 @@ public sealed class RetentionCleaner(
                 // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
                 // digit, so the cost is negligible.
                 var indexBytes = await TrySizeOfAsync(indexBlob, ct);
-                if ((await indexBlob.DeleteIfExistsAsync(cancellationToken: ct)).Value)
+                if ((await WithRetryAsync(t => indexBlob.DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
                     freedBytes += indexBytes;
             }
             if (indexCache is not null)
@@ -178,7 +178,7 @@ public sealed class RetentionCleaner(
             var packId = PackIdOf(blob.Name);
             if (referencedPacks.Contains(packId) || active.Packs.Contains(packId))
                 continue;
-            if ((await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct)).Value)
+            if ((await WithRetryAsync(t => container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
             {
                 deletedPacks.Add(packId);
                 freedBytes += blob.Properties.ContentLength ?? 0;
@@ -196,7 +196,7 @@ public sealed class RetentionCleaner(
             var baseRef = BaseRef(blob.Name);
             if (referencedBlobs.Contains(baseRef) || active.Blobs.Contains(baseRef))
                 continue;
-            if ((await container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: ct)).Value)
+            if ((await WithRetryAsync(t => container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
             {
                 deletedBlobs.Add(baseRef);
                 freedBytes += blob.Properties.ContentLength ?? 0;
@@ -247,12 +247,31 @@ public sealed class RetentionCleaner(
         return new CleanupReport(toDelete.Count, deletedPacks.Count, deletedBlobs.Count, freedBytes);
     }
 
+    /// <summary>
+    /// Runs one cloud operation under the same retry policy the upload path uses.
+    /// <para>
+    /// Cleanup used to call the cloud bare, with nothing but the SDK's own handful of attempts underneath it. That is
+    /// how a three-day backup ended on "Retry failed after 6 tries" — six network timeouts inside one
+    /// AggregateException, which <see cref="TransientErrors.IsTransient"/> does recognise, but which nothing here
+    /// ever handed to a retry. The upload path has ridden out exactly this shape of blip all along, by backing off
+    /// exponentially for as long as two hours.
+    /// </para>
+    /// <para>
+    /// Only point operations are wrapped, not the enumerations around them: a delete is idempotent, so a retry is
+    /// free, whereas restarting a listing of a container with hundreds of thousands of objects to recover one bad
+    /// page would cost more than it saves — and a listing that really cannot finish is now survivable anyway, since
+    /// a failed cleanup no longer condemns the backup that already committed.
+    /// </para>
+    /// </summary>
+    private static Task<T> WithRetryAsync<T>(Func<CancellationToken, Task<T>> op, CancellationToken ct)
+        => RetryPolicy.ExecuteAsync(op, options: null, ex => TransientErrors.IsTransient(ex, ct), ct);
+
     /// <summary>Ask for the size once before deleting. When the blob is already gone (concurrent cleanup, a previous round that died half-way) it counts as 0 rather than aborting the cleanup.</summary>
     private static async Task<long> TrySizeOfAsync(BlobClient blob, CancellationToken ct)
     {
         try
         {
-            return (await blob.GetPropertiesAsync(cancellationToken: ct)).Value.ContentLength;
+            return (await WithRetryAsync(t => blob.GetPropertiesAsync(cancellationToken: t), ct)).Value.ContentLength;
         }
         catch (RequestFailedException)
         {
