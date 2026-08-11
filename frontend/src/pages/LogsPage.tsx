@@ -1,8 +1,13 @@
 import { useEffect, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
 import { systemApi } from '../api/system'
+import { formatLocalDateTime, formatUtcOffset } from '../constants/format'
 
 export function LogsPage() {
+  // The zone every time on this page is written in and read back as. Named on screen because the
+  // backend stores UTC and the reader cannot otherwise tell which of the two they are looking at.
+  const timeZone = formatUtcOffset(new Date())
+
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [minLevel, setMinLevel] = useState<number | ''>('')
   const [source, setSource] = useState('')
@@ -47,7 +52,8 @@ export function LogsPage() {
       setError('Set the "To" time to purge everything before it.')
       return
     }
-    if (!window.confirm(`Delete ALL logs before ${to}?`)) return
+    // The cutoff is spelled out in the same zone as the filter that set it, so nobody confirms a delete against a time they read as UTC.
+    if (!window.confirm(`Delete ALL logs before ${formatLocalDateTime(to)} (${timeZone})?`)) return
     try {
       await logsApi.purgeBefore(new Date(to).toISOString())
       load()
@@ -84,10 +90,11 @@ export function LogsPage() {
           />
         </label>
         <label>
-          From: <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} />
+          From ({timeZone}):{' '}
+          <input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} />
         </label>
         <label>
-          To: <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} />
+          To ({timeZone}): <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} />
         </label>
         <button type="button" onClick={load}>
           Refresh
@@ -104,7 +111,7 @@ export function LogsPage() {
         <table>
           <thead>
             <tr>
-              <th>Time</th>
+              <th>Time ({timeZone})</th>
               <th>Level</th>
               <th>Source</th>
               <th>Message</th>
@@ -120,8 +127,9 @@ export function LogsPage() {
             ) : (
               logs.map((l) => (
                 <tr key={l.id}>
-                  <td className="text-faint" style={{ whiteSpace: 'nowrap' }}>
-                    {new Date(l.timestamp).toLocaleString()}
+                  {/* The stored UTC instant stays reachable on hover: it is what the backend logs and what a bug report has to quote. */}
+                  <td className="text-faint" style={{ whiteSpace: 'nowrap' }} title={`${l.timestamp} (UTC)`}>
+                    {formatLocalDateTime(l.timestamp)}
                   </td>
                   <td>
                     {/* Severity order must match OperationLogLevel: the previous mapping was off by one, which rendered Error as the same plain grey badge as Debug. */}

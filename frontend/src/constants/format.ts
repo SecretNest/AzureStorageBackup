@@ -1,3 +1,37 @@
+const pad = (n: number) => String(n).padStart(2, '0')
+
+/**
+ * A UTC instant as `YYYY-MM-DD HH:mm:ss` in the browser's timezone.
+ *
+ * Built from the local getters (getFullYear/getHours/…), never from the ISO string, so the value on
+ * screen is the reader's wall clock and not the UTC one the backend stores. Log lines are read next
+ * to each other and sorted by eye, so the layout is fixed-width and locale-independent rather than
+ * toLocaleString's "8/11/2026, 8:00:00 PM".
+ */
+export function formatLocalDateTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso // never swallow a value the backend sent
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  )
+}
+
+/**
+ * The browser's UTC offset, as `UTC+08:00`. Shown wherever a screen states or takes a time, so that
+ * "is this UTC or mine?" is answered on the screen instead of being guessed — and a browser that is
+ * genuinely set to UTC says so outright rather than looking like a backend bug.
+ *
+ * getTimezoneOffset counts minutes *behind* UTC, hence the flipped sign; the offset is taken for the
+ * given instant, so a DST switch labels each side with the offset that actually applied.
+ */
+export function formatUtcOffset(at: Date): string {
+  const minutes = -at.getTimezoneOffset()
+  const sign = minutes < 0 ? '-' : '+'
+  const abs = Math.abs(minutes)
+  return `UTC${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+}
+
 /**
  * A version's start and end. Times are stored in UTC and rendered in the browser's timezone.
  *
