@@ -89,6 +89,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Both off on purpose, and stated rather than left to the action's default. Attestations are
+          # pushed as an OCI manifest carrying an `application/vnd.oci.empty.v1+json` descriptor, which
+          # ACR rejects outright ("denied: unknown manifest class"). On 2026-08-13 the action -- a
+          # floating v7 tag -- started passing `--attest type=provenance,mode=max` where the 2026-08-11
+          # run had passed nothing, and the publish died at the ACR push with the GHCR half already
+          # live. Turning the default off here means the next such drift cannot split the two registries
+          # again.
+          provenance: false
+          sbom: false
           # Keep the cache in GHCR, not in GitHub Actions Cache. The type=gha export runs **after**
           # the image push, and a single two-architecture mode=max run crushes it: on 2026-08-06 the
           # image had long been pushed, yet the export sat there for eleven minutes and had to be
