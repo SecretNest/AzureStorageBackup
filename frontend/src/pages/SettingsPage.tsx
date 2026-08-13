@@ -116,36 +116,38 @@ function BackupDefaults() {
         The rule lists below use gitignore syntax and match paths <strong>relative to each backup's local
         root</strong> — write <span className="mono">/Backup/</span>, not the full host path. A trailing{' '}
         <span className="mono">/</span> means "this directory and everything under it".{' '}
-        Each list has two boxes: the first matches <strong>exactly</strong>, the second <strong>ignoring case</strong>.
-        Extensions belong in the second (<span className="mono">*.mp4</span> then also catches{' '}
-        <span className="mono">.MP4</span>), paths in the first — on Linux{' '}
+        Each list has two boxes taking the same syntax: the first matches <strong>case-sensitively</strong>,
+        the second <strong>ignoring case</strong>. Either box takes paths or extensions — extensions are
+        usually easier in the second (<span className="mono">*.mp4</span> then also catches{' '}
+        <span className="mono">.MP4</span>), paths in the first, because on Linux{' '}
         <span className="mono">Temp/</span> and <span className="mono">temp/</span> really are two directories.
+        The two boxes form one list with the insensitive one last, so a rule there overrides a matching rule above it.
       </p>
       <Field label="Ignore rules">
         <Rules value={s.defaultIgnoreRules} onChange={(v) => set('defaultIgnoreRules', v)} />
         <p className="text-muted" style={{ margin: 'var(--sp-2) 0 var(--sp-1)' }}>
-          Ignoring case — put extensions here, paths above.
+          Ignoring case — same syntax as above.
         </p>
         <Rules value={s.defaultIgnoreRulesCaseInsensitive} onChange={(v) => set('defaultIgnoreRulesCaseInsensitive', v)} />
       </Field>
       <Field label="Don't compress">
         <Rules value={s.defaultDontCompressRules} onChange={(v) => set('defaultDontCompressRules', v)} />
         <p className="text-muted" style={{ margin: 'var(--sp-2) 0 var(--sp-1)' }}>
-          Ignoring case — put extensions here, paths above.
+          Ignoring case — same syntax as above.
         </p>
         <Rules value={s.defaultDontCompressRulesCaseInsensitive} onChange={(v) => set('defaultDontCompressRulesCaseInsensitive', v)} />
       </Field>
       <Field label="Don't group">
         <Rules value={s.defaultDontGroupRules} onChange={(v) => set('defaultDontGroupRules', v)} />
         <p className="text-muted" style={{ margin: 'var(--sp-2) 0 var(--sp-1)' }}>
-          Ignoring case — put extensions here, paths above.
+          Ignoring case — same syntax as above.
         </p>
         <Rules value={s.defaultDontGroupRulesCaseInsensitive} onChange={(v) => set('defaultDontGroupRulesCaseInsensitive', v)} />
       </Field>
       <Field label="Pack across directories">
         <Rules value={s.defaultCrossDirGroupRules} onChange={(v) => set('defaultCrossDirGroupRules', v)} />
         <p className="text-muted" style={{ margin: 'var(--sp-2) 0 var(--sp-1)' }}>
-          Ignoring case — put extensions here, paths above.
+          Ignoring case — same syntax as above.
         </p>
         <Rules value={s.defaultCrossDirGroupRulesCaseInsensitive} onChange={(v) => set('defaultCrossDirGroupRulesCaseInsensitive', v)} />
       </Field>

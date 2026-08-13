@@ -1229,7 +1229,9 @@ export function BackupConfigsPage() {
                 root</strong>{form.localRoot.trim() && <> (<span className="mono">{form.localRoot}</span>)</>} —
                 write <span className="mono">/Backup/</span> to mean{' '}
                 <span className="mono">{(form.localRoot.trim() || '<local root>').replace(/\/+$/, '')}/Backup</span>, not the
-                full path. A trailing <span className="mono">/</span> means "this directory and everything under it".
+                full path. A trailing <span className="mono">/</span> means "this directory and everything under it".{' '}
+                Each list has a second box below it matching the same syntax but ignoring case; the two form one
+                list with the insensitive box last, so a rule there overrides a matching rule above it.
               </p>
               <DefaultableField
                 label="Ignore rules"
@@ -1593,7 +1595,8 @@ function CaseInsensitiveHalf({ value, onChange }: { value: string | null; onChan
     <div style={{ marginTop: 'var(--sp-2)' }}>
       <p className="text-muted" style={{ margin: '0 0 var(--sp-1)' }}>
         Ignoring case — <span className="mono">*.mp4</span> here also matches{' '}
-        <span className="mono">.MP4</span> and <span className="mono">.Mp4</span>. Put extensions here and paths above.
+        <span className="mono">.MP4</span> and <span className="mono">.Mp4</span>. Same syntax as the box above;
+        either box takes paths or extensions.
       </p>
       <RuleBox value={value} onChange={onChange} />
     </div>
