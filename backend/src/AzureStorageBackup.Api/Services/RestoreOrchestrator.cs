@@ -44,7 +44,9 @@ public sealed record RestoreRequest
 /// <summary>Restore result. SkippedFiles = skipped because the local copy already holds identical content (overwrite only when changed).
 /// FailedFiles = the number of entries that could not be restored: their storage group failed to download/extract, the entry would be written outside the target root
 /// (including symlink and empty-directory entries), the entry itself is malformed so the write throws, a symlink entry is missing its Target,
-/// or the index contains a duplicate Path (no way to tell which one is authoritative, so neither is written).
+/// the index contains a duplicate Path (no way to tell which one is authoritative, so neither is written),
+/// or several entries' paths differ only in case while the restore target folds case, so they would overwrite each other on the way in
+/// (likewise for pack members when the extraction directory folds case).
 /// RestoredDirs = the number of empty directories **actually created successfully** (escaping/failed ones don't count).</summary>
 public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFiles, int RestoredDirs, int FailedFiles);
 
@@ -66,6 +68,11 @@ public sealed class RestoreOrchestrator(
     /// can escape the 200ms throttle window — once injected, every time query is guaranteed to move forward, so throttling never kicks in,
     /// every state change gets published, and the assertion doesn't have to gamble on whether the real clock happened to cross the throttle window.</summary>
     internal Func<long>? Clock { get; init; }
+
+    /// <summary>Test-injected replacement for <see cref="PathCaseSensitivity.IsCaseInsensitive"/> (directory → does this filesystem fold case).
+    /// Null in production, meaning the real probe. It exists because the interesting half of the behaviour — refusing to merge two paths that differ only in case —
+    /// can only be reached on a folding filesystem, and CI runs on ext4; without an injection point that half could never be tested on the machine that runs the tests.</summary>
+    internal Func<string, bool>? CaseProbe { get; init; }
 
     /// <param name="onProgress">Stage progress (which pack is being restored, how many groups are done, how fast). Before this there was only that one free-text
     /// phase string, and what it actually carried was the error stream — it could never say "how much is left".</param>
@@ -161,6 +168,30 @@ public sealed class RestoreOrchestrator(
             .Where(p => !resolved.Contains(p) && (selected is null || selected.Contains(p)))
             .ToHashSet(StringComparer.Ordinal);
         skipped += unresolved.Count;
+
+        // Two entries whose paths differ only in case — a source tree on a case-sensitive filesystem may well hold
+        // both Foo.txt and foo.txt, with different content and different hashes — collapse onto **one** file when the
+        // restore target folds case, and that collapse used to be silent: NeedsRestoreAsync runs for a whole group
+        // before anything is written, so at that moment neither destination exists yet and both entries are marked
+        // "needed"; the second File.Copy then overwrites the first, and the run still reports both as restored.
+        // The verdict is the same one a duplicate Path already gets (see IndexByPath): two entries that contradict
+        // each other are both refused and reported — one visible failure beats one file's content silently replaced
+        // by another's.
+        // Note this sits **after** the selective-restore filter, deliberately: picking exactly one member of a
+        // colliding pair leaves a group of one, which restores normally. That is the only way to get the content out
+        // onto a folding target, and it needs no special case here.
+        // Finding the collisions is one HashSet pass over keys we already hold; the filesystem probe only runs when
+        // that pass found something, which on a normal backup it does not.
+        var collisions = FindCaseCollisions(byPath.Keys, unresolved);
+        if (collisions.Count > 0 && ProbeCaseInsensitive(request.TargetRoot))
+            foreach (var group in collisions)
+            {
+                phase?.Report(
+                    $"Skipped {group.Count} entries whose paths differ only in case (the restore target is case-insensitive, so they would overwrite each other): {string.Join(", ", group)}");
+                foreach (var p in group)
+                    byPath.Remove(p);
+                failed += group.Count;
+            }
 
         // Empty folders (restore has to recreate them) — selective restore only targets the selected files, it does not rebuild the entire empty-directory tree.
         // These come from the cloud index as well: a directory name containing .. would be created outside the target root, so escaping directory entries are skipped, not created.
@@ -268,6 +299,12 @@ public sealed class RestoreOrchestrator(
 
         // Group by storage: the same pack is downloaded/extracted only once. Groups download concurrently (PRD 3.4), each with its own temp subdirectory to avoid collisions.
         var work = NewTempDir();
+        // The extraction directory's filesystem matters as much as the target's: a pack is extracted whole with
+        // `7z x -y`, so two members differing only in case overwrite **each other while being extracted**, and both
+        // entries then go on to copy the very same bytes. Probing `work` rather than tempRoot is deliberate —
+        // tempRoot may not exist yet, and a probe in a missing directory conservatively answers "folds", which would
+        // arm this gate on every restore. Lazy so the probe is only paid for once a pack group actually gets there.
+        var extractDirFolds = new Lazy<bool>(() => ProbeCaseInsensitive(work));
         var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // base names of the blobs that were rehydrated; re-archived once we're done
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
@@ -295,7 +332,7 @@ public sealed class RestoreOrchestrator(
                 {
                     return await RestoreGroupAsync(
                         container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker,
-                        downloadSizes[g.Key], ct);
+                        downloadSizes[g.Key], extractDirFolds, ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -335,7 +372,8 @@ public sealed class RestoreOrchestrator(
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
         BlobContainerClient container, RestoreRequest request, string? realRoot, string work,
         List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
-        IProgress<string>? phase, StageTracker? tracker, long downloadBytes, CancellationToken ct)
+        IProgress<string>? phase, StageTracker? tracker, long downloadBytes, Lazy<bool> extractDirFolds,
+        CancellationToken ct)
     {
         var skipped = 0;
         var failedEntries = 0;
@@ -471,6 +509,37 @@ public sealed class RestoreOrchestrator(
                 {
                     // pack: after extraction, copy by each member's archive entry name.
                     var extractDir = Path.Combine(groupDir, "x");
+
+                    // On a folding extraction filesystem, two members whose names differ only in case have already
+                    // overwritten one another by the time extraction finishes, so whichever one we ask for may be
+                    // holding the other's bytes — and there is no way to tell which, because pack members are not
+                    // re-hashed after being written. Refuse both rather than hand out content that may belong to
+                    // another file. The listing costs one archive-header read and is only ever paid for on a folding
+                    // temp filesystem, which no Docker deployment has.
+                    if (extractDirFolds.Value)
+                    {
+                        var listed = await compressor.ListEntriesAsync(firstVolume, request.Password, ct);
+                        var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        var twinNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var m in listed)
+                            if (!m.IsDirectory && !seenNames.Add(m.Name))
+                                twinNames.Add(m.Name);
+
+                        if (twinNames.Count > 0)
+                        {
+                            var blocked = needed
+                                .Where(e => twinNames.Contains(
+                                    SevenZipCli.NormalizeEntryName(e.Storage!.EntryName ?? e.Path)))
+                                .Select(e => e.Path)
+                                .ToHashSet(StringComparer.Ordinal);
+                            foreach (var p in blocked.OrderBy(x => x, StringComparer.Ordinal))
+                                phase?.Report(
+                                    $"Cannot restore '{p}': the pack holds another member whose name differs only in case, and the extraction directory is case-insensitive, so the extracted copy cannot be trusted.");
+                            failedEntries += blocked.Count;
+                            needed.RemoveAll(e => blocked.Contains(e.Path));
+                        }
+                    }
+
                     await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
                     foreach (var e in needed)
@@ -853,6 +922,52 @@ public sealed class RestoreOrchestrator(
     }
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
+
+    /// <summary>The real case probe, or the test-injected one. Every probe site goes through here so a test only has to override one thing.</summary>
+    private bool ProbeCaseInsensitive(string dir) => (CaseProbe ?? PathCaseSensitivity.IsCaseInsensitive)(dir);
+
+    /// <summary>
+    /// Groups of paths that are distinct under Ordinal but equal under OrdinalIgnoreCase — i.e. the sets that would
+    /// land on one and the same file if the target filesystem folds case. Paths in <paramref name="excluded"/>
+    /// (unrecoverable, no substitute) take no part: they are not going to be written either way, so they cannot
+    /// collide with anything.
+    /// <para>
+    /// Two passes, and the second one only ever runs when the first found something. The first is a single HashSet
+    /// holding references to strings we already have in hand; grouping straight away with a <c>GroupBy</c> would
+    /// build a whole lookup — over a five-hundred-thousand-entry index, tens of MB — to produce an empty answer,
+    /// which is the answer on every normal backup.
+    /// </para>
+    /// </summary>
+    private static List<List<string>> FindCaseCollisions(IEnumerable<string> paths, IReadOnlySet<string> excluded)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string>? duplicated = null;
+        foreach (var p in paths)
+        {
+            if (excluded.Contains(p))
+                continue;
+            if (!seen.Add(p))
+                (duplicated ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(p);
+        }
+        if (duplicated is null)
+            return [];
+
+        var groups = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in paths)
+        {
+            if (excluded.Contains(p) || !duplicated.Contains(p))
+                continue;
+            if (!groups.TryGetValue(p, out var members))
+                groups[p] = members = [];
+            members.Add(p);
+        }
+
+        // Sorted so the reported line reads the same way on every run — the messages end up in the operation log, and
+        // a line whose order wanders between runs is one nobody can diff.
+        foreach (var members in groups.Values)
+            members.Sort(StringComparer.Ordinal);
+        return [.. groups.Values];
+    }
 
 
 

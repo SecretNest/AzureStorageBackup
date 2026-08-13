@@ -66,8 +66,11 @@ public sealed class RestoreOrchestratorTests : IDisposable
     /// "has the in-flight marker already been dropped at the moment of extraction"), without affecting the packing process itself.</param>
     /// <param name="restoreClock">The time source injected into the restore side's internal <see cref="StageTracker"/>; see
     /// the comment on <see cref="RestoreOrchestrator.Clock"/> — purely to disable the throttle window, it doesn't affect the download/extraction itself.</param>
+    /// <param name="caseProbe">Stands in for the real "does this filesystem fold case" probe (directory → folds). CI runs on ext4, which never folds,
+    /// so without this the whole case-collision half of the restore would be unreachable from a test. Taking the directory as a parameter matters:
+    /// the target root and the extraction directory are probed separately and can legitimately differ.</param>
     private (BackupOrchestrator Backup, RestoreOrchestrator Restore, IBackupInfoStore Store, BlobClientFactory Factory) Build(
-        IFileCompressor? restoreCompressor = null, Func<long>? restoreClock = null)
+        IFileCompressor? restoreCompressor = null, Func<long>? restoreClock = null, Func<string, bool>? caseProbe = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -78,7 +81,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
         var restore = new RestoreOrchestrator(
             factory, store, restoreCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"))
-        { Clock = restoreClock };
+        { Clock = restoreClock, CaseProbe = caseProbe };
         return (backup, restore, store, factory);
     }
 
@@ -1489,6 +1492,192 @@ public sealed class RestoreOrchestratorTests : IDisposable
             var ex = await Xunit.Record.ExceptionAsync(() => run.WaitAsync(TimeSpan.FromSeconds(20)));
 
             Assert.IsNotType<TimeoutException>(ex); // hung = the permit got swallowed
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The source tree has to be on a case-sensitive filesystem for any of the collision tests to mean
+    /// anything — on a folding one "A.txt" and "a.txt" are the same file and the scenario cannot even be set up.</summary>
+    private void SkipUnlessSourceIsCaseSensitive() =>
+        Skip.If(PathCaseSensitivity.IsCaseInsensitive(_src), "the source tree is on a case-folding filesystem");
+
+    [SkippableFact]
+    public async Task Case_Colliding_Paths_Are_Refused_When_The_Target_Folds_Case()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        SkipUnlessSourceIsCaseSensitive();
+
+        // Only the target root folds; the extraction directory stays case-sensitive, so whatever is blocked here was
+        // blocked by the target-side gate and not by the pack-side one.
+        var (backup, restore, _, factory) = Build(caseProbe: dir => dir == _dst);
+        var account = AzuriteAccount();
+        var name = RandomName("rcase-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("A.txt", "upper content");
+            WriteSrc("a.txt", "lower content");
+            WriteSrc("plain.txt", "no twin");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var progress = new SyncProgress();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                CancellationToken.None, progress);
+
+            // Neither side is written: with no way to tell which one would survive the merge, writing either is
+            // writing one file's content under another file's name.
+            Assert.False(File.Exists(Path.Combine(_dst, "A.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "a.txt")));
+            Assert.Equal(2, result.FailedFiles);           // one failure per refused entry
+            Assert.Equal("no twin", File.ReadAllText(Path.Combine(_dst, "plain.txt"))); // everything else proceeds
+            Assert.Equal(1, result.RestoredFiles);
+
+            var report = Assert.Single(progress.Messages, m => m.Contains("differ only in case"));
+            Assert.Contains("A.txt, a.txt", report);       // both named, in a stable order
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Case_Colliding_Paths_Both_Restore_When_The_Target_Is_Case_Sensitive()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        SkipUnlessSourceIsCaseSensitive();
+
+        // The no-regression guard: on a case-sensitive target the gate must not exist at all.
+        var (backup, restore, _, factory) = Build(caseProbe: _ => false);
+        var account = AzuriteAccount();
+        var name = RandomName("rcases-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("A.txt", "upper content");
+            WriteSrc("a.txt", "lower content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal("upper content", File.ReadAllText(Path.Combine(_dst, "A.txt")));
+            Assert.Equal("lower content", File.ReadAllText(Path.Combine(_dst, "a.txt")));
+            Assert.Equal(0, result.FailedFiles);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Selecting_One_Side_Of_A_Case_Collision_Restores_It()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        SkipUnlessSourceIsCaseSensitive();
+
+        // Folding target, case-sensitive extraction directory — the ordinary shape of "restoring onto a Windows share
+        // from the NAS". Selecting one side leaves a group of one, which has nothing to collide with.
+        var (backup, restore, _, factory) = Build(caseProbe: dir => dir == _dst);
+        var account = AzuriteAccount();
+        var name = RandomName("rcasesel-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("A.txt", "upper content");
+            WriteSrc("a.txt", "lower content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst, SelectedPaths = ["A.txt"],
+            });
+
+            Assert.Equal("upper content", File.ReadAllText(Path.Combine(_dst, "A.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "a.txt")));
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal(0, result.FailedFiles);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Collision_Is_Judged_On_The_Whole_Path_Not_The_File_Name()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        SkipUnlessSourceIsCaseSensitive();
+
+        var (backup, restore, _, factory) = Build(caseProbe: dir => dir == _dst);
+        var account = AzuriteAccount();
+        var name = RandomName("rcasedir-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            // Same file name, different directories: no collision, this is the ordinary cross-directory case.
+            WriteSrc("p/X.txt", "in p");
+            WriteSrc("q/x.txt", "in q");
+            // Same file name, and the directory segment is what differs only in case: this *is* a collision, and only
+            // keying on the full relative path catches it.
+            WriteSrc("d/X/f.txt", "under upper d");
+            WriteSrc("d/x/f.txt", "under lower d");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal("in p", File.ReadAllText(Path.Combine(_dst, "p", "X.txt")));
+            Assert.Equal("in q", File.ReadAllText(Path.Combine(_dst, "q", "x.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "d", "X", "f.txt")));
+            Assert.False(File.Exists(Path.Combine(_dst, "d", "x", "f.txt")));
+            Assert.Equal(2, result.RestoredFiles);
+            Assert.Equal(2, result.FailedFiles);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
+    public async Task Pack_Member_With_A_Case_Twin_Is_Refused_When_The_Extraction_Directory_Folds()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+        SkipUnlessSourceIsCaseSensitive();
+
+        // Everything folds, including the extraction directory. Selecting one side gets past the target-side gate, but
+        // inside the pack the twin has already overwritten it during extraction, so the extracted copy cannot be
+        // trusted and this entry has to fail rather than hand over content that may belong to the other file.
+        var (backup, restore, _, factory) = Build(caseProbe: _ => true);
+        var account = AzuriteAccount();
+        var name = RandomName("rcasetmp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("A.txt", "upper content");   // small files → both land in the same pack
+            WriteSrc("a.txt", "lower content");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var progress = new SyncProgress();
+            var result = await restore.RunAsync(
+                new RestoreRequest
+                {
+                    Account = account, Container = name, TargetRoot = _dst, SelectedPaths = ["A.txt"],
+                },
+                CancellationToken.None, progress);
+
+            Assert.False(File.Exists(Path.Combine(_dst, "A.txt")));
+            Assert.Equal(0, result.RestoredFiles);
+            Assert.Equal(1, result.FailedFiles);
+            Assert.Contains(progress.Messages, m =>
+                m.Contains("A.txt") && m.Contains("differs only in case"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
