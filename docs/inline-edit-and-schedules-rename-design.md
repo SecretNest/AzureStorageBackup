@@ -151,6 +151,18 @@ gets shrink rules (the same `overflow-wrap: anywhere` the `ops-row` uses, plus c
 `w-lg` inputs at `max-width: 100%`) until it does not. Rolling back to a below-table form is not the
 fallback.
 
+**Measured 2026-08-14: it does not.** Headless Chrome against a static probe page, with the
+expansion row present and then removed from the same DOM: **657px either way**. No shrink rules were
+needed. Two reasons it lands this way — a `colspan` cell's min-content is shared across all six
+columns rather than loaded onto one, and `.field` collapses to a single column below 900px, so its
+200px label column never competes. (657 rather than 656 is the probe's own button text differing
+slightly from the real page; what matters is that the two measurements are equal.)
+
+One consequence worth knowing, unchanged by this work: at a ~700px window with the form open, the
+page grows tall enough for a vertical scrollbar, whose 15px pushes the available width under 657 and
+makes `.table-scroll` scroll horizontally. That is the backstop doing its job — the page itself
+never scrolls sideways — and it happened the same way when the form sat below the table.
+
 ## 7. Renaming Tasks to Schedules
 
 UI strings only. The tab key has no persistence anywhere — no `localStorage`, no URL hash, no
@@ -207,10 +219,15 @@ itself.
 So layout claims here are settled with a browser, not by reading CSS — this repo has been wrong
 about `index.css` specificity three times already.
 
-- Headless Chrome screenshots at three widths: **390px** (expanded form; scrolled to mid-form to
-  confirm the sticky action bar still works — this is a regression check, it works today; the
-  running + editing three-way merge), **1440px** (desktop inline expansion), and **700px** (the
-  tablet tier, where sticky is deliberately off and the table form still applies).
+- Headless Chrome screenshots at three widths: the phone tier (expanded form; scrolled to mid-form
+  to confirm the sticky action bar still works — a regression check, it works today; the running +
+  editing three-way merge), **1440px** (desktop inline expansion), and **700px** (the tablet tier,
+  where sticky is deliberately off and the table form still applies).
+
+  Note on the phone tier: headless Chrome clamps its viewport to a **500px** minimum, in both the
+  old and new headless modes, so 390px cannot be measured directly. 500px sits in the same ≤640px
+  tier — every rule involved matches identically — so the results carry, but the number in the
+  screenshots is 500, not 390.
 - Measure the Backups table's minimum width and confirm it has not moved past 656px (§6).
 - `npx tsc -b` — **not** `tsc --noEmit`, which is a no-op in this project and passes unconditionally.
 - The frontend test suite.
