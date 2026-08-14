@@ -17,7 +17,7 @@
 |---|---|---|
 | 1 | Target | **Fully operable.** Every page and every dialog can complete its task on a phone, with no "you have to go back to a computer for this" gap |
 | 2 | Breakpoint strategy | **Size and input are orthogonal axes.** `max-width` governs layout (the 900px tablet tier stays, a 640px phone tier is added), `pointer: coarse` governs hit areas. Desktop mouse users see no change at all |
-| 3 | Tables | **Primary tables become cards, secondary ones scroll horizontally.** Backups and Tasks turn each row into a card on the phone tier; Logs, Accounts, Containers, Groups and the restore version table get a horizontal scroll wrapper |
+| 3 | Tables | **Primary tables become cards, secondary ones scroll horizontally.** Backups and Schedules turn each row into a card on the phone tier; Logs, Accounts, Containers, Groups and the restore version table get a horizontal scroll wrapper |
 | 4 | Dialogs | **Full-screen panels on the phone tier**: fixed title bar on top, fixed action bar at the bottom, scrolling content between |
 | 5 | Dialog structure | **A uniform header/body/footer**, not a phone-tier patch. Desktop appearance is unchanged |
 | 6 | Primary navigation | **A fixed bottom tab bar on the phone tier.** `Log out` moves to the settings page, and the desktop sidebar loses it too, so both ends agree |
@@ -108,7 +108,7 @@ This means passing the logout logic down to the settings page, including the sec
 
 ## 5. Tables
 
-### 5.1 Cards (Backups / Tasks)
+### 5.1 Cards (Backups / Schedules)
 
 On the phone tier, `table / thead / tbody / tr / td` become blocks, `thead` is hidden, each `tr` becomes a bordered card, and each `td` shows its field name on the left via `::before { content: attr(data-label) }`:
 
