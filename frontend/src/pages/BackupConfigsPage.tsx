@@ -1306,9 +1306,10 @@ export function BackupConfigsPage() {
         </div>
       )}
       {accounts.length === 0 && <p className="text-muted">Add an account first.</p>}
-      {/* While the form is open this moves inside it (below): the form sits under the table and this sits
-          above it, so a save rejected by the server would show its reason several screens away from the
-          button, which reads as "I pressed it and nothing happened". */}
+      {/* While the form is open this moves inside it: the reason a save was rejected has to appear next to the
+          button that was pressed, and this spot is above the table — which is now potentially many rows away
+          from the form, since editing expands it inline. Left here, it would read as "I pressed it and nothing
+          happened". */}
       {!showForm && error && <p className="text-danger">{error}</p>}
 
       {/* A backstop, not the main mechanism: table-fluid already pushes the table's minimum width down to
@@ -1467,6 +1468,16 @@ export function BackupConfigsPage() {
                     <td colSpan={6}>{ops}</td>
                   </tr>
                 )}
+                {/* The edit form expands under the row it belongs to rather than at the bottom of the page: on a
+                    phone, where every row is a card, a form appended below the table lands several screens from its
+                    own row with nothing on screen connecting the two. Same shape as the ops-row above, and it goes
+                    after it — a backup that is running and being edited shows status first, then the form. A new
+                    backup belongs to no row, so it keeps its place under the table. */}
+                {editing?.id === c.id && (
+                  <tr className="edit-row">
+                    <td colSpan={6}>{formPanel}</td>
+                  </tr>
+                )}
                 </Fragment>
                 )
               })
@@ -1475,7 +1486,7 @@ export function BackupConfigsPage() {
         </table>
       </div>
 
-      {formPanel}
+      {!editing && formPanel}
 
       {browsing && (
         <PathBrowser

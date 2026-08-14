@@ -305,6 +305,30 @@ tbody tr.ops-row:hover {
   background: var(--bg-hover);
 }
 
+/* The edit form expands under the row it belongs to, the same way the running status does, and the row directly above it
+   drops its bottom rule: the two are talking about the same backup.
+   Found with :has() rather than a class on that row, because which row it is depends on state - the main row when the
+   backup is idle, the ops-row when it is running - so one selector covers both where a class would need the branch
+   spelled out in JSX.
+   No hover rule to match the group above: this row holds a form, not data, and highlighting a form on hover is noise.
+   That is also why the touch layer's hover-suppression group at the end of this file needs no new selector - there is no
+   hover here to suppress.
+   Measured 2026-08-14: putting the form in a colspan cell does NOT raise the table's minimum width - 657px both with the
+   row and with it removed. A colspan cell's min-content is shared across all six columns, and .field collapses to a
+   single column below 900px, so the 200px label column never lands on any one of them. */
+tbody tr:has(+ tr.edit-row) > td {
+  border-bottom: none;
+}
+tbody tr.edit-row > td {
+  padding-top: 0;
+}
+/* The form is a .panel, which brings its own frame and a top margin. Both were right when it sat on the page as a block of
+   its own; inside a row the margin is just a gap nobody asked for. The frame is kept here - on desktop the form reads as a
+   distinct block within the table - and dropped on the card tier, where it would be a card inside a card. */
+tbody tr.edit-row > td > .panel {
+  margin-top: 0;
+}
+
 /* Tables whose width follows their container. Under the default table-layout: auto the floor on table width is the sum of
    the columns' min-content, and this table originally had three places that refused to shrink; together they pushed a
    horizontal scrollbar onto the whole page. They are dismantled one at a time below.
@@ -998,6 +1022,7 @@ tbody tr.ops-row:hover {
   table.cards tbody tr,
   table.cards tbody tr.has-ops,
   table.cards tbody tr.ops-row,
+  table.cards tbody tr.edit-row,
   table.cards tbody tr.has-ops:hover + tr.ops-row {
     background: var(--bg-raised);
   }
@@ -1086,6 +1111,44 @@ tbody tr.ops-row:hover {
   }
   table.cards tr.ops-row td::before {
     content: none;
+  }
+
+  /* Same merge for the inline edit form: it is part of the card above it, not a card of its own. With a backup that is
+     both running and being edited, three rows merge into one card - main row, ops-row, edit-row - so this seam must not
+     put back the border the ops-row rules just took off. :has() picks whichever of the two is directly above. */
+  table.cards tr:has(+ tr.edit-row) {
+    margin-bottom: 0;
+    border-bottom: none;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  table.cards tr.edit-row {
+    border-top: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    padding-top: 0;
+  }
+  table.cards tr.edit-row td {
+    display: block;
+    padding-top: 0;
+  }
+  table.cards tr.edit-row td::before {
+    content: none;
+  }
+  /* The row is already the card, so the panel's own frame would draw a second one inside it. Its background matches the
+     card's, so removing that only ever removes a seam. */
+  table.cards tr.edit-row > td > .panel {
+    border: none;
+    border-radius: 0;
+    background: none;
+  }
+
+  /* Carded tables are block-level and cannot overflow horizontally, so this wrapper has no job on this tier - and it is
+     now actively harmful, because the edit form lives inside the table: overflow-x: auto computes overflow-y to auto as
+     well, which makes this a scroll container, and .form-actions' sticky below would position against it instead of the
+     viewport and quietly stop working. No error, no warning - just a working feature that stops. */
+  .table-scroll:has(table.cards) {
+    overflow: visible;
   }
 
   /* Full-screen panel: the action buttons of a long form must stay visible at all times - this is the key piece of being
