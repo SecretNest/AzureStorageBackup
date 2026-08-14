@@ -119,7 +119,7 @@ Element selectors do the groundwork, so most places need no `className` at all.
 
 **Banners**: `.alert` plus `.alert-warn` / `.alert-error` / `.alert-ok`, replacing hard-coded hex colours in the keyring banner.
 
-**Status badges**: `.badge` with semantic colours, used by the status columns on the tasks and backups pages.
+**Status badges**: `.badge` with semantic colours, used by the status columns on the schedules and backups pages.
 
 ## 6. Scope boundaries
 

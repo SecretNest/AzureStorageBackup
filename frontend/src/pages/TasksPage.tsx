@@ -111,7 +111,7 @@ export function TasksPage() {
   }
 
   const remove = async (t: ScheduledTask) => {
-    if (!window.confirm('Delete this task?')) return
+    if (!window.confirm('Delete this schedule?')) return
     try {
       await tasksApi.remove(t.id)
       loadTasks()
@@ -142,9 +142,9 @@ export function TasksPage() {
   return (
     <section>
       <div className="page-header">
-        <h1>Scheduled Tasks</h1>
+        <h1>Schedules</h1>
         <button type="button" className="btn-primary" onClick={startNew}>
-          New Task
+          New Schedule
         </button>
       </div>
 
@@ -154,7 +154,7 @@ export function TasksPage() {
         <thead>
           <tr>
             <th>Target</th>
-            <th>Type</th>
+            <th>Action</th>
             <th>Schedule</th>
             <th>Enabled</th>
             <th>Last run</th>
@@ -165,7 +165,7 @@ export function TasksPage() {
           {tasks.length === 0 ? (
             <tr>
               <td colSpan={6} className="empty-state">
-                No tasks yet.
+                No schedules yet.
               </td>
             </tr>
           ) : (
@@ -174,7 +174,7 @@ export function TasksPage() {
                 <td className="card-title">
                   {targetKindLabels[t.targetKind]}: {describeTarget(t)}
                 </td>
-                <td data-label="Type">{taskTypeLabels[t.taskType]}</td>
+                <td data-label="Action">{taskTypeLabels[t.taskType]}</td>
                 <td data-label="Schedule">
                   <code>{t.cronExpression}</code>
                 </td>
@@ -201,7 +201,7 @@ export function TasksPage() {
 
       {showForm && (
         <div className="panel">
-          <h2>{editing ? 'Edit Task' : 'New Task'}</h2>
+          <h2>{editing ? 'Edit Schedule' : 'New Schedule'}</h2>
 
           <Field label="Target">
             <select
@@ -248,7 +248,7 @@ export function TasksPage() {
             </Field>
           )}
 
-          <Field label="Task type">
+          <Field label="Scheduled action">
             <select value={form.taskType} onChange={(e) => set('taskType', Number(e.target.value))}>
               <option value={ScheduledTaskType.Backup}>Backup</option>
               <option value={ScheduledTaskType.Check}>Check</option>

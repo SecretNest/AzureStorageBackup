@@ -12,11 +12,11 @@ import { setUnauthorizedHandler } from './api/client'
 // Accounts is no longer a top-level tab; it moved into Settings (first section): accounts are
 // configured once and never touched again, so a permanent nav entry misrepresents them. The cost is
 // that new users have no obvious entry point — handled by the default-tab logic below.
-type Tab = 'backups' | 'tasks' | 'logs' | 'settings'
+type Tab = 'backups' | 'schedules' | 'logs' | 'settings'
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'backups', label: 'Backups' },
-  { key: 'tasks', label: 'Tasks' },
+  { key: 'schedules', label: 'Schedules' },
   { key: 'logs', label: 'Logs' },
   { key: 'settings', label: 'Settings' },
 ]
@@ -86,7 +86,7 @@ function App() {
         <KeyringBanner onGoToAccounts={() => setTab('settings')} />
 
         {tab === 'backups' && <BackupConfigsPage />}
-        {tab === 'tasks' && <TasksPage />}
+        {tab === 'schedules' && <TasksPage />}
         {tab === 'logs' && <LogsPage />}
         {tab === 'settings' && <SettingsPage authRequired={auth.required} onLogout={logout} />}
       </main>
