@@ -21,7 +21,7 @@
 |---|---|---|
 | 1 | Where does the edit form open? | **Inline, directly under the row being edited**, on desktop and phone alike. One code path, not a per-tier variant |
 | 2 | What about `New Backup`? | **Stays below the table.** It belongs to no row, so it has no row to open under |
-| 3 | Long form, distant buttons | **The action bar sticks to the bottom on the phone tier only.** See §4 for why the tablet tier is excluded |
+| 3 | Long form, distant buttons | **Already solved — the job is not to break it.** `.form-actions` is sticky on the phone tier today; moving the form into a `<td>` would silently disable it. See §4 |
 | 4 | Scroll target after `Edit` | **The top of the row being edited**, not the top of the form — so "which one am I editing" and the start of the form are on screen together |
 | 5 | Tab name | **`Schedules`**, not `Plans`. "Backup plan" conventionally means what/when/how-long-to-keep, and that configuration lives on the *Backups* page — `Plans` would collide with it. This page holds cron schedules only |
 | 6 | The `Task type` field | **`Scheduled action`.** The page already spends `run` on execution (`Run now`, `Running…`, `Last run`), so any word near it reads as a live state. `Scheduled` fixes the word in the future tense |
@@ -79,21 +79,31 @@ Note the hover-suppression group at the end of `index.css` — four selectors, t
 class. Anything added here has to be counted against them by hand; this file has already been caught
 out by specificity three separate times, and each of those rules carries a comment saying so.
 
-## 4. The sticky action bar
+## 4. Keeping the sticky action bar alive
 
-On the phone tier the form's action bar (`.form-actions`, one per wizard step) sticks above the
-fixed bottom navigation:
+The form's action bar is **already sticky on the phone tier** — `index.css` inside the ≤640px
+block, with a comment naming the new-backup wizard as the reason:
 
 ```css
-position: sticky;
-bottom: calc(52px + env(safe-area-inset-bottom));
+.form-actions {
+  position: sticky;
+  bottom: calc(52px + env(safe-area-inset-bottom));   /* clears the bottom nav */
+  z-index: 30;                                        /* below .sidebar's 40 */
+  margin: var(--sp-4) calc(-1 * var(--sp-4)) 0;       /* span the panel's padding */
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-raised);                       /* content shows through otherwise */
+  border-top: 1px solid var(--border);
+}
 ```
 
-**This requires turning off a scroll container first.** `.table-scroll` is `overflow-x: auto`, and
-per CSS a non-`visible` overflow on one axis computes the other to `auto` — so it is a scroll
-container on both axes, and a `sticky` descendant positions against *it* rather than the viewport.
-Since the element's height is its content height it never scrolls, and the sticky bar would simply
-sit at its static position, doing nothing.
+So there is nothing to add here — but moving the form into a `<td>` **would silently switch it
+off**, and that is the real work of this section.
+
+`.table-scroll` is `overflow-x: auto`, and per CSS a non-`visible` overflow on one axis computes the
+other to `auto` — so it is a scroll container on both axes, and a `sticky` descendant positions
+against *it* rather than the viewport. Its height is its content height, so it never scrolls, and
+the bar would just sit at its static position doing nothing. No error, no warning: a working feature
+quietly stops working.
 
 The fix is to drop the container on the tier where it is already redundant — carded tables are
 block-level and cannot overflow horizontally:
@@ -108,11 +118,20 @@ This also reaches the other carded tables (Accounts, Groups). That is a correcti
 effect: none of them can overflow horizontally in card form either. `:has()` is already used in this
 file (`table.cards tr:has(td.empty-state)`), so it introduces no new baseline requirement.
 
-**Why the phone tier only (≤640px), not the tablet tier (≤900px).** The 900px tier keeps real
-tables, so `.table-scroll` is still doing its job there and cannot be switched off — which means a
-sticky bar inside it would be trapped by the same mechanism described above. The 900px tier also has
-no fixed bottom bar (the sidebar becomes a *top* strip), so the offset above would be wrong. Sticky
-is therefore scoped to the tier that has both the card layout and the bottom bar.
+**Why the phone tier only (≤640px), and not extended to the tablet tier (≤900px).** Sticky is
+already scoped to ≤640px and stays there. The 900px tier keeps real tables, so `.table-scroll` is
+still doing its job and cannot be switched off — a sticky bar there would be trapped by the exact
+mechanism above. That tier also has no fixed bottom bar (the sidebar becomes a *top* strip), so the
+`52px` offset would be wrong for it. It keeps today's non-sticky behaviour.
+
+The tablet tier does inherit one new consequence: its form now sits inside `.table-scroll`, so if
+the form turns out to be wider than the viewport there, the form itself scrolls horizontally rather
+than the page. §6 measures this; the 700px screenshot is what catches it.
+
+**One thing to re-check by eye, not by reasoning:** `.form-actions` uses a negative horizontal
+margin to span its parent's padding. Its parent is about to change from a `.panel` sitting directly
+in the page to a `.panel` nested in a table cell inside a card. If the bar no longer lines up with
+the form's edges, the margin is what to adjust — the sticky behaviour itself is unaffected.
 
 ## 5. Scrolling to the form
 
@@ -179,13 +198,19 @@ survives the rename intact.
 
 ## 8. Verification
 
-Layout claims here are settled with a browser, not by reading CSS — this repo has been wrong about
-`index.css` specificity three times already.
+There is no component-test path for any of this, and none is being added. `vitest.config.ts` runs
+`environment: 'node'` over `src/**/*.test.ts` — pure logic only, no jsdom, no `.tsx` — and the
+mobile adaptation round already decided against introducing a component test framework. Adding
+jsdom and a testing library to cover a layout change would be a far larger decision than the change
+itself.
+
+So layout claims here are settled with a browser, not by reading CSS — this repo has been wrong
+about `index.css` specificity three times already.
 
 - Headless Chrome screenshots at three widths: **390px** (expanded form; scrolled to mid-form to
-  confirm the action bar is still on screen; the running + editing three-way merge), **1440px**
-  (desktop inline expansion), and **700px** (the tablet tier, where sticky is deliberately off and
-  the table form still applies).
+  confirm the sticky action bar still works — this is a regression check, it works today; the
+  running + editing three-way merge), **1440px** (desktop inline expansion), and **700px** (the
+  tablet tier, where sticky is deliberately off and the table form still applies).
 - Measure the Backups table's minimum width and confirm it has not moved past 656px (§6).
 - `npx tsc -b` — **not** `tsc --noEmit`, which is a no-op in this project and passes unconditionally.
 - The frontend test suite.
