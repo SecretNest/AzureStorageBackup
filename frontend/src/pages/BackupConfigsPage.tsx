@@ -203,6 +203,22 @@ export function BackupConfigsPage() {
   const restoresRef = useRef(restores)
   restoresRef.current = restores
 
+  // Pressing Edit expands the form under that row, which on a long list is somewhere below the fold — on a phone
+  // several screens down. Scrolling targets the row, not the form: landing on the form's first field leaves "which
+  // backup am I editing" off screen above it. A flag rather than a call inside startEdit, because the row has to be
+  // committed to the DOM before anything can scroll to it.
+  const editRowRef = useRef<HTMLTableRowElement | null>(null)
+  const [pendingScrollToEdit, setPendingScrollToEdit] = useState(false)
+  useEffect(() => {
+    if (!pendingScrollToEdit) return
+    setPendingScrollToEdit(false)
+    editRowRef.current?.scrollIntoView({
+      block: 'start',
+      // An unrequested smooth scroll is exactly what "reduce motion" is asking not to happen.
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    })
+  }, [pendingScrollToEdit])
+
   // The list refreshes every 5 seconds: a purely local query (configuration rows plus in-memory
   // activity), no cloud.
   // This is an unattended background refresh, so one network blip must not raise an error banner — it
@@ -516,6 +532,7 @@ export function BackupConfigsPage() {
     setNewContainer(false)
     setPickingScope(!!c.scopeRules)
     setShowForm(true)
+    setPendingScrollToEdit(true)
   }
 
   // While editing, the password field is locked and takes no part in the comparison. An empty password
@@ -1384,7 +1401,10 @@ export function BackupConfigsPage() {
                 ].filter(Boolean)
                 return (
                 <Fragment key={c.id}>
-                <tr className={ops.length > 0 ? 'has-ops' : undefined}>
+                <tr
+                  ref={editing?.id === c.id ? editRowRef : undefined}
+                  className={ops.length > 0 ? 'has-ops' : undefined}
+                >
                   <td className="card-title">
                     {c.name}
                     {c.secretsUnavailable && (
