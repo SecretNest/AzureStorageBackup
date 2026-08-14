@@ -1,0 +1,191 @@
+# Inline edit panels, and renaming the Tasks tab
+
+> Two independent UX corrections, both reported from a phone.
+>
+> **One.** Pressing `Edit` on a backup opens a form that is always appended *below the table*. With
+> a dozen backups on a phone that form lands several screens away from the row it belongs to, with
+> nothing on screen connecting the two. The page already owns the right pattern for this — the
+> running-status row (`tr.ops-row`) expands directly under its own card — the edit form simply never
+> used it.
+>
+> **Two.** The bottom tab labelled `Tasks` is the vaguest word in the app. The page it opens is
+> titled `Scheduled Tasks` and contains cron schedules; meanwhile the *Backups* page is where
+> backups, restores and checks are actually running. A user looking for "what is running right now"
+> reads `Tasks` and goes to the wrong place.
+>
+> No backend, API or type changes. Layout, one scroll behaviour, and UI wording only.
+
+## 1. Decisions
+
+| # | Question | Conclusion |
+|---|---|---|
+| 1 | Where does the edit form open? | **Inline, directly under the row being edited**, on desktop and phone alike. One code path, not a per-tier variant |
+| 2 | What about `New Backup`? | **Stays below the table.** It belongs to no row, so it has no row to open under |
+| 3 | Long form, distant buttons | **The action bar sticks to the bottom on the phone tier only.** See §4 for why the tablet tier is excluded |
+| 4 | Scroll target after `Edit` | **The top of the row being edited**, not the top of the form — so "which one am I editing" and the start of the form are on screen together |
+| 5 | Tab name | **`Schedules`**, not `Plans`. "Backup plan" conventionally means what/when/how-long-to-keep, and that configuration lives on the *Backups* page — `Plans` would collide with it. This page holds cron schedules only |
+| 6 | The `Task type` field | **`Scheduled action`.** The page already spends `run` on execution (`Run now`, `Running…`, `Last run`), so any word near it reads as a live state. `Scheduled` fixes the word in the future tense |
+| 7 | The cron column | **Stays `Schedule`.** Considered `When`; rejected as churn for its own sake |
+| 8 | Backend naming | **Untouched.** `ScheduledTask`, `tasksApi` and `/api/tasks` all stay. Renaming them would spread across the backend and buys the user nothing visible |
+
+## 2. Moving the form into the row
+
+`BackupConfigsPage.tsx` currently renders the form as `{showForm && (<div className="panel">…)}`
+after the table — roughly 490 lines of JSX (`983`–`1472`).
+
+That JSX is **hoisted into a variable inside the component**, not extracted into a child component:
+
+```tsx
+const formPanel = showForm && (
+  <div className="panel">…</div>
+)
+```
+
+Extraction was considered and rejected. The form reads twenty-odd pieces of page state — `form`,
+`step`, `editing`, `accounts`, `containerList`, `containerListError`, `scope`, `passwordConfirm`,
+`newContainer`, `busy`, `error` and the setters for most of them. A child component turns every one
+of those into a prop, which is a large diff, a permanent maintenance surface, and no behaviour
+change to show for it. A variable moves the JSX without touching a single reference.
+
+It is then rendered in one of two places, never both:
+
+- **Editing** — inside `configs.map`, after the row (and after its `ops-row`, when that backup is
+  also running):
+  ```tsx
+  {editing?.id === c.id && (
+    <tr className="edit-row"><td colSpan={6}>{formPanel}</td></tr>
+  )}
+  ```
+- **Creating** — `showForm && !editing`, at the existing position below the table.
+
+The comment at `BackupConfigsPage.tsx:814` explaining that errors move inside the form because "the
+form sits under the table" is now only half true, and is updated with it.
+
+## 3. Joining the row to its form
+
+`index.css` already solves this exact problem for `ops-row`, and the same three ingredients are
+reused:
+
+- the row above drops its bottom border — a new `is-editing` class, mirroring `has-ops`
+- `tr.edit-row > td` drops its top padding
+- on the phone tier the card's bottom corners square off and the expansion's top corners square off,
+  so the two read as one card
+
+The three-way case has to work as well: a backup that is **running and being edited** renders as
+main row → `ops-row` → `edit-row`, and all three merge into a single card. The existing `has-ops`
+rules cover the first seam; the new rules must not reintroduce a border at the second.
+
+Note the hover-suppression group at the end of `index.css` — four selectors, three of which carry a
+class. Anything added here has to be counted against them by hand; this file has already been caught
+out by specificity three separate times, and each of those rules carries a comment saying so.
+
+## 4. The sticky action bar
+
+On the phone tier the form's action bar (`.form-actions`, one per wizard step) sticks above the
+fixed bottom navigation:
+
+```css
+position: sticky;
+bottom: calc(52px + env(safe-area-inset-bottom));
+```
+
+**This requires turning off a scroll container first.** `.table-scroll` is `overflow-x: auto`, and
+per CSS a non-`visible` overflow on one axis computes the other to `auto` — so it is a scroll
+container on both axes, and a `sticky` descendant positions against *it* rather than the viewport.
+Since the element's height is its content height it never scrolls, and the sticky bar would simply
+sit at its static position, doing nothing.
+
+The fix is to drop the container on the tier where it is already redundant — carded tables are
+block-level and cannot overflow horizontally:
+
+```css
+@media (max-width: 640px) {
+  .table-scroll:has(table.cards) { overflow: visible; }
+}
+```
+
+This also reaches the other carded tables (Accounts, Groups). That is a correction, not a side
+effect: none of them can overflow horizontally in card form either. `:has()` is already used in this
+file (`table.cards tr:has(td.empty-state)`), so it introduces no new baseline requirement.
+
+**Why the phone tier only (≤640px), not the tablet tier (≤900px).** The 900px tier keeps real
+tables, so `.table-scroll` is still doing its job there and cannot be switched off — which means a
+sticky bar inside it would be trapped by the same mechanism described above. The 900px tier also has
+no fixed bottom bar (the sidebar becomes a *top* strip), so the offset above would be wrong. Sticky
+is therefore scoped to the tier that has both the card layout and the bottom bar.
+
+## 5. Scrolling to the form
+
+`startEdit` records the id; an effect fires after the DOM commits and calls `scrollIntoView({ block:
+'start', behavior: 'smooth' })` on the row being edited. Desktop gets this too — a long table puts
+the row well below the fold there as well.
+
+## 6. The table-width risk
+
+On desktop the form now lives in a `<td colSpan={6}>`, which means its min-content width feeds into
+the table's minimum width. That number is currently **656px**, and `index.css` spends three separate
+rules getting it down there (header wrapping, `overflow-wrap: anywhere` on paths, dropping `nowrap`
+on the actions column); a regression puts a horizontal scrollbar back under the whole table.
+
+This is measured, not reasoned about. If the form's min-content exceeds 656px, `tr.edit-row > td`
+gets shrink rules (the same `overflow-wrap: anywhere` the `ops-row` uses, plus capping the fixed
+`w-lg` inputs at `max-width: 100%`) until it does not. Rolling back to a below-table form is not the
+fallback.
+
+## 7. Renaming Tasks to Schedules
+
+UI strings only. The tab key has no persistence anywhere — no `localStorage`, no URL hash, no
+history entry — so renaming it carries no migration.
+
+Located by string rather than by line, since these line numbers shift as the edit proceeds:
+
+| File | From | To |
+|---|---|---|
+| `App.tsx` | `Tab` union member `'tasks'` | `'schedules'` |
+| `App.tsx` | tab label `Tasks` | `Schedules` |
+| `App.tsx` | `tab === 'tasks'` | `tab === 'schedules'` |
+| `TasksPage.tsx` | `<h1>Scheduled Tasks</h1>` | `<h1>Schedules</h1>` |
+| `TasksPage.tsx` | `New Task` (header button) | `New Schedule` |
+| `TasksPage.tsx` | `<th>Type</th>` | `<th>Action</th>` |
+| `TasksPage.tsx` | `data-label="Type"` | `data-label="Action"` |
+| `TasksPage.tsx` | `No tasks yet.` | `No schedules yet.` |
+| `TasksPage.tsx` | `{editing ? 'Edit Task' : 'New Task'}` | `'Edit Schedule' : 'New Schedule'` |
+| `TasksPage.tsx` | `<Field label="Task type">` | `<Field label="Scheduled action">` |
+| `TasksPage.tsx` | `Delete this task?` | `Delete this schedule?` |
+
+The `data-label` and its `<th>` must move together — the card layout prints `data-label` via
+`::before` as that cell's column name on phones, so leaving one behind gives a card that disagrees
+with the table it came from.
+
+Unchanged on purpose: the `Schedule` column (decision 7), `Last run`, `Run now`, and every
+identifier — `TasksPage`, `tasksApi`, `ScheduledTask`, `taskTypeLabels`, `/api/tasks`. The filename
+`TasksPage.tsx` stays too; renaming the file would churn imports for a name no user ever sees.
+
+The `GroupsSection` embedded at the bottom of the page is unaffected. Groups exist only to be
+targeted by schedules, which is why they are a section here rather than a tab, and that reasoning
+survives the rename intact.
+
+### Documentation
+
+- `docs/mobile-adaptation-design.md:20,111` name the Tasks *table* as one of the two carded tables —
+  updated to `Schedules`.
+- `docs/web-ui-modernization-design.md:122` refers to "the tasks and backups pages" — updated.
+- `docs/backup-feature-design.md`, `docs/m4-backup-engine-design.md`,
+  `docs/product-requirements.md` and `docs/progress-display-design.md` say "scheduled tasks" about
+  the *backend mechanism*, whose type is still `ScheduledTask`. Left alone; they are also records of
+  decisions taken at the time, and rewriting them would falsify that record.
+- `README.md` documents no UI navigation. Its one hit (`README.md:356`, `Scheduler__Enabled`)
+  describes the backend scheduler and stays accurate. Not changed.
+
+## 8. Verification
+
+Layout claims here are settled with a browser, not by reading CSS — this repo has been wrong about
+`index.css` specificity three times already.
+
+- Headless Chrome screenshots at three widths: **390px** (expanded form; scrolled to mid-form to
+  confirm the action bar is still on screen; the running + editing three-way merge), **1440px**
+  (desktop inline expansion), and **700px** (the tablet tier, where sticky is deliberately off and
+  the table form still applies).
+- Measure the Backups table's minimum width and confirm it has not moved past 656px (§6).
+- `npx tsc -b` — **not** `tsc --noEmit`, which is a no-op in this project and passes unconditionally.
+- The frontend test suite.
