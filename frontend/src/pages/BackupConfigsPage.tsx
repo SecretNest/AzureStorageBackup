@@ -749,6 +749,501 @@ export function BackupConfigsPage() {
     </button>
   )
 
+  // The edit form is rendered in one of two places: under the row being edited, or -- for a new backup, which belongs to
+  // no row -- under the table. Held in a variable rather than extracted into a component on purpose: it reads twenty-odd
+  // pieces of page state (form, step, editing, accounts, containerList, scope, passwordConfirm, ...), every one of which
+  // would have to become a prop, for no behaviour change whatsoever.
+  const formPanel = showForm && (
+    <div className="panel">
+      <h2>
+        {editing ? `Edit: ${editing.name}` : 'New Backup'} — Step {step} of 2
+      </h2>
+
+      {step === 1 ? (
+        <>
+          <Field label={editing ? 'Account (locked)' : 'Account'}>
+            <select
+              value={form.accountId}
+              disabled={!!editing}
+              onChange={(e) => {
+                setForm((f) => ({ ...f, accountId: Number(e.target.value), containerName: '' }))
+                setNewContainer(false)
+              }}
+            >
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label={editing ? 'Container (locked)' : 'Container'} multi>
+            {editing || containerListError || containerList === null ? (
+              <>
+                <input
+                  className="w-lg mono"
+                  value={form.containerName}
+                  disabled={!!editing}
+                  onChange={(e) => set('containerName', e.target.value)}
+                />
+                {!editing && containerListError && (
+                  <div className="text-warn">
+                    Could not list containers ({containerListError}). Type the name instead.
+                  </div>
+                )}
+                {!editing && !containerListError && containerList === null && (
+                  <div className="text-faint">Loading containers…</div>
+                )}
+              </>
+            ) : (
+              <>
+                <select
+                  className="w-lg"
+                  value={newContainer ? ' new' : form.containerName}
+                  onChange={(e) => {
+                    if (e.target.value === ' new') {
+                      setNewContainer(true)
+                      set('containerName', '')
+                    } else {
+                      setNewContainer(false)
+                      set('containerName', e.target.value)
+                    }
+                  }}
+                >
+                  <option value="">— select —</option>
+                  {containerList.map((c) => (
+                    // A container already held by a backup is not selectable: the server would
+                    // refuse it with 409 anyway, and two backups writing one container overwrite each
+                    // other's version history while each one's data is deleted as an orphan by the
+                    // other's retention cleanup. Occupancy comes from the local configuration, which
+                    // holds true mid-backup too — the cloud info file is only written by the last step.
+                    <option key={c.name} value={c.name} disabled={!!c.inUseBy}>
+                      {c.name}
+                      {c.inUseBy
+                        ? `  ● in use by "${c.inUseBy}"`
+                        : c.backup !== BackupPresence.None
+                          ? '  ● has backup'
+                          : ''}
+                    </option>
+                  ))}
+                  <option value={' new'}>+ New container…</option>
+                </select>
+                {newContainer && (
+                  <>
+                    <input
+                      className="w-lg mono"
+                      placeholder="new-container-name"
+                      value={form.containerName}
+                      onChange={(e) => set('containerName', e.target.value)}
+                    />
+                    <div
+                      className={
+                        form.containerName && validateContainerName(form.containerName)
+                          ? 'text-danger'
+                          : 'text-faint'
+                      }
+                    >
+                      {(form.containerName && validateContainerName(form.containerName)) ||
+                        containerNameRule}
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </Field>
+          <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
+            <input
+              className="w-lg mono"
+              placeholder="/data/photos"
+              value={form.localRoot}
+              disabled={!!editing}
+              onChange={(e) => set('localRoot', e.target.value)}
+            />
+            {editing ? (
+              // The root stays locked on the ordinary edit path; changing it goes through the dedicated validated channel (for when a mount point moves).
+              <button type="button" onClick={() => setChangingRoot(true)}>
+                Change…
+              </button>
+            ) : (
+              <button type="button" onClick={() => setBrowsing(true)}>
+                Browse
+              </button>
+            )}
+          </Field>
+          <Field label="Scope">
+            <label className="row" style={{ gap: 'var(--sp-1)' }}>
+              <input
+                type="checkbox"
+                checked={!pickingScope}
+                disabled={!form.localRoot.trim()}
+                onChange={(e) => {
+                  setPickingScope(!e.target.checked)
+                  // Both directions return to "everything": re-ticking clears the scope, unticking
+                  // starts from everything selected and lets the user remove from there (design §10).
+                  set('scopeRules', null)
+                }}
+              />
+              <span>Back up everything in this folder</span>
+            </label>
+          </Field>
+          {pickingScope && !!form.localRoot.trim() && (
+            <>
+              <p className="text-muted text-sm" style={{ margin: '0 0 var(--sp-2)' }}>
+                Checking a folder backs up everything inside it, including files added later.
+                Hidden files and files matched by the ignore rules are listed here too — ignore
+                rules are applied separately and still leave those out of the backup.
+              </p>
+              <ScopeTree
+                localRoot={form.localRoot}
+                rules={scope}
+                onChange={(next) => set('scopeRules', scopeToText(next) || null)}
+                ignoreRules={form.ignoreRules ?? editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''}
+              />
+            </>
+          )}
+          <Field label="Name">
+            <input className="w-lg" value={form.name} onChange={(e) => set('name', e.target.value)} />
+          </Field>
+          <Field label="Description">
+            <input
+              className="w-lg"
+              value={form.description ?? ''}
+              onChange={(e) => set('description', e.target.value)}
+            />
+          </Field>
+          <Field label={editing ? 'Password (locked)' : 'Password'}>
+            <input
+              type="password"
+              className="w-lg"
+              placeholder={
+                editing
+                  ? editing.hasPassword
+                    ? 'Encrypted — cannot be changed after creation'
+                    : 'Not encrypted — cannot be changed after creation'
+                  : 'Optional — set to encrypt'
+              }
+              value={form.password ?? ''}
+              disabled={!!editing}
+              onChange={(e) => set('password', e.target.value)}
+            />
+          </Field>
+          {/* Only creation asks twice. A password entered during import or keyring recovery is
+              **verified** (a wrong one fails on the spot); this is the one place it is *set* — nothing
+              can tell whether it is right, and afterwards it cannot be changed and losing it is
+              unrecoverable. One mistyped invisible character surfaces only on the day a restore is
+              actually needed. */}
+          {!editing && (
+            <Field label="Confirm password">
+              <input
+                type="password"
+                className="w-lg"
+                placeholder={form.password ? 'Re-enter the same password' : 'Leave empty for no encryption'}
+                value={passwordConfirm}
+                onChange={(e) => setPasswordConfirm(e.target.value)}
+              />
+            </Field>
+          )}
+          {passwordMismatch && (
+            <div className="text-danger" style={{ marginBottom: '0.4rem' }}>
+              Passwords do not match.
+            </div>
+          )}
+          {!editing && !!form.password && !passwordMismatch && (
+            <div className="text-warn" style={{ marginBottom: '0.4rem' }}>
+              This password cannot be changed or recovered after the backup is created. If it is
+              lost, nothing encrypted with it can be restored — the only way out is to delete the
+              configuration and start over.
+            </div>
+          )}
+          <Field label={editing ? 'Index Tier (locked)' : 'Index Tier'}>
+            <TierSelect
+              value={form.indexTier}
+              onChange={(v) => set('indexTier', v)}
+              archive={false}
+              disabled={!!editing}
+            />
+          </Field>
+          <Field label={editing ? 'Data Tier (locked)' : 'Data Tier'}>
+            <TierSelect
+              value={form.dataTier}
+              onChange={(v) => set('dataTier', v)}
+              archive
+              disabled={!!editing}
+            />
+          </Field>
+
+          <div className="row form-actions" style={{ marginTop: '1rem' }}>
+            <button
+              type="button"
+              onClick={() => setStep(2)}
+              disabled={
+                !form.accountId ||
+                !form.containerName.trim() ||
+                !form.localRoot.trim() ||
+                (newContainer && !!validateContainerName(form.containerName))
+              }
+            >
+              Next
+            </button>
+            <button type="button" onClick={() => setShowForm(false)}>
+              Cancel
+            </button>
+            {deleteButton}
+          </div>
+        </>
+      ) : (
+        <>
+          {/* The path basis has to be stated here. Rules match paths **relative to Local Root**,
+              excluding Local Root itself; without saying so it is natural to write them against the
+              full path on screen, and every rule then matches nothing — silently, leaving the user to
+              infer it from something as indirect as "the pack count did not go down". */}
+          <p className="text-muted" style={{ margin: '0 0 var(--sp-2)' }}>
+            All rule lists below use gitignore syntax and match paths <strong>relative to the local
+            root</strong>{form.localRoot.trim() && <> (<span className="mono">{form.localRoot}</span>)</>} —
+            write <span className="mono">/Backup/</span> to mean{' '}
+            <span className="mono">{(form.localRoot.trim() || '<local root>').replace(/\/+$/, '')}/Backup</span>, not the
+            full path. A trailing <span className="mono">/</span> means "this directory and everything under it".{' '}
+            Each list has a second box below it matching the same syntax but ignoring case; the two form one
+            list with the insensitive box last, so a rule there overrides a matching rule above it.
+          </p>
+          <DefaultableField
+            label="Ignore rules"
+            useDefault={form.ignoreRules === null}
+            onToggle={(useDefault) =>
+              set('ignoreRules', useDefault ? null : (editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''))
+            }
+            effectiveText={(editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules) || '(none)'}
+          >
+            <RuleBox value={form.ignoreRules} onChange={(v) => set('ignoreRules', v)} />
+            <CaseInsensitiveHalf
+              value={form.ignoreRulesCaseInsensitive}
+              onChange={(v) => set('ignoreRulesCaseInsensitive', v)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Don't compress"
+            useDefault={form.dontCompressRules === null}
+            onToggle={(useDefault) =>
+              set(
+                'dontCompressRules',
+                useDefault ? null : (editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules ?? ''),
+              )
+            }
+            effectiveText={(editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules) || '(none)'}
+          >
+            <RuleBox
+              value={form.dontCompressRules}
+              onChange={(v) => set('dontCompressRules', v)}
+            />
+            <CaseInsensitiveHalf
+              value={form.dontCompressRulesCaseInsensitive}
+              onChange={(v) => set('dontCompressRulesCaseInsensitive', v)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Don't group"
+            useDefault={form.dontGroupRules === null}
+            onToggle={(useDefault) =>
+              set(
+                'dontGroupRules',
+                useDefault ? null : (editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules ?? ''),
+              )
+            }
+            effectiveText={(editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules) || '(none)'}
+          >
+            <RuleBox value={form.dontGroupRules} onChange={(v) => set('dontGroupRules', v)} />
+            <CaseInsensitiveHalf
+              value={form.dontGroupRulesCaseInsensitive}
+              onChange={(v) => set('dontGroupRulesCaseInsensitive', v)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Pack across directories"
+            useDefault={form.crossDirGroupRules === null}
+            onToggle={(useDefault) =>
+              set(
+                'crossDirGroupRules',
+                useDefault ? null : (editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules ?? ''),
+              )
+            }
+            effectiveText={(editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules) || '(none)'}
+          >
+            <RuleBox value={form.crossDirGroupRules} onChange={(v) => set('crossDirGroupRules', v)} />
+            <CaseInsensitiveHalf
+              value={form.crossDirGroupRulesCaseInsensitive}
+              onChange={(v) => set('crossDirGroupRulesCaseInsensitive', v)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Include symlinks"
+            useDefault={form.includeSymlinks === null}
+            onToggle={(useDefault) =>
+              set(
+                'includeSymlinks',
+                useDefault ? null : (editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false),
+              )
+            }
+            effectiveText={String(editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false)}
+          >
+            <input
+              type="checkbox"
+              checked={form.includeSymlinks ?? false}
+              onChange={(e) => set('includeSymlinks', e.target.checked)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Verbose (debug) logging"
+            useDefault={form.verboseLogging === null}
+            onToggle={(useDefault) =>
+              set(
+                'verboseLogging',
+                useDefault ? null : (editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false),
+              )
+            }
+            effectiveText={String(editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false)}
+          >
+            <input
+              type="checkbox"
+              checked={form.verboseLogging ?? false}
+              onChange={(e) => set('verboseLogging', e.target.checked)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Max versions"
+            useDefault={form.maxVersions === null}
+            onToggle={(useDefault) =>
+              set('maxVersions', useDefault ? null : (editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100))
+            }
+            effectiveText={String(editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100)}
+          >
+            <input
+              className="w-sm"
+              type="number"
+              value={form.maxVersions ?? 0}
+              onChange={(e) => set('maxVersions', Number(e.target.value))}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Max age (days)"
+            useDefault={form.maxAgeDays === null}
+            onToggle={(useDefault) =>
+              set('maxAgeDays', useDefault ? null : (editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180))
+            }
+            effectiveText={String(editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180)}
+          >
+            <input
+              className="w-sm"
+              type="number"
+              value={form.maxAgeDays ?? 0}
+              onChange={(e) => set('maxAgeDays', Number(e.target.value))}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Retention mode"
+            useDefault={form.retentionMode === null}
+            onToggle={(useDefault) =>
+              set(
+                'retentionMode',
+                useDefault ? null : (editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers),
+              )
+            }
+            effectiveText={
+              retentionModeLabels[
+                editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers
+              ]
+            }
+          >
+            <select
+              value={form.retentionMode ?? RetentionMode.EitherTriggers}
+              onChange={(e) => set('retentionMode', Number(e.target.value))}
+            >
+              {Object.entries(retentionModeLabels).map(([v, label]) => (
+                <option key={v} value={v}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </DefaultableField>
+          <DefaultableField
+            label="Single-file threshold (MB)"
+            useDefault={form.singleFileThresholdBytes === null}
+            onToggle={(useDefault) =>
+              set(
+                'singleFileThresholdBytes',
+                useDefault
+                  ? null
+                  : (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB),
+              )
+            }
+            effectiveText={`${Math.round(
+              (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB) / MB,
+            )} MB`}
+          >
+            <input
+              className="w-sm"
+              type="number"
+              value={Math.round((form.singleFileThresholdBytes ?? 0) / MB)}
+              onChange={(e) => set('singleFileThresholdBytes', Number(e.target.value) * MB)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Group cap (MB)"
+            useDefault={form.groupCapBytes === null}
+            onToggle={(useDefault) =>
+              set(
+                'groupCapBytes',
+                useDefault ? null : (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB),
+              )
+            }
+            effectiveText={`${Math.round(
+              (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB) / MB,
+            )} MB`}
+          >
+            <input
+              className="w-sm"
+              type="number"
+              value={Math.round((form.groupCapBytes ?? 0) / MB)}
+              onChange={(e) => set('groupCapBytes', Number(e.target.value) * MB)}
+            />
+          </DefaultableField>
+          <DefaultableField
+            label="Volume size (MB, 0 = off)"
+            useDefault={form.volumeBytes === null}
+            onToggle={(useDefault) =>
+              set('volumeBytes', useDefault ? null : (editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0))
+            }
+            effectiveText={(() => {
+              const bytes = editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0
+              // 0 = volume splitting off, a representation deliberately introduced by that round of work; this should read "off" rather than "0 MB".
+              return bytes > 0 ? `${Math.round(bytes / MB)} MB` : 'off'
+            })()}
+          >
+            <input
+              className="w-sm"
+              type="number"
+              value={Math.round((form.volumeBytes ?? 0) / MB)}
+              onChange={(e) => set('volumeBytes', Number(e.target.value) * MB)}
+            />
+          </DefaultableField>
+
+          {error && <p className="text-danger">{error}</p>}
+          <div className="row form-actions" style={{ marginTop: '1rem' }}>
+            <button type="button" onClick={() => setStep(1)}>
+              Back
+            </button>
+            <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim() || passwordMismatch}>
+              {editing ? 'Save' : 'Create'}
+            </button>
+            <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
+              Cancel
+            </button>
+            {deleteButton}
+          </div>
+        </>
+      )}
+    </div>
+  )
+
   return (
     <section>
       <div className="page-header">
@@ -980,496 +1475,7 @@ export function BackupConfigsPage() {
         </table>
       </div>
 
-      {showForm && (
-        <div className="panel">
-          <h2>
-            {editing ? `Edit: ${editing.name}` : 'New Backup'} — Step {step} of 2
-          </h2>
-
-          {step === 1 ? (
-            <>
-              <Field label={editing ? 'Account (locked)' : 'Account'}>
-                <select
-                  value={form.accountId}
-                  disabled={!!editing}
-                  onChange={(e) => {
-                    setForm((f) => ({ ...f, accountId: Number(e.target.value), containerName: '' }))
-                    setNewContainer(false)
-                  }}
-                >
-                  {accounts.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.name}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field label={editing ? 'Container (locked)' : 'Container'} multi>
-                {editing || containerListError || containerList === null ? (
-                  <>
-                    <input
-                      className="w-lg mono"
-                      value={form.containerName}
-                      disabled={!!editing}
-                      onChange={(e) => set('containerName', e.target.value)}
-                    />
-                    {!editing && containerListError && (
-                      <div className="text-warn">
-                        Could not list containers ({containerListError}). Type the name instead.
-                      </div>
-                    )}
-                    {!editing && !containerListError && containerList === null && (
-                      <div className="text-faint">Loading containers…</div>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <select
-                      className="w-lg"
-                      value={newContainer ? ' new' : form.containerName}
-                      onChange={(e) => {
-                        if (e.target.value === ' new') {
-                          setNewContainer(true)
-                          set('containerName', '')
-                        } else {
-                          setNewContainer(false)
-                          set('containerName', e.target.value)
-                        }
-                      }}
-                    >
-                      <option value="">— select —</option>
-                      {containerList.map((c) => (
-                        // A container already held by a backup is not selectable: the server would
-                        // refuse it with 409 anyway, and two backups writing one container overwrite each
-                        // other's version history while each one's data is deleted as an orphan by the
-                        // other's retention cleanup. Occupancy comes from the local configuration, which
-                        // holds true mid-backup too — the cloud info file is only written by the last step.
-                        <option key={c.name} value={c.name} disabled={!!c.inUseBy}>
-                          {c.name}
-                          {c.inUseBy
-                            ? `  ● in use by "${c.inUseBy}"`
-                            : c.backup !== BackupPresence.None
-                              ? '  ● has backup'
-                              : ''}
-                        </option>
-                      ))}
-                      <option value={' new'}>+ New container…</option>
-                    </select>
-                    {newContainer && (
-                      <>
-                        <input
-                          className="w-lg mono"
-                          placeholder="new-container-name"
-                          value={form.containerName}
-                          onChange={(e) => set('containerName', e.target.value)}
-                        />
-                        <div
-                          className={
-                            form.containerName && validateContainerName(form.containerName)
-                              ? 'text-danger'
-                              : 'text-faint'
-                          }
-                        >
-                          {(form.containerName && validateContainerName(form.containerName)) ||
-                            containerNameRule}
-                        </div>
-                      </>
-                    )}
-                  </>
-                )}
-              </Field>
-              <Field label={editing ? 'Local Root (locked)' : 'Local Root'}>
-                <input
-                  className="w-lg mono"
-                  placeholder="/data/photos"
-                  value={form.localRoot}
-                  disabled={!!editing}
-                  onChange={(e) => set('localRoot', e.target.value)}
-                />
-                {editing ? (
-                  // The root stays locked on the ordinary edit path; changing it goes through the dedicated validated channel (for when a mount point moves).
-                  <button type="button" onClick={() => setChangingRoot(true)}>
-                    Change…
-                  </button>
-                ) : (
-                  <button type="button" onClick={() => setBrowsing(true)}>
-                    Browse
-                  </button>
-                )}
-              </Field>
-              <Field label="Scope">
-                <label className="row" style={{ gap: 'var(--sp-1)' }}>
-                  <input
-                    type="checkbox"
-                    checked={!pickingScope}
-                    disabled={!form.localRoot.trim()}
-                    onChange={(e) => {
-                      setPickingScope(!e.target.checked)
-                      // Both directions return to "everything": re-ticking clears the scope, unticking
-                      // starts from everything selected and lets the user remove from there (design §10).
-                      set('scopeRules', null)
-                    }}
-                  />
-                  <span>Back up everything in this folder</span>
-                </label>
-              </Field>
-              {pickingScope && !!form.localRoot.trim() && (
-                <>
-                  <p className="text-muted text-sm" style={{ margin: '0 0 var(--sp-2)' }}>
-                    Checking a folder backs up everything inside it, including files added later.
-                    Hidden files and files matched by the ignore rules are listed here too — ignore
-                    rules are applied separately and still leave those out of the backup.
-                  </p>
-                  <ScopeTree
-                    localRoot={form.localRoot}
-                    rules={scope}
-                    onChange={(next) => set('scopeRules', scopeToText(next) || null)}
-                    ignoreRules={form.ignoreRules ?? editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''}
-                  />
-                </>
-              )}
-              <Field label="Name">
-                <input className="w-lg" value={form.name} onChange={(e) => set('name', e.target.value)} />
-              </Field>
-              <Field label="Description">
-                <input
-                  className="w-lg"
-                  value={form.description ?? ''}
-                  onChange={(e) => set('description', e.target.value)}
-                />
-              </Field>
-              <Field label={editing ? 'Password (locked)' : 'Password'}>
-                <input
-                  type="password"
-                  className="w-lg"
-                  placeholder={
-                    editing
-                      ? editing.hasPassword
-                        ? 'Encrypted — cannot be changed after creation'
-                        : 'Not encrypted — cannot be changed after creation'
-                      : 'Optional — set to encrypt'
-                  }
-                  value={form.password ?? ''}
-                  disabled={!!editing}
-                  onChange={(e) => set('password', e.target.value)}
-                />
-              </Field>
-              {/* Only creation asks twice. A password entered during import or keyring recovery is
-                  **verified** (a wrong one fails on the spot); this is the one place it is *set* — nothing
-                  can tell whether it is right, and afterwards it cannot be changed and losing it is
-                  unrecoverable. One mistyped invisible character surfaces only on the day a restore is
-                  actually needed. */}
-              {!editing && (
-                <Field label="Confirm password">
-                  <input
-                    type="password"
-                    className="w-lg"
-                    placeholder={form.password ? 'Re-enter the same password' : 'Leave empty for no encryption'}
-                    value={passwordConfirm}
-                    onChange={(e) => setPasswordConfirm(e.target.value)}
-                  />
-                </Field>
-              )}
-              {passwordMismatch && (
-                <div className="text-danger" style={{ marginBottom: '0.4rem' }}>
-                  Passwords do not match.
-                </div>
-              )}
-              {!editing && !!form.password && !passwordMismatch && (
-                <div className="text-warn" style={{ marginBottom: '0.4rem' }}>
-                  This password cannot be changed or recovered after the backup is created. If it is
-                  lost, nothing encrypted with it can be restored — the only way out is to delete the
-                  configuration and start over.
-                </div>
-              )}
-              <Field label={editing ? 'Index Tier (locked)' : 'Index Tier'}>
-                <TierSelect
-                  value={form.indexTier}
-                  onChange={(v) => set('indexTier', v)}
-                  archive={false}
-                  disabled={!!editing}
-                />
-              </Field>
-              <Field label={editing ? 'Data Tier (locked)' : 'Data Tier'}>
-                <TierSelect
-                  value={form.dataTier}
-                  onChange={(v) => set('dataTier', v)}
-                  archive
-                  disabled={!!editing}
-                />
-              </Field>
-
-              <div className="row form-actions" style={{ marginTop: '1rem' }}>
-                <button
-                  type="button"
-                  onClick={() => setStep(2)}
-                  disabled={
-                    !form.accountId ||
-                    !form.containerName.trim() ||
-                    !form.localRoot.trim() ||
-                    (newContainer && !!validateContainerName(form.containerName))
-                  }
-                >
-                  Next
-                </button>
-                <button type="button" onClick={() => setShowForm(false)}>
-                  Cancel
-                </button>
-                {deleteButton}
-              </div>
-            </>
-          ) : (
-            <>
-              {/* The path basis has to be stated here. Rules match paths **relative to Local Root**,
-                  excluding Local Root itself; without saying so it is natural to write them against the
-                  full path on screen, and every rule then matches nothing — silently, leaving the user to
-                  infer it from something as indirect as "the pack count did not go down". */}
-              <p className="text-muted" style={{ margin: '0 0 var(--sp-2)' }}>
-                All rule lists below use gitignore syntax and match paths <strong>relative to the local
-                root</strong>{form.localRoot.trim() && <> (<span className="mono">{form.localRoot}</span>)</>} —
-                write <span className="mono">/Backup/</span> to mean{' '}
-                <span className="mono">{(form.localRoot.trim() || '<local root>').replace(/\/+$/, '')}/Backup</span>, not the
-                full path. A trailing <span className="mono">/</span> means "this directory and everything under it".{' '}
-                Each list has a second box below it matching the same syntax but ignoring case; the two form one
-                list with the insensitive box last, so a rule there overrides a matching rule above it.
-              </p>
-              <DefaultableField
-                label="Ignore rules"
-                useDefault={form.ignoreRules === null}
-                onToggle={(useDefault) =>
-                  set('ignoreRules', useDefault ? null : (editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules ?? ''))
-                }
-                effectiveText={(editing?.effective.ignoreRules ?? defaults?.defaultIgnoreRules) || '(none)'}
-              >
-                <RuleBox value={form.ignoreRules} onChange={(v) => set('ignoreRules', v)} />
-                <CaseInsensitiveHalf
-                  value={form.ignoreRulesCaseInsensitive}
-                  onChange={(v) => set('ignoreRulesCaseInsensitive', v)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Don't compress"
-                useDefault={form.dontCompressRules === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'dontCompressRules',
-                    useDefault ? null : (editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules ?? ''),
-                  )
-                }
-                effectiveText={(editing?.effective.dontCompressRules ?? defaults?.defaultDontCompressRules) || '(none)'}
-              >
-                <RuleBox
-                  value={form.dontCompressRules}
-                  onChange={(v) => set('dontCompressRules', v)}
-                />
-                <CaseInsensitiveHalf
-                  value={form.dontCompressRulesCaseInsensitive}
-                  onChange={(v) => set('dontCompressRulesCaseInsensitive', v)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Don't group"
-                useDefault={form.dontGroupRules === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'dontGroupRules',
-                    useDefault ? null : (editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules ?? ''),
-                  )
-                }
-                effectiveText={(editing?.effective.dontGroupRules ?? defaults?.defaultDontGroupRules) || '(none)'}
-              >
-                <RuleBox value={form.dontGroupRules} onChange={(v) => set('dontGroupRules', v)} />
-                <CaseInsensitiveHalf
-                  value={form.dontGroupRulesCaseInsensitive}
-                  onChange={(v) => set('dontGroupRulesCaseInsensitive', v)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Pack across directories"
-                useDefault={form.crossDirGroupRules === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'crossDirGroupRules',
-                    useDefault ? null : (editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules ?? ''),
-                  )
-                }
-                effectiveText={(editing?.effective.crossDirGroupRules ?? defaults?.defaultCrossDirGroupRules) || '(none)'}
-              >
-                <RuleBox value={form.crossDirGroupRules} onChange={(v) => set('crossDirGroupRules', v)} />
-                <CaseInsensitiveHalf
-                  value={form.crossDirGroupRulesCaseInsensitive}
-                  onChange={(v) => set('crossDirGroupRulesCaseInsensitive', v)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Include symlinks"
-                useDefault={form.includeSymlinks === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'includeSymlinks',
-                    useDefault ? null : (editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false),
-                  )
-                }
-                effectiveText={String(editing?.effective.includeSymlinks ?? defaults?.defaultIncludeSymlinks ?? false)}
-              >
-                <input
-                  type="checkbox"
-                  checked={form.includeSymlinks ?? false}
-                  onChange={(e) => set('includeSymlinks', e.target.checked)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Verbose (debug) logging"
-                useDefault={form.verboseLogging === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'verboseLogging',
-                    useDefault ? null : (editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false),
-                  )
-                }
-                effectiveText={String(editing?.effective.verboseLogging ?? defaults?.defaultVerboseLogging ?? false)}
-              >
-                <input
-                  type="checkbox"
-                  checked={form.verboseLogging ?? false}
-                  onChange={(e) => set('verboseLogging', e.target.checked)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Max versions"
-                useDefault={form.maxVersions === null}
-                onToggle={(useDefault) =>
-                  set('maxVersions', useDefault ? null : (editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100))
-                }
-                effectiveText={String(editing?.effective.maxVersions ?? defaults?.defaultMaxVersions ?? 100)}
-              >
-                <input
-                  className="w-sm"
-                  type="number"
-                  value={form.maxVersions ?? 0}
-                  onChange={(e) => set('maxVersions', Number(e.target.value))}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Max age (days)"
-                useDefault={form.maxAgeDays === null}
-                onToggle={(useDefault) =>
-                  set('maxAgeDays', useDefault ? null : (editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180))
-                }
-                effectiveText={String(editing?.effective.maxAgeDays ?? defaults?.defaultMaxAgeDays ?? 180)}
-              >
-                <input
-                  className="w-sm"
-                  type="number"
-                  value={form.maxAgeDays ?? 0}
-                  onChange={(e) => set('maxAgeDays', Number(e.target.value))}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Retention mode"
-                useDefault={form.retentionMode === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'retentionMode',
-                    useDefault ? null : (editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers),
-                  )
-                }
-                effectiveText={
-                  retentionModeLabels[
-                    editing?.effective.retentionMode ?? defaults?.defaultRetentionMode ?? RetentionMode.EitherTriggers
-                  ]
-                }
-              >
-                <select
-                  value={form.retentionMode ?? RetentionMode.EitherTriggers}
-                  onChange={(e) => set('retentionMode', Number(e.target.value))}
-                >
-                  {Object.entries(retentionModeLabels).map(([v, label]) => (
-                    <option key={v} value={v}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
-              </DefaultableField>
-              <DefaultableField
-                label="Single-file threshold (MB)"
-                useDefault={form.singleFileThresholdBytes === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'singleFileThresholdBytes',
-                    useDefault
-                      ? null
-                      : (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB),
-                  )
-                }
-                effectiveText={`${Math.round(
-                  (editing?.effective.singleFileThresholdBytes ?? defaults?.defaultSingleFileThresholdBytes ?? 5 * MB) / MB,
-                )} MB`}
-              >
-                <input
-                  className="w-sm"
-                  type="number"
-                  value={Math.round((form.singleFileThresholdBytes ?? 0) / MB)}
-                  onChange={(e) => set('singleFileThresholdBytes', Number(e.target.value) * MB)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Group cap (MB)"
-                useDefault={form.groupCapBytes === null}
-                onToggle={(useDefault) =>
-                  set(
-                    'groupCapBytes',
-                    useDefault ? null : (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB),
-                  )
-                }
-                effectiveText={`${Math.round(
-                  (editing?.effective.groupCapBytes ?? defaults?.defaultGroupCapBytes ?? 100 * MB) / MB,
-                )} MB`}
-              >
-                <input
-                  className="w-sm"
-                  type="number"
-                  value={Math.round((form.groupCapBytes ?? 0) / MB)}
-                  onChange={(e) => set('groupCapBytes', Number(e.target.value) * MB)}
-                />
-              </DefaultableField>
-              <DefaultableField
-                label="Volume size (MB, 0 = off)"
-                useDefault={form.volumeBytes === null}
-                onToggle={(useDefault) =>
-                  set('volumeBytes', useDefault ? null : (editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0))
-                }
-                effectiveText={(() => {
-                  const bytes = editing?.effective.volumeBytes ?? defaults?.defaultVolumeBytes ?? 0
-                  // 0 = volume splitting off, a representation deliberately introduced by that round of work; this should read "off" rather than "0 MB".
-                  return bytes > 0 ? `${Math.round(bytes / MB)} MB` : 'off'
-                })()}
-              >
-                <input
-                  className="w-sm"
-                  type="number"
-                  value={Math.round((form.volumeBytes ?? 0) / MB)}
-                  onChange={(e) => set('volumeBytes', Number(e.target.value) * MB)}
-                />
-              </DefaultableField>
-
-              {error && <p className="text-danger">{error}</p>}
-              <div className="row form-actions" style={{ marginTop: '1rem' }}>
-                <button type="button" onClick={() => setStep(1)}>
-                  Back
-                </button>
-                <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim() || passwordMismatch}>
-                  {editing ? 'Save' : 'Create'}
-                </button>
-                <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
-                  Cancel
-                </button>
-                {deleteButton}
-              </div>
-            </>
-          )}
-        </div>
-      )}
+      {formPanel}
 
       {browsing && (
         <PathBrowser
