@@ -316,6 +316,17 @@ export interface BackupRun {
   version: number | null
   // Files this round could not read, whose old index entries were carried forward. A "successful" backup may have stored nothing at all.
   unreadableFiles: number | null
+  // What the round actually did, the same figures the operation log's summary reports. Optional rather
+  // than nullable: an older backend omits them entirely, and that has to stay distinguishable from a
+  // round that genuinely changed nothing (see runTotals).
+  newFiles?: number | null
+  modifiedFiles?: number | null
+  deletedFiles?: number | null
+  // Source-side raw bytes of the changed files, before compression and dedup.
+  changedBytes?: number | null
+  // Bytes actually pushed to the cloud. Content that hit dedup counts zero — read the two together to
+  // see what compression and dedup each saved.
+  uploadedBytes?: number | null
   error: string | null
   // This backup's start and end (UTC), taken from the version record — the same pair /versions gives the
   // restore dialog. null while running, and against an older backend that does not send them.

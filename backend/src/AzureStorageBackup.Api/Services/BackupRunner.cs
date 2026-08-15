@@ -36,6 +36,31 @@ public sealed class BackupRunState
     /// notification to go on — and notifications drown in other messages.</summary>
     public int? UnreadableFiles { get; set; }
 
+    /// <summary>
+    /// What this round changed and what it cost, copied off <see cref="BackupRunResult"/> when the run finishes.
+    /// The same figures <see cref="BackupSummary"/> puts in the operation log and the webhook notification —
+    /// but the page the operator is actually looking at when a backup ends polls this state, and until these
+    /// were carried here the only way to learn what a round did was to go and open the log.
+    /// <para>
+    /// Null while the run is going, deliberately not 0: zero would read as "this round changed nothing",
+    /// which nobody is in a position to claim before the diff has finished.
+    /// </para>
+    /// </summary>
+    public int? NewFiles { get; set; }
+
+    /// <inheritdoc cref="NewFiles"/>
+    public int? ModifiedFiles { get; set; }
+
+    /// <inheritdoc cref="NewFiles"/>
+    public int? DeletedFiles { get; set; }
+
+    /// <summary>Source-side raw bytes of the changed files, before compression and dedup. See <see cref="NewFiles"/> for why it is nullable.</summary>
+    public long? ChangedBytes { get; set; }
+
+    /// <summary>Bytes actually pushed to the cloud; content that hit dedup counts zero. Read together with
+    /// <see cref="ChangedBytes"/> to see what compression and dedup each saved. See <see cref="NewFiles"/> for why it is nullable.</summary>
+    public long? UploadedBytes { get; set; }
+
     public string? Error { get; set; }
 
     /// <summary>Start and finish moments of this backup, taken from the version record (see <see cref="BackupRunResult.CompletedAt"/>).
@@ -82,11 +107,15 @@ public sealed class BackupRunState
 public sealed record BackupRunResponse(
     string Status, BackupProgress? Progress, int? Version, int? UnreadableFiles, string? Error,
     DateTimeOffset? StartedAt = null, DateTimeOffset? CompletedAt = null,
-    string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null)
+    string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null,
+    // What the round changed and what it uploaded — see the matching properties on BackupRunState.
+    int? NewFiles = null, int? ModifiedFiles = null, int? DeletedFiles = null,
+    long? ChangedBytes = null, long? UploadedBytes = null)
 {
     public static BackupRunResponse From(BackupRunState s) =>
         new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
-            s.RunId, s.Pause, s.SuspendReason?.ToString());
+            s.RunId, s.Pause, s.SuspendReason?.ToString(),
+            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes);
 }
 
 /// <summary>
@@ -439,6 +468,11 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 new StateProgress(state), ct, control);
             state.Version = result.Version;
             state.UnreadableFiles = result.UnreadableFiles;
+            state.NewFiles = result.NewFiles;
+            state.ModifiedFiles = result.ModifiedFiles;
+            state.DeletedFiles = result.DeletedFiles;
+            state.ChangedBytes = result.ChangedBytes;
+            state.UploadedBytes = result.UploadedBytes;
             state.StartedAt = result.StartedAt;
             state.CompletedAt = result.CompletedAt;
             state.Status = RunStatus.Completed;

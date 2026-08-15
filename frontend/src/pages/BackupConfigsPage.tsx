@@ -13,6 +13,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { latestWins } from '../lib/latestWins'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
+import { runTotals } from '../lib/runSummary'
 import { stageLines } from '../lib/stageLines'
 import { Modal } from '../components/Modal'
 import {
@@ -1780,20 +1781,30 @@ function RunStatus({
         </button>
       </div>
     )
-  if (run.status === 'Completed')
+  if (run.status === 'Completed') {
+    // What the round actually did. It was already going to the log and the notification and nowhere
+    // else, so the one screen the operator is watching when a backup ends was the only place that could
+    // not answer "and what did it do?" — see runTotals for the wording rules.
+    const totals = runTotals(run)
     return (
       <div className="text-ok">
-        Completed — version {run.version}
-        {/* The start and end come from the version record, the same pair the restore dialog reads. An older backend does not send them → show the number only. */}
-        {run.completedAt && ` (${formatVersionSpan(run.startedAt, run.completedAt)})`}
-        {/* A "successful" backup may have skipped files — without saying so here, the operator can only find out from a notification that may well be drowned out. */}
-        {!!run.unreadableFiles && (
-          <span className="text-danger">
-            {' '}— {run.unreadableFiles} file(s) could not be read; earlier content kept
-          </span>
-        )}
+        {/* Its own line, not appended to the one above: that one says which version and how long, this
+            one says what moved. Run together they make a sentence long enough that neither gets read. */}
+        <div>
+          Completed — version {run.version}
+          {/* The start and end come from the version record, the same pair the restore dialog reads. An older backend does not send them → show the number only. */}
+          {run.completedAt && ` (${formatVersionSpan(run.startedAt, run.completedAt)})`}
+          {/* A "successful" backup may have skipped files — without saying so here, the operator can only find out from a notification that may well be drowned out. */}
+          {!!run.unreadableFiles && (
+            <span className="text-danger">
+              {' '}— {run.unreadableFiles} file(s) could not be read; earlier content kept
+            </span>
+          )}
+        </div>
+        {totals && <div>{totals}</div>}
       </div>
     )
+  }
   const p = run.progress
   if (!p)
     return (

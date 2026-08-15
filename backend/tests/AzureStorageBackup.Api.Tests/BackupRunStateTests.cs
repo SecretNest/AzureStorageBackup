@@ -35,6 +35,45 @@ public class BackupRunStateTests
         Assert.Equal("network down", response.Pause!.Reason);
     }
 
+    // These figures reach the log through BackupSummary, but the page the operator actually watches a
+    // backup finish on polls this response — so they have to travel this way too, or the only way to
+    // learn what a round did is to go and read the log.
+    [Fact]
+    public void Response_carries_what_the_round_changed_and_uploaded()
+    {
+        var state = new BackupRunState
+        {
+            Status = RunStatus.Completed,
+            Version = 42,
+            NewFiles = 2481,
+            ModifiedFiles = 130,
+            DeletedFiles = 5,
+            ChangedBytes = 5_046_586_572,
+            UploadedBytes = 851_443_712,
+        };
+        var response = BackupRunResponse.From(state);
+
+        Assert.Equal(2481, response.NewFiles);
+        Assert.Equal(130, response.ModifiedFiles);
+        Assert.Equal(5, response.DeletedFiles);
+        Assert.Equal(5_046_586_572, response.ChangedBytes);
+        Assert.Equal(851_443_712, response.UploadedBytes);
+    }
+
+    // Null rather than 0 while the run is still going: 0 would read as "this round changed nothing",
+    // which is a claim nobody is in a position to make until the diff has finished.
+    [Fact]
+    public void Figures_are_absent_until_the_run_finishes()
+    {
+        var response = BackupRunResponse.From(new BackupRunState());
+
+        Assert.Null(response.NewFiles);
+        Assert.Null(response.ModifiedFiles);
+        Assert.Null(response.DeletedFiles);
+        Assert.Null(response.ChangedBytes);
+        Assert.Null(response.UploadedBytes);
+    }
+
     [Fact]
     public void Suspended_is_a_terminal_status_with_a_reason()
     {
