@@ -37,7 +37,11 @@ export function runTotals(run: BackupRun): string | null {
   const files = [
     run.newFiles && `${run.newFiles.toLocaleString()} new`,
     run.modifiedFiles && `${run.modifiedFiles.toLocaleString()} modified`,
-    run.deletedFiles && `${run.deletedFiles.toLocaleString()} deleted`,
+    // The size sits with the count, not in the data segment: that segment tracks what changed at source
+    // against what went over the wire, and deleted bytes went nowhere. A zero (or an older backend that
+    // sends no size at all) drops the parenthesis rather than printing "(0 B)".
+    run.deletedFiles &&
+      `${run.deletedFiles.toLocaleString()} deleted${run.deletedBytes ? ` (${formatBytes(run.deletedBytes)})` : ''}`,
   ]
     .filter(Boolean)
     .join(', ')

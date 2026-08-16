@@ -78,6 +78,19 @@ public sealed record BackupRunResult(int Version, int ChangedFiles, long Changed
     public int DeletedFiles { get; init; }
 
     /// <summary>
+    /// The source-side raw size those deleted files had, taken from the previous version's index entries — by now
+    /// the files themselves are gone, so the index is the only thing left that knows how big they were. Same unit as
+    /// <see cref="ChangedBytes"/>: uncompressed, not deduplicated. Without it, "12 deleted" cannot tell twelve empty
+    /// log stubs from twelve disk images.
+    /// <para>
+    /// **Not the space the cloud gave back.** Older versions still reference that content and it stays in the
+    /// container until retention retires them; what was actually freed is <see cref="CleanupReport.FreedBytes"/>.
+    /// The two are different quantities and do not add up.
+    /// </para>
+    /// </summary>
+    public long DeletedBytes { get; init; }
+
+    /// <summary>
     /// Bytes this run actually pushed to the cloud (archive size **after** compression/encryption). Content
     /// that hit dedup counts for exactly zero bytes — it never went through the upload step at all. Read it
     /// together with <see cref="ChangedBytes"/> to see how much compression and dedup each saved.
@@ -1279,6 +1292,7 @@ public sealed class BackupOrchestrator(
         var newFiles = 0;
         var modifiedFiles = 0;
         var deletedFiles = 0;
+        long deletedBytes = 0;
         var unreadableFiles = 0;
         foreach (var c in diff.Changes)
         {
@@ -1286,7 +1300,10 @@ public sealed class BackupOrchestrator(
             {
                 case ChangeKind.Added: newFiles++; break;
                 case ChangeKind.Modified: modifiedFiles++; break;
-                case ChangeKind.Deleted: deletedFiles++; break;
+                // A Deleted change is synthesized from a previous-version entry and always carries it, so Length is
+                // right there for free; symlinks weigh 0 (their content is the Target string), which is what they
+                // occupied at the source too.
+                case ChangeKind.Deleted: deletedFiles++; deletedBytes += c.Previous?.Length ?? 0; break;
                 case ChangeKind.Unreadable: unreadableFiles++; break;
                 default: break;   // MetadataOnly / Unchanged: nothing was touched this run, so it stays out of the summary
             }
@@ -1302,6 +1319,7 @@ public sealed class BackupOrchestrator(
             NewFiles = newFiles,
             ModifiedFiles = modifiedFiles,
             DeletedFiles = deletedFiles,
+            DeletedBytes = deletedBytes,
             UploadedBytes = state.UploadedBytes,
             Cleanup = cleanup,
             CleanupSkipped = cleanupError?.Message,

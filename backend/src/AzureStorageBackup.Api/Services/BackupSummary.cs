@@ -26,8 +26,15 @@ public static class BackupSummary
             files.Add($"{r.NewFiles} new");
         if (r.ModifiedFiles > 0)
             files.Add($"{r.ModifiedFiles} modified");
+        // The size goes in a parenthesis right after the count, where it reads as "the size of *those* files".
+        // It is kept out of the Data line on purpose: that line tracks changed-at-source against uploaded, and
+        // deleted bytes are neither — sitting there they would be read as part of the upload arithmetic.
+        // Zero bytes drops the parenthesis by the same rule that drops a zero item: a round that deleted twelve
+        // empty files or symlinks should not have to carry "(0 B)" around.
         if (r.DeletedFiles > 0)
-            files.Add($"{r.DeletedFiles} deleted");
+            files.Add(r.DeletedBytes > 0
+                ? $"{r.DeletedFiles} deleted ({ByteSize.Human(r.DeletedBytes)})"
+                : $"{r.DeletedFiles} deleted");
         // An unreadable file counts as neither a change nor a deletion; the index silently carries the old entry
         // forward — so it has to occupy an item of its own. Without this line, a "successful" backup papers over the
         // files this round never actually stored.

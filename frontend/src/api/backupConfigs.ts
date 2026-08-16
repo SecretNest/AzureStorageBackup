@@ -322,6 +322,9 @@ export interface BackupRun {
   newFiles?: number | null
   modifiedFiles?: number | null
   deletedFiles?: number | null
+  // Source-side raw size those deleted files had, off the previous version's index. Not the space the
+  // cloud gave back — older versions still reference the content until retention retires them.
+  deletedBytes?: number | null
   // Source-side raw bytes of the changed files, before compression and dedup.
   changedBytes?: number | null
   // Bytes actually pushed to the cloud. Content that hit dedup counts zero — read the two together to

@@ -14,12 +14,13 @@ public class BackupSummaryTests
     private static BackupRunResult Result(
         int version = 12, int changed = 340, long changedBytes = 4_700_000_000,
         int unreadable = 0, int added = 128, int modified = 212, int deleted = 35,
-        long uploaded = 1_200_000_000, CleanupReport? cleanup = null) =>
+        long deletedBytes = 2_100_000_000, long uploaded = 1_200_000_000, CleanupReport? cleanup = null) =>
         new(version, changed, changedBytes, unreadable)
         {
             NewFiles = added,
             ModifiedFiles = modified,
             DeletedFiles = deleted,
+            DeletedBytes = deletedBytes,
             UploadedBytes = uploaded,
             Cleanup = cleanup ?? CleanupReport.Empty,
         };
@@ -38,6 +39,30 @@ public class BackupSummaryTests
         // question is only half answered.
         Assert.Contains("4.7 GB", text);
         Assert.Contains("1.2 GB", text);
+    }
+
+    /// <summary>
+    /// 35 deleted files can be 35 empty log stubs or 35 disk images, and the count alone cannot tell those apart.
+    /// It is the one item on the Files line with no sense of scale behind it — new and modified at least have
+    /// "changed at source" standing next to them.
+    /// </summary>
+    [Fact]
+    public void Reports_How_Much_The_Deleted_Files_Weighed()
+    {
+        var text = BackupSummary.Format(Result(deleted: 35, deletedBytes: 2_100_000_000));
+
+        Assert.Contains("35 deleted (2.1 GB)", text);
+    }
+
+    /// <summary>The same "a zero makes its item disappear" rule, applied to the parenthesis: a round that deleted
+    /// twelve empty files or symlinks should not be made to carry "(0 B)" around.</summary>
+    [Fact]
+    public void Omits_The_Deleted_Size_When_Those_Files_Weighed_Nothing()
+    {
+        var text = BackupSummary.Format(Result(deleted: 12, deletedBytes: 0));
+
+        Assert.Contains("12 deleted", text);
+        Assert.DoesNotContain("(0 B)", text);
     }
 
     [Fact]
