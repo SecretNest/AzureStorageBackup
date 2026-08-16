@@ -48,6 +48,7 @@ public class BackupRunStateTests
             NewFiles = 2481,
             ModifiedFiles = 130,
             DeletedFiles = 5,
+            DeletedBytes = 3_221_225_472,
             ChangedBytes = 5_046_586_572,
             UploadedBytes = 851_443_712,
         };
@@ -56,6 +57,7 @@ public class BackupRunStateTests
         Assert.Equal(2481, response.NewFiles);
         Assert.Equal(130, response.ModifiedFiles);
         Assert.Equal(5, response.DeletedFiles);
+        Assert.Equal(3_221_225_472, response.DeletedBytes);
         Assert.Equal(5_046_586_572, response.ChangedBytes);
         Assert.Equal(851_443_712, response.UploadedBytes);
     }
@@ -70,6 +72,7 @@ public class BackupRunStateTests
         Assert.Null(response.NewFiles);
         Assert.Null(response.ModifiedFiles);
         Assert.Null(response.DeletedFiles);
+        Assert.Null(response.DeletedBytes);
         Assert.Null(response.ChangedBytes);
         Assert.Null(response.UploadedBytes);
     }

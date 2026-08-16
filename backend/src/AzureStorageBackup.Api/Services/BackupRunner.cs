@@ -54,6 +54,12 @@ public sealed class BackupRunState
     /// <inheritdoc cref="NewFiles"/>
     public int? DeletedFiles { get; set; }
 
+    /// <summary>Source-side raw size of the deleted files, read off the previous version's index. **Not** the space
+    /// the cloud gave back — see <see cref="BackupRunResult.DeletedBytes"/>. Nullable for the reason in <see cref="NewFiles"/>,
+    /// and here that matters twice over: an older backend sends no such field, and rendering it as 0 would state
+    /// something about those files that nobody knows.</summary>
+    public long? DeletedBytes { get; set; }
+
     /// <summary>Source-side raw bytes of the changed files, before compression and dedup. See <see cref="NewFiles"/> for why it is nullable.</summary>
     public long? ChangedBytes { get; set; }
 
@@ -110,12 +116,12 @@ public sealed record BackupRunResponse(
     string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null,
     // What the round changed and what it uploaded — see the matching properties on BackupRunState.
     int? NewFiles = null, int? ModifiedFiles = null, int? DeletedFiles = null,
-    long? ChangedBytes = null, long? UploadedBytes = null)
+    long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null)
 {
     public static BackupRunResponse From(BackupRunState s) =>
         new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, s.Pause, s.SuspendReason?.ToString(),
-            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes);
+            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes);
 }
 
 /// <summary>
@@ -471,6 +477,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.NewFiles = result.NewFiles;
             state.ModifiedFiles = result.ModifiedFiles;
             state.DeletedFiles = result.DeletedFiles;
+            state.DeletedBytes = result.DeletedBytes;
             state.ChangedBytes = result.ChangedBytes;
             state.UploadedBytes = result.UploadedBytes;
             state.StartedAt = result.StartedAt;

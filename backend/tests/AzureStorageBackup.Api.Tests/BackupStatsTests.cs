@@ -118,13 +118,14 @@ public sealed class BackupStatsTests : IDisposable
         {
             Write("keep.txt", "unchanged");
             Write("edit.txt", "before");
-            Write("gone.txt", "doomed");
+            Write("gone.txt", "doomed-but-weighed");
             var v1 = await orchestrator.RunAsync(Request(account, name));
 
             // First run: all three files are new, nothing modified and nothing deleted.
             Assert.Equal(3, v1.NewFiles);
             Assert.Equal(0, v1.ModifiedFiles);
             Assert.Equal(0, v1.DeletedFiles);
+            Assert.Equal(0, v1.DeletedBytes);
 
             Write("edit.txt", "after-and-longer");   // modify one
             Write("added.txt", "brand new");         // add one
@@ -134,6 +135,9 @@ public sealed class BackupStatsTests : IDisposable
             Assert.Equal(1, v2.NewFiles);
             Assert.Equal(1, v2.ModifiedFiles);
             Assert.Equal(1, v2.DeletedFiles);
+            // The size the deleted file had at the source, read off the previous version's index entry — the file
+            // itself is gone by now, so the index is the only place left that knows how big it was.
+            Assert.Equal("doomed-but-weighed".Length, v2.DeletedBytes);
             // Unchanged keep.txt counts as neither new nor modified — that is precisely the part incremental backup saves.
             Assert.Equal(v2.ChangedFiles, v2.NewFiles + v2.ModifiedFiles);
         }

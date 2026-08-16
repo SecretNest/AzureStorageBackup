@@ -18,6 +18,7 @@ function run(over: Partial<BackupRun> = {}): BackupRun {
     newFiles: 0,
     modifiedFiles: 0,
     deletedFiles: 0,
+    deletedBytes: 0,
     changedBytes: 0,
     uploadedBytes: 0,
     ...over,
@@ -27,8 +28,34 @@ function run(over: Partial<BackupRun> = {}): BackupRun {
 describe('runTotals', () => {
   test('lists new, modified and deleted counts alongside the byte figures', () => {
     expect(
-      runTotals(run({ newFiles: 2481, modifiedFiles: 130, deletedFiles: 5, changedBytes: 5046586572, uploadedBytes: 851443712 })),
-    ).toBe('2,481 new, 130 modified, 5 deleted · 4.7 GB changed at source → 812.0 MB uploaded')
+      runTotals(
+        run({
+          newFiles: 2481,
+          modifiedFiles: 130,
+          deletedFiles: 5,
+          deletedBytes: 3221225472,
+          changedBytes: 5046586572,
+          uploadedBytes: 851443712,
+        }),
+      ),
+    ).toBe('2,481 new, 130 modified, 5 deleted (3.0 GB) · 4.7 GB changed at source → 812.0 MB uploaded')
+  })
+
+  // Five deleted files can be five empty stubs or five disk images. The size says which, and it belongs
+  // next to the count rather than in the data segment — that segment tracks what went over the wire, and
+  // deleted bytes went nowhere.
+  test('sizes the deleted files where the count is', () => {
+    expect(runTotals(run({ deletedFiles: 12, deletedBytes: 5046586572 }))).toBe('12 deleted (4.7 GB)')
+  })
+
+  test('leaves the size off when the deleted files weighed nothing', () => {
+    expect(runTotals(run({ deletedFiles: 12, deletedBytes: 0 }))).toBe('12 deleted')
+  })
+
+  // An older backend sends the counts but not this size. Rendering "(0 B)" there would state something
+  // about those files that nothing here knows.
+  test('shows the count alone when the backend sent no size', () => {
+    expect(runTotals(run({ deletedFiles: 12, deletedBytes: undefined }))).toBe('12 deleted')
   })
 
   test('drops the file items that are zero', () => {
