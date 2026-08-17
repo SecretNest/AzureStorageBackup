@@ -2032,129 +2032,20 @@ public sealed class BackupOrchestrator(
                 continue;
             }
 
-            // "Compress this group + upload it" is the retry unit: one hiccup redoes this group from scratch and
-            // leaves the earlier groups alone. The whole thing is re-entrant — the pack id does not change, so the
-            // recompressed output overwrites the same family of volumes (leftovers are cleared before uploading, see
-            // UploadStagedPackAsync). The journal append and the oplog write are **not** inside the retry unit (see
-            // the comment at the call site below): they happen after the cloud has confirmed, and repeating them
+            // "Compress this group + upload it" is the retry unit (see RunGroupAsync): one hiccup redoes this group
+            // from scratch and leaves the earlier groups alone. The journal append and the oplog write are **not**
+            // inside it (see the comment right below): they happen after the cloud has confirmed, and repeating them
             // would only double-count/miscount the uploaded bytes and the index member list, not make "this group"
             // re-entrant again. Re-queueing changed members stays outside too: it mutates queue and attempts, so a
             // repeat would queue the same member twice and double-count its attempts.
-            async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
-            {
-                // This snapshot may be hours removed from the diff: after sealing, the pack still queues in a
-                // bounded queue, and how much work is stacked ahead of it and how many consumers there are is none
-                // of its business. In the meantime a member may well be deleted (a build artifact) or have its
-                // permissions revoked, and Stat would throw right there, taking the whole run down in exactly the
-                // shape this branch fixes. No new mechanism: if it cannot be read, record the snapshot as null and
-                // let the existing "exclude the member" path below handle it (the same path as "the content changed
-                // during compression": exclude it from the archive → re-read the new content → if still unreadable, demote it).
-                // Stat per member: a box has hundreds of members, and on a NAS that is not free. Reported under
-                // "checking on disk", same as the post-compression pass.
-                uploadTracker.BeginChecking();
-                Dictionary<string, (long Mtime, long Length, int Mode)?> before;
-                try
-                {
-                    before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
-                }
-                finally
-                {
-                    uploadTracker.EndChecking();
-                }
-                var (staged, missing) = await CompressPackTolerantAsync(
-                    request, packId, members, storeOnly, uploadTracker, state, ct);
-                // This box's archive is held by this iteration: however this round ends, it goes back. Between here
-                // and where it is consumed lies a whole stretch of code that can throw (the hash recomputation
-                // inside the post-compression re-verification, and the OperationCanceledException thrown on cancel
-                // is outside what that catch collects), and once it escaped, that debt used to hang on the singleton
-                // forever — and the singleton is the backpressure gate on output, so enough of them stall
-                // compression for every run at once. It is still released explicitly the moment it is done with;
-                // this only covers the exception path.
-                using var held = staging.Hold(staged);
+            //
+            // Nothing is precompressed here: this caller is the single worker that runs both halves back to back, so
+            // there is never an archive already waiting when the group gets its turn.
+            var (changedMembers, recordedMembers, recordedVolumes) = await RunGroupAsync(
+                request, packId, members, storeOnly, precompressed: null,
+                uploadScope, uploadTracker, state, control, ct);
 
-                // Members that 7z dropped from the archive must be marked excluded **directly**; the comparison
-                // below cannot be relied on to catch them: that comparison looks at metadata and the content hash,
-                // and revoking permissions changes neither mtime nor length — so the comparison would say "this
-                // member did not change", a pack missing a member would be uploaded as-is, and the index would
-                // claim it is in there.
-                var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
-
-                // Post-compression re-verification: metadata changed **and** the content hash changed → that member
-                // changed during compression.
-                //
-                // The whole stretch registers as "checking on disk": the per-member stat is already not cheap, and
-                // hitting one large changed member means reading it end to end to recompute the hash. This runs
-                // after leaving the staging phase and before registering any in-flight volume, so it emits not a
-                // single progress event — without reporting it, the screen shows a motionless "1 object starting
-                // upload" for tens of seconds.
-                // Pass this archive's bytes along: it is already compressed onto disk and counted in the
-                // backpressure books, yet if the stretch below finds any member changed, the whole thing is thrown
-                // away and recompressed (see the changed.Count branch below) — not one byte of it goes out.
-                // So the UI subtracts it from "pending upload" and lists it separately as "checking".
-                var checkingBytes = staged?.Bytes ?? 0;
-                uploadTracker.BeginChecking(checkingBytes);
-                try
-                {
-                    foreach (var m in members)
-                    {
-                        if (missing.Contains(m.EntryName))
-                            continue;
-
-                        var local = Local(request, m.Path);
-                        bool exclude;
-                        try
-                        {
-                            // Unreadable and content-changed have the same consequence for this pack: neither may
-                            // stay in the archive to be uploaded.
-                            // Already unreadable at snapshot time (before is null) falls into the same class, with
-                            // no need for a second read to confirm.
-                            exclude = before[m.Path] is not { } snapshot
-                                || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                        {
-                            exclude = true;
-                        }
-                        if (exclude)
-                            changed.Add(m);
-                    }
-                }
-                finally
-                {
-                    uploadTracker.EndChecking(checkingBytes);
-                }
-
-                if (changed.Count == 0)
-                {
-                    var vols = await UploadStagedPackAsync(
-                        request, packId, staged!, uploadScope, uploadTracker, state, members.Count, control, ct);
-                    return (changed, members, vols);   // empty list: this group cleanly became one pack
-                }
-
-                // Discard this archive; the stable members still become a pack; the changed ones are handled under
-                // their new hash.
-                // staged can only be null when 7z dropped every member of the group (not even an empty archive was
-                // left), in which case there is nothing to release.
-                if (staged is not null)
-                    staging.Release(staged);
-                var stable = members.Where(m => !changed.Contains(m)).ToList();
-                if (stable.Count > 0)
-                {
-                    var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
-                    var vols2 = await UploadStagedPackAsync(
-                        request, packId, staged2, uploadScope, uploadTracker, state, stable.Count, control, ct);
-                    return (changed, stable, vols2);
-                }
-                return (changed, [], []);   // every member of the group was judged changed/unreadable: no stable members to record
-            }
-
-            List<PackEntry> changedMembers = [];
-            IReadOnlyList<PackEntry> recordedMembers = [];
-            IReadOnlyList<long> recordedVolumes = [];
-            await WithPauseAsync(control, async () =>
-                (changedMembers, recordedMembers, recordedVolumes) = await AttemptAsync(), ct);
-
-            // The journal append and the oplog write were moved here, outside the retry unit: once AttemptAsync
+            // The journal append and the oplog write were moved here, outside the retry unit: once RunGroupAsync
             // above returns successfully the cloud has confirmed the upload and the gate will not let this group run
             // again — so RecordPackAsync/LogFileAsync run exactly once, instead of, as before the move, triggering a
             // recompression of the whole group by throwing a transient error themselves (a local-disk IOException,
@@ -2242,6 +2133,226 @@ public sealed class BackupOrchestrator(
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// One group's retry unit — "compress this group + upload it" — run behind the suspend gate.
+    /// <para>
+    /// The whole thing is re-entrant, and that is what keeps a hiccup from corrupting the container: the pack id is
+    /// taken by the caller **outside** this method and never changes, so a repeat's output overwrites the same
+    /// family of volumes (leftovers are cleared before uploading, see <see cref="UploadStagedPackAsync"/>). The
+    /// repeat recompresses rather than reusing the failed attempt's archive — see the comment on emptying the slot
+    /// below for why reuse would be wrong even if the archive were still on disk.
+    /// </para>
+    /// </summary>
+    /// <param name="precompressed">An archive the compression side already produced for this group, consumed by the
+    /// first pass and by that pass alone. Null means "compress it here", which is what the single-worker caller
+    /// wants; the pipelined caller (a later task) compresses in one loop and uploads in another, and hands the
+    /// result of the first loop in here.</param>
+    /// <returns>The members left out of the pack (changed or unreadable, for the caller to re-queue under their new
+    /// hash), the members that really went into it, and that pack's volume sizes.</returns>
+    private async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)>
+        RunGroupAsync(
+            BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+            GroupAttempt? precompressed, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
+            BackupRunControl? control, CancellationToken ct)
+    {
+        // The archive the next pass should upload instead of compressing one, and nothing more: the first pass takes
+        // whatever the compression side handed in, every later one finds the slot empty and compresses afresh.
+        var pending = precompressed;
+
+        async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
+        {
+            var attempt = pending
+                ?? await CompressGroupAsync(request, packId, members, storeOnly, uploadTracker, state, ct);
+            // Emptied before the upload starts rather than after it ends, because this archive does not outlive the
+            // pass either way — uploaded on success, dead on failure, disposed by the finally below in both cases.
+            // Leaving the slot pointing at it would let a later pass "upload" an archive whose volume files the
+            // staging area has already deleted; and even with the files still there, an archive whose members were
+            // never re-verified against the source is not one to send.
+            pending = null;
+            try
+            {
+                var vols = await UploadGroupAsync(
+                    request, packId, attempt, uploadScope, uploadTracker, state, control, ct);
+                // The cloud confirmed, so nothing is left for Dispose to turn away. The pack path registers no dedup
+                // reservation and so has no waiters to answer either way, but saying which of the two endings this
+                // is stays the handoff's contract, and a later task queues these values between two loops where the
+                // difference is what a discarded entry has to act on.
+                attempt.Handoff.MarkSettled();
+                return (attempt.Changed, attempt.Stable, vols);
+            }
+            finally
+            {
+                // Hand the quota back here, on every path. UploadStagedPackAsync already released whatever it got as
+                // far as sending, but nothing released the archive of a group 7z emptied (there is no upload at all
+                // for it), the one whose upload threw before it started, or the one abandoned when the run was
+                // cancelled. That debt lives on a singleton shared by every run and is at the same time the
+                // backpressure gate on output, so leaking it throttles compression process-wide until a restart.
+                attempt.Handoff.Dispose();
+            }
+        }
+
+        (List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes) result = ([], [], []);
+        await WithPauseAsync(control, async () => result = await AttemptAsync(), ct);
+        return result;
+    }
+
+    /// <summary>
+    /// What the compression half of the pack path produces for one group: the archive, wrapped in the
+    /// <see cref="StagedHandoff"/> that owns its pool quota, plus the member split that goes with it — <c>Changed</c>
+    /// are the members that may not travel in it (7z dropped them, or they changed under it while it was being
+    /// written) and <c>Stable</c> are the ones it holds. That split is decided before anything is uploaded and does
+    /// not depend on the upload, which is why it can be settled on this side of the seam and simply carried across.
+    /// </summary>
+    private sealed record GroupAttempt(
+        StagedHandoff Handoff, List<PackEntry> Changed, IReadOnlyList<PackEntry> Stable);
+
+    /// <summary>
+    /// Compress half of the pack path: the pre-compression stat snapshot, the compression itself, and the
+    /// post-compression re-verification that decides which members may not travel with the archive.
+    /// <para>
+    /// Deliberately takes **no** <see cref="VolumeUploadScope"/> and speaks to no blob client — that is the whole
+    /// point of the cut. Nothing in here waits on the network, so a later task can run this half as its own loop,
+    /// paced only by the staging quota, while the uploaders work through what it has already produced.
+    /// </para>
+    /// <para>
+    /// The archive comes back owned by the caller through the handoff, which is why the <c>staging.Hold</c> that
+    /// used to guard this stretch is gone: the scope it guarded no longer ends inside this method. The hazard it
+    /// existed for has not gone away — see the catch below.
+    /// </para>
+    /// </summary>
+    private async Task<GroupAttempt> CompressGroupAsync(
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+        StageTracker uploadTracker, RunState state, CancellationToken ct)
+    {
+        // This snapshot may be hours removed from the diff: after sealing, the pack still queues in a bounded
+        // queue, and how much work is stacked ahead of it and how many consumers there are is none of its business.
+        // In the meantime a member may well be deleted (a build artifact) or have its permissions revoked, and Stat
+        // would throw right there, taking the whole run down in exactly the shape this branch fixes. No new
+        // mechanism: if it cannot be read, record the snapshot as null and let the existing "exclude the member"
+        // path below handle it (the same path as "the content changed during compression": exclude it from the
+        // archive → re-read the new content → if still unreadable, demote it).
+        // Stat per member: a box has hundreds of members, and on a NAS that is not free. Reported under
+        // "checking on disk", same as the post-compression pass.
+        uploadTracker.BeginChecking();
+        Dictionary<string, (long Mtime, long Length, int Mode)?> before;
+        try
+        {
+            before = members.ToDictionary(m => m.Path, m => TryStat(Local(request, m.Path)));
+        }
+        finally
+        {
+            uploadTracker.EndChecking();
+        }
+        var (staged, missing) = await CompressPackTolerantAsync(
+            request, packId, members, storeOnly, uploadTracker, state, ct);
+        try
+        {
+            // Members that 7z dropped from the archive must be marked excluded **directly**; the comparison
+            // below cannot be relied on to catch them: that comparison looks at metadata and the content hash,
+            // and revoking permissions changes neither mtime nor length — so the comparison would say "this
+            // member did not change", a pack missing a member would be uploaded as-is, and the index would
+            // claim it is in there.
+            var changed = members.Where(m => missing.Contains(m.EntryName)).ToList();
+
+            // Post-compression re-verification: metadata changed **and** the content hash changed → that member
+            // changed during compression.
+            //
+            // The whole stretch registers as "checking on disk": the per-member stat is already not cheap, and
+            // hitting one large changed member means reading it end to end to recompute the hash. This runs
+            // after leaving the staging phase and before registering any in-flight volume, so it emits not a
+            // single progress event — without reporting it, the screen shows a motionless "1 object starting
+            // upload" for tens of seconds.
+            // Pass this archive's bytes along: it is already compressed onto disk and counted in the
+            // backpressure books, yet if the stretch below finds any member changed, the whole thing is thrown
+            // away and recompressed (see the changed.Count branch below) — not one byte of it goes out.
+            // So the UI subtracts it from "pending upload" and lists it separately as "checking".
+            var checkingBytes = staged?.Bytes ?? 0;
+            uploadTracker.BeginChecking(checkingBytes);
+            try
+            {
+                foreach (var m in members)
+                {
+                    if (missing.Contains(m.EntryName))
+                        continue;
+
+                    var local = Local(request, m.Path);
+                    bool exclude;
+                    try
+                    {
+                        // Unreadable and content-changed have the same consequence for this pack: neither may
+                        // stay in the archive to be uploaded.
+                        // Already unreadable at snapshot time (before is null) falls into the same class, with
+                        // no need for a second read to confirm.
+                        exclude = before[m.Path] is not { } snapshot
+                            || (Stat(local) != snapshot && await hasher.FullHashAsync(local, ct) != m.FullHash);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        exclude = true;
+                    }
+                    if (exclude)
+                        changed.Add(m);
+                }
+            }
+            finally
+            {
+                uploadTracker.EndChecking(checkingBytes);
+            }
+
+            if (changed.Count == 0)
+                return new GroupAttempt(new StagedHandoff(staging, staged), changed, members);
+
+            // Discard this archive; the stable members still become a pack; the changed ones are handled under
+            // their new hash.
+            // staged can only be null when 7z dropped every member of the group (not even an empty archive was
+            // left), in which case there is nothing to release.
+            if (staged is not null)
+                staging.Release(staged);
+            var stable = members.Where(m => !changed.Contains(m)).ToList();
+            // Every member of the group was judged changed/unreadable: no stable members to record, and no second
+            // archive to compress or to own — the handoff carries nothing, which is exactly the state
+            // UploadGroupAsync reads as "there is no pack to send".
+            if (stable.Count == 0)
+                return new GroupAttempt(new StagedHandoff(staging, staged: null), changed, []);
+
+            var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
+            return new GroupAttempt(new StagedHandoff(staging, staged2), changed, stable);
+        }
+        catch
+        {
+            // Between the compression above and the returns below lies a stretch that can throw: the hash
+            // recomputation inside the re-verification, and the OperationCanceledException a cancel throws from
+            // anywhere in it. Let that escape with the archive unreleased and its debt hangs on the staging
+            // singleton forever (only a restart clears it) — and that singleton is the backpressure gate on output,
+            // so enough of them stall compression for every run at once. This is the exception path only: once the
+            // archive is wrapped in a StagedHandoff and returned, the caller owns it and releases it there.
+            // Releasing twice is safe (ReleaseFile removes by path), so the changed-member branch above having
+            // already released it before recompressing is not a problem.
+            if (staged is not null)
+                staging.Release(staged);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Upload half of the pack path: send this group's archive and report its volume sizes.
+    /// <para>
+    /// An empty <c>Stable</c> means every member of the group was judged changed or unreadable, so there is no pack
+    /// to send — and that is also the only case in which the handoff carries no archive, which is what makes the
+    /// <c>!</c> below safe rather than hopeful.
+    /// </para>
+    /// </summary>
+    private async Task<IReadOnlyList<long>> UploadGroupAsync(
+        BackupRequest request, string packId, GroupAttempt attempt, VolumeUploadScope uploadScope,
+        StageTracker uploadTracker, RunState state, BackupRunControl? control, CancellationToken ct)
+    {
+        if (attempt.Stable.Count == 0)
+            return [];
+        return await UploadStagedPackAsync(
+            request, packId, attempt.Handoff.Staged!, uploadScope, uploadTracker, state,
+            attempt.Stable.Count, control, ct);
     }
 
     /// <summary>
