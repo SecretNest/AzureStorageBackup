@@ -256,9 +256,10 @@ The cut goes **after** `StreamAndStageAsync` and **before** `ResolveAsync`. `Res
 
 **Interfaces:**
 - Consumes: `StagedHandoff` (Task 1).
-- Produces:
-  - `private async Task<StagedBlob?> StageBlobAsync(BackupRequest request, PlannedFile file, string localPath, bool storeOnly, LocalDedupResolver localResolver, StageTracker uploadTracker, RunState state, BackupRunControl? control, CancellationToken ct)` — returns null when a dedup/resume hit settled the item without compressing anything, in which case `Placement` on the returned record is what the caller uses.
+- Produces (these are the signatures as built — Task 4 wires the second and third of them into two different loops):
+  - `private async Task<BlobPlacement?> ProbeAndResumeAsync(BackupRequest request, PlannedFile file, string localPath, LocalDedupResolver localResolver, StageTracker uploadTracker, BackupRunControl? control, CancellationToken ct)` — null means "nothing matched, go compress"; non-null means a dedup or resume hit settled the item without compressing anything.
   - `private sealed record StagedBlob(BlobContent Content, StagedHandoff Handoff)`
+  - `private async Task<StagedBlob> StageBlobAsync(BackupRequest request, PlannedFile file, string localPath, bool storeOnly, StageTracker uploadTracker, RunState state, CancellationToken ct)` — note what it does **not** take: no `LocalDedupResolver`, no `VolumeUploadScope`, no `BackupRunControl`. That is the seam. It never returns null: by the time it is called the probe has already run.
   - `private async Task<BlobPlacement> UploadStagedBlobItemAsync(BackupRequest request, PlannedFile file, StagedBlob stagedBlob, BlobAddressScheme addressing, LocalDedupResolver localResolver, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, BackupRunControl? control, CancellationToken ct)`
 
 - [ ] **Step 1: Extract the two halves**
