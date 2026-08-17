@@ -143,4 +143,93 @@ public class PauseGateTests
         Assert.False(await waiting);
         Assert.True(gate.IsDowngraded);
     }
+
+    /// <summary>A user pause has no timer to release it: it holds until the user says otherwise.</summary>
+    [Fact]
+    public async Task A_User_Pause_Holds_Until_Resumed()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(10)], steady: TimeSpan.FromMilliseconds(10),
+            patience: TimeSpan.FromMilliseconds(50));
+
+        gate.PauseByUser();
+        var waiting = gate.WaitIfPausedAsync(CancellationToken.None);
+
+        await Task.Delay(200);   // far longer than both the schedule and the patience
+        Assert.False(waiting.IsCompleted);
+        Assert.Equal(PauseSource.User, gate.Current!.Source);
+        Assert.False(gate.IsDowngraded, "a user pause must never downgrade the run");
+
+        gate.ResumeByUser();
+        await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Null(gate.Current);
+    }
+
+    /// <summary>An open gate is a no-op — this is the call at the top of every producing loop.</summary>
+    [Fact]
+    public async Task Waiting_At_An_Open_Gate_Returns_Immediately()
+    {
+        using var gate = new PauseGate();
+        await gate.WaitIfPausedAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    /// <summary>
+    /// The two reasons compose. A volume already on the wire when Pause is pressed can still fail, and
+    /// resuming must not let the run charge back into a network that is still down.
+    /// </summary>
+    [Fact]
+    public async Task Resuming_Does_Not_Release_A_Gate_Trouble_Still_Holds()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1),
+            patience: TimeSpan.FromHours(1));
+
+        gate.PauseByUser();
+        var trouble = gate.WaitAsync(new IOException("network down"), CancellationToken.None);
+
+        gate.ResumeByUser();
+
+        await Task.Delay(100);
+        Assert.False(trouble.IsCompleted, "the transient-error reason still holds the gate");
+        Assert.Equal(PauseSource.TransientError, gate.Current!.Source);
+
+        gate.ReleaseNow();
+        Assert.True(await trouble.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
+    /// The mirror: trouble clears on its own while the user pause stands. The gate stays closed and starts
+    /// reporting the user as the reason, so the UI stops offering "Retry now" for a pause nobody can retry.
+    /// </summary>
+    [Fact]
+    public async Task Trouble_Clearing_Leaves_A_User_Pause_Standing()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+            patience: TimeSpan.FromSeconds(30));
+
+        gate.PauseByUser();
+        var trouble = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+
+        await Task.Delay(200);   // the timer has long since fired
+        Assert.False(trouble.IsCompleted);
+        Assert.Equal(PauseSource.User, gate.Current!.Source);
+
+        gate.ResumeByUser();
+        Assert.True(await trouble.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>Downgrade must pierce a user pause: it is how "Suspend" reaches a parked worker.</summary>
+    [Fact]
+    public async Task Downgrade_Releases_A_User_Pause()
+    {
+        using var gate = new PauseGate();
+        gate.PauseByUser();
+        var waiting = gate.WaitIfPausedAsync(CancellationToken.None);
+
+        gate.Downgrade();
+
+        await waiting.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(gate.IsDowngraded);
+    }
 }
