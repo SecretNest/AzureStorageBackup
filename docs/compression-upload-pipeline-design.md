@@ -240,15 +240,24 @@ the upload.
 This keeps the mutable per-item state (`queue`, `attempts`) single-threaded inside one
 `ProcessPackAsync` invocation, which is what it already assumes.
 
-### 5. Progress accounting is unchanged
+### 5. Progress accounting balances, and one column reads wider than it used to
 
 `BeginWork` moves to where the **prober** takes an item — the first stage, so that an item is counted as
 in-hand for its whole journey across both queues; `EndWork` stays after the upload settles, or fires in
 whichever earlier stage the item stops at (a probe that settles a dedup hit, a drained queue, a failure).
 The identity `processed + preparing + queued + waitingOnArchive + uploading ≡ total`
 (`StageProgress.cs:916-924`) continues to hold, because `uploading` is defined as
-`inWork - _inStaging` — items past staging but not settled — which is exactly what a queue entry
-plus an in-flight upload is. No column changes meaning, and no new column is needed.
+`inWork - _inStaging` — everything in hand that is not currently inside `StageAsync`. No new column is
+needed.
+
+**But `uploading` no longer means "past staging".** `_inStaging` is only incremented once `StageAsync`
+is entered, so an item that has been probed and is sitting in `probedQueue` — up to 128 of them,
+nothing about it compressed yet — is counted in `uploading` too. That is user-visible: the in-flight
+line renders it as `N objects starting upload` (`stageLines.ts:93,139`), and the figure is inflated by
+the depth of the first queue. Before the split there was nowhere for an item to be in-hand-but-not-in-
+staging, so the two readings coincided; now they do not. The identity is unaffected — the term is
+still exactly "in hand, not in staging" — and fixing the *label* belongs with the other in-flight-line
+work noted at the end of this document.
 
 ### 6. A stage that is gone must release the one feeding it
 
@@ -300,8 +309,25 @@ gone. Two rules make it behave:
 
 **It does not keep 7z busy 100% of the time.** The post-compression re-verification stays on the
 compressor (see §1), and while it stats members — or, rarely, rehashes a changed one — 7z idles. The
-guarantee this design makes is narrower and should not be overstated: **the compression stage is never
-blocked by the upload stage, and never waits on the probe's disk reads**.
+guarantee is narrower still than that, because two live paths cross the seam in each direction, and
+both are exceptional rather than steady state:
+
+- **A pack member demoted to a single file uploads on the compressor's thread.** When a member grows
+  past `SingleFileThresholdBytes` while its group is being compressed, `ProcessPackAsync`
+  (`BackupOrchestrator.cs:2633-2636`) hands it to `HandleBlobAsync` → `PlaceBlobAsync`, which
+  compresses *and* uploads it inline — behind the volume gate and behind the network — with the
+  compression stage stopped for the duration. It needs a member to change size mid-compression, so it
+  is rare; keeping it where it is keeps `queue`/`attempts` single-threaded inside one
+  `ProcessPackAsync` invocation (§4), which is the reason the demotion is not worth moving.
+- **The stranded-member tail compresses on an uploader's thread.** When a group's retry excludes
+  members the handed-over pass had kept, the uploader runs a standalone `ProcessPackAsync` for them
+  (`:1081`), with no dispatch — so that call compresses as well as uploads. It needs a transient
+  upload failure *and* a member rewritten inside the gate's wait window. This is one of the three
+  places §3's quota bypass applies.
+
+So the honest form of the guarantee is: **in steady state the compression stage is never blocked by
+the upload stage and never waits on the probe's disk reads**; on two exception paths, one stage does
+the other's work for the length of one item.
 
 **It does not make the probe faster in isolation.** One prober reads no quicker than one prober did
 before; what changes is that its reads now overlap compression instead of competing with five siblings
