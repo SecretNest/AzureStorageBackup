@@ -311,6 +311,124 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// Every uploader retrying at once, against a pool the compression stage has already filled: the run has to come
+    /// out the other side.
+    /// <para>
+    /// A retrying uploader recompresses <b>on its own thread</b> (the single-file closure's
+    /// <c>pending ?? StageBlobAsync</c>, the pack group's <c>pending ?? CompressGroupAsync</c>, and the
+    /// stranded-member tail), so it queues for staging room like anything else. Everything in that pool is released
+    /// by an uploader, though, so an uploader waiting there is waiting for itself — and the failure that sends it
+    /// there is systemic by nature. One network blip trips every in-flight upload at once; each disposes its archive
+    /// and parks at the gate; the compressor, which never sees a network error, fills the pool to
+    /// <c>StagedLimitBytes</c> exactly as this branch intends; and then the gate's timer releases every waiter
+    /// together, and all of them come back to recompress against a pool held entirely by queue entries no uploader
+    /// owns. Nothing can release, and nothing can notice: <c>downstreamGone</c> triggers on the uploaders being
+    /// **gone**, and these are alive; the gate cannot downgrade because nobody is at it; and <c>RequestStop</c> only
+    /// fires the abort token for <c>StopNow</c>, so Suspend and "finish current files" hang along with the run.
+    /// </para>
+    /// <para>
+    /// The suite had both halves of this and never the two together: <c>Transient_failure_pauses_then_heals</c> has
+    /// the recovery but a 200 MB pool over zeroes that never fills, and
+    /// <see cref="An_auto_suspend_that_kills_every_uploader_does_not_strand_the_compressor"/> has the full pool but
+    /// zero patience, so the gate downgrades on the first failure and no uploader ever reaches the retry. So the
+    /// numbers here are all load-bearing: a 4 MB pool, incompressible source, one failure per uploader, a backoff
+    /// long enough for the compressor to reach the ceiling while they are all out of circulation, and patience long
+    /// enough that the gate really does let them all back in.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Every_uploader_retrying_at_once_against_a_full_pool_still_finishes()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("gate");
+        // One failure per uploader, and the uploader count is turned down to make that a race nobody can lose: the
+        // scene needs **every** uploader parked at the gate at the same moment, and each failure is instantaneous
+        // while the compression that feeds the next one is not, so with the default six the six knock-outs have to
+        // fit inside one backoff on a machine running the rest of the suite in parallel. UploadConcurrency 1 →
+        // max(2, N+1) = two uploaders, two failures, and the hazard is unchanged: it is about *all* the live
+        // uploaders retrying at once, not about how many there are. Once the two failures are spent every retry
+        // succeeds, so a healthy pipeline finishes.
+        var flaky = new FlakyUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), failures: 2);
+        var (orchestrator, factory, staging) = Build(flaky, stagingLimit: 4_000_000);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        // Only used to unblock a hung run so the rest of the session is not left with every stage parked on a full
+        // pool; on the passing path it is never fired.
+        using var abort = new CancellationTokenSource();
+        try
+        {
+            // Incompressible, and 24 MB of it against a 4 MB pool that holds two of these archives: the compressor is
+            // meant to hit the ceiling here. Zeroes — what the rest of this suite writes — compress to a few hundred
+            // bytes and would never fill a pool of any size.
+            for (var i = 0; i < 12; i++)
+                WriteRandom($"f{i}.bin", 2_000_000);
+
+            await using var control = new BackupRunControl(_journals, 5, "run-retry-jam", new PauseGate(
+                // Five seconds, and the size of it is load-bearing. A failure is instantaneous while compressing 2 MB
+                // of noise is not, so while any uploader is awake the queue drains as fast as it fills and the pool
+                // never grows: the backoff is what takes both of them out of circulation at once and leaves the
+                // compressor alone with the pool long enough to reach the ceiling. Patience is what the sibling test
+                // above lacks — at zero the gate downgrades on the first failure and no uploader reaches the retry.
+                schedule: [TimeSpan.FromSeconds(5)], steady: TimeSpan.FromSeconds(5),
+                patience: TimeSpan.FromSeconds(60)));
+
+            // Single-file blobs only, so one item is one file and one upload call.
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    UploadConcurrency = 1,
+                },
+            };
+
+            // The scene is the precondition of the whole test and nothing below would notice if it stopped
+            // assembling — compressible content, a larger pool or a shorter backoff would each quietly dissolve it
+            // into an ordinary retry. So sample for the scene itself: the pool at its ceiling *while the gate is
+            // holding waiters*, which is the compression stage stopped dead on bytes that only a parked uploader
+            // could give back.
+            var peakWhileGated = 0L;
+            using var sampling = new CancellationTokenSource();
+            var sampler = Task.Run(async () =>
+            {
+                while (!sampling.IsCancellationRequested)
+                {
+                    if (control.Gate.Current is not null)
+                        peakWhileGated = Math.Max(peakWhileGated, staging.StagedBytes);
+                    try { await Task.Delay(10, sampling.Token); } catch (OperationCanceledException) { return; }
+                }
+            }, CancellationToken.None);
+
+            var run = orchestrator.RunAsync(request, null, abort.Token, control);
+            if (await Task.WhenAny(run, Task.Delay(TimeSpan.FromMinutes(2))) != run)
+            {
+                await abort.CancelAsync();
+                _ = run.ContinueWith(static t => _ = t.Exception, TaskScheduler.Default);
+                Assert.Fail(
+                    "the run never finished. Every uploader had gone back to recompress what it has to resend, and "
+                    + $"they were all waiting for staging room in a 4,000,000-byte pool holding {staging.StagedBytes} "
+                    + "bytes of queue entries that no uploader owns — so the release they are waiting for can never come.");
+            }
+
+            var result = await run;
+            await sampling.CancelAsync();
+            await sampler;
+
+            Assert.Equal(1, result.Version);
+            // 12 items uploaded once each, plus the two blips. Anything less means the injection stopped biting and
+            // the run never went near the retry path.
+            Assert.True(flaky.Attempts >= 14, $"expected at least 14 upload calls (12 items + 2 blips), saw {flaky.Attempts}.");
+            Assert.True(peakWhileGated >= 4_000_000,
+                $"while the gate held its waiters the staged pool never got past {peakWhileGated} bytes of its "
+                + "4,000,000-byte ceiling, so the uploaders were not released into a full pool and this test proves nothing.");
+            Assert.Equal(0, staging.StagedBytes);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The run Step 6 uses: patience threshold set to 0 so it downgrades the moment it hits the wall, with opLog swapped for a double we can peek into.</summary>
     private async Task RunWithAlwaysFailingUploadAsync(RecordingOperationLog log)
     {

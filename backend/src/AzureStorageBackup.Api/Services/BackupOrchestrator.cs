@@ -979,7 +979,7 @@ public sealed class BackupOrchestrator(
                     try
                     {
                         staged = await StageBlobAsync(
-                            request, single, localPath, storeOnly, uploadTracker, state, token);
+                            request, single, localPath, storeOnly, bypassQuota: false, uploadTracker, state, token);
                     }
                     catch (Exception ex)
                     {
@@ -998,6 +998,17 @@ public sealed class BackupOrchestrator(
                     // failed pass disposed its own. Reusing a disposed archive would upload volume files the staging
                     // area has already deleted. The slot is emptied before the upload starts, not after it ends, so
                     // no later pass can find it pointing at a dead archive.
+                    //
+                    // That recompression happens **on this uploader**, and it is why it may not wait for staging room
+                    // (bypassQuota). Everything in the pool is released by an uploader, so an uploader that parks on
+                    // the quota is waiting for itself; and the failure that sends it here is systemic by nature — a
+                    // network outage trips every in-flight upload into the gate together, the compressor meanwhile
+                    // fills the pool to the ceiling exactly as designed, and the gate then releases every waiter in
+                    // one go. All of them arriving here at once with the pool full and no owner left is a wait with no
+                    // end: downstreamGone does not fire (the uploaders are alive, not gone), the gate cannot downgrade
+                    // (nobody is at it), and only StopNow cancels the token they are blocked on — so Suspend and
+                    // "finish current files" both hang. The overshoot the bypass permits is one archive per uploader.
+                    // See StagingArea.StageWithoutBackpressureAsync.
                     StagedBlob? pending = compressed;
                     await WithPauseAsync(control, async () =>
                     {
@@ -1005,7 +1016,7 @@ public sealed class BackupOrchestrator(
                         try
                         {
                             var blob = pending ?? await StageBlobAsync(
-                                request, single, localPath, storeOnly, uploadTracker, state, t);
+                                request, single, localPath, storeOnly, bypassQuota: true, uploadTracker, state, t);
                             pending = null;
                             placement = await UploadStagedBlobItemAsync(
                                 request, single, blob, addressing, localResolver, uploadScope, uploadTracker, state,
@@ -1036,6 +1047,9 @@ public sealed class BackupOrchestrator(
                 request, probed.Item.Pack!, poolStoreOnly, addressing, localResolver, info, storageByPath,
                 tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control,
                 token,
+                // This invocation runs on the compression stage, where waiting for staging room is the backpressure
+                // the whole split exists to make binding. What it hands to an uploader is marked below, one call at a time.
+                bypassQuota: false,
                 dispatch: async (packId, members, bytes, t) =>
                 {
                     GroupAttempt? attempt = null;
@@ -1043,14 +1057,17 @@ public sealed class BackupOrchestrator(
                     // halves back to back this stretch was inside RunGroupAsync's own gate, and a transient failure
                     // in it still has to wait rather than take the run down.
                     await WithPauseAsync(control, async () => attempt = await CompressGroupAsync(
-                        request, packId, members, poolStoreOnly, uploadTracker, state, t), t);
+                        request, packId, members, poolStoreOnly, bypassQuota: false, uploadTracker, state, t), t);
                     var group = attempt!;
 
                     await HandOffAsync(group.Handoff, share, async u =>
                     {
+                        // bypassQuota: this runs on an uploader. The first pass consumes the archive above, but a
+                        // retry recompresses right here, and an uploader that waits for staging room waits on a pool
+                        // only an uploader drains — see the same note on the single-file closure above.
                         var (rejudged, recorded, volumes) = await RunGroupAsync(
-                            request, packId, members, poolStoreOnly, precompressed: group, uploadScope,
-                            uploadTracker, state, control, u);
+                            request, packId, members, poolStoreOnly, bypassQuota: true, precompressed: group,
+                            uploadScope, uploadTracker, state, control, u);
                         await SettlePackAsync(
                             request, packId, recorded, volumes, poolStoreOnly, info, storageByPath, ReportItem,
                             bytes, control, u);
@@ -1076,12 +1093,16 @@ public sealed class BackupOrchestrator(
                         // group.Stable and is disjoint from group.Changed by construction. The reverse — a member
                         // this loop already re-queued turning up in the retry's archive too — is prevented there
                         // rather than mopped up here, because by this point the second copy is already in the cloud.
+                        //
+                        // bypassQuota again, and for a wider reason than the retry above: with no dispatch this call
+                        // compresses **and** uploads on this uploader, so every archive it makes is one an uploader
+                        // is waiting on itself to release.
                         var stranded = rejudged;
                         if (stranded.Count > 0)
                             await ProcessPackAsync(
                                 request, [.. stranded.Select(ToPlannedFile)], poolStoreOnly, addressing,
                                 localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable,
-                                uploadScope, static _ => { }, uploadTracker, state, control, u);
+                                uploadScope, static _ => { }, uploadTracker, state, control, u, bypassQuota: true);
                     }, t);
 
                     return group.Changed;
@@ -1909,8 +1930,12 @@ public sealed class BackupOrchestrator(
     /// compressing and keeps its re-verification.
     /// </para>
     /// </summary>
+    /// <param name="bypassQuota">Passed straight through to <see cref="StageBlobAsync"/>: true when this whole
+    /// compress-and-upload runs on an uploader thread, which must not wait on the staging quota it is itself
+    /// responsible for returning (see <see cref="StagingArea.StageWithoutBackpressureAsync"/>).</param>
     private async Task HandleBlobAsync(
-        BackupRequest request, PlannedFile file, BlobAddressScheme addressing, LocalDedupResolver localResolver,
+        BackupRequest request, PlannedFile file, bool bypassQuota,
+        BlobAddressScheme addressing, LocalDedupResolver localResolver,
         ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, RunState state,
@@ -1923,8 +1948,8 @@ public sealed class BackupOrchestrator(
         try
         {
             placement = await PlaceBlobAsync(
-                request, file, localPath, storeOnly, addressing, localResolver, uploadScope, uploadTracker, state,
-                control, ct);
+                request, file, localPath, storeOnly, bypassQuota, addressing, localResolver, uploadScope,
+                uploadTracker, state, control, ct);
         }
         // This try wraps more than reading the source file — it also wraps compression, staging and upload — so the
         // exception type alone is not enough to conclude "the file cannot be read"; see
@@ -2053,7 +2078,7 @@ public sealed class BackupOrchestrator(
     /// </para>
     /// </summary>
     private async Task<BlobPlacement> PlaceBlobAsync(
-        BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
+        BackupRequest request, PlannedFile file, string localPath, bool storeOnly, bool bypassQuota,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
         VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, BackupRunControl? control,
         CancellationToken ct)
@@ -2064,7 +2089,8 @@ public sealed class BackupOrchestrator(
 
         // 2 + 3. Compress (the future compress half) and upload (the future upload half), still called back to back
         // by this one worker — see the cut rationale on StageBlobAsync.
-        var stagedBlob = await StageBlobAsync(request, file, localPath, storeOnly, uploadTracker, state, ct);
+        var stagedBlob = await StageBlobAsync(
+            request, file, localPath, storeOnly, bypassQuota, uploadTracker, state, ct);
         return await UploadStagedBlobItemAsync(
             request, file, stagedBlob, addressing, localResolver, uploadScope, uploadTracker, state, control, ct);
     }
@@ -2112,13 +2138,16 @@ public sealed class BackupOrchestrator(
     /// doing both in sequence.
     /// </para>
     /// </summary>
+    /// <param name="bypassQuota">True when this call runs on an <b>uploader</b> — a thread the staging quota depends
+    /// on to come back, and which therefore must never wait for it. See
+    /// <see cref="StagingArea.StageWithoutBackpressureAsync"/> for what happens when it does.</param>
     private async Task<StagedBlob> StageBlobAsync(
-        BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
+        BackupRequest request, PlannedFile file, string localPath, bool storeOnly, bool bypassQuota,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
         var (content, staged) = await StreamAndStageAsync(
-            request, localPath, file.Path, storeOnly, headBytes, uploadTracker, state, ct);
+            request, localPath, file.Path, storeOnly, bypassQuota, headBytes, uploadTracker, state, ct);
         return new StagedBlob(content, new StagedHandoff(staging, staged));
     }
 
@@ -2227,7 +2256,7 @@ public sealed class BackupOrchestrator(
     /// <summary>One read pass: the source file's bytes stream into the hasher and the archive (or raw temp file) at
     /// the same time. So "the bytes that were hashed" and "the bytes that were stored" are the same set by construction.</summary>
     private async Task<(BlobContent Content, StagedItem Staged)> StreamAndStageAsync(
-        BackupRequest request, string localPath, string entryName, bool storeOnly, int segmentBytes,
+        BackupRequest request, string localPath, string entryName, bool storeOnly, bool bypassQuota, int segmentBytes,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         // Grab the metadata once before starting to read. The length decides raw; the mtime must be **the one from
@@ -2243,11 +2272,13 @@ public sealed class BackupOrchestrator(
 
         var streaming = new StreamingHasher(segmentBytes, segmentBytes);
         var name = StagedName(entryName);
-        var staged = await staging.StageAsync(async (compressTemp, token) => raw
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (compressTemp, token) => raw
             ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
             : await CompressStreamingAsync(
-                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token),
-            state.Staging, ct, uploadTracker);
+                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token);
+        var staged = bypassQuota
+            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker)
+            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker);
 
         return (Identity(streaming, mtime, raw), staged);
     }
@@ -2494,6 +2525,11 @@ public sealed class BackupOrchestrator(
     /// Everything else stays on this side either way: the group split, the attempt counter, re-queueing a member
     /// that changed under 7z and demoting one that grew past the threshold are all decided before the upload and
     /// all mutate state this single invocation owns.</param>
+    /// <param name="bypassQuota">True when this whole invocation runs on an uploader — the stranded-member tail is
+    /// the one caller that does — so that everything it compresses here (a group of its own, or a member demoted to
+    /// a single file) skips the staging-quota wait. An uploader parked on that quota is waiting for a release only an
+    /// uploader can make; see <see cref="StagingArea.StageWithoutBackpressureAsync"/>. Every other caller runs on the
+    /// compression stage or on the run's own thread, where waiting for room is exactly right.</param>
     private async Task ProcessPackAsync(
         BackupRequest request, IReadOnlyList<PlannedFile> pool, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
@@ -2501,7 +2537,8 @@ public sealed class BackupOrchestrator(
         ConcurrentDictionary<string, string> tailByPath,
         ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
-        RunState state, BackupRunControl? control, CancellationToken ct, GroupDispatch? dispatch = null)
+        RunState state, BackupRunControl? control, CancellationToken ct, bool bypassQuota = false,
+        GroupDispatch? dispatch = null)
     {
         var plan = request.Options.Plan;
         var threshold = plan.SingleFileThresholdBytes;
@@ -2579,7 +2616,7 @@ public sealed class BackupOrchestrator(
             else
             {
                 var (changed, recordedMembers, recordedVolumes) = await RunGroupAsync(
-                    request, packId, members, storeOnly, precompressed: null,
+                    request, packId, members, storeOnly, bypassQuota, precompressed: null,
                     uploadScope, uploadTracker, state, control, ct);
                 await SettlePackAsync(
                     request, packId, recordedMembers, recordedVolumes, storeOnly, info, storageByPath, onItem,
@@ -2631,7 +2668,7 @@ public sealed class BackupOrchestrator(
                     // shape as the single-file path in the consumer loop, so it uses the same retry unit — without
                     // putting it behind the gate, one hiccup on this single item could take the whole run down.
                     await WithPauseAsync(control, () => HandleBlobAsync(
-                        request, new PlannedFile(m.Path, newLen, newHash), addressing, localResolver,
+                        request, new PlannedFile(m.Path, newLen, newHash), bypassQuota, addressing, localResolver,
                         storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
                         uploadTracker, state, control, ct), ct);
                 }
@@ -2710,11 +2747,14 @@ public sealed class BackupOrchestrator(
     /// first pass and by that pass alone. Null means "compress it here", which is what the single-worker caller
     /// wants; the pipelined caller compresses in one loop and uploads in another, and hands the result of the
     /// first loop in here.</param>
+    /// <param name="bypassQuota">True when this runs on an uploader. Only a **retry** compresses in here — the first
+    /// pass consumes <paramref name="precompressed"/> — and a retrying uploader that waits for staging room waits on
+    /// a pool only an uploader can drain (see <see cref="StagingArea.StageWithoutBackpressureAsync"/>).</param>
     /// <returns>The members left out of the pack (changed or unreadable, for the caller to re-queue under their new
     /// hash), the members that really went into it, and that pack's volume sizes.</returns>
     private async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)>
         RunGroupAsync(
-            BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+            BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly, bool bypassQuota,
             GroupAttempt? precompressed, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
             BackupRunControl? control, CancellationToken ct)
     {
@@ -2746,7 +2786,8 @@ public sealed class BackupOrchestrator(
         async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
         {
             var attempt = pending
-                ?? await CompressGroupAsync(request, packId, retryMembers, storeOnly, uploadTracker, state, ct);
+                ?? await CompressGroupAsync(
+                    request, packId, retryMembers, storeOnly, bypassQuota, uploadTracker, state, ct);
             // Emptied before the upload starts rather than after it ends, because this archive does not outlive the
             // pass either way — uploaded on success, dead on failure, disposed by the finally below in both cases.
             // Leaving the slot pointing at it would let a later pass "upload" an archive whose volume files the
@@ -2804,8 +2845,12 @@ public sealed class BackupOrchestrator(
     /// existed for has not gone away — see the catch below.
     /// </para>
     /// </summary>
+    /// <param name="bypassQuota">True when this runs on an uploader recompressing a group it has to resend, which
+    /// must not wait on the staging quota only an uploader hands back (see
+    /// <see cref="StagingArea.StageWithoutBackpressureAsync"/>). False on the compression stage, where waiting for
+    /// room is the backpressure this whole design is built around.</param>
     private async Task<GroupAttempt> CompressGroupAsync(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly, bool bypassQuota,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         // This snapshot may be hours removed from the diff: after sealing, the pack still queues in a bounded
@@ -2828,7 +2873,7 @@ public sealed class BackupOrchestrator(
             uploadTracker.EndChecking();
         }
         var (staged, missing) = await CompressPackTolerantAsync(
-            request, packId, members, storeOnly, uploadTracker, state, ct);
+            request, packId, members, storeOnly, bypassQuota, uploadTracker, state, ct);
         try
         {
             // Members that 7z dropped from the archive must be marked excluded **directly**; the comparison
@@ -2899,7 +2944,8 @@ public sealed class BackupOrchestrator(
             if (stable.Count == 0)
                 return new GroupAttempt(new StagedHandoff(staging, staged: null), changed, []);
 
-            var staged2 = await CompressPackAsync(request, packId, stable, storeOnly, uploadTracker, state, ct);
+            var staged2 = await CompressPackAsync(
+                request, packId, stable, storeOnly, bypassQuota, uploadTracker, state, ct);
             return new GroupAttempt(new StagedHandoff(staging, staged2), changed, stable);
         }
         catch
@@ -2945,7 +2991,7 @@ public sealed class BackupOrchestrator(
     /// established semantics an unreadable member means "exclude that member", not "fail the whole run".
     /// </summary>
     private async Task<(StagedItem? Staged, IReadOnlySet<string> Missing)> CompressPackTolerantAsync(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly, bool bypassQuota,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var remaining = members.ToList();
@@ -2955,7 +3001,8 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                return (await CompressPackAsync(request, packId, remaining, storeOnly, uploadTracker, state, ct), missing);
+                return (await CompressPackAsync(
+                    request, packId, remaining, storeOnly, bypassQuota, uploadTracker, state, ct), missing);
             }
             catch (ArchiveMembersMissingException ex)
             {
@@ -2981,13 +3028,17 @@ public sealed class BackupOrchestrator(
     }
 
     private Task<StagedItem> CompressPackAsync(
-        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly,
+        BackupRequest request, string packId, IReadOnlyList<PackEntry> members, bool storeOnly, bool bypassQuota,
         StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var entries = members.Select(m => m.EntryName).ToList();
-        return staging.StageAsync((compressTemp, token) => CompressAsync(
-            request, compressTemp, packId, entries, storeOnly, token),
-            state.Staging, ct, uploadTracker);
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = (compressTemp, token) => CompressAsync(
+            request, compressTemp, packId, entries, storeOnly, token);
+        // An uploader recompressing a group it has to resend must not wait on the pool it is itself the only source
+        // of releases for — see StagingArea.StageWithoutBackpressureAsync.
+        return bypassQuota
+            ? staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker)
+            : staging.StageAsync(produce, state.Staging, ct, uploadTracker);
     }
 
     /// <returns>The byte size of each of this pack's volumes (in .001..N order; recorded for verifying volume completeness/size).</returns>

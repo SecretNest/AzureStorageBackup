@@ -162,7 +162,7 @@ Four paths must reach that `Dispose`:
    limit, which is precisely the failure `PauseGate.cs:23-27` warns about, made larger by this change
    because the queue can now hold that much.
 
-### 3. Upload failure recompresses in place
+### 3. Upload failure recompresses in place, and that recompression does not queue for room
 
 An uploader that needs a recompression takes the compression lock itself and reruns the attempt,
 rather than handing the item back to the compressor.
@@ -175,6 +175,59 @@ recompression. Steady-state continuity, which is what this rework is for, is una
 
 Mechanically this means `AttemptAsync`'s closure (`members`, `packId`, the pre-compression stat
 snapshot) travels with the queue entry so the uploader can rerun it.
+
+**The thing that argument missed.** Deciding *where* the recompression runs is only half the
+question; the other half is what it is allowed to wait for. Staging that archive means going through
+`StagingArea.StageAsync`, whose first act is `WaitForRoomAsync` — and everything in that pool is
+released by an uploader. So an uploader waiting there is waiting for itself, and the state the
+paragraph above rejects for the compressor is precisely the state it creates for the uploaders,
+one door further along:
+
+1. Any systemic upload failure — a network outage is the ordinary case — trips every in-flight
+   upload at once. Each uploader disposes its archive (its bytes go back) and parks at the pause
+   gate.
+2. The compressor never sees a network error, so it carries on until the pool is at
+   `StagedLimitBytes` and parks in `WaitForRoomAsync`. **This is the headline feature of this whole
+   document working exactly as designed** — and it leaves the pool held entirely by queue entries no
+   uploader owns.
+3. The gate releases every waiter together, by construction (`PauseGate` keeps one signal for all of
+   them). All `max(2, N+1)` uploaders re-enter their retry and ask for room. None of them has any.
+
+Nothing can break it: `ReleaseFile`/`Release` are only reached from a volume upload, a `Handoff`
+disposal or a discarded compression, each of which needs an uploader that is not blocked. §6's
+`downstreamGone` does not fire, because it triggers on the uploaders being *gone* and these are alive.
+The gate cannot downgrade, because nobody is at it. And `RequestStop` only fires the abort token for
+`StopNow`, so **Suspend and "finish current files" hang along with the run** — the operator's HTTP
+request never returns and the only ways out are "Stop now" or restarting the container.
+
+This is a regression the split introduces rather than an old bug: before it, the pool could only ever
+hold what ≤6 workers had staged, and a worker that was retrying had already released its own archive
+while its siblings went on releasing volume by volume.
+
+**So: staging on an uploader thread skips the wait for room.** `StagingArea` grows one new entry
+point for it, `StageWithoutBackpressureAsync` — same files, same accounting, same global compression
+lock, only `WaitForRoomAsync` skipped — and `StageAsync` keeps the exact semantics every existing
+caller relies on. Three call sites use it, and they are exactly the three places an uploader
+compresses: the single-file closure's `pending ?? StageBlobAsync`, `AttemptAsync`'s
+`pending ?? CompressGroupAsync`, and the stranded-member tail's standalone `ProcessPackAsync` (which
+compresses *and* uploads there — see "What this does not do").
+
+Why this is the right shape rather than a wider one:
+
+- **The overshoot is bounded and is a trade `HasRoom` already makes.** That test deliberately lets an
+  item starting from zero begin even when its output is bound to exceed the allowance, because
+  otherwise a file larger than the allowance could never be backed up at all. A retrying uploader is
+  replacing an archive this pool has already admitted once, and holds at most one at a time, so the
+  ceiling is exceeded by at most `N+1` archives before the ordinary gate binds again.
+- **Widening the trigger instead ("fire `downstreamGone` when every live uploader is parked on the
+  quota") does not work.** The uploaders wait on `working`, not on the feeding token, so cancelling
+  the feeding stages would not release them; and it would end the compression side — and with it the
+  run — over what is very often a blip the gate was about to ride out.
+- **Handing the retry back to the compressor does not work either**, for the reason above: it is the
+  same deadlock with the two stages swapped.
+
+The compression stage must never reach the new entry point. Its waiting for room *is* the
+backpressure this document exists to make binding.
 
 ### 4. Changed members stay on the compression side
 
@@ -206,6 +259,20 @@ one go when it disposes a dropped entry's archive. The prober's is a slot in `pr
 the compressor frees one. A resource nobody is left to return is a wait with no end: the run never
 finishes, `SettleAsync(consumers)` waits on it forever, the busy lock is never released, and not one
 word of the error that killed the downstream stage ever surfaces.
+
+**"Only a live uploader returns it" is a stronger constraint than it first reads**, and the rest of
+this section only covers half of it. The obvious half is a dead upload side, and the token below is
+the answer to that. The other half is that **the uploaders wait on that same quota themselves**, on
+the three paths where an uploader compresses (§3), and an uploader parked there cannot release
+anything either. A live-but-blocked upload side is invisible to everything here: the token's trigger
+is the last uploader *leaving*. §3 has the sequence, and the resolution — uploader-side staging skips
+the wait for room — belongs there, next to the recompression it protects. What matters at this level
+is the rule the two halves share:
+
+> No stage may block on a resource whose only source is a stage that can, in turn, be blocked on it.
+
+The token below enforces it for "the source is gone". §3 enforces it for "the source is the same
+thread".
 
 Neither `working` nor `control.Stop` covers it. `working` is linked only to `ct` and
 `control.AbortToken`, and a pause-gate downgrade sets no stop kind (only `RequestStop` calls
@@ -269,6 +336,14 @@ of this document could not be read off the screen directly. Worth fixing, separa
   zero: the run has to end as `BackupSuspendedException`, with the suspend mark on disk and the pool
   back at zero. Note the pool size — every other test in this suite runs a 200 MB pool over a few
   megabytes of zeroes, which is why the suite could not see this class of bug at all.
+- **Every uploader retrying at once against a full pool still finishes** (§3). Four numbers, and all
+  four are load-bearing: a pool small enough to fill, **incompressible** source, one injected failure
+  per uploader, and a backoff long enough that all of them are out of circulation while the
+  compressor fills the pool — a failure is instantaneous and compressing is not, so while any
+  uploader is awake the queue drains as fast as it fills and the pool never grows. The suite had both
+  halves of this hazard and never the two together: the existing retry test runs a 200 MB pool over
+  zeroes, and the auto-suspend test above has the full pool but zero patience, so the gate downgrades
+  on the first failure and the retry path is never entered.
 - **A pack retry does not store a member the first pass already re-queued** (§4). Blip on the
   **first** group of a pool that was cut in two by a changed member, with that member settling
   afterwards, and assert the first group's pack holds only the members that pass kept.
