@@ -176,6 +176,18 @@ cheaper than Suspend. After a restart the run is gone and its journal is on disk
 shows an interrupted run with a Resume button — the Suspend outcome. Pause therefore does not replace
 Suspend, and the shutdown path must still suspend rather than pause.
 
+What the hold *does* survive as is the **reason** written next to the journal. A shutdown suspends every
+live run as `ShuttingDown`, and `AutoResumeService.PickResumableAsync` restarts exactly the configs whose
+every volume says `ShuttingDown` — so without more than that, Pause → pull the new image → restart would
+leave the backup running again, the hold gone and no record it ever existed. On a NAS the container
+restart *is* the routine upgrade path, so that is not a corner case but the first thing that happens to an
+operator who pauses and then updates. `BackupRunner.RequestStop` therefore records a suspension that
+catches a standing user hold as `UserRequested`, whatever the caller asked for, and auto-resume leaves
+those alone: the operator comes back to an interrupted run with a Resume button, which is the outcome the
+paragraph above promises. The reason has to be decided there because that is the only point where the stop
+request and the run's gate are both in hand, and it has to be read before `BackupRunControl.RequestStop`,
+which downgrades the gate and thereby ends the hold.
+
 **It does not make Pause instant.** See §3.
 
 **It does not add Pause to restore, check or repair.** Those runs are short; the machinery is not
@@ -187,8 +199,12 @@ worth duplicating until one of them is measured to need it.
 
 - **Suspend stops the feeding stages at once.** With a slow probe in progress, a suspend returns
   without waiting for that read to finish, and the run still journals the volume that was on the wire.
-- **Pause holds all four loops.** After a pause, `processed` stops advancing and the staged pool stops
-  growing; both resume after `ResumeByUser`.
+- **Pause holds all four loops** — and each gate has to be pinned by an observable that only *it* can move,
+  or three of the four ride free on the fourth. Each case builds its backlog first and makes the work
+  available after the hold is already standing, because a producing stage left to run is normally blocked
+  on an empty input or on backpressure rather than on its gate, and a gate nothing was going to pass is
+  invisible. What each measures: upload calls (the uploader's), probe calls and staged bytes (the prober's
+  and the compressor's), a settled total (the diff's).
 - **Pause preserves work.** Items compressed before the pause are uploaded after the resume without
   being compressed a second time.
 - **The two reasons compose.** A transient failure during a user pause leaves the gate closed after
@@ -196,3 +212,8 @@ worth duplicating until one of them is measured to need it.
 - **Paused → Suspend.** From a paused run, a suspend completes and writes a resumable journal.
 - **A user pause never downgrades.** Held far longer than the gate's patience, the run stays Running
   rather than auto-suspending.
+- **A pause is not undone by a restart.** A shutdown that catches a paused run marks its journal
+  `UserRequested`, and the startup auto-resume declines it; an unpaused run in the same shutdown is still
+  marked `ShuttingDown` and is still picked back up.
+- **Pause answers honestly.** On a run that is already winding down — where the gate is downgraded and can
+  never hold anyone again — the endpoint is a conflict, not a 204.

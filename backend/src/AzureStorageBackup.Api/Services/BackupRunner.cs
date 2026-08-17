@@ -288,13 +288,44 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             // control is already disposed before the status flips to terminal (`await using` takes effect ahead of
             // the catch blocks). A stop request arriving in that instant can do nothing — this round is winding down
             // anyway, so treat it as "not running".
-            try { control.RequestStop(kind, reason); }
+            try { control.RequestStop(kind, ReasonFor(control, kind, reason)); }
             catch (ObjectDisposedException) { return null; }
         }
         else
             state.Cancellation.Cancel();   // hasn't reached the point where control gets built yet (config resolution stage)
         return state;
     }
+
+    /// <summary>
+    /// The suspend reason to record on disk: the caller's, unless the operator is holding this run at the pause
+    /// gate — in which case the suspension is theirs, whoever asked for it.
+    /// <para>
+    /// The case that matters is the shutdown: <c>GracefulSuspendService</c> suspends every live run as
+    /// <see cref="SuspendReason.ShuttingDown"/>, and <see cref="AutoResumeService.PickResumableAsync"/> restarts
+    /// exactly the configs whose every volume says ShuttingDown. Without this, Pause → upgrade the image → restart
+    /// leaves the backup running again with the hold gone and no record it ever existed — and on this deployment,
+    /// a container restart is the routine way to install an upgrade, so it is not a corner case but the first thing
+    /// that happens to an operator who pauses and then updates. Recording it as
+    /// <see cref="SuspendReason.UserRequested"/> lands the run where the design says it should: an interrupted run
+    /// with a Resume button, waiting for the person who paused it.
+    /// </para>
+    /// <para>
+    /// This is the only place the two facts meet. The reason travels stop request → <c>_suspendReason</c> CAS →
+    /// <c>SettleStopAsync</c> → <c>BackupSuspendedException</c> → <c>MarkSuspended</c>, and of those only the stop
+    /// request has the run's control — and therefore its gate — in hand. It also has to be read **here**, before
+    /// <see cref="BackupRunControl.RequestStop"/> is called: that method downgrades the gate to wake the workers
+    /// parked at it, and a downgrade ends the user's hold (<c>PauseGate.DowngradeLocked</c>), so asking afterwards
+    /// always answers no.
+    /// </para>
+    /// <para>
+    /// Only for <see cref="StopKind.Suspend"/>, because only a suspension writes a mark at all; the two cancel
+    /// kinds deliberately leave none. And it can only ever move the value **towards** the operator, never away
+    /// from it: <see cref="SuspendReason.AutoSuspended"/> cannot coincide with a standing hold in the first place
+    /// (patience does not run while the user holds the gate), and UserRequested → UserRequested is a no-op.
+    /// </para>
+    /// </summary>
+    private static SuspendReason ReasonFor(BackupRunControl control, StopKind kind, SuspendReason reason) =>
+        kind == StopKind.Suspend && control.Gate.IsPausedByUser ? SuspendReason.UserRequested : reason;
 
     /// <summary>Stop right now (without waiting for the flush to disk). Kept so the shared /cancel endpoint has the same shape as the other runners.</summary>
     public bool Cancel(int configId) => RequestStop(configId, StopKind.StopNow) is not null;
