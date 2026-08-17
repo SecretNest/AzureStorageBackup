@@ -363,4 +363,88 @@ public sealed class CompressionContinuityTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// A suspend must not wait for work it is about to throw away. The probe reads a whole candidate file to derive
+    /// a content identity that is persisted nowhere, and the compressor's output goes into a queue the suspend tail
+    /// drains — so finishing either is pure cost, paid in a stretch where the operator is watching a progress bar
+    /// that has stopped meaning anything. Only the upload in flight is worth finishing, because only it can be
+    /// journalled.
+    /// <para>
+    /// The shared 2 MB <see cref="FileSize"/> compresses in well under a second, which is exactly why it is not used
+    /// here: with it, the suspend would almost always land between items rather than inside one, and the bound below
+    /// would pass regardless of whether the fix is present. This test needs a compression that is still running,
+    /// with certainty, at the moment Suspend is pressed — so <c>bigFileSize</c> is chosen to make one archive take
+    /// tens of seconds through 7z -mx9 (measured ~35s for 150 MB of incompressible bytes on the CI machine via the
+    /// same <c>-si</c> streaming path <see cref="SevenZipCompressor.CompressStreamAsync"/> uses).
+    /// </para>
+    /// <para>
+    /// The wait below gates on <c>staging.StagedBytes >= FileSize</c>, not on a progress flag: <c>StageProgress</c>'s
+    /// <c>Uploading</c> counts an item from the moment it enters the pre-compression dedup check (see the
+    /// <c>Checking</c> field doc on <see cref="StageProgress"/>), so it can be non-zero for both files before either
+    /// has finished compressing — a wait built on it can be satisfied while only the small file, not the big one, is
+    /// in flight, which lets Suspend land too early and passes the test whether or not the fix is present.
+    /// <see cref="StagingArea.StagedBytes"/> has no such ambiguity: <c>StageCoreAsync</c> only adds to it after a
+    /// file's compression and move-to-staged are both complete, so once it reflects the small file's full size, the
+    /// small file is provably done compressing. Compression is strictly serial (one lock in <see cref="StagingArea"/>),
+    /// so whatever is in the compress-temp directory at that point can only be the big file's archive.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Suspend_Does_Not_Wait_For_The_Feeding_Stages()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int bigFileSize = 150 * 1024 * 1024;
+        // Ordinal names so LocalFileScanner's sort (see LocalFileScanner.cs:69) puts the small file first: the
+        // single compressor is serial, so this is what guarantees the small file is the one already uploading —
+        // not the one whose compression gets abandoned — by the time both conditions below are checked.
+        WriteFile("0-small.bin", FileSize);
+        WriteFile("1-big.bin", bigFileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            new BlockingUploader(block.Task, new BlobUploader(factory)),
+            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "staged-stop");
+
+        var compressDir = Path.Combine(_temp, "compress");
+        bool BigFileCompressing() => Directory.Exists(compressDir) && Directory.EnumerateFiles(compressDir).Any();
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+            await WaitUntil(
+                () => staging.StagedBytes >= FileSize && BigFileCompressing(), TimeSpan.FromSeconds(60),
+                () => $"pipeline never reached both stages at once; staged={staging.StagedBytes}, "
+                    + $"compressing={BigFileCompressing()}.");
+
+            var pressed = System.Diagnostics.Stopwatch.StartNew();
+            control.RequestStop(StopKind.Suspend);
+            block.SetResult();
+            // Suspend maps to BackupSuspendedException (see BackupOrchestrator.SettleStopAsync), not a raw
+            // OperationCanceledException — that distinction is the whole point of the exception, so the run's
+            // journal is treated as a resumable midpoint rather than a failure.
+            await Assert.ThrowsAsync<BackupSuspendedException>(() => run);
+            pressed.Stop();
+
+            // The bound is the point: without the StopToken link the run has to finish compressing the 150 MB file,
+            // which measured ~35s on this machine, and on a real backup can be minutes. With it, the feeding stages
+            // are cancelled within about as long as it takes to kill the 7z process and let one CopyToAsync chunk
+            // observe cancellation, and only the released upload — already small and already in flight — has to drain.
+            Assert.True(pressed.Elapsed < TimeSpan.FromSeconds(20),
+                $"suspend took {pressed.Elapsed.TotalSeconds:F1}s — the feeding stages were not cancelled.");
+            Assert.Equal(0, staging.StagedBytes);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }

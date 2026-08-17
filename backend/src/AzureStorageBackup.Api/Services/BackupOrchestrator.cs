@@ -797,9 +797,19 @@ public sealed class BackupOrchestrator(
         // the user is the one that killed the downstream stage, and a cancellation thrown from an earlier task in the
         // consumers list would be the one Task.WhenAll surfaces instead, masking it.
         using var downstreamGone = new CancellationTokenSource();
-        using var feeding = CancellationTokenSource.CreateLinkedTokenSource(working.Token, downstreamGone.Token);
+        // A stop belongs here for the same reason a dead downstream does: what these two stages have in hand is
+        // worth nothing once the run is winding down. The probe's content identity is persisted nowhere and the
+        // compressor's archive goes to a queue DrainQueues is about to release, so finishing either only delays the
+        // stop. The uploaders stay on `working` — a volume that completes can be journalled, and that is the one
+        // piece of in-flight work a suspend should wait for. StopNow is unaffected: it fires _abort → working, which
+        // cancels the uploads too, so `feeding` is already covered on that path via working.Token.
+        using var feeding = CancellationTokenSource.CreateLinkedTokenSource(
+            working.Token, downstreamGone.Token, control?.StopToken ?? CancellationToken.None);
         // True when this run is being torn down by the line above rather than by anything the user did — the filter
-        // for "exit quietly" on both feeding stages.
+        // for "exit quietly" on both feeding stages. A stop-triggered cancellation deliberately does not satisfy
+        // this: it falls through to the catch's rethrow, propagates out of the loop task, and is then swallowed by
+        // SettleAsync's catch-all along with every other consumer's exception, so the exception the caller actually
+        // sees is the one SettleStopAsync builds from control.Stop, not whatever shape this cancellation took here.
         bool DownstreamGone() => downstreamGone.IsCancellationRequested && !working.IsCancellationRequested;
 
         // The uploader count stays UploadConcurrency + 1: the extra consumer is what keeps the volume gate's
