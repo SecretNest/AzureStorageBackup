@@ -184,4 +184,175 @@ public sealed class CompressionContinuityTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// The point of the whole rework: the staging limit, not the worker pool, is what stops compression.
+    /// Before it the pool saturated first, so this setting had no effect at any value — 10 GB, 2 GB and
+    /// 40 GB all produced identical behaviour.
+    /// </summary>
+    [SkippableFact]
+    public async Task The_Staging_Limit_Is_What_Stops_Compression()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        for (var i = 0; i < 12; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        // Four items' worth of room. HasRoom admits a caller whose current usage is below the limit, so a
+        // single archive may overshoot it — hence the slack in the assertion below.
+        var limit = 4L * FileSize;
+        var (orchestrator, staging, request) = Build(
+            new BlockingUploader(block.Task, new BlobUploader(factory)),
+            stagingLimit: limit, uploadConcurrency: 2, container: name);
+
+        var seen = new List<StageProgress>();
+        var progress = new Progress<BackupProgress>(p =>
+        {
+            if (p.Detail is { Stage: "Uploading" } d)
+                lock (seen) seen.Add(d);
+        });
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress);
+            try
+            {
+                // The compressor now queues on the quota instead of on a free worker, and says so on screen.
+                // That column reading non-zero is the visible evidence the operator never sees today.
+                await WaitUntil(
+                    () => { lock (seen) return seen.Any(s => s.WaitingOnArchive > 0); },
+                    TimeSpan.FromSeconds(60),
+                    () =>
+                    {
+                        lock (seen)
+                            return $"WaitingOnArchive never went above zero across {seen.Count} snapshots; "
+                                + "the staging limit was never the binding constraint.";
+                    });
+                Assert.True(staging.StagedBytes <= limit + FileSize,
+                    $"pool grew past the limit plus one archive: {staging.StagedBytes}");
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            await run;
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// Both queues, and the assertion is on the pool because that is what a leak costs: the quota is booked
+    /// on a process-wide singleton, so anything left behind throttles every other backup on the machine until
+    /// the process restarts.
+    /// </summary>
+    [SkippableFact]
+    public async Task Stop_Releases_Everything_Still_Queued()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        for (var i = 0; i < 12; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            new BlockingUploader(block.Task, new BlobUploader(factory)),
+            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "stop-drain");
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+            await WaitUntil(
+                () => staging.StagedBytes > 4L * FileSize, TimeSpan.FromSeconds(60),
+                () => $"Pool never grew past {4L * FileSize} bytes, staged={staging.StagedBytes}.");
+
+            // FinishCurrentFiles is the ordinary stop: the item in hand finishes, nothing new starts.
+            // Everything the compressor produced that no uploader claimed has to be handed back.
+            control.RequestStop(StopKind.FinishCurrentFiles);
+            block.SetResult();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+            Assert.Equal(0, staging.StagedBytes);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(_temp, "staged")));
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// The identity the operator uses to judge "did work vanish": processed + preparing + queued +
+    /// waitingOnArchive + uploading == total. Entries parked in either queue fall under `uploading`
+    /// (inWork - inStaging), so the sum must not drift while both queues are full.
+    /// </summary>
+    [SkippableFact]
+    public async Task The_Item_Ledger_Balances_With_Entries_Parked_In_The_Queues()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        for (var i = 0; i < 12; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            new BlockingUploader(block.Task, new BlobUploader(factory)),
+            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var seen = new List<StageProgress>();
+        var progress = new Progress<BackupProgress>(p =>
+        {
+            if (p.Detail is { Stage: "Uploading" } d)
+                lock (seen) seen.Add(d);
+        });
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress);
+            try
+            {
+                await WaitUntil(
+                    () => staging.StagedBytes > 4L * FileSize, TimeSpan.FromSeconds(60),
+                    () => $"Pool never grew past {4L * FileSize} bytes, staged={staging.StagedBytes}.");
+
+                // The total only settles once the diff finishes, so only snapshots that have one can be checked.
+                List<StageProgress> settled;
+                lock (seen) settled = [.. seen.Where(s => s.Total > 0)];
+                Assert.NotEmpty(settled);
+                foreach (var s in settled)
+                    Assert.Equal(
+                        s.Total,
+                        s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive + s.Uploading);
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            await run;
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }
