@@ -130,6 +130,21 @@ and re-queue) would need 7z killed, partial output deleted and the item re-enque
 would be recompressed from scratch next time; that trades a real recompression for a few seconds of
 responsiveness.
 
+**One gate means these four also park on a transient-error pause**, which is a change in how the
+pipeline behaves during a network blip and not only during a Pause. Before, an upload that hit trouble
+parked only itself (`WithPauseAsync`), while the compressor went on filling the staging pool and the
+diff went on reading the disk; now every producing loop stops at its next item boundary until the
+backoff releases them — up to one steady interval, five minutes by default. That follows from §2's
+decision that a worker should not have to ask *why* it is parked, and it is mostly an improvement:
+compressing more output that cannot be uploaded only fills a pool that is process-wide, and it is the
+pool filling up behind parked uploaders that produced the retry deadlock
+`StagingArea.StageWithoutBackpressureAsync` exists to break. It is stated here because it is invisible
+in the code — `WaitIfPausedAsync` deliberately does not name a reason — and because the effect is real:
+`BackupPauseGateIntegrationTests.Every_uploader_retrying_at_once_against_a_full_pool_still_finishes`
+assembles its scene by letting the compressor fill the pool while both uploaders sit out a backoff, and
+that no longer happens (measured: with the compressor's gate removed the case passes 3/3 in ~15s; with
+it, 1/3 in ~35s, its scene guard reporting a pool one archive short of the ceiling).
+
 ### 4. What the operator sees
 
 `RunStatus` is **unchanged** — the run is genuinely still Running, it is merely holding. Paused is
