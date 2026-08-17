@@ -13,6 +13,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
+import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { runTotals } from '../lib/runSummary'
 import { stageLines } from '../lib/stageLines'
@@ -679,6 +680,27 @@ export function BackupConfigsPage() {
     setError(null)
     try {
       await backupConfigsApi.retryNow(c.id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // Hold a running backup in place. Named distinctly from the `onResume` above (which restarts a
+  // suspended/interrupted run via run() — resuming there is not a mode) because this pair lifts a hold
+  // that never tore anything down; the two "resume"s mean different things to the backend.
+  const pauseBackup = async (c: BackupConfig) => {
+    setError(null)
+    try {
+      await backupConfigsApi.pause(c.id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const resumePausedBackup = async (c: BackupConfig) => {
+    setError(null)
+    try {
+      await backupConfigsApi.resume(c.id)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -1382,6 +1404,8 @@ export function BackupConfigsPage() {
                       onStop={() => stopOp(c, 'backup', 'backup')}
                       onSuspend={() => void suspendBackup(c)}
                       onRetryNow={() => void retryNow(c)}
+                      onPause={() => void pauseBackup(c)}
+                      onResumePause={() => void resumePausedBackup(c)}
                       stopping={windingDown[c.id]}
                       onResume={() => void run(c)}
                       onDiscard={() => void discardInterrupted(c)}
@@ -1643,19 +1667,27 @@ function CaseInsensitiveHalf({ value, onChange }: { value: string | null; onChan
   )
 }
 
-// The running button group, backup only (it adds Suspend and Retry now, which restore, repair and check
-// have no concept of).
+// The running button group, backup only (it adds Suspend, Retry now, Pause and Resume, which restore,
+// repair and check have no concept of).
 // Stopping is asynchronous (after the signal, the run winds down at the next cancellation checkpoint), so
 // pressing it does not change this row immediately — the wording promises nothing about "stopped".
 function RunButtons({
   onStop,
   onSuspend,
   onRetryNow,
+  onPause,
+  onResumePause,
   stopping,
 }: {
   onStop: () => void
   onSuspend: () => void
   onRetryNow?: () => void
+  // Hold the run / lift that hold. Mutually exclusive with each other by construction (the caller passes
+  // at most one, keyed off `pausedByUser`) but independent of onRetryNow — a plain transient-error backoff
+  // offers both Retry now and Pause at once: the operator can either skip the wait or go further and hold
+  // the run until they are back.
+  onPause?: () => void
+  onResumePause?: () => void
   stopping?: 'suspend' | 'stop'
 }) {
   // Both buttons go disabled once either has been pressed: the run is winding down and asking it to wind down
@@ -1668,6 +1700,22 @@ function RunButtons({
           {' '}
           <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onRetryNow}>
             Retry now
+          </button>
+        </>
+      )}
+      {onResumePause && (
+        <>
+          {' '}
+          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onResumePause}>
+            Resume
+          </button>
+        </>
+      )}
+      {onPause && (
+        <>
+          {' '}
+          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onPause}>
+            Pause
           </button>
         </>
       )}{' '}
@@ -1742,6 +1790,8 @@ function RunStatus({
   onStop,
   onSuspend,
   onRetryNow,
+  onPause,
+  onResumePause,
   onResume,
   onDiscard,
   stopping,
@@ -1750,6 +1800,10 @@ function RunStatus({
   onStop: () => void
   onSuspend: () => void
   onRetryNow: () => void
+  onPause: () => void
+  // Lifts the operator's own hold. Distinct from `onResume` below, which restarts a suspended/interrupted
+  // run — a different endpoint entirely (see the comment on the pauseBackup/resumePausedBackup handlers).
+  onResumePause: () => void
   onResume: () => void
   onDiscard: () => void
   /// Set once this run has been asked to wind down, so the buttons can say so while it does.
@@ -1807,12 +1861,23 @@ function RunStatus({
       </div>
     )
   }
+  // Decides the label and which of Resume/Retry now apply — see pauseDisplay for why `source` alone
+  // cannot make this call (pausedByUser is the tie-breaker for a hold pressed on top of a live backoff).
+  const pd = pauseDisplay(run.pause, run.pausedByUser)
   const p = run.progress
   if (!p)
     return (
       <div className="text-faint">
         Starting…
-        <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} stopping={stopping} />
+        {pd && <div className="text-warn">{pd.label}</div>}
+        <RunButtons
+          onStop={onStop}
+          onSuspend={onSuspend}
+          onRetryNow={pd?.canRetryNow ? onRetryNow : undefined}
+          onPause={!run.pausedByUser ? onPause : undefined}
+          onResumePause={pd?.canResume ? onResumePause : undefined}
+          stopping={stopping}
+        />
       </div>
     )
 
@@ -1856,6 +1921,12 @@ function RunStatus({
   // returns null outright (no denominator, so do not guess), which is why this field is naturally empty
   // while both run — showing nothing beats showing a number that goes backwards.
   const pace = uploading ?? details[0]
+  // What a paused run is holding on disk — the exact figure the in-flight line below calls "ready to
+  // upload" (see stageLines' stagedBytes entry), not a second computation of it. Worth stating on the
+  // paused row specifically: that compressed output is what makes Resume cheap, the quota it sits against
+  // is process-wide, and there is deliberately no timeout on a user pause (see design §4), so the cost
+  // belongs on screen where the operator can weigh it.
+  const stagedBytes = pace?.stagedBytes ?? 0
   // The speed field uses the same gate as the detail line: show it whenever a transfer is in flight, even
   // if this instant reads 0 (a stream just started, nothing booked yet), or the number flickers at the
   // start and end of every stream.
@@ -1895,13 +1966,28 @@ function RunStatus({
       {label}
       {headline && ` ${headline}`}
       {changed}
-      {run.pause && (
+      {pd && (
         <div className="text-warn">
-          Paused — {run.pause.reason} (attempt {run.pause.failures})
-          {run.pause.nextRetryAt && `; retrying ${formatRetryIn(run.pause.nextRetryAt)}`}
+          {pd.label}
+          {/* Attempt count and countdown only belong to the pure transient-error case (canRetryNow): once
+              a user hold stands, the backoff's timer no longer releases anyone when it fires — it only
+              relabels this line back to plain "Paused" (see PauseGate.ReleaseLocked) — so a countdown
+              here would promise a retry that is not coming. */}
+          {pd.canRetryNow && ` (attempt ${run.pause!.failures})`}
+          {pd.canRetryNow && run.pause!.nextRetryAt && `; retrying ${formatRetryIn(run.pause!.nextRetryAt)}`}
+          {/* Stated whenever there is something to state — a pause reached before any output has been
+              compressed (e.g. still diffing) is holding nothing yet. */}
+          {stagedBytes > 0 && ` · holding ${formatBytes(stagedBytes)} of staging`}
         </div>
       )}
-      <RunButtons onStop={onStop} onSuspend={onSuspend} onRetryNow={run.pause ? onRetryNow : undefined} stopping={stopping} />
+      <RunButtons
+        onStop={onStop}
+        onSuspend={onSuspend}
+        onRetryNow={pd?.canRetryNow ? onRetryNow : undefined}
+        onPause={!run.pausedByUser ? onPause : undefined}
+        onResumePause={pd?.canResume ? onResumePause : undefined}
+        stopping={stopping}
+      />
       {/* Details are folded into an expandable area: the path being processed can be very long and would
           distort the table if laid out in the row. One line of overall progress by default, expanded when
           wanted. */}
