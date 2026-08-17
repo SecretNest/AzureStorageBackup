@@ -11,6 +11,7 @@ import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { runTotals } from '../lib/runSummary'
@@ -1386,9 +1387,10 @@ export function BackupConfigsPage() {
                       onDiscard={() => void discardInterrupted(c)}
                     />
                   ),
-                  // No run in memory but a journal on disk = the round before the restart did not finish.
-                  // Show it and wait for the user, rather than deciding for them whether to continue.
-                  !runs[c.id] && interrupted[c.id]?.length > 0 && (
+                  // A journal on disk that this row is not already offering a way out of — see
+                  // showsInterruptedNotice for which run states those are. Show it and wait for the user,
+                  // rather than deciding for them whether to continue.
+                  showsInterruptedNotice(runs[c.id], interrupted[c.id]?.length ?? 0) && (
                     <InterruptedNotice
                       key="interrupted"
                       runs={interrupted[c.id]}
