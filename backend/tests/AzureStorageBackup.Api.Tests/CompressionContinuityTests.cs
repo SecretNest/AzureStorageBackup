@@ -300,6 +300,12 @@ public sealed class CompressionContinuityTests : IDisposable
     /// The identity the operator uses to judge "did work vanish": processed + preparing + queued +
     /// waitingOnArchive + uploading == total. Entries parked in either queue fall under `uploading`
     /// (inWork - inStaging), so the sum must not drift while both queues are full.
+    /// <para>
+    /// The staging limit is deliberately the same small one the limit test uses, and the wait is on
+    /// waitingOnArchive rather than on the pool size: with a roomy limit that term stays 0 for the
+    /// whole run, and the identity would be checked with one of its five terms never exercised —
+    /// which is exactly the term this pipeline rework introduced a way to hold non-zero.
+    /// </para>
     /// </summary>
     [SkippableFact]
     public async Task The_Item_Ledger_Balances_With_Entries_Parked_In_The_Queues()
@@ -315,7 +321,7 @@ public sealed class CompressionContinuityTests : IDisposable
         var name = RandomName("cont");
         var (orchestrator, staging, request) = Build(
             new BlockingUploader(block.Task, new BlobUploader(factory)),
-            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+            stagingLimit: 4L * FileSize, uploadConcurrency: 2, container: name);
 
         var seen = new List<StageProgress>();
         var progress = new Progress<BackupProgress>(p =>
@@ -331,8 +337,10 @@ public sealed class CompressionContinuityTests : IDisposable
             try
             {
                 await WaitUntil(
-                    () => staging.StagedBytes > 4L * FileSize, TimeSpan.FromSeconds(60),
-                    () => $"Pool never grew past {4L * FileSize} bytes, staged={staging.StagedBytes}.");
+                    () => { lock (seen) return seen.Any(s => s.WaitingOnArchive > 0); },
+                    TimeSpan.FromSeconds(60),
+                    () => $"waitingOnArchive never became non-zero, so the identity would be checked "
+                        + $"with that term dead; staged={staging.StagedBytes}.");
 
                 // The total only settles once the diff finishes, so only snapshots that have one can be checked.
                 List<StageProgress> settled;
