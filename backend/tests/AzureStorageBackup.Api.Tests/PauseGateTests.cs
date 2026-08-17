@@ -220,6 +220,43 @@ public class PauseGateTests
     }
 
     /// <summary>
+    /// The mirror image of <see cref="Trouble_Clearing_Leaves_A_User_Pause_Standing"/>, and at least as likely in
+    /// production: the run is <em>already</em> backing off when the operator presses Pause. That ordering takes
+    /// PauseByUser's other branch — the gate is closed already, so the pause records itself on top of the existing
+    /// closure instead of creating one — and it is the trouble's own timer, started before the hold existed, that
+    /// has to find the hold when it fires and release nobody.
+    /// </summary>
+    [Fact]
+    public async Task Pausing_On_Top_Of_A_Backoff_Holds_The_Gate_When_The_Timer_Fires()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(150)], steady: TimeSpan.FromMilliseconds(150),
+            patience: TimeSpan.FromSeconds(30));
+
+        var trouble = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+        Assert.Equal(PauseSource.TransientError, gate.Current!.Source);
+
+        gate.PauseByUser();   // inside the backoff: opening the gate is synchronous, so this lands first
+        var parked = gate.WaitIfPausedAsync(CancellationToken.None);   // a stage reaching the gate in the meantime
+
+        await Task.Delay(500);   // the 150 ms backoff has long since fired
+        Assert.False(trouble.IsCompleted, "a backoff timer must not release a gate the user is holding");
+        Assert.False(parked.IsCompleted);
+        Assert.True(gate.IsPausedByUser);
+
+        // Once the backoff is spent the user is the whole reason, and the gate says so: no countdown, no
+        // Retry-now to offer. The failure that happened is still reported rather than zeroed away.
+        Assert.Equal(PauseSource.User, gate.Current!.Source);
+        Assert.Null(gate.Current.NextRetryAt);
+        Assert.Equal(1, gate.Current.Failures);
+
+        gate.ResumeByUser();
+        Assert.True(await trouble.WaitAsync(TimeSpan.FromSeconds(5)));
+        await parked.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Null(gate.Current);
+    }
+
+    /// <summary>
     /// The patience clock measures "nothing recovered despite retrying". A user pause fabricates that evidence,
     /// because under the hold nobody is permitted to retry at all.
     /// <para>
