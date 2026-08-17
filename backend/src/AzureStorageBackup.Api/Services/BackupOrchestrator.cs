@@ -2202,8 +2202,8 @@ public sealed class BackupOrchestrator(
             request, file, stagedBlob, addressing, localResolver, uploadScope, uploadTracker, state, control, ct);
     }
 
-    /// <summary>Dedup/resume pre-filter for the single-file path: both tiers settle the item without compressing a
-    /// single byte, so this runs before anything is staged. Returns null when neither tier matched, meaning the
+    /// <summary>Dedup/resume pre-filter for the single-file path: all three tiers settle the item without compressing a
+    /// single byte, so this runs before anything is staged. Returns null when no tier matched, meaning the
     /// caller must fall through to <see cref="StageBlobAsync"/>.</summary>
     private async Task<BlobPlacement?> ProbeAndResumeAsync(
         BackupRequest request, PlannedFile file, string localPath, LocalDedupResolver localResolver,
@@ -2211,11 +2211,37 @@ public sealed class BackupOrchestrator(
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
+        // Zeroth tier, and the only one that costs no read at all: the previous run uploaded this path and the file has
+        // not been touched since. It is asked **first**, in front of the probe, because everything below it opens the
+        // file — the pre-filter reads the head, and a candidate escalates to reading the whole thing to get a content
+        // identity. That is the read this tier exists to avoid, and asking afterwards would avoid nothing.
+        // The judgement it makes is the diff's own (length + mtime), not a relaxation of the content test below; see
+        // JournalResume.FindUntouchedBlob for why that is sound and where its boundary lies.
+        // The empty table is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
+        // a first one most of all) would otherwise pay one more stat per file to be told there is nothing to resume.
+        // Exists is checked because FileInfo.Length throws on a file that has gone away, and where "the source
+        // disappeared" gets settled is the existing route below, unchanged.
+        if (control?.Resume is { IsEmpty: false } resume && new FileInfo(localPath) is { Exists: true } info)
+        {
+            var mtime = new DateTimeOffset(info.LastWriteTimeUtc);
+            // The identity comes from the record, which is the identity of the bytes that were actually uploaded — the
+            // same thing the tier below hands over, just without having re-derived it from the file. A record missing
+            // any of the three hashes cannot supply one, and falls through to the content test like any other miss.
+            if (resume.FindUntouchedBlob(file.Path, mtime, info.Length)
+                is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched)
+                return new BlobPlacement(
+                    untouched.Ref, false, Math.Max(1, untouched.Volumes), [.. untouched.VolumeSizes],
+                    new BlobContent(full, head, tail, untouched.Length, mtime, untouched.Raw),
+                    Resumed: true);
+        }
+
         if (await ProbeForDedupAsync(localPath, headBytes, localResolver, uploadTracker, ct) is { } p)
         {
             // First tier: the copy the previous run already confirmed as uploaded. Both path **and** content must
             // match — after an interruption the file may well have been modified, and reusing on path alone would
-            // write old content into the index as if it were new.
+            // write old content into the index as if it were new. (The tier above is not that: it reuses on path plus
+            // metadata, and what it accepts is exactly what the diff accepts as unchanged. Anything it declines,
+            // including every record written before the mtime field existed, arrives here.)
             if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done)
                 return new BlobPlacement(
                     done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },

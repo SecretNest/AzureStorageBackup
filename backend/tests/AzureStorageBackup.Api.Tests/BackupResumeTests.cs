@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Text.Json.Nodes;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -117,8 +119,58 @@ public sealed class BackupResumeTests : IDisposable
             });
     }
 
+    /// <summary>
+    /// Counts, per source path, every call that opens that file to hash it. The resume path's "reads nothing" claim is
+    /// only worth anything if it is <b>measured</b>: a timing assertion would pass on a fast disk whatever the code did,
+    /// and a run that quietly re-read every file would look exactly like a run that did not.
+    /// <para>
+    /// All four members are counted, not just <c>HeadHashAsync</c>. The probe today happens to start with the head hash,
+    /// but that is an implementation detail of one method; what the assertions mean is "the source file was not opened
+    /// on the upload path at all", and that has to stay true however the probe is rearranged later.
+    /// </para>
+    /// </summary>
+    private sealed class CountingHasher(IFileHasher inner) : IFileHasher
+    {
+        private readonly ConcurrentDictionary<string, int> _reads = new(StringComparer.Ordinal);
+
+        /// <param name="localPath">The absolute path, exactly as the orchestrator forms it from root + relative path.</param>
+        public int Reads(string localPath) => _reads.GetValueOrDefault(localPath);
+
+        private void Note(string path) => _reads.AddOrUpdate(path, 1, (_, n) => n + 1);
+
+        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
+        {
+            Note(path);
+            return inner.HeadHashAsync(path, headBytes, ct);
+        }
+
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default)
+        {
+            Note(path);
+            return inner.TailHashAsync(path, tailBytes, ct);
+        }
+
+        public Task<string> FullHashAsync(
+            string path, CancellationToken ct = default, IProgress<long>? onRead = null)
+        {
+            Note(path);
+            return inner.FullHashAsync(path, ct, onRead);
+        }
+
+        public Task<ContentIdentity> ContentIdentityAsync(
+            string path, int segmentBytes, CancellationToken ct = default)
+        {
+            Note(path);
+            return inner.ContentIdentityAsync(path, segmentBytes, ct);
+        }
+    }
+
+    /// <param name="hasher">Substituted for the orchestrator's hasher only — the differ keeps its own. What the counting
+    /// tests below are about is the <b>second</b> read, the one the resume path pays to answer "was this already
+    /// uploaded"; the diff's own reads are a separate question with a separate answer, and mixing them into one counter
+    /// would make every number ambiguous.</param>
     private (BackupOrchestrator Orchestrator, BackupInfoStore Store, BlobClientFactory Factory) Build(
-        IBlobUploader uploader)
+        IBlobUploader uploader, IFileHasher? hasher = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -133,7 +185,7 @@ public sealed class BackupResumeTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            hasher ?? new FileHasher(), authority.IndexCache, authority.Tracked);
         return (orchestrator, store, factory);
     }
 
@@ -485,6 +537,273 @@ public sealed class BackupResumeTests : IDisposable
                 await o2.RunAsync(Request(account, name, password: "pw"), null, default, c2);
 
             Assert.Equal(3, again.Uploads);
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    private const string FirstRunId = "run-a";
+
+    /// <summary>
+    /// The scene every metadata-resume test below starts from: three single-file blobs, a run that suspends once the
+    /// first upload has confirmed, and the journal it leaves behind. Returns the records that run really did upload —
+    /// how many is deliberately not pinned down (the orchestrator runs more than one worker, so the second item may
+    /// well have been underway when the stop landed), only that it is at least one and not all three.
+    /// </summary>
+    private async Task<IReadOnlyList<JournalRecord>> InterruptedFirstRunAsync(Account account, string container)
+    {
+        WriteBytes("a.bin", 6_000_000);
+        WriteBytes("b.bin", 6_000_001);
+        WriteBytes("c.bin", 6_000_002);
+
+        BackupRunControl? first = null;
+        var stopping = new CountingUploader(
+            new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), stopAt: 1,
+            stop: () => { first!.RequestStop(StopKind.Suspend); return StopKind.Suspend; });
+        await using (var c = new BackupRunControl(_journals, 9, FirstRunId))
+        {
+            first = c;
+            var (o1, _, _) = Build(stopping);
+            await Assert.ThrowsAsync<BackupSuspendedException>(
+                () => o1.RunAsync(Request(account, container), null, default, c));
+        }
+
+        var done = (await _journals.ListAsync(account.Id, container, default))[0].Content.Records;
+        Assert.NotEmpty(done);
+        Assert.True(done.Count < 3, $"the first run was supposed to be interrupted, it did all {done.Count}");
+        // Everything below turns on the recorded mtime, so make sure it was recorded at all: without this, a run that
+        // wrote nothing into the field would send every one of these tests down the fallback path and they would all
+        // still be green, proving nothing.
+        Assert.All(done, r => Assert.NotNull(r.MtimeUtcTicks));
+        return done;
+    }
+
+    private string LocalPath(string rel) => Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>The paths of the three source files that the interrupted run did <b>not</b> get to.</summary>
+    private static IEnumerable<string> NotDone(IReadOnlyList<JournalRecord> done) =>
+        new[] { "a.bin", "b.bin", "c.bin" }.Except(done.Select(r => r.Path!), StringComparer.Ordinal);
+
+    /// <summary>
+    /// A file the previous run already uploaded, untouched since, is reused <b>without being opened</b>.
+    /// <para>
+    /// The point of the whole change: answering "did the previous run already upload this?" used to require a content
+    /// identity, and a content identity requires reading the file end to end — so a resume read every file it was about
+    /// to skip. Measured on a real resume, 194 GB was read to establish that 704 MB needed sending.
+    /// </para>
+    /// <para>
+    /// The zero is only meaningful next to a number that is not zero, which is why the files the first run never
+    /// reached are asserted on in the same breath, off the same counter: an instrumentation that had come unplugged
+    /// would report zero for both, and half this test would still pass.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_untouched_file_is_reused_without_being_read()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var done = await InterruptedFirstRunAsync(account, name);
+
+            var counting = new CountingHasher(new FileHasher());
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming, counting);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
+
+            foreach (var r in done)
+                Assert.Equal(0, counting.Reads(LocalPath(r.Path!)));
+            foreach (var rest in NotDone(done))
+                Assert.True(counting.Reads(LocalPath(rest)) > 0, $"{rest} had to be read, it was never uploaded");
+
+            // And the reuse is a real one: nothing re-uploaded, and the index points at the very blob the previous run left behind.
+            Assert.Equal(3 - done.Count, resuming.Uploads);
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            Assert.Equal(3, index.Entries.Count(e => e.Storage is not null));
+            foreach (var r in done)
+            {
+                var entry = index.Entries.Single(e => e.Path == r.Path);
+                Assert.Equal(r.Ref, entry.Storage!.Ref);
+                Assert.Equal(r.FullHash, entry.FullHash);
+            }
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The mtime moved, so the cheap question cannot be answered and the file goes down the content test — which then
+    /// accepts it, because the content really is the same.
+    /// <para>
+    /// Both halves matter. That it <b>was read</b> is the fast path declining to answer; that it was <b>still reused</b>
+    /// is the fallback being exactly the route that runs today. A mismatch must fall through, not settle the item as a
+    /// miss — settling it would re-upload content that is already in the cloud, and worse, it would mean the fast path
+    /// had taken over a decision it is not entitled to make.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_file_whose_mtime_moved_falls_back_to_the_content_test()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var done = await InterruptedFirstRunAsync(account, name);
+            var touched = done[0];
+            var full = LocalPath(touched.Path!);
+
+            // Touched, not modified: the content is byte for byte what it was, only the timestamp moved.
+            File.SetLastWriteTimeUtc(full, DateTime.UtcNow.AddMinutes(-5));
+            Assert.NotEqual(touched.MtimeUtcTicks, new FileInfo(full).LastWriteTimeUtc.Ticks);
+            Assert.Equal(touched.Length, new FileInfo(full).Length);   // the length is untouched, so only the mtime can do the stopping
+
+            var counting = new CountingHasher(new FileHasher());
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming, counting);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
+
+            Assert.True(counting.Reads(full) > 0, "a moved mtime must not be answered from the journal record");
+            Assert.Equal(3 - done.Count, resuming.Uploads);   // the content test then reused it, exactly as it did before this change
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            Assert.Equal(touched.Ref, index.Entries.Single(e => e.Path == touched.Path).Storage!.Ref);
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The length changed while the mtime was put back to what the journal recorded: the file is read, and the content
+    /// test correctly sends it up again. Two tests are needed because either half of the metadata test on its own would
+    /// let a modified file through — this is the one that fails if the length comparison is ever dropped as redundant.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_file_whose_length_changed_falls_back_even_when_the_mtime_matches()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var done = await InterruptedFirstRunAsync(account, name);
+            var grown = done[0];
+            var full = LocalPath(grown.Path!);
+
+            using (var fs = new FileStream(full, FileMode.Append, FileAccess.Write))
+                fs.WriteByte(0xFF);
+            File.SetLastWriteTimeUtc(full, new DateTime(grown.MtimeUtcTicks!.Value, DateTimeKind.Utc));
+
+            // The scene guard, and the whole reason this test is separate from the one above: the mtime really does
+            // match to the tick, so nothing but the length comparison can stop this file.
+            Assert.Equal(grown.MtimeUtcTicks, new FileInfo(full).LastWriteTimeUtc.Ticks);
+            Assert.Equal(grown.Length + 1, new FileInfo(full).Length);
+
+            var counting = new CountingHasher(new FileHasher());
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming, counting);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
+
+            Assert.True(counting.Reads(full) > 0, "a changed length must not be answered from the journal record");
+            // The ones the first run never reached, plus this one: its content changed, so the content test rejects the record too.
+            Assert.Equal(3 - done.Count + 1, resuming.Uploads);
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            var entry = index.Entries.Single(e => e.Path == grown.Path);
+            Assert.Equal(grown.Length + 1, entry.Length);          // the index records the file as it is now
+            Assert.NotEqual(grown.Ref, entry.Storage!.Ref);        // and no longer points at the old content's blob
+            Assert.Empty(await _journals.ListAsync(account.Id, name, default));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// Rewrite a journal volume the way a version without the mtime field wrote it: the property removed outright, not
+    /// set to null. That is what is actually on disk in a journal left behind by an older build.
+    /// </summary>
+    private void StripMtimeFromJournal(int accountId, string container, string runId)
+    {
+        var path = _journals.PathFor(accountId, container, runId);
+        var lines = File.ReadAllLines(path);
+        for (var i = 1; i < lines.Length; i++)   // line 0 is the header, which has no such field
+        {
+            if (lines[i].Length == 0)
+                continue;
+            var node = JsonNode.Parse(lines[i])!.AsObject();
+            node.Remove(nameof(JournalRecord.MtimeUtcTicks));
+            lines[i] = node.ToJsonString();
+        }
+        File.WriteAllLines(path, lines);
+    }
+
+    /// <summary>
+    /// A record from before the mtime field existed must fall back, <b>not</b> match on path alone.
+    /// <para>
+    /// This is the compatibility case, and it is the one that would put wrong content into the index if it were got
+    /// wrong: a record that cannot answer the cheap question must not be allowed to answer it by default. Every journal
+    /// on a NAS that has not been upgraded yet looks exactly like this, and the file at that path may well have been
+    /// modified since the interruption — which is precisely what the content test exists to catch.
+    /// </para>
+    /// <para>
+    /// The files here are untouched, so the fallback accepts them and nothing is re-uploaded. That is the point: what
+    /// must be visible is not a different outcome but a different <b>route</b> — the file was opened and its content
+    /// checked, rather than waved through on the strength of its path.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_record_without_an_mtime_falls_back_instead_of_matching_on_path_alone()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("resume");
+        var factory0 = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory0.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            var done = await InterruptedFirstRunAsync(account, name);
+            StripMtimeFromJournal(account.Id, name, FirstRunId);
+
+            // The scene guard: the volume still parses, still holds the same records, and none of them can answer the cheap question.
+            var stripped = (await _journals.ListAsync(account.Id, name, default))[0].Content.Records;
+            Assert.Equal(done.Count, stripped.Count);
+            Assert.All(stripped, r => Assert.Null(r.MtimeUtcTicks));
+
+            var counting = new CountingHasher(new FileHasher());
+            var resuming = new CountingUploader(new BlobUploader(factory0));
+            var (o2, store2, _) = Build(resuming, counting);
+            await using (var c2 = new BackupRunControl(_journals, 9, "run-b"))
+                Assert.Equal(1, (await o2.RunAsync(Request(account, name), null, default, c2)).Version);
+
+            foreach (var r in stripped)
+                Assert.True(
+                    counting.Reads(LocalPath(r.Path!)) > 0,
+                    $"{r.Path} was accepted without being read, on a record that carries no mtime at all");
+
+            // The fallback is unchanged: the content matches, so these are still reused rather than uploaded again.
+            Assert.Equal(3 - done.Count, resuming.Uploads);
+            var info = await store2.ReadInfoAsync(account, name, null, default);
+            var index = await store2.ReadIndexAsync(account, name, info!.Versions[^1].IndexBlob, null, default);
+            foreach (var r in stripped)
+                Assert.Equal(r.Ref, index.Entries.Single(e => e.Path == r.Path).Storage!.Ref);
             Assert.Empty(await _journals.ListAsync(account.Id, name, default));
         }
         finally { await container.DeleteIfExistsAsync(); }
