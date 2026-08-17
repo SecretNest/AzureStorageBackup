@@ -450,6 +450,53 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
+    /// <summary>
+    /// The user pressed Pause: hold the run where it is. Each stage finishes the item in hand and then parks at the
+    /// gate, so it takes effect within one item per stage — worst case, the time to compress one large file.
+    /// <para>
+    /// Nothing is discarded and nothing is flushed. The run stays alive, holding its staging quota — which is booked
+    /// on a process-wide singleton, so a run paused overnight makes this machine's other backups wait overnight —
+    /// until <see cref="Resume"/>. That is the price of Resume being free: there is nothing to re-scan, re-diff or
+    /// re-probe, because none of it was thrown away.
+    /// </para>
+    /// <para>
+    /// A process restart loses all of it, which is why this does not replace Suspend: pause is memory state, and the
+    /// shutdown path still has to suspend.
+    /// </para>
+    /// </summary>
+    /// <returns>false when this config has no live run to pause.</returns>
+    public bool Pause(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        // Unlike RetryNow this cannot lean on `state.Pause is not null` to prove the control is there — the whole
+        // point is to pause a run that is not paused — so Control is checked directly. It is assigned a few awaits
+        // into RunCoreAsync (config, account and settings are loaded first), and until then a run really is Running
+        // with no gate to hold.
+        if (state is not { Status: RunStatus.Running, Control: not null })
+            return false;
+        state.Control.Gate.PauseByUser();
+        return true;
+    }
+
+    /// <summary>
+    /// Lift a user pause. If a transient error is holding the gate as well — pressing Pause does not stop the volume
+    /// already on the wire, and that upload can still fail — the run stays parked on that one and the UI goes on
+    /// reporting it, which is correct: the run is not ready to proceed just because the operator is.
+    /// </summary>
+    /// <returns>false when this config has no live run to resume.</returns>
+    public bool Resume(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running, Control: not null })
+            return false;
+        state.Control.Gate.ResumeByUser();
+        return true;
+    }
+
     /// <summary>The execution body shared by both entry points. **Does not touch the busy lock** — the lock is the caller's job.</summary>
     private async Task RunCoreAsync(int configId, BackupRunState state, CancellationToken ct)
     {

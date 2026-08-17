@@ -888,6 +888,21 @@ public sealed class BackupOrchestrator(
                     if (control is { Stop: not StopKind.None })
                         break;
 
+                    // Hold here while the gate is closed — this is the entry path a pause needs, next to the
+                    // failure path WithPauseAsync already covers. It sits **above** BeginWork on purpose: an item
+                    // parked here has not been claimed, so nothing of the ledger is owed while the run waits, and
+                    // an OperationCanceledException out of the wait costs exactly what the break above does.
+                    //
+                    // The stop check is repeated below rather than merely being made once above, because being
+                    // released is not the same as being resumed: RequestStop sets the intent and *then* downgrades
+                    // the gate (BackupRunControl.RequestStop), precisely so a parked worker wakes up — and a worker
+                    // woken that way must not go on to take another item. WaitIfPausedAsync ignores its released
+                    // value for the same reason: what a release means is decided here.
+                    if (control is not null)
+                        await control.Gate.WaitIfPausedAsync(feeding.Token);
+                    if (control is { Stop: not StopKind.None })
+                        break;
+
                     // BeginWork belongs to the first stage, so an item counts as in hand for its whole journey
                     // across both queues. Between here and BeginUpload lie the probe, compression and staging, and
                     // pushing a 100 MB box through 7z can take tens of seconds — the UI has to show that stretch,
@@ -1146,6 +1161,23 @@ public sealed class BackupOrchestrator(
                     }
                     try
                     {
+                        // The gate, and the repeat of the check above it. Inside this try rather than beside the
+                        // check above, because by this point the item **is** claimed: the prober handed its share
+                        // over with the entry, and the wait below can end in an OperationCanceledException
+                        // (feeding is cancelled by a stop, by an abort, or by the upload side dying). Above the
+                        // try that share would simply be gone, and the uploading column would stay inflated by it
+                        // for the rest of the run. The finally hands it back on every exit, which is also what
+                        // makes the bare `continue` below equivalent to the release-and-continue above it.
+                        //
+                        // Why check the stop intent again: RequestStop sets the intent and then downgrades the
+                        // gate to wake whoever is parked at it, so a release here can mean "the user resumed" or
+                        // "a stop is on its way", and only the check tells them apart. Nothing has been compressed
+                        // yet in either case, so all this entry owes back is the item ledger.
+                        if (control is not null)
+                            await control.Gate.WaitIfPausedAsync(feeding.Token);
+                        if (control is { Stop: not StopKind.None })
+                            continue;
+
                         await StageProbedAsync(probed, feeding.Token);
                     }
                     finally
@@ -1199,6 +1231,23 @@ public sealed class BackupOrchestrator(
                     }
                     try
                     {
+                        // The gate, and the repeat of the check above it — inside this try for the reason the
+                        // compressor's is, and here it is worth more than a progress column: this entry owns a
+                        // compressed archive, whose quota is booked on a singleton shared by every run on the
+                        // machine. An OperationCanceledException out of the wait (working is cancelled by ct and
+                        // by Stop now) above the try would leak that quota until the process restarts, and it is
+                        // reachable exactly when a Stop now lands on a paused run. The finally hands both back on
+                        // every exit, so the bare `continue` below does what the release-and-continue above does.
+                        //
+                        // Repeating the check is what keeps "finish the item in hand, then hold" from turning into
+                        // "take one more": RequestStop downgrades the gate after setting the intent, so a worker
+                        // parked here is woken by the very stop it must now obey. What is still queued never
+                        // starts; not a byte of it reached the container, so discarding it costs only local CPU.
+                        if (control is not null)
+                            await control.Gate.WaitIfPausedAsync(working.Token);
+                        if (control is { Stop: not StopKind.None })
+                            continue;
+
                         await entry.RunAsync(working.Token);
                     }
                     finally
@@ -1316,6 +1365,23 @@ public sealed class BackupOrchestrator(
 
         async Task OnChangeAsync(FileChange c, CancellationToken token)
         {
+            // The diff passes the gate too: "pause the backup" means the disk stops being read at all, not merely
+            // that the pipeline stops draining. Parking the differ's callback parks the walk that calls it.
+            //
+            // No stop check on either side of this one, unlike the three consumer loops, because the diff has no
+            // "check and break" to reach: it stops by having its token cancelled, and always has. `token` here is
+            // stopProducing, linked to control.StopToken, so a stop cancels this wait outright and the cancellation
+            // travels the diff's own established exit — the catch below the diff's try, and SettleStopAsync after
+            // it. The gate's other way out, a patience downgrade, sets no stop intent for a check to find anyway;
+            // it takes the consumers down, and each of them cancels stopProducing on its way out (see the catches
+            // in the three loops above). What is left — released with the run still healthy — is a resumed diff,
+            // which is the whole point.
+            //
+            // Nothing is claimed at this point: the item this callback may go on to build does not exist yet, and
+            // the local Enqueue that books it into the ledger is only ever reached from below this wait.
+            if (control is not null)
+                await control.Gate.WaitIfPausedAsync(token);
+
             var changed = c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null;
             if (changed)
             {

@@ -94,6 +94,34 @@ public sealed class CompressionContinuityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Every upload costs <paramref name="delay"/> before it is let through. Unlike <see cref="BlockingUploader"/>
+    /// this never stops the pipeline — it only makes the run long enough that a pause pressed part-way through has
+    /// work left to hold, which is the difference between a test of the gate and a test of the clock.
+    /// </summary>
+    private sealed class SlowUploader(TimeSpan delay, IBlobUploader inner) : IBlobUploader
+    {
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            await Task.Delay(delay, ct);
+            return await inner.UploadIfMissingAsync(
+                account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+
+        public async Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            await Task.Delay(delay, ct);
+            await inner.UploadOverwriteAsync(
+                account, container, blobName, filePath, tier, retry, ct, metadata);
+        }
+    }
+
     /// <param name="describe">What the pool looked like when patience ran out. Without it the failure reads
     /// "condition not met", which cannot tell "compression stalled" (the regression) from "the staging limit was
     /// set too low for this test" — and those want opposite reactions.</param>
@@ -357,6 +385,99 @@ public sealed class CompressionContinuityTests : IDisposable
             }
 
             await run;
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// Pause holds every producing loop, and holds the work rather than discarding it — that is the whole
+    /// difference from Suspend. A resumed run must not have lost, or have to redo, what it had already staged.
+    /// <para>
+    /// The uploader is throttled on purpose. Twelve 2 MB files against a local Azurite take a couple of seconds
+    /// end to end, and a run that finishes before the second reading is taken would report the same
+    /// <c>processed</c> twice whether or not anything checks the gate — a test that passes on the unfixed code.
+    /// A fixed cost per upload puts enough work behind the pause that "it stopped" and "it was already over" are
+    /// distinguishable, and the assertion that the reading at the pause is short of the total is what says so out
+    /// loud rather than leaving it to the timing.
+    /// </para>
+    /// <para>
+    /// The delay is also what makes the three-second settling window meaningful: at most one item per stage is in
+    /// hand when Pause lands (granularity is "finish the item in hand, then hold"), and every one of them lands
+    /// well inside that window.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Pause_Holds_The_Pipeline_And_Resume_Picks_It_Up()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int files = 12;
+        for (var i = 0; i < files; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, _, request) = Build(
+            new SlowUploader(TimeSpan.FromSeconds(2), new BlobUploader(factory)),
+            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "pause-hold");
+
+        var seen = new List<StageProgress>();
+        var progress = new Progress<BackupProgress>(p =>
+        {
+            if (p.Detail is { Stage: "Uploading" } d)
+                lock (seen) seen.Add(d);
+        });
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress, ct: default, control: control);
+            await WaitUntil(
+                () => { lock (seen) return seen.Any(s => s.Processed > 0); }, TimeSpan.FromSeconds(60),
+                () => "the run never processed an item before the pause.");
+
+            control.Gate.PauseByUser();
+            // One item per stage may still be in hand; let them land, then take the reading.
+            await Task.Delay(3000);
+            StageProgress atPause;
+            lock (seen) atPause = seen[^1];
+            Assert.Equal(PauseSource.User, control.Gate.Current!.Source);
+            // Without this the test would pass on a run that was simply over: two equal readings prove nothing
+            // if there was nothing left to do between them.
+            Assert.True(atPause.Processed < files,
+                $"the run had already processed {atPause.Processed} of {files} items when the pause was pressed — "
+                + "there was no work left for the pause to hold, so this run proves nothing.");
+
+            await Task.Delay(3000);
+            int processedLater;
+            lock (seen) processedLater = seen[^1].Processed;
+            Assert.Equal(atPause.Processed, processedLater);
+
+            control.Gate.ResumeByUser();
+            var result = await run.WaitAsync(TimeSpan.FromMinutes(3));
+            Assert.Equal(1, result.Version);
+
+            // Held, not discarded: every item the run started with reaches processed. BackupRunResult has no
+            // "files uploaded" member (its file counts are all diff-derived), so the ledger is the witness —
+            // processed == total on the far side of the pause is exactly "nothing was dropped at the gate".
+            // Snapshots are delivered through Progress<T>, i.e. on the thread pool, so the last one may still be
+            // in flight when the run's task completes.
+            await WaitUntil(
+                () => { lock (seen) return seen[^1] is { Total: files } s && s.Processed == files; },
+                TimeSpan.FromSeconds(30),
+                () =>
+                {
+                    lock (seen)
+                        return $"the run ended with processed={seen[^1].Processed} of total={seen[^1].Total}: "
+                            + "work queued when the pause landed never came back.";
+                });
         }
         finally
         {
