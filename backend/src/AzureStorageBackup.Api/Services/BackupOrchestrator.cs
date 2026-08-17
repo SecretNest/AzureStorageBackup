@@ -846,9 +846,27 @@ public sealed class BackupOrchestrator(
         // Stage 2 → 3. Compression is globally serial (StagingArea holds one compression lock across every run), so
         // this side is one worker by definition — a pool would be a queue in front of a lock that admits one.
         //
-        // This one carries no depth limit: its depth is already bounded in bytes by the staging pool, which is the
-        // bound the operator configured, and a second, item-count bound would reintroduce a constraint that fires
-        // before the one they set.
+        // This one carries no depth limit: the depth of everything that owns an archive is already bounded in bytes
+        // by the staging pool, which is the bound the operator configured, and a second, item-count bound would
+        // reintroduce a constraint that fires before the one they set.
+        //
+        // Two kinds of entry own no archive and are therefore bounded by nothing here: a dedup or resume hit (since
+        // the pipeline was split in two) and a raw in-place item (since the raw route stopped copying). For a
+        // store-only workload — the media library the DontCompress rule exists for — the compressor's only limiter
+        // is then disk read speed, so it can hash and queue the whole dataset while the uploaders trickle.
+        //
+        // Accepted deliberately, on two counts. What it holds is a closure, a content identity and a path per
+        // entry — no copy of any file, and nothing charged to a quota another backup on this machine shares. And
+        // what it widens is the stretch between an in-place item's hash and its upload, which the guard around that
+        // upload measures rather than races (see InPlaceSource): the guard's verdict does not weaken with time, only
+        // its chance of tripping rises, and a trip costs one wasted upload, a take-back and a retry through the
+        // copying route.
+        //
+        // Bounding it would have to count only the entries that own no handoff, or it fires before the operator's
+        // byte limit for everything else — which means a second resource with its own exactly-once release on the
+        // queue-write failure, the stop drain, DrainQueues and the uploader's pickup, sitting alongside the item
+        // ledger and the staging quota. Two disciplines of that kind is what this pipeline's correctness already
+        // rests on; a third, bought for a window that costs no correctness, is not a trade worth making here.
         var stagedQueue = Channel.CreateUnbounded<PendingUpload>(
             new UnboundedChannelOptions { SingleWriter = true, SingleReader = false });
 
@@ -2273,11 +2291,19 @@ public sealed class BackupOrchestrator(
     /// restore and check all read the index, and the index would agree with the name.
     /// </para>
     /// <para>
-    /// What replaces it is a bracket: this pair is stat'ed before the hashing read begins and again after the
-    /// upload returns, and any movement in either <see cref="Length"/> or <see cref="MtimeUtc"/> means the upload
-    /// did not necessarily send what was hashed. That is the same test the diff trusts to call a file unchanged
-    /// (see BackupDiffer's compare of length + last write time), applied over a much shorter window: there, minutes
-    /// may pass between the scan and the read; here, only this item's own hash-and-upload.
+    /// What replaces it is a bracket: this pair is stat'ed before the hashing read begins and again once the upload
+    /// is over, however it ended, and any movement in either <see cref="Length"/> or <see cref="MtimeUtc"/> means
+    /// the upload did not necessarily send what was hashed. That is the same test the diff trusts to call a file
+    /// unchanged (see BackupDiffer's compare of length + last write time), applied to this item's own hash, its wait
+    /// for an uploader, and its upload.
+    /// </para>
+    /// <para>
+    /// That stretch is **not** short, and the bracket does not assume it is. It compares two stats taken around the
+    /// whole of it rather than racing it: a file that has not moved between them did not move, however long it took.
+    /// The length of the stretch changes only how often this trips — and on a store-only run it is long, because a
+    /// raw item charges nothing to the staging pool and so nothing bounds how far the compressor may run ahead of
+    /// the uploaders (see the note on stagedQueue in RunCoreAsync); for the tail of a large one it is hours. What
+    /// that costs when it does trip is one wasted upload, a take-back and a retry through the copying route.
     /// </para>
     /// <para>
     /// It is not absolute, and deliberately so: a file rewritten during its own upload **and** restored to exactly

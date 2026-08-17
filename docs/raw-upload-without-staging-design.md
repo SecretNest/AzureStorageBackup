@@ -57,9 +57,21 @@ closed here by bracketing the upload with the same metadata test the diff uses t
 unchanged — length and last-write time — and treating any movement as a failure of that upload:
 
 ```csharp
-// Same test the diff trusts to call a file unchanged (BackupDiffer.cs:195-201), applied to a much
-// shorter window: there, minutes may pass between the scan and the read; here, only the upload itself.
+// Same test the diff trusts to call a file unchanged (BackupDiffer.cs:195-201), applied to this item's
+// own hash, its wait for an uploader, and its upload.
 ```
+
+**How long that window is, is not this test's business.** It is a comparison of two `stat`s taken around the
+whole stretch, not a race against it: a source that has not moved between them was not moved, however long it
+took, and one that has is caught. Length only changes how *often* the guard trips — and a trip costs one wasted
+upload, the take-back below, and a retry through the copying route.
+
+The stretch is genuinely long on the workload this feature ships for. Compression is one worker and the staged
+queue it feeds has no item limit, because its depth was bounded in bytes by the staging pool; a raw item charges
+nothing to that pool, so on a store-only run the compressor is limited only by disk read speed and can queue the
+whole dataset while the uploaders trickle. For the tail of such a run the hash-to-upload distance is hours, not
+seconds. That is stated rather than fixed: see the note on `stagedQueue` in `BackupOrchestrator` for why a second
+bound was not worth its own exactly-once release discipline.
 
 If the metadata moved, the blob that was just written is **deleted** — it is named for a hash its content
 may no longer match, and leaving it would be worse than not having uploaded at all — and the item is
@@ -118,7 +130,9 @@ saving.
 
 **It does not close the rewrite window absolutely.** A file rewritten during its upload *and* restored to
 its previous length and mtime would pass the guard. That is the same boundary the diff has lived with
-since the beginning, now applied over a window of seconds rather than minutes.
+since the beginning — and the stretch it is applied over is not short: this item's hash, its wait on the
+staged queue, and its upload, which for the tail of a large store-only run is hours (see §2). What that
+buys is a bigger chance of the guard tripping, not a bigger chance of it being wrong.
 
 **It does not apply when the file needs splitting.** A volume-split raw file has more than one output
 object, and those objects do not exist until 7z writes them.
