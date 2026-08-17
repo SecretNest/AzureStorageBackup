@@ -487,7 +487,11 @@ This is the task that changes behaviour. Write the acceptance test first — it 
 - Modify: `backend/src/AzureStorageBackup.Api/Services/BackupOrchestrator.cs:721-759` (the consumer loop and its startup), `:1004` / `:1013` / `:1052-1055` (settle points)
 
 **Interfaces:**
-- Consumes: `StagedHandoff` (Task 1), `StageBlobAsync` / `UploadStagedBlobItemAsync` (Task 2), `CompressGroupAsync` / `UploadGroupAsync` (Task 3).
+- Consumes, as actually built by Tasks 1-3:
+  - `StagedHandoff(StagingArea area, StagedItem? staged, Action<Exception>? abandon = null)` with `Staged`, `MarkSettled()`, `Dispose()` (Task 1).
+  - Single-file path (Task 2): `ProbeAndResumeAsync(request, file, localPath, localResolver, uploadTracker, control, ct)` → `BlobPlacement?`; `StageBlobAsync(request, file, localPath, storeOnly, uploadTracker, state, ct)` → `StagedBlob(BlobContent Content, StagedHandoff Handoff)`; `UploadStagedBlobItemAsync(request, file, stagedBlob, addressing, localResolver, uploadScope, uploadTracker, state, control, ct)` → `BlobPlacement`.
+  - Pack path (Task 3): `CompressGroupAsync(request, packId, members, storeOnly, uploadTracker, state, ct)` → `GroupAttempt(StagedHandoff Handoff, List<PackEntry> Changed, IReadOnlyList<PackEntry> Stable)`, and `RunGroupAsync(request, packId, members, storeOnly, GroupAttempt? precompressed, uploadScope, uploadTracker, state, control, ct)` → `(Changed, Recorded, Volumes)`.
+  - **`RunGroupAsync` is the pack side's wiring point, and `precompressed` is why it exists.** The compressor calls `CompressGroupAsync` for one group and puts the `GroupAttempt` in the queue; the uploader calls `RunGroupAsync` with that attempt as `precompressed`. The first pass consumes it, and any retry inside `RunGroupAsync` compresses afresh — which is what keeps the retry unit honest. Note the granularity: it is per **group**, not per pool. A pool splits into several groups and each has its own pack id, so the compressor produces one queue entry per group.
 - Produces:
   - `private sealed record PendingUpload(StagedHandoff Handoff, Func<CancellationToken, Task> RunAsync)`
   - A `Channel<PendingUpload>` local to `RunAsync`, written by the compressor and read by the uploaders.
