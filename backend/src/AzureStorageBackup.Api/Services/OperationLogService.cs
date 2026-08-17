@@ -80,11 +80,14 @@ public sealed class OperationLogService(AppDbContext db) : IOperationLog
             .ToListAsync(ct);
     }
 
+    /// <summary>One unconditional DELETE, like the other deleters here — deliberately not RemoveRange + SaveChanges.
+    /// That shape loads the whole table into the change tracker and then deletes row by row under a per-row optimistic
+    /// concurrency check (each DELETE must affect exactly 1 row); on a large log the gap between loading and committing
+    /// is seconds wide, and any concurrent deleter in that gap (the per-minute retention Trim, a deleted backup config,
+    /// a second clear request) leaves one DELETE affecting 0 rows and fails the whole clear with DbUpdateConcurrencyException.
+    /// Clearing is idempotent — a row someone else already deleted is exactly the outcome asked for, not a conflict.</summary>
     public async Task ClearAsync(CancellationToken ct = default)
-    {
-        db.LogEntries.RemoveRange(db.LogEntries);
-        await db.SaveChangesAsync(ct);
-    }
+        => await db.LogEntries.ExecuteDeleteAsync(ct);
 
     public async Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default)
     {

@@ -3,6 +3,7 @@ using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -94,6 +95,47 @@ public sealed class OperationLogServiceTests : IDisposable
         await _sut.ClearAsync();
 
         Assert.Empty(await _sut.QueryAsync(null, null, null, null, 100));
+    }
+
+    /// <summary>Regression lock: clearing must not be a load-the-whole-table-then-delete-row-by-row
+    /// (RemoveRange + SaveChanges). That shape asks EF for a per-row optimistic concurrency check —
+    /// every DELETE has to affect exactly 1 row — and the window between loading the entities and
+    /// committing them is seconds wide once the log grows. Anything deleting concurrently in that window
+    /// (SchedulerService's per-minute retention Trim, a deleted backup config, a second clear request)
+    /// makes one DELETE affect 0 rows and the whole clear blows up with DbUpdateConcurrencyException.
+    /// Clearing is idempotent by definition — a row someone else already deleted is the desired outcome,
+    /// not a conflict — so it must go out as a single unconditional DELETE statement.</summary>
+    [Fact]
+    public async Task Clear_Survives_Rows_Deleted_Concurrently()
+    {
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "a");
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "b");
+        await _sut.AppendAsync(OperationLogLevel.Info, "s", "c");
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite(_connection)
+            .AddInterceptors(new DeleteRowWhileSavingInterceptor(_connection, "b"))
+            .Options;
+        await using var racing = new AppDbContext(options);
+
+        await new OperationLogService(racing).ClearAsync();
+
+        Assert.Empty(await _sut.QueryAsync(null, null, null, null, 100));
+    }
+
+    /// <summary>Stands in for the concurrent deleters of production: deletes one row straight on the
+    /// connection at the moment a SaveChanges is about to be persisted.</summary>
+    private sealed class DeleteRowWhileSavingInterceptor(SqliteConnection connection, string message) : SaveChangesInterceptor
+    {
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData, InterceptionResult<int> result, CancellationToken ct = default)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "DELETE FROM LogEntries WHERE Message = $m";
+            cmd.Parameters.AddWithValue("$m", message);
+            cmd.ExecuteNonQuery();
+            return ValueTask.FromResult(result);
+        }
     }
 
     [Fact]
