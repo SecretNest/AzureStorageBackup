@@ -1446,29 +1446,68 @@ public sealed class BackupOrchestrator(
                 control, ct);
         }
         // This try wraps more than reading the source file — it also wraps compression, staging and upload — so the
-        // exception type alone is not enough to conclude "the file cannot be read": BlobUploader classifies
-        // IOException as a retryable network error (BlobUploader.IsTransient) and rethrows it verbatim once the
-        // retry budget runs out, landing right here. Accepting it on type alone would turn one NAS network outage
-        // into a pile of "file unreadable, carrying the old entry forward" while the run still reports success —
-        // the operator sees "Backup succeeded, 0 changed files" when in fact nothing was uploaded. So the filter
-        // probes the source file once more: only genuinely unreadable files get degraded, and if it opens fine the
-        // exception keeps propagating and the whole run fails loudly.
-        // ArchiveMembersMissingException is the exception that needs no probe: it is only thrown when 7z did not put
-        // this file into the archive intact, which is already proof that "this run failed to store this file", and
-        // it is thrown before the upload so no empty archive is left in the cloud.
-        catch (Exception ex) when (ex is ArchiveMembersMissingException
-            || ((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
+        // exception type alone is not enough to conclude "the file cannot be read"; see
+        // <see cref="TrySettleUnreadableAsync"/> for the whole reasoning, which is why that check is a method and
+        // not three inline conditions.
+        catch (Exception ex)
         {
-            // Readable at diff time, unreadable afterwards (when compression / raw upload reopens the source file):
-            // handled exactly like diff-stage unreadability — no blob is produced, nothing is written to
-            // storageByPath/overrides (from which the index stage carries the old entry forward or omits it
-            // entirely), and one warning is logged through the existing channel; this single file must never take
-            // the whole run down.
-            await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
-            onItem(file.Length);
-            return;
+            if (await TrySettleUnreadableAsync(request, file, localPath, ex, postDiffUnreadable, onItem, ct))
+                return;
+            throw;
         }
 
+        await FinishBlobAsync(
+            request, file, placement, storageByPath, tailByPath, overrides, onItem, control, ct);
+    }
+
+    /// <summary>
+    /// Recognise "this run failed to store this file" and settle it as such: no blob is produced, the index carries
+    /// the old entry forward or omits it, one warning is logged, and the run continues. Readable at diff time and
+    /// unreadable afterwards (when compression / raw upload reopens the source file) is handled exactly like
+    /// diff-stage unreadability — nothing is written to storageByPath/overrides, and this single file must never
+    /// take the whole run down.
+    /// <para>
+    /// The exception type on its own is not enough to conclude it: <see cref="BlobUploader"/> classifies
+    /// IOException as a retryable network error and rethrows it verbatim once the retry budget runs out, in exactly
+    /// the same shape. Accepting on type alone would turn one NAS network outage into a pile of "file unreadable,
+    /// carrying the old entry forward" while the run still reports success — the operator sees "Backup succeeded,
+    /// 0 changed files" when in fact nothing was uploaded. Hence the second look at the source file: only a
+    /// genuinely unreadable one gets degraded, and if it opens fine the exception keeps propagating and the run
+    /// fails loudly. <see cref="ArchiveMembersMissingException"/> needs no such look — it is only thrown when 7z did
+    /// not put this file into the archive intact, which is already proof, and it is thrown before the upload so no
+    /// empty archive is left in the cloud.
+    /// </para>
+    /// <para>
+    /// A predicate called from inside a <c>catch</c> rather than the exception filter it used to be, because
+    /// **a filter cannot await** and both halves of the settle do: the warning goes through the record gate, and
+    /// once the pipeline runs as three stages all three of them need this same check.
+    /// </para>
+    /// </summary>
+    /// <returns>true when this exception was recognised and the item settled; false when the caller must rethrow.</returns>
+    private async Task<bool> TrySettleUnreadableAsync(
+        BackupRequest request, PlannedFile file, string localPath, Exception ex,
+        ConcurrentDictionary<string, string> postDiffUnreadable, Action<long> onItem, CancellationToken ct)
+    {
+        if (ex is not ArchiveMembersMissingException
+            && !((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
+            return false;
+        await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
+        onItem(file.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Everything that happens once this file's content has a home in the cloud, whether it got there by being
+    /// uploaded or by being recognised as already present. Split out because those two answers arrive in different
+    /// stages of the pipeline — a dedup or resume hit is settled by the probe and never reaches the compressor —
+    /// and both have to record exactly the same things.
+    /// </summary>
+    private async Task FinishBlobAsync(
+        BackupRequest request, PlannedFile file, BlobPlacement placement,
+        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
+        ConcurrentDictionary<string, EntryOverride> overrides, Action<long> onItem,
+        BackupRunControl? control, CancellationToken ct)
+    {
         // The content actually stored is not the same as what the diff saw: override the index entry with the
         // former, so that fullHash/length/head-and-tail hash match the bytes inside data/{hash}. All these values
         // come from the read pass just performed — **the source file is not reopened**.
@@ -1497,10 +1536,11 @@ public sealed class BackupOrchestrator(
                 Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
 
         // The collision warning is an after-the-fact report once the content has been processed/uploaded
-        // successfully, and it never touches the source file again — it must not stay inside the try above:
-        // otherwise a failure of this notification (or of its internal log write) would be misread as "the file
-        // cannot be read", causing content that was already uploaded successfully to be carried forward as the old
-        // entry or dropped entirely from the index, while the cloud in fact already holds that data.
+        // successfully, and it never touches the source file again — which is why this whole method sits **outside**
+        // every caller's unreadable-source catch: otherwise a failure of this notification (or of its internal log
+        // write) would be misread as "the file cannot be read", causing content that was already uploaded
+        // successfully to be carried forward as the old entry or dropped entirely from the index, while the cloud in
+        // fact already holds that data.
         if (placement.Collision)
             await Record(NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
                 $"Hash collision avoided: {file.Path}",
