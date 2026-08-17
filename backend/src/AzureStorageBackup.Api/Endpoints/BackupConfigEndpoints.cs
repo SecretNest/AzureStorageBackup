@@ -330,6 +330,22 @@ public static class BackupConfigEndpoints
                 ? Results.NoContent()
                 : Results.Conflict(new { error = "This backup is not waiting to retry." }));
 
+        // A real pause: every stage finishes the item in hand and parks, and the run stays alive holding its
+        // staging quota. Distinct from Suspend, which tears the run down and makes the next start re-diff and
+        // re-probe everything. Mirrors retry-now's shape: both reach into a live run's gate, and answer a
+        // conflict rather than a silent success when there is nothing to act on.
+        group.MapPost("/{id:int}/pause", (int id, BackupRunner runner) =>
+            runner.Pause(id)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "No backup is running." }));
+
+        // Lift a user pause. If a transient error is also holding the gate, the run stays parked on that one —
+        // see PauseInfo.Source / BackupRunResponse.PausedByUser for how the UI tells the two apart.
+        group.MapPost("/{id:int}/resume", (int id, BackupRunner runner) =>
+            runner.Resume(id)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "This backup is not paused." }));
+
         // Which runs on this container stopped partway. Right after startup the UI uses this to put "there is unfinished work" in front of the user and wait for a click,
         // rather than deciding on their behalf whether to keep going.
         group.MapGet("/{id:int}/interrupted", async (

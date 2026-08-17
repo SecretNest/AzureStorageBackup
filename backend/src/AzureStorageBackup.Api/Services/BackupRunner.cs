@@ -91,6 +91,19 @@ public sealed class BackupRunState
     public PauseInfo? Pause => Control?.Gate.Current;
 
     /// <summary>
+    /// Whether the operator's own hold is standing right now. Deliberately not read off <see cref="Pause"/>:
+    /// <see cref="PauseInfo.Source"/> reports only whichever reason most recently closed the gate, so a Pause
+    /// pressed while a transient-error backoff is already running leaves <c>Pause.Source</c> saying
+    /// <c>TransientError</c> — countdown and Retry-now affordance included — until that backoff's own timer
+    /// fires, up to one steady interval (five minutes by default). A UI rendering paused-ness from <c>Pause</c>
+    /// alone would show such a run as merely stuck and retrying, as though the operator's Pause had done
+    /// nothing. Reading <see cref="PauseGate.IsPausedByUser"/> live, instead of a value baked into a stored
+    /// <see cref="PauseInfo"/>, is what lets this stay true for as long as the hold does, independent of which
+    /// reason <c>Pause.Source</c> happens to be reporting at the moment.
+    /// </summary>
+    public bool PausedByUser => Control?.Gate.IsPausedByUser ?? false;
+
+    /// <summary>
     /// Internal machinery, not part of the HTTP contract: the original exception on failure. Set alongside Error in
     /// RunCoreAsync's catch so TaskDispatcher can attach it as the InnerException when it rethrows — the container log
     /// therefore keeps the status code, request id and real stack that the Azure exception carries, instead of being
@@ -116,12 +129,15 @@ public sealed record BackupRunResponse(
     string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null,
     // What the round changed and what it uploaded — see the matching properties on BackupRunState.
     int? NewFiles = null, int? ModifiedFiles = null, int? DeletedFiles = null,
-    long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null)
+    long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null,
+    // Sibling of Pause, not a field on it — see BackupRunState.PausedByUser for why the two can disagree.
+    bool PausedByUser = false)
 {
     public static BackupRunResponse From(BackupRunState s) =>
         new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, s.Pause, s.SuspendReason?.ToString(),
-            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes);
+            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
+            s.PausedByUser);
 }
 
 /// <summary>

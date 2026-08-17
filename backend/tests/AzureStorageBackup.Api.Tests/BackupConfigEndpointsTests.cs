@@ -1063,6 +1063,30 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
     }
 
+    /// <summary>Same shape as Suspend/Retry now: the operator pressed a button and is owed an answer about why
+    /// nothing happened, not a silent no-op.</summary>
+    [Fact]
+    public async Task Pausing_without_a_running_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("pause-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("pa", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/pause", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Resuming_without_a_paused_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("resume-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("re", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/resume", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
     [Fact]
     public async Task Interrupted_runs_are_listed_with_their_block_count()
     {
