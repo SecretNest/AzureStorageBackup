@@ -716,8 +716,10 @@ public sealed class BackupOrchestrator(
         // thousand volumes split out of a single big file, and issuing per item would let that whole stretch occupy
         // exactly one stream, making the number in the settings do nothing at all for large files.
         // Between items the permits are arbitrated **by item age**, not first-come-first-served (see
-        // VolumeUploadGate): there are UploadConcurrency + 1 consumers, and first-come-first-served would leave that
-        // many items half-finished at once — which is exactly how many get thrown away on an interruption.
+        // VolumeUploadGate): there are UploadConcurrency + 1 uploaders, and first-come-first-served would leave that
+        // many items half-finished at once. An interruption throws away more than that now: those, plus every entry
+        // the compressor has already put on the staged queue that no uploader has claimed (see DrainQueues) — local
+        // CPU only, since not a byte of a queued entry has reached the container.
         var streams = Math.Max(1, opts.UploadConcurrency);
         var uploadGate = new VolumeUploadGate(streams);
         var uploadScope = new VolumeUploadScope(uploadGate, uploadTracker, streams);
@@ -1627,7 +1629,8 @@ public sealed class BackupOrchestrator(
         // not necessarily a short stretch, possibly a whole subtree.
         //
         // The progress trade-off is harsher than "the UI sits at 100%": uploadTracker.BeginWork()/EndWork() do not
-        // wrap this re-run (those two only appear paired inside ConsumeAsync above), onItem is the no-op below, so
+        // wrap this re-run (the pair belongs to the pipeline — BeginWork in the prober, the matching EndWork owed by
+        // that item's WorkShare — and this loop runs after every stage has settled), onItem is the no-op below, so
         // ReportItem never runs and SetTransferred is never called — the bytes uploaded by the re-run are
         // **completely invisible** in the readings until uploadTracker.Complete() further down, and the in-flight
         // item count stays 0 throughout. Sitting at 100% while silently running for a long time is, for this user
@@ -2679,8 +2682,8 @@ public sealed class BackupOrchestrator(
                     // handled (Finding 1: a caller's catch should not enclose all of the callee's work).
                     // The gate is a different matter: it swallows nothing, it merely waits on a transient error and
                     // then repeats **the same** item. This item is a single file that fell out of the pool, the same
-                    // shape as the single-file path in the consumer loop, so it uses the same retry unit — without
-                    // putting it behind the gate, one hiccup on this single item could take the whole run down.
+                    // shape as the single-file path the uploader's closure runs, so it uses the same retry unit —
+                    // without putting it behind the gate, one hiccup on this single item could take the whole run down.
                     await WithPauseAsync(control, () => HandleBlobAsync(
                         request, new PlannedFile(m.Path, newLen, newHash), bypassQuota, addressing, localResolver,
                         storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
