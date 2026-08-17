@@ -1502,6 +1502,52 @@ public sealed class BackupOrchestrator(
                 diffTracker.Complete();
                 work.CompleteAdding(); // no matter what, the consumers must learn "there is no more work", or they wait forever
             }
+
+            // Everything from here to the settle below is inside this try for one reason: **it runs while the
+            // consumers are still running**, and every one of these calls can throw. RecordUnreadableWarningsAsync
+            // goes through the record gate, the operation log and the notifier — this repository has had
+            // "SQLite Error 5: database is locked" out of exactly that path — and SetTotal/Settle call straight into
+            // the caller's progress sink, which is somebody else's code. Left outside, one such throw walks out of
+            // this method with three stages still live: `using var downstreamGone` is disposed on the way, the last
+            // uploader's finally then calls CancelAsync on a disposed source and gets ObjectDisposedException, and —
+            // the part that outlives the run — SettleAsync/DrainQueues never happen, so every queued entry's pool
+            // quota stays booked on a process-wide singleton that gates compression for every backup on the machine
+            // until the process restarts.
+            //
+            // Overlap disabled: only start working once all the work has been accumulated, back to the old "decide everything first, then upload" behavior.
+            if (!overlap)
+                StartConsumers();
+
+            // The diff is done and no more work will appear in the queue → only now is the upload denominator settled, and only now does the percentage in the UI mean anything.
+            uploadTracker.SetTotal(totalItems);
+            reporter.Settle(totalItems);
+
+            // Unreadable files count as neither changed nor deleted, and the index stage silently carries the old
+            // entries forward — but the operator has to be told.
+            // Placed before waiting on the uploads: this path runs every single time, and pushing it to the very end
+            // would let one upload failure swallow these warnings along the way — precisely when "some files could not
+            // be read" is what the operator most needs to hear.
+            await RecordUnreadableWarningsAsync(request, scan, diff, ct);
+
+            // Settle the consumers first, then check for a stop request: once stopped, no version index may be
+            // written — writing a version for a run that did not finish amounts to claiming the files that were never
+            // uploaded are backed up.
+            //
+            // There is a window between this check and the index write below: if the stop request arrives just after
+            // the check passes, this run finishes writing the index and reports Completed, while SuspendAsync/
+            // CancelAsync still return true once a terminal state is reached.
+            // That is **inherent and acceptable**: at that moment the work really is all done, "stop" has nothing left
+            // to stop, and the user gets a complete, successful backup — a better outcome than stopping at the door.
+            // Do **not** add a lock to serialize the index write against stop requests: that lock would span three I/O
+            // operations (write index + write info file + write local cache), and a stop request comes in synchronously
+            // from the HTTP thread (Cancel() inside BackupRunner.RequestStop runs its callbacks on the current thread),
+            // so the request from the user pressing stop would hang on a chain of cloud writes — all to remove a race
+            // whose outcome was already correct.
+            await SettleAsync(consumers);
+            DrainQueues();
+            if (control is { Stop: var stopKind } && stopKind != StopKind.None)
+                throw await SettleStopAsync(stopKind);
+            await Task.WhenAll(consumers);
         }
         catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
         {
@@ -1515,46 +1561,14 @@ public sealed class BackupOrchestrator(
         }
         catch
         {
-            // The busy lock is only released when RunAsync returns, so returning early would leave a pile of compression/uploads running outside the lock.
+            // The busy lock is only released when RunAsync returns, so returning early would leave a pile of
+            // compression/uploads running outside the lock. Reached twice over on the paths that settle inside the
+            // try above (a stop, or a consumer's fault surfacing from Task.WhenAll) — harmless, because both calls
+            // are idempotent: SettleAsync on already-completed tasks and DrainQueues on drained channels do nothing.
             await SettleAsync(consumers);
             DrainQueues();
             throw;
         }
-
-        // Overlap disabled: only start working once all the work has been accumulated, back to the old "decide everything first, then upload" behavior.
-        if (!overlap)
-            StartConsumers();
-
-        // The diff is done and no more work will appear in the queue → only now is the upload denominator settled, and only now does the percentage in the UI mean anything.
-        uploadTracker.SetTotal(totalItems);
-        reporter.Settle(totalItems);
-
-        // Unreadable files count as neither changed nor deleted, and the index stage silently carries the old
-        // entries forward — but the operator has to be told.
-        // Placed before waiting on the uploads: this path runs every single time, and pushing it to the very end
-        // would let one upload failure swallow these warnings along the way — precisely when "some files could not
-        // be read" is what the operator most needs to hear.
-        await RecordUnreadableWarningsAsync(request, scan, diff, ct);
-
-        // Settle the consumers first, then check for a stop request: once stopped, no version index may be
-        // written — writing a version for a run that did not finish amounts to claiming the files that were never
-        // uploaded are backed up.
-        //
-        // There is a window between this check and the index write below: if the stop request arrives just after
-        // the check passes, this run finishes writing the index and reports Completed, while SuspendAsync/
-        // CancelAsync still return true once a terminal state is reached.
-        // That is **inherent and acceptable**: at that moment the work really is all done, "stop" has nothing left
-        // to stop, and the user gets a complete, successful backup — a better outcome than stopping at the door.
-        // Do **not** add a lock to serialize the index write against stop requests: that lock would span three I/O
-        // operations (write index + write info file + write local cache), and a stop request comes in synchronously
-        // from the HTTP thread (Cancel() inside BackupRunner.RequestStop runs its callbacks on the current thread),
-        // so the request from the user pressing stop would hang on a chain of cloud writes — all to remove a race
-        // whose outcome was already correct.
-        await SettleAsync(consumers);
-        DrainQueues();
-        if (control is { Stop: var stopKind } && stopKind != StopKind.None)
-            throw await SettleStopAsync(stopKind);
-        await Task.WhenAll(consumers);
 
         // Wrap-up for this run's cross-box dedup: backfill the aliases hanging off each leader with the leader's
         // own StorageRef.
