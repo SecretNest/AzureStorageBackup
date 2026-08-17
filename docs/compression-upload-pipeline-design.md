@@ -1,4 +1,4 @@
-# Splitting compression and upload into two stages
+# Splitting probe, compression and upload into three stages
 
 ## The problem
 
@@ -72,17 +72,35 @@ Facts the design has to hold to, all of them load-bearing:
 
 ## Design
 
-### 1. Two stages, one queue
+### 1. Three stages, two queues
 
 ```
-DiffWorkQueue ──> [compressor × 1] ──> stagedQueue ──> [uploaders × (UploadConcurrency + 1)]
+DiffWorkQueue ──> [prober × 1] ──> probedQueue ──> [compressor × 1] ──> stagedQueue ──> [uploaders × (UploadConcurrency + 1)]
 ```
 
-| | compressor (1) | uploader (UploadConcurrency + 1) |
-|---|---|---|
-| takes from | `DiffWorkQueue` | `stagedQueue` |
-| does | dedup probe, 7z, move to pool, post-compression re-verify, re-queue/demote changed members | dedup resolve, upload every volume, `RecordPackAsync`, journal, `onItem` |
-| blocks on | `WaitForRoomAsync` only | upload slots, network |
+| | prober (1) | compressor (1) | uploader (UploadConcurrency + 1) |
+|---|---|---|---|
+| takes from | `DiffWorkQueue` | `probedQueue` | `stagedQueue` |
+| does | dedup probe of single-file items; settles the hits outright. Packs pass straight through. | 7z, move to pool, post-compression re-verify, re-queue/demote changed members | dedup resolve, upload every volume, `RecordPackAsync`, journal, `onItem` |
+| bound by | one disk | one CPU (the compression lock is global anyway) | upload slots, network |
+| blocks on | nothing but its own read | `WaitForRoomAsync` only | upload slots, network |
+
+**Why the prober is one worker and not several.** The probe is disk-bound: on a candidate hit it reads
+the whole file to derive its content identity (`BackupOrchestrator.cs:1599-1622`). Concurrency does not
+make a disk faster, and on spinning media or a NAS share it makes it slower by turning one sequential
+read into several competing seeks. The reason to give it its own stage is not parallelism — it is
+**overlap**: while the prober reads the next item, the compressor is working on the previous one, so the
+CPU stops waiting on a hash and the disk stops waiting on 7z.
+
+Today's six workers each run probe → compress → upload end to end, so six probes can be in flight at
+once — but all six then queue behind the same global compression lock, and the throughput ceiling is the
+lock, not the probes. Trading six competing readers for one reader that overlaps the compressor is
+therefore a gain twice over: the disk does sequential work, and neither stage idles waiting for the other.
+
+**What stays on the compressor.** The pack path's post-compression re-verification
+(`BackupOrchestrator.cs:2015-2055`) checks the archive that was just produced, so it belongs with the
+thing that produced it. It normally costs one `stat` per member; only a member changed mid-compression
+forces a rehash, which is rare. Moving it would need a fourth stage to buy very little.
 
 The compressor's only blocking point is the staging quota. That is the entire point of the change:
 **`StagedLimitBytes` becomes the sole backpressure on the compression side**, and the pool fills to
@@ -116,8 +134,10 @@ Four paths must reach that `Dispose`:
 1. **Normal completion** — the uploader releases per volume as it goes and disposes the owner at the
    end (already how it works today).
 2. **Exception** — the uploader's `finally`.
-3. **Stop** — the compressor stops taking new work and disposes every entry still sitting in
-   `stagedQueue`; entries already claimed by an uploader run to completion. This matches the current
+3. **Stop** — the prober stops taking new work and both queues are drained. `probedQueue` entries hold
+   no staging quota (nothing has been compressed yet), so draining them only has to settle the item
+   ledger; `stagedQueue` entries hold an archive each and must be disposed. Entries already claimed by
+   an uploader run to completion. This matches the current
    promise, "finish the current item, then stop" (`BackupOrchestrator.cs:727-730`), with "current
    item" now meaning the ones uploaders hold. Work compressed but not yet claimed is discarded — the
    local CPU spent on it is lost, no bytes reached the cloud, and nothing is left in the container.
@@ -153,7 +173,9 @@ This keeps the mutable per-item state (`queue`, `attempts`) single-threaded insi
 
 ### 5. Progress accounting is unchanged
 
-`BeginWork` moves to where the compressor takes an item; `EndWork` stays after the upload settles.
+`BeginWork` moves to where the **prober** takes an item — the first stage, so that an item is counted as
+in-hand for its whole journey across both queues; `EndWork` stays after the upload settles, or fires in
+whichever earlier stage the item stops at (a probe that settles a dedup hit, a drained queue, a failure).
 The identity `processed + preparing + queued + waitingOnArchive + uploading ≡ total`
 (`StageProgress.cs:916-924`) continues to hold, because `uploading` is defined as
 `inWork - _inStaging` — items past staging but not settled — which is exactly what a queue entry
@@ -161,13 +183,15 @@ plus an in-flight upload is. No column changes meaning, and no new column is nee
 
 ## What this does not do
 
-**It does not keep 7z busy 100% of the time.** The compressor also runs the dedup probe, which reads
-a whole candidate file end to end (`BackupOrchestrator.cs:1599-1622`), and the post-compression
-re-verification, which stats every member and may rehash a changed one
-(`BackupOrchestrator.cs:2015-2055`). Both are local I/O on the compression worker, and 7z idles
-through them. The guarantee this design makes is narrower and should not be overstated: **the
-compression stage is never blocked by the upload stage**. Pushing the probe off the compressor too
-would need a third stage and is not worth it until measurement says otherwise.
+**It does not keep 7z busy 100% of the time.** The post-compression re-verification stays on the
+compressor (see §1), and while it stats members — or, rarely, rehashes a changed one — 7z idles. The
+guarantee this design makes is narrower and should not be overstated: **the compression stage is never
+blocked by the upload stage, and never waits on the probe's disk reads**.
+
+**It does not make the probe faster in isolation.** One prober reads no quicker than one prober did
+before; what changes is that its reads now overlap compression instead of competing with five siblings
+for the same disk and then queuing behind the same lock. A run that is purely dedup hits — resuming a
+large backup, say — is bound by that single disk either way.
 
 **It does not change how much gets uploaded in parallel.** `VolumeUploadGate`, its per-volume
 accounting and its item-age arbitration are untouched.
@@ -184,7 +208,7 @@ of this document could not be read off the screen directly. Worth fixing, separa
 - **The staging limit binds.** With a slow upload backend, pool occupancy converges on
   `StagedLimitBytes` and `waitingOnArchive` becomes non-zero — versus today, where it stays at zero
   and occupancy plateaus wherever the worker pool leaves it.
-- **Stop releases everything queued.** After a stop with a non-empty `stagedQueue`,
+- **Stop releases everything queued.** After a stop with both queues non-empty,
   `StagingArea.StagedBytes` returns to zero, the staged temp directory is empty, and no reservation
   waiter is left hanging.
 - **Downgrade releases everything queued.** Same assertions on the pause-gate downgrade path.

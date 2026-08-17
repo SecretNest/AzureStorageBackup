@@ -4,7 +4,7 @@
 
 **Goal:** Make the compression stage independent of the upload stage, so that `StagedLimitBytes` — not the size of the worker pool — is what limits how far compression runs ahead.
 
-**Architecture:** The single consumer loop in `BackupOrchestrator.RunAsync` becomes two: exactly one compressor (compression is already globally serial behind `StagingArea._compressLock`) and `UploadConcurrency + 1` uploaders, joined by an unbounded `Channel<PendingUpload>`. The compressor stops at "the archive is in the staged pool" and packages the rest of the item's work as a closure; an uploader runs that closure. Queue depth is bounded in bytes by the staging quota, which is the bound the operator configured.
+**Architecture:** The single consumer loop in `BackupOrchestrator.RunAsync` becomes three, joined by two unbounded channels: one prober (the dedup probe is disk-bound, and concurrent reads do not make a disk faster — the stage exists so its reads overlap compression, not so they run in parallel), one compressor (compression is already globally serial behind `StagingArea._compressLock`), and `UploadConcurrency + 1` uploaders. Each stage stops at a well-defined handover and packages the rest of the item's work as a closure for the next one. Queue depth is bounded in bytes by the staging quota, which is the bound the operator configured.
 
 **Tech Stack:** C# / .NET, xUnit, `System.Threading.Channels`. Integration tests run against Azurite.
 
@@ -15,7 +15,7 @@
 - **Integration tests need Azurite**: `npx azurite --skipApiVersionCheck` — without it 189 tests skip silently and a green run means nothing.
 - **Do not change** `VolumeUploadGate`, `VolumeUploadScope`, `StagingArea`'s quota semantics, or any index/journal format.
 - **The progress identity must keep holding:** `processed + preparing + queued + waitingOnArchive + uploading ≡ total` (`StageProgress.cs:916-924`).
-- **`BeginWork`/`EndWork` must stay exactly paired.** `BeginWork` is called once when the compressor claims an item; `EndWork` is called once when that item leaves the pipeline — by the uploader after it settles, or by the compressor if the item never entered the queue. An unpaired call permanently skews the `uploading` column.
+- **`BeginWork`/`EndWork` must stay exactly paired.** `BeginWork` is called once when the **prober** claims an item — the first stage, so an item counts as in-hand for its whole journey across both queues. `EndWork` is called once when that item leaves the pipeline: by the uploader after it settles, or by whichever earlier stage the item stops at (settled as unreadable, or discarded from a drained queue). An unpaired call permanently skews the `uploading` column.
 - Spec: `docs/compression-upload-pipeline-design.md`.
 
 ## File Structure
@@ -478,13 +478,15 @@ EOF
 
 ---
 
-### Task 4: Two loops joined by a staged queue
+### Task 4: Three stages, two queues
 
 This is the task that changes behaviour. Write the acceptance test first — it fails on today's code for the reason the spec documents.
 
+The stage count changed after the plan was first written, so read `docs/compression-upload-pipeline-design.md` §1 before starting. In short: the dedup probe gets its own stage, with **one** worker. It is disk-bound (a candidate hit reads the whole file to derive its content identity), and concurrency does not make a disk faster — on spinning media or a NAS share it makes it slower by turning one sequential read into several competing seeks. The reason to give it a stage of its own is overlap, not parallelism: while it reads the next item, the compressor works on the previous one, so the CPU stops waiting on a hash and the disk stops waiting on 7z.
+
 **Files:**
 - Create: `backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs`
-- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupOrchestrator.cs:721-759` (the consumer loop and its startup), `:1004` / `:1013` / `:1052-1055` (settle points)
+- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupOrchestrator.cs:721-759` (the consumer loop and its startup), `:1431-1522` (`HandleBlobAsync`, split in Step 3), `:1004` / `:1013` / `:1052-1055` (settle points)
 
 **Interfaces:**
 - Consumes, as actually built by Tasks 1-3:
@@ -493,8 +495,11 @@ This is the task that changes behaviour. Write the acceptance test first — it 
   - Pack path (Task 3): `CompressGroupAsync(request, packId, members, storeOnly, uploadTracker, state, ct)` → `GroupAttempt(StagedHandoff Handoff, List<PackEntry> Changed, IReadOnlyList<PackEntry> Stable)`, and `RunGroupAsync(request, packId, members, storeOnly, GroupAttempt? precompressed, uploadScope, uploadTracker, state, control, ct)` → `(Changed, Recorded, Volumes)`.
   - **`RunGroupAsync` is the pack side's wiring point, and `precompressed` is why it exists.** The compressor calls `CompressGroupAsync` for one group and puts the `GroupAttempt` in the queue; the uploader calls `RunGroupAsync` with that attempt as `precompressed`. The first pass consumes it, and any retry inside `RunGroupAsync` compresses afresh — which is what keeps the retry unit honest. Note the granularity: it is per **group**, not per pool. A pool splits into several groups and each has its own pack id, so the compressor produces one queue entry per group.
 - Produces:
-  - `private sealed record PendingUpload(StagedHandoff Handoff, Func<CancellationToken, Task> RunAsync)`
-  - A `Channel<PendingUpload>` local to `RunAsync`, written by the compressor and read by the uploaders.
+  - `private sealed record ProbedItem(WorkItem Item, BlobPlacement? Hit)` — `Hit` non-null means the probe already settled where this content lives, so nothing needs compressing.
+  - `private sealed record PendingUpload(StagedHandoff? Handoff, Func<CancellationToken, Task> RunAsync)` — `Handoff` is null for a probe hit, which owns no archive.
+  - `private async Task FinishBlobAsync(BackupRequest request, PlannedFile file, BlobPlacement placement, ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath, ConcurrentDictionary<string, EntryOverride> overrides, Action<long> onItem, BackupRunControl? control, CancellationToken ct)` — the single-file item's settle half, extracted in Step 3.
+  - `private async Task<bool> TrySettleUnreadableAsync(BackupRequest request, PlannedFile file, string localPath, Exception ex, ConcurrentDictionary<string, string> postDiffUnreadable, Action<long> onItem, CancellationToken ct)` — returns true when it recognised and settled the exception as "this file cannot be read", false when the caller must rethrow.
+  - Two `Channel<>`s local to `RunAsync`: `probedQueue` (written by the prober, read by the compressor) and `stagedQueue` (written by the compressor, read by the uploaders).
 
 - [ ] **Step 1: Write the failing acceptance test**
 
@@ -686,18 +691,97 @@ dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Te
 
 Expected: FAIL — the pool plateaus at three items' worth and `WaitUntil` times out. If it passes, the test is not reproducing the condition; check that `UploadConcurrency` really is 2 and that the staging limit is not the thing stopping it.
 
-- [ ] **Step 3: Introduce the queue and the two loops**
+- [ ] **Step 3: Extract the single-file item's settle half (no behaviour change)**
 
-In `RunAsync`, replace the single `ConsumeAsync` (`BackupOrchestrator.cs:721-744`) with:
+`HandleBlobAsync` (`BackupOrchestrator.cs:1431-1522`) wraps probe + compress + upload in one `try`, and everything after that `try` is the item's **settle**: the journal append, the collision warning, the index override, `storageByPath` / `tailByPath`, `LogFileAsync`, `onItem`. Once the three stages exist, two different stages need to reach that settle (a probe hit settles without ever compressing), and all three need the unreadable-source handling. Extract both, leaving `HandleBlobAsync` behaving exactly as it does now.
+
+The settle half, moved verbatim from `BackupOrchestrator.cs:1472-1521`:
 
 ```csharp
-// Compression is globally serial (StagingArea holds one compression lock across every run), so the compression
-// side is one worker by definition — a pool would just be a queue in front of a lock that admits one.
-// Its only blocking point is the staging quota, which is what makes StagedLimitBytes the setting it claims to be.
+/// <summary>
+/// Everything that happens once this file's content has a home in the cloud, whether it got there by being
+/// uploaded or by being recognised as already present. Split out because those two answers now arrive in
+/// different stages of the pipeline, and both have to record the same things.
+/// </summary>
+private async Task FinishBlobAsync(
+    BackupRequest request, PlannedFile file, BlobPlacement placement,
+    ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
+    ConcurrentDictionary<string, EntryOverride> overrides, Action<long> onItem,
+    BackupRunControl? control, CancellationToken ct)
+{
+    // ... the body from BackupOrchestrator.cs:1478-1521, comments included, unchanged ...
+}
+```
+
+The unreadable-source handling, from the `catch` filter at `BackupOrchestrator.cs:1459-1470`. It becomes a predicate the callers invoke from inside a `catch` block rather than an exception filter, because **an exception filter cannot `await`** and `SourceUnreadable` plus `MarkPostDiffUnreadableAsync` both need to:
+
+```csharp
+/// <summary>
+/// Recognise "this run failed to store this file" and settle it as such: no blob is produced, the index
+/// carries the old entry forward or omits it, one warning is logged, and the run continues.
+/// <para>
+/// The probe is not enough on its own — BlobUploader classifies IOException as a retryable network error
+/// and rethrows it verbatim once the retry budget runs out, so accepting on type alone would turn one NAS
+/// outage into a pile of "file unreadable" while the run still reports success. Hence the second look at the
+/// source file. ArchiveMembersMissingException needs no such look: it is only thrown when 7z did not put
+/// this file in the archive intact, which is already proof, and it is thrown before the upload.
+/// </para>
+/// </summary>
+/// <returns>true when this exception was recognised and the item settled; false when the caller must rethrow.</returns>
+private async Task<bool> TrySettleUnreadableAsync(
+    BackupRequest request, PlannedFile file, string localPath, Exception ex,
+    ConcurrentDictionary<string, string> postDiffUnreadable, Action<long> onItem, CancellationToken ct)
+{
+    if (ex is not ArchiveMembersMissingException
+        && !((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
+        return false;
+    await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
+    onItem(file.Length);
+    return true;
+}
+```
+
+`HandleBlobAsync` then becomes probe-or-place, catch-and-settle, finish — same behaviour, three named pieces. Keep it: `ProcessPackAsync` still calls it when a member grows past the threshold and is demoted to a single file (`BackupOrchestrator.cs:2169-2172` before this task's edits).
+
+Run the full suite (`1231 passed, 0 failed, 0 skipped`) and commit this extraction on its own:
+
+```bash
+git commit -m "$(cat <<'EOF'
+refactor: extract the single-file settle and unreadable paths
+
+Once probe, compression and upload are three stages, two of them need to
+reach the settle half — a probe hit records the same journal entry, index
+override and storageByPath row as a finished upload — and all three need
+the unreadable-source handling.
+
+The unreadable check becomes a predicate called from a catch block rather
+than an exception filter, because a filter cannot await and both halves of
+the check do.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+- [ ] **Step 4: Introduce the three stages**
+
+In `RunAsync`, replace the single `ConsumeAsync` (`BackupOrchestrator.cs:721-744`) with three loops joined by two channels:
+
+```csharp
+// Stage 1 → 2. The probe is disk-bound: on a candidate hit it reads the whole file end to end to derive
+// its content identity. One worker, deliberately — concurrency does not make a disk faster, and on
+// spinning media or a NAS share it makes it slower by turning one sequential read into several competing
+// seeks. What this stage buys is overlap: while it reads the next item, the compressor works on the
+// previous one, so the CPU stops waiting on a hash and the disk stops waiting on 7z.
+var probedQueue = Channel.CreateUnbounded<ProbedItem>(
+    new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+// Stage 2 → 3. Compression is globally serial (StagingArea holds one compression lock across every run),
+// so this side is one worker by definition — a pool would be a queue in front of a lock that admits one.
+// Its only blocking point is the staging quota, which is what finally makes StagedLimitBytes bind.
 var stagedQueue = Channel.CreateUnbounded<PendingUpload>(
     new UnboundedChannelOptions { SingleWriter = true, SingleReader = false });
 
-async Task CompressAsync()
+async Task ProbeAsync()
 {
     try
     {
@@ -705,21 +789,68 @@ async Task CompressAsync()
         {
             if (control is { Stop: not StopKind.None })
                 break;
+            // BeginWork belongs to the first stage, so an item counts as in-hand for its whole journey
+            // across both queues. Exactly one of the three stages calls the matching EndWork.
             uploadTracker.BeginWork();
             var handed = false;
             try
             {
-                // Returns null when the item settled here (a dedup or resume hit uploads nothing at all).
-                if (await StageItemAsync(item, working.Token) is { } pending)
+                ProbedItem probed;
+                if (item.Single is { } single)
                 {
-                    await stagedQueue.Writer.WriteAsync(pending, working.Token);
-                    handed = true;
+                    var hit = await ProbeAndResumeAsync(
+                        request, single, Local(request, single.Path), localResolver, uploadTracker,
+                        control, working.Token);
+                    probed = new ProbedItem(item, hit);
                 }
+                else
+                {
+                    probed = new ProbedItem(item, Hit: null);   // a pack has no pre-compression probe
+                }
+                await probedQueue.Writer.WriteAsync(probed, working.Token);
+                handed = true;
+            }
+            catch (Exception ex)
+            {
+                // The source went unreadable between the diff and this read. Settle it and carry on; one
+                // file must never take the run down. Not an exception filter: it has to await.
+                if (item.Single is not { } f || !await TrySettleUnreadableAsync(
+                        request, f, Local(request, f.Path), ex, postDiffUnreadable, ReportItem, working.Token))
+                    throw;
             }
             finally
             {
-                // EndWork belongs to whoever finishes the item: the uploader once it settles, or this loop when
-                // the item never made it into the queue. Exactly one of the two runs it.
+                if (!handed)
+                    uploadTracker.EndWork();
+            }
+        }
+    }
+    finally
+    {
+        // However this loop ends, the compressor must learn there is no more work, or it waits forever.
+        probedQueue.Writer.Complete();
+    }
+}
+
+async Task CompressAsync()
+{
+    try
+    {
+        await foreach (var probed in probedQueue.Reader.ReadAllAsync(working.Token))
+        {
+            var handed = false;
+            try
+            {
+                handed = await StageProbedAsync(probed, working.Token);
+            }
+            catch (Exception ex)
+            {
+                if (probed.Item.Single is not { } f || !await TrySettleUnreadableAsync(
+                        request, f, Local(request, f.Path), ex, postDiffUnreadable, ReportItem, working.Token))
+                    throw;
+            }
+            finally
+            {
                 if (!handed)
                     uploadTracker.EndWork();
             }
@@ -741,48 +872,85 @@ async Task UploadAsync()
         }
         finally
         {
-            pending.Handoff.Dispose();
+            pending.Handoff?.Dispose();
             uploadTracker.EndWork();
         }
     }
 }
 ```
 
-`StageItemAsync` dispatches on the work item exactly as `RunItemAsync` did, calling the compress half from Task 2 or Task 3 and packaging the upload half in the closure:
+`StageProbedAsync` is where the two paths part. It returns true when it handed the item to `stagedQueue` (so the uploader owns the `EndWork`), false when the item is finished here:
 
 ```csharp
-async Task<PendingUpload?> StageItemAsync(WorkItem item, CancellationToken token)
+async Task<bool> StageProbedAsync(ProbedItem probed, CancellationToken token)
 {
-    if (item.Single is { } single)
+    // A dedup or resume hit: nothing to compress, and no archive to own. It still travels through the
+    // queue rather than settling here, so that every single-file item's settle happens in one place —
+    // and so the uploader's EndWork stays the single accounting exit.
+    if (probed.Hit is { } hit)
     {
-        // The probe and the two dedup tiers settle the item without compressing anything; that path finishes
-        // here and hands nothing on.
-        ...
-        var stagedBlob = await StageBlobAsync(request, single, ..., token);
-        return new PendingUpload(stagedBlob.Handoff, t => WithPauseAsync(control, () =>
-            FinishBlobAsync(request, single, stagedBlob, ..., t), t));
+        var file = probed.Item.Single!;
+        await stagedQueue.Writer.WriteAsync(
+            new PendingUpload(null, t => FinishBlobAsync(
+                request, file, hit, storageByPath, tailByPath, overrides, ReportItem, control, t)),
+            token);
+        return true;
     }
 
-    // A pack pool splits into several groups, each with its own pack id and its own retry unit. The compressor
-    // takes one group at a time so that the queue drains group by group instead of pool by pool.
-    ...
+    if (probed.Item.Single is { } single)
+    {
+        var localPath = Local(request, single.Path);
+        var storeOnly = request.Options.DontCompress?.MatchesFileOrAncestorDir(single.Path) ?? false;
+        var staged = await StageBlobAsync(request, single, localPath, storeOnly, uploadTracker, state, token);
+        // The retry unit is still "compress + upload", exactly as it is for a pack: the first pass uses the
+        // archive this stage just produced, and any retry compresses a fresh one, because the failed pass
+        // disposed its own. Reusing a disposed archive would upload volume files that are no longer on disk.
+        await stagedQueue.Writer.WriteAsync(new PendingUpload(staged.Handoff, async t =>
+        {
+            StagedBlob? pending = staged;
+            await WithPauseAsync(control, async () =>
+            {
+                var blob = pending ?? await StageBlobAsync(
+                    request, single, localPath, storeOnly, uploadTracker, state, t);
+                pending = null;
+                var placement = await UploadStagedBlobItemAsync(
+                    request, single, blob, addressing, localResolver, uploadScope, uploadTracker, state,
+                    control, t);
+                await FinishBlobAsync(
+                    request, single, placement, storageByPath, tailByPath, overrides, ReportItem, control, t);
+            }, t);
+        }), token);
+        return true;
+    }
+
+    // A pack pool splits into groups, each with its own pack id and its own retry unit, so the compressor
+    // produces one queue entry per group. The group loop, the member re-queueing and the demotion to a
+    // single file all stay here: they are decided before the upload and mutate state this loop owns.
+    // ... adapt ProcessPackAsync's while loop so that, per group, it calls CompressGroupAsync and enqueues
+    // a PendingUpload whose RunAsync calls RunGroupAsync(..., precompressed: attempt, ...) followed by the
+    // RecordPackAsync / LogFileAsync / onItem tail that currently sits at BackupOrchestrator.cs:2049-2080 ...
+    return true;
 }
 ```
 
-Start them where the old consumers started (`BackupOrchestrator.cs:755-759`, `:1024-1025`):
+For the pack branch, work from `ProcessPackAsync` as Task 3 left it: the `while (queue.Count > 0)` loop keeps its structure, but where it now calls `RunGroupAsync` inline and then records, it instead calls `CompressGroupAsync` and enqueues the record-and-settle tail as the `PendingUpload`'s `RunAsync`. The resume short-circuit (`control?.Resume.FindPack`) settles in place exactly as it does today.
+
+Start all three where the old consumers started (`BackupOrchestrator.cs:755-759`, `:1024-1025`):
 
 ```csharp
-var workers = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+var uploaders = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
 List<Task> consumers = [];
 void StartConsumers() =>
-    consumers = [Task.Run(CompressAsync, working.Token),
-                 .. Enumerable.Range(0, workers).Select(_ => Task.Run(UploadAsync, working.Token))];
+    consumers = [Task.Run(ProbeAsync, working.Token),
+                 Task.Run(CompressAsync, working.Token),
+                 .. Enumerable.Range(0, uploaders).Select(_ => Task.Run(UploadAsync, working.Token))];
 ```
 
 The uploader count stays `UploadConcurrency + 1`: the extra consumer is what keeps the volume gate's hand-off from stalling at item boundaries (`VolumeBlobIO.cs:143-167`), and that reasoning is untouched here.
 
-The existing `SettleAsync(consumers)` / `Task.WhenAll(consumers)` call sites (`:1010`, `:1013`, `:1019`, `:1052`, `:1055`) need no change — `consumers` now simply holds one more task.
+The existing `SettleAsync(consumers)` / `Task.WhenAll(consumers)` call sites (`:1010`, `:1013`, `:1019`, `:1052`, `:1055`) need no change — `consumers` now holds two more tasks.
 
+Neither channel needs a depth limit. `stagedQueue`'s depth is bounded in bytes by the staging pool, which is the bound the operator configured; `probedQueue` holds items that own nothing yet.
 - [ ] **Step 4: Run the acceptance test, then the full suite**
 
 ```bash
@@ -818,9 +986,9 @@ EOF
 
 ---
 
-### Task 5: Drain the queue on stop and on downgrade
+### Task 5: Drain both queues on stop and on downgrade
 
-The queue can now hold up to the whole staging limit. Two exits must empty it, or that much quota stays booked on the singleton: a user stop, and the pause gate's downgrade — `PauseGate.cs:23-27` warns that a suspended run holding the staging seat "blocks every parallel backup completely", and this change makes the amount it can hold much larger.
+The staged queue can now hold up to the whole staging limit. Two exits must empty it, or that much quota stays booked on the singleton: a user stop, and the pause gate's downgrade — `PauseGate.cs:23-27` warns that a suspended run holding the staging seat "blocks every parallel backup completely", and this change makes the amount it can hold much larger.
 
 Per the decision recorded in the spec: entries an uploader has already claimed run to completion; entries still in the queue are discarded.
 
@@ -829,8 +997,8 @@ Per the decision recorded in the spec: entries an uploader has already claimed r
 - Test: `backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs`
 
 **Interfaces:**
-- Consumes: the `stagedQueue` and `PendingUpload` from Task 4.
-- Produces: `void DrainStagedQueue()` — local function in `RunAsync`.
+- Consumes: `probedQueue`, `stagedQueue`, `ProbedItem` and `PendingUpload` from Task 4.
+- Produces: `void DrainQueues()` — local function in `RunAsync`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -886,19 +1054,27 @@ Expected: FAIL — `StagedBytes` is non-zero, and volume files are left in stage
 - [ ] **Step 3: Implement the drain**
 
 ```csharp
-// Whatever the compressor produced that no uploader claimed. Every entry here is compressed but has not sent a
-// byte, so discarding it costs local CPU only and leaves nothing behind in the container. Its quota, though, is
-// booked on a singleton shared by every run — leave it booked and this machine's other backups pay for it until
-// the process restarts.
-void DrainStagedQueue()
+// Everything the pipeline is still carrying that no uploader has claimed. The two queues differ in what they
+// owe back:
+//
+// · stagedQueue entries own a compressed archive each. Discarding one costs local CPU only — not a byte of it
+//   reached the container — but its quota is booked on a singleton shared by every run, so leaving it booked
+//   makes this machine's other backups pay for it until the process restarts.
+// · probedQueue entries own nothing yet; nothing has been compressed. All they owe is the item ledger, or the
+//   uploading column stays permanently inflated by however many were in flight at the stop.
+void DrainQueues()
 {
+    while (probedQueue.Reader.TryRead(out _))
+        uploadTracker.EndWork();
     while (stagedQueue.Reader.TryRead(out var pending))
     {
-        pending.Handoff.Dispose();
+        pending.Handoff?.Dispose();   // null on a probe hit: it never had an archive
         uploadTracker.EndWork();
     }
 }
 ```
+
+Order matters: drain `probedQueue` first. The compressor may still be running and would otherwise move an entry across into `stagedQueue` after that queue was already drained.
 
 Call it in `SettleStopAsync` before `control.FlushAsync` (`BackupOrchestrator.cs:505`), and in the `catch` blocks at `:1007-1021` after `SettleAsync(consumers)`. The downgrade path reaches `SettleStopAsync` through `BackupSuspendedException`, so both exits are covered by the same two call sites — confirm this while implementing by tracing where `BackupSuspendedException` from `WithPauseAsync` (`:1881`) is handled.
 
