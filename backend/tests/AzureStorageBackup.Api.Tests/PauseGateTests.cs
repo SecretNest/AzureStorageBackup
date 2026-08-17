@@ -379,4 +379,38 @@ public class PauseGateTests
         Assert.True(gate.IsDowngraded);
         Assert.False(gate.IsPausedByUser, "a downgraded gate must not go on claiming a user hold");
     }
+
+    /// <summary>
+    /// A downgraded gate refuses the hold, and says so. Both calls used to return nothing at all, and the endpoint
+    /// above them reported 204 whatever happened — so pressing Pause on a run that was winding down (a Suspend or a
+    /// Stop, whose run stays <c>Running</c> for as long as the upload in hand takes, or a patience auto-suspend)
+    /// told the operator the run was held while nothing whatsoever had happened.
+    /// </summary>
+    [Fact]
+    public void A_Downgraded_Gate_Refuses_To_Be_Paused_Or_Resumed()
+    {
+        using var gate = new PauseGate();
+        gate.Downgrade();
+
+        Assert.False(gate.PauseByUser(), "a run that is winding down cannot be held");
+        Assert.False(gate.IsPausedByUser);
+        Assert.False(gate.ResumeByUser(), "there is no hold on a downgraded gate to lift");
+    }
+
+    /// <summary>
+    /// The two ordinary answers, which are what make the refusal above mean something: a gate that can be held
+    /// answers true, and it answers true again to a second press — the hold the operator asked for is standing,
+    /// which is the question they asked. Resume answers false when nobody is holding the run.
+    /// </summary>
+    [Fact]
+    public void Pausing_And_Resuming_Report_Whether_The_Hold_Stands()
+    {
+        using var gate = new PauseGate();
+
+        Assert.False(gate.ResumeByUser(), "nobody has pressed Pause");
+        Assert.True(gate.PauseByUser());
+        Assert.True(gate.PauseByUser(), "pressing Pause twice leaves the run held, which is a success");
+        Assert.True(gate.ResumeByUser());
+        Assert.False(gate.ResumeByUser(), "the hold was already lifted");
+    }
 }

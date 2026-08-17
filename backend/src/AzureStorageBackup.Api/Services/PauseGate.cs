@@ -162,12 +162,29 @@ public sealed class PauseGate : IDisposable
     /// reason stands (see <see cref="ReleaseLocked"/>).
     /// </para>
     /// </summary>
-    public void PauseByUser()
+    /// <returns>
+    /// Whether the hold now stands. False means this gate is downgraded — the run is winding down towards a
+    /// suspend or a stop and will never wait here again, so there is nothing left to hold.
+    /// <para>
+    /// The answer has to come from inside the lock, and it has to come from here rather than from a caller
+    /// reading <see cref="IsDowngraded"/> first: a run stays <see cref="RunStatus.Running"/> throughout a
+    /// wind-down that can take minutes (Suspend waits for a multi-GB upload to finish), and after a patience
+    /// downgrade nothing outside this class changes at all. A caller testing the flag separately would be
+    /// answering from a reading taken before its own call, which is the same silent success by a longer route.
+    /// </para>
+    /// <para>
+    /// Pressing Pause on a run already held by the user is true, not false: the hold the operator asked for is
+    /// standing, which is what they were asking about.
+    /// </para>
+    /// </returns>
+    public bool PauseByUser()
     {
         lock (_lock)
         {
-            if (_downgraded || _pausedByUser)
-                return;
+            if (_downgraded)
+                return false;
+            if (_pausedByUser)
+                return true;
             _pausedByUser = true;
             _userPausedSince = DateTimeOffset.UtcNow;
             if (_release is null)
@@ -175,6 +192,7 @@ public sealed class PauseGate : IDisposable
                 _release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 _current = UserPauseInfo();
             }
+            return true;
         }
     }
 
@@ -183,12 +201,17 @@ public sealed class PauseGate : IDisposable
     /// the workers stay parked and the UI goes on reporting the trouble, which is correct — the run is
     /// not ready to proceed just because the operator is.
     /// </summary>
-    public void ResumeByUser()
+    /// <returns>
+    /// Whether there was a hold to lift. False covers both "nobody ever pressed Pause" and "the hold was already
+    /// ended by a downgrade" (<see cref="DowngradeLocked"/> clears the flag), and both deserve the same answer:
+    /// this run is not being held for the operator, so nothing was lifted for them either.
+    /// </returns>
+    public bool ResumeByUser()
     {
         lock (_lock)
         {
             if (!_pausedByUser)
-                return;
+                return false;
             _pausedByUser = false;
 
             // The patience budget starts over, exactly as it does for Retry now (see ReleaseNow), and for the
@@ -209,6 +232,7 @@ public sealed class PauseGate : IDisposable
             // _timer first). So Current already reports TransientError.
             if (_timer is null)
                 ReleaseLocked(true);
+            return true;
         }
     }
 

@@ -480,7 +480,18 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// shutdown path still has to suspend.
     /// </para>
     /// </summary>
-    /// <returns>false when this config has no live run to pause.</returns>
+    /// <returns>
+    /// false when there is nothing to hold: no live run for this config, or a run whose gate is already
+    /// downgraded.
+    /// <para>
+    /// The second case is not an edge: <see cref="RunStatus"/> stays Running for the whole wind-down after a
+    /// Suspend or a Stop — which can be minutes, since a suspend waits for the volume in hand to finish
+    /// uploading — and it stays Running after a patience auto-suspend too. Pressing Pause in that window used to
+    /// return success while <see cref="PauseGate.PauseByUser"/> quietly did nothing, so the operator was told the
+    /// run was held and it was not. The answer comes from the gate itself rather than from a
+    /// <see cref="PauseGate.IsDowngraded"/> check here, so that it cannot be read before the call it describes.
+    /// </para>
+    /// </returns>
     public bool Pause(int configId)
     {
         BackupRunState? state;
@@ -492,8 +503,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         // with no gate to hold.
         if (state is not { Status: RunStatus.Running, Control: not null })
             return false;
-        state.Control.Gate.PauseByUser();
-        return true;
+        return state.Control.Gate.PauseByUser();
     }
 
     /// <summary>
@@ -501,7 +511,12 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// already on the wire, and that upload can still fail — the run stays parked on that one and the UI goes on
     /// reporting it, which is correct: the run is not ready to proceed just because the operator is.
     /// </summary>
-    /// <returns>false when this config has no live run to resume.</returns>
+    /// <returns>
+    /// false when there is no hold to lift: no live run, or a run nobody is holding — including one whose hold a
+    /// Suspend, a Stop or a patience downgrade has already ended, which is the same window
+    /// <see cref="Pause"/> describes and wants the same answer, so that the endpoint's conflict means what it
+    /// says rather than reporting success for a button press that changed nothing.
+    /// </returns>
     public bool Resume(int configId)
     {
         BackupRunState? state;
@@ -509,8 +524,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state = _runs.GetValueOrDefault(configId);
         if (state is not { Status: RunStatus.Running, Control: not null })
             return false;
-        state.Control.Gate.ResumeByUser();
-        return true;
+        return state.Control.Gate.ResumeByUser();
     }
 
     /// <summary>The execution body shared by both entry points. **Does not touch the busy lock** — the lock is the caller's job.</summary>

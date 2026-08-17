@@ -1690,15 +1690,28 @@ function RunButtons({
   onResumePause?: () => void
   stopping?: 'suspend' | 'stop'
 }) {
-  // Both buttons go disabled once either has been pressed: the run is winding down and asking it to wind down
-  // a second, different way only produces a race nobody can predict the outcome of.
+  // Every button in this group goes disabled once Suspend or Stop has been pressed: the run is winding down and
+  // asking it to wind down a second, different way only produces a race nobody can predict the outcome of.
+  //
+  // That covers the other three too, and not merely for tidiness. All three reach into the run's pause gate, and a
+  // stop **downgrades** that gate — after which it can never hold anyone again. So Pause on a winding-down run
+  // cannot do what its label says, however long the wind-down lasts, and a suspend waiting on a multi-GB upload
+  // lasts minutes with the run still reporting itself as Running. The backend now answers those presses with a
+  // conflict rather than a silent 204; disabling them here is the half that keeps the operator from meeting that
+  // error in the first place.
   const pending = stopping !== undefined
   return (
     <>
       {onRetryNow && (
         <>
           {' '}
-          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onRetryNow}>
+          <button
+            type="button"
+            className="btn-ghost"
+            style={{ padding: '0 0.3rem' }}
+            onClick={onRetryNow}
+            disabled={pending}
+          >
             Retry now
           </button>
         </>
@@ -1706,7 +1719,13 @@ function RunButtons({
       {onResumePause && (
         <>
           {' '}
-          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onResumePause}>
+          <button
+            type="button"
+            className="btn-ghost"
+            style={{ padding: '0 0.3rem' }}
+            onClick={onResumePause}
+            disabled={pending}
+          >
             Resume
           </button>
         </>
@@ -1714,7 +1733,13 @@ function RunButtons({
       {onPause && (
         <>
           {' '}
-          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onPause}>
+          <button
+            type="button"
+            className="btn-ghost"
+            style={{ padding: '0 0.3rem' }}
+            onClick={onPause}
+            disabled={pending}
+          >
             Pause
           </button>
         </>

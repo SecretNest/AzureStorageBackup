@@ -334,10 +334,14 @@ public static class BackupConfigEndpoints
         // staging quota. Distinct from Suspend, which tears the run down and makes the next start re-diff and
         // re-probe everything. Mirrors retry-now's shape: both reach into a live run's gate, and answer a
         // conflict rather than a silent success when there is nothing to act on.
+        // The conflict covers two cases and says both, because from the operator's chair they are one question:
+        // there is no run at all, or there is one that is already winding down (Suspend, Stop, or a patience
+        // auto-suspend) — and a run winding down still reports itself as Running, for minutes, while an upload
+        // finishes. Answering 204 there is the silent success this comment promises not to give.
         group.MapPost("/{id:int}/pause", (int id, BackupRunner runner) =>
             runner.Pause(id)
                 ? Results.NoContent()
-                : Results.Conflict(new { error = "No backup is running." }));
+                : Results.Conflict(new { error = "No backup is running, or it is already stopping." }));
 
         // Lift a user pause. If a transient error is also holding the gate, the run stays parked on that one —
         // see PauseInfo.Source / BackupRunResponse.PausedByUser for how the UI tells the two apart.
