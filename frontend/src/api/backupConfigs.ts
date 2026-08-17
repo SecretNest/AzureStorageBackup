@@ -288,13 +288,20 @@ export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspe
 // Stuck on a transient error, waiting for the self-healing retry. **This is not a status**: status is
 // still Running, because the background task is alive and the staging lease is still held. Making it a
 // status would hide the stop button — and being stuck is exactly when stopping is most wanted.
+// Why the gate is closed (serialises as a number, matching the backend enum PauseSource — pinned there,
+// mirrored here). TransientError = the self-healing retry above. User = the operator pressed Pause: no
+// countdown, nothing to retry now, and it never degrades to suspended on its own.
+export const PauseSource = { TransientError: 0, User: 1 } as const
+
 export interface PauseInfo {
   reason: string
   since: string
   // When the next automatic retry is due (UTC). null while a retry is already under way.
   nextRetryAt: string | null
-  // Consecutive failures. Reaching the threshold degrades automatically to suspended.
+  // Consecutive failures. Reaching the threshold degrades automatically to suspended — unless the user's own
+  // hold is standing, which stops that clock entirely.
   failures: number
+  source: number // PauseSource
 }
 
 // A run left half-finished on disk. After a restart nothing is in memory, so this is the only way to know.

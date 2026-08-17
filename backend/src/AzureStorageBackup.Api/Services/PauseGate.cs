@@ -1,13 +1,23 @@
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>Why the gate is closed. The two compose; see PauseGate's remarks.</summary>
+/// <summary>
+/// Why the gate is closed. The two compose; see PauseGate's remarks.
+/// <para>
+/// The numbers are the wire contract and are mirrored in <c>frontend/src/api/backupConfigs.ts</c>: PauseInfo goes
+/// to the browser as itself, with no DTO in between to project the enum into a string the way BackupRunResponse
+/// does for Status and SuspendReason, and nothing in this application registers a JsonStringEnumConverter — so
+/// this serialises as a number, exactly like CloudState/LocalState, which cross the boundary the same way. Pinning
+/// the values keeps a later reordering from silently redefining what the browser already believes, and putting
+/// TransientError at 0 means the default value is the behaviour that predates the user's pause.
+/// </para>
+/// </summary>
 public enum PauseSource
 {
     /// <summary>A worker hit a transient error. Self-heals on a timer, and downgrades if patience runs out.</summary>
-    TransientError,
+    TransientError = 0,
 
     /// <summary>The user pressed Pause. No timer, no patience, and it never downgrades on its own.</summary>
-    User,
+    User = 1,
 }
 
 /// <summary>The pause currently in effect, for the frontend to look at.</summary>

@@ -72,7 +72,11 @@ The gate stays one gate — a worker should not have to ask *why* it is parked �
 way to be closed and a source on what it reports:
 
 ```csharp
-public enum PauseSource { TransientError, User }
+// The numbers are the wire contract, mirrored in frontend/src/api/backupConfigs.ts. PauseInfo goes to the
+// browser as itself — no DTO projects the enum into a string the way BackupRunResponse does for Status and
+// SuspendReason — and no JsonStringEnumConverter is registered, so this serialises as a number, exactly as
+// CloudState/LocalState already do from the same position.
+public enum PauseSource { TransientError = 0, User = 1 }
 
 public sealed record PauseInfo(
     string Reason, DateTimeOffset Since, DateTimeOffset? NextRetryAt, int Failures,
@@ -129,7 +133,13 @@ responsiveness.
 ### 4. What the operator sees
 
 `RunStatus` is **unchanged** — the run is genuinely still Running, it is merely holding. Paused is
-expressed by `PauseInfo.Source == User`, and the frontend renders that as a paused run:
+expressed by `PauseInfo.Source == User` **or** `PauseGate.IsPausedByUser`, and the second one is not
+redundant: `PauseInfo` carries a single source, and a pause pressed while a transient-error backoff is
+running leaves the backoff reporting itself until its timer fires — up to one steady interval, five
+minutes by default. Rendering from the source alone would show such a run as "stuck, retrying in 4:37",
+with a Retry-now button, as if the Pause had done nothing. The two facts are kept separate rather than
+having the pause overwrite the trouble, because a run really can be both, and whichever the screen
+chooses to lead with, the other is still there to say. The frontend renders it as a paused run:
 
 ```
 Paused 23 minutes ago · holding 4.2 GB of staging
