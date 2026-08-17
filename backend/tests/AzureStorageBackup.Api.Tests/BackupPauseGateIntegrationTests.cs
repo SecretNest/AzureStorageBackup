@@ -55,16 +55,31 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         File.WriteAllBytes(full, new byte[size]);
     }
 
+    /// <summary>
+    /// Incompressible content, so one file's archive is the same size as the file and "how much is in the staged
+    /// pool" follows from the file sizes. <see cref="WriteBytes"/>'s all-zero content compresses down to a few
+    /// hundred bytes and would never fill a pool of any size — which is exactly why every test in this suite could
+    /// run with a 200 MB pool and never notice what happens when it is full.
+    /// </summary>
+    private void WriteRandom(string rel, int size)
+    {
+        var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        var bytes = new byte[size];
+        Random.Shared.NextBytes(bytes);
+        File.WriteAllBytes(full, bytes);
+    }
+
     // Same shape as BackupJournalWriteTests.Build: the real constructor's 13th parameter is the opLog one (notifier
     // comes before it), so an optional parameter is added here, notifier is skipped with a named argument, and the
     // rest (verboseLog/spillFactory) stay at their defaults.
-    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory) Build(
-        IBlobUploader uploader, IOperationLog? opLog = null)
+    private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, StagingArea Staging) Build(
+        IBlobUploader uploader, IOperationLog? opLog = null, long stagingLimit = 200_000_000)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
-            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
+            Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => stagingLimit);
         var compactor = new DeadWeightCompactor(
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
             staging);
@@ -76,7 +91,7 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
             new FileHasher(), authority.IndexCache, authority.Tracked,
             notifier: null, opLog: opLog);
-        return (orchestrator, factory);
+        return (orchestrator, factory, staging);
     }
 
     private BackupRequest Request(Account account, string container, long? volumeBytes = null) => new()
@@ -168,7 +183,7 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("gate");
         var flaky = new FlakyUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), failures: 1);
-        var (orchestrator, factory) = Build(flaky);
+        var (orchestrator, factory, _) = Build(flaky);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
@@ -197,7 +212,7 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("gate");
         var flaky = new FlakyUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), failures: 1000);
-        var (orchestrator, factory) = Build(flaky);
+        var (orchestrator, factory, _) = Build(flaky);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
@@ -219,13 +234,90 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>
+    /// An auto-suspend takes every uploader with it, and the compression stage must go too — not sit waiting for
+    /// staging room that only an uploader could ever hand back.
+    /// <para>
+    /// This is the shape of the whole three-stage split turning against itself. The compressor's one blocking point
+    /// is the staging quota, and that quota comes back only from a **live** uploader. When the gate's patience runs
+    /// out, every uploader throws <see cref="BackupSuspendedException"/> out of <c>WithPauseAsync</c> at once, while
+    /// the compressor sails on — 7z and the local disk never raise the transient errors the gate reacts to. Once the
+    /// pool is full of entries nobody will ever claim, <c>StagingArea.WaitForRoomAsync</c> never returns, and with it
+    /// the run never ends: no exception surfaces, the busy lock is never released, and the UI shows a backup that is
+    /// simply frozen. Before the split all six workers were uploaders as well, so they all left and released their
+    /// own quota on the way out, and the run suspended cleanly.
+    /// </para>
+    /// <para>
+    /// The two numbers are the whole test. The pool is 4 MB against 40 MB of **incompressible** source, so it really
+    /// does fill — every other test in this file runs a 200 MB pool over a few megabytes of zeroes, which is exactly
+    /// why the suite could not see this. And the failure has to surface as the suspension that caused it, not as the
+    /// cancellation used to unblock the compressor.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task An_auto_suspend_that_kills_every_uploader_does_not_strand_the_compressor()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("gate");
+        var flaky = new FlakyUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), failures: 1000);
+        var (orchestrator, factory, staging) = Build(flaky, stagingLimit: 4_000_000);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        // Only used to unblock a hung run so the rest of the session is not left with a compressor parked on a full
+        // pool; on the passing path it is never fired, and the run's own token stays untouched.
+        using var abort = new CancellationTokenSource();
+        try
+        {
+            // Twenty items, of which the uploaders can consume at most one each before dying (UploadConcurrency 5 →
+            // six of them), so there is always work left over for the compressor to jam on.
+            for (var i = 0; i < 20; i++)
+                WriteRandom($"f{i}.bin", 2_000_000);
+
+            await using var control = new BackupRunControl(_journals, 5, "run-stranded", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(10)], steady: TimeSpan.FromMilliseconds(10),
+                patience: TimeSpan.Zero));
+
+            // Single-file blobs only: one item per file, so "how many items are in flight" is exactly the number of
+            // files and there is no packing to reason about.
+            var request = Request(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            };
+
+            var run = orchestrator.RunAsync(request, null, abort.Token, control);
+            if (await Task.WhenAny(run, Task.Delay(TimeSpan.FromMinutes(2))) != run)
+            {
+                await abort.CancelAsync();
+                _ = run.ContinueWith(static t => _ = t.Exception, TaskScheduler.Default);
+                Assert.Fail(
+                    "the run never finished. Every uploader was gone and the compressor was still waiting for "
+                    + $"staging room only an uploader could free — {staging.StagedBytes} bytes were sitting in a "
+                    + "4,000,000-byte pool that nobody was left to drain.");
+            }
+
+            var ex = await Assert.ThrowsAsync<BackupSuspendedException>(() => run);
+            // The suspension is the real cause and has to be what comes out. Unblocking the compressor with a
+            // cancellation is the fix's mechanism, and a mechanism that surfaces instead of the cause would leave the
+            // run recorded as Canceled — no suspend mark, so the next startup never resumes it.
+            Assert.Equal(SuspendReason.AutoSuspended, ex.Reason);
+            Assert.Equal(SuspendReason.AutoSuspended, _journals.ReadSuspendMark(account.Id, name, "run-stranded"));
+            // Whatever was still queued when the stages stopped has to hand its archive back. That debt lives on a
+            // process-wide singleton and is the backpressure gate on output, so leaking it here would throttle every
+            // other backup on the machine until a restart.
+            Assert.Equal(0, staging.StagedBytes);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The run Step 6 uses: patience threshold set to 0 so it downgrades the moment it hits the wall, with opLog swapped for a double we can peek into.</summary>
     private async Task RunWithAlwaysFailingUploadAsync(RecordingOperationLog log)
     {
         var account = AzuriteAccount();
         var name = RandomName("gate");
         var flaky = new FlakyUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), failures: 1000);
-        var (orchestrator, factory) = Build(flaky, log);
+        var (orchestrator, factory, _) = Build(flaky, log);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {
@@ -322,7 +414,7 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("gate");
         var flaky = new FailOnLastVolume(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), 1_000_000);
-        var (orchestrator, factory) = Build(flaky);
+        var (orchestrator, factory, _) = Build(flaky);
         var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         try
         {

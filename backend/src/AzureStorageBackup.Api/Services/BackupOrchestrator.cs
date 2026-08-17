@@ -770,6 +770,47 @@ public sealed class BackupOrchestrator(
         // no index at all, just occupying space in the container, with a record in info.Packs pointing at each
         // orphan. So pack retries stay pushed down into the group (see RunGroupAsync).
 
+        // "The stage downstream of me is gone." Splitting one loop into three turned every hand-off into a place
+        // where an upstream stage waits on a resource that **only the downstream stage hands back**, and a resource
+        // nobody is left to hand back is a wait with no end:
+        //
+        // · the compressor's one blocking point is the staging quota (StagingArea.WaitForRoomAsync), and that quota
+        //   comes back only from a live uploader — volume by volume as it sends, or in one go when it disposes a
+        //   dropped entry's archive. With every uploader dead the pool stays full and the compressor sits in
+        //   _releaseSignal.WaitAsync forever, SettleAsync(consumers) waits on it forever, the run never ends, the
+        //   busy lock is never released, and not one word of the error that killed the uploaders ever surfaces.
+        // · the prober's is a slot in probedQueue, and only the compressor frees one.
+        //
+        // This is not an exotic corner. Any systemic upload failure kills all max(2, N+1) uploaders one entry at a
+        // time, and the worst case is the auto-suspend feature working exactly as designed: when the gate's patience
+        // runs out every uploader throws BackupSuspendedException out of WithPauseAsync at once, while the compressor
+        // sails on, because 7z and the local disk never raise the transient errors the gate reacts to. Before the
+        // split all six workers were uploaders too, so they all left and released their own quota on the way out.
+        //
+        // Neither `working` nor control.Stop covers it: `working` is linked only to ct and control.AbortToken, and a
+        // gate downgrade sets no stop kind (only RequestStop does — see BackupRunControl). So the two feeding stages
+        // get a token of their own, cancelled the moment the stage in front of them is gone. It plays the same role
+        // for them that stopProducing plays for the diff, and like the diff (see the catch below the diff's try) they
+        // treat that particular cancellation as "stop quietly", **not** as an error: the exception that has to reach
+        // the user is the one that killed the downstream stage, and a cancellation thrown from an earlier task in the
+        // consumers list would be the one Task.WhenAll surfaces instead, masking it.
+        using var downstreamGone = new CancellationTokenSource();
+        using var feeding = CancellationTokenSource.CreateLinkedTokenSource(working.Token, downstreamGone.Token);
+        // True when this run is being torn down by the line above rather than by anything the user did — the filter
+        // for "exit quietly" on both feeding stages.
+        bool DownstreamGone() => downstreamGone.IsCancellationRequested && !working.IsCancellationRequested;
+
+        // The uploader count stays UploadConcurrency + 1: the extra consumer is what keeps the volume gate's
+        // hand-off from stalling at item boundaries (see VolumeBlobIO), and that reasoning is untouched by the split.
+        // The prober and the compressor are one each, for the reasons on the two channels below.
+        var uploaders = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+        // How many of them are still alive. The trigger for "the upload side is gone" is the **last** one leaving,
+        // not the first one faulting: one uploader dying of a permanently refused blob is an ordinary failure, and
+        // the run's remaining work still gets compressed, uploaded and journalled by its siblings — that is how it
+        // behaved when every worker owned an item end to end, and a resumable run's journal is worth more than an
+        // early exit. It is only when none is left that the compressor's quota is never coming back.
+        var liveUploaders = uploaders;
+
         // Stage 1 → 2. The probe is disk-bound: on a candidate hit it reads the whole file end to end to derive its
         // content identity. One worker, deliberately — concurrency does not make a disk faster, and on spinning
         // media or a NAS share it makes it slower by turning one sequential read into several competing seeks. What
@@ -809,7 +850,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                while (await work.DequeueAsync(working.Token) is { } item)
+                while (await work.DequeueAsync(feeding.Token) is { } item)
                 {
                     // Work that has not started yet is not done after a stop. The item already started is
                     // unaffected — the promise "finish the current item, then stop" is kept right at this spot.
@@ -837,19 +878,19 @@ public sealed class BackupOrchestrator(
                                 {
                                     hit = await ProbeAndResumeAsync(
                                         request, single, localPath, localResolver, uploadTracker, control,
-                                        working.Token);
+                                        feeding.Token);
                                 }
                                 catch (Exception ex)
                                 {
                                     if (!await TrySettleUnreadableAsync(
                                             request, single, localPath, ex, postDiffUnreadable, ReportItem,
-                                            working.Token))
+                                            feeding.Token))
                                         throw;
                                     return;
                                 }
-                                await probedQueue.Writer.WriteAsync(new ProbedItem(item, hit, share), working.Token);
+                                await probedQueue.Writer.WriteAsync(new ProbedItem(item, hit, share), feeding.Token);
                                 handed = true;
-                            }, working.Token);
+                            }, feeding.Token);
                         }
                         else
                         {
@@ -857,7 +898,7 @@ public sealed class BackupOrchestrator(
                             // existing packs back on the diff side (see TryFindPackMember), and whatever is left has
                             // to be compressed before anything about it can be decided.
                             await probedQueue.Writer.WriteAsync(
-                                new ProbedItem(item, Hit: null, share), working.Token);
+                                new ProbedItem(item, Hit: null, share), feeding.Token);
                             handed = true;
                         }
                     }
@@ -868,6 +909,14 @@ public sealed class BackupOrchestrator(
                             share.Release();
                     }
                 }
+            }
+            catch (OperationCanceledException) when (DownstreamGone())
+            {
+                // The compressor is gone, so this loop's only customer is gone with it. Leave quietly rather than
+                // faulting: whatever killed the compression side is already on its way up through Task.WhenAll, and
+                // this task comes **before** it in the consumers list — fault here and it is this cancellation the
+                // user is shown instead of the real cause.
+                await stopProducing.CancelAsync();
             }
             catch
             {
@@ -1024,7 +1073,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                await foreach (var probed in probedQueue.Reader.ReadAllAsync(working.Token))
+                await foreach (var probed in probedQueue.Reader.ReadAllAsync(feeding.Token))
                 {
                     // The same promise the single worker made at the top of its loop, kept one stage further down:
                     // work that has not started is not done after a stop. Before the split the prober's check was
@@ -1039,7 +1088,7 @@ public sealed class BackupOrchestrator(
                     }
                     try
                     {
-                        await StageProbedAsync(probed, working.Token);
+                        await StageProbedAsync(probed, feeding.Token);
                     }
                     finally
                     {
@@ -1050,6 +1099,13 @@ public sealed class BackupOrchestrator(
                     }
                 }
             }
+            catch (OperationCanceledException) when (DownstreamGone())
+            {
+                // Every uploader is gone, which means the staging quota this loop waits on is never coming back. Leave
+                // quietly, for the same reason the prober does: the exception that has to reach the user is the one
+                // that killed the uploaders, and this task sits ahead of them in the consumers list.
+                await stopProducing.CancelAsync();
+            }
             catch
             {
                 await stopProducing.CancelAsync();
@@ -1058,6 +1114,11 @@ public sealed class BackupOrchestrator(
             finally
             {
                 stagedQueue.Writer.Complete();
+                // However this loop ends — drained, faulted, or cancelled by the line above — the prober must not be
+                // left waiting for a probedQueue slot that only this loop frees. Cancelling on the ordinary path too
+                // is safe and deliberate: the only way out of the loop above without an exception is probedQueue
+                // being completed, which the prober does in its own finally, so by then it has already finished.
+                await downstreamGone.CancelAsync();
             }
         }
 
@@ -1099,6 +1160,20 @@ public sealed class BackupOrchestrator(
                 await stopProducing.CancelAsync();
                 throw;
             }
+            finally
+            {
+                // Last one out turns off the light. A systemic failure — the network down, or the gate's patience
+                // exhausted, in which case every uploader throws BackupSuspendedException at once — takes all of
+                // them, and from that moment the compressor is waiting on a pool nobody will ever drain. Firing here
+                // rather than in the catch above is what keeps a single permanently refused blob from cutting the
+                // compression side short while its siblings are still working (see liveUploaders).
+                //
+                // It fires on the ordinary ending too, when stagedQueue completes and every uploader drains out.
+                // Harmless: the compressor completes that channel on its way out, so by then it has already finished
+                // and cancelled this source itself.
+                if (Interlocked.Decrement(ref liveUploaders) == 0)
+                    await downstreamGone.CancelAsync();
+            }
         }
 
         // Everything the pipeline is still carrying once its loops have stopped. The two queues differ in what they
@@ -1129,10 +1204,8 @@ public sealed class BackupOrchestrator(
             }
         }
 
-        // The uploader count stays UploadConcurrency + 1: the extra consumer is what keeps the volume gate's
-        // hand-off from stalling at item boundaries (see VolumeBlobIO), and that reasoning is untouched by the
-        // split. The prober and the compressor are one each, for the reasons on the two channels above.
-        var uploaders = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+        // One prober, one compressor, `uploaders` uploaders — the counts and the reasoning for each are up where
+        // `uploaders` is worked out, next to the two channels.
         List<Task> consumers = [];
         void StartConsumers() =>
             consumers = [
