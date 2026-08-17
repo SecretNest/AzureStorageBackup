@@ -11,6 +11,7 @@ import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
 import { pauseDisplay } from '../lib/pauseDisplay'
@@ -2113,8 +2114,11 @@ function StatusBadge({
             Azure exception text is unreadable in a tooltip, and nobody thinks to hover — so after a page
             refresh it became "go find the error in the logs". The text was persisted all along
             (BackupConfig.LastError); all it lacked was somewhere readable to put it. */}
+        {/* The label carries a tense (see errorBadgeLabel): nothing but a successful run or a manual
+            Reset clears this state, so an error from days ago survives every pause, suspend and resume
+            in between and, without a timestamp, looks exactly like one from a minute ago. */}
         <button type="button" className="badge badge-danger" onClick={onShowError}>
-          Error
+          {errorBadgeLabel(config.lastError, config.lastErrorAt) ?? 'Error'}
         </button>
         <button type="button" className="btn-ghost" onClick={onReset}>
           Reset
