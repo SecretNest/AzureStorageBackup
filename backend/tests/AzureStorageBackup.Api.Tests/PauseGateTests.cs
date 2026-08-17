@@ -219,6 +219,72 @@ public class PauseGateTests
         Assert.True(await trouble.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
+    /// <summary>
+    /// The patience clock measures "nothing recovered despite retrying". A user pause fabricates that evidence,
+    /// because under the hold nobody is permitted to retry at all.
+    /// <para>
+    /// The scene: Pause is pressed, then an upload that was already on the wire fails. Its backoff fires and
+    /// self-suppresses under the hold — leaving no timer to re-check patience — and much later a second in-flight
+    /// upload fails. That second failure's <c>OpenLocked</c> used to read the stale trouble clock and suspend the
+    /// run while the operator was away, which is exactly what design §4 promises can never happen.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_Failure_Under_A_User_Pause_Cannot_Auto_Suspend_The_Run()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+            patience: TimeSpan.FromMilliseconds(100));
+
+        gate.PauseByUser();
+        var first = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+
+        // Long enough for the 20 ms backoff to have fired and self-suppressed under the hold, and for the
+        // 100 ms patience to have "expired" several times over while no worker was allowed to try anything.
+        await Task.Delay(400);
+        Assert.False(first.IsCompleted, "the user's hold still parks the first worker");
+
+        var second = gate.WaitAsync(new IOException("still down"), CancellationToken.None);
+
+        Assert.False(gate.IsDowngraded, "a user pause must never downgrade the run");
+        Assert.False(second.IsCompleted, "the second failure must park too, not be told to suspend");
+
+        // And the run really does carry on when the operator comes back — the downgrade was not merely deferred.
+        await Task.Delay(200);   // let the second failure's backoff fire and self-suppress as well
+        gate.ResumeByUser();
+        Assert.True(await first.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await second.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
+    /// The other half of the same coin: a pause must not spend the patience budget it never used. Pause overnight
+    /// after one failure, press Resume, and the first retry fails — the run has to get a backoff, not an instant
+    /// downgrade, because that retry is the first chance it has been given since the hold went up.
+    /// </summary>
+    [Fact]
+    public async Task Resuming_Gives_The_Run_Its_Full_Patience_Back()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(150)], steady: TimeSpan.FromMilliseconds(150),
+            patience: TimeSpan.FromMilliseconds(250));
+
+        var trouble = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+        gate.PauseByUser();   // inside the backoff: opening the gate is synchronous, so this lands first
+
+        await Task.Delay(700);   // the backoff fired under the hold; the patience window is long past
+        Assert.False(trouble.IsCompleted, "the user's hold outranks the backoff timer");
+
+        gate.ResumeByUser();
+        Assert.True(await trouble.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        // The retry the operator just authorised fails. This is the run's first actual retry, so it deserves
+        // the full patience window; before the fix the clock had been running throughout the pause.
+        var retry = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+        Assert.False(gate.IsDowngraded, "the pause must not have consumed the patience budget");
+        Assert.True(await retry.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(gate.IsDowngraded);
+    }
+
     /// <summary>Downgrade must pierce a user pause: it is how "Suspend" reaches a parked worker.</summary>
     [Fact]
     public async Task Downgrade_Releases_A_User_Pause()

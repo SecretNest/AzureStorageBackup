@@ -88,6 +88,19 @@ upload can still fail. The gate is closed while **either** reason holds, and `Re
 only the user's. A resume that finds the error reason still standing leaves the gate closed and the
 UI showing the transient-error pause, which is correct — the run is not ready to proceed.
 
+The patience clock belongs to the transient-error reason alone, and the user's hold stops it. Patience
+means "the run kept retrying and nothing ever recovered"; while the hold stands no worker is permitted to
+retry anything, so the clock would be reading an operator's coffee break as a network that never came
+back. Two consequences, both load-bearing:
+
+- A failure that lands during a pause parks its worker and starts its backoff, but can never downgrade
+  the run — `PatienceExhausted` answers no while the hold is up. Without this, a paused run auto-suspends
+  itself while the operator is away, which §4 promises can never happen.
+- `ResumeByUser` clears the clock and the failure count, exactly as `Retry now` does. The retry the
+  operator has just authorised is the first one the run has been allowed since the hold went up, so it
+  gets the full patience window and a backoff ladder starting at its first step, rather than finding the
+  budget already spent by a pause during which nothing was tried.
+
 `WaitIfPausedAsync` is deliberately not `WaitAsync`: the existing method means "I failed, count it
 against the patience". Passing through a gate must not register a failure, and must not be able to
 trigger a downgrade.
@@ -127,7 +140,8 @@ The staging figure is not decoration. A paused run keeps its compressed output o
 makes Resume cheap — and that quota is process-wide, so a run paused overnight holds it overnight.
 There is deliberately **no timeout**: an automatic downgrade would turn a pause into a suspend exactly
 when the operator is not watching, which is the opposite of what they asked for. The cost is stated on
-screen instead, and the operator decides.
+screen instead, and the operator decides. The gate's own patience is the other route to an automatic
+downgrade, and §2 closes it: it does not run while the hold stands.
 
 Two endpoints, following `/retry-now`'s shape:
 

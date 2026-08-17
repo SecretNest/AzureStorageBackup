@@ -54,7 +54,9 @@ public sealed class PauseGate : IDisposable
     private TaskCompletionSource<bool>? _release;   // non-null = paused right now
     private CancellationTokenSource? _timer;
     private int _failures;
-    private DateTimeOffset? _troubleSince;          // null = no trouble at the moment (a success clears it)
+    // null = no trouble at the moment. A success clears it, and so do Retry now and Resume — all three mean
+    // "the run is starting over from here", which is what the patience clock is entitled to measure from.
+    private DateTimeOffset? _troubleSince;
     private PauseInfo? _current;
     private bool _downgraded;
 
@@ -154,7 +156,7 @@ public sealed class PauseGate : IDisposable
 
     /// <summary>
     /// The user pressed Resume. Only lifts the user's own hold: if trouble is still keeping the gate shut,
-    /// the workers stay parked and the UI goes back to reporting the trouble, which is correct — the run is
+    /// the workers stay parked and the UI goes on reporting the trouble, which is correct — the run is
     /// not ready to proceed just because the operator is.
     /// </summary>
     public void ResumeByUser()
@@ -164,11 +166,25 @@ public sealed class PauseGate : IDisposable
             if (!_pausedByUser)
                 return;
             _pausedByUser = false;
-            // _timer is non-null exactly while a transient-error pause is running its backoff.
+
+            // The patience budget starts over, exactly as it does for Retry now (see ReleaseNow), and for the
+            // same reason: the run has not been given a single chance to retry since the hold went up, so
+            // whatever the clock accumulated in the meantime is evidence of nothing. Without this, pausing
+            // overnight after one failure means the first retry after Resume finds the ten minutes already
+            // spent and downgrades the run on the spot, with no retry window at all. Clearing _failures with
+            // it restarts the backoff ladder at its first step, which is the same fresh start seen from the
+            // other side: what the operator authorised is one more honest attempt, not the tail of an old one.
+            _troubleSince = null;
+            _failures = 0;
+
+            // _timer is non-null exactly while a transient-error pause is running its backoff, and leaving the
+            // gate shut in that case is the point: the trouble reason outlives the user's. There is nothing to
+            // relabel on the way out, either — while _timer is non-null, _current is necessarily the PauseInfo
+            // OpenLocked wrote next to it, because the only other writers are PauseByUser (which writes only
+            // when the gate was fully open, and an open gate has no timer) and ReleaseLocked (which nulls
+            // _timer first). So Current already reports TransientError.
             if (_timer is null)
                 ReleaseLocked(true);
-            else
-                _current = _current! with { Source = PauseSource.TransientError };
         }
     }
 
@@ -197,8 +213,30 @@ public sealed class PauseGate : IDisposable
         await release.WaitAsync(ct);
     }
 
+    /// <summary>
+    /// Reported while the user's hold is what the workers are parked on. <c>NextRetryAt</c> is null because there
+    /// is nothing to count down to, and the failure count is passed through as it stands rather than zeroed: if
+    /// trouble did happen (before the pause, or to a volume that was already on the wire when it was pressed),
+    /// hiding that from the operator is a lie, and it is the very number the next backoff's length comes from.
+    /// It carries no threat here — see <see cref="PatienceExhausted"/>, a user pause cannot downgrade — and
+    /// <see cref="ResumeByUser"/> resets it the moment the hold comes down.
+    /// </summary>
     private PauseInfo UserPauseInfo() =>
-        new("Paused by the user.", _userPausedSince, NextRetryAt: null, Failures: 0, PauseSource.User);
+        new("Paused by the user.", _userPausedSince, NextRetryAt: null, _failures, PauseSource.User);
+
+    /// <summary>
+    /// Has this round of trouble outlasted our patience, i.e. is it time to downgrade the run to an auto-suspend?
+    /// <para>
+    /// A standing user hold makes the answer no, whatever the clock says. What patience measures is "the run kept
+    /// retrying and nothing ever recovered"; while the user holds the gate shut, no worker is permitted to retry
+    /// anything, so the elapsed time is not evidence of a network that will not come back — it is evidence of an
+    /// operator having a coffee. Design §4 states the promise this keeps: a user pause never downgrades the run
+    /// on its own, because an automatic downgrade would turn a pause into a suspend exactly when nobody is
+    /// watching. <see cref="ResumeByUser"/> then clears the clock, so the run comes back with its full budget.
+    /// </para>
+    /// </summary>
+    private bool PatienceExhausted(DateTimeOffset now) =>
+        !_pausedByUser && _troubleSince is { } since && now - since >= _patience;
 
     private Task<bool> OpenLocked(Exception cause)
     {
@@ -206,7 +244,7 @@ public sealed class PauseGate : IDisposable
         _troubleSince ??= now;
         _failures++;
 
-        if (now - _troubleSince.Value >= _patience)
+        if (PatienceExhausted(now))
         {
             DowngradeLocked();
             return Task.FromResult(false);
@@ -228,7 +266,7 @@ public sealed class PauseGate : IDisposable
             {
                 // The timer fired, so ask first: has this round of trouble already outlasted our patience?
                 // Checking only when the gate opens is not enough — the last backoff can be as long as 5 minutes.
-                if (_troubleSince is { } since && DateTimeOffset.UtcNow - since >= _patience)
+                if (PatienceExhausted(DateTimeOffset.UtcNow))
                     DowngradeLocked();
                 else
                     ReleaseLocked(true);
