@@ -51,11 +51,20 @@ using var feeding = CancellationTokenSource.CreateLinkedTokenSource(
 
 Adding `StopToken` to the link makes Suspend and Finish-current-files cancel the prober and the
 compressor while leaving the uploaders on `working`. 7z is killed by `SevenZipCli`'s existing
-cancellation path, partial output is cleaned by `MoveToStaged`'s catch, and the queues are released by
-`DrainQueues` as they already are. The uploaders finish the volume in hand and write the journal,
+cancellation path, its partial output is deleted by `SevenZipCompressor`'s own catch, and the queues are
+released by `DrainQueues` as they already are. The uploaders finish the volume in hand and write the journal,
 which is the only in-flight work worth finishing.
 
 `StopNow` is unchanged: it fires `_abort` → `working`, which cancels everything including uploads.
+
+Two corrections found while implementing this, both now in the code. The cleanup is **not**
+`MoveToStaged`'s catch — that one only fires when the move itself fails after a compression already
+succeeded. It is `SevenZipCompressor`'s, and the pack path did not have one at all: it cleaned up only
+on the "7z dropped a member" exit code, so a cancelled pack compression left its volumes behind. That
+was unreachable in practice while interrupting a compression took `StopNow`; this change makes it
+ordinary. And the cleanup both paths did have matched only *finished* volumes (`name.7z.001`), while a
+cancelled 7z leaves `name.7z.001.tmp` — it renames each volume only once complete. So the file a
+cancellation actually produces was precisely the one the cleanup could not see.
 
 ### 2. `PauseGate` learns a second reason to be closed
 

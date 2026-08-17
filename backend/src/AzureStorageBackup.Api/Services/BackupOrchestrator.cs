@@ -877,8 +877,14 @@ public sealed class BackupOrchestrator(
             {
                 while (await work.DequeueAsync(feeding.Token) is { } item)
                 {
-                    // Work that has not started yet is not done after a stop. The item already started is
-                    // unaffected — the promise "finish the current item, then stop" is kept right at this spot.
+                    // Work that has not started yet is not done after a stop.
+                    //
+                    // The item already in hand is a different matter here than it used to be, and than it is on
+                    // the upload side. "Finish the current item, then stop" is a promise about work worth
+                    // finishing, and a probe's is not: its content identity is persisted nowhere, so a stop
+                    // cancels feeding.Token and cuts the read off mid-file rather than making the operator wait
+                    // for a hundred gigabytes to be hashed for nothing. The promise still holds where it means
+                    // something — an uploader on working.Token finishes its volume and journals it.
                     if (control is { Stop: not StopKind.None })
                         break;
 
