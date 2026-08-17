@@ -1523,16 +1523,40 @@ public sealed class BackupOrchestrator(
 
     /// <summary>Decide which blob this content finally lands on: probe through the pre-filter first (on a dedup hit
     /// nothing is compressed at all), otherwise do hashing + compression in one read pass, then use the resulting
-    /// hash to decide dedup/collision avoidance and upload.</summary>
+    /// hash to decide dedup/collision avoidance and upload.
+    /// <para>
+    /// Kept as the single-worker composition of the two halves: the pipelined path (a later task) calls
+    /// <see cref="StageBlobAsync"/> and <see cref="UploadStagedBlobItemAsync"/> from two different loops, and the
+    /// retry inside a pack demotion (see ProcessPackAsync) still wants "do the whole thing here and now", so this
+    /// composition stays around as the single-item entry point for both callers.
+    /// </para>
+    /// </summary>
     private async Task<BlobPlacement> PlaceBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
         VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state, BackupRunControl? control,
         CancellationToken ct)
     {
+        // 1. Pre-filter + probe. On a hit it ends right here: not one byte is compressed or uploaded.
+        if (await ProbeAndResumeAsync(request, file, localPath, localResolver, uploadTracker, control, ct) is { } hit)
+            return hit;
+
+        // 2 + 3. Compress (the future compress half) and upload (the future upload half), still called back to back
+        // by this one worker — see the cut rationale on StageBlobAsync.
+        var stagedBlob = await StageBlobAsync(request, file, localPath, storeOnly, uploadTracker, state, ct);
+        return await UploadStagedBlobItemAsync(
+            request, file, stagedBlob, addressing, localResolver, uploadScope, uploadTracker, state, control, ct);
+    }
+
+    /// <summary>Dedup/resume pre-filter for the single-file path: both tiers settle the item without compressing a
+    /// single byte, so this runs before anything is staged. Returns null when neither tier matched, meaning the
+    /// caller must fall through to <see cref="StageBlobAsync"/>.</summary>
+    private async Task<BlobPlacement?> ProbeAndResumeAsync(
+        BackupRequest request, PlannedFile file, string localPath, LocalDedupResolver localResolver,
+        StageTracker uploadTracker, BackupRunControl? control, CancellationToken ct)
+    {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
-        // 1. Pre-filter + probe. On a hit it ends right here: not one byte is compressed or uploaded.
         if (await ProbeForDedupAsync(localPath, headBytes, localResolver, uploadTracker, ct) is { } p)
         {
             // First tier: the copy the previous run already confirmed as uploaded. Both path **and** content must
@@ -1548,12 +1572,46 @@ public sealed class BackupOrchestrator(
                 return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
         }
 
-        // 2. One read pass: compute the three-segment hash while feeding the bytes into 7z (or copying them straight into a raw temp file).
+        return null;
+    }
+
+    /// <summary>The archive on disk plus the handoff that owns its pool quota — everything
+    /// <see cref="UploadStagedBlobItemAsync"/> needs to finish the item, and everything that must be released
+    /// exactly once if it never gets that far.</summary>
+    private sealed record StagedBlob(BlobContent Content, StagedHandoff Handoff);
+
+    /// <summary>Compress half of the single-file path: one read pass computes the three-segment hash while feeding
+    /// the bytes into 7z (or copying them straight into a raw temp file).
+    /// <para>
+    /// Deliberately takes **no** <see cref="LocalDedupResolver"/> and **no** <see cref="VolumeUploadScope"/> —
+    /// that is the whole point of the cut. <see cref="LocalDedupResolver.ResolveAsync"/> can block this call
+    /// waiting on <c>Reservation.Completion</c> when another item in the same batch is uploading identical
+    /// content, which is a wait on someone else's network; keeping that call (and the volume gate it feeds) out of
+    /// this method is what lets a later task run compression and upload as two independently-paced loops instead
+    /// of one worker doing both in sequence.
+    /// </para>
+    /// </summary>
+    private async Task<StagedBlob> StageBlobAsync(
+        BackupRequest request, PlannedFile file, string localPath, bool storeOnly,
+        StageTracker uploadTracker, RunState state, CancellationToken ct)
+    {
+        var headBytes = request.Options.Diff.HeadHashBytes;
         var (content, staged) = await StreamAndStageAsync(
             request, localPath, file.Path, storeOnly, headBytes, uploadTracker, state, ct);
+        return new StagedBlob(content, new StagedHandoff(staging, staged));
+    }
+
+    /// <summary>Upload half of the single-file path: the name is only known once compression finishes, so dedup and
+    /// collision avoidance are decided here, followed by the actual upload (or, on a dedup hit, no upload at all).
+    /// </summary>
+    private async Task<BlobPlacement> UploadStagedBlobItemAsync(
+        BackupRequest request, PlannedFile file, StagedBlob stagedBlob, BlobAddressScheme addressing,
+        LocalDedupResolver localResolver, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
+        BackupRunControl? control, CancellationToken ct)
+    {
+        var content = stagedBlob.Content;
         try
         {
-            // 3. The name is only known once compression finishes, so dedup and collision avoidance are decided here.
             // Purely local decision: cross-version lookups against the map, and within this batch a reservation
             // coordinates things (same content shares ref/raw/volume count, different content steps aside). No cloud reads.
             var res = await localResolver.ResolveAsync(
@@ -1561,27 +1619,34 @@ public sealed class BackupOrchestrator(
             if (res.Exists)
             {
                 var existing = res.Existing!;
+                // Compressed for nothing, but the pool quota must go back immediately all the same.
+                stagedBlob.Handoff.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, existing.Volumes, existing.VolumeSizes,
                     content with { Raw = existing.Raw }); // the existing blob's actual raw flag wins
             }
             try
             {
                 var (volumes, sizes) = await UploadStagedBlobAsync(
-                    request, res.Ref, staged, content, addressing, uploadScope, uploadTracker, state,
-                    file.Path, control, ct);
+                    request, res.Ref, stagedBlob.Handoff.Staged!, content, addressing, uploadScope, uploadTracker,
+                    state, file.Path, control, ct);
                 res.Complete(content.Raw, volumes, sizes); // wake the later arrivals with the same content in this batch and hand them the same storage info
+                stagedBlob.Handoff.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
             }
             catch (Exception ex)
             {
-                res.Fail(ex);   // fail the waiters along with it; never dedup onto a blob that was not uploaded successfully
+                res.Fail(ex);                       // fail the waiters along with it; never dedup onto a blob that was not uploaded successfully
+                stagedBlob.Handoff.MarkSettled();   // the waiters have been answered; Dispose must not answer them twice
                 throw;
             }
         }
         finally
         {
-            // On a dedup hit this archive was compressed for nothing, but it still has to go back to the staging area immediately — it occupies backpressure quota.
-            staging.Release(staged);
+            // On a dedup hit this archive was compressed for nothing, but it still has to go back to the staging
+            // area immediately — it occupies backpressure quota. Routed through the handoff (not a bare
+            // staging.Release(staged)) so that the same call also covers the discarded-before-upload case once a
+            // later task starts queuing StagedBlob values between two independently-paced loops.
+            stagedBlob.Handoff.Dispose();
         }
     }
 
