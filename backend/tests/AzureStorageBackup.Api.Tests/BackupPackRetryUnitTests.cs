@@ -80,8 +80,16 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     /// two groups — a multi-group scene **without touching the code under test**.
     /// It also records how many times each pack number was compressed, to answer "did the group that had already
     /// uploaded get recompressed".
+    /// <para>
+    /// <paramref name="maxMutations"/> caps how many times it will do that. Leave it alone and the member changes on
+    /// every whole-group compression, which is what "a file that keeps being rewritten" looks like. Set it to 1 and
+    /// the file settles instead: the group's first pass excludes it, and any later pass over the same member list
+    /// finds it unchanged since **that pass's** snapshot and takes it back in — which is the scene where a retry can
+    /// store a member the earlier verdict had already sent somewhere else.
+    /// </para>
     /// </summary>
-    private sealed class MutatingCompressor(IFileCompressor inner, string root) : IFileCompressor
+    private sealed class MutatingCompressor(IFileCompressor inner, string root, int maxMutations = int.MaxValue)
+        : IFileCompressor
     {
         private readonly List<string> _compressed = [];
         private int _mutations;
@@ -111,9 +119,10 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 // then the old whole-item retry behaviour would masquerade as correct (only one group left after a
                 // blip), and the test would lose all its discriminating power.
                 var n = Interlocked.Increment(ref _mutations);
-                File.WriteAllBytes(
-                    Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)),
-                    new byte[33_000 + (n * 1_000)]);
+                if (n <= maxMutations)
+                    File.WriteAllBytes(
+                        Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)),
+                        new byte[33_000 + (n * 1_000)]);
             }
 
             return inner.CompressAsync(request, ct);
@@ -154,6 +163,57 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                     trip = _packs.Add(id) && _packs.Count == nth;
                 }
                 if (trip && Interlocked.Exchange(ref _thrown, 1) == 0)
+                    throw new AggregateException("Retry failed after 6 tries.", new TaskCanceledException("timeout"));
+            }
+            return call();
+        }
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata));
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry, CancellationToken ct, IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
+            => GateAsync(blobName, () => inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress));
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath, AccessTier tier,
+            RetryOptions? retry = null, CancellationToken ct = default, IReadOnlyDictionary<string, string>? metadata = null)
+            => GateAsync(blobName, async () =>
+            {
+                await inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+                return true;
+            });
+    }
+
+    /// <summary>
+    /// Blip once on the pool's <paramref name="ordinal"/>th group, named by its pack number rather than by when its
+    /// upload happens to arrive.
+    /// <para>
+    /// <see cref="FlakyOnNthPack"/> counts the order the uploads turn up in, and since compression and upload became
+    /// separate stages that order is a race: the compressor hands group 1 to one uploader and group 2 to another a
+    /// few milliseconds later, and either can reach the wire first. A test that means "blip on the group the
+    /// compressor has already moved on from" has to say which group, not which arrival.
+    /// </para>
+    /// <para>
+    /// Pack numbers come from <c>RunState.NextPackId</c>: a per-run random tag followed by a four-digit counter, so
+    /// the pool's first group always ends in 0001.
+    /// </para>
+    /// </summary>
+    private sealed class FlakyOnGroup(IBlobUploader inner, int ordinal) : IBlobUploader
+    {
+        private readonly string _suffix = ordinal.ToString("D4");
+        private int _thrown;
+
+        private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
+        {
+            if (blobName.StartsWith("packs/", StringComparison.Ordinal))
+            {
+                // Volume names are packs/{id}.7z.001, so cutting at the first ".7z" leaves the pack id either way.
+                var id = blobName[..blobName.IndexOf(".7z", StringComparison.Ordinal)];
+                if (id.EndsWith(_suffix, StringComparison.Ordinal) && Interlocked.Exchange(ref _thrown, 1) == 0)
                     throw new AggregateException("Retry failed after 6 tries.", new TaskCanceledException("timeout"));
             }
             return call();
@@ -381,6 +441,86 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
             Assert.Equal(referenced, inContainer);   // no orphan pack in the container that the index cannot reach
             Assert.Equal(2, referenced.Count);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// A member the first compression pass threw out must not come back in the retry's archive. The compressor acted
+    /// on that pass's verdict the moment it was given: the member was re-read under its new hash and re-queued into
+    /// a later group, which has its own pack number and stores it there.
+    /// <para>
+    /// A retry that re-judges the **original** member list finds that member unchanged since its own snapshot — it
+    /// settled the instant it was rewritten — and takes it back in. The same content then sits in two packs, and two
+    /// uploader threads write <c>storageByPath[path]</c> with nothing ordering them, so which one the index ends up
+    /// with is a coin toss. The losing shape is the dangerous one: the entry carries the new hash from
+    /// <c>overrides</c> while pointing at the pack that recorded the member under its stale diff-time hash, and the
+    /// other pack is left in the container referenced by nobody.
+    /// </para>
+    /// <para>
+    /// Before the pipeline split this could not happen — one worker compressed and uploaded a group back to back, so
+    /// the verdict it acted on was always the final pass's. The blip is on the **first** pack here, precisely so
+    /// that the retry's re-judgement lands on a member list the compressor has already moved on from.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_retry_does_not_store_a_member_the_first_pass_already_re_queued()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        // One mutation only: m3 is excluded from group 1 and then stays put, so the retry sees it as stable.
+        var compressor = new MutatingCompressor(new SevenZipCompressor(), _root, maxMutations: 1);
+        var flaky = new FlakyOnGroup(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), ordinal: 1);
+        var (orchestrator, factory, store) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-dup", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            var result = await orchestrator.RunAsync(Request(account, name), null, default, control);
+            Assert.Equal(1, result.Version);
+
+            // Precondition for this scene: the pool really was cut into two groups by the excluded member.
+            Assert.Equal(2, compressor.Compressed.Distinct(StringComparer.Ordinal).Count());
+
+            var firstPack = compressor.Compressed[0];
+            // The other half of the precondition, and the one the assertions below cannot speak for: the blip has to
+            // have fired. FlakyOnGroup picks its victim by pack number and by the ".7z" cut in the blob name, and if
+            // either ever stops matching, group 1 compresses twice, uploads once, records the five members it kept,
+            // and every assertion below passes while the defect this test guards goes completely unexercised — with
+            // nothing else in the suite covering it. Three compressions of the same pack id is what says otherwise:
+            // the full six, the five that were left when m3 dropped out, and the retry the blip forced.
+            Assert.Equal(3, compressor.Compressed.Count(p => p == firstPack));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            // The first group's pack holds the five members that pass kept, and only those. Six means the retry took
+            // the re-queued one back in, so the same content is in this archive **and** in the pack the compressor
+            // built for it a moment later.
+            //
+            // This has to be asked of the member list rather than of the container, because the duplicate hides: the
+            // two writes to storageByPath race, the index keeps one of them, and the first run's orphan sweep then
+            // deletes the archive nobody kept and prunes it out of info.Packs. What is left behind is a pack whose
+            // recorded members no longer describe what the index says is in it — which check reports and dead-weight
+            // compaction miscounts, long after the run that caused it reported success.
+            Assert.Equal(5, info!.Packs[firstPack].Members.Count);
+
+            var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
+            Assert.Equal(referenced, inContainer);
+
+            // Every index row has to agree with the pack it points at. PackInfo.Members is the list of member content
+            // hashes, so a row whose hash is missing from its own pack is exactly the shape above: the entry carries
+            // the member's settled hash while the pack recorded it under the stale diff-time one.
+            var index = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
+            foreach (var e in index.Entries.Where(e => e.Storage is { Kind: "pack" }))
+                Assert.True(
+                    info.Packs[e.Storage!.Ref!].Members.Contains(e.FullHash, StringComparer.Ordinal),
+                    $"{e.Path} points at pack {e.Storage.Ref}, which does not record its content hash.");
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }

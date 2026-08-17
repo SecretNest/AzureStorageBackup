@@ -8,6 +8,7 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// Compression is globally non-concurrent (one compression lock); output is written to compress-temp first, then the whole set moves into staged-temp.
 /// staged-temp has a byte ceiling: the next compression only starts while we are below it (a single result is allowed to overshoot temporarily);
 /// once over it, new compressions block until an upload calls <see cref="ReleaseFile"/> / <see cref="Release"/> and frees space.
+/// The one exception is <see cref="StageWithoutBackpressureAsync"/>, for callers the release itself depends on — see the reasoning there.
 /// <para>
 /// Release granularity is a **single volume**, not the whole family: a large file splits into thousands of volumes, and deleting only
 /// after the whole family is uploaded makes peak usage equal the entire archive (a 100 GB file needs 100 GB of temp space — that one has
@@ -190,11 +191,52 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     /// <param name="lease">
     /// This run's seat (see <see cref="AcquireLease"/>). Pass null to opt out of the allowance split and be bounded only by the global ceiling.
     /// </param>
-    public async Task<StagedItem> StageAsync(
+    public Task<StagedItem> StageAsync(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
         StagingLease? lease = null,
         CancellationToken ct = default,
         StageTracker? tracker = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: true);
+
+    /// <summary>
+    /// Stage an archive **without waiting for room**: same files, same accounting, same global compression lock —
+    /// only the backpressure wait is skipped.
+    /// <para>
+    /// This exists for one caller and one caller only: <b>a thread the quota depends on to come back</b>. Everything
+    /// in this pool is released by an upload — volume by volume as it sends, or in one go when a dropped archive is
+    /// disposed — so an uploader that parks in <see cref="WaitForRoomAsync"/> is waiting for itself. One doing it is
+    /// merely slow; all of them doing it at once is permanent. That is not a hypothetical: a network outage trips
+    /// every in-flight upload into the suspend gate together, the compression side meanwhile fills the pool to the
+    /// ceiling exactly as it is designed to, and when the gate's timer releases every waiter in one go they all come
+    /// back here to recompress what they have to resend. Nobody is left holding an archive to release, and the run
+    /// freezes with no error, no progress, and no way out but "Stop now" or a restart.
+    /// </para>
+    /// <para>
+    /// The overshoot this permits is bounded and is the same trade <see cref="HasRoom"/> already makes: it lets an
+    /// item starting from zero begin even when its output is bound to exceed the allowance, because the alternative
+    /// is that the work can never happen at all. Here the caller is *replacing* an archive this pool already admitted
+    /// once, and at most one per uploader is in hand at a time, so the ceiling is exceeded by at most that many
+    /// archives before the ordinary gate binds again.
+    /// </para>
+    /// <para>
+    /// It is a separate entry point rather than a flag on the gate deliberately: <see cref="StageAsync"/> keeps the
+    /// exact semantics every other caller already relies on, and the compression stage — the one this backpressure
+    /// exists to pace — must never reach this method.
+    /// </para>
+    /// </summary>
+    public Task<StagedItem> StageWithoutBackpressureAsync(
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
+        StagingLease? lease = null,
+        CancellationToken ct = default,
+        StageTracker? tracker = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: false);
+
+    private async Task<StagedItem> StageCoreAsync(
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
+        StagingLease? lease,
+        CancellationToken ct,
+        StageTracker? tracker,
+        bool waitForRoom)
     {
         // Count as "queued" the moment we enter here: the compression lock is global, so we will most likely idle a while, and
         // idling is indistinguishable to the user from "not picked up yet". Only flip to "preparing" once we hold the lock.
@@ -207,6 +249,15 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             // compression lock, and other runs cannot even start compressing. Handing anyone more quota saves nobody; it just deadlocks for a different reason.
             while (true)
             {
+                if (!waitForRoom)
+                {
+                    // The backpressure wait is the only thing skipped. The compression lock is still taken, so
+                    // compression stays globally serial and this caller queues behind whoever holds it — including
+                    // the compression stage, which is waiting for room outside the lock and therefore is not in the way.
+                    await _compressLock.WaitAsync(ct);
+                    break;
+                }
+
                 await WaitForRoomAsync(lease, ct);
 
                 await _compressLock.WaitAsync(ct);

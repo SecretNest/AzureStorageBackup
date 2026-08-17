@@ -327,8 +327,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// that really came to rest as <see cref="RunStatus.Suspended"/>.
     /// <para>
     /// Shutdown path only, and it has to be honest about what it cannot do: <see cref="StopKind.Suspend"/> deliberately
-    /// does not touch the AbortToken, and the consumer loop only exits before starting the **next** item, so the item in
-    /// hand — possibly a multi-GB upload — is left to run to completion. The wait here is therefore **capped**
+    /// does not touch the AbortToken, and each pipeline stage only exits before starting the **next** entry, so what an
+    /// uploader has in hand — possibly a multi-GB upload — is left to run to completion. The wait here is therefore **capped**
     /// (<see cref="SuspendWaitCap"/>): a run that has not flushed by the deadline is abandoned mid-flight, and at the next
     /// start it is an interrupted run **with no marker**, which the operator has to Resume by hand; it is not picked up automatically.
     /// </para>
