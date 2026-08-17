@@ -281,9 +281,12 @@ public sealed class BackupRunControl(
     }
 
     /// <summary>Record a single-file blob. **Only** call this after the upload confirmation has returned.</summary>
+    /// <param name="mtimeUtc">The source file's last-write time **from before the read** that produced the hashes
+    /// (see <see cref="JournalRecord.MtimeUtcTicks"/>) — the caller already has it on the <c>BlobContent</c> that
+    /// carries those hashes, captured for exactly this reason.</param>
     public async Task RecordBlobAsync(
         string path, string blobRef, string fullHash, string headHash, string tailHash, long length,
-        int volumes, bool raw, IReadOnlyList<long> volumeSizes, CancellationToken ct)
+        DateTimeOffset mtimeUtc, int volumes, bool raw, IReadOnlyList<long> volumeSizes, CancellationToken ct)
     {
         if (_journal is null)
             return;
@@ -291,6 +294,7 @@ public sealed class BackupRunControl(
         {
             Kind = "blob", Ref = blobRef, Path = path, FullHash = fullHash, HeadHash = headHash,
             TailHash = tailHash, Length = length, Volumes = volumes, Raw = raw, VolumeSizes = volumeSizes,
+            MtimeUtcTicks = mtimeUtc.UtcTicks,
         }, ct);
     }
 

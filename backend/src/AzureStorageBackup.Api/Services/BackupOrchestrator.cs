@@ -2145,7 +2145,8 @@ public sealed class BackupOrchestrator(
         if (control is not null && !placement.Resumed)
             await control.RecordBlobAsync(
                 file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
-                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
+                content.Mtime, Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes],
+                CancellationToken.None);
 
         // The collision warning is an after-the-fact report once the content has been processed/uploaded
         // successfully, and it never touches the source file again — which is why this whole method sits **outside**

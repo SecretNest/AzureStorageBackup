@@ -47,6 +47,20 @@ public sealed record JournalRecord
     public long Length { get; init; }
     public bool Raw { get; init; }
 
+    /// <summary>
+    /// The source file's last-write time when this blob was uploaded, as UTC ticks.
+    /// <para>
+    /// Nullable because journals written before this field existed must keep working: null means "this record
+    /// cannot answer the cheap question", and the resume falls back to reading the file exactly as it did
+    /// before. No format version and no migration — an absent field deserialises to null.
+    /// </para>
+    /// <para>
+    /// Ticks rather than a formatted timestamp so the comparison is exact. A round trip through a rendered
+    /// time is where "equal" quietly stops meaning equal.
+    /// </para>
+    /// </summary>
+    public long? MtimeUtcTicks { get; init; }
+
     // pack only, below
     public bool StoreOnly { get; init; }
     public IReadOnlyList<JournalMember> Members { get; init; } = [];

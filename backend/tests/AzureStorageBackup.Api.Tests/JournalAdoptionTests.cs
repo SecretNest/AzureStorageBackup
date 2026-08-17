@@ -224,7 +224,8 @@ public sealed class JournalAdoptionTests : IDisposable
         await using (var control = await OpenAsync("run-same"))
         {
             Assert.Equal(1, control.Resume.RecordCount);
-            await control.RecordBlobAsync("b.bin", "data/b", "fb", "hb", "tb", 7, 1, false, [7], default);
+            await control.RecordBlobAsync(
+                "b.bin", "data/b", "fb", "hb", "tb", 7, DateTimeOffset.UnixEpoch, 1, false, [7], default);
         }
 
         var content = await BackupJournal.ReadAsync(planted, default);
