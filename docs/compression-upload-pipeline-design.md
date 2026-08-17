@@ -106,6 +106,9 @@ The compressor's only blocking point is the staging quota. That is the entire po
 **`StagedLimitBytes` becomes the sole backpressure on the compression side**, and the pool fills to
 the configured ceiling instead of to whatever the worker pool happens to allow.
 
+It is a ceiling on the compression stage, not a hard ceiling on the pool — see §3 and "What this does
+not do": an uploader recompressing after a failed upload deliberately steps over it.
+
 The visible consequence is that `N objects waiting for the archive slot` starts appearing in the
 in-flight line during steady state. That line is not a warning — it is the evidence that the limit
 is binding, and its absence today is the bug.
@@ -314,20 +317,29 @@ both are exceptional rather than steady state:
 
 - **A pack member demoted to a single file uploads on the compressor's thread.** When a member grows
   past `SingleFileThresholdBytes` while its group is being compressed, `ProcessPackAsync`
-  (`BackupOrchestrator.cs:2633-2636`) hands it to `HandleBlobAsync` → `PlaceBlobAsync`, which
+  (`BackupOrchestrator.cs:2687-2690`) hands it to `HandleBlobAsync` → `PlaceBlobAsync`, which
   compresses *and* uploads it inline — behind the volume gate and behind the network — with the
   compression stage stopped for the duration. It needs a member to change size mid-compression, so it
   is rare; keeping it where it is keeps `queue`/`attempts` single-threaded inside one
   `ProcessPackAsync` invocation (§4), which is the reason the demotion is not worth moving.
 - **The stranded-member tail compresses on an uploader's thread.** When a group's retry excludes
   members the handed-over pass had kept, the uploader runs a standalone `ProcessPackAsync` for them
-  (`:1081`), with no dispatch — so that call compresses as well as uploads. It needs a transient
+  (`:1104`), with no dispatch — so that call compresses as well as uploads. It needs a transient
   upload failure *and* a member rewritten inside the gate's wait window. This is one of the three
   places §3's quota bypass applies.
 
+**It does not make `StagedLimitBytes` a hard ceiling on the pool.** It is a ceiling on the
+*compression stage*. An uploader that recompresses after a failed upload bypasses the quota wait
+deliberately (§3), because waiting there is what deadlocked the pipeline. Each uploader holds at most
+one archive at a time, so the overshoot is bounded by `UploadConcurrency + 1` archives — and only
+while uploads are failing, which is to say only when the run is already degraded. An operator sizing
+the staging volume should leave that much headroom above the configured limit; the backend does not
+validate free space, and `StagingArea` fails the backup outright if the disk fills.
+
 So the honest form of the guarantee is: **in steady state the compression stage is never blocked by
 the upload stage and never waits on the probe's disk reads**; on two exception paths, one stage does
-the other's work for the length of one item.
+the other's work for the length of one item; and on the retry path the pool may exceed the configured
+limit by up to `UploadConcurrency + 1` archives.
 
 **It does not make the probe faster in isolation.** One prober reads no quicker than one prober did
 before; what changes is that its reads now overlap compression instead of competing with five siblings

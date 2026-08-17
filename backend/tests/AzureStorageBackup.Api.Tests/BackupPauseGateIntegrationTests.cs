@@ -115,12 +115,18 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
     private sealed class FlakyUploader(IBlobUploader inner, int failures) : IBlobUploader
     {
         private int _left = failures;
+        private int _attempts;
 
-        public int Attempts { get; private set; }
+        /// <summary>
+        /// Interlocked, not a plain increment: several uploaders call this concurrently, and the deadlock test
+        /// asserts on an exact expected call count with no slack. One lost update there turns that test red for
+        /// a reason that has nothing to do with what it is testing.
+        /// </summary>
+        public int Attempts => Volatile.Read(ref _attempts);
 
         private void Gate()
         {
-            Attempts++;
+            Interlocked.Increment(ref _attempts);
             if (Interlocked.Decrement(ref _left) >= 0)
                 throw new AggregateException("Retry failed after 6 tries.", new TaskCanceledException("timeout"));
         }
@@ -407,6 +413,10 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
             {
                 await abort.CancelAsync();
                 _ = run.ContinueWith(static t => _ = t.Exception, TaskScheduler.Default);
+                // Assert.Fail unwinds past the `using` above, after which the sampler's next touch of the token
+                // throws an ObjectDisposedException its catch does not cover — and that, not the diagnosis below,
+                // would be the failure the test reports.
+                await sampling.CancelAsync();
                 Assert.Fail(
                     "the run never finished. Every uploader had gone back to recompress what it has to resend, and "
                     + $"they were all waiting for staging room in a 4,000,000-byte pool holding {staging.StagedBytes} "

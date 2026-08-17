@@ -1554,6 +1554,13 @@ public sealed class BackupOrchestrator(
         catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
         {
             // The diff was told to stop: either the upload side failed, or the user issued a stop.
+            //
+            // A stop that already settled inside the try above lands here as well: SettleStopAsync returns an
+            // OperationCanceledException for every kind but Suspend, and RequestStop has already cancelled
+            // stopProducing, so this filter matches it. SettleStopAsync therefore runs a **second** time —
+            // PurgeInFlightAsync re-lists a container it has already emptied, and the journal is fsynced again with
+            // nothing pending. Both are idempotent, so the outcome and the exception the user sees are unchanged;
+            // the cost is one extra container listing on a path that is already winding down.
             await SettleAsync(consumers);
             DrainQueues();
             if (control is { Stop: var stopped } && stopped != StopKind.None)
