@@ -78,6 +78,20 @@ public sealed class PauseGate : IDisposable
     public bool IsDowngraded { get { lock (_lock) return _downgraded; } }
 
     /// <summary>
+    /// Is the user's own hold standing? Ask this rather than reading <c>Current.Source</c>, which cannot answer it
+    /// on its own: a pause pressed while a transient-error backoff is running leaves <see cref="Current"/>
+    /// reporting the backoff (with its countdown and its Retry-now affordance) until that backoff's timer fires,
+    /// up to one steady interval — five minutes by default. A pause the operator can neither see nor distinguish
+    /// from "stuck, retrying shortly" is a pause that looks like it did nothing.
+    /// <para>
+    /// The two facts are deliberately kept separate instead of having the pause overwrite the trouble: a run can
+    /// genuinely be both paused and mid-backoff, and callers that must know which to show would have no way back
+    /// to the discarded half.
+    /// </para>
+    /// </summary>
+    public bool IsPausedByUser { get { lock (_lock) return _pausedByUser; } }
+
+    /// <summary>
     /// Wait at the gate.
     /// </summary>
     /// <returns>true = released, go retry; false = already downgraded, the caller should take the suspend-and-exit path.</returns>
@@ -304,6 +318,14 @@ public sealed class PauseGate : IDisposable
     private void DowngradeLocked()
     {
         _downgraded = true;
+
+        // The user's hold ends here with everything else: a downgraded run is suspending, not pausing, and it
+        // will never wait at this gate again. Clearing the flag before ReleaseLocked also keeps the downgrade
+        // from depending on that method's `proceed &&` half to pierce the hold — the release below is
+        // unconditional either way, and nothing left behind can claim afterwards that the operator is holding
+        // a run that has already gone.
+        _pausedByUser = false;
+
         ReleaseLocked(false);
     }
 

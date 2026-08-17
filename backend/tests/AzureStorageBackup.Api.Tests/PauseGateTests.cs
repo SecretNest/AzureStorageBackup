@@ -298,4 +298,48 @@ public class PauseGateTests
         await waiting.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(gate.IsDowngraded);
     }
+
+    /// <summary>
+    /// A standing user hold has to be knowable even while <see cref="PauseGate.Current"/> is reporting a
+    /// transient-error backoff, because Current carries one source and the backoff wins it. Pressing Pause during
+    /// a backoff would otherwise be invisible for up to one steady interval — five minutes by default — and the
+    /// frontend, which renders paused-ness from the pause it is given, would show a paused run as "stuck,
+    /// retrying in 4:37" with a Retry-now button, i.e. as if the Pause had done nothing at all.
+    /// </summary>
+    [Fact]
+    public void A_User_Pause_Is_Visible_While_A_Backoff_Is_Running()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1), patience: TimeSpan.FromHours(1));
+        Assert.False(gate.IsPausedByUser);
+
+        var trouble = gate.WaitAsync(new IOException("network down"), CancellationToken.None);
+        gate.PauseByUser();
+
+        Assert.True(gate.IsPausedByUser, "the operator pressed Pause and nothing has lifted the hold");
+
+        // The other half of the truth is left where it was on purpose: the run IS also in a backoff, and both
+        // facts are now readable. Which of them to show, and how, is the frontend's problem.
+        Assert.Equal(PauseSource.TransientError, gate.Current!.Source);
+        Assert.NotNull(gate.Current.NextRetryAt);
+        Assert.False(trouble.IsCompleted);   // released by the gate's Dispose; nothing here needs to await it
+    }
+
+    /// <summary>
+    /// A downgrade ends the user's hold along with everything else — it is the run agreeing to suspend, not a
+    /// pause any more. Inert while nothing could observe the flag; a trap the moment <c>IsPausedByUser</c> exists,
+    /// because a suspended run would go on claiming to be paused.
+    /// </summary>
+    [Fact]
+    public void A_Downgrade_Ends_The_User_Hold()
+    {
+        using var gate = new PauseGate();
+        gate.PauseByUser();
+        Assert.True(gate.IsPausedByUser);
+
+        gate.Downgrade();
+
+        Assert.True(gate.IsDowngraded);
+        Assert.False(gate.IsPausedByUser, "a downgraded gate must not go on claiming a user hold");
+    }
 }
