@@ -986,148 +986,33 @@ EOF
 
 ---
 
-### Task 5: Drain both queues on stop and on downgrade
+### Task 5: The three acceptance tests the design still owes
 
-The staged queue can now hold up to the whole staging limit. Two exits must empty it, or that much quota stays booked on the singleton: a user stop, and the pause gate's downgrade — `PauseGate.cs:23-27` warns that a suspended run holding the staging seat "blocks every parallel backup completely", and this change makes the amount it can hold much larger.
+**Task 4 already landed this task's implementation work.** It had to: four existing resume/stop tests went red without stop rechecks in the compressor and uploader plus a `DrainQueues()`, because a prober that races ahead makes the old single `break` meaningless — the stop had nothing left to prevent. The original plan called `DrainQueues` from `SettleStopAsync`, which runs *after* the consumers settle and would have been a no-op.
 
-Per the decision recorded in the spec: entries an uploader has already claimed run to completion; entries still in the queue are discarded.
+So what remains is evidence. Of the six tests `docs/compression-upload-pipeline-design.md` lists, three have landed:
 
-**Files:**
-- Modify: `backend/src/AzureStorageBackup.Api/Services/BackupOrchestrator.cs` (`SettleStopAsync` at `:501-515`, and the catch blocks at `:1007-1021`)
-- Test: `backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs`
+- compression proceeds while every uploader is blocked — `CompressionContinuityTests` (Task 4)
+- downgrade releases everything queued — the F1 regression test asserts `StagedBytes == 0` after an auto-suspend that kills every uploader (`BackupPauseGateIntegrationTests`)
+- upload failure recompresses under the same pack id — existing `BackupPackRetryUnitTests` plus F2's new test
 
-**Interfaces:**
-- Consumes: `probedQueue`, `stagedQueue`, `ProbedItem` and `PendingUpload` from Task 4.
-- Produces: `void DrainQueues()` — local function in `RunAsync`.
-
-- [ ] **Step 1: Write the failing test**
-
-```csharp
-/// <summary>
-/// Stop with a full queue: everything compressed but unclaimed is discarded, and its quota goes back. The quota
-/// lives on a process-wide singleton, so anything left booked here stays booked until the process restarts and
-/// throttles every other backup on the machine.
-/// </summary>
-[Fact]
-public async Task Stop_Releases_Everything_Still_Queued()
-{
-    if (!AzuriteReachable() || !SevenZip())
-        return;
-
-    for (var i = 0; i < 12; i++)
-        WriteFile($"f{i}.bin", 2 * 1024 * 1024);
-
-    var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-    var factory = new BlobClientFactory();
-    var (orchestrator, staging, request) = Build(
-        new BlockingUploader(block.Task, new BlobUploader(factory)),
-        stagingLimit: 200_000_000, uploadConcurrency: 2);
-
-    var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
-    await using var control = new BackupRunControl(journals, configId: 1, runId: "stop-drain");
-
-    var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
-    await WaitUntil(() => staging.StagedBytes > 4L * FileSize, TimeSpan.FromSeconds(60));
-
-    // FinishCurrentFiles is the ordinary stop: the item in hand finishes, nothing new starts. Everything the
-    // compressor produced that no uploader claimed has to be handed back.
-    control.RequestStop(StopKind.FinishCurrentFiles);
-    block.SetResult();
-    await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
-
-    Assert.Equal(0, staging.StagedBytes);
-    Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(_temp, "staged")));
-}
-```
-
-`BackupRunControl`'s constructor is `(BackupJournalStore store, int configId, string runId, PauseGate? gate = null)` and it is `IAsyncDisposable`; `BackupCancelModesTests` builds one the same way.
-
-- [ ] **Step 2: Run it to verify it fails**
-
-```bash
-dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj \
-  --filter "FullyQualifiedName~CompressionContinuityTests.Stop_Releases"
-```
-
-Expected: FAIL — `StagedBytes` is non-zero, and volume files are left in staged-temp.
-
-- [ ] **Step 3: Implement the drain**
-
-```csharp
-// Everything the pipeline is still carrying that no uploader has claimed. The two queues differ in what they
-// owe back:
-//
-// · stagedQueue entries own a compressed archive each. Discarding one costs local CPU only — not a byte of it
-//   reached the container — but its quota is booked on a singleton shared by every run, so leaving it booked
-//   makes this machine's other backups pay for it until the process restarts.
-// · probedQueue entries own nothing yet; nothing has been compressed. All they owe is the item ledger, or the
-//   uploading column stays permanently inflated by however many were in flight at the stop.
-void DrainQueues()
-{
-    while (probedQueue.Reader.TryRead(out _))
-        uploadTracker.EndWork();
-    while (stagedQueue.Reader.TryRead(out var pending))
-    {
-        pending.Handoff?.Dispose();   // null on a probe hit: it never had an archive
-        uploadTracker.EndWork();
-    }
-}
-```
-
-Order matters: drain `probedQueue` first. The compressor may still be running and would otherwise move an entry across into `stagedQueue` after that queue was already drained.
-
-Call it in `SettleStopAsync` before `control.FlushAsync` (`BackupOrchestrator.cs:505`), and in the `catch` blocks at `:1007-1021` after `SettleAsync(consumers)`. The downgrade path reaches `SettleStopAsync` through `BackupSuspendedException`, so both exits are covered by the same two call sites — confirm this while implementing by tracing where `BackupSuspendedException` from `WithPauseAsync` (`:1881`) is handled.
-
-- [ ] **Step 4: Run the test, then the full suite**
-
-```bash
-dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj \
-  --filter "FullyQualifiedName~CompressionContinuityTests"
-dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj
-```
-
-Expected: PASS. `BackupCancelModesTests` and `GracefulSuspendTests` are the ones to watch — they pin the stop and suspend semantics this touches.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add backend/src/AzureStorageBackup.Api/Services/BackupOrchestrator.cs \
-        backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs
-git commit -m "$(cat <<'EOF'
-fix: release the staged queue on stop and on downgrade
-
-The queue can hold up to the whole staging limit, and its quota is booked
-on a process-wide singleton. Leaving it booked on the way out throttles
-every other backup on the machine until the process restarts — the failure
-PauseGate already warns about, now with much more to leak.
-
-Claimed entries still run to completion; queued ones are discarded, which
-costs local CPU only and leaves nothing in the container.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-EOF
-)"
-```
-
----
-
-### Task 6: Prove the limit binds and the ledger balances
-
-Two claims from the spec are still unasserted: that `StagedLimitBytes` is now the binding constraint, and that the item ledger still balances with entries sitting in the queue.
+Three are still owed, and two of them cover the paths where Task 4's Critical hang lived — which is the argument for writing them rather than declaring the feature done.
 
 **Files:**
 - Modify: `backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs`
 
 **Interfaces:**
-- Consumes: everything from Tasks 4 and 5.
-- Produces: no production code.
+- Consumes: everything from Tasks 1-4. No production code should need to change; if a test cannot be written without changing production code, stop and report that — it is a finding about the design, not a licence to edit.
 
-- [ ] **Step 1: Write the tests**
+- [ ] **Step 1: The staging limit binds**
+
+This is the assertion the whole rework exists for. Before it, the worker pool saturated first and `StagedLimitBytes` had no effect at any value.
 
 ```csharp
 /// <summary>
-/// The point of the whole rework: the staging limit, not the worker pool, is what stops compression. Before it,
-/// the pool saturated first and this setting had no effect at any value.
+/// The point of the whole rework: the staging limit, not the worker pool, is what stops compression.
+/// Before it the pool saturated first, so this setting had no effect at any value — 10 GB, 2 GB and
+/// 40 GB all produced identical behaviour.
 /// </summary>
 [Fact]
 public async Task The_Staging_Limit_Is_What_Stops_Compression()
@@ -1140,8 +1025,8 @@ public async Task The_Staging_Limit_Is_What_Stops_Compression()
 
     var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     var factory = new BlobClientFactory();
-    // Four items' worth of room. HasRoom admits a caller whose current usage is below the limit, so a single
-    // archive may overshoot it — hence the slack in the assertion below.
+    // Four items' worth of room. HasRoom admits a caller whose current usage is below the limit, so a
+    // single archive may overshoot it — hence the slack in the assertion below.
     var limit = 4L * FileSize;
     var (orchestrator, staging, request) = Build(
         new BlockingUploader(block.Task, new BlobUploader(factory)),
@@ -1157,7 +1042,8 @@ public async Task The_Staging_Limit_Is_What_Stops_Compression()
     var run = orchestrator.RunAsync(request, progress);
     try
     {
-        // The compressor now queues on the quota instead of on a free worker, and says so.
+        // The compressor now queues on the quota instead of on a free worker, and says so on screen.
+        // That column reading non-zero is the visible evidence the operator never sees today.
         await WaitUntil(
             () => { lock (seen) return seen.Any(s => s.WaitingOnArchive > 0); },
             TimeSpan.FromSeconds(60));
@@ -1171,14 +1057,55 @@ public async Task The_Staging_Limit_Is_What_Stops_Compression()
 
     await run;
 }
+```
 
+- [ ] **Step 2: Stop releases everything still queued**
+
+Both queues, and the assertion is on the pool because that is what a leak costs: the quota is booked on a process-wide singleton, so anything left behind throttles every other backup on the machine until the process restarts.
+
+```csharp
+[Fact]
+public async Task Stop_Releases_Everything_Still_Queued()
+{
+    if (!AzuriteReachable() || !SevenZip())
+        return;
+
+    for (var i = 0; i < 12; i++)
+        WriteFile($"f{i}.bin", FileSize);
+
+    var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var factory = new BlobClientFactory();
+    var (orchestrator, staging, request) = Build(
+        new BlockingUploader(block.Task, new BlobUploader(factory)),
+        stagingLimit: 200_000_000, uploadConcurrency: 2);
+
+    var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+    await using var control = new BackupRunControl(journals, configId: 1, runId: "stop-drain");
+
+    var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+    await WaitUntil(() => staging.StagedBytes > 4L * FileSize, TimeSpan.FromSeconds(60));
+
+    // FinishCurrentFiles is the ordinary stop: the item in hand finishes, nothing new starts.
+    // Everything the compressor produced that no uploader claimed has to be handed back.
+    control.RequestStop(StopKind.FinishCurrentFiles);
+    block.SetResult();
+    await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+    Assert.Equal(0, staging.StagedBytes);
+    Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(_temp, "staged")));
+}
+```
+
+- [ ] **Step 3: The ledger balances with entries parked in the queues**
+
+```csharp
 /// <summary>
-/// The identity the operator uses to judge "did work vanish": processed + preparing + queued + waitingOnArchive
-/// + uploading == total. Entries parked in the staged queue fall under `uploading` (inWork - inStaging), so the
-/// sum must not drift while the queue is full.
+/// The identity the operator uses to judge "did work vanish": processed + preparing + queued +
+/// waitingOnArchive + uploading == total. Entries parked in either queue fall under `uploading`
+/// (inWork - inStaging), so the sum must not drift while both queues are full.
 /// </summary>
 [Fact]
-public async Task The_Item_Ledger_Balances_With_Entries_Parked_In_The_Queue()
+public async Task The_Item_Ledger_Balances_With_Entries_Parked_In_The_Queues()
 {
     if (!AzuriteReachable() || !SevenZip())
         return;
@@ -1222,35 +1149,32 @@ public async Task The_Item_Ledger_Balances_With_Entries_Parked_In_The_Queue()
 }
 ```
 
-Confirm `BackupProgress.Detail`'s type and the `StageProgress` property names against `StageProgress.cs:120-135` while writing these; `StageByteBreakdownTests` and `UploadWaitVisibilityTests` assert the same columns and are the reference for how.
-
-- [ ] **Step 2: Run them**
+- [ ] **Step 4: Run the new tests, then the whole suite**
 
 ```bash
 dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj \
   --filter "FullyQualifiedName~CompressionContinuityTests"
-```
-
-Expected: PASS. If the ledger test fails, a `BeginWork`/`EndWork` pair has been broken — check the `handed` flag in `CompressAsync` and the `finally` in `UploadAsync`.
-
-- [ ] **Step 3: Run the whole suite one final time**
-
-```bash
 dotnet test backend/tests/AzureStorageBackup.Api.Tests/AzureStorageBackup.Api.Tests.csproj
 ```
 
-Expected: PASS, no skips beyond the usual environment-gated ones. Confirm Azurite was up — a silent skip of 189 integration tests would make this green and meaningless.
+Expected: the three new tests pass; the full suite reports **1237 passed, 0 failed, 0 skipped** (1234 + 3). Skipped tests mean Azurite died and the integration coverage silently vanished — report that rather than treating it as green.
 
-- [ ] **Step 4: Commit**
+If the ledger test fails, a `BeginWork`/`EndWork` pair has been broken — check the `WorkShare` release points in the prober's `if (!handed)`, the compressor's `finally`, and the uploader's `finally`.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add backend/tests/AzureStorageBackup.Api.Tests/CompressionContinuityTests.cs
 git commit -m "$(cat <<'EOF'
 test: pin the staging limit as the binding constraint
 
-Two claims from the design were still unasserted: that compression now
-stops at StagedLimitBytes rather than at the size of the worker pool, and
-that the item ledger balances while entries sit in the staged queue.
+Three claims from the design were still unasserted: that compression now
+stops at StagedLimitBytes rather than at the size of the worker pool, that
+a stop hands back everything still queued, and that the item ledger
+balances while entries sit in the two queues.
+
+The first and last cover the paths where the compressor-hang bug lived,
+which is why they are worth writing rather than declaring the feature done.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 EOF
@@ -1261,8 +1185,8 @@ EOF
 
 ## Self-review notes
 
-**Spec coverage.** Every section of `docs/compression-upload-pipeline-design.md` maps to a task: §1 two stages → Task 4; §2 `StagedUnit` and the four release paths → Task 1 (the guard), Tasks 2–3 (normal and exception paths), Task 5 (stop and downgrade); §3 recompress in place → Task 3 Step 3; §4 changed members stay on the compression side → Task 3 Step 1, where they are returned by `CompressGroupAsync`; §5 progress accounting → Task 4 Step 3 and Task 6.
+**Spec coverage.** Every section of `docs/compression-upload-pipeline-design.md` maps to a task: §1 three stages → Task 4; §2 the ownership guard and the release paths → Task 1 (the guard), Tasks 2-3 (normal and exception paths), Task 4 (stop, downgrade and the drain); §3 recompress in place → Task 3; §4 changed members stay on the compression side → Task 3; §5 progress accounting → Task 4's `WorkShare` and Task 5's ledger test. The design's six tests → three landed during Tasks 3-4, three in Task 5.
 
-**Naming.** The spec calls the queue entry `StagedUnit`; this plan implements it as `StagedHandoff` (the guard) plus `PendingUpload` (the queue entry that pairs it with the closure). Same thing, split because the guard is unit-testable on its own and the closure is not.
+**Naming.** The design calls the queue entry `StagedUnit`; the implementation is `StagedHandoff` (the guard) plus `PendingUpload` and `ProbedItem` (the queue entries). Same thing, split because the guard is unit-testable on its own and the closures are not.
 
-**Known thin spot.** Task 4 Step 3 gives the shape of `StageItemAsync` rather than a complete body: it dispatches on `WorkItem` exactly as today's `RunItemAsync` does, and the two halves it calls are fully specified by Tasks 2 and 3. Everything else in the plan is complete code. Where a step depends on a signature that must be read from the current source (`BackupEngineOptions`' property names, `BackupInfoStore`'s constructor, `StageProgress`' column names), the step names the file to check.
+**Where the plan was wrong, and what corrected it.** Task 2's interface block contradicted its own code (corrected in `57b931c`). Task 3's sketch left a disposed archive reachable and put `precompressed` at pool granularity where a second group would re-consume it — the implementer caught both. Task 4's `UploadAsync` would have fired one `EndWork` per queue entry against one `BeginWork` per item, which `WorkShare` fixed, and its stage count went from two to three mid-flight (`1209c07`). The plan was a starting point in each case, not the authority.
