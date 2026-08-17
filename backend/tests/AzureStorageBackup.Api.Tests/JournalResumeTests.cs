@@ -4,10 +4,13 @@ namespace AzureStorageBackup.Api.Tests;
 
 public class JournalResumeTests
 {
-    private static JournalRecord Blob(string path, string full) => new()
+    /// <param name="mtimeTicks">Null by default, which is what every journal written before the field existed
+    /// carries — see <see cref="Untouched_blob_needs_a_recorded_mtime_and_both_metadata_tests"/>.</param>
+    private static JournalRecord Blob(string path, string full, long? mtimeTicks = null) => new()
     {
         Kind = "blob", Ref = "data/" + full, Path = path, FullHash = full,
         HeadHash = "h" + full, TailHash = "t" + full, Length = 100, Volumes = 1, VolumeSizes = [100],
+        MtimeUtcTicks = mtimeTicks,
     };
 
     private static JournalRecord Pack(string packId, params JournalMember[] members) => new()
@@ -91,6 +94,43 @@ public class JournalResumeTests
         var r = new JournalResume([Blob("a.bin", "aaa"), Blob("a.bin", "aaa")]);
         Assert.Equal(1, r.RecordCount);
         Assert.Equal("data/aaa", r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
+    }
+
+    /// <summary>
+    /// The cheap resume test: path plus length plus mtime, no read at all. It is the rule in this class that would
+    /// silently accept the wrong file if it were got wrong, and of its three ways to say no, the first is the one
+    /// that matters most.
+    /// <para>
+    /// **A record that cannot answer must not answer.** Every journal written before the mtime field existed has a
+    /// null there, and a comparison that let null through would turn this into a match on path alone — reusing last
+    /// run's blob for a file that has been rewritten since, which is not a missed upload but a wrong one: the index
+    /// would name content the file no longer has, and nothing downstream re-derives that. The other two are the
+    /// metadata test itself, and they are what makes this exactly as strict as the diff.
+    /// </para>
+    /// <para>
+    /// Unit-level on purpose. These four assertions used to live only in an Azurite-backed integration case, which
+    /// skips wholesale on a machine without Azurite — so on such a machine the one rule that could accept the wrong
+    /// file was guarded by nothing at all.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Untouched_blob_needs_a_recorded_mtime_and_both_metadata_tests()
+    {
+        var mtime = DateTimeOffset.UnixEpoch.AddHours(3);
+        var r = new JournalResume([Blob("a.bin", "aaa", mtime.UtcTicks)]);
+
+        // The positive control: without it the three refusals below could all be "the path is not in the table".
+        Assert.Equal("data/aaa", r.FindUntouchedBlob("a.bin", mtime, 100)!.Ref);
+
+        Assert.Null(r.FindUntouchedBlob("a.bin", mtime.AddTicks(1), 100));  // touched: a different last-write time
+        Assert.Null(r.FindUntouchedBlob("a.bin", mtime, 101));              // touched: a different length
+
+        // The record predates the field. It cannot say whether the file has been touched, so it must not be read as
+        // saying no.
+        var old = new JournalResume([Blob("a.bin", "aaa")]);
+        Assert.Null(old.FindUntouchedBlob("a.bin", mtime, 100));
+        // …and it still takes part in the content test, which is the route it took before the field existed.
+        Assert.Equal("data/aaa", old.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
     }
 
     [Fact]
