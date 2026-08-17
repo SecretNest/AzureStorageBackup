@@ -70,6 +70,30 @@ The asymmetry is deliberate: the fast path is optimistic and verified, the fallb
 unconditional. A file being rewritten during its own backup is rare; paying a copy for every raw file to
 pre-empt it is not worth it, and never noticing would be unacceptable.
 
+**The test is applied on both endings of the upload, not only on the returning one.** "The upload threw"
+does not mean "nothing was committed": Azure acknowledges a commit over a connection that can die on the way
+back, which is the routine NAS-to-Azure blip — the SDK's retries exhaust and what surfaces is a status-0
+error with the object already in the container. An upload that ends in an exception therefore runs the same
+stat-and-take-back before the exception continues on its way. Only when the source moved: an upload that
+failed with the file exactly as it was hashed leaves nothing that cannot be vouched for, and deleting it
+regardless would throw away a correct object the retry's if-missing upload would otherwise skip — a full
+re-upload of a multi-GB file, bought for nothing, on the failure that happens most often.
+
+That matters because of what an orphan of this kind turns into. The retry re-hashes the moved source, so it
+lands on a *different* address and the first object is orphaned rather than overwritten; nothing sweeps it
+afterwards (the in-flight purge runs for Stop now alone, the closing orphan sweep only for a round that
+adopted or voided a journal or is its config's first on the container). A later run that legitimately
+produces that same hash then claims the address, finds the single-volume path clearing nothing, and is told
+"already there" by the if-missing upload without a byte being read — so the index records `data/{H}` as
+holding `H`, and it does not.
+
+**A take-back that cannot be done is said out loud.** The delete is retried under the same bounded policy
+the cleanup path uses for its point operations, and if it still fails the address goes into the operation
+log and out through the `UnrecoverableError` channel, naming the blob and the file. Nothing else in the
+system will ever find that object: check and restore both read the index, the index agrees with the name,
+and the name is the only thing about it that is wrong. The in-flight registration is deliberately left
+standing in that case, so a Stop now still clears the address.
+
 ### 3. What stays exactly as it is
 
 Encrypted, compressed, or split blobs keep copying — their stored bytes are not the source bytes, so
@@ -100,5 +124,12 @@ object, and those objects do not exist until 7z writes them.
   blocking uploader: begin the upload, rewrite the source, release. The run must not leave a
   `data/{hash}` whose content hashes differently — either it retried through the copy or the object is
   absent.
+- **The same, on an upload that commits and then fails.** The uploader parks, is let through to the real
+  one so the object is genuinely written, and only then reports a status-0 error. Run without a run control,
+  so the injected error is not retried and nothing but the code under test can have touched the container:
+  afterwards it must hold no data object at all.
+- **A take-back that cannot be done names the address.** Sabotage only the orchestrator's own view of the
+  container, from the instant the source is rewritten. The run survives (the copying route is immune), the
+  object is still there, and the operation log holds an error naming it and the file it came from.
 - **Encrypted and compressed blobs still copy.** The route is chosen by the same predicate as before;
   pin it so an over-eager future edit cannot send an encrypted blob's plaintext.

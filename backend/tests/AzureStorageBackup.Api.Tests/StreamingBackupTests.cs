@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -292,6 +293,107 @@ public sealed class StreamingBackupTests : IDisposable
     }
 
     /// <summary>
+    /// The other way an upload ends: the commit lands and the acknowledgement does not.
+    /// <para>
+    /// It parks the first data upload exactly where <see cref="BlockingUploader"/> does, then lets it through to
+    /// the real uploader — so the object really is written — and only then reports the failure the wire would
+    /// have reported: a status-0 <see cref="RequestFailedException"/>, which is what Azure.Core produces when a
+    /// connection dies with the request already served, and what <see cref="TransientErrors"/> calls transient.
+    /// That combination is the whole point: to the run it looks like an ordinary NAS-to-Azure blip and the item is
+    /// retried, while the container is holding an object nobody in the run believes is there.
+    /// </para>
+    /// <para>
+    /// Only the **first** data upload is treated this way. The retry has to be allowed through, or the run never
+    /// reaches the state this case is about (one object per address, each named for its own content).
+    /// </para>
+    /// </summary>
+    private sealed class LostAckUploader(Task gate, IBlobUploader inner) : IBlobUploader
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _dataUploads;
+
+        /// <summary>Completes when the first data blob's upload has been handed its path and is parked on the gate.</summary>
+        public Task Entered => _entered.Task;
+
+        public int DataUploads => Volatile.Read(ref _dataUploads);
+
+        /// <summary>The path the first data upload was handed. On the raw route this is the **source file**, which
+        /// is what makes rewriting it while the upload is parked mean anything at all.</summary>
+        public string? FirstPath { get; private set; }
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            if (!blobName.StartsWith("data/", StringComparison.Ordinal)
+                || Interlocked.Increment(ref _dataUploads) != 1)
+                return await inner.UploadIfMissingAsync(
+                    account, container, blobName, filePath, tier, retry, ct, metadata);
+
+            FirstPath = filePath;
+            _entered.TrySetResult();
+            await gate.WaitAsync(ct);
+            // Committed, and then lost on the way back. Nothing above this line ever learns that it landed.
+            await inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+            throw new RequestFailedException(0, "the connection dropped after the commit");
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+    }
+
+    /// <summary>
+    /// Hands out working clients until <see cref="Armed"/>, and from then on refuses with the shape a NAS-to-Azure
+    /// blip has: a status-0 <see cref="RequestFailedException"/>, which is transient, so whatever retry sits above
+    /// it really does try again before giving up.
+    /// </summary>
+    private sealed class RefusesWhenArmed(IBlobClientFactory inner) : IBlobClientFactory
+    {
+        public bool Armed { get; set; }
+
+        public BlobServiceClient CreateServiceClient(Account account) => Armed
+            ? throw new RequestFailedException(0, "the connection dropped")
+            : inner.CreateServiceClient(account);
+
+        public Task<ConnectionResult> TestConnectionAsync(Account account, CancellationToken ct = default)
+            => inner.TestConnectionAsync(account, ct);
+    }
+
+    /// <summary>Keeps what the run wrote to the operation log, which is where an operator reads it.</summary>
+    private sealed class RecordingOperationLog : IOperationLog
+    {
+        private readonly List<(OperationLogLevel Level, string Message)> _entries = [];
+
+        public IReadOnlyList<(OperationLogLevel Level, string Message)> Entries
+        {
+            get { lock (_entries) return [.. _entries]; }
+        }
+
+        public Task AppendAsync(
+            OperationLogLevel level, string source, string message, CancellationToken ct = default,
+            bool? durable = null)
+        {
+            lock (_entries) _entries.Add((level, message));
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(
+            OperationLogLevel? minLevel, string? source, DateTimeOffset? from, DateTimeOffset? to, int limit,
+            CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
+            => Task.CompletedTask;
+    }
+
+    /// <summary>
     /// Samples the staging pool for the whole life of a run and keeps the largest reading.
     /// <para>
     /// The peak is the reading that means anything here. The pool is back at zero by the time a run ends whether
@@ -330,8 +432,13 @@ public sealed class StreamingBackupTests : IDisposable
         }
     }
 
+    /// <param name="cloud">The factory the **orchestrator itself** reaches the container through, for the point
+    /// operations it does outside the uploader — clearing leftover volumes, and taking back a raw upload the guard
+    /// rejected. Everything else (the uploader, the info store, the cleaner) keeps the real one, so sabotaging this
+    /// one sabotages exactly those operations and nothing else. Null = the real one, like every other case here.</param>
     private (BackupOrchestrator Orchestrator, StagingArea Staging, BackupRequest Request) Build(
-        IBlobUploader? uploader, string container, string? password, bool dontCompress)
+        IBlobUploader? uploader, string container, string? password, bool dontCompress,
+        IBlobClientFactory? cloud = null, IOperationLog? opLog = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -340,10 +447,10 @@ public sealed class StreamingBackupTests : IDisposable
         var authority = new TestLocalAuthority(store);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
-            new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
+            new SevenZipCompressor(), uploader ?? new BlobUploader(factory), cloud ?? factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            new FileHasher(), authority.IndexCache, authority.Tracked, notifier: null, opLog: opLog);
         var request = new BackupRequest
         {
             Account = AzuriteAccount(),
@@ -573,6 +680,168 @@ public sealed class StreamingBackupTests : IDisposable
                 $"only {uploader.DataUploads} data upload(s): this run never asked the guard anything — either the "
                 + "upload was reading a snapshot rather than the source, or the rewrite landed outside the window.");
             Assert.Equal(311_111, entry.Length);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The same guarantee, on the ending the guard cannot reach by watching an upload return: the commit lands and
+    /// the acknowledgement does not.
+    /// <para>
+    /// This is the routine NAS-to-Azure failure, not an exotic one. Azure writes the blob, the connection dies
+    /// before the response arrives, the SDK's own retries exhaust, and what comes out is a status-0
+    /// <see cref="RequestFailedException"/>. The upload never returned, so a guard placed only after it is never
+    /// asked whether the source moved — and the object is in the container all the same, at an address this run
+    /// cannot vouch for. Nothing sweeps it afterwards: the in-flight purge runs for Stop now alone, and the
+    /// closing orphan sweep only runs when the round adopted or voided a journal, or is this config's first on the
+    /// container.
+    /// </para>
+    /// <para>
+    /// What that leaves is the one shape this project cannot detect afterwards — <c>data/{H}</c> holding something
+    /// other than <c>H</c>. A later run that legitimately produces <c>H</c> claims that address, the single-volume
+    /// path clears nothing, and the if-missing upload is told "already there" without a byte being read: the index
+    /// then records <c>data/{H}</c> as holding <c>H</c>, and it does not.
+    /// </para>
+    /// <para>
+    /// Deliberately run **without** a <c>BackupRunControl</c>, which is what makes the scene readable. With one,
+    /// the status-0 error is transient, the item is retried, and the run ends by committing an index — and the
+    /// closing sweep of a first round would then delete the orphan for reasons that have nothing to do with the
+    /// guard, which is exactly how this case passed before it was written properly. Without one, the run fails on
+    /// the injected error and nothing but the code under test can have touched the container.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Commit_Whose_Acknowledgement_Is_Lost_Leaves_No_Blob_That_Contradicts_Its_Name()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var source = await WriteSourceAsync("media/clip.bin", 250_000);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("sbkraw-");
+        var uploader = new LostAckUploader(block.Task, new BlobUploader(factory));
+        var (orchestrator, _, request) = Build(uploader, name, password: null, dontCompress: true);
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            var run = orchestrator.RunAsync(request);
+            try
+            {
+                await uploader.Entered.WaitAsync(TimeSpan.FromSeconds(60));
+                // Rewritten to a different length as well as different bytes, so the guard's verdict does not
+                // depend on the filesystem's timestamp resolution.
+                var rewritten = new byte[311_111];
+                Random.Shared.NextBytes(rewritten);
+                await File.WriteAllBytesAsync(source, rewritten);
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            // The injected failure is not retried without a control, so it takes the run down. That is this case's
+            // scene, not its subject: what matters is what the container holds afterwards.
+            var ex = await Assert.ThrowsAnyAsync<RequestFailedException>(
+                () => run.WaitAsync(TimeSpan.FromMinutes(2)));
+            Assert.Equal(0, ex.Status);
+
+            var blobs = await DataBlobsAsync(container);
+            // Named first, so a failure says which object contradicts itself rather than merely how many there are.
+            foreach (var (blobName, bytes) in blobs)
+                Assert.Equal("data/" + FullHashOf(bytes), blobName);
+            // And in this scene the invariant has a sharper form: exactly one object was ever committed, the run
+            // never established that it holds the content its name claims, and no retry followed that could have
+            // replaced it — so nothing at all may be left behind.
+            Assert.Empty(blobs);
+
+            // Anti-vacuity. The upload was handed the source file itself, so this really was the raw route and
+            // rewriting that file really did change what went over the wire; and it was reached exactly once, so
+            // the commit this case is about really was attempted.
+            Assert.Equal(source, uploader.FirstPath);
+            Assert.Equal(1, uploader.DataUploads);
+            Assert.Equal(311_111, new FileInfo(source).Length);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The one ending the code cannot put right, and therefore the one it has to talk about: the guard rejected
+    /// the upload, and the container will not let the object go.
+    /// <para>
+    /// Everything else here is about leaving nothing behind. This case is about the residue that cannot be
+    /// removed — and about it not being silent. No later check finds it: check and restore both read the index,
+    /// the index agrees with the name, and the name is the only thing about the object that is wrong. The address
+    /// has to reach the operator, because an operator with the address can delete it in one command and nothing
+    /// else in this system will.
+    /// </para>
+    /// <para>
+    /// Only the orchestrator's own view of the container is sabotaged, and only from the instant the source is
+    /// rewritten: the upload itself goes through the real client and really does commit, so the object under
+    /// discussion is genuinely there — which the last assertion checks, since a report about an object that was
+    /// removed after all would prove nothing.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Blob_That_Cannot_Be_Taken_Back_Is_Reported_By_Address()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var source = await WriteSourceAsync("media/clip.bin", 250_000);
+        // The address the upload in flight is claiming: the content identity of the bytes as they are now.
+        var doomed = "data/" + FullHashOf(await File.ReadAllBytesAsync(source));
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var name = RandomName("sbkraw-");
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var cloud = new RefusesWhenArmed(factory);
+        var log = new RecordingOperationLog();
+        var (orchestrator, _, request) = Build(uploader, name, password: null, dontCompress: true, cloud, log);
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            var run = orchestrator.RunAsync(request);
+            try
+            {
+                await uploader.Entered.WaitAsync(TimeSpan.FromSeconds(60));
+                var rewritten = new byte[311_111];
+                Random.Shared.NextBytes(rewritten);
+                await File.WriteAllBytesAsync(source, rewritten);
+                // From here the guard will find the source moved and try to take its upload back, and every
+                // attempt at it will be refused.
+                cloud.Armed = true;
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            // The run itself survives: the item is re-staged through the copying route, which is immune, and the
+            // failure to clean up is not allowed to cost the operator the backup as well.
+            await run.WaitAsync(TimeSpan.FromMinutes(2));
+
+            var told = Assert.Single(log.Entries, e => e.Message.Contains(doomed, StringComparison.Ordinal));
+            Assert.Equal(OperationLogLevel.Error, told.Level);
+            Assert.Contains("media/clip.bin", told.Message, StringComparison.Ordinal);
+
+            // Anti-vacuity: the object really is still there, so the report is about something real. And the entry
+            // this run committed points at the **other** address, the one named for the bytes it actually sent.
+            var blobs = await DataBlobsAsync(container);
+            Assert.Contains(blobs, b => b.Name == doomed);
+            var entry = await SingleEntryAsync(store, AzuriteAccount(), name, password: null);
+            Assert.NotEqual(doomed, entry.Storage!.Ref);
+            var stored = Assert.Single(blobs, b => b.Name == entry.Storage.Ref);
+            Assert.Equal("data/" + FullHashOf(stored.Bytes), stored.Name);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

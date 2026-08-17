@@ -2308,7 +2308,8 @@ public sealed class BackupOrchestrator(
 
     /// <summary>
     /// The source file moved while it was being uploaded in place, so the object written under its content address
-    /// may not hold the content that address names. Thrown **after** that object has been deleted again.
+    /// may not hold the content that address names. Thrown **after** that object has been taken back — or, in the
+    /// one case where it could not be, after that has been reported (see <see cref="UndoInPlaceUploadAsync"/>).
     /// <para>
     /// Private, and never allowed to escape this class's own retry: the one caller that can see it answers it by
     /// re-staging the item through the copying route, which uploads a snapshot and is therefore immune. It does
@@ -2657,30 +2658,11 @@ public sealed class BackupOrchestrator(
             // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
             // half of that pair has moved since, the bytes just written under this content address are not
             // guaranteed to be the bytes that produced it — and an object whose name contradicts its content is a
-            // corruption no restore would detect until it failed. So it is deleted again, before anything is
+            // corruption no restore would detect until it failed. So it is taken back, before anything is
             // recorded, and the caller retries the item through the copying route.
-            //
-            // Deleting is safe precisely here and nowhere else: this run holds the exclusive in-run claim on this
-            // address (LocalDedupResolver.ResolveAsync hands out one at a time), and an address that any retained
-            // version index or any adopted journal already referenced would have been resolved as a dedup hit
-            // instead of being claimed — so nothing in this backup points at what is being removed. The only other
-            // thing that could be sitting here is an orphan of an interrupted earlier run, which no index and no
-            // adopted journal names either, and which the next run re-uploads if it is ever wanted again.
-            //
-            // The delete runs on CancellationToken.None and the in-flight registration is cleared only after it: a
-            // cancelled cleanup would leave exactly the object this branch exists to remove, and until the delete
-            // returns, the registration is what makes "Stop now" clear it (see PurgeInFlightAsync). Clearing it
-            // afterwards is not optional either — a stale registration on an address a **later** item may
-            // legitimately claim and upload would have Stop now delete that one's good blob.
-            // A hard crash inside that window still leaves the object behind; it is the same window
-            // ClearLeftoverVolumesAsync has always had between its delete and its re-upload.
             if (inPlace?.Moved() is { } what)
             {
-                await factory.CreateServiceClient(request.Account)
-                    .GetBlobContainerClient(request.Container)
-                    .GetBlobClient(blobRef)
-                    .DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
-                control?.ClearInFlight(blobRef);
+                await UndoInPlaceUploadAsync(request, blobRef, inPlace, what, control);
                 // Thrown before AddUploaded/ConfirmUpload, like any other failed upload: these bytes are on their
                 // way back off the wire, and the retry that follows will count its own.
                 throw new SourceMovedDuringUploadException(inPlace.Path, what);
@@ -2696,9 +2678,101 @@ public sealed class BackupOrchestrator(
             uploadTracker.ConfirmUpload(blobRef);
             return (files.Count, sizes);
         }
+        // The same bracket, on the ending where the upload does **not** return. It is not an edge case: "the
+        // upload threw" does not mean "nothing was committed". Azure acknowledges a commit over a connection that
+        // can die on the way back, which is the routine NAS-to-Azure blip this whole codebase is built around —
+        // RetryPolicy exhausting on status 0 comes out here with the object already in the container. A Stop now
+        // landing between the commit and the stat arrives here as well, and it is answered the same way.
+        //
+        // Left to the success path alone, every one of those endings kept the object **and** sent the item round
+        // again: the retry re-hashes the moved source, lands on a different address, and the first object is
+        // orphaned rather than overwritten. Nothing removes it afterwards — PurgeInFlightAsync runs for Stop now
+        // alone, and the closing orphan sweep only for a round that adopted or voided a journal or is the first on
+        // its container — and a later run that legitimately produces that hash claims the address, finds the
+        // single-volume path clearing nothing, and is told "already there" by the if-missing upload without a byte
+        // being read. That is the one failure this codebase cannot detect after the fact.
+        //
+        // Filtered on inPlace because only the raw route can put bytes it did not produce at a content address:
+        // every other route uploads a snapshot taken under the compression lock, whose content cannot move.
+        // SourceMovedDuringUploadException is excluded because the branch above has already done exactly this.
+        catch (Exception ex) when (inPlace is not null && ex is not SourceMovedDuringUploadException)
+        {
+            // Conditional on the same test the success path uses, not unconditional. An upload that failed with
+            // the source still exactly as it was hashed leaves nothing this run cannot vouch for: whatever the
+            // server committed, it committed from a file that has not changed, so it holds the content its address
+            // names. Deleting it regardless would throw away a correct object that the retry's if-missing upload
+            // would otherwise skip — on a multi-GB raw file, a full re-upload bought for nothing, on the failure
+            // that happens most often.
+            if (inPlace.Moved() is { } what)
+                await UndoInPlaceUploadAsync(request, blobRef, inPlace, what, control);
+            throw;
+        }
         finally
         {
             uploadTracker.EndUpload(blobRef);
+        }
+    }
+
+    /// <summary>
+    /// Take back the object an in-place upload may have committed at <paramref name="blobRef"/>, the source having
+    /// moved while it was in flight.
+    /// <para>
+    /// Deleting is safe precisely here and nowhere else: this run holds the exclusive in-run claim on this address
+    /// (<see cref="LocalDedupResolver.ResolveAsync"/> hands out one at a time), and an address that any retained
+    /// version index or any adopted journal already referenced would have been resolved as a dedup hit instead of
+    /// being claimed — so nothing in this backup points at what is being removed. The only other thing that could
+    /// be sitting here is an orphan of an interrupted earlier run, which no index and no adopted journal names
+    /// either, and which the next run re-uploads if it is ever wanted again. That argument does not depend on how
+    /// the upload ended, which is why the failing path can use it too.
+    /// </para>
+    /// <para>
+    /// It runs on <see cref="CancellationToken.None"/> and clears the in-flight registration only after the delete
+    /// returns: a cancelled cleanup would leave exactly the object this exists to remove, and until the delete
+    /// returns, the registration is what makes "Stop now" clear it (see <see cref="PurgeInFlightAsync"/>). Clearing
+    /// it afterwards is not optional either — a stale registration on an address a **later** item may legitimately
+    /// claim and upload would have Stop now delete that one's good blob. A hard crash inside that window still
+    /// leaves the object behind; it is the same window <see cref="ClearLeftoverVolumesAsync"/> has always had
+    /// between its delete and its re-upload.
+    /// </para>
+    /// <para>
+    /// The delete is retried, because the failure it is most likely to meet is the same blip that brought the
+    /// caller here — under the same policy the cleanup path uses for its point operations (see RetentionCleaner),
+    /// which is bounded by attempt count rather than by the upload path's two hours: this runs in the tear-down of
+    /// one item, and a run that spends hours failing to remove one object helps nobody.
+    /// </para>
+    /// <para>
+    /// A delete that ultimately fails is **said out loud** rather than swallowed. What is left behind is an object
+    /// whose name may contradict its content, and no later check can tell: check and restore both read the index,
+    /// and the index agrees with the name. So it goes into the operation log and out through the same
+    /// <see cref="NotificationEvents.UnrecoverableError"/> channel as a hash collision, naming the address, because
+    /// an operator with the address can delete it in one command and nothing else in this system will.
+    /// </para>
+    /// </summary>
+    private async Task UndoInPlaceUploadAsync(
+        BackupRequest request, string blobRef, InPlaceSource inPlace, string what, BackupRunControl? control)
+    {
+        try
+        {
+            await RetryPolicy.ExecuteAsync(
+                t => factory.CreateServiceClient(request.Account)
+                    .GetBlobContainerClient(request.Container)
+                    .GetBlobClient(blobRef)
+                    .DeleteIfExistsAsync(cancellationToken: t),
+                options: null, ex => TransientErrors.IsTransient(ex), CancellationToken.None);
+            control?.ClearInFlight(blobRef);
+        }
+        catch (Exception ex)
+        {
+            // The registration is deliberately left standing: it is the only thing that will still clear this
+            // address if the operator answers with Stop now.
+            await Record(
+                NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                $"Could not remove a blob that may hold the wrong content: {blobRef}",
+                $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
+                + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
+                + "produces that same content will be told the address is already taken and will record it without "
+                + "reading a byte of it.",
+                CancellationToken.None);
         }
     }
 
