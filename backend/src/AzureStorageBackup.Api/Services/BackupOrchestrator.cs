@@ -1057,7 +1057,13 @@ public sealed class BackupOrchestrator(
                         // diff-time hash makes the first group exclude them, the tail re-reads them under their
                         // settled hash, and the next group stores them. onItem is the no-op because this group's
                         // slot was reported once already, just above.
-                        var stranded = rejudged.Where(m => !group.Changed.Contains(m)).ToList();
+                        //
+                        // The whole list, unfiltered: a recompression only ever judges the members the handed-over
+                        // pass kept (see retryMembers in RunGroupAsync), so everything in here comes out of
+                        // group.Stable and is disjoint from group.Changed by construction. The reverse — a member
+                        // this loop already re-queued turning up in the retry's archive too — is prevented there
+                        // rather than mopped up here, because by this point the second copy is already in the cloud.
+                        var stranded = rejudged;
                         if (stranded.Count > 0)
                             await ProcessPackAsync(
                                 request, [.. stranded.Select(ToPlannedFile)], poolStoreOnly, addressing,
@@ -2684,6 +2690,8 @@ public sealed class BackupOrchestrator(
     /// below for why reuse would be wrong even if the archive were still on disk.
     /// </para>
     /// </summary>
+    /// <param name="members">This group's members, as the caller cut them. Only a pass that compresses here uses the
+    /// list, and then only through <paramref name="precompressed"/>'s filter — see <c>retryMembers</c> below.</param>
     /// <param name="precompressed">An archive the compression side already produced for this group, consumed by the
     /// first pass and by that pass alone. Null means "compress it here", which is what the single-worker caller
     /// wants; the pipelined caller compresses in one loop and uploads in another, and hands the result of the
@@ -2700,10 +2708,31 @@ public sealed class BackupOrchestrator(
         // whatever the compression side handed in, every later one finds the slot empty and compresses afresh.
         var pending = precompressed;
 
+        // What a recompression is allowed to put in this pack, and the answer is not always "this group's members".
+        //
+        // A caller that hands in an archive has **already acted on that pass's verdict**: by the time this method is
+        // entered, ProcessPackAsync has re-read every member that pass excluded under its new hash and either queued
+        // it into a later group or demoted it to a single file. Re-judging the original list would let a member that
+        // was excluded then and looks stable now travel in this archive **as well as** in wherever the compressor
+        // has meanwhile sent it. The same content stored twice, and worse: two threads writing storageByPath[path]
+        // with nothing ordering them, so which row survives is a coin toss, and the losing shape is an index entry
+        // carrying the member's new hash while pointing at a pack that recorded it under the stale diff-time one —
+        // restore then pulls out content that does not match the entry beside it.
+        //
+        // Confining the retry to that pass's stable set makes it impossible by construction rather than by a check
+        // after the fact. It is also the shape the code already trusts: the changed-member branch inside
+        // CompressGroupAsync recompresses a subset under the same pack id for the same reason.
+        //
+        // The other direction — a member that pass kept and this one excludes — cannot be settled here, because only
+        // the caller knows what it did with the verdict it was given; it is handled by the stranded-member tail in
+        // RunCoreAsync's dispatch. Null precompressed has neither problem: that caller runs both halves back to back
+        // and consumes the final pass's verdict, so the group's own member list is exactly right.
+        var retryMembers = precompressed?.Stable ?? members;
+
         async Task<(List<PackEntry> Changed, IReadOnlyList<PackEntry> Recorded, IReadOnlyList<long> Volumes)> AttemptAsync()
         {
             var attempt = pending
-                ?? await CompressGroupAsync(request, packId, members, storeOnly, uploadTracker, state, ct);
+                ?? await CompressGroupAsync(request, packId, retryMembers, storeOnly, uploadTracker, state, ct);
             // Emptied before the upload starts rather than after it ends, because this archive does not outlive the
             // pass either way — uploaded on success, dead on failure, disposed by the finally below in both cases.
             // Leaving the slot pointing at it would let a later pass "upload" an archive whose volume files the
