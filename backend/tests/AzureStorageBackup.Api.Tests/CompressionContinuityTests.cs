@@ -70,14 +70,25 @@ public sealed class CompressionContinuityTests : IDisposable
     /// Every upload hangs on <paramref name="gate"/> before being let through to the real uploader, so the run
     /// still completes normally once the gate opens. Only the 8-argument overload needs implementing: the
     /// progress-reporting one has a default implementation that forwards to it (see IBlobUploader).
+    /// <para>
+    /// <see cref="Uploads"/> counts the entries the upload loop has taken past its gate. It is counted here rather
+    /// than read off a progress column because it must be exact and must not depend on anything being published:
+    /// the assertion it carries in <see cref="Pause_Holds_The_Pipeline_And_Resume_Picks_It_Up"/> is that this number
+    /// never grows past one entry per uploader once the hold is up.
+    /// </para>
     /// </summary>
     private sealed class BlockingUploader(Task gate, IBlobUploader inner) : IBlobUploader
     {
+        private int _uploads;
+
+        public int Uploads => Volatile.Read(ref _uploads);
+
         public async Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
         {
+            Interlocked.Increment(ref _uploads);
             await gate.WaitAsync(ct);
             return await inner.UploadIfMissingAsync(
                 account, container, blobName, filePath, tier, retry, ct, metadata);
@@ -96,8 +107,15 @@ public sealed class CompressionContinuityTests : IDisposable
 
     /// <summary>
     /// Every upload costs <paramref name="delay"/> before it is let through. Unlike <see cref="BlockingUploader"/>
-    /// this never stops the pipeline — it only makes the run long enough that a pause pressed part-way through has
-    /// work left to hold, which is the difference between a test of the gate and a test of the clock.
+    /// this never stops the pipeline — it only makes the run long enough that a stop pressed part-way through still
+    /// has work in flight to reach.
+    /// <para>
+    /// Note what it is **not** good for: proving that the upload loop honours the gate. A throttle leaves the
+    /// compressor as the stage running ahead, so by the time a pause lands the uploaders hold everything staged and
+    /// the queue behind them is empty — with nothing left to take, "processed stopped advancing" is true whether or
+    /// not the loop checks anything. <see cref="Pause_Holds_The_Pipeline_And_Resume_Picks_It_Up"/> uses
+    /// <see cref="BlockingUploader"/> for exactly that reason.
+    /// </para>
     /// </summary>
     private sealed class SlowUploader(TimeSpan delay, IBlobUploader inner) : IBlobUploader
     {
@@ -122,6 +140,68 @@ public sealed class CompressionContinuityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Counts every probe and holds the **first** one open until <paramref name="release"/> completes.
+    /// <para>
+    /// Both halves are load-bearing for <see cref="A_Pause_Holds_The_Prober_And_The_Compressor"/>. The count is the
+    /// prober's own observable: <c>ProbeForDedupAsync</c> calls <c>HeadHashAsync</c> as the first thing it does with
+    /// an item it has claimed (BackupOrchestrator.cs:2328), so "how many probes have happened" is exactly "how many
+    /// items the prober has taken past its gate" — no progress column in between, nothing to publish, nothing to
+    /// throttle. The hold is what makes the observation deterministic rather than a race: it keeps the prober inside
+    /// its first item until the pause is already standing, so the work the loops would consume if their gates were
+    /// gone becomes available **after** the hold goes up, not before.
+    /// </para>
+    /// <para>
+    /// Only the orchestrator's own hasher is wrapped. The diff has its own <see cref="FileHasher"/> instance (see
+    /// <see cref="Build"/>), so the walk that fills the work queue runs at full speed and is not counted here.
+    /// <see cref="ContentIdentityAsync"/> is forwarded rather than left to the interface's default, which would
+    /// reach back into <see cref="HeadHashAsync"/> and inflate the count from a caller that is not the prober.
+    /// </para>
+    /// </summary>
+    private sealed class GatedHasher(Task release, IFileHasher inner) : IFileHasher
+    {
+        private int _probes;
+        private int _held;
+
+        public int Probes => Volatile.Read(ref _probes);
+
+        public async Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _probes);
+            if (Interlocked.Exchange(ref _held, 1) == 0)
+                await release.WaitAsync(ct);
+            return await inner.HeadHashAsync(path, headBytes, ct);
+        }
+
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
+            inner.TailHashAsync(path, tailBytes, ct);
+
+        public Task<string> FullHashAsync(
+            string path, CancellationToken ct = default, IProgress<long>? onRead = null) =>
+            inner.FullHashAsync(path, ct, onRead);
+
+        public Task<ContentIdentity> ContentIdentityAsync(
+            string path, int segmentBytes, CancellationToken ct = default) =>
+            inner.ContentIdentityAsync(path, segmentBytes, ct);
+    }
+
+    /// <summary>
+    /// Every "Uploading" line out of the pipeline reporter, in order.
+    /// <para>
+    /// Reads <c>Details</c> rather than <c>Detail</c> on purpose: while the diff is still walking, the reporter
+    /// publishes both lines and <c>Detail</c> is <c>Details[0]</c>, which is the **diff's** — so a filter on
+    /// <c>Detail</c> silently drops every upload snapshot taken before the diff finishes. That is invisible in a
+    /// test that only ever reads the last one, and fatal in a test whose assertion is that a particular snapshot
+    /// never appeared.
+    /// </para>
+    /// </summary>
+    private static Progress<BackupProgress> UploadSnapshots(List<StageProgress> into) =>
+        new(p =>
+        {
+            foreach (var d in p.Details.Where(d => d.Stage == "Uploading"))
+                lock (into) into.Add(d);
+        });
+
     /// <param name="describe">What the pool looked like when patience ran out. Without it the failure reads
     /// "condition not met", which cannot tell "compression stalled" (the regression) from "the staging limit was
     /// set too low for this test" — and those want opposite reactions.</param>
@@ -137,8 +217,12 @@ public sealed class CompressionContinuityTests : IDisposable
         throw new TimeoutException($"Condition was not met in time. {describe()}");
     }
 
+    /// <param name="hasher">The orchestrator's own hasher, i.e. the one the **probe** goes through. Null = the real
+    /// one. The diff keeps its own instance either way, so substituting this one slows or counts the pipeline's
+    /// first stage without touching the walk that feeds it.</param>
     private (BackupOrchestrator Orchestrator, StagingArea Staging, BackupRequest Request) Build(
-        IBlobUploader? uploader, long stagingLimit, int uploadConcurrency, string container)
+        IBlobUploader? uploader, long stagingLimit, int uploadConcurrency, string container,
+        IFileHasher? hasher = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -150,7 +234,7 @@ public sealed class CompressionContinuityTests : IDisposable
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            hasher ?? new FileHasher(), authority.IndexCache, authority.Tracked);
         var request = new BackupRequest
         {
             Account = AzuriteAccount(),
@@ -393,20 +477,31 @@ public sealed class CompressionContinuityTests : IDisposable
     }
 
     /// <summary>
-    /// Pause holds every producing loop, and holds the work rather than discarding it — that is the whole
+    /// Pause holds the **uploader's** loop, and holds the work rather than discarding it — that is the whole
     /// difference from Suspend. A resumed run must not have lost, or have to redo, what it had already staged.
     /// <para>
-    /// The uploader is throttled on purpose. Twelve 2 MB files against a local Azurite take a couple of seconds
-    /// end to end, and a run that finishes before the second reading is taken would report the same
-    /// <c>processed</c> twice whether or not anything checks the gate — a test that passes on the unfixed code.
-    /// A fixed cost per upload puts enough work behind the pause that "it stopped" and "it was already over" are
-    /// distinguishable, and the assertion that the reading at the pause is short of the total is what says so out
-    /// loud rather than leaving it to the timing.
+    /// One gate, not four. <c>Processed</c> only advances when an upload completes, which is strictly downstream of
+    /// the uploader's gate, so this case is blind to the other three: park the uploaders and the compressor can go
+    /// on staging, the prober on probing and the diff on enqueuing without moving this number by one.
+    /// <see cref="A_Pause_Holds_The_Prober_And_The_Compressor"/> pins the middle two and
+    /// <see cref="A_Suspend_Reaches_A_Run_Paused_Before_The_Diff_Ever_Started"/> the first; measured by deleting
+    /// each gate in turn and watching which case went red (see the fix report).
     /// </para>
     /// <para>
-    /// The delay is also what makes the three-second settling window meaningful: at most one item per stage is in
-    /// hand when Pause lands (granularity is "finish the item in hand, then hold"), and every one of them lands
-    /// well inside that window.
+    /// The backlog is built before the hold goes up, and it is built with a blocked uploader rather than a slow one.
+    /// A throttle is not enough here, and the difference is the whole difference between a test of the gate and a
+    /// test of the clock: with the uploads merely slowed, the compressor is the stage running ahead, so by the time
+    /// the pause lands the uploaders hold everything that has been staged and the queue behind them is empty —
+    /// delete their gate and there is nothing for them to take, so <c>processed</c> stands still either way and the
+    /// case passes on the broken code. (Measured: with the uploader's gate deleted, the throttled version of this
+    /// case stayed green.) Blocking the uploads instead lets the compressor stage the whole fixture while not one
+    /// upload completes, so when the hold goes up there are eight-odd entries queued and at most one per uploader
+    /// claimed — a real backlog, and no way to consume it except past the gate.
+    /// </para>
+    /// <para>
+    /// The block is released **after** the pause, which is what makes the reading deterministic rather than a race:
+    /// the entries in hand finish and their uploaders come back to the gate and park. So the count of upload calls
+    /// settles at one per uploader and stops, while with the gate gone it runs on through the queue.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -416,39 +511,50 @@ public sealed class CompressionContinuityTests : IDisposable
         Skip.IfNot(SevenZip(), "7z executable not available");
 
         const int files = 12;
+        // UploadLoopAsync runs Max(2, UploadConcurrency + 1) consumers (see the `uploaders` local in
+        // BackupOrchestrator.RunAsync), and each holds at most one queue entry — so this is the most entries that
+        // can be in hand, and therefore the most upload calls the run may still make after the hold goes up.
+        const int uploaders = 3;
         for (var i = 0; i < files; i++)
             WriteFile($"f{i}.bin", FileSize);
 
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var name = RandomName("cont");
-        var (orchestrator, _, request) = Build(
-            new SlowUploader(TimeSpan.FromSeconds(2), new BlobUploader(factory)),
-            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var (orchestrator, staging, request) = Build(
+            uploader, stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
 
         var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
         await using var control = new BackupRunControl(journals, configId: 1, runId: "pause-hold");
 
         var seen = new List<StageProgress>();
-        var progress = new Progress<BackupProgress>(p =>
-        {
-            if (p.Detail is { Stage: "Uploading" } d)
-                lock (seen) seen.Add(d);
-        });
 
         var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
         try
         {
-            var run = orchestrator.RunAsync(request, progress, ct: default, control: control);
+            var run = orchestrator.RunAsync(request, UploadSnapshots(seen), ct: default, control: control);
+            // Eight archives in the pool with every upload blocked = at least five entries queued behind the three
+            // an uploader can be holding. That margin is what the assertion below rests on: five is more than one
+            // per uploader, so "no more than one per uploader was uploaded" cannot be satisfied by an empty queue.
             await WaitUntil(
-                () => { lock (seen) return seen.Any(s => s.Processed > 0); }, TimeSpan.FromSeconds(60),
-                () => "the run never processed an item before the pause.");
+                () => staging.StagedBytes >= 8L * FileSize, TimeSpan.FromSeconds(90),
+                () => $"the pool only reached {staging.StagedBytes} bytes, so there was no backlog for the pause "
+                    + $"to hold; the staging limit was 200,000,000 and {files} files were written.");
 
             control.Gate.PauseByUser();
-            // One item per stage may still be in hand; let them land, then take the reading.
+            Assert.Equal(PauseSource.User, control.Gate.Current!.Source);
+            // Now let the entries in hand run to completion. "Finish the item in hand, then hold" means each
+            // uploader may make its one call and must then park; three seconds is many times what these 2 MB
+            // uploads to a local Azurite need.
+            block.SetResult();
             await Task.Delay(3000);
+
+            Assert.True(uploader.Uploads <= uploaders,
+                $"{uploader.Uploads} uploads for {uploaders} uploaders: the queue kept being consumed after the "
+                + "hold went up, so the upload loop is not checking the gate.");
             StageProgress atPause;
             lock (seen) atPause = seen[^1];
-            Assert.Equal(PauseSource.User, control.Gate.Current!.Source);
             // Without this the test would pass on a run that was simply over: two equal readings prove nothing
             // if there was nothing left to do between them.
             Assert.True(atPause.Processed < files,
@@ -463,6 +569,10 @@ public sealed class CompressionContinuityTests : IDisposable
             control.Gate.ResumeByUser();
             var result = await run.WaitAsync(TimeSpan.FromMinutes(3));
             Assert.Equal(1, result.Version);
+            // The other half of the backlog assertion: everything the hold stopped the uploaders from taking was
+            // still there to take afterwards.
+            Assert.True(uploader.Uploads >= files,
+                $"only {uploader.Uploads} uploads for {files} files: work queued at the pause never came back.");
 
             // Held, not discarded: every item the run started with reaches processed. BackupRunResult has no
             // "files uploaded" member (its file counts are all diff-derived), so the ledger is the witness —
@@ -478,6 +588,108 @@ public sealed class CompressionContinuityTests : IDisposable
                         return $"the run ended with processed={seen[^1].Processed} of total={seen[^1].Total}: "
                             + "work queued when the pause landed never came back.";
                 });
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// The two middle gates: with the hold up, the prober takes no further item out of the work queue and the
+    /// compressor stages nothing out of the probed queue — however much work is put in front of them.
+    /// <para>
+    /// The difficulty this fixture exists to solve is that a producing stage is normally blocked on something other
+    /// than the gate. Left to run, the pipeline settles into one of two states, and its gates are invisible in both:
+    /// with a small fixture every stage drains its input and waits on an empty queue, and with a large one every
+    /// stage fills its output and waits on backpressure (probed queue capacity 128, staging quota in bytes). Either
+    /// way, deleting a gate changes nothing observable and a test built on "these two readings are equal" passes on
+    /// the broken code. So the work is made available **after** the pause is already standing: the prober is held
+    /// inside its first probe by <see cref="GatedHasher"/>, the pause goes up, and only then is the probe released.
+    /// The prober then walks back to the top of its loop with seven items waiting in the queue behind it, and the
+    /// compressor finds the one item that prober just handed over sitting in front of it — both with their inputs
+    /// non-empty, both with room downstream, and both with nothing to stop them except the gate.
+    /// </para>
+    /// <para>
+    /// The observables are direct rather than progress columns. <c>GatedHasher.Probes</c> counts what the prober
+    /// claimed (<c>HeadHashAsync</c> is the first thing <c>ProbeForDedupAsync</c> does with a claimed item) and
+    /// <c>StagingArea.StagedBytes</c> counts what the compressor produced (<c>StageCoreAsync</c> adds to it only
+    /// once a compression and its move-to-staged are both complete). Neither depends on a snapshot being published:
+    /// <c>Enqueue</c> and <c>BeginWork</c> publish nothing at all, and the heartbeat that would otherwise refresh
+    /// the numbers stops when no stream is in flight — which is precisely the state a pause produces. A reading
+    /// taken off <c>StageProgress</c> here could be a stale copy of the one taken before the pause, and two equal
+    /// readings of the same stale snapshot prove nothing.
+    /// </para>
+    /// <para>
+    /// The resume at the end is the anti-vacuity half: it is what proves the seven items really were queued and the
+    /// eighth really was compressible, i.e. that the frozen readings above were work being held rather than work
+    /// that did not exist.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Pause_Holds_The_Prober_And_The_Compressor()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int files = 8;
+        for (var i = 0; i < files; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var probing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hasher = new GatedHasher(probing.Task, new FileHasher());
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            uploader: null, stagingLimit: 200_000_000, uploadConcurrency: 2, container: name, hasher: hasher);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "pause-feeding");
+
+        var seen = new List<StageProgress>();
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, UploadSnapshots(seen), ct: default, control: control);
+
+            // Two conditions, and the second is what makes the prober's half of this test mean anything: a settled
+            // total is the diff saying it has finished enqueuing, so the other seven items are provably **in the
+            // work queue**, not merely undiscovered. Without it a slow walk could leave the prober parked at its
+            // gate with nothing behind it, and "it took no further item" would be true of a queue that was empty.
+            await WaitUntil(
+                () =>
+                {
+                    lock (seen) return hasher.Probes == 1 && seen.Any(s => s.Total == files);
+                },
+                TimeSpan.FromSeconds(60),
+                () =>
+                {
+                    lock (seen)
+                        return $"probes={hasher.Probes} (want 1) and the diff "
+                            + (seen.Any(s => s.Total == files) ? "settled" : "never settled")
+                            + $" its total across {seen.Count} upload snapshots.";
+                });
+
+            control.Gate.PauseByUser();
+            // The hold is up first, then the work appears: the released probe finishes, its item lands in the
+            // probed queue, and the prober comes back round to a queue with seven items in it. Both loops now have
+            // something to take and nothing but the gate stopping them.
+            probing.SetResult();
+            await Task.Delay(3000);
+
+            Assert.Equal(1, hasher.Probes);
+            Assert.Equal(0, staging.StagedBytes);
+
+            control.Gate.ResumeByUser();
+            var result = await run.WaitAsync(TimeSpan.FromMinutes(3));
+            Assert.Equal(1, result.Version);
+            // Held, not lost. Every file was probed after the resume, so the queue the prober walked away from was
+            // full the whole time it stood still — the two assertions above were measuring a hold, not an
+            // already-finished run. (The count is a lower bound: the index-entry override re-reads the head hash
+            // of each file it uploads, through this same hasher.)
+            Assert.True(hasher.Probes >= files,
+                $"only {hasher.Probes} probes for {files} files: the pause dropped work rather than holding it.");
         }
         finally
         {
@@ -575,10 +787,12 @@ public sealed class CompressionContinuityTests : IDisposable
     /// <c>proceed &amp;&amp; _pausedByUser</c> guard is never taken for a downgrade, whose <c>proceed</c> is always
     /// false) — and leave a journal the next run can pick up.
     /// <para>
-    /// The uploader is throttled for the same reason <see cref="SlowUploader"/> exists on the pause/resume test
-    /// above: with the real uploader, twelve 2 MB files against a local Azurite can finish before the pause even
+    /// The uploader is throttled rather than blocked, which is the right choice here and the wrong one one test up:
+    /// with the real uploader, twelve 2 MB files against a local Azurite can finish before the pause even
     /// lands, and a pipeline with nothing left to hold proves nothing about whether Suspend reaches a parked
-    /// worker. The delay also gives the three-second settling window below room to let at least one upload — begun
+    /// worker. What this case asserts is that the suspend arrives and the journal is written, not that a queue
+    /// stopped being consumed, so it does not need <see cref="SlowUploader"/>'s blind spot closed.
+    /// The delay also gives the three-second settling window below room to let at least one upload — begun
     /// before the pause, since uploads run on <c>working</c> and are never gated — actually land, so the journal
     /// assertion at the end is not vacuously checking an empty file.
     /// </para>
@@ -662,6 +876,15 @@ public sealed class CompressionContinuityTests : IDisposable
     /// pipeline that was never actually held would have nothing left to do with 400 tiny files and no throttling,
     /// and would simply finish.
     /// </para>
+    /// <para>
+    /// This is also where the **diff's own** gate is pinned, and neither of those two readings does it: the prober's
+    /// gate is up as well, so with the diff's gate deleted all 400 items would be enqueued and then sit in the work
+    /// queue — nothing staged, nothing completed, both readings unchanged. What separates the two is whether the
+    /// pipeline was ever offered anything, and the settled total is where that shows: <c>SetTotal</c> is called once
+    /// the diff has finished walking and force-publishes, followed immediately by <c>Settle</c>, so an upload
+    /// snapshot carrying a total (or anything queued) is proof the walk ran. With the gate in place the diff never
+    /// gets past its first change callback, so no such snapshot can exist.
+    /// </para>
     /// </summary>
     [SkippableFact]
     public async Task A_Suspend_Reaches_A_Run_Paused_Before_The_Diff_Ever_Started()
@@ -685,15 +908,22 @@ public sealed class CompressionContinuityTests : IDisposable
         // OnChangeAsync ever offers the pipeline a single item.
         control.Gate.PauseByUser();
 
+        var seen = new List<StageProgress>();
+
         var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
         try
         {
-            var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+            var run = orchestrator.RunAsync(request, UploadSnapshots(seen), ct: default, control: control);
 
             await Task.Delay(8000);
             Assert.False(run.IsCompleted,
                 "the run finished before the pause was ever exercised — this proves nothing.");
             Assert.Equal(0, staging.StagedBytes);
+            // Not one item was ever offered to the pipeline: the diff parked in its own change callback, so it
+            // never reached the end of the walk that settles the total, and never enqueued anything for the
+            // stages behind it to hold.
+            lock (seen)
+                Assert.DoesNotContain(seen, s => s.Total > 0 || s.Queued > 0);
 
             var pressed = System.Diagnostics.Stopwatch.StartNew();
             control.RequestStop(StopKind.Suspend);
