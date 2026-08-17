@@ -311,6 +311,18 @@ var dataDir = Path.GetDirectoryName(Path.GetFullPath(dataSource));
 if (!string.IsNullOrEmpty(dataDir))
     Directory.CreateDirectory(dataDir);
 
+// Write-ahead logging, before anything else opens the database. A backup writes to it for hours on end
+// while the UI polls and the scheduler reads; under SQLite's default journal those two shut each other out
+// and the backup dies with "database is locked" (see SqliteJournalMode). The mode is persisted in the file
+// header, so this one call covers every connection the process will open.
+// The result is logged rather than assumed: WAL needs a local filesystem, and on a network share the PRAGMA
+// quietly leaves the old mode in place — better to say so on line one of the log than to leave the operator
+// wondering why the locking never went away.
+var journalMode = SqliteJournalMode.Enable(sqliteConn);
+app.Logger.Log(
+    journalMode == "wal" ? LogLevel.Information : LogLevel.Warning,
+    "SQLite journal mode is {JournalMode}", journalMode);
+
 // Create/upgrade the database from the EF migrations at startup (migration history included). A database created by the old EnsureCreated has no migration history and must be deleted and rebuilt (there are no deployments yet).
 using (var scope = app.Services.CreateScope())
 {
