@@ -93,7 +93,14 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
             // Without forwarding it, OperationCanceledException would be misjudged as a transient error and enter the retry flow.
             await RetryPolicy.ExecuteAsync(async token =>
             {
-                await using var stream = File.OpenRead(filePath);
+                // FileHasher.OpenRead, not File.OpenRead. Since the raw route stopped copying, the path handed in
+                // here can be a **source file** rather than something this process wrote into staged-temp, and
+                // reading a source file has exactly one door in this project for a reason: an ordinary open() on a
+                // FIFO blocks forever waiting for a writer, inside a syscall no CancellationToken can reach, and it
+                // would take the whole run with it. See the remarks on FileHasher.OpenRead. For the staged volumes
+                // that come through here otherwise it is the same open — O_NONBLOCK has no effect on the read
+                // semantics of a regular file.
+                await using var stream = FileHasher.OpenRead(filePath);
                 await blob.UploadAsync(stream, options, token);
             }, retry, ex => TransientErrors.IsTransient(ex, ct), ct);
         }
