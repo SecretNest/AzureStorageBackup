@@ -3,8 +3,14 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>
 /// A lookup table built from however many journal volumes still count, answering "was this content already uploaded last run".
 /// <para>
-/// The test is always **path plus content, both matching**. Path alone will not do — the file may well have been modified after
-/// the interruption; content hash alone will not do either — the journal records by path, and identical content at a different path is a separate entry in the index.
+/// The test is **path plus evidence that the file is still the one that was uploaded**. Path alone will not do — the file may well have been
+/// modified after the interruption; content hash alone will not do either — the journal records by path, and identical content at a different path is a separate entry in the index.
+/// </para>
+/// <para>
+/// The evidence comes at two prices. <see cref="FindBlob"/> takes a full content identity, which costs a read of the whole file;
+/// <see cref="FindUntouchedBlob"/> takes length + mtime, which costs a <c>stat</c> — the same judgement the diff makes to call a
+/// file unchanged. The caller asks the cheap one first and falls back to the expensive one on any miss; see
+/// <see cref="FindUntouchedBlob"/> for why the cheap one is not a weakening.
 /// </para>
 /// <para>
 /// When the same path shows up in several volumes the newer one wins; for the rule see <see cref="FromVolumes"/>.
@@ -90,6 +96,50 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
             && r.Length == length
             && string.Equals(r.HeadHash, headHash, StringComparison.Ordinal)
             && string.Equals(r.TailHash, tailHash, StringComparison.Ordinal)
+            ? r
+            : null;
+
+    /// <summary>
+    /// The previous run uploaded this exact path and the file has not been touched since.
+    /// <para>
+    /// Returns null when the record predates <see cref="JournalRecord.MtimeUtcTicks"/>, when the path is absent, or when
+    /// either metadata test fails — in every one of those the caller must fall back to the content test, which is the
+    /// route that ran before this method existed and is unchanged by it. A null mtime is the case to be most careful
+    /// about: a record that **cannot** answer the cheap question must not be allowed to answer it by default, or every
+    /// journal written by an older build would start matching on path alone.
+    /// </para>
+    /// <para>
+    /// This is weaker than <see cref="FindBlob"/> on purpose, and exactly as weak as the diff. The class remarks above
+    /// say path alone will not do, "the file may well have been modified after the interruption", and that is true —
+    /// but path **and metadata** is a different proposition, and it is the one the diff already makes a thousand times a
+    /// second: a file whose length and mtime match its previous version is called Unchanged in <c>BackupDiffer</c>
+    /// without a byte being read. So a file that slips past this check would also have slipped past the diff and never
+    /// entered the pipeline at all — the resume accepts nothing the run as a whole had not already accepted.
+    /// </para>
+    /// <para>
+    /// Permissions, which the diff also compares, are deliberately left out: they do not affect the **content**, which
+    /// is all a journal record claims, and the index entry's metadata is rewritten from the current scan regardless.
+    /// </para>
+    /// <para>
+    /// What the strictness of <see cref="FindBlob"/> bought — catching a file rewritten between the interruption and the
+    /// resume — it still buys, on the fallback path every non-match takes. A rewrite that preserves both length and
+    /// mtime defeats this check, and it defeats the diff identically; that is a pre-existing boundary of the whole
+    /// design, not a hole opened here.
+    /// </para>
+    /// <para>
+    /// The reason for having it at all is what the content test costs: <c>FindBlob</c> needs a full content identity,
+    /// and that means reading the whole file. Measured on a real resume, 194.1 GB of source was read to establish that
+    /// 704.4 MB needed sending — better than 99% of it spent proving that nothing had to be done.
+    /// </para>
+    /// </summary>
+    /// <param name="mtimeUtc">The source file's current last-write time, from the <c>stat</c> the caller has done anyway.</param>
+    public JournalRecord? FindUntouchedBlob(string path, DateTimeOffset mtimeUtc, long length)
+        => _blobs.TryGetValue(path, out var r)
+            // Spelled out rather than left to `r.MtimeUtcTicks == mtimeUtc.UtcTicks`, which would also be correct (a
+            // null long? equals no long) but reads as an ordinary comparison — and "the record has an answer" is the
+            // single condition this whole method's safety rests on. It deserves to be visible.
+            && r.MtimeUtcTicks is { } ticks && ticks == mtimeUtc.UtcTicks
+            && r.Length == length
             ? r
             : null;
 

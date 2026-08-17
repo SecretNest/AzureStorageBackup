@@ -25,6 +25,18 @@ public static class TransientErrors
         // We used to miss it here, so our own RetryPolicy layer never retried even once and simply pronounced the run dead.
         AggregateException agg => agg.InnerExceptions.Count > 0
             && agg.InnerExceptions.All(inner => IsTransient(inner, ct)),
+        // A raw upload undid itself: the source moved while it was in flight, so the object was taken back and the
+        // address given up again. The item that hit it never presents it here — its own caller answers it by
+        // re-staging through the copying route, which cannot throw it. The one thing that does is a **peer**:
+        // another file in this run whose content is byte-identical, parked on the same dedup reservation, which is
+        // failed with whatever failed the upload. It receives it inside LocalDedupResolver.ResolveAsync, outside the
+        // catch that answers it, so this line is all that stands between it and a dead run.
+        // Retrying is also the right answer on the merits: for that peer this means what any failed upload means —
+        // the address it was waiting for was withdrawn, so it has to upload the content itself, which is precisely
+        // what a retry makes it do. And the wait it was in is the guilty item's **whole** upload, minutes for a
+        // multi-GB file, with byte-identical duplicates being ordinary in the media library the raw route exists
+        // for: not a window worth leaving a run-killer in.
+        BackupOrchestrator.SourceMovedDuringUploadException => true,
         _ => false,
     };
 }

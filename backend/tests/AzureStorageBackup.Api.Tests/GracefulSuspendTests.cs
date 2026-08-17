@@ -133,6 +133,79 @@ public class GracefulSuspendTests : IDisposable
         Assert.Equal(SuspendReason.UserRequested, c.SuspendReason);
     }
 
+    /// <summary>
+    /// A run the operator paused is **theirs**, and a shutdown that catches it must record it that way — otherwise
+    /// Pause, upgrade the image, restart, and the backup is running again with the hold gone and no record it ever
+    /// existed. On this deployment a container restart is the routine way to install an upgrade, so that is not a
+    /// corner case: it is the first thing that happens to an operator who pauses and then updates.
+    /// <para>
+    /// The whole chain is exercised rather than just the reason field, because the reason is only interesting for
+    /// what the **next startup** does with it. <c>MarkSuspended</c> is called here the way the orchestrator's
+    /// suspend path calls it (BackupOrchestrator.cs:384 passes the reason off the exception SettleStopAsync builds
+    /// from <c>control.SuspendReason</c>), and then the real auto-resume criterion is asked the real question.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_shutdown_records_a_paused_run_as_the_operators_own_suspend()
+    {
+        using var factory = new TestWebAppFactory();
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+        var store = Store();
+        await using var control = new BackupRunControl(store, configId: 7, runId: "run-paused");
+        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, default);
+        control.Gate.PauseByUser();
+
+        // Completion is pre-settled so the shutdown's wait returns at once: what is under test is the reason that
+        // goes out with the request, not how long anyone waits for it.
+        var state = new BackupRunState { Status = RunStatus.Running, Control = control };
+        state.Completion.TrySetResult();
+        InjectRun(runner, 900_778, state);
+        try
+        {
+            await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default);
+
+            Assert.Equal(SuspendReason.UserRequested, control.SuspendReason);
+            control.MarkSuspended(control.SuspendReason);
+            Assert.Equal(SuspendReason.UserRequested, store.ReadSuspendMark(1, "c", "run-paused"));
+            Assert.Empty(await AutoResumeService.PickResumableAsync(store, [(7, 1, "c")], default));
+        }
+        finally
+        {
+            RemoveRun(runner, 900_778);
+        }
+    }
+
+    /// <summary>
+    /// The other half, and the one that keeps the case above from being satisfied by simply never writing
+    /// ShuttingDown again: the same shutdown, the same machinery, no hold — and the run is picked back up on the
+    /// next startup exactly as it was before.
+    /// </summary>
+    [Fact]
+    public async Task A_shutdown_still_records_an_unpaused_run_as_shutting_down()
+    {
+        using var factory = new TestWebAppFactory();
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+        var store = Store();
+        await using var control = new BackupRunControl(store, configId: 8, runId: "run-going");
+        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, default);
+
+        var state = new BackupRunState { Status = RunStatus.Running, Control = control };
+        state.Completion.TrySetResult();
+        InjectRun(runner, 900_779, state);
+        try
+        {
+            await runner.SuspendAllAsync(SuspendReason.ShuttingDown, default);
+
+            Assert.Equal(SuspendReason.ShuttingDown, control.SuspendReason);
+            control.MarkSuspended(control.SuspendReason);
+            Assert.Equal([8], await AutoResumeService.PickResumableAsync(store, [(8, 1, "c")], default));
+        }
+        finally
+        {
+            RemoveRun(runner, 900_779);
+        }
+    }
+
     /// <summary>A run suspended before the journal was opened leaves nothing on disk, so the mark would only become an
     /// orphan pointing at a journal that does not exist — and Task 15 would follow it looking for a journal volume that isn't there.</summary>
     [Fact]

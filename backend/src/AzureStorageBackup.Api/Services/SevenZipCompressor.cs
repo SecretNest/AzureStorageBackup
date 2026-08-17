@@ -165,7 +165,25 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add(Path.GetFullPath(request.OutputArchivePath));
         args.AddRange(request.Entries);
 
-        var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
+        SevenZipRun run;
+        try
+        {
+            run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
+        }
+        catch
+        {
+            // Same rule as the streaming path below: not one byte of a half-written archive may survive, because
+            // the caller (StagingArea) collects whatever is in compress-temp as the product — an abandoned volume
+            // is not merely wasted disk, it is a fragment sitting where a finished archive is expected.
+            // SevenZipCli kills the process tree on cancellation but does no filesystem cleanup of its own; that
+            // is deliberately left here, where the output paths are known.
+            // This used to be unreachable in practice because interrupting a compression took Stop now. Once a
+            // plain Suspend cancels the compression stage it became ordinary — and on a NAS the process restart
+            // that sweeps compress-temp may be months away, so the fragments would accumulate.
+            DeleteArchiveRemnants(request.OutputArchivePath);
+            throw;
+        }
+
         var volumes = CollectVolumes(request.OutputArchivePath);
 
         // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1 is
@@ -245,10 +263,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         catch
         {
             // Not one byte of a half-written archive may survive: the caller (StagingArea) collects whatever is in compress-temp as the product.
-            foreach (var v in CollectVolumes(request.OutputArchivePath))
-            {
-                try { File.Delete(v); } catch { /* best effort */ }
-            }
+            // Remnants rather than volumes: a cancelled 7z leaves `.001.tmp`, which CollectVolumes does not match.
+            DeleteArchiveRemnants(request.OutputArchivePath);
             throw;
         }
 
@@ -383,6 +399,36 @@ public sealed class SevenZipCompressor : IFileCompressor
     /// <summary>
     /// Collects the volume files produced. When splitting, 7z produces out.7z.001/.002...; when not, out.7z.
     /// </summary>
+    /// <summary>
+    /// Delete everything this archive left in the temp area, 7-Zip's own in-progress files included.
+    /// <para>
+    /// <see cref="CollectVolumes"/> deliberately matches only **finished** volumes — names ending in three
+    /// digits — because that is what a successful run produces. A cancelled run leaves something else:
+    /// 7-Zip writes each volume as <c>name.7z.001.tmp</c> and renames it only once the volume is complete,
+    /// so cleaning up by CollectVolumes alone misses precisely the file a cancellation creates. That was
+    /// measured, not assumed: the cancellation test failed with <c>canceled.7z.001.tmp</c> left behind.
+    /// </para>
+    /// <para>
+    /// Matching on the archive name as a prefix is safe here because compression is globally serial (one
+    /// lock in StagingArea) and every archive gets its own name, so nothing else in the temp area can share
+    /// this prefix.
+    /// </para>
+    /// </summary>
+    private static void DeleteArchiveRemnants(string archivePath)
+    {
+        var full = Path.GetFullPath(archivePath);
+        var dir = Path.GetDirectoryName(full)!;
+        var name = Path.GetFileName(full);
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, name + "*"))
+            {
+                try { File.Delete(f); } catch { /* best effort */ }
+            }
+        }
+        catch { /* the directory itself may already be gone */ }
+    }
+
     private static IReadOnlyList<string> CollectVolumes(string archivePath)
     {
         var full = Path.GetFullPath(archivePath);

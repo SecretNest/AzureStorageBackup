@@ -288,13 +288,20 @@ export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspe
 // Stuck on a transient error, waiting for the self-healing retry. **This is not a status**: status is
 // still Running, because the background task is alive and the staging lease is still held. Making it a
 // status would hide the stop button — and being stuck is exactly when stopping is most wanted.
+// Why the gate is closed (serialises as a number, matching the backend enum PauseSource — pinned there,
+// mirrored here). TransientError = the self-healing retry above. User = the operator pressed Pause: no
+// countdown, nothing to retry now, and it never degrades to suspended on its own.
+export const PauseSource = { TransientError: 0, User: 1 } as const
+
 export interface PauseInfo {
   reason: string
   since: string
   // When the next automatic retry is due (UTC). null while a retry is already under way.
   nextRetryAt: string | null
-  // Consecutive failures. Reaching the threshold degrades automatically to suspended.
+  // Consecutive failures. Reaching the threshold degrades automatically to suspended — unless the user's own
+  // hold is standing, which stops that clock entirely.
   failures: number
+  source: number // PauseSource
 }
 
 // A run left half-finished on disk. After a restart nothing is in memory, so this is the only way to know.
@@ -339,6 +346,14 @@ export interface BackupRun {
   runId: string
   // Non-null = stuck on a transient error awaiting retry. status is still 'Running'.
   pause: PauseInfo | null
+  // Whether the operator's own hold is standing right now. A sibling of `pause`, not a field on it, and
+  // deliberately not inferable from `pause.source`: pressing Pause while a transient-error backoff already
+  // holds the gate leaves `pause.source` reporting 'TransientError' — countdown and Retry-now affordance
+  // included — until that backoff's own timer fires, up to one steady interval (five minutes by default).
+  // Rendering paused-ness from `pause` alone would show such a run as merely stuck and retrying, as though
+  // the operator's Pause had done nothing. This flag stays true for as long as the hold does, regardless of
+  // what `pause.source` says at the moment.
+  pausedByUser: boolean
   // Why, when status === 'Suspended': UserRequested / AutoSuspended.
   suspendReason: string | null
 }
@@ -571,6 +586,11 @@ export const backupConfigsApi = {
   suspend: (id: number) => api.post<void>(`/backup-configs/${id}/suspend`, {}),
   // Release one retry immediately, without waiting for the self-healing timer.
   retryNow: (id: number) => api.post<void>(`/backup-configs/${id}/retry-now`, {}),
+  // Hold the run in place: every stage finishes the item in hand and parks, keeping its staging quota until
+  // resume() lifts the hold. Not the same "resume" the suspend comment above disclaims — that one means
+  // continuing a torn-down run via run(); this one lifts a pause that never tore anything down.
+  pause: (id: number) => api.post<void>(`/backup-configs/${id}/pause`, {}),
+  resume: (id: number) => api.post<void>(`/backup-configs/${id}/resume`, {}),
   interrupted: (id: number) => api.get<InterruptedRun[]>(`/backup-configs/${id}/interrupted`),
   discardInterrupted: (id: number) => api.del(`/backup-configs/${id}/interrupted`),
   resetPassword: (id: number, password: string) =>

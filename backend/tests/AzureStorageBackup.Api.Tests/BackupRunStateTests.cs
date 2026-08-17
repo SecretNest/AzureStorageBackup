@@ -14,6 +14,34 @@ public class BackupRunStateTests
         Assert.False(string.IsNullOrEmpty(response.RunId));
         Assert.Null(response.Pause);
         Assert.Null(response.SuspendReason);
+        Assert.False(response.PausedByUser);
+    }
+
+    /// <summary>
+    /// The scenario the review caught: the operator presses Pause while a transient-error backoff already holds
+    /// the gate. <c>Pause.Source</c> keeps reporting <c>TransientError</c> — with its countdown and its Retry-now
+    /// affordance — until that backoff's own timer fires, up to one steady interval. Without a separate signal, the
+    /// UI would render this run as merely stuck and retrying, as if the operator's Pause had done nothing.
+    /// <c>PausedByUser</c> is read live off the gate rather than baked into the stored <see cref="PauseInfo"/>,
+    /// which is exactly why it can tell the truth here where <c>Pause.Source</c> cannot.
+    /// </summary>
+    [Fact]
+    public async Task PausedByUser_reports_the_operators_hold_even_while_a_backoff_owns_the_pause_object()
+    {
+        var store = new BackupJournalStore(Path.Combine(Path.GetTempPath(), "asb-rs-" + Guid.NewGuid().ToString("N")));
+        var gate = new PauseGate(
+            schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1), patience: TimeSpan.FromHours(1));
+        await using var control = new BackupRunControl(store, 1, "run-x", gate);
+        var state = new BackupRunState { Control = control };
+
+        _ = gate.WaitAsync(new IOException("network down"), default);
+        for (var i = 0; i < 200 && gate.Current is null; i++)
+            await Task.Delay(5);
+        gate.PauseByUser();
+
+        var response = BackupRunResponse.From(state);
+        Assert.Equal(PauseSource.TransientError, response.Pause!.Source);
+        Assert.True(response.PausedByUser, "the operator's hold is standing regardless of what Source says");
     }
 
     // While paused the status is still Running (a sub-state), or the scheduler would conclude the round had ended and start another one on top of it.

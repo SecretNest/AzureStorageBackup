@@ -1063,6 +1063,71 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
     }
 
+    /// <summary>Same shape as Suspend/Retry now: the operator pressed a button and is owed an answer about why
+    /// nothing happened, not a silent no-op.</summary>
+    [Fact]
+    public async Task Pausing_without_a_running_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("pause-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("pa", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/pause", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Resuming_without_a_paused_backup_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("resume-idle");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("re", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var res = await _client.PostAsync($"/api/backup-configs/{created!.Id}/resume", null);
+        Assert.Equal(HttpStatusCode.Conflict, res.StatusCode);
+    }
+
+    /// <summary>
+    /// The window this endpoint used to answer 204 in while doing nothing at all. A run that has been told to stop
+    /// stays <see cref="RunStatus.Running"/> for the whole wind-down — potentially minutes, since a Suspend waits
+    /// for the volume in hand to finish uploading — but its gate has been downgraded, and a downgraded gate can
+    /// never hold anyone again. So the operator would press Pause on a stopping run, be told it worked, and watch
+    /// the run stop anyway. Same for the shape a patience auto-suspend leaves behind, which downgrades the very
+    /// same gate with nothing else about the run changing.
+    /// <para>
+    /// <see cref="BackupRunControl.RequestStop"/> is what puts a real run into this state, and it is used here
+    /// rather than a bare <c>Gate.Downgrade()</c> for that reason: it is the production path, and it downgrades the
+    /// gate as a side effect of setting the stop intent.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Pausing_a_backup_that_is_already_stopping_is_a_conflict()
+    {
+        var accountId = await CreateAccountAsync("pause-stopping");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("ps", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
+        var journals = _services.GetRequiredService<BackupJournalStore>();
+        await using var control = new BackupRunControl(journals, created!.Id, "run-stopping");
+        control.RequestStop(StopKind.Suspend);
+        InjectRun(backupRunner, created.Id, new BackupRunState { Status = RunStatus.Running, Control = control });
+        try
+        {
+            var paused = await _client.PostAsync($"/api/backup-configs/{created.Id}/pause", null);
+            Assert.Equal(HttpStatusCode.Conflict, paused.StatusCode);
+
+            // And the same for its counterpart: the downgrade ended whatever hold there was, so there is nothing
+            // for a Resume to lift either.
+            var resumed = await _client.PostAsync($"/api/backup-configs/{created.Id}/resume", null);
+            Assert.Equal(HttpStatusCode.Conflict, resumed.StatusCode);
+        }
+        finally
+        {
+            RemoveRun(backupRunner, created.Id);
+        }
+    }
+
     [Fact]
     public async Task Interrupted_runs_are_listed_with_their_block_count()
     {

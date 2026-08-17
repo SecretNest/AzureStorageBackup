@@ -1,3 +1,4 @@
+using System.Text.Json;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -112,6 +113,51 @@ public class BackupJournalTests : IDisposable
     [Fact]
     public async Task Missing_file_reads_as_null()
         => Assert.Null(await BackupJournal.ReadAsync(Path_("nope.jsonl"), default));
+
+    // Ticks rather than a formatted timestamp so the round trip is exact: this pins that the value comes back
+    // bit-for-bit, not "close enough after going through a rendered time".
+    [Fact]
+    public async Task Blob_record_mtime_round_trips_exactly()
+    {
+        var file = Path_("mtime.jsonl");
+        var mtimeUtc = new DateTimeOffset(2026, 3, 14, 15, 9, 26, TimeSpan.Zero).AddTicks(5926535);
+
+        await using (var j = await BackupJournal.CreateAsync(file, Header(), default))
+            await j.AppendAsync(new JournalRecord
+            {
+                Kind = "blob", Ref = "data/aaa", Path = "x/y.bin", FullHash = "aaa",
+                HeadHash = "h", TailHash = "t", Length = 10,
+                MtimeUtcTicks = mtimeUtc.UtcTicks,
+            }, default);
+
+        var content = await BackupJournal.ReadAsync(file, default);
+        Assert.NotNull(content);
+        Assert.Equal(mtimeUtc.UtcTicks, content!.Records[0].MtimeUtcTicks);
+    }
+
+    /// <summary>
+    /// The compatibility case that matters most (see <see cref="JournalRecord.MtimeUtcTicks"/>): a line written by a
+    /// version of this program that predates the field simply does not have the property at all — not
+    /// `"MtimeUtcTicks":null`, absent entirely. Deserialising it must not throw, and must not produce anything that
+    /// could be mistaken for a real mtime; it has to come back as null so the resume falls back to the full content
+    /// test, exactly as it did before this field existed. Getting this wrong is the one mistake that could put the
+    /// wrong content in the index (see <see cref="JournalResume.FindBlob"/>'s reasoning for why path alone is unsafe).
+    /// </summary>
+    [Fact]
+    public async Task Record_without_the_mtime_field_deserialises_as_null()
+    {
+        var file = Path_("no-mtime.jsonl");
+        var headerLine = JsonSerializer.Serialize(Header(), JournalJson.Options);
+        // Hand-written, deliberately omitting MtimeUtcTicks, to stand in for a line an older version actually wrote.
+        var recordLine = "{\"Kind\":\"blob\",\"Ref\":\"data/aaa\",\"Path\":\"x/y.bin\",\"FullHash\":\"aaa\"," +
+                          "\"HeadHash\":\"h\",\"TailHash\":\"t\",\"Length\":10}";
+        await File.WriteAllTextAsync(file, headerLine + "\n" + recordLine + "\n");
+
+        var content = await BackupJournal.ReadAsync(file, default);
+        Assert.NotNull(content);
+        Assert.Single(content!.Records);
+        Assert.Null(content.Records[0].MtimeUtcTicks);
+    }
 
     [Fact]
     public async Task Flush_makes_records_readable_while_still_open()

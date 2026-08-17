@@ -91,6 +91,19 @@ public sealed class BackupRunState
     public PauseInfo? Pause => Control?.Gate.Current;
 
     /// <summary>
+    /// Whether the operator's own hold is standing right now. Deliberately not read off <see cref="Pause"/>:
+    /// <see cref="PauseInfo.Source"/> reports only whichever reason most recently closed the gate, so a Pause
+    /// pressed while a transient-error backoff is already running leaves <c>Pause.Source</c> saying
+    /// <c>TransientError</c> — countdown and Retry-now affordance included — until that backoff's own timer
+    /// fires, up to one steady interval (five minutes by default). A UI rendering paused-ness from <c>Pause</c>
+    /// alone would show such a run as merely stuck and retrying, as though the operator's Pause had done
+    /// nothing. Reading <see cref="PauseGate.IsPausedByUser"/> live, instead of a value baked into a stored
+    /// <see cref="PauseInfo"/>, is what lets this stay true for as long as the hold does, independent of which
+    /// reason <c>Pause.Source</c> happens to be reporting at the moment.
+    /// </summary>
+    public bool PausedByUser => Control?.Gate.IsPausedByUser ?? false;
+
+    /// <summary>
     /// Internal machinery, not part of the HTTP contract: the original exception on failure. Set alongside Error in
     /// RunCoreAsync's catch so TaskDispatcher can attach it as the InnerException when it rethrows — the container log
     /// therefore keeps the status code, request id and real stack that the Azure exception carries, instead of being
@@ -116,12 +129,15 @@ public sealed record BackupRunResponse(
     string RunId = "", PauseInfo? Pause = null, string? SuspendReason = null,
     // What the round changed and what it uploaded — see the matching properties on BackupRunState.
     int? NewFiles = null, int? ModifiedFiles = null, int? DeletedFiles = null,
-    long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null)
+    long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null,
+    // Sibling of Pause, not a field on it — see BackupRunState.PausedByUser for why the two can disagree.
+    bool PausedByUser = false)
 {
     public static BackupRunResponse From(BackupRunState s) =>
         new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, s.Pause, s.SuspendReason?.ToString(),
-            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes);
+            s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
+            s.PausedByUser);
 }
 
 /// <summary>
@@ -272,13 +288,44 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             // control is already disposed before the status flips to terminal (`await using` takes effect ahead of
             // the catch blocks). A stop request arriving in that instant can do nothing — this round is winding down
             // anyway, so treat it as "not running".
-            try { control.RequestStop(kind, reason); }
+            try { control.RequestStop(kind, ReasonFor(control, kind, reason)); }
             catch (ObjectDisposedException) { return null; }
         }
         else
             state.Cancellation.Cancel();   // hasn't reached the point where control gets built yet (config resolution stage)
         return state;
     }
+
+    /// <summary>
+    /// The suspend reason to record on disk: the caller's, unless the operator is holding this run at the pause
+    /// gate — in which case the suspension is theirs, whoever asked for it.
+    /// <para>
+    /// The case that matters is the shutdown: <c>GracefulSuspendService</c> suspends every live run as
+    /// <see cref="SuspendReason.ShuttingDown"/>, and <see cref="AutoResumeService.PickResumableAsync"/> restarts
+    /// exactly the configs whose every volume says ShuttingDown. Without this, Pause → upgrade the image → restart
+    /// leaves the backup running again with the hold gone and no record it ever existed — and on this deployment,
+    /// a container restart is the routine way to install an upgrade, so it is not a corner case but the first thing
+    /// that happens to an operator who pauses and then updates. Recording it as
+    /// <see cref="SuspendReason.UserRequested"/> lands the run where the design says it should: an interrupted run
+    /// with a Resume button, waiting for the person who paused it.
+    /// </para>
+    /// <para>
+    /// This is the only place the two facts meet. The reason travels stop request → <c>_suspendReason</c> CAS →
+    /// <c>SettleStopAsync</c> → <c>BackupSuspendedException</c> → <c>MarkSuspended</c>, and of those only the stop
+    /// request has the run's control — and therefore its gate — in hand. It also has to be read **here**, before
+    /// <see cref="BackupRunControl.RequestStop"/> is called: that method downgrades the gate to wake the workers
+    /// parked at it, and a downgrade ends the user's hold (<c>PauseGate.DowngradeLocked</c>), so asking afterwards
+    /// always answers no.
+    /// </para>
+    /// <para>
+    /// Only for <see cref="StopKind.Suspend"/>, because only a suspension writes a mark at all; the two cancel
+    /// kinds deliberately leave none. And it can only ever move the value **towards** the operator, never away
+    /// from it: <see cref="SuspendReason.AutoSuspended"/> cannot coincide with a standing hold in the first place
+    /// (patience does not run while the user holds the gate), and UserRequested → UserRequested is a no-op.
+    /// </para>
+    /// </summary>
+    private static SuspendReason ReasonFor(BackupRunControl control, StopKind kind, SuspendReason reason) =>
+        kind == StopKind.Suspend && control.Gate.IsPausedByUser ? SuspendReason.UserRequested : reason;
 
     /// <summary>Stop right now (without waiting for the flush to disk). Kept so the shared /cancel endpoint has the same shape as the other runners.</summary>
     public bool Cancel(int configId) => RequestStop(configId, StopKind.StopNow) is not null;
@@ -448,6 +495,67 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             return false;
         state.Control!.Gate.ReleaseNow();
         return true;
+    }
+
+    /// <summary>
+    /// The user pressed Pause: hold the run where it is. Each stage finishes the item in hand and then parks at the
+    /// gate, so it takes effect within one item per stage — worst case, the time to compress one large file.
+    /// <para>
+    /// Nothing is discarded and nothing is flushed. The run stays alive, holding its staging quota — which is booked
+    /// on a process-wide singleton, so a run paused overnight makes this machine's other backups wait overnight —
+    /// until <see cref="Resume"/>. That is the price of Resume being free: there is nothing to re-scan, re-diff or
+    /// re-probe, because none of it was thrown away.
+    /// </para>
+    /// <para>
+    /// A process restart loses all of it, which is why this does not replace Suspend: pause is memory state, and the
+    /// shutdown path still has to suspend.
+    /// </para>
+    /// </summary>
+    /// <returns>
+    /// false when there is nothing to hold: no live run for this config, or a run whose gate is already
+    /// downgraded.
+    /// <para>
+    /// The second case is not an edge: <see cref="RunStatus"/> stays Running for the whole wind-down after a
+    /// Suspend or a Stop — which can be minutes, since a suspend waits for the volume in hand to finish
+    /// uploading — and it stays Running after a patience auto-suspend too. Pressing Pause in that window used to
+    /// return success while <see cref="PauseGate.PauseByUser"/> quietly did nothing, so the operator was told the
+    /// run was held and it was not. The answer comes from the gate itself rather than from a
+    /// <see cref="PauseGate.IsDowngraded"/> check here, so that it cannot be read before the call it describes.
+    /// </para>
+    /// </returns>
+    public bool Pause(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        // Unlike RetryNow this cannot lean on `state.Pause is not null` to prove the control is there — the whole
+        // point is to pause a run that is not paused — so Control is checked directly. It is assigned a few awaits
+        // into RunCoreAsync (config, account and settings are loaded first), and until then a run really is Running
+        // with no gate to hold.
+        if (state is not { Status: RunStatus.Running, Control: not null })
+            return false;
+        return state.Control.Gate.PauseByUser();
+    }
+
+    /// <summary>
+    /// Lift a user pause. If a transient error is holding the gate as well — pressing Pause does not stop the volume
+    /// already on the wire, and that upload can still fail — the run stays parked on that one and the UI goes on
+    /// reporting it, which is correct: the run is not ready to proceed just because the operator is.
+    /// </summary>
+    /// <returns>
+    /// false when there is no hold to lift: no live run, or a run nobody is holding — including one whose hold a
+    /// Suspend, a Stop or a patience downgrade has already ended, which is the same window
+    /// <see cref="Pause"/> describes and wants the same answer, so that the endpoint's conflict means what it
+    /// says rather than reporting success for a button press that changed nothing.
+    /// </returns>
+    public bool Resume(int configId)
+    {
+        BackupRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running, Control: not null })
+            return false;
+        return state.Control.Gate.ResumeByUser();
     }
 
     /// <summary>The execution body shared by both entry points. **Does not touch the busy lock** — the lock is the caller's job.</summary>

@@ -14,6 +14,7 @@ function run(over: Partial<BackupRun> = {}): BackupRun {
     completedAt: null,
     runId: 'abc123',
     pause: null,
+    pausedByUser: false,
     suspendReason: null,
     newFiles: 0,
     modifiedFiles: 0,

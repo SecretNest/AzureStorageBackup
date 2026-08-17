@@ -51,11 +51,20 @@ using var feeding = CancellationTokenSource.CreateLinkedTokenSource(
 
 Adding `StopToken` to the link makes Suspend and Finish-current-files cancel the prober and the
 compressor while leaving the uploaders on `working`. 7z is killed by `SevenZipCli`'s existing
-cancellation path, partial output is cleaned by `MoveToStaged`'s catch, and the queues are released by
-`DrainQueues` as they already are. The uploaders finish the volume in hand and write the journal,
+cancellation path, its partial output is deleted by `SevenZipCompressor`'s own catch, and the queues are
+released by `DrainQueues` as they already are. The uploaders finish the volume in hand and write the journal,
 which is the only in-flight work worth finishing.
 
 `StopNow` is unchanged: it fires `_abort` → `working`, which cancels everything including uploads.
+
+Two corrections found while implementing this, both now in the code. The cleanup is **not**
+`MoveToStaged`'s catch — that one only fires when the move itself fails after a compression already
+succeeded. It is `SevenZipCompressor`'s, and the pack path did not have one at all: it cleaned up only
+on the "7z dropped a member" exit code, so a cancelled pack compression left its volumes behind. That
+was unreachable in practice while interrupting a compression took `StopNow`; this change makes it
+ordinary. And the cleanup both paths did have matched only *finished* volumes (`name.7z.001`), while a
+cancelled 7z leaves `name.7z.001.tmp` — it renames each volume only once complete. So the file a
+cancellation actually produces was precisely the one the cleanup could not see.
 
 ### 2. `PauseGate` learns a second reason to be closed
 
@@ -63,7 +72,11 @@ The gate stays one gate — a worker should not have to ask *why* it is parked �
 way to be closed and a source on what it reports:
 
 ```csharp
-public enum PauseSource { TransientError, User }
+// The numbers are the wire contract, mirrored in frontend/src/api/backupConfigs.ts. PauseInfo goes to the
+// browser as itself — no DTO projects the enum into a string the way BackupRunResponse does for Status and
+// SuspendReason — and no JsonStringEnumConverter is registered, so this serialises as a number, exactly as
+// CloudState/LocalState already do from the same position.
+public enum PauseSource { TransientError = 0, User = 1 }
 
 public sealed record PauseInfo(
     string Reason, DateTimeOffset Since, DateTimeOffset? NextRetryAt, int Failures,
@@ -78,6 +91,19 @@ The two reasons can coexist: pressing Pause does not stop the volume already on 
 upload can still fail. The gate is closed while **either** reason holds, and `ResumeByUser` clears
 only the user's. A resume that finds the error reason still standing leaves the gate closed and the
 UI showing the transient-error pause, which is correct — the run is not ready to proceed.
+
+The patience clock belongs to the transient-error reason alone, and the user's hold stops it. Patience
+means "the run kept retrying and nothing ever recovered"; while the hold stands no worker is permitted to
+retry anything, so the clock would be reading an operator's coffee break as a network that never came
+back. Two consequences, both load-bearing:
+
+- A failure that lands during a pause parks its worker and starts its backoff, but can never downgrade
+  the run — `PatienceExhausted` answers no while the hold is up. Without this, a paused run auto-suspends
+  itself while the operator is away, which §4 promises can never happen.
+- `ResumeByUser` clears the clock and the failure count, exactly as `Retry now` does. The retry the
+  operator has just authorised is the first one the run has been allowed since the hold went up, so it
+  gets the full patience window and a backoff ladder starting at its first step, rather than finding the
+  budget already spent by a pause during which nothing was tried.
 
 `WaitIfPausedAsync` is deliberately not `WaitAsync`: the existing method means "I failed, count it
 against the patience". Passing through a gate must not register a failure, and must not be able to
@@ -104,10 +130,31 @@ and re-queue) would need 7z killed, partial output deleted and the item re-enque
 would be recompressed from scratch next time; that trades a real recompression for a few seconds of
 responsiveness.
 
+**One gate means these four also park on a transient-error pause**, which is a change in how the
+pipeline behaves during a network blip and not only during a Pause. Before, an upload that hit trouble
+parked only itself (`WithPauseAsync`), while the compressor went on filling the staging pool and the
+diff went on reading the disk; now every producing loop stops at its next item boundary until the
+backoff releases them — up to one steady interval, five minutes by default. That follows from §2's
+decision that a worker should not have to ask *why* it is parked, and it is mostly an improvement:
+compressing more output that cannot be uploaded only fills a pool that is process-wide, and it is the
+pool filling up behind parked uploaders that produced the retry deadlock
+`StagingArea.StageWithoutBackpressureAsync` exists to break. It is stated here because it is invisible
+in the code — `WaitIfPausedAsync` deliberately does not name a reason — and because the effect is real:
+`BackupPauseGateIntegrationTests.Every_uploader_retrying_at_once_against_a_full_pool_still_finishes`
+assembles its scene by letting the compressor fill the pool while both uploaders sit out a backoff, and
+that no longer happens (measured: with the compressor's gate removed the case passes 3/3 in ~15s; with
+it, 1/3 in ~35s, its scene guard reporting a pool one archive short of the ceiling).
+
 ### 4. What the operator sees
 
 `RunStatus` is **unchanged** — the run is genuinely still Running, it is merely holding. Paused is
-expressed by `PauseInfo.Source == User`, and the frontend renders that as a paused run:
+expressed by `PauseInfo.Source == User` **or** `PauseGate.IsPausedByUser`, and the second one is not
+redundant: `PauseInfo` carries a single source, and a pause pressed while a transient-error backoff is
+running leaves the backoff reporting itself until its timer fires — up to one steady interval, five
+minutes by default. Rendering from the source alone would show such a run as "stuck, retrying in 4:37",
+with a Retry-now button, as if the Pause had done nothing. The two facts are kept separate rather than
+having the pause overwrite the trouble, because a run really can be both, and whichever the screen
+chooses to lead with, the other is still there to say. The frontend renders it as a paused run:
 
 ```
 Paused 23 minutes ago · holding 4.2 GB of staging
@@ -118,7 +165,8 @@ The staging figure is not decoration. A paused run keeps its compressed output o
 makes Resume cheap — and that quota is process-wide, so a run paused overnight holds it overnight.
 There is deliberately **no timeout**: an automatic downgrade would turn a pause into a suspend exactly
 when the operator is not watching, which is the opposite of what they asked for. The cost is stated on
-screen instead, and the operator decides.
+screen instead, and the operator decides. The gate's own patience is the other route to an automatic
+downgrade, and §2 closes it: it does not run while the hold stands.
 
 Two endpoints, following `/retry-now`'s shape:
 
@@ -143,6 +191,18 @@ cheaper than Suspend. After a restart the run is gone and its journal is on disk
 shows an interrupted run with a Resume button — the Suspend outcome. Pause therefore does not replace
 Suspend, and the shutdown path must still suspend rather than pause.
 
+What the hold *does* survive as is the **reason** written next to the journal. A shutdown suspends every
+live run as `ShuttingDown`, and `AutoResumeService.PickResumableAsync` restarts exactly the configs whose
+every volume says `ShuttingDown` — so without more than that, Pause → pull the new image → restart would
+leave the backup running again, the hold gone and no record it ever existed. On a NAS the container
+restart *is* the routine upgrade path, so that is not a corner case but the first thing that happens to an
+operator who pauses and then updates. `BackupRunner.RequestStop` therefore records a suspension that
+catches a standing user hold as `UserRequested`, whatever the caller asked for, and auto-resume leaves
+those alone: the operator comes back to an interrupted run with a Resume button, which is the outcome the
+paragraph above promises. The reason has to be decided there because that is the only point where the stop
+request and the run's gate are both in hand, and it has to be read before `BackupRunControl.RequestStop`,
+which downgrades the gate and thereby ends the hold.
+
 **It does not make Pause instant.** See §3.
 
 **It does not add Pause to restore, check or repair.** Those runs are short; the machinery is not
@@ -154,8 +214,12 @@ worth duplicating until one of them is measured to need it.
 
 - **Suspend stops the feeding stages at once.** With a slow probe in progress, a suspend returns
   without waiting for that read to finish, and the run still journals the volume that was on the wire.
-- **Pause holds all four loops.** After a pause, `processed` stops advancing and the staged pool stops
-  growing; both resume after `ResumeByUser`.
+- **Pause holds all four loops** — and each gate has to be pinned by an observable that only *it* can move,
+  or three of the four ride free on the fourth. Each case builds its backlog first and makes the work
+  available after the hold is already standing, because a producing stage left to run is normally blocked
+  on an empty input or on backpressure rather than on its gate, and a gate nothing was going to pass is
+  invisible. What each measures: upload calls (the uploader's), probe calls and staged bytes (the prober's
+  and the compressor's), a settled total (the diff's).
 - **Pause preserves work.** Items compressed before the pause are uploaded after the resume without
   being compressed a second time.
 - **The two reasons compose.** A transient failure during a user pause leaves the gate closed after
@@ -163,3 +227,8 @@ worth duplicating until one of them is measured to need it.
 - **Paused → Suspend.** From a paused run, a suspend completes and writes a resumable journal.
 - **A user pause never downgrades.** Held far longer than the gate's patience, the run stays Running
   rather than auto-suspending.
+- **A pause is not undone by a restart.** A shutdown that catches a paused run marks its journal
+  `UserRequested`, and the startup auto-resume declines it; an unpaused run in the same shutdown is still
+  marked `ShuttingDown` and is still picked back up.
+- **Pause answers honestly.** On a run that is already winding down — where the gate is downgraded and can
+  never hold anyone again — the endpoint is a conflict, not a 204.

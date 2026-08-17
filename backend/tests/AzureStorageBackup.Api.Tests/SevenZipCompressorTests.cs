@@ -266,4 +266,49 @@ public sealed class SevenZipCompressorTests : IDisposable
         var entries = await compressor.ListEntriesAsync(result.VolumeFiles[0], null);
         Assert.Equal("a.txt", Assert.Single(entries).Name);
     }
+
+    /// <summary>
+    /// A cancelled compression must not leave its half-written volumes behind.
+    /// <para>
+    /// 7z writes straight into the shared compression temp area, and the caller (StagingArea) treats
+    /// whatever it finds there as the product — so an abandoned volume is not merely wasted disk, it is a
+    /// fragment sitting where a finished archive is expected. The streaming path has always cleaned up
+    /// after itself; this path had not, and only cleaned up on the "7z dropped a member" exit code.
+    /// </para>
+    /// <para>
+    /// It went unnoticed because a cancellation mid-compression used to need <c>Stop now</c>. Once a plain
+    /// Suspend cancels the compression stage, this became an ordinary occurrence — and on a NAS, where the
+    /// process restart that sweeps the temp area may be months apart, the fragments accumulate.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Canceled_Compression_Leaves_No_Volumes_Behind()
+    {
+        var compressor = Compressor();
+        var src = SourceDir();
+        // Incompressible, so 7z is still working when the cancel lands rather than having finished instantly.
+        var bytes = new byte[24 * 1024 * 1024];
+        Random.Shared.NextBytes(bytes);
+        WriteInto(src, "big.bin", bytes);
+        var archive = Path.Combine(_dir, "canceled.7z");
+
+        using var cts = new CancellationTokenSource();
+        var running = compressor.CompressAsync(
+            new CompressionRequest(src, ["big.bin"], archive, VolumeBytes: 1_000_000), cts.Token);
+
+        // Cancel only once 7z has actually put something on disk — cancelling before that would pass
+        // whether or not anything cleans up.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (!Directory.EnumerateFiles(_dir, "canceled.7z*").Any())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "7z never wrote a volume, so the cancel would prove nothing.");
+            await Task.Delay(20);
+        }
+
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+
+        var leftovers = Directory.EnumerateFiles(_dir, "canceled.7z*").Select(Path.GetFileName).ToList();
+        Assert.True(leftovers.Count == 0, "left behind: " + string.Join(", ", leftovers));
+    }
 }

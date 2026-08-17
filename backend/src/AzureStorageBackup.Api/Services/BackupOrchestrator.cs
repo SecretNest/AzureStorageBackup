@@ -797,9 +797,19 @@ public sealed class BackupOrchestrator(
         // the user is the one that killed the downstream stage, and a cancellation thrown from an earlier task in the
         // consumers list would be the one Task.WhenAll surfaces instead, masking it.
         using var downstreamGone = new CancellationTokenSource();
-        using var feeding = CancellationTokenSource.CreateLinkedTokenSource(working.Token, downstreamGone.Token);
+        // A stop belongs here for the same reason a dead downstream does: what these two stages have in hand is
+        // worth nothing once the run is winding down. The probe's content identity is persisted nowhere and the
+        // compressor's archive goes to a queue DrainQueues is about to release, so finishing either only delays the
+        // stop. The uploaders stay on `working` — a volume that completes can be journalled, and that is the one
+        // piece of in-flight work a suspend should wait for. StopNow is unaffected: it fires _abort → working, which
+        // cancels the uploads too, so `feeding` is already covered on that path via working.Token.
+        using var feeding = CancellationTokenSource.CreateLinkedTokenSource(
+            working.Token, downstreamGone.Token, control?.StopToken ?? CancellationToken.None);
         // True when this run is being torn down by the line above rather than by anything the user did — the filter
-        // for "exit quietly" on both feeding stages.
+        // for "exit quietly" on both feeding stages. A stop-triggered cancellation deliberately does not satisfy
+        // this: it falls through to the catch's rethrow, propagates out of the loop task, and is then swallowed by
+        // SettleAsync's catch-all along with every other consumer's exception, so the exception the caller actually
+        // sees is the one SettleStopAsync builds from control.Stop, not whatever shape this cancellation took here.
         bool DownstreamGone() => downstreamGone.IsCancellationRequested && !working.IsCancellationRequested;
 
         // The uploader count stays UploadConcurrency + 1: the extra consumer is what keeps the volume gate's
@@ -836,9 +846,27 @@ public sealed class BackupOrchestrator(
         // Stage 2 → 3. Compression is globally serial (StagingArea holds one compression lock across every run), so
         // this side is one worker by definition — a pool would be a queue in front of a lock that admits one.
         //
-        // This one carries no depth limit: its depth is already bounded in bytes by the staging pool, which is the
-        // bound the operator configured, and a second, item-count bound would reintroduce a constraint that fires
-        // before the one they set.
+        // This one carries no depth limit: the depth of everything that owns an archive is already bounded in bytes
+        // by the staging pool, which is the bound the operator configured, and a second, item-count bound would
+        // reintroduce a constraint that fires before the one they set.
+        //
+        // Two kinds of entry own no archive and are therefore bounded by nothing here: a dedup or resume hit (since
+        // the pipeline was split in two) and a raw in-place item (since the raw route stopped copying). For a
+        // store-only workload — the media library the DontCompress rule exists for — the compressor's only limiter
+        // is then disk read speed, so it can hash and queue the whole dataset while the uploaders trickle.
+        //
+        // Accepted deliberately, on two counts. What it holds is a closure, a content identity and a path per
+        // entry — no copy of any file, and nothing charged to a quota another backup on this machine shares. And
+        // what it widens is the stretch between an in-place item's hash and its upload, which the guard around that
+        // upload measures rather than races (see InPlaceSource): the guard's verdict does not weaken with time, only
+        // its chance of tripping rises, and a trip costs one wasted upload, a take-back and a retry through the
+        // copying route.
+        //
+        // Bounding it would have to count only the entries that own no handoff, or it fires before the operator's
+        // byte limit for everything else — which means a second resource with its own exactly-once release on the
+        // queue-write failure, the stop drain, DrainQueues and the uploader's pickup, sitting alongside the item
+        // ledger and the staging quota. Two disciplines of that kind is what this pipeline's correctness already
+        // rests on; a third, bought for a window that costs no correctness, is not a trade worth making here.
         var stagedQueue = Channel.CreateUnbounded<PendingUpload>(
             new UnboundedChannelOptions { SingleWriter = true, SingleReader = false });
 
@@ -867,8 +895,29 @@ public sealed class BackupOrchestrator(
             {
                 while (await work.DequeueAsync(feeding.Token) is { } item)
                 {
-                    // Work that has not started yet is not done after a stop. The item already started is
-                    // unaffected — the promise "finish the current item, then stop" is kept right at this spot.
+                    // Work that has not started yet is not done after a stop.
+                    //
+                    // The item already in hand is a different matter here than it used to be, and than it is on
+                    // the upload side. "Finish the current item, then stop" is a promise about work worth
+                    // finishing, and a probe's is not: its content identity is persisted nowhere, so a stop
+                    // cancels feeding.Token and cuts the read off mid-file rather than making the operator wait
+                    // for a hundred gigabytes to be hashed for nothing. The promise still holds where it means
+                    // something — an uploader on working.Token finishes its volume and journals it.
+                    if (control is { Stop: not StopKind.None })
+                        break;
+
+                    // Hold here while the gate is closed — this is the entry path a pause needs, next to the
+                    // failure path WithPauseAsync already covers. It sits **above** BeginWork on purpose: an item
+                    // parked here has not been claimed, so nothing of the ledger is owed while the run waits, and
+                    // an OperationCanceledException out of the wait costs exactly what the break above does.
+                    //
+                    // The stop check is repeated below rather than merely being made once above, because being
+                    // released is not the same as being resumed: RequestStop sets the intent and *then* downgrades
+                    // the gate (BackupRunControl.RequestStop), precisely so a parked worker wakes up — and a worker
+                    // woken that way must not go on to take another item. WaitIfPausedAsync ignores its released
+                    // value for the same reason: what a release means is decided here.
+                    if (control is not null)
+                        await control.Gate.WaitIfPausedAsync(feeding.Token);
                     if (control is { Stop: not StopKind.None })
                         break;
 
@@ -981,7 +1030,8 @@ public sealed class BackupOrchestrator(
                     try
                     {
                         staged = await StageBlobAsync(
-                            request, single, localPath, storeOnly, bypassQuota: false, uploadTracker, state, token);
+                            request, single, localPath, storeOnly, bypassQuota: false, allowInPlace: true,
+                            uploadTracker, state, token);
                     }
                     catch (Exception ex)
                     {
@@ -1017,8 +1067,13 @@ public sealed class BackupOrchestrator(
                         BlobPlacement placement;
                         try
                         {
+                            // allowInPlace stays true here: nothing about a network hiccup makes uploading from the
+                            // source unsafe, and the guard on the far side of the upload judges each attempt on its
+                            // own. The one retry that must copy is the one the guard itself asks for, and that one
+                            // is issued inside UploadStagedBlobItemAsync rather than here.
                             var blob = pending ?? await StageBlobAsync(
-                                request, single, localPath, storeOnly, bypassQuota: true, uploadTracker, state, t);
+                                request, single, localPath, storeOnly, bypassQuota: true, allowInPlace: true,
+                                uploadTracker, state, t);
                             pending = null;
                             placement = await UploadStagedBlobItemAsync(
                                 request, single, blob, addressing, localResolver, uploadScope, uploadTracker, state,
@@ -1130,6 +1185,23 @@ public sealed class BackupOrchestrator(
                     }
                     try
                     {
+                        // The gate, and the repeat of the check above it. Inside this try rather than beside the
+                        // check above, because by this point the item **is** claimed: the prober handed its share
+                        // over with the entry, and the wait below can end in an OperationCanceledException
+                        // (feeding is cancelled by a stop, by an abort, or by the upload side dying). Above the
+                        // try that share would simply be gone, and the uploading column would stay inflated by it
+                        // for the rest of the run. The finally hands it back on every exit, which is also what
+                        // makes the bare `continue` below equivalent to the release-and-continue above it.
+                        //
+                        // Why check the stop intent again: RequestStop sets the intent and then downgrades the
+                        // gate to wake whoever is parked at it, so a release here can mean "the user resumed" or
+                        // "a stop is on its way", and only the check tells them apart. Nothing has been compressed
+                        // yet in either case, so all this entry owes back is the item ledger.
+                        if (control is not null)
+                            await control.Gate.WaitIfPausedAsync(feeding.Token);
+                        if (control is { Stop: not StopKind.None })
+                            continue;
+
                         await StageProbedAsync(probed, feeding.Token);
                     }
                     finally
@@ -1183,6 +1255,23 @@ public sealed class BackupOrchestrator(
                     }
                     try
                     {
+                        // The gate, and the repeat of the check above it — inside this try for the reason the
+                        // compressor's is, and here it is worth more than a progress column: this entry owns a
+                        // compressed archive, whose quota is booked on a singleton shared by every run on the
+                        // machine. An OperationCanceledException out of the wait (working is cancelled by ct and
+                        // by Stop now) above the try would leak that quota until the process restarts, and it is
+                        // reachable exactly when a Stop now lands on a paused run. The finally hands both back on
+                        // every exit, so the bare `continue` below does what the release-and-continue above does.
+                        //
+                        // Repeating the check is what keeps "finish the item in hand, then hold" from turning into
+                        // "take one more": RequestStop downgrades the gate after setting the intent, so a worker
+                        // parked here is woken by the very stop it must now obey. What is still queued never
+                        // starts; not a byte of it reached the container, so discarding it costs only local CPU.
+                        if (control is not null)
+                            await control.Gate.WaitIfPausedAsync(working.Token);
+                        if (control is { Stop: not StopKind.None })
+                            continue;
+
                         await entry.RunAsync(working.Token);
                     }
                     finally
@@ -1300,6 +1389,23 @@ public sealed class BackupOrchestrator(
 
         async Task OnChangeAsync(FileChange c, CancellationToken token)
         {
+            // The diff passes the gate too: "pause the backup" means the disk stops being read at all, not merely
+            // that the pipeline stops draining. Parking the differ's callback parks the walk that calls it.
+            //
+            // No stop check on either side of this one, unlike the three consumer loops, because the diff has no
+            // "check and break" to reach: it stops by having its token cancelled, and always has. `token` here is
+            // stopProducing, linked to control.StopToken, so a stop cancels this wait outright and the cancellation
+            // travels the diff's own established exit — the catch below the diff's try, and SettleStopAsync after
+            // it. The gate's other way out, a patience downgrade, sets no stop intent for a check to find anyway;
+            // it takes the consumers down, and each of them cancels stopProducing on its way out (see the catches
+            // in the three loops above). What is left — released with the run still healthy — is a resumed diff,
+            // which is the whole point.
+            //
+            // Nothing is claimed at this point: the item this callback may go on to build does not exist yet, and
+            // the local Enqueue that books it into the ledger is only ever reached from below this wait.
+            if (control is not null)
+                await control.Gate.WaitIfPausedAsync(token);
+
             var changed = c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null;
             if (changed)
             {
@@ -2063,7 +2169,8 @@ public sealed class BackupOrchestrator(
         if (control is not null && !placement.Resumed)
             await control.RecordBlobAsync(
                 file.Path, placement.Ref, content.FullHash, content.HeadHash, content.TailHash, content.Length,
-                Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes], CancellationToken.None);
+                content.Mtime, Math.Max(1, placement.Volumes), content.Raw, [.. placement.VolumeSizes],
+                CancellationToken.None);
 
         // The collision warning is an after-the-fact report once the content has been processed/uploaded
         // successfully, and it never touches the source file again — which is why this whole method sits **outside**
@@ -2114,13 +2221,13 @@ public sealed class BackupOrchestrator(
         // 2 + 3. Compress (the future compress half) and upload (the future upload half), still called back to back
         // by this one worker — see the cut rationale on StageBlobAsync.
         var stagedBlob = await StageBlobAsync(
-            request, file, localPath, storeOnly, bypassQuota, uploadTracker, state, ct);
+            request, file, localPath, storeOnly, bypassQuota, allowInPlace: true, uploadTracker, state, ct);
         return await UploadStagedBlobItemAsync(
             request, file, stagedBlob, addressing, localResolver, uploadScope, uploadTracker, state, control, ct);
     }
 
-    /// <summary>Dedup/resume pre-filter for the single-file path: both tiers settle the item without compressing a
-    /// single byte, so this runs before anything is staged. Returns null when neither tier matched, meaning the
+    /// <summary>Dedup/resume pre-filter for the single-file path: all three tiers settle the item without compressing a
+    /// single byte, so this runs before anything is staged. Returns null when no tier matched, meaning the
     /// caller must fall through to <see cref="StageBlobAsync"/>.</summary>
     private async Task<BlobPlacement?> ProbeAndResumeAsync(
         BackupRequest request, PlannedFile file, string localPath, LocalDedupResolver localResolver,
@@ -2128,11 +2235,37 @@ public sealed class BackupOrchestrator(
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
 
+        // Zeroth tier, and the only one that costs no read at all: the previous run uploaded this path and the file has
+        // not been touched since. It is asked **first**, in front of the probe, because everything below it opens the
+        // file — the pre-filter reads the head, and a candidate escalates to reading the whole thing to get a content
+        // identity. That is the read this tier exists to avoid, and asking afterwards would avoid nothing.
+        // The judgement it makes is the diff's own (length + mtime), not a relaxation of the content test below; see
+        // JournalResume.FindUntouchedBlob for why that is sound and where its boundary lies.
+        // The empty table is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
+        // a first one most of all) would otherwise pay one more stat per file to be told there is nothing to resume.
+        // Exists is checked because FileInfo.Length throws on a file that has gone away, and where "the source
+        // disappeared" gets settled is the existing route below, unchanged.
+        if (control?.Resume is { IsEmpty: false } resume && new FileInfo(localPath) is { Exists: true } info)
+        {
+            var mtime = new DateTimeOffset(info.LastWriteTimeUtc);
+            // The identity comes from the record, which is the identity of the bytes that were actually uploaded — the
+            // same thing the tier below hands over, just without having re-derived it from the file. A record missing
+            // any of the three hashes cannot supply one, and falls through to the content test like any other miss.
+            if (resume.FindUntouchedBlob(file.Path, mtime, info.Length)
+                is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched)
+                return new BlobPlacement(
+                    untouched.Ref, false, Math.Max(1, untouched.Volumes), [.. untouched.VolumeSizes],
+                    new BlobContent(full, head, tail, untouched.Length, mtime, untouched.Raw),
+                    Resumed: true);
+        }
+
         if (await ProbeForDedupAsync(localPath, headBytes, localResolver, uploadTracker, ct) is { } p)
         {
             // First tier: the copy the previous run already confirmed as uploaded. Both path **and** content must
             // match — after an interruption the file may well have been modified, and reusing on path alone would
-            // write old content into the index as if it were new.
+            // write old content into the index as if it were new. (The tier above is not that: it reuses on path plus
+            // metadata, and what it accepts is exactly what the diff accepts as unchanged. Anything it declines,
+            // including every record written before the mtime field existed, arrives here.)
             if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done)
                 return new BlobPlacement(
                     done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
@@ -2146,10 +2279,89 @@ public sealed class BackupOrchestrator(
         return null;
     }
 
-    /// <summary>The archive on disk plus the handoff that owns its pool quota — everything
-    /// <see cref="UploadStagedBlobItemAsync"/> needs to finish the item, and everything that must be released
-    /// exactly once if it never gets that far.</summary>
-    private sealed record StagedBlob(BlobContent Content, StagedHandoff Handoff);
+    /// <summary>
+    /// A raw item whose bytes are sent straight from the source file rather than from a staged copy, plus the
+    /// metadata that has to still be true afterwards for that to have been safe.
+    /// <para>
+    /// The copy this replaces was not there to save a read. It was there to **fix the content**: the hash was
+    /// computed while copying (<see cref="HashingStream"/>), so the bytes hashed and the bytes stored were the same
+    /// set by construction — and that matters because a data blob's address *is* its content. It lives at
+    /// <c>data/{fullHash}</c>, and if the bytes that reach the cloud are not the bytes that produced that hash, the
+    /// container holds an object whose name contradicts its content. Nothing downstream would notice: dedup,
+    /// restore and check all read the index, and the index would agree with the name.
+    /// </para>
+    /// <para>
+    /// What replaces it is a bracket: this pair is stat'ed before the hashing read begins and again once the upload
+    /// is over, however it ended, and any movement in either <see cref="Length"/> or <see cref="MtimeUtc"/> means
+    /// the upload did not necessarily send what was hashed. That is the same test the diff trusts to call a file
+    /// unchanged (see BackupDiffer's compare of length + last write time), applied to this item's own hash, its wait
+    /// for an uploader, and its upload.
+    /// </para>
+    /// <para>
+    /// That stretch is **not** short, and the bracket does not assume it is. It compares two stats taken around the
+    /// whole of it rather than racing it: a file that has not moved between them did not move, however long it took.
+    /// The length of the stretch changes only how often this trips — and on a store-only run it is long, because a
+    /// raw item charges nothing to the staging pool and so nothing bounds how far the compressor may run ahead of
+    /// the uploaders (see the note on stagedQueue in RunCoreAsync); for the tail of a large one it is hours. What
+    /// that costs when it does trip is one wasted upload, a take-back and a retry through the copying route.
+    /// </para>
+    /// <para>
+    /// It is not absolute, and deliberately so: a file rewritten during its own upload **and** restored to exactly
+    /// its previous length and mtime would pass. That is the boundary the diff has lived with since the beginning.
+    /// Paying a full copy of every raw file to pre-empt it is not worth it; never noticing would be unacceptable,
+    /// which is what the undo-and-retry on the other side of the bracket is for.
+    /// </para>
+    /// </summary>
+    /// <param name="StoreOnly">Carried so the fallback can re-stage this item the pessimistic way. It cannot be
+    /// re-derived here — the rule matches by path and the caller that owns it is several stages upstream.</param>
+    private sealed record InPlaceSource(string Path, long Length, DateTime MtimeUtc, bool StoreOnly)
+    {
+        /// <summary>Has the file moved under us since it was hashed? Returns the description of what moved, or null
+        /// when it did not. A file that cannot be stat'ed at all counts as moved: the upload's bytes cannot be
+        /// vouched for either way, and the safe reading of "I cannot tell" is the same as "it changed".</summary>
+        public string? Moved()
+        {
+            var now = new FileInfo(Path);
+            if (!now.Exists)
+                return "it no longer exists";
+            if (now.Length != Length)
+                return $"length {Length} -> {now.Length}";
+            return now.LastWriteTimeUtc != MtimeUtc
+                ? $"last write {MtimeUtc:O} -> {now.LastWriteTimeUtc:O}"
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// The source file moved while it was being uploaded in place, so the object written under its content address
+    /// may not hold the content that address names. Thrown **after** that object has been taken back — or, in the
+    /// one case where it could not be, after that has been reported (see <see cref="UndoInPlaceUploadAsync"/>).
+    /// <para>
+    /// The item that hit it never gets to see it twice: its own caller answers it by re-staging through the copying
+    /// route, which uploads a snapshot and is therefore immune, so a retry cannot throw it again. It does travel one
+    /// step further in one case — a same-content peer waiting on this item's dedup reservation is failed with it,
+    /// exactly as it would be by any other upload failure, because the alternative is letting it point its index
+    /// entry at a blob that was just deleted.
+    /// </para>
+    /// <para>
+    /// That peer is why this type is <c>internal</c> rather than private: it reaches the peer at
+    /// <see cref="LocalDedupResolver.ResolveAsync"/>, which is **outside** the catch that answers it, so the only
+    /// thing standing between it and a dead run is <see cref="TransientErrors.IsTransient"/> — and that judgement is
+    /// deliberately made in one place for the whole codebase, which has to be able to name the type.
+    /// </para>
+    /// </summary>
+    internal sealed class SourceMovedDuringUploadException(string path, string what)
+        : Exception($"'{path}' changed while it was being uploaded ({what}); the upload was undone.");
+
+    /// <summary>What <see cref="UploadStagedBlobItemAsync"/> needs to finish an item, and everything that must be
+    /// released exactly once if it never gets that far.
+    /// <para>
+    /// Exactly one of the two is set. <see cref="Handoff"/> is the archive on disk plus the ownership of its pool
+    /// quota — the copying route. <see cref="Source"/> is the raw route, which stages nothing and therefore owns no
+    /// quota and no temp files, so it travels with a null handoff: the same shape a probe hit already uses.
+    /// </para>
+    /// </summary>
+    private sealed record StagedBlob(BlobContent Content, StagedHandoff? Handoff, InPlaceSource? Source);
 
     /// <summary>Compress half of the single-file path: one read pass computes the three-segment hash while feeding
     /// the bytes into 7z (or copying them straight into a raw temp file).
@@ -2165,14 +2377,20 @@ public sealed class BackupOrchestrator(
     /// <param name="bypassQuota">True when this call runs on an <b>uploader</b> — a thread the staging quota depends
     /// on to come back, and which therefore must never wait for it. See
     /// <see cref="StagingArea.StageWithoutBackpressureAsync"/> for what happens when it does.</param>
+    /// <param name="allowInPlace">Passed straight through to <see cref="StreamAndStageAsync"/>; see there.</param>
     private async Task<StagedBlob> StageBlobAsync(
         BackupRequest request, PlannedFile file, string localPath, bool storeOnly, bool bypassQuota,
-        StageTracker uploadTracker, RunState state, CancellationToken ct)
+        bool allowInPlace, StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
-        var (content, staged) = await StreamAndStageAsync(
-            request, localPath, file.Path, storeOnly, bypassQuota, headBytes, uploadTracker, state, ct);
-        return new StagedBlob(content, new StagedHandoff(staging, staged));
+        var (content, staged, source) = await StreamAndStageAsync(
+            request, localPath, file.Path, storeOnly, bypassQuota, headBytes, allowInPlace, uploadTracker, state, ct);
+        // A raw item owns no archive and no quota, so it gets no handoff at all rather than an empty one: there is
+        // nothing for a Dispose to hand back, and a handoff that owns nothing is one more thing to reason about on
+        // every path that has to release one.
+        return source is not null
+            ? new StagedBlob(content, Handoff: null, source)
+            : new StagedBlob(content, new StagedHandoff(staging, staged), Source: null);
     }
 
     /// <summary>Upload half of the single-file path: the name is only known once compression finishes, so dedup and
@@ -2184,6 +2402,8 @@ public sealed class BackupOrchestrator(
         BackupRunControl? control, CancellationToken ct)
     {
         var content = stagedBlob.Content;
+        // Null on the raw route, which owns no archive — the same shape a probe hit's entry already travels with.
+        var handoff = stagedBlob.Handoff;
         try
         {
             // Purely local decision: cross-version lookups against the map, and within this batch a reservation
@@ -2194,23 +2414,59 @@ public sealed class BackupOrchestrator(
             {
                 var existing = res.Existing!;
                 // Compressed for nothing, but the pool quota must go back immediately all the same.
-                stagedBlob.Handoff.MarkSettled();
+                handoff?.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, existing.Volumes, existing.VolumeSizes,
                     content with { Raw = existing.Raw }); // the existing blob's actual raw flag wins
             }
             try
             {
+                // The raw route names the source file; every other route names the volumes in staged-temp.
+                var files = stagedBlob.Source is { } src ? [src.Path] : stagedBlob.Handoff!.Staged!.Files;
+                var bytes = stagedBlob.Source?.Length ?? stagedBlob.Handoff!.Staged!.Bytes;
                 var (volumes, sizes) = await UploadStagedBlobAsync(
-                    request, res.Ref, stagedBlob.Handoff.Staged!, content, addressing, uploadScope, uploadTracker,
-                    state, file.Path, control, ct);
+                    request, res.Ref, files, bytes, stagedBlob.Source, content, addressing, uploadScope,
+                    uploadTracker, state, file.Path, control, ct);
                 res.Complete(content.Raw, volumes, sizes); // wake the later arrivals with the same content in this batch and hand them the same storage info
-                stagedBlob.Handoff.MarkSettled();
+                handoff?.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
+            }
+            catch (SourceMovedDuringUploadException ex) when (stagedBlob.Source is { } moved)
+            {
+                // The object that upload wrote has already been deleted (see UploadStagedBlobAsync) — it was named
+                // for a hash its content may no longer have matched, and leaving it would be worse than never
+                // having uploaded at all: the next run to produce that same hash would find it, skip its own
+                // if-missing upload, and index somebody else's bytes.
+                //
+                // The claim on that address has to go back with it, and failing it is the only way this table
+                // offers to do that. Fail does two things and both are wanted here: it wakes any same-content peer
+                // in this run that is waiting on the address (they must never deduplicate onto a blob that has just
+                // been deleted — that half is the existing contract for any failed upload), and it withdraws the
+                // claim so the retry below, or a later file with the same content, can take the address afresh.
+                res.Fail(ex);
+                handoff?.MarkSettled(); // null here, but the pairing is stated once so it cannot drift
+                //
+                // One retry, through the copying route. It is immune by construction: it uploads a snapshot taken
+                // under the compression lock, so whatever the source does next cannot reach the bytes in flight.
+                // The asymmetry is the design's: the fast path is optimistic and verified, the fallback is
+                // pessimistic and unconditional. Past this, an item that keeps failing is the existing
+                // transient-error machinery's problem, not this method's.
+                //
+                // bypassQuota, because this always runs on the thread that just finished an upload. In the pipeline
+                // that is an uploader, and everything in the staging pool is released by an uploader — one that
+                // parks on the quota is waiting for itself (see StagingArea.StageWithoutBackpressureAsync). The
+                // overshoot it permits is one archive, the same bound the transient retry beside it already accepts.
+                var copied = await StageBlobAsync(
+                    request, file, moved.Path, moved.StoreOnly, bypassQuota: true, allowInPlace: false,
+                    uploadTracker, state, ct);
+                // Terminates after exactly one level: `copied` carries a handoff and no source, so the branch above
+                // it cannot be reached a second time.
+                return await UploadStagedBlobItemAsync(
+                    request, file, copied, addressing, localResolver, uploadScope, uploadTracker, state, control, ct);
             }
             catch (Exception ex)
             {
-                res.Fail(ex);                       // fail the waiters along with it; never dedup onto a blob that was not uploaded successfully
-                stagedBlob.Handoff.MarkSettled();   // the waiters have been answered; Dispose must not answer them twice
+                res.Fail(ex);           // fail the waiters along with it; never dedup onto a blob that was not uploaded successfully
+                handoff?.MarkSettled(); // the waiters have been answered; Dispose must not answer them twice
                 throw;
             }
         }
@@ -2220,7 +2476,7 @@ public sealed class BackupOrchestrator(
             // area immediately — it occupies backpressure quota. Routed through the handoff (not a bare
             // staging.Release(staged)) so that the same call also covers the discarded-before-upload case once a
             // pipeline queues StagedBlob values between two independently-paced loops.
-            stagedBlob.Handoff.Dispose();
+            handoff?.Dispose();
         }
     }
 
@@ -2267,34 +2523,85 @@ public sealed class BackupOrchestrator(
     {
         var mtime = new FileInfo(localPath).LastWriteTimeUtc;
         var streaming = new StreamingHasher(segmentBytes, segmentBytes);
-        await using (var source = FileHasher.OpenRead(localPath))
-        {
-            var buffer = new byte[81920];
-            int read;
-            while ((read = await source.ReadAsync(buffer, ct)) > 0)
-                streaming.Append(buffer.AsSpan(0, read));
-        }
+        await HashOnlyAsync(localPath, streaming, ct);
         return Identity(streaming, mtime, raw: false);
     }
 
+    /// <summary>Read the file through once, feeding every byte to the hasher and writing nothing anywhere. The one
+    /// way this project opens a source file (<see cref="FileHasher.OpenRead"/>) — a FIFO at this path must fail
+    /// rather than block the whole run inside open().</summary>
+    private static async Task HashOnlyAsync(
+        string localPath, StreamingHasher streaming, CancellationToken ct)
+    {
+        await using var source = FileHasher.OpenRead(localPath);
+        var buffer = new byte[81920];
+        int read;
+        while ((read = await source.ReadAsync(buffer, ct)) > 0)
+            streaming.Append(buffer.AsSpan(0, read));
+    }
+
     /// <summary>One read pass: the source file's bytes stream into the hasher and the archive (or raw temp file) at
-    /// the same time. So "the bytes that were hashed" and "the bytes that were stored" are the same set by construction.</summary>
-    private async Task<(BlobContent Content, StagedItem Staged)> StreamAndStageAsync(
+    /// the same time. So "the bytes that were hashed" and "the bytes that were stored" are the same set by construction.
+    /// <para>
+    /// The raw route is the exception, and <paramref name="allowInPlace"/> is what turns it on: there the stored
+    /// bytes **are** the source bytes, so nothing is produced at all — the read only hashes, and the caller uploads
+    /// the source file itself (see <see cref="InPlaceSource"/> for how the property above is preserved without a copy).
+    /// </para>
+    /// </summary>
+    /// <param name="allowInPlace">False forces the copying route even where the raw predicate holds. The fallback
+    /// after the in-place guard trips passes false: it needs a snapshot precisely because the source moved, and an
+    /// in-place retry of an in-place failure could only trip the same guard again.</param>
+    private async Task<(BlobContent Content, StagedItem? Staged, InPlaceSource? Source)> StreamAndStageAsync(
         BackupRequest request, string localPath, string entryName, bool storeOnly, bool bypassQuota, int segmentBytes,
-        StageTracker uploadTracker, RunState state, CancellationToken ct)
+        bool allowInPlace, StageTracker uploadTracker, RunState state, CancellationToken ct)
     {
         // Grab the metadata once before starting to read. The length decides raw; the mtime must be **the one from
         // before the read**: if the file is rewritten during the read, recording the earlier mtime makes the next
         // diff consider it changed and re-check it (the safe direction), while recording the later one would mean
         // that newer content never gets backed up again (the dangerous direction).
+        // On the in-place route this pair is load-bearing for a second reason as well: it is the "before" half of
+        // the bracket the upload is checked against, and taking it before the read (rather than after it) means the
+        // bracket covers the hashing read too, not just the upload.
         var before = new FileInfo(localPath);
         var mtime = before.LastWriteTimeUtc;
 
-        // Raw direct upload (PRD 3.3.2): store-only + unencrypted + no volume splitting needed → copy the original file directly and skip one 7z wrapping.
+        // Raw direct upload (PRD 3.3.2): store-only + unencrypted + no volume splitting needed → the source bytes
+        // are the stored bytes, so no 7z wrapping is needed around them.
         var raw = storeOnly && string.IsNullOrEmpty(request.Password)
             && (request.Options.VolumeBytes is not { } vb || before.Length <= vb);
 
         var streaming = new StreamingHasher(segmentBytes, segmentBytes);
+
+        if (raw && allowInPlace)
+        {
+            // No copy, no staging quota, no compression lock. What used to happen here was a byte-for-byte
+            // duplicate of the source written into compress-temp, moved into staged-temp and uploaded from there:
+            // two reads and a write for content identical to the source still sitting on disk, with the whole of
+            // it booked against a quota every other backup on the machine shares.
+            //
+            // The compression lock is deliberately **not** taken. It serialises production into the temp area, and
+            // this route produces nothing; holding it would make every raw file block every other run's compression
+            // for the length of a full-file read, buying nothing. (The compress stage is a single worker, so at
+            // most one of these reads is in flight per run regardless.)
+            //
+            // It is reported as Checking, the same column the dedup probe's whole-file read uses: this is an item
+            // reading from disk, pushing no bytes and waiting on nothing, and for a few-GB file on a NAS it is tens
+            // of seconds during which the screen would otherwise show nothing at all. Checking is a subdivision of
+            // Uploading (= inWork - inStaging), and this route touches neither staging counter, so the item ledger
+            // identity holds with the item counted exactly once.
+            uploadTracker.BeginChecking();
+            try
+            {
+                await HashOnlyAsync(localPath, streaming, ct);
+            }
+            finally
+            {
+                uploadTracker.EndChecking();
+            }
+            return (Identity(streaming, mtime, raw: true), null,
+                new InPlaceSource(localPath, before.Length, mtime, storeOnly));
+        }
+
         var name = StagedName(entryName);
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (compressTemp, token) => raw
             ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
@@ -2304,7 +2611,7 @@ public sealed class BackupOrchestrator(
             ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker)
             : await staging.StageAsync(produce, state.Staging, ct, uploadTracker);
 
-        return (Identity(streaming, mtime, raw), staged);
+        return (Identity(streaming, mtime, raw), staged, null);
     }
 
     private static BlobContent Identity(StreamingHasher streaming, DateTime mtimeUtc, bool raw) => new(
@@ -2348,13 +2655,17 @@ public sealed class BackupOrchestrator(
         return result.VolumeFiles;
     }
 
+    /// <param name="files">What to send: the volumes in staged-temp, or — on the raw route — the one source file
+    /// itself, which is uploaded from where it already sits.</param>
+    /// <param name="inPlace">Non-null exactly when <paramref name="files"/> is the source file. It carries the
+    /// metadata the upload is bracketed against; see <see cref="InPlaceSource"/> for why the bracket is there.</param>
     /// <returns>The blob's volume count and the byte size of each volume.</returns>
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
-        BackupRequest request, string blobRef, StagedItem staged, BlobContent content,
-        BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker, RunState state,
-        string sourceLabel, BackupRunControl? control, CancellationToken ct)
+        BackupRequest request, string blobRef, IReadOnlyList<string> files, long fileBytes, InPlaceSource? inPlace,
+        BlobContent content, BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker,
+        RunState state, string sourceLabel, BackupRunControl? control, CancellationToken ct)
     {
-        var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
+        var sizes = files.Select(f => new FileInfo(f).Length).ToList();
         // The gate and the in-flight registration are both pushed down to each volume (VolumeUploadScope); this
         // only marks "this item has entered the upload phase" so it can be told apart from the ones still compressing.
         uploadTracker.BeginUpload(blobRef);
@@ -2364,13 +2675,31 @@ public sealed class BackupOrchestrator(
                 addressing.Metadata(content.FullHash, content.Length, content.HeadHash, content.TailHash));
             if (content.Raw)
                 meta["raw"] = "1";
-            await ClearLeftoverVolumesAsync(request, blobRef, staged.Files.Count, staged.Bytes, uploadTracker, ct);
+            await ClearLeftoverVolumesAsync(request, blobRef, files.Count, fileBytes, uploadTracker, ct);
             control?.TrackInFlight(blobRef);
             await VolumeBlobIO.UploadAsync(
-                uploader, request.Account, request.Container, blobRef, staged.Files,
+                uploader, request.Account, request.Container, blobRef, files,
                 request.DataTier, request.Options.Upload, ct, meta, uploadScope,
-                onVolumeUploaded: staging.ReleaseFile,   // drop each volume from the temp disk as soon as it is uploaded
+                // Drop each volume from the temp disk as soon as it is uploaded. Never on the raw route: what was
+                // "uploaded" there is the user's own file. (ReleaseFile ignores a path it never staged, so this is
+                // belt as well as braces — but a callback that deletes files should not be handed a path it has no
+                // business deleting on the strength of a lookup miss.)
+                onVolumeUploaded: inPlace is null ? staging.ReleaseFile : null,
                 label: sourceLabel);                     // show the source file path in the UI, not the content-addressed blob name
+
+            // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
+            // half of that pair has moved since, the bytes just written under this content address are not
+            // guaranteed to be the bytes that produced it — and an object whose name contradicts its content is a
+            // corruption no restore would detect until it failed. So it is taken back, before anything is
+            // recorded, and the caller retries the item through the copying route.
+            if (inPlace?.Moved() is { } what)
+            {
+                await UndoInPlaceUploadAsync(request, blobRef, inPlace, what, control);
+                // Thrown before AddUploaded/ConfirmUpload, like any other failed upload: these bytes are on their
+                // way back off the wire, and the retry that follows will count its own.
+                throw new SourceMovedDuringUploadException(inPlace.Path, what);
+            }
+
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
             control?.ClearInFlight(blobRef);
@@ -2379,11 +2708,103 @@ public sealed class BackupOrchestrator(
             // bytes twice.
             state.AddUploaded(sizes.Sum());
             uploadTracker.ConfirmUpload(blobRef);
-            return (staged.Files.Count, sizes);
+            return (files.Count, sizes);
+        }
+        // The same bracket, on the ending where the upload does **not** return. It is not an edge case: "the
+        // upload threw" does not mean "nothing was committed". Azure acknowledges a commit over a connection that
+        // can die on the way back, which is the routine NAS-to-Azure blip this whole codebase is built around —
+        // RetryPolicy exhausting on status 0 comes out here with the object already in the container. A Stop now
+        // landing between the commit and the stat arrives here as well, and it is answered the same way.
+        //
+        // Left to the success path alone, every one of those endings kept the object **and** sent the item round
+        // again: the retry re-hashes the moved source, lands on a different address, and the first object is
+        // orphaned rather than overwritten. Nothing removes it afterwards — PurgeInFlightAsync runs for Stop now
+        // alone, and the closing orphan sweep only for a round that adopted or voided a journal or is the first on
+        // its container — and a later run that legitimately produces that hash claims the address, finds the
+        // single-volume path clearing nothing, and is told "already there" by the if-missing upload without a byte
+        // being read. That is the one failure this codebase cannot detect after the fact.
+        //
+        // Filtered on inPlace because only the raw route can put bytes it did not produce at a content address:
+        // every other route uploads a snapshot taken under the compression lock, whose content cannot move.
+        // SourceMovedDuringUploadException is excluded because the branch above has already done exactly this.
+        catch (Exception ex) when (inPlace is not null && ex is not SourceMovedDuringUploadException)
+        {
+            // Conditional on the same test the success path uses, not unconditional. An upload that failed with
+            // the source still exactly as it was hashed leaves nothing this run cannot vouch for: whatever the
+            // server committed, it committed from a file that has not changed, so it holds the content its address
+            // names. Deleting it regardless would throw away a correct object that the retry's if-missing upload
+            // would otherwise skip — on a multi-GB raw file, a full re-upload bought for nothing, on the failure
+            // that happens most often.
+            if (inPlace.Moved() is { } what)
+                await UndoInPlaceUploadAsync(request, blobRef, inPlace, what, control);
+            throw;
         }
         finally
         {
             uploadTracker.EndUpload(blobRef);
+        }
+    }
+
+    /// <summary>
+    /// Take back the object an in-place upload may have committed at <paramref name="blobRef"/>, the source having
+    /// moved while it was in flight.
+    /// <para>
+    /// Deleting is safe precisely here and nowhere else: this run holds the exclusive in-run claim on this address
+    /// (<see cref="LocalDedupResolver.ResolveAsync"/> hands out one at a time), and an address that any retained
+    /// version index or any adopted journal already referenced would have been resolved as a dedup hit instead of
+    /// being claimed — so nothing in this backup points at what is being removed. The only other thing that could
+    /// be sitting here is an orphan of an interrupted earlier run, which no index and no adopted journal names
+    /// either, and which the next run re-uploads if it is ever wanted again. That argument does not depend on how
+    /// the upload ended, which is why the failing path can use it too.
+    /// </para>
+    /// <para>
+    /// It runs on <see cref="CancellationToken.None"/> and clears the in-flight registration only after the delete
+    /// returns: a cancelled cleanup would leave exactly the object this exists to remove, and until the delete
+    /// returns, the registration is what makes "Stop now" clear it (see <see cref="PurgeInFlightAsync"/>). Clearing
+    /// it afterwards is not optional either — a stale registration on an address a **later** item may legitimately
+    /// claim and upload would have Stop now delete that one's good blob. A hard crash inside that window still
+    /// leaves the object behind; it is the same window <see cref="ClearLeftoverVolumesAsync"/> has always had
+    /// between its delete and its re-upload.
+    /// </para>
+    /// <para>
+    /// The delete is retried, because the failure it is most likely to meet is the same blip that brought the
+    /// caller here — under the same policy the cleanup path uses for its point operations (see RetentionCleaner),
+    /// which is bounded by attempt count rather than by the upload path's two hours: this runs in the tear-down of
+    /// one item, and a run that spends hours failing to remove one object helps nobody.
+    /// </para>
+    /// <para>
+    /// A delete that ultimately fails is **said out loud** rather than swallowed. What is left behind is an object
+    /// whose name may contradict its content, and no later check can tell: check and restore both read the index,
+    /// and the index agrees with the name. So it goes into the operation log and out through the same
+    /// <see cref="NotificationEvents.UnrecoverableError"/> channel as a hash collision, naming the address, because
+    /// an operator with the address can delete it in one command and nothing else in this system will.
+    /// </para>
+    /// </summary>
+    private async Task UndoInPlaceUploadAsync(
+        BackupRequest request, string blobRef, InPlaceSource inPlace, string what, BackupRunControl? control)
+    {
+        try
+        {
+            await RetryPolicy.ExecuteAsync(
+                t => factory.CreateServiceClient(request.Account)
+                    .GetBlobContainerClient(request.Container)
+                    .GetBlobClient(blobRef)
+                    .DeleteIfExistsAsync(cancellationToken: t),
+                options: null, ex => TransientErrors.IsTransient(ex), CancellationToken.None);
+            control?.ClearInFlight(blobRef);
+        }
+        catch (Exception ex)
+        {
+            // The registration is deliberately left standing: it is the only thing that will still clear this
+            // address if the operator answers with Stop now.
+            await Record(
+                NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                $"Could not remove a blob that may hold the wrong content: {blobRef}",
+                $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
+                + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
+                + "produces that same content will be told the address is already taken and will record it without "
+                + "reading a byte of it.",
+                CancellationToken.None);
         }
     }
 
