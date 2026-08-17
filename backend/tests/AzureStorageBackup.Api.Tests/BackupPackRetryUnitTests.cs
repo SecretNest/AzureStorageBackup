@@ -489,6 +489,15 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             // Precondition for this scene: the pool really was cut into two groups by the excluded member.
             Assert.Equal(2, compressor.Compressed.Distinct(StringComparer.Ordinal).Count());
 
+            var firstPack = compressor.Compressed[0];
+            // The other half of the precondition, and the one the assertions below cannot speak for: the blip has to
+            // have fired. FlakyOnGroup picks its victim by pack number and by the ".7z" cut in the blob name, and if
+            // either ever stops matching, group 1 compresses twice, uploads once, records the five members it kept,
+            // and every assertion below passes while the defect this test guards goes completely unexercised — with
+            // nothing else in the suite covering it. Three compressions of the same pack id is what says otherwise:
+            // the full six, the five that were left when m3 dropped out, and the retry the blip forced.
+            Assert.Equal(3, compressor.Compressed.Count(p => p == firstPack));
+
             var info = await store.ReadInfoAsync(account, name, null);
             // The first group's pack holds the five members that pass kept, and only those. Six means the retry took
             // the re-queued one back in, so the same content is in this archive **and** in the pack the compressor
@@ -499,7 +508,6 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             // deletes the archive nobody kept and prunes it out of info.Packs. What is left behind is a pack whose
             // recorded members no longer describe what the index says is in it — which check reports and dead-weight
             // compaction miscounts, long after the run that caused it reported success.
-            var firstPack = compressor.Compressed[0];
             Assert.Equal(5, info!.Packs[firstPack].Members.Count);
 
             var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
