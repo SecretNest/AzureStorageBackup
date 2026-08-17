@@ -816,14 +816,27 @@ public sealed class BackupOrchestrator(
         // media or a NAS share it makes it slower by turning one sequential read into several competing seeks. What
         // this stage buys is overlap, not parallelism: while it reads the next item, the compressor works on the
         // previous one, so the CPU stops waiting on a hash and the disk stops waiting on 7z.
-        var probedQueue = Channel.CreateUnbounded<ProbedItem>(
-            new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+        //
+        // Small on purpose, and Wait rather than Drop. What this stage buys is **overlap, not buffering**: one or two
+        // items of lookahead is the whole benefit, and everything past that is a copy of DiffWorkQueue held on the
+        // heap instead of on disk. That queue exists precisely to cap the consumer backlog — 2,000 items / 64 MB by
+        // default, remainder spilled to a file (see the DiffWorkQueueFactory registration in Program.cs) — and that
+        // cap is stated as the precondition of the whole spill design a few lines above. Left unbounded, this channel
+        // relays out of the bounded queue at one head-read per item while the compressor consumes at 7z speed, two
+        // rates orders of magnitude apart, so it drains the spill file back into memory in its entirety on exactly
+        // the runs the spill was built for: at the 500,000-entry scale this repo has measured, WorkItem.EstimatedBytes
+        // puts that at roughly 170 MB of live objects, on a NAS.
+        var probedQueue = Channel.CreateBounded<ProbedItem>(
+            new BoundedChannelOptions(128)
+            {
+                FullMode = BoundedChannelFullMode.Wait, SingleWriter = true, SingleReader = true,
+            });
         // Stage 2 → 3. Compression is globally serial (StagingArea holds one compression lock across every run), so
         // this side is one worker by definition — a pool would be a queue in front of a lock that admits one.
         //
-        // Neither queue carries a depth limit. This one's depth is bounded in bytes by the staging pool, which is
-        // the bound the operator configured; a second, item-count bound would reintroduce a constraint that fires
-        // before the one they set. probedQueue's entries own nothing at all yet.
+        // This one carries no depth limit: its depth is already bounded in bytes by the staging pool, which is the
+        // bound the operator configured, and a second, item-count bound would reintroduce a constraint that fires
+        // before the one they set.
         var stagedQueue = Channel.CreateUnbounded<PendingUpload>(
             new UnboundedChannelOptions { SingleWriter = true, SingleReader = false });
 
@@ -1189,7 +1202,8 @@ public sealed class BackupOrchestrator(
         //   it reached the container — but its quota is booked on a singleton shared by every run and is at the same
         //   time the backpressure gate on output, so leaving it booked makes this machine's other backups pay for it
         //   until the process restarts.
-        // · probedQueue entries own nothing yet, nothing having been compressed. All they owe is the item ledger,
+        // · probedQueue entries hold no quota, nothing having been compressed yet — they hold heap, which is what
+        //   this channel's depth limit is for, not anything a drain can hand back. All they owe is the item ledger,
         //   or the uploading column stays inflated by however many were in flight for the rest of the run.
         //
         // The loops hand these back themselves on a stop, one entry at a time. This is the backstop for the exits

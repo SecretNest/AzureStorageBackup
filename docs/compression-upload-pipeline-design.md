@@ -118,6 +118,22 @@ untouched by this split.
 which is the bound the user configured; adding a second, item-count bound would reintroduce a
 constraint that fires before the one they set.
 
+`probedQueue` **does** need one, and it is small: 128 entries, `FullMode.Wait`. An earlier draft of
+this design said its entries "own nothing", which is true of staging quota and false of memory. What
+they own is the `WorkItem` itself, and `DiffWorkQueue` exists precisely to keep those off the heap —
+it caps the consumer backlog at 2,000 items / 64 MB and spills the remainder to a file
+(`Program.cs:137-138`), a cap this document names as the precondition of the whole spill design.
+Unbounded, this channel relays out of that bounded queue at one head-read per item while the
+compressor consumes at 7z speed, two rates orders of magnitude apart, so it drains the spill file
+back into memory in its entirety — on exactly the runs the spill was built for. At this repository's
+measured scale (500,000 index entries, ~60-character paths, 64-character hashes),
+`WorkItem.EstimatedBytes` (`DiffWorkQueue.cs:31-39`) puts that at roughly 170 MB of live objects, on
+a NAS.
+
+The bound costs nothing, because what this stage buys is **overlap, not buffering**: one or two items
+of lookahead delivers all of it. It does add a second blocking hand-off — a full `probedQueue` stops
+the prober, and only the compressor frees a slot — which §6 covers along with the first.
+
 ### 2. `StagedUnit` and the four release paths
 
 A queue entry owns two things that must be handed back exactly once:
@@ -181,6 +197,38 @@ The identity `processed + preparing + queued + waitingOnArchive + uploading ≡ 
 `inWork - _inStaging` — items past staging but not settled — which is exactly what a queue entry
 plus an in-flight upload is. No column changes meaning, and no new column is needed.
 
+### 6. A stage that is gone must release the one feeding it
+
+Splitting one loop into three turned every hand-off into a place where an upstream stage waits on a
+resource that **only the downstream stage returns**. The compressor's one blocking point is the
+staging quota, and that comes back only from a live uploader — volume by volume as it sends, or in
+one go when it disposes a dropped entry's archive. The prober's is a slot in `probedQueue`, and only
+the compressor frees one. A resource nobody is left to return is a wait with no end: the run never
+finishes, `SettleAsync(consumers)` waits on it forever, the busy lock is never released, and not one
+word of the error that killed the downstream stage ever surfaces.
+
+Neither `working` nor `control.Stop` covers it. `working` is linked only to `ct` and
+`control.AbortToken`, and a pause-gate downgrade sets no stop kind (only `RequestStop` calls
+`Gate.Downgrade()`). The worst case is therefore the auto-suspend feature working exactly as
+designed: when patience runs out **every** uploader throws `BackupSuspendedException` out of
+`WithPauseAsync` at once, while the compressor sails on, because 7z and the local disk never raise
+the transient errors the gate reacts to. Before the split all six workers were uploaders too, so they
+all left and released their own quota on the way out, and the run suspended cleanly.
+
+So the two feeding stages run on a token of their own, cancelled when the stage in front of them is
+gone. Two rules make it behave:
+
+- **The trigger is the last uploader leaving, not the first one faulting.** One uploader dying on a
+  permanently refused blob is an ordinary failure, and the rest of the run still gets compressed,
+  uploaded and journalled by its siblings — which is how it behaved when one worker owned an item end
+  to end, and a resumable run's journal is worth more than an early exit. The compressor cancels the
+  token for the prober in its own `finally`, by the same argument one stage further up.
+- **The feeding stages treat that cancellation as "leave quietly", not as an error** — the same way
+  the diff treats `stopProducing`. They come before the uploaders in the `consumers` list, so a
+  cancellation faulted out of them is the one `Task.WhenAll` would surface, masking the failure that
+  caused it. A run auto-suspended this way must end as `BackupSuspendedException`, or it is recorded
+  as canceled, no suspend mark is written, and the next startup never resumes it.
+
 ## What this does not do
 
 **It does not keep 7z busy 100% of the time.** The post-compression re-verification stays on the
@@ -216,3 +264,11 @@ of this document could not be read off the screen directly. Worth fixing, separa
   passing through the uploader-driven path.
 - **The accounting identity holds across the queue.** Extend the existing ledger assertions to a run
   with entries sitting in `stagedQueue`.
+- **An auto-suspend that kills every uploader does not strand the compressor** (§6). A pool small
+  enough to fill against incompressible source, an uploader that refuses everything, and patience at
+  zero: the run has to end as `BackupSuspendedException`, with the suspend mark on disk and the pool
+  back at zero. Note the pool size — every other test in this suite runs a 200 MB pool over a few
+  megabytes of zeroes, which is why the suite could not see this class of bug at all.
+- **A pack retry does not store a member the first pass already re-queued** (§4). Blip on the
+  **first** group of a pool that was cut in two by a changed member, with that member settling
+  afterwards, and assert the first group's pack holds only the members that pass kept.
