@@ -72,4 +72,12 @@ public class TransientErrorsTests
     [Fact]
     public void Plain_bug_is_not_transient()
         => Assert.False(TransientErrors.IsTransient(new InvalidOperationException("bug")));
+
+    // A raw upload undoing itself reaches a same-content peer through the dedup reservation, and it reaches it
+    // outside the catch that answers it for the item itself — so this one line decides whether that peer retries
+    // its own upload or the whole run dies over a duplicate file.
+    [Fact]
+    public void A_raw_upload_that_undid_itself_is_transient()
+        => Assert.True(TransientErrors.IsTransient(
+            new BackupOrchestrator.SourceMovedDuringUploadException("/data/src/clip.bin", "length 1 -> 2")));
 }

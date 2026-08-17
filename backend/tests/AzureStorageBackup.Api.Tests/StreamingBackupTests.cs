@@ -270,6 +270,11 @@ public sealed class StreamingBackupTests : IDisposable
         /// guard throws away, which is exactly what the rewrite case needs to be able to see.</summary>
         public int DataUploads => Volatile.Read(ref _dataUploads);
 
+        /// <summary>The path the first data upload was handed. On the raw route that is the source file, and with
+        /// two byte-identical files in one run it is the only way to tell which of them is the one being uploaded
+        /// and which is the one waiting on its reservation.</summary>
+        public string? FirstPath { get; private set; }
+
         public async Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -277,7 +282,8 @@ public sealed class StreamingBackupTests : IDisposable
         {
             if (blobName.StartsWith("data/", StringComparison.Ordinal))
             {
-                Interlocked.Increment(ref _dataUploads);
+                if (Interlocked.Increment(ref _dataUploads) == 1)
+                    FirstPath = filePath;
                 _entered.TrySetResult();
                 await gate.WaitAsync(ct);
             }
@@ -361,6 +367,24 @@ public sealed class StreamingBackupTests : IDisposable
 
         public Task<ConnectionResult> TestConnectionAsync(Account account, CancellationToken ct = default)
             => inner.TestConnectionAsync(account, ct);
+    }
+
+    /// <summary>
+    /// Watches the progress stream for an item parked on a same-batch reservation
+    /// (<see cref="StageProgress.WaitingOnPeer"/>), which is the only outside sign that one file really is waiting
+    /// on another file's upload rather than getting on with its own.
+    /// </summary>
+    private sealed class PeerWaitWatcher : IProgress<BackupProgress>
+    {
+        private int _seen;
+
+        public bool Seen => Volatile.Read(ref _seen) != 0;
+
+        public void Report(BackupProgress value)
+        {
+            if (value.Details.Any(d => d.WaitingOnPeer > 0))
+                Volatile.Write(ref _seen, 1);
+        }
     }
 
     /// <summary>Keeps what the run wrote to the operation log, which is where an operator reads it.</summary>
@@ -765,6 +789,101 @@ public sealed class StreamingBackupTests : IDisposable
             Assert.Equal(source, uploader.FirstPath);
             Assert.Equal(1, uploader.DataUploads);
             Assert.Equal(311_111, new FileInfo(source).Length);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The guard trips on a file another file in the same run is waiting for. The run has to survive it.
+    /// <para>
+    /// Two byte-identical files share one content identity, so the second to arrive does not upload anything: it
+    /// parks on the first one's dedup reservation and takes its result. When the first one's guard trips, that
+    /// reservation is failed — the peer must never be handed an address that was just deleted — and what it is
+    /// failed with is the guard's own exception. It arrives at the peer inside the resolver, **outside** the catch
+    /// that answers it for the item itself, so unless it counts as transient the peer is not retried and the whole
+    /// run dies over a duplicate file.
+    /// </para>
+    /// <para>
+    /// This is not a sub-second window. The peer waits for the guilty item's **whole** upload — minutes for a
+    /// multi-GB file — and byte-identical duplicates are ordinary in a media library, which is exactly the workload
+    /// the store-only rule exists for.
+    /// </para>
+    /// <para>
+    /// The wait is not assumed: the case waits for the pipeline to report an item parked on a peer before it
+    /// rewrites anything, so a run where the second file had already resolved on its own would time out here rather
+    /// than pass without testing anything.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Same_Content_Peer_Survives_The_Guard_Tripping()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var first = await WriteSourceAsync("media/a.bin", 250_000);
+        // Byte-identical, so both files resolve to one content identity and one address.
+        var second = Path.Combine(_root, "media", "b.bin");
+        File.Copy(first, second);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var name = RandomName("sbkraw-");
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var (orchestrator, _, request) = Build(uploader, name, password: null, dontCompress: true);
+        var watcher = new PeerWaitWatcher();
+
+        // A run control, because the retry this case is about is the pause gate's: without one, nothing in the
+        // pipeline retries anything and every failure is fatal by construction. Its schedule is turned down to
+        // milliseconds — the production 30 seconds would be spent waiting for what is settled immediately.
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal-" + name));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "raw-peer", new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+            patience: TimeSpan.FromSeconds(30)));
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            var run = orchestrator.RunAsync(request, watcher, ct: default, control: control);
+            try
+            {
+                await uploader.Entered.WaitAsync(TimeSpan.FromSeconds(60));
+                var until = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+                while (!watcher.Seen && DateTime.UtcNow < until)
+                    await Task.Delay(10);
+                Assert.True(watcher.Seen, "no item ever parked on a peer's reservation, so this case tests nothing");
+
+                // Rewrite the one that is being uploaded, not the one that is waiting: the guard is about the file
+                // whose bytes are on the wire, and only the uploader knows which of the two that is.
+                var rewritten = new byte[311_111];
+                Random.Shared.NextBytes(rewritten);
+                await File.WriteAllBytesAsync(uploader.FirstPath!, rewritten);
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            // The whole point: the run finishes. The guilty item goes round through the copying route, and the peer
+            // — woken with an exception it did nothing to deserve — uploads its own content itself.
+            await run.WaitAsync(TimeSpan.FromMinutes(2));
+
+            var info = await store.ReadInfoAsync(AzuriteAccount(), name, password: null);
+            var idx = await store.ReadIndexAsync(AzuriteAccount(), name, info!.Versions[^1].IndexBlob, null);
+            Assert.Equal(2, idx.Entries.Count);
+
+            var blobs = await DataBlobsAsync(container);
+            foreach (var e in idx.Entries)
+            {
+                var stored = Assert.Single(blobs, b => b.Name == e.Storage!.Ref);
+                Assert.Equal("data/" + FullHashOf(stored.Bytes), stored.Name);
+                // Each entry holds the content of its own file as it now stands — the rewritten one for the file
+                // that moved, the original for the one that did not.
+                var file = Path.Combine(_root, e.Path.Replace('/', Path.DirectorySeparatorChar));
+                Assert.Equal(await File.ReadAllBytesAsync(file), stored.Bytes);
+            }
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

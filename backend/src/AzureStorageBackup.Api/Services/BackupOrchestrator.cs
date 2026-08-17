@@ -2311,14 +2311,20 @@ public sealed class BackupOrchestrator(
     /// may not hold the content that address names. Thrown **after** that object has been taken back — or, in the
     /// one case where it could not be, after that has been reported (see <see cref="UndoInPlaceUploadAsync"/>).
     /// <para>
-    /// Private, and never allowed to escape this class's own retry: the one caller that can see it answers it by
-    /// re-staging the item through the copying route, which uploads a snapshot and is therefore immune. It does
-    /// travel one step further in one case — a same-content peer waiting on this item's dedup reservation is failed
-    /// with it, exactly as it would be by any other upload failure, because the alternative is letting it point its
-    /// index entry at a blob that was just deleted.
+    /// The item that hit it never gets to see it twice: its own caller answers it by re-staging through the copying
+    /// route, which uploads a snapshot and is therefore immune, so a retry cannot throw it again. It does travel one
+    /// step further in one case — a same-content peer waiting on this item's dedup reservation is failed with it,
+    /// exactly as it would be by any other upload failure, because the alternative is letting it point its index
+    /// entry at a blob that was just deleted.
+    /// </para>
+    /// <para>
+    /// That peer is why this type is <c>internal</c> rather than private: it reaches the peer at
+    /// <see cref="LocalDedupResolver.ResolveAsync"/>, which is **outside** the catch that answers it, so the only
+    /// thing standing between it and a dead run is <see cref="TransientErrors.IsTransient"/> — and that judgement is
+    /// deliberately made in one place for the whole codebase, which has to be able to name the type.
     /// </para>
     /// </summary>
-    private sealed class SourceMovedDuringUploadException(string path, string what)
+    internal sealed class SourceMovedDuringUploadException(string path, string what)
         : Exception($"'{path}' changed while it was being uploaded ({what}); the upload was undone.");
 
     /// <summary>What <see cref="UploadStagedBlobItemAsync"/> needs to finish an item, and everything that must be

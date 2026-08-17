@@ -87,6 +87,15 @@ produces that same hash then claims the address, finds the single-volume path cl
 "already there" by the if-missing upload without a byte being read — so the index records `data/{H}` as
 holding `H`, and it does not.
 
+**A same-content peer is failed transiently, not fatally.** Another file in the same run with byte-identical
+content does not upload anything: it parks on this item's dedup reservation, and when the guard trips that
+reservation is failed — it must never be handed an address that has just been deleted. What it is failed with is
+the guard's own exception, and it arrives *inside the resolver*, outside the catch that answers it for the item
+itself. So that exception counts as transient (`TransientErrors`), which is both what the peer needs — retry, and
+upload the content itself, since nobody else is going to — and what the situation is: the peer waits for the
+guilty item's whole upload, minutes for a multi-GB file, and byte-identical duplicates are ordinary in the media
+library this route exists for.
+
 **A take-back that cannot be done is said out loud.** The delete is retried under the same bounded policy
 the cleanup path uses for its point operations, and if it still fails the address goes into the operation
 log and out through the `UnrecoverableError` channel, naming the blob and the file. Nothing else in the
@@ -128,6 +137,9 @@ object, and those objects do not exist until 7z writes them.
   one so the object is genuinely written, and only then reports a status-0 error. Run without a run control,
   so the injected error is not retried and nothing but the code under test can have touched the container:
   afterwards it must hold no data object at all.
+- **A duplicate file does not take the run down with it.** Two byte-identical sources, one parked mid-upload and
+  the other waiting on its reservation (waited for through the progress stream, not assumed), then the uploading
+  one is rewritten. The run must finish, with each file's blob holding that file's own content.
 - **A take-back that cannot be done names the address.** Sabotage only the orchestrator's own view of the
   container, from the instant the source is rewritten. The run survives (the copying route is immune), the
   object is still there, and the operation log holds an error naming it and the file it came from.
