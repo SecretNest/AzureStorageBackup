@@ -568,4 +568,145 @@ public sealed class CompressionContinuityTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>
+    /// Paused is not a dead end. Suspend from a paused run must reach every worker parked at the gate — the
+    /// assertion behind <c>Downgrade</c> piercing a user pause (<c>PauseGate.ReleaseLocked</c>'s
+    /// <c>proceed &amp;&amp; _pausedByUser</c> guard is never taken for a downgrade, whose <c>proceed</c> is always
+    /// false) — and leave a journal the next run can pick up.
+    /// <para>
+    /// The uploader is throttled for the same reason <see cref="SlowUploader"/> exists on the pause/resume test
+    /// above: with the real uploader, twelve 2 MB files against a local Azurite can finish before the pause even
+    /// lands, and a pipeline with nothing left to hold proves nothing about whether Suspend reaches a parked
+    /// worker. The delay also gives the three-second settling window below room to let at least one upload — begun
+    /// before the pause, since uploads run on <c>working</c> and are never gated — actually land, so the journal
+    /// assertion at the end is not vacuously checking an empty file.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Paused_Run_Can_Still_Be_Suspended()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        for (var i = 0; i < 12; i++)
+            WriteFile($"f{i}.bin", FileSize);
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            new SlowUploader(TimeSpan.FromSeconds(2), new BlobUploader(factory)),
+            stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "paused-suspend");
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+            await WaitUntil(
+                () => staging.StagedBytes > 0, TimeSpan.FromSeconds(60),
+                () => "the pipeline never got going before the pause.");
+
+            control.Gate.PauseByUser();
+            // One item per stage may still be in hand; let the whole pipeline park before pressing Suspend.
+            await Task.Delay(3000);
+            Assert.Equal(PauseSource.User, control.Gate.Current!.Source);
+
+            var pressed = System.Diagnostics.Stopwatch.StartNew();
+            // Intent first, then Downgrade (inside RequestStop) does the releasing — no separate ReleaseNow call.
+            // See the task report for why an extra one would be redundant.
+            control.RequestStop(StopKind.Suspend);
+            await Assert.ThrowsAsync<BackupSuspendedException>(() => run.WaitAsync(TimeSpan.FromSeconds(30)));
+            pressed.Stop();
+
+            // Had any loop stayed parked behind the pause, this would time out rather than throw.
+            Assert.True(pressed.Elapsed < TimeSpan.FromSeconds(25),
+                $"suspend took {pressed.Elapsed.TotalSeconds:F1}s — a loop stayed parked behind the pause.");
+            Assert.Equal(0, staging.StagedBytes);
+
+            // The journal is the resumable midpoint the design promises: at least the upload already on the wire
+            // when the pause landed must have been written down for the next run to pick up.
+            var journal = Assert.Single(await journals.ListAsync(request.Account.Id, name, default));
+            Assert.NotEmpty(journal.Content.Records);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// The severest case: a pause pressed before the run even starts must not leave the run permanently silent.
+    /// Design §3 says pausing "stops the disk being read at all" — the diff's own gate, at the very top of
+    /// <c>OnChangeAsync</c>, is what makes that true — and this pins that a Suspend still terminates cleanly when
+    /// the diff's gate is the *only* one any loop ever reached.
+    /// <para>
+    /// Unlike <see cref="A_Paused_Run_Can_Still_Be_Suspended"/>, this is not independent proof of
+    /// <c>PauseGate.Downgrade</c>'s piercing: the diff waits on <c>stopProducing.Token</c>, which
+    /// <c>BackupOrchestrator.RunAsync</c> links straight to <c>control.StopToken</c> (see the comment above
+    /// <c>stopProducing</c>'s declaration), and <c>RequestStop</c> cancels that token unconditionally, independently
+    /// of whatever the gate itself does. So this loop would unblock on a Suspend even if <c>Downgrade</c> stopped
+    /// releasing the gate outright — confirmed by temporarily disabling the piercing in <c>PauseGate</c> and
+    /// re-running both tests: <see cref="A_Paused_Run_Can_Still_Be_Suspended"/> failed (timeout), this one still
+    /// passed. It is kept anyway because it pins a real and distinct risk — "paused before anything was produced"
+    /// is the shape most likely to hang — regardless of which of the two independent mechanisms is what saves it.
+    /// </para>
+    /// <para>
+    /// 400 tiny files rather than the shared 2 MB <see cref="FileSize"/>: were neither mechanism holding, this many
+    /// small files would start landing in <c>staging</c> within a couple of seconds even through the real
+    /// 7z/Azurite path, so <c>staging.StagedBytes</c> staying at exactly 0 for the whole 8-second wait below is
+    /// direct evidence the diff never got past its very first parked item — not just that this particular run
+    /// happened to be slow. <c>run.IsCompleted</c> staying false is the same evidence from the other side: a
+    /// pipeline that was never actually held would have nothing left to do with 400 tiny files and no throttling,
+    /// and would simply finish.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Suspend_Reaches_A_Run_Paused_Before_The_Diff_Ever_Started()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int files = 400;
+        for (var i = 0; i < files; i++)
+            WriteFile($"f{i}.bin", 256);
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            uploader: null, stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "paused-before-start");
+
+        // Closed before the run is even started: the diff's very first WaitIfPausedAsync call parks before
+        // OnChangeAsync ever offers the pipeline a single item.
+        control.Gate.PauseByUser();
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+
+            await Task.Delay(8000);
+            Assert.False(run.IsCompleted,
+                "the run finished before the pause was ever exercised — this proves nothing.");
+            Assert.Equal(0, staging.StagedBytes);
+
+            var pressed = System.Diagnostics.Stopwatch.StartNew();
+            control.RequestStop(StopKind.Suspend);
+            await Assert.ThrowsAsync<BackupSuspendedException>(() => run.WaitAsync(TimeSpan.FromSeconds(30)));
+            pressed.Stop();
+
+            Assert.True(pressed.Elapsed < TimeSpan.FromSeconds(25),
+                $"suspend took {pressed.Elapsed.TotalSeconds:F1}s — the diff stayed parked behind the pause.");
+            Assert.Equal(0, staging.StagedBytes);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
 }
