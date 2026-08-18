@@ -27,9 +27,10 @@ Everything this needs already exists in some form:
 
 - **`PauseGate`** is already the gate every worker passes through — but only on the way out of a
   transient error, with a self-heal timer and a patience that downgrades the run to auto-suspend
-  (`PauseGate.cs:29-55`). Its `WaitAsync(Exception cause, CancellationToken)` means "I hit trouble,
+  (`PauseGate.WaitAsync`). Its `WaitAsync(Exception cause, CancellationToken)` means "I hit trouble,
   park me"; there is no "park me because I was told to".
-- **`feeding`** (`BackupOrchestrator.cs:800`) is a token linked to `working` and `downstreamGone` and
+- **`feeding`** (`BackupOrchestrator.cs`, the linked token source built in `RunCoreAsync`) is a token
+  linked to `working` and `downstreamGone` and
   used by exactly the two stages whose in-flight work is worthless at stop time — the prober and the
   compressor. The uploaders use `working`. The split this design needs is already drawn.
 - **`BackupRunControl.StopToken`** (`:74`) fires for every stop kind, `AbortToken` (`:75`) only for
@@ -37,14 +38,15 @@ Everything this needs already exists in some form:
 - **`/retry-now`** (`BackupConfigEndpoints.cs:328`) is the precedent for an endpoint that reaches into
   a live run's gate; `PauseGate.ReleaseNow` is what it calls.
 - The frontend already has a `PauseInfo` type and a `pause` field on the run status
-  (`backupConfigs.ts:291,341`), and `RunStatus` renders a pause today.
+  (`backupConfigs.ts`'s `PauseInfo` interface and `BackupRun.pause`), and `RunStatus` renders a pause
+  today.
 
 ## Design
 
 ### 1. A staged stop, in one line
 
 ```csharp
-// BackupOrchestrator.cs:800
+// BackupOrchestrator.cs, in RunCoreAsync
 using var feeding = CancellationTokenSource.CreateLinkedTokenSource(
     working.Token, downstreamGone.Token, control?.StopToken ?? default);
 ```
@@ -114,12 +116,12 @@ trigger a downgrade.
 `WithPauseAsync` wraps an item's *failure* path. Pause needs the *entry* path, so each producing loop
 gains one `await control.Gate.WaitIfPausedAsync(token)` at the top:
 
-| loop | file:line (before this change) | token |
+| loop | file | token |
 |---|---|---|
-| the diff's `OnChangeAsync` | `BackupOrchestrator.cs:1301` | `stopProducing` |
-| prober (`ProbeLoopAsync`) | `:868` | `feeding` |
-| compressor (`CompressLoopAsync`) | `:1118` | `feeding` |
-| uploader (`UploadLoopAsync`) | `:1167` | `working` |
+| the diff's `OnChangeAsync` | `BackupOrchestrator.cs` | `stopProducing` |
+| prober (`ProbeLoopAsync`) | `BackupOrchestrator.cs` | `feeding` |
+| compressor (`CompressLoopAsync`) | `BackupOrchestrator.cs` | `feeding` |
+| uploader (`UploadLoopAsync`) | `BackupOrchestrator.cs` | `working` |
 
 The diff is included because "pause the backup" means the disk stops being read at all, not just that
 the pipeline stops draining.

@@ -145,7 +145,7 @@ public sealed class CompressionContinuityTests : IDisposable
     /// <para>
     /// Both halves are load-bearing for <see cref="A_Pause_Holds_The_Prober_And_The_Compressor"/>. The count is the
     /// prober's own observable: <c>ProbeForDedupAsync</c> calls <c>HeadHashAsync</c> as the first thing it does with
-    /// an item it has claimed (BackupOrchestrator.cs:2328), so "how many probes have happened" is exactly "how many
+    /// an item it has claimed (see BackupOrchestrator.ProbeForDedupAsync), so "how many probes have happened" is exactly "how many
     /// items the prober has taken past its gate" — no progress column in between, nothing to publish, nothing to
     /// throttle. The hold is what makes the observation deterministic rather than a race: it keeps the prober inside
     /// its first item until the pause is already standing, so the work the loops would consume if their gates were

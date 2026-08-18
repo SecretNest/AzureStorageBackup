@@ -16,7 +16,8 @@ Everything needed is already in hand at the point the summary is built:
 - `IndexEntry.Length` is the source-side raw byte size — the same figure summed into
   `VersionStats.Bytes`, and the same unit as `BackupRunResult.ChangedBytes`.
 - `BackupOrchestrator` already walks `diff.Changes` once at the end to count the categories
-  (`BackupOrchestrator.cs:1283`).
+  (`BackupOrchestrator.cs`, the single-pass category loop at the tail of `RunCoreAsync`, just before it
+  builds the `BackupRunResult`).
 
 So the number costs one addition inside a loop that already runs. No extra pass, no extra IO, no
 index format change.
