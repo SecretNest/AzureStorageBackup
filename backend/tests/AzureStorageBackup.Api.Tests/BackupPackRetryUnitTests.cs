@@ -146,6 +146,69 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
+    /// <summary>
+    /// The mirror of <see cref="MutatingCompressor"/>: leaves the first pass alone and rewrites a member during the
+    /// **recompression**, i.e. the pass a mid-upload blip forces.
+    /// <para>
+    /// That ordering is what builds the stranded-member scene, and nothing else does. The first pass keeps all six
+    /// members and hands the archive over, so the loop that would re-queue an excluded member has already settled
+    /// its verdict and moved on; the retry's own re-verification then drops one — someone rewrote it while the
+    /// group sat on the queue — and that member is now in no pack and on nobody's list.
+    /// </para>
+    /// <para>
+    /// It mutates on the **second** compression of a pack id, not on every one after the first: the retry's pass
+    /// excludes the member and immediately recompresses the five that are left, and a double that fired again
+    /// there would keep the group shrinking instead of settling.
+    /// </para>
+    /// </summary>
+    private sealed class MutatesOnRecompression(IFileCompressor inner, string root) : IFileCompressor
+    {
+        private readonly Dictionary<string, int> _passes = new(StringComparer.Ordinal);
+        private readonly List<string> _compressed = [];
+
+        public IReadOnlyList<string> Compressed
+        {
+            get { lock (_compressed) return [.. _compressed]; }
+        }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var packId = Path.GetFileNameWithoutExtension(request.OutputArchivePath);
+            int pass;
+            lock (_compressed)
+            {
+                _compressed.Add(packId);
+                pass = _passes[packId] = _passes.GetValueOrDefault(packId) + 1;
+            }
+
+            var target = request.Entries.FirstOrDefault(e => e.EndsWith(TargetLeaf, StringComparison.Ordinal));
+            // A different length, for the reason MutatingCompressor gives: re-verification compares metadata first,
+            // and a same-length rewrite inside one second is invisible to it.
+            if (pass == 2 && target is not null)
+                File.WriteAllBytes(
+                    Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)), new byte[41_000]);
+
+            return inner.CompressAsync(request, ct);
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+    }
+
     /// <summary>Blip on the Nth **pack**'s first upload (once only). N=2 means "the earlier group had already finished uploading when things went wrong".</summary>
     private sealed class FlakyOnNthPack(IBlobUploader inner, int nth) : IBlobUploader
     {
@@ -524,6 +587,77 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             // hashes, so a row whose hash is missing from its own pack is exactly the shape above: the entry carries
             // the member's settled hash while the pack recorded it under the stale diff-time one.
             var index = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
+            foreach (var e in index.Entries.Where(e => e.Storage is { Kind: "pack" }))
+                Assert.True(
+                    info.Packs[e.Storage!.Ref!].Members.Contains(e.FullHash, StringComparer.Ordinal),
+                    $"{e.Path} points at pack {e.Storage.Ref}, which does not record its content hash.");
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The other direction of the same seam, and the one that loses data rather than duplicating it: a member the
+    /// handed-over pass kept, which the **retry's** re-verification then drops.
+    /// <para>
+    /// Nobody is left holding it. The compression stage decided this group's excluded list before the archive ever
+    /// reached an uploader and moved on to the next item; the retry runs on an uploader, where re-queueing into a
+    /// pool that has already been sealed is not on offer. Left alone, the member reaches the index with a length
+    /// and no storage reference — an entry that says "this file is backed up, this big" and points at nothing,
+    /// which no check reports, because check reads the index and the index is internally consistent.
+    /// </para>
+    /// <para>
+    /// The guard hands such members to a standalone <c>ProcessPackAsync</c>, so the assertion is simply that the
+    /// file is stored. The scene is built rather than waited for: the blip is on the first group so the retry lands
+    /// on a member list the compressor has finished with, and the compressor double rewrites the member on the
+    /// second compression of that pack — i.e. during the retry and not before it.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_member_the_retry_drops_is_still_stored()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatesOnRecompression(new SevenZipCompressor(), _root);
+        var flaky = new FlakyOnGroup(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), ordinal: 1);
+        var (orchestrator, factory, store) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-stranded", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            var result = await orchestrator.RunAsync(Request(account, name), null, default, control);
+            Assert.Equal(1, result.Version);
+
+            // Preconditions, both of which the assertion below cannot speak for. Three compressions of the first
+            // pack id: the six the compressor handed over, the six the blip forced it to redo, and the five that
+            // were left once the rewritten member dropped out of that second pass. Without the blip there would be
+            // one, and without the rewrite two — and either way the guard is never reached and every assertion
+            // below passes on a run that never entered the code this case exists for.
+            var firstPack = compressor.Compressed[0];
+            Assert.Equal(3, compressor.Compressed.Count(p => p == firstPack));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            Assert.Equal(5, info!.Packs[firstPack].Members.Count);   // the handed-over six minus the one it dropped
+
+            var index = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
+            var stranded = Assert.Single(index.Entries, e => e.Path.EndsWith(TargetLeaf, StringComparison.Ordinal));
+            Assert.NotNull(stranded.Storage);
+            Assert.False(
+                string.IsNullOrEmpty(stranded.Storage!.Ref),
+                $"{stranded.Path} is in the index with a length and nothing to restore it from.");
+
+            // ...and stored somewhere other than the pack that dropped it, which is what says it was picked up
+            // again rather than quietly taken back into an archive the run had already judged.
+            Assert.NotEqual(firstPack, stranded.Storage.Ref);
+
+            var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
+            Assert.Equal(referenced, inContainer);
             foreach (var e in index.Entries.Where(e => e.Storage is { Kind: "pack" }))
                 Assert.True(
                     info.Packs[e.Storage!.Ref!].Members.Contains(e.FullHash, StringComparer.Ordinal),
