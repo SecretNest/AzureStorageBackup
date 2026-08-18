@@ -318,34 +318,6 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         SignalRelease();
     }
 
-    /// <summary>
-    /// Tie ownership of one archive to a scope: it is handed back when the block ends, whether that is a normal finish, a <c>continue</c>, or a throw.
-    /// <para>
-    /// The reason it exists is the **throw** case: this account lives on a singleton, an in-process memory counter, so leaking it
-    /// once leaves it hanging there forever (only a restart clears it), and it is at the same time the backpressure gate on
-    /// output — inflate it to the ceiling and compression/packing in every run gets stuck on
-    /// <see cref="WaitForRoomAsync"/>, degrading the whole pipeline into "one item uploads before the next is let through".
-    /// And you cannot see it in the UI: that column shows this run's seat usage, not the global account.
-    /// </para>
-    /// <para>
-    /// It coexists with "hand it back as soon as you are done" rather than replacing it: callers should still call
-    /// <see cref="Release(StagedItem)"/> the moment they are done to free the allowance (a second earlier back is a second
-    /// earlier somebody else can start work); this only covers the exception path. Releasing twice is safe —
-    /// <see cref="ReleaseFile"/> does a <c>TryRemove</c> by path, so the second time short-circuits.
-    /// </para>
-    /// <param name="item">May be null (when 7z drops every member of the group there is not even an empty archive), in which case this does nothing.</param>
-    /// </summary>
-    public IDisposable Hold(StagedItem? item) => new Holder(this, item);
-
-    private sealed class Holder(StagingArea area, StagedItem? item) : IDisposable
-    {
-        public void Dispose()
-        {
-            if (item is not null)
-                area.Release(item);
-        }
-    }
-
     /// <summary>Whole-family tail: release everything not already released volume by volume (on a dedup hit not a single volume
     /// was uploaded, so it all comes back here), then delete the emptied GUID subdirectory. Whatever was already released per volume short-circuits idempotently inside <see cref="ReleaseFile"/>.</summary>
     public void Release(StagedItem item)

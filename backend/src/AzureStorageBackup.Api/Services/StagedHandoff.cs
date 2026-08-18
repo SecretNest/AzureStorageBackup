@@ -6,10 +6,16 @@ namespace AzureStorageBackup.Api.Services;
 /// <para>
 /// Two things ride along. The <see cref="StagedItem"/> holds pool quota — an in-memory counter on a singleton
 /// shared by every run — plus volume files on disk; leaking it books that space until the process restarts, and
-/// since the quota gates output for all runs, enough leaks stall compression process-wide (see
-/// <see cref="StagingArea.Hold"/>). The optional abandon callback is the dedup reservation of a single-file item:
+/// since the quota is also the gate output waits at (<see cref="StagingArea.WaitForRoomAsync"/>), enough leaks
+/// stall compression process-wide, invisibly: the UI column shows this run's seat usage, not the global account.
+/// The optional abandon callback is the dedup reservation of a single-file item:
 /// latecomers in this run with identical content are blocked on it, and an entry discarded without answering them
 /// leaves them waiting for the rest of the run.
+/// </para>
+/// <para>
+/// This is the whole of that guard now. <c>StagingArea.Hold</c> used to wrap the same release in a <c>using</c>
+/// scope, and it was deleted along with its last caller when the pack path was cut in two: the archive's lifetime
+/// stopped ending inside the method that produced it, so a scope guard had nothing left to scope.
 /// </para>
 /// <para>
 /// <see cref="MarkSettled"/> is the difference between "the upload answered the waiters" and "this archive died on

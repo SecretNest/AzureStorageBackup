@@ -144,9 +144,10 @@ A queue entry owns two things that must be handed back exactly once:
 - the `StagedItem` — pool quota plus volume files on disk;
 - for single files, the dedup reservation, with later same-content arrivals blocked on it.
 
-Both are wrapped in one disposable owner whose `Dispose` calls `staging.Release(staged)` and
-`res.Fail(...)`, idempotently — the same shape as the existing `StagingArea.Hold`
-(`StagingArea.cs:287-296`), and for the same reason it exists.
+Both are wrapped in one disposable owner (`StagedHandoff`) whose `Dispose` calls `staging.Release(staged)`
+and `res.Fail(...)`, idempotently — the same shape, and for the same reason, as the `using`-scoped
+`StagingArea.Hold` it replaces. That one has since been deleted: once the archive's lifetime stopped ending
+inside the method that produced it, a scope guard had nothing left to scope.
 
 Four paths must reach that `Dispose`:
 

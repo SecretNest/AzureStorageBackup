@@ -5,8 +5,8 @@ namespace AzureStorageBackup.Api.Tests;
 /// <summary>
 /// The ownership guard for one entry of the staged queue. Everything here is about the release happening
 /// **exactly once**: the pool quota lives on a process-wide singleton, so leaking it keeps that space booked
-/// until the process restarts, and since the quota gates output for every run, enough leaks stall compression
-/// process-wide (see StagingArea's remarks on Hold).
+/// until the process restarts, and since the quota is also the gate output waits at
+/// (StagingArea.WaitForRoomAsync), enough leaks stall compression process-wide.
 /// </summary>
 public sealed class StagedHandoffTests : IDisposable
 {

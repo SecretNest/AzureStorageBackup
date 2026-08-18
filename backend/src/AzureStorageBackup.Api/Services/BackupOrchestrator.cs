@@ -3319,9 +3319,9 @@ public sealed class BackupOrchestrator(
     /// the staging quota, while the uploaders work through what it has already produced.
     /// </para>
     /// <para>
-    /// The archive comes back owned by the caller through the handoff, which is why the <c>staging.Hold</c> that
-    /// used to guard this stretch is gone: the scope it guarded no longer ends inside this method. The hazard it
-    /// existed for has not gone away — see the catch below.
+    /// The archive comes back owned by the caller through the handoff, which is why the <c>using</c>-scoped guard
+    /// that used to hold this stretch is gone (<c>StagingArea.Hold</c>, deleted with its last caller): the scope it
+    /// guarded no longer ends inside this method. The hazard it existed for has not gone away — see the catch below.
     /// </para>
     /// </summary>
     /// <param name="bypassQuota">True when this runs on an uploader recompressing a group it has to resend, which
