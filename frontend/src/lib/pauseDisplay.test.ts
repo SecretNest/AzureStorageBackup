@@ -13,6 +13,14 @@ const pause = (source: number, reason = 'network down'): PauseInfo => ({
 })
 
 describe('pauseDisplay', () => {
+  // The other side of the same pin. The backend has PauseSource as explicit numerics and a case asserting the
+  // JSON it produces; this mirror is hand-written, so nothing but a literal here keeps the two from drifting.
+  // Every other test in this file goes through the constant and would follow a renumbering in silence.
+  test('the PauseSource mirror still matches the numbers the backend sends', () => {
+    expect(PauseSource.TransientError).toBe(0)
+    expect(PauseSource.User).toBe(1)
+  })
+
   test('a run that is not paused renders nothing', () => {
     expect(pauseDisplay(null, false)).toBeNull()
   })

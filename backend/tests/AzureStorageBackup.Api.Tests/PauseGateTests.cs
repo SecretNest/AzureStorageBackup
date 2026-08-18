@@ -1,9 +1,36 @@
+using System.Text.Json;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
 public class PauseGateTests
 {
+    /// <summary>
+    /// PauseSource's numbers are the wire contract, and until now nothing held them to it. PauseInfo goes to the
+    /// browser as itself — no DTO projects the enum into a string the way BackupRunResponse does for Status and
+    /// SuspendReason — and this application registers no JsonStringEnumConverter, so it serialises as a number and
+    /// <c>frontend/src/api/backupConfigs.ts</c> mirrors those numbers by hand.
+    /// <para>
+    /// Every other assertion in this file names the members symbolically and would follow a renumbering in
+    /// silence, all the way to a browser that reads <c>source: 1</c> and draws the wrong half of the pause UI.
+    /// This one is deliberately written in literals on both sides of the boundary: the values, and the JSON they
+    /// actually produce. The second half is the one that catches a converter being registered globally later.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PauseSource_Crosses_The_Wire_As_The_Numbers_The_Frontend_Mirrors()
+    {
+        Assert.Equal(0, (int)PauseSource.TransientError);
+        Assert.Equal(1, (int)PauseSource.User);
+
+        var info = new PauseInfo("Paused by the user.", DateTimeOffset.UnixEpoch, null, 0, PauseSource.User);
+        // JsonSerializerDefaults.Web is what ASP.NET's own result serialisation uses, and nothing in Program.cs
+        // overrides it.
+        var json = JsonSerializer.Serialize(info, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Contains("\"source\":1", json, StringComparison.Ordinal);
+    }
+
     private static PauseGate Fast(TimeSpan? patience = null) => new(
         schedule: [TimeSpan.FromMilliseconds(10)],
         steady: TimeSpan.FromMilliseconds(10),
