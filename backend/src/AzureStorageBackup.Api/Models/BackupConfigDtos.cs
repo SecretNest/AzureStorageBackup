@@ -159,7 +159,7 @@ public record BackupConfigRequest(
     };
 }
 
-/// <summary>The verdict of a local-root migration check (design docs/change-local-root-design.md §5).</summary>
+/// <summary>The verdict of a local-root migration check (design docs/configuration.md).</summary>
 public enum LocalRootVerdict
 {
     /// <summary>Sampled match rate ≥95%: let it straight through.</summary>

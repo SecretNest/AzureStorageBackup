@@ -13,7 +13,7 @@
 > startup. The session cookie is signed with the Data Protection key ring under `/keys`, while the
 > password itself is read straight from the environment — so losing the key ring only signs people
 > out, it does not lock them out. Changing the password means changing the variable and
-> restarting. See [auth-password-design.md](auth-password-design.md).
+> restarting. See [operations.md](operations.md).
 
 ## 0. Settings storage
 
@@ -64,7 +64,7 @@ Defaults for backup and check; a backup that ticks "use default" inherits them.
 - **3.1 Tier** (set separately for index files and data files):
   - Index files: Hot (default), Cool, Cold
   - Data files: Hot, Cool, Cold, **Archive (default)**
-  - **Implementation note (code is authoritative)**: the `StorageTier` enum is `Hot/Cool/Cold/Archive`, **without Smart** (dropped because the Azure SDK does not offer it as an option — see the "settled" section of [backup-feature-design.md](backup-feature-design.md)). Data files default to **Archive** (lowest cost; rehydration before restore is expected behaviour for archival backup semantics).
+  - **Implementation note (code is authoritative)**: the `StorageTier` enum is `Hot/Cool/Cold/Archive`, **without Smart** (dropped because the Azure SDK does not offer it as an option — see §8.5 below). Data files default to **Archive** (lowest cost; rehydration before restore is expected behaviour for archival backup semantics).
 - **3.2 Versions and time** — maximum version count (100 default), maximum age (180 days default), and how the two combine (both reached / either reached / count only / age only).
 - **3.3 Local files**:
   - **3.3.1 Ignore** — matching paths and files are ignored, with support for exceptions (re-inclusion), using gitignore-style syntax. If an existing backup contains these files, new versions exclude them (as if deleted).
@@ -115,6 +115,93 @@ List every temp directory path (read-only) so the user can set up docker path ma
 ## 7. Version
 
 Display the current tool version, for verification.
+
+---
+
+## 8. Backup feature requirements
+
+> Provided by the user on 2026-07-16, supplementing chapter 2. Covers the backup list UI, the backup
+> engine, and check and restore.
+
+### 8.1 The backup list and status
+
+List every backup in the tool. Each one can be created, deleted, run, inspected per run, and shown
+with its current status: **Normal** (the last task ended cleanly), **Error** (the last task failed,
+or a check found something wrong), or **Backing up** / **Restoring** / **Checking**.
+
+A backup sitting in Error can be reset back to Normal. Outside a run, everything except the fields
+marked immutable at creation can be edited, and a rename must be reflected in the UI. Deleting a
+backup asks whether to delete the container as well; standalone container deletion lives in the
+account settings screen.
+
+### 8.2 Creating a backup
+
+**Step 1 — basics**, immutable after creation except name and description: account plus container (a
+container can be created here), the local root path (exactly one), name, description, an optional
+password, and the two tiers (index files including the info file, and data files).
+
+**Step 2 — per-backup settings derived from the defaults**, each settable individually or ticked as
+"use default", including symlink handling and run-record retention.
+
+On completion, either "back up now" or "not yet".
+
+### 8.3 Run progress
+
+Progress must be visible while running: a percentage, plus the count and size of this run's changed
+files — **uncompressed, before grouping**, with deletions not counting towards size.
+
+Backups must include **empty directories**, and restore must recreate them.
+
+### 8.4 Restore, check and cleanup
+
+**Restore.** The user picks a destination root or restores in place. Conflict handling is overwrite
+(only if changed) / skip / rename and keep both. The source version is selectable, and a lazily
+loaded file tree covering all folders and files lets the user choose. If any data is in the Archive
+tier, a rehydrate priority is required: Standard (default) or High.
+
+**Check.** The method is selectable, including from a scheduled task: whether to check cloud file
+existence (listing; default yes), whether to check cloud file content (downloading; default no), and
+whether to check local file existence (date and length, comparing hashes when the date differs but
+the length matches).
+
+**Historical version cleanup** is triggered when a backup completes, and by a dedicated cleanup
+scheduled task.
+
+### 8.5 Settled questions (2026-07-16)
+
+1. **Password means encryption**: a backup created with a password uses an encrypted info file plus
+   7z encryption; without one, nothing is encrypted anywhere. It is a single switch.
+2. **Symlinks are skipped by default.**
+3. **Run-record retention and version retention are two independent policies** — execution logs
+   versus data versions.
+4. **Restore's "overwrite only if changed" compares hashes**, aligned with the hashes in the index.
+5. **Tiers and "Smart"**, verified against the Azure .NET SDK: `AccessTier` supports only
+   Hot/Cool/Cold/Archive. "Smart tier" is an *account-level* auto-tiering feature, not a tier
+   settable on an individual blob, so the tool offers no Smart option. Index tier: Hot (default) /
+   Cool / Cold. Data tier: Hot / Cool / Cold / Archive (default). Cold requires SDK ≥ 12.15.0.
+
+### 8.6 Key technical constraints
+
+**A. Index contents and comparison logic.** The index must hold, for each file, its permissions,
+modification date, length and hash. When comparing: if the length matches but the date or permissions
+differ, compare hashes. If only permissions or date changed, the next backup **only updates the
+index** and does not re-upload data.
+
+**B. Index distribution.** The index must be distributed so that no single index becomes enormous or
+is rewritten repeatedly. Index files are themselves compressed and encrypted. Splitting by version
+into a two-level index is to be considered.
+
+**C. Atomicity and safety.** Because grouped files can change, the index of a historical version can
+change too — and such changes must be safe: a network failure must not corrupt the whole thing.
+
+**D. Post-processing recheck and repeat protection.** After processing a file, check its modification
+time and permissions again; if they changed, recompute the hash; if the hash changed too, reprocess
+the file. After a threshold of repeats (5 by default, configurable by environment variable), record a
+warning and save the file's current version, stopping retries. For grouped files, run the same
+recheck against the group's original files after compressing; a changed one is moved out of the group
+and into the next group for that directory, or handled as a single file if there is none. Finally,
+after all processing and **before uploading the index**, run the recheck once more across everything,
+skipping files that already warned.
 
 ---
 

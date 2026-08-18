@@ -23,7 +23,7 @@ interface Loaded {
 }
 
 /**
- * The backup scope selection tree (design docs/backup-scope-selection-design.md §8).
+ * The backup scope selection tree (design docs/configuration.md).
  *
  * Deliberately **not** a reuse of RestoreDialog's tree: that one's source is the cloud version index
  * (a finite known set, with tri-state computed from loaded descendants), while this one's is a live

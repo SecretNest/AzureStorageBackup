@@ -1,7 +1,7 @@
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// The boundary rule set of a backup's scope (design docs/backup-scope-selection-design.md). Each rule is one
+/// The boundary rule set of a backup's scope (design docs/configuration.md). Each rule is one
 /// "path → include/exclude"; the decision comes from the **longest matching prefix**; no match at all means include (the root's implicit default).
 /// <para>
 /// Deliberately **not shared** with <see cref="IgnoreRuleSet"/>: that one is glob matching + last rule wins,

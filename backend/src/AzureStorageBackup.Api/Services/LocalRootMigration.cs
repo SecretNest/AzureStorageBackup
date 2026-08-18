@@ -3,7 +3,7 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// The verdict logic for migrating the local root path (design docs/change-local-root-design.md).
+/// The verdict logic for migrating the local root path (design docs/configuration.md).
 ///
 /// **Static and dependency-free** on purpose: it does pure computation plus read-only filesystem access, and never touches
 /// the database, the cloud, or decryption. The account/password/cloud info needed to fetch the index is prepared by the

@@ -233,7 +233,7 @@ public sealed class StreamingBackupTests : IDisposable
     }
 
     // ------------------------------------------------------------------------------------------------------
-    // Uploading a raw blob from where it already is (docs/raw-upload-without-staging-design.md).
+    // Uploading a raw blob from where it already is (docs/pipeline.md).
     //
     // A store-only, unencrypted file that fits one volume used to be copied into the staging area in full and
     // uploaded from the copy. The copy was what fixed the content between hashing and uploading; it is now

@@ -57,7 +57,7 @@ public class BackupConfig
     public string? CrossDirGroupRulesCaseInsensitive { get; set; }
 
     /// <summary>
-    /// Backup scope (design docs/backup-scope-selection-design.md): one `+ path` / `- path` per line,
+    /// Backup scope (design docs/configuration.md): one `+ path` / `- path` per line,
     /// decided by longest-prefix match. null/empty = **everything** under the root.
     /// <para>
     /// Note that null here means something **different** from null on the rule fields above: those mean "inherit the global default",

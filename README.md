@@ -374,7 +374,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 > Every EF Core SQL statement is logged at `Information`, which is the framework default and makes `docker logs` almost unreadable — the app's own messages get lost among `Microsoft.EntityFrameworkCore.Database.Command[20101]` lines. It is therefore raised to `Warning` here. To turn it back on for a debugging session, set `Logging__LogLevel__Microsoft.EntityFrameworkCore.Database.Command=Information`. The same pattern works for any category: `Logging__LogLevel__<Category>=<Level>`.
 
-> Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [keyring-loss-recovery-design.md](docs/keyring-loss-recovery-design.md).
+> Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [operations.md](docs/operations.md).
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
 
@@ -469,4 +469,8 @@ The examples elsewhere in this README use the GHCR name; either image is the sam
 
 ## Documentation
 
-Roadmap: `docs/roadmap.md`. Full requirements: `docs/product-requirements.md`. Backup engine design: `docs/m4-backup-engine-design.md`.
+Design documentation lives in [`docs/`](docs/README.md), organised by topic. Start with
+[`docs/architecture.md`](docs/architecture.md) for what the system is and the principles the rest
+follows from, then [`docs/backup-engine.md`](docs/backup-engine.md) for a run end to end.
+Full requirements are in [`docs/product-requirements.md`](docs/product-requirements.md), and
+[`docs/history.md`](docs/history.md) records how the project got here.

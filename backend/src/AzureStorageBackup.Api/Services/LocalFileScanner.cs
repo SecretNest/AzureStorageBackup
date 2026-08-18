@@ -38,7 +38,7 @@ public sealed record ScanOptions
     /// <summary>Whether to include symlinks (skipped by default, M4 decision).</summary>
     public bool IncludeSymlinks { get; init; } = false;
 
-    /// <summary>Backup scope (design docs/backup-scope-selection-design.md). Includes everything by default.</summary>
+    /// <summary>Backup scope (design docs/configuration.md). Includes everything by default.</summary>
     public ScopeRuleSet Scope { get; init; } = ScopeRuleSet.All;
 }
 

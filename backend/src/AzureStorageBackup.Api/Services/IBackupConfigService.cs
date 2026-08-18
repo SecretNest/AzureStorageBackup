@@ -14,7 +14,7 @@ public interface IBackupConfigService
     Task<BackupConfig?> UpdateAsync(int id, BackupConfig update, CancellationToken ct = default);
 
     /// <summary>
-    /// Migrate the local root path (design docs/change-local-root-design.md). Changes exactly one field, LocalRoot,
+    /// Migrate the local root path (design docs/configuration.md). Changes exactly one field, LocalRoot,
     /// and nothing else — ScopeRules are coordinates relative to the root, so their meaning is unchanged after the move and they must be kept verbatim.
     /// Validation is done beforehand by the caller (the endpoint); this method only writes to the database. Returns null if the config does not exist.
     /// </summary>

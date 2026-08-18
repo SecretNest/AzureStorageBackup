@@ -791,7 +791,7 @@ public static class BackupConfigEndpoints
             return Results.NoContent();
         });
 
-        // Migrate the local root path (design docs/change-local-root-design.md).
+        // Migrate the local root path (design docs/configuration.md).
         // preview and apply are separate: preview is a pure query, idempotent and freely retryable (trying another path leaves no trace),
         // while apply's confirmation semantics are independently identifiable in the log. The same shape already exists in restore-estimate and restore.
         group.MapPost("/{id:int}/local-root/preview", async (

@@ -324,7 +324,7 @@ public class PathBoundaryEnforcementTests
 
     /// <summary>
     /// The "out-of-bounds path → 409 + code: path_outside_root" row listed in the migration design doc
-    /// (docs/change-local-root-design.md, "Tests") had nothing covering it on the preview endpoint — the guard sits right inside
+    /// (docs/configuration.md) had nothing covering it on the preview endpoint — the guard sits right inside
     /// PrepareLocalRootAsync (BackupConfigEndpoints.cs :844), and deleting that line would turn no
     /// test red. Whether the target root is out of bounds and whether the migrated config's own LocalRoot is in or out of bounds are two different things:
     /// here CreateInRootConfigAsync builds a clean in-bounds config so that only "the new root is out of bounds" trips the guard,

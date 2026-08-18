@@ -1,4 +1,4 @@
-// Local-root migration verdict → UI decision (see docs/change-local-root-design.md).
+// Local-root migration verdict → UI decision (see docs/configuration.md).
 // A pure function so it can be tested: the repository has no component-rendering infrastructure, and
 // the dialog only draws what this returns.
 
