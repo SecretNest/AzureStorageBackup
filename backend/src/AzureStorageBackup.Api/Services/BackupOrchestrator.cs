@@ -2811,14 +2811,34 @@ public sealed class BackupOrchestrator(
         {
             // The registration is deliberately left standing: it is the only thing that will still clear this
             // address if the operator answers with Stop now.
-            await Record(
-                NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                $"Could not remove a blob that may hold the wrong content: {blobRef}",
-                $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
-                + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
-                + "produces that same content will be told the address is already taken and will record it without "
-                + "reading a byte of it.",
-                CancellationToken.None);
+            try
+            {
+                await Record(
+                    NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                    $"Could not remove a blob that may hold the wrong content: {blobRef}",
+                    $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
+                    + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
+                    + "produces that same content will be told the address is already taken and will record it without "
+                    + "reading a byte of it.",
+                    CancellationToken.None);
+            }
+            catch
+            {
+                // This method must not throw, and this is the one statement in it that can: Record goes through
+                // SQLite and a webhook, and this repository has had "database is locked" out of exactly that path.
+                //
+                // Both callers are on their way to an exception of their own, and a throw from here replaces it.
+                // On the failing path that costs the diagnosis — the blip that ended the upload is what explains
+                // the run, and a logging error in its place explains nothing. On the success path it costs more
+                // than the message: the replacement escapes before `throw new SourceMovedDuringUploadException`
+                // runs, and then satisfies the very filter of the catch below, so the take-back runs a second
+                // time; and because what finally surfaces is not that exception, the catch that re-queues the item
+                // through the copying route never matches and the file loses its retry altogether.
+                //
+                // So it is swallowed. The alternative is not "report it somewhere else": the operation log and the
+                // notifier are the two channels this application has, and this line only runs when they are both
+                // in the hands of something that just failed.
+            }
         }
     }
 
