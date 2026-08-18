@@ -137,6 +137,14 @@ buys is a bigger chance of the guard tripping, not a bigger chance of it being w
 **It does not apply when the file needs splitting.** A volume-split raw file has more than one output
 object, and those objects do not exist until 7z writes them.
 
+**It does not survive a hard crash between the commit and the take-back.** The delete runs on
+`CancellationToken.None` and the in-flight registration is cleared only after it returns, so a Stop now
+inside that window still removes the object. A power cut does not: what is left is an object at an address
+that names content it may not hold, and — unlike every other leftover — nothing later detects it, because
+check and restore both read the index and the index agrees with the name. It is the same window
+`ClearLeftoverVolumesAsync` has always had between its delete and its re-upload, and closing it would need
+a durable record written before the upload rather than after, which is a change to the journal format.
+
 ## Tests
 
 - **A raw upload leaves nothing in staging.** After backing up a store-only unencrypted file, the staged

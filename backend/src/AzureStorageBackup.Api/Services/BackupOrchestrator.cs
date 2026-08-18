@@ -1325,8 +1325,13 @@ public sealed class BackupOrchestrator(
         // on its way out, so once it is gone nothing can be written in behind this drain.
         void DrainQueues()
         {
-            // probedQueue first. It makes no difference once the consumers are all settled, but it is the order
-            // that stays correct if this is ever called while the compressor can still move an entry across.
+            // Called only after the consumers have settled — that is a precondition, not a preference, and the
+            // order below does not soften it. probedQueue is SingleReader, and its single reader is the
+            // compressor's ReadAllAsync; a TryRead here while that loop is alive is a second concurrent reader on
+            // a channel configured for one, which is undefined behaviour in its fast path rather than a question
+            // of which entry ends up where. Draining probedQueue first is only so that an entry cannot be moved
+            // across into stagedQueue behind a drain that has already passed it; it does not make an early call
+            // safe, and there is no ordering that would.
             while (probedQueue.Reader.TryRead(out var probed))
                 probed.Share.Release();
             while (stagedQueue.Reader.TryRead(out var entry))
@@ -1338,6 +1343,15 @@ public sealed class BackupOrchestrator(
 
         // One prober, one compressor, `uploaders` uploaders — the counts and the reasoning for each are up where
         // `uploaders` is worked out, next to the two channels.
+        //
+        // The ORDER matters, and it is a seam rather than a rule: Task.WhenAll surfaces the first faulted task in
+        // list order, so the two feeding stages outrank every uploader. The prober's and the compressor's own
+        // comments already say this about the cancellation they throw on the way out, and take care not to fault
+        // ahead of the real cause. What no comment covered until now is the other half: a NON-cancellation fault
+        // in either of them would outrank the uploaders' cause the same way, and there is nothing in place to keep
+        // it from doing so. It costs nothing today because neither stage has a blocking call that can fail on its
+        // own account — the compressor's one wait is the staging quota, which throws only cancellation. Add one
+        // that can fail for a reason of its own and this is the line to re-read.
         List<Task> consumers = [];
         void StartConsumers() =>
             consumers = [
@@ -2784,7 +2798,10 @@ public sealed class BackupOrchestrator(
     /// The delete is retried, because the failure it is most likely to meet is the same blip that brought the
     /// caller here — under the same policy the cleanup path uses for its point operations (see RetentionCleaner),
     /// which is bounded by attempt count rather than by the upload path's two hours: this runs in the tear-down of
-    /// one item, and a run that spends hours failing to remove one object helps nobody.
+    /// one item, and a run that spends hours failing to remove one object helps nobody. Concretely that is
+    /// <see cref="RetryOptions"/>'s defaults — five attempts, 200 ms doubling, so about three seconds of backoff
+    /// plus whatever the SDK spends inside each attempt. An outage longer than that is answered by the report
+    /// below rather than by waiting it out.
     /// </para>
     /// <para>
     /// A delete that ultimately fails is **said out loud** rather than swallowed. What is left behind is an object
@@ -3286,11 +3303,21 @@ public sealed class BackupOrchestrator(
             }
             finally
             {
-                // Hand the quota back here, on every path. UploadStagedPackAsync already released whatever it got as
-                // far as sending, but nothing released the archive of a group 7z emptied (there is no upload at all
-                // for it), the one whose upload threw before it started, or the one abandoned when the run was
-                // cancelled. That debt lives on a singleton shared by every run and is at the same time the
-                // backpressure gate on output, so leaking it throttles compression process-wide until a restart.
+                // Hand the quota back here, on every path — but there is exactly one path that has nothing else to
+                // hand it back, and it is worth naming precisely, because a list of cases that are already covered
+                // elsewhere reads as though this line could be dropped once any of them changes.
+                //
+                // That path is an upload that throws BEFORE its own try: UploadStagedPackAsync sizes the volumes
+                // and calls BeginUpload above its try, and a throw from either skips the finally that would have
+                // released the archive. Everything else is already accounted for. An upload that got as far as
+                // sending releases in that same finally, cancellation included. A group 7z emptied carries either
+                // a null archive (nothing to release) or a zero-file, zero-byte one. And a throw out of the
+                // compression itself never reaches here at all — CompressGroupAsync runs above this try and cleans
+                // up in its own catch.
+                //
+                // What the debt costs is why the one path is enough to keep it: it lives on a singleton shared by
+                // every run and is at the same time the backpressure gate on output, so leaking it throttles
+                // compression process-wide until a restart.
                 attempt.Handoff.Dispose();
             }
         }
@@ -3407,6 +3434,10 @@ public sealed class BackupOrchestrator(
                 uploadTracker.EndChecking(checkingBytes);
             }
 
+            // An empty `changed` is the good ending, and the one the caller reads it as: nothing was dropped and
+            // nothing moved under the compression, so this group cleanly became one pack and every member of it
+            // travels in the archive being handed over. (The two lists are not interchangeable even here — see
+            // GroupAttempt: `members` is what was asked for, and it is only equal to what went in on this path.)
             if (changed.Count == 0)
                 return new GroupAttempt(new StagedHandoff(staging, staged), changed, members);
 
