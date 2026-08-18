@@ -102,6 +102,21 @@ public sealed class PauseGate : IDisposable
     public bool IsPausedByUser { get { lock (_lock) return _pausedByUser; } }
 
     /// <summary>
+    /// Both halves of "why is this run paused" as of one instant. Anything that reports the two together must
+    /// come through here rather than reading <see cref="Current"/> and <see cref="IsPausedByUser"/> in turn: those
+    /// take the lock separately, so a Pause or a Resume landing between them yields a pair that never existed.
+    /// The UI renders from exactly that pair, and both mixtures are wrong in a way the operator can see — a null
+    /// <see cref="PauseInfo"/> beside a standing hold draws no pause label at all, and a
+    /// <see cref="PauseSource.User"/> info beside <c>false</c> draws the transient-error branch, countdown and
+    /// Retry-now button included, on a run the operator has simply paused.
+    /// </summary>
+    public (PauseInfo? Current, bool ByUser) Snapshot()
+    {
+        lock (_lock)
+            return (_current, _pausedByUser);
+    }
+
+    /// <summary>
     /// Wait at the gate.
     /// </summary>
     /// <returns>true = released, go retry; false = already downgraded, the caller should take the suspend-and-exit path.</returns>
@@ -147,7 +162,16 @@ public sealed class PauseGate : IDisposable
         }
     }
 
-    /// <summary>Downgrade: the user clicked Suspend, or patience ran out. Every waiter gets false.</summary>
+    /// <summary>
+    /// Downgrade: the user clicked Suspend, patience ran out, or the run is tearing down after a fault. Every
+    /// waiter gets false, and no later <see cref="PauseByUser"/> can close the gate again.
+    /// <para>
+    /// The third caller is the one worth naming, because it is not about pausing at all: the orchestrator's error
+    /// teardown waits for the producing loops to settle, and those loops park here. A user hold has no timer and
+    /// no patience, so without this the failed run would wait for a pause that only the operator can lift, holding
+    /// the busy lock and the process-wide staging quota the whole time.
+    /// </para>
+    /// </summary>
     public void Downgrade()
     {
         lock (_lock)

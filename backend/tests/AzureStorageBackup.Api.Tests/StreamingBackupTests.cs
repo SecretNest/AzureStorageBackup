@@ -387,6 +387,38 @@ public sealed class StreamingBackupTests : IDisposable
         }
     }
 
+    /// <summary>An operation log that is itself broken: it counts what it was asked to write and then fails.
+    /// The path this exercises reaches SQLite and a webhook, and "SQLite Error 5: database is locked" has come out
+    /// of exactly that path in this repository before.</summary>
+    private sealed class ThrowingOperationLog(Func<string, bool> breaksOn) : IOperationLog
+    {
+        private readonly List<string> _asked = [];
+
+        /// <summary>Only the messages that hit the break, so a count here is a count of attempts at that one report.</summary>
+        public IReadOnlyList<string> Asked { get { lock (_asked) return [.. _asked]; } }
+
+        public Task AppendAsync(
+            OperationLogLevel level, string source, string message, CancellationToken ct = default,
+            bool? durable = null)
+        {
+            if (!breaksOn(message))
+                return Task.CompletedTask;
+            lock (_asked) _asked.Add(message);
+            throw new InvalidOperationException("the operation log is down");
+        }
+
+        public Task<IReadOnlyList<LogEntry>> QueryAsync(
+            OperationLogLevel? minLevel, string? source, DateTimeOffset? from, DateTimeOffset? to, int limit,
+            CancellationToken ct = default) => Task.FromResult<IReadOnlyList<LogEntry>>([]);
+
+        public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteForContainerAsync(int accountId, string container, CancellationToken ct = default)
+            => Task.CompletedTask;
+        public Task PurgeBeforeAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.CompletedTask;
+        public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default)
+            => Task.CompletedTask;
+    }
+
     /// <summary>Keeps what the run wrote to the operation log, which is where an operator reads it.</summary>
     private sealed class RecordingOperationLog : IOperationLog
     {
@@ -961,6 +993,79 @@ public sealed class StreamingBackupTests : IDisposable
             Assert.NotEqual(doomed, entry.Storage!.Ref);
             var stored = Assert.Single(blobs, b => b.Name == entry.Storage.Ref);
             Assert.Equal("data/" + FullHashOf(stored.Bytes), stored.Name);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The same ending as above, with the one channel it has left also broken: the take-back's own report must not
+    /// become the failure.
+    /// <para>
+    /// <c>Record</c> writes SQLite and pushes a webhook, and this repository has had "SQLite Error 5: database is
+    /// locked" out of that path on a running backup. It sits in the catch of the take-back, one statement before
+    /// the guard raises the exception that sends the item round through the copying route. A throw from it used to
+    /// escape ahead of that <c>throw new</c>, and then satisfy the filter of the very next catch — so the take-back
+    /// ran a second time, and because what finally surfaced was the logging error rather than
+    /// <c>SourceMovedDuringUploadException</c>, the catch that re-queues the file never matched and the file lost
+    /// its retry. One broken logger, and a backup that would otherwise have completed does not.
+    /// </para>
+    /// <para>
+    /// So the assertions are the outcome, not the mechanism: the run finishes, the file is recorded at the address
+    /// of the bytes it now holds, and the report was attempted exactly once. The last one is what separates "the
+    /// throw was swallowed" from "the throw was swallowed twice on the way through the same code".
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Broken_Log_Does_Not_Cost_The_File_Its_Retry()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var source = await WriteSourceAsync("media/clip.bin", 250_000);
+        var doomed = "data/" + FullHashOf(await File.ReadAllBytesAsync(source));
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var name = RandomName("sbkraw-");
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var cloud = new RefusesWhenArmed(factory);
+        // Broken for this one report and nothing else: the case is about what that report's failure costs, not
+        // about a run whose whole audit trail is down.
+        var log = new ThrowingOperationLog(m => m.Contains(doomed, StringComparison.Ordinal));
+        var (orchestrator, _, request) = Build(uploader, name, password: null, dontCompress: true, cloud, log);
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            var run = orchestrator.RunAsync(request);
+            try
+            {
+                await uploader.Entered.WaitAsync(TimeSpan.FromSeconds(60));
+                var rewritten = new byte[311_111];
+                Random.Shared.NextBytes(rewritten);
+                await File.WriteAllBytesAsync(source, rewritten);
+                cloud.Armed = true;
+            }
+            finally
+            {
+                block.SetResult();
+            }
+
+            await run.WaitAsync(TimeSpan.FromMinutes(2));
+
+            // The report really was attempted — otherwise this run took some other route and proves nothing —
+            // and attempted once, not once per pass through the take-back.
+            Assert.Single(log.Asked);
+
+            var entry = await SingleEntryAsync(store, AzuriteAccount(), name, password: null);
+            Assert.NotEqual(doomed, entry.Storage!.Ref);
+            var blobs = await DataBlobsAsync(container);
+            var stored = Assert.Single(blobs, b => b.Name == entry.Storage.Ref);
+            Assert.Equal("data/" + FullHashOf(stored.Bytes), stored.Name);
+            Assert.Equal(await File.ReadAllBytesAsync(source), stored.Bytes);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

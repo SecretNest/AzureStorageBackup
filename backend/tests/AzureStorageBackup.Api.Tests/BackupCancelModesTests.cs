@@ -627,7 +627,8 @@ public sealed class BackupCancelModesTests : IDisposable
     /// pressed hangs for just as long.
     /// <para>
     /// This one pins the **skip** half — the stop intent has already landed before cleanup is entered
-    /// (<c>BackupOrchestrator.cs:1028</c>), so <c>cleaner.CleanupAsync</c> is never invoked at all. The half where
+    /// (the <c>if (control is { Stop: not StopKind.None })</c> guard that sets <c>cleanup = CleanupReport.Empty</c> in
+    /// <c>BackupOrchestrator.RunCoreAsync</c>), so <c>cleaner.CleanupAsync</c> is never invoked at all. The half where
     /// compaction is interrupted midway is in
     /// <see cref="A_stop_requested_mid_compaction_lets_the_run_finish_promptly"/>: that one is where the double that
     /// stalls the re-upload is needed, this one does not need it — you cannot stall a call that is never made, and
@@ -680,7 +681,8 @@ public sealed class BackupCancelModesTests : IDisposable
 
     /// <summary>The other half of the cleanup tail, and the dangerous half: dead-weight compaction really has been
     /// invoked and is midway through downloading/recompressing/re-uploading when the user presses stop. The
-    /// <c>catch (OperationCanceledException) when (...)</c> at <c>BackupOrchestrator.cs:1050</c> catches exactly this
+    /// <c>catch (OperationCanceledException) when (...)</c> around <c>cleaner.CleanupAsync</c> in
+    /// <c>BackupOrchestrator.RunCoreAsync</c> catches exactly this
     /// cancellation — miss it and an already-committed successful backup gets docked down to Suspended/Canceled; get the
     /// guard wrong and it swallows the host's genuine shutdown cancellation along with it
     /// (see <see cref="A_genuine_cancellation_mid_compaction_still_propagates_as_a_failure"/>).
@@ -738,8 +740,9 @@ public sealed class BackupCancelModesTests : IDisposable
     }
 
     /// <summary>Mid-compaction, what gets canceled is **the caller's own token** (the host-shutdown path), not the
-    /// user's stop button: the <c>!ct.IsCancellationRequested</c> clause in the guard at
-    /// <c>BackupOrchestrator.cs:1050</c> exists precisely so this kind is not swallowed. No
+    /// user's stop button: the <c>!ct.IsCancellationRequested</c> clause in that same
+    /// <c>OperationCanceledException</c> guard in <c>BackupOrchestrator.RunCoreAsync</c> exists precisely so
+    /// this kind is not swallowed. No
     /// <see cref="BackupRunControl"/> here — what this case pins down is exactly "nobody pressed stop, something outside
     /// cut the token" — and this cancellation must propagate untouched, to be recorded as a genuine failure by the
     /// catch-all <c>catch (Exception)</c> at the top of <c>RunAsync</c>, rather than quietly swallowed by that catch into

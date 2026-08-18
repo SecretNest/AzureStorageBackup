@@ -165,10 +165,22 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add(Path.GetFullPath(request.OutputArchivePath));
         args.AddRange(request.Entries);
 
-        SevenZipRun run;
+        IReadOnlyList<string> volumes;
         try
         {
-            run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
+            var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
+            volumes = CollectVolumes(request.OutputArchivePath);
+
+            // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1
+            // is exactly the exit code 7z gives when it drops a member it could not read (it also covers other
+            // harmless warnings, so we must compare contents rather than fail on sight of a 1).
+            if (run.ExitCode == 1)
+            {
+                var missing = await FindMissingEntriesAsync(volumes, request, ct);
+                if (missing.Count > 0)
+                    throw new ArchiveMembersMissingException(missing,
+                        $"7-Zip left {missing.Count} member(s) out of the archive: {string.Join(", ", missing)}");
+            }
         }
         catch
         {
@@ -180,28 +192,16 @@ public sealed class SevenZipCompressor : IFileCompressor
             // This used to be unreachable in practice because interrupting a compression took Stop now. Once a
             // plain Suspend cancels the compression stage it became ordinary — and on a NAS the process restart
             // that sweeps compress-temp may be months away, so the fragments would accumulate.
+            //
+            // The re-check is inside this try, not after it: FindMissingEntriesAsync runs a **second** 7z (the
+            // listing) on the same token, so a Suspend landing in that window used to walk out past every cleanup
+            // — and unlike the interrupted-write case what it left behind was a complete-looking set of finished
+            // .NNN volumes, the one shape nothing downstream can tell from a product.
+            // The mutilated-archive case comes through here too, and deletes by prefix rather than volume by
+            // volume as it used to: 7z renames each volume only when it is complete, so a partial one is
+            // name.7z.NNN.tmp, which CollectVolumes does not match and the old loop therefore could not remove.
             DeleteArchiveRemnants(request.OutputArchivePath);
             throw;
-        }
-
-        var volumes = CollectVolumes(request.OutputArchivePath);
-
-        // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1 is
-        // exactly the exit code 7z gives when it drops a member it could not read (it also covers other harmless
-        // warnings, so we must compare contents rather than fail on sight of a 1).
-        if (run.ExitCode == 1)
-        {
-            var missing = await FindMissingEntriesAsync(volumes, request, ct);
-            if (missing.Count > 0)
-            {
-                // Do not leave the mutilated archive in the compression temp area: it is unusable, and keeping it only eats disk and risks being mistaken for a product.
-                foreach (var v in volumes)
-                {
-                    try { File.Delete(v); } catch { /* best effort */ }
-                }
-                throw new ArchiveMembersMissingException(missing,
-                    $"7-Zip left {missing.Count} member(s) out of the archive: {string.Join(", ", missing)}");
-            }
         }
 
         return new CompressionResult(volumes);

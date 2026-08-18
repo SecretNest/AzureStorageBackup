@@ -214,7 +214,8 @@ public sealed class LocalRootMigrationInspectTests : IDisposable
         Assert.Equal(20, r.Matched);
     }
 
-    /// <summary>A symlink's IndexEntry.Length is always 0 (LocalFileScanner.cs:170), so size cannot be compared.</summary>
+    /// <summary>A symlink's IndexEntry.Length is always 0 (LocalFileScanner.ScanDirectory builds the symlink
+    /// ScannedEntry with a hard-coded length of 0), so size cannot be compared.</summary>
     [Fact]
     public void Symlinks_Are_Matched_On_Existence_Only()
     {

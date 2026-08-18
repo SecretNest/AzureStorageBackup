@@ -1325,8 +1325,13 @@ public sealed class BackupOrchestrator(
         // on its way out, so once it is gone nothing can be written in behind this drain.
         void DrainQueues()
         {
-            // probedQueue first. It makes no difference once the consumers are all settled, but it is the order
-            // that stays correct if this is ever called while the compressor can still move an entry across.
+            // Called only after the consumers have settled — that is a precondition, not a preference, and the
+            // order below does not soften it. probedQueue is SingleReader, and its single reader is the
+            // compressor's ReadAllAsync; a TryRead here while that loop is alive is a second concurrent reader on
+            // a channel configured for one, which is undefined behaviour in its fast path rather than a question
+            // of which entry ends up where. Draining probedQueue first is only so that an entry cannot be moved
+            // across into stagedQueue behind a drain that has already passed it; it does not make an early call
+            // safe, and there is no ordering that would.
             while (probedQueue.Reader.TryRead(out var probed))
                 probed.Share.Release();
             while (stagedQueue.Reader.TryRead(out var entry))
@@ -1338,6 +1343,15 @@ public sealed class BackupOrchestrator(
 
         // One prober, one compressor, `uploaders` uploaders — the counts and the reasoning for each are up where
         // `uploaders` is worked out, next to the two channels.
+        //
+        // The ORDER matters, and it is a seam rather than a rule: Task.WhenAll surfaces the first faulted task in
+        // list order, so the two feeding stages outrank every uploader. The prober's and the compressor's own
+        // comments already say this about the cancellation they throw on the way out, and take care not to fault
+        // ahead of the real cause. What no comment covered until now is the other half: a NON-cancellation fault
+        // in either of them would outrank the uploaders' cause the same way, and there is nothing in place to keep
+        // it from doing so. It costs nothing today because neither stage has a blocking call that can fail on its
+        // own account — the compressor's one wait is the staging quota, which throws only cancellation. Add one
+        // that can fail for a reason of its own and this is the line to re-read.
         List<Task> consumers = [];
         void StartConsumers() =>
             consumers = [
@@ -1667,6 +1681,7 @@ public sealed class BackupOrchestrator(
             // PurgeInFlightAsync re-lists a container it has already emptied, and the journal is fsynced again with
             // nothing pending. Both are idempotent, so the outcome and the exception the user sees are unchanged;
             // the cost is one extra container listing on a path that is already winding down.
+            control?.Gate.Downgrade();   // see the catch below; RequestStop has usually done it already, and it repeats safely
             await SettleAsync(consumers);
             DrainQueues();
             if (control is { Stop: var stopped } && stopped != StopKind.None)
@@ -1680,6 +1695,19 @@ public sealed class BackupOrchestrator(
             // compression/uploads running outside the lock. Reached twice over on the paths that settle inside the
             // try above (a stop, or a consumer's fault surfacing from Task.WhenAll) — harmless, because both calls
             // are idempotent: SettleAsync on already-completed tasks and DrainQueues on drained channels do nothing.
+            //
+            // The gate comes down FIRST, and it is not tidiness: SettleAsync is an unbounded Task.WhenAll over
+            // loops that park at that gate, and a user pause holds it with no timer and no patience by design
+            // (PatienceExhausted answers no while the hold stands). So a fault out of the tail of this try — the
+            // progress sink, RecordUnreadableWarningsAsync, the diff itself — arriving while the operator has the
+            // run paused would wait here for as long as the pause lasts, with nothing able to end it: nothing on
+            // this path cancels the consumers' tokens, and the only other Downgrade caller is RequestStop, which
+            // the operator would have to reach for without being told why. The run would never return, so the busy
+            // lock would never come back and the process-wide staging quota would stay booked.
+            // Downgrading here says the true thing — this run is over and will never wait at that gate again —
+            // and leaves the parked loops to drain what is queued and exit, exactly as they do when a fault lands
+            // on a run nobody paused.
+            control?.Gate.Downgrade();
             await SettleAsync(consumers);
             DrainQueues();
             throw;
@@ -2770,7 +2798,10 @@ public sealed class BackupOrchestrator(
     /// The delete is retried, because the failure it is most likely to meet is the same blip that brought the
     /// caller here — under the same policy the cleanup path uses for its point operations (see RetentionCleaner),
     /// which is bounded by attempt count rather than by the upload path's two hours: this runs in the tear-down of
-    /// one item, and a run that spends hours failing to remove one object helps nobody.
+    /// one item, and a run that spends hours failing to remove one object helps nobody. Concretely that is
+    /// <see cref="RetryOptions"/>'s defaults — five attempts, 200 ms doubling, so about three seconds of backoff
+    /// plus whatever the SDK spends inside each attempt. An outage longer than that is answered by the report
+    /// below rather than by waiting it out.
     /// </para>
     /// <para>
     /// A delete that ultimately fails is **said out loud** rather than swallowed. What is left behind is an object
@@ -2797,14 +2828,34 @@ public sealed class BackupOrchestrator(
         {
             // The registration is deliberately left standing: it is the only thing that will still clear this
             // address if the operator answers with Stop now.
-            await Record(
-                NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
-                $"Could not remove a blob that may hold the wrong content: {blobRef}",
-                $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
-                + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
-                + "produces that same content will be told the address is already taken and will record it without "
-                + "reading a byte of it.",
-                CancellationToken.None);
+            try
+            {
+                await Record(
+                    NotificationEvents.UnrecoverableError, $"backup:{request.Account.Id}/{request.Container}",
+                    $"Could not remove a blob that may hold the wrong content: {blobRef}",
+                    $"'{inPlace.Path}' changed while it was being uploaded ({what}), and deleting {blobRef} failed "
+                    + $"({ex.Message}). Delete it from the container by hand: while it is there, any later backup that "
+                    + "produces that same content will be told the address is already taken and will record it without "
+                    + "reading a byte of it.",
+                    CancellationToken.None);
+            }
+            catch
+            {
+                // This method must not throw, and this is the one statement in it that can: Record goes through
+                // SQLite and a webhook, and this repository has had "database is locked" out of exactly that path.
+                //
+                // Both callers are on their way to an exception of their own, and a throw from here replaces it.
+                // On the failing path that costs the diagnosis — the blip that ended the upload is what explains
+                // the run, and a logging error in its place explains nothing. On the success path it costs more
+                // than the message: the replacement escapes before `throw new SourceMovedDuringUploadException`
+                // runs, and then satisfies the very filter of the catch below, so the take-back runs a second
+                // time; and because what finally surfaces is not that exception, the catch that re-queues the item
+                // through the copying route never matches and the file loses its retry altogether.
+                //
+                // So it is swallowed. The alternative is not "report it somewhere else": the operation log and the
+                // notifier are the two channels this application has, and this line only runs when they are both
+                // in the hands of something that just failed.
+            }
         }
     }
 
@@ -3252,11 +3303,21 @@ public sealed class BackupOrchestrator(
             }
             finally
             {
-                // Hand the quota back here, on every path. UploadStagedPackAsync already released whatever it got as
-                // far as sending, but nothing released the archive of a group 7z emptied (there is no upload at all
-                // for it), the one whose upload threw before it started, or the one abandoned when the run was
-                // cancelled. That debt lives on a singleton shared by every run and is at the same time the
-                // backpressure gate on output, so leaking it throttles compression process-wide until a restart.
+                // Hand the quota back here, on every path — but there is exactly one path that has nothing else to
+                // hand it back, and it is worth naming precisely, because a list of cases that are already covered
+                // elsewhere reads as though this line could be dropped once any of them changes.
+                //
+                // That path is an upload that throws BEFORE its own try: UploadStagedPackAsync sizes the volumes
+                // and calls BeginUpload above its try, and a throw from either skips the finally that would have
+                // released the archive. Everything else is already accounted for. An upload that got as far as
+                // sending releases in that same finally, cancellation included. A group 7z emptied carries either
+                // a null archive (nothing to release) or a zero-file, zero-byte one. And a throw out of the
+                // compression itself never reaches here at all — CompressGroupAsync runs above this try and cleans
+                // up in its own catch.
+                //
+                // What the debt costs is why the one path is enough to keep it: it lives on a singleton shared by
+                // every run and is at the same time the backpressure gate on output, so leaking it throttles
+                // compression process-wide until a restart.
                 attempt.Handoff.Dispose();
             }
         }
@@ -3285,9 +3346,9 @@ public sealed class BackupOrchestrator(
     /// the staging quota, while the uploaders work through what it has already produced.
     /// </para>
     /// <para>
-    /// The archive comes back owned by the caller through the handoff, which is why the <c>staging.Hold</c> that
-    /// used to guard this stretch is gone: the scope it guarded no longer ends inside this method. The hazard it
-    /// existed for has not gone away — see the catch below.
+    /// The archive comes back owned by the caller through the handoff, which is why the <c>using</c>-scoped guard
+    /// that used to hold this stretch is gone (<c>StagingArea.Hold</c>, deleted with its last caller): the scope it
+    /// guarded no longer ends inside this method. The hazard it existed for has not gone away — see the catch below.
     /// </para>
     /// </summary>
     /// <param name="bypassQuota">True when this runs on an uploader recompressing a group it has to resend, which
@@ -3373,6 +3434,10 @@ public sealed class BackupOrchestrator(
                 uploadTracker.EndChecking(checkingBytes);
             }
 
+            // An empty `changed` is the good ending, and the one the caller reads it as: nothing was dropped and
+            // nothing moved under the compression, so this group cleanly became one pack and every member of it
+            // travels in the archive being handed over. (The two lists are not interchangeable even here — see
+            // GroupAttempt: `members` is what was asked for, and it is only equal to what went in on this path.)
             if (changed.Count == 0)
                 return new GroupAttempt(new StagedHandoff(staging, staged), changed, members);
 

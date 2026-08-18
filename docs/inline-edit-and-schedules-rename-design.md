@@ -58,8 +58,9 @@ It is then rendered in one of two places, never both:
   ```
 - **Creating** — `showForm && !editing`, at the existing position below the table.
 
-The comment at `BackupConfigsPage.tsx:814` explaining that errors move inside the form because "the
-form sits under the table" is now only half true, and is updated with it.
+The JSX comment in `BackupConfigsPage.tsx` above the page-level error banner (the one guarded by
+`!showForm`), explaining that errors move inside the form because the form sits under the table, is
+now only half true, and is updated with it.
 
 ## 3. Joining the row to its form
 
@@ -205,8 +206,8 @@ survives the rename intact.
   `docs/product-requirements.md` and `docs/progress-display-design.md` say "scheduled tasks" about
   the *backend mechanism*, whose type is still `ScheduledTask`. Left alone; they are also records of
   decisions taken at the time, and rewriting them would falsify that record.
-- `README.md` documents no UI navigation. Its one hit (`README.md:356`, `Scheduler__Enabled`)
-  describes the backend scheduler and stays accurate. Not changed.
+- `README.md` documents no UI navigation. Its one hit (`README.md`'s `Scheduler__Enabled` row in the
+  environment-variable table) describes the backend scheduler and stays accurate. Not changed.
 
 ## 8. Verification
 

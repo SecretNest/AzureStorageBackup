@@ -1,9 +1,36 @@
+using System.Text.Json;
 using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
 public class PauseGateTests
 {
+    /// <summary>
+    /// PauseSource's numbers are the wire contract, and until now nothing held them to it. PauseInfo goes to the
+    /// browser as itself — no DTO projects the enum into a string the way BackupRunResponse does for Status and
+    /// SuspendReason — and this application registers no JsonStringEnumConverter, so it serialises as a number and
+    /// <c>frontend/src/api/backupConfigs.ts</c> mirrors those numbers by hand.
+    /// <para>
+    /// Every other assertion in this file names the members symbolically and would follow a renumbering in
+    /// silence, all the way to a browser that reads <c>source: 1</c> and draws the wrong half of the pause UI.
+    /// This one is deliberately written in literals on both sides of the boundary: the values, and the JSON they
+    /// actually produce. The second half is the one that catches a converter being registered globally later.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void PauseSource_Crosses_The_Wire_As_The_Numbers_The_Frontend_Mirrors()
+    {
+        Assert.Equal(0, (int)PauseSource.TransientError);
+        Assert.Equal(1, (int)PauseSource.User);
+
+        var info = new PauseInfo("Paused by the user.", DateTimeOffset.UnixEpoch, null, 0, PauseSource.User);
+        // JsonSerializerDefaults.Web is what ASP.NET's own result serialisation uses, and nothing in Program.cs
+        // overrides it.
+        var json = JsonSerializer.Serialize(info, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Contains("\"source\":1", json, StringComparison.Ordinal);
+    }
+
     private static PauseGate Fast(TimeSpan? patience = null) => new(
         schedule: [TimeSpan.FromMilliseconds(10)],
         steady: TimeSpan.FromMilliseconds(10),
@@ -360,6 +387,35 @@ public class PauseGateTests
         Assert.Equal(PauseSource.TransientError, gate.Current!.Source);
         Assert.NotNull(gate.Current.NextRetryAt);
         Assert.False(trouble.IsCompleted);   // released by the gate's Dispose; nothing here needs to await it
+    }
+
+    /// <summary>
+    /// <see cref="PauseGate.Snapshot"/> reports the same two facts as the two properties, which is the whole
+    /// reason it exists: the response that carries them to the browser must not read them one after the other,
+    /// because those are two acquisitions of the lock and a Pause or Resume landing in between yields a pair that
+    /// was never true.
+    /// <para>
+    /// Atomicity itself is not what this pins — a race is not a thing a test can assert without measuring luck.
+    /// What it pins is the mistake that would make the single read pointless: deriving "the user is holding it"
+    /// from <c>Current.Source</c>. In the composed state below, the state this whole pair exists for, that
+    /// derivation answers <c>false</c> while the operator's hold is standing.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void One_Read_Reports_Both_Halves_Of_A_Composed_Pause()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1), patience: TimeSpan.FromHours(1));
+
+        Assert.Equal((null, false), gate.Snapshot());
+
+        var trouble = gate.WaitAsync(new IOException("network down"), CancellationToken.None);
+        gate.PauseByUser();
+
+        var (current, byUser) = gate.Snapshot();
+        Assert.True(byUser, "the operator's hold is standing and one read of the gate has to say so");
+        Assert.Equal(PauseSource.TransientError, current!.Source);   // ...even though the backoff owns Current
+        Assert.False(trouble.IsCompleted);   // released by the gate's Dispose
     }
 
     /// <summary>

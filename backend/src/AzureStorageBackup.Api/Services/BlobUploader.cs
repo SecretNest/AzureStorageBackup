@@ -4,7 +4,17 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-/// <summary>Upload of data/pack/index blobs (M4 §5): setting the Tier, retry backoff, content-addressed idempotent skipping, concurrency.</summary>
+/// <summary>
+/// Upload of data/pack/index blobs (M4 §5): setting the Tier, retry backoff, content-addressed idempotent
+/// skipping, concurrency.
+/// <para>
+/// <c>filePath</c> is not always something this process wrote. Since the raw route stopped copying, a store-only,
+/// unencrypted, single-volume item is uploaded straight from the **user's own file** — so an implementation must
+/// open it the way this project opens source files, through <see cref="FileHasher.OpenRead"/>, and must not move,
+/// truncate or delete it. The reason is in that method's remarks: an ordinary open() on a FIFO blocks forever
+/// inside a syscall no CancellationToken can reach, and it would take the whole run with it.
+/// </para>
+/// </summary>
 public interface IBlobUploader
 {
     /// <summary>Upload a file to a blob (with Tier + optional metadata). If the blob already exists, skip it and return false (content-addressed idempotency).</summary>

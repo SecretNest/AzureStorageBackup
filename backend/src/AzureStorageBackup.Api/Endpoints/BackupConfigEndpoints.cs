@@ -334,14 +334,20 @@ public static class BackupConfigEndpoints
         // staging quota. Distinct from Suspend, which tears the run down and makes the next start re-diff and
         // re-probe everything. Mirrors retry-now's shape: both reach into a live run's gate, and answer a
         // conflict rather than a silent success when there is nothing to act on.
-        // The conflict covers two cases and says both, because from the operator's chair they are one question:
-        // there is no run at all, or there is one that is already winding down (Suspend, Stop, or a patience
-        // auto-suspend) — and a run winding down still reports itself as Running, for minutes, while an upload
-        // finishes. Answering 204 there is the silent success this comment promises not to give.
+        // The conflict covers three cases and says all three, because from the operator's chair they are one
+        // question — "why did nothing happen?" — and each of them is a different answer:
+        //   · there is no run at all;
+        //   · there is one winding down (Suspend, Stop, or a patience auto-suspend), which still reports itself as
+        //     Running for minutes while the upload in hand finishes;
+        //   · there is one that has not finished starting — BackupRunner.Pause needs the run's control, and that is
+        //     assigned a few awaits into RunCoreAsync, after the config, the account, the settings and the backup
+        //     password have been loaded.
+        // Answering 204 for any of them is the silent success this comment promises not to give. The third used to
+        // be told it was not running, which is false on both counts the old wording offered.
         group.MapPost("/{id:int}/pause", (int id, BackupRunner runner) =>
             runner.Pause(id)
                 ? Results.NoContent()
-                : Results.Conflict(new { error = "No backup is running, or it is already stopping." }));
+                : Results.Conflict(new { error = "No backup is running, or it is still starting or already stopping." }));
 
         // Lift a user pause. If a transient error is also holding the gate, the run stays parked on that one —
         // see PauseInfo.Source / BackupRunResponse.PausedByUser for how the UI tells the two apart.

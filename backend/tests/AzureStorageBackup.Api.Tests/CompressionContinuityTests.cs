@@ -145,7 +145,7 @@ public sealed class CompressionContinuityTests : IDisposable
     /// <para>
     /// Both halves are load-bearing for <see cref="A_Pause_Holds_The_Prober_And_The_Compressor"/>. The count is the
     /// prober's own observable: <c>ProbeForDedupAsync</c> calls <c>HeadHashAsync</c> as the first thing it does with
-    /// an item it has claimed (BackupOrchestrator.cs:2328), so "how many probes have happened" is exactly "how many
+    /// an item it has claimed (see BackupOrchestrator.ProbeForDedupAsync), so "how many probes have happened" is exactly "how many
     /// items the prober has taken past its gate" — no progress column in between, nothing to publish, nothing to
     /// throttle. The hold is what makes the observation deterministic rather than a race: it keeps the prober inside
     /// its first item until the pause is already standing, so the work the loops would consume if their gates were
@@ -933,6 +933,96 @@ public sealed class CompressionContinuityTests : IDisposable
             Assert.True(pressed.Elapsed < TimeSpan.FromSeconds(25),
                 $"suspend took {pressed.Elapsed.TotalSeconds:F1}s — the diff stayed parked behind the pause.");
             Assert.Equal(0, staging.StagedBytes);
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// A sink that runs on the reporting thread, unlike <see cref="Progress{T}"/>, which posts the callback
+    /// elsewhere and swallows whatever it throws. The orchestrator's own comment above <c>SetTotal</c> says these
+    /// calls go "straight into the caller's progress sink, which is somebody else's code" — that is only true of a
+    /// synchronous sink, and it is the shape RestoreOrchestrator and BackupChecker are handed in production.
+    /// </summary>
+    private sealed class SynchronousSink(Action<BackupProgress> on) : IProgress<BackupProgress>
+    {
+        public void Report(BackupProgress value) => on(value);
+    }
+
+    /// <summary>
+    /// A run that fails in the tail of its own body must still end, even with the operator's pause standing.
+    /// <para>
+    /// The teardown for such a failure waits for the producing loops to settle, and those loops park at the pause
+    /// gate. A user pause is deliberately without a timer and without patience (design §4: an automatic downgrade
+    /// would convert a pause into a suspend exactly when nobody is watching), so before the fix that wait had
+    /// nothing that could ever end it: no token on this path is cancelled, and the only other caller of
+    /// <c>Downgrade</c> is <c>RequestStop</c>. <c>RunAsync</c> never returned, so the busy lock stayed taken and
+    /// the process-wide staging quota stayed booked until the container was restarted.
+    /// </para>
+    /// <para>
+    /// The fault is injected where the orchestrator itself names the hazard — the caller's progress sink, reached
+    /// from <c>SetTotal</c> once the diff has settled the denominator. Injecting it there rather than in a consumer
+    /// is the point: a consumer's fault cancels the producing side on its way out, while this one leaves every
+    /// token untouched, which is the state that hung.
+    /// </para>
+    /// <para>
+    /// The sink closes the gate itself, one statement before it throws, so the ordering the case needs — held
+    /// first, failed second — is caused rather than waited for. What the loops do afterwards is not asserted here
+    /// beyond "they finish": a downgrade releases them to drain what is queued and exit, which is exactly what
+    /// they do when a fault lands on a run nobody paused.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Run_That_Fails_While_Paused_Still_Ends()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int files = 24;
+        for (var i = 0; i < files; i++)
+            WriteFile($"f{i}.bin", 4096);
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var (orchestrator, staging, request) = Build(
+            uploader: null, stagingLimit: 200_000_000, uploadConcurrency: 2, container: name);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "fail-while-paused");
+
+        var held = 0;
+        var thrown = 0;
+        // The first publish carrying a non-zero Uploading total is SetTotal's own: until the diff has finished,
+        // every other publish of that stage reports a total of 0.
+        var sink = new SynchronousSink(p =>
+        {
+            if (!p.Details.Any(d => d.Stage == "Uploading" && d.Total > 0))
+                return;
+            if (Interlocked.Exchange(ref thrown, 1) != 0)
+                return;
+            if (control.Gate.PauseByUser())
+                Interlocked.Exchange(ref held, 1);
+            throw new InvalidOperationException("the progress sink broke");
+        });
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, sink, ct: default, control: control);
+
+            var settled = await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(60)));
+            Assert.True(
+                ReferenceEquals(settled, run),
+                "the run never returned. The pause was still holding the gate its producing loops park at, and "
+                + "nothing on the failure path takes that hold down — so the busy lock and the process-wide "
+                + "staging quota are held until the process restarts.");
+
+            Assert.Equal(1, Volatile.Read(ref thrown));   // the scene really was built
+            Assert.Equal(1, Volatile.Read(ref held));     // ...with the hold standing when it was
+            await Assert.ThrowsAsync<InvalidOperationException>(() => run);
+            Assert.Equal(0, staging.StagedBytes);         // and the queues were drained, not abandoned
         }
         finally
         {

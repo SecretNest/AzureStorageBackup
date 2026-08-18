@@ -146,6 +146,69 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
+    /// <summary>
+    /// The mirror of <see cref="MutatingCompressor"/>: leaves the first pass alone and rewrites a member during the
+    /// **recompression**, i.e. the pass a mid-upload blip forces.
+    /// <para>
+    /// That ordering is what builds the stranded-member scene, and nothing else does. The first pass keeps all six
+    /// members and hands the archive over, so the loop that would re-queue an excluded member has already settled
+    /// its verdict and moved on; the retry's own re-verification then drops one — someone rewrote it while the
+    /// group sat on the queue — and that member is now in no pack and on nobody's list.
+    /// </para>
+    /// <para>
+    /// It mutates on the **second** compression of a pack id, not on every one after the first: the retry's pass
+    /// excludes the member and immediately recompresses the five that are left, and a double that fired again
+    /// there would keep the group shrinking instead of settling.
+    /// </para>
+    /// </summary>
+    private sealed class MutatesOnRecompression(IFileCompressor inner, string root) : IFileCompressor
+    {
+        private readonly Dictionary<string, int> _passes = new(StringComparer.Ordinal);
+        private readonly List<string> _compressed = [];
+
+        public IReadOnlyList<string> Compressed
+        {
+            get { lock (_compressed) return [.. _compressed]; }
+        }
+
+        public Task<CompressionResult> CompressAsync(CompressionRequest request, CancellationToken ct = default)
+        {
+            var packId = Path.GetFileNameWithoutExtension(request.OutputArchivePath);
+            int pass;
+            lock (_compressed)
+            {
+                _compressed.Add(packId);
+                pass = _passes[packId] = _passes.GetValueOrDefault(packId) + 1;
+            }
+
+            var target = request.Entries.FirstOrDefault(e => e.EndsWith(TargetLeaf, StringComparison.Ordinal));
+            // A different length, for the reason MutatingCompressor gives: re-verification compares metadata first,
+            // and a same-length rewrite inside one second is invisible to it.
+            if (pass == 2 && target is not null)
+                File.WriteAllBytes(
+                    Path.Combine(root, target.Replace('/', Path.DirectorySeparatorChar)), new byte[41_000]);
+
+            return inner.CompressAsync(request, ct);
+        }
+
+        public Task ExtractAsync(string firstVolumePath, string outputDir, string? password, CancellationToken ct = default)
+            => inner.ExtractAsync(firstVolumePath, outputDir, password, ct);
+
+        public Task<CompressionResult> CompressStreamAsync(
+            StreamCompressionRequest request, Func<Stream, CancellationToken, Task<long>> writeSource,
+            CancellationToken ct = default)
+            => inner.CompressStreamAsync(request, writeSource, ct);
+
+        public Task<IReadOnlyList<ArchiveEntry>> ListEntriesAsync(
+            string firstVolumePath, string? password, CancellationToken ct = default)
+            => inner.ListEntriesAsync(firstVolumePath, password, ct);
+
+        public Task<long> ExtractToStreamAsync(
+            string firstVolumePath, string? entryName, string? password, Stream destination,
+            CancellationToken ct = default)
+            => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
+    }
+
     /// <summary>Blip on the Nth **pack**'s first upload (once only). N=2 means "the earlier group had already finished uploading when things went wrong".</summary>
     private sealed class FlakyOnNthPack(IBlobUploader inner, int nth) : IBlobUploader
     {
@@ -321,10 +384,17 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     /// <summary>An uploader that trips the cancellation token and throws OperationCanceledException: used to verify the gate does not swallow a cancellation.</summary>
     private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
     {
+        private int _cancels;
+
+        /// <summary>How many pack uploads have been cancelled from here. More than one means the gate waited the
+        /// first cancellation out and let the group be tried again.</summary>
+        public int Cancels => Volatile.Read(ref _cancels);
+
         private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
         {
             if (blobName.StartsWith("packs/", StringComparison.Ordinal))
             {
+                Interlocked.Increment(ref _cancels);
                 cts.Cancel();
                 // Exactly the same shape as "cancelled halfway through an upload": a real cancellation is thrown from right here.
                 throw new OperationCanceledException(cts.Token);
@@ -526,6 +596,77 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     }
 
     /// <summary>
+    /// The other direction of the same seam, and the one that loses data rather than duplicating it: a member the
+    /// handed-over pass kept, which the **retry's** re-verification then drops.
+    /// <para>
+    /// Nobody is left holding it. The compression stage decided this group's excluded list before the archive ever
+    /// reached an uploader and moved on to the next item; the retry runs on an uploader, where re-queueing into a
+    /// pool that has already been sealed is not on offer. Left alone, the member reaches the index with a length
+    /// and no storage reference — an entry that says "this file is backed up, this big" and points at nothing,
+    /// which no check reports, because check reads the index and the index is internally consistent.
+    /// </para>
+    /// <para>
+    /// The guard hands such members to a standalone <c>ProcessPackAsync</c>, so the assertion is simply that the
+    /// file is stored. The scene is built rather than waited for: the blip is on the first group so the retry lands
+    /// on a member list the compressor has finished with, and the compressor double rewrites the member on the
+    /// second compression of that pack — i.e. during the retry and not before it.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_member_the_retry_drops_is_still_stored()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        var account = AzuriteAccount();
+        var name = RandomName("pack");
+        var compressor = new MutatesOnRecompression(new SevenZipCompressor(), _root);
+        var flaky = new FlakyOnGroup(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)), ordinal: 1);
+        var (orchestrator, factory, store) = Build(flaky, compressor);
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            WritePool();
+            await using var control = new BackupRunControl(_journals, 5, "run-stranded", new PauseGate(
+                schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
+                patience: TimeSpan.FromSeconds(5)));
+
+            var result = await orchestrator.RunAsync(Request(account, name), null, default, control);
+            Assert.Equal(1, result.Version);
+
+            // Preconditions, both of which the assertion below cannot speak for. Three compressions of the first
+            // pack id: the six the compressor handed over, the six the blip forced it to redo, and the five that
+            // were left once the rewritten member dropped out of that second pass. Without the blip there would be
+            // one, and without the rewrite two — and either way the guard is never reached and every assertion
+            // below passes on a run that never entered the code this case exists for.
+            var firstPack = compressor.Compressed[0];
+            Assert.Equal(3, compressor.Compressed.Count(p => p == firstPack));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            Assert.Equal(5, info!.Packs[firstPack].Members.Count);   // the handed-over six minus the one it dropped
+
+            var index = await store.ReadIndexAsync(account, name, info.Versions[^1].IndexBlob, null);
+            var stranded = Assert.Single(index.Entries, e => e.Path.EndsWith(TargetLeaf, StringComparison.Ordinal));
+            Assert.NotNull(stranded.Storage);
+            Assert.False(
+                string.IsNullOrEmpty(stranded.Storage!.Ref),
+                $"{stranded.Path} is in the index with a length and nothing to restore it from.");
+
+            // ...and stored somewhere other than the pack that dropped it, which is what says it was picked up
+            // again rather than quietly taken back into an archive the run had already judged.
+            Assert.NotEqual(firstPack, stranded.Storage.Ref);
+
+            var (inContainer, referenced) = await PacksAsync(cc, store, account, name);
+            Assert.Equal(referenced, inContainer);
+            foreach (var e in index.Entries.Where(e => e.Storage is { Kind: "pack" }))
+                Assert.True(
+                    info.Packs[e.Storage!.Ref!].Members.Contains(e.FullHash, StringComparer.Ordinal),
+                    $"{e.Path} points at pack {e.Storage.Ref}, which does not record its content hash.");
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
     /// Progress is written off exactly once per group, however many blips there were. A whole-item retry writes off
     /// a group that was already written off a second time, and uploaded is inflated from then on (once it passes
     /// total, the speed and the remaining time both go wrong).
@@ -579,16 +720,43 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
                 patience: TimeSpan.FromSeconds(5)));
 
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
-
             // The exception type alone is not enough: what really has to hold is "the cancellation never entered the
             // gate at all". If the transient test is handed a token other than the run's own, a cancellation gets
             // taken for a blip and waits at the gate again and again until patience runs out and the run is declared
             // suspended — at which point the user pressed cancel but the UI says "suspended, will resume
             // automatically later".
-            Assert.False(control.Gate.IsDowngraded, "the gate swallowed the cancellation and turned it into an automatic suspend.");
-            Assert.Null(control.Gate.Current);
+            //
+            // That used to be read off IsDowngraded once the run had ended. It cannot be any more: the error
+            // teardown brings the gate down on its way out — it has to, because the loops it waits for park at that
+            // gate and a user pause has no timer to release them — so the flag now reads true after any failed run.
+            // What replaces it is a witness taken WHILE the run is going, and it is the stricter statement: a gate
+            // that never opens is what "the cancellation never entered it" means, and the end of the run cannot
+            // answer that either way, because the gate closes again on its way out whichever route it took.
+            using var watching = new CancellationTokenSource();
+            var opened = 0;
+            var watcher = Task.Run(async () =>
+            {
+                while (!watching.IsCancellationRequested)
+                {
+                    if (control.Gate.Current is not null)
+                        Volatile.Write(ref opened, 1);
+                    try { await Task.Delay(5, watching.Token); } catch (OperationCanceledException) { return; }
+                }
+            });
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
+
+            await watching.CancelAsync();
+            await watcher;
+
+            Assert.True(
+                Volatile.Read(ref opened) == 0,
+                "the gate opened for the cancellation, i.e. took it for a blip; left to run it waits that out until "
+                + "patience expires and the run is declared suspended, so the user pressed cancel and the UI says "
+                + "\"suspended, will resume automatically later\".");
+            // And it was never sent round again, which is the other half of the same sentence.
+            Assert.Equal(1, uploader.Cancels);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
@@ -680,9 +848,27 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
                 patience: TimeSpan.FromSeconds(2)));
 
+            // Same witness as the cancellation case, and for the same reason: a gate that never opens is what "this
+            // failure did not go through the gate" means, and it has to be watched while the run is going, since
+            // the error teardown now brings the gate down on its way out whichever route the run took.
+            using var watching = new CancellationTokenSource();
+            var opened = 0;
+            var watcher = Task.Run(async () =>
+            {
+                while (!watching.IsCancellationRequested)
+                {
+                    if (control.Gate.Current is not null)
+                        Volatile.Write(ref opened, 1);
+                    try { await Task.Delay(5, watching.Token); } catch (OperationCanceledException) { return; }
+                }
+            });
+
             // A failure in the bookkeeping stage now propagates as-is: it no longer goes through the suspend gate's "wait a bit and come back".
             await Assert.ThrowsAnyAsync<IOException>(
                 () => orchestrator.RunAsync(request, null, default, control));
+
+            await watching.CancelAsync();
+            await watcher;
 
             // Compression ran exactly once — the group whose upload was already confirmed was not recompressed or
             // re-uploaded. More than 1 means a bookkeeping-stage failure still drags the whole group into a retry and
@@ -690,8 +876,9 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             Assert.Single(compressor.Compressed);
             // A bookkeeping-stage failure should not go through the gate at all: it is already outside the retry
             // scope, and the gate should not even record one consecutive failure for it.
-            Assert.False(control.Gate.IsDowngraded, "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
-            Assert.Null(control.Gate.Current);
+            Assert.True(
+                Volatile.Read(ref opened) == 0,
+                "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }

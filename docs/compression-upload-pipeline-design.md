@@ -16,10 +16,13 @@ absent for the same reason: **nothing was inside `StagingArea.StageAsync` at tha
 (`StageProgress.cs:895`). Zero on both means the 7z stage was not merely blocked — it was empty,
 while 23 items sat in the queue waiting for it.
 
-The cause is the shape of the consumer loop. `ConsumeAsync` (`BackupOrchestrator.cs:721-744`) takes
+The cause is the shape of the consumer loop. `ConsumeAsync` (`BackupOrchestrator.cs`; the symbol is
+gone from the repository now — the three-stage `ProbeLoopAsync`/`CompressLoopAsync`/`UploadLoopAsync`
+loops this document introduces replaced it) takes
 an item and holds its worker for the item's entire life — compression, staging, every volume of the
 upload, and the settle — inside one `await RunItemAsync`. There are `UploadConcurrency + 1` workers
-(`BackupOrchestrator.cs:753`), six by default. Once six items are in their upload phase, no worker
+(`BackupOrchestrator.cs`, the `var uploaders = Math.Max(2, …)` local in `RunCoreAsync`), six by
+default. Once six items are in their upload phase, no worker
 is left to reach `StageAsync`, and compression stops until one of them finishes. The staged pool can
 only drain during that stretch, which is what the second snapshot caught: `+4.1 GB on the cloud`
 fell to `+100.0 MB` as a large item settled, a worker came free, `1 object preparing` reappeared,
@@ -28,7 +31,7 @@ and `ready to upload` had meanwhile ticked down from 4.5 GB to 4.0 GB.
 The consequence the user actually sees is that **`StagedLimitBytes` does nothing**. The worker pool
 saturates long before the pool does, so the staging limit is never the binding constraint. Setting
 it to 10 GB, 2 GB, or 40 GB produces identical behaviour; the knob in Settings
-(`SettingsPage.tsx:185`) is decorative.
+(`SettingsPage.tsx`'s "Staging area size limit (MB)" field, bound to `stagedLimitBytes`) is decorative.
 
 Enlarging the worker pool does not fix this, and the reason is worth stating because it is the
 argument for the whole rework: any extra worker eventually enters its own item's upload phase and is
@@ -41,33 +44,38 @@ an item from compression through upload, no arrangement of pool sizes guarantees
 Facts the design has to hold to, all of them load-bearing:
 
 - **Compression is globally serial.** `StagingArea._compressLock` is a `SemaphoreSlim(1, 1)` on a
-  singleton shared across every backup (`StagingArea.cs:20`, `Program.cs:77-88`). So the compression
+  singleton shared across every backup (`StagingArea.cs`, `Program.cs:77-88`). So the compression
   side needs exactly one worker; a pool would be a queue in front of a lock that admits one.
-- **Backpressure already exists and is already correct.** `HasRoom` (`StagingArea.cs:117-119`) gates
+- **Backpressure already exists and is already correct.** `HasRoom` (`StagingArea.HasRoom`) gates
   on current pool occupancy against the limit, with the per-run quota split across live leases. It
-  is checked before the compression lock is taken, deliberately (`StagingArea.cs:204-218`), so a run
+  is checked before the compression lock is taken, deliberately (`StagingArea.WaitForRoomAsync`,
+  which `StageCoreAsync` awaits ahead of `_compressLock`), so a run
   waiting for space does not pin the lock. Nothing here needs to change — it just needs to become
   the binding constraint.
 - **The retry unit for a pack is "compress this group + upload it".** `AttemptAsync`
-  (`BackupOrchestrator.cs:1978-2084`) is re-entrant by design: the pack id is taken outside it and
-  never changes, so a recompression overwrites the same volume family
-  (`BackupOrchestrator.cs:1936-1940`). An upload failure therefore has to be able to trigger a
+  (`BackupOrchestrator.cs`, a local function inside `RunGroupAsync`) is re-entrant by design: the pack
+  id is taken outside it and never changes, so a recompression overwrites the same volume family
+  (`BackupOrchestrator.cs`: `ProcessPackAsync` takes it once per group from `RunState.NextPackId`). An
+  upload failure therefore has to be able to trigger a
   recompression.
 - **The journal write, `RecordPackAsync` and `onItem` sit outside the retry unit**
-  (`BackupOrchestrator.cs:2092-2124`), after the cloud has confirmed. They must stay exactly there.
+  (`BackupOrchestrator.SettlePackAsync`), after the cloud has confirmed. They must stay exactly there.
 - **`changedMembers` is decided before the upload.** The post-compression re-verification
-  (`BackupOrchestrator.cs:2015-2055`) determines it; the upload result contributes nothing to it.
+  (`BackupOrchestrator.CompressGroupAsync`) determines it; the upload result contributes nothing to it.
   The code returns it alongside the upload result only as a convenience.
 - **A single-file item carries a dedup reservation across the upload.** `ResolveAsync`
-  (`BackupOrchestrator.cs:1559`) hands back a reservation that later arrivals with identical content
-  are blocked on; `res.Complete` / `res.Fail` (`1572`, `1577`) are driven by the upload outcome.
+  (`BackupOrchestrator.cs`, called from `UploadStagedBlobItemAsync`) hands back a reservation that
+  later arrivals with identical content
+  are blocked on; `res.Complete` / `res.Fail`, in that same method, are driven by the upload outcome.
 - **A leaked staging debt is permanent.** The quota lives on a singleton in memory; leaking it once
   keeps that space booked until the process restarts, and since it gates output for every run, enough
-  leaks stall compression process-wide (`StagingArea.cs:270-286`). `PauseGate` documents the same
+  leaks stall compression process-wide (`StagingArea.Release` / `StagingArea.ReleaseFile` are the only
+  ways it comes back). `PauseGate` documents the same
   hazard from the other end: a downgraded run must release its staging seat or it "blocks every
-  parallel backup completely" (`PauseGate.cs:23-27`).
+  parallel backup completely" (`PauseGate`'s class remarks).
 - **Grouping is finished before enqueue.** Cross-directory packs are sealed on the diff side
-  (`BackupOrchestrator.cs:898-941`), so the consumer side has no ordering constraint between items
+  (`BackupOrchestrator.cs`'s `OnChangeAsync`, in its `crossPending` lanes), so the consumer side has no
+  ordering constraint between items
   and a single-threaded compressor may take work strictly in queue order.
 
 ## Design
@@ -86,7 +94,8 @@ DiffWorkQueue ──> [prober × 1] ──> probedQueue ──> [compressor × 1
 | blocks on | nothing but its own read | `WaitForRoomAsync` only | upload slots, network |
 
 **Why the prober is one worker and not several.** The probe is disk-bound: on a candidate hit it reads
-the whole file to derive its content identity (`BackupOrchestrator.cs:1599-1622`). Concurrency does not
+the whole file to derive its content identity (`BackupOrchestrator.ProbeForDedupAsync` →
+`ReadContentIdentityAsync`). Concurrency does not
 make a disk faster, and on spinning media or a NAS share it makes it slower by turning one sequential
 read into several competing seeks. The reason to give it its own stage is not parallelism — it is
 **overlap**: while the prober reads the next item, the compressor is working on the previous one, so the
@@ -98,7 +107,7 @@ lock, not the probes. Trading six competing readers for one reader that overlaps
 therefore a gain twice over: the disk does sequential work, and neither stage idles waiting for the other.
 
 **What stays on the compressor.** The pack path's post-compression re-verification
-(`BackupOrchestrator.cs:2015-2055`) checks the archive that was just produced, so it belongs with the
+(`BackupOrchestrator.CompressGroupAsync`) checks the archive that was just produced, so it belongs with the
 thing that produced it. It normally costs one `stat` per member; only a member changed mid-compression
 forces a rehash, which is rare. Moving it would need a fourth stage to buy very little.
 
@@ -144,9 +153,10 @@ A queue entry owns two things that must be handed back exactly once:
 - the `StagedItem` — pool quota plus volume files on disk;
 - for single files, the dedup reservation, with later same-content arrivals blocked on it.
 
-Both are wrapped in one disposable owner whose `Dispose` calls `staging.Release(staged)` and
-`res.Fail(...)`, idempotently — the same shape as the existing `StagingArea.Hold`
-(`StagingArea.cs:287-296`), and for the same reason it exists.
+Both are wrapped in one disposable owner (`StagedHandoff`) whose `Dispose` calls `staging.Release(staged)`
+and `res.Fail(...)`, idempotently — the same shape, and for the same reason, as the `using`-scoped
+`StagingArea.Hold` it replaces. That one has since been deleted: once the archive's lifetime stopped ending
+inside the method that produced it, a scope guard had nothing left to scope.
 
 Four paths must reach that `Dispose`:
 
@@ -157,12 +167,13 @@ Four paths must reach that `Dispose`:
    no staging quota (nothing has been compressed yet), so draining them only has to settle the item
    ledger; `stagedQueue` entries hold an archive each and must be disposed. Entries already claimed by
    an uploader run to completion. This matches the current
-   promise, "finish the current item, then stop" (`BackupOrchestrator.cs:727-730`), with "current
+   promise, "finish the current item, then stop" (`BackupOrchestrator.cs`, where `UploadLoopAsync` now
+   carries it), with "current
    item" now meaning the ones uploaders hold. Work compressed but not yet claimed is discarded — the
    local CPU spent on it is lost, no bytes reached the cloud, and nothing is left in the container.
 4. **Pause-gate downgrade** — the suspend-and-exit path drains and disposes the queue before
    releasing the staging seat. Without this the run suspends while still holding up to the full
-   limit, which is precisely the failure `PauseGate.cs:23-27` warns about, made larger by this change
+   limit, which is precisely the failure `PauseGate`'s class remarks warn about, made larger by this change
    because the queue can now hold that much.
 
 ### 3. Upload failure recompresses in place, and that recompression does not queue for room
@@ -236,7 +247,8 @@ backpressure this document exists to make binding.
 
 Because `changedMembers` is settled before the upload (see Starting point), the whole tail that
 handles them — recomputing the hash, writing the index override, re-queueing into a later group, or
-demoting to a single file past the attempt limit (`BackupOrchestrator.cs:2126-2178`) — stays in the
+demoting to a single file past the attempt limit (`BackupOrchestrator.cs`, the `changedMembers` tail of
+`ProcessPackAsync`) — stays in the
 compressor and does not cross the queue. Only `RecordPackAsync`, `LogFileAsync` and `onItem` follow
 the upload.
 
@@ -317,14 +329,16 @@ both are exceptional rather than steady state:
 
 - **A pack member demoted to a single file uploads on the compressor's thread.** When a member grows
   past `SingleFileThresholdBytes` while its group is being compressed, `ProcessPackAsync`
-  (`BackupOrchestrator.cs:2687-2690`) hands it to `HandleBlobAsync` → `PlaceBlobAsync`, which
+  (`BackupOrchestrator.cs`, in its `changedMembers` tail) hands it to `HandleBlobAsync` →
+  `PlaceBlobAsync`, which
   compresses *and* uploads it inline — behind the volume gate and behind the network — with the
   compression stage stopped for the duration. It needs a member to change size mid-compression, so it
   is rare; keeping it where it is keeps `queue`/`attempts` single-threaded inside one
   `ProcessPackAsync` invocation (§4), which is the reason the demotion is not worth moving.
 - **The stranded-member tail compresses on an uploader's thread.** When a group's retry excludes
   members the handed-over pass had kept, the uploader runs a standalone `ProcessPackAsync` for them
-  (`:1104`), with no dispatch — so that call compresses as well as uploads. It needs a transient
+  (the `stranded` call inside `StageProbedAsync`'s pack `dispatch` closure), with no dispatch — so that
+  call compresses as well as uploads. It needs a transient
   upload failure *and* a member rewritten inside the gate's wait window. This is one of the three
   places §3's quota bypass applies.
 

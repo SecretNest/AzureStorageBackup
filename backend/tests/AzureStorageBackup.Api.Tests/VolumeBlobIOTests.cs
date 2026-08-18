@@ -92,20 +92,62 @@ public sealed class VolumeBlobIOTests
     private static VolumeUploadScope Scope(VolumeUploadGate gate, int perItem) =>
         new(gate, new StageTracker("Uploading", 0, static _ => { }), perItem);
 
-    /// <summary>Records the order in which volumes start uploading, and makes uploads slow enough that two volume families really contend.</summary>
-    private sealed class OrderProbe : IBlobUploader
+    /// <summary>
+    /// Records the order in which volumes start uploading and holds each one open until the test hands it back.
+    /// Nothing finishes on a clock: the test says when a slot is released, which is what lets the case below
+    /// arrange the contention it is about instead of racing the scheduler for it.
+    /// </summary>
+    private sealed class SteppedProbe : IBlobUploader
     {
         private readonly Lock _gate = new();
-        public List<string> Started { get; } = [];
+        private readonly Dictionary<string, TaskCompletionSource> _held = new(StringComparer.Ordinal);
+        private readonly List<string> _started = [];
+        private bool _open;
+
+        public int StartedCount { get { lock (_gate) return _started.Count; } }
+
+        public IReadOnlyList<string> Started { get { lock (_gate) return [.. _started]; } }
 
         public async Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
         {
-            lock (_gate) Started.Add(blobName);
-            await Task.Delay(20, ct);
+            TaskCompletionSource tcs;
+            lock (_gate)
+            {
+                _started.Add(blobName);
+                tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (_open)
+                    tcs.TrySetResult();
+                else
+                    _held[blobName] = tcs;
+            }
+            // A hang detector, not a timing assumption: in the healthy case the test hands this back explicitly.
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
             return true;
+        }
+
+        /// <summary>Let one named volume finish, which releases its gate slot.</summary>
+        public void Finish(string blobName)
+        {
+            TaskCompletionSource tcs;
+            lock (_gate)
+                tcs = _held[blobName];
+            tcs.TrySetResult();
+        }
+
+        /// <summary>Let everything still held finish, and everything starting afterwards go straight through.</summary>
+        public void FinishAll()
+        {
+            List<TaskCompletionSource> all;
+            lock (_gate)
+            {
+                _open = true;
+                all = [.. _held.Values];
+            }
+            foreach (var tcs in all)
+                tcs.TrySetResult();
         }
 
         public Task UploadOverwriteAsync(
@@ -113,6 +155,18 @@ public sealed class VolumeBlobIOTests
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
             => throw new NotSupportedException();
+    }
+
+    /// <summary>Poll until <paramref name="condition"/> holds, failing with <paramref name="what"/> if it never does.</summary>
+    private static async Task WaitFor(Func<bool> condition, Func<string> what)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+                Assert.Fail($"timed out waiting for {what()}");
+            await Task.Delay(5);
+        }
     }
 
     /// <summary>
@@ -126,26 +180,41 @@ public sealed class VolumeBlobIOTests
     /// halfway; arbitrating by item age leaves essentially one.
     /// </para>
     /// <para>
-    /// **Why the assertion is not "not a single volume cuts in"**: a finished volume releases its slot in
+    /// **Why the releases are stepped rather than timed.** A finished volume releases its slot in
     /// <c>RunAsync</c>'s finally, while this family's next volume cannot queue up until the <c>WhenAny</c>
-    /// continuation gets to run — there is a crack between those two things. The extra volume
-    /// <c>WindowPerItem</c> queues (the baton) covers the common timing: at the changeover instant this family
-    /// still has a waiter on the gate that catches the slot on its smaller ticket. But when the thread pool is
-    /// starved the continuation can be hundreds of milliseconds late, and in that crack the new family really can
-    /// pick up a volume. In production the crack is measured in microseconds while a volume upload takes seconds,
-    /// so it is a tolerable leak, not a bug.
-    /// The bound is 2: under first-come-first-served this is reliably 3 volumes (half of them), and after the fix
-    /// it is normally 0 and at worst 1 — the two sides are far apart.
+    /// continuation gets to run — there is a crack between those two things, and a slot freed inside it goes to
+    /// whoever is already on the gate. The extra volume <c>WindowPerItem</c> queues (the baton) covers it as long
+    /// as the continuation is prompt; when the thread pool is starved it is not, and in that crack the newer
+    /// family really can pick up a volume. That tolerance is a property of the **product** (see
+    /// <see cref="VolumeUploadScope.WindowPerItem"/>: microseconds against a volume upload measured in seconds),
+    /// not something this case should be measuring — an earlier version of it let uploads finish on a 20 ms timer
+    /// and then asserted a tolerance of "fewer than 2", which made a loaded machine, not the arbitration, decide
+    /// the result: it failed 1 run in 4 under six busy loops.
+    /// <para>
+    /// So the releases are driven one at a time, and each one waits for the older family to be provably back on
+    /// the gate (<c>WaitingOnSlot</c> is the gate's own waiter count, published by <c>BeginWait</c>/<c>EndWait</c>)
+    /// before the next slot is freed. The crack is then closed by construction on every machine, the expected
+    /// number of cut-ins is exactly 0, and the assertion is the whole start order rather than a bound.
+    /// Under first-come-first-served the second release lands on <c>data/newer.001</c> instead of
+    /// <c>data/older.004</c> and that assertion fails on its first element — the two sides are still far apart.
+    /// </para>
     /// </para>
     /// </summary>
     [Fact]
     public async Task An_Older_Archive_Is_Not_Interleaved_With_A_Newer_One()
     {
-        var up = new OrderProbe();
+        var up = new SteppedProbe();
         var gate = new VolumeUploadGate(2);
-        var scope = Scope(gate, perItem: 2);
-        var older = Enumerable.Range(1, 6).Select(i => $"/tmp/a.{i:000}").ToList();
-        var newer = Enumerable.Range(1, 6).Select(i => $"/tmp/b.{i:000}").ToList();
+        StageProgress? latest = null;
+        // The injected clock also switches off the heartbeat timer, so the only snapshots published are the forced
+        // ones from BeginWait/EndWait — i.e. exactly the gate's own arrivals and departures.
+        using var tracker = new StageTracker("Uploading", 0, p => Volatile.Write(ref latest, p)) { Clock = () => 0 };
+        var scope = new VolumeUploadScope(gate, tracker, maxParallelPerItem: 2);   // window = 3
+        var older = Enumerable.Range(1, 4).Select(i => $"/tmp/a.{i:000}").ToList();
+        var newer = Enumerable.Range(1, 4).Select(i => $"/tmp/b.{i:000}").ToList();
+
+        int Queued() => Volatile.Read(ref latest)?.WaitingOnSlot ?? 0;
+        string Order() => string.Join(", ", up.Started);
 
         // The ticket is taken in UploadAsync's synchronous section, so the family called first is guaranteed to
         // be the older one — no sleeps guessing at timing.
@@ -153,17 +222,34 @@ public sealed class VolumeBlobIOTests
             up, Acc(), "c", "data/older", older, AccessTier.Hot, scope: scope);
         var second = VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/newer", newer, AccessTier.Hot, scope: scope);
+
+        // The scene: both families have filled their window. Two of the older family's volumes hold the two slots;
+        // the other four (older.003, and all three the newer family queued) are waiting on the gate.
+        await WaitFor(() => up.StartedCount == 2 && Queued() == 4,
+            () => $"both windows to reach the gate (started {Order()}, {Queued()} queued)");
+
+        // Release 1. The only waiter with the older ticket is older.003, which has been on the gate since the
+        // scene was built, so this one cannot fall into the changeover crack in either implementation.
+        up.Finish("data/older.001");
+        // Waiting for the count to come back to 4 is waiting for the older family's WhenAny continuation to have
+        // queued older.004. That is the precondition release 2 needs and the one the old version raced for.
+        await WaitFor(() => up.StartedCount == 3 && Queued() == 4,
+            () => $"the freed slot to be taken and the next volume queued (started {Order()}, {Queued()} queued)");
+
+        // Release 2 — the one that discriminates. Waiting on the gate now: older.004 on the smaller ticket, and
+        // the newer family's three. Age-based arbitration hands it to older.004; first-come-first-served hands it
+        // to newer.001, which has been queued longer.
+        up.Finish("data/older.002");
+        await WaitFor(() => up.StartedCount == 4, () => $"a fourth volume to start (started {Order()})");
+
+        Assert.Equal(
+            ["data/older.001", "data/older.002", "data/older.003", "data/older.004"],
+            up.Started);
+
+        up.FinishAll();
         await Task.WhenAll(first, second);
-
-        Assert.Equal(12, up.Started.Count);
-        var lastOfOlder = up.Started.FindLastIndex(n => n.StartsWith("data/older", StringComparison.Ordinal));
-        var newerBeforeOlderFinished = up.Started
-            .Take(lastOfOlder)
-            .Count(n => n.StartsWith("data/newer", StringComparison.Ordinal));
-
-        Assert.True(newerBeforeOlderFinished < 2,
-            $"the newer family grabbed {newerBeforeOlderFinished} volumes before the older one finished: {string.Join(", ", up.Started)}");
-        Assert.Equal(2, gate.Free);
+        Assert.Equal(8, up.StartedCount);
+        Assert.Equal(2, gate.Free);   // every slot returned
     }
 
     /// <summary>

@@ -92,12 +92,14 @@ public static class LocalRootMigration
     /// </summary>
     private static Outcome Compare(IndexEntry entry, string fullPath, ref int mtimeDiffers)
     {
-        // A symlink's IndexEntry.Length is always 0 (LocalFileScanner.cs:170), so comparing size is meaningless;
+        // A symlink's IndexEntry.Length is always 0 (LocalFileScanner.ScanDirectory builds the symlink ScannedEntry
+        // with a hard-coded length of 0), so comparing size is meaningless;
         // all we confirm is that there is still a link at this position.
         //
         // **Do not add Exists back**: FileInfo.Exists answers false for a link pointing **at a directory** (it asks "is this a
         // file", and the link resolves to a directory), while the scanning side registers a symlink purely on LinkTarget being
-        // non-null (LocalFileScanner.cs:136), so directory links are in the index too. Add that check and every intact directory
+        // non-null (LocalFileScanner.ScanDirectory: `var isSymlink = info.LinkTarget is not null;`), so directory links
+        // are in the index too. Add that check and every intact directory
         // link is judged Missing, dragging the match rate of a perfectly correct migration down and forcing it onto the force path.
         // A non-null LinkTarget already says "there really is a symlink lying here"; it is null when the path does not exist.
         if (string.Equals(entry.Kind, "symlink", StringComparison.Ordinal))
