@@ -225,6 +225,98 @@ public sealed class StagingAreaTests : IDisposable
         Assert.Equal(10, area.StagedBytes);
     }
 
+    /// <summary>
+    /// The one thing <see cref="StagingArea.StageWithoutBackpressureAsync"/> exists to do: a caller the quota depends
+    /// on to come back must not queue for that quota.
+    /// <para>
+    /// Everything in this pool is released by an upload, so an uploader that parks in the backpressure wait is
+    /// waiting for itself. One doing it is merely slow; all of them doing it at once is permanent, and it is a scene
+    /// a single network blip assembles — every in-flight upload trips into the suspend gate together, each drops the
+    /// archive it was sending, the gate's timer then releases them all in one go, and they all come back to
+    /// recompress what they have to resend against a pool nobody is left to drain. No error surfaces, no progress
+    /// moves, and not even Suspend gets out: <c>downstreamGone</c> triggers on the uploaders being gone and these are
+    /// alive, and the gate cannot downgrade because nobody is at it.
+    /// </para>
+    /// <para>
+    /// The state this test puts the pool into is exactly that one — over the ceiling, with nothing in the test that
+    /// will ever hand a byte back — so a bypass that quietly went back to waiting hangs here forever rather than
+    /// running slowly. That is deliberate: the failure mode this guards against **is** a hang, and the gap between
+    /// "returns in a millisecond" and "never returns" is what the timeout below measures, on any machine.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Restaging_Without_Backpressure_Does_Not_Wait_For_Room()
+    {
+        using var area = Area(limit: 100);
+
+        // Fill the pool past its ceiling and keep it there. Nothing below releases these bytes, which is the whole
+        // point: a re-staging uploader looking at this pool is looking at bytes only an uploader could return.
+        var held = await area.StageAsync(Produce("held", 150));
+        Assert.Equal(150, area.StagedBytes);
+
+        // The ordinary entry point parks, and there is no release coming for it to be woken by.
+        var blocked = area.StageAsync(Produce("blocked", 10));
+
+        // The uploader's entry point goes straight through, with not one byte having been handed back in between.
+        // Spelled out rather than left to WaitAsync so the failure says what happened: a bare TimeoutException from
+        // this line reads like a slow machine, and it is the opposite — a wait that was never going to end.
+        var restaged = area.StageWithoutBackpressureAsync(Produce("restaged", 10));
+        if (await Task.WhenAny(restaged, Task.Delay(TimeSpan.FromSeconds(30))) != restaged)
+            Assert.Fail(
+                $"the uploader's entry point queued for room: {area.StagedBytes} bytes are staged against a "
+                + "100-byte ceiling and nothing here will ever release them, which is the deadlock this method "
+                + "exists to avoid — in a run it is every uploader waiting for a pool only an uploader can drain.");
+
+        var item = await restaged;
+        Assert.Equal(10, item.Bytes);
+        Assert.Equal(160, area.StagedBytes);   // the overshoot the bypass permits, booked like any other staging
+        // Cannot flake: `blocked` is waiting on a release signal nothing above fires, so it is incomplete at every
+        // instant between its start and the Release below, on a machine of any speed.
+        Assert.False(blocked.IsCompleted);
+
+        // And the ordinary caller is still an ordinary caller: it moves when, and only when, room comes back.
+        area.Release(held);
+        var second = await blocked.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(10, second.Bytes);
+    }
+
+    /// <summary>
+    /// The bypass skips the backpressure wait and nothing else. Compression stays globally serial, because the
+    /// compression lock is not what deadlocks: it is held only while 7z runs and is always given back by its holder,
+    /// whereas the quota is given back by a *different* thread than the one waiting for it. Letting a retry compress
+    /// concurrently with the compression stage would put two 7z processes on the same temp disk and hand this run
+    /// CPU the operator capped on purpose — a different bug, bought with the fix for this one.
+    /// <para>
+    /// Same shape as <see cref="Compression_Is_Globally_Non_Concurrent"/>, one bypass caller substituted in, so the
+    /// two read as the one rule they are.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Restaging_Without_Backpressure_Still_Compresses_One_At_A_Time()
+    {
+        using var area = Area(limit: 1_000_000);
+        var concurrent = 0;
+        var maxConcurrent = 0;
+
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> Job(string name) => async (dir, ct) =>
+        {
+            var now = Interlocked.Increment(ref concurrent);
+            maxConcurrent = Math.Max(maxConcurrent, now);
+            await Task.Delay(50, ct);
+            Interlocked.Decrement(ref concurrent);
+            var path = Path.Combine(dir, name);
+            await File.WriteAllBytesAsync(path, new byte[10], ct);
+            return (IReadOnlyList<string>)[path];
+        };
+
+        await Task.WhenAll(
+            area.StageAsync(Job("a")),
+            area.StageWithoutBackpressureAsync(Job("b")),
+            area.StageWithoutBackpressureAsync(Job("c")));
+
+        Assert.Equal(1, maxConcurrent);
+    }
+
     [Fact]
     public async Task Release_Deletes_Staged_Files()
     {
