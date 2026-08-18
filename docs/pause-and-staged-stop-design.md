@@ -126,6 +126,16 @@ gains one `await control.Gate.WaitIfPausedAsync(token)` at the top:
 The diff is included because "pause the backup" means the disk stops being read at all, not just that
 the pipeline stops draining.
 
+**A run that fails while paused has to be able to end.** Parking four loops on a gate only the operator
+can open means a failure raised *outside* those loops — the run's own tail, where the totals are settled
+and the unreadable-file warnings are written — would otherwise wait forever for workers nobody is going
+to release, holding the busy lock and the process-wide staging quota until the container restarts. So
+the orchestrator's teardown downgrades the gate before it rethrows, which is a **second** caller of
+`Downgrade` beside `RequestStop`. Two consequences follow from it being unconditional: `IsDowngraded`
+reads true after any failed run, and a worker parked mid-transient-backoff at that moment is released
+with `false` rather than retrying until patience expires — a little journalled progress traded for a
+teardown that terminates.
+
 Granularity is "finish the item in hand, then hold". A press of Pause therefore takes effect within
 one item per stage — worst case, the time to compress one large file. The alternative (abort mid-item
 and re-queue) would need 7z killed, partial output deleted and the item re-enqueued, and the item

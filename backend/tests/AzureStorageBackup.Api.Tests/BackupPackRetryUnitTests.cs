@@ -757,7 +757,6 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 + "\"suspended, will resume automatically later\".");
             // And it was never sent round again, which is the other half of the same sentence.
             Assert.Equal(1, uploader.Cancels);
-            Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
@@ -880,7 +879,6 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             Assert.True(
                 Volatile.Read(ref opened) == 0,
                 "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
-            Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }

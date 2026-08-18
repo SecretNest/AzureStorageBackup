@@ -46,7 +46,7 @@ Facts the design has to hold to, all of them load-bearing:
 - **Compression is globally serial.** `StagingArea._compressLock` is a `SemaphoreSlim(1, 1)` on a
   singleton shared across every backup (`StagingArea.cs`, `Program.cs:77-88`). So the compression
   side needs exactly one worker; a pool would be a queue in front of a lock that admits one.
-- **Backpressure already exists and is already correct.** `HasRoom` (`StagingArea.cs:117-119`) gates
+- **Backpressure already exists and is already correct.** `HasRoom` (`StagingArea.HasRoom`) gates
   on current pool occupancy against the limit, with the per-run quota split across live leases. It
   is checked before the compression lock is taken, deliberately (`StagingArea.WaitForRoomAsync`,
   which `StageCoreAsync` awaits ahead of `_compressLock`), so a run

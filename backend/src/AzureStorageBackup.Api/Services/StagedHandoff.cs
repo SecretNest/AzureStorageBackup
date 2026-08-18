@@ -6,11 +6,17 @@ namespace AzureStorageBackup.Api.Services;
 /// <para>
 /// Two things ride along. The <see cref="StagedItem"/> holds pool quota — an in-memory counter on a singleton
 /// shared by every run — plus volume files on disk; leaking it books that space until the process restarts, and
-/// since the quota is also the gate output waits at (<see cref="StagingArea.WaitForRoomAsync"/>), enough leaks
-/// stall compression process-wide, invisibly: the UI column shows this run's seat usage, not the global account.
-/// The optional abandon callback is the dedup reservation of a single-file item:
-/// latecomers in this run with identical content are blocked on it, and an entry discarded without answering them
-/// leaves them waiting for the rest of the run.
+/// since the quota is also the gate output waits at (<c>StagingArea.WaitForRoomAsync</c>, private, hence not a
+/// cref), enough leaks stall compression process-wide, invisibly: the UI column shows this run's seat usage, not
+/// the global account.
+/// <para>
+/// The optional abandon callback answers a dedup reservation that would otherwise be left waiting. **No production
+/// caller passes one today**: the single-file reservation is taken on the uploader, inside the same method that
+/// answers it (<c>res.Fail</c> paired with <c>MarkSettled</c>), so it never crosses the queue and cannot be
+/// orphaned by a discarded entry. The parameter is kept because the ownership rule it encodes is the one thing this
+/// class exists to state — a queue entry that dies owes an answer to whoever is waiting on it — and the next thing
+/// to travel this queue may well owe one.
+/// </para>
 /// </para>
 /// <para>
 /// This is the whole of that guard now. <c>StagingArea.Hold</c> used to wrap the same release in a <c>using</c>
