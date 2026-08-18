@@ -197,14 +197,23 @@ A restore downloads each archive under `restore/` before writing files out. Sing
 
 ### Stopping, pausing and resuming
 
-A run that ends early no longer throws away what it already uploaded. Every object is recorded in a **journal** on disk — one file per run under `/data/journal/` — and the line is appended only *after* Azure confirms the write, never before. A later run reads that journal back and adopts what is already in the cloud instead of sending it again. An interrupted backup therefore costs the compression a second time, but not the bandwidth.
+A run that ends early no longer throws away what it already uploaded. Every object is recorded in a **journal** on disk — one file per run under `/data/journal/` — and the line is appended only *after* Azure confirms the write, never before. A later run reads that journal back and adopts what is already in the cloud instead of sending it again. An interrupted backup therefore costs the compression a second time, but not the bandwidth — and for a file nothing has touched since, not even a second read: the journal records the file's last-write time, so the next run answers "already uploaded?" from a `stat` rather than by hashing the file again. Anything whose length or timestamp moved is hashed as before.
 
-Two buttons sit on a running backup:
+Three buttons sit on a running backup:
 
 | Button | What it does |
 | --- | --- |
+| **Pause** | Holds the run where it is. Each stage finishes the one item it has in hand and then stops; nothing is discarded and nothing is flushed. The run stays **Running**, holding its staged output, until you press **Resume**. |
 | **Suspend** | Stops taking new work, lets the transfers already in flight finish, flushes the journal, and hands back the compression lock and the staging quota. The run ends as **Suspended**. |
 | **Cancel** | Asks how first. *Stop now* kills the in-flight transfers immediately and deletes the half-uploaded volumes they left behind; *Finish current files* lets each file that is already uploading finish all of its volumes. The run ends as **Canceled**. |
+
+**Pause is not Suspend, and the difference is what resuming costs.** Suspend tears the run down: the next one re-scans, re-diffs and re-checks every file before it reaches where the last one stopped. Pause keeps the run alive in memory, so Resume continues from the exact item it stopped on, with the work already compressed still sitting in the staging area waiting to go.
+
+That waiting output is the price. A paused run keeps holding the staging disk — the row tells you how much, next to how long it has been paused — and that quota is shared across every backup on the machine, so a run paused overnight is a run holding it overnight. There is deliberately no timeout: a pause that turned itself into a suspend while you were away would be exactly the wrong thing to do with a button you pressed on purpose. From a pause you can still press **Suspend** or **Cancel**, and both behave as they would have.
+
+Being memory-only also means a paused run does not survive a container restart. It does not restart itself either — see *Restarts and upgrades* below.
+
+**A stop no longer waits for work it is about to throw away.** Suspend and *Finish current files* let the uploads in flight finish, because a volume that completes gets written to the journal and skipped next time. They no longer wait for a hashing or a compression to finish: neither leaves anything behind — the archive goes back to the staging pool, the hash is recomputed next run — so the only thing waiting achieved was making you wait, sometimes for several minutes on a large file.
 
 Neither button returns until the run has really settled — journal on disk, temporary files gone, locks released. That is deliberate: an endpoint that returned early would let your next action (edit the config, delete it, start another run) collide with a run that had not finished dying.
 
@@ -214,7 +223,7 @@ A journal is only adopted if the run it describes still matches: same local root
 
 #### Network trouble suspends the run instead of failing it
 
-Transient errors — connection resets, timeouts, `5xx`, `408`, `429`, and the `AggregateException` the Azure SDK raises when its own retries are exhausted — no longer end a backup. The worker that hit the wall waits at a gate while every other worker keeps going, and the gate reopens on a ladder of **30s → 1m → 5m, then every 5 minutes**. **Retry now** opens it immediately. While anything is waiting the row reads `Paused — <error> (attempt N)`, and the run's status is still Running: it is holding its staging quota and its slot, and the details of the workers still transferring stay on screen beside it.
+Transient errors — connection resets, timeouts, `5xx`, `408`, `429`, and the `AggregateException` the Azure SDK raises when its own retries are exhausted — no longer end a backup. The worker that hit the wall waits at a gate while every other worker keeps going, and the gate reopens on a ladder of **30s → 1m → 5m, then every 5 minutes**. **Retry now** opens it immediately. While anything is waiting the row reads `Paused — <error> (attempt N)` — with **Retry now** rather than the **Resume** a pause you pressed yourself offers, because there is nothing here for you to lift — and the run's status is still Running: it is holding its staging quota and its slot, and the details of the workers still transferring stay on screen beside it.
 
 That is also why the wait is bounded. The staging limit is global, so a stuck run sitting on 2 GB of finished archives can freeze an unrelated backup — different account, different network path — because nothing will ever free the space. After **10 minutes** with no progress the run therefore gives itself up: journal flushed, quota and locks released, everything else unblocked, and its own progress kept. It ends as **Suspended**, and the row says so (`Suspended after repeated network errors`). Both suspending and downgrading send a notification.
 
@@ -226,7 +235,7 @@ On `SIGTERM` — `docker stop`, a container upgrade — every running backup is 
 
 On the next start, **Resume interrupted backups on startup** (Settings page, on by default) picks those runs back up about 15 seconds after boot, one at a time so they do not queue behind each other on the global compression lock.
 
-**Only runs carrying the planned-shutdown marker are resumed automatically**, and only when *every* journal left for that backup carries it. Everything else waits for you to press Run: a run you suspended by hand (resuming it would erase the intent behind the button), one that downgraded itself after network trouble (the outage is probably still there, so it would just hit the wall again), and one that died without writing a marker at all. That last group is deliberately broad — a `SIGKILL`, a power cut, a shutdown that timed out, and a cancel all look identical on disk, and at least one of them is you saying *stop*. When a backup is skipped for this reason the log says which journal blocked it and why. The Backups page lists interrupted runs it finds either way, so you can Resume or Discard them yourself.
+**Only runs carrying the planned-shutdown marker are resumed automatically**, and only when *every* journal left for that backup carries it. Everything else waits for you to press Run: a run you suspended by hand (resuming it would erase the intent behind the button), **one that was paused when the shutdown arrived** (the pause itself is memory-only and does not survive, but the intent behind it does — the shutdown records that run as user-requested, so it waits for you rather than starting itself during an upgrade), one that downgraded itself after network trouble (the outage is probably still there, so it would just hit the wall again), and one that died without writing a marker at all. That last group is deliberately broad — a `SIGKILL`, a power cut, a shutdown that timed out, and a cancel all look identical on disk, and at least one of them is you saying *stop*. When a backup is skipped for this reason the log says which journal blocked it and why. The Backups page lists interrupted runs it finds either way, so you can Resume or Discard them yourself.
 
 ## Notifications
 

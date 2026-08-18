@@ -91,6 +91,10 @@ the authority.
 | 08-06 | Changing the local root (a verified migration; the root is no longer immutable) | [change-local-root-design.md](change-local-root-design.md) |
 | 08-07 | Cross-pack member dedup within one run (<5 MB, leader coverage, alias restore) | [m4-backup-engine-design.md](m4-backup-engine-design.md) §6.1 |
 | 08-08 | Suspendable, pausable, resumable backups (journal, gates, graceful shutdown, auto-resume at startup) | [backup-suspend-resume-design.md](backup-suspend-resume-design.md) |
+| 08-17 | Probe, compression and upload split into three stages, so `StagedLimitBytes` is what limits how far compression runs ahead instead of the size of the worker pool | [compression-upload-pipeline-design.md](compression-upload-pipeline-design.md) |
+| 08-18 | A real Pause (holds the run in memory; Resume continues from the item it stopped on), and a stop that abandons the stages whose in-flight work it was about to discard | [pause-and-staged-stop-design.md](pause-and-staged-stop-design.md) |
+| 08-18 | A resume that answers "already uploaded?" from a `stat` instead of re-reading every candidate file | [journal-mtime-fast-resume-design.md](journal-mtime-fast-resume-design.md) |
+| 08-18 | A store-only unencrypted blob uploaded from the source rather than from a copy in the staging area | [raw-upload-without-staging-design.md](raw-upload-without-staging-design.md) |
 
 ## Notes
 
