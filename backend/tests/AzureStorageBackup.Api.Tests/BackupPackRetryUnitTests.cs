@@ -321,10 +321,17 @@ public sealed class BackupPackRetryUnitTests : IDisposable
     /// <summary>An uploader that trips the cancellation token and throws OperationCanceledException: used to verify the gate does not swallow a cancellation.</summary>
     private sealed class CancellingUploader(IBlobUploader inner, CancellationTokenSource cts) : IBlobUploader
     {
+        private int _cancels;
+
+        /// <summary>How many pack uploads have been cancelled from here. More than one means the gate waited the
+        /// first cancellation out and let the group be tried again.</summary>
+        public int Cancels => Volatile.Read(ref _cancels);
+
         private Task<bool> GateAsync(string blobName, Func<Task<bool>> call)
         {
             if (blobName.StartsWith("packs/", StringComparison.Ordinal))
             {
+                Interlocked.Increment(ref _cancels);
                 cts.Cancel();
                 // Exactly the same shape as "cancelled halfway through an upload": a real cancellation is thrown from right here.
                 throw new OperationCanceledException(cts.Token);
@@ -579,15 +586,43 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
                 patience: TimeSpan.FromSeconds(5)));
 
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
-
             // The exception type alone is not enough: what really has to hold is "the cancellation never entered the
             // gate at all". If the transient test is handed a token other than the run's own, a cancellation gets
             // taken for a blip and waits at the gate again and again until patience runs out and the run is declared
             // suspended — at which point the user pressed cancel but the UI says "suspended, will resume
             // automatically later".
-            Assert.False(control.Gate.IsDowngraded, "the gate swallowed the cancellation and turned it into an automatic suspend.");
+            //
+            // That used to be read off IsDowngraded once the run had ended. It cannot be any more: the error
+            // teardown brings the gate down on its way out — it has to, because the loops it waits for park at that
+            // gate and a user pause has no timer to release them — so the flag now reads true after any failed run.
+            // What replaces it is a witness taken WHILE the run is going, and it is the stricter statement: a gate
+            // that never opens is what "the cancellation never entered it" means, and the end of the run cannot
+            // answer that either way, because the gate closes again on its way out whichever route it took.
+            using var watching = new CancellationTokenSource();
+            var opened = 0;
+            var watcher = Task.Run(async () =>
+            {
+                while (!watching.IsCancellationRequested)
+                {
+                    if (control.Gate.Current is not null)
+                        Volatile.Write(ref opened, 1);
+                    try { await Task.Delay(5, watching.Token); } catch (OperationCanceledException) { return; }
+                }
+            });
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => orchestrator.RunAsync(Request(account, name), null, cts.Token, control));
+
+            await watching.CancelAsync();
+            await watcher;
+
+            Assert.True(
+                Volatile.Read(ref opened) == 0,
+                "the gate opened for the cancellation, i.e. took it for a blip; left to run it waits that out until "
+                + "patience expires and the run is declared suspended, so the user pressed cancel and the UI says "
+                + "\"suspended, will resume automatically later\".");
+            // And it was never sent round again, which is the other half of the same sentence.
+            Assert.Equal(1, uploader.Cancels);
             Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
@@ -680,9 +715,27 @@ public sealed class BackupPackRetryUnitTests : IDisposable
                 schedule: [TimeSpan.FromMilliseconds(20)], steady: TimeSpan.FromMilliseconds(20),
                 patience: TimeSpan.FromSeconds(2)));
 
+            // Same witness as the cancellation case, and for the same reason: a gate that never opens is what "this
+            // failure did not go through the gate" means, and it has to be watched while the run is going, since
+            // the error teardown now brings the gate down on its way out whichever route the run took.
+            using var watching = new CancellationTokenSource();
+            var opened = 0;
+            var watcher = Task.Run(async () =>
+            {
+                while (!watching.IsCancellationRequested)
+                {
+                    if (control.Gate.Current is not null)
+                        Volatile.Write(ref opened, 1);
+                    try { await Task.Delay(5, watching.Token); } catch (OperationCanceledException) { return; }
+                }
+            });
+
             // A failure in the bookkeeping stage now propagates as-is: it no longer goes through the suspend gate's "wait a bit and come back".
             await Assert.ThrowsAnyAsync<IOException>(
                 () => orchestrator.RunAsync(request, null, default, control));
+
+            await watching.CancelAsync();
+            await watcher;
 
             // Compression ran exactly once — the group whose upload was already confirmed was not recompressed or
             // re-uploaded. More than 1 means a bookkeeping-stage failure still drags the whole group into a retry and
@@ -690,7 +743,9 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             Assert.Single(compressor.Compressed);
             // A bookkeeping-stage failure should not go through the gate at all: it is already outside the retry
             // scope, and the gate should not even record one consecutive failure for it.
-            Assert.False(control.Gate.IsDowngraded, "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
+            Assert.True(
+                Volatile.Read(ref opened) == 0,
+                "the gate took a bookkeeping-stage failure for a transient blip and waited on it.");
             Assert.Null(control.Gate.Current);
         }
         finally { await cc.DeleteIfExistsAsync(); }
