@@ -363,6 +363,35 @@ public class PauseGateTests
     }
 
     /// <summary>
+    /// <see cref="PauseGate.Snapshot"/> reports the same two facts as the two properties, which is the whole
+    /// reason it exists: the response that carries them to the browser must not read them one after the other,
+    /// because those are two acquisitions of the lock and a Pause or Resume landing in between yields a pair that
+    /// was never true.
+    /// <para>
+    /// Atomicity itself is not what this pins — a race is not a thing a test can assert without measuring luck.
+    /// What it pins is the mistake that would make the single read pointless: deriving "the user is holding it"
+    /// from <c>Current.Source</c>. In the composed state below, the state this whole pair exists for, that
+    /// derivation answers <c>false</c> while the operator's hold is standing.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void One_Read_Reports_Both_Halves_Of_A_Composed_Pause()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1), patience: TimeSpan.FromHours(1));
+
+        Assert.Equal((null, false), gate.Snapshot());
+
+        var trouble = gate.WaitAsync(new IOException("network down"), CancellationToken.None);
+        gate.PauseByUser();
+
+        var (current, byUser) = gate.Snapshot();
+        Assert.True(byUser, "the operator's hold is standing and one read of the gate has to say so");
+        Assert.Equal(PauseSource.TransientError, current!.Source);   // ...even though the backoff owns Current
+        Assert.False(trouble.IsCompleted);   // released by the gate's Dispose
+    }
+
+    /// <summary>
     /// A downgrade ends the user's hold along with everything else — it is the run agreeing to suspend, not a
     /// pause any more. Inert while nothing could observe the flag; a trap the moment <c>IsPausedByUser</c> exists,
     /// because a suspended run would go on claiming to be paused.

@@ -104,6 +104,14 @@ public sealed class BackupRunState
     public bool PausedByUser => Control?.Gate.IsPausedByUser ?? false;
 
     /// <summary>
+    /// <see cref="Pause"/> and <see cref="PausedByUser"/> as of one instant. Use this wherever both are reported
+    /// together: read one after the other they come from two separate acquisitions of the gate's lock, and a
+    /// Pause or Resume landing in between yields a pair that was never true — see <see cref="PauseGate.Snapshot"/>
+    /// for what each mixture renders as. The two properties stay for callers that want only one of them.
+    /// </summary>
+    internal (PauseInfo? Pause, bool ByUser) PauseView => Control?.Gate.Snapshot() ?? (null, false);
+
+    /// <summary>
     /// Internal machinery, not part of the HTTP contract: the original exception on failure. Set alongside Error in
     /// RunCoreAsync's catch so TaskDispatcher can attach it as the InnerException when it rethrows — the container log
     /// therefore keeps the status code, request id and real stack that the Azure exception carries, instead of being
@@ -133,11 +141,16 @@ public sealed record BackupRunResponse(
     // Sibling of Pause, not a field on it — see BackupRunState.PausedByUser for why the two can disagree.
     bool PausedByUser = false)
 {
-    public static BackupRunResponse From(BackupRunState s) =>
-        new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
-            s.RunId, s.Pause, s.SuspendReason?.ToString(),
+    public static BackupRunResponse From(BackupRunState s)
+    {
+        // One read, not two: this response is the only place the two halves are published side by side, and the
+        // browser draws its pause label from the pair. See BackupRunState.PauseView.
+        var (pause, byUser) = s.PauseView;
+        return new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
+            s.RunId, pause, s.SuspendReason?.ToString(),
             s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
-            s.PausedByUser);
+            byUser);
+    }
 }
 
 /// <summary>
