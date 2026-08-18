@@ -1667,6 +1667,7 @@ public sealed class BackupOrchestrator(
             // PurgeInFlightAsync re-lists a container it has already emptied, and the journal is fsynced again with
             // nothing pending. Both are idempotent, so the outcome and the exception the user sees are unchanged;
             // the cost is one extra container listing on a path that is already winding down.
+            control?.Gate.Downgrade();   // see the catch below; RequestStop has usually done it already, and it repeats safely
             await SettleAsync(consumers);
             DrainQueues();
             if (control is { Stop: var stopped } && stopped != StopKind.None)
@@ -1680,6 +1681,19 @@ public sealed class BackupOrchestrator(
             // compression/uploads running outside the lock. Reached twice over on the paths that settle inside the
             // try above (a stop, or a consumer's fault surfacing from Task.WhenAll) — harmless, because both calls
             // are idempotent: SettleAsync on already-completed tasks and DrainQueues on drained channels do nothing.
+            //
+            // The gate comes down FIRST, and it is not tidiness: SettleAsync is an unbounded Task.WhenAll over
+            // loops that park at that gate, and a user pause holds it with no timer and no patience by design
+            // (PatienceExhausted answers no while the hold stands). So a fault out of the tail of this try — the
+            // progress sink, RecordUnreadableWarningsAsync, the diff itself — arriving while the operator has the
+            // run paused would wait here for as long as the pause lasts, with nothing able to end it: nothing on
+            // this path cancels the consumers' tokens, and the only other Downgrade caller is RequestStop, which
+            // the operator would have to reach for without being told why. The run would never return, so the busy
+            // lock would never come back and the process-wide staging quota would stay booked.
+            // Downgrading here says the true thing — this run is over and will never wait at that gate again —
+            // and leaves the parked loops to drain what is queued and exit, exactly as they do when a fault lands
+            // on a run nobody paused.
+            control?.Gate.Downgrade();
             await SettleAsync(consumers);
             DrainQueues();
             throw;

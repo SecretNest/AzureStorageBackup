@@ -147,7 +147,16 @@ public sealed class PauseGate : IDisposable
         }
     }
 
-    /// <summary>Downgrade: the user clicked Suspend, or patience ran out. Every waiter gets false.</summary>
+    /// <summary>
+    /// Downgrade: the user clicked Suspend, patience ran out, or the run is tearing down after a fault. Every
+    /// waiter gets false, and no later <see cref="PauseByUser"/> can close the gate again.
+    /// <para>
+    /// The third caller is the one worth naming, because it is not about pausing at all: the orchestrator's error
+    /// teardown waits for the producing loops to settle, and those loops park here. A user hold has no timer and
+    /// no patience, so without this the failed run would wait for a pause that only the operator can lift, holding
+    /// the busy lock and the process-wide staging quota the whole time.
+    /// </para>
+    /// </summary>
     public void Downgrade()
     {
         lock (_lock)
