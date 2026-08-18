@@ -293,6 +293,25 @@ public sealed class BackupOrchestrator(
         /// produce more entries from it. Handing the item to the next stage hands that share along with it.</summary>
         private int _outstanding = 1;
 
+        /// <summary>
+        /// Per hand-off channel: 0 = never parked, 1 = parked and the progress reading is held, 2 = picked up and the
+        /// reading has been given back for good.
+        /// <para>
+        /// Three states rather than a counter, because the column this feeds counts <b>items</b> while the channel
+        /// holds <b>entries</b>, and one item can have several entries queued at once — a pack pool splits into
+        /// groups and the compressor dispatches them one after another. So the reading is taken when the first entry
+        /// parks and given back when the first one is picked up: from that moment an uploader is working on this
+        /// item, which is the further-along of the two states and the one worth reporting. Counting entries instead
+        /// would subtract more items than exist and break
+        /// <c>processed + preparing + queued + waitingOnArchive + awaiting… + uploading ≡ total</c>.
+        /// </para>
+        /// <para>
+        /// Both transitions are compare-and-swap, which makes them idempotent — the drain can call Unpark on an entry
+        /// an uploader already took, and a write that fails can call it on one that never parked.
+        /// </para>
+        /// </summary>
+        private readonly int[] _parked = new int[Enum.GetValues<HandoffQueue>().Length];
+
         /// <summary>One more piece of this item is about to exist. Call it **before** the piece can be picked up by
         /// another thread, or the count can reach zero between the two and fire EndWork early.</summary>
         public void Take() => Interlocked.Increment(ref _outstanding);
@@ -301,6 +320,22 @@ public sealed class BackupOrchestrator(
         {
             if (Interlocked.Decrement(ref _outstanding) == 0)
                 tracker.EndWork();
+        }
+
+        /// <summary>This item now has an entry sitting in <paramref name="queue"/>. Call it **before** the write that
+        /// publishes the entry: park afterwards and the next stage can pick it up and unpark first, which leaves the
+        /// reading held for the rest of the run.</summary>
+        public void Park(HandoffQueue queue)
+        {
+            if (Interlocked.CompareExchange(ref _parked[(int)queue], 1, 0) == 0)
+                tracker.EnterHandoff(queue);
+        }
+
+        /// <summary>The next stage took an entry out, or the write never landed, or a drain discarded it.</summary>
+        public void Unpark(HandoffQueue queue)
+        {
+            if (Interlocked.CompareExchange(ref _parked[(int)queue], 2, 1) == 1)
+                tracker.LeaveHandoff(queue);
         }
     }
 
@@ -877,6 +912,7 @@ public sealed class BackupOrchestrator(
             StagedHandoff? handoff, WorkShare share, Func<CancellationToken, Task> run, CancellationToken token)
         {
             share.Take();
+            share.Park(HandoffQueue.Upload);   // before the write, for the reason spelled out on WorkShare.Park
             try
             {
                 await stagedQueue.Writer.WriteAsync(new PendingUpload(handoff, share, run), token);
@@ -884,6 +920,7 @@ public sealed class BackupOrchestrator(
             catch
             {
                 handoff?.Dispose();
+                share.Unpark(HandoffQueue.Upload);
                 share.Release();
                 throw;
             }
@@ -952,6 +989,10 @@ public sealed class BackupOrchestrator(
                                         throw;
                                     return;
                                 }
+                                // Park before the write, not after: the compressor can pick this entry up the
+                                // instant it lands, and unparking something that never parked leaves the reading
+                                // held for the rest of the run. See WorkShare.Park.
+                                share.Park(HandoffQueue.Compression);
                                 await probedQueue.Writer.WriteAsync(new ProbedItem(item, hit, share), feeding.Token);
                                 handed = true;
                             }, feeding.Token);
@@ -961,6 +1002,7 @@ public sealed class BackupOrchestrator(
                             // A pack has no pre-compression probe: its members were content-matched against the
                             // existing packs back on the diff side (see TryFindPackMember), and whatever is left has
                             // to be compressed before anything about it can be decided.
+                            share.Park(HandoffQueue.Compression);   // before the write, as above
                             await probedQueue.Writer.WriteAsync(
                                 new ProbedItem(item, Hit: null, share), feeding.Token);
                             handed = true;
@@ -969,8 +1011,13 @@ public sealed class BackupOrchestrator(
                     finally
                     {
                         // Handing the item on hands its share along with it; stopping here means putting it back.
+                        // The write is the only thing that can fail between parking and being handed on, and Unpark
+                        // is a no-op on an item that never parked, so one call covers both exits.
                         if (!handed)
+                        {
+                            share.Unpark(HandoffQueue.Compression);
                             share.Release();
+                        }
                     }
                 }
             }
@@ -1172,6 +1219,11 @@ public sealed class BackupOrchestrator(
             {
                 await foreach (var probed in probedQueue.Reader.ReadAllAsync(feeding.Token))
                 {
+                    // Out of the queue and into this stage's hands. First line of the body, so it covers the stop
+                    // branch below as well as the ordinary path — an entry that leaves here without unparking keeps
+                    // its reading for the rest of the run.
+                    probed.Share.Unpark(HandoffQueue.Compression);
+
                     // The same promise the single worker made at the top of its loop, kept one stage further down:
                     // work that has not started is not done after a stop. Before the split the prober's check was
                     // the only one needed, because taking an item and compressing it were the same act; now the
@@ -1242,6 +1294,11 @@ public sealed class BackupOrchestrator(
             {
                 await foreach (var entry in stagedQueue.Reader.ReadAllAsync(working.Token))
                 {
+                    // Out of the queue and into an uploader's hands — first line of the body, covering the stop
+                    // branch below too. From here this item reads as uploading rather than awaiting an uploader,
+                    // even if the compressor left further entries of it queued behind this one (see WorkShare).
+                    entry.Share.Unpark(HandoffQueue.Upload);
+
                     // "Finish the current item, then stop", now measured per queue entry: what an uploader has in
                     // hand runs to completion, what is still queued never starts. Discarding a queued entry costs
                     // the local CPU that compressed it and nothing else — not a byte of it reached the container —
@@ -1333,10 +1390,14 @@ public sealed class BackupOrchestrator(
             // across into stagedQueue behind a drain that has already passed it; it does not make an early call
             // safe, and there is no ordering that would.
             while (probedQueue.Reader.TryRead(out var probed))
+            {
+                probed.Share.Unpark(HandoffQueue.Compression);
                 probed.Share.Release();
+            }
             while (stagedQueue.Reader.TryRead(out var entry))
             {
                 entry.Handoff?.Dispose();
+                entry.Share.Unpark(HandoffQueue.Upload);
                 entry.Share.Release();
             }
         }

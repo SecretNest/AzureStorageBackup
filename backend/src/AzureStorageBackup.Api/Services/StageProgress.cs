@@ -31,6 +31,20 @@ public enum UploadWait
 }
 
 /// <summary>
+/// The two channels the upload run hands work across (prober → compressor → uploaders). An item parked in one of them
+/// is claimed but idle: no thread is doing anything to it, it is waiting for the next stage to have room.
+/// </summary>
+public enum HandoffQueue
+{
+    /// <summary>Probed, waiting for the single compressor (<c>probedQueue</c>).</summary>
+    Compression,
+
+    /// <summary>Compressed — or a dedup/resume hit, or a raw in-place item, none of which own an archive at all —
+    /// waiting for an uploader (<c>stagedQueue</c>).</summary>
+    Upload,
+}
+
+/// <summary>
 /// What a stage is currently doing. Backup/restore/check share one shape; only the stage names differ.
 /// <para>
 /// Why it exists: before this, the UI reported a stage exactly once, when it was **entered**. Diffing on a first backup
@@ -160,7 +174,7 @@ public sealed record StageProgress(
     /// </para>
     /// <para>
     /// The item-count identity therefore gains a term:
-    /// <c>Processed + Preparing + Queued + WaitingOnArchive + Uploading ≡ Total</c>.
+    /// <c>Processed + Preparing + Queued + WaitingOnArchive + AwaitingCompression + AwaitingUpload + Uploading ≡ Total</c>.
     /// </para>
     /// </summary>
     int WaitingOnArchive = 0,
@@ -173,13 +187,47 @@ public sealed record StageProgress(
     /// this archive gets **thrown away whole and repacked**, with not one byte transferred. Calling that "ready to upload" is overpromising.
     /// </para>
     /// </summary>
-    long CheckingBytes = 0)
+    long CheckingBytes = 0,
+    /// <summary>
+    /// Items probed and parked in the hand-off channel waiting for the single compressor
+    /// (<see cref="HandoffQueue.Compression"/>). Claimed, but nothing is being done to them.
+    /// <para>
+    /// Its own column because it is neither of its neighbours. <see cref="Queued"/> means "nobody has picked this up",
+    /// which is no longer true — the prober read it and settled its content identity. <see cref="WaitingOnArchive"/>
+    /// means "inside the staging area, queued on the global compression lock", which is also not it: an item here has
+    /// not reached the staging area, because the compressor is one worker and processes one item at a time.
+    /// Folded into <see cref="Uploading"/> (as it used to be) it becomes the UI's "N objects starting upload" — a
+    /// number that climbs to the channel's ceiling and never comes down, describing items that are not uploading and
+    /// not starting.
+    /// </para>
+    /// </summary>
+    int AwaitingCompression = 0,
+    /// <summary>
+    /// Items parked in the hand-off channel waiting for an uploader (<see cref="HandoffQueue.Upload"/>): compressed,
+    /// or a dedup/resume hit, or a raw in-place item.
+    /// <para>
+    /// This one has no ceiling to climb to. That channel is deliberately unbounded — what owns an archive is already
+    /// bounded in bytes by the staging pool, which is the limit the operator configured — but the three entry kinds
+    /// listed above own no archive and so are bounded by nothing. On a store-only workload (the media library the
+    /// DontCompress rule exists for) the compressor's only limiter is disk read speed, so it can queue the whole
+    /// dataset while the uploaders trickle. Every one of those items used to be reported as "starting upload".
+    /// </para>
+    /// </summary>
+    int AwaitingUpload = 0)
 {
     /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
     {
         UploadWait.Peer => WaitingOnPeer,
         UploadWait.Slot => WaitingOnSlot,
+        _ => 0,
+    };
+
+    /// <summary>How many items are parked in one particular hand-off channel.</summary>
+    public int Awaiting(HandoffQueue queue) => queue switch
+    {
+        HandoffQueue.Compression => AwaitingCompression,
+        HandoffQueue.Upload => AwaitingUpload,
         _ => 0,
     };
 
@@ -304,6 +352,9 @@ public sealed class StageTracker(
     // Current occupancy of each wait phase, indexed by the UploadWait ordinal. An array rather than one field per phase: callers index by the enum,
     // so adding a wait phase takes only one more enum member and the publish end needs no extra line per phase.
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
+    // Items parked in each hand-off channel, indexed by the HandoffQueue ordinal. Same array-per-enum shape as _waits,
+    // and for the same reason: the caller indexes by the enum, so a third channel would cost one enum member.
+    private readonly int[] _handoffs = new int[Enum.GetValues<HandoffQueue>().Length];
     // The "workload" used for remaining time. A different thing from _bytes: the latter is bytes that actually crossed the wire (post-compression, 0 on a dedup hit),
     // and using it as completion makes the remaining time jump around with the compression ratio and the dedup hit rate. When no stage declares a workload (0),
     // remaining time falls back to extrapolating from item counts.
@@ -549,6 +600,26 @@ public sealed class StageTracker(
     public void BeginStaging() => Interlocked.Increment(ref _inStaging);
 
     public void EndStaging() => Interlocked.Decrement(ref _inStaging);
+
+    /// <summary>
+    /// An item is parked in one of the pipeline's hand-off channels (pair it with <see cref="LeaveHandoff"/>).
+    /// Call it <b>before</b> the write that publishes the entry, so the next stage cannot pick it up and leave
+    /// before this side has entered it — the count would go negative for the moment in between and clamp to 0,
+    /// which on screen is this column flickering.
+    /// <para>
+    /// <b>No forced publish</b>, unlike <see cref="BeginWait"/> and <see cref="BeginChecking"/>. Those two fire once
+    /// per item at most and mark a stretch nothing else reports; these fire on every single entry crossing every
+    /// channel, which at the 500,000-item scale this repo measures is the densest event in the run. The column does
+    /// not need the immediacy either: while a queue has depth the stage in front of it is working and publishing
+    /// on its own, and when the whole run really is idle the throttle window is 200ms.
+    /// </para>
+    /// </summary>
+    public void EnterHandoff(HandoffQueue queue) => Interlocked.Increment(ref _handoffs[(int)queue]);
+
+    /// <summary>The next stage has taken the item out (or a drain discarded it). Must answer every
+    /// <see cref="EnterHandoff"/> exactly once — miss one and this column carries an entry that never goes away for
+    /// the rest of the run, with <see cref="StageProgress.Uploading"/> under-reporting by the same amount.</summary>
+    public void LeaveHandoff(HandoffQueue queue) => Interlocked.Decrement(ref _handoffs[(int)queue]);
 
     /// <summary>The compression lock is taken and volume files really start being produced (pair it with <see cref="EndPacking"/>).
     /// The UI's "N preparing" in the upload stage counts only this, so by definition of the lock it is always 0 or 1; restore/verify
@@ -894,6 +965,10 @@ public sealed class StageTracker(
         // with two backups running concurrently that lock can be in someone else's hands the whole time, and queued cannot say that (see WaitingOnArchive).
         var waitingOnArchive = Math.Max(0, Volatile.Read(ref _inStaging) - preparing);
         var queued = Math.Max(0, Volatile.Read(ref _enqueued) - _processed - inWork);
+        // Claimed but idle in a hand-off channel: no thread is doing anything to them, they are waiting for the next
+        // stage to have room. They come out of the uploading subtraction below — see StageProgress.AwaitingCompression.
+        var awaitingCompression = Math.Max(0, Volatile.Read(ref _handoffs[(int)HandoffQueue.Compression]));
+        var awaitingUpload = Math.Max(0, Volatile.Read(ref _handoffs[(int)HandoffQueue.Upload]));
 
         // In-flight snapshot. Each stream's sent bytes are updated concurrently, so what we take here are readings from a single instant,
         // and the subtraction below uses the same batch of values — reading twice would occasionally make "staged" compute a negative that gets clamped back to 0, which on screen is a jump.
@@ -913,20 +988,28 @@ public sealed class StageTracker(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
             Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(), staged,
             Volatile.Read(ref _transferTotal), Interlocked.Read(ref _spilled),
-            // Items that have left the compression/staging phase = items in hand - items still in staging.
+            // Items that have left the compression/staging phase = items in hand - items still in staging - items
+            // parked in a hand-off channel.
             //
             // Deliberately **not** _inUpload (the BeginUpload/EndUpload pair): that only starts counting at UploadStagedBlobAsync,
             // and between the end of packing and getting there lies the reservation coordination — an item can stall there for minutes
             // while not being in _inUpload. Use that as the unit and the item ledger fails to balance exactly when balancing matters most,
             // and a ledger that does not balance is the very reason this column exists. This subtraction folds that gap in as well, so
-            // processed + preparing + queued + waitingOnArchive + uploading ≡ total is an identity,
-            // independent of any call site.
-            Math.Max(0, inWork - Volatile.Read(ref _inStaging)),
+            // processed + preparing + queued + waitingOnArchive + awaitingCompression + awaitingUpload + uploading ≡ total
+            // is an identity, independent of any call site.
+            //
+            // The two hand-off terms are what the subtraction was missing. It was written when one worker owned an item end to end,
+            // where "in hand and not in staging" did mean "past compression, on its way to the wire". Splitting the run into
+            // prober → compressor → uploaders added two states that satisfy the same subtraction while being neither, and folding them
+            // in here is what put "24 objects starting upload" on screen, climbing all run with nothing on the wire.
+            Math.Max(0, inWork - Volatile.Read(ref _inStaging) - awaitingCompression - awaitingUpload),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
             Math.Max(0, Volatile.Read(ref _inChecking)),
             waitingOnArchive,
-            checkingBytes));
+            checkingBytes,
+            awaitingCompression,
+            awaitingUpload));
     }
 
     /// <summary>

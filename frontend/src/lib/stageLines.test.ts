@@ -32,6 +32,8 @@ function progress(over: Partial<StageProgress> = {}): StageProgress {
     waitingOnPeer: 0,
     waitingOnSlot: 0,
     checking: 0,
+    awaitingCompression: 0,
+    awaitingUpload: 0,
     ...over,
   }
 }
@@ -56,10 +58,12 @@ describe('stageLines', () => {
         waitingOnPeer: 2,
         waitingOnSlot: 3,
         stagedBytes: 2_800_000_000,
+        awaitingUpload: 9,
         checking: 1,
         checkingBytes: 100_000_000,
         preparing: 1,
         waitingOnArchive: 4,
+        awaitingCompression: 128,
         queued: 4_365,
         spilledItems: 12,
       }),
@@ -70,14 +74,47 @@ describe('stageLines', () => {
       '2 volumes uploading',
       '2 objects waiting on the same content elsewhere',
       '3 volumes waiting for an upload slot',
+      // The two hand-off queues bracket the compression stretch, one on each side: waiting for an uploader sits
+      // just past "ready to upload" (the bytes those very items are holding), waiting for the compressor sits
+      // just before "queued" (probed, but the single compressor has not got to them).
+      '9 objects waiting for an uploader',
       '2.6 GB ready to upload',
       '1 object checking files',
       '95.4 MB being checked',
       '1 object preparing',
       '4 objects waiting for the archive slot',
+      '128 objects waiting for the compressor',
       '4,365 objects queued',
       '12 objects buffered to disk',
     ])
+  })
+
+  /**
+   * The reported symptom, reproduced. An operator saw
+   * `+66.8 MB on the cloud · nothing on the wire right now · 24 objects starting upload · 66.8 MB ready to
+   * upload · 1 object preparing`, with that 24 climbing all run and never coming back down.
+   *
+   * Those items were parked in the hand-off channel waiting for an uploader — claimed, nothing being done to
+   * them. The backend folded them into `uploading`, and everything in `uploading` that cannot say what it is
+   * waiting on gets reported as "starting upload", so a queue depth was rendered as a stalled upload. The fix is
+   * on the backend (they no longer count as uploading); what this test pins is that the line now names the queue
+   * they are actually in, and that "starting upload" is gone once the tier is empty.
+   */
+  test('a hand-off queue does not read as a stalled upload', () => {
+    const { pipeline } = stageLines(
+      progress({
+        unfinishedItemBytes: 66_800_000,
+        awaitingUpload: 24,
+        stagedBytes: 66_800_000,
+        preparing: 1,
+      }),
+    )
+
+    expect(pipeline).toBe(
+      '+63.7 MB on the cloud · nothing on the wire right now · ' +
+        '24 objects waiting for an uploader · 63.7 MB ready to upload · 1 object preparing',
+    )
+    expect(pipeline).not.toContain('starting upload')
   })
 
   /** Empty segments disappear entirely — no "0 objects queued" noise. */

@@ -137,6 +137,17 @@ export function stageLines(detail: StageProgress) {
     detail.waitingOnSlot > 0 &&
       `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
+    // Claimed, compressed (or needing no compression at all), and parked in the hand-off channel waiting for an
+    // uploader to come free. Not "starting upload": nothing is being done to these, and the distinction is the
+    // whole point of the entry — folded into the tier above, this was a number that climbed all run and never
+    // came back down, describing items that were neither starting nor uploading.
+    //
+    // Unbounded by construction, so it can reach five figures. The channel is deliberately not depth-limited —
+    // whatever owns an archive is already bounded in bytes by the staging pool, which is the limit the operator
+    // set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a store-only workload the
+    // compressor can queue the whole dataset here while the uploaders trickle. A big number is the pipeline
+    // working as designed; what it tells the operator is that the bottleneck is the wire, not the CPU.
+    detail.awaitingUpload > 0 && `${withUnit(detail.awaitingUpload, unit)} waiting for an uploader`,
     // Directly after starting upload: these bytes are the output those items have already checked and
     // are holding, ready to go. "ready to upload" is now accurate — the part still in checking was split
     // into the entry below and no longer mixes in. It used to report both together, so "compressed" was
@@ -160,6 +171,12 @@ export function stageLines(detail: StageProgress) {
     // is moving; preparing=0 with this non-zero means another run holds it, and you can go stop that one.
     detail.waitingOnArchive > 0 &&
       `${withUnit(detail.waitingOnArchive, unit)} waiting for the archive slot`,
+    // One stage earlier than the archive slot, and not the same wait. These have been probed — their content
+    // identity is settled — but they have not reached the staging area at all, because the compressor is a single
+    // worker and takes one item at a time. Capped at the channel's depth (128), so unlike its counterpart above
+    // this one plateaus; sitting at the cap all run means compression is the bottleneck.
+    detail.awaitingCompression > 0 &&
+      `${withUnit(detail.awaitingCompression, unit)} waiting for the compressor`,
     detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
     downloading && detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
     // The diff decides orders of magnitude faster than compression and upload can consume, so running

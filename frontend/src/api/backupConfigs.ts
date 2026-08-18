@@ -248,10 +248,22 @@ export interface StageProgress {
   // either have volumes in flight or are stuck in one of the three tiers below.
   // A different basis from activeItems — that holds **volumes**, and one item can have several in flight
   // or none at all.
-  // processed + preparing + queued + uploading ≡ total is an identity, and the numbers on screen have to
-  // add up to it. They did not: an item stuck in this stretch was counted by nothing, and could only be
-  // found by lining up several screenshots and doing subtraction.
+  // processed + preparing + queued + waitingOnArchive + awaitingCompression + awaitingUpload + uploading
+  // ≡ total is an identity, and the numbers on screen have to add up to it. They did not: an item stuck
+  // in this stretch was counted by nothing, and could only be found by lining up several screenshots and
+  // doing subtraction.
   uploading: number
+  // Claimed but idle in one of the pipeline's two hand-off channels: nothing is being done to them, they
+  // are waiting for the next stage to have room. The run is prober → compressor → uploaders, and each
+  // arrow is a channel.
+  //
+  // They used to be folded into uploading, which is where "N objects starting upload" came from — a
+  // number that climbed all run and never came back down while nothing was on the wire. Neither queue is
+  // small: probedQueue holds 128, and stagedQueue is unbounded for the entry kinds that own no archive
+  // (a dedup hit, a resume hit, a raw in-place item), so a store-only workload can queue the whole
+  // dataset in it while the uploaders trickle.
+  awaitingCompression: number // Probed, waiting for the single compressor
+  awaitingUpload: number // Compressed (or needing no compression at all), waiting for an uploader
   waitingOnPeer: number // Of those, items waiting for the first uploader of identical content to finish
   waitingOnSlot: number // Of those, **volumes** queuing on the global upload gate (the gate queues per volume, a different unit from waitingOnPeer)
   // Of those, items doing disk checking: pushing no bytes and waiting on nothing. A single file's dedup

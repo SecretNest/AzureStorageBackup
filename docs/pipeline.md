@@ -46,9 +46,15 @@ steady state. That line is not a warning — it is the evidence that the configu
 
 ## The queues
 
+Both depths are on screen, as `N objects waiting for the compressor` and `N objects waiting for an
+uploader`, and each carries its own term in the item ledger — see
+[progress-display.md](progress-display.md). Which of the two is deep says which stage is the
+bottleneck, so keeping them apart is worth a term each.
+
 **`stagedQueue` has no depth limit of its own.** Its depth is bounded in bytes by the staging pool,
 which is the bound the operator configured; a second item-count bound would fire before the one they
-set.
+set. Three entry kinds escape even that, owning no archive at all — a dedup hit, a resume hit, a raw
+in-place item — so on a store-only workload this queue can hold the whole dataset.
 
 **`probedQueue` is bounded at 128 entries**, `FullMode.Wait`.
 

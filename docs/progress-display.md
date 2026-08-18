@@ -74,7 +74,8 @@ measured, the count read 75% while the bytes were at 31%. Only when the byte tot
 ## The item ledger
 
 ```
-processed + preparing + queued + waitingOnArchive + uploading ≡ total
+processed + preparing + queued + waitingOnArchive
+    + awaitingCompression + awaitingUpload + uploading ≡ total
 ```
 
 **This identity is the skeleton of the design, not decoration.** If it holds, every item at every
@@ -88,9 +89,12 @@ doing subtraction. That trap has been stepped in twice.
 | `preparing` | items | holding the **global compression lock**. One lock, so always 0 or 1 |
 | `waitingOnArchive` | items | picked up by a worker, queuing behind that same lock |
 | `queued` | items | still in the queue, not picked up |
+| `awaitingCompression` | items | probed, parked in `probedQueue` waiting for the single compressor |
+| `awaitingUpload` | items | past compression, parked in `stagedQueue` waiting for an uploader |
 | `uploading` | items | everything past staging: in flight, waiting on a resource, or checking |
 
-`uploading` is `inWork - inStaging` and deliberately **not** a `BeginUpload`/`EndUpload` pair.
+`uploading` is `inWork - inStaging - awaitingCompression - awaitingUpload`, and deliberately **not** a
+`BeginUpload`/`EndUpload` pair.
 
 > **Rationale.** The pair only starts counting at the upload call, while the stretch between
 > "compressed" and there still contains checking and reservation coordination — an item can sit there
@@ -98,11 +102,45 @@ doing subtraction. That trap has been stepped in twice.
 > ledger that fails there is the whole reason the term exists. The subtraction folds that gap in, so
 > the identity does not depend on any call site.
 
-> **A term that reads wider than it used to.** `inStaging` is only incremented once staging is
-> entered, so an item that has been probed and is sitting in the first queue — nothing about it
-> compressed yet — counts in `uploading` too. Before the pipeline was split into three stages there
-> was nowhere for an item to be in-hand-but-not-in-staging, so the two readings coincided; now they
-> do not. The identity is unaffected, because the term is still exactly "in hand, not in staging".
+### The two hand-off queues
+
+The run is `prober → compressor → uploaders`, and each arrow is a channel. An item parked in one is
+**claimed but idle** — no thread is doing anything to it, it is waiting for the next stage to have
+room — so each channel gets its own term rather than being folded into a neighbour.
+
+| Queue | Term | Depth | What a large reading means |
+|---|---|---|---|
+| `probedQueue` | `awaitingCompression` | bounded, 128 | compression is the bottleneck |
+| `stagedQueue` | `awaitingUpload` | unbounded | the wire is the bottleneck |
+
+`stagedQueue` has no depth limit because whatever owns an archive is already bounded in bytes by the
+staging pool, which is the limit the operator set. Three entry kinds own no archive — a dedup hit, a
+resume hit, a raw in-place item — and those are bounded by nothing, so on a store-only workload the
+compressor can queue the whole dataset while the uploaders trickle. A five-figure reading here is the
+pipeline working as designed.
+
+> **Rationale.** Neither term is its neighbour. `queued` means "nobody has picked this up", which is
+> false for a probed item — the prober read it and settled its content identity. `waitingOnArchive`
+> means "inside the staging area, queued on the global compression lock", which is also not it: an
+> item awaiting compression has not reached the staging area, because the compressor is one worker
+> and takes one item at a time.
+>
+> Folded into `uploading` (as they were, when `uploading` was plain `inWork - inStaging`) they become
+> the display's "starting upload", since that tier is whatever in `uploading` cannot say what it is
+> waiting on. The identity still balanced — the entries were banked, just in the wrong term — so the
+> only visible symptom was on screen: `24 objects starting upload` climbing all run and never coming
+> back down, with nothing on the wire. Balancing is therefore necessary but not sufficient, and the
+> integration case that pins the identity also pins that parked entries are counted as parked.
+>
+> The subtraction was correct when it was written: one worker owned an item end to end, so
+> "in hand and not in staging" did mean "past compression, on its way to the wire". Splitting the run
+> into three stages added two states that satisfy the same subtraction while being neither.
+
+Counting is per **item** while a channel holds **entries**, and one item can have several entries
+queued at once — a pack pool splits into groups and the compressor dispatches them one after another.
+So `WorkShare` takes the reading when the item's first entry parks and gives it back when the first
+one is picked up: from that moment an uploader is working on the item, which is the further-along of
+the two states. Counting entries would subtract more items than exist and break the identity.
 
 ### Subdividing `uploading`
 
@@ -310,10 +348,15 @@ The second line runs **backwards along the timeline**, with counts and bytes int
 each belongs to. An item's forward order is:
 
 ```
-queued → waiting for the archive slot → preparing → [archive lands on disk]
-       → checking files → ready to upload → starting upload
+queued → waiting for the compressor → waiting for the archive slot → preparing
+       → [archive lands on disk] → checking files → ready to upload
+       → waiting for an uploader → starting upload
        → waiting on peer/slot → uploading → on the cloud → settled (first line)
 ```
+
+The two hand-off queues bracket the compression stretch, one on each side, and each sits next to the
+bytes it explains: `waiting for an uploader` follows `ready to upload` because those are the very
+bytes those items are holding.
 
 > **Why they must be interleaved.** With counts on one line and bytes on another, each was ordered by
 > its own logic and nothing on screen placed `+2.0 GB on the cloud` next to `100 MB ready to upload`.

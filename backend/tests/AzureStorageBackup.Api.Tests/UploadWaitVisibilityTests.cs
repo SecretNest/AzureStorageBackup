@@ -236,4 +236,96 @@ public sealed class UploadWaitVisibilityTests
         tracker.Complete();
         Assert.Equal(0, seen[^1].Waiting(UploadWait.Slot));
     }
+
+    /// <summary>
+    /// An item parked in one of the pipeline's hand-off queues has not entered the upload leg, and must not be
+    /// reported as if it had.
+    /// <para>
+    /// <c>uploading = items in hand − items in staging</c> was written when one worker owned an item end to end:
+    /// back then "in hand and not in staging" really did mean "past compression, on its way to the wire". Splitting
+    /// the run into prober → compressor → uploaders added two states that satisfy the same subtraction while being
+    /// neither: parked in <c>probedQueue</c> waiting for the single compressor, and parked in <c>stagedQueue</c>
+    /// waiting for an uploader. The latter queue is unbounded for entries that own no archive — a dedup hit, a
+    /// resume hit, a raw in-place item — so on a store-only workload the compressor can pile the whole dataset into
+    /// it while the uploaders trickle.
+    /// </para>
+    /// <para>
+    /// What that looked like on screen: <c>24 objects starting upload</c> climbing all run and never coming back
+    /// down, while not one byte was on the wire. They are not starting upload; they are queued behind a stage.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Items_Parked_In_A_Handoff_Queue_Are_Not_Counted_As_Entering_Upload()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 4, seen.Add, speedWhileInFlight: true);
+        for (var i = 0; i < 4; i++)
+            tracker.Enqueue();
+
+        // Two probed and parked waiting for the compressor.
+        tracker.BeginWork();
+        tracker.EnterHandoff(HandoffQueue.Compression);
+        tracker.BeginWork();
+        tracker.EnterHandoff(HandoffQueue.Compression);
+
+        // One compressed (or a dedup hit that owns no archive) and parked waiting for an uploader.
+        tracker.BeginWork();
+        tracker.EnterHandoff(HandoffQueue.Upload);
+
+        // One genuinely in the upload leg: out of staging, no volume on the wire yet.
+        tracker.BeginWork();
+        tracker.BeginStaging();
+        tracker.EndStaging();
+        tracker.BeginUpload("data/x");
+
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(2, s.AwaitingCompression);
+        Assert.Equal(1, s.AwaitingUpload);
+        Assert.Equal(1, s.Uploading);   // ← used to be 4: the three parked items were folded in here
+        Assert.Equal(
+            4,
+            s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive
+                + s.AwaitingCompression + s.AwaitingUpload + s.Uploading);
+    }
+
+    /// <summary>
+    /// Leaving a hand-off queue must bring the column back down — the whole complaint was a number that only ever
+    /// grew. Over-releasing clamps at zero rather than showing a negative, the same defence
+    /// <see cref="Checking_Never_Goes_Negative_Or_Sticks_High"/> covers for its own column.
+    /// <para>
+    /// The clock is driven by hand because entering a hand-off queue deliberately does <b>not</b> force a publish
+    /// (see <see cref="StageTracker.EnterHandoff"/>: it is the densest event in the run). So the reading only becomes
+    /// visible on the next publish past the throttle window, and stepping the clock is how the test reaches it
+    /// without sleeping.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(HandoffQueue.Compression)]
+    [InlineData(HandoffQueue.Upload)]
+    public void Leaving_A_Handoff_Queue_Releases_The_Item(HandoffQueue queue)
+    {
+        var seen = new List<StageProgress>();
+        var now = 0L;
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.Enqueue();
+        tracker.BeginWork();
+        tracker.EnterHandoff(queue);
+        now += 1_000;
+        tracker.Touch(null);   // any publish past the throttle window will do
+        Assert.Equal(1, seen[^1].Awaiting(queue));
+        Assert.Equal(0, seen[^1].Uploading);
+
+        tracker.LeaveHandoff(queue);
+        tracker.LeaveHandoff(queue);   // one release too many: clamp, do not show a negative
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].Awaiting(queue));
+        Assert.Equal(1, seen[^1].Uploading);
+    }
 }

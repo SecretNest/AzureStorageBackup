@@ -410,13 +410,22 @@ public sealed class CompressionContinuityTests : IDisposable
 
     /// <summary>
     /// The identity the operator uses to judge "did work vanish": processed + preparing + queued +
-    /// waitingOnArchive + uploading == total. Entries parked in either queue fall under `uploading`
-    /// (inWork - inStaging), so the sum must not drift while both queues are full.
+    /// waitingOnArchive + awaitingCompression + awaitingUpload + uploading == total. The sum must not
+    /// drift while both hand-off queues are full.
     /// <para>
     /// The staging limit is deliberately the same small one the limit test uses, and the wait is on
     /// waitingOnArchive rather than on the pool size: with a roomy limit that term stays 0 for the
-    /// whole run, and the identity would be checked with one of its five terms never exercised —
+    /// whole run, and the identity would be checked with one of its terms never exercised —
     /// which is exactly the term this pipeline rework introduced a way to hold non-zero.
+    /// </para>
+    /// <para>
+    /// The two awaiting terms are the ones this case was originally written without, and their absence is
+    /// what let the reported bug through: entries parked in either queue used to fall under `uploading`
+    /// (inWork - inStaging), the identity balanced anyway because that is where they were being counted,
+    /// and the screen reported a queue depth as <c>N objects starting upload</c> — a number that climbed
+    /// all run with nothing on the wire. So balancing is no longer sufficient on its own; the case also
+    /// pins that parked entries are counted as parked. A blocked uploader is what makes that observable:
+    /// it fills stagedQueue while the pool ceiling holds the compressor, so both queues carry depth.
     /// </para>
     /// </summary>
     [SkippableFact]
@@ -461,7 +470,12 @@ public sealed class CompressionContinuityTests : IDisposable
                 foreach (var s in settled)
                     Assert.Equal(
                         s.Total,
-                        s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive + s.Uploading);
+                        s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive
+                            + s.AwaitingCompression + s.AwaitingUpload + s.Uploading);
+
+                // Balancing alone is what the broken version did too — it simply banked the parked entries in
+                // the wrong term. With the uploads blocked, entries must actually show up as parked.
+                Assert.Contains(settled, s => s.AwaitingCompression + s.AwaitingUpload > 0);
             }
             finally
             {
