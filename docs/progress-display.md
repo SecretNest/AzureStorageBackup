@@ -169,9 +169,12 @@ motionless `1 object starting upload` for minutes — neither starting nor uploa
 > it, and the screen could no longer tell compressing from reading.
 
 > **Why it publishes unthrottled.** During these stretches the caller produces no events at all, so a
-> publish swallowed by the 200 ms throttle gets no later compensation — the screen would stay frozen
-> until the stretch ends, and the whole point would be lost. The cost is negligible: registration
-> happens per item, not per volume.
+> publish swallowed by the 200 ms throttle gets no later compensation from the caller. The heartbeat
+> now covers the stretch (it runs on work in hand, not on a stream being open), so this is no longer
+> the only thing standing between the operator and a frozen line — but it still buys immediacy the
+> timer cannot: entering the stretch shows up at once instead of up to a second later, which is what
+> makes a short check distinguishable from a stall. The cost is negligible: registration happens per
+> item, not per volume.
 
 **All four sites must pair in `try/finally`.** One missed pairing leaves that column stuck at an
 inflated number for the rest of the run — which is exactly how `BeginPacking` was caught out once in
@@ -305,12 +308,34 @@ Mutating the active set and toggling the clock happen inside the same critical s
 speed does not decay to zero during a silence — it holds "the speed during the most recent stretch of
 uploading". The `nothing on the wire right now` beside it already states that nothing is moving.
 
-**The heartbeat**: a stall produces no events, so a 1-second timer runs **only during active
-stretches** and does one publish. Two guards are not optional — the callback first checks whether the
-stage is complete (a finished stage must not get a late extra snapshot, and disposal cannot recall an
-already-queued callback), and it wraps in `try/catch`, because it runs on a thread-pool timer thread
-where no caller can catch anything and an escaping exception takes down the process by default.
-Progress reporting has no business bringing down a running backup.
+**The heartbeat**: a stall produces no events, so a 1-second timer does one publish. It runs **while
+the stage holds work** — not merely while a stream is open. Two guards are not optional — the callback
+first checks whether the stage is complete (a finished stage must not get a late extra snapshot, and
+disposal cannot recall an already-queued callback), and it wraps in `try/catch`, because it runs on a
+thread-pool timer thread where no caller can catch anything and an escaping exception takes down the
+process by default. Progress reporting has no business bringing down a running backup.
+
+> **Why work in hand, not a stream on the wire.** The two are not the same, and the gap is not small:
+> a dedup hit, a resume hit and a raw in-place item all settle without a byte going over the wire, so
+> a run whose remaining work is mostly hits can spend hours holding dozens of items with nothing in
+> flight. Gated on the stream, the stage published nothing for that whole stretch and the UI went on
+> displaying the snapshot taken the instant the last volume finished — its queue depths, its byte
+> columns, its `nothing on the wire right now`, every one of them a photograph. Measured in the field
+> as `+66.8 MB on the cloud · 24 objects starting upload` motionless for hours, disappearing whenever
+> a transfer started (a live snapshot finally replaced it) and returning to identical figures when
+> that transfer ended.
+>
+> The premise it rested on was that pure compression has nothing new to report. That was true of a
+> much smaller record; `preparing`, the staged and checking byte columns and every queue depth all
+> move throughout compression. A frozen line reads as a hang, and hides one.
+
+**A frozen clock skips the sample, not the publish.** Every sample taken while the virtual clock is
+stopped carries the same timestamp, so time-based eviction can never remove it: the queue would fill
+with duplicates until the `MaxSamples` backstop began dropping from the head, and the first ones
+dropped are exactly the pre-freeze samples carrying a real span — collapsing the reading from "the
+last speed seen on the wire" to 0. The sample says nothing anyway, since the byte total cannot move
+with no stream open. Skipping it is what lets the heartbeat keep publishing through a freeze without
+corrupting the window.
 
 The virtual clock applies to Uploading, Restoring and Verifying — the three stages that genuinely
 report as they transfer. Everything else leaves it off, or the clock would sit at 0 forever and the

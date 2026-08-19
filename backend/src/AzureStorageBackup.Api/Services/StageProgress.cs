@@ -511,11 +511,27 @@ public sealed class StageTracker(
         Interlocked.Increment(ref _inWork);
         // The first item being picked up = this stage really started working; the average speed is measured from here.
         Interlocked.CompareExchange(ref _workStartMs, NowMs(), -1);
+        // Work in hand is enough to keep the heartbeat running — it must not wait for a stream to open. The stretches
+        // that settle without transferring a byte (a dedup hit, a resume hit, a raw in-place item) would otherwise
+        // leave the stage publishing nothing at all, and the UI displaying the snapshot from the last volume that
+        // did transfer. See Tick().
+        lock (_gate)
+            Heartbeat(on: true);
     }
 
     /// <summary>A worker thread finished an item (call it on both success and failure). Like <see cref="Advance"/>, it **does not count** —
     /// slot counting belongs to Advance alone, and bumping the progress bar here on the side would push it past 100%.</summary>
-    public void EndWork() => Interlocked.Decrement(ref _inWork);
+    public void EndWork()
+    {
+        // Nothing in hand and nothing on the wire: stop the timer rather than let it publish identical snapshots
+        // forever. Both halves are required — an item can finish while other volumes are still transferring, and a
+        // stream can close while the stage still holds plenty of work. Complete()/Dispose() are not enough on their
+        // own: between the last item and the wrap-up a stage can idle for a long time waiting on the diff.
+        if (Interlocked.Decrement(ref _inWork) == 0)
+            lock (_gate)
+                if (_active.IsEmpty)
+                    Heartbeat(on: false);
+    }
 
     /// <summary>
     /// A family of volumes starts uploading (pair it with <see cref="EndUpload"/>). Again, it **does not count**.
@@ -811,7 +827,11 @@ public sealed class StageTracker(
                 {
                     _activeMs += NowMs() - _activeSince;
                     _activeSince = -1;
-                    Heartbeat(on: false);
+                    // The speed clock stops here regardless; the heartbeat only stops if the stage has nothing left
+                    // in hand either. Closing the last stream is precisely when the old code went silent, and the
+                    // snapshot it went silent on is the one that stayed on screen — see Tick().
+                    if (Volatile.Read(ref _inWork) == 0)
+                        Heartbeat(on: false);
                 }
             }
             _bytes += bytes;
@@ -830,10 +850,23 @@ public sealed class StageTracker(
             // has long since let go — without this guard another snapshot would appear after the final one, breaking the promise that "the last one is the real final state".
             if (_completed)
                 return;
-            // Not a single stream is open: this time does not enter the denominator anyway, and there is nothing new to report.
-            // This is a different matter from the one above: even when the stage has not wrapped up, samples must not go in while the virtual clock is frozen —
-            // frozen samples all carry the same timestamp and can never be squeezed out of the _samples window.
-            if (speedWhileInFlight && _activeSince < 0)
+            // Nothing on the wire **and** nothing in hand: there is genuinely nothing to say, so do not keep a timer
+            // publishing identical snapshots at a stage that is only waiting to be handed its first item.
+            //
+            // With work in hand this must go through, and that is the whole point of the condition. "No stream open"
+            // is not the same as "nothing happening": a dedup hit, a resume hit and a raw in-place item all settle
+            // without a byte going over the wire, so a run whose remaining work is mostly hits can spend hours here.
+            // Bailing out unconditionally — as this used to — stopped the stage publishing altogether for that whole
+            // stretch, and the UI went on displaying the snapshot taken the instant the last volume finished:
+            // its queue depths, its byte columns, its "nothing on the wire", all of them a photograph. Measured in
+            // the field as `+66.8 MB on the cloud · 24 objects starting upload` motionless for hours, disappearing
+            // whenever a transfer started (a live snapshot finally replaced it) and returning to the identical
+            // figures when that transfer ended. A frozen line reads as a hang, and hides one.
+            //
+            // The reason the bail-out existed is real, and it moved rather than disappeared: samples must not enter
+            // the speed window while the virtual clock is frozen. PublishIfDue now skips the sample instead — see
+            // there.
+            if (speedWhileInFlight && _activeSince < 0 && Volatile.Read(ref _inWork) == 0)
                 return;
             PublishIfDue(force: false);
         }
@@ -936,11 +969,23 @@ public sealed class StageTracker(
 
         // Throttling uses the wall clock (it governs "how often to refresh the UI"), the speed uses the virtual axis (it governs "how much transfer time these bytes took").
         var tick = SpeedNow(now);
-        _samples.Enqueue((tick, _bytes));
-        // Besides time-based eviction (the main path), a hard count-based eviction: while the virtual clock is frozen all samples share the same
-        // Ms, the first condition never holds, and only this clause caps the queue (see the comment on MaxSamples).
-        while (_samples.Count > 1 && (tick - _samples.Peek().Ms > SpeedWindowMs || _samples.Count > MaxSamples))
-            _samples.Dequeue();
+        // While the virtual clock is frozen the sample is **skipped**, not taken. Every sample during a freeze would
+        // carry the same Ms, so the time-based eviction below can never remove it and the queue fills with identical
+        // entries until the MaxSamples backstop starts dropping from the head — and the first ones dropped are exactly
+        // the pre-freeze samples that carry a real span, which collapses the reading from "the last speed seen on the
+        // wire" to 0. It also says nothing: _bytes cannot move with no stream open, so the sample is a duplicate by
+        // construction.
+        //
+        // This is what lets Tick() go on publishing through a freeze (see there). Before, the tick itself was skipped,
+        // which protected the window and froze the whole snapshot along with it.
+        if (!speedWhileInFlight || _activeSince >= 0)
+        {
+            _samples.Enqueue((tick, _bytes));
+            // Besides time-based eviction (the main path), a hard count-based eviction, as a backstop against any
+            // path that manages to publish densely inside one active segment (see the comment on MaxSamples).
+            while (_samples.Count > 1 && (tick - _samples.Peek().Ms > SpeedWindowMs || _samples.Count > MaxSamples))
+                _samples.Dequeue();
+        }
 
         long speed = 0;
         if (_samples.Count > 1)

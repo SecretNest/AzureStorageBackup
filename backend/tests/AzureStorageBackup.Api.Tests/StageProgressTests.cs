@@ -591,11 +591,20 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
-    /// Through pure compression not one stream is open: that time never enters the denominator, so there is nothing new
-    /// to report. The heartbeat must stay quiet, or tens of seconds of packing would spam a run of identical snapshots.
+    /// A stage holding nothing at all, with nothing on the wire, has genuinely nothing to say — no timer should be
+    /// publishing identical snapshots at it. The stretch is real rather than theoretical: the upload stage's tracker
+    /// is constructed the moment the diff starts, and on a large scan it can wait a long time for its first item.
+    /// <para>
+    /// This case used to assert the same silence for a stage that had <b>claimed</b> an item and was compressing it,
+    /// on the grounds that pure compression has "nothing new to report". That premise does not hold — <c>preparing</c>,
+    /// the staged and checking byte columns and every queue depth all move throughout compression — and the silence it
+    /// bought is exactly what left the UI displaying the snapshot from the last volume that transferred, for however
+    /// long the stage went without transferring another. Its counterpart now lives in
+    /// <c>UploadWaitVisibilityTests.The_Snapshot_Keeps_Refreshing_With_Work_In_Hand_And_Nothing_On_The_Wire</c>.
+    /// </para>
     /// </summary>
     [Fact]
-    public void The_Heartbeat_Stays_Silent_While_Nothing_Is_On_The_Wire()
+    public void The_Heartbeat_Stays_Silent_While_The_Stage_Holds_Nothing()
     {
         long now = 0;
         var seen = new List<StageProgress>();
@@ -604,7 +613,18 @@ public sealed class StageProgressTests
             Clock = () => now,
         };
 
-        tracker.BeginWork();   // work claimed, but still compressing: not one stream open
+        // No BeginWork and no BeginItem: not one item has reached this stage yet.
+        for (var i = 0; i < 5; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Empty(seen);
+
+        // And once the last item is handed back, silence returns — the timer must not outlive the work.
+        tracker.BeginWork();
+        tracker.EndWork();
         seen.Clear();
 
         for (var i = 0; i < 5; i++)

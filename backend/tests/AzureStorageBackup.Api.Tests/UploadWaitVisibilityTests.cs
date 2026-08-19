@@ -291,6 +291,105 @@ public sealed class UploadWaitVisibilityTests
     }
 
     /// <summary>
+    /// With work in hand and nothing on the wire, the snapshot must keep refreshing.
+    /// <para>
+    /// The heartbeat used to run only while a stream was transferring, so a stage holding plenty of work but
+    /// pushing no bytes stopped publishing entirely and the UI kept displaying the last snapshot taken — the one
+    /// captured the instant the final volume finished. That state is not rare and it is not brief: a dedup hit, a
+    /// resume hit and a raw in-place item all settle without a byte going over the wire, and a run whose remaining
+    /// work is mostly hits can spend hours there.
+    /// </para>
+    /// <para>
+    /// What the operator saw: <c>+66.8 MB on the cloud · nothing on the wire right now · 24 objects starting
+    /// upload</c>, motionless for hours, vanishing whenever a transfer started (a real snapshot finally replaced
+    /// it) and coming back to the identical figures when that transfer ended. Every number on the line was a
+    /// photograph, which is worse than a stale number — it reads as a hang, and it hides a real one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void The_Snapshot_Keeps_Refreshing_With_Work_In_Hand_And_Nothing_On_The_Wire()
+    {
+        var seen = new List<StageProgress>();
+        var now = 0L;
+        var tracker = new StageTracker("Uploading", total: 2, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.Enqueue();
+        tracker.Enqueue();
+        tracker.BeginWork();          // claimed, and it settles without transferring — a dedup hit
+        tracker.BeginWork();
+
+        // One transfer runs and ends, which is what leaves the tracker holding the stale photograph.
+        tracker.BeginItem("data/a.001", "a", 10);
+        now += 1_000;
+        tracker.EndItem("data/a.001", 10);
+
+        var frozen = seen.Count;
+        now += 1_000;
+        tracker.Tick();
+        Assert.True(
+            seen.Count > frozen,
+            "with two items in hand the heartbeat must go on publishing, even with nothing on the wire");
+
+        // And it must stop once the stage really has nothing left — an idle timer publishing forever is the
+        // other failure, and Complete()/Dispose() are not the only way out of an active stretch.
+        tracker.EndWork();
+        tracker.EndWork();
+        var quiet = seen.Count;
+        now += 1_000;
+        tracker.Tick();
+        Assert.Equal(quiet, seen.Count);
+    }
+
+    /// <summary>
+    /// Publishing while the virtual clock is frozen must not feed the speed window.
+    /// <para>
+    /// The clock only advances while a stream is open, so every sample taken during a freeze carries the same
+    /// timestamp and the time-based eviction below can never remove it — the queue would fill with identical
+    /// entries until the <c>MaxSamples</c> backstop started dropping from the head, and the first ones dropped are
+    /// exactly the pre-freeze samples carrying a real span. That collapses the reading from "the last speed seen
+    /// on the wire" to 0. It is the reason the heartbeat used to bail out of a frozen tick altogether, so keeping
+    /// the tick means the sample has to be the thing that is skipped.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Publishing_While_Frozen_Does_Not_Corrupt_The_Speed_Window()
+    {
+        var seen = new List<StageProgress>();
+        var now = 0L;
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.Enqueue();
+        tracker.BeginWork();
+
+        // A real transfer: 1 MB across one second of virtual time. Reported in two halves, because the speed
+        // window needs two samples to have a span to divide by.
+        tracker.BeginItem("data/a.001", "a", 1_000_000);
+        var sent = tracker.ItemProgress("data/a.001");
+        now += 500;
+        sent.Report(500_000);
+        now += 500;
+        sent.Report(1_000_000);
+        tracker.EndItem("data/a.001", 0);   // the bytes were counted as they went; adding them again would double count
+        var onTheWire = seen[^1].BytesPerSecond;
+        Assert.True(onTheWire > 0, "the transfer itself must produce a speed reading");
+
+        // Now freeze and tick far more often than MaxSamples, which is what a long hit-only stretch does.
+        for (var i = 0; i < 400; i++)
+        {
+            now += 1_000;
+            tracker.Tick();
+        }
+
+        Assert.Equal(onTheWire, seen[^1].BytesPerSecond);
+    }
+
+    /// <summary>
     /// Leaving a hand-off queue must bring the column back down — the whole complaint was a number that only ever
     /// grew. Over-releasing clamps at zero rather than showing a negative, the same defence
     /// <see cref="Checking_Never_Goes_Negative_Or_Sticks_High"/> covers for its own column.
