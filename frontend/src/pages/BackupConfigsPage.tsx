@@ -1720,9 +1720,11 @@ function RunButtons({
       {onResumePause && (
         <>
           {' '}
+          {/* Bordered like the Pause it replaces: the two are one control in two states, and leaving this one
+              bare would make the button appear to vanish into text the moment the operator pauses. */}
           <button
             type="button"
-            className="btn-ghost"
+            className="btn-ghost btn-outline"
             style={{ padding: '0 0.3rem' }}
             onClick={onResumePause}
             disabled={pending}
@@ -1734,9 +1736,11 @@ function RunButtons({
       {onPause && (
         <>
           {' '}
+          {/* Bordered for the same reason as Suspend below: Pause is an action on the run itself, not a link,
+              and a borderless one sitting in the same group as Suspend and Stop reads as plain text. */}
           <button
             type="button"
-            className="btn-ghost"
+            className="btn-ghost btn-outline"
             style={{ padding: '0 0.3rem' }}
             onClick={onPause}
             disabled={pending}
