@@ -64,7 +64,12 @@ work — a backup that packs 46,624 files into 4,995 archives is reporting both 
 | Cloud (check) | objects | one `HEAD` per pack, not per file |
 | Verifying (check) | objects | a pack downloaded, extracted and re-hashed |
 | Local (check) | files | an index entry |
-| Orphans (cleanup) | blobs | a blob in the container |
+| Listing (check) | blobs | a blob in the container, orphan or not |
+
+> **The listing stage is named for the work, not for the quarry.** It counts every blob it lists on
+> the way to subtracting the reference set, so the number it reports is the container's size. Called
+> `Orphans`, a six-figure container read as six figures of garbage — right number, right unit, wrong
+> heading. The orphan count itself is not a progress figure at all; it is in the check report.
 
 **Completion is computed from source bytes, not from the item count.** One item can be a 6.8 GB
 single file or a pack of several hundred 5 KB files, and counting them equally is meaningless —

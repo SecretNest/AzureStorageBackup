@@ -12,7 +12,9 @@ const STAGE_UNITS: Record<string, string> = {
   Cloud: 'objects',
   Verifying: 'objects',
   Local: 'files',
-  Orphans: 'blobs',
+  // The orphan scan's listing pass, named for the work rather than the quarry: it counts every blob it lists,
+  // not the orphans among them, and under the old name Orphans the container's own size read as an orphan count.
+  Listing: 'blobs',
 }
 
 /**

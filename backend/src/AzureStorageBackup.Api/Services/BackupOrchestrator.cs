@@ -390,7 +390,13 @@ public sealed class BackupOrchestrator(
         // touching each of the twelve Report call sites keeps this from going stale when a stage is added.
         var cursor = new StageCursor();
         progress = cursor.Wrap(progress);
-        await Record(NotificationEvents.BackupStart, source, $"Backup started: {request.Name}", request.Container, ct);
+        // The body says **where from and where to**. It used to be the container name alone, which the title's
+        // backup name already implies and which the log's own source column (backup:{accountId}/{container}) already
+        // states verbatim — one line carrying the same word three times and the local root, the one thing not
+        // recoverable from anywhere else on the row, nowhere on it.
+        await Record(
+            NotificationEvents.BackupStart, source, $"Backup started: {request.Name}",
+            $"{request.LocalRoot} → {request.Container}", ct);
         try
         {
             var result = await RunCoreAsync(request, startedAt, progress, ct, control);
@@ -501,7 +507,11 @@ public sealed class BackupOrchestrator(
         try
         {
             if (opLog is not null)
-                await opLog.AppendAsync(level ?? EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable);
+                // The separator joins two things; with only one of them present it is punctuation hanging off the
+                // end of the line, and a reader who sees a line ending in " — " goes looking for what got cut off.
+                await opLog.AppendAsync(
+                    level ?? EventLog.LevelOf(evt), source,
+                    string.IsNullOrWhiteSpace(body) ? title : $"{title} — {body}", ct, durable);
             if (notifier is not null && notify)
                 await notifier.NotifyAsync(evt, title, body, ct);
         }

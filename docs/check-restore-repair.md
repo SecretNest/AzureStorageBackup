@@ -144,7 +144,7 @@ in-flight list and the speed clock. Their stage units differ:
 | Cloud (check) | objects | one `HEAD` per pack, not per file |
 | Verifying (check) | objects | a pack downloaded, extracted and re-hashed |
 | Local (check) | files | one index entry |
-| Orphans (cleanup) | blobs | one blob in the container |
+| Listing (check) | blobs | one blob in the container, orphan or not — it counts what it lists, not what it finds |
 
 See [progress-display.md](progress-display.md).
 

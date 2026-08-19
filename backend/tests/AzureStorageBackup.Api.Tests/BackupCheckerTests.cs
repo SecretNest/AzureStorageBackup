@@ -434,6 +434,20 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.DoesNotContain(BackupDiscovery.IndexBlobName, check.OrphanBlobs);
             Assert.True(check.Ok); // orphans do not affect Ok
 
+            // The report says the scan ran. Without this the only evidence is a non-empty OrphanBlobs, and a clean
+            // container produces the same empty list as a scan nobody asked for — which is exactly how a completed
+            // scan came to report nothing at all on screen (the UI was inferring it from its own checkbox, and the
+            // dialog that owns the checkbox closes the instant the check starts).
+            Assert.True(check.OrphansChecked);
+            Assert.Null(check.OrphanScanIssue);
+
+            // The other half of the distinction, on the same container: not asked for, so nothing is claimed either
+            // way. OrphanBlobs is empty here too, which is the whole point — the flag is what tells them apart.
+            var unscanned = await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src);
+            Assert.False(unscanned.OrphansChecked);
+            Assert.Null(unscanned.OrphanScanIssue);
+            Assert.Empty(unscanned.OrphanBlobs);
+
             // Repair deletes the orphans (cleanupOrphans): the deletion runs even when no blob is broken.
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null,

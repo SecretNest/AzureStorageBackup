@@ -422,6 +422,13 @@ export interface CheckReport {
   corruptedPaths: string[]
   repairablePaths: string[]
   orphanBlobs: string[]
+  // Whether the scan ran at all. An empty orphanBlobs cannot say: "nobody asked" and "asked, container clean" are
+  // the same empty list. This used to be inferred from the dialog's own checkbox — which the dialog loses as soon
+  // as it closes, and it closes the instant the check starts, so a finished scan reported nothing whatever it found.
+  orphansChecked: boolean
+  // Set when the scan was asked for but abandoned (the full reference set could not be built). Shown rather than
+  // swallowed: silence is indistinguishable from "never ticked", which is the confusion being fixed.
+  orphanScanIssue: string | null
 }
 
 export interface RepairReport {

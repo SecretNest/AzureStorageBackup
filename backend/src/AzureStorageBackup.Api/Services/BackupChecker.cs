@@ -42,17 +42,30 @@ public sealed class BackupChecker(
         CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null)
     {
         var source = $"check:{account.Id}/{container}";
-        await Record(NotificationEvents.CheckStart, source, $"Check started: {container}", "", ct);
+        // What this run was actually asked to do. The two axes and the orphan scan are each independently
+        // switchable, and every one of them changes what a later "passed" is worth — a pass at Cloud=None/Local=None
+        // establishes almost nothing. Without them recorded, the log cannot answer "what did that check cover?",
+        // which is the first question anyone asks of it.
+        await Record(
+            NotificationEvents.CheckStart, source, $"Check started: {container}",
+            $"cloud {options.Cloud}, local {options.Local}"
+                + (options.ListOrphans ? ", scanning for unreferenced blobs" : ""), ct);
         try
         {
             var report = await CheckCoreAsync(account, container, password, version, options, localRoot, downloadConcurrency, onProgress, ct);
             var problems = report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
+            // The orphan scan is a separate axis from Ok (orphans are not corruption, so they never fail a check),
+            // and it therefore has to be stated separately — otherwise a run that turned up tens of thousands of
+            // reclaimable blobs is logged as a bare "passed" and the finding is lost.
+            var orphanNote = report.OrphanScanIssue is { } issue
+                ? $"; unreferenced-blob scan abandoned: {issue}"
+                : report.OrphansChecked ? $"; {report.OrphanBlobs.Count} unreferenced blob(s)" : "";
             await Record(
                 report.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure, source,
                 $"Check {(report.Ok ? "passed" : "failed")}: {container}",
-                report.Ok
+                (report.Ok
                     ? $"{report.Findings.Count} file(s) OK"
-                    : $"{problems} problem(s), {report.RepairablePaths.Count} repairable from local", ct);
+                    : $"{problems} problem(s), {report.RepairablePaths.Count} repairable from local") + orphanNote, ct);
             return report;
         }
         catch (Exception ex)
@@ -65,7 +78,11 @@ public sealed class BackupChecker(
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
     {
         if (opLog is not null)
-            await opLog.AppendAsync(EventLog.LevelOf(evt), source, $"{title} — {body}", ct, durable: true);
+            // The separator joins two things; with only one of them present it is punctuation hanging off the end of
+            // the line, and a reader who sees "Check started: public — " goes looking for the part that got cut off.
+            await opLog.AppendAsync(
+                EventLog.LevelOf(evt), source,
+                string.IsNullOrWhiteSpace(body) ? title : $"{title} — {body}", ct, durable: true);
         if (notifier is not null)
             await notifier.NotifyAsync(evt, title, body, ct);
     }
@@ -140,11 +157,18 @@ public sealed class BackupChecker(
         }
         localTracker?.Complete();
 
-        var orphans = options.ListOrphans
+        var (orphans, orphanIssue) = options.ListOrphans
             ? await ListOrphansAsync(cc, account, container, password, info, onProgress, ct)
-            : [];
+            : ([], null);
 
-        return new CheckReport(ver.Version, findings, metaIssue) { OrphanBlobs = orphans };
+        return new CheckReport(ver.Version, findings, metaIssue)
+        {
+            OrphanBlobs = orphans,
+            // Whether it ran, carried on the report rather than left for the caller to infer from an empty list —
+            // see CheckReport.OrphansChecked. Abandoned counts as not run, and the reason travels with it.
+            OrphansChecked = options.ListOrphans && orphanIssue is null,
+            OrphanScanIssue = orphanIssue,
+        };
     }
 
     /// <summary>
@@ -152,7 +176,8 @@ public sealed class BackupChecker(
     /// **complete** reference set cannot be built (a version index is missing and the cloud read fails) → give up on
     /// listing, log a Warning, return empty (never call a referenced blob an orphan on incomplete information).
     /// </summary>
-    private async Task<IReadOnlyList<string>> ListOrphansAsync(
+    /// <returns>The orphan names, and — when the scan was abandoned — why. The two never both carry content.</returns>
+    private async Task<(IReadOnlyList<string> Orphans, string? Issue)> ListOrphansAsync(
         BlobContainerClient cc, Account account, string container, string? password, BackupInfoFile info,
         Action<StageProgress>? onProgress, CancellationToken ct)
     {
@@ -163,14 +188,21 @@ public sealed class BackupChecker(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            var issue = $"could not build the full reference set ({ex.Message})";
             if (opLog is not null)
                 await opLog.AppendAsync(OperationLogLevel.Warning, $"check:{account.Id}/{container}",
-                    $"Orphan detection skipped: could not build the full reference set ({ex.Message}).", ct, durable: true);
-            return [];
+                    $"Orphan detection skipped: {issue}.", ct, durable: true);
+            // Returned as well as logged: an operator who ticked the box is owed an answer on the screen they
+            // ticked it on, and "no orphans" is not that answer — it is a different claim entirely.
+            return ([], issue);
         }
 
+        // Named for what it does, not for what it is looking for. The counter below ticks once per blob **listed**,
+        // orphan or not, so a stage called Orphans put a five-figure container size on screen under a heading that
+        // reads as a five-figure orphan count. The number is right and its unit is right; only the name lied.
+        //
         // How many blobs the container holds is only learned while listing → total 0, report "how many listed so far".
-        var listing = Track(onProgress, "Orphans", 0);
+        var listing = Track(onProgress, "Listing", 0);
         var orphans = new List<string>();
         await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
         {
@@ -180,7 +212,7 @@ public sealed class BackupChecker(
             listing?.Advance(0);
         }
         listing?.Complete();
-        return orphans;
+        return (orphans, null);
     }
 
     /// <summary>

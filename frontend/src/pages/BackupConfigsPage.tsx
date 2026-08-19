@@ -2205,11 +2205,20 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
   if (run.status === 'Completed') {
     const r = run.report
     if (!r) return <div className="text-ok">Check completed</div>
+    // The orphan scan is a separate axis from ok — orphans are not corruption and never fail a check — so its
+    // result has to be stated separately or it is not stated at all. This line is where it matters most: the
+    // dialog closes when the check starts, so for most of a check's life this row is the only thing on screen.
+    const orphans = r.orphanScanIssue
+      ? ' · unreferenced-blob scan abandoned'
+      : r.orphansChecked && r.orphanBlobs.length > 0
+        ? ` · ${r.orphanBlobs.length.toLocaleString()} unreferenced blob(s), reclaimable by repair`
+        : ''
     return (
       <div className={r.ok ? 'text-ok' : 'text-danger'}>
         {r.ok
           ? `Check completed — all checked objects OK (version ${r.version})`
           : `Check completed — ${r.missingRefs.length} problem(s), ${r.repairablePaths.length} repairable (version ${r.version})`}
+        {orphans && <span className="text-warn">{orphans}</span>}
       </div>
     )
   }
@@ -2693,7 +2702,16 @@ function CheckModal({
             {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
             {' '}(version {report.version})
           </div>
-          {listOrphans && (
+          {/* Driven by the report, not by the checkbox above it. The checkbox is state of *this* dialog, and
+              runCheck closes the dialog the moment the check starts — so by the time a report exists to show,
+              the tick that produced it is gone and this block never rendered, whatever the scan turned up. */}
+          {report.orphanScanIssue && (
+            <div className="text-warn" style={{ margin: '0.4rem 0' }}>
+              Unreferenced-blob scan abandoned: {report.orphanScanIssue}. Nothing was listed, and nothing would be
+              deleted by a repair — this is not a statement that the container is clean.
+            </div>
+          )}
+          {report.orphansChecked && (
             <div className={report.orphanBlobs.length ? 'text-warn' : 'text-ok'} style={{ margin: '0.4rem 0' }}>
               {report.orphanBlobs.length === 0
                 ? 'No unreferenced blobs found'

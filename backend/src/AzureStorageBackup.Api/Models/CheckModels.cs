@@ -79,6 +79,29 @@ public sealed record CheckReport(int Version, IReadOnlyList<FileFinding> Finding
     /// </summary>
     public IReadOnlyList<string> OrphanBlobs { get; init; } = [];
 
+    /// <summary>
+    /// Whether the cloud listing check actually ran, which an empty <see cref="OrphanBlobs"/> cannot say on its own:
+    /// "nobody asked" and "asked, and the container is clean" are the same empty list, and a reader with only that
+    /// list has to guess.
+    /// <para>
+    /// The guess was being made in the UI, off the state of its own checkbox — which is lost the moment the dialog
+    /// closes, and the dialog closes as soon as the check starts. So a completed scan reported nothing at all,
+    /// whatever it found. The report has to carry this itself, because the report is what outlives the dialog.
+    /// </para>
+    /// <para>False when the scan was asked for but abandoned; <see cref="OrphanScanIssue"/> then says why.</para>
+    /// </summary>
+    public bool OrphansChecked { get; init; }
+
+    /// <summary>
+    /// Why the orphan scan was abandoned even though it was asked for (the full reference set could not be built, so
+    /// calling anything an orphan would be a guess). Null when it ran, and when it was never asked for.
+    /// <para>
+    /// Reported rather than merely logged: silence here looks exactly like "the box was never ticked", which is the
+    /// very confusion <see cref="OrphansChecked"/> exists to end.
+    /// </para>
+    /// </summary>
+    public string? OrphanScanIssue { get; init; }
+
     /// <summary>Names of the broken blobs (deduplicated; kept for the old frontend).</summary>
     public IReadOnlyList<string> MissingRefs =>
         Findings.Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
