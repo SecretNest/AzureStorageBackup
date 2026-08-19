@@ -93,6 +93,25 @@ export function stageLines(detail: StageProgress) {
   // above, and another tier would only blur which number is which. That reasoning does not apply to
   // checking (which says plainly what it is doing), so checking has no such gate.
   const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
+  // The two upload-side waits, stated as **one** entry. They really are different stages — volumes already
+  // claimed by an uploader and queuing at the global gate, versus objects still parked in the hand-off
+  // channel with nobody on them — but on screen the difference rested entirely on "an upload slot" versus
+  // "an uploader", one word apart, and that word could not carry it: read side by side the two lines looked
+  // like the same thing counted twice.
+  //
+  // Merged, the **units** do the separating, which they were already doing anyway: what is counted in volumes
+  // is at the gate, what is counted in objects has not been picked up. Anyone who needs the finer distinction
+  // gets it from the unit; anyone who does not gets one number for "queued on the upload side", which is the
+  // question actually being asked of this line.
+  //
+  // The cost, stated: this pulls the object count away from "N ready to upload" directly below it, and those
+  // bytes are exactly what these objects are holding. The pairing is no longer adjacent on screen.
+  const waitingToUpload = [
+    detail.waitingOnSlot > 0 && withUnit(detail.waitingOnSlot, 'volumes'),
+    detail.awaitingUpload > 0 && withUnit(detail.awaitingUpload, unit),
+  ]
+    .filter(Boolean)
+    .join(' + ')
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // The in-flight number's unit **differs by direction**:
@@ -135,21 +154,22 @@ export function stageLines(detail: StageProgress) {
     idleOnStaging && 'nothing on the wire right now',
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    // The unit is **volumes**, not items (the gate queues per volume), deliberately different from its neighbours.
-    detail.waitingOnSlot > 0 &&
-      `${withUnit(detail.waitingOnSlot, 'volumes')} waiting for an upload slot`,
-    detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
-    // Claimed, compressed (or needing no compression at all), and parked in the hand-off channel waiting for an
-    // uploader to come free. Not "starting upload": nothing is being done to these, and the distinction is the
-    // whole point of the entry — folded into the tier above, this was a number that climbed all run and never
-    // came back down, describing items that were neither starting nor uploading.
+    // Both upload-side waits as one entry, the units keeping them apart (volumes = queuing at the global gate,
+    // which queues per volume; objects = claimed and compressed but not yet picked up by any uploader). Built
+    // above, where the reasoning and what it costs are set out.
     //
-    // Unbounded by construction, so it can reach five figures. The channel is deliberately not depth-limited —
-    // whatever owns an archive is already bounded in bytes by the staging pool, which is the limit the operator
-    // set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a store-only workload the
-    // compressor can queue the whole dataset here while the uploaders trickle. A big number is the pipeline
-    // working as designed; what it tells the operator is that the bottleneck is the wire, not the CPU.
-    detail.awaitingUpload > 0 && `${withUnit(detail.awaitingUpload, unit)} waiting for an uploader`,
+    // Neither half is "starting upload", and that distinction is the whole point of the entry: nothing is being
+    // done to any of them. Folded into the tier below, the object half was a number that climbed all run and
+    // never came back down, describing items that were neither starting nor uploading.
+    //
+    // That half is also unbounded by construction, so it can reach five figures. Its channel is deliberately not
+    // depth-limited — whatever owns an archive is already bounded in bytes by the staging pool, which is the
+    // limit the operator set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a
+    // store-only workload the compressor can queue the whole dataset here while the uploaders trickle. A big
+    // number is the pipeline working as designed; what it tells the operator is that the bottleneck is the wire,
+    // not the CPU.
+    waitingToUpload && `${waitingToUpload} waiting for uploading`,
+    detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
     // Directly after starting upload: these bytes are the output those items have already checked and
     // are holding, ready to go. "ready to upload" is now accurate — the part still in checking was split
     // into the entry below and no longer mixes in. It used to report both together, so "compressed" was

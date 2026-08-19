@@ -46,8 +46,8 @@ steady state. That line is not a warning — it is the evidence that the configu
 
 ## The queues
 
-Both depths are on screen, as `N objects waiting for the compressor` and `N objects waiting for an
-uploader`, and each carries its own term in the item ledger — see
+Both depths are on screen — `N objects waiting for the compressor`, and the object half of
+`N volumes + N objects waiting for uploading` — and each carries its own term in the item ledger; see
 [progress-display.md](progress-display.md). Which of the two is deep says which stage is the
 bottleneck, so keeping them apart is worth a term each.
 
@@ -56,7 +56,7 @@ which is the bound the operator configured; a second item-count bound would fire
 set. Three entry kinds escape even that, owning no archive at all — a dedup hit, a resume hit, a raw
 in-place item — so on a store-only workload this queue can hold the whole dataset.
 
-**`probedQueue` is bounded at 128 entries**, `FullMode.Wait`.
+**`probedQueue` is bounded at 9 entries**, `FullMode.Wait`.
 
 > **Rationale.** Its entries own no staging quota, but they own the `WorkItem` itself — and
 > `DiffWorkQueue` exists precisely to keep those off the heap, capping the backlog at 2,000 items /
@@ -66,6 +66,14 @@ in-place item — so on a store-only workload this queue can hold the whole data
 > was built for. At this repository's measured scale (500,000 index entries, ~60-character paths)
 > that is roughly 170 MB of live objects, on a NAS. The bound costs nothing, because what this stage
 > buys is overlap, not buffering: one or two items of lookahead delivers all of it.
+>
+> **Nine, specifically, is a display decision.** This depth is shown verbatim as
+> `N objects waiting for the compressor`, and a deep one reads as "compression is the bottleneck" when
+> most of the time it is the opposite: the compressor is held by staging-pool backpressure because the
+> uploaders are behind, and the backlog piles up here as a *symptom* of the wire being slow. A number
+> that cannot exceed ten cannot tell that lie loudly. The cost is the flip side of the same coin —
+> nine items of lookahead does not cover the prober stalling on one large single file's full-content
+> dedup read, so the compressor can briefly run dry where a deeper queue would have carried it.
 
 ## The staging area
 

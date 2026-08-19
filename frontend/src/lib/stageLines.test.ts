@@ -58,12 +58,13 @@ describe('stageLines', () => {
         waitingOnPeer: 2,
         waitingOnSlot: 3,
         stagedBytes: 2_800_000_000,
-        awaitingUpload: 9,
+        awaitingUpload: 7,
         checking: 1,
         checkingBytes: 100_000_000,
         preparing: 1,
         waitingOnArchive: 4,
-        awaitingCompression: 128,
+        // The probedQueue bound, so this is the deepest this entry can ever read (see BackupOrchestrator).
+        awaitingCompression: 9,
         queued: 4_365,
         spilledItems: 12,
       }),
@@ -73,17 +74,17 @@ describe('stageLines', () => {
       '+2.8 GB on the cloud',
       '2 volumes uploading',
       '2 objects waiting on the same content elsewhere',
-      '3 volumes waiting for an upload slot',
-      // The two hand-off queues bracket the compression stretch, one on each side: waiting for an uploader sits
-      // just past "ready to upload" (the bytes those very items are holding), waiting for the compressor sits
-      // just before "queued" (probed, but the single compressor has not got to them).
-      '9 objects waiting for an uploader',
+      // Both upload-side waits in one entry, each keeping its own unit: volumes are queuing at the global gate,
+      // objects have been claimed and compressed but no uploader has picked them up. The compression stretch is
+      // still bracketed by the two hand-off queues — this one just past "ready to upload" (whose bytes these very
+      // objects are holding), "waiting for the compressor" just before "queued".
+      '3 volumes + 7 objects waiting for uploading',
       '2.6 GB ready to upload',
       '1 object checking files',
       '95.4 MB being checked',
       '1 object preparing',
       '4 objects waiting for the archive slot',
-      '128 objects waiting for the compressor',
+      '9 objects waiting for the compressor',
       '4,365 objects queued',
       '12 objects buffered to disk',
     ])
@@ -112,9 +113,27 @@ describe('stageLines', () => {
 
     expect(pipeline).toBe(
       '+63.7 MB on the cloud · nothing on the wire right now · ' +
-        '24 objects waiting for an uploader · 63.7 MB ready to upload · 1 object preparing',
+        '24 objects waiting for uploading · 63.7 MB ready to upload · 1 object preparing',
     )
     expect(pipeline).not.toContain('starting upload')
+  })
+
+  /**
+   * The merged entry has three shapes, and the two half-empty ones must not leave a dangling "+" or an
+   * orphaned unit. Only the halves that are non-zero get named, and each keeps its own unit — that unit is
+   * the only thing left saying which of the two stages a number belongs to.
+   */
+  test('the upload-side wait names only the halves that are non-zero', () => {
+    expect(stageLines(progress({ waitingOnSlot: 5, awaitingUpload: 230 })).pipeline).toContain(
+      '5 volumes + 230 objects waiting for uploading',
+    )
+    expect(stageLines(progress({ waitingOnSlot: 5 })).pipeline).toContain(
+      '5 volumes waiting for uploading',
+    )
+    expect(stageLines(progress({ awaitingUpload: 1 })).pipeline).toContain(
+      '1 object waiting for uploading',
+    )
+    expect(stageLines(progress({})).pipeline).not.toContain('waiting for uploading')
   })
 
   /** Empty segments disappear entirely — no "0 objects queued" noise. */

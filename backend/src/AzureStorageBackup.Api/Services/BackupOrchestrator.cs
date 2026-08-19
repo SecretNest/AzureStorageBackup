@@ -883,8 +883,16 @@ public sealed class BackupOrchestrator(
         // rates orders of magnitude apart, so it drains the spill file back into memory in its entirety on exactly
         // the runs the spill was built for: at the 500,000-entry scale this repo has measured, WorkItem.EstimatedBytes
         // puts that at roughly 170 MB of live objects, on a NAS.
+        //
+        // Nine is that "one or two items of lookahead" with room to spare, and it keeps the depth **legible on
+        // screen**: this queue's depth is shown verbatim as "N objects waiting for the compressor", and a deep one
+        // reads as "compression is the bottleneck" when most of the time it is the opposite — the compressor is held
+        // by staging-pool backpressure because the uploaders are behind, and the backlog piles up here as a symptom.
+        // A number that cannot exceed ten cannot tell that lie loudly. The cost is the flip side of the same coin:
+        // nine items of lookahead does not cover the prober stalling on one large single file's full-content dedup
+        // read, so the compressor can briefly run dry where a deeper queue would have carried it.
         var probedQueue = Channel.CreateBounded<ProbedItem>(
-            new BoundedChannelOptions(128)
+            new BoundedChannelOptions(9)
             {
                 FullMode = BoundedChannelFullMode.Wait, SingleWriter = true, SingleReader = true,
             });

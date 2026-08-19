@@ -95,7 +95,7 @@ doing subtraction. That trap has been stepped in twice.
 | `waitingOnArchive` | items | picked up by a worker, queuing behind that same lock |
 | `queued` | items | still in the queue, not picked up |
 | `awaitingCompression` | items | probed, parked in `probedQueue` waiting for the single compressor |
-| `awaitingUpload` | items | past compression, parked in `stagedQueue` waiting for an uploader |
+| `awaitingUpload` | items | past compression, parked in `stagedQueue` with no uploader on them yet |
 | `uploading` | items | everything past staging: in flight, waiting on a resource, or checking |
 
 `uploading` is `inWork - inStaging - awaitingCompression - awaitingUpload`, and deliberately **not** a
@@ -200,9 +200,9 @@ holds the lock, all of this backup's threads queue behind it, and this backup's 
 > and nothing that could say "this backup is blocked by another run". Once split, the diagnosis is
 > free and the lock holder never has to be exposed.
 
-The wording `waiting for the archive slot` mirrors `waiting for an upload slot` on the same line —
-two global gates, one for production and one for upload. It deliberately avoids "compress": a
-store-only pack does not compress and a raw passthrough never runs 7z, yet all three take that lock.
+`waiting for the archive slot` names one of the two global gates; the other is the volumes half of
+`waiting for uploading` — one gate for production, one for upload. It deliberately avoids "compress":
+a store-only pack does not compress and a raw passthrough never runs 7z, yet all three take that lock.
 
 ## The byte ledger
 
@@ -380,13 +380,21 @@ each belongs to. An item's forward order is:
 ```
 queued → waiting for the compressor → waiting for the archive slot → preparing
        → [archive lands on disk] → checking files → ready to upload
-       → waiting for an uploader → starting upload
-       → waiting on peer/slot → uploading → on the cloud → settled (first line)
+       → waiting for uploading (objects half) → starting upload
+       → waiting on peer → waiting for uploading (volumes half) → uploading
+       → on the cloud → settled (first line)
 ```
 
-The two hand-off queues bracket the compression stretch, one on each side, and each sits next to the
-bytes it explains: `waiting for an uploader` follows `ready to upload` because those are the very
-bytes those items are holding.
+**The two upload-side waits are printed as one entry**, `N volumes + N objects waiting for uploading`,
+and the units are what keep them apart: volumes are queuing at the global upload gate (which queues
+per volume) and have an uploader on them; objects are compressed and claimed but not yet picked up by
+any uploader at all.
+
+> **Rationale.** As two entries they read as the same thing counted twice. The whole distinction rested
+> on `an upload slot` versus `an uploader` — one word, carrying a stage boundary — and it did not carry
+> it. The units were already doing that work, so the merge costs nothing a reader was actually using.
+> What it does cost is adjacency: the object count no longer sits directly above `N ready to upload`,
+> which is the bytes those very objects are holding.
 
 > **Why they must be interleaved.** With counts on one line and bytes on another, each was ordered by
 > its own logic and nothing on screen placed `+2.0 GB on the cloud` next to `100 MB ready to upload`.
