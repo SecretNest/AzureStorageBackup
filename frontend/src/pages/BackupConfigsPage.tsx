@@ -1929,8 +1929,8 @@ function RunStatus({
   // so once it is held by the bounded queue it sits still while uploading is in fact progressing, and the
   // headline looks hung.
   //
-  // So the percentage is labelled as the diff's, alongside the upload's **absolute** completed volume —
-  // with no reliable denominator, an absolute figure is more honest than a fake percentage that falls back.
+  // So the percentage is labelled as the diff's, alongside the upload's completed volume — stated as a
+  // fraction of the source total, never as a second percentage that could fall back.
   // Completion is by **source bytes**, not item count. An item-count percentage during upload means very
   // little: one item may be a 6.8 GB single file or a pack of several hundred 5 KB files, and counting
   // them equally is what produced a measured 75% by count against 31% by source bytes — the headline runs
@@ -1971,12 +1971,27 @@ function RunStatus({
     diffing && uploading
       ? diffing.percent != null && `${diffing.percent}% diffed`
       : singlePercent != null && `${singlePercent}%`,
-    // The upload's absolute volume must appear in **both** layouts. It used to hang off the parallel
+    // The upload's volume must appear in **both** layouts. It used to hang off the parallel
     // branch only, so the moment the diff finished and the detail went from two lines back to one, the
     // tens of gigabytes already uploaded vanished from the headline — leaving a source-byte percentage
     // that sits at 0% for a long time early in a large backup, which reads as the whole round starting
-    // over. The absolute figure is the one number here that never goes backwards.
-    uploading && uploading.workDone > 0 && `${formatBytes(uploading.workDone)} uploaded`,
+    // over. The completed figure is the one number here that never goes backwards.
+    //
+    // It carries its denominator: "313.6 GB uploaded" says how far the round has come but nothing about
+    // how far it has to go, and the operator's actual question is the ratio — the same
+    // "313.6 GB / 1.4 TB original" the detail line below states, minus the word (the headline's own
+    // percentage right before it already names what the fraction is). Both sides are **source** bytes,
+    // pre-compression, which is why this pairs with singlePercent above and not with the wire volume.
+    //
+    // The denominator still grows while the diff enqueues, so the fraction shifts under the reader —
+    // that is honest and unavoidable (it is the same number the detail line shows), and it is exactly
+    // why no second percentage is computed from it here. Falls back to the bare figure if the total is
+    // not there at all, since a "/ 0 B" would be worse than saying nothing.
+    uploading &&
+      uploading.workDone > 0 &&
+      (uploading.workTotal > 0
+        ? `${formatBytes(uploading.workDone)} / ${formatBytes(uploading.workTotal)}`
+        : `${formatBytes(uploading.workDone)} uploaded`),
     speed,
     eta,
   ]
