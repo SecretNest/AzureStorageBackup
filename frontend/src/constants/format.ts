@@ -71,7 +71,14 @@ export function formatDuration(seconds: number): string {
   return `${s}s`
 }
 
-/** Human-readable byte counts. Used all over the backup UI (sizes, speeds); centralised so the copies cannot drift. */
+/**
+ * Human-readable byte counts. Used all over the backup UI (sizes, speeds); centralised so the copies cannot drift.
+ *
+ * GB and above carry three decimals, KB and MB one. A single decimal at the GB level moves in ~100 MB
+ * steps, so a progress line can sit on "191.0 GB" while a good few hundred megabytes go past — the
+ * digits are there to show that the number is still moving. At the MB level one decimal already
+ * resolves to ~100 KB, and three would be noise rather than news.
+ */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
   const units = ['KB', 'MB', 'GB', 'TB']
@@ -81,5 +88,5 @@ export function formatBytes(n: number): string {
     v /= 1024
     i++
   }
-  return `${v.toFixed(1)} ${units[i]}`
+  return `${v.toFixed(i >= 2 ? 3 : 1)} ${units[i]}`
 }

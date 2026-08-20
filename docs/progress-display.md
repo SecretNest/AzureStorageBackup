@@ -428,8 +428,8 @@ The first line is what has **settled**; the second is what has not. The dividing
 you can actually answer: **can this number still go backwards?**
 
 ```
-Uploading: 6,676 of 11,004 objects · 1.7 TB / 2.7 TB original (62%) · 1.7 TB uploaded (100% of original) · 13.3 MB/s · ~1d 10h left
-In flight: +3.4 GB on the cloud · 5 volumes uploading · 2 volumes + 118 objects (9.2 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
+Uploading: 6,676 of 11,004 objects · 1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original) · 13.3 MB/s · ~1d 10h left
+In flight: +3.400 GB on the cloud · 5 volumes uploading · 2 volumes + 118 objects (9.201 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
 ```
 
 The second line runs **backwards along the timeline**, with counts and bytes interleaved at the point
@@ -478,6 +478,11 @@ Hard constraints on wording:
   already shows terabytes transferred.
 - The percentage after `uploaded` must carry `of original`: a bare `(95%)` reads as upload progress,
   and the same line already contains a real progress percentage.
+- **GB and TB carry three decimals, KB and MB one** (`formatBytes`, frontend only — the backend's
+  `ByteSize.Human` writes the summary text and keeps one). A single decimal at the GB level moves in
+  ~100 MB steps, so on a slow link the figure sits still while real progress happens; the digits are
+  what show the number is alive. The zeros are padded rather than trimmed, so a number being watched
+  never changes width under the eye. Below a GB one decimal already resolves to ~100 KB.
 
 The string assembly lives in one module. **The entire difficulty of these two lines is order and
 wording**, and once a string is inside JSX there is nowhere left to assert it — a wrong order raises

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatDuration, formatLocalDateTime, formatUtcOffset } from './format'
+import { formatBytes, formatDuration, formatLocalDateTime, formatUtcOffset } from './format'
 
 describe('formatLocalDateTime', () => {
   it('pads every field to a fixed width so a log column lines up', () => {
@@ -59,5 +59,26 @@ describe('formatDuration', () => {
   it('folds zero and negatives to 0s rather than printing something strange', () => {
     expect(formatDuration(0)).toBe('0s')
     expect(formatDuration(-5)).toBe('0s')
+  })
+})
+
+describe('formatBytes', () => {
+  it('gives GB and above three decimals, padded, so a slow line is still visibly moving', () => {
+    // One decimal at this scale steps in ~100 MB: a progress line can hold "191.0 GB" through several
+    // minutes of real upload. The zeros are kept rather than trimmed, so the digit count never shifts
+    // under a number that is being watched.
+    expect(formatBytes(3 * 1024 ** 3)).toBe('3.000 GB')
+    expect(formatBytes(2_800_000_000)).toBe('2.608 GB')
+    expect(formatBytes(3 * 1024 ** 4)).toBe('3.000 TB')
+  })
+
+  it('keeps one decimal below GB, where three would be noise', () => {
+    expect(formatBytes(1024)).toBe('1.0 KB')
+    expect(formatBytes(100_000_000)).toBe('95.4 MB')
+  })
+
+  it('counts plain bytes whole', () => {
+    expect(formatBytes(0)).toBe('0 B')
+    expect(formatBytes(512)).toBe('512 B')
   })
 })

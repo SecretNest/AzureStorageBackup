@@ -75,7 +75,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline.split(' · ')).toEqual([
-      '+2.8 GB on the cloud',
+      '+2.794 GB on the cloud',
       '2 volumes uploading',
       // Beside the in-flight count, because that is mostly what it is: the unsent tail of the volumes on the wire,
       // plus the archives of the peer waiters below. Everything here is already owned by an uploader, which is the
@@ -86,7 +86,7 @@ describe('stageLines', () => {
       // objects have been claimed and compressed but no uploader has picked them up. The bytes in the parentheses
       // are measured on exactly those two waits, so the counts and the size finally describe the same set — the
       // old pairing put the whole pool next to them, tail of the in-flight transfers included.
-      '3 volumes + 7 objects (2.6 GB) waiting for uploading',
+      '3 volumes + 7 objects (2.608 GB) waiting for uploading',
       '1 object checking files',
       '95.4 MB being checked',
       '1 object preparing',
@@ -156,7 +156,7 @@ describe('stageLines', () => {
     expect(
       stageLines(progress({ waitingOnSlot: 2, awaitingUpload: 9, waitingToUploadBytes: 3_500_000_000 }))
         .pipeline,
-    ).toContain('2 volumes + 9 objects (3.3 GB) waiting for uploading')
+    ).toContain('2 volumes + 9 objects (3.260 GB) waiting for uploading')
 
     const noArchives = stageLines(progress({ awaitingUpload: 12_000 })).pipeline
     expect(noArchives).toContain('12,000 objects waiting for uploading')
@@ -211,14 +211,14 @@ describe('stageLines', () => {
    * For the stretch that is compressed but not yet checked, the count and the bytes are separate
    * entries that **do not overlap**: the backend already subtracts checkingBytes from stagedBytes,
    * so the frontend only has to stop adding them together. Together they read as "one object is
-   * being checked and those 95.4 MB are its; another 2.6 GB is in an uploader's hands".
+   * being checked and those 95.4 MB are its; another 2.608 GB is in an uploader's hands".
    */
   test('keeps bytes being checked out of the pool figure beside them', () => {
     const { pipeline } = stageLines(
       progress({ stagedBytes: 2_800_000_000, checking: 1, checkingBytes: 100_000_000 }),
     )
     expect(pipeline).toBe(
-      "2.6 GB in the uploaders' hands · 1 object checking files · 95.4 MB being checked",
+      "2.608 GB in the uploaders' hands · 1 object checking files · 95.4 MB being checked",
     )
   })
 
@@ -244,7 +244,7 @@ describe('stageLines', () => {
         stagedBytes: 2_800_000_000,
       }),
     )
-    expect(done).toBe('1.7 TB / 2.7 TB original (62%) · 1.7 TB uploaded (100% of original)')
+    expect(done).toBe('1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original)')
   })
 
   /**
@@ -263,7 +263,7 @@ describe('stageLines', () => {
         activeItems: [{ label: 'a', sent: 1, total: 2, percent: 50 }],
       }),
     )
-    expect(done).toBe('476.8 MB / 1.9 GB downloaded · 381.5 MB restored')
-    expect(pipeline).toBe('1 object downloading · 1.5 GB to go')
+    expect(done).toBe('476.8 MB / 1.863 GB downloaded · 381.5 MB restored')
+    expect(pipeline).toBe('1 object downloading · 1.490 GB to go')
   })
 })

@@ -44,7 +44,7 @@ export function stageLines(detail: StageProgress) {
   const unit = STAGE_UNITS[detail.stage] ?? 'items'
   // "of" rather than "/": a slash is fraction notation, and putting one there invites a percentage —
   // while an item-count percentage means very little during upload (one item may be a 6.8 GB single file
-  // or a pack of several hundred 5 KB files). Real completion is by bytes, in the "60.6 GB / 191.0 GB
+  // or a pack of several hundred 5 KB files). Real completion is by bytes, in the "60.618 GB / 191.000 GB
   // original (31%)" on the next line, which does use a slash because its percentage follows it and the
   // fraction is one you can legitimately form.
   const counts =

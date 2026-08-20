@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { browseApi, type BrowseEntry } from '../api/browse'
 import { isInScope, scopeState, withRule, type ScopeRules } from '../lib/scopeRules'
+import { formatBytes } from '../constants/format'
 
 const PAGE_SIZE = 500
 
@@ -362,17 +363,6 @@ function Row({
       )}
     </div>
   )
-}
-
-const formatBytes = (n: number): string => {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = n
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`
 }
 
 /**

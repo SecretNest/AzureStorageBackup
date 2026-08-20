@@ -39,14 +39,18 @@ describe('runTotals', () => {
           uploadedBytes: 851443712,
         }),
       ),
-    ).toBe('2,481 new, 130 modified, 5 deleted (3.0 GB) · 4.7 GB changed at source → 812.0 MB uploaded')
+    ).toBe(
+      '2,481 new, 130 modified, 5 deleted (3.000 GB) · 4.700 GB changed at source → 812.0 MB uploaded',
+    )
   })
 
   // Five deleted files can be five empty stubs or five disk images. The size says which, and it belongs
   // next to the count rather than in the data segment — that segment tracks what went over the wire, and
   // deleted bytes went nowhere.
   test('sizes the deleted files where the count is', () => {
-    expect(runTotals(run({ deletedFiles: 12, deletedBytes: 5046586572 }))).toBe('12 deleted (4.7 GB)')
+    expect(runTotals(run({ deletedFiles: 12, deletedBytes: 5046586572 }))).toBe(
+      '12 deleted (4.700 GB)',
+    )
   })
 
   test('leaves the size off when the deleted files weighed nothing', () => {
@@ -69,7 +73,7 @@ describe('runTotals', () => {
   // Dropping the data segment because uploaded is zero would hide exactly the figure worth reading.
   test('keeps the data segment when everything hit dedup', () => {
     expect(runTotals(run({ modifiedFiles: 12, changedBytes: 5046586572, uploadedBytes: 0 }))).toBe(
-      '12 modified · 4.7 GB changed at source → 0 B uploaded',
+      '12 modified · 4.700 GB changed at source → 0 B uploaded',
     )
   })
 
