@@ -40,6 +40,79 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
+    /// The upload-side queue's bytes are measured, not inferred from the pool. The counts beside them on screen
+    /// (volumes at the gate, objects waiting for an uploader) cannot be turned into bytes by the reader, and the
+    /// obvious substitute — the pool total — is wrong by exactly the part that is moving.
+    /// </summary>
+    [Fact]
+    public void The_Upload_Queues_Bytes_Are_Its_Own_And_Come_Out_Of_The_Pool()
+    {
+        var pool = 10_000L;
+        var (tracker, seen) = Rig(stagedBytes: () => pool);
+
+        // One archive parked waiting for an uploader, one volume queuing at the gate, and one volume on the wire
+        // half sent. All three are lying in the pool; only the first two are queued.
+        tracker.EnterUploadQueue(6_000);
+        tracker.BeginWait(UploadWait.Slot, 3_000);
+        tracker.BeginItem("d.001", "photos/a.bin", 1_000);
+        tracker.ItemProgress("d.001").Report(400);
+        tracker.Complete();
+
+        Assert.Equal(9_000, seen[^1].WaitingToUploadBytes);   // 6000 parked + 3000 at the gate, and nothing else
+        Assert.Equal(600, seen[^1].StagedBytes);              // what is left is the unsent tail of the flow on the wire
+
+        // The uploader picks the parked entry up: its bytes stop being queued, but they are still on the disk.
+        tracker.LeaveUploadQueue(6_000);
+        tracker.Complete();
+
+        Assert.Equal(3_000, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(6_600, seen[^1].StagedBytes);
+    }
+
+    /// <summary>
+    /// A volume's bytes move from the queue column into the in-flight one and are never in both — the gate's wait ends
+    /// at the very instant the volume registers as in flight. Counted in both, the pool would be over-subtracted and
+    /// the "in the uploaders' hands" figure would read 0 while a transfer was plainly running.
+    /// </summary>
+    [Fact]
+    public void A_Volume_Leaving_The_Gate_Is_Not_Counted_Twice()
+    {
+        var pool = 5_000L;
+        var (tracker, seen) = Rig(stagedBytes: () => pool);
+
+        tracker.BeginWait(UploadWait.Slot, 5_000);
+        tracker.Complete();
+        Assert.Equal(5_000, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(0, seen[^1].StagedBytes);
+
+        tracker.EndWait(UploadWait.Slot, 5_000);
+        tracker.BeginItem("d.001", "photos/a.bin", 5_000);
+        tracker.ItemProgress("d.001").Report(2_000);
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(3_000, seen[^1].StagedBytes);   // the unsent half, counted once
+    }
+
+    /// <summary>
+    /// The queue's item count and its byte count answer different questions and must be free to disagree: a dedup hit,
+    /// a resume hit and a raw in-place item all queue owning no archive at all. On a store-only run the channel can
+    /// hold the whole dataset while the pool holds nothing, and reporting bytes proportional to the count would turn
+    /// that into a temp disk about to burst.
+    /// </summary>
+    [Fact]
+    public void A_Deep_Queue_Can_Be_Worth_No_Bytes()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 0);
+
+        for (var i = 0; i < 5_000; i++)
+            tracker.EnterUploadQueue(0);   // dedup/resume hits and raw in-place items: nothing in the pool
+        tracker.Complete();
+
+        Assert.Equal(0, seen[^1].WaitingToUploadBytes);
+    }
+
+    /// <summary>
     /// Staged = pool usage − the part the in-flight flows have already sent. Those volumes really are still sitting
     /// whole in the pool (released per volume, deleted only once sent) and only a slice of them has gone; without the
     /// subtraction the same bytes get counted once here and once in the in-flight list.

@@ -221,6 +221,51 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
+    /// Inside the staging area an item can be parked on two completely different things, and until they were split the
+    /// screen called both "waiting for the archive slot" — which made the diagnosis on that column actively wrong. A full
+    /// pool shows preparing=0 with someone waiting, exactly the shape the column says means "another run holds the lock",
+    /// so it sent the operator off to stop a backup that was not in the way. The lock points at a producer; the pool's
+    /// byte ceiling points at the wire, and only an upload can clear it.
+    /// <para>
+    /// The split is arithmetic, not a new term: the two still add up to "inside staging, without the lock", so the item
+    /// identity keeps balancing.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void A_Full_Pool_Is_Not_Reported_As_A_Lock_Held_Elsewhere()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 3, seen.Add);
+
+        for (var i = 0; i < 3; i++)
+            tracker.Enqueue();
+
+        // The compressor is in the staging area and the pool is at its ceiling: no lock is involved at all.
+        tracker.BeginWork();
+        tracker.BeginStaging();
+        tracker.BeginRoomWait();
+        tracker.Complete();
+
+        var full = seen[^1];
+        Assert.Equal(1, full.WaitingOnRoom);
+        Assert.Equal(0, full.WaitingOnArchive);   // ← this used to read 1, pointing at a lock nobody was holding
+        Assert.Equal(0, full.Preparing);
+        Assert.Equal(3, full.Processed + full.Preparing + full.Queued
+            + full.WaitingOnRoom + full.WaitingOnArchive + full.Uploading);
+
+        // An upload frees space; now the wait really is on the lock, and it is not ours (nothing of ours is packing).
+        tracker.EndRoomWait();
+        tracker.Complete();
+
+        var onLock = seen[^1];
+        Assert.Equal(0, onLock.WaitingOnRoom);
+        Assert.Equal(1, onLock.WaitingOnArchive);
+        Assert.Equal(0, onLock.Preparing);
+        Assert.Equal(3, onLock.Processed + onLock.Preparing + onLock.Queued
+            + onLock.WaitingOnRoom + onLock.WaitingOnArchive + onLock.Uploading);
+    }
+
+    /// <summary>
     /// Between finishing compression and starting the upload there is real work: a pack re-<c>Stat</c>s every member
     /// (rehashing the ones that changed), a single file looks up the dedup map, and a dedup hit is never uploaded at
     /// all. That work **must not** count as queued — reporting something that is working as "queued" is even more

@@ -352,7 +352,19 @@ public sealed class BackupOrchestrator(
     /// owns no archive.
     /// </summary>
     private sealed record PendingUpload(
-        StagedHandoff? Handoff, WorkShare Share, Func<CancellationToken, Task> RunAsync);
+        StagedHandoff? Handoff, WorkShare Share, Func<CancellationToken, Task> RunAsync)
+    {
+        /// <summary>
+        /// The archive this entry is holding on the staging disk while it waits for an uploader
+        /// (<see cref="StageTracker.EnterUploadQueue"/>). Derived rather than stored, so the number booked on the way in and
+        /// the one repaid on the way out cannot drift apart — the repayment happens on three different exits.
+        /// <para>
+        /// Zero for the entry kinds that own no archive: a dedup or resume hit, and a raw in-place item. They are why this
+        /// queue's item count and its byte count answer different questions.
+        /// </para>
+        /// </summary>
+        public long QueuedBytes => Handoff?.Staged?.Bytes ?? 0;
+    }
 
     private static PlannedFile ToPlannedFile(PackEntry m) => new(m.Path, m.Length, m.FullHash);
 
@@ -929,14 +941,20 @@ public sealed class BackupOrchestrator(
         async Task HandOffAsync(
             StagedHandoff? handoff, WorkShare share, Func<CancellationToken, Task> run, CancellationToken token)
         {
+            var entry = new PendingUpload(handoff, share, run);
             share.Take();
             share.Park(HandoffQueue.Upload);   // before the write, for the reason spelled out on WorkShare.Park
+            // The bytes go on beside the park and come back off wherever this entry leaves the channel — picked up, drained,
+            // or dropped by the catch below. Booked per entry rather than through the park's per-item latch, because a pack
+            // pool hands over one entry per group and each carries its own archive (see StageTracker.EnterUploadQueue).
+            uploadTracker.EnterUploadQueue(entry.QueuedBytes);
             try
             {
-                await stagedQueue.Writer.WriteAsync(new PendingUpload(handoff, share, run), token);
+                await stagedQueue.Writer.WriteAsync(entry, token);
             }
             catch
             {
+                uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
                 handoff?.Dispose();
                 share.Unpark(HandoffQueue.Upload);
                 share.Release();
@@ -1316,6 +1334,9 @@ public sealed class BackupOrchestrator(
                     // branch below too. From here this item reads as uploading rather than awaiting an uploader,
                     // even if the compressor left further entries of it queued behind this one (see WorkShare).
                     entry.Share.Unpark(HandoffQueue.Upload);
+                    // The byte side is per entry, so it comes off here unconditionally — the sibling entries this item may still
+                    // have queued keep their own bytes booked, which is the whole point of not sharing the park's latch.
+                    uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
 
                     // "Finish the current item, then stop", now measured per queue entry: what an uploader has in
                     // hand runs to completion, what is still queued never starts. Discarding a queued entry costs
@@ -1414,6 +1435,7 @@ public sealed class BackupOrchestrator(
             }
             while (stagedQueue.Reader.TryRead(out var entry))
             {
+                uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
                 entry.Handoff?.Dispose();
                 entry.Share.Unpark(HandoffQueue.Upload);
                 entry.Share.Release();

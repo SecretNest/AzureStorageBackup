@@ -210,12 +210,19 @@ export interface StageProgress {
   // Split out, the diagnosis is free: preparing=1 with waiters means the lock is your own;
   // preparing=0 with waiters means someone else holds it.
   waitingOnArchive: number
+  // Inside the staging area but not even at the lock yet: parked on the pool's byte ceiling, waiting for an **upload**
+  // to free space. Split out of waitingOnArchive because the two point at opposite culprits — the lock means another
+  // producer is packing (possibly another backup's, which you can go stop), room means the wire is the bottleneck and
+  // compression is being throttled on purpose. Reported as one number, a full pool looked exactly like a foreign lock,
+  // which is the state an upload-bound run spends most of its time in.
+  waitingOnRoom: number
   percent: number | null
   etaSeconds: number | null // Seconds remaining, extrapolated by the backend from the whole-run average; estimatedRemaining derives from it
   estimatedRemaining: string | null // A .NET TimeSpan serialised as "hh:mm:ss"
-  // The byte breakdown. The segments never overlap: workRemaining (source bytes not yet processed),
-  // stagedBytes (compressed but not sent), transferredBytes (in the cloud with the item complete) and
-  // unfinishedItemBytes (in the cloud with the item unfinished).
+  // The byte breakdown. The segments never overlap: workRemaining (source bytes not yet processed), the three
+  // post-compression on-disk ones (waitingToUploadBytes queued, checkingBytes not yet cleared, stagedBytes in an
+  // uploader's hands), transferredBytes (in the cloud with the item complete) and unfinishedItemBytes (in the cloud
+  // with the item unfinished).
   // workDone/workTotal are pre-compression, and give the real completion figure.
   workTotal: number // Total source bytes (pre-compression). During upload it keeps growing until the diff finishes
   workDone: number // Of those, the ones fully finished (excluding in flight)
@@ -227,7 +234,19 @@ export interface StageProgress {
   // workDone) and they are no longer in stagedBytes either (the pool releases per volume). They fold
   // into the former and reset to zero when the item completes.
   unfinishedItemBytes: number
-  stagedBytes: number // Compressed, **checked**, and waiting to go (post-compression); what is still being checked is in checkingBytes
+  // Pool bytes held by items an uploader **already has in hand** (post-compression): the unsent tail of every volume on
+  // the wire, plus the archives of items stuck on a peer or not yet past their first volume. The pool's other three
+  // parts have their own fields — checkingBytes, waitingToUploadBytes, and the sent part of activeItems — and all four
+  // are disjoint, so nothing is counted twice.
+  // It used to be everything except the first and the third, shown as "ready to upload" beside the upload queue's item
+  // counts. That read as an equality and was not one: the tail of everything in flight sat inside it.
+  stagedBytes: number
+  // The byte side of the upload-side queue, and only that: archives parked waiting for an uploader plus volumes queuing
+  // at the global gate. Nothing is being done to any of them.
+  // Already subtracted from stagedBytes. It deliberately does not divide by the counts beside it — a dedup hit, a resume
+  // hit and a raw in-place item all queue owning no archive, so a deep queue can be worth almost no bytes, and that is
+  // the pipeline working rather than a disk filling up.
+  waitingToUploadBytes: number
   // Bytes compressed onto disk but still in checking and not cleared to upload (the byte side of
   // checking, already subtracted from stagedBytes).
   // Output is booked against backpressure the moment compression ends (that ledger needs "how much is on
@@ -248,8 +267,8 @@ export interface StageProgress {
   // either have volumes in flight or are stuck in one of the three tiers below.
   // A different basis from activeItems — that holds **volumes**, and one item can have several in flight
   // or none at all.
-  // processed + preparing + queued + waitingOnArchive + awaitingCompression + awaitingUpload + uploading
-  // ≡ total is an identity, and the numbers on screen have to add up to it. They did not: an item stuck
+  // processed + preparing + queued + waitingOnRoom + waitingOnArchive + awaitingCompression + awaitingUpload +
+  // uploading ≡ total is an identity, and the numbers on screen have to add up to it. They did not: an item stuck
   // in this stretch was counted by nothing, and could only be found by lining up several screenshots and
   // doing subtraction.
   uploading: number

@@ -194,7 +194,10 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
         var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
         if (!acquire.IsCompletedSuccessfully)
         {
-            tracker.BeginWait(UploadWait.Slot);
+            // The size travels with the wait: this volume is a file lying in the staging pool that nobody is sending, and the byte side of
+            // the upload-side queue is assembled from exactly these (see StageProgress.WaitingToUploadBytes). It is the same number that
+            // BeginItem is given below, so a volume's bytes move from the queue column to the in-flight one and are never in both.
+            tracker.BeginWait(UploadWait.Slot, volumeBytes);
             var acquired = false;
             try
             {
@@ -210,7 +213,7 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
                 // of the leak.
                 try
                 {
-                    tracker.EndWait(UploadWait.Slot);
+                    tracker.EndWait(UploadWait.Slot, volumeBytes);
                 }
                 catch
                 {

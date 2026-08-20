@@ -167,21 +167,40 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     }
 
     /// <summary>Wait until there is space. **Does not hold the compression lock** — that is the whole point, see the class remarks.</summary>
-    private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct)
+    /// <param name="tracker">Optional progress accounting, for the caller's own tracker only (same rule as <see cref="StageAsync"/>).
+    /// A real wait is reported as its own phase rather than being left to read as "queueing for the archive lock": this one ends only when
+    /// an <b>upload</b> frees pool space, the lock's ends when a producer lets go, and the operator's response to the two is opposite —
+    /// see <see cref="StageProgress.WaitingOnRoom"/>.</param>
+    private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct, StageTracker? tracker = null)
     {
-        while (!HasRoom(lease))
+        // The overwhelmingly common case is that there is room, and it must stay free of progress events: registering
+        // unconditionally would force two publishes per item for a wait that never happened, the same trade the upload
+        // gate makes when it finds itself free (see VolumeUploadScope.RunAsync).
+        if (HasRoom(lease))
+            return;
+        // BeginRoomWait sits inside the try: it raises the counter before it publishes, and publish is external code
+        // deliberately allowed to throw here, so the finally has to cover that case too.
+        try
         {
-            Interlocked.Increment(ref _waiting);
-            try
+            tracker?.BeginRoomWait();
+            while (!HasRoom(lease))
             {
-                if (HasRoom(lease))   // look again after registering as a waiter, so we do not miss a release that just happened
-                    return;
-                await _releaseSignal.WaitAsync(ct);
+                Interlocked.Increment(ref _waiting);
+                try
+                {
+                    if (HasRoom(lease))   // look again after registering as a waiter, so we do not miss a release that just happened
+                        return;
+                    await _releaseSignal.WaitAsync(ct);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _waiting);
+                }
             }
-            finally
-            {
-                Interlocked.Decrement(ref _waiting);
-            }
+        }
+        finally
+        {
+            tracker?.EndRoomWait();
         }
     }
 
@@ -258,7 +277,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                     break;
                 }
 
-                await WaitForRoomAsync(lease, ct);
+                await WaitForRoomAsync(lease, ct, tracker);
 
                 await _compressLock.WaitAsync(ct);
                 // Between getting space and getting the lock there is a window in which somebody else may have used that space up.

@@ -141,20 +141,21 @@ During **Restoring / Verifying** the direction reverses, and the download total 
 #### The second line — the pipeline, newest first
 
 ```
-In flight: +3.4 GB on the cloud · 5 volumes uploading · 2.6 GB ready to upload · 1 object preparing · 4,365 objects queued
+In flight: +3.4 GB on the cloud · 5 volumes uploading · 2 volumes + 118 objects (9.2 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
 ```
 
 Everything that has **not** settled, laid out along a single timeline and read backwards: closest to done first, `queued` last. An item's forward order is
 
 ```
-queued → waiting for the archive slot → preparing → [archive lands on disk]
-       → checking files → ready to upload → starting upload
-       → waiting on peer/slot → uploading → on the cloud → settled (first line)
+queued → waiting for the compressor → waiting for staging room
+       → waiting for the archive slot → preparing → [archive lands on disk]
+       → checking files → waiting for uploading → starting upload
+       → waiting on peer → uploading → on the cloud → settled (first line)
 ```
 
-Counts and bytes are interleaved at the point each belongs to, rather than living on separate lines. That is not cosmetic. With two independently ordered lines, nothing on screen placed `+2.0 GB on the cloud` relative to `100.0 MB ready to upload`, and the natural reading — "one item, two thirds uploaded, stuck before the last volume" — was wrong in every part. They are different items at different points of the pipeline, and volumes never stall between one another: the loop that uploads them does nothing but take a slot, `PUT`, and delete the local file.
+Counts and bytes are interleaved at the point each belongs to, rather than living on separate lines. That is not cosmetic. With two independently ordered lines, nothing on screen placed `+2.0 GB on the cloud` relative to the `100.0 MB` sitting on disk, and the natural reading — "one item, two thirds uploaded, stuck before the last volume" — was wrong in every part. They are different items at different points of the pipeline, and volumes never stall between one another: the loop that uploads them does nothing but take a slot, `PUT`, and delete the local file.
 
-The identity **`processed + preparing + queued + waitingOnArchive + uploading ≡ total`** always holds, in **items**. Two entries are counted in **volumes** instead and say so in their wording, because the upload gate hands out slots per volume, not per item. The byte segments never overlap either — each byte is in at most one of them. Zero segments are omitted entirely, which is why Scanning and Diffing show almost nothing here.
+The identity **`processed + preparing + queued + waitingOnRoom + waitingOnArchive + awaitingCompression + awaitingUpload + uploading ≡ total`** always holds, in **items**. Two entries are counted in **volumes** instead and say so in their wording, because the upload gate hands out slots per volume, not per item. The byte segments never overlap either — each byte is in at most one of them. Zero segments are omitted entirely, which is why Scanning and Diffing show almost nothing here.
 
 | What you see | Unit | Meaning |
 | --- | --- | --- |
@@ -162,14 +163,16 @@ The identity **`processed + preparing + queued + waitingOnArchive + uploading �
 | `N volumes uploading` / `N downloading` | volumes / items | Transfers actually moving bytes. Upload registers one entry **per volume**, so a single large item can occupy the whole concurrency allowance on its own; download registers one per object. |
 | `nothing on the wire right now` | — | This instant has no transfer in flight while an item is being prepared. It says *right now*, not *not yet*: several TB may already have gone up earlier in the run. |
 | `N waiting on the same content elsewhere` | items | The identical content is already being uploaded by another item in this run; this one waits for that upload to finish rather than sending the bytes twice. Can take minutes. |
-| `N volumes waiting for an upload slot` | **volumes** | The global upload gate is saturated. Slots are handed out **oldest item first**, not first-come-first-served — see below. |
+| `N volumes + N objects (X) waiting for uploading` | **volumes** + items + bytes | The upload side's queue, printed as one entry with the units keeping its two halves apart: **volumes** are queuing at the global upload gate (saturated; slots go **oldest item first**, not first-come-first-served — see below), **objects** are compressed and claimed but not yet picked up by any uploader. The bytes are measured on exactly those two waits, and they do not divide by the counts — a dedup hit, a resume hit and a raw in-place item all queue owning no archive, so a store-only run can show five figures of objects against almost nothing on disk. |
 | `N starting upload` | items | The archive is verified and the bytes have not left yet, for none of the reasons above. Shown **only when no transfer is in flight**; an item that gets a slot immediately simply appears under `volumes uploading` instead. |
-| `X ready to upload` | bytes | Verified archives sitting in `staged/` waiting for their turn. Rising means compression is outrunning the network; falling means the uploads have caught up. |
+| `X in the uploaders' hands` | bytes | The rest of the staging pool: the unsent tail of every volume on the wire, plus the archives of items parked on a peer or not yet past their first volume. Rising means compression is outrunning the network; falling means the uploads have caught up. |
 | `N checking files` | items | Local work that pushes no bytes and waits on nothing: hashing a whole file for the dedup pre-check, `stat`-ing every member of a pack before and after compression (re-hashing the ones that moved), listing leftover cloud volumes before a multi-volume upload. Each of these can run for minutes on a NAS while emitting not one progress event — without this entry the screen showed a motionless `1 object starting upload` that was neither starting nor uploading. |
-| `X being checked` | bytes | The part of the staged pool belonging to those checks: compressed, on disk, **not yet cleared to upload**. Held apart from `ready to upload` because the post-compression recheck can still discard the whole archive and recompress it — those bytes may never go anywhere. Zero for checks that run before any archive exists (the dedup pre-check, the pre-compression `stat` sweep). |
+| `X being checked` | bytes | The part of the staged pool belonging to those checks: compressed, on disk, **not yet cleared to upload**. Held apart from the other pool figures because the post-compression recheck can still discard the whole archive and recompress it — those bytes may never go anywhere. Zero for checks that run before any archive exists (the dedup pre-check, the pre-compression `stat` sweep). |
 | `N preparing` (Uploading) | items | Holding the **global compression lock** and producing volume files. There is exactly one lock, so this is always `0` or `1`. |
 | `N extracting` (Restoring / Verifying) | items | Downloaded and now extracting / re-hashing. No global lock here, so this can go up to the download concurrency. |
 | `N waiting for the archive slot` | items | Picked up by a worker and queuing behind that same global lock. Split out from `queued` because the lock is global **across backups**: run two at once and one of them can sit entirely behind the other's lock. The diagnosis is then free — `preparing = 1` plus this entry means the lock is your own and the queue is moving; `preparing = 0` plus this entry means another run holds it. |
+| `N waiting for staging room` | items | One step earlier, and pointing the other way: the staging pool is at its byte ceiling (`StagedLimitBytes`) and no compression may start until an **upload** frees space. The wire is the bottleneck and the throttling is deliberate — stopping anything would be the wrong move. Split out of `waiting for the archive slot`, which it used to be reported as, making that entry's `preparing = 0` diagnosis point at a lock nobody was holding. This is the state an upload-bound run spends most of its life in. |
+| `N waiting for the compressor` | items | Probed — their content identity is settled — but not yet in the staging area at all, because the compressor is a single worker taking one item at a time. Capped at the hand-off channel's depth, so unlike its unbounded counterpart above it plateaus. |
 | `N queued` | items | Not started: still in the queue, not yet picked up by any worker. |
 | `X to go` | bytes | Restoring / Verifying only: source bytes not yet written back out. |
 | `N buffered to disk` | items | Diff ran ahead and its surplus work was spilled to a temp file. Cumulative for the run — it only ever grows. See `Backup__DiffQueueMaxItems` below. |

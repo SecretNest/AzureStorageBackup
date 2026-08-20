@@ -91,6 +91,14 @@ nothing there belongs to a live run, and leftovers are never reused.
 against the limit, with the per-run quota split across live leases, and it is checked **before** the
 compression lock is taken so a run waiting for space does not pin the lock.
 
+That ordering is also why the wait has its own progress column, `N objects waiting for staging room`,
+rather than sharing the archive lock's. The two are consecutive inside `StageCoreAsync` and look
+identical from outside — nothing of ours is packing, somebody is waiting — but the lock ends when a
+producer lets go while this one ends only when an **upload** frees space, and the archive-lock entry's
+documented reading ("another run holds it, go and stop that one") is wrong for every item parked here.
+It is registered only on a real wait; with room to spare `WaitForRoomAsync` returns before touching the
+tracker, so the common path costs no progress events. See `docs/progress-display.md`.
+
 One item starting from zero is allowed to overshoot the limit.
 
 > **Rationale.** Otherwise a file whose output is larger than the whole allowance could never be

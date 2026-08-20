@@ -1951,12 +1951,23 @@ function RunStatus({
   // returns null outright (no denominator, so do not guess), which is why this field is naturally empty
   // while both run — showing nothing beats showing a number that goes backwards.
   const pace = uploading ?? details[0]
-  // What a paused run is holding on disk — the exact figure the in-flight line below calls "ready to
-  // upload" (see stageLines' stagedBytes entry), not a second computation of it. Worth stating on the
-  // paused row specifically: that compressed output is what makes Resume cheap, the quota it sits against
-  // is process-wide, and there is deliberately no timeout on a user pause (see design §4), so the cost
+  // What a paused run is holding on disk: the staging pool, whole. Worth stating on the paused row
+  // specifically — that compressed output is what makes Resume cheap, the quota it sits against is
+  // process-wide, and there is deliberately no timeout on a user pause (see design §4), so the cost
   // belongs on screen where the operator can weigh it.
-  const stagedBytes = pace?.stagedBytes ?? 0
+  //
+  // It has to be the **sum** of the four columns the backend splits the pool into, not stagedBytes alone.
+  // That field used to be the pool minus what was in flight, and reading it here was reading the pool; it
+  // now means only the part an uploader has in hand, and on a pause that is close to nothing — everything
+  // else is parked in the upload queue, which is precisely what makes a pause cheap to resume. Adding the
+  // four back together reconstructs the pool exactly, because they are exactly what was subtracted from it
+  // (see StageTracker's staged computation): queued + being checked + in an uploader's hands + the part of
+  // each in-flight volume already sent, which is still on the disk until that volume completes.
+  const stagedBytes =
+    (pace?.stagedBytes ?? 0) +
+    (pace?.waitingToUploadBytes ?? 0) +
+    (pace?.checkingBytes ?? 0) +
+    (pace?.activeItems ?? []).reduce((sum, f) => sum + f.sent, 0)
   // The speed field uses the same gate as the detail line: show it whenever a transfer is in flight, even
   // if this instant reads 0 (a stream just started, nothing booked yet), or the number flickers at the
   // start and end of every stream.

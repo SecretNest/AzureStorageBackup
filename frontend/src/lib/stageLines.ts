@@ -104,14 +104,24 @@ export function stageLines(detail: StageProgress) {
   // gets it from the unit; anyone who does not gets one number for "queued on the upload side", which is the
   // question actually being asked of this line.
   //
-  // The cost, stated: this pulls the object count away from "N ready to upload" directly below it, and those
-  // bytes are exactly what these objects are holding. The pairing is no longer adjacent on screen.
+  // The bytes come with them, in parentheses. Merging the two counts had pulled them away from the "N ready to upload"
+  // that used to sit directly below, and that entry was never the right partner anyway: it was the whole pool minus
+  // what the in-flight streams had sent, so it also carried the unsent tail of everything on the wire and the archives
+  // of items an uploader was already holding. Read as this queue's size it overstated it by whatever was moving.
+  // The backend now measures exactly these two waits in bytes and subtracts them out of the pool, so the number in
+  // the parentheses is the queue's own and nothing else's.
+  //
+  // Omitted when zero, which is not a rounding artefact but a real state: a dedup hit, a resume hit and a raw in-place
+  // item all queue here owning no archive at all, so a store-only run can show five figures of objects against no
+  // bytes. That pairing is the answer to "should I be worried about my temp disk" — no, the queue is deep in items.
   const waitingToUpload = [
     detail.waitingOnSlot > 0 && withUnit(detail.waitingOnSlot, 'volumes'),
     detail.awaitingUpload > 0 && withUnit(detail.awaitingUpload, unit),
   ]
     .filter(Boolean)
     .join(' + ')
+  const waitingToUploadBytes =
+    detail.waitingToUploadBytes > 0 ? ` (${formatBytes(detail.waitingToUploadBytes)})` : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // The in-flight number's unit **differs by direction**:
@@ -129,15 +139,20 @@ export function stageLines(detail: StageProgress) {
   const downloading = detail.stage === 'Restoring' || detail.stage === 'Verifying'
   // Counts and bytes go on **one timeline** — that is the entire point of this reordering. With counts
   // on one line and bytes on another, each ordered by its own logic, nothing on screen could say whether
-  // "+2.0 GB unfinished" and "100 MB ready to upload" were two halves of one item (they are not: the
-  // former's bytes are already in the cloud, the latter has not left, and a whole upload separates them).
+  // "+2.0 GB unfinished" and "100 MB on disk" were two halves of one item (they are not: the former's
+  // bytes are already in the cloud, the latter has not left, and a whole upload separates them).
   // Those two numbers really were questioned at length, when the answer only needed them laid out in order.
   //
   // Ordered **backwards along the timeline**: closest to "this item is done" first, earliest last,
-  // ending at queued. An item's forward order is queued → waiting for the archive slot (the global
-  // production lock) → preparing (holding it) → the archive lands on disk → checking (recheck / clearing
-  // leftover cloud volumes) → ready to upload → starting upload → waiting on peer/slot → uploading →
-  // on the cloud → settled into the line above. Read the array below in reverse and that is it.
+  // ending at queued. An item's forward order is queued → waiting for the compressor → waiting for staging
+  // room (the pool's byte ceiling) → waiting for the archive slot (the global production lock) → preparing
+  // (holding it) → the archive lands on disk → checking (recheck / clearing leftover cloud volumes) →
+  // waiting for uploading → starting upload → waiting on peer → uploading → on the cloud → settled into
+  // the line above. Read the array below in reverse and that is it.
+  //
+  // The bytes now ride with the stage that owns them rather than forming a stage of their own: the upload
+  // queue's are in its parentheses, checking's are the entry below it, and what the uploaders are holding
+  // sits beside the in-flight count.
   //
   // to go and buffered to disk land at the end: the former is source bytes not yet restored on the
   // download side, the latter is how far the diff has run ahead (queued, not yet picked up). Both sit at
@@ -152,6 +167,15 @@ export function stageLines(detail: StageProgress) {
     // holds the compression lock), not "it has not started". Mid-run the line above already shows
     // terabytes accumulated, so "yet" would be false.
     idleOnStaging && 'nothing on the wire right now',
+    // What the uploaders are holding on the staging disk. Three things at once, and they share the one property worth
+    // stating here — an uploader already owns every one of them: the unsent tail of each volume on the wire, the
+    // archives of items parked on a peer, and the archives of items past "entered upload" but not yet on any wire.
+    //
+    // It sat below the upload-side queue reading "N ready to upload", which was two claims and both were shaky: those
+    // bytes are not what that queue is holding (the queue's own bytes are now in its parentheses above), and "ready"
+    // over-promises for the part already half-sent. Moved up here, next to the in-flight entry it mostly belongs to,
+    // and named for the only thing all three have in common.
+    detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} in the uploaders' hands`,
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
     // Both upload-side waits as one entry, the units keeping them apart (volumes = queuing at the global gate,
@@ -168,14 +192,8 @@ export function stageLines(detail: StageProgress) {
     // store-only workload the compressor can queue the whole dataset here while the uploaders trickle. A big
     // number is the pipeline working as designed; what it tells the operator is that the bottleneck is the wire,
     // not the CPU.
-    waitingToUpload && `${waitingToUpload} waiting for uploading`,
+    waitingToUpload && `${waitingToUpload}${waitingToUploadBytes} waiting for uploading`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
-    // Directly after starting upload: these bytes are the output those items have already checked and
-    // are holding, ready to go. "ready to upload" is now accurate — the part still in checking was split
-    // into the entry below and no longer mixes in. It used to report both together, so "compressed" was
-    // being called "ready to send", when a recheck finding a changed member discards the whole archive
-    // and recompresses it, sending not one byte.
-    detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} ready to upload`,
     // The disk-checking stretches (dedup pre-check full read, per-member stat before and after packing,
     // clearing leftover cloud volumes). They emit not one progress event, and the heartbeat only runs
     // while something is in flight — unreported, the screen shows a motionless "1 object starting
@@ -189,11 +207,20 @@ export function stageLines(detail: StageProgress) {
     // Queuing behind that global archive lock. The wording deliberately avoids compressing/compressor:
     // the lock protects "producing this item's volume files", and store-only only packs while a raw
     // passthrough never runs 7z at all — all three take the same lock.
-    // The diagnosis comes free: preparing=1 with this non-zero means the lock is your own and the queue
-    // is moving; preparing=0 with this non-zero means another run holds it, and you can go stop that one.
+    // The diagnosis comes free, and it only holds because the pool's byte ceiling was split into the entry
+    // below rather than reported here: preparing=1 with this non-zero means the lock is your own and the
+    // queue is moving; preparing=0 with this non-zero means another run holds it, and you can go stop that one.
     detail.waitingOnArchive > 0 &&
       `${withUnit(detail.waitingOnArchive, unit)} waiting for the archive slot`,
-    // One stage earlier than the archive slot, and not the same wait. These have been probed — their content
+    // One step before the lock, and the far commoner of the two: the staging pool is at its byte ceiling and no
+    // compression may start until an **upload** frees space. Both used to be reported as the archive slot, and that
+    // made the diagnosis above actively wrong — a run whose pool is full shows preparing=0 with someone waiting, which
+    // the archive-slot entry says means another run holds the lock, and it sends the operator off to stop a backup
+    // that is not in the way. Split out, the pair reads straight: the archive slot points at a producer, this one
+    // points at the wire, and this one is where an upload-bound run spends most of its life.
+    detail.waitingOnRoom > 0 &&
+      `${withUnit(detail.waitingOnRoom, unit)} waiting for staging room`,
+    // Earlier than either of the two above, and not the same wait as either. These have been probed — their content
     // identity is settled — but they have not reached the staging area at all, because the compressor is a single
     // worker and takes one item at a time. Capped at the channel's depth (128), so unlike its counterpart above
     // this one plateaus; sitting at the cap all run means compression is the bottleneck.

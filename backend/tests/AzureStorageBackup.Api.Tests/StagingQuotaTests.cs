@@ -161,4 +161,63 @@ public sealed class StagingQuotaTests : IDisposable
         var item = await area.StageAsync(Produce("anon", 800)).WaitAsync(Patience);
         Assert.Equal(800, item.Bytes);
     }
+
+    /// <summary>
+    /// What backpressure looks like on screen. It is the state an upload-bound run spends most of its life in — the pool
+    /// fills because the wire is slower than the compressor, exactly as designed — and it used to be reported as
+    /// "waiting for the archive slot", the column whose documented reading is "another run holds the lock, go and stop
+    /// it". Nobody held a lock here; there was simply no space, and only an upload could make some.
+    /// </summary>
+    [Fact]
+    public async Task A_Run_Blocked_By_A_Full_Pool_Says_So_Instead_Of_Blaming_The_Lock()
+    {
+        using var area = Area(limit: 500);
+        using var lease = area.AcquireLease();
+        StageProgress? latest = null;
+        var tracker = new StageTracker("Uploading", total: 2, p => Volatile.Write(ref latest, p));
+
+        var filled = await area.StageAsync(Produce("a1", 500), lease, tracker: tracker).WaitAsync(Patience);
+
+        // The pool is now at its ceiling, so the next item cannot even start producing.
+        var blocked = area.StageAsync(Produce("a2", 100), lease, tracker: tracker);
+        await Until(() => Volatile.Read(ref latest)?.WaitingOnRoom == 1, "the blocked item should report waiting for room");
+
+        var s = Volatile.Read(ref latest)!;
+        Assert.Equal(1, s.WaitingOnRoom);
+        Assert.Equal(0, s.WaitingOnArchive);   // no lock is involved — the previous item let go of it long ago
+        Assert.Equal(0, s.Preparing);
+        Assert.False(blocked.IsCompleted);
+
+        // An upload frees space, and it proceeds. The column empties with it.
+        area.Release(filled);
+        var resumed = await blocked.WaitAsync(Patience);
+        Assert.Equal(100, resumed.Bytes);
+        await Until(() => Volatile.Read(ref latest)?.WaitingOnRoom == 0, "the column must empty once the wait ends");
+    }
+
+    /// <summary>
+    /// A wait that never happens must stay silent. Registering the phase unconditionally would force two publishes per
+    /// item for nothing, which is the same trade the upload gate makes when it finds itself free — and at this repo's
+    /// measured scale (hundreds of thousands of items) "for nothing" is the expensive part.
+    /// </summary>
+    [Fact]
+    public async Task Staging_With_Room_To_Spare_Reports_No_Wait_At_All()
+    {
+        using var area = Area(limit: 1000);
+        using var lease = area.AcquireLease();
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        await area.StageAsync(Produce("a1", 100), lease, tracker: tracker).WaitAsync(Patience);
+        tracker.Complete();
+
+        Assert.All(seen, p => Assert.Equal(0, p.WaitingOnRoom));
+    }
+
+    private static async Task Until(Func<bool> reached, string because)
+    {
+        for (var i = 0; i < 500 && !reached(); i++)
+            await Task.Delay(20);
+        Assert.True(reached(), because);
+    }
 }
