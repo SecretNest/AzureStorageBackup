@@ -205,12 +205,18 @@ public sealed class CompressionContinuityTests : IDisposable
     /// <param name="describe">What the pool looked like when patience ran out. Without it the failure reads
     /// "condition not met", which cannot tell "compression stalled" (the regression) from "the staging limit was
     /// set too low for this test" — and those want opposite reactions.</param>
-    private static async Task WaitUntil(Func<bool> condition, TimeSpan patience, Func<string> describe)
+    private static Task WaitUntil(Func<bool> condition, TimeSpan patience, Func<string> describe)
+        => WaitUntil(() => Task.FromResult(condition()), patience, describe);
+
+    /// <param name="condition">Async because some of what these tests wait on is only readable by going back to
+    /// disk — the journal, in particular. Blocking on it inside a sync predicate would work here (xUnit has no
+    /// synchronisation context) but is exactly the habit that stops working the moment one does.</param>
+    private static async Task WaitUntil(Func<Task<bool>> condition, TimeSpan patience, Func<string> describe)
     {
         var deadline = DateTime.UtcNow + patience;
         while (DateTime.UtcNow < deadline)
         {
-            if (condition())
+            if (await condition())
                 return;
             await Task.Delay(50);
         }
@@ -833,9 +839,17 @@ public sealed class CompressionContinuityTests : IDisposable
         try
         {
             var run = orchestrator.RunAsync(request, progress: null, ct: default, control: control);
+            // Wait for a **journalled upload**, not merely for staged bytes. `StagedBytes > 0` says only that the
+            // compressor produced something; an uploader may not have touched it yet, and pausing on that signal is
+            // what made this test flaky. Under load the gate landed before any uploader picked the first entry up,
+            // so there was never an upload on the wire to finish, the journal stayed empty, and the assertion at the
+            // end failed — the run was fine, the precondition was not. Twelve files against two upload slots leaves
+            // plenty still to do after the first record, so the pause still lands squarely mid-run.
             await WaitUntil(
-                () => staging.StagedBytes > 0, TimeSpan.FromSeconds(60),
-                () => "the pipeline never got going before the pause.");
+                async () => (await journals.ListAsync(request.Account.Id, name, default))
+                    .Any(j => j.Content.Records.Count > 0),
+                TimeSpan.FromSeconds(120),
+                () => $"no upload was journalled before the pause; the pool reached {staging.StagedBytes} bytes.");
 
             control.Gate.PauseByUser();
             // One item per stage may still be in hand; let the whole pipeline park before pressing Suspend.
@@ -854,8 +868,12 @@ public sealed class CompressionContinuityTests : IDisposable
                 $"suspend took {pressed.Elapsed.TotalSeconds:F1}s — a loop stayed parked behind the pause.");
             Assert.Equal(0, staging.StagedBytes);
 
-            // The journal is the resumable midpoint the design promises: at least the upload already on the wire
-            // when the pause landed must have been written down for the next run to pick up.
+            // The journal is the resumable midpoint the design promises, and what is checked here is that the
+            // suspend did not take it away: one journal for this run, still carrying its records after the run was
+            // torn down mid-flight. That a record *appears* at all is pinned by the wait above — and that a pause
+            // lets the item already in an uploader's hands run to completion is pinned separately, and
+            // deterministically, by <see cref="Pause_Holds_The_Pipeline_And_Resume_Picks_It_Up"/>, which gates the
+            // uploads itself instead of racing a stopwatch against them.
             var journal = Assert.Single(await journals.ListAsync(request.Account.Id, name, default));
             Assert.NotEmpty(journal.Content.Records);
         }
