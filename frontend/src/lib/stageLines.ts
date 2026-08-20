@@ -18,6 +18,22 @@ const STAGE_UNITS: Record<string, string> = {
 }
 
 /**
+ * What each stage is called **on screen**. The backend's stage token is an internal identifier, and
+ * printing it raw only ever worked by luck: every other stage happens to be one English word, so
+ * nobody noticed there was no mapping until the check's opening stage — `LoadingIndex` — reached a
+ * user as "LoadingIndex: 0 entries so far".
+ *
+ * The numeric backup stage already has this map (`backupStageLabels`, where WritingIndex reads
+ * "Writing index"); this is the same map on the string axis, which had none.
+ *
+ * Only tokens that do not read as English need an entry. The fallback is the token itself, so a
+ * stage added on the backend and forgotten here degrades to a terse heading rather than a blank one.
+ */
+const STAGE_LABELS: Record<string, string> = {
+  LoadingIndex: 'Loading index',
+}
+
+/**
  * Give a number its own unit word, with singular and plural following the number.
  *
  * The in-flight line carries two counting bases at once — upload registers per **volume** (VolumeBlobIO
@@ -42,6 +58,7 @@ function withUnit(n: number, plural: string): string {
  */
 export function stageLines(detail: StageProgress) {
   const unit = STAGE_UNITS[detail.stage] ?? 'items'
+  const label = STAGE_LABELS[detail.stage] ?? detail.stage
   // "of" rather than "/": a slash is fraction notation, and putting one there invites a percentage —
   // while an item-count percentage means very little during upload (one item may be a 6.8 GB single file
   // or a pack of several hundred 5 KB files). Real completion is by bytes, in the "60.618 GB / 191.000 GB
@@ -222,8 +239,10 @@ export function stageLines(detail: StageProgress) {
       `${withUnit(detail.waitingOnRoom, unit)} waiting for staging room`,
     // Earlier than either of the two above, and not the same wait as either. These have been probed — their content
     // identity is settled — but they have not reached the staging area at all, because the compressor is a single
-    // worker and takes one item at a time. Capped at the channel's depth (128), so unlike its counterpart above
-    // this one plateaus; sitting at the cap all run means compression is the bottleneck.
+    // worker and takes one item at a time. Capped at the channel's depth (9), so unlike its counterpart above this
+    // one plateaus — and the cap is deliberately small enough that plateauing says little: nine is a display
+    // decision, because a deep queue here reads as "compression is the bottleneck" when usually it is the
+    // opposite (the compressor is held by staging backpressure, waiting on the uploaders).
     detail.awaitingCompression > 0 &&
       `${withUnit(detail.awaitingCompression, unit)} waiting for the compressor`,
     detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
@@ -321,5 +340,5 @@ export function stageLines(detail: StageProgress) {
   // ("5 volumes uploading in parallel:") assembles exactly the same sentence, and letting the caller
   // build it again would copy the "upload counts volumes, download counts items" rule into a second
   // place — change one, miss the other.
-  return { counts, done, pipeline, speed, eta, inFlightPhrase }
+  return { counts, done, pipeline, speed, eta, inFlightPhrase, label }
 }

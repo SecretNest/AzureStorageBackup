@@ -11,6 +11,7 @@ import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { orphanSummary } from '../lib/checkSummary'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
@@ -2072,7 +2073,7 @@ function RunStatus({
 /// 0%, indistinguishable from a hang.
 
 function StageDetail({ detail }: { detail: StageProgress }) {
-  const { counts, done, pipeline, speed, eta, inFlightPhrase } = stageLines(detail)
+  const { counts, done, pipeline, speed, eta, inFlightPhrase, label } = stageLines(detail)
 
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
@@ -2109,8 +2110,9 @@ function StageDetail({ detail }: { detail: StageProgress }) {
         </div>
       ))}
       <div>
-        {/* The stage name has to be spelled out: with two details side by side, two rows of numbers alone do not say which is the diff and which is the upload. */}
-        <span className="text-faint">{detail.stage}: </span>
+        {/* The stage name has to be spelled out: with two details side by side, two rows of numbers alone do not say which is the diff and which is the upload.
+            Spelled out from the label map, never from detail.stage itself — that is the backend's own token, and printing it raw put "LoadingIndex:" on screen. */}
+        <span className="text-faint">{label}: </span>
         {counts}
         {/* The item-count percentage appears only when bytes cannot provide one (scanning and diffing
             report no byte workload) — and there it shares a basis with the fraction beside it. The
@@ -2234,17 +2236,18 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
     // The orphan scan is a separate axis from ok — orphans are not corruption and never fail a check — so its
     // result has to be stated separately or it is not stated at all. This line is where it matters most: the
     // dialog closes when the check starts, so for most of a check's life this row is the only thing on screen.
-    const orphans = r.orphanScanIssue
-      ? ' · unreferenced-blob scan abandoned'
-      : r.orphansChecked && r.orphanBlobs.length > 0
-        ? ` · ${r.orphanBlobs.length.toLocaleString()} unreferenced blob(s), reclaimable by repair`
-        : ''
+    // Including when it found nothing: see orphanSummary for why the criterion is "the scan ran", not "the scan
+    // found something".
+    const orphans = orphanSummary(r)
+    // Amber only when there is something to act on. A clean scan is good news and takes the row's own tone —
+    // colouring "no unreferenced blobs" as a warning is how a reassurance turns into a thing to worry about.
+    const orphansWarn = r.orphanScanIssue != null || r.orphanBlobs.length > 0
     return (
       <div className={r.ok ? 'text-ok' : 'text-danger'}>
         {r.ok
           ? `Check completed — all checked objects OK (version ${r.version})`
           : `Check completed — ${r.missingRefs.length} problem(s), ${r.repairablePaths.length} repairable (version ${r.version})`}
-        {orphans && <span className="text-warn">{orphans}</span>}
+        {orphans && <span className={orphansWarn ? 'text-warn' : undefined}>{orphans}</span>}
       </div>
     )
   }

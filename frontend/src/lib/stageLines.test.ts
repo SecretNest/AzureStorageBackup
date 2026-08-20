@@ -267,3 +267,29 @@ describe('stageLines', () => {
     expect(pipeline).toBe('1 object downloading · 1.490 GB to go')
   })
 })
+
+/**
+ * The stage name is printed on screen, so it cannot be the backend's own token. Every other stage
+ * happens to be a single English word and reads fine untranslated, which is exactly why the one
+ * compound token — the index-loading stage a check opens with — shipped raw: "LoadingIndex:".
+ * The same trap `backupStageLabels` already solved for the numeric enum (WritingIndex → "Writing
+ * index"), only on the string axis, where nothing was mapping at all.
+ */
+describe('stage labels', () => {
+  test('a compound stage token is spelled out for the screen', () => {
+    expect(stageLines(progress({ stage: 'LoadingIndex' })).label).toBe('Loading index')
+  })
+
+  test('single-word stages keep their own name', () => {
+    expect(stageLines(progress({ stage: 'Uploading' })).label).toBe('Uploading')
+    expect(stageLines(progress({ stage: 'Verifying' })).label).toBe('Verifying')
+  })
+
+  /**
+   * An unmapped token must still print something rather than nothing — a stage added on the backend
+   * and not here should read a little terse, not vanish and leave a bare "  : 12 of 40 files".
+   */
+  test('an unknown stage falls back to its own token', () => {
+    expect(stageLines(progress({ stage: 'Something' })).label).toBe('Something')
+  })
+})
