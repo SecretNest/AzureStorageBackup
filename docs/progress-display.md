@@ -115,8 +115,14 @@ room — so each channel gets its own term rather than being folded into a neigh
 
 | Queue | Term | Depth | What a large reading means |
 |---|---|---|---|
-| `probedQueue` | `awaitingCompression` | bounded, 128 | compression is the bottleneck |
+| `probedQueue` | `awaitingCompression` | bounded, 9 | little on its own — see below |
 | `stagedQueue` | `awaitingUpload` | unbounded | the wire is the bottleneck |
+
+**The cap of nine is itself a display decision**, and it is why this term's large reading says so little.
+Sitting at the cap reads as "compression is the bottleneck" when most of the time it is the opposite:
+the compressor is held by staging-pool backpressure because the uploaders are behind, and the backlog
+piles up here as a *symptom* of the wire being slow. A number that cannot exceed ten cannot tell that
+lie loudly. The reasoning behind the depth is in [pipeline.md](pipeline.md).
 
 `stagedQueue` has no depth limit because whatever owns an archive is already bounded in bytes by the
 staging pool, which is the limit the operator set. Three entry kinds own no archive — a dedup hit, a

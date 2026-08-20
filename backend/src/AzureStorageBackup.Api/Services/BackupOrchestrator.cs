@@ -3848,9 +3848,13 @@ public sealed class BackupOrchestrator(
                 // Tail hash precedence: for single-file blobs uploaded this run, use the value computed during the
                 // compression pass (the most authoritative — those are the bytes that actually went into the
                 // archive); otherwise use what the diff computed; otherwise inherit the previous version's entry.
-                // The middle tier is new: pack members used to have none of these, so they could only dedup on three
-                // criteria, inconsistent with the four used on the single-file blob path. The diff now computes it
-                // for unchanged files too (see BackupDiffer.UnchangedAsync), so one run fills this in for old backups.
+                // The middle tier is the one that fills gaps: pack members used to have none of these, so they could
+                // only dedup on three criteria, inconsistent with the four used on the single-file blob path. It is
+                // filled in by BackupDiffer whenever an entry is actually read — added, modified, or metadata-only.
+                // An Unchanged entry is **not** one of those and reaches the third tier with the previous version's
+                // value, null included: there is deliberately no backfill pass, because it would be a random read
+                // conjured out of nothing on files nobody touched (content-identity.md § "An unchanged entry reads
+                // nothing"). So a tail-less entry in an old index stays tail-less until its file is modified.
                 TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.TailHash ?? c.Previous?.TailHash,
                 FullHash = ov?.FullHash ?? c.FullHash,
                 Target = c.Current.Target,

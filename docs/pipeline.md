@@ -87,7 +87,7 @@ volume can never be modified mid-compression. A completed upload deletes from st
 immediately. Both directories are emptied at startup — the process has just started, so by definition
 nothing there belongs to a live run, and leftovers are never reused.
 
-`StagedLimitBytes` (1 GB by default) is the backpressure. `HasRoom` gates on current pool occupancy
+`StagedLimitBytes` (2 GB by default, changeable at runtime from Settings) is the backpressure. `HasRoom` gates on current pool occupancy
 against the limit, with the per-run quota split across live leases, and it is checked **before** the
 compression lock is taken so a run waiting for space does not pin the lock.
 

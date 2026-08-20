@@ -46,10 +46,28 @@ root" case.
 A pack is checked once per archive, not once per file, so the unit on screen is objects rather than
 files.
 
-> **A known gap.** `POST /backup-configs/{id}/check` is **synchronous** — it holds the HTTP request
-> until the report is produced, with no runner and no matching `GET`. So refreshing the page during a
-> check loses the report. The badge still shows `Checking` from the in-memory busy tracker, but the
-> result is gone. Fixing it means reshaping check into the runner pattern repair already uses.
+### The check is a background job
+
+`POST /backup-configs/{id}/check` returns **202** with a run state and you poll `GET` on the same
+path; `CheckRunner` owns the run, the same pattern restore and repair use.
+
+> **Rationale — it used to be synchronous, and that was the defect.** The request was held until the
+> report was produced. A content-level check downloads and re-hashes the whole backup, so for a few
+> hundred GB the browser or the reverse proxy cut the connection off first: the check had run for
+> hours, there was nothing to watch it with, and the result was thrown away at the end.
+
+Two consequences are load-bearing and each is deliberate:
+
+- **The report outlives the run.** `GET` keeps returning the last report after the check finishes,
+  because the dialog closes the instant a check starts and reopening it has to bring the result back.
+- **"Never checked" answers 204, not 404.** The dialog asks once as soon as it opens, and a 404 there
+  leaves a red error in the browser console that reads like a malfunction — which is exactly how it
+  was first reported.
+
+Because the dialog is gone for the whole of a check's life, the backup's status row is the only thing
+on screen, so it has to carry the outcome of **both** axes: the object result *and* the
+unreferenced-blob scan, including when that scan ran and found nothing (`orphansChecked`, not
+`orphanBlobs.length` — an empty list cannot tell "nobody asked" from "asked, container clean").
 
 ## Repair from local
 

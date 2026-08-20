@@ -213,7 +213,10 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // single-file threshold (a few MB up to hundreds of GB), so 4KB may buy out an entire full-file read — a sure win.
             // Pack members are the other way round — they are small, and once classified Modified the fullHash still has to be computed and
             // written into the index, so exiting early saves nothing and just wastes one open + seek.
-            // A null prev.TailHash is an old index's transitional state (see the backfill in UnchangedAsync); skip this probe then.
+            // A null prev.TailHash is an old index's entry, written before this field existed; there is nothing to compare against, so skip
+            // this probe. It is not backfilled anywhere — Unchanged() carries the null forward on purpose (see content-identity.md
+            // § "An unchanged entry reads nothing"): backfilling would be a random read conjured out of nothing, ~5-10 ms per file on a
+            // NAS spinning disk, close to an hour for 500,000 files. A file that actually gets modified fills it in naturally.
             if (deferFull && prev.TailHash is not null)
             {
                 var tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);

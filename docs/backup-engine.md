@@ -108,21 +108,37 @@ Two details are load-bearing:
 
 ## Post-processing recheck and repeat protection
 
-A source file can change while it is being read, compressed or uploaded. After processing, the file's
-mtime and permissions are read again; if they moved, it is rehashed, and if the hash moved too, the
-item is reprocessed under the new content.
+A source file can change while it is being read, compressed or uploaded. The invariant is the same on
+every route — **the index must describe the bytes that were actually stored, and no archive may
+travel with a file in it that has already changed** — but the three routes reach it differently, and
+only one of them has a repeat counter.
 
-After `ProcessingMaxAttempts` repeats (5 by default) the run raises a warning, saves what it has, and
-stops retrying that file.
+**Single-file blobs — no recheck; the read is the record.** The hash, the length and the mtime all
+fall out of the one compression pass (`StreamAndStageAsync`), so the bytes hashed and the bytes
+stored are the same set by construction and there is no window to check afterwards. When the content
+turns out to differ from what the diff saw, an `EntryOverride` is written and the index entry is
+built from **it** rather than from the scan — same file, new length, new hashes. Nothing is
+reprocessed, because nothing needs to be: what went to the cloud is correct, it is just not what the
+diff expected.
 
-For a pack, the recheck runs against the group's original files after compression. A member that
-moved is taken out of the archive and re-queued into a later group for that directory, or handled as
-a single file if there is none — and the archive that contained it is discarded and recompressed.
+**Packs — recheck, exclude and recompress.** The group's members are `stat`ed before compression and
+re-verified after it, all on the compression stage and all **before** the upload. A member counts as
+changed only when its metadata **and** its content hash both moved; it is then taken out of the
+archive and re-queued into a later group for that directory, or handled as a single file if there is
+none — and the archive that contained it is discarded and recompressed without it.
 
 > **Rationale.** The requirement is an invariant, not an implementation: *never upload a pack that
-> keeps an already-changed file in it as garbage*. Excluding and recompressing satisfies it.
+> keeps an already-changed file in it as garbage*. Excluding and recompressing satisfies it, and
+> settling it before the upload means the wasted work is one compression, not one transfer.
 
-The raw in-place route has its own version of this guard, described in [pipeline.md](pipeline.md).
+`ProcessingMaxAttempts` (5 by default) belongs to **this route only**. A member that keeps changing
+across that many attempts is demoted to a single-file blob and the run raises a warning; a member
+that grows past the single-file threshold is demoted immediately, without waiting for the counter.
+
+**The raw in-place route — a stat bracket around the whole upload.** Length and mtime are compared
+before the hashing read and again after the upload has ended, however it ended; any movement means
+the blob just written may not hold the content its address names, so it is deleted and the item is
+retried through the copying route. Described in full in [pipeline.md](pipeline.md).
 
 ## Unreadable input
 
@@ -221,15 +237,37 @@ thousand webhooks, drowning the operator and stalling the run on pushing.
 
 ## The rule engine
 
-One gitignore-syntax implementation is shared by three rule sets, each holding its own text:
+One gitignore-syntax implementation (`IgnoreRuleSet`) is shared by four rule sets:
 
 | Rule set | Effect |
 |---|---|
 | Ignore | matching paths are excluded from the backup entirely |
 | Don't-compress | matching paths are stored without compression (still backed up) |
 | Don't-group | matching paths are never packed; each becomes its own blob |
+| Cross-directory | matching paths are packed by full-path order, ignoring directory boundaries ([packing.md](packing.md)) |
 
 Negation with `!` is supported, and the last matching rule wins.
+
+### Each set has two halves, and they are one set
+
+Every rule set holds **two** blocks of text — a case-sensitive one and a case-insensitive one — and
+each half inherits from global settings on its own (`IgnoreRules` / `IgnoreRulesCaseInsensitive`, and
+so on for the other three). Overriding "the mp4 rules" for one backup should not silently drag the
+global path rules along with it, nor the other way round.
+
+`BackupRequestMapper.Rules` concatenates the pair into **one** `IgnoreRuleSet` — sensitive first,
+insensitive after — with case sensitivity carried **per rule** (`IgnoreRuleSet.FromTagged`).
+
+> **Rationale — why one set rather than two consulted in turn.** "The last matching rule decides" has
+> to keep holding across the pair. Two sets OR-ed together would break exactly that: a `!keep.mp4` in
+> either half could never override a match in the other, and the negation would silently do nothing.
+> Sensitive-first is the arbitrary half of the choice; what matters is that the order is fixed and
+> written down, so a negation can be authored knowing what it overrides.
+
+> **Rationale — why insensitivity is a flag and not something you write in the pattern.** There is no
+> character-class support: everything that is not `*` or `?` goes through `Regex.Escape`, so `[wW]`
+> matches those three characters literally. `*.JPG` and `*.jpg` as separate rules is the alternative,
+> and it does not scale past a couple of extensions.
 
 Scope rules are deliberately **not** part of this engine — they are exact paths with
 longest-prefix-wins semantics, and the reasoning is in [configuration.md](configuration.md).

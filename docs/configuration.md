@@ -19,7 +19,7 @@ A two-step form.
 
 ## Inheritance: `null` means inherit
 
-Eleven fields have a `Default*` counterpart in global settings and follow one rule with no
+Sixteen fields have a `Default*` counterpart in global settings and follow one rule with no
 exceptions: **NULL means inherit, non-NULL means override.**
 
 | Field | "Explicitly none" is expressed as |
@@ -28,12 +28,22 @@ exceptions: **NULL means inherit, non-NULL means override.**
 | `SingleFileThresholdBytes`, `GroupCapBytes` | n/a |
 | `IncludeSymlinks`, `VerboseLogging` | n/a |
 | `VolumeBytes` | **`0`** = splitting off |
-| `IgnoreRules`, `DontCompressRules`, `DontGroupRules` | **`''`** = no rules |
+| `IgnoreRules`, `DontCompressRules`, `DontGroupRules`, `CrossDirGroupRules` | **`''`** = no rules |
+| the four `*CaseInsensitive` counterparts of those | **`''`** = no rules |
+
+**Each rule list is two independently inheritable fields**, not one. `IgnoreRules` and
+`IgnoreRulesCaseInsensitive` are separate columns with separate `Default*` counterparts, and the same
+for the other three lists — that is eight of the sixteen.
+
+> **Rationale.** Overriding "the mp4 rules" for one backup must not silently drag the global path
+> rules along with it, nor the other way round. Whether the two halves are then matched as one set or
+> two is a different question, settled in [backup-engine.md](backup-engine.md) § *The rule engine*:
+> they are concatenated into one, because "the last matching rule decides" has to hold across the pair.
 
 > **Rationale — why `VolumeBytes` moved "off" from `null` to `0`.** That field used `null` to mean
-> "splitting off", which collides with inheritance. One rule across all eleven fields is worth more
+> "splitting off", which collides with inheritance. One rule across all sixteen fields is worth more
 > than preserving a per-field convention, and the settings page already said `0 = off`, so the UI
-> semantics were already there. The three rule fields are the mirror image: `null` inherits and `''`
+> semantics were already there. The eight rule fields are the mirror image: `null` inherits and `''`
 > is explicitly no rules, and `string?` passes through from DTO to entity untouched, so the two stay
 > distinguishable.
 
@@ -48,7 +58,7 @@ rows show `locked after creation` rather than a checkbox.
 ### Resolution happens at use
 
 `ResolvedBackupSettings` takes `(BackupConfig, GlobalSettings)` and produces the effective value of
-all eleven. Four paths go through it: backup, check, cleanup and restore.
+all sixteen. Four paths go through it: backup, check, cleanup and restore.
 
 > **Rationale — resolution must not fill values in when the configuration is read.** Fill them in at
 > read time and the edit screen can no longer tell "an inherited 100" from "a 100 I typed", so saving
