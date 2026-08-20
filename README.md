@@ -45,10 +45,40 @@ npm run dev
 ## Tests
 
 ```bash
-cd backend && dotnet test
+cd backend && dotnet test      # 1299 tests
+cd frontend && npx vitest run  #   85 tests
 ```
 
-Integration tests that talk to Azure use [Azurite](https://github.com/Azure/Azurite); they are skipped automatically when Azurite is not reachable on `127.0.0.1:10000`.
+The backend suite needs **two things on the machine**, and it is worth setting both up before you
+trust a green run — without them most of it does not run at all, and a good part of the rest fails
+for reasons that have nothing to do with your change.
+
+**7-Zip.** Use the official `7zz` binary, not the distro's p7zip: p7zip (and 7-Zip 23.01) writes a
+zero attribute for `-si` stdin input, which makes single-file blobs unrestorable. The Dockerfile
+fetches it the same way.
+
+```bash
+ver="$(curl -fsSL https://www.7-zip.org/download.html \
+       | grep -oE '7z[0-9]{4}-linux-x64\.tar\.xz' | grep -oE '[0-9]{4}' | sort -rn | head -1)"
+curl -fsSL "https://www.7-zip.org/a/7z${ver}-linux-x64.tar.xz" | tar -xJ -C ~/.local/bin 7zz
+```
+
+Tests that compress are guarded and skip without it — but the endpoint tests are **not** guarded, and
+fail with `No 7-Zip executable found on PATH` for what looks like an unrelated 500.
+
+**Azurite**, reachable on `127.0.0.1:10000`. Tests that talk to Azure skip automatically when it is
+not.
+
+```bash
+npx azurite --location /tmp/azurite --skipApiVersionCheck --silent
+```
+
+`--skipApiVersionCheck` is not optional: the Azure SDK this project pins negotiates an
+`x-ms-version` newer than the list Azurite validates against, so without it **every** request comes
+back `400 InvalidHeaderValue` and the whole integration suite fails rather than skipping.
+
+A run with neither reports roughly `943 passed, 34 failed, 322 skipped`. A correct one reports
+`1299 passed, 0 skipped` — if you see skips, the suite is not telling you what you think it is.
 
 ## How a backup runs
 

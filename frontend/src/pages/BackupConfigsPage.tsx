@@ -11,6 +11,7 @@ import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
+import { EmptyRow } from '../components/EmptyRow'
 import { orphanSummary } from '../lib/checkSummary'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
@@ -121,6 +122,12 @@ function formatRetryIn(at: string): string {
 
 export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
+  // Set once the first list request comes back, whatever it came back with. Without it an empty
+  // `configs` cannot say "no backups" from "no backups *yet fetched*", and this page — the landing
+  // page — greets the user with "No backups yet." before showing them their backups. See EmptyRow.
+  // The 5-second refresh below deliberately does not touch it: once loaded, always loaded, so a tick
+  // that fails or returns late leaves the previous list on screen rather than blanking the table.
+  const [loaded, setLoaded] = useState(false)
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   // Which runs have been asked to wind down, and how. Stopping is asynchronous — the signal only takes effect
@@ -180,6 +187,9 @@ export function BackupConfigsPage() {
         refreshInterrupted(list)
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      // finally, not then: a failed load must still end the "loading" state, or the table sits on
+      // "Loading…" forever with the real reason in the error line above it.
+      .finally(() => setLoaded(true))
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
   // List the containers of the selected account (the PRD 1.2 endpoint, already used by ContainersPage).
@@ -1388,11 +1398,9 @@ export function BackupConfigsPage() {
           </thead>
           <tbody>
             {configs.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="empty-state">
-                  No backups yet.
-                </td>
-              </tr>
+              <EmptyRow loaded={loaded} colSpan={6}>
+                No backups yet.
+              </EmptyRow>
             ) : (
               configs.map((c) => {
                 // The run status is moved out of the action column onto its own row (see .ops-row in

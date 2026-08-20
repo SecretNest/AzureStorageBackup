@@ -15,6 +15,7 @@ import {
 import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
+import { EmptyRow } from '../components/EmptyRow'
 import { GroupsSection } from './GroupsPage'
 import { Field } from '../components/Field'
 
@@ -33,6 +34,9 @@ const emptyForm: TaskInput = {
 
 export function TasksPage() {
   const [tasks, setTasks] = useState<ScheduledTask[]>([])
+  // Set once the first list request comes back, whatever it came back with — an empty `tasks` cannot
+  // otherwise say "none" from "none yet". Same flag `poolLoaded` below already is. See EmptyRow.
+  const [loaded, setLoaded] = useState(false)
   const [groups, setGroups] = useState<Group[]>([])
   const [pool, setPool] = useState<DiscoveredBackup[]>([])
   const [poolLoaded, setPoolLoaded] = useState(false)
@@ -41,7 +45,14 @@ export function TasksPage() {
   const [form, setForm] = useState<TaskInput>(emptyForm)
   const [error, setError] = useState<string | null>(null)
 
-  const loadTasks = () => tasksApi.list().then(setTasks).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+  const loadTasks = () =>
+    tasksApi
+      .list()
+      .then(setTasks)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      // finally, not then: a failed load must still end the "loading" state, or the table sits on
+      // "Loading…" forever with the real reason in the error line above it.
+      .finally(() => setLoaded(true))
   useEffect(() => {
     loadTasks()
     groupsApi.list().then(setGroups).catch(() => {})
@@ -163,11 +174,9 @@ export function TasksPage() {
         </thead>
         <tbody>
           {tasks.length === 0 ? (
-            <tr>
-              <td colSpan={6} className="empty-state">
-                No schedules yet.
-              </td>
-            </tr>
+            <EmptyRow loaded={loaded} colSpan={6}>
+              No schedules yet.
+            </EmptyRow>
           ) : (
             tasks.map((t) => (
               <tr key={t.id}>

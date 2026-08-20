@@ -1,10 +1,14 @@
 import { useEffect, useState } from 'react'
 import { groupsApi, type Group, type GroupMember } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
+import { EmptyRow } from '../components/EmptyRow'
 import { Field } from '../components/Field'
 
 export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groups, setGroups] = useState<Group[]>([])
+  // The same flag `poolLoaded` below is, for the same reason and on the list this section is about:
+  // an empty `groups` cannot say "none" from "none yet". See EmptyRow.
+  const [groupsLoaded, setGroupsLoaded] = useState(false)
   const [pool, setPool] = useState<DiscoveredBackup[]>([])
   const [poolLoaded, setPoolLoaded] = useState(false)
   const [editing, setEditing] = useState<Group | null>(null)
@@ -18,6 +22,9 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
       .list()
       .then(setGroups)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      // finally, not then: a failed load must still end the "loading" state, or the table sits on
+      // "Loading…" forever with the real reason in the error line above it.
+      .finally(() => setGroupsLoaded(true))
   useEffect(() => {
     loadGroups()
   }, [])
@@ -117,11 +124,9 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
           </thead>
           <tbody>
             {groups.length === 0 ? (
-              <tr>
-                <td colSpan={3} className="empty-state">
-                  No groups yet.
-                </td>
-              </tr>
+              <EmptyRow loaded={groupsLoaded} colSpan={3}>
+                No groups yet.
+              </EmptyRow>
             ) : (
               groups.map((g) => (
                 <tr key={g.id}>

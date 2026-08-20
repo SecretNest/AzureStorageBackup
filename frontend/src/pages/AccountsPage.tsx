@@ -10,6 +10,7 @@ import {
 } from '../api/accounts'
 import { refreshKeyringStatus } from '../api/keyring'
 import { Modal } from '../components/Modal'
+import { EmptyRow } from '../components/EmptyRow'
 import { Field } from '../components/Field'
 import { ContainersPage } from './ContainersPage'
 
@@ -58,6 +59,10 @@ const emptyForm: AccountInput = {
 /// a way back, which works just as well nested in a section.
 export function AccountsSection() {
   const [accounts, setAccounts] = useState<Account[]>([])
+  // Set once the first list request comes back, whatever it came back with. Without it an empty
+  // `accounts` cannot say whether there are none or none yet, and the table announces "No accounts
+  // yet." while the request is still in flight. See EmptyRow.
+  const [loaded, setLoaded] = useState(false)
   const [editing, setEditing] = useState<Account | null>(null)
   const [form, setForm] = useState<AccountInput>(emptyForm)
   const [showForm, setShowForm] = useState(false)
@@ -68,7 +73,13 @@ export function AccountsSection() {
   const [resetting, setResetting] = useState<Account | null>(null)
 
   const load = () => {
-    accountsApi.list().then(setAccounts).catch((e) => setError(e instanceof Error ? e.message : String(e)))
+    accountsApi
+      .list()
+      .then(setAccounts)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      // finally, not then: a failed load still ends the "loading" state, or the table sits on
+      // "Loading…" forever with the real reason shown in the error line above it.
+      .finally(() => setLoaded(true))
   }
   useEffect(load, [])
 
@@ -228,11 +239,9 @@ export function AccountsSection() {
           </thead>
           <tbody>
             {accounts.length === 0 ? (
-              <tr>
-                <td colSpan={5} className="empty-state">
-                  No accounts yet.
-                </td>
-              </tr>
+              <EmptyRow loaded={loaded} colSpan={5}>
+                No accounts yet.
+              </EmptyRow>
             ) : (
               accounts.map((a) => (
                 <tr key={a.id}>

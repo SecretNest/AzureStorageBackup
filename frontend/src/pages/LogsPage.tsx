@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
 import { systemApi } from '../api/system'
+import { EmptyRow } from '../components/EmptyRow'
 import { formatLocalDateTime, formatUtcOffset } from '../constants/format'
 
 export function LogsPage() {
@@ -9,6 +10,11 @@ export function LogsPage() {
   const timeZone = formatUtcOffset(new Date())
 
   const [logs, setLogs] = useState<LogEntry[]>([])
+  // Set once a query comes back, whatever it came back with. Without it an empty `logs` cannot say
+  // "no entries" from "not asked yet", and the table announces "No log entries." while the request is
+  // still in flight — which on this page is doubly wrong, because a filter change re-runs the query
+  // and the flash then lands between two populated results. See EmptyRow.
+  const [loaded, setLoaded] = useState(false)
   const [minLevel, setMinLevel] = useState<number | ''>('')
   const [source, setSource] = useState('')
   const [from, setFrom] = useState('')
@@ -28,6 +34,12 @@ export function LogsPage() {
       })
       .then(setLogs)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      // finally, not then: a failed query must still end the "loading" state, or the table sits on
+      // "Loading…" forever with the real reason in the error line above it.
+      // Deliberately never reset to false on a re-query: a filter change then leaves the previous
+      // result on screen until the new one lands, which is what should happen — blanking the table
+      // between two populated results is the same flash this flag exists to remove.
+      .finally(() => setLoaded(true))
   }
   useEffect(load, [minLevel, source, from, to])
 
@@ -119,11 +131,9 @@ export function LogsPage() {
           </thead>
           <tbody>
             {logs.length === 0 ? (
-              <tr>
-                <td colSpan={4} className="empty-state">
-                  No log entries.
-                </td>
-              </tr>
+              <EmptyRow loaded={loaded} colSpan={4}>
+                No log entries.
+              </EmptyRow>
             ) : (
               logs.map((l) => (
                 <tr key={l.id}>
