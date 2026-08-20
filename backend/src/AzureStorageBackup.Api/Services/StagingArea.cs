@@ -72,6 +72,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     {
         private readonly StagingArea _area;
         private long _bytes;
+        private int _files;
         private int _disposed;
 
         internal StagingLease(StagingArea area) => _area = area;
@@ -79,7 +80,25 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         /// <summary>Staged bytes this run currently occupies.</summary>
         public long Bytes => Interlocked.Read(ref _bytes);
 
-        internal void Add(long bytes) => Interlocked.Add(ref _bytes, bytes);
+        /// <summary>
+        /// How many **volume files** those bytes are spread across. The UI reports the two side by side
+        /// ("N volumes, X GB waiting for uploading"), and neither can be derived from the other: volumes of one
+        /// archive are uniform but the last one is a remainder, and a run mixes archives of wildly different sizes.
+        /// <para>
+        /// <see cref="ReserveAsync"/> deliberately books bytes with **no** files — a reservation is temp space the
+        /// caller manages itself (repair's compose directory, compaction's unpacked members), not volumes waiting to
+        /// travel. Those callers run outside a backup, so a run's own lease never mixes the two; if one ever did, its
+        /// bytes would show up against no volumes.
+        /// </para>
+        /// </summary>
+        public int Files => Volatile.Read(ref _files);
+
+        internal void Add(long bytes, int files = 0)
+        {
+            Interlocked.Add(ref _bytes, bytes);
+            if (files != 0)
+                Interlocked.Add(ref _files, files);
+        }
 
         public void Dispose()
         {
@@ -303,7 +322,10 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                     var produced = await produce(compressTempDir, ct);
                     var item = MoveToStaged(produced, lease);
                     Interlocked.Add(ref _stagedBytes, item.Bytes);
-                    lease?.Add(item.Bytes);
+                    // The whole archive lands at once — every volume of it, charged to the seat in one go. That is
+                    // what makes the volume count worth showing: the moment 7z finishes, all N volumes are on the
+                    // disk, while the uploader that receives them can only start a handful at a time.
+                    lease?.Add(item.Bytes, item.Files.Count);
                     return item;
                 }
                 finally
@@ -333,7 +355,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         try { File.Delete(file); } catch { /* best effort */ }
         Interlocked.Add(ref _stagedBytes, -entry.Bytes);
         // Debit the seat's account too: without that this run's usage only ever grows, and its own quota is permanently full in short order.
-        entry.Lease?.Add(-entry.Bytes);
+        // One volume gone from the disk is one off the file count as well, and the idempotent TryRemove above is what
+        // keeps that exact — the whole-family tail releases every volume a second time.
+        entry.Lease?.Add(-entry.Bytes, -1);
         SignalRelease();
     }
 

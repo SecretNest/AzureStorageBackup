@@ -110,35 +110,38 @@ export function stageLines(detail: StageProgress) {
   // above, and another tier would only blur which number is which. That reasoning does not apply to
   // checking (which says plainly what it is doing), so checking has no such gate.
   const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
-  // The two upload-side waits, stated as **one** entry. They really are different stages — volumes already
-  // claimed by an uploader and queuing at the global gate, versus objects still parked in the hand-off
-  // channel with nobody on them — but on screen the difference rested entirely on "an upload slot" versus
-  // "an uploader", one word apart, and that word could not carry it: read side by side the two lines looked
-  // like the same thing counted twice.
+  // The whole upload-side wait as **one** entry, three numbers over one population: everything on the staging disk
+  // with not one byte on the wire.
   //
-  // Merged, the **units** do the separating, which they were already doing anyway: what is counted in volumes
-  // is at the gate, what is counted in objects has not been picked up. Anyone who needs the finer distinction
-  // gets it from the unit; anyone who does not gets one number for "queued on the upload side", which is the
-  // question actually being asked of this line.
+  // It replaced a two-entry split — "N volumes + N objects waiting for uploading" next to "X in the uploaders' hands"
+  // — whose dividing line was **ownership**: had an uploader thread picked this archive up yet? That is an
+  // implementation detail nobody at the screen can act on, and reading the two side by side they looked like the same
+  // thing counted twice. Worse, between them they counted neither of the volumes an uploader owns but has not started:
+  // the per-item sliding window opens no task for those, so they sit in no queue at all and appeared in no number,
+  // while being the bulk of the bytes (measured: 8.268 GB in that lump against 19 volumes reported as queued).
   //
-  // The bytes come with them, in parentheses. Merging the two counts had pulled them away from the "N ready to upload"
-  // that used to sit directly below, and that entry was never the right partner anyway: it was the whole pool minus
-  // what the in-flight streams had sent, so it also carried the unsent tail of everything on the wire and the archives
-  // of items an uploader was already holding. Read as this queue's size it overstated it by whatever was moving.
-  // The backend now measures exactly these two waits in bytes and subtracts them out of the pool, so the number in
-  // the parentheses is the queue's own and nothing else's.
+  // The three numbers cannot be derived from one another, which is why all three are stated:
+  // · objects — how many items are stuck here. Can exceed the volume count: a dedup hit, a resume hit and a raw
+  //   in-place item own no archive at all, so a store-only run shows five figures of objects against few bytes, and
+  //   that pairing is the answer to "should I worry about my temp disk" — no, the wire is the bottleneck.
+  // · volumes — omitted when equal to the objects, since one volume per object means nothing was split and the word
+  //   would carry no information.
+  // · bytes — omitted when zero, which is a real state (see the objects note), not a rounding artefact.
   //
-  // Omitted when zero, which is not a rounding artefact but a real state: a dedup hit, a resume hit and a raw in-place
-  // item all queue here owning no archive at all, so a store-only run can show five figures of objects against no
-  // bytes. That pairing is the answer to "should I be worried about my temp disk" — no, the queue is deep in items.
-  const waitingToUpload = [
-    detail.waitingOnSlot > 0 && withUnit(detail.waitingOnSlot, 'volumes'),
-    detail.awaitingUpload > 0 && withUnit(detail.awaitingUpload, unit),
+  // In-flight volumes are excluded from all three, so this entry and the "N volumes uploading" above it never overlap.
+  // The unsent tail of a volume on the wire is already on screen, per stream, as that stream's sent/total.
+  const waitingInner = [
+    detail.waitingToUploadVolumes > 0 &&
+      detail.waitingToUploadVolumes !== detail.waitingToUploadObjects &&
+      withUnit(detail.waitingToUploadVolumes, 'volumes'),
+    detail.waitingToUploadBytes > 0 && formatBytes(detail.waitingToUploadBytes),
   ]
     .filter(Boolean)
-    .join(' + ')
-  const waitingToUploadBytes =
-    detail.waitingToUploadBytes > 0 ? ` (${formatBytes(detail.waitingToUploadBytes)})` : ''
+    .join(', ')
+  const waitingToUpload =
+    detail.waitingToUploadObjects > 0 || detail.waitingToUploadBytes > 0
+      ? `${withUnit(detail.waitingToUploadObjects, unit)}${waitingInner ? ` (${waitingInner})` : ''}`
+      : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
   // The in-flight number's unit **differs by direction**:
@@ -167,9 +170,9 @@ export function stageLines(detail: StageProgress) {
   // waiting for uploading → starting upload → waiting on peer → uploading → on the cloud → settled into
   // the line above. Read the array below in reverse and that is it.
   //
-  // The bytes now ride with the stage that owns them rather than forming a stage of their own: the upload
-  // queue's are in its parentheses, checking's are the entry below it, and what the uploaders are holding
-  // sits beside the in-flight count.
+  // The bytes ride with the stage that owns them rather than forming a stage of their own: the upload wait's
+  // are in its parentheses, checking's are the entry below it, and the bytes of what is actually on the wire
+  // are per stream in the in-flight list, as each stream's sent/total.
   //
   // to go and buffered to disk land at the end: the former is source bytes not yet restored on the
   // download side, the latter is how far the diff has run ahead (queued, not yet picked up). Both sit at
@@ -184,32 +187,19 @@ export function stageLines(detail: StageProgress) {
     // holds the compression lock), not "it has not started". Mid-run the line above already shows
     // terabytes accumulated, so "yet" would be false.
     idleOnStaging && 'nothing on the wire right now',
-    // What the uploaders are holding on the staging disk. Three things at once, and they share the one property worth
-    // stating here — an uploader already owns every one of them: the unsent tail of each volume on the wire, the
-    // archives of items parked on a peer, and the archives of items past "entered upload" but not yet on any wire.
-    //
-    // It sat below the upload-side queue reading "N ready to upload", which was two claims and both were shaky: those
-    // bytes are not what that queue is holding (the queue's own bytes are now in its parentheses above), and "ready"
-    // over-promises for the part already half-sent. Moved up here, next to the in-flight entry it mostly belongs to,
-    // and named for the only thing all three have in common.
-    detail.stagedBytes > 0 && `${formatBytes(detail.stagedBytes)} in the uploaders' hands`,
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    // Both upload-side waits as one entry, the units keeping them apart (volumes = queuing at the global gate,
-    // which queues per volume; objects = claimed and compressed but not yet picked up by any uploader). Built
-    // above, where the reasoning and what it costs are set out.
+    // The whole upload-side wait, assembled above where the reasoning is set out. Nothing here is "starting upload",
+    // and that distinction is the entry's whole point: not one thing is being done to any of it. Folded into the tier
+    // below, this was a number that climbed all run and never came back down, describing items that were neither
+    // starting nor uploading.
     //
-    // Neither half is "starting upload", and that distinction is the whole point of the entry: nothing is being
-    // done to any of them. Folded into the tier below, the object half was a number that climbed all run and
-    // never came back down, describing items that were neither starting nor uploading.
-    //
-    // That half is also unbounded by construction, so it can reach five figures. Its channel is deliberately not
-    // depth-limited — whatever owns an archive is already bounded in bytes by the staging pool, which is the
-    // limit the operator set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a
-    // store-only workload the compressor can queue the whole dataset here while the uploaders trickle. A big
-    // number is the pipeline working as designed; what it tells the operator is that the bottleneck is the wire,
-    // not the CPU.
-    waitingToUpload && `${waitingToUpload}${waitingToUploadBytes} waiting for uploading`,
+    // It is unbounded by construction and can reach five figures. The hand-off channel behind it is deliberately not
+    // depth-limited — whatever owns an archive is already bounded in bytes by the staging pool, which is the limit the
+    // operator set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a store-only workload
+    // the compressor can queue the whole dataset here while the uploaders trickle. A big number is the pipeline working
+    // as designed; what it tells the operator is that the bottleneck is the wire, not the CPU.
+    waitingToUpload && `${waitingToUpload} waiting for uploading`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
     // The disk-checking stretches (dedup pre-check full read, per-member stat before and after packing,
     // clearing leftover cloud volumes). They emit not one progress event, and the heartbeat only runs

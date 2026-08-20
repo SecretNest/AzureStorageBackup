@@ -214,6 +214,68 @@ public sealed class StagingQuotaTests : IDisposable
         Assert.All(seen, p => Assert.Equal(0, p.WaitingOnRoom));
     }
 
+    /// <summary>
+    /// The seat counts volume **files** as well as bytes, because the UI states both ("N volumes, X GB waiting for
+    /// uploading") and neither can be derived from the other. A whole archive lands at once — that is what makes the
+    /// volume count worth showing, since the uploader receiving it can only start a handful of its volumes at a time.
+    /// </summary>
+    [Fact]
+    public async Task A_Seat_Counts_Volume_Files_Alongside_Its_Bytes()
+    {
+        using var area = Area(limit: 10_000);
+        using var lease = area.AcquireLease();
+
+        Assert.Equal(0, lease.Files);
+
+        var item = await area.StageAsync(
+            async (dir, ct) =>
+            {
+                var files = new List<string>();
+                foreach (var n in new[] { "a.001", "a.002", "a.003" })
+                {
+                    var path = Path.Combine(dir, n);
+                    await File.WriteAllBytesAsync(path, new byte[100], ct);
+                    files.Add(path);
+                }
+                return files;
+            },
+            lease).WaitAsync(Patience);
+
+        Assert.Equal(3, lease.Files);      // the whole archive, in one go
+        Assert.Equal(300, lease.Bytes);
+
+        // Per-volume release: one uploaded volume is one file fewer, and the whole-family tail is idempotent, so
+        // releasing again must not drive the count below what is really on the disk.
+        area.ReleaseFile(item.Files[0]);
+        Assert.Equal(2, lease.Files);
+        Assert.Equal(200, lease.Bytes);
+
+        area.Release(item);
+        Assert.Equal(0, lease.Files);
+        Assert.Equal(0, lease.Bytes);
+    }
+
+    /// <summary>
+    /// A reservation books bytes with **no** files: it is temp space the caller manages itself (repair's compose
+    /// directory, compaction's unpacked members), not volumes waiting to travel. Counting them as volumes would put a
+    /// number in the UI that no upload will ever work off.
+    /// </summary>
+    [Fact]
+    public async Task A_Reservation_Books_Bytes_But_No_Volumes()
+    {
+        using var area = Area(limit: 10_000);
+        using var lease = area.AcquireLease();
+
+        using (await area.ReserveAsync(500, lease))
+        {
+            Assert.Equal(500, lease.Bytes);
+            Assert.Equal(0, lease.Files);
+        }
+
+        Assert.Equal(0, lease.Bytes);
+        Assert.Equal(0, lease.Files);
+    }
+
     private static async Task Until(Func<bool> reached, string because)
     {
         for (var i = 0; i < 500 && !reached(); i++)

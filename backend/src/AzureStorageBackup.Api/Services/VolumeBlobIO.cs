@@ -178,10 +178,13 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
     /// Finished volumes are recorded under it in the "landed in the cloud, item not yet settled" ledger; it stays the same across retries, so an abandoned attempt can be wiped out in one row.
     /// **Do not use ticket instead**: a ticket is taken fresh on every <see cref="VolumeBlobIO.UploadAsync"/> call, so a retry gets a new one,
     /// and using it as the ledger key would never find the previous attempt's row again.</param>
+    /// <param name="staged">Whether this volume is a file in the staging pool. It has to come out of the "waiting to upload"
+    /// columns while it is on the wire, and only pool files may — the raw in-place route sends the user's own file, which
+    /// was never charged to the pool (see <c>StageProgress</c>'s in-flight subtraction).</param>
     public async Task RunAsync(
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
         long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0,
-        string? owner = null)
+        string? owner = null, bool staged = false)
     {
         // When the gate is free AcquireAsync returns an already-completed Task, and in that case we do **not**
         // report "waiting for a slot": marking it there would add one forced publish per volume for nothing — a
@@ -194,10 +197,11 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
         var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
         if (!acquire.IsCompletedSuccessfully)
         {
-            // The size travels with the wait: this volume is a file lying in the staging pool that nobody is sending, and the byte side of
-            // the upload-side queue is assembled from exactly these (see StageProgress.WaitingToUploadBytes). It is the same number that
-            // BeginItem is given below, so a volume's bytes move from the queue column to the in-flight one and are never in both.
-            tracker.BeginWait(UploadWait.Slot, volumeBytes);
+            // Count only. This volume's bytes need no ledger entry of their own: it is a file lying in the staging pool
+            // with nothing on the wire, which is exactly what the pool's own file and byte counters already say, and
+            // what StageProgress.WaitingToUploadBytes is derived from. Booking them here as well only created a second
+            // debt to repay on every exit path.
+            tracker.BeginWait(UploadWait.Slot);
             var acquired = false;
             try
             {
@@ -213,7 +217,7 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
                 // of the leak.
                 try
                 {
-                    tracker.EndWait(UploadWait.Slot, volumeBytes);
+                    tracker.EndWait(UploadWait.Slot);
                 }
                 catch
                 {
@@ -225,7 +229,7 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
         }
         try
         {
-            tracker.BeginItem(blobName, label, volumeBytes, owner);
+            tracker.BeginItem(blobName, label, volumeBytes, owner, staged);
             // One ItemProgress per volume: DeltaProgress's baseline is per call, so if parallel volumes share
             // one instance each other's cumulative values look like a rewind. With the key, these bytes land on
             // the account of the right stream.
@@ -311,7 +315,11 @@ public static class VolumeBlobIO
                 await scope.RunAsync(
                     name,
                     p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
-                    ct, ticket, index, LabelFor(index), SizeOf(file), baseRef);
+                    ct, ticket, index, LabelFor(index), SizeOf(file), baseRef,
+                    // The same discriminator the per-volume release uses two arguments down the call: a caller that
+                    // wants its volumes released as they go is a caller whose volumes came out of the pool, and the raw
+                    // in-place route — the only one that passes no callback — is uploading the user's own file.
+                    staged: onVolumeUploaded is not null);
             onVolumeUploaded?.Invoke(file);
         }
 

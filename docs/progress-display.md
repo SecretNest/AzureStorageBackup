@@ -252,11 +252,12 @@ Every byte is in at most one segment. If they do not add up, this line is worse 
 | `transferredBytes uploaded` | bytes this run actually pushed, post-compression and post-encryption |
 | `unfinishedItemBytes` | already in the cloud, but the item they belong to has not settled |
 | `checkingBytes` | compressed and on disk, but still in checking — not cleared to upload |
-| `waitingToUploadBytes` | on disk and **queued**: archives parked for an uploader, plus volumes queuing at the gate |
-| `stagedBytes` | on disk and in an **uploader's hands**: the unsent tail of what is on the wire, plus peer waiters |
+| `waitingToUploadBytes` | on disk with **not one byte on the wire**, whoever happens to own it |
+| the in-flight volumes | on disk and moving; stated per stream in the in-flight list as `sent / total` |
 
-The last two plus `checkingBytes` plus the sent part of the in-flight streams reconstruct the staging
-pool exactly — they are precisely what the snapshot subtracts from it.
+Those three reconstruct the staging pool exactly — they are precisely what the snapshot subtracts
+from it. The in-flight term is each volume's **whole** size, not the part already sent: the file
+stays on the disk in full until its transfer completes and the per-volume release deletes it.
 
 A fraction only means something when both sides share a unit, which is why the first is measured in
 source bytes: the compressed total does not exist until compression has run. The ratio of `uploaded`
@@ -313,37 +314,40 @@ delete; that is precisely the shape of the old drift.
 
 Pool occupancy is booked the moment production moves into staging, and **that is correct**: it is the
 backpressure gate and it needs "how much is on the disk right now". Booking it a second later risks
-blowing the temp disk. But that one number covers four completely different states, and the screen has
+blowing the temp disk. But that one number covers three completely different states, and the screen has
 to take them apart or it will pair a total with the counts of one part.
 
-**Archives still being checked come out first.** At the moment of booking, the archive still has to
-pass the post-compression recheck, and a multi-volume one must first clear leftover cloud volumes. If
-the recheck finds a member changed, **the whole archive is discarded and recompressed** — not one byte
-goes up. Calling that ready to send over-promises, so the `checking` tier has a byte side.
+**Archives still being checked come out first**, in both units. At the moment of booking, the archive
+still has to pass the post-compression recheck, and a multi-volume one must first clear leftover cloud
+volumes. If the recheck finds a member changed, **the whole archive is discarded and recompressed** —
+not one byte goes up. Calling that ready to send over-promises, so the `checking` tier has a byte side,
+and its volumes come out alongside its bytes or the two waiting figures contradict each other.
 
-**The upload-side queue comes out next, measured rather than inferred.** `waitingToUploadBytes` is
-booked per queue **entry** as it parks (`EnterUploadQueue` / `LeaveUploadQueue`) and per **volume** as
-it queues at the gate (`BeginWait(Slot, bytes)`), so it describes exactly the set the `N volumes + N
-objects waiting for uploading` entry counts — and it is what goes in that entry's parentheses.
+**The in-flight volumes come out next, whole.** Their files really do lie in the pool in full until the
+transfer completes, but what is left is meant to say "nothing of this is moving", and the unsent tail of
+a volume on the wire is already on screen, per stream, as that stream's `sent / total`.
 
-> **Rationale.** The pool total used to be printed beside those counts as `N ready to upload`, and read
-> as an equality it was not one: the unsent tail of every volume on the wire sat inside it, so the
-> number said the queue was fatter than it was. Nothing on screen could be used to correct it either —
-> a reader cannot turn "118 objects" into bytes.
+**What is left is `waitingToUploadBytes`**, with `waitingToUploadVolumes` beside it: everything on the
+staging disk that has not one byte on the wire. Ownership plays no part — an archive parked in the
+hand-off channel and one an uploader claimed ten minutes ago are the same thing to an operator.
+
+> **Rationale.** Why ownership plays no part in this figure is set out under
+> [the display](#the-display-two-lines-one-timeline), where the entry it feeds is described.
 >
-> It does not divide by the count, and must not be expected to. Two of the three entry kinds in that
-> queue own no archive at all (a dedup hit, a resume hit, a raw in-place item), so a store-only run can
-> queue five figures of objects against almost no bytes. That pairing is the answer to "should I worry
-> about the temp disk": no — the queue is deep in items, not in bytes.
-
-**What is left is `stagedBytes`**, and it means "in the uploaders' hands": the unsent tail of each
-in-flight volume, plus the archives of items parked on a peer or not yet past their first volume. It
-sits beside the in-flight count, which is mostly what it is.
+> The object count comes from the item ledger rather than from counting archives on disk, and must not
+> be expected to divide into the bytes. Three of the entry kinds own no archive at all (a dedup hit, a
+> resume hit, a raw in-place item), so a store-only run can queue five figures of objects against almost
+> no bytes. That pairing is the answer to "should I worry about the temp disk": no — the queue is deep in
+> items, not in bytes. Counting archives on the disk instead would erase exactly those objects.
+>
+> Peer waiters are excluded from the object count (they have their own entry naming the reason) while
+> their archives still count in the two figures above, whose basis is "on the disk, not on the wire"
+> rather than "which object owns it".
 
 The subtractions never overlap. Checking happens entirely before the first volume takes off, so one
-archive can never be hit by both "in flight" and "being checked"; an entry leaves the hand-off channel
-before its uploader queues a single volume; and a volume is registered in flight only once the gate has
-let it through, which is the same instant its slot wait ends.
+archive can never be hit by both "in flight" and "being checked". Only volumes that came out of the pool
+are subtracted from it: the raw in-place route uploads the user's own file, never staged and never
+charged, so it is excluded from the in-flight subtraction by an explicit flag.
 
 ## Speed: the clock only runs while something is on the wire
 
@@ -435,7 +439,7 @@ you can actually answer: **can this number still go backwards?**
 
 ```
 Uploading: 6,676 of 11,004 objects · 1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original) · 13.3 MB/s · ~1d 10h left
-In flight: +3.400 GB on the cloud · 5 volumes uploading · 2 volumes + 118 objects (9.201 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
+In flight: +3.400 GB on the cloud · 5 volumes uploading · 118 objects (2,043 volumes, 9.201 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
 ```
 
 The second line runs **backwards along the timeline**, with counts and bytes interleaved at the point
@@ -444,25 +448,32 @@ each belongs to. An item's forward order is:
 ```
 queued → waiting for the compressor → waiting for staging room → waiting for the archive slot
        → preparing → [archive lands on disk] → checking files
-       → waiting for uploading (objects half) → starting upload
-       → waiting on peer → waiting for uploading (volumes half) → uploading
+       → waiting for uploading → starting upload → waiting on peer → uploading
        → on the cloud → settled (first line)
 ```
 
-**The two upload-side waits are printed as one entry**, `N volumes + N objects (X) waiting for
-uploading`, and the units are what keep them apart: volumes are queuing at the global upload gate
-(which queues per volume) and have an uploader on them; objects are compressed and claimed but not yet
-picked up by any uploader at all. The bytes in the parentheses are measured on exactly those two waits.
+**The whole upload-side wait is one entry**, `N objects (M volumes, X) waiting for uploading`: one
+population — everything on the staging disk with not one byte on the wire — stated three ways. The
+volume count is dropped when it equals the object count, since one volume per object means nothing was
+split and the word would carry no information. The bytes are dropped when zero, which is a real state
+rather than a rounding artefact.
 
-> **Rationale.** As two entries they read as the same thing counted twice. The whole distinction rested
-> on `an upload slot` versus `an uploader` — one word, carrying a stage boundary — and it did not carry
-> it. The units were already doing that work, so the merge costs nothing a reader was actually using.
-> The one thing it did cost was adjacency to the bytes those objects hold, and the parentheses buy that
-> back with a number that is now the queue's own rather than the whole pool's.
+Nothing on the wire is in any of the three, so this entry and `5 volumes uploading` never overlap.
 
-**Bytes ride with the stage that owns them** rather than forming stages of their own: the queue's are
-in its parentheses, checking's are the entry below its count, and what the uploaders are holding sits
-beside the in-flight count as `X in the uploaders' hands`.
+> **Rationale.** This was two entries, split by **ownership**: had an uploader thread picked the archive
+> up yet? That is an implementation detail nobody at the screen can act on, and side by side the two read
+> as the same thing counted twice.
+>
+> The real damage was what neither of them counted. An uploader walks its archive's volumes through a
+> sliding window of `UploadConcurrency + 1`; a volume outside that window has no task open for it, so it
+> is in no queue and was in no number — while being most of the bytes. Measured in the field:
+> `8.268 GB in the uploaders' hands · 19 volumes (1.855 GB) waiting for uploading`, which invited exactly
+> the wrong question ("only 19 volumes, so what is the 8 GB?"). One entry over one population, with the
+> volume count included, answers it before it is asked.
+
+**Bytes ride with the stage that owns them** rather than forming stages of their own: the wait's are in
+its parentheses, checking's are the entry below its count, and the bytes actually on the wire are in the
+in-flight list, per stream, as each stream's `sent / total`.
 
 > **Why they must be interleaved.** With counts on one line and bytes on another, each was ordered by
 > its own logic and nothing on screen placed `+2.0 GB on the cloud` next to `100 MB` on disk.

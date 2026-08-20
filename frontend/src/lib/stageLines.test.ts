@@ -24,8 +24,9 @@ function progress(over: Partial<StageProgress> = {}): StageProgress {
     workRemaining: 0,
     transferredBytes: 0,
     unfinishedItemBytes: 0,
-    stagedBytes: 0,
     waitingToUploadBytes: 0,
+    waitingToUploadVolumes: 0,
+    waitingToUploadObjects: 0,
     checkingBytes: 0,
     transferTotal: 0,
     workPercent: null,
@@ -57,11 +58,10 @@ describe('stageLines', () => {
           { label: 'a', sent: 1, total: 2, percent: 50 },
           { label: 'b', sent: 1, total: 2, percent: 50 },
         ],
-        stagedBytes: 500_000_000,
         waitingOnPeer: 2,
-        waitingOnSlot: 3,
-        waitingToUploadBytes: 2_800_000_000,
-        awaitingUpload: 7,
+        waitingToUploadObjects: 7,
+        waitingToUploadVolumes: 33,
+        waitingToUploadBytes: 3_300_000_000,
         checking: 1,
         checkingBytes: 100_000_000,
         preparing: 1,
@@ -77,16 +77,11 @@ describe('stageLines', () => {
     expect(pipeline.split(' · ')).toEqual([
       '+2.794 GB on the cloud',
       '2 volumes uploading',
-      // Beside the in-flight count, because that is mostly what it is: the unsent tail of the volumes on the wire,
-      // plus the archives of the peer waiters below. Everything here is already owned by an uploader, which is the
-      // one thing that distinguishes it from the queue two entries down.
-      "476.8 MB in the uploaders' hands",
       '2 objects waiting on the same content elsewhere',
-      // Both upload-side waits in one entry, each keeping its own unit: volumes are queuing at the global gate,
-      // objects have been claimed and compressed but no uploader has picked them up. The bytes in the parentheses
-      // are measured on exactly those two waits, so the counts and the size finally describe the same set — the
-      // old pairing put the whole pool next to them, tail of the in-flight transfers included.
-      '3 volumes + 7 objects (2.608 GB) waiting for uploading',
+      // The whole upload-side wait as one entry: objects, the volumes they are split across, and their size on
+      // disk — one population stated three ways. Nothing on the wire is in any of the three, so this entry and
+      // the "2 volumes uploading" above it never overlap.
+      '7 objects (33 volumes, 3.073 GB) waiting for uploading',
       '1 object checking files',
       '95.4 MB being checked',
       '1 object preparing',
@@ -115,7 +110,8 @@ describe('stageLines', () => {
     const { pipeline } = stageLines(
       progress({
         unfinishedItemBytes: 66_800_000,
-        awaitingUpload: 24,
+        waitingToUploadObjects: 24,
+        waitingToUploadVolumes: 24,
         waitingToUploadBytes: 66_800_000,
         preparing: 1,
       }),
@@ -129,61 +125,69 @@ describe('stageLines', () => {
   })
 
   /**
-   * The merged entry has three shapes, and the two half-empty ones must not leave a dangling "+" or an
-   * orphaned unit. Only the halves that are non-zero get named, and each keeps its own unit — that unit is
-   * the only thing left saying which of the two stages a number belongs to.
+   * The volume count is dropped when it equals the object count: one volume per object means nothing was split,
+   * and the word would carry no information — worse, two identical numbers side by side read as a bug. It stays
+   * the moment they diverge, because that difference is the entire reason the count exists.
    */
-  test('the upload-side wait names only the halves that are non-zero', () => {
-    expect(stageLines(progress({ waitingOnSlot: 5, awaitingUpload: 230 })).pipeline).toContain(
-      '5 volumes + 230 objects waiting for uploading',
-    )
-    expect(stageLines(progress({ waitingOnSlot: 5 })).pipeline).toContain(
-      '5 volumes waiting for uploading',
-    )
-    expect(stageLines(progress({ awaitingUpload: 1 })).pipeline).toContain(
-      '1 object waiting for uploading',
-    )
+  test('names the volumes only when something is actually split', () => {
+    expect(
+      stageLines(
+        progress({
+          waitingToUploadObjects: 14,
+          waitingToUploadVolumes: 80,
+          waitingToUploadBytes: 10_400_000_000,
+        }),
+      ).pipeline,
+    ).toContain('14 objects (80 volumes, 9.686 GB) waiting for uploading')
+
+    expect(
+      stageLines(
+        progress({
+          waitingToUploadObjects: 14,
+          waitingToUploadVolumes: 14,
+          waitingToUploadBytes: 10_400_000_000,
+        }),
+      ).pipeline,
+    ).toContain('14 objects (9.686 GB) waiting for uploading')
+
     expect(stageLines(progress({})).pipeline).not.toContain('waiting for uploading')
   })
 
   /**
-   * The queue's bytes are its own, and they are allowed to disagree with its item count in either direction.
-   * A dedup hit, a resume hit and a raw in-place item all queue owning no archive at all, so a store-only run
-   * queues the whole dataset here against nothing on disk — and printing "(0 B)" beside five figures of objects
-   * would read as a bug, or worse, as a full temp disk. The parentheses simply drop out.
+   * The bytes are allowed to disagree with the object count in either direction. A dedup hit, a resume hit and a
+   * raw in-place item all queue owning no archive at all, so a store-only run queues the whole dataset here
+   * against nothing on disk — and printing "(0 B)" beside five figures of objects would read as a bug, or worse,
+   * as a full temp disk. The parentheses simply drop out.
    */
-  test('the upload-side wait carries its own bytes, and none when it holds none', () => {
-    expect(
-      stageLines(progress({ waitingOnSlot: 2, awaitingUpload: 9, waitingToUploadBytes: 3_500_000_000 }))
-        .pipeline,
-    ).toContain('2 volumes + 9 objects (3.260 GB) waiting for uploading')
-
-    const noArchives = stageLines(progress({ awaitingUpload: 12_000 })).pipeline
+  test('drops the parentheses entirely when the queue owns no archives', () => {
+    const noArchives = stageLines(progress({ waitingToUploadObjects: 12_000 })).pipeline
     expect(noArchives).toContain('12,000 objects waiting for uploading')
     expect(noArchives).not.toContain('(')
   })
 
   /**
-   * The bytes an uploader is already holding are a different set from the bytes queued for one, and after the
-   * merge they are also different entries: the queue's own size sits in its parentheses, and what is left of the
-   * pool — the unsent tail of everything on the wire, and the archives of items stuck on a peer — moves up beside
-   * the in-flight count. Pairing the pool total with the queue's counts, as the old "ready to upload" did,
-   * overstated the queue by exactly the amount that was moving.
+   * The entry and the in-flight count never overlap, which is the whole point of merging them into one
+   * population: the backend excludes every in-flight volume from all three numbers, whole rather than by the
+   * part already sent. What is on the wire is described by the in-flight list, per stream, as its sent/total.
+   *
+   * The lump this replaced ("in the uploaders' hands") did include that tail, so the same bytes were named
+   * twice on one line — and the volumes an uploader owned but had not started appeared in no number at all,
+   * which is how 8.268 GB came to sit against 19 reported volumes.
    */
-  test('separates what is queued for an uploader from what one already holds', () => {
+  test('nothing on the wire appears in the waiting entry', () => {
     const { pipeline } = stageLines(
       progress({
         activeItems: [{ label: 'a', sent: 400_000_000, total: 500_000_000, percent: 80 }],
-        stagedBytes: 100_000_000,
-        awaitingUpload: 3,
+        waitingToUploadObjects: 3,
+        waitingToUploadVolumes: 9,
         waitingToUploadBytes: 900_000_000,
       }),
     )
 
     expect(pipeline).toBe(
-      "1 volume uploading · 95.4 MB in the uploaders' hands · 3 objects (858.3 MB) waiting for uploading",
+      '1 volume uploading · 3 objects (9 volumes, 858.3 MB) waiting for uploading',
     )
-    expect(pipeline).not.toContain('ready to upload')
+    expect(pipeline).not.toContain("uploaders' hands")
   })
 
   /**
@@ -209,16 +213,23 @@ describe('stageLines', () => {
 
   /**
    * For the stretch that is compressed but not yet checked, the count and the bytes are separate
-   * entries that **do not overlap**: the backend already subtracts checkingBytes from stagedBytes,
-   * so the frontend only has to stop adding them together. Together they read as "one object is
-   * being checked and those 95.4 MB are its; another 2.608 GB is in an uploader's hands".
+   * entries that **do not overlap** with the waiting one: the backend subtracts checking's bytes *and* its
+   * volumes from it, so the frontend only has to stop adding them together. Together they read as "one object
+   * is being checked and those 95.4 MB are its; another 2.608 GB across 28 volumes is waiting to go".
    */
-  test('keeps bytes being checked out of the pool figure beside them', () => {
+  test('keeps what is being checked out of the waiting entry beside it', () => {
     const { pipeline } = stageLines(
-      progress({ stagedBytes: 2_800_000_000, checking: 1, checkingBytes: 100_000_000 }),
+      progress({
+        waitingToUploadObjects: 4,
+        waitingToUploadVolumes: 28,
+        waitingToUploadBytes: 2_800_000_000,
+        checking: 1,
+        checkingBytes: 100_000_000,
+      }),
     )
     expect(pipeline).toBe(
-      "2.608 GB in the uploaders' hands · 1 object checking files · 95.4 MB being checked",
+      '4 objects (28 volumes, 2.608 GB) waiting for uploading · ' +
+        '1 object checking files · 95.4 MB being checked',
     )
   })
 
@@ -241,7 +252,7 @@ describe('stageLines', () => {
         workPercent: 62,
         transferredBytes: 1_900_000_000_000,
         unfinishedItemBytes: 3_000_000_000,
-        stagedBytes: 2_800_000_000,
+        waitingToUploadBytes: 2_800_000_000,
       }),
     )
     expect(done).toBe('1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original)')

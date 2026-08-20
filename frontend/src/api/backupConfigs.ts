@@ -219,10 +219,10 @@ export interface StageProgress {
   percent: number | null
   etaSeconds: number | null // Seconds remaining, extrapolated by the backend from the whole-run average; estimatedRemaining derives from it
   estimatedRemaining: string | null // A .NET TimeSpan serialised as "hh:mm:ss"
-  // The byte breakdown. The segments never overlap: workRemaining (source bytes not yet processed), the three
-  // post-compression on-disk ones (waitingToUploadBytes queued, checkingBytes not yet cleared, stagedBytes in an
-  // uploader's hands), transferredBytes (in the cloud with the item complete) and unfinishedItemBytes (in the cloud
-  // with the item unfinished).
+  // The byte breakdown. The segments never overlap: workRemaining (source bytes not yet processed), the two
+  // post-compression on-disk ones (waitingToUploadBytes with nothing on the wire, checkingBytes not yet cleared to
+  // travel), the in-flight volumes in activeItems, transferredBytes (in the cloud with the item complete) and
+  // unfinishedItemBytes (in the cloud with the item unfinished).
   // workDone/workTotal are pre-compression, and give the real completion figure.
   workTotal: number // Total source bytes (pre-compression). During upload it keeps growing until the diff finishes
   workDone: number // Of those, the ones fully finished (excluding in flight)
@@ -231,24 +231,34 @@ export interface StageProgress {
   // Bytes in the cloud whose item has not finished (post-compression). A large item is split into many
   // volumes, and when the first few complete those bytes really are in the cloud — but the item is not
   // done, so they cannot enter transferredBytes (which is kept per item, to line up with the per-item
-  // workDone) and they are no longer in stagedBytes either (the pool releases per volume). They fold
+  // workDone) and they are no longer on the staging disk either (the pool releases per volume). They fold
   // into the former and reset to zero when the item completes.
   unfinishedItemBytes: number
-  // Pool bytes held by items an uploader **already has in hand** (post-compression): the unsent tail of every volume on
-  // the wire, plus the archives of items stuck on a peer or not yet past their first volume. The pool's other three
-  // parts have their own fields — checkingBytes, waitingToUploadBytes, and the sent part of activeItems — and all four
-  // are disjoint, so nothing is counted twice.
-  // It used to be everything except the first and the third, shown as "ready to upload" beside the upload queue's item
-  // counts. That read as an equality and was not one: the tail of everything in flight sat inside it.
-  stagedBytes: number
-  // The byte side of the upload-side queue, and only that: archives parked waiting for an uploader plus volumes queuing
-  // at the global gate. Nothing is being done to any of them.
-  // Already subtracted from stagedBytes. It deliberately does not divide by the counts beside it — a dedup hit, a resume
-  // hit and a raw in-place item all queue owning no archive, so a deep queue can be worth almost no bytes, and that is
-  // the pipeline working rather than a disk filling up.
+  // Everything on the staging disk with **not one byte on the wire** — this run's pool occupancy minus the whole size
+  // of every in-flight volume and minus what checking still holds. Together with the two counts below it is one
+  // population reported three ways, and it is the single "waiting for uploading" entry on screen.
+  //
+  // In-flight volumes come out whole rather than by the part already sent. Their files really do lie in the pool in
+  // full until the transfer completes, but this figure claims nothing of it is moving, and the unsent tail of a volume
+  // on the wire is already visible per stream as the sent/total of its activeItems entry.
+  //
+  // It replaced a two-entry split — queued for an uploader versus in an uploader's hands — divided by **ownership**,
+  // which is an implementation detail no operator can act on, and which counted neither the volumes an uploader owns
+  // but has not started: the per-item sliding window opens no task for those, so they queued nowhere at all.
   waitingToUploadBytes: number
+  // How many volume files those bytes are spread across. Not derivable from either neighbour: an archive's volumes are
+  // uniform except for its remainder, and one run mixes archives of wildly different sizes. Omitted from the rendered
+  // line when it equals waitingToUploadObjects — one volume per object means nothing was split.
+  waitingToUploadVolumes: number
+  // And how many **objects** own them: parked in the hand-off channel, or past staging with no volume yet on the wire.
+  // From the item ledger rather than by counting archives on disk, because the three entry kinds that own no archive at
+  // all (a dedup hit, a resume hit, a raw in-place item) have to keep showing here — "many objects, few bytes" is what
+  // says the wire is the constraint and the temp disk is not.
+  // Peer waiters are excluded (they have their own entry naming the reason) while their archives still count in the two
+  // figures above, whose basis is "on the disk, not on the wire" rather than "which object owns it".
+  waitingToUploadObjects: number
   // Bytes compressed onto disk but still in checking and not cleared to upload (the byte side of
-  // checking, already subtracted from stagedBytes).
+  // checking, already subtracted from waitingToUploadBytes, as are its volumes).
   // Output is booked against backpressure the moment compression ends (that ledger needs "how much is on
   // the disk right now", and booking it a second later risks blowing the temp disk), but it still has to
   // pass the post-compression recheck — and if that finds a member changed during compression, the whole

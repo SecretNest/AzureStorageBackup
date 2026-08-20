@@ -352,19 +352,7 @@ public sealed class BackupOrchestrator(
     /// owns no archive.
     /// </summary>
     private sealed record PendingUpload(
-        StagedHandoff? Handoff, WorkShare Share, Func<CancellationToken, Task> RunAsync)
-    {
-        /// <summary>
-        /// The archive this entry is holding on the staging disk while it waits for an uploader
-        /// (<see cref="StageTracker.EnterUploadQueue"/>). Derived rather than stored, so the number booked on the way in and
-        /// the one repaid on the way out cannot drift apart — the repayment happens on three different exits.
-        /// <para>
-        /// Zero for the entry kinds that own no archive: a dedup or resume hit, and a raw in-place item. They are why this
-        /// queue's item count and its byte count answer different questions.
-        /// </para>
-        /// </summary>
-        public long QueuedBytes => Handoff?.Staged?.Bytes ?? 0;
-    }
+        StagedHandoff? Handoff, WorkShare Share, Func<CancellationToken, Task> RunAsync);
 
     private static PlannedFile ToPlannedFile(PackEntry m) => new(m.Path, m.Length, m.FullHash);
 
@@ -743,10 +731,11 @@ public sealed class BackupOrchestrator(
         // Speed only counts the time when "there is traffic on the wire": most of this stage is spent in 7z, and
         // putting compression in the denominator measures neither transfer speed nor wall-clock throughput
         // (see StageTracker.SpeedNow).
-        // The staged-pool reading is wired in: the "compressed, not yet sent" figure in the UI is that value minus the in-flight bytes already sent.
+        // The staged-pool reading is wired in, in both units: the UI's "N volumes, X GB waiting for uploading" is this
+        // seat's occupancy minus the volumes currently on the wire and the ones held in checking.
         var uploadTracker = new StageTracker(
             "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true,
-            stagedBytes: () => stagingLease.Bytes);
+            stagedBytes: () => stagingLease.Bytes, stagedFiles: () => stagingLease.Files);
         // "Bytes transferred" uses the item-level authoritative reading (RunState.UploadedBytes) rather than a
         // per-volume accumulation — it has to be read side by side with the raw bytes that are settled per item, so
         // the two must be measured the same way. This line claims ownership before the first item completes; see the note on SetTransferred.
@@ -944,17 +933,14 @@ public sealed class BackupOrchestrator(
             var entry = new PendingUpload(handoff, share, run);
             share.Take();
             share.Park(HandoffQueue.Upload);   // before the write, for the reason spelled out on WorkShare.Park
-            // The bytes go on beside the park and come back off wherever this entry leaves the channel — picked up, drained,
-            // or dropped by the catch below. Booked per entry rather than through the park's per-item latch, because a pack
-            // pool hands over one entry per group and each carries its own archive (see StageTracker.EnterUploadQueue).
-            uploadTracker.EnterUploadQueue(entry.QueuedBytes);
+            // No byte booking to go with it. An archive parked here is a file lying in the staging pool with nothing on
+            // the wire, which is what the pool's own counters already state — see StageProgress.WaitingToUploadBytes.
             try
             {
                 await stagedQueue.Writer.WriteAsync(entry, token);
             }
             catch
             {
-                uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
                 handoff?.Dispose();
                 share.Unpark(HandoffQueue.Upload);
                 share.Release();
@@ -1334,9 +1320,6 @@ public sealed class BackupOrchestrator(
                     // branch below too. From here this item reads as uploading rather than awaiting an uploader,
                     // even if the compressor left further entries of it queued behind this one (see WorkShare).
                     entry.Share.Unpark(HandoffQueue.Upload);
-                    // The byte side is per entry, so it comes off here unconditionally — the sibling entries this item may still
-                    // have queued keep their own bytes booked, which is the whole point of not sharing the park's latch.
-                    uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
 
                     // "Finish the current item, then stop", now measured per queue entry: what an uploader has in
                     // hand runs to completion, what is still queued never starts. Discarding a queued entry costs
@@ -1435,7 +1418,6 @@ public sealed class BackupOrchestrator(
             }
             while (stagedQueue.Reader.TryRead(out var entry))
             {
-                uploadTracker.LeaveUploadQueue(entry.QueuedBytes);
                 entry.Handoff?.Dispose();
                 entry.Share.Unpark(HandoffQueue.Upload);
                 entry.Share.Release();
@@ -3009,9 +2991,10 @@ public sealed class BackupOrchestrator(
         // Strictly speaking this stretch inspects volumes in the cloud rather than local files, but it still counts
         // under the "checking" column — giving it a column of its own is not worth it, and there is only one thing
         // to say: this item is checking, not transferring.
-        // Pass the archive bytes along: this family of volumes is all sitting on disk waiting, and not one of them
-        // can set off until this listing-plus-deletes round trip completes.
-        uploadTracker.BeginChecking(archiveBytes);
+        // Pass the archive bytes and volume count along: this family of volumes is all sitting on disk waiting, and not
+        // one of them can set off until this listing-plus-deletes round trip completes. Both units, or the waiting
+        // columns disagree with each other — the bytes would come out while their volumes stayed in.
+        uploadTracker.BeginChecking(archiveBytes, volumeCount);
         try
         {
             var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -3026,7 +3009,7 @@ public sealed class BackupOrchestrator(
         }
         finally
         {
-            uploadTracker.EndChecking(archiveBytes);
+            uploadTracker.EndChecking(archiveBytes, volumeCount);
         }
     }
 
@@ -3503,7 +3486,8 @@ public sealed class BackupOrchestrator(
             // away and recompressed (see the changed.Count branch below) — not one byte of it goes out.
             // So the UI subtracts it from "pending upload" and lists it separately as "checking".
             var checkingBytes = staged?.Bytes ?? 0;
-            uploadTracker.BeginChecking(checkingBytes);
+            var checkingFiles = staged?.Files.Count ?? 0;
+            uploadTracker.BeginChecking(checkingBytes, checkingFiles);
             try
             {
                 foreach (var m in members)
@@ -3532,7 +3516,7 @@ public sealed class BackupOrchestrator(
             }
             finally
             {
-                uploadTracker.EndChecking(checkingBytes);
+                uploadTracker.EndChecking(checkingBytes, checkingFiles);
             }
 
             // An empty `changed` is the good ending, and the one the caller reads it as: nothing was dropped and

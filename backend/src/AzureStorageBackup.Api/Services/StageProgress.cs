@@ -93,27 +93,11 @@ public sealed record StageProgress(
     /// Bytes that have **landed safely in the cloud while their owning item has not been written off yet** (after compression). A big item is cut into many volumes;
     /// when the first few volumes finish, those bytes really are in the cloud, but the item as a whole is not done, so they can neither enter
     /// <see cref="TransferredBytes"/> (that ledger counts per item, which is what makes it line up with the per-item
-    /// <see cref="WorkDone"/>) nor still be in <see cref="StagedBytes"/> (the pool releases volume by volume).
+    /// <see cref="WorkDone"/>) nor still be in <see cref="WaitingToUploadBytes"/> (the pool releases volume by volume).
     /// Without this field those bytes simply vanish from the UI, and the tens of minutes of a large-file upload look like nothing is happening.
     /// <para>When the item completes it is folded into TransferredBytes and reset to zero; 0 = no such half-finished item, and the UI hides the whole section.</para>
     /// </summary>
     long UnfinishedItemBytes = 0,
-    /// <summary>
-    /// Bytes in the staging pool held by items an uploader **already has in hand** (after compression): the pool's total occupancy, minus the part of
-    /// the in-flight streams already sent, minus what is still in checking (<see cref="CheckingBytes"/>), minus what is queued on the upload side
-    /// (<see cref="WaitingToUploadBytes"/>). What is left is the unsent tail of every volume on the wire, plus the archives of items stuck on a peer
-    /// or between "entered upload" and their first volume taking off.
-    /// <para>
-    /// What is subtracted for the in-flight streams is their **sent** bytes, not whole volumes: those volumes really are still lying in the pool in full (per-volume release deletes only after the transfer),
-    /// and only a slice of them has shipped. Without the subtraction the same bytes get counted twice, here and in <see cref="ActiveItems"/>.
-    /// </para>
-    /// <para>
-    /// It used to be the whole pool minus those two, and was shown as "ready to upload" next to the upload-side queue's item counts. That pairing read as
-    /// an equality and was not one: the tail of everything on the wire sat inside it, so the number said the queue was fatter than it was. The queue's own
-    /// bytes now have their own column and come out of here, which leaves this one meaning "in the uploaders' hands" — and the two together are still the pool.
-    /// </para>
-    /// </summary>
-    long StagedBytes = 0,
     /// <summary>
     /// How many bytes this stage has to push over the wire in total (after compression). 0 = unknown.
     /// <para>
@@ -205,7 +189,7 @@ public sealed record StageProgress(
     int WaitingOnRoom = 0,
     /// <summary>
     /// Bytes already packed onto disk but **not yet cleared to travel**: stuck in the post-compression re-verify or the clear-leftover-cloud-volumes phase
-    /// (the byte side of <see cref="Checking"/>). Already subtracted out of <see cref="StagedBytes"/>, so the two columns never overlap.
+    /// (the byte side of <see cref="Checking"/>). Already subtracted out of <see cref="WaitingToUploadBytes"/>, so the two columns never overlap.
     /// <para>
     /// The reason for splitting it out is the same one that split out <see cref="Checking"/>. Output enters the backpressure ledger the moment it is packed (recording it a second
     /// late can blow out the temp disk), but at that moment it still has to pass the re-verify — and if the re-verify finds that a member changed during compression,
@@ -240,22 +224,59 @@ public sealed record StageProgress(
     /// </summary>
     int AwaitingUpload = 0,
     /// <summary>
-    /// The **byte** side of the two upload-side waits, and only those two: the archives held by the items in <see cref="AwaitingUpload"/> plus
-    /// the volumes queuing at the global gate (<see cref="WaitingOnSlot"/>). Post-compression, sitting on the staging disk, with nothing being
-    /// done to a single one of them.
+    /// Everything on this run's staging disk that has **not one byte on the wire**, in bytes. The pool's occupancy for
+    /// this run, minus the whole size of every in-flight volume, minus what is still in checking
+    /// (<see cref="CheckingBytes"/>).
     /// <para>
-    /// It exists because the counts alone cannot be turned into bytes by anyone reading the screen, and the obvious substitute is wrong:
-    /// <see cref="StagedBytes"/> is the whole pool, which also holds the unsent tail of every volume actually on the wire and the archives of
-    /// items an uploader is already holding. Pairing that total with these counts overstates the queue by exactly the amount that is moving.
-    /// Already subtracted out of <see cref="StagedBytes"/>, so the two never overlap — see there for what is left.
+    /// The subtraction for in-flight volumes takes their **full** size, not the part already sent. Those volume files
+    /// really are lying in the pool in full until the transfer completes and the per-volume release deletes them — but
+    /// this column claims "nothing of this is moving", and the unsent tail of a volume on the wire is already on screen,
+    /// per stream, as the <c>sent / total</c> of its <see cref="ActiveItems"/> entry. Subtracting only the sent part
+    /// (as an earlier split did) put that tail in two places at once.
     /// </para>
     /// <para>
-    /// It does not divide by the counts. Two of the three entry kinds in <see cref="AwaitingUpload"/> own no archive at all (a dedup or resume
-    /// hit, a raw in-place item), so on a run full of those this is small while the count is five figures, and that is the pipeline working:
-    /// the queue is deep in items and shallow in bytes, which is the opposite of a full staging disk.
+    /// This is one population reported three ways, together with <see cref="WaitingToUploadObjects"/> and
+    /// <see cref="WaitingToUploadVolumes"/>. It replaced a two-entry split — "queued for an uploader" versus "in the
+    /// uploaders' hands" — whose boundary was **ownership**, an implementation detail no operator can act on, and which
+    /// left the volumes an uploader owns but has not started in neither count: the per-item sliding window
+    /// (<see cref="VolumeUploadScope.WindowPerItem"/>) has opened no task for them, so they queue nowhere at all.
+    /// </para>
+    /// <para>
+    /// It does not divide by the object count. A dedup hit, a resume hit and a raw in-place item own no archive, so a
+    /// store-only run shows five figures of objects against few bytes — the queue deep in items and shallow in bytes,
+    /// which is the opposite of a full staging disk.
     /// </para>
     /// </summary>
-    long WaitingToUploadBytes = 0)
+    long WaitingToUploadBytes = 0,
+    /// <summary>
+    /// Of those bytes, how many **volume files** they are spread across (this run's staged file count, minus the
+    /// in-flight volumes, minus the ones held in checking). Neither derivable from the byte figure nor from the object
+    /// count: an archive's volumes are uniform except for its remainder, and one run mixes archives of wildly
+    /// different sizes.
+    /// <para>
+    /// The UI omits it when it equals <see cref="WaitingToUploadObjects"/> — one volume per object means nothing was
+    /// split, and the word would carry no information.
+    /// </para>
+    /// </summary>
+    int WaitingToUploadVolumes = 0,
+    /// <summary>
+    /// **Objects** on the upload side with nothing to show for themselves: parked in the hand-off channel
+    /// (<see cref="AwaitingUpload"/>), or past staging and holding an archive with no volume yet on the wire.
+    /// Formally <c>AwaitingUpload + Uploading − WaitingOnPeer − Checking −</c> the number of **distinct** objects with
+    /// a volume in flight (one object can hold several volumes at once, so the in-flight stream count is not it).
+    /// <para>
+    /// It comes from the item ledger rather than from counting archives on the disk, and that is deliberate: the three
+    /// entry kinds that own no archive at all (a dedup hit, a resume hit, a raw in-place item) have to keep showing up
+    /// here, since "many objects, few bytes" is exactly the signal that the wire, not the temp disk, is the constraint.
+    /// </para>
+    /// <para>
+    /// Peer waiters are excluded — they have their own entry naming the reason. Their archives' volumes and bytes are
+    /// still counted in the two columns above, whose basis is "on the disk, not on the wire" rather than "which object
+    /// owns it". In the state where that shows (duplicate content inside one batch) the object count reads slightly
+    /// low against the volumes beside it; the alternative is reporting those objects in two entries at once.
+    /// </para>
+    /// </summary>
+    int WaitingToUploadObjects = 0)
 {
     /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -328,9 +349,14 @@ public sealed record StageProgress(
 /// A reading of the staging pool's current occupancy (post-compression bytes). The upload stage passes this run's staging reservation; other stages have no pool and omit it.
 /// Read fresh on every publish — it seesaws with compression and upload, so a cached value is permanently one beat behind.
 /// </param>
+/// <param name="stagedFiles">
+/// The same reading in **volume files**, from the same seat. Passed and read on exactly the same terms as
+/// <paramref name="stagedBytes"/>, and pointless without it: the pair is what the UI needs to say
+/// "N volumes, X GB waiting for uploading", and neither half can be computed from the other.
+/// </param>
 public sealed class StageTracker(
     string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false,
-    Func<long>? stagedBytes = null) : IDisposable
+    Func<long>? stagedBytes = null, Func<int>? stagedFiles = null) : IDisposable
 {
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
@@ -347,7 +373,7 @@ public sealed class StageTracker(
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     /// <summary>An in-flight stream: the key is the blob/volume name (unique), the value carries the human-facing label, bytes sent and total bytes.</summary>
-    private sealed class InFlight(string label, long total, string? owner)
+    private sealed class InFlight(string label, long total, string? owner, bool staged)
     {
         public string Label { get; } = label;
         public long Total { get; } = total;
@@ -356,6 +382,12 @@ public sealed class StageTracker(
         /// instead of piling them onto one global scalar — see <see cref="StageTracker.BeginUpload"/>.
         /// Null on the download side and on paths that do not go through the upload gate: those paths never touch this ledger.</summary>
         public string? Owner { get; } = owner;
+
+        /// <summary>Whether this volume is a file in the staging pool, and therefore has to be subtracted out of the
+        /// "waiting to upload" columns while it is on the wire. False on the raw in-place route, which sends the user's
+        /// own file — never staged, never charged to the pool, so subtracting it would make those columns under-report
+        /// by one volume for as long as the transfer lasts. Also false on the whole download side.</summary>
+        public bool Staged { get; } = staged;
         private long _sent;
         public long Sent => Interlocked.Read(ref _sent);
 
@@ -395,17 +427,17 @@ public sealed class StageTracker(
     // backpressure ledger the moment it is packed (that ledger wants "how much is on disk right now"), but it still has to pass the re-verify before it may travel, and if the re-verify
     // finds a member changed this archive gets thrown away whole and repacked. Subtracted out of staged, given its own column.
     private long _checkingBytes;
+    // And the same in volume files, so that the two "waiting to upload" columns stay on one basis: the bytes of an
+    // archive in checking come out of that column, so its volumes have to come out too, or the pair contradicts itself.
+    private int _checkingFiles;
     // Current occupancy of each wait phase, indexed by the UploadWait ordinal. An array rather than one field per phase: callers index by the enum,
     // so adding a wait phase takes only one more enum member and the publish end needs no extra line per phase.
+    //
+    // Counts only — there is deliberately no byte ledger alongside. A volume queuing at the gate and an archive parked
+    // in the hand-off channel are both simply "a staged file with nothing on the wire", which the pool's own file and
+    // byte counters already state exactly; tracking their bytes a second time here bought nothing but an exactly-once
+    // repayment obligation spread across every exit path (miss one and the column was wrong for the rest of the run).
     private readonly int[] _waits = new int[Enum.GetValues<UploadWait>().Length];
-    // The bytes those waiters are holding on the staging disk, same indexing. Only the gate fills it in: a volume queuing there is a file lying
-    // in the pool with a size known at the call site, whereas a peer waiter's archive is not what the peer column is about (it is one item waiting
-    // on another item's upload, and its bytes belong with the rest of what an uploader is holding).
-    private readonly long[] _waitBytes = new long[Enum.GetValues<UploadWait>().Length];
-    // Archive bytes parked in the upload hand-off channel. Booked per **entry**, deliberately not per item like _handoffs: bytes are a property of
-    // the archive, and one item can have several entries queued at once (a pack pool splits into groups, each with its own archive). Riding this on
-    // the item-level park/unpark would count the first group's bytes and lose every sibling's.
-    private long _queuedArchiveBytes;
     // Items parked in each hand-off channel, indexed by the HandoffQueue ordinal. Same array-per-enum shape as _waits,
     // and for the same reason: the caller indexes by the enum, so a third channel would cost one enum member.
     private readonly int[] _handoffs = new int[Enum.GetValues<HandoffQueue>().Length];
@@ -639,54 +671,18 @@ public sealed class StageTracker(
     /// this column exists to explain. Wait events themselves are not dense (the gate path even tries a non-blocking acquire first), so the cost is negligible.
     /// </para>
     /// </summary>
-    /// <param name="bytes">How much this waiter is holding on the staging disk, for <see cref="StageProgress.WaitingToUploadBytes"/>. The gate passes the
-    /// volume's size; omit it where the wait holds nothing the pool is charged for.</param>
-    public void BeginWait(UploadWait kind, long bytes = 0)
+    public void BeginWait(UploadWait kind)
     {
         Interlocked.Increment(ref _waits[(int)kind]);
-        if (bytes > 0)
-            Interlocked.Add(ref _waitBytes[(int)kind], bytes);
         lock (_gate)
             PublishIfDue(force: true);
     }
 
-    /// <param name="bytes">Must be the same number as the paired <see cref="BeginWait"/> — as with <see cref="EndChecking"/>, one missed repayment
-    /// leaves this column carrying bytes for the rest of the run, with the staged column under-reporting by the same amount.</param>
-    public void EndWait(UploadWait kind, long bytes = 0)
+    public void EndWait(UploadWait kind)
     {
         Interlocked.Decrement(ref _waits[(int)kind]);
-        if (bytes > 0)
-            Interlocked.Add(ref _waitBytes[(int)kind], -bytes);
         lock (_gate)
             PublishIfDue(force: true);
-    }
-
-    /// <summary>
-    /// An archive is parked in the upload hand-off channel: its bytes are on the staging disk and nobody is sending them
-    /// (pair it with <see cref="LeaveUploadQueue"/>). Call it beside the entry's own park, and answer it wherever that entry
-    /// leaves the channel — picked up, drained, or dropped because the write itself failed.
-    /// <para>
-    /// A separate pair from <see cref="EnterHandoff"/> rather than a <c>bytes</c> parameter on it, because the two count
-    /// different things: that one counts **items** through an idempotent per-item latch (one item, several queued entries,
-    /// one reading), this one counts **entries**, since every entry carries its own archive. Handing bytes to the latch would
-    /// book the first group of a pack pool and silently lose the rest.
-    /// </para>
-    /// <para>
-    /// <b>No forced publish</b>, for the reason spelled out on <see cref="EnterHandoff"/>: this fires on every entry crossing
-    /// the channel, the densest event in the run.
-    /// </para>
-    /// </summary>
-    public void EnterUploadQueue(long bytes)
-    {
-        if (bytes > 0)
-            Interlocked.Add(ref _queuedArchiveBytes, bytes);
-    }
-
-    /// <param name="bytes">The same number the paired <see cref="EnterUploadQueue"/> was given.</param>
-    public void LeaveUploadQueue(long bytes)
-    {
-        if (bytes > 0)
-            Interlocked.Add(ref _queuedArchiveBytes, -bytes);
     }
 
     /// <summary>
@@ -796,22 +792,29 @@ public sealed class StageTracker(
     /// <param name="bytes">Bytes of the archive being checked that are **already on disk**, subtracted out of staged (see
     /// <see cref="StageProgress.CheckingBytes"/>). Just omit it for the phases where the archive does not exist yet (dedup pre-screening's full read of the source file,
     /// a pack's per-member stat **before** compression) — at that point there is not a single byte in the pool.</param>
-    public void BeginChecking(long bytes = 0)
+    /// <param name="files">How many volume files those bytes are, subtracted out of the waiting-to-upload volume count for
+    /// the same reason and on the same terms. Omitted wherever <paramref name="bytes"/> is.</param>
+    public void BeginChecking(long bytes = 0, int files = 0)
     {
         Interlocked.Increment(ref _inChecking);
         if (bytes > 0)
             Interlocked.Add(ref _checkingBytes, bytes);
+        if (files > 0)
+            Interlocked.Add(ref _checkingFiles, files);
         lock (_gate)
             PublishIfDue(force: true);
     }
 
     /// <param name="bytes">Must pass the same number as the paired <see cref="BeginChecking"/> — miss one repayment and
     /// this column carries an entry that never goes away for the rest of the run, with the staged column permanently under-reporting along with it.</param>
-    public void EndChecking(long bytes = 0)
+    /// <param name="files">Same rule, same consequence.</param>
+    public void EndChecking(long bytes = 0, int files = 0)
     {
         Interlocked.Decrement(ref _inChecking);
         if (bytes > 0)
             Interlocked.Add(ref _checkingBytes, -bytes);
+        if (files > 0)
+            Interlocked.Add(ref _checkingFiles, -files);
         lock (_gate)
             PublishIfDue(force: true);
     }
@@ -827,11 +830,13 @@ public sealed class StageTracker(
     /// <param name="totalBytes">Total bytes of this stream; 0 = unknown (a download does not know until the response headers arrive).</param>
     /// <param name="owner">Which family this volume belongs to (<see cref="BeginUpload"/>'s blobRef). Mandatory on the upload side —
     /// it decides which ledger this volume's bytes go into; the download side and paths that skip the upload gate can just omit it.</param>
-    public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null)
+    /// <param name="staged">Whether this volume is a file in the staging pool, and so has to come out of the waiting-to-upload
+    /// columns while it is on the wire. False for the raw in-place route, which sends the user's own file — see <see cref="InFlight.Staged"/>.</param>
+    public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null, bool staged = false)
     {
         lock (_gate)
         {
-            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner)))
+            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner, staged)))
                 return;
             if (speedWhileInFlight && _activeSince < 0)
             {
@@ -1132,45 +1137,70 @@ public sealed class StageTracker(
         // stage to have room. They come out of the uploading subtraction below — see StageProgress.AwaitingCompression.
         var awaitingCompression = Math.Max(0, Volatile.Read(ref _handoffs[(int)HandoffQueue.Compression]));
         var awaitingUpload = Math.Max(0, Volatile.Read(ref _handoffs[(int)HandoffQueue.Upload]));
+        // Items that have left the compression/staging phase = items in hand - items still in staging - items
+        // parked in a hand-off channel.
+        //
+        // Deliberately **not** _inUpload (the BeginUpload/EndUpload pair): that only starts counting at UploadStagedBlobAsync,
+        // and between the end of packing and getting there lies the reservation coordination — an item can stall there for minutes
+        // while not being in _inUpload. Use that as the unit and the item ledger fails to balance exactly when balancing matters most,
+        // and a ledger that does not balance is the very reason this column exists. This subtraction folds that gap in as well, so
+        // processed + preparing + queued + waitingOnRoom + waitingOnArchive + awaitingCompression + awaitingUpload + uploading ≡ total
+        // is an identity, independent of any call site.
+        //
+        // The two hand-off terms are what the subtraction was missing. It was written when one worker owned an item end to end,
+        // where "in hand and not in staging" did mean "past compression, on its way to the wire". Splitting the run into
+        // prober → compressor → uploaders added two states that satisfy the same subtraction while being neither, and folding them
+        // in here is what put "24 objects starting upload" on screen, climbing all run with nothing on the wire.
+        var uploading = Math.Max(0, inWork - Volatile.Read(ref _inStaging) - awaitingCompression - awaitingUpload);
 
-        // In-flight snapshot. Each stream's sent bytes are updated concurrently, so what we take here are readings from a single instant,
-        // and the subtraction below uses the same batch of values — reading twice would occasionally make "staged" compute a negative that gets clamped back to 0, which on screen is a jump.
-        var inFlight = _active.Values
+        // In-flight snapshot, taken **once**: each stream's sent bytes are updated concurrently, and the subtractions
+        // below all work off this same batch of values. Read twice and the waiting columns occasionally compute a
+        // negative that gets clamped back to 0, which on screen is a jump.
+        var active = _active.Values.ToList();
+        var inFlight = active
             .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total))
             .ToList();
-        // Not yet shipped out of the staging pool: pool occupancy − the part of the in-flight streams already sent (those volumes still lie in the pool in full,
-        // since per-volume release deletes only after the transfer) − the archives still stuck in checking and not cleared to travel. The three never overlap:
-        // checking happens entirely before the first volume takes off, so one archive cannot be hit by both of the latter two subtractions.
-        // Without the subtraction the same bytes get counted twice here and in ActiveItems / CheckingBytes.
+        // Only the volumes that came out of the pool may be subtracted from it. The raw in-place route sends the user's
+        // own file, which was never staged and never charged — subtract it and the waiting columns under-report for as
+        // long as that transfer lasts.
+        var inFlightStaged = active.Where(f => f.Staged).ToList();
         var checkingBytes = Math.Max(0, Volatile.Read(ref _checkingBytes));
-        // The upload side's queue, in bytes: archives parked in the hand-off channel plus volumes queuing at the gate. The two cannot overlap —
-        // an entry leaves the channel before its uploader queues a single volume — and neither can overlap the in-flight subtraction below, since
-        // a volume is registered in flight only after the gate lets it through.
-        var waitingToUpload = Math.Max(0,
-            Volatile.Read(ref _queuedArchiveBytes) + Volatile.Read(ref _waitBytes[(int)UploadWait.Slot]));
-        var staged = stagedBytes is null
+        var checkingFiles = Math.Max(0, Volatile.Read(ref _checkingFiles));
+        // What is on this run's staging disk with **not one byte on the wire**, in bytes and in volume files:
+        // the pool's occupancy for this seat, minus the in-flight volumes, minus the archives held in checking and not
+        // yet cleared to travel. The two subtractions cannot overlap — checking happens entirely before an archive's
+        // first volume takes off — so no file is struck twice.
+        //
+        // In-flight volumes come out **whole**, not merely by the part already sent. Those files really are lying in the
+        // pool in full until the transfer completes, but this column says "nothing of this is moving", and the unsent
+        // tail of a volume on the wire is already on screen as the sent/total of its own ActiveItems entry. Subtracting
+        // only the sent part put that tail in two places at once, which is what the two columns this replaced did.
+        var waitingBytes = stagedBytes is null
             ? 0
-            : Math.Max(0, stagedBytes() - inFlight.Sum(f => f.Sent) - checkingBytes - waitingToUpload);
+            : Math.Max(0, stagedBytes() - inFlightStaged.Sum(f => f.Total) - checkingBytes);
+        var waitingVolumes = stagedFiles is null
+            ? 0
+            : Math.Max(0, stagedFiles() - inFlightStaged.Count - checkingFiles);
+        // The object side of the same entry, and the one number here that comes from the **item** ledger rather than
+        // from the disk: objects parked in the hand-off channel plus objects past staging that have nothing on the wire.
+        // Distinct owners, not the in-flight stream count — one object can hold several volumes at once, and using the
+        // stream count would subtract the same object as many times as it has volumes moving.
+        //
+        // From the ledger because the three entry kinds that own no archive (a dedup hit, a resume hit, a raw in-place
+        // item) have to keep showing up: "many objects, few bytes" is what says the wire is the constraint and the temp
+        // disk is not. Counting archives on the disk instead would erase exactly those.
+        var inFlightObjects = inFlight.Count == 0
+            ? 0
+            : active.Select(f => f.Owner).Where(o => o is not null).Distinct(StringComparer.Ordinal).Count();
+        var waitingObjects = Math.Max(0,
+            awaitingUpload + uploading - Volatile.Read(ref _waits[(int)UploadWait.Peer])
+                - Math.Max(0, Volatile.Read(ref _inChecking)) - inFlightObjects);
 
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
-            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(), staged,
+            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(),
             Volatile.Read(ref _transferTotal), Interlocked.Read(ref _spilled),
-            // Items that have left the compression/staging phase = items in hand - items still in staging - items
-            // parked in a hand-off channel.
-            //
-            // Deliberately **not** _inUpload (the BeginUpload/EndUpload pair): that only starts counting at UploadStagedBlobAsync,
-            // and between the end of packing and getting there lies the reservation coordination — an item can stall there for minutes
-            // while not being in _inUpload. Use that as the unit and the item ledger fails to balance exactly when balancing matters most,
-            // and a ledger that does not balance is the very reason this column exists. This subtraction folds that gap in as well, so
-            // processed + preparing + queued + waitingOnRoom + waitingOnArchive + awaitingCompression + awaitingUpload + uploading ≡ total
-            // is an identity, independent of any call site.
-            //
-            // The two hand-off terms are what the subtraction was missing. It was written when one worker owned an item end to end,
-            // where "in hand and not in staging" did mean "past compression, on its way to the wire". Splitting the run into
-            // prober → compressor → uploaders added two states that satisfy the same subtraction while being neither, and folding them
-            // in here is what put "24 objects starting upload" on screen, climbing all run with nothing on the wire.
-            Math.Max(0, inWork - Volatile.Read(ref _inStaging) - awaitingCompression - awaitingUpload),
+            uploading,
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Slot])),
             Math.Max(0, Volatile.Read(ref _inChecking)),
@@ -1179,7 +1209,9 @@ public sealed class StageTracker(
             checkingBytes,
             awaitingCompression,
             awaitingUpload,
-            waitingToUpload));
+            waitingBytes,
+            waitingVolumes,
+            waitingObjects));
     }
 
     /// <summary>

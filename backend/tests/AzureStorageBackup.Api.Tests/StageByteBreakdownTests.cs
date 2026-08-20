@@ -14,10 +14,12 @@ namespace AzureStorageBackup.Api.Tests;
 public sealed class StageByteBreakdownTests
 {
     private static (StageTracker Tracker, List<StageProgress> Seen) Rig(
-        int total = 0, Func<long>? stagedBytes = null)
+        int total = 0, Func<long>? stagedBytes = null, Func<int>? stagedFiles = null)
     {
         var seen = new List<StageProgress>();
-        return (new StageTracker("Uploading", total, seen.Add, speedWhileInFlight: true, stagedBytes), seen);
+        return (
+            new StageTracker("Uploading", total, seen.Add, speedWhileInFlight: true, stagedBytes, stagedFiles),
+            seen);
     }
 
     /// <summary>
@@ -40,96 +42,116 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// The upload-side queue's bytes are measured, not inferred from the pool. The counts beside them on screen
-    /// (volumes at the gate, objects waiting for an uploader) cannot be turned into bytes by the reader, and the
-    /// obvious substitute — the pool total — is wrong by exactly the part that is moving.
+    /// The waiting figure is read off the pool itself rather than assembled from the queues feeding it. Whether an
+    /// archive is parked in the hand-off channel or already claimed by an uploader makes no difference to it — that
+    /// distinction is ownership, an implementation detail, and the two entries it used to produce read as the same
+    /// thing counted twice while between them counting neither the volumes an uploader owns but has not started.
     /// </summary>
     [Fact]
-    public void The_Upload_Queues_Bytes_Are_Its_Own_And_Come_Out_Of_The_Pool()
+    public void Waiting_Is_The_Pool_Minus_What_Is_On_The_Wire()
     {
         var pool = 10_000L;
-        var (tracker, seen) = Rig(stagedBytes: () => pool);
+        var files = 10;
+        var (tracker, seen) = Rig(stagedBytes: () => pool, stagedFiles: () => files);
 
-        // One archive parked waiting for an uploader, one volume queuing at the gate, and one volume on the wire
-        // half sent. All three are lying in the pool; only the first two are queued.
-        tracker.EnterUploadQueue(6_000);
-        tracker.BeginWait(UploadWait.Slot, 3_000);
-        tracker.BeginItem("d.001", "photos/a.bin", 1_000);
+        // Nine volumes lying on the disk untouched, one on the wire. Who owns which is not this figure's business.
+        tracker.BeginItem("d.001", "photos/a.bin", 1_000, owner: "data/a", staged: true);
         tracker.ItemProgress("d.001").Report(400);
         tracker.Complete();
 
-        Assert.Equal(9_000, seen[^1].WaitingToUploadBytes);   // 6000 parked + 3000 at the gate, and nothing else
-        Assert.Equal(600, seen[^1].StagedBytes);              // what is left is the unsent tail of the flow on the wire
+        Assert.Equal(9_000, seen[^1].WaitingToUploadBytes);   // the in-flight volume comes out whole, not by what it has sent
+        Assert.Equal(9, seen[^1].WaitingToUploadVolumes);
 
-        // The uploader picks the parked entry up: its bytes stop being queued, but they are still on the disk.
-        tracker.LeaveUploadQueue(6_000);
+        // That volume finishes and leaves the pool: one file fewer on the disk, and nothing on the wire.
+        tracker.EndItem("d.001", 0);
+        pool = 9_000;
+        files = 9;
         tracker.Complete();
 
-        Assert.Equal(3_000, seen[^1].WaitingToUploadBytes);
-        Assert.Equal(6_600, seen[^1].StagedBytes);
+        Assert.Equal(9_000, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(9, seen[^1].WaitingToUploadVolumes);
     }
 
     /// <summary>
-    /// A volume's bytes move from the queue column into the in-flight one and are never in both — the gate's wait ends
-    /// at the very instant the volume registers as in flight. Counted in both, the pool would be over-subtracted and
-    /// the "in the uploaders' hands" figure would read 0 while a transfer was plainly running.
+    /// An in-flight volume comes out of the waiting figure **whole**, not by the part it has already sent. Its file
+    /// really does lie in the pool in full until the transfer completes, but the entry claims nothing of it is moving,
+    /// and the unsent tail is already on screen as that stream's own sent/total. Subtracting only the sent part is what
+    /// put the same bytes in two entries at once.
     /// </summary>
     [Fact]
-    public void A_Volume_Leaving_The_Gate_Is_Not_Counted_Twice()
+    public void An_In_Flight_Volume_Comes_Out_Whole()
     {
-        var pool = 5_000L;
-        var (tracker, seen) = Rig(stagedBytes: () => pool);
+        var (tracker, seen) = Rig(stagedBytes: () => 5_000, stagedFiles: () => 2);
 
-        tracker.BeginWait(UploadWait.Slot, 5_000);
+        tracker.BeginItem("d.001", "photos/a.bin", 3_000, owner: "data/a", staged: true);
         tracker.Complete();
-        Assert.Equal(5_000, seen[^1].WaitingToUploadBytes);
-        Assert.Equal(0, seen[^1].StagedBytes);
+        Assert.Equal(2_000, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(1, seen[^1].WaitingToUploadVolumes);
 
-        tracker.EndWait(UploadWait.Slot, 5_000);
-        tracker.BeginItem("d.001", "photos/a.bin", 5_000);
-        tracker.ItemProgress("d.001").Report(2_000);
+        // Half of it goes out. The waiting figure must not move — those bytes were never in it.
+        tracker.ItemProgress("d.001").Report(1_500);
         tracker.Complete();
-
-        Assert.Equal(0, seen[^1].WaitingToUploadBytes);
-        Assert.Equal(3_000, seen[^1].StagedBytes);   // the unsent half, counted once
+        Assert.Equal(2_000, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(1, seen[^1].WaitingToUploadVolumes);
     }
 
     /// <summary>
-    /// The queue's item count and its byte count answer different questions and must be free to disagree: a dedup hit,
-    /// a resume hit and a raw in-place item all queue owning no archive at all. On a store-only run the channel can
-    /// hold the whole dataset while the pool holds nothing, and reporting bytes proportional to the count would turn
-    /// that into a temp disk about to burst.
+    /// Only volumes that came out of the pool may be subtracted from it. The raw in-place route uploads the user's own
+    /// file — never staged, never charged — so subtracting it would make both waiting columns under-report for as long
+    /// as that transfer runs, and on a large raw file that is the whole upload.
+    /// </summary>
+    [Fact]
+    public void A_Raw_In_Place_Upload_Is_Not_Subtracted_From_The_Pool()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 5_000, stagedFiles: () => 2);
+
+        tracker.BeginItem("data/raw", "movies/big.mp4", 40_000, owner: "data/raw", staged: false);
+        tracker.Complete();
+
+        Assert.Equal(5_000, seen[^1].WaitingToUploadBytes);   // the pool is untouched by it
+        Assert.Equal(2, seen[^1].WaitingToUploadVolumes);
+    }
+
+    /// <summary>
+    /// The object count and the byte count answer different questions and must be free to disagree: a dedup hit, a
+    /// resume hit and a raw in-place item all queue owning no archive at all. On a store-only run the channel can hold
+    /// the whole dataset while the pool holds nothing, and reporting bytes proportional to the count would turn that
+    /// into a temp disk about to burst.
     /// </summary>
     [Fact]
     public void A_Deep_Queue_Can_Be_Worth_No_Bytes()
     {
-        var (tracker, seen) = Rig(stagedBytes: () => 0);
+        var (tracker, seen) = Rig(stagedBytes: () => 0, stagedFiles: () => 0);
 
         for (var i = 0; i < 5_000; i++)
-            tracker.EnterUploadQueue(0);   // dedup/resume hits and raw in-place items: nothing in the pool
+            tracker.EnterHandoff(HandoffQueue.Upload);   // dedup/resume hits and raw in-place items: nothing in the pool
         tracker.Complete();
 
+        Assert.Equal(5_000, seen[^1].WaitingToUploadObjects);
         Assert.Equal(0, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(0, seen[^1].WaitingToUploadVolumes);
     }
 
     /// <summary>
-    /// Staged = pool usage − the part the in-flight flows have already sent. Those volumes really are still sitting
-    /// whole in the pool (released per volume, deleted only once sent) and only a slice of them has gone; without the
-    /// subtraction the same bytes get counted once here and once in the in-flight list.
+    /// The object count subtracts **distinct owners** in flight, not in-flight streams. One object can hold several
+    /// volumes on the wire at once (the per-item window is the gate's capacity plus one), and subtracting per stream
+    /// would strike the same object off as many times as it has volumes moving, driving the count to 0 while objects
+    /// were plainly still waiting.
     /// </summary>
     [Fact]
-    public void Staged_Subtracts_What_The_In_Flight_Flows_Already_Sent()
+    public void The_Object_Count_Subtracts_Owners_Not_Streams()
     {
-        var pool = 1_000L;
-        var (tracker, seen) = Rig(stagedBytes: () => pool);
+        var (tracker, seen) = Rig(stagedBytes: () => 0, stagedFiles: () => 0);
 
-        tracker.BeginItem("data/aaa.001", "photos/a.bin", 600);
+        // Three objects in hand, past staging; one of them has three volumes on the wire.
+        for (var i = 0; i < 3; i++)
+            tracker.BeginWork();
+        tracker.BeginItem("d.001", "a", 10, owner: "data/a", staged: true);
+        tracker.BeginItem("d.002", "a", 10, owner: "data/a", staged: true);
+        tracker.BeginItem("d.003", "a", 10, owner: "data/a", staged: true);
         tracker.Complete();
-        Assert.Equal(1000, seen[^1].StagedBytes);   // not one byte has gone out yet
 
-        tracker.ItemProgress("data/aaa.001").Report(250);
-        tracker.Complete();
-        Assert.Equal(750, seen[^1].StagedBytes);    // 250 sent, 750 still sitting in the pool
+        Assert.Equal(2, seen[^1].WaitingToUploadObjects);   // 3 in hand − 1 owner on the wire, not − 3 streams
     }
 
     /// <summary>Every in-flight row must carry "who, how big, how much sent" — the label is the source file path, not the content-addressed blob name.</summary>
@@ -504,19 +526,25 @@ public sealed class StageByteBreakdownTests
     public void Bytes_Still_Being_Verified_Are_Not_Ready_To_Upload()
     {
         long pool = 0;
-        var (tracker, seen) = Rig(stagedBytes: () => pool);
+        var files = 0;
+        var (tracker, seen) = Rig(stagedBytes: () => pool, stagedFiles: () => files);
 
-        pool = 100_000;                    // a pack finished compressing; the output hit the disk and entered the backpressure ledger
-        tracker.BeginChecking(100_000);    // but it is re-verifying member by member
+        pool = 100_000;                       // a pack finished compressing; the output hit the disk and entered the backpressure ledger
+        files = 4;
+        tracker.BeginChecking(100_000, 4);    // but it is re-verifying member by member
         tracker.Complete();
 
-        Assert.Equal(0, seen[^1].StagedBytes);           // not "ready to send"
-        Assert.Equal(100_000, seen[^1].CheckingBytes);   // but "still being checked"
+        Assert.Equal(0, seen[^1].WaitingToUploadBytes);     // not "ready to send"
+        // Both units come out together, or the two waiting columns contradict each other — the bytes would be gone
+        // while their volumes stayed behind.
+        Assert.Equal(0, seen[^1].WaitingToUploadVolumes);
+        Assert.Equal(100_000, seen[^1].CheckingBytes);      // but "still being checked"
 
-        tracker.EndChecking(100_000);
+        tracker.EndChecking(100_000, 4);
         tracker.Complete();
 
-        Assert.Equal(100_000, seen[^1].StagedBytes);     // only counts once it has been checked
+        Assert.Equal(100_000, seen[^1].WaitingToUploadBytes);   // only counts once it has been checked
+        Assert.Equal(4, seen[^1].WaitingToUploadVolumes);
         Assert.Equal(0, seen[^1].CheckingBytes);
     }
 
@@ -538,9 +566,9 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(1, seen[^1].Checking);   // the item-count column carries on as usual
     }
 
-    /// <summary>Stages with no pool (scanning/diffing/local checks) report no staged bytes, and that row disappears from the UI entirely.</summary>
+    /// <summary>Stages with no pool (scanning/diffing/local checks) report nothing waiting to upload, in either unit, and that entry disappears from the UI entirely.</summary>
     [Fact]
-    public void Stages_Without_A_Pool_Report_No_Staged_Bytes()
+    public void Stages_Without_A_Pool_Report_Nothing_Waiting()
     {
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Diffing", total: 10, seen.Add);
@@ -548,6 +576,7 @@ public sealed class StageByteBreakdownTests
         tracker.Advance(100);
         tracker.Complete();
 
-        Assert.Equal(0, seen[^1].StagedBytes);
+        Assert.Equal(0, seen[^1].WaitingToUploadBytes);
+        Assert.Equal(0, seen[^1].WaitingToUploadVolumes);
     }
 }
