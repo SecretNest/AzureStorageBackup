@@ -82,8 +82,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 
         /// <summary>
         /// How many **volume files** those bytes are spread across. The UI reports the two side by side
-        /// ("N volumes, X GB waiting for uploading"), and neither can be derived from the other: volumes of one
-        /// archive are uniform but the last one is a remainder, and a run mixes archives of wildly different sizes.
+        /// ("N objects waiting for uploading (M volumes on the staging disk, X GB)"), and neither can be derived from
+        /// the other: volumes of one archive are uniform but the last one is a remainder, and a run mixes archives of
+        /// wildly different sizes.
         /// <para>
         /// <see cref="ReserveAsync"/> deliberately books bytes with **no** files — a reservation is temp space the
         /// caller manages itself (repair's compose directory, compaction's unpacked members), not volumes waiting to

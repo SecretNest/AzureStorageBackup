@@ -352,7 +352,7 @@ public sealed record StageProgress(
 /// <param name="stagedFiles">
 /// The same reading in **volume files**, from the same seat. Passed and read on exactly the same terms as
 /// <paramref name="stagedBytes"/>, and pointless without it: the pair is what the UI needs to say
-/// "N volumes, X GB waiting for uploading", and neither half can be computed from the other.
+/// "M volumes on the staging disk, X GB", and neither half can be computed from the other.
 /// </param>
 public sealed class StageTracker(
     string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false,

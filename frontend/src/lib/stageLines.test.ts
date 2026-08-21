@@ -81,7 +81,7 @@ describe('stageLines', () => {
       // The whole upload-side wait as one entry: objects, the volumes they are split across, and their size on
       // disk — one population stated three ways. Nothing on the wire is in any of the three, so this entry and
       // the "2 volumes uploading" above it never overlap.
-      '7 objects (33 volumes, 3.073 GB) waiting for uploading',
+      '7 objects waiting for uploading (33 volumes on the staging disk, 3.073 GB)',
       '1 object checking files',
       '95.4 MB being checked',
       '1 object preparing',
@@ -119,7 +119,7 @@ describe('stageLines', () => {
 
     expect(pipeline).toBe(
       '+63.7 MB on the cloud · nothing on the wire right now · ' +
-        '24 objects (63.7 MB) waiting for uploading · 1 object preparing',
+        '24 objects waiting for uploading (63.7 MB) · 1 object preparing',
     )
     expect(pipeline).not.toContain('starting upload')
   })
@@ -128,6 +128,9 @@ describe('stageLines', () => {
    * The volume count is dropped when it equals the object count: one volume per object means nothing was split,
    * and the word would carry no information — worse, two identical numbers side by side read as a bug. It stays
    * the moment they diverge, because that difference is the entire reason the count exists.
+   *
+   * Only that term drops. The size stays either way — it is the number the temp-disk question is asked of, and it
+   * has nothing to do with whether anything was split.
    */
   test('names the volumes only when something is actually split', () => {
     expect(
@@ -138,7 +141,7 @@ describe('stageLines', () => {
           waitingToUploadBytes: 10_400_000_000,
         }),
       ).pipeline,
-    ).toContain('14 objects (80 volumes, 9.686 GB) waiting for uploading')
+    ).toContain('14 objects waiting for uploading (80 volumes on the staging disk, 9.686 GB)')
 
     expect(
       stageLines(
@@ -148,9 +151,30 @@ describe('stageLines', () => {
           waitingToUploadBytes: 10_400_000_000,
         }),
       ).pipeline,
-    ).toContain('14 objects (9.686 GB) waiting for uploading')
+    ).toContain('14 objects waiting for uploading (9.686 GB)')
 
     expect(stageLines(progress({})).pipeline).not.toContain('waiting for uploading')
+  })
+
+  /**
+   * Where the volumes were measured has to be said, because the two counts do not share a source: objects comes
+   * from the item ledger, volumes off the staging pool. Left bare, "362 objects (119 volumes)" reads as several
+   * objects merged into one volume — which never happens — when it actually means the objects owning no archive
+   * (a dedup hit, a resume hit, a raw in-place item) never reached the disk to be counted. On a store-only run
+   * those are the majority, so the pair is on screen looking like a merge ratio for most of the run.
+   */
+  test('says where the volume count was measured', () => {
+    const split = stageLines(
+      progress({
+        waitingToUploadObjects: 362,
+        waitingToUploadVolumes: 119,
+        waitingToUploadBytes: 6_943_888_875,
+      }),
+    ).pipeline
+
+    expect(split).toContain('362 objects waiting for uploading (119 volumes on the staging disk, 6.467 GB)')
+    // Not a bare "(119 volumes" — that is the reading this entry exists to prevent.
+    expect(split).not.toContain('(119 volumes,')
   })
 
   /**
@@ -185,7 +209,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '1 volume uploading · 3 objects (9 volumes, 858.3 MB) waiting for uploading',
+      '1 volume uploading · 3 objects waiting for uploading (9 volumes on the staging disk, 858.3 MB)',
     )
     expect(pipeline).not.toContain("uploaders' hands")
   })
@@ -228,7 +252,7 @@ describe('stageLines', () => {
       }),
     )
     expect(pipeline).toBe(
-      '4 objects (28 volumes, 2.608 GB) waiting for uploading · ' +
+      '4 objects waiting for uploading (28 volumes on the staging disk, 2.608 GB) · ' +
         '1 object checking files · 95.4 MB being checked',
     )
   })

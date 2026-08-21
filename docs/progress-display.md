@@ -439,7 +439,7 @@ you can actually answer: **can this number still go backwards?**
 
 ```
 Uploading: 6,676 of 11,004 objects · 1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original) · 13.3 MB/s · ~1d 10h left
-In flight: +3.400 GB on the cloud · 5 volumes uploading · 118 objects (2,043 volumes, 9.201 GB) waiting for uploading · 1 object waiting for staging room · 4,365 objects queued
+In flight: +3.400 GB on the cloud · 5 volumes uploading · 118 objects waiting for uploading (2,043 volumes on the staging disk, 9.201 GB) · 1 object waiting for staging room · 4,365 objects queued
 ```
 
 The second line runs **backwards along the timeline**, with counts and bytes interleaved at the point
@@ -452,13 +452,24 @@ queued → waiting for the compressor → waiting for staging room → waiting f
        → on the cloud → settled (first line)
 ```
 
-**The whole upload-side wait is one entry**, `N objects (M volumes, X) waiting for uploading`: one
-population — everything on the staging disk with not one byte on the wire — stated three ways. The
-volume count is dropped when it equals the object count, since one volume per object means nothing was
-split and the word would carry no information. The bytes are dropped when zero, which is a real state
-rather than a rounding artefact.
+**The whole upload-side wait is one entry**, `N objects waiting for uploading (M volumes on the staging
+disk, X)`: one population — everything on the staging disk with not one byte on the wire — stated three
+ways. The volume count is dropped when it equals the object count, since one volume per object means
+nothing was split and the word would carry no information; only that term goes, the size stays. The
+bytes are dropped when zero, which is a real state rather than a rounding artefact — and with both gone
+the parentheses go with them.
 
 Nothing on the wire is in any of the three, so this entry and `5 volumes uploading` never overlap.
+
+> **Why the volumes say where they were measured.** The two counts have different sources — objects
+> comes from the item ledger, volumes and bytes are measured off the staging pool — and a bare
+> `362 objects (119 volumes, 6.467 GB)` puts them in a ratio the reader will try to form. The only
+> available reading of "fewer volumes than objects" is that several objects were merged into one volume,
+> and that never happens: an object's volumes live in its own directory and belong to it alone. What the
+> gap actually means is the opposite — the objects owning **no archive at all** (a dedup hit, a resume
+> hit, a raw in-place item) never reached the disk to be counted, so they are in the left number and not
+> the right one. On a store-only or raw-heavy run those are the majority, which is exactly when the pair
+> is on screen. Four words name the basis and the question does not arise.
 
 > **Rationale.** This was two entries, split by **ownership**: had an uploader thread picked the archive
 > up yet? That is an implementation detail nobody at the screen can act on, and side by side the two read

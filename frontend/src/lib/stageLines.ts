@@ -125,22 +125,39 @@ export function stageLines(detail: StageProgress) {
   //   in-place item own no archive at all, so a store-only run shows five figures of objects against few bytes, and
   //   that pairing is the answer to "should I worry about my temp disk" — no, the wire is the bottleneck.
   // · volumes — omitted when equal to the objects, since one volume per object means nothing was split and the word
-  //   would carry no information.
-  // · bytes — omitted when zero, which is a real state (see the objects note), not a rounding artefact.
+  //   would carry no information. The bytes stay either way; only this term drops.
+  // · bytes — omitted when zero, which is a real state (see the objects note), not a rounding artefact. With both
+  //   omitted the parentheses go with them, leaving the object count alone.
+  //
+  // The volumes carry "on the staging disk" because the two counts have **different sources**, and without saying so
+  // the pair invites a division that means nothing: objects comes from the item ledger, volumes and bytes are measured
+  // off the pool (StagingArea's per-lease file count). Fewer volumes than objects therefore reads as "several objects
+  // were merged into one volume" — which never happens, one volume belongs to exactly one object — when what it really
+  // says is that the objects owning no archive at all never reached the disk to be counted. On a store-only or
+  // raw-heavy run those are the majority, so the pair sits on screen looking like a merge ratio for the whole run.
+  // Naming where the number was measured answers it in four words and needs nothing new from the backend.
+  //
+  // The qualifier rides on the volumes rather than the whole parenthesis: it is only needed while the two counts
+  // disagree, and the one case where it is dropped is exactly the case where they are equal.
   //
   // In-flight volumes are excluded from all three, so this entry and the "N volumes uploading" above it never overlap.
   // The unsent tail of a volume on the wire is already on screen, per stream, as that stream's sent/total.
   const waitingInner = [
     detail.waitingToUploadVolumes > 0 &&
       detail.waitingToUploadVolumes !== detail.waitingToUploadObjects &&
-      withUnit(detail.waitingToUploadVolumes, 'volumes'),
+      `${withUnit(detail.waitingToUploadVolumes, 'volumes')} on the staging disk`,
     detail.waitingToUploadBytes > 0 && formatBytes(detail.waitingToUploadBytes),
   ]
     .filter(Boolean)
     .join(', ')
+  // The parenthesis follows the verb rather than splitting subject from it. Between the two it grew long enough
+  // ("362 objects (119 volumes on the staging disk, 6.467 GB) waiting for uploading") that the reader reaches the
+  // verb having lost the noun, and the aside is a measurement detail — it belongs after the sentence is complete.
   const waitingToUpload =
     detail.waitingToUploadObjects > 0 || detail.waitingToUploadBytes > 0
-      ? `${withUnit(detail.waitingToUploadObjects, unit)}${waitingInner ? ` (${waitingInner})` : ''}`
+      ? `${withUnit(detail.waitingToUploadObjects, unit)} waiting for uploading${
+          waitingInner ? ` (${waitingInner})` : ''
+        }`
       : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
@@ -199,7 +216,7 @@ export function stageLines(detail: StageProgress) {
     // operator set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a store-only workload
     // the compressor can queue the whole dataset here while the uploaders trickle. A big number is the pipeline working
     // as designed; what it tells the operator is that the bottleneck is the wire, not the CPU.
-    waitingToUpload && `${waitingToUpload} waiting for uploading`,
+    waitingToUpload,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
     // The disk-checking stretches (dedup pre-check full read, per-member stat before and after packing,
     // clearing leftover cloud volumes). They emit not one progress event, and the heartbeat only runs

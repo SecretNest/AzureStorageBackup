@@ -731,8 +731,11 @@ public sealed class BackupOrchestrator(
         // Speed only counts the time when "there is traffic on the wire": most of this stage is spent in 7z, and
         // putting compression in the denominator measures neither transfer speed nor wall-clock throughput
         // (see StageTracker.SpeedNow).
-        // The staged-pool reading is wired in, in both units: the UI's "N volumes, X GB waiting for uploading" is this
-        // seat's occupancy minus the volumes currently on the wire and the ones held in checking.
+        // The staged-pool reading is wired in, in both units: the "M volumes on the staging disk, X GB" the UI puts
+        // after "N objects waiting for uploading" is this seat's occupancy minus the volumes currently on the wire and
+        // the ones held in checking. Both halves are measured **here**, off the pool — which is why the UI names the
+        // disk: the object count beside them comes from the item ledger instead, and objects owning no archive at all
+        // never reach this seat to be counted.
         var uploadTracker = new StageTracker(
             "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true,
             stagedBytes: () => stagingLease.Bytes, stagedFiles: () => stagingLease.Files);

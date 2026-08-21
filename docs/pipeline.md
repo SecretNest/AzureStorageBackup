@@ -46,9 +46,9 @@ steady state. That line is not a warning — it is the evidence that the configu
 
 ## The queues
 
-Both depths are on screen — `N objects waiting for the compressor`, and `N objects (M volumes, X)
-waiting for uploading`, which folds this queue in with everything else on the staging disk that has
-nothing on the wire — and each carries its own term in the item ledger; see
+Both depths are on screen — `N objects waiting for the compressor`, and `N objects waiting for
+uploading (M volumes on the staging disk, X)`, which folds this queue in with everything else on the
+staging disk that has nothing on the wire — and each carries its own term in the item ledger; see
 [progress-display.md](progress-display.md). Which of the two is deep says which stage is the
 bottleneck, so keeping them apart is worth a term each.
 
