@@ -504,6 +504,14 @@ public sealed class StageTracker(
     // remaining time falls back to extrapolating from item counts.
     private long _totalWork;
     private long _doneWork;
+    /// <summary>Of <see cref="_doneWork"/>, the part that cost no transfer time: items written off having pushed
+    /// nothing over the wire. It is subtracted out of the remaining-time denominator, never out of the progress —
+    /// see <see cref="Eta"/> for why the two need different numbers.</summary>
+    private long _skippedWork;
+    /// <summary>Work written off by <see cref="Advance"/> and not yet judged transferred-or-not; settled by the next
+    /// <see cref="SetTransferred"/>. Accumulates rather than overwrites, so that if several items were written off
+    /// against one refresh they are all judged together instead of all but the last being forgotten.</summary>
+    private long _pendingWork;
     // Bytes that have landed safely in the cloud / on disk (post-compression). The difference from _bytes: that one adds as it transfers and includes the in-flight part,
     // and is used for speed; this one only counts what finished. On the upload side SetTransferred supplies the authoritative per-**item** reading; the download side accumulates per volume.
     private long _transferred;
@@ -597,6 +605,11 @@ public sealed class StageTracker(
             _processed++;
             _bytes += bytes;
             _doneWork += work ?? bytes;
+            // Held until the transferred total is refreshed, which is what says whether this item moved anything.
+            // `bytes` cannot answer it: the upload stage passes 0 here for **every** item and supplies the real
+            // figure through SetTransferred instead (see the note there on the authoritative per-item reading), so
+            // reading a skip off this parameter would mark the entire run as skipped.
+            _pendingWork += work ?? bytes;
             PublishIfDue(force: false);
         }
     }
@@ -629,6 +642,20 @@ public sealed class StageTracker(
             // (failed, cancelled) are simply not here, having been voided back in EndUpload, so "did we subtract too much or too little" does not arise.
             foreach (var owner in _unfinished.Where(e => e.Value.Confirmed).Select(e => e.Key).ToList())
                 _unfinished.Remove(owner);
+            // The items Advance has written off since the last refresh, and whether any of them moved a byte. This
+            // is the only place that can tell: Advance runs first and is handed 0 bytes on this stage, and the
+            // authoritative figure arrives here (the two are called as a pair for every item — see the note at
+            // BackupOrchestrator's ReportItem, and the case at ClearLeftoverVolumesAsync that states the pairing by
+            // pointing out where neither runs).
+            //
+            // Work that moved nothing consumed none of the elapsed time the estimate divides by, so it is booked
+            // aside for Eta and nowhere else — the item is genuinely finished and must keep counting as progress.
+            // A resume is where this stops being a rounding error: the run adopts everything its journal vouches
+            // for within seconds, and an estimate that treats those gigabytes as time-earning reads as minutes for
+            // hours of work.
+            if (total <= _transferred)
+                _skippedWork += _pendingWork;
+            _pendingWork = 0;
             _transferred = total;
             PublishIfDue(force: false);
         }
@@ -1350,12 +1377,24 @@ public sealed class StageTracker(
         if (done <= 0 || done >= total)
             return null;
 
+        // What is *left* is everything not yet written off — skips included, since a skip really is done.
+        // What the elapsed time was *spent on* is a different quantity, and it is the one that belongs under the
+        // division: an item that pushed no bytes took no transfer time with it. Resuming is where the two diverge
+        // hard enough to be absurd — a run adopts every object its journal already vouches for within seconds, so
+        // gigabytes land in `done` against an elapsed of almost nothing, and an estimate divided by that reads as
+        // minutes for hours of work. The item-count fallback keeps using `done` as it is: it serves the diff stage,
+        // where entries are uniform and almost all of them are one stat.
+        var timedWork = totalWork > 0 ? done - Volatile.Read(ref _skippedWork) : done;
+        // Only skips so far. There is no rate to extrapolate from yet, and saying nothing beats saying zero.
+        if (timedWork <= 0)
+            return null;
+
         var startMs = Volatile.Read(ref _workStartMs);
         var elapsedMs = now - (startMs < 0 ? 0 : startMs);
         if (elapsedMs <= 0)
             return null;
 
-        return (double)elapsedMs * (total - done) / done / 1000;
+        return (double)elapsedMs * (total - done) / timedWork / 1000;
     }
 
     /// <summary>Stop the heartbeat. <see cref="Complete"/> already did it once when the stage wrapped up; missing it on an exception path does not matter —

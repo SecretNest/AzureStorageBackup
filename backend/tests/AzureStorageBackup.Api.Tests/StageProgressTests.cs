@@ -496,6 +496,52 @@ public sealed class StageProgressTests
         Assert.True(eta < TimeSpan.FromMilliseconds(200), $"expected a byte-weighted estimate, got {eta}");
     }
 
+    /// <summary>
+    /// A resumed run adopts everything its journal already vouches for, and does it in seconds. Those items are
+    /// finished — they must count as progress — but they earned none of the elapsed time, so dividing by them says
+    /// the rest of the run will take almost no time at all. Reported from a real resume, where the estimate came out
+    /// in minutes for hours of work.
+    /// <para>
+    /// The pair is what production does per item: Advance writes the item off with 0 bytes (this stage always passes
+    /// 0 there, supplying the real figure separately), then SetTransferred refreshes the authoritative cumulative
+    /// total. A total that did not move is what identifies the skip; nothing else in either call can.
+    /// </para>
+    /// <para>
+    /// On the injected clock rather than a delay, so the two answers are exact rather than merely far apart: three
+    /// quarters of the work skipped means the wrong denominator reports a quarter of the right one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Upload_Ignores_Skipped_Work_When_Estimating()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        // Five items of equal size, so one is still outstanding at the end — an estimate only exists while
+        // something remains.
+        for (var i = 0; i < 5; i++) tracker.Enqueue(1000);
+        tracker.SetTotal(5);
+        tracker.BeginWork();
+
+        // Three adopted from the journal, at no cost in time at all: the clock does not move.
+        for (var i = 0; i < 3; i++)
+        {
+            tracker.Advance(0, work: 1000);
+            tracker.SetTransferred(0);
+        }
+
+        // One real upload, which is what the whole elapsed second was spent on. 1000 of work left after it.
+        now = 1000;
+        tracker.Advance(0, work: 1000);
+        tracker.SetTransferred(500);
+        tracker.Complete();   // the throttle would otherwise decide whether the last state was ever published
+
+        // One second bought 1000 of transferred work and 1000 remains, so the honest answer is one second.
+        // Counting the three adopted items as time-earning puts 4000 under the division and answers 250ms.
+        Assert.Equal(TimeSpan.FromSeconds(1), seen[^1].EstimatedRemaining);
+    }
+
     /// <summary>Stages that declare no workload (diff/restore/check) fall back to extrapolating by item count — still a
     /// whole-run average, still ignoring instantaneous speed. For diff the item count is the right proxy anyway: the
     /// vast majority of entries are just stat'ed and passed over.</summary>
