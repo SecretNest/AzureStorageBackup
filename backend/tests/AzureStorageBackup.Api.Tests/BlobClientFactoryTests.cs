@@ -101,4 +101,88 @@ public class BlobClientFactoryTests
         Assert.True(handler.UseProxy);
         Assert.NotNull(handler.Proxy);
     }
+
+    /// <summary>
+    /// The whole point of the cache, and reference equality is the only way to assert it: the connection pool lives
+    /// in the handler behind the client, so "the same instance" is the same pool and a new instance is a fresh TCP
+    /// connect plus TLS handshake. BlobUploader reaches this once per volume, so before the cache every 100 MB
+    /// volume opened its own connection and started its congestion window from zero.
+    /// </summary>
+    [Fact]
+    public void CreateServiceClient_Reuses_One_Client_Per_Account()
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var acct = Sample();
+        acct.Id = 7;
+
+        Assert.Same(factory.CreateServiceClient(acct), factory.CreateServiceClient(acct));
+    }
+
+    /// <summary>
+    /// Reuse must not outlive the settings it was built from. The account object handed in is re-read from the
+    /// database on each scope, so the cache cannot rely on reference identity to notice an edit — it compares a
+    /// fingerprint, and this is the case that says the fingerprint is actually consulted.
+    /// </summary>
+    [Fact]
+    public void CreateServiceClient_Rebuilds_When_The_Endpoint_Changes()
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var acct = Sample();
+        acct.Id = 7;
+        var first = factory.CreateServiceClient(acct);
+
+        acct.BlobEndpoint = "https://other.blob.core.windows.net";
+        var second = factory.CreateServiceClient(acct);
+
+        Assert.NotSame(first, second);
+        Assert.Equal("other", second.AccountName);
+    }
+
+    /// <summary>
+    /// A rotated key has to reach the cloud without a restart. The fingerprint is taken over the **ciphertext**, so
+    /// this is what proves that choice works: nothing else about the account moved, and the client still has to be
+    /// rebuilt or every subsequent request is signed with the key the operator just replaced.
+    /// </summary>
+    [Fact]
+    public void CreateServiceClient_Rebuilds_When_The_Key_Is_Rotated()
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var acct = Sample();
+        acct.Id = 7;
+        var first = factory.CreateServiceClient(acct);
+
+        acct.AccountKeyProtected = TestSecrets.Protect("c2Vjb25ka2V5");
+        Assert.NotSame(first, factory.CreateServiceClient(acct));
+    }
+
+    /// <summary>Turning a proxy on is a different route to the same endpoint, and the pool behind the old client
+    /// does not go through it.</summary>
+    [Fact]
+    public void CreateServiceClient_Rebuilds_When_The_Proxy_Changes()
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var acct = Sample();
+        acct.Id = 7;
+        var first = factory.CreateServiceClient(acct);
+
+        acct.UseProxy = true;
+        acct.ProxyMode = ProxyMode.Independent;
+        acct.ProxyHost = "proxy.local";
+        acct.ProxyPort = 8080;
+
+        Assert.NotSame(first, factory.CreateServiceClient(acct));
+    }
+
+    /// <summary>Two accounts are two pools, however much else they have in common.</summary>
+    [Fact]
+    public void CreateServiceClient_Keeps_Accounts_Apart()
+    {
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var one = Sample();
+        one.Id = 1;
+        var two = Sample();
+        two.Id = 2;
+
+        Assert.NotSame(factory.CreateServiceClient(one), factory.CreateServiceClient(two));
+    }
 }

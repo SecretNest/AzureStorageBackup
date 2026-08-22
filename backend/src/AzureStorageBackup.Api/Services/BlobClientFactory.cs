@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using Azure.Core.Pipeline;
 using Azure.Storage;
@@ -23,7 +24,52 @@ public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
         return uri.Host.Split('.')[0];
     }
 
+    /// <summary>
+    /// One live client per account, keyed by id and guarded by a fingerprint of everything
+    /// <see cref="Build"/> reads. This type is a DI **singleton** (see Program.cs), so the cache is
+    /// process-wide, which is the whole point.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, (string Fingerprint, BlobServiceClient Client)> _clients = new();
+
+    /// <summary>
+    /// The client for this account, built once and reused.
+    /// <para>
+    /// Reuse is not a micro-optimisation here, it is the connection pool. The pool lives in the
+    /// <c>HttpClientHandler</c> that <see cref="CreateProxyHandler"/> makes, and building one per call — which is
+    /// what this did, on a path <c>BlobUploader</c> reaches **once per volume** — gives every 100 MB volume its own
+    /// pool with nothing in it: a fresh TCP connect and TLS handshake, and a congestion window starting from scratch,
+    /// for a transfer that is over before it has finished opening up. Azure.Core shares one HttpClient by default
+    /// precisely to avoid this; passing a custom <c>Transport</c> for proxy support is what opted out of it, and this
+    /// is the part that opts back in.
+    /// </para>
+    /// <para>
+    /// The fingerprint is built from **stored** fields only, ciphertext included, so a hit costs no decryption on a
+    /// path taken once per volume — and a rotated key still misses, because the ciphertext moves with it. Data
+    /// Protection re-encrypts nondeterministically, so re-saving an account without changing anything rebuilds too;
+    /// that is the harmless direction.
+    /// </para>
+    /// <para>
+    /// A replaced client is dropped, never disposed. Disposal would tear down a connection pool that in-flight
+    /// uploads are still using, and an account edited mid-backup would take that backup down with it. What is left
+    /// behind is one idle handler per edit, which the GC gets to and which no realistic amount of editing makes
+    /// matter.
+    /// </para>
+    /// </summary>
     public BlobServiceClient CreateServiceClient(Account account)
+    {
+        var fingerprint = FingerprintOf(account);
+        if (_clients.TryGetValue(account.Id, out var hit) && hit.Fingerprint == fingerprint)
+            return hit.Client;
+
+        // Two callers arriving on the same miss both build, and the later write wins. Deliberately not locked: the
+        // loser's client is a working client that simply is not the cached one, so the cost of the race is one extra
+        // handler, and the alternative is holding a lock across construction on every account's first call.
+        var built = Build(account);
+        _clients[account.Id] = (fingerprint, built);
+        return built;
+    }
+
+    private BlobServiceClient Build(Account account)
     {
         var uri = new Uri(account.BlobEndpoint);
         var accountName = ParseAccountName(uri);
@@ -31,6 +77,21 @@ public class BlobClientFactory(ISecretReader secrets) : IBlobClientFactory
 
         return new BlobServiceClient(uri, credential, CreateOptions(CreateProxyHandler(account)));
     }
+
+    /// <summary>Unit separator: a byte that cannot occur in an endpoint, host, user name or Base64
+    /// ciphertext, so no rearrangement of these fields can spell out another account's fingerprint.</summary>
+    private const char FieldSeparator = (char)0x1f;
+
+    /// <summary>
+    /// Every field <see cref="Build"/> reads, in one string. <see cref="Account.Region"/> is deliberately absent —
+    /// it takes no part in building the client, and including it would rebuild the pool for a change that cannot
+    /// affect it. Anything added to <see cref="Build"/> has to be added here, or an edit to it goes unnoticed and
+    /// the account keeps talking to the cloud with its old settings until a restart.
+    /// </summary>
+    private static string FingerprintOf(Account a) => string.Join(
+        FieldSeparator,
+        a.BlobEndpoint, a.AccountKeyProtected,
+        a.UseProxy, (int)a.ProxyMode, a.ProxyHost, a.ProxyPort, a.ProxyUsername, a.ProxyPasswordProtected);
 
     /// <summary>
     /// How long one attempt at a single request may take before the SDK abandons it and retries.
