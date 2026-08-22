@@ -322,20 +322,42 @@ public sealed class BackupOrchestrator(
                 tracker.EndWork();
         }
 
+        /// <summary>Which archiveless kind this item parked for an uploader as, remembered so that <see cref="Unpark"/>
+        /// gives back the one it took. Null = it owns an archive (and always null for the compression channel, which
+        /// reports one number for everything in it — see <see cref="ArchivelessUpload"/>).
+        /// <para>
+        /// One field rather than one per queue, read only on the upload branch: an item passes through the compression
+        /// channel first and is unparked from it before it ever parks for an uploader, so the two cannot be in flight
+        /// together — but a stray idempotent Unpark(Compression) could still land afterwards, and consulting this on
+        /// that path would give back a count nobody took.
+        /// </para></summary>
+        private ArchivelessUpload? _archiveless;
+
         /// <summary>This item now has an entry sitting in <paramref name="queue"/>. Call it **before** the write that
         /// publishes the entry: park afterwards and the next stage can pick it up and unpark first, which leaves the
         /// reading held for the rest of the run.</summary>
-        public void Park(HandoffQueue queue)
+        /// <param name="archiveless">Set on the upload channel when this item owns no archive, which decides the entry
+        /// it is named in on screen. Left null it counts as an archive waiting on the staging disk, which is what every
+        /// call site that produced one wants.</param>
+        public void Park(HandoffQueue queue, ArchivelessUpload? archiveless = null)
         {
-            if (Interlocked.CompareExchange(ref _parked[(int)queue], 1, 0) == 0)
-                tracker.EnterHandoff(queue);
+            if (archiveless is not null)
+                _archiveless = archiveless;
+            if (Interlocked.CompareExchange(ref _parked[(int)queue], 1, 0) != 0)
+                return;
+            tracker.EnterHandoff(queue);
+            if (queue == HandoffQueue.Upload && archiveless is { } kind)
+                tracker.EnterArchiveless(kind);
         }
 
         /// <summary>The next stage took an entry out, or the write never landed, or a drain discarded it.</summary>
         public void Unpark(HandoffQueue queue)
         {
-            if (Interlocked.CompareExchange(ref _parked[(int)queue], 2, 1) == 1)
-                tracker.LeaveHandoff(queue);
+            if (Interlocked.CompareExchange(ref _parked[(int)queue], 2, 1) != 1)
+                return;
+            tracker.LeaveHandoff(queue);
+            if (queue == HandoffQueue.Upload && _archiveless is { } kind)
+                tracker.LeaveArchiveless(kind);
         }
     }
 
@@ -931,11 +953,15 @@ public sealed class BackupOrchestrator(
         // uploader will put back has to be taken **before** the entry can be picked up. If the write itself fails,
         // nothing downstream exists to hand back either the share or the archive, and both are owed here.
         async Task HandOffAsync(
-            StagedHandoff? handoff, WorkShare share, Func<CancellationToken, Task> run, CancellationToken token)
+            StagedHandoff? handoff, WorkShare share, Func<CancellationToken, Task> run, CancellationToken token,
+            ArchivelessUpload? archiveless = null)
         {
             var entry = new PendingUpload(handoff, share, run);
             share.Take();
-            share.Park(HandoffQueue.Upload);   // before the write, for the reason spelled out on WorkShare.Park
+            // Before the write, for the reason spelled out on WorkShare.Park. The kind decides which entry on screen
+            // this item waits in: an archive on the staging disk, a source file to be sent in place, or nothing at all
+            // to send — see ArchivelessUpload for why the three cannot share one.
+            share.Park(HandoffQueue.Upload, archiveless);
             // No byte booking to go with it. An archive parked here is a file lying in the staging pool with nothing on
             // the wire, which is what the pool's own counters already state — see StageProgress.WaitingToUploadBytes.
             try
@@ -1083,7 +1109,7 @@ public sealed class BackupOrchestrator(
                     control,
                     () => FinishBlobAsync(
                         request, file, hit, storageByPath, tailByPath, overrides, ReportItem, control, t),
-                    t), token);
+                    t), token, ArchivelessUpload.AlreadyStored);   // nothing to send: the index entry and the journal record are all that is left
                 return;
             }
 
@@ -1161,7 +1187,10 @@ public sealed class BackupOrchestrator(
                         await FinishBlobAsync(
                             request, single, placement, storageByPath, tailByPath, overrides, ReportItem, control, t);
                     }, t);
-                }, token);
+                    // The raw in-place route produced no archive (see StreamAndStageAsync): nothing of this item is in
+                    // the pool, so it cannot wait in the entry the pool describes. It is still waiting to upload — the
+                    // whole file, straight from where it sits — which is its own entry.
+                }, token, compressed.Source is null ? null : ArchivelessUpload.InPlace);
                 return;
             }
 
@@ -2782,7 +2811,7 @@ public sealed class BackupOrchestrator(
         var sizes = files.Select(f => new FileInfo(f).Length).ToList();
         // The gate and the in-flight registration are both pushed down to each volume (VolumeUploadScope); this
         // only marks "this item has entered the upload phase" so it can be told apart from the ones still compressing.
-        uploadTracker.BeginUpload(blobRef);
+        uploadTracker.BeginUpload(blobRef, files.Count);
         try
         {
             var meta = new Dictionary<string, string>(
@@ -3647,7 +3676,7 @@ public sealed class BackupOrchestrator(
     {
         var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before Release
         var blobName = $"packs/{packId}.7z";
-        uploadTracker.BeginUpload(blobName);   // for the gate and the in-flight registration see VolumeUploadScope; both live at the per-volume level
+        uploadTracker.BeginUpload(blobName, staged.Files.Count);   // for the gate and the in-flight registration see VolumeUploadScope; both live at the per-volume level
         try
         {
             // Same discipline as for single-file blobs (see ClearLeftoverVolumesAsync): only for multi-volume, and

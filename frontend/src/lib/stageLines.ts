@@ -121,43 +121,59 @@ export function stageLines(detail: StageProgress) {
   // while being the bulk of the bytes (measured: 8.268 GB in that lump against 19 volumes reported as queued).
   //
   // The three numbers cannot be derived from one another, which is why all three are stated:
-  // · objects — how many items are stuck here. Can exceed the volume count: a dedup hit, a resume hit and a raw
-  //   in-place item own no archive at all, so a store-only run shows five figures of objects against few bytes, and
-  //   that pairing is the answer to "should I worry about my temp disk" — no, the wire is the bottleneck.
-  // · volumes — omitted when equal to the objects, since one volume per object means nothing was split and the word
-  //   would carry no information. The bytes stay either way; only this term drops.
-  // · bytes — omitted when zero, which is a real state (see the objects note), not a rounding artefact. With both
-  //   omitted the parentheses go with them, leaving the object count alone.
+  // · volumes — the subject whenever it says anything the object count does not. One object split across hundreds of
+  //   volumes is the ordinary shape of a big-file backup, and the volumes are what the temp disk is actually holding.
+  // · objects — how many own those volumes, plus the ones owning no archive at all (a dedup hit, a resume hit, a raw
+  //   in-place item), which is why it can exceed the volume count. A store-only run shows five figures of objects
+  //   against few bytes, and that pairing is the answer to "should I worry about my temp disk" — no, the wire is.
+  // · bytes — omitted when zero, which is a real state (see the objects note), not a rounding artefact.
   //
-  // The volumes carry "on the staging disk" because the two counts have **different sources**, and without saying so
-  // the pair invites a division that means nothing: objects comes from the item ledger, volumes and bytes are measured
-  // off the pool (StagingArea's per-lease file count). Fewer volumes than objects therefore reads as "several objects
-  // were merged into one volume" — which never happens, one volume belongs to exactly one object — when what it really
-  // says is that the objects owning no archive at all never reached the disk to be counted. On a store-only or
-  // raw-heavy run those are the majority, so the pair sits on screen looking like a merge ratio for the whole run.
-  // Naming where the number was measured answers it in four words and needs nothing new from the backend.
+  // **Which of them leads** is the whole design of this entry, and it changed. The objects used to lead
+  // unconditionally, with the volumes in the aside, and that put a 0 at the head of a sentence whose own parenthesis
+  // said 269: "0 objects waiting for uploading (269 volumes on the staging disk, 26.260 GB)" — because an object with
+  // any volume on the wire was struck from the count whole while its remaining volumes stayed in the aside. The
+  // backend now keeps counting an object here for as long as it still owns a volume that is not moving (see
+  // StageProgress.WaitingToUploadObjects), and the volumes lead, so the number in front is the one that cannot fall to
+  // nothing while the disk is full. One consequence is deliberate: an object partway through its volumes appears here
+  // *and* in the "N volumes uploading" above. Different units, both true — and the alternative was a sentence
+  // contradicting its own parenthesis.
   //
-  // The qualifier rides on the volumes rather than the whole parenthesis: it is only needed while the two counts
-  // disagree, and the one case where it is dropped is exactly the case where they are equal.
+  // The objects take the sentence back when the two counts are equal, since one volume per object means nothing was
+  // split and the word would carry no information — and when there are no volumes at all, where they are all there is.
   //
-  // In-flight volumes are excluded from all three, so this entry and the "N volumes uploading" above it never overlap.
-  // The unsent tail of a volume on the wire is already on screen, per stream, as that stream's sent/total.
-  const waitingInner = [
+  // "on the staging disk" now appears only when the objects **outnumber** the volumes, the one direction that invites
+  // a division that means nothing: the two counts have different sources (objects from the item ledger, volumes and
+  // bytes measured off the pool — StagingArea's per-lease file count), so fewer volumes than objects reads as "several
+  // objects were merged into one volume", which never happens; one volume belongs to exactly one object. What it
+  // really says is that the objects owning no archive never reached the disk to be counted, and naming where the
+  // number was measured answers that in four words. The other direction needs no such defence — many volumes to one
+  // object is just a split file, and saying so was only ever noise.
+  //
+  // In-flight volumes are excluded from the volumes and the bytes, so those two never overlap the "N volumes
+  // uploading" above. The unsent tail of a volume on the wire is already on screen, per stream, as its sent/total.
+  const byVolume =
     detail.waitingToUploadVolumes > 0 &&
-      detail.waitingToUploadVolumes !== detail.waitingToUploadObjects &&
-      `${withUnit(detail.waitingToUploadVolumes, 'volumes')} on the staging disk`,
+    detail.waitingToUploadVolumes !== detail.waitingToUploadObjects
+  const waitingSubject = byVolume
+    ? `${withUnit(detail.waitingToUploadVolumes, 'volumes')}${
+        detail.waitingToUploadObjects > detail.waitingToUploadVolumes ? ' on the staging disk' : ''
+      }`
+    : withUnit(detail.waitingToUploadObjects, unit)
+  const waitingInner = [
+    // The object term drops out at 0 rather than printing "(0 objects": that is the peer-waiter state — their volumes
+    // are on the disk and counted, while the objects themselves are named in their own entry above — and writing the
+    // zero would restate the very contradiction this entry was reshaped to remove.
+    byVolume && detail.waitingToUploadObjects > 0 && withUnit(detail.waitingToUploadObjects, unit),
     detail.waitingToUploadBytes > 0 && formatBytes(detail.waitingToUploadBytes),
   ]
     .filter(Boolean)
     .join(', ')
-  // The parenthesis follows the verb rather than splitting subject from it. Between the two it grew long enough
-  // ("362 objects (119 volumes on the staging disk, 6.467 GB) waiting for uploading") that the reader reaches the
-  // verb having lost the noun, and the aside is a measurement detail — it belongs after the sentence is complete.
+  // The parenthesis sits between subject and verb rather than after it. It is the subject's own breakdown — who owns
+  // these volumes, and how much they weigh — so it belongs with the noun; placed after the verb it trails a sentence
+  // that has already ended, and reads as a fourth thing waiting.
   const waitingToUpload =
     detail.waitingToUploadObjects > 0 || detail.waitingToUploadBytes > 0
-      ? `${withUnit(detail.waitingToUploadObjects, unit)} waiting for uploading${
-          waitingInner ? ` (${waitingInner})` : ''
-        }`
+      ? `${waitingSubject}${waitingInner ? ` (${waitingInner})` : ''} waiting for uploading`
       : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
   const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
@@ -187,6 +203,11 @@ export function stageLines(detail: StageProgress) {
   // waiting for uploading → starting upload → waiting on peer → uploading → on the cloud → settled into
   // the line above. Read the array below in reverse and that is it.
   //
+  // Three of those entries sit at **one** point of that order — the wait for an uploader — and are separate only
+  // because what they are waiting to have done to them differs: an archive on the staging disk waits to be uploaded,
+  // a raw in-place item waits to be uploaded from the source, and a dedup or resume hit waits only to be recorded,
+  // having nothing to send. They are kept adjacent and in that order, decreasing by what is left to do.
+  //
   // The bytes ride with the stage that owns them rather than forming a stage of their own: the upload wait's
   // are in its parentheses, checking's are the entry below it, and the bytes of what is actually on the wire
   // are per stream in the in-flight list, as each stream's sent/total.
@@ -206,17 +227,32 @@ export function stageLines(detail: StageProgress) {
     idleOnStaging && 'nothing on the wire right now',
     detail.waitingOnPeer > 0 &&
       `${withUnit(detail.waitingOnPeer, unit)} waiting on the same content elsewhere`,
-    // The whole upload-side wait, assembled above where the reasoning is set out. Nothing here is "starting upload",
-    // and that distinction is the entry's whole point: not one thing is being done to any of it. Folded into the tier
-    // below, this was a number that climbed all run and never came back down, describing items that were neither
-    // starting nor uploading.
+    // The upload-side wait, assembled above where the reasoning is set out. Nothing here is "starting upload", and that
+    // distinction is the entry's whole point: not one thing is being done to any of it. Folded into the tier below,
+    // this was a number that climbed all run and never came back down, describing items that were neither starting nor
+    // uploading.
     //
-    // It is unbounded by construction and can reach five figures. The hand-off channel behind it is deliberately not
-    // depth-limited — whatever owns an archive is already bounded in bytes by the staging pool, which is the limit the
-    // operator set — but a dedup hit, a resume hit and a raw in-place item own no archive, so on a store-only workload
-    // the compressor can queue the whole dataset here while the uploaders trickle. A big number is the pipeline working
-    // as designed; what it tells the operator is that the bottleneck is the wire, not the CPU.
+    // It describes **the staging disk** and nothing else — every figure in it is measured off the pool, which is what
+    // makes "should I worry about my temp disk" answerable from it alone. The two entries after it are the items that
+    // wait at this same point owning nothing there, and they used to be counted in here: that is what made this entry
+    // read as five figures of objects against a handful of volumes, a ratio that looks like a merge and was really
+    // three populations printed as one.
     waitingToUpload,
+    // Waiting to upload, but not off the staging disk: the raw in-place route sends the user's own file from where it
+    // already sits, so it is bounded by nothing the pool knows and has no volume to be counted as. On a store-only,
+    // unencrypted run (a media library, which is what that route exists for) this is the ordinary path, not a corner.
+    detail.awaitingInPlace > 0 &&
+      `${withUnit(detail.awaitingInPlace, unit)} waiting to upload in place`,
+    // And the ones with nothing to send at all: a dedup hit or a resume hit, whose content is already stored — by an
+    // earlier version, or by this run's own earlier attempt. Waiting for an uploader whose entire job for them is the
+    // index entry and the journal record, which is why the verb cannot be "uploading".
+    //
+    // Unbounded by construction and the likeliest five-figure number on this line: the hand-off channel behind it is
+    // deliberately not depth-limited (whatever owns an archive is bounded in bytes by the staging pool, the limit the
+    // operator set), and these own no archive at all, so a mostly-unchanged run can queue the whole dataset here.
+    // A big number is the pipeline working as designed — and now it says so, instead of claiming a full temp disk.
+    detail.awaitingRecording > 0 &&
+      `${withUnit(detail.awaitingRecording, unit)} waiting to be recorded`,
     detail.activeItems.length === 0 && stalled > 0 && `${withUnit(stalled, unit)} starting upload`,
     // The disk-checking stretches (dedup pre-check full read, per-member stat before and after packing,
     // clearing leftover cloud volumes). They emit not one progress event, and the heartbeat only runs

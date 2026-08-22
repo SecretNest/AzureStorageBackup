@@ -247,16 +247,29 @@ export interface StageProgress {
   // but has not started: the per-item sliding window opens no task for those, so they queued nowhere at all.
   waitingToUploadBytes: number
   // How many volume files those bytes are spread across. Not derivable from either neighbour: an archive's volumes are
-  // uniform except for its remainder, and one run mixes archives of wildly different sizes. Omitted from the rendered
-  // line when it equals waitingToUploadObjects — one volume per object means nothing was split.
+  // uniform except for its remainder, and one run mixes archives of wildly different sizes. It leads the rendered line,
+  // and drops out of it when it equals waitingToUploadObjects — one volume per object means nothing was split.
   waitingToUploadVolumes: number
-  // And how many **objects** own them: parked in the hand-off channel, or past staging with no volume yet on the wire.
-  // From the item ledger rather than by counting archives on disk, because the three entry kinds that own no archive at
-  // all (a dedup hit, a resume hit, a raw in-place item) have to keep showing here — "many objects, few bytes" is what
-  // says the wire is the constraint and the temp disk is not.
+  // And how many **objects** own them: parked in the hand-off channel, or past staging and still holding a volume no
+  // stream has opened. From the item ledger rather than by counting archives on disk, because the three entry kinds
+  // that own no archive at all (a dedup hit, a resume hit, a raw in-place item) have to keep showing here — "many
+  // objects, few bytes" is what says the wire is the constraint and the temp disk is not.
+  // An object partway through its volumes counts here **and** shows in activeItems: it really is doing both, and
+  // striking it out whole is what made a single big file read as "0 objects waiting (269 volumes on the staging disk)".
   // Peer waiters are excluded (they have their own entry naming the reason) while their archives still count in the two
   // figures above, whose basis is "on the disk, not on the wire" rather than "which object owns it".
   waitingToUploadObjects: number
+  // Parked for an uploader owning no archive, but with the whole source file still to send from where it already sits
+  // (the raw in-place route). Its own entry because the pool cannot describe it — never staged, never charged, so it
+  // has no volumes and no bytes in the three figures above, and folded into their object count it read as an object
+  // waiting on a staging disk it never touched.
+  awaitingInPlace: number
+  // Parked for an uploader with **nothing to send at all**: a dedup hit or a resume hit, whose content is already
+  // stored by an earlier version or by this run's own earlier attempt. What remains is the index entry and the journal
+  // record. This is the population that made the upload wait unreadable — on a store-only or mostly-unchanged run it
+  // is five figures against a handful of volumes, and while it counted as "waiting for uploading" the entry claimed a
+  // temp disk full of work that did not exist. It never appears in activeItems either: no bytes, so no stream.
+  awaitingRecording: number
   // Bytes compressed onto disk but still in checking and not cleared to upload (the byte side of
   // checking, already subtracted from waitingToUploadBytes, as are its volumes).
   // Output is booked against backpressure the moment compression ends (that ledger needs "how much is on

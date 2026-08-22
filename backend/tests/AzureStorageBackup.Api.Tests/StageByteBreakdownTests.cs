@@ -124,12 +124,75 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig(stagedBytes: () => 0, stagedFiles: () => 0);
 
         for (var i = 0; i < 5_000; i++)
-            tracker.EnterHandoff(HandoffQueue.Upload);   // dedup/resume hits and raw in-place items: nothing in the pool
+        {
+            tracker.EnterHandoff(HandoffQueue.Upload);   // dedup/resume hits: nothing in the pool…
+            tracker.EnterArchiveless(ArchivelessUpload.AlreadyStored);   // …and nothing to send either
+        }
         tracker.Complete();
 
-        Assert.Equal(5_000, seen[^1].WaitingToUploadObjects);
+        // The queue depth is real and belongs on screen; what it is not is a temp disk about to burst, and it is
+        // not waiting to upload anything. It leaves by its own column.
+        Assert.Equal(5_000, seen[^1].AwaitingUpload);
+        Assert.Equal(5_000, seen[^1].AwaitingRecording);
+        Assert.Equal(0, seen[^1].WaitingToUploadObjects);
         Assert.Equal(0, seen[^1].WaitingToUploadBytes);
         Assert.Equal(0, seen[^1].WaitingToUploadVolumes);
+    }
+
+    /// <summary>
+    /// The three populations parked for an uploader are counted apart, and the total over them is untouched — that
+    /// total is what holds the item ledger's identity together, so the split may only decide which entry on screen
+    /// each item is named in.
+    /// <para>
+    /// Together in one column they made the upload wait unreadable: hits and raw in-place items own nothing in the
+    /// pool, so a mostly-unchanged run showed five figures of objects against a handful of volumes — a ratio that
+    /// looks like a merge and is really three populations printed as one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void What_Is_Parked_For_An_Uploader_Is_Split_By_What_It_Still_Has_To_Do()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 8_000, stagedFiles: () => 4);
+
+        tracker.EnterHandoff(HandoffQueue.Upload);   // an archive on the staging disk
+        tracker.EnterHandoff(HandoffQueue.Upload);   // a raw in-place item: the source file, nothing staged
+        tracker.EnterArchiveless(ArchivelessUpload.InPlace);
+        tracker.EnterHandoff(HandoffQueue.Upload);   // a hit: nothing to send at all
+        tracker.EnterArchiveless(ArchivelessUpload.AlreadyStored);
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(3, s.AwaitingUpload);            // the identity's term, unchanged by the split
+        Assert.Equal(1, s.AwaitingInPlace);
+        Assert.Equal(1, s.AwaitingRecording);
+        Assert.Equal(1, s.WaitingToUploadObjects);    // only the one that owns those 4 volumes
+        Assert.Equal(4, s.WaitingToUploadVolumes);
+        Assert.Equal(8_000, s.WaitingToUploadBytes);
+    }
+
+    /// <summary>
+    /// A peer waiter stays counted, which reversed with the split above. It compressed before the name was decided
+    /// (the blob ref is only known once compression finishes), so its archive really is in the pool and counted in
+    /// the volumes and bytes beside it — striking the object out left the entry able to read "0 objects" against a
+    /// disk that was plainly not empty.
+    /// <para>
+    /// It is named in its own entry as well, and that is correct: this count reads as "who owns these volumes", not
+    /// "who is waiting", the same way an object partway through its volumes is in both this and the in-flight list.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void A_Peer_Waiter_Still_Owns_Its_Volumes()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 9_000, stagedFiles: () => 9);
+
+        tracker.BeginWork();          // in the upload leg, past staging, archive in the pool
+        tracker.BeginWait(UploadWait.Peer);
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.WaitingOnPeer);
+        Assert.Equal(1, s.WaitingToUploadObjects);   // ← was 0, against the 9 volumes below it
+        Assert.Equal(9, s.WaitingToUploadVolumes);
     }
 
     /// <summary>
@@ -152,6 +215,56 @@ public sealed class StageByteBreakdownTests
         tracker.Complete();
 
         Assert.Equal(2, seen[^1].WaitingToUploadObjects);   // 3 in hand − 1 owner on the wire, not − 3 streams
+    }
+
+    /// <summary>
+    /// The same defect from the other side. Subtracting owners rather than streams stopped the count going below what
+    /// was really waiting, but subtracting an owner **whole** the moment its first volume moved drove it to 0 while
+    /// hundreds of that same object's volumes were still lying on the disk. The reported line read
+    /// <c>0 objects waiting for uploading (269 volumes on the staging disk, 26.260 GB)</c> — one population, counted
+    /// two ways, disagreeing about whether it was empty.
+    /// <para>
+    /// Only an owner with **nothing left to start** may be subtracted. That an object then appears both here and in
+    /// the in-flight list is correct and deliberate: it is doing both things at once, in different units.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void An_Object_With_Volumes_Left_To_Start_Is_Still_Waiting()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 30_000, stagedFiles: () => 274);
+
+        tracker.BeginWork();                                  // one object, past staging
+        tracker.BeginUpload("data/a", volumes: 274);          // split into 274 volumes…
+        for (var i = 1; i <= 5; i++)                          // …of which five are on the wire
+            tracker.BeginItem($"a.{i:000}", "big.bin", 1_000, owner: "data/a", staged: true);
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.WaitingToUploadObjects);   // ← was 0, against the 269 volumes below it
+        Assert.Equal(269, s.WaitingToUploadVolumes);
+        Assert.Equal(25_000, s.WaitingToUploadBytes);
+    }
+
+    /// <summary>
+    /// And it drops out the moment the last volume starts: what is left of it is on the wire, described per stream by
+    /// the in-flight list. Without this the count could only climb — every object would linger in it from its first
+    /// volume to the end of the run.
+    /// </summary>
+    [Fact]
+    public void An_Object_With_Every_Volume_Started_Drops_Out()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 5_000, stagedFiles: () => 5);
+
+        tracker.BeginWork();
+        tracker.BeginUpload("data/a", volumes: 5);
+        for (var i = 1; i <= 5; i++)
+            tracker.BeginItem($"a.{i:000}", "big.bin", 1_000, owner: "data/a", staged: true);
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(0, s.WaitingToUploadObjects);
+        Assert.Equal(0, s.WaitingToUploadVolumes);
+        Assert.Equal(0, s.WaitingToUploadBytes);
     }
 
     /// <summary>Every in-flight row must carry "who, how big, how much sent" — the label is the source file path, not the content-addressed blob name.</summary>
@@ -353,7 +466,7 @@ public sealed class StageByteBreakdownTests
         tracker.SetTransferred(0);
 
         // One item split into two volumes, 8000 after compression. The first volume is through.
-        tracker.BeginUpload("data/d");
+        tracker.BeginUpload("data/d", volumes: 2);
         tracker.BeginItem("d.001", "photos/big.bin", 5_000, "data/d");
         tracker.ItemProgress("d.001").Report(5_000);
         tracker.EndItem("d.001", 0);
@@ -394,8 +507,8 @@ public sealed class StageByteBreakdownTests
             tracker.EndItem(name, 0);
         }
 
-        tracker.BeginUpload("data/a");
-        tracker.BeginUpload("data/b");
+        tracker.BeginUpload("data/a", volumes: 2);
+        tracker.BeginUpload("data/b", volumes: 2);
         Volume("data/a", "a.001", "a.bin", 500);    // A's first half
         Volume("data/b", "b.001", "b.bin", 1_000);  // B's first half (concurrent)
         Volume("data/a", "a.002", "a.bin", 500);    // A is complete
@@ -430,7 +543,7 @@ public sealed class StageByteBreakdownTests
         var (tracker, seen) = Rig();
         tracker.SetTransferred(0);
 
-        tracker.BeginUpload("data/d");
+        tracker.BeginUpload("data/d", volumes: 1);
         tracker.BeginItem("d.001", "a.bin", 5_000, "data/d");   // declares 5000, but not one byte is sent
         tracker.EndItem("d.001", 0);
         tracker.Complete();
@@ -463,7 +576,7 @@ public sealed class StageByteBreakdownTests
         }
 
         // First attempt: two of the three volumes went before it died. No ConfirmUpload — the cloud never confirmed the family.
-        tracker.BeginUpload("data/abc");
+        tracker.BeginUpload("data/abc", volumes: 3);
         Volume("data/abc", "data/abc.001", 1_000);
         Volume("data/abc", "data/abc.002", 1_000);
         tracker.EndUpload("data/abc");
@@ -472,7 +585,7 @@ public sealed class StageByteBreakdownTests
         Assert.Equal(0, seen[^1].UnfinishedItemBytes);
 
         // Second attempt: all three volumes land, the cloud confirms, and the item-level settle folds them into uploaded.
-        tracker.BeginUpload("data/abc");
+        tracker.BeginUpload("data/abc", volumes: 3);
         Volume("data/abc", "data/abc.001", 1_000);
         Volume("data/abc", "data/abc.002", 1_000);
         Volume("data/abc", "data/abc.003", 1_000);
@@ -504,8 +617,8 @@ public sealed class StageByteBreakdownTests
             tracker.EndItem(name, 0);
         }
 
-        tracker.BeginUpload("data/aaa");
-        tracker.BeginUpload("data/bbb");
+        tracker.BeginUpload("data/aaa", volumes: 1);
+        tracker.BeginUpload("data/bbb", volumes: 1);
         Volume("data/aaa", "data/aaa.001", 500);
         Volume("data/bbb", "data/bbb.001", 1_000);   // B runs concurrently with A
 

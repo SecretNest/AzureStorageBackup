@@ -103,7 +103,7 @@ public sealed class StageProgressTests
         tracker.BeginPacking();
         tracker.EndPacking();
         tracker.EndStaging();
-        tracker.BeginUpload("data/x");
+        tracker.BeginUpload("data/x", volumes: 1);
         tracker.BeginItem("packs/p0001.7z"); // in-flight registers **volumes**
         // the other one is holding the compress lock and producing
         tracker.BeginStaging();
@@ -141,7 +141,7 @@ public sealed class StageProgressTests
         tracker.BeginPacking();
         tracker.BeginStaging();
         tracker.BeginStaging();
-        tracker.BeginUpload("data/x");    // and one more has already entered the upload leg…
+        tracker.BeginUpload("data/x", volumes: 5);    // and one more has already entered the upload leg…
         for (var i = 1; i <= 5; i++)
             tracker.BeginItem($"data/big.{i:000}"); // …which alone has 5 volumes on the wire at once
         tracker.Complete();

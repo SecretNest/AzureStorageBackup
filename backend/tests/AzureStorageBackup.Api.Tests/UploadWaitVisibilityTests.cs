@@ -46,7 +46,7 @@ public sealed class UploadWaitVisibilityTests
         tracker.BeginWork();           // third item: claimed → compressed and out of staging → in the upload leg, no volume in flight yet
         tracker.BeginStaging();
         tracker.EndStaging();
-        tracker.BeginUpload("data/x");
+        tracker.BeginUpload("data/x", volumes: 1);
 
         tracker.Complete();
 
@@ -66,7 +66,7 @@ public sealed class UploadWaitVisibilityTests
 
         tracker.Enqueue();
         tracker.BeginWork();
-        tracker.BeginUpload("data/x");
+        tracker.BeginUpload("data/x", volumes: 9);
         // One item can have several volumes in flight at once (MaxParallelPerItem) — it is still one item.
         tracker.BeginItem("data/abc.002", "photo.raw (2/9)", 1024);
         tracker.BeginItem("data/abc.003", "photo.raw (3/9)", 1024);
@@ -149,7 +149,7 @@ public sealed class UploadWaitVisibilityTests
         tracker.BeginWork();
         tracker.BeginStaging();
         tracker.EndStaging();
-        tracker.BeginUpload("data/x");
+        tracker.BeginUpload("data/x", volumes: 1);
 
         tracker.Complete();
 
@@ -276,7 +276,7 @@ public sealed class UploadWaitVisibilityTests
         tracker.BeginWork();
         tracker.BeginStaging();
         tracker.EndStaging();
-        tracker.BeginUpload("data/x");
+        tracker.BeginUpload("data/x", volumes: 1);
 
         tracker.Complete();
 
