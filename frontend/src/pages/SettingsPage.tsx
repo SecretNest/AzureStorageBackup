@@ -229,10 +229,23 @@ function BackupDefaults() {
         </select>
       </Field>
       <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
-        Compression and extraction are the most CPU-hungry things this app does. Lowest keeps them
-        out of the way of everything else on the machine — they only get the CPU nobody else wants,
-        so a backup running in the background stays invisible. Raise it if backups are the reason
-        you bought the machine. Applies to every 7-Zip process: backup, restore, check, and repair.
+        Compression and extraction are the most CPU-hungry things this app does. Lowest gives them
+        only the CPU nobody else wants. Raise it if backups are the reason you bought the machine.
+        Applies to every 7-Zip process: backup, restore, check, and repair.
+      </p>
+      {/* This setting used to promise it kept backups "out of the way of everything else on the machine",
+          full stop. On Linux it sets nice, which reaches the CPU scheduler and not the block-IO queue, so
+          for the complaint people actually have — the box going unresponsive during a backup — it does
+          nothing, and the old wording sent them to the wrong knob. */}
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        <strong>CPU only.</strong> If what suffers during a backup is the <em>disk</em> — file listings
+        over SMB stalling for seconds, other apps crawling — this setting will not help, because the
+        contention is not for the CPU. Lower the whole process's disk priority instead, with the{' '}
+        <span className="mono">Backup__IoPriority</span> environment variable (
+        <span className="mono">Normal</span> / <span className="mono">Low</span> /{' '}
+        <span className="mono">Idle</span>); it covers scanning, hashing, compression and uploading
+        alike. It has to be set before the app starts, which is why it is not on this page. Note that
+        only the BFQ disk scheduler acts on it — the startup log records whether it took.
       </p>
 
       <div className="row" style={{ marginTop: '1rem' }}>
