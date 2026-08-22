@@ -342,13 +342,20 @@ public sealed class CompressionContinuityTests : IDisposable
             {
                 // The compressor now queues on the quota instead of on a free worker, and says so on screen.
                 // That column reading non-zero is the visible evidence the operator never sees today.
+                // WaitingOnRoom, not WaitingOnArchive: the pool ceiling and the compression lock stopped
+                // sharing a column when backpressure was split off the lock, and StageProgress computes
+                // `waitingOnArchive = inStaging - preparing - waitingOnRoom` — an item parked on the quota is
+                // subtracted straight back out of it. Asserting the old column left this case passing on a
+                // race: the counters advance independently, so a snapshot caught between two of them reads
+                // one on the archive term for an instant, and whether the poll lands inside that window is
+                // luck. It ran out on a CI runner, across 76 snapshots that never saw it.
                 await WaitUntil(
-                    () => { lock (seen) return seen.Any(s => s.WaitingOnArchive > 0); },
+                    () => { lock (seen) return seen.Any(s => s.WaitingOnRoom > 0); },
                     TimeSpan.FromSeconds(60),
                     () =>
                     {
                         lock (seen)
-                            return $"WaitingOnArchive never went above zero across {seen.Count} snapshots; "
+                            return $"WaitingOnRoom never went above zero across {seen.Count} snapshots; "
                                 + "the staging limit was never the binding constraint.";
                     });
                 Assert.True(staging.StagedBytes <= limit + FileSize,
@@ -463,20 +470,28 @@ public sealed class CompressionContinuityTests : IDisposable
             var run = orchestrator.RunAsync(request, progress);
             try
             {
+                // The term the blocked uploader actually drives is WaitingOnRoom — the pool ceiling holding the
+                // compressor — since backpressure was split off the archive lock. Waiting on the lock term
+                // instead meant this case could start checking the identity with the room term dead, which is
+                // exactly the term the sum below was missing.
                 await WaitUntil(
-                    () => { lock (seen) return seen.Any(s => s.WaitingOnArchive > 0); },
+                    () => { lock (seen) return seen.Any(s => s.WaitingOnRoom > 0); },
                     TimeSpan.FromSeconds(60),
-                    () => $"waitingOnArchive never became non-zero, so the identity would be checked "
+                    () => $"waitingOnRoom never became non-zero, so the identity would be checked "
                         + $"with that term dead; staged={staging.StagedBytes}.");
 
                 // The total only settles once the diff finishes, so only snapshots that have one can be checked.
                 List<StageProgress> settled;
                 lock (seen) settled = [.. seen.Where(s => s.Total > 0)];
                 Assert.NotEmpty(settled);
+                // Every term of the identity documented on StageProgress, WaitingOnRoom included. Leaving it out
+                // did not merely risk a false failure — with the room term missing, a snapshot holding entries
+                // there could only balance if some *other* term was over-counting by the same amount, so the
+                // assertion would have passed on the very imbalance it exists to catch.
                 foreach (var s in settled)
                     Assert.Equal(
                         s.Total,
-                        s.Processed + s.Preparing + s.Queued + s.WaitingOnArchive
+                        s.Processed + s.Preparing + s.Queued + s.WaitingOnRoom + s.WaitingOnArchive
                             + s.AwaitingCompression + s.AwaitingUpload + s.Uploading);
 
                 // Balancing alone is what the broken version did too — it simply banked the parked entries in
