@@ -136,19 +136,90 @@ public sealed class FileHasher : IFileHasher
     /// fatal there, and "reading a source file" must have exactly one way of opening in this project, or this protection will get bypassed sooner or later.
     /// </para>
     /// </summary>
-    public static FileStream OpenRead(string path) => Open(path);
+    public static FileStream OpenRead(string path) => Open(path, StreamingBufferBytes);
 
-    private static FileStream Open(string path)
+    /// <summary>
+    /// The buffer for the hashing reads inside this class: head, tail and the full-hash pass. Each of those asks for
+    /// a segment of its own size, so the buffer only has to not get in their way.
+    /// </summary>
+    private const int HashingBufferBytes = 81920;
+
+    /// <summary>
+    /// The buffer for <see cref="OpenRead"/>, the whole-file sequential route: the upload's read of a staged volume
+    /// or of a source file on the raw route, the raw route's hash-only pass, and the feed into 7z.
+    /// <para>
+    /// Fifty times the hashing one, because on the upload path this number sets the **network** rate, not the disk's.
+    /// A volume under the SDK's single-shot threshold is one Put Blob over one connection, and the SDK copies our
+    /// stream into the socket in 80 KB slices, so the loop is strictly serial: read a slice, wait for the disk, write
+    /// it, read the next. Every disk read is dead air on the socket, and 80 KB per write is far under what a link with
+    /// any real round-trip needs in flight to stay at line rate — measured, five streams could not fill an uplink that
+    /// another tool held at its ceiling, while the staging disk sat at 200-400 read IOPS with latency to spare. The
+    /// disk was answering exactly what was asked of it and no more.
+    /// </para>
+    /// <para>
+    /// The SDK's 80 KB slices stay 80 KB; what changes is where they come from. Fifty of them in a row are served out
+    /// of this buffer as memory copies, and only the fifty-first waits for a platter, so the socket gets its writes
+    /// back to back instead of one per seek. The cost is one buffer per open file — at the default upload concurrency
+    /// that is the five uploaders plus whatever the compression side has open.
+    /// </para>
+    /// <para>
+    /// The hashing reads above deliberately do **not** get this. Head and tail hashing read one small segment and
+    /// close; a buffer this size would pull megabytes off the disk to satisfy a request for kilobytes, on every file
+    /// in the diff pass — the exact opposite trade, and that pass runs over the whole tree.
+    /// </para>
+    /// <para>
+    /// It is a **ceiling**, not a size — see <see cref="BufferFor"/> for why a file smaller than it must not get it.
+    /// </para>
+    /// </summary>
+    private const int StreamingBufferBytes = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// The buffer an open of this length actually gets: never below <see cref="HashingBufferBytes"/>, never above the
+    /// caller's ceiling, and never above the file itself.
+    /// <para>
+    /// The last clause is the one that matters. Anything past 85 KB is a large-object-heap allocation, and
+    /// <c>ArrayPool</c> does not pool past 1 MB, so a fixed ceiling-sized buffer would put a fresh 4 MB array on the
+    /// LOH for **every open** — and <see cref="OpenRead"/> is per file, not per volume: the raw route opens every
+    /// single-file item and the feed into 7z opens every member. A tree of a few hundred thousand small files would
+    /// pay a few hundred thousand 4 MB allocations to buffer files of a few KB, which is a gen2 collector running
+    /// flat out to buy nothing at all — the read that buffer exists to smooth does not exist below one buffer's worth.
+    /// </para>
+    /// <para>
+    /// Length 0 lands on the floor, which covers both an empty file and the "cannot tell" of a handle that will not
+    /// answer — a FIFO, rejected a few lines below anyway.
+    /// </para>
+    /// </summary>
+    private static int BufferFor(long length, int ceiling)
+        => length <= HashingBufferBytes ? HashingBufferBytes : (int)Math.Min(length, ceiling);
+
+    /// <summary>The length behind a handle, or 0 when it will not say — anything not a regular file.</summary>
+    private static long LengthOrZero(SafeFileHandle handle)
+    {
+        try { return RandomAccess.GetLength(handle); }
+        catch { return 0; }
+    }
+
+    private static FileStream Open(string path, int bufferCeiling = HashingBufferBytes)
     {
         if (OperatingSystem.IsWindows())
-            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+        {
+            var length = 0L;
+            try { length = new FileInfo(path).Length; } catch { /* fall back to the floor */ }
+            return new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                BufferFor(length, bufferCeiling), useAsync: true);
+        }
 
         var fd = open(path, O_RDONLY | (OperatingSystem.IsMacOS() ? O_NONBLOCK_BSD : O_NONBLOCK_LINUX));
         if (fd < 0)
             throw new IOException(
                 $"Cannot open '{path}' for reading (errno {Marshal.GetLastPInvokeError()}).");
 
-        var stream = new FileStream(new SafeFileHandle(fd, ownsHandle: true), FileAccess.Read, 81920);
+        // The handle is asked for its length **before** it is handed to the FileStream, because that is the only
+        // moment the size is known and the buffer has to be chosen at construction. The FileStream takes ownership
+        // either way, so a throw from here on still closes the fd through the stream's own disposal.
+        var handle = new SafeFileHandle(fd, ownsHandle: true);
+        var stream = new FileStream(handle, FileAccess.Read, BufferFor(LengthOrZero(handle), bufferCeiling));
         if (stream.CanSeek)
             return stream;
 
