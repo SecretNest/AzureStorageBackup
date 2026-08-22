@@ -225,6 +225,30 @@ Two kinds, asked at the moment of cancelling:
 > next time anyway. `Suspend` has no such choice — by definition it *is* "finish current files" — so
 > `Stop now` is the only path that ever kills an in-flight upload.
 
+### The kinds form a ladder, and a wind-down can be escalated
+
+```
+None (0)  <  Suspend (1)  <  FinishCurrentFiles (2)  <  StopNow (3)
+```
+
+`BackupRunControl.RequestStop` is a CAS loop that only ever moves the value **up** — a request weaker
+than or equal to the standing one returns without doing anything, a stronger one takes effect. So a
+second stop is not a race with an unpredictable winner; the strongest one asked for is the one that
+happens, whenever it arrives.
+
+This is not an incidental property, it is the escape hatch. `Suspend` and `Finish current files` both
+wait for the file in hand and every volume of it, with the run still reporting itself as `Running`
+throughout — minutes on a slow uplink, and the operator often only learns *what* it is waiting on
+after pressing. Escalating to `Stop now` is the one correct move at that point, and per the table
+above it is also the only one that interrupts the transfer already on the wire.
+
+The UI therefore keeps **Stop** live while anything weaker winds down, and quiet only once `Stop now`
+itself is the standing request. The other controls do go disabled, for a reason that does not apply to
+Stop: `Retry now`, `Resume` and `Pause` all act on the pause gate, and `RequestStop` **downgrades**
+that gate, after which it can never hold anyone again — so those buttons could not do what their
+labels say however long the wind-down lasted. `Suspend` is disabled as a step back down the ladder,
+which would be ignored. See `frontend/src/lib/windDownControls.ts`.
+
 **Cancel does not delete the journal.** Having decided to leave completed blocks in the cloud for the
 next run to reuse, there is no reason to burn the ledger recording *which* blocks are complete —
 delete it and the next run has to rediscover them one request at a time, and packs are unrecoverable

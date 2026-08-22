@@ -226,6 +226,8 @@ Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 
 Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
 
+**Upload and download concurrency are counted per operation, not shared between them.** They sit under a *Global* heading, next to the staging-area limit — which really is one budget split across the runs in flight — so it is easy to read them as a shared ceiling, and they are not. Each backup gets its own upload streams and each restore or deep check its own downloads, so two backups running at once open twice the configured number of connections. Divide by however many you expect to overlap if you are sizing this against a bandwidth cap. A backup also runs one stream above the number set, which is what keeps a split archive's volumes from stalling at the hand-off between them.
+
 A restore downloads each archive under `restore/` before writing files out. Single-file blobs — anything above the *single-file threshold* — are decompressed straight into the destination file, so they cost only the downloaded archive; the file's own bytes are never written twice. Packs are still extracted to disk first, so their peak is the downloaded pack plus its uncompressed contents, times the download concurrency.
 
 ### Stopping, pausing and resuming
@@ -249,6 +251,8 @@ Being memory-only also means a paused run does not survive a container restart. 
 **A stop no longer waits for work it is about to throw away.** Suspend and *Finish current files* let the uploads in flight finish, because a volume that completes gets written to the journal and skipped next time. They no longer wait for a hashing or a compression to finish: neither leaves anything behind — the archive goes back to the staging pool, the hash is recomputed next run — so the only thing waiting achieved was making you wait, sometimes for several minutes on a large file.
 
 Neither button returns until the run has really settled — journal on disk, temporary files gone, locks released. That is deliberate: an endpoint that returned early would let your next action (edit the config, delete it, start another run) collide with a run that had not finished dying.
+
+**A wind-down can still be escalated, and Stop stays available while one is under way.** Suspend and *Finish current files* both wait for the file in hand — every volume of it — with the run still reporting itself as Running, which on a slow uplink is minutes. If you find out what it is waiting on and would rather not wait, press **Stop** and choose *Stop now*: the stop kinds form a ladder, a stronger one always wins, and only *Stop now* interrupts the transfer already on the wire. The other buttons do go quiet — Retry now, Resume and Pause all act on the pause gate, which any stop has already released for good, and Suspend is a step back down the ladder that would be ignored.
 
 Both keep what finished uploading, and both keep the journal, so the next run picks those objects up rather than re-uploading them. The difference is what the UI offers next: a **Suspended** run shows **Resume** and **Discard**, a **Canceled** one goes back to a normal **Run** button. *Resume* is simply Run — every run adopts a still-valid journal on the way in, so there is no separate resume mode. *Discard* throws the recovery point away; the objects it was protecting stop being reserved and the next cleanup removes them.
 
@@ -389,6 +393,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
+| `Backup__IoPriority` | Block-IO priority for the whole process: `Normal`, `Low` or `Idle`. Set it if backups make the rest of the machine unresponsive — but read the note below first, because most kernels ignore it. | `Normal` |
 | `Backup__IndexCacheSize` | How many deserialised version indexes to keep in memory. Trades RAM for responsiveness when browsing large backups — see below. `0` disables it. | `2` |
 | `Backup__SevenZipMethodArgs` | Compression method switches handed to `7zz` — see below. Only `-m…` switches are accepted. | `-mx9` |
 | `Backup__MaxPackMembers` | Largest number of files the app will put into one pack archive — see below. Caps how much memory `7zz` needs for member metadata. | `20000` |
@@ -410,6 +415,23 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [operations.md](docs/operations.md).
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
+
+> **`Backup__IoPriority`: what it is for, and why it is so often inert.**
+>
+> The complaint it answers is the machine, not the backup: a NAS that also serves SMB, where a directory listing stalls for seconds while a backup runs. That is contention for the *disk*, and the **7-Zip CPU priority** setting cannot help with it — on Linux that sets `nice`, which is the CPU scheduler and has no reach into the block-IO queue.
+>
+> `Low` still gets a share of a contended disk, just the smallest one. `Idle` takes disk time only when nobody else wants any — the strongest yield, and enough to starve a backup outright behind a busy fileserver. It covers everything the app reads: the diff, the dedup probe, compression and the uploads alike. It is an environment variable rather than a Settings row because it has to be applied before the app creates its second thread — IO priority is inherited from the creating thread, so there is no later moment at which it could be made to cover the work already running.
+>
+> **Two things commonly make it do nothing at all, and neither is detectable from inside the container:**
+>
+> 1. **Only the BFQ scheduler acts on IO priority.** Under `mq-deadline`, `kyber` or `none` the value is accepted and then never consulted. Check which one is in force — the one in brackets — and whether BFQ is even offered:
+>    ```
+>    cat /sys/block/sda/queue/scheduler
+>    ```
+>    `none [mq-deadline] kyber` means this setting will change nothing on that disk. Many NAS and virtualised kernels do not ship BFQ at all.
+> 2. **It applies to block devices, not to network filesystems.** If the backup source is an SMB/CIFS or NFS mount, those reads never touch a block-IO queue on this machine and no IO priority can rank them. The same is true of a virtual disk inside a VM: the guest can only order requests among themselves before they all funnel through one device to the host, which schedules by its own rules.
+>
+> The startup log records what was requested and whether the kernel accepted the call — but "accepted" is not "acted on", and only the two checks above can tell you that.
 
 > `Backup__IndexCacheSize` trades memory for responsiveness, and which way you want it depends entirely on how much RAM the machine has.
 >

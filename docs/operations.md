@@ -328,6 +328,54 @@ index encoding/decoding.
 > case — losing that race — is that some threads stay at the old priority: no effect on correctness,
 > only on effectiveness.
 
+**This setting is about the CPU and nothing else.** `nice` reaches the CPU scheduler; it has no
+bearing on the block-IO queue. The opening paragraph of this section — "everybody notices the machine
+stalling" — describes a symptom that in practice is usually disk contention rather than CPU
+contention, and for that this knob does nothing. See *Disk priority* below.
+
+## Disk priority
+
+`Backup__IoPriority` (`Normal` *(default)* / `Low` / `Idle`) lowers the block-IO priority of the whole
+process. It exists because the stall an operator actually reports — a directory listing over SMB
+taking seconds while a backup runs — is contention for the disk, and the CPU knob above cannot touch
+it.
+
+**Whole process, not the 7z child.** The reads competing for the array are four different things on
+three threads: the diff, the dedup probe's whole-file reads, the uploaders reading out of the staging
+pool, and 7z itself. Lowering only the child would leave three of the four at full priority. 7z is
+forked from a pool thread and inherits along with everything else, so it needs nothing of its own.
+
+**That forces the shape.** IO priority is per-thread and inherited from the creating thread, exactly
+like nice, so the only moment it can be made to cover the thread pool is before the pool has any
+threads — the call therefore runs before `WebApplication.CreateBuilder`. Which in turn is why the
+level is an environment variable and not a `GlobalSettings` row: at that point there is no database,
+and a value changed later would reach none of the threads already reading.
+
+Lowering the uploaders' reads along with everything else is accepted rather than worked around: both
+classes below only yield when something *else* wants the disk, so an otherwise idle array charges
+nothing for it.
+
+> **It is a request, and two common situations make it a no-op. Neither is detectable from inside the
+> process, which is why the outcome is written to the startup log every start rather than assumed.**
+>
+> **Only BFQ acts on it.** Under `mq-deadline`, `kyber` or `none` the syscall succeeds and the value
+> is never consulted again. `cat /sys/block/<dev>/queue/scheduler` shows the one in force, in
+> brackets, and whether BFQ is offered at all — many NAS and virtualised kernels do not ship it.
+>
+> **It is block-device IO only.** Reads from an SMB/CIFS or NFS mount never enter a block-IO queue on
+> this machine, so no IO priority can rank them; the same applies to a virtual disk in a VM, where the
+> guest merely orders requests among themselves before they funnel through one device to a host that
+> schedules by its own rules.
+>
+> Where neither holds, the lever that does work regardless of scheduler is an application-level limit
+> on how fast this process reads — which costs backup throughput by construction, and is not built.
+
+> **Implementation note.** glibc exports no `ioprio_set` wrapper, so the call goes through `syscall(2)`
+> with an architecture-dependent number (x86-64 `251`, arm64 and the other generic-table architectures
+> `30`). An architecture not on the list gets nothing rather than a guessed number — a wrong syscall
+> number is not a failed call, it is a *different* call. Neither level needs privileges: lowering your
+> own priority is always allowed, and `IOPRIO_CLASS_IDLE` dropped its privilege requirement in 2.6.25.
+
 ## 7-Zip binary
 
 The image fetches the **official `7zz` binary** for the target architecture at build time, not the
@@ -358,6 +406,7 @@ in the clear.
 | `Auth__Password` | the UI password gate; unset means open |
 | `Backup__Root` | the local path boundary; unset means unrestricted |
 | `Backup__SevenZipMethodArgs` | extra 7z arguments, e.g. `-mmt=N` |
+| `Backup__IoPriority` | block-IO priority for the whole process; see *Disk priority* above, including the two cases where it does nothing |
 | `Scheduler__Enabled` | whether the background scheduler runs |
 
 Azure credentials are **not** configured through environment variables — each storage account is
