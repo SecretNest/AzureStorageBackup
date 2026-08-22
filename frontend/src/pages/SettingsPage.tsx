@@ -166,6 +166,17 @@ function BackupDefaults() {
       <Field label="Download concurrency">
         <Num value={s.downloadConcurrency} onChange={(v) => set('downloadConcurrency', v)} />
       </Field>
+      {/* Set globally, but spent per run — the one thing about these two numbers a user is likely to
+          get wrong, since everything else under this heading really is one shared budget. */}
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        Counted per operation, not shared between them. Each backup gets this many upload streams of
+        its own, and each restore or deep check this many downloads, so two backups running at once
+        open twice this many connections — divide by how many you expect to overlap if you are
+        sizing this against a bandwidth cap. A backup runs one stream above the number set here; the
+        extra one is what keeps a split archive's volumes from stalling at the hand-off. The staging
+        area below is the setting that <em>is</em> shared: its allowance is split evenly across the
+        runs in flight.
+      </p>
       <Field label="Ephemeral log retention (days)">
         <Num value={s.logEphemeralMaxAgeDays} onChange={(v) => set('logEphemeralMaxAgeDays', v)} />
       </Field>
