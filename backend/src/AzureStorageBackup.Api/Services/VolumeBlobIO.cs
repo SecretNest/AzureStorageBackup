@@ -32,19 +32,27 @@ public sealed class VolumeUploadGate
     /// sensibly when each item advances one volume after another.</summary>
     private readonly PriorityQueue<TaskCompletionSource, (long Ticket, int Volume)> _waiters = new();
     private readonly Lock _lock = new();
+    private readonly Func<int> _capacity;
     private long _nextTicket;
-    private int _free;
 
-    public VolumeUploadGate(int capacity)
-    {
-        Capacity = Math.Max(1, capacity);
-        _free = Capacity;
-    }
+    /// <summary>Slots handed out and not yet returned. The bookkeeping is deliberately "in use" rather than the
+    /// "free" it replaced: free had to be recomputed whenever the capacity moved, while in-use is independent of it
+    /// and every question is answered by comparing the two.</summary>
+    private int _inUse;
 
-    public int Capacity { get; }
+    /// <param name="capacity">Read **live**, on every admission decision, so a change to the upload-concurrency
+    /// setting reaches a run already going — the same treatment the staging limit gets (see StagingArea's
+    /// <c>stagedLimit</c>, and "decision 4" at its wiring in Program.cs). Raising it lets the extra waiters
+    /// straight through on the next pump; lowering it hands out nothing more until enough volumes have finished,
+    /// because a transfer already on the wire is not something to interrupt over a settings change.</param>
+    public VolumeUploadGate(Func<int> capacity) => _capacity = capacity;
+
+    public VolumeUploadGate(int capacity) : this(() => capacity) { }
+
+    public int Capacity => Math.Max(1, _capacity());
 
     /// <summary>How many slots are free right now. For tests and diagnostics — this number is the only way to tell whether a slot has leaked.</summary>
-    public int Free { get { lock (_lock) return _free; } }
+    public int Free { get { lock (_lock) return Math.Max(0, Capacity - _inUse); } }
 
     /// <summary>Take a ticket. **One per volume family**, i.e. "the moment this archive started uploading".</summary>
     public long NextTicket() => Interlocked.Increment(ref _nextTicket);
@@ -92,10 +100,12 @@ public sealed class VolumeUploadGate
             // that safety net back up. A double release is not a small thing: slots appear out of nowhere and the
             // in-flight stream count silently exceeds the concurrency the user set, and it fails silently — all
             // you see is a backup mysteriously eating more bandwidth than configured.
-            if (_free >= Capacity)
-                throw new InvalidOperationException(
-                    $"Upload slot released more times than acquired (capacity {Capacity}).");
-            _free++;
+            // Asked of the in-use count, not of the free one: "more released than taken" is a statement about this
+            // gate's own bookkeeping and must stay true across a capacity change, which the old comparison against
+            // Capacity did not — lower the setting mid-run and free legitimately exceeds it while volumes drain.
+            if (_inUse <= 0)
+                throw new InvalidOperationException("Upload slot released more times than acquired.");
+            _inUse--;
             Pump();
         }
     }
@@ -104,12 +114,16 @@ public sealed class VolumeUploadGate
     private void Pump()
     {
         // A loop rather than a single pop: what comes out may be a cancelled corpse, in which case the slot has
-        // not been handed over yet and the search must continue. And because the loop always restarts from
-        // _free > 0, there is no "queue full of corpses + free slots = nobody gets one" deadlock — the corpses
+        // not been handed over yet and the search must continue. And because the loop always re-tests the
+        // condition, there is no "queue full of corpses + free slots = nobody gets one" deadlock — the corpses
         // get cleared out by subsequent Pumps.
-        while (_free > 0 && _waiters.TryDequeue(out var waiter, out _))
+        // The capacity is re-read every turn of this loop, which is what makes a raise land immediately: the
+        // waiters queued under the old, smaller value are already sitting here, and the next release — or any
+        // later acquisition, since Acquire always enqueues and pumps — lets as many of them through as the new
+        // value allows, in ticket order.
+        while (_inUse < Capacity && _waiters.TryDequeue(out var waiter, out _))
             if (waiter.TrySetResult())
-                _free--;
+                _inUse++;
     }
 }
 
@@ -131,14 +145,19 @@ public sealed class VolumeUploadGate
 /// an approximation.
 /// </para>
 /// </summary>
-public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracker, int maxParallelPerItem)
+public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracker, Func<int> maxParallelPerItem)
 {
+    public VolumeUploadScope(VolumeUploadGate gate, StageTracker tracker, int maxParallelPerItem)
+        : this(gate, tracker, () => maxParallelPerItem) { }
+
     /// <summary>How many volumes of a single item may be pushed up at once. This window is **not** here to let
     /// later small items squeeze in — slots are already arbitrated by item age (see <see cref="VolumeUploadGate"/>),
     /// and keeping latecomers out is exactly the intent.
     /// It guards something else: do not shove all thousand-odd volumes of one large file into the waiting queue
     /// at once, which wastes memory, and their staging files cannot be torn down until each has finished.</summary>
-    public int MaxParallelPerItem { get; } = Math.Max(1, maxParallelPerItem);
+    /// <remarks>Read live, for the same reason the gate's capacity is: a window frozen at the value the run started
+    /// with would cap one item at the old concurrency however many slots the gate had been raised to offer.</remarks>
+    public int MaxParallelPerItem => Math.Max(1, maxParallelPerItem());
 
     /// <summary>
     /// The width of the sliding window: <see cref="MaxParallelPerItem"/> **plus one volume**. That extra volume
