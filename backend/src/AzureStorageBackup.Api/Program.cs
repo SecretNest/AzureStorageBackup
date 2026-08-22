@@ -8,6 +8,12 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
+// Before the host, before configuration, before anything that might want a thread pool thread: block-IO priority is
+// inherited from the creating thread, so the only moment it can be made to cover the whole process is while the main
+// thread is still the only one of ours. The outcome is a string rather than a log call because there is nothing to
+// log to yet. See IoPriority.
+var ioPriorityOutcome = IoPriority.Apply();
+
 var builder = WebApplication.CreateBuilder(args);
 
 const string CorsPolicy = "frontend";
@@ -304,6 +310,11 @@ builder.Services.AddCors(options => options.AddPolicy(CorsPolicy, policy =>
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+// Said out loud at Information, every start, whatever the outcome. This setting is invisible from inside the
+// application — nothing it does can tell whether the kernel is acting on the value — so the startup log is the only
+// place an operator can find out that it was asked for at all, let alone that it was refused or ignored.
+app.Logger.LogInformation("{IoPriority}", ioPriorityOutcome);
 
 // Make sure the directory holding the SQLite file exists (the connection string looks like "Data Source=data/app.db").
 var dataSource = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource;

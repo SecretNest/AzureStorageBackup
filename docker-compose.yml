@@ -14,6 +14,10 @@ services:
     environment:
       # Cron time zone for scheduled tasks (IANA id).
       - Scheduler__TimeZone=${SCHEDULER_TIMEZONE:-UTC}
+      # Block-IO priority for the whole process: Normal (default), Low, Idle. Applied before the app has a
+      # second thread, so it covers the diff, the dedup probe, 7-Zip and the uploads alike. Only the BFQ
+      # scheduler acts on it — see .env.example, and the line this writes to the startup log.
+      - Backup__IoPriority=${BACKUP_IO_PRIORITY:-Normal}
     volumes:
       - app-data:/data      # SQLite database (persist)
       - app-keys:/keys      # Data Protection key ring (persist; losing it makes secrets undecryptable)
