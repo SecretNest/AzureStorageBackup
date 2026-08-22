@@ -18,6 +18,7 @@ import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
 import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
+import { windDownControls, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
 import { stageLines } from '../lib/stageLines'
 import { Modal } from '../components/Modal'
@@ -133,7 +134,10 @@ export function BackupConfigsPage() {
   // Which runs have been asked to wind down, and how. Stopping is asynchronous — the signal only takes effect
   // at the next cancellation checkpoint, and the row refreshes on a 5-second poll — so without this the UI says
   // nothing at all between the click and the run actually settling, which reads as "the button is broken".
-  const [windingDown, setWindingDown] = useState<Record<number, 'suspend' | 'stop'>>({})
+  // Keyed by the **kind** asked for, not merely "a stop was asked for": the two stop modes sit on
+  // different rungs of the backend's ladder, and collapsing them loses the one fact that decides whether
+  // Stop still has anywhere to escalate to. See windDownControls.
+  const [windingDown, setWindingDown] = useState<Record<number, WindDownKind>>({})
   const [restores, setRestores] = useState<Record<number, RestoreRun>>({})
   const [repairs, setRepairs] = useState<Record<number, RepairRun>>({})
   const [checks, setChecks] = useState<Record<number, CheckRun>>({})
@@ -1624,7 +1628,10 @@ export function BackupConfigsPage() {
             setError(null)
             // Marked here rather than on the button: Stop opens a confirmation dialog first, and an operator who
             // backs out of it must not be left looking at a row that claims to be stopping.
-            setWindingDown((m) => ({ ...m, [stopping.id]: 'stop' }))
+            // Which of the two modes was chosen is recorded, not flattened to "stopping": Finish current files
+            // still has StopNow above it, and that escalation is the one operators reach for once they find out
+            // what "current files" was waiting on.
+            setWindingDown((m) => ({ ...m, [stopping.id]: finishCurrentFiles ? 'finish' : 'now' }))
             try {
               await backupConfigsApi.cancel(stopping.id, 'backup', finishCurrentFiles)
               load()
@@ -1698,18 +1705,14 @@ function RunButtons({
   // the run until they are back.
   onPause?: () => void
   onResumePause?: () => void
-  stopping?: 'suspend' | 'stop'
+  stopping?: WindDownKind
 }) {
-  // Every button in this group goes disabled once Suspend or Stop has been pressed: the run is winding down and
-  // asking it to wind down a second, different way only produces a race nobody can predict the outcome of.
-  //
-  // That covers the other three too, and not merely for tidiness. All three reach into the run's pause gate, and a
-  // stop **downgrades** that gate — after which it can never hold anyone again. So Pause on a winding-down run
-  // cannot do what its label says, however long the wind-down lasts, and a suspend waiting on a multi-GB upload
-  // lasts minutes with the run still reporting itself as Running. The backend now answers those presses with a
-  // conflict rather than a silent 204; disabling them here is the half that keeps the operator from meeting that
-  // error in the first place.
-  const pending = stopping !== undefined
+  // Which of these stay live once a wind-down is under way, and why Stop is not one of the ones that goes
+  // quiet: see windDownControls. The short of it is that the backend's stop kinds form a ladder and
+  // RequestStop only ever climbs it, so Stop on a suspending run is an escalation rather than a race —
+  // and it is the only way out of a wait that can run to tens of minutes.
+  const { canStop, canActOnGate, stopLabel, suspendLabel } = windDownControls(stopping)
+  const pending = !canActOnGate
   return (
     <>
       {onRetryNow && (
@@ -1767,16 +1770,16 @@ function RunButtons({
         onClick={onSuspend}
         disabled={pending}
       >
-        {stopping === 'suspend' ? 'Suspending…' : 'Suspend'}
+        {suspendLabel}
       </button>{' '}
       <button
         type="button"
         className="btn-ghost btn-danger"
         style={{ padding: '0 0.3rem' }}
         onClick={onStop}
-        disabled={pending}
+        disabled={!canStop}
       >
-        {stopping === 'stop' ? 'Stopping…' : 'Stop'}
+        {stopLabel}
       </button>
     </>
   )
@@ -1846,7 +1849,7 @@ function RunStatus({
   onResume: () => void
   onDiscard: () => void
   /// Set once this run has been asked to wind down, so the buttons can say so while it does.
-  stopping?: 'suspend' | 'stop'
+  stopping?: WindDownKind
 }) {
   // The expanded state stays inside the component: polling replaces props every second, but React keeps the same instance, so expansion is not reset.
   const [showDetail, setShowDetail] = useState(false)
