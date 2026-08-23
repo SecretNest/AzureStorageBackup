@@ -596,16 +596,29 @@ public sealed class RestoreOrchestratorTests : IDisposable
             Assert.Single(packRefs); // all three members belong to the same pack
 
             // Select only one member inside the pack → only that member lands on disk, the rest are not over-restored.
-            var result = await restore.RunAsync(new RestoreRequest
-            {
-                Account = account, Container = name, TargetRoot = _dst,
-                SelectedPaths = ["dir/a.txt"],
-            });
+            var seen = new List<StageProgress>();
+            var result = await restore.RunAsync(
+                new RestoreRequest
+                {
+                    Account = account, Container = name, TargetRoot = _dst,
+                    SelectedPaths = ["dir/a.txt"],
+                },
+                onProgress: p => { lock (seen) seen.Add(p); });
 
             Assert.Equal(1, result.RestoredFiles);
             Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
             Assert.False(File.Exists(Path.Combine(_dst, "dir", "b.txt"))); // unselected members don't land on disk
             Assert.False(File.Exists(Path.Combine(_dst, "dir", "c.txt")));
+
+            // …and the row naming the extraction describes **the batch**, not the pack. The pack holds three
+            // members; only one was asked for, so only one may be spoken of. Reaching for the manifest instead of
+            // the filtered set is a one-word change at the call site that nothing else here would notice, and on a
+            // real backup it puts directories the user did not select on their screen — this is the guard for it.
+            List<string> preparing;
+            lock (seen)
+                preparing = [.. seen.Select(s => s.PreparingItem).OfType<string>().Distinct()];
+            Assert.Contains("/dir — 1 file", preparing);
+            Assert.DoesNotContain(preparing, p => p.Contains("3 files"));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

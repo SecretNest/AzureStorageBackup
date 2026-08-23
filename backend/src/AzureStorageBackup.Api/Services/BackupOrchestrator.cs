@@ -2750,9 +2750,11 @@ public sealed class BackupOrchestrator(
             ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
             : await CompressStreamingAsync(
                 request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token);
+        // A single file names itself. Not the staged name a line above — that is a hash of the path, chosen for not
+        // colliding in the temp area, and it says nothing to the person reading the row.
         var staged = bypassQuota
-            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker)
-            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker);
+            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, entryName)
+            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker, entryName);
 
         return (Identity(streaming, mtime, raw), staged, null);
     }
@@ -3661,11 +3663,15 @@ public sealed class BackupOrchestrator(
         var entries = members.Select(m => m.EntryName).ToList();
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = (compressTemp, token) => CompressAsync(
             request, compressTemp, packId, entries, storeOnly, token);
+        // The pack id is content-addressed and means nothing to a person, so the row is named by where the members
+        // come from. Built from `entries` — the members of *this* archive, which for a retry is the narrowed set
+        // rather than the group the planner first put together.
+        var label = TransferLabel.Folders(entries);
         // An uploader recompressing a group it has to resend must not wait on the pool it is itself the only source
         // of releases for — see StagingArea.StageWithoutBackpressureAsync.
         return bypassQuota
-            ? staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker)
-            : staging.StageAsync(produce, state.Staging, ct, uploadTracker);
+            ? staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, label)
+            : staging.StageAsync(produce, state.Staging, ct, uploadTracker, label);
     }
 
     /// <returns>The byte size of each of this pack's volumes (in .001..N order; recorded for verifying volume completeness/size).</returns>

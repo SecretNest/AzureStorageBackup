@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 
 import type { StageProgress } from '../api/backupConfigs'
-import { stageLines } from './stageLines'
+import { preparingLabelOf, stageLines } from './stageLines'
 
 function progress(over: Partial<StageProgress> = {}): StageProgress {
   return {
@@ -426,5 +426,17 @@ describe('stage labels', () => {
    */
   test('an unknown stage falls back to its own token', () => {
     expect(stageLines(progress({ stage: 'Something' })).label).toBe('Something')
+  })
+})
+
+describe('preparingLabelOf', () => {
+  /**
+   * The count and the row naming the item are two halves of one statement, so they read the word from one
+   * place. "1 object preparing" above a row that says "extracting" would read as two different things.
+   */
+  test('the upload side prepares and the download side extracts', () => {
+    expect(preparingLabelOf('Uploading')).toBe('preparing')
+    expect(preparingLabelOf('Restoring')).toBe('extracting')
+    expect(preparingLabelOf('Verifying')).toBe('extracting')
   })
 })

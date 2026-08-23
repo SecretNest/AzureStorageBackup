@@ -419,7 +419,7 @@ public sealed class BackupChecker(
                 // in StageProgress.cs). Left outside the try, a throw here would increment _inPacking with no matching
                 // EndPacking, and preparing would sit at an inflated number for the rest of the run; moved inside, the
                 // finally below backstops it.
-                tracker?.BeginPacking();
+                tracker?.BeginPacking(TransferLabel.Folders(members.Select(m => m.Path)));
                 // The shared contract of this stretch is "extraction/hashing happens after this item has already
                 // left ActiveItems", the same shape as in RestoreOrchestrator; on this side it is pinned by the
                 // identically named Extraction_Starts_After_Item_Is_Removed_From_ActiveItems in BackupCheckerTests

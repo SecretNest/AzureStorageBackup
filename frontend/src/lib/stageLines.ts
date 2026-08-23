@@ -88,7 +88,7 @@ export function stageLines(detail: StageProgress) {
   // The wording avoids "compressing": a backup configured not to compress still goes through 7z
   // (encryption, packing, volume splitting), so compressing would be wrong; restore and verify really
   // are extracting and hashing, so those say it plainly.
-  const preparingLabel = detail.stage === 'Uploading' ? 'preparing' : 'extracting'
+  const preparingLabel = preparingLabelOf(detail.stage)
   // Where an item is stuck between "compressed" and "bytes on the wire". The three are handled
   // completely differently, so they are stated separately:
   // · peer  — identical content is being uploaded by someone else; it can only wait for that whole item (minutes)
@@ -384,4 +384,16 @@ export function stageLines(detail: StageProgress) {
   // build it again would copy the "upload counts volumes, download counts items" rule into a second
   // place — change one, miss the other.
   return { counts, done, pipeline, speed, eta, inFlightPhrase, label }
+}
+
+/**
+ * What the local-CPU phase is called for a given stage. Exported so the count and the row naming the item
+ * cannot drift apart — they are two halves of one statement, and "1 object preparing" above a row that says
+ * "extracting" reads as two different things happening.
+ *
+ * The wording avoids "compressing": a backup configured not to compress still goes through 7z (encryption,
+ * packing, volume splitting), so compressing would be wrong. Restore and verify really are extracting.
+ */
+export function preparingLabelOf(stage: string): string {
+  return stage === 'Uploading' ? 'preparing' : 'extracting'
 }

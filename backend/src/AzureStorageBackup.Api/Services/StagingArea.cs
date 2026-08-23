@@ -234,8 +234,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
         StagingLease? lease = null,
         CancellationToken ct = default,
-        StageTracker? tracker = null)
-        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: true);
+        StageTracker? tracker = null,
+        string? label = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: true, label);
 
     /// <summary>
     /// Stage an archive **without waiting for room**: same files, same accounting, same global compression lock —
@@ -267,15 +268,19 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
         StagingLease? lease = null,
         CancellationToken ct = default,
-        StageTracker? tracker = null)
-        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: false);
+        StageTracker? tracker = null,
+        string? label = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: false, label);
 
     private async Task<StagedItem> StageCoreAsync(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
         StagingLease? lease,
         CancellationToken ct,
         StageTracker? tracker,
-        bool waitForRoom)
+        bool waitForRoom,
+        // Opaque to this class on purpose: `produce` is a closure and this area has no idea what is inside it, so
+        // the only place that can name the work is the caller that built both.
+        string? label = null)
     {
         // Count as "queued" the moment we enter here: the compression lock is global, so we will most likely idle a while, and
         // idling is indistinguishable to the user from "not picked up yet". Only flip to "preparing" once we hold the lock.
@@ -315,7 +320,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                     // deliberately let exceptions thrown by publish propagate (see the notes on BeginPacking in StageProgress.cs).
                     // Left outside the try, one throw here would increment _inPacking with no matching EndPacking, and preparing
                     // would stay stuck at an inflated number for the rest of the run; moved inside, the finally below covers it.
-                    tracker?.BeginPacking();
+                    tracker?.BeginPacking(label);
 
                     Directory.CreateDirectory(compressTempDir);
                     Directory.CreateDirectory(stagedTempDir);

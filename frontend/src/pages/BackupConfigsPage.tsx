@@ -20,7 +20,7 @@ import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
-import { stageLines } from '../lib/stageLines'
+import { preparingLabelOf, stageLines } from '../lib/stageLines'
 import { Modal } from '../components/Modal'
 import {
   activityBadgeLabels,
@@ -2118,6 +2118,19 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           )}
         </div>
       ))}
+      {/* The one item being produced or unpacked, on a row of its own beside the transfers. It carries no
+          sent/total: nothing of it is on the wire, which is the whole reason it was invisible here before —
+          7z on a 100 MB pack runs for tens of seconds with an empty in-flight list above it. Named rather
+          than counted, because "1 object preparing" cannot say *which*, and a pack's id is content-addressed
+          and says nothing to a person either (see TransferLabel.Folders for what it is named after).
+          Last in the list on purpose: the transfers are the moving parts and should not shift down a row
+          every time an archive starts. */}
+      {detail.preparingItem && (
+        <div className="mono" style={{ wordBreak: 'break-all' }}>
+          {detail.preparingItem}
+          <span className="text-faint"> — {preparingLabelOf(detail.stage)}</span>
+        </div>
+      )}
       <div>
         {/* The stage name has to be spelled out: with two details side by side, two rows of numbers alone do not say which is the diff and which is the upload.
             Spelled out from the label map, never from detail.stage itself — that is the backend's own token, and printing it raw put "LoadingIndex:" on screen. */}

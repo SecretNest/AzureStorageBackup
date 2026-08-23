@@ -23,6 +23,53 @@ public static class TransferLabel
             : members.Count > 0 ? members[0].Path : storage.Ref;
 
     /// <summary>
+    /// The name for the row of the one item being **produced or unpacked** — compression on the backup side,
+    /// extraction on the restore and check side. A pack holds hundreds of files with no room to list them, and its
+    /// id is content-addressed, so what identifies it to a person is where its files come from.
+    /// <para>
+    /// The two biggest contributing directories, then the rest as a count. Ordered by how many files each
+    /// contributed so the two named are the two that describe the pack; ties broken by name, because without that
+    /// the same pack renders differently between two refreshes and the row reads as having moved on.
+    /// </para>
+    /// <para>
+    /// **It describes the batch it is given, never a pack's manifest** — the same rule the member count in
+    /// <see cref="For"/> already follows, and on the restore side it is the whole of what keeps a selective restore
+    /// from naming folders the user did not ask for. Hand it the filtered set; there is deliberately no scope
+    /// argument here to get wrong.
+    /// </para>
+    /// <para>
+    /// Paths arrive relative to the local root with <c>/</c> separators, which is why the split is on that
+    /// character rather than through <c>Path.GetDirectoryName</c> — that one follows the host's separator and would
+    /// find no directory at all in <c>photos/2024/a.jpg</c> on Windows. They are printed with a leading slash, the
+    /// way this project already writes a root-relative path everywhere the user types one (see the rule lists).
+    /// </para>
+    /// </summary>
+    public static string Folders(IEnumerable<string> paths)
+    {
+        var byFolder = paths
+            .GroupBy(FolderOf, StringComparer.Ordinal)
+            .Select(g => (Folder: g.Key, Count: g.Count()))
+            .OrderByDescending(g => g.Count)
+            .ThenBy(g => g.Folder, StringComparer.Ordinal)
+            .ToList();
+        if (byFolder.Count == 0)
+            return "";
+
+        var files = byFolder.Sum(g => g.Count);
+        var named = string.Join(", ", byFolder.Take(2).Select(g => g.Folder));
+        var rest = byFolder.Count - 2;
+        return $"{named}{(rest > 0 ? $" (+{rest} more)" : "")} — {files} file{(files == 1 ? "" : "s")}";
+    }
+
+    /// <summary>The directory holding this entry, root-relative and leading-slashed; the bare separator for a file
+    /// sitting directly in the local root.</summary>
+    private static string FolderOf(string path)
+    {
+        var cut = path.LastIndexOf('/');
+        return cut <= 0 ? "/" : "/" + path[..cut];
+    }
+
+    /// <summary>
     /// How many bytes this storage object has to pull down (compressed, all volumes included). The index recorded
     /// each volume's size at backup time, so there is no need to ask the cloud first.
     /// <para>

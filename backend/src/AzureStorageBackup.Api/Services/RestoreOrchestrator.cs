@@ -477,7 +477,7 @@ public sealed class RestoreOrchestrator(
                 // publish is deliberately allowed to propagate (see the notes on BeginPacking in StageProgress.cs).
                 // Left outside the try, a throw here would mean _inPacking was incremented with no matching EndPacking,
                 // and preparing would sit at an inflated number for the rest of the run; moving it inside gives it the finally below as a backstop.
-                tracker?.BeginPacking();
+                tracker?.BeginPacking(TransferLabel.Folders(needed.Select(e => e.Path)));
                 if (storage.Kind == "blob")
                 {
                     // Single-file blob: the content is exactly one file (raw = the original bytes; otherwise the sole entry inside the 7z).

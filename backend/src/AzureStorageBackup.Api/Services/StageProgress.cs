@@ -330,7 +330,12 @@ public sealed record StageProgress(
     /// <see cref="ActiveItems"/>: it never opens a stream, because it has no bytes to open one for.
     /// </para>
     /// </summary>
-    int AwaitingRecording = 0)
+    int AwaitingRecording = 0,
+    /// <summary>What the item counted in <see cref="Preparing"/> is: a source path, or the directories a pack's
+    /// members come from. Null when nothing is preparing, or when the caller has nothing to say — the count then
+    /// renders alone, as it did before this row existed.
+    /// <para>One string, not a list, because the compression lock is global: a run never has two of these at once.</para></summary>
+    string? PreparingItem = null)
 {
     /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -472,6 +477,10 @@ public sealed class StageTracker(
     // and under the default config the UI shows 5 preparing, which looks like five items progressing in parallel when really one is packing and four are idling.
     private int _inStaging;
     private int _inPacking;
+    /// <summary>What the one item in <see cref="_inPacking"/> is; null when nothing is. A single field is enough
+    /// because the compression lock is global, so a run never has two of these at once (see the case pinning
+    /// preparing at 1).</summary>
+    private string? _preparingItem;
     // Of those inside staging, the ones parked on the pool's byte ceiling rather than on the archive lock. A subset of _inStaging and disjoint from
     // _inPacking (backpressure is waited out **before** the lock is taken), so subtracting it out of the archive-lock column keeps that column's
     // arithmetic a straight split rather than a new term. See StageProgress.WaitingOnRoom for why the two must not share one number.
@@ -866,12 +875,24 @@ public sealed class StageTracker(
     /// could only reach the UI when some other call happens to publish next — and right after a download, during decompression/hashing, there is precisely no other
     /// call running, so this beat would stay stuck on the stale snapshot and the UI would freeze until this phase ends, which is exactly the "freeze" it is meant to fix.
     /// The 200ms throttle still applies; not every call really publishes.</para></summary>
-    public void BeginPacking()
+    /// <param name="label">What is being produced or unpacked, for the row beside the count — a source path, or the
+    /// directories a pack's members come from (see <see cref="TransferLabel.Folders"/>). Null shows the count alone,
+    /// which is what every caller did before there was a row to fill.
+    /// <para>Carried by this pair rather than by <see cref="Touch"/> so it cannot outlive the work: whatever set it
+    /// is the thing that clears it, and the finally that guarantees <see cref="EndPacking"/> guarantees this too.</para></param>
+    public void BeginPacking(string? label = null)
     {
         lock (_gate)
         {
             Interlocked.Increment(ref _inPacking);
-            PublishIfDue(force: false);
+            _preparingItem = label;
+            // Forced when there is a name to show, throttled when there is not. The throttle is a 200ms window and
+            // this row exists to say what a piece of work that can run for minutes actually is — but a piece that
+            // finishes *inside* one window would never be published at all, so the row simply would not appear for
+            // it, and the next thing published would be some later item's name. Which of the two an operator sees
+            // would come down to how long each pack happened to take. One publish per archive is a rate the
+            // throttle was never protecting against; per file, below, it would be.
+            PublishIfDue(force: label is not null);
         }
     }
 
@@ -880,6 +901,7 @@ public sealed class StageTracker(
         lock (_gate)
         {
             Interlocked.Decrement(ref _inPacking);
+            _preparingItem = null;
             PublishIfDue(force: false);
         }
     }
@@ -1349,7 +1371,8 @@ public sealed class StageTracker(
             waitingVolumes,
             waitingObjects,
             awaitingInPlace,
-            awaitingRecording));
+            awaitingRecording,
+            _preparingItem));
     }
 
     /// <summary>
