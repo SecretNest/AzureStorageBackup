@@ -567,6 +567,9 @@ public sealed class StageTracker(
     // idle waiting before the first item shows up; measuring the average speed from construction smears that idling in and stretches the ETA the whole way.
     // -1 = not started yet (stages where nobody calls BeginWork — diff, for one — are uniformly treated as "construction is the start", which is correct).
     private long _workStartMs = -1;
+    /// <summary>When this stage first got a byte onto the wire; -1 until then. The remaining-time estimate divides
+    /// by work that moved bytes, so it has to measure time from when bytes started moving — see <see cref="Eta"/>.</summary>
+    private long _firstMoveMs = -1;
 
     // The timeline used for speed: it advances only while _active is non-empty (when speedWhileInFlight is true).
     // It freezes during compression, so the samples on both sides of the pause are contiguous within the window — the speed is neither diluted by idling
@@ -967,6 +970,13 @@ public sealed class StageTracker(
     {
         lock (_gate)
         {
+            // The first stream opening is when this stage starts doing the thing the estimate extrapolates, and it
+            // is the earliest moment that can be said of — earlier than any byte landing, and after the adoption
+            // burst of a resume, which settles its items without ever reaching the upload leg. Stamping on the
+            // first byte to *land* instead would throw away the time that produced it, which for one big item's
+            // first volume is minutes. See Eta.
+            if (_firstMoveMs < 0)
+                _firstMoveMs = NowMs();
             if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner, staged)))
                 return;
             // One more of this family's volumes has left the disk. Counted here rather than at the gate: what the waiting
@@ -1354,9 +1364,17 @@ public sealed class StageTracker(
             awaitingUpload + uploading - Math.Max(0, Volatile.Read(ref _inChecking))
                 - settledObjects - awaitingInPlace - awaitingRecording);
 
+        // Bytes that have actually landed, this instant: completed items plus the part of the in-flight ones that
+        // is already up. Stamped the first time it is non-zero — that moment is when this stage started doing the
+        // thing the estimate extrapolates, and everything before it (adopting a journal, the first item's hashing
+        // and compression) belongs to neither side of that division. Taken here rather than at each call that moves
+        // a byte because it costs nothing: this runs under _gate on a throttled path, and being late by up to one
+        // 200ms window is nothing against the hours being estimated.
+        var unfinished = UnfinishedBytes();
+
         publish(new StageProgress(
             stage, _processed, _total, _bytes, _current, inFlight, speed, preparing, queued,
-            Eta(now), Volatile.Read(ref _totalWork), _doneWork, _transferred, UnfinishedBytes(),
+            Eta(now, unfinished), Volatile.Read(ref _totalWork), _doneWork, _transferred, unfinished,
             Volatile.Read(ref _transferTotal), Interlocked.Read(ref _spilled),
             uploading,
             Math.Max(0, Volatile.Read(ref _waits[(int)UploadWait.Peer])),
@@ -1385,39 +1403,77 @@ public sealed class StageTracker(
     /// and extrapolating by item count treats them as equally heavy. Conversely the diff stage is right to use item counts — there, the vast majority of entries pass with a single stat.
     /// </para>
     /// <para>
-    /// A known rough edge: the progress of the in-flight item does not count (write-off happens all at once at completion). When only one 100 GB file is left transferring,
-    /// the remaining time climbs the whole way and only drops once it finishes. Fixing that means folding in the partial progress of in-flight items, which requires each item's
-    /// expected total (known only after packing) — more cost than benefit, so let it be accurate in the normal "many items" case first.
+    /// **On the workload path, both sides of the division are about transferring, and nothing else.** Two populations
+    /// break the naive form, and they break it in opposite directions:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>Work that cost no time — items adopted from a journal on resume. A run writes off everything already in
+    /// the cloud within seconds, so gigabytes land in <c>done</c> against almost no elapsed time and the answer comes
+    /// out in minutes for hours of work. They come out of the denominator (<c>_skippedWork</c>), and the clock starts
+    /// at the first byte on the wire (<c>_firstMoveMs</c>) rather than at the stage, so their time is not counted
+    /// either. Removing one without the other is worse than removing neither.</item>
+    /// <item>Time that has produced no write-off yet — one enormous item. An item counts all at once at completion,
+    /// so while a 70 GB file hashes, compresses and uploads, <c>done</c> does not move for hours while the elapsed
+    /// side does, and the estimate climbs the whole way. Measured: with a 5 TB run resumed, 100 days became 765 days
+    /// over an hour and a half of uninterrupted uploading. The bytes of that item that have already landed are
+    /// credited as partial progress, which is what keeps the denominator moving.</item>
+    /// </list>
+    /// <para>
+    /// The partial credit is in stored bytes and the workload is in source bytes, so it is converted by the ratio
+    /// this run has actually observed — completed timed work over what those items stored. Before any item has
+    /// completed there is no ratio, and stored is assumed to be source, which is exact for a store-only workload and
+    /// the safe direction otherwise (it credits less, never more).
+    /// </para>
+    /// <para>
+    /// The item-count fallback below keeps the plain form. It serves the diff stage, where entries are uniform,
+    /// nearly all of them are one stat, and there is no such thing as an item half-done.
     /// </para>
     /// </summary>
-    private double? Eta(long now)
+    /// <param name="unfinishedBytes">Stored bytes already landed for items not yet written off — see the caller,
+    /// which reads it once so this and the snapshot beside it cannot disagree.</param>
+    private double? Eta(long now, long unfinishedBytes)
     {
         if (_total <= 0)   // The total is not settled yet (diff is still stuffing work into the queue) — no denominator at all, do not guess
             return null;
 
         var totalWork = Volatile.Read(ref _totalWork);
-        var (total, done) = totalWork > 0 ? (totalWork, _doneWork) : (_total, _processed);
-        if (done <= 0 || done >= total)
+        if (totalWork <= 0)
+        {
+            // No declared workload: extrapolate by item count, from the stage's own start.
+            if (_processed <= 0 || _processed >= _total)
+                return null;
+            var since = Volatile.Read(ref _workStartMs);
+            var ms = now - (since < 0 ? 0 : since);
+            return ms <= 0 ? null : (double)ms * (_total - _processed) / _processed / 1000;
+        }
+
+        var done = _doneWork;
+        var timedWork = done - Volatile.Read(ref _skippedWork);
+
+        // The in-flight items' landed bytes, as source-side work.
+        var partial = unfinishedBytes <= 0
+            ? 0L
+            : timedWork > 0 && _transferred > 0
+                ? (long)((double)unfinishedBytes * timedWork / _transferred)
+                : unfinishedBytes;
+
+        var moved = timedWork + partial;
+        var remaining = totalWork - done - partial;
+        if (moved <= 0 || remaining <= 0)
             return null;
 
-        // What is *left* is everything not yet written off — skips included, since a skip really is done.
-        // What the elapsed time was *spent on* is a different quantity, and it is the one that belongs under the
-        // division: an item that pushed no bytes took no transfer time with it. Resuming is where the two diverge
-        // hard enough to be absurd — a run adopts every object its journal already vouches for within seconds, so
-        // gigabytes land in `done` against an elapsed of almost nothing, and an estimate divided by that reads as
-        // minutes for hours of work. The item-count fallback keeps using `done` as it is: it serves the diff stage,
-        // where entries are uniform and almost all of them are one stat.
-        var timedWork = totalWork > 0 ? done - Volatile.Read(ref _skippedWork) : done;
-        // Only skips so far. There is no rate to extrapolate from yet, and saying nothing beats saying zero.
-        if (timedWork <= 0)
+        // Falls back to the stage's own start for a stage that declares a workload and completes items without
+        // ever opening a stream. Nothing in the backup does that today, but the fallback is what keeps this
+        // honest for one that does: there the write-offs *are* the work, and their whole span is the right clock.
+        var firstMove = Volatile.Read(ref _firstMoveMs);
+        var startMs = firstMove >= 0 ? firstMove : Volatile.Read(ref _workStartMs);
+        if (startMs < 0)
             return null;
-
-        var startMs = Volatile.Read(ref _workStartMs);
-        var elapsedMs = now - (startMs < 0 ? 0 : startMs);
+        var elapsedMs = now - startMs;
         if (elapsedMs <= 0)
             return null;
 
-        return (double)elapsedMs * (total - done) / timedWork / 1000;
+        return (double)elapsedMs * remaining / moved / 1000;
     }
 
     /// <summary>Stop the heartbeat. <see cref="Complete"/> already did it once when the stage wrapped up; missing it on an exception path does not matter —

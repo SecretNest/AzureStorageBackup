@@ -542,6 +542,64 @@ public sealed class StageProgressTests
         Assert.Equal(TimeSpan.FromSeconds(1), seen[^1].EstimatedRemaining);
     }
 
+    /// <summary>
+    /// The reported shape: a 5 TB run resumed, most of it adopted from the journal in seconds, and then one 70 GB
+    /// file that hashes, compresses and uploads for hours. An item is written off all at once at completion, so
+    /// through all of that the done side does not move while the elapsed side does — and the estimate climbed from
+    /// 100 days to 765 days over an hour and a half of uninterrupted uploading.
+    /// <para>
+    /// What stops the climb is crediting the bytes of that item that have already landed. Here the clock is moved
+    /// twice with volumes landing in between: without the credit the second answer must be larger than the first
+    /// (the denominator frozen, the numerator growing), and it must not be.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Upload_Counts_A_Huge_In_Flight_Item_Towards_The_Estimate()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        // 1000 of adopted work, then one item worth 4000 that is still going.
+        tracker.Enqueue(1000);
+        tracker.Enqueue(4000);
+        tracker.SetTotal(2);
+        tracker.BeginWork();
+
+        // Adopted from the journal: written off instantly, nothing on the wire.
+        tracker.Advance(0, work: 1000);
+        tracker.SetTransferred(0);
+
+        // The big one starts, and its volumes begin landing.
+        tracker.BeginUpload("data/huge", volumes: 8);
+        void Volume(int i)
+        {
+            var name = $"data/huge.{i:000}";
+            tracker.BeginItem(name, owner: "data/huge", totalBytes: 100);
+            // The bytes have to be reported as they flow: a volume that never registered any is one the
+            // if-missing upload skipped, and the ledger deliberately does not credit those.
+            tracker.ItemProgress(name).Report(100);
+            tracker.EndItem(name, 100);
+        }
+
+        now = 1000;
+        Volume(1);          // the first stream opening is where the estimate's clock starts
+        now = 1500;
+        tracker.Complete();
+        var early = seen[^1].EstimatedRemaining;
+
+        now = 2500;
+        for (var i = 2; i <= 5; i++) Volume(i);
+        tracker.Complete();
+        var later = seen[^1].EstimatedRemaining;
+
+        Assert.NotNull(early);
+        Assert.NotNull(later);
+        // Twice the elapsed bought three times the landed bytes, so the answer must come **down**. Frozen, it could
+        // only go up — that is the 100-days-to-765-days climb.
+        Assert.True(later < early, $"the estimate climbed while volumes were landing: {early} → {later}");
+    }
+
     /// <summary>Stages that declare no workload (diff/restore/check) fall back to extrapolating by item count — still a
     /// whole-run average, still ignoring instantaneous speed. For diff the item count is the right proxy anyway: the
     /// vast majority of entries are just stat'ed and passed over.</summary>
