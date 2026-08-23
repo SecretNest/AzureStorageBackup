@@ -2753,8 +2753,8 @@ public sealed class BackupOrchestrator(
         // A single file names itself. Not the staged name a line above — that is a hash of the path, chosen for not
         // colliding in the temp area, and it says nothing to the person reading the row.
         var staged = bypassQuota
-            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, entryName)
-            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker, entryName);
+            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, entryName, before.Length)
+            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker, entryName, before.Length);
 
         return (Identity(streaming, mtime, raw), staged, null);
     }

@@ -335,7 +335,11 @@ public sealed record StageProgress(
     /// members come from. Null when nothing is preparing, or when the caller has nothing to say — the count then
     /// renders alone, as it did before this row existed.
     /// <para>One string, not a list, because the compression lock is global: a run never has two of these at once.</para></summary>
-    string? PreparingItem = null)
+    string? PreparingItem = null,
+    /// <summary>Source size of <see cref="PreparingItem"/>; 0 when there is none to state (a pack, which reports a
+    /// member count instead). Sent as a number, not formatted here — this row sits among the transfer rows and has
+    /// to size-format the way they do, which is the frontend's business.</summary>
+    long PreparingBytes = 0)
 {
     /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -481,6 +485,8 @@ public sealed class StageTracker(
     /// because the compression lock is global, so a run never has two of these at once (see the case pinning
     /// preparing at 1).</summary>
     private string? _preparingItem;
+    /// <summary>The source size of <see cref="_preparingItem"/>, 0 when it has no single size to state.</summary>
+    private long _preparingBytes;
     // Of those inside staging, the ones parked on the pool's byte ceiling rather than on the archive lock. A subset of _inStaging and disjoint from
     // _inPacking (backpressure is waited out **before** the lock is taken), so subtracting it out of the archive-lock column keeps that column's
     // arithmetic a straight split rather than a new term. See StageProgress.WaitingOnRoom for why the two must not share one number.
@@ -570,6 +576,11 @@ public sealed class StageTracker(
     /// <summary>When this stage first got a byte onto the wire; -1 until then. The remaining-time estimate divides
     /// by work that moved bytes, so it has to measure time from when bytes started moving — see <see cref="Eta"/>.</summary>
     private long _firstMoveMs = -1;
+
+    /// <summary>How far the remaining-time estimate may reach beyond what it has measured, and the absolute sample
+    /// that excuses it from that bound — whichever is satisfied first. See <see cref="Eta"/>.</summary>
+    private const int MaxEtaReach = 20;
+    private const long EtaSampleFloor = 1024L * 1024 * 1024;
 
     // The timeline used for speed: it advances only while _active is non-empty (when speedWhileInFlight is true).
     // It freezes during compression, so the samples on both sides of the pause are contiguous within the window — the speed is neither diluted by idling
@@ -883,12 +894,17 @@ public sealed class StageTracker(
     /// which is what every caller did before there was a row to fill.
     /// <para>Carried by this pair rather than by <see cref="Touch"/> so it cannot outlive the work: whatever set it
     /// is the thing that clears it, and the finally that guarantees <see cref="EndPacking"/> guarantees this too.</para></param>
-    public void BeginPacking(string? label = null)
+    /// <param name="bytes">The item's source size, for the row to state beside its name; 0 when there is no one
+    /// size to state. A pack has no single size worth showing — its row already carries a member count — but a
+    /// single file spending an hour in this stage is explained entirely by how big it is, and that is exactly the
+    /// question its row otherwise leaves open.</param>
+    public void BeginPacking(string? label = null, long bytes = 0)
     {
         lock (_gate)
         {
             Interlocked.Increment(ref _inPacking);
             _preparingItem = label;
+            _preparingBytes = bytes;
             // Forced when there is a name to show, throttled when there is not. The throttle is a 200ms window and
             // this row exists to say what a piece of work that can run for minutes actually is — but a piece that
             // finishes *inside* one window would never be published at all, so the row simply would not appear for
@@ -905,6 +921,7 @@ public sealed class StageTracker(
         {
             Interlocked.Decrement(ref _inPacking);
             _preparingItem = null;
+            _preparingBytes = 0;
             PublishIfDue(force: false);
         }
     }
@@ -1390,7 +1407,8 @@ public sealed class StageTracker(
             waitingObjects,
             awaitingInPlace,
             awaitingRecording,
-            _preparingItem));
+            _preparingItem,
+            _preparingBytes));
     }
 
     /// <summary>
@@ -1460,6 +1478,19 @@ public sealed class StageTracker(
         var moved = timedWork + partial;
         var remaining = totalWork - done - partial;
         if (moved <= 0 || remaining <= 0)
+            return null;
+
+        // Say nothing until the sample can carry the extrapolation. Reported from a resumed 5 TB run: 44.9 KB had
+        // moved when the first very large file went into its hours-long hash-and-compress, and extrapolating 4.5 TB
+        // from that — a hundred-million-fold reach — printed "~33976d left".
+        //
+        // The bound is on the **reach**, not on an absolute amount, because that is what the error is proportional
+        // to: the same 5 GB sample is ample for a 100 GB run and meaningless for a 5 TB one. It also bounds the
+        // other symptom, since an item counts only when it completes and the answer therefore steps up while a
+        // large one is in hand: at 20x, an hour of a big file preparing moves the answer by at most twenty hours,
+        // and it steps back down when the file lands. Below the bound there is no honest number to print, and on a
+        // run of 70 GB items that silence lasts hours — which is the true state of knowledge, not a defect.
+        if (moved * MaxEtaReach < remaining && moved < EtaSampleFloor)
             return null;
 
         // Falls back to the stage's own start for a stage that declares a workload and completes items without

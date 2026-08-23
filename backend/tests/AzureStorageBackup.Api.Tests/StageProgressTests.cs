@@ -560,14 +560,15 @@ public sealed class StageProgressTests
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
 
-        // 1000 of adopted work, then one item worth 4000 that is still going.
-        tracker.Enqueue(1000);
-        tracker.Enqueue(4000);
+        // 200 of adopted work, then one item worth 800 that is still going. Kept in a ratio the estimate will
+        // actually answer for: below its reach bound it withholds the number, which is a different case.
+        tracker.Enqueue(200);
+        tracker.Enqueue(800);
         tracker.SetTotal(2);
         tracker.BeginWork();
 
         // Adopted from the journal: written off instantly, nothing on the wire.
-        tracker.Advance(0, work: 1000);
+        tracker.Advance(0, work: 200);
         tracker.SetTransferred(0);
 
         // The big one starts, and its volumes begin landing.
@@ -598,6 +599,66 @@ public sealed class StageProgressTests
         // Twice the elapsed bought three times the landed bytes, so the answer must come **down**. Frozen, it could
         // only go up — that is the 100-days-to-765-days climb.
         Assert.True(later < early, $"the estimate climbed while volumes were landing: {early} → {later}");
+    }
+
+    /// <summary>
+    /// The numbers off a real screen: a resumed 5.3 TB run with 44.9 KB moved, the first very large file in its
+    /// hours-long hash-and-compress, and "~33976d left" printed from a hundred-million-fold extrapolation. Below
+    /// the reach bound there is no honest answer, so none is given.
+    /// </summary>
+    [Fact]
+    public void Upload_Withholds_An_Estimate_It_Cannot_Support()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        const long tb = 1024L * 1024 * 1024 * 1024;
+        tracker.Enqueue(5 * tb);            // everything still to do
+        tracker.Enqueue(45_000);            // and the handful of KB that has actually moved
+        tracker.SetTotal(2);
+        tracker.BeginWork();
+
+        now = 1000;
+        tracker.BeginItem("data/tiny", owner: "data/tiny", totalBytes: 45_000);
+        tracker.ItemProgress("data/tiny").Report(45_000);
+        tracker.EndItem("data/tiny", 45_000);
+        tracker.Advance(0, work: 45_000);
+        tracker.SetTransferred(45_000);
+        now = 60_000;                       // and then a very large file goes quiet for a minute
+        tracker.Complete();
+
+        Assert.Null(seen[^1].EstimatedRemaining);
+    }
+
+    /// <summary>
+    /// The floor that lets the number appear on a run too big for the reach bound to be met in any reasonable
+    /// time. A gigabyte measured is taken as enough to say something, whatever is left.
+    /// </summary>
+    [Fact]
+    public void Upload_Will_Estimate_Once_A_Gigabyte_Has_Moved()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        const long gb = 1024L * 1024 * 1024;
+        tracker.Enqueue(5000 * gb);
+        tracker.Enqueue(2 * gb);
+        tracker.SetTotal(2);
+        tracker.BeginWork();
+
+        now = 1000;
+        tracker.BeginItem("data/first", owner: "data/first", totalBytes: 2 * gb);
+        tracker.ItemProgress("data/first").Report(2 * gb);
+        tracker.EndItem("data/first", 2 * gb);
+        tracker.Advance(0, work: 2 * gb);
+        tracker.SetTransferred(2 * gb);
+        now = 2000;
+        tracker.Complete();
+
+        // Nowhere near a twentieth of what is left, but past the floor, so an answer is offered.
+        Assert.NotNull(seen[^1].EstimatedRemaining);
     }
 
     /// <summary>Stages that declare no workload (diff/restore/check) fall back to extrapolating by item count — still a

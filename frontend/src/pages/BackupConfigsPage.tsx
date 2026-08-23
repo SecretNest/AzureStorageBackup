@@ -2134,8 +2134,17 @@ function StageDetail({ detail }: { detail: StageProgress }) {
           every time an archive starts. */}
       {detail.preparingItem && (
         <div className="mono" style={{ wordBreak: 'break-all' }}>
+          {/* The verb leads, the way "N volumes uploading in parallel:" leads the rows above. It used to
+              trail the name instead, which made this the only row in the group whose suffix was a word
+              rather than a measurement. */}
+          <span className="text-faint">{preparingLabelOf(detail.stage)}: </span>
           {detail.preparingItem}
-          <span className="text-faint"> — {preparingLabelOf(detail.stage)}</span>
+          {/* A single file states its size; a pack states a member count inside its own label instead,
+              there being no one size worth naming. An hour spent on this row is explained entirely by
+              how big the thing is, and without it the row leaves exactly that question open. */}
+          {detail.preparingBytes > 0 && (
+            <span className="text-faint"> — {formatBytes(detail.preparingBytes)}</span>
+          )}
         </div>
       )}
       <div>

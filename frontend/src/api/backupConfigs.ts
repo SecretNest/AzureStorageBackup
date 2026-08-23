@@ -206,6 +206,9 @@ export interface StageProgress {
   // is preparing, and also when the caller had nothing to say — the count then stands alone, as it did before
   // there was a row for it. One string rather than a list because the archive lock is global.
   preparingItem: string | null
+  // Source size of preparingItem; 0 when there is none worth stating (a pack, whose label carries a member
+  // count instead). A number rather than text, so this row size-formats the way the transfer rows beside it do.
+  preparingBytes: number
   queued: number // Not yet picked up — the queue only (those waiting on the archive lock are in waitingOnArchive)
   // Items picked up by a worker and queuing behind the **archive lock**. That lock is global
   // (StagingArea is a singleton, so production does not run concurrently across backups either), so one

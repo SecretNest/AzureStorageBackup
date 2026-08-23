@@ -12,6 +12,7 @@ function progress(over: Partial<StageProgress> = {}): StageProgress {
     currentItem: null,
     activeItems: [],
     preparingItem: null,
+    preparingBytes: 0,
     bytesPerSecond: 0,
     preparing: 0,
     queued: 0,
