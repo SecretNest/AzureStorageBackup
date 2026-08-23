@@ -7,6 +7,7 @@ function run(over: Partial<BackupRun> = {}): BackupRun {
   return {
     status: 'Completed',
     progress: null,
+    stopRequested: 'None',
     version: 42,
     unreadableFiles: null,
     error: null,

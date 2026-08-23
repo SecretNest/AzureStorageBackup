@@ -104,6 +104,19 @@ public sealed class BackupRunState
     public bool PausedByUser => Control?.Gate.IsPausedByUser ?? false;
 
     /// <summary>
+    /// The strongest stop asked of this run so far, or <see cref="StopKind.None"/>. Read live off the control for
+    /// the same reason <see cref="PausedByUser"/> is: it is the run's own state, and a copy would go stale.
+    /// <para>
+    /// It is reported because winding down takes minutes — Suspend and Finish current files both wait out the file
+    /// in hand, every volume of it — while the run keeps saying <see cref="RunStatus.Running"/> throughout. Without
+    /// this the fact that a stop had been asked for existed **only** in the browser tab that asked: switch away and
+    /// back, and the row came up as an ordinary running backup, offering buttons for a decision already taken and
+    /// saying nothing about the one in progress. The operator had no way to tell whether their click had landed.
+    /// </para>
+    /// </summary>
+    public StopKind StopRequested => Control?.Stop ?? StopKind.None;
+
+    /// <summary>
     /// <see cref="Pause"/> and <see cref="PausedByUser"/> as of one instant. Use this wherever both are reported
     /// together: read one after the other they come from two separate acquisitions of the gate's lock, and a
     /// Pause or Resume landing in between yields a pair that was never true — see <see cref="PauseGate.Snapshot"/>

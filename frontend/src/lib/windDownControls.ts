@@ -28,6 +28,30 @@
  */
 export type WindDownKind = 'suspend' | 'finish' | 'now'
 
+/** The backend's own name for the same ladder, as it arrives on `BackupRun.stopRequested`. */
+export type StopRequested = 'None' | 'Suspend' | 'FinishCurrentFiles' | 'StopNow'
+
+/**
+ * The wind-down a running backup is actually in, as reported by the server.
+ *
+ * Until this existed the answer lived only in the browser tab that had pressed the button — local state, lost on
+ * unmount. Switching away and back during a wind-down brought the row up as an ordinary running backup, with every
+ * button live again and nothing on screen about the stop already in progress; and since Suspend waits out the file
+ * in hand, that window is minutes long. The server knows the whole time, so this is what the row should key off,
+ * with the local mark kept only to cover the gap before the next poll.
+ *
+ * An unrecognised value reads as no wind-down rather than throwing — a newer server naming a rung this build has
+ * never heard of should cost a row its label, not the page.
+ */
+export function windDownFromServer(stop: StopRequested | string | null | undefined): WindDownKind | undefined {
+  switch (stop) {
+    case 'Suspend': return 'suspend'
+    case 'FinishCurrentFiles': return 'finish'
+    case 'StopNow': return 'now'
+    default: return undefined
+  }
+}
+
 export function windDownControls(kind: WindDownKind | undefined): {
   /** Stop stays pressable while anything weaker than StopNow is winding down. */
   canStop: boolean

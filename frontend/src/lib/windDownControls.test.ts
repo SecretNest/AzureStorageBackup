@@ -1,5 +1,28 @@
 import { describe, expect, test } from 'vitest'
-import { windDownControls } from './windDownControls'
+import { windDownControls, windDownFromServer } from './windDownControls'
+
+describe('windDownFromServer', () => {
+  /**
+   * The bug this exists for: the wind-down was known only to the tab that had pressed the button. Suspend waits
+   * out the file in hand, so the row sits in that state for minutes — switch away and back and it came up as an
+   * ordinary running backup, every button live again, nothing said about the stop already under way.
+   */
+  test('each rung of the server ladder maps to its own', () => {
+    expect(windDownFromServer('Suspend')).toBe('suspend')
+    expect(windDownFromServer('FinishCurrentFiles')).toBe('finish')
+    expect(windDownFromServer('StopNow')).toBe('now')
+  })
+
+  test('a run nobody has stopped is not winding down', () => {
+    expect(windDownFromServer('None')).toBeUndefined()
+    expect(windDownFromServer(null)).toBeUndefined()
+    expect(windDownFromServer(undefined)).toBeUndefined()
+  })
+
+  // A newer server naming a rung this build has never heard of costs a row its label, not the page.
+  test('an unknown rung reads as no wind-down', () =>
+    expect(windDownFromServer('Annihilate')).toBeUndefined())
+})
 
 describe('windDownControls', () => {
   test('nothing winding down leaves every control live', () => {

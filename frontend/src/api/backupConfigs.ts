@@ -1,5 +1,6 @@
 import { api } from './client'
 import type { LocalRootPreview } from '../lib/localRootVerdict'
+import type { StopRequested } from '../lib/windDownControls'
 
 // Mirrors the backend enum (System.Text.Json serialises it as a number by default)
 export const StorageTier = { Hot: 0, Cool: 1, Cold: 2, Archive: 3 } as const
@@ -412,6 +413,10 @@ export interface BackupRun {
   // the operator's Pause had done nothing. This flag stays true for as long as the hold does, regardless of
   // what `pause.source` says at the moment.
   pausedByUser: boolean
+  // The strongest stop asked of this run so far, 'None' when nobody has. Reported because winding down takes
+  // minutes with the status still reading 'Running', and without it the fact that a stop had been asked for
+  // lived only in the tab that asked — see windDownFromServer.
+  stopRequested: StopRequested
   // Why, when status === 'Suspended': UserRequested / AutoSuspended.
   suspendReason: string | null
 }

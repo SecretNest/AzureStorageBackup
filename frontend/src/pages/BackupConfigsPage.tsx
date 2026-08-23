@@ -21,6 +21,7 @@ import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
 import { preparingLabelOf, stageLines } from '../lib/stageLines'
+import { windDownFromServer } from '../lib/windDownControls'
 import { Modal } from '../components/Modal'
 import {
   activityBadgeLabels,
@@ -1420,7 +1421,13 @@ export function BackupConfigsPage() {
                       onRetryNow={() => void retryNow(c)}
                       onPause={() => void pauseBackup(c)}
                       onResumePause={() => void resumePausedBackup(c)}
-                      stopping={windingDown[c.id]}
+                      stopping={
+                        // Server first, local mark second: the server knows for as long as the wind-down
+                        // lasts and outlives this component, while the local mark only covers the gap
+                        // between the click and the next poll. Local-only, switching away and back during
+                        // a suspend brought the row up as an ordinary running backup.
+                        windDownFromServer(runs[c.id]?.stopRequested) ?? windingDown[c.id]
+                      }
                       onResume={() => void run(c)}
                       onDiscard={() => void discardInterrupted(c)}
                     />
