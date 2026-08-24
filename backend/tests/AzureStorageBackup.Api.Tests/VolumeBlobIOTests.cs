@@ -183,34 +183,35 @@ public sealed class VolumeBlobIOTests
     /// **Why the releases are stepped rather than timed.** A finished volume releases its slot in
     /// <c>RunAsync</c>'s finally, while this family's next volume cannot queue up until the <c>WhenAny</c>
     /// continuation gets to run — there is a crack between those two things, and a slot freed inside it goes to
-    /// whoever is already on the gate. The extra volume <c>WindowPerItem</c> queues (the baton) covers it as long
-    /// as the continuation is prompt; when the thread pool is starved it is not, and in that crack the newer
-    /// family really can pick up a volume. That tolerance is a property of the **product** (see
-    /// <see cref="VolumeUploadScope.WindowPerItem"/>: microseconds against a volume upload measured in seconds),
-    /// not something this case should be measuring — an earlier version of it let uploads finish on a 20 ms timer
-    /// and then asserted a tolerance of "fewer than 2", which made a loaded machine, not the arbitration, decide
-    /// the result: it failed 1 run in 4 under six busy loops.
+    /// whoever is already on the gate. The relief line <c>WindowPerItem</c> keeps queued is what covers it. This
+    /// case drives one release at a time so that what it measures is the arbitration and nothing else: an earlier
+    /// version let uploads finish on a 20 ms timer and asserted a tolerance of "fewer than 2", which made a loaded
+    /// machine, not the gate, decide the result — it failed 1 run in 4 under six busy loops.
     /// <para>
-    /// So the releases are driven one at a time, and each one waits for the older family to be provably back on
-    /// the gate (<c>WaitingOnSlot</c> is the gate's own waiter count, published by <c>BeginWait</c>/<c>EndWait</c>)
-    /// before the next slot is freed. The crack is then closed by construction on every machine, the expected
-    /// number of cut-ins is exactly 0, and the assertion is the whole start order rather than a bound.
+    /// So each release waits for the older family to be provably back on the gate (<c>WaitingOnSlot</c> is the
+    /// gate's own waiter count, published by <c>BeginWait</c>/<c>EndWait</c>) before the next slot is freed. The
+    /// expected number of cut-ins is exactly 0, and the assertion is the whole start order rather than a bound.
     /// Under first-come-first-served the second release lands on <c>data/newer.001</c> instead of
     /// <c>data/older.004</c> and that assertion fails on its first element — the two sides are still far apart.
+    /// A wave of releases arriving together is the other half of the story, and it has a case of its own:
+    /// <see cref="A_Wave_Of_Completions_Does_Not_Hand_A_Slot_To_The_Newer_Family"/>.
     /// </para>
     /// </para>
     /// </summary>
     [Fact]
     public async Task An_Older_Archive_Is_Not_Interleaved_With_A_Newer_One()
     {
+        const int capacity = 2;
         var up = new SteppedProbe();
-        var gate = new VolumeUploadGate(2);
+        var gate = new VolumeUploadGate(capacity);
         StageProgress? latest = null;
         // The injected clock also switches off the heartbeat timer, so the only snapshots published are the forced
         // ones from BeginWait/EndWait — i.e. exactly the gate's own arrivals and departures.
         using var tracker = new StageTracker("Uploading", 0, p => Volatile.Write(ref latest, p)) { Clock = () => 0 };
-        var scope = new VolumeUploadScope(gate, tracker, maxParallelPerItem: 2);   // window = 3
-        var older = Enumerable.Range(1, 4).Select(i => $"/tmp/a.{i:000}").ToList();
+        var scope = new VolumeUploadScope(gate, tracker, maxParallelPerItem: capacity);
+        // The older family is deliberately longer than its window, so that refilling it takes a real changeover
+        // continuation rather than handing the whole family to the gate up front.
+        var older = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:000}").ToList();
         var newer = Enumerable.Range(1, 4).Select(i => $"/tmp/b.{i:000}").ToList();
 
         int Queued() => Volatile.Read(ref latest)?.WaitingOnSlot ?? 0;
@@ -223,22 +224,23 @@ public sealed class VolumeBlobIOTests
         var second = VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/newer", newer, AccessTier.Hot, scope: scope);
 
-        // The scene: both families have filled their window. Two of the older family's volumes hold the two slots;
-        // the other four (older.003, and all three the newer family queued) are waiting on the gate.
-        await WaitFor(() => up.StartedCount == 2 && Queued() == 4,
-            () => $"both windows to reach the gate (started {Order()}, {Queued()} queued)");
+        // The scene: both families have filled their window. The older family's first two volumes hold both slots;
+        // everything else it queued — its relief line — and the newer family's whole window are on the gate.
+        var onTheGate = scope.WindowPerItem - capacity + scope.WindowPerItem;
+        await WaitFor(() => up.StartedCount == capacity && Queued() == onTheGate,
+            () => $"both windows to reach the gate (started {Order()}, {Queued()} of {onTheGate} queued)");
 
-        // Release 1. The only waiter with the older ticket is older.003, which has been on the gate since the
+        // Release 1. The best waiter with the older ticket is older.003, which has been on the gate since the
         // scene was built, so this one cannot fall into the changeover crack in either implementation.
         up.Finish("data/older.001");
-        // Waiting for the count to come back to 4 is waiting for the older family's WhenAny continuation to have
-        // queued older.004. That is the precondition release 2 needs and the one the old version raced for.
-        await WaitFor(() => up.StartedCount == 3 && Queued() == 4,
+        // Waiting for the count to come back is waiting for the older family's WhenAny continuation to have queued
+        // its next volume. That is the precondition release 2 needs and the one the old version raced for.
+        await WaitFor(() => up.StartedCount == 3 && Queued() == onTheGate,
             () => $"the freed slot to be taken and the next volume queued (started {Order()}, {Queued()} queued)");
 
-        // Release 2 — the one that discriminates. Waiting on the gate now: older.004 on the smaller ticket, and
-        // the newer family's three. Age-based arbitration hands it to older.004; first-come-first-served hands it
-        // to newer.001, which has been queued longer.
+        // Release 2 — the one that discriminates. Waiting on the gate now: the older family's relief line on the
+        // smaller ticket, and the newer family's window. Age-based arbitration hands it to older.004;
+        // first-come-first-served hands it to newer.001, which has been queued longer.
         up.Finish("data/older.002");
         await WaitFor(() => up.StartedCount == 4, () => $"a fourth volume to start (started {Order()})");
 
@@ -248,8 +250,70 @@ public sealed class VolumeBlobIOTests
 
         up.FinishAll();
         await Task.WhenAll(first, second);
-        Assert.Equal(8, up.StartedCount);
-        Assert.Equal(2, gate.Free);   // every slot returned
+        Assert.Equal(older.Count + newer.Count, up.StartedCount);
+        Assert.Equal(capacity, gate.Free);   // every slot returned
+    }
+
+    /// <summary>
+    /// **A whole wave of the older family's volumes landing at once must not leak a single slot.**
+    /// <para>
+    /// The case above releases one slot at a time and waits for the relief volume to be back on the gate before
+    /// freeing the next. Production does not do that. Volumes are equal-sized (100 MB by default) and share one
+    /// link, so the family's whole in-flight set is started together and finishes together — a wave of up to
+    /// <c>capacity</c> releases inside one instant, with the changeover continuations still queued on the thread
+    /// pool behind them. Every slot in that wave is handed out synchronously inside <c>Release</c>, to whoever is
+    /// on the gate at that moment.
+    /// </para>
+    /// <para>
+    /// With a relief line one volume deep, the first release lands on it and the rest of the wave lands on the
+    /// newer family — its volume 1 first, since within a ticket the lowest volume wins. On screen that is the
+    /// symptom this case exists for: a file that has only just finished preparing puts its <c>(1/xxx)</c> into the
+    /// transfer list and finishes it ahead of every volume the previous file has left. The relief line therefore
+    /// has to be as deep as the number of slots the family can hold, which is what <see cref="VolumeUploadScope.WindowPerItem"/> sizes it to.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_Wave_Of_Completions_Does_Not_Hand_A_Slot_To_The_Newer_Family()
+    {
+        const int capacity = 3;
+        var up = new SteppedProbe();
+        var gate = new VolumeUploadGate(capacity);
+        StageProgress? latest = null;
+        using var tracker = new StageTracker("Uploading", 0, p => Volatile.Write(ref latest, p)) { Clock = () => 0 };
+        var scope = new VolumeUploadScope(gate, tracker, maxParallelPerItem: capacity);
+        var older = Enumerable.Range(1, 20).Select(i => $"/tmp/a.{i:000}").ToList();
+        var newer = Enumerable.Range(1, 20).Select(i => $"/tmp/b.{i:000}").ToList();
+
+        int Queued() => Volatile.Read(ref latest)?.WaitingOnSlot ?? 0;
+        string Order() => string.Join(", ", up.Started);
+
+        var first = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/older", older, AccessTier.Hot, scope: scope);
+        var second = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/newer", newer, AccessTier.Hot, scope: scope);
+
+        // The scene: the older family holds every slot, and both families have their whole window on the gate —
+        // the older one's relief line (window minus the slots it holds) and all of the newer one's.
+        var onTheGate = scope.WindowPerItem - capacity + scope.WindowPerItem;
+        await WaitFor(() => up.StartedCount == capacity && Queued() == onTheGate,
+            () => $"both windows to reach the gate (started {Order()}, {Queued()} of {onTheGate} queued)");
+
+        // The wave. Nothing is awaited between these: the three slots are freed inside one instant, which is what
+        // three equal volumes sharing one link do, and none of the older family's changeover continuations has run.
+        foreach (var v in new[] { "data/older.001", "data/older.002", "data/older.003" })
+            up.Finish(v);
+
+        await WaitFor(() => up.StartedCount == capacity * 2, () => $"the wave to be taken up (started {Order()})");
+        // Sorted, because the gate decides **which** volumes are admitted and the thread pool decides in which
+        // order their continuations get as far as the uploader. Only the first of those is this case's subject;
+        // asserting the recording order as well would be asserting the scheduler.
+        Assert.Equal(
+            ["data/older.004", "data/older.005", "data/older.006"],
+            up.Started.Skip(capacity).Take(capacity).OrderBy(v => v, StringComparer.Ordinal));
+
+        up.FinishAll();
+        await Task.WhenAll(first, second);
+        Assert.Equal(capacity, gate.Free);   // every slot returned
     }
 
     /// <summary>
@@ -542,11 +606,15 @@ public sealed class VolumeBlobIOTests
         var gate = new VolumeUploadGate(3);
         var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
 
+        // The window is MaxParallelPerItem * 2 (see WindowPerItem), and it is sized to 4 here on purpose: this
+        // volume dies on the **first changeover**, so the loop has to be made to reach one. Volumes 1-4 are opened
+        // unconditionally and the fifth is the first the loop must stop at — which is where it looks at what
+        // WhenAny handed back. Widen the window past 4 and the loop runs on to volume 6 before it ever pauses, and
+        // what this asserts becomes a question of how fast the pool ran the doubles' continuations.
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
-            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 2)));
 
-        // The window is MaxParallelPerItem + 1 = 4, so volumes 1-4 start unconditionally. Volume 4 is dead by the
-        // first changeover, so the fifth must never be reached.
+        // Volume 4 is dead by that first changeover, so the fifth must never be reached.
         Assert.Equal(4, up.Order.Count);
         Assert.Equal(3, gate.Free);
     }
@@ -605,8 +673,9 @@ public sealed class VolumeBlobIOTests
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 3)));
 
-        // The window is MaxParallelPerItem + 1 = 4, so volumes 1-4 start unconditionally and the fifth is the
-        // first one the loop is free to refuse. It dies on the fourth, so exactly four ever ran.
+        // Volume 4 throws before it awaits anything, so its task is already faulted when the loop returns from
+        // opening it — the check in front of the next volume sees it and stops there. Exactly four ever ran, and
+        // that holds whatever the window is: it is the fault check, not the window, that ends this loop.
         Assert.Equal(4, up.Order.Count);
         // Every gate slot returned = no volume is still holding one. If anything were still running at the throw, this would come up short.
         Assert.Equal(4, gate.Free);

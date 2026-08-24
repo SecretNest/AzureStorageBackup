@@ -280,10 +280,25 @@ one ticket when it starts uploading, lower tickets win, and within a family volu
 > throughput is unaffected because the slots stay saturated: whatever the oldest item cannot use goes
 > to the next one immediately.
 
-The sliding window is `MaxParallelPerItem + 1` — the extra volume is a **baton**. Without it, at each
-volume changeover a slot leaks to a newer item, and the priority is priority in name only. The baton
-covers the common timing but not all of it: a starved thread pool can still let the occasional volume
-slip through, which is why the guard is "fewer than 2 volumes stolen", not zero.
+The sliding window is `MaxParallelPerItem × 2`: half of it is the family's share of the wire, and half
+is its **relief line** on the gate — one queued volume per slot it holds. Without a relief line, every
+volume changeover leaks a slot to a newer item, because the slot is handed over synchronously inside
+`Release` while this family's next volume cannot queue until its `WhenAny` continuation runs.
+
+> **Rationale — why one spare volume was not enough.** The relief line used to be a single volume, a
+> "baton", on the reasoning that the changeover crack is microseconds wide against a volume upload
+> measured in seconds. That is true of the crack and irrelevant to the leak, because releases do not
+> arrive one at a time. Volumes are equal-sized and share one link, so a family's in-flight set starts
+> together and **finishes together**: up to `MaxParallelPerItem` releases inside one instant, with every
+> changeover continuation still queued behind them on the thread pool. The baton caught the first and
+> the rest of the wave went to the newer item — its volume 1 first, since the lowest volume within a
+> ticket wins. On screen: a file that had only just finished preparing put its `(1/xxx)` in front of
+> everything the previous file had left to send, on every wave. A wave can never be wider than the
+> slots the family holds, so a relief line that deep closes it outright.
+
+The window governs which volumes are **queued**, not which exist: compression has already written the
+whole volume set to the pool before any of it is uploaded, and each volume is released from the pool as
+it lands. So the depth costs a few more waiters and nothing on disk.
 
 ## Where this stops short
 

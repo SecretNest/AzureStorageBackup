@@ -160,30 +160,40 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
     public int MaxParallelPerItem => Math.Max(1, maxParallelPerItem());
 
     /// <summary>
-    /// The width of the sliding window: <see cref="MaxParallelPerItem"/> **plus one volume**. That extra volume
-    /// is the baton.
+    /// The width of the sliding window: <see cref="MaxParallelPerItem"/> **twice over**. One half is this family's
+    /// share of the wire; the other is its **relief line** on the gate — one waiter per slot it can hold.
     /// <para>
-    /// Without it, age-based arbitration leaks one slot through the crack at every volume changeover: a finished
-    /// volume calls <c>Release</c> in <c>RunAsync</c>'s finally, while this family's next volume cannot queue up
-    /// until the <c>WhenAny</c> continuation gets to run. The handover inside <c>Release</c> is synchronous, and
-    /// at that instant the queue holds only other items — the slot is given away on the spot.
-    /// One leak per completed volume, and the older item's priority is priority in name only.
+    /// The relief line is what makes age-based arbitration survive a changeover. A finished volume calls
+    /// <c>Release</c> in <c>RunAsync</c>'s finally, while this family's next volume cannot queue up until the
+    /// <c>WhenAny</c> continuation gets to run. The handover inside <c>Release</c> is synchronous, so a slot freed
+    /// in between is given away on the spot to whoever is on the gate — and with nothing of this family's queued,
+    /// that is always a newer item. One leak per completed volume, and the older item's priority is priority in
+    /// name only.
     /// </para>
     /// <para>
-    /// With one extra volume queued, at the changeover instant this family usually still has a waiter sitting on
-    /// the gate, and it catches the slot on the strength of its smaller ticket.
-    /// The cost is only the memory of one extra waiter per item.
+    /// **It has to be as deep as the wave, not one volume deep.** A single spare waiter — the "baton" this
+    /// replaced — covers one release and no more, and releases do not arrive one at a time. Volumes are equal-sized
+    /// (100 MB by default) and share one link, so a family's whole in-flight set starts together and finishes
+    /// together: up to <see cref="MaxParallelPerItem"/> releases inside one instant, every changeover continuation
+    /// still queued behind them on the thread pool. The first lands on the baton and the **rest of the wave lands
+    /// on the newer item** — on its volume 1 first, since the lowest volume within a ticket wins. That was not a
+    /// starved-thread-pool corner but what a saturated link does on every wave, and on screen it read as a file
+    /// that had only just finished preparing pushing its <c>(1/xxx)</c> in front of everything the previous file
+    /// had left to send. A wave can never exceed the slots the family holds, so a relief line that deep closes it
+    /// outright rather than narrowing it.
     /// </para>
     /// <para>
-    /// **It covers the common timing, not all of it.** After that family is let through, the next waiter is only
-    /// added once the continuation runs, and there is still a crack in between; when the thread pool is starved
-    /// the continuation is late, and if another volume happens to finish inside that crack the slot leaks to a
-    /// new item. In production this crack is measured in microseconds while a volume upload takes seconds, so
-    /// what leaks is at most the occasional volume — not enough to justify rebuilding this into "each volume
-    /// family holds on to its own slots" (that would be absolute, at the cost of turning this whole layer over).
+    /// The cost is the memory of a few more queued waiters per item, and nothing else. The window governs which
+    /// volumes are **queued**, not which exist: compression has written the family's whole volume set to the pool
+    /// before any of it is uploaded, and each volume is released from the pool as it lands, whatever the window.
+    /// </para>
+    /// <para>
+    /// The two halves line up because <c>BackupOrchestrator</c> sizes <see cref="MaxParallelPerItem"/> to the gate's
+    /// own capacity: the family that owns the gate holds exactly that many slots and queues exactly that many
+    /// behind them.
     /// </para>
     /// </summary>
-    public int WindowPerItem => MaxParallelPerItem + 1;
+    public int WindowPerItem => MaxParallelPerItem * 2;
 
     /// <summary>Take a ticket, one per volume family. See <see cref="VolumeUploadGate.NextTicket"/>.</summary>
     public long NextTicket() => gate.NextTicket();
@@ -360,8 +370,10 @@ public static class VolumeBlobIO
         // The window width is still bounded: thousands of volumes must not be shoved into the global gate's
         // waiting queue at once, which wastes memory, and the staging files of queued volumes cannot be torn
         // down until each has finished uploading (see VolumeUploadScope).
-        // The width is MaxParallelPerItem + 1 (see WindowPerItem): the part equal to the gate capacity lets this
-        // family eat every slot on its own, and the extra volume is the baton that catches the slot at a changeover.
+        // The width is MaxParallelPerItem * 2 (see WindowPerItem): one half equals the gate capacity and lets this
+        // family eat every slot on its own, and the other half is the relief line that catches the slots back at a
+        // changeover — one waiter per slot, because a whole in-flight set of equal volumes on one link finishes in
+        // one wave and a single spare waiter catches only the first of them.
         var window = scope?.WindowPerItem ?? 1;
         var started = new List<Task>(volumeFiles.Count);
         var running = new List<Task>(window);
