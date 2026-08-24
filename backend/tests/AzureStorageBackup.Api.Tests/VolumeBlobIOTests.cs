@@ -549,35 +549,56 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(10, up.Order.Count);
     }
 
-    /// <summary>One volume dies.</summary>
     /// <summary>
-    /// Volume 1 succeeds first; volume 4 only fails <b>after</b> it, so both are complete by the time the loop
-    /// reaches its first <c>WhenAny</c> — and <c>WhenAny</c> hands back the one that finished first, the success.
-    /// That is precisely the arrangement under which a check that only inspects the returned task never sees the
-    /// failure at all.
+    /// Builds the changeover this case is about, **by construction rather than by scheduling luck**: by the time
+    /// the loop pauses at the window boundary, one sibling has finished successfully and the doomed volume is
+    /// already faulted.
+    /// <para>
+    /// Both endings are settled inside the loop's own synchronous stretch — <paramref name="succeeds"/> returns an
+    /// already-completed task and <paramref name="bad"/> an already-faulted one — and every other volume stays
+    /// open until the fault has happened, so nothing else can complete and change what the loop sees. The loop
+    /// cannot look before it pauses, and it cannot pause before it has opened the whole window.
+    /// </para>
+    /// <para>
+    /// **Which of the two <c>WhenAny</c> hands back is deliberately left alone.** Both are complete when it is
+    /// called, and picking between them is the runtime's business, not this case's; the point is that the loop has
+    /// to stop either way — straight off the returned task if it gets the faulted one, off the sweep of what is
+    /// still in flight if it gets the success. Pinning the choice would be testing <c>WhenAny</c>.
+    /// </para>
+    /// <para>
+    /// What this replaced made the fault wait on the success (<c>await _firstFinished.Task</c> before throwing),
+    /// which left the loop racing the thread pool: the doomed volume had to be admitted, resumed and thrown before
+    /// the loop's next look, and nothing made it so. Measured on unmodified <c>main</c>, 9 failures in 14 isolated
+    /// runs, opening 5, 7 or all 8 volumes instead of 4. It passed in a full-suite run, which is why CI stayed green.
+    /// </para>
     /// </summary>
-    private sealed class FailsAfterAnotherSucceeds : IBlobUploader
+    private sealed class FailsWithASiblingAlreadyDone(string succeeds, string bad) : IBlobUploader
     {
-        private readonly TaskCompletionSource _firstFinished =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _dead = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public List<string> Order { get; } = [];
 
-        public async Task<bool> UploadIfMissingAsync(
+        public Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
             IReadOnlyDictionary<string, string>? metadata = null)
         {
             lock (Order) Order.Add(blobName);
-            if (blobName == "data/h.004")
+            if (blobName == bad)
             {
-                await _firstFinished.Task;
-                throw new IOException("volume died");
+                _dead.SetResult();
+                // Faulted on return, not thrown from an async body after an await: the caller's task has to be
+                // faulted the moment the loop finishes opening this volume, which is the whole construction.
+                return Task.FromException<bool>(new IOException("volume died"));
             }
 
-            await Task.Yield();
-            if (blobName == "data/h.001")
-                _firstFinished.SetResult();
+            return blobName == succeeds ? Task.FromResult(true) : Held();
+        }
+
+        /// <summary>Stays open until the fault is a fact, then succeeds so the run can be awaited to the end.</summary>
+        private async Task<bool> Held()
+        {
+            await _dead.Task;
             return true;
         }
 
@@ -592,31 +613,39 @@ public sealed class VolumeBlobIOTests
     /// "Once a volume dies, no new ones start" has to hold whichever task WhenAny happens to return.
     /// <para>
     /// It returns <b>one</b> of the tasks that completed, and when several land together which one is unspecified.
-    /// So a volume could fail while the loop was looking at a sibling that succeeded, and the loop would carry on
-    /// starting volumes over a dead upload. In production every volume takes seconds to minutes, so the faulted one
-    /// was nearly always the one WhenAny returned and the gap never showed; it surfaced on CI, where the doubles
-    /// complete instantly and the ordering is arbitrary, as an intermittent red on
-    /// <see cref="A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running"/>.
+    /// So a volume can fail while the loop is looking at a sibling that succeeded, and unless the loop also sweeps
+    /// what is still in flight it carries on starting volumes over a dead upload. In production every volume takes
+    /// seconds to minutes, so the faulted one was nearly always the one WhenAny returned and the gap never showed;
+    /// it surfaced on CI, where the doubles complete instantly and the ordering is arbitrary, as an intermittent
+    /// red on <see cref="A_Dead_Volume_Stops_New_Ones_And_Leaves_Nothing_Running"/>.
+    /// </para>
+    /// <para>
+    /// The count is what is asserted, and it is a fact rather than a hope: the loop opens the window, pauses,
+    /// finds one sibling done and one dead, and stops. Both routes out of that pause give the same four — which is
+    /// what makes leaving WhenAny's choice to the runtime the right call rather than a gap. See
+    /// <see cref="FailsWithASiblingAlreadyDone"/> for how the scene is built and what the flaky version did.
     /// </para>
     /// </summary>
     [Fact]
     public async Task A_failure_stops_new_volumes_even_when_a_sibling_completes_first()
     {
-        var up = new FailsAfterAnotherSucceeds();
-        var gate = new VolumeUploadGate(3);
+        const int capacity = 4;
+        var up = new FailsWithASiblingAlreadyDone(succeeds: "data/h.001", bad: "data/h.004");
+        // Wide enough to admit the whole window: every one of the four has to reach the uploader inside the loop's
+        // own synchronous stretch, or the two endings this case needs are not settled when the loop pauses.
+        var gate = new VolumeUploadGate(capacity);
         var files = Enumerable.Range(1, 8).Select(i => $"/tmp/a.{i:D3}").ToList();
 
         // The window is MaxParallelPerItem * 2 (see WindowPerItem), and it is sized to 4 here on purpose: this
         // volume dies on the **first changeover**, so the loop has to be made to reach one. Volumes 1-4 are opened
         // unconditionally and the fifth is the first the loop must stop at — which is where it looks at what
-        // WhenAny handed back. Widen the window past 4 and the loop runs on to volume 6 before it ever pauses, and
-        // what this asserts becomes a question of how fast the pool ran the doubles' continuations.
+        // WhenAny handed back. Widen the window past 4 and the loop opens volumes 5 and 6 before it ever pauses.
         await Assert.ThrowsAsync<IOException>(() => VolumeBlobIO.UploadAsync(
-            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, 2)));
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, capacity / 2)));
 
         // Volume 4 is dead by that first changeover, so the fifth must never be reached.
         Assert.Equal(4, up.Order.Count);
-        Assert.Equal(3, gate.Free);
+        Assert.Equal(capacity, gate.Free);   // every slot returned, including the dead volume's
     }
 
     private sealed class FailingVolume(string bad) : IBlobUploader
