@@ -602,6 +602,80 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
+    /// Off a real screen again, and the opposite failure to the one below: <c>1.628 TB / 5.320 TB original (30%) ·
+    /// 109.4 KB uploaded (0% of original) · 13.7 MB/s · ~1d 18h left</c>. Even if every byte still to come went up
+    /// at exactly the speed on that line it would take over three days, so the estimate was out by about half.
+    /// <para>
+    /// The in-flight item's landed bytes are stored bytes and the workload is source bytes, so the credit converts
+    /// between them by the ratio this run has observed — completed timed work over what those items stored. On that
+    /// screen the whole observation was <b>one</b> item: 109.4 KB. Every one of the 222 before it was a dedup or
+    /// resume hit, correctly kept out of the timed side, which leaves the ratio resting on a sample four
+    /// hundred-thousandths the size of what it is asked to convert.
+    /// </para>
+    /// <para>
+    /// A ratio read off that sample is not a measurement, and it lands twice: the credit is added to what has moved
+    /// and subtracted from what is left, so a factor of two in it is a factor of two in the answer. Worse, the
+    /// product is what the reach bound is then tested against — the extrapolation manufactures the very sample size
+    /// that excuses it from the check written to catch extrapolations. Below the bar the safe reading is the one
+    /// this code already takes before any item has completed: count a landed byte as one byte of source work,
+    /// which is exact for a store-only workload and credits too little rather than too much everywhere else.
+    /// </para>
+    /// <para>
+    /// Here one hour lands 100 GiB against 3 TiB left, so crediting them one for one answers about 29 hours.
+    /// Passing them through a ratio of two says 14, and the run is nowhere near twice as far along as it looks.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Upload_Will_Not_Convert_In_Flight_Bytes_Through_An_Unmeasured_Ratio()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        const long kb = 1024L;
+        const long gb = 1024L * 1024 * 1024;
+        const long tb = 1024L * gb;
+
+        tracker.Enqueue(tb);        // adopted from the journal, nothing on the wire for it
+        tracker.Enqueue(200 * kb);  // the one item that really uploaded, and the entire sample
+        tracker.Enqueue(3 * tb);    // the enormous one, still going
+        tracker.SetTotal(3);
+        tracker.BeginWork();
+        tracker.SetTransferred(0);
+
+        tracker.Advance(0, work: tb);
+        tracker.SetTransferred(0);
+
+        // 200 KiB of source stored as 100 KiB: a two-to-one ratio, measured on a single small file.
+        now = 1_000;                // the first stream opening is where the estimate's clock starts
+        tracker.BeginUpload("data/tiny", volumes: 1);
+        tracker.BeginItem("data/tiny", owner: "data/tiny", totalBytes: 100 * kb);
+        tracker.ItemProgress("data/tiny").Report(100 * kb);
+        tracker.EndItem("data/tiny", 100 * kb);
+        tracker.ConfirmUpload("data/tiny");
+        tracker.EndUpload("data/tiny");
+        tracker.Advance(0, work: 200 * kb);
+        tracker.SetTransferred(100 * kb);
+
+        // Then the big one, landing 100 GiB over the next hour and not written off in that time.
+        tracker.BeginUpload("data/huge", volumes: 4096);
+        for (var i = 0; i < 100; i++)
+        {
+            var name = $"data/huge.{i:000}";
+            tracker.BeginItem(name, owner: "data/huge", totalBytes: gb);
+            tracker.ItemProgress(name).Report(gb);
+            tracker.EndItem(name, gb);
+        }
+        now = 1_000 + 3_600_000;
+        tracker.Complete();
+
+        var eta = seen[^1].EstimatedRemaining;
+        Assert.NotNull(eta);
+        // 100 GiB an hour against the 2,972 GiB those bytes leave behind. Doubling the credit answers 14.4.
+        Assert.InRange(eta.Value.TotalHours, 29, 31);
+    }
+
+    /// <summary>
     /// The numbers off a real screen: a resumed 5.3 TB run with 44.9 KB moved, the first very large file in its
     /// hours-long hash-and-compress, and "~33976d left" printed from a hundred-million-fold extrapolation. Below
     /// the reach bound there is no honest answer, so none is given.
@@ -633,7 +707,7 @@ public sealed class StageProgressTests
 
     /// <summary>
     /// The floor that lets the number appear on a run too big for the reach bound to be met in any reasonable
-    /// time. A gigabyte measured is taken as enough to say something, whatever is left.
+    /// time. A gigabyte **on the wire** is taken as enough to say something, whatever is left.
     /// </summary>
     [Fact]
     public void Upload_Will_Estimate_Once_A_Gigabyte_Has_Moved()
@@ -647,18 +721,77 @@ public sealed class StageProgressTests
         tracker.Enqueue(2 * gb);
         tracker.SetTotal(2);
         tracker.BeginWork();
+        tracker.SetTransferred(0);   // as the orchestrator does — see the sibling test below for what it changes
 
         now = 1000;
+        tracker.BeginUpload("data/first", volumes: 1);
         tracker.BeginItem("data/first", owner: "data/first", totalBytes: 2 * gb);
         tracker.ItemProgress("data/first").Report(2 * gb);
-        tracker.EndItem("data/first", 2 * gb);
+        tracker.EndItem("data/first", 0);
+        tracker.ConfirmUpload("data/first");
+        tracker.EndUpload("data/first");
         tracker.Advance(0, work: 2 * gb);
         tracker.SetTransferred(2 * gb);
         now = 2000;
         tracker.Complete();
 
-        // Nowhere near a twentieth of what is left, but past the floor, so an answer is offered.
-        Assert.NotNull(seen[^1].EstimatedRemaining);
+        // Nowhere near a twentieth of what is left, but past the floor, so an answer is offered. On EtaSeconds, not
+        // EstimatedRemaining: the latter has a crude fallback of its own that answers whether or not the floor was
+        // cleared, so it cannot tell this test's subject apart from its absence.
+        Assert.NotNull(seen[^1].EtaSeconds);
+    }
+
+    /// <summary>
+    /// What the floor is a floor **of**. It excuses an estimate from the reach bound on the grounds that enough has
+    /// been seen to extrapolate from, and the only thing this stage actually observes is bytes going over the wire —
+    /// so that is what has to clear it. Measured against the workload instead, the compression ratio decides when
+    /// the estimate is allowed to speak: ten gigabytes of text stored as a hundred megabytes clears a gigabyte of
+    /// "moved" on a tenth of a gigabyte of evidence, and a run of nothing but text clears it on a hundredth.
+    /// <para>
+    /// It is the same confusion of source bytes for stored bytes that let a ratio read off 109.4 KB pass itself off
+    /// as a sample, one term further out: there the product was tested against the floor, here the multiplicand is.
+    /// Both are answered by measuring the sample where the sample is taken.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Upload_Measures_Its_Sample_Floor_In_Bytes_Actually_Uploaded()
+    {
+        var now = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add) { Clock = () => now };
+
+        const long mb = 1024L * 1024;
+        const long gb = 1024 * mb;
+
+        tracker.Enqueue(10 * gb);      // ten gigabytes of highly compressible source
+        tracker.Enqueue(5000 * gb);    // and everything else, untouched
+        tracker.SetTotal(2);
+        tracker.BeginWork();
+        // As the orchestrator does before the first item: without it EndItem keeps its own per-volume tally, the
+        // refresh below then reads as "nothing moved", and the item is written off as a skip — which reaches the
+        // answer through moved <= 0 and never gets near the floor this test is about.
+        tracker.SetTransferred(0);
+
+        // Stored as a hundred megabytes. That is the whole of what this run has watched cross the wire.
+        now = 1000;
+        tracker.BeginUpload("data/text", volumes: 1);
+        tracker.BeginItem("data/text", owner: "data/text", totalBytes: 100 * mb);
+        tracker.ItemProgress("data/text").Report(100 * mb);
+        tracker.EndItem("data/text", 0);
+        tracker.ConfirmUpload("data/text");
+        tracker.EndUpload("data/text");
+        tracker.Advance(0, work: 10 * gb);
+        tracker.SetTransferred(100 * mb);
+        now = 2000;
+        tracker.Complete();
+
+        // Five hundred times the reach bound allows, on a tenth of the evidence the floor asks for.
+        //
+        // Asserted on EtaSeconds rather than EstimatedRemaining, because the two part company here and it is
+        // EtaSeconds the screen prints — stageLines draws the segment only when it is non-null. EstimatedRemaining
+        // falls through to the crude "average bytes per item ÷ current speed", which off a single item and a
+        // one-second window answers two seconds for five terabytes: a different estimator, and not this one.
+        Assert.Null(seen[^1].EtaSeconds);
     }
 
     /// <summary>Stages that declare no workload (diff/restore/check) fall back to extrapolating by item count — still a

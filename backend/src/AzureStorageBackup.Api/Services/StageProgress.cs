@@ -578,7 +578,9 @@ public sealed class StageTracker(
     private long _firstMoveMs = -1;
 
     /// <summary>How far the remaining-time estimate may reach beyond what it has measured, and the absolute sample
-    /// that excuses it from that bound — whichever is satisfied first. See <see cref="Eta"/>.</summary>
+    /// that excuses it from that bound — whichever is satisfied first. The floor is in bytes that actually crossed
+    /// the wire, never in source-side workload; see <see cref="Eta"/> for what goes wrong when the two are
+    /// mistaken for each other.</summary>
     private const int MaxEtaReach = 20;
     private const long EtaSampleFloor = 1024L * 1024 * 1024;
 
@@ -1438,9 +1440,17 @@ public sealed class StageTracker(
     /// </list>
     /// <para>
     /// The partial credit is in stored bytes and the workload is in source bytes, so it is converted by the ratio
-    /// this run has actually observed — completed timed work over what those items stored. Before any item has
-    /// completed there is no ratio, and stored is assumed to be source, which is exact for a store-only workload and
-    /// the safe direction otherwise (it credits less, never more).
+    /// this run has actually observed — completed timed work over what those items stored. Until that observation
+    /// clears the sample floor there is no ratio worth the name, and stored is assumed to be source, which is exact
+    /// for a store-only workload and the safe direction otherwise (it credits less, never more).
+    /// </para>
+    /// <para>
+    /// The floor is the same one the reach bound uses, and it guards the same thing from the other side. Reported:
+    /// <c>1.628 TB / 5.320 TB original · 109.4 KB uploaded · 13.7 MB/s · ~1d 18h left</c>, where three days was the
+    /// floor at the speed on that very line. Every item but one had been a dedup or resume hit, so the ratio rested
+    /// on that single 109.4 KB — and it lands twice, added to what has moved and subtracted from what is left, so
+    /// its factor of two was the answer's factor of two. The product is also what the reach bound is tested against,
+    /// which let the extrapolation manufacture the sample size that excused it from the check.
     /// </para>
     /// <para>
     /// The item-count fallback below keeps the plain form. It serves the diff stage, where entries are uniform,
@@ -1468,10 +1478,12 @@ public sealed class StageTracker(
         var done = _doneWork;
         var timedWork = done - Volatile.Read(ref _skippedWork);
 
-        // The in-flight items' landed bytes, as source-side work.
+        // The in-flight items' landed bytes, as source-side work. The conversion needs a ratio, and the ratio needs
+        // to have been measured on something: below the sample floor the landed bytes count one for one, the same
+        // reading taken before any item has completed at all.
         var partial = unfinishedBytes <= 0
             ? 0L
-            : timedWork > 0 && _transferred > 0
+            : timedWork > 0 && _transferred >= EtaSampleFloor
                 ? (long)((double)unfinishedBytes * timedWork / _transferred)
                 : unfinishedBytes;
 
@@ -1490,7 +1502,14 @@ public sealed class StageTracker(
         // large one is in hand: at 20x, an hour of a big file preparing moves the answer by at most twenty hours,
         // and it steps back down when the file lands. Below the bound there is no honest number to print, and on a
         // run of 70 GB items that silence lasts hours — which is the true state of knowledge, not a defect.
-        if (moved * MaxEtaReach < remaining && moved < EtaSampleFloor)
+        //
+        // The floor that excuses a run from that bound is counted in bytes this stage has actually put on the wire —
+        // settled and landed-but-not-written-off — and not in <c>moved</c>, which is source-side workload. They are
+        // not the same quantity and the difference is the compression ratio: measured against the workload, ten
+        // gigabytes of text stored as a hundred megabytes clears the floor on a tenth of the evidence, and a run of
+        // nothing but text on a hundredth. Watching bytes cross the wire is the only observation this stage makes,
+        // so it is the one the floor has to be denominated in.
+        if (moved * MaxEtaReach < remaining && _transferred + unfinishedBytes < EtaSampleFloor)
             return null;
 
         // Falls back to the stage's own start for a stage that declares a workload and completes items without
