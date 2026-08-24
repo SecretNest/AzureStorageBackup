@@ -1,5 +1,6 @@
 import type { StageProgress } from '../api/backupConfigs'
 import { formatBytes, formatDuration } from '../constants/format'
+import type { WindDownKind } from './windDownControls'
 
 const STAGE_UNITS: Record<string, string> = {
   Scanning: 'entries',
@@ -49,14 +50,48 @@ function withUnit(n: number, plural: string): string {
 }
 
 /**
+ * What has stopped the front of the pipeline, when something has.
+ *
+ * Only two entries of the in-flight line are frozen by either of these, and both are frozen at the same
+ * place: the compressor's loop checks the stop intent and then the pause gate **before** it does anything
+ * to the item it has just taken (`BackupOrchestrator`, the probed-queue loop). Everything the line reports
+ * downstream of that point — inside the staging area, checking, on the wire — is already past the check
+ * and goes on moving, which is exactly why a suspend can take minutes.
+ *
+ * The distinction between the two words matters: a wind-down **abandons** that queue for this run, while a
+ * pause merely holds it.
+ */
+export type PipelineHold = 'winding-down' | 'paused'
+
+/**
+ * Which hold a row is under, given the two the backend reports separately.
+ *
+ * A stop **outranks** a pause rather than being an alternative to it, and the run really can be in both
+ * states at once: `RequestStop` downgrades the pause gate on its way past, so from that moment the gate can
+ * never hold anyone again (see windDownControls, which disables Resume for the same reason) and the run is
+ * winding down whatever `pause` still says. Reading the pause first would put "held by the pause" on a
+ * queue that is being abandoned, promising a resume the run is not going to reach.
+ */
+export function pipelineHold(
+  windDown: WindDownKind | undefined,
+  paused: boolean,
+): PipelineHold | undefined {
+  if (windDown) return 'winding-down'
+  return paused ? 'paused' : undefined
+}
+
+/**
  * Split one stage snapshot into the two lines on screen.
  *
  * Extracted so it can be tested: the entire difficulty of these two lines is **order** and **wording**,
  * and both can otherwise only be confirmed by reading the code — once a string is inside JSX there is
  * nowhere left to assert it. A wrong order raises no error, it just regrows the endless "which of these
  * two numbers comes first?" question on screen.
+ *
+ * `hold` is the run's own state, which the snapshot cannot carry: the backend goes on counting the queue
+ * truthfully while nothing is consuming it, and only the row knows that. See the entry it governs.
  */
-export function stageLines(detail: StageProgress) {
+export function stageLines(detail: StageProgress, hold?: PipelineHold) {
   const unit = STAGE_UNITS[detail.stage] ?? 'items'
   const label = STAGE_LABELS[detail.stage] ?? detail.stage
   // "of" rather than "/": a slash is fraction notation, and putting one there invites a percentage —
@@ -110,6 +145,12 @@ export function stageLines(detail: StageProgress) {
   // above, and another tier would only blur which number is which. That reasoning does not apply to
   // checking (which says plainly what it is doing), so checking has no such gate.
   const stalled = Math.max(0, detail.uploading - detail.waitingOnPeer - detail.checking)
+  // The front of the pipeline as one number, for the held case below. The two are summed rather than
+  // stated apart because a hold makes them one population: neither has been started, and the only thing
+  // that told them apart — whether the prober had read the item yet — decides nothing while nothing is
+  // consuming either queue. Kept beside the other derived count rather than inline, so the entry that
+  // prints it reads as the one sentence it is.
+  const notStarted = detail.awaitingCompression + detail.queued
   // The whole upload-side wait as **one** entry, three numbers over one population: everything on the staging disk
   // with not one byte on the wire.
   //
@@ -280,15 +321,40 @@ export function stageLines(detail: StageProgress) {
     // points at the wire, and this one is where an upload-bound run spends most of its life.
     detail.waitingOnRoom > 0 &&
       `${withUnit(detail.waitingOnRoom, unit)} waiting for staging room`,
+    // The front of the pipeline, and the only part of this line a hold freezes. Three entries, of which
+    // at most two ever render: without a hold the original pair, with one a single entry replacing both.
+    //
+    // They collapse because the hold makes them one population — not started, and not going to be while it
+    // stands — so the distinction the split exists for ("is compression the bottleneck?") stops having an
+    // answer. And their own wording promises motion that the row directly above has just denied: an
+    // operator watching "Suspending…" was still being told 4,365 objects were queued, as if a queue that
+    // nothing was consuming were merely deep.
+    //
+    // Under a wind-down it is worse than stale. `queued` is a subtraction — enqueued minus processed minus
+    // in-hand (StageProgress.Tick) — and draining the probed channel releases each item's share **without**
+    // marking it processed, so abandoned work migrates into this number and it climbs while the run winds
+    // down. The count is the one honest thing left in it; every verb around it was wrong.
+    //
+    // The two holds do different things to the same queue and cannot share a word: a wind-down abandons it
+    // for this run, a pause merely holds it. "left for the next run" is true of every stop kind and not
+    // only Suspend — SettleStopAsync flushes the journal before it returns whatever the kind, and a
+    // Canceled run's row offers Resume off that journal (see showsInterruptedNotice). What a stop discards
+    // is the index version, not the work already done.
+    hold &&
+      notStarted > 0 &&
+      `${withUnit(notStarted, unit)} ${
+        hold === 'winding-down' ? 'left for the next run' : 'held by the pause'
+      }`,
     // Earlier than either of the two above, and not the same wait as either. These have been probed — their content
     // identity is settled — but they have not reached the staging area at all, because the compressor is a single
     // worker and takes one item at a time. Capped at the channel's depth (9), so unlike its counterpart above this
     // one plateaus — and the cap is deliberately small enough that plateauing says little: nine is a display
     // decision, because a deep queue here reads as "compression is the bottleneck" when usually it is the
     // opposite (the compressor is held by staging backpressure, waiting on the uploaders).
-    detail.awaitingCompression > 0 &&
+    !hold &&
+      detail.awaitingCompression > 0 &&
       `${withUnit(detail.awaitingCompression, unit)} waiting for the compressor`,
-    detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
+    !hold && detail.queued > 0 && `${withUnit(detail.queued, unit)} queued`,
     downloading && detail.workRemaining > 0 && `${formatBytes(detail.workRemaining)} to go`,
     // The diff decides orders of magnitude faster than compression and upload can consume, so running
     // ahead is normal; the surplus is buffered to disk until the downstream catches up. This replaced

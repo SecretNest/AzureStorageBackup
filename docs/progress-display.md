@@ -516,6 +516,52 @@ The string assembly lives in one module. **The entire difficulty of these two li
 wording**, and once a string is inside JSX there is nowhere left to assert it — a wrong order raises
 no error, it just regrows the "which of these two comes first?" question on screen.
 
+### When the front of the pipeline has stopped
+
+A run that is winding down, or held at the pause gate, is still a **running** run: it goes on reporting
+progress, and the entries describing what is on the staging disk and on the wire go on moving — that is
+exactly why a suspend can take minutes. But the two entries at the front of the timeline stop dead, and
+their own wording promises motion the row directly above has just denied:
+
+```
+Suspending…
+In flight: 1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · 4,374 objects left for the next run
+```
+
+```
+Paused
+In flight: 1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · 4,374 objects held by the pause
+```
+
+`queued` and `waiting for the compressor` collapse into **one** entry, because the hold makes them one
+population — not started, and not going to be while it stands. The thing that told them apart, whether
+the prober had read the item yet, decides nothing once nothing is consuming either queue.
+
+The two words are not interchangeable. A wind-down **abandons** that queue for this run; a pause merely
+**holds** it. `left for the next run` is true of every stop kind and not only of Suspend: `SettleStopAsync`
+flushes the journal before it returns whatever the kind, and a `Canceled` run's row offers Resume off that
+journal (`showsInterruptedNotice`). What a stop discards is the index version, not the work already done.
+
+Where the boundary falls is not a display choice — it is the one place in the engine where the hold is
+checked. The compressor's loop tests the stop intent and then the pause gate **before** it does anything
+to the item it has just taken (`BackupOrchestrator`, the probed-queue loop); everything the line reports
+downstream of that point is already past the check. So `waiting for staging room`, `waiting for the
+archive slot`, `preparing`, `checking files` and the whole upload-side wait keep their own wording and
+keep moving, and replacing them would take away the only numbers that answer *why is this still going?*
+
+> **Rationale.** Under a wind-down the old line was worse than stale. `queued` is a subtraction —
+> `enqueued − processed − inWork` — and draining the probed channel releases each item's share **without**
+> marking it processed, so abandoned work migrates into that number and it **climbs** while the run winds
+> down. An operator watching `Suspending…` was being told that 4,365 objects were queued and rising, as if
+> a queue nothing was consuming were merely deep.
+
+The hold is not in the snapshot and cannot be: the backend goes on counting the queue truthfully, and only
+the row knows nothing is draining it. It comes from the two facts the server already reports —
+`stopRequested` and the pause the warn line renders — so it survives a tab switch exactly as the buttons
+do. A stop **outranks** a pause rather than being an alternative to it: `RequestStop` downgrades the pause
+gate on its way past, so from that moment the gate can never hold anyone again and the run is winding down
+whatever `pause` still says.
+
 **The in-flight list** gives each concurrent transfer its own line with its own progress. The header
 says *parallel* explicitly: seeing two or three names at once suggests parallel compression, which
 never happens. The list is **never truncated** — its length is already bounded by the concurrency

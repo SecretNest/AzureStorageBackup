@@ -20,7 +20,7 @@ import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
-import { preparingLabelOf, stageLines } from '../lib/stageLines'
+import { pipelineHold, preparingLabelOf, stageLines, type PipelineHold } from '../lib/stageLines'
 import { windDownFromServer } from '../lib/windDownControls'
 import { Modal } from '../components/Modal'
 import {
@@ -2077,7 +2077,15 @@ function RunStatus({
           </button>
           {/* Two parallel details stack vertically rather than spreading horizontally — details widening
               the table has been raised before, and a second one warrants more care. */}
-          {showDetail && details.map((d) => <StageDetail key={d.stage} detail={d} />)}
+          {/* The hold travels down with the detail because the snapshot cannot carry it: the backend goes
+              on counting the front of the pipeline truthfully while nothing is consuming it, so only this
+              row knows that "4,365 objects queued" describes a queue that has stopped. Both facts come
+              from the server (stopRequested, and the pause the warn line above renders), so it survives a
+              tab switch exactly as the buttons do. */}
+          {showDetail &&
+            details.map((d) => (
+              <StageDetail key={d.stage} detail={d} hold={pipelineHold(stopping, pd !== null)} />
+            ))}
         </>
       )}
     </div>
@@ -2088,8 +2096,8 @@ function RunStatus({
 /// diff reads every file end to end to hash it, which can run for hours while the UI shows a motionless
 /// 0%, indistinguishable from a hang.
 
-function StageDetail({ detail }: { detail: StageProgress }) {
-  const { counts, done, pipeline, speed, eta, inFlightPhrase, label } = stageLines(detail)
+function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineHold }) {
+  const { counts, done, pipeline, speed, eta, inFlightPhrase, label } = stageLines(detail, hold)
 
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 
 import type { StageProgress } from '../api/backupConfigs'
-import { preparingLabelOf, stageLines } from './stageLines'
+import { pipelineHold, preparingLabelOf, stageLines } from './stageLines'
 
 function progress(over: Partial<StageProgress> = {}): StageProgress {
   return {
@@ -402,6 +402,128 @@ describe('stageLines', () => {
     )
     expect(done).toBe('476.8 MB / 1.863 GB downloaded · 381.5 MB restored')
     expect(pipeline).toBe('1 object downloading · 1.490 GB to go')
+  })
+})
+
+/**
+ * The reported symptom: a backup winding down or held at the pause gate still read
+ * `9 objects waiting for the compressor · 4,365 objects queued`, two verbs promising motion that had
+ * already stopped — while the row directly above said "Suspending…" or "Paused".
+ *
+ * The two entries are the only ones in the list the hold provably freezes, and both freeze for the same
+ * reason: the compressor's loop checks the stop intent (`control is { Stop: not StopKind.None }`) and the
+ * pause gate the line after it, **before** anything is done to the item. Everything downstream of that
+ * check is already past it — an item inside the staging area goes on to compress and upload, which is
+ * precisely why a suspend takes minutes, so those entries stay as they are and go on moving.
+ *
+ * The wind-down case is worse than a stale number: `queued` is a subtraction
+ * (`_enqueued - _processed - inWork`, see StageProgress.Tick), and draining the probed channel releases
+ * each item's share without marking it processed — so abandoned work **migrates into** queued and the
+ * number climbs while the run winds down.
+ */
+describe('a held pipeline', () => {
+  const held = () =>
+    progress({
+      activeItems: [{ label: 'a', sent: 1, total: 2, percent: 50 }],
+      waitingToUploadObjects: 7,
+      waitingToUploadVolumes: 33,
+      waitingToUploadBytes: 3_300_000_000,
+      awaitingCompression: 9,
+      queued: 4_365,
+    })
+
+  /**
+   * The two counts become one because the hold makes them one population — neither has been started and
+   * neither will be — and stating them apart would keep inviting the question the split exists to answer
+   * ("is the compressor the bottleneck?"), which no longer has an answer once nothing is running.
+   *
+   * The journal outlives every stop kind (`SettleStopAsync` flushes before it returns, and
+   * `showsInterruptedNotice` offers Resume for Canceled as well as Suspended), so "left for the next run"
+   * is true of a Stop, not only of a Suspend.
+   */
+  test('a wind-down says the queue is not going to be started', () => {
+    expect(stageLines(held(), 'winding-down').pipeline).toBe(
+      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+        '4,374 objects left for the next run',
+    )
+  })
+
+  /** A pause holds the same population rather than abandoning it, and the wording has to say which. */
+  test('a pause says the queue is held', () => {
+    expect(stageLines(held(), 'paused').pipeline).toBe(
+      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+        '4,374 objects held by the pause',
+    )
+  })
+
+  /**
+   * The entries the hold does **not** freeze keep their own wording. A suspend waits out the file in hand
+   * and every one of its volumes, so what is on the staging disk and on the wire is the one thing on this
+   * line that answers "why is this still going?" — replacing it would take away the only number that does.
+   */
+  test('leaves everything already past the hold alone', () => {
+    const { pipeline } = stageLines(
+      progress({
+        preparing: 1,
+        waitingOnArchive: 4,
+        waitingOnRoom: 1,
+        checking: 1,
+        checkingBytes: 100_000_000,
+      }),
+      'winding-down',
+    )
+    expect(pipeline).toBe(
+      'nothing on the wire right now · 1 object checking files · 95.4 MB being checked · ' +
+        '1 object preparing · 4 objects waiting for the archive slot · 1 object waiting for staging room',
+    )
+  })
+
+  /** An empty queue stays empty: a hold is not a reason to print "0 objects left for the next run". */
+  test('drops the entry when there is no queue to hold', () => {
+    expect(stageLines(progress({ preparing: 1 }), 'paused').pipeline).toBe(
+      'nothing on the wire right now · 1 object preparing',
+    )
+  })
+
+  /** Nothing changes for a run that is neither winding down nor paused. */
+  test('an unheld run reads exactly as before', () => {
+    expect(stageLines(held()).pipeline).toBe(
+      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+        '9 objects waiting for the compressor · 4,365 objects queued',
+    )
+  })
+})
+
+/**
+ * Which of the two holds the row is actually under. Its own function because the answer is not the
+ * disjunction it looks like: a run can be both at once, and only one of the two words is true then.
+ */
+describe('pipelineHold', () => {
+  /**
+   * Every rung of the stop ladder abandons the queue identically — the orchestrator's check is
+   * `Stop: not StopKind.None`, never a comparison against one kind — so all three read the same here.
+   */
+  test('every stop kind is one wind-down', () => {
+    expect(pipelineHold('suspend', false)).toBe('winding-down')
+    expect(pipelineHold('finish', false)).toBe('winding-down')
+    expect(pipelineHold('now', false)).toBe('winding-down')
+  })
+
+  test('a pause with no stop under way is a pause', () => {
+    expect(pipelineHold(undefined, true)).toBe('paused')
+  })
+
+  /**
+   * Both at once, and the stop wins. A stop **downgrades** the pause gate (see windDownControls), after
+   * which the gate can never hold anyone again — so at that moment the queue is abandoned, not held, and
+   * "held by the pause" would promise a resume that the run is no longer going to reach.
+   */
+  test('a stop outranks a pause it has already downgraded', () => {
+    expect(pipelineHold('suspend', true)).toBe('winding-down')
+  })
+
+  test('an ordinary running backup is under no hold', () => {
+    expect(pipelineHold(undefined, false)).toBeUndefined()
   })
 })
 
