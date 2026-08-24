@@ -152,7 +152,27 @@ public sealed record BackupRunResponse(
     int? NewFiles = null, int? ModifiedFiles = null, int? DeletedFiles = null,
     long? ChangedBytes = null, long? UploadedBytes = null, long? DeletedBytes = null,
     // Sibling of Pause, not a field on it — see BackupRunState.PausedByUser for why the two can disagree.
-    bool PausedByUser = false)
+    bool PausedByUser = false,
+    /// <summary>
+    /// The strongest stop asked of this run so far, by name; <c>"None"</c> when nobody has. See
+    /// <see cref="BackupRunState.StopRequested"/> for why a wind-down has to be reported separately from the
+    /// status — the run says <see cref="RunStatus.Running"/> for the whole of it, and that is minutes.
+    /// <para>
+    /// **As a name, like Status and SuspendReason, and for the same reason.** Nothing in this application registers
+    /// a <c>JsonStringEnumConverter</c> (see the remarks on <see cref="PauseSource"/>), so publishing the enum
+    /// itself would put <c>1</c> on the wire, where the browser's ladder switches on <c>'Suspend'</c> and would
+    /// read it as no wind-down at all.
+    /// </para>
+    /// <para>
+    /// **It is spelled out at the bottom of the ladder rather than omitted.** An absent property and <c>"None"</c>
+    /// are the same value to a browser that defaults it, and they are not the same thing: one says nobody has asked
+    /// this run to stop, the other says this server does not report it. That difference is what let this field go
+    /// missing here for a release while <see cref="BackupRunState.StopRequested"/>, the frontend type and both
+    /// sides' tests all had it — the row simply read <c>undefined</c> and offered Suspend for a decision already
+    /// taken.
+    /// </para>
+    /// </summary>
+    string StopRequested = nameof(StopKind.None))
 {
     public static BackupRunResponse From(BackupRunState s)
     {
@@ -162,7 +182,7 @@ public sealed record BackupRunResponse(
         return new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, pause, s.SuspendReason?.ToString(),
             s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
-            byUser);
+            byUser, s.StopRequested.ToString());
     }
 }
 

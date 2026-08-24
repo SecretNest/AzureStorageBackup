@@ -1128,6 +1128,72 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         }
     }
 
+    /// <summary>
+    /// The wind-down has to reach the browser, and this asserts it **on the wire** rather than on
+    /// <see cref="BackupRunState"/>.
+    /// <para>
+    /// That distinction is the bug this was written for. <c>BackupRunState.StopRequested</c> reports the standing
+    /// stop kind live off the control, and the frontend reads <c>run.stopRequested</c> to decide which controls
+    /// stay live during a wind-down — but nothing carried the one into the other, because the polled payload is
+    /// <see cref="BackupRunResponse"/> and the field was never added to it. Both ends had tests and both passed:
+    /// the state exposed it, the browser's ladder parsed it, and the property in between was simply absent from the
+    /// JSON. What the operator saw was the symptom the reporting was added to fix, unchanged — press Suspend,
+    /// switch page, come back, and Suspend is offered again for a decision already taken, with nothing on screen
+    /// about the stop already running.
+    /// </para>
+    /// <para>
+    /// So this reads the raw JSON rather than deserialising into a typed record: a typed read would fill a missing
+    /// property with a default and assert nothing about whether it crossed the boundary at all.
+    /// </para>
+    /// <para>
+    /// The name, not the number. Nothing in this application registers a <c>JsonStringEnumConverter</c> — see the
+    /// remarks on <see cref="PauseSource"/> — so a stop kind published as itself would arrive as <c>1</c> and the
+    /// browser's <c>windDownFromServer</c>, which switches on the names, would read it as no wind-down at all: the
+    /// very failure this test exists to catch, in a shape that looks like it works.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task A_running_backup_reports_the_stop_it_was_asked_for()
+    {
+        var accountId = await CreateAccountAsync("stop-reported");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs", SampleRequest("sr", accountId)))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var backupRunner = factory.Services.GetRequiredService<BackupRunner>();
+        var journals = _services.GetRequiredService<BackupJournalStore>();
+        await using var control = new BackupRunControl(journals, created!.Id, "run-winding-down");
+        InjectRun(backupRunner, created.Id, new BackupRunState { Status = RunStatus.Running, Control = control });
+        try
+        {
+            // Before anyone asks: the bottom of the ladder, spelled out rather than omitted, so the browser can
+            // tell "no stop" apart from "this build does not report it".
+            var before = await _client.GetFromJsonAsync<System.Text.Json.JsonElement>(
+                $"/api/backup-configs/{created.Id}/run");
+            Assert.Equal(nameof(StopKind.None), before.GetProperty("stopRequested").GetString());
+
+            // RequestStop is the production path — it is what the /suspend endpoint calls, and it downgrades the
+            // gate as a side effect of setting the intent.
+            control.RequestStop(StopKind.Suspend);
+
+            var during = await _client.GetFromJsonAsync<System.Text.Json.JsonElement>(
+                $"/api/backup-configs/{created.Id}/run");
+            // Still Running throughout the wind-down — which is exactly why the stop kind has to be reported
+            // separately for the row to say anything true about it.
+            Assert.Equal(nameof(RunStatus.Running), during.GetProperty("status").GetString());
+            Assert.Equal(nameof(StopKind.Suspend), during.GetProperty("stopRequested").GetString());
+
+            // And it escalates, because the ladder is what the browser keys Stop's own affordance off.
+            control.RequestStop(StopKind.StopNow);
+            var escalated = await _client.GetFromJsonAsync<System.Text.Json.JsonElement>(
+                $"/api/backup-configs/{created.Id}/run");
+            Assert.Equal(nameof(StopKind.StopNow), escalated.GetProperty("stopRequested").GetString());
+        }
+        finally
+        {
+            RemoveRun(backupRunner, created.Id);
+        }
+    }
+
     [Fact]
     public async Task Interrupted_runs_are_listed_with_their_block_count()
     {
