@@ -542,7 +542,7 @@ Multi-arch images are published to **two** registries in the same run, under the
 
 ```
 ghcr.io/secretnest/azurestoragebackup:latest              # GitHub Container Registry
-<ACR_REGISTRY>/secretnest/azurestoragebackup:latest       # Azure Container Registry
+crpi-xck5ot77uijk4gvl.cn-shenzhen.personal.cr.aliyuncs.com/secretnest/azurestoragebackup:latest       # Azure Container Registry
 ```
 
 Publishing is a **manual** GitHub Action (`.github/workflows/docker-publish.yml`, `workflow_dispatch`) that builds `linux/amd64` and `linux/arm64` with Buildx and pushes both, tagging each with the tag you type (required, defaults to `latest`) plus the commit SHA. The ACR host and its credentials come from the `ACR_REGISTRY`, `ACR_USERNAME` and `ACR_PASSWORD` repository secrets — the repository path within it is fixed — while the GHCR push uses the workflow's own `GITHUB_TOKEN`. The build cache is kept in GHCR (`:buildcache`) rather than the GitHub Actions cache, because exporting a two-architecture `mode=max` cache to `type=gha` runs *after* the push and has stalled a finished publish for eleven minutes.
