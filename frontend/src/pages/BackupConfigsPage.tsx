@@ -6,6 +6,7 @@ import { settingsApi, type GlobalSettings } from '../api/settings'
 import { ChangeLocalRootDialog } from '../components/ChangeLocalRootDialog'
 import { DefaultableField } from '../components/DefaultableField'
 import { PathBrowser } from '../components/PathBrowser'
+import { SentinelField } from '../components/SentinelField'
 import { RestoreDialog } from '../components/RestoreDialog'
 import { ScopeTree } from '../components/ScopeTree'
 import { StopBackupDialog } from '../components/StopBackupDialog'
@@ -13,6 +14,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
 import { orphanSummary } from '../lib/checkSummary'
+import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins } from '../lib/latestWins'
@@ -81,6 +83,7 @@ const emptyForm: BackupConfigInput = {
   name: '',
   description: '',
   localRoot: '',
+  sentinelPath: '',
   password: '',
   indexTier: StorageTier.Hot,
   dataTier: StorageTier.Hot,
@@ -153,6 +156,7 @@ export function BackupConfigsPage() {
   const [showForm, setShowForm] = useState(false)
   const [browsing, setBrowsing] = useState(false)
   const [changingRoot, setChangingRoot] = useState(false)
+  const [browsingSentinel, setBrowsingSentinel] = useState(false)
   const [editing, setEditing] = useState<BackupConfig | null>(null)
   const [step, setStep] = useState<1 | 2>(1)
   const [form, setForm] = useState<BackupConfigInput>(emptyForm)
@@ -525,6 +529,7 @@ export function BackupConfigsPage() {
       name: c.name,
       description: c.description ?? '',
       localRoot: c.localRoot,
+      sentinelPath: c.sentinelPath ?? '',
       password: '',
       indexTier: c.indexTier,
       dataTier: c.dataTier,
@@ -927,6 +932,16 @@ export function BackupConfigsPage() {
                 Browse
               </button>
             )}
+          </Field>
+          {/* Directly under the root, because the two are one decision: this says whether that root is
+              really there. See SentinelField for why an absent path is not an error here. */}
+          <Field label="Run only if this exists">
+            <SentinelField
+              value={form.sentinelPath ?? ''}
+              localRoot={form.localRoot}
+              onChange={(v) => set('sentinelPath', v)}
+              onBrowse={() => setBrowsingSentinel(true)}
+            />
           </Field>
           <Field label="Scope">
             <label className="row" style={{ gap: 'var(--sp-1)' }}>
@@ -1566,6 +1581,20 @@ export function BackupConfigsPage() {
           onClose={() => setBrowsing(false)}
         />
       )}
+      {browsingSentinel && (
+        <PathBrowser
+          title="Choose the file or folder to check for"
+          // Starts at the sentinel if there is one, otherwise at this backup's root — which is where it
+          // has to live anyway, so there is nowhere else worth opening on.
+          initialPath={form.sentinelPath?.trim() || form.localRoot || undefined}
+          allowFiles
+          onPick={(p) => {
+            set('sentinelPath', p)
+            setBrowsingSentinel(false)
+          }}
+          onClose={() => setBrowsingSentinel(false)}
+        />
+      )}
       {changingRoot && editing && (
         <ChangeLocalRootDialog
           configId={editing.id}
@@ -1866,6 +1895,11 @@ function RunStatus({
   // Stopping is neither success nor failure: the backend does not write it as the backup's Error status, and this does not colour it red.
   if (run.status === 'Canceled')
     return <div className="text-warn">Backup stopped — nothing was recorded for this run</div>
+  // The sentinel said the source is not there, so this round never started. Amber like a stop, never red:
+  // an unmounted NAS is not a fault, and a red badge every morning is an alarm nobody still reads after a
+  // week. The wording has to carry "nothing was recorded" — see runSkipNotice.
+  if (run.status === 'Skipped')
+    return <div className="text-warn">{runSkipNotice(run)}</div>
   // Suspension is the same, and goes further than stopping: the scene is preserved and the next run picks
   // up from here, so the button says Resume rather than Run.
   // "Resume" actually calls run() — resuming is not a mode, since every run recognises any still-valid
@@ -2288,12 +2322,18 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
     // Amber only when there is something to act on. A clean scan is good news and takes the row's own tone —
     // colouring "no unreferenced blobs" as a warning is how a reassurance turns into a thing to worry about.
     const orphansWarn = r.orphanScanIssue != null || r.orphanBlobs.length > 0
+    // Whether the local half ran at all. Empty when it did.
+    const localSkip = checkLocalSkipNotice(r)
     return (
       <div className={r.ok ? 'text-ok' : 'text-danger'}>
         {r.ok
           ? `Check completed — all checked objects OK (version ${r.version})`
           : `Check completed — ${r.missingRefs.length} problem(s), ${r.repairablePaths.length} repairable (version ${r.version})`}
         {orphans && <span className={orphansWarn ? 'text-warn' : undefined}>{orphans}</span>}
+        {/* Its own line, and always amber whatever the verdict above says: a column of "not checked"
+            reads as a clean bill of health, which is the same false reassurance in a different costume.
+            See checkLocalSkipNotice. */}
+        {localSkip && <div className="text-warn">{localSkip}</div>}
       </div>
     )
   }

@@ -186,8 +186,48 @@ public static class SystemEndpoints
         })
         .WithTags("System");
 
+        // Does this one path exist right now, and is it a file or a directory? Behind the sentinel field
+        // (docs/configuration.md), which is a setting whose value is *supposed* to be absent half the time —
+        // so a form that cannot say which half it is right now leaves a typo and an unmounted disk looking
+        // exactly alike, and the difference only surfaces later as a backup that quietly skipped.
+        //
+        // Separate from /browse rather than folded into it: browse lists a directory's children and 404s when
+        // the directory is not there, and neither of those fits a question about one path that may well be a
+        // file and may well be legitimately missing.
+        app.MapGet("/api/system/path-exists", (string? path, PathBoundary boundary) =>
+        {
+            // Blank is not a question. "No sentinel" is a state the form has to be able to hold, and answering
+            // "does not exist" for an empty field would paint that state as a problem.
+            if (string.IsNullOrWhiteSpace(path))
+                return Results.BadRequest(new { error = "path is required." });
+
+            // The same admission filter as everything else. Without it this is an existence oracle for the
+            // whole file system, one path per request.
+            if (PathBoundaryGuard.Blocked(boundary, path) is { } outside)
+                return outside;
+
+            // 200 with exists:false, never 404: absence is the expected answer here — it is exactly what an
+            // unmounted source looks like — and a form field cannot tell an error status apart from "the
+            // backend is unreachable", which is a different thing to tell the operator.
+            //
+            // Directory first: on a directory, File.Exists is false on Unix, so the order decides nothing, but
+            // stating it here keeps a future reader from having to work that out.
+            if (Directory.Exists(path))
+                return Results.Ok(new PathExistsResponse(true, "directory"));
+            // The kind matters, not just the yes/no: a sentinel aimed at a directory that is still there while
+            // the mount is not is precisely the mistake this feature is about, and the form is the cheapest
+            // place to notice that "file" was meant.
+            if (File.Exists(path))
+                return Results.Ok(new PathExistsResponse(true, "file"));
+            return Results.Ok(new PathExistsResponse(false, null));
+        })
+        .WithTags("System");
+
         return app;
     }
+
+    /// <summary>Answer of the existence probe. <c>Kind</c> is "file"/"directory", or null when nothing is there.</summary>
+    private sealed record PathExistsResponse(bool Exists, string? Kind);
 
     /// <summary>
     /// The default start when no <c>path</c> is passed: begin at the root if one is configured, otherwise at the filesystem root.

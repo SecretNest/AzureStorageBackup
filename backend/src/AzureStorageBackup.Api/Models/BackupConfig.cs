@@ -28,6 +28,22 @@ public class BackupConfig
     /// <summary>Local root path (device-local; re-specified when restoring on another device).</summary>
     public string LocalRoot { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Optional precondition: a path that must exist before this backup is allowed to look at its source.
+    /// null/empty = no precondition, which is what every backup created before this field existed has.
+    /// <para>
+    /// It exists because an unmounted root is not an absent root — see <see cref="SentinelGate"/> for what goes
+    /// wrong without it. Point it at something that only appears **after** the mount: a marker file inside it, or
+    /// a subdirectory that is always there when the data is.
+    /// </para>
+    /// <para>
+    /// Unlike <see cref="LocalRoot"/> this is **not** a locked base field. Nothing downstream is keyed by it — no
+    /// index, no journal, no local authority — so changing it desynchronises nothing, and an operator who
+    /// reorganises a mount has to be able to follow it without recreating the backup.
+    /// </para>
+    /// </summary>
+    public string? SentinelPath { get; set; }
+
     /// <summary>Ciphertext of the encryption password. Empty = not encrypted. Use ISecretReader.RevealBackupPassword to get the plaintext.</summary>
     public string? PasswordProtected { get; set; }
 

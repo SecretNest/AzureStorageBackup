@@ -22,6 +22,12 @@ export interface BrowseResult {
   entries: BrowseEntry[]
 }
 
+/** The answer of the existence probe. kind is 'file' | 'directory', or null when nothing is there. */
+export interface PathExists {
+  exists: boolean
+  kind: 'file' | 'directory' | null
+}
+
 export const browseApi = {
   // signal: the caller (PathBrowser) uses it to cancel a still-pending request when directories are
   // switched quickly, so a slow old response cannot arrive late and overwrite the new directory.
@@ -37,4 +43,10 @@ export const browseApi = {
     const qs = params.toString()
     return api.get<BrowseResult>(`/system/browse${qs ? `?${qs}` : ''}`, { signal })
   },
+
+  // Behind the sentinel field: one path, does it exist right now, file or directory. A plain 200 with
+  // exists:false is the normal answer for an unmounted source, so callers must not treat absence as an
+  // error. signal cancels a probe made stale by further typing.
+  exists: (path: string, signal?: AbortSignal) =>
+    api.get<PathExists>(`/system/path-exists?path=${encodeURIComponent(path)}`, { signal }),
 }

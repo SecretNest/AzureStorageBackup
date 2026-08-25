@@ -1,3 +1,5 @@
+using AzureStorageBackup.Api.Models;
+
 namespace AzureStorageBackup.Api.Services;
 
 public enum RunStatus
@@ -22,6 +24,20 @@ public enum RunStatus
     /// </para>
     /// </summary>
     Suspended,
+
+    /// <summary>
+    /// The run never started, because the path that vouches for the source was not there — this backup's
+    /// sentinel, or its local root when no sentinel is configured (see <see cref="SentinelGate"/>).
+    /// <para>
+    /// Its own status rather than a flavour of <see cref="Failed"/> or <see cref="Canceled"/>, because it is
+    /// neither and the difference is what the whole feature is for. Failed would write an Error the operator has
+    /// to clear by hand, and a NAS that is simply not mounted overnight would wear a red badge every morning —
+    /// the alarm would be worthless within a week. Canceled says a person changed their mind, which nobody did.
+    /// What actually happened is that a precondition was not met, so nothing was attempted and nothing is known
+    /// about the source; the persisted status is therefore left exactly as it was, in both directions.
+    /// </para>
+    /// </summary>
+    Skipped,
 }
 
 /// <summary>In-memory state of one backup run (polled by the frontend).</summary>
@@ -79,6 +95,14 @@ public sealed class BackupRunState
 
     /// <summary>Why the run was suspended; null when it is not suspended.</summary>
     public SuspendReason? SuspendReason { get; set; }
+
+    /// <summary>
+    /// Why the run was skipped; null when it was not. Kept apart from <see cref="Error"/> on purpose: the browser
+    /// renders that one red, and a backup waiting on a mount is not in an error state. Names the path that was
+    /// missing — the sentinel, or the local root standing in for one — because the operator's next move is to go
+    /// and look at it, and "skipped" alone does not say which path to look at.
+    /// </summary>
+    public string? SkipReason { get; set; }
 
     /// <summary>Internal machinery, not part of the HTTP contract: the handle on this run — Suspend / Retry now reach the gate through it.</summary>
     internal BackupRunControl? Control { get; set; }
@@ -172,7 +196,13 @@ public sealed record BackupRunResponse(
     /// taken.
     /// </para>
     /// </summary>
-    string StopRequested = nameof(StopKind.None))
+    string StopRequested = nameof(StopKind.None),
+    /// <summary>
+    /// Why this run was skipped; null when it was not. Published as its own field rather than folded into
+    /// <see cref="Error"/> for the reason on <see cref="BackupRunState.SkipReason"/> — the browser paints Error
+    /// red, and a backup waiting on a mount is not in an error state.
+    /// </summary>
+    string? SkipReason = null)
 {
     public static BackupRunResponse From(BackupRunState s)
     {
@@ -182,7 +212,7 @@ public sealed record BackupRunResponse(
         return new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, pause, s.SuspendReason?.ToString(),
             s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
-            byUser, s.StopRequested.ToString());
+            byUser, s.StopRequested.ToString(), s.SkipReason);
     }
 }
 
@@ -615,6 +645,35 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var config = await configs.GetAsync(configId, ct)
                 ?? throw new InvalidOperationException($"Backup config {configId} not found.");
+
+            // The sentinel gate, and this is the only place it sits. All three ways into a backup — the UI button
+            // (StartAsync), the scheduler (RunTrackedAsync) and the automatic resume after a restart — share this
+            // execution body, so one check covers them all and no future entry point can forget it.
+            //
+            // It goes **before** the account lookup, ahead of every piece of network I/O and before the run
+            // control opens a journal: a round that is not going to happen should cost nothing and must not be
+            // able to fail for a second, unrelated reason on its way to being skipped.
+            if (SentinelGate.Missing(config.SentinelPath, config.LocalRoot) is { } missing)
+            {
+                // Which of the two was configured decides how the line reads. "Sentinel path X does not exist"
+                // for a backup that has no sentinel would send the operator looking for a setting they never
+                // made; what is missing in that case is the root itself, and saying so is what makes the
+                // message actionable.
+                state.SkipReason = string.IsNullOrWhiteSpace(config.SentinelPath)
+                    ? $"Local root '{missing}' does not exist — the source is most likely not mounted."
+                    : $"Sentinel path '{missing}' does not exist — the source is most likely not mounted.";
+                state.Status = RunStatus.Skipped;
+                // Neither WriteStatusAsync(null) nor SetErrorAsync: nothing was attempted, so nothing is known
+                // about this backup that was not known before, and the persisted status must not move in either
+                // direction. Writing Normal here would quietly wipe a genuine earlier failure off a backup that
+                // has not run since.
+                await sp.GetRequiredService<IOperationLog>().AppendAsync(
+                    OperationLogLevel.Warning, $"backup:{config.AccountId}/{config.ContainerName}",
+                    $"Skipped backup '{config.Name}': {state.SkipReason}", ct);
+                state.Completion.TrySetResult();
+                return;
+            }
+
             var account = await sp.GetRequiredService<IAccountService>().GetAsync(config.AccountId, ct)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync(ct);

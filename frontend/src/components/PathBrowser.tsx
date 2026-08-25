@@ -4,18 +4,26 @@ import { ApiError } from '../api/client'
 import { Modal } from './Modal'
 
 /**
- * The local directory picker (design §7). Only directories are selectable; files are listed but not
- * selectable, so the user can confirm they picked the right place. Out-of-bounds entries (usually a
- * symlink pointing outside the root) are greyed out and unclickable.
+ * The local directory picker (design §7). Directories are always selectable; files are listed but not
+ * selectable by default, so the user can confirm they picked the right place. Out-of-bounds entries
+ * (usually a symlink pointing outside the root) are greyed out and unclickable.
+ *
+ * `allowFiles` turns the files into picks as well, for the sentinel field — a sentinel is most often a
+ * marker file inside the mount, and a picker that can only reach directories would push the operator
+ * back to typing the path by hand for the commonest case.
  */
 export function PathBrowser({
   initialPath,
   onPick,
   onClose,
+  allowFiles = false,
+  title = 'Choose a folder',
 }: {
   initialPath?: string
   onPick: (path: string) => void
   onClose: () => void
+  allowFiles?: boolean
+  title?: string
 }) {
   const [data, setData] = useState<BrowseResult | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -65,7 +73,7 @@ export function PathBrowser({
 
   return (
     <Modal
-      title="Choose a folder"
+      title={title}
       onClose={onClose}
       secondary
       footer={
@@ -105,6 +113,19 @@ export function PathBrowser({
                 onClick={() => go(e.fullPath)}
               >
                 {e.name}/
+              </button>
+            ) : allowFiles ? (
+              <button
+                type="button"
+                className="browse-row"
+                disabled={e.outsideRoot}
+                title={e.outsideRoot ? 'Outside the configured root' : undefined}
+                // Picks immediately rather than selecting-then-confirming: the footer button says "use
+                // this folder" and always means the directory being listed, so a file has nowhere to be
+                // held. One click is also what the user expects of a leaf.
+                onClick={() => onPick(e.fullPath)}
+              >
+                {e.name}
               </button>
             ) : (
               <span className="text-faint">{e.name}</span>

@@ -37,11 +37,32 @@ public sealed class BackupChecker(
     /// whole backup and rehashes it, running for hours is normal, and yet the UI showed nothing but a spinner — you
     /// could not tell "still checking" from "wedged".
     /// </param>
+    /// <param name="sentinelPath">
+    /// This backup's sentinel (<see cref="SentinelGate"/>), or null when it has none — in which case
+    /// <paramref name="localRoot"/> stands in for one. When the probed path is absent, the **local axis only**
+    /// is demoted to <see cref="LocalCheckLevel.None"/>: the source is not there to
+    /// compare against, so every entry would come back <see cref="LocalState.Missing"/> — the same false alarm the
+    /// backup gate exists to prevent, rendered as a failed check instead of a version with everything deleted. The
+    /// cloud axis is untouched, because the cloud copy is still there and still worth verifying.
+    /// <para>
+    /// It sits next to <paramref name="localRoot"/> rather than at the end of the parameter list on purpose: the
+    /// two describe one thing (the source, and whether to believe in it), and putting it here makes every existing
+    /// call site — which passed <c>localRoot, ct</c> positionally — a compile error that has to be answered
+    /// deliberately, instead of a silent default that a caller can forget.
+    /// </para>
+    /// </param>
     public async Task<CheckReport> CheckAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
+        string? sentinelPath = null,
         CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null)
     {
         var source = $"check:{account.Id}/{container}";
+        // Demoted before anything is recorded, so the "what was this asked to do" line below states what the run
+        // will actually do rather than what was requested. A log that says `local Content` for a run whose local
+        // axis never executed is worse than no log: it is the exact question this line exists to answer.
+        var localSkipped = SentinelGate.Missing(sentinelPath, localRoot);
+        if (localSkipped is not null)
+            options = options with { Local = LocalCheckLevel.None };
         // What this run was actually asked to do. The two axes and the orphan scan are each independently
         // switchable, and every one of them changes what a later "passed" is worth — a pass at Cloud=None/Local=None
         // establishes almost nothing. Without them recorded, the log cannot answer "what did that check cover?",
@@ -49,10 +70,13 @@ public sealed class BackupChecker(
         await Record(
             NotificationEvents.CheckStart, source, $"Check started: {container}",
             $"cloud {options.Cloud}, local {options.Local}"
-                + (options.ListOrphans ? ", scanning for unreferenced blobs" : ""), ct);
+                + (options.ListOrphans ? ", scanning for unreferenced blobs" : "")
+                + SkipNote(localSkipped), ct);
         try
         {
             var report = await CheckCoreAsync(account, container, password, version, options, localRoot, downloadConcurrency, onProgress, ct);
+            if (localSkipped is not null)
+                report = report with { LocalSkippedSentinel = localSkipped };
             var problems = report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
             // The orphan scan is a separate axis from Ok (orphans are not corruption, so they never fail a check),
             // and it therefore has to be stated separately — otherwise a run that turned up tens of thousands of
@@ -65,7 +89,13 @@ public sealed class BackupChecker(
                 $"Check {(report.Ok ? "passed" : "failed")}: {container}",
                 (report.Ok
                     ? $"{report.Findings.Count} file(s) OK"
-                    : $"{problems} problem(s), {report.RepairablePaths.Count} repairable from local") + orphanNote, ct);
+                    : $"{problems} problem(s), {report.RepairablePaths.Count} repairable from local")
+                + orphanNote
+                // Repeated on the closing line and not only on the opening one, because these two lines are read
+                // in completely different circumstances: the opening one scrolls away, and the closing one is what
+                // a notification carries and what anyone auditing "did this backup verify?" months later reads.
+                // Without it, a cloud-only pass is written down as an unqualified "Check passed".
+                + SkipNote(localSkipped), ct);
             return report;
         }
         catch (Exception ex)
@@ -74,6 +104,11 @@ public sealed class BackupChecker(
             throw;
         }
     }
+
+    /// <summary>The one wording for "the local axis was demoted", so the opening and closing lines cannot describe
+    /// the same event differently. Empty when nothing was demoted.</summary>
+    private static string SkipNote(string? localSkipped) =>
+        localSkipped is null ? "" : $"; local check skipped: sentinel '{localSkipped}' does not exist";
 
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
     {

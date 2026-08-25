@@ -32,7 +32,7 @@ document is a bug.
 
 | | |
 |---|---|
-| [configuration.md](configuration.md) | What a backup is configured with: default inheritance, the container picker, scope rules, and changing the local root. |
+| [configuration.md](configuration.md) | What a backup is configured with: default inheritance, the container picker, scope rules, the sentinel path, and changing the local root. |
 | [operations.md](operations.md) | The password gate, the local path boundary, key ring loss and recovery, 7-Zip settings, and environment variables. |
 
 ## Interface

@@ -317,6 +317,33 @@ too, though some receivers cap URL length.
 > **operation log** at Warning level with the error, so a receiver rejecting the payload is visible from the UI
 > rather than only in the container log.
 
+## Run only if this exists
+
+If your local root is a mount — a NAS share, an external disk, anything that can be absent — set
+**Run only if this exists** on that backup, and point it at something that appears *only once the mount is up*:
+a marker file inside it, or a subdirectory that is always there when the data is. Pick it with **Browse** (files
+are selectable here) or type it; it has to live under that backup's local root, and the line under the box tells
+you whether it is there right now.
+
+The reason to bother: an unmounted share is not a missing folder. The mount point is still there, empty. The
+scan walks it, finds nothing, and the diff concludes — correctly, by its own rules — that you deleted every
+file. That round finishes green, with a tidy summary saying a few hundred thousand files were removed, and
+retention starts counting down on the versions that still hold your data. Nothing about it looks wrong until you
+need it.
+
+When the path is not there:
+
+- **Backups don't run.** The round is recorded as *Skipped*, in amber rather than red, with one line in the
+  operation log. Nothing is written and nothing is recorded, including the backup's own error status — so a
+  failure from last week still shows as a failure.
+- **Checks drop their local half and keep the cloud half.** Verifying the cloud copy is still worth doing; the
+  local comparison would report every file as missing, which is the same false alarm in different clothing. The
+  result says which half ran.
+- **Restore and repair are unaffected.**
+
+Leave the box empty and the local root itself is used, which is almost always what you want if the root *is* the
+mount point: a root that is not there cannot be backed up either way.
+
 ## Rule lists, and why each one has two boxes
 
 Four settings take a list of patterns — **Ignore**, **Don't compress**, **Don't group**, **Pack across

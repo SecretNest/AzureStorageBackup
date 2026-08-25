@@ -293,6 +293,22 @@ also take over every unhandled exception outside that scope, changing existing f
 Status 400–499 passes through with Azure's code and description; everything else, including
 connection failures, maps to **502** meaning the storage account is unreachable.
 
+## Live probes in a form
+
+The sentinel field asks the backend, as you type, whether the path is there — debounced 400 ms, with
+the in-flight request aborted on every keystroke so a stale answer cannot land last and describe a
+path already edited away.
+
+It is the one field in the app where **absence is a normal value**, so the verdict is worded as an
+observation rather than a judgement, and rendered amber rather than red: "not there right now" is not
+something to fix if the disk is simply not mounted at this moment, and only the operator knows which
+it is. The save is never blocked by it — refusing to save an absent sentinel would make the setting
+impossible to enter exactly when it is needed. Only a genuine refusal (outside the configured root)
+is red.
+
+With the box empty the probe follows the local root instead, mirroring the backend's `SentinelGate`,
+so the line describes the check that will really run rather than one the form invented.
+
 ## How this is verified
 
 There is no component-rendering test coverage. vitest runs `environment: 'node'` over pure functions

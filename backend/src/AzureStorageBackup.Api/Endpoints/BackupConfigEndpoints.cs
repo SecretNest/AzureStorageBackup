@@ -167,6 +167,7 @@ public static class BackupConfigEndpoints
             if (string.IsNullOrWhiteSpace(req.Name))
                 return Results.BadRequest(new { error = "Name is required." });
             if (PathBoundaryGuard.Blocked(boundary, req.LocalRoot) is { } outside) return outside;
+            if (SentinelOutside(req) is { } sentinelOutside) return sentinelOutside;
             if (await accounts.GetAsync(req.AccountId, ct) is null)
                 return Results.BadRequest(new { error = "Account not found." });
             if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
@@ -185,6 +186,9 @@ public static class BackupConfigEndpoints
             // Name is not one of the locked fields and stays editable, so blanks still have to be blocked here (the same rule as on the create endpoint).
             if (string.IsNullOrWhiteSpace(req.Name))
                 return Results.BadRequest(new { error = "Name is required." });
+            // The sentinel *is* editable, so unlike the locked fields its boundary check has to be repeated here —
+            // the create guard cannot speak for a value that arrives later.
+            if (SentinelOutside(req) is { } sentinelOutside) return sentinelOutside;
 
             // Empty password = keep the existing value, non-empty = refuse (decision 8), both decided in the service layer: the ciphertext carries a random IV, so it cannot be compared here.
             var update = req.ToConfig(encryption);
@@ -876,6 +880,42 @@ public static class BackupConfigEndpoints
         + "backup — pointing a second one at it would make both write their own version history to the "
         + "same place, and each would delete the other's data as it cleans up old versions. Pick another "
         + "container, or delete that backup first.";
+
+    /// <summary>
+    /// Where the sentinel is allowed to point, checked on both create and update (it is editable, so the create
+    /// guard cannot speak for a value that arrives later).
+    /// <para>
+    /// It must lie **inside this backup's own local root**. That is stricter than the <c>Backup__Root</c> filter
+    /// every other path goes through, and deliberately so: the sentinel's whole job is to say whether *this
+    /// backup's source* is mounted, and one that lives somewhere else answers a different question — it would go
+    /// on saying "yes" while the source it is supposed to vouch for is gone. Being under the local root also puts
+    /// it inside <c>Backup__Root</c> for free, since the root itself is admitted there.
+    /// </para>
+    /// <para>
+    /// What is deliberately **not** checked is whether the sentinel exists. The moment an operator configures one
+    /// is very likely a moment when the mount is not there — that is the situation the setting is for — so
+    /// validating existence at save time would make it impossible to enter exactly when it is needed. The UI
+    /// probes it live instead (<c>/api/system/path-exists</c>) and reports what it finds without refusing to save.
+    /// </para>
+    /// <para>
+    /// Blank is not a path and skips the check: that is how the feature is turned off, and the local root then
+    /// stands in as the sentinel (see <see cref="SentinelGate"/>).
+    /// </para>
+    /// </summary>
+    private static IResult? SentinelOutside(BackupConfigRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.SentinelPath))
+            return null;
+        var sentinel = req.SentinelPath.Trim();
+        return PathBoundary.IsWithin(req.LocalRoot, sentinel)
+            ? null
+            : Results.BadRequest(new
+            {
+                error = $"The sentinel path '{sentinel}' must be inside this backup's local root "
+                    + $"'{req.LocalRoot}'. It exists to say whether this backup's source is mounted, and a path "
+                    + "outside the root cannot answer that.",
+            });
+    }
 
     /// <summary>
     /// Whether this backup config is still awaiting a password reset. When Healthy it short-circuits, so the list endpoint triggers no

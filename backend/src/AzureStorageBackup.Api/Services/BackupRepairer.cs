@@ -64,8 +64,13 @@ public sealed class BackupRepairer(
         // Find the blobs that are bad in the cloud: run the checker (at the chosen depth) over the target version.
         // Orphan listing is left to the deletion step, which recomputes it itself (TOCTOU-safe).
         var report = await (checker ?? throw new InvalidOperationException("Repair requires a checker."))
+            // sentinelPath: null deliberately. The sentinel's only effect on a check is to demote the local axis,
+            // and this check already pins it to None — so there is nothing here for it to demote, and passing one
+            // would just be a value with no consequence. Repair itself needs no gate either: it rebuilds bad cloud
+            // blobs *from* local content, one direction only, so an unmounted source means "nothing is repairable
+            // from local" and the run does less, never something wrong.
             .CheckAsync(account, container, password, target.Version,
-                checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, ct);
+                checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct);
         var badBlobs = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);

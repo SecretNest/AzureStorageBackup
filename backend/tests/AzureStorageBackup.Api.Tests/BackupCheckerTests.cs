@@ -552,7 +552,7 @@ public sealed class BackupCheckerTests : IDisposable
             var result = await checker.CheckAsync(
                 account, name, null, null,
                 new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.Content },
-                _src, CancellationToken.None,
+                _src, ct: CancellationToken.None,
                 onProgress: d => { lock (reports) reports.Add(d); });
 
             Assert.True(result.Ok);
@@ -636,7 +636,7 @@ public sealed class BackupCheckerTests : IDisposable
             var result = await checker.CheckAsync(
                 account, name, null, null,
                 new CheckOptions { Cloud = CloudCheckLevel.Content },
-                _src, CancellationToken.None,
+                _src, ct: CancellationToken.None,
                 onProgress: d => { lock (reports) reports.Add(d); });
 
             Assert.True(result.Ok);
@@ -749,7 +749,7 @@ public sealed class BackupCheckerTests : IDisposable
 
             var check = checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src,
-                CancellationToken.None, downloadConcurrency: 1,
+                ct: CancellationToken.None, downloadConcurrency: 1,
                 // Break only during the download-verification stretch. If the whole sink broke, the check would blow
                 // up back in the listing/metadata stages and never reach the gate at all — that would be testing
                 // something else.

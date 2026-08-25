@@ -70,6 +70,10 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
         existing.CrossDirGroupRulesCaseInsensitive = update.CrossDirGroupRulesCaseInsensitive;
         // Scope is editable (it is not one of the locked base fields); a change takes effect on the next backup.
         existing.ScopeRules = update.ScopeRules;
+        // So is the sentinel, and for a stronger reason than scope: nothing downstream is keyed by it, so changing
+        // it desynchronises nothing. Locking it would mean an operator who reorganises a mount point has to
+        // recreate the backup — and recreating it is precisely the expensive operation the sentinel exists to avoid.
+        existing.SentinelPath = update.SentinelPath;
         existing.IncludeSymlinks = update.IncludeSymlinks;
         existing.MaxVersions = update.MaxVersions;
         existing.MaxAgeDays = update.MaxAgeDays;

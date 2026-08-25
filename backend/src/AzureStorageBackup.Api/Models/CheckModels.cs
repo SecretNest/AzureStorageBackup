@@ -80,6 +80,23 @@ public sealed record CheckReport(int Version, IReadOnlyList<FileFinding> Finding
     public IReadOnlyList<string> OrphanBlobs { get; init; } = [];
 
     /// <summary>
+    /// The sentinel path that was missing, which is why every <see cref="FileFinding.Local"/> on this report reads
+    /// <see cref="LocalState.NotChecked"/>; null when the local axis was not demoted.
+    /// <para>
+    /// It has to be carried on the report for the same reason <see cref="OrphansChecked"/> does, and the failure
+    /// mode is worse here: a column of NotChecked cannot tell "nobody asked for a local check" from "asked, and
+    /// the source was not mounted", and a reader who assumes the former concludes the backup verified fine. The
+    /// check dialog is closed by the time anyone reads this, so the report is the only thing left that can say it.
+    /// </para>
+    /// <para>
+    /// It deliberately does **not** affect <see cref="Ok"/>. The cloud half really did run and really did pass;
+    /// failing the whole check because half of it was not applicable would be the false alarm this feature exists
+    /// to remove, just moved to a different screen.
+    /// </para>
+    /// </summary>
+    public string? LocalSkippedSentinel { get; init; }
+
+    /// <summary>
     /// Whether the cloud listing check actually ran, which an empty <see cref="OrphanBlobs"/> cannot say on its own:
     /// "nobody asked" and "asked, and the container is clean" are the same empty list, and a reader with only that
     /// list has to guess.

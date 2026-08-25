@@ -100,7 +100,7 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             {
                 state.Report = await sp.GetRequiredService<BackupChecker>().CheckAsync(
                     account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
-                    version, options, config.LocalRoot, state.Cancellation.Token,
+                    version, options, config.LocalRoot, config.SentinelPath, state.Cancellation.Token,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
                     onProgress: d => state.Detail = d);
                 state.Status = RunStatus.Completed;

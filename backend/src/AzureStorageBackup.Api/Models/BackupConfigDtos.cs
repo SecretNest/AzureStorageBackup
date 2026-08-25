@@ -42,7 +42,9 @@ public record BackupConfigResponse(
     string? IgnoreRulesCaseInsensitive = null,
     string? DontCompressRulesCaseInsensitive = null,
     string? DontGroupRulesCaseInsensitive = null,
-    string? CrossDirGroupRulesCaseInsensitive = null)
+    string? CrossDirGroupRulesCaseInsensitive = null,
+    /// <summary>The path that must exist before this backup runs; null = no precondition. See <see cref="BackupConfig.SentinelPath"/>.</summary>
+    string? SentinelPath = null)
 {
     /// <summary>
     /// <paramref name="secretsUnavailable"/> must be passed according to whether this config's ciphertext can actually be
@@ -64,7 +66,7 @@ public record BackupConfigResponse(
         secretsUnavailable && !string.IsNullOrEmpty(c.PasswordProtected),
         ResolvedBackupSettings.From(c, settings), c.CrossDirGroupRules, c.ScopeRules,
         c.IgnoreRulesCaseInsensitive, c.DontCompressRulesCaseInsensitive,
-        c.DontGroupRulesCaseInsensitive, c.CrossDirGroupRulesCaseInsensitive);
+        c.DontGroupRulesCaseInsensitive, c.CrossDirGroupRulesCaseInsensitive, c.SentinelPath);
 }
 
 /// <summary>Restore request body. An empty TargetRoot means the config's local root; an empty Version means the latest version.
@@ -126,11 +128,23 @@ public record BackupConfigRequest(
     string? IgnoreRulesCaseInsensitive = null,
     string? DontCompressRulesCaseInsensitive = null,
     string? DontGroupRulesCaseInsensitive = null,
-    string? CrossDirGroupRulesCaseInsensitive = null)
+    string? CrossDirGroupRulesCaseInsensitive = null,
+    /// <summary>The path that must exist before this backup runs; null or blank = no precondition. See <see cref="BackupConfig.SentinelPath"/>.</summary>
+    string? SentinelPath = null)
 {
+    /// <summary>
+    /// The sentinel as it should be stored: a blank becomes null, so "no sentinel" has exactly one representation
+    /// in the database. Both the create and the update path go through <see cref="ToConfig"/>, so normalising here
+    /// covers both — and it is what lets an operator turn the feature off by emptying the text box, rather than
+    /// saving a sentinel whose path is the empty string.
+    /// </summary>
+    private string? NormalizedSentinel =>
+        string.IsNullOrWhiteSpace(SentinelPath) ? null : SentinelPath.Trim();
+
     /// <summary>The Password in the request body is plaintext; it is encrypted the moment it lands on the entity (design §3.1: the entity holds ciphertext only).</summary>
     public BackupConfig ToConfig(IEncryptionService encryption) => new()
     {
+        SentinelPath = NormalizedSentinel,
         VolumeBytes = VolumeBytes,
         VerboseLogging = VerboseLogging,
         AccountId = AccountId,

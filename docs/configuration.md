@@ -345,6 +345,83 @@ apply's own pass.
 > as narrowing the scope by hand, with no data corruption and no cloud versions deleted. This is
 > spelled out on the forced-migration confirmation screen.
 
+## Sentinel path: refusing to run on an unmounted source
+
+An unmounted root is not an absent root, and that is the whole problem. The mount point stays on
+disk with nothing under it. The scan walks it and finds an empty tree. The diff compares that with
+the previous version and concludes, correctly by its own rules, that every file was deleted. One
+round records a version in which the entire backup has vanished — and **nothing about it looks like a
+failure**: no error, no warning, a green run and a tidy summary saying a few hundred thousand files
+were removed. Retention then starts counting down on the versions that still hold the data.
+
+The sentinel turns that into a question asked before the run instead of a conclusion reached after
+it. Point `SentinelPath` at something that only exists **once the mount is up** — a marker file
+inside it, or a subdirectory that is always present when the data is — and the run checks for it
+first.
+
+**Existence only.** Not readability, not emptiness, not a listing. A genuinely empty directory is a
+legitimate thing to back up and must not be mistaken for an unmounted one, and every deeper probe is
+a new way to fail on a source that is perfectly healthy.
+
+**With no sentinel configured, the local root stands in as one.** A root that is not there cannot be
+backed up under any circumstances, so it answers the same question. This is why the backup path has
+no separate root-existence test — this is that test, with a better answer when a sentinel is
+configured. It also means every config that predates the feature gets the protection without being
+edited.
+
+**A configured sentinel must live inside that backup's local root**, which is stricter than the
+`Backup__Root` admission filter every other path goes through. The sentinel's job is to vouch for
+*this* backup's source; one living elsewhere answers a different question and would go on saying
+"yes" while the source it speaks for is gone. Refused with 400 at create and update alike — the
+setting stays editable after creation, so the create-time check cannot speak for a value that arrives
+later.
+
+**Its existence is deliberately not validated when saving.** The moment an operator configures a
+sentinel is very likely a moment when the mount is not there; that is the situation it is for.
+Refusing to save would make the setting impossible to enter exactly when it is needed. The form
+probes it live instead (`GET /api/system/path-exists`) and reports what it finds — found, not there
+right now, or outside the root — without blocking the save. The reason that probe exists at all is
+that a typo and an unmounted disk are indistinguishable in a text box, and the difference otherwise
+surfaces days later as a backup that has been quietly skipping every night.
+
+### What a missing sentinel does to each operation
+
+| Operation | Effect |
+|---|---|
+| Backup | Does not start. `RunStatus.Skipped`, one `Warning` in the operation log, persisted status untouched. |
+| Check | The **local axis only** is demoted to `LocalCheckLevel.None`. The cloud axis runs in full. |
+| Repair | Unaffected. |
+| Restore | Unaffected. |
+
+**Backups skip rather than fail.** See
+[run-lifecycle.md](run-lifecycle.md#the-status-model) for why `Skipped` had to be its own status. The
+short version: an unmounted NAS is not a fault, a red badge every morning is an alarm nobody reads
+after a week, and writing `Normal` instead would wipe a genuine earlier failure off a backup that has
+not run since. The gate sits in `BackupRunner.RunCoreAsync`, ahead of every piece of network I/O and
+before the run control opens a journal, so a round that will not happen costs nothing and cannot fail
+for some second, unrelated reason on its way to being skipped. All three entry points — the UI
+button, the scheduler and the automatic resume after a restart — share that body, so one check covers
+them and no future entry point can forget it.
+
+**Checks lose half, not all of themselves.** The cloud copy is still there and still worth verifying
+when the source is not mounted; the local comparison is not, because every entry would come back
+`Missing` — the same false alarm, rendered as a failed check instead of a version with everything
+deleted. This matters most on the scheduled path, which runs unattended: without the demotion, a
+perfectly healthy backup sends a failure notification every night the disk is not mounted. The
+demotion is applied in `BackupChecker.CheckAsync`, the one point all three callers (the UI runner,
+the scheduler, repair's internal pre-check) pass through.
+
+The report carries `LocalSkippedSentinel` and the log line says so at both ends of the run. That is
+not decoration: a column of `NotChecked` cannot tell "nobody asked for a local check" from "asked,
+and the source was not mounted", and a reader who assumes the first concludes the backup verified
+fine. The check dialog is closed long before anyone reads the result, so the report is the only thing
+left that can say it. It does **not** affect `CheckReport.Ok` — the cloud half really did run and
+really did pass, and failing the whole check because the other half was inapplicable would just move
+the false alarm to a different screen.
+
+**Repair needs no gate.** It rebuilds bad cloud blobs *from* local content, one direction only, so an
+unmounted source means "nothing is repairable from local" — the run does less, never something wrong.
+
 ## Other configuration
 
 **Groups** hold at least one backup and exist to be targeted by schedules. A schedule on a group runs

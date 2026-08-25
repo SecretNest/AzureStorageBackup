@@ -125,6 +125,12 @@ public sealed class TaskDispatcher(
                     // is in fact safely preserved and the next round picks it back up. Treated the same as Canceled: end quietly.
                     if (backupState.Status == RunStatus.Suspended)
                         return;
+                    // The sentinel said the source is not there, so nothing was attempted. Returning here is not
+                    // decoration: the line at the bottom of this method writes Normal after any dispatch that did
+                    // not throw, and reaching it would let a round that did nothing wipe the red badge off the last
+                    // round that genuinely failed. The runner has already written the skip to the operation log.
+                    if (backupState.Status == RunStatus.Skipped)
+                        return;
                     break;
 
                 case ScheduledTaskType.Check:
@@ -137,7 +143,11 @@ public sealed class TaskDispatcher(
                         RehydrateTier = task.CheckRehydrateTier is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     };
                     var result = await sp.GetRequiredService<BackupChecker>()
-                        .CheckAsync(account, container, password, null, options, config.LocalRoot, ct,
+                        // The sentinel matters most on this path: a scheduled check runs unattended, so the
+                        // "every file is Missing" report a check of an unmounted source produces would arrive as a
+                        // failure notification in the middle of the night, night after night, for a backup that is
+                        // perfectly healthy. The cloud half still runs.
+                        .CheckAsync(account, container, password, null, options, config.LocalRoot, config.SentinelPath, ct,
                             downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5);
                     if (!result.Ok)
                         logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",

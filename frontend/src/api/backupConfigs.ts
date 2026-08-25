@@ -145,6 +145,13 @@ export interface BackupConfig {
   lastErrorAt: string | null
   activity: BackupActivity
   secretsUnavailable: boolean
+  /**
+   * A path that must exist before this backup runs; null = no precondition. It exists because an unmounted
+   * root is not an absent root: the mount point is still there with nothing under it, so the diff concludes
+   * every file was deleted and records a version in which the whole backup has vanished. Point it at
+   * something that only appears after the mount.
+   */
+  sentinelPath: string | null
 }
 
 export interface BackupConfigInput {
@@ -176,6 +183,8 @@ export interface BackupConfigInput {
   groupCapBytes: number | null
   volumeBytes: number | null
   verboseLogging: boolean | null
+  /** See BackupConfig.sentinelPath. A blank is normalised to null by the backend, which is how it is cleared. */
+  sentinelPath: string | null
 }
 
 // The validation report for a local-root migration (the backend's LocalRootPreviewResponse).
@@ -345,7 +354,11 @@ export interface BackupProgress {
 // manual Reset).
 // Suspended = stopped after saving the scene safely, semantically closer to Canceled than to Failed:
 // the next run picks up exactly where it left off.
-export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspended'
+// Skipped = the run never started, because this backup's sentinel path was not there (the source is most
+// likely not mounted). Its own state rather than a flavour of Failed or Canceled: nothing was attempted,
+// so the persisted status is left exactly as it was — in both directions, which matters, because writing
+// "Normal" would wipe a genuine earlier failure off a backup that has not run since.
+export type RunStatus = 'Running' | 'Completed' | 'Failed' | 'Canceled' | 'Suspended' | 'Skipped'
 
 // Stuck on a transient error, waiting for the self-healing retry. **This is not a status**: status is
 // still Running, because the background task is alive and the staging lease is still held. Making it a
@@ -420,6 +433,9 @@ export interface BackupRun {
   // minutes with the status still reading 'Running', and without it the fact that a stop had been asked for
   // lived only in the tab that asked — see windDownFromServer.
   stopRequested: StopRequested
+  // Why the run was skipped; absent when it was not, and absent from an older backend. Kept apart from
+  // `error` on purpose: that one is painted red, and a backup waiting on a mount is not in an error state.
+  skipReason?: string | null
   // Why, when status === 'Suspended': UserRequested / AutoSuspended.
   suspendReason: string | null
 }
@@ -483,6 +499,11 @@ export interface CheckReport {
   // Set when the scan was asked for but abandoned (the full reference set could not be built). Shown rather than
   // swallowed: silence is indistinguishable from "never ticked", which is the confusion being fixed.
   orphanScanIssue: string | null
+  // The sentinel that was missing, which is why every finding's local state reads "not checked"; null when
+  // the local axis ran. Carried on the report for the same reason orphansChecked is — the check dialog is
+  // long closed by the time anyone reads this, and a column of "not checked" cannot tell "nobody asked" from
+  // "asked, and the source was not mounted". Optional: an older backend does not send it.
+  localSkippedSentinel?: string | null
 }
 
 export interface RepairReport {

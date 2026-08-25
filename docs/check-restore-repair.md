@@ -31,10 +31,28 @@ single `deep` boolean, which could not express the combinations that matter.
 The local ladder is the same one the diff uses: length → mtime and permissions → head hash → full
 hash.
 
+**The sentinel demotes this axis and only this axis.** When the backup's sentinel path is absent —
+or, with none configured, its local root — the level is forced to Skip before the run starts, while
+the cloud axis proceeds untouched. Without it, checking an unmounted source reports every entry as
+`Missing`: a total failure that says nothing about the data, produced by a backup that is perfectly
+healthy. On the scheduled path that arrives as a failure notification every night the disk is down.
+
+The demotion happens in `BackupChecker.CheckAsync`, the single point all three callers pass through
+(the UI runner, the scheduler, and repair's internal pre-check), and the report carries
+`LocalSkippedSentinel` so the result can say which half ran. It does not affect `Ok` — the cloud half
+really did pass. See
+[configuration.md](configuration.md#sentinel-path-refusing-to-run-on-an-unmounted-source).
+
 ### The report
 
 Every file gets a `CloudState`, a `LocalState` and a `Repairable` flag. Scheduled checks carry both
 levels.
+
+`LocalSkippedSentinel` names the path that was not there when the local axis was demoted, and is null
+otherwise. It has to be on the report rather than left for the caller to infer, for the same reason
+`OrphansChecked` does: a column of `NotChecked` cannot tell "nobody asked" from "asked, and the
+source was not mounted", and the dialog that knew which one it was is closed by the time anyone reads
+the result.
 
 Local verification tolerates unreadable files: one that cannot be read is `LocalState.Missing` — no
 usable local copy, and unusable as a repair source — consistent with the existing "path outside the

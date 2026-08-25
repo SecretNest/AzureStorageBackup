@@ -10,7 +10,7 @@ survive, and the automatic resume after a restart.
 backend, and the frontend polls in a `while (run.status === 'Running')` loop. That shapes the model:
 
 ```csharp
-public enum RunStatus { Running, Completed, Failed, Canceled, Suspended }
+public enum RunStatus { Running, Completed, Failed, Canceled, Suspended, Skipped }
 public enum SuspendReason { UserRequested, AutoSuspended, ShuttingDown }
 ```
 
@@ -43,9 +43,25 @@ The UI distinguishes them by reason.
 | `Running` + `Suspending` | winding down, waiting for in-flight uploads | lease + busy lock | (none) |
 | `Running` + `Canceling` | winding down | lease + busy lock | (none) |
 | `Suspended` | resumable | all released | `Resume` `Discard` |
+| `Skipped` | never started: the sentinel was not there | never taken | `Run` |
 
 Both transitional sub-states keep `Status == Running` because the resources have not been handed
 back, so everything should still consider the target busy.
+
+**`Skipped` is its own status because it is neither of the two it resembles.** A backup whose
+sentinel path is absent never starts — see
+[configuration.md](configuration.md#sentinel-path-refusing-to-run-on-an-unmounted-source). `Failed`
+would write an `Error` the operator has to clear by hand, and a NAS that is simply not mounted
+overnight would wear a red badge every morning until the alarm stopped being read. `Canceled` says a
+person changed their mind, and nobody did. What happened is that a precondition was not met, so
+nothing was attempted and **nothing new is known about this backup** — which is why the persisted
+status is left exactly as it was, in both directions. Writing `Normal` would be the worse of the two:
+it would wipe a genuine earlier failure off a backup that has not run since.
+
+> **The check every caller has to make.** `TaskDispatcher` writes `Normal` after any dispatch that
+> did not throw, so a status it has not been taught about is silently treated as a success. Adding
+> `Skipped` therefore meant adding a fourth early return beside `Canceled` and `Suspended`. Anything
+> else that concludes "not `Failed`, so it worked" needs the same treatment.
 
 ## The pause gate
 
