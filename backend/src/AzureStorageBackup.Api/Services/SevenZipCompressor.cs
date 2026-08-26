@@ -169,7 +169,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         try
         {
             var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
-            volumes = CollectVolumes(request.OutputArchivePath);
+            volumes = CollectVolumes(request.OutputArchivePath, request.VolumeBytes);
 
             // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1
             // is exactly the exit code 7z gives when it drops a member it could not read (it also covers other
@@ -254,11 +254,16 @@ public sealed class SevenZipCompressor : IFileCompressor
         args.Add(Path.GetFullPath(request.OutputArchivePath));
 
         long written = 0;
+        IReadOnlyList<string> volumes;
         try
         {
             await SevenZipCli.RunStreamingAsync(_exe, args, ct,
                 writeStdin: async (stdin, token) => written = await writeSource(stdin, token),
                 priority: _priority);
+            // Inside the same try as the run: collection is where an incomplete family is caught
+            // (see EnsureFamilyComplete), and that verdict has to leave the temp area as clean as a failed run does,
+            // or the fragments it rejected stay behind looking exactly like a finished product.
+            volumes = CollectVolumes(request.OutputArchivePath, request.VolumeBytes);
         }
         catch
         {
@@ -267,8 +272,6 @@ public sealed class SevenZipCompressor : IFileCompressor
             DeleteArchiveRemnants(request.OutputArchivePath);
             throw;
         }
-
-        var volumes = CollectVolumes(request.OutputArchivePath);
 
         // The entry must really be in the archive, and its uncompressed size must equal the byte count we fed in.
         // Those fed bytes are exactly the bytes we hashed, so once this check passes there is no gap left between
@@ -397,9 +400,6 @@ public sealed class SevenZipCompressor : IFileCompressor
     }
 
     /// <summary>
-    /// Collects the volume files produced. When splitting, 7z produces out.7z.001/.002...; when not, out.7z.
-    /// </summary>
-    /// <summary>
     /// Delete everything this archive left in the temp area, 7-Zip's own in-progress files included.
     /// <para>
     /// <see cref="CollectVolumes"/> deliberately matches only **finished** volumes — names ending in three
@@ -429,20 +429,97 @@ public sealed class SevenZipCompressor : IFileCompressor
         catch { /* the directory itself may already be gone */ }
     }
 
-    private static IReadOnlyList<string> CollectVolumes(string archivePath)
+    /// <summary>
+    /// Collects the volume files produced. When splitting, 7z produces out.7z.001/.002...; when not, out.7z.
+    /// <para>
+    /// **Three digits is the padding, not the width.** 7-Zip zero-pads to three and then simply keeps counting:
+    /// .999 is followed by .1000, .1001, and so on. Matching "exactly three digits" therefore caps the family at
+    /// 999 volumes, and ordering the names as plain text puts .1000 between .100 and .101. Neither failure is
+    /// visible where it happens: every volume 7z wrote is still on the temp disk, so the archive opens and verifies
+    /// perfectly in place — the damage is confined to the list handed to the uploader, and surfaces only as an
+    /// unopenable archive in the container months later (the 7z end header lives in the **last** volume, so a
+    /// truncated family is not a partial restore but no restore at all).
+    /// </para>
+    /// <para>
+    /// With the default 100 MiB volumes it takes a ~97.6 GiB file to reach 999, which is why this went unnoticed.
+    /// </para>
+    /// </summary>
+    /// <param name="volumeBytes">The split size this archive was written with, for <see cref="EnsureFamilyComplete"/>.
+    /// null = the caller did not split, so there is nothing to verify.</param>
+    private static IReadOnlyList<string> CollectVolumes(string archivePath, long? volumeBytes = null)
     {
         var full = Path.GetFullPath(archivePath);
         var dir = Path.GetDirectoryName(full)!;
         var name = Path.GetFileName(full);
 
+        // Ordered by volume **number**, never by name: the uploader gives the i-th file of this list the blob name
+        // .00(i+1), so a text ordering would store .1000's content under the name .100 — an archive that is complete,
+        // correctly sized, and shuffled, which no later check can detect.
         var volumes = Directory.EnumerateFiles(dir, name + ".*")
-            .Where(f => System.Text.RegularExpressions.Regex.IsMatch(f, @"\.\d{3}$"))
-            .OrderBy(f => f, StringComparer.Ordinal)
+            .Select(f => (File: f, Number: VolumeNumber(f)))
+            .Where(x => x.Number > 0)
+            .OrderBy(x => x.Number)
             .ToList();
 
         if (volumes.Count > 0)
-            return volumes;
+        {
+            EnsureFamilyComplete(volumes, volumeBytes);
+            return [.. volumes.Select(x => x.File)];
+        }
 
         return File.Exists(full) ? [full] : [];
+    }
+
+    /// <summary>The volume number in <c>name.7z.NNN</c>, or -1 when this is not a finished volume of that archive.
+    /// Digits are tested with <see cref="char.IsAsciiDigit"/> rather than a <c>\d</c> regex, which in .NET also
+    /// accepts non-ASCII digits that would then fail to parse — the same rule <see cref="VolumeBlobIO.IsVolumeOf"/>
+    /// applies to blob names. 7z's in-progress <c>.NNN.tmp</c> files fall out here too, since their extension is
+    /// <c>.tmp</c>.</summary>
+    private static int VolumeNumber(string path)
+    {
+        var ext = Path.GetExtension(path);
+        if (ext.Length < 4)             // '.' plus at least the three digits 7z pads to
+            return -1;
+        var digits = ext[1..];
+        return digits.All(char.IsAsciiDigit) && int.TryParse(digits, out var n) ? n : -1;
+    }
+
+    /// <summary>
+    /// The backstop for the whole class of defect above: whatever the collector matched, does it actually add up to
+    /// a whole archive?
+    /// <para>
+    /// Two things are asserted, both free. **The numbers run 1..N with no gaps** — a family missing a volume in the
+    /// middle. And **the last volume is short** — 7z fills every volume it writes except the final one, so a family
+    /// whose last volume is still exactly full is a family that was cut off, which is precisely the shape a capped
+    /// collector produces.
+    /// </para>
+    /// <para>
+    /// This has to live here rather than in the callers' own verification, because that verification is structurally
+    /// blind to it: <see cref="CompressStreamAsync"/> proves the archive holds the right member at the right size by
+    /// **listing the archive on disk**, where every volume is still present — so it passes with flying colours over
+    /// a list that is missing its tail. Nothing downstream can see it either; the index records whatever count it is
+    /// given, and check verifies the volumes against that same count.
+    /// </para>
+    /// </summary>
+    private static void EnsureFamilyComplete(IReadOnlyList<(string File, int Number)> volumes, long? volumeBytes)
+    {
+        for (var i = 0; i < volumes.Count; i++)
+        {
+            if (volumes[i].Number != i + 1)
+                throw new InvalidOperationException(
+                    $"7-Zip volume family '{Path.GetFileName(volumes[0].File)}' is not contiguous: "
+                    + $"expected volume {i + 1}, found {volumes[i].Number}.");
+        }
+
+        // A single volume is a complete archive in its own right and is never padded to the split size.
+        if (volumeBytes is not { } size || volumes.Count < 2)
+            return;
+
+        var last = new FileInfo(volumes[^1].File).Length;
+        if (last >= size)
+            throw new InvalidOperationException(
+                $"7-Zip volume family '{Path.GetFileName(volumes[0].File)}' looks truncated: it ends at volume "
+                + $"{volumes[^1].Number} with a full {last}-byte volume, so more volumes were written than were "
+                + "collected. Refusing to upload a partial archive.");
     }
 }

@@ -82,6 +82,75 @@ public sealed class SevenZipCompressorTests : IDisposable
         Assert.Equal(25_000, new FileInfo(Path.Combine(outDir, "big.bin")).Length);
     }
 
+    /// <summary>
+    /// Past the 999th volume 7-Zip stops zero-padding to three digits and writes <c>.1000</c>, <c>.1001</c>… — four
+    /// digits and more. A collector that matches "exactly three digits" therefore silently caps the family at 999,
+    /// and a collector that sorts the names as plain strings puts <c>.1000</c> between <c>.100</c> and <c>.101</c>.
+    /// <para>
+    /// Both failures are silent where it matters most. The volumes 7z produced are all still on the temp disk, so
+    /// the archive opens and verifies perfectly **in place** — the truncation only exists in the list handed to the
+    /// uploader. That is why this test extracts from a copy holding **only the collected volumes**: that copy is
+    /// what the container ends up with, and it is the only place the defect is visible.
+    /// </para>
+    /// <para>
+    /// The threshold is 999 × volume size, so with the default 100 MiB volumes it takes a ~97.6 GiB file to reach —
+    /// which is exactly why it went unnoticed. 1000-byte volumes reproduce it in about a second.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Collects_Every_Volume_Past_The_Three_Digit_Boundary()
+    {
+        var compressor = Compressor();
+        var src = SourceDir();
+        // Store mode, 1000-byte volumes → a little over 1000 volumes, i.e. safely past .999.
+        WriteInto(src, "big.bin", new byte[1_005_000]);
+
+        var archive = Path.Combine(_dir, "wide.7z");
+        var result = await compressor.CompressAsync(
+            new CompressionRequest(src, ["big.bin"], archive, VolumeBytes: 1_000, StoreOnly: true));
+
+        Assert.True(result.VolumeFiles.Count > 999,
+            $"the family runs past .999, but only {result.VolumeFiles.Count} volume(s) were collected");
+
+        // Ascending by volume **number**, not by name: the uploader names the i-th file of this list .00(i+1), so a
+        // list ordered as text would map .1000's content onto the blob named .100 and corrupt the archive silently.
+        var numbers = result.VolumeFiles
+            .Select(f => int.Parse(Path.GetExtension(f)[1..], System.Globalization.CultureInfo.InvariantCulture))
+            .ToList();
+        Assert.Equal(Enumerable.Range(1, result.VolumeFiles.Count), numbers);
+
+        // Only what was collected reaches the container. Extract from exactly that set.
+        var uploaded = Path.Combine(_dir, "uploaded");
+        Directory.CreateDirectory(uploaded);
+        foreach (var v in result.VolumeFiles)
+            File.Copy(v, Path.Combine(uploaded, Path.GetFileName(v)));
+
+        var outDir = Path.Combine(_dir, "wide-extracted");
+        await compressor.ExtractAsync(
+            Path.Combine(uploaded, Path.GetFileName(result.VolumeFiles[0])), outDir, password: null);
+        Assert.Equal(1_005_000, new FileInfo(Path.Combine(outDir, "big.bin")).Length);
+    }
+
+    /// <summary>
+    /// The guard behind the collector: 7z fills every volume but the last, so a final volume that is still exactly
+    /// full means the family was cut short. Asserted here through the ordinary success path — a correct compression
+    /// must not trip it.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Complete_Family_Ends_On_A_Short_Volume()
+    {
+        var compressor = Compressor();
+        var src = SourceDir();
+        WriteInto(src, "big.bin", new byte[25_000]);
+
+        var archive = Path.Combine(_dir, "tail.7z");
+        var result = await compressor.CompressAsync(
+            new CompressionRequest(src, ["big.bin"], archive, VolumeBytes: 10_000, StoreOnly: true));
+
+        Assert.True(new FileInfo(result.VolumeFiles[^1]).Length < 10_000,
+            "the last volume of a finished archive is the short one");
+    }
+
     [SkippableFact]
     public async Task Encrypted_Archive_RoundTrips_And_Requires_Password()
     {
