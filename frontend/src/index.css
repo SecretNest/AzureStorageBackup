@@ -711,6 +711,22 @@ tbody tr.edit-row > td > .panel {
   color: var(--text-muted);
   white-space: nowrap;
 }
+/* The control side of the row, as a single flex item however many controls it holds. A rule list has two - the
+   case-sensitive box and the case-insensitive one under it - and as two flex items of .defaultable the second one
+   wrapped onto a line of its own, flush against the left edge of the row instead of under the box above it.
+   Block, not flex: the controls stack in normal flow, and a percentage width inside (the phone layer widens .w-lg
+   to 100%) resolves against this box rather than against a column whose own width is still being decided. */
+.defaultable-control {
+  display: block;
+  min-width: 0;
+}
+/* Same idea as the bare-checkbox rule on .field above: a lone checkbox has neither an input's height nor its padding,
+   so against the 32px "Use default" row beside it it reads as sitting too high. Give it that height and centre it. */
+.defaultable-control:has(> input[type='checkbox']:only-child) {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-h);
+}
 
 @media (max-width: 900px) {
   .field {

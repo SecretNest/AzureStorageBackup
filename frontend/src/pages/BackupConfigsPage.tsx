@@ -1709,7 +1709,9 @@ function StopButton({ onStop }: { onStop: () => void }) {
  */
 function CaseInsensitiveHalf({ value, onChange }: { value: string | null; onChange: (v: string) => void }) {
   return (
-    <div style={{ marginTop: 'var(--sp-2)' }}>
+    /* w-lg: the same width as the box it explains, so the caption wraps at the box's right edge instead of running
+       past it and widening the whole control side of the row. */
+    <div className="w-lg" style={{ marginTop: 'var(--sp-2)' }}>
       <p className="text-muted" style={{ margin: '0 0 var(--sp-1)' }}>
         Ignoring case — <span className="mono">*.mp4</span> here also matches{' '}
         <span className="mono">.MP4</span> and <span className="mono">.Mp4</span>. Same syntax as the box above;

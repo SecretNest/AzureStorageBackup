@@ -33,7 +33,15 @@ export function DefaultableField({
           Use default
         </label>
         {/* defaultable-effective: same height as the checkbox row, so this line of text sits on the same centreline as the label to its left. */}
-        {useDefault ? <span className="defaultable-effective text-muted">{effectiveText}</span> : children}
+        {/* defaultable-control: one flex item for the whole control side, however many controls it holds. Without it a
+            field with two controls (the rule lists: a case-sensitive box and the case-insensitive one under it) hands
+            .defaultable two flex items, and the second wraps onto its own line flush with the left edge of the row —
+            under "Use default" rather than under the box it belongs to. */}
+        {useDefault ? (
+          <span className="defaultable-effective text-muted">{effectiveText}</span>
+        ) : (
+          <span className="defaultable-control">{children}</span>
+        )}
       </span>
     </Field>
   )
