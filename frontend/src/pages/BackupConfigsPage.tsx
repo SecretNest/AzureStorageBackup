@@ -1658,6 +1658,14 @@ export function BackupConfigsPage() {
           config={checkModal}
           onClose={() => setCheckModal(null)}
           onError={setError}
+          repairRun={repairs[checkModal.id] ?? null}
+          onResumeRepair={async () => {
+            try {
+              const s = await backupConfigsApi.repairResume(checkModal.id)
+              setRepairs((r) => ({ ...r, [checkModal.id]: s }))
+              setCheckModal(null)
+            } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+          }}
         />
       )}
       {restoreModal && (
@@ -2740,8 +2748,16 @@ function ResetPasswordModal({
 }
 
 function CheckModal({
-  config, onClose, onError,
-}: { config: BackupConfig; onClose: () => void; onError: (e: string) => void }) {
+  config, onClose, onError, repairRun, onResumeRepair,
+}: {
+  config: BackupConfig; onClose: () => void; onError: (e: string) => void
+  // The repair's live run state, so the plan cannot offer "Repair now" as if nothing were happening: with
+  // a repair running, a new start is silently swallowed (the runner returns the existing run and the fresh
+  // selection goes nowhere); with one suspended, it quietly supersedes the saved selection. Both are
+  // decisions the operator must see, not trip over.
+  repairRun: RepairRun | null
+  onResumeRepair: () => void
+}) {
   // As in the restore dialog: a number cannot identify "the one from last Thursday", so the whole record is kept to show the start and end times.
   const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
@@ -3148,7 +3164,37 @@ function CheckModal({
               </table>
             </div>
           )}
-          {plan && (
+          {plan && repairRun?.status === 'Running' && (
+            // A running repair owns this backup (the busy tracker is exclusive); a fresh start here would be
+            // swallowed by the runner and the new selection silently lost. Say so instead of offering it.
+            <div className="text-warn" style={{ marginTop: '0.6rem' }}>
+              A repair is already running on this backup — its progress is on the backup row. Stop or suspend
+              it there before starting a different selection.
+            </div>
+          )}
+          {plan && repairRun?.status === 'Suspended' && (
+            <div style={{ marginTop: '0.6rem' }}>
+              <div className="text-warn">
+                A suspended repair already holds a saved selection for this backup.
+              </div>
+              <div style={{ marginTop: '0.3rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button type="button" className="btn-primary" onClick={onResumeRepair}>
+                  Resume the suspended repair
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runRepair(
+                    [...planSelected],
+                    plan.rows.filter((r) => !planSelected.has(r.path)).map((r) => r.path),
+                  )}
+                  disabled={running}
+                >
+                  Start over with this selection — replaces the saved one
+                </button>
+              </div>
+            </div>
+          )}
+          {plan && repairRun?.status !== 'Running' && repairRun?.status !== 'Suspended' && (
             <div style={{ marginTop: '0.6rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
               {(() => {
                 // Distinct by object: several paths can share one blob, and the bill must not double-count it.
