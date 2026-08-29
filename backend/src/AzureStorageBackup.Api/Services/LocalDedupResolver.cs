@@ -53,19 +53,25 @@ public sealed class LocalDedupResolver
     private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // prescreen: what this run has started on
     // A pack member's content identity (three fields) → which member of which pack it sits on. See the notes on TryFindPackMember.
     private readonly IReadOnlyDictionary<string, PackMemberRef> _packMembers;
+    // Blob refs some retained version marks unrecoverable: occupied names holding broken bytes. They stay in
+    // _priorRefs (the name really is taken, by this very content), but the backstop below must not resurrect
+    // them as dedup hits — a same-content claim on such a name is the healing upload, not a reuse.
+    private readonly IReadOnlySet<string> _damagedRefs;
 
     private LocalDedupResolver(
         BlobAddressScheme addressing,
         IReadOnlyDictionary<string, ResolvedBlob> priorByContent,
         IReadOnlyDictionary<string, string> priorRefs,
         IReadOnlySet<string> priorHeads,
-        IReadOnlyDictionary<string, PackMemberRef> packMembers)
+        IReadOnlyDictionary<string, PackMemberRef> packMembers,
+        IReadOnlySet<string> damagedRefs)
     {
         _addressing = addressing;
         _priorByContent = priorByContent;
         _priorRefs = priorRefs;
         _priorHeads = priorHeads;
         _packMembers = packMembers;
+        _damagedRefs = damagedRefs;
     }
 
     /// <summary>
@@ -90,6 +96,11 @@ public sealed class LocalDedupResolver
 
     /// <summary>Only consults the cross-version map; it does **not** take a ref and creates no reservation. For the
     /// prescreen path of "probe once, and on a hit skip compression entirely"; an actual upload must still go through <see cref="ResolveAsync"/> to get a reservation.</summary>
+    /// <summary>Whether some retained version marks this blob ref's content unrecoverable — the upload side's cue
+    /// to replace rather than trust: an if-missing upload would bounce off the broken family with "already
+    /// there", and a label-trusting skip would believe metadata a condemned blob has no right to.</summary>
+    public bool IsDamagedRef(string @ref) => _damagedRefs.Contains(@ref);
+
     public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
         _priorByContent.GetValueOrDefault(ContentKey(fullHash, length, headHash, tailHash));
 
@@ -126,12 +137,33 @@ public sealed class LocalDedupResolver
         var refs = new Dictionary<string, string>(StringComparer.Ordinal);
         var heads = new HashSet<string>(StringComparer.Ordinal);
         var packMembers = new Dictionary<string, PackMemberRef>(StringComparer.Ordinal);
+        var damagedRefs = new HashSet<string>(StringComparer.Ordinal);
         foreach (var index in indexes)
         {
+            // Damage is a first-class fact dedup must respect (volume-identity.md): an entry whose path this
+            // version marks unrecoverable references a broken blob, and offering it as a dedup target would hand
+            // a brand new file — its bytes sitting right there on disk — a reference to garbage, born dead.
+            // Excluded, the new file compresses and uploads through the replacement primitive to the same content
+            // address, and thereby heals the family in passing. The ref stays in the collision table below: the
+            // name really is occupied, by this very content, so a healing upload lands at the base address with
+            // no collision detour.
+            var marked = index.UnrecoverablePaths.Count == 0
+                ? null
+                : new HashSet<string>(index.UnrecoverablePaths, StringComparer.Ordinal);
             foreach (var e in index.Entries)
             {
                 if (e.FullHash is null)
                     continue;
+                if (marked?.Contains(e.Path) == true)
+                {
+                    // Blob refs still occupy their name for collision avoidance; everything else is withheld.
+                    if (e.Storage is { Kind: "blob" } damaged)
+                    {
+                        refs.TryAdd(damaged.Ref, ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash));
+                        damagedRefs.Add(damaged.Ref);
+                    }
+                    continue;
+                }
 
                 // Pack member: the content already sits inside some existing pack, so a new file with the same content
                 // points straight at it instead of packing another box. Duplicates within one pack are already
@@ -174,7 +206,7 @@ public sealed class LocalDedupResolver
             refs.TryAdd(c.Blob.Ref, ck);
             heads.Add(HeadKey(c.Length, c.HeadHash));
         }
-        return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers);
+        return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers, damagedRefs);
     }
 
     /// <summary>
@@ -225,8 +257,11 @@ public sealed class LocalDedupResolver
             {
                 if (priorCk != ck)
                     continue;                                     // an older version's different content holds this address → step aside
-                return Resolution.ForExisting(                     // in theory _priorByContent already hit; a safe backstop
-                    new ResolvedBlob(refName, false, 1, []), collision);
+                if (!_damagedRefs.Contains(refName))
+                    return Resolution.ForExisting(                 // in theory _priorByContent already hit; a safe backstop
+                        new ResolvedBlob(refName, false, 1, []), collision);
+                // The name holds this very content, damaged: fall through and claim it — that upload is the heal,
+                // landing at the base address with no collision detour.
             }
 
             // The same address may need more than one attempt, hence the extra loop here — the reason is in the TryGetValue-misses branch below.

@@ -2568,7 +2568,10 @@ public sealed class BackupOrchestrator(
                 var bytes = stagedBlob.Source?.Length ?? stagedBlob.Handoff!.Staged!.Bytes;
                 var (volumes, sizes) = await UploadStagedBlobAsync(
                     request, res.Ref, files, bytes, stagedBlob.Source, content, addressing, uploadScope,
-                    uploadTracker, state, file.Path, control, ct);
+                    uploadTracker, state, file.Path, control, ct,
+                    // The healing upload: this content address is marked damaged in some retained version, so the
+                    // family is replaced outright — nothing a condemned blob says about itself is trusted.
+                    damagedTarget: localResolver.IsDamagedRef(res.Ref));
                 res.Complete(content.Raw, volumes, sizes); // wake the later arrivals with the same content in this batch and hand them the same storage info
                 handoff?.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
@@ -2808,7 +2811,8 @@ public sealed class BackupOrchestrator(
     private async Task<(int Volumes, IReadOnlyList<long> Sizes)> UploadStagedBlobAsync(
         BackupRequest request, string blobRef, IReadOnlyList<string> files, long fileBytes, InPlaceSource? inPlace,
         BlobContent content, BlobAddressScheme addressing, VolumeUploadScope uploadScope, StageTracker uploadTracker,
-        RunState state, string sourceLabel, BackupRunControl? control, CancellationToken ct)
+        RunState state, string sourceLabel, BackupRunControl? control, CancellationToken ct,
+        bool damagedTarget = false)
     {
         var sizes = files.Select(f => new FileInfo(f).Length).ToList();
         // The gate and the in-flight registration are both pushed down to each volume (VolumeUploadScope); this
@@ -2819,8 +2823,21 @@ public sealed class BackupOrchestrator(
             var meta = new Dictionary<string, string>(
                 addressing.Metadata(content.FullHash, content.Length, content.HeadHash, content.TailHash));
             if (content.Raw)
+            {
                 meta["raw"] = "1";
-            await ClearLeftoverVolumesAsync(request, blobRef, files.Count, fileBytes, uploadTracker, ct);
+                // The raw route's blob IS the source file, whose full hash is already in hand and in the same
+                // format as the volume identity label — supplied here so the uploader neither buffers nor
+                // rehashes it (see the caller-supplied-label rule in BlobUploader).
+                meta[VolumeIdentity.MetaKey] = content.FullHash;
+            }
+            var existingVolumes = await FetchFamilyLabelsAsync(
+                request, blobRef, files.Count, fileBytes, uploadTracker, ct, force: damagedTarget);
+            if (damagedTarget && existingVolumes is not null)
+                // A condemned family's labels prove nothing (a preserved label over rotten bytes is the one damage
+                // no metadata can see) — stripped, every existing volume is overwritten and the trim collects the
+                // leftovers: the backup heals the family in passing (volume-identity.md).
+                existingVolumes = existingVolumes.ToDictionary(
+                    kv => kv.Key, kv => kv.Value with { Label = null }, StringComparer.Ordinal);
             control?.TrackInFlight(blobRef);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobRef, files,
@@ -2830,7 +2847,8 @@ public sealed class BackupOrchestrator(
                 // belt as well as braces — but a callback that deletes files should not be handed a path it has no
                 // business deleting on the strength of a lookup miss.)
                 onVolumeUploaded: inPlace is null ? staging.ReleaseFile : null,
-                label: sourceLabel);                     // show the source file path in the UI, not the content-addressed blob name
+                label: sourceLabel,                      // show the source file path in the UI, not the content-addressed blob name
+                existingVolumes: existingVolumes);
 
             // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
             // half of that pair has moved since, the bytes just written under this content address are not
@@ -2845,6 +2863,12 @@ public sealed class BackupOrchestrator(
                 throw new SourceMovedDuringUploadException(inPlace.Path, what);
             }
 
+            // Leftovers beyond the new count go only now, after every new volume is committed — upload first,
+            // delete after, the same crash-window reasoning as ReplaceAsync. The criterion is the name, never
+            // "was not uploaded this run": the skipped, verified-in-place volumes are exactly the ones this run
+            // did not upload, and they must survive.
+            if (existingVolumes is not null)
+                await TrimFamilyAsync(request, blobRef, files.Count, existingVolumes, ct);
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
             control?.ClearInFlight(blobRef);
@@ -3013,38 +3037,50 @@ public sealed class BackupOrchestrator(
     /// whereas listing once for every new blob would mean hundreds of thousands of pointless round trips on a first backup.
     /// </para>
     /// </summary>
-    private async Task ClearLeftoverVolumesAsync(
+    /// <param name="force">Fetch even for a single-volume family — the healing path must see (and then
+    /// replace) whatever sits at a condemned name, where the single-volume fast path would have skipped the
+    /// listing entirely.</param>
+    private async Task<Dictionary<string, VolumeBlobIO.CloudVolume>?> FetchFamilyLabelsAsync(
         BackupRequest request, string blobRef, int volumeCount, long archiveBytes,
-        StageTracker uploadTracker, CancellationToken ct)
+        StageTracker uploadTracker, CancellationToken ct, bool force = false)
     {
-        if (volumeCount <= 1)
-            return;
+        if (volumeCount <= 1 && !force)
+            return null;
 
         // Registered after the early return: with a single volume this does nothing, and flashing a column on the
         // screen for that case is pure noise.
+        // This used to wipe the family before uploading; now it only **reads** it — one listing with metadata
+        // brings back every existing volume's identity label (volume-identity.md), and the upload itself decides
+        // per volume: label-match → verified in place and skipped (a stopped run's landed volumes are salvaged
+        // instead of re-sent), anything unproven → overwritten. The leftovers beyond the new count fall to
+        // TrimFamilyAsync **after** the upload, so the crash window shrinks the same way ReplaceAsync's does.
         // Strictly speaking this stretch inspects volumes in the cloud rather than local files, but it still counts
-        // under the "checking" column — giving it a column of its own is not worth it, and there is only one thing
-        // to say: this item is checking, not transferring.
-        // Pass the archive bytes and volume count along: this family of volumes is all sitting on disk waiting, and not
-        // one of them can set off until this listing-plus-deletes round trip completes. Both units, or the waiting
-        // columns disagree with each other — the bytes would come out while their volumes stayed in.
+        // under the "checking" column — there is only one thing to say: this item is checking, not transferring.
         uploadTracker.BeginChecking(archiveBytes, volumeCount);
         try
         {
             var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
-            await foreach (var b in cc.GetBlobsAsync(BlobTraits.None, BlobStates.None, blobRef, ct))
-            {
-                // Listing by prefix also picks up collision-avoidance siblings (data/{hash}~1 and its volumes),
-                // which are **different content** referenced by other index entries, and deleting them by mistake
-                // is real data loss. IsVolumeOf only accepts this archive's own volumes.
-                if (VolumeBlobIO.IsVolumeOf(blobRef, b.Name))
-                    await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
-            }
+            return await VolumeBlobIO.ListFamilyLabelsAsync(cc, blobRef, ct);
         }
         finally
         {
             uploadTracker.EndChecking(archiveBytes, volumeCount);
         }
+    }
+
+    /// <summary>Delete the family's volumes whose number exceeds the new count — from the pre-upload listing, so
+    /// no second round trip. By name only: the verified-in-place (skipped) volumes are exactly the ones this run
+    /// did not upload, and a bookkeeping-based trim would delete everything the skip machinery just saved.</summary>
+    private async Task TrimFamilyAsync(
+        BackupRequest request, string blobRef, int newCount, Dictionary<string, VolumeBlobIO.CloudVolume> existingVolumes, CancellationToken ct)
+    {
+        var keep = new HashSet<string>(VolumeBlobIO.VolumeNames(blobRef, newCount), StringComparer.Ordinal);
+        var stale = existingVolumes.Keys.Where(n => !keep.Contains(n)).ToList();
+        if (stale.Count == 0)
+            return;
+        var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
+        foreach (var name in stale)
+            await cc.GetBlobClient(name).DeleteIfExistsAsync(cancellationToken: ct);
     }
 
     /// <summary>
@@ -3693,16 +3729,19 @@ public sealed class BackupOrchestrator(
             // data on: a member's mtime changing between the two attempts (with the content unchanged, so
             // re-verification does not exclude it) is enough to make the archive headers differ, and the spliced
             // result is just as unopenable.
-            await ClearLeftoverVolumesAsync(request, blobName, staged.Files.Count, staged.Bytes, uploadTracker, ct);
+            var existingVolumes = await FetchFamilyLabelsAsync(request, blobName, staged.Files.Count, staged.Bytes, uploadTracker, ct);
             control?.TrackInFlight(blobName);
             await VolumeBlobIO.UploadAsync(
                 uploader, request.Account, request.Container, blobName, staged.Files,
                 request.DataTier, request.Options.Upload, ct, scope: uploadScope,
                 onVolumeUploaded: staging.ReleaseFile,   // drop each volume from the temp disk as soon as it is uploaded
                 // A box holds hundreds of files, too many to list — report the pack id and the member count.
-                label: $"pack {packId} ({memberCount} files)");
+                label: $"pack {packId} ({memberCount} files)",
+                existingVolumes: existingVolumes);
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
+            if (existingVolumes is not null)
+                await TrimFamilyAsync(request, blobName, staged.Files.Count, existingVolumes, ct);
             control?.ClearInFlight(blobName);
             state.AddUploaded(sizes.Sum());   // same timing as the single-file path: recorded only when the whole item is uploaded
             uploadTracker.ConfirmUpload(blobName);

@@ -317,11 +317,17 @@ public static class VolumeBlobIO
     /// <param name="onVolumeUploaded">Called the moment a volume finishes, with its **local** file path.
     /// The backup path hangs per-volume staging release on this: if deletion waited for the whole family, the temp
     /// disk peak would equal the entire archive (a 100 GB file would need 100 GB of temp space), and the watermark would sit against the ceiling the whole time and choke compression.</param>
+    /// <param name="existingVolumes">The family's existing cloud volumes with their identity labels and lengths
+    /// (one listing, see <see cref="ListFamilyLabelsAsync"/>), or null to behave as before. With it, a volume
+    /// whose cloud label **and length** equal its own is **skipped** (verified in place — a stopped run's landed
+    /// volumes are salvaged instead of re-sent), and a volume whose name exists without proving itself is
+    /// **overwritten** (an if-missing upload would keep the impostor on the grounds that something is there).</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
-        Action<string>? onVolumeUploaded = null, string? label = null)
+        Action<string>? onVolumeUploaded = null, string? label = null,
+        IReadOnlyDictionary<string, CloudVolume>? existingVolumes = null)
     {
         // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
         // volumes, and showing only the path would repeat the same line thousands of times with no sign of
@@ -338,12 +344,27 @@ public static class VolumeBlobIO
 
         async Task One(string name, string file, int index)
         {
+            var exists = existingVolumes?.ContainsKey(name) == true;
+            if (exists && existingVolumes![name] is { Label: { } cloudLabel } cloud
+                && cloud.Length == new FileInfo(file).Length
+                && cloudLabel == await VolumeIdentity.ComputeAsync(file, ct))
+            {
+                // Verified in place: the cloud volume IS this volume, byte for byte. It still releases its
+                // staging seat below — the temp disk must not keep a skipped volume hostage.
+                onVolumeUploaded?.Invoke(file);
+                return;
+            }
+            // Existing but unproven → overwrite; absent → if-missing (the server-conditional upload keeps its
+            // idempotency for retries and its Archive-tier semantics).
+            Task Send(IProgress<long>? p) => exists
+                ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p)
+                : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p);
             if (scope is null)
-                await uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata);
+                await Send(null);
             else
                 await scope.RunAsync(
                     name,
-                    p => uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p),
+                    p => Send(p),
                     ct, ticket, index, LabelFor(index), SizeOf(file), baseRef,
                     // The same discriminator the per-volume release uses two arguments down the call: a caller that
                     // wants its volumes released as they go is a caller whose volumes came out of the pool, and the raw
@@ -421,9 +442,27 @@ public static class VolumeBlobIO
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
-        // 1) Overwrite-upload the new volumes. For a single volume the loop runs once and writes baseRef.
+        // 0) One listing with metadata collects every existing volume's identity label — the whole compare side
+        //    of the skip decision in a single request (volume-identity.md).
+        var existing = await ListFamilyLabelsAsync(container, baseRef, ct);
+
+        // 1) Upload the new volumes — skipping any proven identical. This is the replacement of a blob a check
+        //    condemned, so nothing the cloud *says* about itself is trusted: label and length only nominate a
+        //    candidate cheaply, and the actual cloud bytes are then downloaded and hashed — same-length bit rot
+        //    under a preserved label (the one damage no metadata can see) is caught right here. The economics
+        //    still work in the incident's favor: a verification download stands in for a re-upload, and on the
+        //    asymmetric links this product lives on, downlink is the cheap direction. A kept volume is one whose
+        //    **bytes** matched, so any mix of kept and uploaded assembles into exactly the new family. For a
+        //    single volume the loop runs once and writes baseRef.
         for (var i = 0; i < volumeFiles.Count; i++)
+        {
+            if (existing.TryGetValue(newNames[i], out var cloud) && cloud.Label is not null
+                && cloud.Length == new FileInfo(volumeFiles[i]).Length
+                && cloud.Label == await VolumeIdentity.ComputeAsync(volumeFiles[i], ct)
+                && await CloudBytesMatchAsync(container, newNames[i], cloud.Label, ct))
+                continue;
             await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
+        }
 
         // 2) Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
         //    one, or the old naming after a single↔multi switch).
@@ -434,6 +473,49 @@ public static class VolumeBlobIO
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
             if (IsVolumeOf(baseRef, b.Name) && !keep.Contains(b.Name))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
+    }
+
+    /// <summary>Whether the cloud volume's **actual bytes** hash to the expected label — the verification a
+    /// replacement demands before keeping anything (streamed, nothing buffered). Labels nominate; bytes decide.</summary>
+    private static async Task<bool> CloudBytesMatchAsync(
+        BlobContainerClient container, string name, string expected, CancellationToken ct)
+    {
+        try
+        {
+            await using var stream = await container.GetBlobClient(name).OpenReadAsync(cancellationToken: ct);
+            var hash = new System.IO.Hashing.XxHash128();
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+                hash.Append(buffer.AsSpan(0, read));
+            return "xxh128:" + Convert.ToHexString(hash.GetCurrentHash()).ToLowerInvariant() == expected;
+        }
+        catch (RequestFailedException)
+        {
+            // Vanished or unreadable mid-decision → not provable → upload it.
+            return false;
+        }
+    }
+
+    /// <summary>An existing cloud volume as the skip decision sees it: its identity label (null where a legacy
+    /// volume carries none — read as "different") and its length. A skip requires **both** to match: the label
+    /// is a claim, and a blob rewritten under a preserved label betrays itself by its size — the label answers
+    /// "whose bytes", the length answers "did anything replace them cheaply". Matching label with mismatched
+    /// length is a lie, and lies get overwritten.</summary>
+    public readonly record struct CloudVolume(string? Label, long Length);
+
+    /// <summary>One listing, the whole compare side: every existing volume of this archive (IsVolumeOf-filtered,
+    /// so collision-avoidance siblings stay out) with its identity label and length.</summary>
+    public static async Task<Dictionary<string, CloudVolume>> ListFamilyLabelsAsync(
+        BlobContainerClient container, string baseRef, CancellationToken ct)
+    {
+        var existing = new Dictionary<string, CloudVolume>(StringComparer.Ordinal);
+        await foreach (var b in container.GetBlobsAsync(BlobTraits.Metadata, BlobStates.None, baseRef, ct))
+            if (IsVolumeOf(baseRef, b.Name))
+                existing[b.Name] = new CloudVolume(
+                    b.Metadata is { } m && m.TryGetValue(VolumeIdentity.MetaKey, out var v) ? v : null,
+                    b.Properties.ContentLength ?? -1);
+        return existing;
     }
 
     /// <summary>

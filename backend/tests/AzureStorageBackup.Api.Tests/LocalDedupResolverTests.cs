@@ -33,6 +33,25 @@ public sealed class LocalDedupResolverTests
         Assert.False(res.Collision);
     }
 
+    /// <summary>Damage is a first-class fact dedup must respect (volume-identity.md): an entry whose path the
+    /// version marks unrecoverable references a broken blob, and offering it as a dedup target would hand a brand
+    /// new file — its bytes sitting right there on disk — a reference to garbage. Excluded, the new file uploads
+    /// through the replacement primitive to the same content address and heals the family in passing.</summary>
+    [Fact]
+    public async Task A_Marked_Entrys_Blob_Is_Never_Offered_As_A_Dedup_Target()
+    {
+        var index = IndexWith(
+            Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h"));
+        index.UnrecoverablePaths.Add("data/xxh128:h"); // the entry's Path (test helper names paths after refs)
+
+        var r = LocalDedupResolver.Build(Plain, [index]);
+        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl");
+
+        Assert.False(res.Exists);                 // not a dedup hit: the content must upload afresh
+        Assert.Equal("data/xxh128:h", res.Ref);   // to the same content address — that upload IS the heal
+        Assert.False(res.Collision);              // and it is no collision: the name holds this very content
+    }
+
     [Fact]
     public async Task New_Content_Claims_Base_Address()
     {

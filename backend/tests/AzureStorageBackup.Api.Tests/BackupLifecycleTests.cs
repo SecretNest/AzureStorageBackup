@@ -500,10 +500,15 @@ public sealed class BackupLifecycleTests : IDisposable
 
             // The collision-detection metadata that repair rebuilds has to equal the fresh backup's key for key — "present is good enough" is not the bar, since differing values make dedup misjudge a collision
             // (defect 2: repair used to drop len/head/tail entirely, silently switching collision protection off).
+            // The identity label is the one legitimate difference: it describes the blob's **own archive bytes**,
+            // and backup (streaming, timestamp suppressed) and repair (by file name) are two different but equally
+            // valid productions of the same content — each label must be present and true to its own bytes, not
+            // equal to the other's (volume-identity.md).
             var clipMetaAfterRepair = (await cc.GetBlobClient(clip3.Ref).GetPropertiesAsync()).Value.Metadata;
-            Assert.Equal(
-                clipMetaBaseline.OrderBy(kv => kv.Key, StringComparer.Ordinal),
-                clipMetaAfterRepair.OrderBy(kv => kv.Key, StringComparer.Ordinal));
+            Assert.True(clipMetaAfterRepair.ContainsKey(VolumeIdentity.MetaKey));
+            static IOrderedEnumerable<KeyValuePair<string, string>> Collision(IDictionary<string, string> m) =>
+                m.Where(kv => kv.Key != VolumeIdentity.MetaKey).OrderBy(kv => kv.Key, StringComparer.Ordinal);
+            Assert.Equal(Collision(clipMetaBaseline), Collision(clipMetaAfterRepair));
 
             var afterRepair = await rig.Checker.CheckAsync(account, name, password, null, deep, _root);
             Assert.True(afterRepair.Ok);

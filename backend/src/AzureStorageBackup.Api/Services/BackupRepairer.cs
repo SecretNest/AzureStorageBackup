@@ -98,6 +98,14 @@ public sealed class BackupRepairer(
         var deferredBlobs = badFindings
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal)
             .Where(r => !badBlobs.Contains(r)).ToHashSet(StringComparer.Ordinal);
+        // Selected paths whose blob the pre-check found healthy: healed by other means (the backup's own healing
+        // upload of a dedup-excluded twin, an earlier repair the marks never caught up with). The verdict is
+        // overturned by the evidence, so the marks come off — this is what lets the deferred-repair loop converge
+        // after a heal it did not itself perform.
+        var healedPaths = onlyPaths is null
+            ? []
+            : report.Findings.Where(f => f.Cloud == CloudState.Ok && onlyPaths.Contains(f.Path))
+                .Select(f => f.Path).ToList();
 
         // The same addressing scheme as the backup path: repairing a single-file blob has to reproduce exactly the
         // collision-detection metadata a fresh backup would write (§ defect 2).
@@ -107,10 +115,11 @@ public sealed class BackupRepairer(
         var unrecoverable = new List<string>();
         var deletedOrphans = new List<string>();
 
-        if (badBlobs.Count > 0)
+        if (badBlobs.Count > 0 || deferredBlobs.Count > 0 || healedPaths.Count > 0)
         {
             // Load every version index (pack members are aggregated across versions, and after a repair the sizes
-            // are synced / paths marked unrecoverable).
+            // are synced / paths marked unrecoverable). Loaded for marking-only and unmarking-only runs too: an
+            // empty selection ("mark everything for the next version") is all marks and no repairs.
             var indexes = new Dictionary<int, VersionIndex>();
             foreach (var ver in info.Versions)
                 indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
@@ -124,6 +133,14 @@ public sealed class BackupRepairer(
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
                         dontCompress, repaired, unrecoverable, changedVersions, lease, ct);
+            }
+
+            foreach (var path in healedPaths)
+            {
+                foreach (var (vnum, idx) in indexes)
+                    ClearUnrecoverable(idx, path, changedVersions, vnum);
+                // Reported as repaired: what the caller asked ("make this path whole") is true, whoever did the work.
+                repaired.Add(path);
             }
 
             // Deferred blobs: the mark and nothing else. Every path referencing the blob, in every version that
@@ -285,7 +302,12 @@ public sealed class BackupRepairer(
         // identical, so length/head/tail ought to be the same on every referencing entry anyway).
         var metaEntry = refs.Select(r => r.Entry)
             .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
-        var meta = addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash);
+        var meta = new Dictionary<string, string>(
+            addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash));
+        if (raw)
+            // The raw route's blob IS the source file, whose full hash is already verified this very repair — the
+            // uploader uses it verbatim instead of buffering and rehashing (see BlobUploader's caller-supplied-label rule).
+            meta[VolumeIdentity.MetaKey] = fullHash!;
         // The same derivation as a fresh backup (BackupOrchestrator.HandleBlobAsync): a path that hits DontCompress is stored, not compressed.
         var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
         var newSizes = await ReplaceBlobAsync(

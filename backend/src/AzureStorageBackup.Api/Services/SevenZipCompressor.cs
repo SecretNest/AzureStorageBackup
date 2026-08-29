@@ -228,7 +228,15 @@ public sealed class SevenZipCompressor : IFileCompressor
         Directory.CreateDirectory(outDir);
 
         // -si{name} makes 7z read the content from stdin and use name as the entry name inside the archive. Encryption/header encryption/splitting are fully compatible with it.
-        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0" };
+        //
+        // -mtm=off suppresses the member's modification time. Reading from a pipe, 7z cannot see the source mtime
+        // and used to stamp **the moment of compression** into the trailing header — which made two runs over the
+        // same input differ in the last volume (the header) and the first (its signature CRCs cover the trailing
+        // header), and only there. The stamp has no consumer in this product: display uses index metadata, and
+        // restore resets times from the index. Removing it makes this path byte-deterministic end to end, which is
+        // what the per-volume skip machinery prices its savings on (volume-identity.md); the determinism test pins
+        // it. Placed before the -m method switches so an operator's explicit configuration can still override it.
+        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mtm=off" };
         var method = MethodArgs(request.StoreOnly).ToList();
         args.AddRange(method);
         args.Add("-si" + request.EntryName);

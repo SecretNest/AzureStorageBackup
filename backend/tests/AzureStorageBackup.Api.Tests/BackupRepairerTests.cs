@@ -160,6 +160,64 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The whole self-healing loop, end to end (volume-identity.md § damage is a first-class fact):
+    /// a file's blob is damaged and marked (deferred); a NEW file with identical content joins the next backup.
+    /// Dedup must not hand it the broken ref — excluded, it re-uploads to the same content address and heals the
+    /// family in passing, resurrecting the old version's file. The deferred repair that follows the backup then
+    /// finds the blob healthy and lifts the marks. Nothing in this loop was told to "repair" anything.</summary>
+    [SkippableFact]
+    public async Task A_Same_Content_Twin_Heals_The_Damaged_Blob_And_The_Marks_Come_Off()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, repairer, tracked, indexCache, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("heal-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "twin content, worth healing");
+            await backup.RunAsync(Req(account, name));
+
+            // Damage + defer: the blob's volumes vanish, and a repair with an empty selection marks everything
+            // for the next backup version ("mark all", the plan's defer-everything choice).
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            var deferAll = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: Array.Empty<string>());
+            Assert.Contains("a.txt", deferAll.Unrecoverable);
+            Assert.Empty(deferAll.Repaired);
+
+            // The next backup brings a twin: same bytes, different path. Dedup must not chain it to the corpse.
+            await File.WriteAllTextAsync(Path.Combine(_src, "b.txt"), "twin content, worth healing");
+            await backup.RunAsync(Req(account, name));
+
+            // The healing upload has already happened as a side effect: v1's file is restorable again.
+            var deep = await checker.CheckAsync(
+                account, name, null, 1, new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.None });
+            Assert.True(deep.Ok);
+
+            // The deferred repair (what DeferredRepairs hands off after the backup) finds the blob healthy and
+            // lifts the marks — the loop converges instead of marking forever.
+            var deferred = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["a.txt"]);
+            Assert.Contains("a.txt", deferred.Repaired);
+
+            var info = await tracked.LoadAsync(account, name, null);
+            foreach (var v in info!.Versions)
+            {
+                var idx = await indexCache.ReadAsync(account, name, v.Version, info.Backup.CreatedAt.UtcTicks, v.IndexBlob, null, v.IndexVolumes);
+                Assert.DoesNotContain("a.txt", idx.UnrecoverablePaths);
+            }
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>Clicking repair used to push "Check started" — the repairer's internal pre-check notified as if
     /// it were a user-initiated check, and the user who had just clicked Repair reasonably wondered what was
     /// running. The pre-check is an implementation detail and stays silent; the repair announces itself.</summary>
