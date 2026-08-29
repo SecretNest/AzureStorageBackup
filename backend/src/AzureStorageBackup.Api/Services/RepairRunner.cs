@@ -33,7 +33,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, RepairRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans)
+    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, bool recoverPrefixes = false)
     {
         lock (_lock)
         {
@@ -42,7 +42,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var state = new RepairRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, state));
+            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, recoverPrefixes, state));
             return state;
         }
     }
@@ -67,7 +67,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
-    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, RepairRunState state)
+    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, bool recoverPrefixes, RepairRunState state)
     {
         try
         {
@@ -107,7 +107,8 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     resolved.VolumeBytes is > 0 ? resolved.VolumeBytes : null,
                     // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
                     // compression mode a fresh backup writes.
-                    BackupRequestMapper.OptionalRules(resolved.DontCompressRules), state.Cancellation.Token);
+                    BackupRequestMapper.OptionalRules(resolved.DontCompressRules),
+                    recoverPrefixes: recoverPrefixes, ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
             }
             finally

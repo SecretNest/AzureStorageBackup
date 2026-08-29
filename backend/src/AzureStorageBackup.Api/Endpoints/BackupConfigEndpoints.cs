@@ -476,17 +476,28 @@ public static class BackupConfigEndpoints
 
             var full = Path.Combine(config.LocalRoot, path);
             LocalState local;
+            var grown = false;
             if (!System.IO.File.Exists(full))
+            {
                 local = LocalState.Missing;
+            }
             else if (new FileInfo(full).Length != entry.Length || entry.FullHash is null)
+            {
                 local = LocalState.Changed;
+                // A changed file that is LONGER than the recorded content may hold it as a prefix (append-only
+                // growth) — that is what repair's opt-in prefix recovery acts on, so the row can say so. Length
+                // alone cannot promise the prefix matches; it only makes the offer worth surfacing.
+                grown = entry.FullHash is not null && new FileInfo(full).Length > entry.Length;
+            }
             else
+            {
                 local = string.Equals(await hasher.FullHashAsync(full, ct), entry.FullHash, StringComparison.Ordinal)
                     ? LocalState.Ok
                     : LocalState.Changed;
+            }
             // The same criterion as FileFinding.Repairable's local half: content match is what repair verifies
             // before replacing a blob, so this answer predicts exactly what repair would do with this file.
-            return Results.Ok(new { path, local, repairable = local == LocalState.Ok });
+            return Results.Ok(new { path, local, repairable = local == LocalState.Ok, grown });
         });
 
         // The file paths marked unrecoverable in a given version (drives per-file substitution during restore).
@@ -651,7 +662,7 @@ public static class BackupConfigEndpoints
         });
 
         // Repair corrupt/missing cloud blobs from local files (an explicit action, background job): holds the busy lock until it finishes, during which this backup can do nothing else. Whatever cannot be repaired is marked unrecoverable.
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, bool? recoverPrefixes, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -659,7 +670,9 @@ public static class BackupConfigEndpoints
             if (config is null)
                 return Results.NotFound();
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
-            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false);
+            // recoverPrefixes is the user's call, not a default: rebuilding an appended file from its prefix
+            // re-uploads the whole object, and that cost belongs to whoever pays for the transfer.
+            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false, recoverPrefixes ?? false);
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 

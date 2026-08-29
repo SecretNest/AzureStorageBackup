@@ -20,7 +20,8 @@ public sealed class BackupChecker(
     string? tempRoot = null,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
-    TrackedInfoStore? trackedInfo = null)
+    TrackedInfoStore? trackedInfo = null,
+    BackupJournalStore? journals = null)
 {
     /// <summary>Test-injected millisecond time source, handed through verbatim to every
     /// <see cref="StageTracker"/> built internally via <see cref="Track"/> (see the comment on the field of the same
@@ -256,6 +257,13 @@ public sealed class BackupChecker(
         Action<StageProgress>? onProgress, CancellationToken ct)
     {
         HashSet<string> referenced;
+        // Active journals are the other "don't call me an orphan" list, exactly as in the retention sweep: a
+        // suspended run's uploads are in the cloud but in no version index, and only the journal records that
+        // they exist. Reporting them reclaimable — and repair then deleting them — makes the eventual resume
+        // re-upload everything it had already sent. Empty when no journal store is wired (older call sites).
+        var active = journals is null
+            ? ActiveJournalRefs.Empty
+            : await journals.LoadActiveRefsAsync(account.Id, container, ct);
         try
         {
             referenced = await BuildReferencedSetAsync(account, container, password, info, ct);
@@ -281,12 +289,27 @@ public sealed class BackupChecker(
         await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
         {
             listing?.Touch(b.Name);
-            if (!referenced.Contains(b.Name))
+            if (!referenced.Contains(b.Name) && !JournalProtected(b.Name, active))
                 orphans.Add(b.Name);
             listing?.Advance(0);
         }
         listing?.Complete();
         return (orphans, null);
+    }
+
+    /// <summary>Whether this blob name is held by an active journal. The journal records base refs (a data blob's
+    /// base name, a pack's id) without volume counts, so the listed name is normalized back to its base the same
+    /// way the retention sweep normalizes: a pack name is cut at ".7z" whatever the suffix width, and a data
+    /// volume sheds its all-digit suffix (three digits is the uploader's padding, not its width).</summary>
+    internal static bool JournalProtected(string name, ActiveJournalRefs active)
+    {
+        if (name.StartsWith("packs/", StringComparison.Ordinal))
+        {
+            var rest = name["packs/".Length..];
+            var cut = rest.IndexOf(".7z", StringComparison.Ordinal);
+            return active.Packs.Contains(cut >= 0 ? rest[..cut] : rest);
+        }
+        return active.Blobs.Contains(RetentionCleaner.BaseRef(name));
     }
 
     /// <summary>

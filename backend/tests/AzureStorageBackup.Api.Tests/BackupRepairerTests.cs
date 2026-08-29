@@ -25,12 +25,15 @@ public sealed class BackupRepairerTests : IDisposable
     private readonly SqliteConnection _connection;
     private readonly AppDbContext _db;
 
+    private readonly BackupJournalStore _journals;
+
     public BackupRepairerTests()
     {
         _base = Path.Combine(Path.GetTempPath(), "asb-repair-" + Guid.NewGuid().ToString("N"));
         _src = Path.Combine(_base, "src");
         _temp = Path.Combine(_base, "temp");
         Directory.CreateDirectory(_src);
+        _journals = new BackupJournalStore(Path.Combine(_base, "journal"));
 
         _connection = new SqliteConnection("DataSource=:memory:");
         _connection.Open();
@@ -101,11 +104,11 @@ public sealed class BackupRepairerTests : IDisposable
             indexCache: indexCache, trackedInfo: tracked);
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
-            trackedInfo: tracked);
+            trackedInfo: tracked, journals: _journals);
         var repairer = new BackupRepairer(
             factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
             Path.Combine(_temp, "repair"), staging,
-            opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache);
+            opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache, journals: _journals);
         return (backup, checker, repairer, tracked, indexCache, factory);
     }
 
@@ -148,7 +151,7 @@ public sealed class BackupRepairerTests : IDisposable
 
             var report = await repairer.RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null);
+                dontCompress: null, recoverPrefixes: true);
 
             Assert.Contains("grow.log", report.Repaired);
             Assert.Empty(report.Unrecoverable);
@@ -159,6 +162,96 @@ public sealed class BackupRepairerTests : IDisposable
             var check = await checker.CheckAsync(
                 account, name, null, 1, new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.None });
             Assert.True(check.Ok);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The retention cleaner has honoured active journals all along; the repair-side orphan sweep did
+    /// not, and it runs off the same "referenced by a retained version" set. With a backup suspended mid-run —
+    /// the exact state in which a user repairs damage before resuming — its journalled uploads are in the cloud
+    /// but in no version index, and a ticked "clean up orphans" would have deleted them, making the eventual
+    /// resume re-upload everything it had already sent.</summary>
+    [SkippableFact]
+    public async Task Orphan_Cleanup_Spares_A_Suspended_Runs_Journalled_Blobs()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repj-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            // A suspended run's traces: blobs in the cloud that no version references, held only by the journal —
+            // plus one true orphan with no journal to its name.
+            await container.GetBlobClient("data/journaled").UploadAsync(BinaryData.FromString("in flight"), overwrite: true);
+            await container.GetBlobClient("packs/pjournal.7z").UploadAsync(BinaryData.FromString("in-flight pack"), overwrite: true);
+            await container.GetBlobClient("data/trueorphan").UploadAsync(BinaryData.FromString("junk"), overwrite: true);
+            await using (var j = await _journals.CreateAsync(account.Id, name, "run-suspended", new JournalHeader
+            {
+                RunId = "run-suspended", ConfigId = 1, StartedAt = DateTimeOffset.UnixEpoch,
+                BaselineVersion = 1, LocalRoot = _src, EncryptionIdentity = "plain",
+            }, default))
+            {
+                await j.AppendAsync(new JournalRecord { Kind = "blob", Ref = "data/journaled", Path = "b.bin", FullHash = "h", Volumes = 1 }, default);
+                await j.AppendAsync(new JournalRecord { Kind = "pack", Ref = "pjournal", VolumeSizes = [14] }, default);
+            }
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions { ListOrphans = true },
+                Azure.Storage.Blobs.Models.AccessTier.Hot, null, dontCompress: null);
+
+            Assert.Contains("data/trueorphan", report.DeletedOrphans);
+            Assert.DoesNotContain("data/journaled", report.DeletedOrphans);
+            Assert.DoesNotContain("packs/pjournal.7z", report.DeletedOrphans);
+            Assert.True((await container.GetBlobClient("data/journaled").ExistsAsync()).Value);
+            Assert.True((await container.GetBlobClient("packs/pjournal.7z").ExistsAsync()).Value);
+
+            // The check's own orphan listing must agree: a journalled blob is not reported as reclaimable either.
+            var check = await checker.CheckAsync(
+                account, name, null, null,
+                new CheckOptions { Local = LocalCheckLevel.None, ListOrphans = true }, _src);
+            Assert.DoesNotContain("data/journaled", check.OrphanBlobs);
+            Assert.DoesNotContain("packs/pjournal.7z", check.OrphanBlobs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Prefix recovery re-uploads the whole object — for the field case that is ~100 GB over a home
+    /// uplink, hours of traffic the user may judge not worth one version's snapshot (any later version of an
+    /// append-only file contains it as a prefix anyway). That judgement belongs to the person paying for the
+    /// transfer: without the explicit opt-in, an appended file stays unrecoverable exactly as before.</summary>
+    [SkippableFact]
+    public async Task Prefix_Recovery_Is_Opt_In()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repo-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "grow.log"), "the content as of version 1\n");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            await File.AppendAllTextAsync(Path.Combine(_src, "grow.log"), "appended after the backup\n");
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
+
+            Assert.Contains("grow.log", report.Unrecoverable);
+            Assert.Empty(report.Repaired);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

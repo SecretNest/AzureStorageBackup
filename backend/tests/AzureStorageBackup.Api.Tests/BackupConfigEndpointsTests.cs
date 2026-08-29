@@ -724,7 +724,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
     private sealed record UnreadableRow(string path, DateTimeOffset unreadableAt);
 
-    private sealed record HashFileRow(string path, int local, bool repairable);
+    private sealed record HashFileRow(string path, int local, bool repairable, bool grown);
 
     /// <summary>The in-memory report already survives closing the dialog; this pins that it survives the
     /// process. The host in this test has never run a check, so its runner's memory is exactly a freshly
@@ -841,11 +841,13 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Assert.Equal((int)LocalState.Ok, ok!.local);
             Assert.True(ok.repairable);
 
-            // Appended → changed; the length answers it without reading the content.
+            // Appended → changed; the length answers it without reading the content, and the growth is
+            // surfaced so the UI can point at repair's opt-in prefix recovery.
             await File.AppendAllTextAsync(file, "!");
             var changedRow = await _client.GetFromJsonAsync<HashFileRow>(url);
             Assert.Equal((int)LocalState.Changed, changedRow!.local);
             Assert.False(changedRow.repairable);
+            Assert.True(changedRow.grown);
 
             // Gone → missing.
             File.Delete(file);

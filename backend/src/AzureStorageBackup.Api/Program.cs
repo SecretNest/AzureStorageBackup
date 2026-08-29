@@ -195,7 +195,8 @@ builder.Services.AddScoped(sp => new BackupChecker(
     Path.Combine(tempPath, "check"),
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
-    sp.GetRequiredService<TrackedInfoStore>())); // metadata drift comparison uses the local-authority cache
+    sp.GetRequiredService<TrackedInfoStore>(),  // metadata drift comparison uses the local-authority cache
+    journals: sp.GetRequiredService<BackupJournalStore>())); // active journals protect a suspended run's uploads from the orphan listing
 builder.Services.AddScoped(sp => new BackupRepairer(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),
@@ -208,7 +209,8 @@ builder.Services.AddScoped(sp => new BackupRepairer(
     sp.GetRequiredService<IOperationLog>(),
     sp.GetRequiredService<BackupChecker>(),
     sp.GetRequiredService<TrackedInfoStore>(),
-    sp.GetRequiredService<ILocalIndexCache>())); // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
+    sp.GetRequiredService<ILocalIndexCache>(),  // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
+    journals: sp.GetRequiredService<BackupJournalStore>())); // active journals protect a suspended run's uploads from the orphan sweep
 
 // Operation log (M8) + global settings
 builder.Services.AddScoped<IOperationLog, OperationLogService>();

@@ -477,6 +477,9 @@ export interface FileFinding {
   cloud: number // CloudState
   local: number // LocalState
   repairable: boolean
+  // Filled in by the per-file hash: the local file is longer than the recorded content, so it may hold it
+  // as a prefix — what repair's opt-in prefix recovery acts on. Absent until hashed.
+  grown?: boolean
   // Non-null = the cloud copy was carried over from an earlier version (the backup could never read the
   // source). Without it, local=Changed reads as "the local file was modified", when the real cause is
   // that the backup never managed to update the cloud copy.
@@ -636,7 +639,7 @@ export const backupConfigsApi = {
   // The targeted follow-up to a cloud-only check: hash ONE path against the version's recorded
   // content. The backend compares the length first, so an appended huge file answers instantly.
   hashFile: (id: number, path: string, version: number | null) =>
-    api.get<{ path: string; local: number; repairable: boolean }>(
+    api.get<{ path: string; local: number; repairable: boolean; grown: boolean }>(
       `/backup-configs/${id}/hash-file?path=${encodeURIComponent(path)}${version != null ? `&version=${version}` : ''}`,
     ),
   unrecoverablePaths: (id: number, version: number | null) =>
@@ -655,12 +658,13 @@ export const backupConfigsApi = {
   },
   // When this backup has never been checked the backend answers 204 (not 404, which would leave a red error in the browser console), so this comes back empty.
   checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
-  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false) => {
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, recoverPrefixes = false) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (cleanupOrphans) p.set('cleanupOrphans', 'true')
+    if (recoverPrefixes) p.set('recoverPrefixes', 'true')
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
   },
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),

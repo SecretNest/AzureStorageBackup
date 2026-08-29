@@ -32,7 +32,10 @@ public sealed class BackupRepairer(
     IOperationLog? opLog = null,
     BackupChecker? checker = null,
     TrackedInfoStore? trackedInfo = null,
-    ILocalIndexCache? indexCache = null)
+    ILocalIndexCache? indexCache = null,
+    // The other "don't call me an orphan" list, exactly as in the retention sweep: a suspended run's uploads are
+    // in the cloud but in no version index, and only the journal records that they exist.
+    BackupJournalStore? journals = null)
 {
     /// <param name="dontCompress">
     /// The configured "don't compress" rules (the very same set as BackupEngineOptions.DontCompress). When repairing
@@ -42,6 +45,7 @@ public sealed class BackupRepairer(
     public async Task<RepairReport> RepairAsync(
         Account account, string container, string? password, string localRoot, int? version,
         CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, IgnoreRuleSet? dontCompress,
+        bool recoverPrefixes = false,
         CancellationToken ct = default)
     {
         // Local-authoritative read first (same as the orchestrator/checker): if it is local, zero cloud reads; if
@@ -99,7 +103,7 @@ public sealed class BackupRepairer(
                         repaired, unrecoverable, changedVersions, lease, ct);
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                        dontCompress, repaired, unrecoverable, changedVersions, lease, ct);
+                        dontCompress, recoverPrefixes, repaired, unrecoverable, changedVersions, lease, ct);
             }
 
             // Persist the changed version indexes + info file (through the local-authoritative state machine, which
@@ -158,9 +162,14 @@ public sealed class BackupRepairer(
             return;
         }
 
+        var active = journals is null
+            ? ActiveJournalRefs.Empty
+            : await journals.LoadActiveRefsAsync(account.Id, container, ct);
         await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
         {
-            if (referenced.Contains(b.Name))
+            // Referenced by a retained version, or held by an active journal (a suspended run's uploads — deleting
+            // them makes the eventual resume re-upload everything it had already sent): both mean "not an orphan".
+            if (referenced.Contains(b.Name) || BackupChecker.JournalProtected(b.Name, active))
                 continue;
             // Best effort per blob: one failed orphan deletion only logs a Warning and moves on without
             // interrupting the rest (only blobs outside the reference set get here, so valid data is never deleted).
@@ -182,7 +191,7 @@ public sealed class BackupRepairer(
     private async Task RepairBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, Dictionary<int, VersionIndex> indexes, string localRoot,
         string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes,
-        IgnoreRuleSet? dontCompress, List<string> repaired,
+        IgnoreRuleSet? dontCompress, bool recoverPrefixes, List<string> repaired,
         List<string> unrecoverable, HashSet<int> changedVersions,
         StagingArea.StagingLease lease, CancellationToken ct)
     {
@@ -229,8 +238,11 @@ public sealed class BackupRepairer(
         // prefix-hash pass filters first, so a non-matching candidate costs one read and no temp write; the copy
         // is then re-hashed whole before upload, so a file rewritten in place mid-copy cannot smuggle wrong bytes
         // into the cloud — the copy is what gets uploaded, so the copy is what must prove itself.
+        // Opt-in (recoverPrefixes): rebuilding from the prefix re-uploads the whole object — for a ~100 GB file,
+        // hours of traffic the user may judge not worth one version's snapshot (any later version of an append-only
+        // file contains it as a prefix anyway). That judgement belongs to the person paying for the transfer.
         string? prefixDir = null;
-        if (localSource is null && fullHash is not null)
+        if (localSource is null && fullHash is not null && recoverPrefixes)
         {
             foreach (var (_, e) in refs)
             {
