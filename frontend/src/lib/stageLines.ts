@@ -230,7 +230,25 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
       ? `${waitingSubject}${waitingInner ? ` (${waitingInner})` : ''} waiting for uploading`
       : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
-  const inFlightVerb = detail.stage === 'Uploading' ? 'uploading' : 'downloading'
+  // The repair stage's in-flight items are two different activities at two different times, and one static
+  // verb cannot cover both — worse, the old fallback ('downloading') was actively false for both of them.
+  // A field report shows the stakes: the hash gate (reading the LOCAL file to prove it still matches the
+  // recorded content) displayed as "1 object downloading", and to an operator whose backup lives in the
+  // Archive tier a download implies a rehydration they never consented to — one wrong verb got a healthy
+  // repair stopped. The item's label already says which activity it is: VolumeBlobIO registers cloud
+  // volume names (data/…, packs/…) while the hash gate registers the local source path, so the verb is
+  // read off the labels rather than invented per stage. The two phases never overlap (a repair handles
+  // one object at a time), so one verb per snapshot is enough.
+  const repairUploading =
+    detail.stage === 'Repairing' &&
+    detail.activeItems.length > 0 &&
+    detail.activeItems.every((a) => a.label.startsWith('data/') || a.label.startsWith('packs/'))
+  const inFlightVerb =
+    detail.stage === 'Uploading' || repairUploading
+      ? 'uploading'
+      : detail.stage === 'Repairing'
+        ? 'hashing'
+        : 'downloading'
   // The in-flight number's unit **differs by direction**:
   // · upload: VolumeBlobIO registers one entry per volume, so a single large item can occupy the whole
   //   concurrency allowance (5 by default);
@@ -241,7 +259,7 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
   // "5 volumes uploading" / "1 volume uploading" / "3 objects downloading"
   const inFlightPhrase = `${withUnit(
     detail.activeItems.length,
-    detail.stage === 'Uploading' ? 'volumes' : unit,
+    detail.stage === 'Uploading' || repairUploading ? 'volumes' : unit,
   )} ${inFlightVerb}`
   const downloading = detail.stage === 'Restoring' || detail.stage === 'Verifying'
   // Counts and bytes go on **one timeline** — that is the entire point of this reordering. With counts
@@ -482,5 +500,7 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
  * packing, volume splitting), so compressing would be wrong. Restore and verify really are extracting.
  */
 export function preparingLabelOf(stage: string): string {
-  return stage === 'Uploading' ? 'preparing' : 'extracting'
+  // Repairing joins Uploading: its preparing stretch is 7z producing the replacement volumes, the same
+  // work the upload stage calls preparing — "extracting" would claim the opposite direction.
+  return stage === 'Uploading' || stage === 'Repairing' ? 'preparing' : 'extracting'
 }

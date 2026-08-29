@@ -197,6 +197,70 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>Two truthfulness defects reported from the field, one fixture: (1) the pre-check's Local
+    /// bookkeeping pass (pinned to None, instant) published its entry count under the Assessing token, whose
+    /// UI unit is volumes — the operator saw "4 of 4 volumes" flash at the end of an assessment that probes
+    /// per volume; (2) the Repairing stage never told the tracker an object was in hand, so the screen read
+    /// "4 objects queued" while one of the four was visibly being hashed. Both are progress-shape contracts:
+    /// every Assessing total must be the probe workload (the family's recorded volume count), and a
+    /// single-object repair must never report its only object as queued.</summary>
+    [SkippableFact]
+    public async Task Progress_Reports_Probe_Totals_And_In_Hand_Objects_Truthfully()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var bytes = new byte[2_500_000];
+            new Random(7).NextBytes(bytes); // incompressible, so the volume split survives compression
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), bytes);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var volumes = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                volumes.Add(b.Name);
+            Assert.True(volumes.Count >= 3, $"fixture needs a multi-volume family, got {volumes.Count}");
+            await container.GetBlobClient(volumes.Order(StringComparer.Ordinal).ElementAt(1)).DeleteIfExistsAsync();
+
+            var assessTotals = new List<int>();
+            var repairingQueued = new List<int>();
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                1_000_000, dontCompress: null, onlyPaths: ["big.bin"], alsoMarkPaths: null,
+                onProgress: d =>
+                {
+                    lock (assessTotals)
+                    {
+                        if (d.Stage == "Assessing" && d.Total > 0) assessTotals.Add(d.Total);
+                        if (d.Stage == "Repairing") repairingQueued.Add(d.Queued);
+                    }
+                });
+
+            Assert.Equal(["big.bin"], report.Repaired);
+            lock (assessTotals)
+            {
+                Assert.NotEmpty(assessTotals);
+                Assert.All(assessTotals, t => Assert.Equal(volumes.Count, t));
+                Assert.All(repairingQueued, q => Assert.Equal(0, q));
+            }
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The retirement-interplay kernel (volume-identity.md § retirement needs no coordination): a
     /// resumed repair replays its selection against a fresh pre-check, and a selected path that no longer exists
     /// in any retained version — its only referencing version retired while the repair sat suspended — simply

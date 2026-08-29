@@ -553,6 +553,49 @@ describe('stage labels', () => {
   })
 })
 
+describe('repairing in-flight wording', () => {
+  /**
+   * A field report drove this: the repair's first hours are the hash gate — reading the LOCAL file to
+   * prove it still matches the recorded content — and the screen said "1 object downloading". The
+   * operator's backup lives in the Archive tier, where a download implies a rehydration they never
+   * consented to, so one wrong verb read as "the app is quietly pulling 113 GB out of Archive" and got
+   * a healthy repair stopped. The verb must follow what the item actually is: a local path is being
+   * hashed; a cloud volume name (data/… or packs/…) is being uploaded.
+   */
+  test('the hash gate reads as hashing, not downloading', () => {
+    const { inFlightPhrase } = stageLines(
+      progress({
+        stage: 'Repairing',
+        activeItems: [{ label: '/nas/movies/big.mkv', sent: 80_000, total: 113_949_000_000, percent: 0 }],
+      }),
+    )
+    expect(inFlightPhrase).toBe('1 object hashing')
+  })
+
+  test('volume replacement reads as uploading, counted in volumes', () => {
+    const { inFlightPhrase } = stageLines(
+      progress({
+        stage: 'Repairing',
+        activeItems: [
+          { label: 'data/xxh128:aa.1001', sent: 1, total: 2, percent: 50 },
+          { label: 'data/xxh128:aa.1002', sent: 0, total: 2, percent: 0 },
+        ],
+      }),
+    )
+    expect(inFlightPhrase).toBe('2 volumes uploading')
+  })
+
+  test('a pack volume also counts as uploading', () => {
+    const { inFlightPhrase } = stageLines(
+      progress({
+        stage: 'Repairing',
+        activeItems: [{ label: 'packs/abc.7z.001', sent: 0, total: 2, percent: 0 }],
+      }),
+    )
+    expect(inFlightPhrase).toBe('1 volume uploading')
+  })
+})
+
 describe('preparingLabelOf', () => {
   /**
    * The count and the row naming the item are two halves of one statement, so they read the word from one
@@ -561,6 +604,9 @@ describe('preparingLabelOf', () => {
   test('the upload side prepares and the download side extracts', () => {
     expect(preparingLabelOf('Uploading')).toBe('preparing')
     expect(preparingLabelOf('Restoring')).toBe('extracting')
+    // The repair's preparing stretch is 7z producing the replacement volumes — the same work the
+    // upload stage calls preparing. "extracting" would claim the opposite direction.
+    expect(preparingLabelOf('Repairing')).toBe('preparing')
     expect(preparingLabelOf('Verifying')).toBe('extracting')
   })
 })

@@ -89,9 +89,20 @@ public sealed class BackupRepairer(
             .CheckAsync(account, container, password, target.Version,
                 checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct,
                 notify: false,
-                // The pre-check's stages surface under the repair's own name: a user watching "Cloud: N volumes"
-                // concluded a check had started instead of their repair. Same work, but the label must say whose.
-                onProgress: onProgress is null ? null : d => onProgress(d with { Stage = "Assessing" }),
+                // The pre-check's probing surfaces under the repair's own name: a user watching "Cloud: N
+                // volumes" concluded a check had started instead of their repair. Same work, but the label must
+                // say whose. Only the Cloud stage is renamed, though — the token decides the UI's unit word, and
+                // the check's Local pass (pinned to None here, an instant bookkeeping sweep over the scoped
+                // entries) published its entry count under the volumes-unit token: a field report saw "4 of 4
+                // volumes" flash at the end of an assessment whose real workload was thousands of probes. That
+                // pass says nothing a user can act on, so it is dropped rather than renamed; everything else
+                // (LoadingIndex, a Content level's Verifying) passes through under its own honest name and unit.
+                onProgress: onProgress is null ? null : d =>
+                {
+                    if (d.Stage == "Local")
+                        return;
+                    onProgress(d.Stage == "Cloud" ? d with { Stage = "Assessing" } : d);
+                },
                 // Scoped to the two lists' union: a path in neither is not assessed at all. Under this scope the
                 // deferral formula below keeps its meaning for free — "bad findings not selected" can only be the
                 // alsoMark ones, because nothing else was looked at.
@@ -150,13 +161,24 @@ public sealed class BackupRepairer(
                     tracker.Enqueue(WorkOf(badRef));
             foreach (var badRef in badBlobs)
             {
+                // In hand before the first publish, or the queue over-reports: without BeginWork the tracker's
+                // queued subtraction (enqueued − processed − in hand) still counts the object being worked on,
+                // and the screen read "1 object hashing · 4 objects queued" over a four-object repair.
+                tracker?.BeginWork();
                 tracker?.Touch(badRef);
-                if (badRef.StartsWith("packs/", StringComparison.Ordinal))
-                    await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                        repaired, unrecoverable, changedVersions, lease, ct, tracker);
-                else
-                    await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                        dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker);
+                try
+                {
+                    if (badRef.StartsWith("packs/", StringComparison.Ordinal))
+                        await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
+                            repaired, unrecoverable, changedVersions, lease, ct, tracker);
+                    else
+                        await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
+                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker);
+                }
+                finally
+                {
+                    tracker?.EndWork();
+                }
                 tracker?.Advance(0, WorkOf(badRef));
             }
 
@@ -440,18 +462,36 @@ public sealed class BackupRepairer(
             // Through StagingArea: compression therefore shares the one global lock with backup (the two no longer
             // chew CPU at the same time), its output counts against the same budget, and it keeps the per-volume
             // release — each volume is deleted once uploaded, so the peak is only the volumes not yet uploaded.
-            var staged = await staging.StageAsync(
-                async (compressTemp, token) =>
-                {
-                    // The compression mode comes from the value the pack itself recorded (PackInfo.StoreOnly); the
-                    // don't-compress rules are not re-run: this rewrites the archive of the same packId in place, so
-                    // the repaired pack should match the one originally written.
-                    var result = await compressor.CompressAsync(
-                        new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
-                            password, VolumeBytes: volumeBytes,
-                            StoreOnly: info.Packs.TryGetValue(packId, out var packInfo) && packInfo.StoreOnly), token);
-                    return result.VolumeFiles;
-                }, lease, ct);
+            // Staging/packing registration: same reasoning as the single-file path (see ReplaceBlobAsync).
+            tracker?.BeginStaging();
+            StagedItem staged;
+            try
+            {
+                staged = await staging.StageAsync(
+                    async (compressTemp, token) =>
+                    {
+                        tracker?.BeginPacking(packId);
+                        try
+                        {
+                            // The compression mode comes from the value the pack itself recorded (PackInfo.StoreOnly); the
+                            // don't-compress rules are not re-run: this rewrites the archive of the same packId in place, so
+                            // the repaired pack should match the one originally written.
+                            var result = await compressor.CompressAsync(
+                                new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
+                                    password, VolumeBytes: volumeBytes,
+                                    StoreOnly: info.Packs.TryGetValue(packId, out var packInfo) && packInfo.StoreOnly), token);
+                            return result.VolumeFiles;
+                        }
+                        finally
+                        {
+                            tracker?.EndPacking();
+                        }
+                    }, lease, ct);
+            }
+            finally
+            {
+                tracker?.EndStaging();
+            }
             List<long> newSizes;
             try
             {
@@ -513,14 +553,36 @@ public sealed class BackupRepairer(
             // The source file is fed straight to 7z, with no compose-style intermediates, so only the archive output
             // needs accounting — StageAsync covers all of it: the global compression lock, the budget, and the
             // per-volume release.
-            var staged = await staging.StageAsync(
-                async (compressTemp, token) =>
-                {
-                    var result = await compressor.CompressAsync(
-                        new CompressionRequest(srcDir, [entry], Path.Combine(compressTemp, "b.7z"), password,
-                            VolumeBytes: volumeBytes, StoreOnly: storeOnly), token);
-                    return result.VolumeFiles;
-                }, lease, ct);
+            // Registered as staging + packing for the same reason the backup path registers them: producing
+            // the replacement volumes for a 100 GB file is a long, byteless stretch, and unregistered it
+            // rendered as a silent gap ("1 object starting upload" at best). Staging spans the wait for the
+            // global compression lock too — held by a concurrent backup, that wait is real and diagnosable
+            // ("waiting for the archive slot") only if the tracker knows the item is inside.
+            tracker?.BeginStaging();
+            StagedItem staged;
+            try
+            {
+                staged = await staging.StageAsync(
+                    async (compressTemp, token) =>
+                    {
+                        tracker?.BeginPacking(localSource, new FileInfo(localSource).Length);
+                        try
+                        {
+                            var result = await compressor.CompressAsync(
+                                new CompressionRequest(srcDir, [entry], Path.Combine(compressTemp, "b.7z"), password,
+                                    VolumeBytes: volumeBytes, StoreOnly: storeOnly), token);
+                            return result.VolumeFiles;
+                        }
+                        finally
+                        {
+                            tracker?.EndPacking();
+                        }
+                    }, lease, ct);
+            }
+            finally
+            {
+                tracker?.EndStaging();
+            }
             try
             {
                 var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before releasing
