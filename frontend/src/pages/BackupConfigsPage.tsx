@@ -18,7 +18,7 @@ import { stageLabelOf } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
-import { latestWins } from '../lib/latestWins'
+import { latestWins, type LatestWins } from '../lib/latestWins'
 import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type WindDownKind } from '../lib/windDownControls'
@@ -181,6 +181,21 @@ export function BackupConfigsPage() {
   // one and the UI keeps showing an interrupted run that no longer exists until the next tick. Why not a
   // cancelled flag: see the note in latestWins.
   const interruptedGate = useRef(latestWins())
+  // The SAME race, one line up: load() (user actions) and the unattended 5-second poll both call list()
+  // and both setConfigs() wholesale. A tick's stale response landing after a click's fresh one flipped a
+  // just-started run back to Idle — and because activeKey derives from configs, that flicker also
+  // restarted the active-polling effect and fired its departure logic for a run that never left. The gate
+  // begins when a list() is SENT, so whichever request started later wins, not whichever returned later.
+  const configsGate = useRef(latestWins())
+  const refreshConfigs = () => {
+    const isLatest = configsGate.current.begin()
+    return backupConfigsApi.list().then((list) => {
+      if (!isLatest()) return null
+      setConfigs(list)
+      refreshInterrupted(list)
+      return list
+    })
+  }
   const refreshInterrupted = (list: BackupConfig[]) => {
     const isLatest = interruptedGate.current.begin()
     void Promise.all(
@@ -191,23 +206,41 @@ export function BackupConfigsPage() {
   }
 
   const load = () => {
-    backupConfigsApi
-      .list()
+    refreshConfigs()
       .then((list) => {
-        setConfigs(list)
-        refreshInterrupted(list)
+        if (list === null) return
         // Hydrate repair states: a suspended repair must show its resume button after a page load or a
-        // container restart, and the row-level polling only runs while activity says Repairing. One quiet
-        // GET per config; "never repaired" 404s are part of the normal answer.
+        // container restart, and the row-level polling only runs while activity says Repairing. Routed
+        // through the per-config repair gate like every other writer of that map.
         for (const c of list)
-          backupConfigsApi.repairStatus(c.id)
-            .then((s) => { if (s && s.status !== 'Completed') setRepairs((r) => ({ ...r, [c.id]: s })) })
-            .catch(() => {})
+          void refreshRepair(c.id)
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       // finally, not then: a failed load must still end the "loading" state, or the table sits on
       // "Loading…" forever with the real reason in the error line above it.
       .finally(() => setLoaded(true))
+  }
+
+  // --- The repair map's single write path. ---
+  // Three unsynchronized writers used to share it: the load-time hydration, the 1-second active poll, and
+  // the row's own button handlers (suspend/pause/resume each did their own status GET and wrote the map).
+  // The poll's status call can outlive a second (7z saturates the CPU during a repair), so a click's fresh
+  // "Suspended" could be overwritten moments later by the slow tick's stale "Repairing" — a Suspend button
+  // reappearing on a run already suspended. One gate per config id; every writer begins a claim when its
+  // request is SENT and only the latest claim may write.
+  const repairGates = useRef(new Map<number, LatestWins>())
+  const refreshRepair = (id: number) => {
+    let gate = repairGates.current.get(id)
+    if (!gate) repairGates.current.set(id, gate = latestWins())
+    const isLatest = gate.begin()
+    return backupConfigsApi.repairStatus(id)
+      .then((s) => {
+        if (!isLatest() || !s) return
+        // The hydration rule rides along: a long-completed repair is not resurrected into the map on load,
+        // but a live map entry may legitimately transition to Completed through this same path.
+        setRepairs((r) => (r[id] || s.status !== 'Completed' ? { ...r, [id]: s } : r))
+      })
+      .catch(() => {})
   }
   const [defaults, setDefaults] = useState<GlobalSettings | null>(null)
   // List the containers of the selected account (the PRD 1.2 endpoint, already used by ContainersPage).
@@ -258,14 +291,7 @@ export function BackupConfigsPage() {
   // could cover another error the user is reading, and there is nothing they can do about this refresh
   // anyway. The next tick retries naturally.
   useEffect(() => {
-    const refresh = () =>
-      backupConfigsApi
-        .list()
-        .then((list) => {
-          setConfigs(list)
-          refreshInterrupted(list)
-        })
-        .catch(() => {})
+    const refresh = () => refreshConfigs().catch(() => {})
     const t = setInterval(refresh, 5000)
     // Browsers throttle background-tab timers to minutes, so switching back shows the previous tick's
     // stale snapshot and waits a full period to update — with a long job running, that is half the reason
@@ -359,11 +385,7 @@ export function BackupConfigsPage() {
                   }),
                 )
               } else if (item.activity === 'Repairing') {
-                tasks.push(
-                  backupConfigsApi.repairStatus(item.id).then((s) => {
-                    if (!cancelled) setRepairs((r) => ({ ...r, [item.id]: s }))
-                  }),
-                )
+                tasks.push(refreshRepair(item.id))
               } else if (item.activity === 'Checking') {
                 tasks.push(
                   backupConfigsApi.checkStatus(item.id).then((s) => {
@@ -430,10 +452,7 @@ export function BackupConfigsPage() {
               .then((s) => setRestores((r) => ({ ...r, [item.id]: s })))
               .catch(() => {})
           } else if (item.activity === 'Repairing') {
-            void backupConfigsApi
-              .repairStatus(item.id)
-              .then((s) => setRepairs((r) => ({ ...r, [item.id]: s })))
-              .catch(() => {})
+            void refreshRepair(item.id)
           } else if (item.activity === 'Checking') {
             void backupConfigsApi
               .checkStatus(item.id)
@@ -1476,22 +1495,19 @@ export function BackupConfigsPage() {
                       onSuspend={async () => {
                         try {
                           await backupConfigsApi.repairSuspend(c.id)
-                          const s = await backupConfigsApi.repairStatus(c.id)
-                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                          await refreshRepair(c.id)
                         } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
                       }}
                       onPause={async () => {
                         try {
                           await backupConfigsApi.repairPause(c.id)
-                          const s = await backupConfigsApi.repairStatus(c.id)
-                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                          await refreshRepair(c.id)
                         } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
                       }}
                       onResumePause={async () => {
                         try {
                           await backupConfigsApi.repairUnpause(c.id)
-                          const s = await backupConfigsApi.repairStatus(c.id)
-                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                          await refreshRepair(c.id)
                         } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
                       }}
                       onResume={async () => {

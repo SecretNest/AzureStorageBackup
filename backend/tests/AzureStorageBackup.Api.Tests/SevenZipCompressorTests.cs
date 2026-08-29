@@ -380,4 +380,51 @@ public sealed class SevenZipCompressorTests : IDisposable
         var leftovers = Directory.EnumerateFiles(_dir, "canceled.7z*").Select(Path.GetFileName).ToList();
         Assert.True(leftovers.Count == 0, "left behind: " + string.Join(", ", leftovers));
     }
+    /// <summary>File names are DATA, never grammar. 7-Zip's argument parser reads a bare argv token as a
+    /// switch when it starts with '-', as a list-file when it starts with '@', and as a wildcard when it
+    /// contains '*' or '?' — all perfectly legal Linux file names. Without a "--" terminator, a file
+    /// literally named "-mhe=off" would OVERRIDE the encryption-header switch (7z exits 0; the archive is
+    /// simply wrong), "@names" would make 7z read that file's CONTENT as the list of files to add, and
+    /// "a*b" would silently substitute a glob match for the named file. Every one of these is a clean exit
+    /// with a wrong archive — the exact failure class this compressor's own comments say the project has
+    /// walked into once before.</summary>
+    [SkippableFact]
+    public async Task Hostile_File_Names_Are_Data_Not_Grammar()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "The hostile names are not legal on Windows.");
+
+        var compressor = Compressor();
+        var src = SourceDir();
+        var outDir = Path.Combine(_dir, "out-" + Guid.NewGuid().ToString("N")[..6]);
+        Directory.CreateDirectory(outDir);
+        var archive = Path.Combine(_dir, "hostile.7z");
+        File.WriteAllText(Path.Combine(src, "-mhe=off"), "switch-shaped");
+        File.WriteAllText(Path.Combine(src, "-mx0"), "another switch shape");
+        File.WriteAllText(Path.Combine(src, "@names"), "listfile-shaped");
+        File.WriteAllText(Path.Combine(src, "a*b"), "wildcard-shaped");
+        File.WriteAllText(Path.Combine(src, "plain.txt"), "control");
+
+        var result = await compressor.CompressAsync(new CompressionRequest(
+            src, ["-mhe=off", "-mx0", "@names", "a*b", "plain.txt"], archive, Password: "pw"));
+        await compressor.ExtractAsync(result.VolumeFiles[0], outDir, password: "pw");
+
+        Assert.Equal("switch-shaped", File.ReadAllText(Path.Combine(outDir, "-mhe=off")));
+        Assert.Equal("another switch shape", File.ReadAllText(Path.Combine(outDir, "-mx0")));
+        Assert.Equal("listfile-shaped", File.ReadAllText(Path.Combine(outDir, "@names")));
+        Assert.Equal("wildcard-shaped", File.ReadAllText(Path.Combine(outDir, "a*b")));
+        Assert.Equal("control", File.ReadAllText(Path.Combine(outDir, "plain.txt")));
+    }
+
+    /// <summary>The duplicate-name detector behind the false-clean guard: our writer never produces two
+    /// members under one name, so a duplicate is a malformed archive — and hashing "the first occurrence"
+    /// while extraction keeps "the last" is a verdict about nothing. Ordinal and exact: case variants are a
+    /// different (filesystem-folding) problem with its own guard.</summary>
+    [Fact]
+    public void Duplicated_Entry_Names_Are_Detected_Exactly()
+    {
+        Assert.Empty(SevenZipCli.DuplicatedEntryNames(["a", "b", "A"]));
+        Assert.Equal(["a"], SevenZipCli.DuplicatedEntryNames(["a", "b", "a", "a"]));
+        Assert.Equal(2, SevenZipCli.DuplicatedEntryNames(["x", "x", "y", "y", "z"]).Count);
+    }
+
 }

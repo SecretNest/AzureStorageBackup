@@ -247,10 +247,32 @@ internal static class SevenZipCli
         var args = new List<string> { "l", "-slt", "-y" };
         if (!string.IsNullOrEmpty(password))
             args.Add("-p" + password);
+        args.Add("--"); // file names are data, never grammar — see SevenZipCompressor.CompressAsync
         args.Add(Path.GetFullPath(firstVolumePath));
 
         var run = await RunAsync(exe, args, ct, priority: priority);
         return ParseEntryDetails(run.StdOut);
+    }
+
+    // KNOWN LIMITATION (documented in the README): 7-Zip accepts passwords only via the -p switch, so the
+    // password rides the child's argv and is readable through /proc/<pid>/cmdline by root (or the same UID)
+    // for the process's lifetime. There is no file/stdin/env alternative in 7zz's CLI; inside the product's
+    // single-user container the exposure is moot, and shelling differently would not remove it.
+
+    /// <summary>Entry names that appear more than once in a listing. Our writer never produces a duplicate
+    /// (a pack's members are distinct paths; single-file archives hold one member), so a duplicate is a
+    /// malformed — after /import, plausibly hostile — archive. The danger of ignoring it is a FALSE CLEAN:
+    /// the streaming verifier hashes the first occurrence while an extraction to disk keeps the last, so a
+    /// check could pass a pack whose restore delivers different bytes for the same path. Every consumer of a
+    /// listing treats a duplicated name as damage instead of picking a winner.</summary>
+    public static HashSet<string> DuplicatedEntryNames(IEnumerable<string> names)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var dup = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in names)
+            if (!seen.Add(n))
+                dup.Add(n);
+        return dup;
     }
 
     /// <summary>Parses the output of `l -slt`. The information block for the archive **itself** also has a line "Path = &lt;archive file name&gt;",

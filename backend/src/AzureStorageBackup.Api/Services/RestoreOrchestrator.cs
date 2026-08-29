@@ -557,6 +557,26 @@ public sealed class RestoreOrchestrator(
                         }
                     }
 
+                    // A duplicated member name is a malformed — after /import, plausibly hostile — archive
+                    // (see SevenZipCli.DuplicatedEntryNames): extraction keeps whichever occurrence lands
+                    // last, so serving any of them would hand the user bytes no verdict ever covered. The
+                    // affected entries fail alone; their companions restore as usual.
+                    var packListing = await compressor.ListEntriesAsync(firstVolume, request.Password, ct);
+                    var duplicated = SevenZipCli.DuplicatedEntryNames(
+                        packListing.Where(l => !l.IsDirectory).Select(l => l.Name));
+                    if (duplicated.Count > 0)
+                    {
+                        var blockedDup = needed.Where(e => duplicated.Contains(
+                            SevenZipCli.NormalizeEntryName(e.Storage?.EntryName ?? e.Path))).ToList();
+                        foreach (var e in blockedDup)
+                            phase?.Report($"{e.Path}: the archive holds more than one member under this name — refused");
+                        failedEntries += blockedDup.Count;
+                        needed.RemoveAll(e => duplicated.Contains(
+                            SevenZipCli.NormalizeEntryName(e.Storage?.EntryName ?? e.Path)));
+                        if (needed.Count == 0)
+                            return (restored, skipped, failedEntries);
+                    }
+
                     await compressor.ExtractAsync(firstVolume, extractDir, request.Password, ct);
 
                     foreach (var e in needed)

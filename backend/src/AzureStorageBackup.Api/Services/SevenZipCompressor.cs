@@ -162,6 +162,11 @@ public sealed class SevenZipCompressor : IFileCompressor
         }
         if (request.VolumeBytes is { } size)
             args.Add($"-v{size}b");
+        // "--" ends 7-Zip's argument grammar: everything after it is a file name, full stop. Without it,
+        // a real file named "-mhe=off" is parsed as a switch (overriding the encryption header, exit 0,
+        // wrong archive), "@names" as a list-file (that file's CONTENT becomes the list of files to add),
+        // and "a*b" as a wildcard — all legal Linux names, all clean exits with a wrong archive.
+        args.Add("--");
         args.Add(Path.GetFullPath(request.OutputArchivePath));
         args.AddRange(request.Entries);
 
@@ -259,6 +264,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         }
         if (request.VolumeBytes is { } size)
             args.Add($"-v{size}b");
+        args.Add("--"); // file names are data, never grammar — see CompressAsync
         args.Add(Path.GetFullPath(request.OutputArchivePath));
 
         long written = 0;
@@ -326,6 +332,9 @@ public sealed class SevenZipCompressor : IFileCompressor
         var args = new List<string> { "x", "-so", "-y", "-bso0", "-bsp0" };
         if (!string.IsNullOrEmpty(password))
             args.Add("-p" + password);
+        // "--" matters most right here: entryName comes from the cloud index, which after /import is
+        // attacker-controlled — a name shaped like a switch or a list-file must stay a name.
+        args.Add("--");
         args.Add(Path.GetFullPath(firstVolumePath));
         if (entryName is not null)
             args.Add(entryName);
@@ -350,6 +359,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         if (!string.IsNullOrEmpty(password))
             args.Add("-p" + password);
         args.Add("-o" + Path.GetFullPath(outputDir));
+        args.Add("--"); // file names are data, never grammar — see CompressAsync
         args.Add(Path.GetFullPath(firstVolumePath));
 
         await SevenZipCli.RunAsync(_exe, args, ct, priority: _priority);

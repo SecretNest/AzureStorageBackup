@@ -451,6 +451,8 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [operations.md](docs/operations.md).
 >
+> **The backup password is visible to root on the host while 7-Zip runs.** 7-Zip accepts passwords only as a command-line switch, so for the seconds-to-minutes an encryption or extraction runs, any process able to read that PID's `/proc/<pid>/cmdline` (root, or the container's own UID) can read the password. Inside the single-user container this is moot; if you share the host with untrusted users, know the boundary.
+>
 > **One endpoint, one account entry.** Adding the same storage endpoint twice is refused: two local entries for one real storage account would let two operations (say, a backup and a retention cleanup) run against the same cloud container at the same instant, each blind to the other. Existing duplicates in an old database are left alone, but new additions and edits are checked.
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.

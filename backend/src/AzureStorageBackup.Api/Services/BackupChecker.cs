@@ -675,6 +675,26 @@ public sealed class BackupChecker(
         var listing = await compressor!.ListEntriesAsync(firstVolume, password, ct);
         var files = listing.Where(e => !e.IsDirectory).Select(e => (e.Name, e.Size)).ToList();
 
+        // A duplicated member name is a malformed archive (see SevenZipCli.DuplicatedEntryNames): the
+        // streaming splitter would hash the first occurrence while an on-disk extraction keeps the last, so
+        // any per-name verdict over such a pack is a coin toss. Members carrying a duplicated name are
+        // corrupt outright; the rest of the pack is still judged normally.
+        var duplicated = SevenZipCli.DuplicatedEntryNames(files.Select(f => f.Name));
+        var dupCorrupted = new List<string>();
+        if (duplicated.Count > 0)
+        {
+            members = members.Where(e =>
+            {
+                if (!duplicated.Contains(SevenZipCli.NormalizeEntryName(e.Storage!.EntryName ?? e.Path)))
+                    return true;
+                dupCorrupted.Add(e.Path);
+                return false;
+            }).ToList();
+            files = files.Where(f => !duplicated.Contains(f.Name)).ToList();
+            if (members.Count == 0)
+                return dupCorrupted;
+        }
+
         var actual = new Dictionary<string, (long Length, string Hash)>(StringComparer.Ordinal);
         var splitter = new SegmentHashingStream(files, (name, len, hash) => actual.TryAdd(name, (len, hash)));
         await using (splitter)
@@ -713,6 +733,7 @@ public sealed class BackupChecker(
 
         if (suspect.Count > 0)
             corrupted.AddRange(await VerifyPackOnDiskAsync(firstVolume, groupDir, suspect, password, ct));
+        corrupted.AddRange(dupCorrupted);
         return corrupted;
     }
 
