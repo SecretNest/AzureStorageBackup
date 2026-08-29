@@ -399,6 +399,47 @@ public sealed class BackupCheckerTests : IDisposable
         CloudCheckLevel cloud, LocalCheckLevel local, string expected)
         => Assert.Equal(expected, BackupChecker.DescribeLevels(new CheckOptions { Cloud = cloud, Local = local }));
 
+    /// <summary>"0 repairable from local" after a check that never hashed a local file is a false verdict —
+    /// repairability was not assessed, not absent, and the wording sent a user away from the repair that would
+    /// have hashed exactly the affected files and fixed the recoverable ones.</summary>
+    [Fact]
+    public void The_Closing_Summary_Says_Not_Assessed_When_Local_Was_Not_Checked()
+    {
+        var report = new CheckReport(9,
+        [
+            new FileFinding("a.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked),
+            new FileFinding("b.bin", "data/y", CloudState.MissingOrBad, LocalState.NotChecked),
+            new FileFinding("c.bin", "data/z", CloudState.Ok, LocalState.NotChecked),
+        ]);
+        Assert.Equal(
+            "2 problem(s), local repairability not assessed — run repair to hash just the affected files",
+            BackupChecker.ProblemsSummary(report));
+    }
+
+    [Fact]
+    public void The_Closing_Summary_Counts_Repairable_When_Local_Content_Was_Checked()
+    {
+        var report = new CheckReport(9,
+        [
+            new FileFinding("a.bin", "data/x", CloudState.MissingOrBad, LocalState.Ok),
+            new FileFinding("b.bin", "data/y", CloudState.MissingOrBad, LocalState.Changed),
+        ]);
+        Assert.Equal("2 problem(s), 1 repairable from local", BackupChecker.ProblemsSummary(report));
+    }
+
+    /// <summary>The mixed case: a sentinel demotion or a partial local pass can leave some problems assessed and
+    /// others not, and folding the unassessed ones into "not repairable" is the same false verdict as above.</summary>
+    [Fact]
+    public void The_Closing_Summary_States_The_Unassessed_Separately()
+    {
+        var report = new CheckReport(9,
+        [
+            new FileFinding("a.bin", "data/x", CloudState.MissingOrBad, LocalState.Ok),
+            new FileFinding("b.bin", "data/y", CloudState.MissingOrBad, LocalState.NotChecked),
+        ]);
+        Assert.Equal("2 problem(s), 1 repairable from local, 1 not assessed", BackupChecker.ProblemsSummary(report));
+    }
+
     /// <summary>Progress truthfulness on both cloud stages. The HEAD stage's unit of real work is the volume
     /// (one probe each), so its total and ticks count volumes — a thousand-volume object counted as one tick
     /// freezes the bar for minutes while single-volume packs race it forward. The download stage's real work is

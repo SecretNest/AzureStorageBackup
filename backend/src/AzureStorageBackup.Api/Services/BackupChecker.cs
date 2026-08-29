@@ -80,7 +80,6 @@ public sealed class BackupChecker(
                 headConcurrency ?? downloadConcurrency, onProgress, ct);
             if (localSkipped is not null)
                 report = report with { LocalSkippedSentinel = localSkipped };
-            var problems = report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
             // The orphan scan is a separate axis from Ok (orphans are not corruption, so they never fail a check),
             // and it therefore has to be stated separately — otherwise a run that turned up tens of thousands of
             // reclaimable blobs is logged as a bare "passed" and the finding is lost.
@@ -92,7 +91,7 @@ public sealed class BackupChecker(
                 $"Check {(report.Ok ? "passed" : "failed")}: {container}",
                 (report.Ok
                     ? $"{report.Findings.Count} file(s) OK"
-                    : $"{problems} problem(s), {report.RepairablePaths.Count} repairable from local")
+                    : ProblemsSummary(report))
                 + orphanNote
                 // Repeated on the closing line and not only on the opening one, because these two lines are read
                 // in completely different circumstances: the opening one scrolls away, and the closing one is what
@@ -112,6 +111,21 @@ public sealed class BackupChecker(
     /// the same event differently. Empty when nothing was demoted.</summary>
     private static string SkipNote(string? localSkipped) =>
         localSkipped is null ? "" : $"; local check skipped: sentinel '{localSkipped}' does not exist";
+
+    /// <summary>The failing check's closing line. Repairability is only a verdict where the local content was
+    /// actually hashed; a problem whose local side was never checked must read as "not assessed", never as "not
+    /// repairable" — the latter sends the user away from the repair that would have hashed exactly the affected
+    /// files and fixed the recoverable ones.</summary>
+    internal static string ProblemsSummary(CheckReport report)
+    {
+        var problems = report.Findings.Where(f => f.Cloud == CloudState.MissingOrBad).ToList();
+        var unassessed = problems.Count(f => f.Local == LocalState.NotChecked);
+        var repairability = unassessed == problems.Count && problems.Count > 0
+            ? "local repairability not assessed — run repair to hash just the affected files"
+            : $"{report.RepairablePaths.Count} repairable from local"
+              + (unassessed > 0 ? $", {unassessed} not assessed" : "");
+        return $"{problems.Count} problem(s), {repairability}";
+    }
 
     /// <summary>The two check levels in plain words for the start notification: this line lands in a push message,
     /// and enum identifiers such as "ExistenceSize" are code, not prose.</summary>

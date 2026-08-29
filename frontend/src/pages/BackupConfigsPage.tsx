@@ -13,7 +13,7 @@ import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
-import { orphanSummary } from '../lib/checkSummary'
+import { orphanSummary, repairabilitySummary } from '../lib/checkSummary'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
@@ -2330,7 +2330,7 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
       <div className={r.ok ? 'text-ok' : 'text-danger'}>
         {r.ok
           ? `Check completed — all checked objects OK (version ${r.version})`
-          : `Check completed — ${r.missingRefs.length} problem(s), ${r.repairablePaths.length} repairable (version ${r.version})`}
+          : `Check completed — ${repairabilitySummary(r)} (version ${r.version})`}
         {orphans && <span className={orphansWarn ? 'text-warn' : undefined}>{orphans}</span>}
         {/* Its own line, and always amber whatever the verdict above says: a column of "not checked"
             reads as a clean bill of health, which is the same false reassurance in a different costume.
@@ -2619,7 +2619,10 @@ function CheckModal({
   const [versions, setVersions] = useState<BackupVersionInfo[]>([])
   const [version, setVersion] = useState<number | null>(null)
   const [cloud, setCloud] = useState<number>(CloudCheckLevel.ExistenceSize)
-  const [local, setLocal] = useState<number>(LocalCheckLevel.Content)
+  // Local defaults to off: a content-level local pass reads the whole tree and can run for hours, and in
+  // practice a check is about the cloud side. Repairability of whatever it finds is answered afterwards,
+  // per file, by the hash button in the findings table — or by repair itself, which hashes before replacing.
+  const [local, setLocal] = useState<number>(LocalCheckLevel.None)
   const [rehydrate, setRehydrate] = useState<number | null>(null)
   const [listOrphans, setListOrphans] = useState(false)
   const [running, setRunning] = useState(false)
@@ -2716,6 +2719,38 @@ function CheckModal({
     }
   }
 
+  // Per-file local hashing, the targeted follow-up to a cloud-only check: one row's "unknown" becomes a
+  // verdict without hashing the whole tree. The result is folded back into the report so the summary, the
+  // repairable column and repairablePaths all update together.
+  const [hashingPath, setHashingPath] = useState<string | null>(null)
+  const hashOne = async (path: string) => {
+    if (!report) return
+    setHashingPath(path)
+    try {
+      const r = await backupConfigsApi.hashFile(config.id, path, report.version)
+      setCheckRun((cur) => {
+        if (!cur?.report) return cur
+        return {
+          ...cur,
+          report: {
+            ...cur.report,
+            findings: cur.report.findings.map((f) =>
+              f.path === path ? { ...f, local: r.local, repairable: r.repairable } : f,
+            ),
+            repairablePaths:
+              r.repairable && !cur.report.repairablePaths.includes(path)
+                ? [...cur.report.repairablePaths, path]
+                : cur.report.repairablePaths,
+          },
+        }
+      })
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setHashingPath(null)
+    }
+  }
+
   const problems = report ? report.findings.filter((f) => f.cloud === CloudState.MissingOrBad) : []
   // Entries whose content was carried over from an earlier version: the cloud blob itself is usually fine, so they are not in problems, but they still have to be reported.
   const stale = report ? report.findings.filter((f) => f.unreadableAt) : []
@@ -2732,7 +2767,10 @@ function CheckModal({
           {running && (
             <button type="button" className="btn-danger" onClick={stopCheck}>Stop</button>
           )}
-          {(problems.some((f) => f.repairable) || (report?.orphanBlobs?.length ?? 0) > 0) && (
+          {/* Offered whenever there are problems at all, not only proven-repairable ones: repair re-checks
+              the cloud and hashes locally per bad object on its own, so an unassessed local side (the check ran
+              without a content-level local pass) must not hide the one action that would assess it. */}
+          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && (
             <button type="button" onClick={runRepair} disabled={repairing || running}>
               {repairing ? 'Repairing…' : 'Repair from local'}
             </button>
@@ -2819,7 +2857,7 @@ function CheckModal({
             <div className="text-danger">Metadata drift: {report.metadataIssue}</div>
           )}
           <div className={report.ok ? 'text-ok' : 'text-danger'} style={{ margin: '0.4rem 0' }}>
-            {report.ok ? 'All checked objects OK' : `${problems.length} problem(s), ${report.repairablePaths.length} repairable from local`}
+            {report.ok ? 'All checked objects OK' : repairabilitySummary(report)}
             {' '}(version {report.version})
           </div>
           {/* Driven by the report, not by the checkbox above it. The checkbox is state of *this* dialog, and
@@ -2868,8 +2906,31 @@ function CheckModal({
                         {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
                       </td>
                       <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
-                      <td style={{ textAlign: 'center' }}>{localStateLabel(f.local)}</td>
-                      <td style={{ textAlign: 'center' }}>{f.repairable ? 'yes' : 'no'}</td>
+                      <td style={{ textAlign: 'center' }}>
+                        {localStateLabel(f.local)}
+                        {/* The row's local side was never checked (the check ran cloud-only): offer to hash
+                            just this file. The backend compares the length first, so an appended huge file
+                            answers instantly; only a same-length file pays for a full read. */}
+                        {f.local === LocalState.NotChecked && (
+                          <>
+                            {' '}
+                            <button
+                              type="button"
+                              className="btn-ghost"
+                              style={{ padding: '0 0.3rem' }}
+                              disabled={hashingPath != null}
+                              onClick={() => hashOne(f.path)}
+                            >
+                              {hashingPath === f.path ? 'hashing…' : 'hash now'}
+                            </button>
+                          </>
+                        )}
+                      </td>
+                      {/* "unknown", not "no": without a local hash there is no verdict to print, and "no"
+                          reads as "repair cannot help" when the question was simply never asked. */}
+                      <td style={{ textAlign: 'center' }}>
+                        {f.repairable ? 'yes' : f.local === LocalState.NotChecked ? 'unknown' : 'no'}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

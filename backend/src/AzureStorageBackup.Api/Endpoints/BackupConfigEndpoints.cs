@@ -441,6 +441,54 @@ public static class BackupConfigEndpoints
             return Results.Ok(candidates);
         });
 
+        // Hash ONE local file against a version's recorded content — the targeted follow-up to a cloud-only check.
+        // A check run without a content-level local pass cannot say whether a damaged blob is repairable from
+        // local ("not assessed", not "no"), and hashing the whole tree to answer it for a handful of files is out
+        // of proportion. The length is compared first: an appended file answers "changed" without reading a byte,
+        // which matters when the file in question is 100 GB. Only a same-length file pays for a full read.
+        group.MapGet("/{id:int}/hash-file", async (int id, int? version, string path,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            ISecretReader secrets, IFileHasher hasher, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
+        {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var password = secrets.RevealBackupPassword(config);
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            var ver = version is { } vv
+                ? info?.Versions.FirstOrDefault(x => x.Version == vv)
+                : info?.Versions.Count > 0 ? info.Versions[^1] : null;
+            if (info is null || ver is null)
+                return Results.NotFound();
+            var idx = await indexCache.ReadAsync(
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks,
+                ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var entry = idx.Entries.FirstOrDefault(e => e.Path == path);
+            if (entry is null)
+                return Results.NotFound();
+
+            var full = Path.Combine(config.LocalRoot, path);
+            LocalState local;
+            if (!System.IO.File.Exists(full))
+                local = LocalState.Missing;
+            else if (new FileInfo(full).Length != entry.Length || entry.FullHash is null)
+                local = LocalState.Changed;
+            else
+                local = string.Equals(await hasher.FullHashAsync(full, ct), entry.FullHash, StringComparison.Ordinal)
+                    ? LocalState.Ok
+                    : LocalState.Changed;
+            // The same criterion as FileFinding.Repairable's local half: content match is what repair verifies
+            // before replacing a blob, so this answer predicts exactly what repair would do with this file.
+            return Results.Ok(new { path, local, repairable = local == LocalState.Ok });
+        });
+
         // The file paths marked unrecoverable in a given version (drives per-file substitution during restore).
         group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {

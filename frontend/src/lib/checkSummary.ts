@@ -1,4 +1,5 @@
 import type { CheckReport } from '../api/backupConfigs'
+import { CloudState, LocalState } from '../api/backupConfigs'
 
 /**
  * The unreferenced-blob half of a finished check's one-line result.
@@ -28,4 +29,26 @@ export function orphanSummary(report: CheckReport): string {
   return report.orphanBlobs.length > 0
     ? ` · ${report.orphanBlobs.length.toLocaleString()} unreferenced blob(s), reclaimable by repair`
     : ' · no unreferenced blobs'
+}
+
+/**
+ * The repairability half of a failing check's one-line result, shared by the config row and the
+ * dialog summary so the two cannot drift.
+ *
+ * Repairability is only a **verdict** where the local content was actually hashed. A check run
+ * without a content-level local check knows nothing about the local side, and printing
+ * "0 repairable" there is a verdict where there was only an unanswered question — it sends the user
+ * away from the repair that would have hashed exactly the affected files (repair re-checks the
+ * cloud and hashes locally per bad object on its own; it never trusted this report's flag).
+ * Mirrors BackupChecker.ProblemsSummary on the notification side.
+ */
+export function repairabilitySummary(report: CheckReport): string {
+  const problems = report.findings.filter((f) => f.cloud === CloudState.MissingOrBad)
+  const unassessed = problems.filter((f) => f.local === LocalState.NotChecked).length
+  const repairability =
+    unassessed === problems.length && problems.length > 0
+      ? 'local repairability not assessed — repair will hash just the affected files'
+      : `${report.repairablePaths.length} repairable from local` +
+        (unassessed > 0 ? `, ${unassessed} not assessed` : '')
+  return `${problems.length} problem(s), ${repairability}`
 }

@@ -633,6 +633,12 @@ export const backupConfigsApi = {
   restoreStatus: (id: number) => api.get<RestoreRun>(`/backup-configs/${id}/restore`),
   fileVersions: (id: number, path: string) =>
     api.get<FileVersionOption[]>(`/backup-configs/${id}/file-versions?path=${encodeURIComponent(path)}`),
+  // The targeted follow-up to a cloud-only check: hash ONE path against the version's recorded
+  // content. The backend compares the length first, so an appended huge file answers instantly.
+  hashFile: (id: number, path: string, version: number | null) =>
+    api.get<{ path: string; local: number; repairable: boolean }>(
+      `/backup-configs/${id}/hash-file?path=${encodeURIComponent(path)}${version != null ? `&version=${version}` : ''}`,
+    ),
   unrecoverablePaths: (id: number, version: number | null) =>
     api.get<string[]>(`/backup-configs/${id}/unrecoverable${version != null ? `?version=${version}` : ''}`),
   unreadableEntries: (id: number, version: number | null) =>

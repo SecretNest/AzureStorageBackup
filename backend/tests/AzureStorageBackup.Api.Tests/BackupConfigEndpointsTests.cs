@@ -724,6 +724,74 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
     private sealed record UnreadableRow(string path, DateTimeOffset unreadableAt);
 
+    private sealed record HashFileRow(string path, int local, bool repairable);
+
+    /// <summary>The targeted follow-up to a cloud-only check: a check run without a content-level local pass
+    /// cannot say whether a damaged blob is repairable from local, and hashing the whole tree to find out for
+    /// four files is out of proportion. This endpoint hashes ONE path against the version's recorded content —
+    /// with a length shortcut, so an appended 100 GB file answers "changed" without reading a byte.</summary>
+    [Fact]
+    public async Task Hash_File_Answers_Repairability_For_One_Path()
+    {
+        var accountId = await CreateAccountAsync("hash-file");
+        var root = Path.Combine(Path.GetTempPath(), "asb-hashfile-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                    SampleRequest("hash-file", accountId) with { ContainerName = "hash-file-container", LocalRoot = root }))
+                .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+            var file = Path.Combine(root, "a.bin");
+            await File.WriteAllTextAsync(file, "the recorded content");
+            var hash = await new FileHasher().FullHashAsync(file);
+            var identity = SeedLocalInfo(accountId, created!.ContainerName,
+                [new BackupVersion
+                {
+                    Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
+                    Stats = new VersionStats(1, 20, 1, 20),
+                }]);
+            using (var scope = factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
+                    accountId, created.ContainerName, 9, identity,
+                    new VersionIndex
+                    {
+                        Version = 9,
+                        Entries =
+                        [
+                            new IndexEntry
+                            {
+                                Path = "a.bin", Kind = "file", Length = new FileInfo(file).Length,
+                                Permissions = "0644", FullHash = hash,
+                            },
+                        ],
+                    });
+
+            var url = $"/api/backup-configs/{created.Id}/hash-file?version=9&path=a.bin";
+
+            // Unchanged content → repairable.
+            var ok = await _client.GetFromJsonAsync<HashFileRow>(url);
+            Assert.Equal((int)LocalState.Ok, ok!.local);
+            Assert.True(ok.repairable);
+
+            // Appended → changed; the length answers it without reading the content.
+            await File.AppendAllTextAsync(file, "!");
+            var changedRow = await _client.GetFromJsonAsync<HashFileRow>(url);
+            Assert.Equal((int)LocalState.Changed, changedRow!.local);
+            Assert.False(changedRow.repairable);
+
+            // Gone → missing.
+            File.Delete(file);
+            var missingRow = await _client.GetFromJsonAsync<HashFileRow>(url);
+            Assert.Equal((int)LocalState.Missing, missingRow!.local);
+            Assert.False(missingRow.repairable);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     /// <summary>Now that the check is a background job, busy is no longer a synchronous 409: the POST only gets the run started,
     /// and the conflict has to surface in the **run state** (the same convention as /repair).</summary>
     [Fact]
