@@ -351,23 +351,23 @@ public sealed class BackupChecker(
             .GroupBy(e => BlobNameOf(e.Storage!))
             .ToList();
 
-        // What gets counted are **storage objects** (packs and single-file blobs), not files — a pack is checked
-        // once. The UI unit is labelled objects to match, so the mismatch with the file count is not read as
-        // "packing didn't take effect".
+        // What gets counted are **volumes** (probes), not objects and not files: a probe is the stage's unit of
+        // real work, and a thousand-volume object counted as one tick freezes the bar for minutes while a run of
+        // single-volume packs then races it forward. The UI unit is labelled volumes to match.
         //
         // All objects go to the prober as one worklist: the head budget spans the whole stage, so a container of
         // thousands of single-volume packs advances at budget×(1/RTT) objects a second, not one per round-trip.
-        var tracker = Track(onProgress, "Cloud", groups.Count);
         var presentGroups = new List<IGrouping<string, IndexEntry>>();
         var families = groups.Select(g =>
         {
             var (vols, sizes) = ExpectedVolumes(info, g.First().Storage!);
             return (g.Key, vols, sizes);
         }).ToList();
+        var tracker = Track(onProgress, "Cloud", families.Sum(f => Math.Max(1, f.vols)));
         var verdicts = await VolumeBlobIO.VerifyFamiliesAsync(
             cc, families, headConcurrency, ct,
             // HEAD downloads no content: count 0 bytes, or the reported "speed" has nothing to do with actual traffic.
-            onFamilyDone: i => { tracker?.Touch(groups[i].Key); tracker?.Advance(0); });
+            onProbe: i => { tracker?.Touch(groups[i].Key); tracker?.Advance(0); });
         tracker?.Complete();
         for (var i = 0; i < groups.Count; i++)
         {
@@ -415,6 +415,17 @@ public sealed class BackupChecker(
         using var gate = new SemaphoreSlim(Math.Max(1, downloadConcurrency));
         // This is the only stage in the whole check that actually downloads data, and the only one that can run for hours.
         var tracker = Track(onProgress, "Verifying", presentGroups.Count, inFlight: true);
+        // Declare the workload in bytes, the same two units the restore side reports: what will be re-hashed
+        // (source bytes) and what comes over the wire (compressed volumes). A group count alone distorts the
+        // progress — one group can be a single 100 GB file or a box of several hundred small ones. The download
+        // total is only reported when every group can answer it (an old index without volume sizes must not hand
+        // out an undersized denominator that pins the percentage at 100% early).
+        var groupWork = presentGroups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
+        var downloadSizes = presentGroups.ToDictionary(
+            g => g.Key, g => TransferLabel.DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
+        var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
+        foreach (var g in presentGroups)
+            tracker?.Enqueue(groupWork[g.Key], downloadTotalKnown ? downloadSizes[g.Key] : 0);
         try
         {
             var perGroup = await Task.WhenAll(presentGroups.Select(async g =>
@@ -422,7 +433,9 @@ public sealed class BackupChecker(
                 try { return await VerifyGroupAsync(cc, info, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
                 finally
                 {
-                    tracker?.Advance(0); // counting is separate from in-flight: one group takes exactly one slot
+                    // Counting and in-flight are separate concerns: one group takes exactly one slot. Work is
+                    // retired in one go — failed groups too, or the remainder never reaches zero and the ETA hangs.
+                    tracker?.Advance(0, groupWork[g.Key]);
                 }
             }));
             return perGroup.SelectMany(x => x).ToList();

@@ -7,10 +7,11 @@ const STAGE_UNITS: Record<string, string> = {
   Diffing: 'files',
   Uploading: 'objects',
   Restoring: 'objects',
-  // The check stages. Cloud counts stored objects (one HEAD per pack), Verifying counts packs that get
-  // downloaded, extracted and re-hashed, and Local counts index entries — the three differ by orders of
-  // magnitude and cannot share one word.
-  Cloud: 'objects',
+  // The check stages. Cloud counts volumes (one HEAD per volume — its unit of real work, so a
+  // thousand-volume object does not freeze the bar as one tick), Verifying counts packs that get
+  // downloaded, extracted and re-hashed (its bytes carry the real progress), and Local counts index
+  // entries — the three differ by orders of magnitude and cannot share one word.
+  Cloud: 'volumes',
   Verifying: 'objects',
   Local: 'files',
   // The orphan scan's listing pass, named for the work rather than the quarry: it counts every blob it lists,
@@ -395,8 +396,16 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
             (detail.transferTotal > 0
               ? `${formatBytes(detail.transferredBytes)} / ${formatBytes(detail.transferTotal)} downloaded`
               : `${formatBytes(detail.transferredBytes)} downloaded`),
-          // Restored: source bytes written back out after extraction. What has not been restored (to go) sits at the end of the timeline below.
-          detail.workDone > 0 && `${formatBytes(detail.workDone)} restored`,
+          // Source bytes fully settled (restored to disk / verified against the index), as a fraction of the
+          // declared workload with its byte-based percentage — the honest progress for a stage whose groups
+          // range from one 100 GB file to a box of hundreds of small ones. The verb follows the stage: these
+          // two lines share every mechanism but do opposite things with the bytes.
+          detail.workTotal > 0
+            ? `${formatBytes(detail.workDone)} / ${formatBytes(detail.workTotal)} ${
+                detail.stage === 'Verifying' ? 'verified' : 'restored'
+              }${detail.workPercent != null ? ` (${detail.workPercent}%)` : ''}`
+            : detail.workDone > 0 &&
+              `${formatBytes(detail.workDone)} ${detail.stage === 'Verifying' ? 'verified' : 'restored'}`,
         ]
       : [
           // Completed and total **source** bytes, pre-compression. A fraction only means something when

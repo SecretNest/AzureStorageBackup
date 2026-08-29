@@ -2343,7 +2343,10 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
   return (
     <div className="text-faint">
       Checking
-      {run.detail?.percent != null && ` ${run.detail.percent}%`}
+      {/* Byte-based when the stage declares a workload (the deep verify), volume-count otherwise (the
+          HEAD stage, where one probe really is one unit of work). */}
+      {(run.detail?.workPercent ?? run.detail?.percent) != null &&
+        ` ${run.detail!.workPercent ?? run.detail!.percent}%`}
       <StopButton onStop={onStop} />
       {run.detail && (
         <>

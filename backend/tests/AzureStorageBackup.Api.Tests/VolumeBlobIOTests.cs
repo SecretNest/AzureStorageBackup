@@ -893,6 +893,41 @@ public sealed class VolumeBlobIOTests
         finally { await cc.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>Progress is counted in probes (volumes), not families: a family of a thousand volumes is a
+    /// thousand round-trips of real work, and counting it as one tick freezes the bar for minutes while a run of
+    /// single-volume packs then races it forward — jumpy and untruthful both ways. Skipped probes of a condemned
+    /// family still tick, or the bar could never reach its total.</summary>
+    [SkippableFact]
+    public async Task The_Progress_Callback_Fires_Once_Per_Volume_Skips_Included()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var probe = new HeadOverlapProbe();
+        var name = RandomName("vvp-");
+        var cc = ProbedContainer(name, probe);
+        await cc.CreateIfNotExistsAsync();
+        try
+        {
+            foreach (var i in new[] { 1, 2, 3 })
+                await cc.GetBlobClient($"data/whole.{i:D3}").UploadAsync(
+                    BinaryData.FromString("v"), overwrite: true);
+            await cc.GetBlobClient("data/single").UploadAsync(BinaryData.FromString("s"), overwrite: true);
+            // "data/hole" is never uploaded: every probe of it settles or skips, and each must still tick.
+
+            var ticks = 0;
+            var verdicts = await VolumeBlobIO.VerifyFamiliesAsync(
+                cc,
+                [("data/whole", 3, []), ("data/single", 1, []), ("data/hole", 6, [])],
+                concurrency: 4, default, _ => Interlocked.Increment(ref ticks));
+
+            Assert.Equal((true, true), verdicts[0]);
+            Assert.Equal((true, true), verdicts[1]);
+            Assert.Equal((false, false), verdicts[2]);
+            Assert.Equal(3 + 1 + 6, ticks);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>Once one volume of a family is found missing the family's verdict is settled, so the remaining
     /// volumes are not worth a round-trip each — with ~1000 volumes that tail is the bulk of the work. A shared
     /// flag replaces the serial version's early return: tasks that take a concurrency slot after the flag is up

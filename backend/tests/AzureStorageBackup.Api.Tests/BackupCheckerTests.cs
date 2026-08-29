@@ -399,6 +399,59 @@ public sealed class BackupCheckerTests : IDisposable
         CloudCheckLevel cloud, LocalCheckLevel local, string expected)
         => Assert.Equal(expected, BackupChecker.DescribeLevels(new CheckOptions { Cloud = cloud, Local = local }));
 
+    /// <summary>Progress truthfulness on both cloud stages. The HEAD stage's unit of real work is the volume
+    /// (one probe each), so its total and ticks count volumes — a thousand-volume object counted as one tick
+    /// freezes the bar for minutes while single-volume packs race it forward. The download stage's real work is
+    /// bytes, so it declares its workload the way restore does, and the byte-based WorkPercent takes over from
+    /// the object count.</summary>
+    [SkippableFact]
+    public async Task Check_Progress_Counts_Volumes_For_HEADs_And_Bytes_For_Downloads()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkp-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var buf = new byte[6_000_000];
+            new Random(31).NextBytes(buf);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            StageProgress? cloud = null, verifying = null;
+            var result = await checker.CheckAsync(
+                account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content }, _src,
+                onProgress: p =>
+                {
+                    if (p.Stage == "Cloud") cloud = p;
+                    if (p.Stage == "Verifying") verifying = p;
+                });
+
+            Assert.True(result.Ok);
+            // One object, six-plus volumes: an object-counting stage would report Total == 1.
+            Assert.NotNull(cloud);
+            Assert.True(cloud!.Total >= 6, $"Cloud total is {cloud.Total}, an object count, not volumes");
+            Assert.Equal(cloud.Total, cloud.Processed);
+            // The deep stage declares its byte workload and retires it fully.
+            Assert.NotNull(verifying);
+            Assert.Equal(6_000_000, verifying!.WorkTotal);
+            Assert.Equal(verifying.WorkTotal, verifying.WorkDone);
+            Assert.True(verifying.TransferTotal > 0, "download total not declared despite known volume sizes");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The same client wiring as Build()'s factory, with the overlap probe spliced into the pipeline.</summary>
     private sealed class ProbedFactory(HeadOverlapProbe probe) : IBlobClientFactory
     {

@@ -495,16 +495,17 @@ public static class VolumeBlobIO
     /// not settle: the family is bad either way, but which volumes exist is still worth knowing at HEAD prices.
     /// </para>
     /// </summary>
-    /// <param name="onFamilyDone">Called once per family, when its last probe completes (skips included) — the
-    /// progress hook. Called from worker threads, possibly concurrently; the index is into <paramref name="families"/>.</param>
+    /// <param name="onProbe">Called once per probe — one per volume, skips included — the progress hook.
+    /// Progress is counted in probes rather than families: a thousand-volume family is a thousand round-trips of
+    /// real work, and counting it as one tick freezes the bar for minutes while single-volume packs then race it
+    /// forward. Called from worker threads, possibly concurrently; the index is into <paramref name="families"/>.</param>
     public static async Task<(bool Present, bool SizeOk)[]> VerifyFamiliesAsync(
         BlobContainerClient cc,
         IReadOnlyList<(string BaseRef, int Volumes, IReadOnlyList<long> Sizes)> families,
-        int concurrency, CancellationToken ct, Action<int>? onFamilyDone = null)
+        int concurrency, CancellationToken ct, Action<int>? onProbe = null)
     {
         var missing = new bool[families.Count];   // "some volume is gone" — settles the family (§ skip above)
         var sizeBad = new bool[families.Count];   // "a volume exists at the wrong size"
-        var pending = families.Select(f => Math.Max(1, f.Volumes)).ToArray();
 
         var work = families.SelectMany((f, fi) =>
             Enumerable.Range(1, Math.Max(1, f.Volumes)).Select(vi => (Family: fi, Volume: vi)));
@@ -531,8 +532,7 @@ public static class VolumeBlobIO
                     else if (sizes.Count >= vi && len != sizes[vi - 1])
                         sizeBad[fi] = true;
                 }
-                if (Interlocked.Decrement(ref pending[fi]) == 0)
-                    onFamilyDone?.Invoke(fi);
+                onProbe?.Invoke(fi);
             });
 
         return [.. families.Select((_, i) => missing[i] ? (false, false) : (true, !sizeBad[i]))];
