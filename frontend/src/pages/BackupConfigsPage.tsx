@@ -49,6 +49,7 @@ import {
   type StageProgress,
   type RestoreRun,
   type CheckRun,
+  type RepairPlan,
   type RepairRun,
 } from '../api/backupConfigs'
 import {
@@ -2629,6 +2630,10 @@ function CheckModal({
   const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
+  // The repair plan under review: fetched when the user clicks Repair, executed only on confirm.
+  const [plan, setPlan] = useState<RepairPlan | null>(null)
+  const [planSelected, setPlanSelected] = useState<Set<string>>(new Set())
+  const [planning, setPlanning] = useState(false)
   // True until the on-open fetch of the last report answers. Without it the dialog opens empty and
   // silently fills in whenever the fetch lands — on a phone that is seconds of "there is no report",
   // which is exactly how a user read it.
@@ -2703,11 +2708,26 @@ function CheckModal({
     }
   }
 
-  const runRepair = async (recoverPrefixes: boolean) => {
+  const openPlan = async () => {
+    setPlanning(true)
+    try {
+      const p = await backupConfigsApi.repairPlan(config.id, report?.version ?? null)
+      setPlan(p)
+      // Ticked = repair now. Only stat-repairable rows start ticked; the rest are deferred by default.
+      setPlanSelected(new Set(p.rows.filter((r) => r.action === 'reupload').map((r) => r.path)))
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setPlanning(false)
+    }
+  }
+
+  const runRepair = async (paths: string[]) => {
     setRepairing(true)
+    setPlan(null)
     try {
       // Repair is a background job (holding the lock until it completes); poll for its state.
-      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, recoverPrefixes)
+      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, false, paths)
       setRepairReport(run)
       while (run.status === 'Running') {
         await delay(1500)
@@ -2908,15 +2928,9 @@ function CheckModal({
                   exists locally — it turns Unknown into Yes or No without checking anything else.
                 </li>
                 <li>
-                  <strong>Repair from local</strong> rebuilds every damaged object whose local content matches
-                  this version&apos;s record. Files that do not match are marked unrecoverable <em>in this
-                  version only</em>; restoring can then substitute them from another version, and the next
-                  backup stores their current content as usual.
-                </li>
-                <li>
-                  A <strong>grown</strong> file is rebuilt only by the second repair button — that re-uploads
-                  the whole object in full. The plain repair leaves it unrecoverable here, and loses nothing:
-                  a later backup of the grown file contains all of this content anyway.
+                  <strong>Repair…</strong> first shows the plan — which files can be re-uploaded from local and
+                  at what size, priced without reading a byte — and runs only what you tick. Everything
+                  unticked is marked damaged and left to the next backup version.
                 </li>
               </ul>
             </div>
@@ -2935,15 +2949,6 @@ function CheckModal({
                       <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
                       <td style={{ textAlign: 'center' }}>
                         {localStateLabel(f.local)}
-                        {/* "may": the length proves growth, not that the first bytes are untouched — the
-                            authoritative prefix hash happens inside repair, and a wrong guess costs one read.
-                            What would be recovered is the version's recorded content, rebuilt from the local
-                            file; surviving cloud volumes play no part either way. */}
-                        {f.grown && (
-                          <span className="text-faint">
-                            {' '}(grown — the recorded content may survive as this file&apos;s prefix)
-                          </span>
-                        )}
                         {/* The row's local side was never checked (the check ran cloud-only): offer to hash
                             just this file. The backend compares the length first, so an appended huge file
                             answers instantly; only a same-length file pays for a full read. */}
@@ -2973,21 +2978,67 @@ function CheckModal({
               </table>
             </div>
           )}
-          {/* The repair actions live with the findings they act on, not in the footer among the check
-              controls — check options and repair actions in one pile is how the prefix toggle got read as
-              a check option. Two verbs instead of a button-plus-checkbox: what each click does is in its
-              own label, and there is no state to have set beforehand. Offered whenever there are problems
-              at all, not only proven-repairable ones — repair hashes locally per bad object on its own. */}
-          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && (
-            <div style={{ marginTop: '0.6rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <button type="button" onClick={() => runRepair(false)} disabled={repairing || running}>
-                {repairing ? 'Repairing…' : 'Repair from local'}
+          {/* The repair flow: one button, then the plan, then consent. The plan is stat-and-index only, so
+              it answers instantly whatever the file sizes; nothing runs — and nothing is priced by reading a
+              byte — until the user confirms. Ticked = re-upload now; unticked = mark damaged, leave it to the
+              next backup version (which heals unchanged content by re-uploading it in place). */}
+          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && !plan && (
+            <div style={{ marginTop: '0.6rem' }}>
+              <button type="button" onClick={openPlan} disabled={repairing || running || planning}>
+                {repairing ? 'Repairing…' : planning ? 'Pricing the repair…' : 'Repair…'}
               </button>
-              {problems.length > 0 && !repairing && (
-                <button type="button" onClick={() => runRepair(true)} disabled={running}>
-                  Repair + rebuild grown files (full re-upload)
-                </button>
-              )}
+            </div>
+          )}
+          {plan && !repairing && (
+            <div style={{ marginTop: '0.6rem' }}>
+              <div className="text-faint">
+                Tick what to re-upload now; everything unticked is marked damaged and left to the next backup
+                version.
+              </div>
+              <ul style={{ margin: '0.3rem 0 0.3rem 1.2rem', listStyle: 'none', padding: 0 }}>
+                {plan.rows.map((r) => (
+                  <li key={r.path}>
+                    {r.action === 'reupload' ? (
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={planSelected.has(r.path)}
+                          onChange={(e) => {
+                            const next = new Set(planSelected)
+                            if (e.target.checked) next.add(r.path)
+                            else next.delete(r.path)
+                            setPlanSelected(next)
+                          }}
+                        />{' '}
+                        <span className="mono">{r.path}</span> — re-upload {formatBytes(r.uploadBytes)}
+                      </label>
+                    ) : (
+                      <span className="text-faint">
+                        <span className="mono">{r.path}</span> — local content changed; will be marked and left
+                        to the next backup version
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {(() => {
+                // Distinct by object: several paths can share one blob, and the bill must not double-count it.
+                const bytes = new Map<string, number>()
+                for (const r of plan.rows)
+                  if (r.action === 'reupload' && planSelected.has(r.path)) bytes.set(r.ref ?? r.path, r.uploadBytes)
+                const total = [...bytes.values()].reduce((a, b) => a + b, 0)
+                const deferred = plan.rows.length - [...planSelected].length
+                return (
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <button type="button" className="btn-primary" onClick={() => runRepair([...planSelected])} disabled={running}>
+                      {total > 0
+                        ? `Repair now — re-uploads ${formatBytes(total)}${deferred > 0 ? `, defers ${deferred}` : ''}`
+                        : `Mark all ${plan.rows.length} for the next backup version`}
+                    </button>
+                    <button type="button" onClick={() => setPlan(null)}>Cancel</button>
+                  </div>
+                )
+              })()}
             </div>
           )}
         </div>

@@ -175,7 +175,13 @@ builder.Services.AddSingleton<IFileCompressor>(sp =>
 builder.Services.AddSingleton<IBlobUploader, BlobUploader>();
 builder.Services.AddScoped<BackupOrchestrator>();
 builder.Services.AddSingleton<BackupBusyTracker>();
-builder.Services.AddSingleton<BackupRunner>();
+// The second half of the repair plan's deferral: after a backup completes, marked-but-still-matching content
+// is handed to a repair scoped to those paths (see DeferredRepairs).
+builder.Services.AddSingleton<DeferredRepairs>();
+builder.Services.AddSingleton(sp => new BackupRunner(
+    sp.GetRequiredService<IServiceScopeFactory>(),
+    sp.GetRequiredService<BackupBusyTracker>(),
+    sp.GetRequiredService<DeferredRepairs>()));
 builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),

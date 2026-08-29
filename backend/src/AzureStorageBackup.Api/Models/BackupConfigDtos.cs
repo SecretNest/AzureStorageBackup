@@ -89,6 +89,10 @@ public record RestoreEstimateRequestBody(int? Version, List<string> Paths);
 /// can only be answered by asking the cloud, and there is no reason to make the user click that separately.</param>
 public record ImportRequest(int AccountId, string ContainerName, string? Password, bool? CheckAfterImport = null);
 
+/// <summary>Optional body of POST /repair: the plan's per-file selection. Null/empty = repair everything the
+/// pre-check finds (the pre-plan behavior, and what the parameterless POST of older UIs sends).</summary>
+public sealed record RepairStartBody(string[]? Paths);
+
 /// <summary>The result of an import: the config that was created, plus the two things the import itself discovered.</summary>
 /// <param name="CheckStarted">The cloud verification is already running in the background, so the frontend can open the check panel directly
 /// instead of making the user hunt for that button.</param>

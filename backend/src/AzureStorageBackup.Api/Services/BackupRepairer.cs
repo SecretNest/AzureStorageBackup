@@ -46,6 +46,10 @@ public sealed class BackupRepairer(
         Account account, string container, string? password, string localRoot, int? version,
         CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, IgnoreRuleSet? dontCompress,
         bool recoverPrefixes = false,
+        // The plan's per-file selection: null = everything the pre-check finds. A path left out is deferred
+        // entirely — not repaired, not marked unrecoverable, not touched. Deselection is a scheduling decision;
+        // unrecoverable is a verdict, and nobody asked for one.
+        IReadOnlyCollection<string>? onlyPaths = null,
         CancellationToken ct = default)
     {
         // Local-authoritative read first (same as the orchestrator/checker): if it is local, zero cloud reads; if
@@ -84,9 +88,18 @@ public sealed class BackupRepairer(
             .CheckAsync(account, container, password, target.Version,
                 checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct,
                 notify: false);
-        var badBlobs = report.Findings
+        var badFindings = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
+            .ToList();
+        var badBlobs = badFindings
+            .Where(f => onlyPaths is null || onlyPaths.Contains(f.Path))
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
+        // The plan's selection semantics: unticked = mark damaged and leave it to the next backup version. No
+        // probing, no hashing, no upload for a deferred blob — just the mark, applied to every path referencing
+        // it in every version, which is what restore substitution and the heal-on-next-backup path key off.
+        var deferredBlobs = badFindings
+            .Select(f => f.Ref!).Distinct(StringComparer.Ordinal)
+            .Where(r => !badBlobs.Contains(r)).ToHashSet(StringComparer.Ordinal);
 
         // The same addressing scheme as the backup path: repairing a single-file blob has to reproduce exactly the
         // collision-detection metadata a fresh backup would write (§ defect 2).
@@ -113,6 +126,19 @@ public sealed class BackupRepairer(
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
                         dontCompress, recoverPrefixes, repaired, unrecoverable, changedVersions, lease, ct);
+            }
+
+            // Deferred blobs: the mark and nothing else. Every path referencing the blob, in every version that
+            // does — the same aggregation the repair paths use, minus all the work.
+            foreach (var deferredRef in deferredBlobs)
+            {
+                var bareRef = deferredRef.StartsWith("packs/", StringComparison.Ordinal)
+                    ? deferredRef["packs/".Length..^".7z".Length]
+                    : deferredRef;
+                foreach (var (vnum, idx) in indexes)
+                    foreach (var e in idx.Entries)
+                        if (e.Storage is { } s && s.Ref == bareRef)
+                            MarkUnrecoverable(idx, e.Path, unrecoverable, changedVersions, vnum);
             }
 
             // Persist the changed version indexes + info file (through the local-authoritative state machine, which

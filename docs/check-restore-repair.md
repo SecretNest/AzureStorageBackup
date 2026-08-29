@@ -78,11 +78,7 @@ from the repair that would have fixed things). The summaries distinguish assesse
 **Hash now** answers the question for one file: the row's button hashes that single path against
 the version's recorded content, instead of demanding a content-level pass over the whole tree. The
 length is compared first, so a file that grew or shrank answers instantly without reading a byte —
-which matters when the file is 100 GB. A changed row that **grew** is additionally labelled
-*"grown — the recorded content may survive as this file's prefix"*: the length alone proves only
-growth, not that the first bytes are untouched, so the wording is *may*. The authoritative prefix
-hash happens inside repair (see below); ticking prefix recovery for a file that turns out rewritten
-costs one wasted read and nothing else.
+which matters when the file is 100 GB.
 
 `LocalSkippedSentinel` names the path that was not there when the local axis was demoted, and is null
 otherwise. It has to be on the report rather than left for the caller to infer, for the same reason
@@ -140,7 +136,44 @@ and **replaces it completely**, deleting all old volumes before writing.
 The mtime inside the archive does not matter: display uses index metadata, and restore resets times
 and permissions.
 
-### Prefix recovery for append-only files (opt-in)
+### The plan comes first, and consent is per file
+
+Clicking **Repair…** does not run anything: it prices the repair. The plan is built from the last
+check report, the local index and one stat per problem file — no cloud request and not a byte read,
+so it answers instantly even when every problem file is 100 GB. Each row states its fate:
+
+- a file whose local length still matches the recorded length can be **re-uploaded now** (ticked by
+  default, its object size on the row — subject to the hash gate below once the repair actually runs);
+- a file whose local content changed **cannot be repaired from local**, and is marked damaged and
+  left to the next backup version.
+
+Everything unticked is deferred the same way: marked, not touched, no probing and no upload. The
+confirm button carries the bill ("re-uploads X, defers N") before anything is spent. The hash runs
+only inside the confirmed repair, only for ticked files — it answers "is this local byte-for-byte
+the content the version recorded", the one question a stat cannot, and the one that must be answered
+before any bytes may impersonate a recorded identity.
+
+**What "repairable" is about — and not about.** Repair rebuilds the version's recorded content from
+the local file and replaces the damaged object whole. Surviving cloud volumes play no part and are
+never reused: 7z output is not byte-reproducible, so a fresh compression cannot splice into an old
+family, and "just re-create the missing volume" does not exist.
+
+### Deferral is a promise, and the next backup keeps it
+
+Marking a file is not a shrug — it is "leave it to the next backup version", and that only means
+something because the engine acts on it. Content addressing would otherwise make the damage
+permanent for unchanged files: diff sees "unchanged", dedup sees "already in the cloud", and no
+future backup would ever re-upload the broken blob on its own.
+
+So after every **completed** backup run (manual or scheduled), the marks across the retained
+versions are collected, filtered by a stat — only paths whose local length still matches their
+recorded length can heal, so nothing unhealable triggers a nightly repair-and-renotify loop — and
+handed to a repair scoped to exactly those paths. A healed blob is every referencing version's blob
+at once, and the marks come off with it (a verdict overturned comes off the record). A file whose
+content moved on never heals its old version this way; its current content is in the newer versions,
+which is where it lives now.
+
+### Prefix recovery for append-only files (API-level, not in the UI)
 
 A file that only ever grows — a log, a large append-only store — can outlive its own backup: the
 version's blob is damaged, the live file has grown past it, and no local file matches the recorded
@@ -151,14 +184,13 @@ match the prefix is copied into the repair temp area, the copy is re-hashed whol
 uploaded is what must prove itself), and the blob is rebuilt from it. The live file is never
 touched, and the temp disk must hold one prefix copy.
 
-It is **off by default, deliberately**: recovery means re-uploading the whole object — for the case
-that motivated it, ~100 GB over a home uplink — and whether one version's snapshot is worth that
-belongs to the person paying for the transfer. Leaving it off is a sound choice: any later version
-of an append-only file contains the older content as a prefix anyway, so "restore the newer version,
-truncate to the recorded length" reproduces the old snapshot byte-for-byte without the upload. What
-is being recovered is **the version's recorded content**, not the leftover cloud volumes — those are
-overwritten or deleted by the replacement regardless (see above: fresh compression cannot splice
-into an old family).
+It is **off by default and no longer surfaced in the dialog**: in repair, prefix knowledge cannot
+shrink the work — the archive must be rebuilt whole either way, so the choice collapses to "full
+re-upload or defer", which the plan already expresses. If append-aware storage is ever worth having,
+it belongs in the backup engine as a first-class capability, not as a repair special case. The
+`recoverPrefixes` API parameter remains for the rare deliberate rescue: any later version of an
+append-only file contains the older content as a prefix anyway, so "restore the newer version,
+truncate to the recorded length" reproduces the old snapshot byte-for-byte without the upload.
 
 ### Unrecoverable is a verdict, and verdicts can be overturned
 

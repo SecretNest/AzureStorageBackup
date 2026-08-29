@@ -220,7 +220,7 @@ public sealed record BackupRunResponse(
 /// Background backup runner: runs BackupOrchestrator in the background for a config id, keeping progress in memory for polling.
 /// A config that is already running is not started a second time. Globally non-concurrent compression is guaranteed by the singleton StagingArea.
 /// </summary>
-public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
+public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker busy, DeferredRepairs? deferredRepairs = null)
 {
     private readonly Dictionary<int, BackupRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -286,6 +286,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             {
                 busy.Release(accountId, container);
             }
+            // After the lock is back: the second half of "mark it and leave it to the next backup version".
+            // Only after a completed run — a suspended or failed round proved nothing about the cloud's state.
+            if (state.Status == RunStatus.Completed && deferredRepairs is not null)
+                await deferredRepairs.TryStartAsync(configId);
         });
 
         return state;

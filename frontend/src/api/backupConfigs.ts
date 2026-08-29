@@ -486,6 +486,23 @@ export interface FileFinding {
   unreadableAt: string | null
 }
 
+export interface RepairPlanRow {
+  path: string
+  ref: string | null
+  action: 'reupload' | 'grown' | 'unrecoverable'
+  grown: boolean
+  uploadBytes: number
+}
+
+export interface RepairPlan {
+  version: number
+  rows: RepairPlanRow[]
+  reuploadObjects: number
+  reuploadBytes: number
+  unrecoverableCount: number
+  grownCount: number
+}
+
 export interface CheckReport {
   version: number
   findings: FileFinding[]
@@ -658,15 +675,18 @@ export const backupConfigsApi = {
   },
   // When this backup has never been checked the backend answers 204 (not 404, which would leave a red error in the browser console), so this comes back empty.
   checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
-  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, recoverPrefixes = false) => {
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, recoverPrefixes = false, paths: string[] | null = null) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (cleanupOrphans) p.set('cleanupOrphans', 'true')
     if (recoverPrefixes) p.set('recoverPrefixes', 'true')
-    return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, {})
+    return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, { paths })
   },
+  // The repair's price tag before any consent is spent: stat-and-index only, so it answers instantly.
+  repairPlan: (id: number, version: number | null = null) =>
+    api.get<RepairPlan>(`/backup-configs/${id}/repair-plan${version != null ? `?version=${version}` : ''}`),
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
   // Stop whatever is running. Omitting `what` stops every running operation on this configuration.
   //

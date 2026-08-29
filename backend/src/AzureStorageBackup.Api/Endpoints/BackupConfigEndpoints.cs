@@ -441,6 +441,87 @@ public static class BackupConfigEndpoints
             return Results.Ok(candidates);
         });
 
+        // The repair's price tag, before any consent is spent: built from the last check report, the local index
+        // and one stat per problem file — no cloud request and not a byte read, so it answers instantly even when
+        // every problem file is 100 GB. Hashing belongs inside the repair the user then confirms; it must never
+        // run before consent, because whatever it answers, the user has not yet agreed to act on it.
+        group.MapGet("/{id:int}/repair-plan", async (int id, int? version,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            ISecretReader secrets, CheckRunner checks, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
+        {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+
+            var config = await svc.GetAsync(id, ct);
+            if (config is null)
+                return Results.NotFound();
+            if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
+            var account = await accounts.GetAsync(config.AccountId, ct);
+            if (account is null)
+                return Results.BadRequest(new { error = "Account not found." });
+
+            var lastRun = await checks.GetOrLoadAsync(id, ct);
+            if (lastRun?.Report is not { } report || (version is { } rv && report.Version != rv))
+                return Results.Conflict(new { error = "Run a check first — the plan is priced from its findings." });
+
+            var password = secrets.RevealBackupPassword(config);
+            var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
+            var ver = info?.Versions.FirstOrDefault(x => x.Version == report.Version);
+            if (info is null || ver is null)
+                return Results.NotFound();
+            var idx = await indexCache.ReadAsync(
+                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks,
+                ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var entries = idx.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+
+            long UploadBytesOf(StorageRef s) =>
+                s.Kind == "pack"
+                    ? info.Packs.TryGetValue(s.Ref, out var pi) ? pi.VolumeSizes.Sum() : 0
+                    : s.VolumeSizes.Sum();
+
+            var rows = new List<object>();
+            var reuploadRefs = new Dictionary<string, long>(StringComparer.Ordinal);
+            int unrecoverableCount = 0, grownCount = 0;
+            foreach (var f in report.Findings.Where(x => x.Cloud == CloudState.MissingOrBad))
+            {
+                if (!entries.TryGetValue(f.Path, out var entry) || entry.Storage is null)
+                    continue;
+                var local = Path.Combine(config.LocalRoot, f.Path);
+                var exists = System.IO.File.Exists(local) && PathBoundary.IsWithin(config.LocalRoot, local);
+                var len = exists ? new FileInfo(local).Length : -1;
+                var uploadBytes = UploadBytesOf(entry.Storage);
+                string action;
+                var grown = false;
+                if (exists && len == entry.Length && entry.FullHash is not null)
+                {
+                    // Subject to the hash gate inside the repair itself; the stat prices it, the hash admits it.
+                    action = "reupload";
+                    reuploadRefs[entry.Storage.Ref] = uploadBytes;
+                }
+                else if (exists && len > entry.Length && entry.FullHash is not null)
+                {
+                    action = "grown";
+                    grown = true;
+                    grownCount++;
+                }
+                else
+                {
+                    action = "unrecoverable";
+                    unrecoverableCount++;
+                }
+                rows.Add(new { path = f.Path, @ref = entry.Storage.Ref, action, grown, uploadBytes });
+            }
+
+            return Results.Ok(new
+            {
+                version = report.Version,
+                rows,
+                reuploadObjects = reuploadRefs.Count,
+                reuploadBytes = reuploadRefs.Values.Sum(),
+                unrecoverableCount,
+                grownCount,
+            });
+        });
+
         // Hash ONE local file against a version's recorded content — the targeted follow-up to a cloud-only check.
         // A check run without a content-level local pass cannot say whether a damaged blob is repairable from
         // local ("not assessed", not "no"), and hashing the whole tree to answer it for a handful of files is out
@@ -662,7 +743,7 @@ public static class BackupConfigEndpoints
         });
 
         // Repair corrupt/missing cloud blobs from local files (an explicit action, background job): holds the busy lock until it finishes, during which this backup can do nothing else. Whatever cannot be repaired is marked unrecoverable.
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, bool? recoverPrefixes, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, bool? recoverPrefixes, RepairStartBody? body, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -672,7 +753,11 @@ public static class BackupConfigEndpoints
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
             // recoverPrefixes is the user's call, not a default: rebuilding an appended file from its prefix
             // re-uploads the whole object, and that cost belongs to whoever pays for the transfer.
-            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false, recoverPrefixes ?? false);
+            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false, recoverPrefixes ?? false,
+                // The plan's selection: an absent body/array (older UIs, the bare POST) = everything; a PRESENT
+                // array is honored verbatim, empty included — empty means "repair nothing now, mark everything
+                // for the next backup version", which is a legitimate choice the plan UI can express.
+                body?.Paths);
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 

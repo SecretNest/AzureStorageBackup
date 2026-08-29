@@ -34,9 +34,10 @@ public sealed class TaskDispatcher(
                     $"Skipped scheduled {task.TaskType}: backup is busy with another operation", ct);
                 continue;
             }
+            var completedBackupConfigId = (int?)null;
             try
             {
-                await ExecuteAsync(sp, task, accountId, container, ct);
+                completedBackupConfigId = await ExecuteAsync(sp, task, accountId, container, ct);
             }
             catch (Exception ex)
             {
@@ -46,6 +47,10 @@ public sealed class TaskDispatcher(
             {
                 busy.Release(accountId, container);
             }
+            // After the lock is back: the second half of "mark it and leave it to the next backup version" — the
+            // same trigger the UI-button path fires in BackupRunner, so scheduled backups heal deferred damage too.
+            if (completedBackupConfigId is { } healId)
+                await sp.GetRequiredService<DeferredRepairs>().TryStartAsync(healId, ct);
         }
     }
 
@@ -64,7 +69,9 @@ public sealed class TaskDispatcher(
         return [];
     }
 
-    private async Task ExecuteAsync(
+    /// <returns>The config id when this dispatch ran a backup to completion — the caller's cue to fire the
+    /// deferred-repair trigger once the busy lock is back. Null for every other outcome and task type.</returns>
+    private async Task<int?> ExecuteAsync(
         IServiceProvider sp, ScheduledTask task, int accountId, string container, CancellationToken ct)
     {
         var configs = sp.GetRequiredService<IBackupConfigService>();
@@ -73,7 +80,7 @@ public sealed class TaskDispatcher(
         if (config is null || account is null)
         {
             logger.LogWarning("No backup config for {Account}/{Container}; skipping scheduled {Type}", accountId, container, task.TaskType);
-            return;
+            return null;
         }
 
         if (!boundary.IsInside(config.LocalRoot))
@@ -94,7 +101,7 @@ public sealed class TaskDispatcher(
                 OperationLogLevel.Error, $"schedule:{accountId}/{container}",
                 $"Skipped scheduled {task.TaskType}: local root '{config.LocalRoot}' is outside the configured root '{boundary.ConfiguredRoot}'",
                 ct);
-            return;
+            return null;
         }
 
         var password = secrets.RevealBackupPassword(config);
@@ -120,17 +127,17 @@ public sealed class TaskDispatcher(
                     // failure nor a successful backup. Return outright and skip the "persist Normal on success" line below —
                     // otherwise a backup that was called off gets recorded as having run fine, and the genuine earlier Error status gets wiped along with it.
                     if (backupState.Status == RunStatus.Canceled)
-                        return;
+                        return null;
                     // Suspension is not a failure: throwing would log a red error against this scheduled task, while the state
                     // is in fact safely preserved and the next round picks it back up. Treated the same as Canceled: end quietly.
                     if (backupState.Status == RunStatus.Suspended)
-                        return;
+                        return null;
                     // The sentinel said the source is not there, so nothing was attempted. Returning here is not
                     // decoration: the line at the bottom of this method writes Normal after any dispatch that did
                     // not throw, and reaching it would let a round that did nothing wipe the red badge off the last
                     // round that genuinely failed. The runner has already written the skip to the operation log.
                     if (backupState.Status == RunStatus.Skipped)
-                        return;
+                        return null;
                     break;
 
                 case ScheduledTaskType.Check:
@@ -191,5 +198,6 @@ public sealed class TaskDispatcher(
 
         // Persist Normal on success (decision 2), best-effort: failing to write the status must not misjudge an already-successful run as failed.
         await configs.WriteStatusAsync(config.Id, error: null, logger, ct);
+        return task.TaskType == ScheduledTaskType.Backup ? config.Id : null;
     }
 }

@@ -166,6 +166,44 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The plan's selection semantics, as the user defined them: ticked = repair now (re-upload);
+    /// unticked = mark damaged and leave it to the next backup version — no probing, no hashing, no upload for
+    /// it, just the mark that the heal-on-next-backup path acts on. Deselection is fast by construction.</summary>
+    [SkippableFact]
+    public async Task Repair_Reuploads_The_Selected_And_Marks_The_Rest_For_The_Next_Version()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, tracked, indexCache, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("reps-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "one.txt"), "content of the first");
+            await File.WriteAllTextAsync(Path.Combine(_src, "two.txt"), "content of the second");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["one.txt"]);
+
+            Assert.Equal(["one.txt"], report.Repaired);
+            Assert.Equal(["two.txt"], report.Unrecoverable);
+
+            var info = await tracked.LoadAsync(account, name, null);
+            var v1 = info!.Versions.Single(x => x.Version == 1);
+            var index = await indexCache.ReadAsync(account, name, 1, info.Backup.CreatedAt.UtcTicks, v1.IndexBlob, null);
+            Assert.Contains("two.txt", index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>Clicking repair used to push "Check started" — the repairer's internal pre-check notified as if
     /// it were a user-initiated check, and the user who had just clicked Repair reasonably wondered what was
     /// running. The pre-check is an implementation detail and stays silent; the repair announces itself.</summary>

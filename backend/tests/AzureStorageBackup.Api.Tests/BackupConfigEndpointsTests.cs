@@ -726,6 +726,98 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
     private sealed record HashFileRow(string path, int local, bool repairable, bool grown);
 
+    private sealed record PlanRow(string path, string? @ref, string action, bool grown, long uploadBytes);
+    private sealed record PlanResponse(
+        int version, List<PlanRow> rows, int reuploadObjects, long reuploadBytes, int unrecoverableCount, int grownCount);
+
+    /// <summary>The cost of a repair must be on the table before anything runs: the plan is built from the last
+    /// check report, the local index and a stat per file — no cloud request and not a byte read, so it answers
+    /// instantly even when every problem file is 100 GB. Hashing belongs inside the repair the user then
+    /// confirms, never before consent.</summary>
+    [Fact]
+    public async Task Repair_Plan_Prices_The_Repair_From_Stats_Alone()
+    {
+        var accountId = await CreateAccountAsync("repair-plan");
+        var root = Path.Combine(Path.GetTempPath(), "asb-plan-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                    SampleRequest("repair-plan", accountId) with { ContainerName = "repair-plan-container", LocalRoot = root }))
+                .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+            // Three problem files, one of each fate: unchanged (same length → re-upload), grown (longer →
+            // prefix-rebuild candidate), rewritten shorter (→ unrecoverable).
+            await File.WriteAllTextAsync(Path.Combine(root, "same.bin"), "0123456789");
+            await File.WriteAllTextAsync(Path.Combine(root, "grown.bin"), "0123456789ABCDEF");
+            await File.WriteAllTextAsync(Path.Combine(root, "shrunk.bin"), "0123");
+
+            var identity = SeedLocalInfo(accountId, created!.ContainerName,
+                [new BackupVersion
+                {
+                    Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
+                    Stats = new VersionStats(3, 30, 3, 30),
+                }]);
+            using (var scope = factory.Services.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
+                    accountId, created.ContainerName, 9, identity,
+                    new VersionIndex
+                    {
+                        Version = 9,
+                        Entries =
+                        [
+                            new IndexEntry
+                            {
+                                Path = "same.bin", Kind = "file", Permissions = "0644", Length = 10, FullHash = "h1",
+                                Storage = new StorageRef { Kind = "blob", Ref = "data/s", Volumes = 2, VolumeSizes = [7, 3] },
+                            },
+                            new IndexEntry
+                            {
+                                Path = "grown.bin", Kind = "file", Permissions = "0644", Length = 10, FullHash = "h2",
+                                Storage = new StorageRef { Kind = "blob", Ref = "data/g", Volumes = 1, VolumeSizes = [8] },
+                            },
+                            new IndexEntry
+                            {
+                                Path = "shrunk.bin", Kind = "file", Permissions = "0644", Length = 10, FullHash = "h3",
+                                Storage = new StorageRef { Kind = "blob", Ref = "data/k", Volumes = 1, VolumeSizes = [6] },
+                            },
+                        ],
+                    });
+
+            await factory.Services.GetRequiredService<CheckRunner>().PersistAsync(created.Id, new CheckRunState
+            {
+                Status = RunStatus.Completed,
+                Report = new CheckReport(9,
+                [
+                    new FileFinding("same.bin", "data/s", CloudState.MissingOrBad, LocalState.NotChecked),
+                    new FileFinding("grown.bin", "data/g", CloudState.MissingOrBad, LocalState.NotChecked),
+                    new FileFinding("shrunk.bin", "data/k", CloudState.MissingOrBad, LocalState.NotChecked),
+                    new FileFinding("fine.bin", "data/f", CloudState.Ok, LocalState.NotChecked),
+                ]),
+            });
+
+            var plan = await _client.GetFromJsonAsync<PlanResponse>(
+                $"/api/backup-configs/{created.Id}/repair-plan");
+
+            Assert.Equal(9, plan!.version);
+            Assert.Equal("reupload", plan.rows.Single(r => r.path == "same.bin").action);
+            Assert.Equal(10, plan.rows.Single(r => r.path == "same.bin").uploadBytes); // 7 + 3 recorded volume bytes
+            var grown = plan.rows.Single(r => r.path == "grown.bin");
+            Assert.Equal("grown", grown.action);
+            Assert.True(grown.grown);
+            Assert.Equal("unrecoverable", plan.rows.Single(r => r.path == "shrunk.bin").action);
+            Assert.DoesNotContain(plan.rows, r => r.path == "fine.bin");
+            Assert.Equal(1, plan.reuploadObjects);
+            Assert.Equal(10, plan.reuploadBytes);
+            Assert.Equal(1, plan.unrecoverableCount);
+            Assert.Equal(1, plan.grownCount);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     /// <summary>The in-memory report already survives closing the dialog; this pins that it survives the
     /// process. The host in this test has never run a check, so its runner's memory is exactly a freshly
     /// restarted container's — the GET must come back from the persisted row.</summary>
