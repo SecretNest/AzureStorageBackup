@@ -2917,6 +2917,31 @@ function CheckModal({
               {stale.length > 20 && <div>…and {stale.length - 20} more</div>}
             </div>
           )}
+          {/* The facts alone leave the user staring at a red table with no verb. This block is the verb:
+              what each action does, and what happens to what cannot be repaired. Reviewed against a real
+              incident where the operator had the full report and still did not know what to click. */}
+          {problems.length > 0 && (
+            <div className="text-faint" style={{ margin: '0.4rem 0' }}>
+              What to do:
+              <ul style={{ margin: '0.2rem 0 0.2rem 1.2rem' }}>
+                <li>
+                  <strong>Hash now</strong> (per row) answers whether that file&apos;s recorded content still
+                  exists locally — it turns Unknown into Yes or No without checking anything else.
+                </li>
+                <li>
+                  <strong>Repair from local</strong> rebuilds every damaged object whose local content matches
+                  this version&apos;s record. Files that do not match are marked unrecoverable <em>in this
+                  version only</em>; restoring can then substitute them from another version, and the next
+                  backup stores their current content as usual.
+                </li>
+                <li>
+                  A <strong>grown</strong> file is rebuilt from its prefix only when the checkbox above is
+                  ticked — that re-uploads the whole object. Left unticked it stays unrecoverable here, and
+                  loses nothing: a later backup of the grown file contains all of this content anyway.
+                </li>
+              </ul>
+            </div>
+          )}
           {problems.length > 0 && (
             <div className="table-scroll" tabIndex={0}>
               <table className="text-faint">
