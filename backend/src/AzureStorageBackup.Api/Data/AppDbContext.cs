@@ -19,6 +19,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<CachedVersionIndex> CachedVersionIndexes => Set<CachedVersionIndex>();
     public DbSet<LocalBackupState> LocalBackupStates => Set<LocalBackupState>();
     public DbSet<KeyringCanary> KeyringCanaries => Set<KeyringCanary>();
+    public DbSet<LastCheckRun> LastCheckRuns => Set<LastCheckRun>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -97,6 +98,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.Id);
             e.Property(x => x.Ciphertext).IsRequired();
+        });
+
+        modelBuilder.Entity<LastCheckRun>(e =>
+        {
+            e.HasKey(x => x.BackupConfigId);
+            e.Property(x => x.ReportJson).IsRequired();
         });
     }
 }

@@ -729,9 +729,11 @@ public static class BackupConfigEndpoints
         });
 
         // The status and report of the most recent check. **The report stays around** after the run finishes: closing the dialog and reopening it has to bring the result back.
-        group.MapGet("/{id:int}/check", (int id, CheckRunner runner) =>
+        group.MapGet("/{id:int}/check", async (int id, CheckRunner runner, CancellationToken ct) =>
         {
-            var state = runner.Get(id);
+            // Falls back to the persisted last completed run: the in-memory report survives closing the dialog,
+            // but not pulling a new image, and a restart must not force a re-run just to see a finished result.
+            var state = await runner.GetOrLoadAsync(id, ct);
             // "Never checked" is not an error: the check dialog asks once as soon as it opens, and a 404 leaves a red error in the
             // browser console that looks like a malfunction (which is exactly how a user reported it). 204 = there is no check to report.
             return state is null ? Results.NoContent() : Results.Ok(CheckRunResponse.From(state));

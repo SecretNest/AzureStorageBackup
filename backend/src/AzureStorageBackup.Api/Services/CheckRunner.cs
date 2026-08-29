@@ -1,4 +1,7 @@
+using System.Text.Json;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Services;
 
@@ -63,6 +66,61 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             return _runs.GetValueOrDefault(configId);
     }
 
+    /// <summary>
+    /// <see cref="Get"/>, falling back to the persisted last completed run when this process has none — the
+    /// in-memory report survives closing the dialog, but not pulling a new image, and a restart must not force a
+    /// re-run just to see a result that was already computed. Only the GET endpoint needs the fallback; the
+    /// activity checks stay on <see cref="Get"/>, since a persisted run is by definition not Running.
+    /// </summary>
+    public async Task<CheckRunState?> GetOrLoadAsync(int configId, CancellationToken ct = default)
+    {
+        if (Get(configId) is { } live)
+            return live;
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.LastCheckRuns.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.BackupConfigId == configId, ct);
+        if (row is null)
+            return null;
+        try
+        {
+            return new CheckRunState
+            {
+                Status = RunStatus.Completed,
+                Report = JsonSerializer.Deserialize<CheckReport>(row.ReportJson),
+            };
+        }
+        catch (JsonException)
+        {
+            // A row an older build cannot read (the report shape moved on) is the same as no row: the check can
+            // simply be re-run, which beats a 500 on a GET that fires every time the dialog opens.
+            return null;
+        }
+    }
+
+    /// <summary>Persist a run's report as the config's last completed check. Best-effort: a failed write leaves
+    /// the in-memory state serving this process, exactly as before persistence existed.</summary>
+    internal async Task PersistAsync(int configId, CheckRunState state)
+    {
+        if (state.Report is null)
+            return; // failed runs carry no report, and must not clobber the last real result (see LastCheckRun)
+        try
+        {
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var row = await db.LastCheckRuns.FirstOrDefaultAsync(x => x.BackupConfigId == configId);
+            if (row is null)
+                db.LastCheckRuns.Add(row = new LastCheckRun { BackupConfigId = configId });
+            row.ReportJson = JsonSerializer.Serialize(state.Report);
+            row.FinishedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+        }
+        catch
+        {
+            // best effort by design
+        }
+    }
+
     /// <summary>Stop the check that is currently running. Returns false = nothing is running right now.
     /// Cancel() runs its callbacks synchronously on the calling thread, so the lock covers looking the record up but
     /// not the cancellation itself (see the same comment on BackupRunner.Cancel).</summary>
@@ -113,6 +171,7 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             // A check that ran to completion counts as success, whether or not it found problems; only an
             // exception sets Error (decision 2).
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<CheckRunner>>());
+            await PersistAsync(configId, state);
         }
         catch (OperationCanceledException)
         {

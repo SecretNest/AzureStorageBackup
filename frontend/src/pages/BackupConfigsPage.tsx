@@ -2921,7 +2921,7 @@ function CheckModal({
                               disabled={hashingPath != null}
                               onClick={() => hashOne(f.path)}
                             >
-                              {hashingPath === f.path ? 'hashing…' : 'hash now'}
+                              {hashingPath === f.path ? 'Hashing…' : 'Hash now'}
                             </button>
                           </>
                         )}

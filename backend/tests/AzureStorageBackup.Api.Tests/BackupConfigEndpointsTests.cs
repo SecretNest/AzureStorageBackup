@@ -726,6 +726,73 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
     private sealed record HashFileRow(string path, int local, bool repairable);
 
+    /// <summary>The in-memory report already survives closing the dialog; this pins that it survives the
+    /// process. The host in this test has never run a check, so its runner's memory is exactly a freshly
+    /// restarted container's — the GET must come back from the persisted row.</summary>
+    [Fact]
+    public async Task A_Persisted_Check_Report_Survives_A_Restart()
+    {
+        var accountId = await CreateAccountAsync("check-persist");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-persist", accountId) with { ContainerName = "check-persist-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var runner = factory.Services.GetRequiredService<CheckRunner>();
+        await runner.PersistAsync(created!.Id, new CheckRunState
+        {
+            Status = RunStatus.Completed,
+            Report = new CheckReport(9,
+                [new FileFinding("a.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked)]),
+        });
+
+        var run = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+            .Content.ReadFromJsonAsync<CheckRunResponse>();
+        Assert.Equal("Completed", run!.Status);
+        Assert.Equal(9, run.Report!.Version);
+        Assert.Equal("a.bin", Assert.Single(run.Report.Findings).Path);
+    }
+
+    /// <summary>The persisted row answers "what did the last finished check find", not "what happened most
+    /// recently": a failed run (here, a busy click) carries no report and must leave the row untouched.</summary>
+    [Fact]
+    public async Task A_Failed_Run_Does_Not_Clobber_The_Persisted_Report()
+    {
+        var accountId = await CreateAccountAsync("check-noclobber");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-noclobber", accountId) with { ContainerName = "check-noclobber-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var runner = factory.Services.GetRequiredService<CheckRunner>();
+        await runner.PersistAsync(created!.Id, new CheckRunState
+        {
+            Status = RunStatus.Completed,
+            Report = new CheckReport(9, []),
+        });
+
+        var busy = factory.Services.GetRequiredService<BackupBusyTracker>();
+        Assert.True(busy.TryAcquire(created.AccountId, created.ContainerName));
+        try
+        {
+            await _client.PostAsync($"/api/backup-configs/{created.Id}/check", null);
+            for (var i = 0; i < 200; i++)
+            {
+                var r = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+                    .Content.ReadFromJsonAsync<CheckRunResponse>();
+                if (r!.Status != "Running") break;
+                await Task.Delay(25);
+            }
+        }
+        finally
+        {
+            busy.Release(created.AccountId, created.ContainerName);
+        }
+
+        using var scope = factory.Services.CreateScope();
+        var row = scope.ServiceProvider.GetRequiredService<AppDbContext>()
+            .LastCheckRuns.Single(x => x.BackupConfigId == created.Id);
+        Assert.Contains("\"Version\":9", row.ReportJson);
+    }
+
     /// <summary>The targeted follow-up to a cloud-only check: a check run without a content-level local pass
     /// cannot say whether a damaged blob is repairable from local, and hashing the whole tree to find out for
     /// four files is out of proportion. This endpoint hashes ONE path against the version's recorded content —
