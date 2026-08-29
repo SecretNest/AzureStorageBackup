@@ -157,6 +157,39 @@ public sealed class RetentionCleanerJournalTests : IDisposable
     }
 
     [SkippableFact]
+    public async Task A_volume_past_the_999th_survives_the_sweep()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("cleanj");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // The uploader names volumes {index:D3} — three digits of padding, four digits and up past .999.
+            // Only the family's edges matter to the normalizer, so the middle 997 volumes are not uploaded.
+            await PutAsync(container, "data/keep.001", "first volume");
+            await PutAsync(container, "data/keep.999", "the last 3-digit volume");
+            await PutAsync(container, "data/keep.1000", "the first 4-digit volume");
+            await PutAsync(container, "data/keep.1001", "holds the 7z end header");
+            await WriteJournalAsync(account.Id, name, "run-x",
+                new JournalRecord { Kind = "blob", Ref = "data/keep", Path = "a.bin", FullHash = "keep", Volumes = 1001 });
+
+            var report = await Cleaner(factory).CleanupAsync(
+                account, name, null, Options(),
+                new BackupInfoFile { Backup = new BackupMeta { Name = name, CreatedAt = DateTimeOffset.UnixEpoch } },
+                default, sweepOrphans: true);
+
+            Assert.Equal(["data/keep.001", "data/keep.1000", "data/keep.1001", "data/keep.999"],
+                await NamesAsync(container, "data/"));
+            Assert.Equal(0, report.DeletedBlobs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [SkippableFact]
     public async Task Once_the_journal_is_gone_the_blocks_are_swept()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");

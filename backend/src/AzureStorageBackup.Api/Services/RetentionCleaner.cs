@@ -279,15 +279,19 @@ public sealed class RetentionCleaner(
         }
     }
 
-    /// <summary>Normalizes a volume name baseRef.NNN (3-digit numeric suffix) back to its base name; a non-volume name is returned unchanged (§7).</summary>
-    private static string BaseRef(string blobName)
+    /// <summary>Normalizes a volume name baseRef.NNN (numeric suffix of at least 3 digits) back to its base name; a non-volume name is returned unchanged (§7).
+    /// Three digits is the uploader's padding (<c>{index:D3}</c> in VolumeBlobIO.VolumeName), not its width: .999 is followed by .1000.
+    /// Requiring exactly three here left .1000 and later un-normalized, so the sweep deleted those volumes of a still-referenced blob as orphans —
+    /// keeping .001–.999 while taking the last volume, the one holding the 7z end header, which turns the archive unopenable rather than partial.</summary>
+    internal static string BaseRef(string blobName)
     {
         var dot = blobName.LastIndexOf('.');
-        if (dot >= 0 && blobName.Length - dot - 1 == 3)
+        if (dot >= 0 && blobName.Length - dot - 1 >= 3)
         {
-            var suffix = blobName.AsSpan(dot + 1);
-            if (char.IsAsciiDigit(suffix[0]) && char.IsAsciiDigit(suffix[1]) && char.IsAsciiDigit(suffix[2]))
-                return blobName[..dot];
+            foreach (var c in blobName.AsSpan(dot + 1))
+                if (!char.IsAsciiDigit(c))
+                    return blobName;
+            return blobName[..dot];
         }
         return blobName;
     }
