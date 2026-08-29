@@ -354,27 +354,33 @@ public sealed class BackupChecker(
         // What gets counted are **storage objects** (packs and single-file blobs), not files — a pack is checked
         // once. The UI unit is labelled objects to match, so the mismatch with the file count is not read as
         // "packing didn't take effect".
+        //
+        // All objects go to the prober as one worklist: the head budget spans the whole stage, so a container of
+        // thousands of single-volume packs advances at budget×(1/RTT) objects a second, not one per round-trip.
         var tracker = Track(onProgress, "Cloud", groups.Count);
         var presentGroups = new List<IGrouping<string, IndexEntry>>();
-        foreach (var g in groups)
+        var families = groups.Select(g =>
         {
-            tracker?.Touch(g.Key);
-            var s = g.First().Storage!;
-            var (vols, sizes) = ExpectedVolumes(info, s);
-            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct, headConcurrency);
-            if (!present || !sizeOk)
+            var (vols, sizes) = ExpectedVolumes(info, g.First().Storage!);
+            return (g.Key, vols, sizes);
+        }).ToList();
+        var verdicts = await VolumeBlobIO.VerifyFamiliesAsync(
+            cc, families, headConcurrency, ct,
+            // HEAD downloads no content: count 0 bytes, or the reported "speed" has nothing to do with actual traffic.
+            onFamilyDone: i => { tracker?.Touch(groups[i].Key); tracker?.Advance(0); });
+        tracker?.Complete();
+        for (var i = 0; i < groups.Count; i++)
+        {
+            if (verdicts[i] is { Present: true, SizeOk: true })
             {
-                foreach (var e in g)
-                    bad.Add(e.Path);
+                presentGroups.Add(groups[i]);
             }
             else
             {
-                presentGroups.Add(g);
+                foreach (var e in groups[i])
+                    bad.Add(e.Path);
             }
-            // HEAD downloads no content: count 0 bytes, or the reported "speed" has nothing to do with actual traffic.
-            tracker?.Advance(0);
         }
-        tracker?.Complete();
 
         if (options.Cloud >= CloudCheckLevel.Content)
         {

@@ -461,6 +461,49 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The head budget must span objects, not just the volumes of one family. A real container is
+    /// dominated by single-volume objects (a pack per group, per version), and probing those one object at a
+    /// time is one round-trip each — the stage advances at 1/RTT objects per second no matter what the budget
+    /// says, which in the field read as "still 20 per refresh" at a ~50 ms RTT. The budget is one shared gate:
+    /// however the container splits into families, total in-flight HEADs stay at the configured number.</summary>
+    [SkippableFact]
+    public async Task ExistenceSize_Check_Overlaps_HEADs_Across_Objects()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chko-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // Eight small files, threshold 1 → eight single-volume data blobs: one HEAD each, so any
+            // overlap can only come from probing the objects concurrently.
+            for (var i = 0; i < 8; i++)
+                await File.WriteAllTextAsync(Path.Combine(_src, $"f{i}.txt"), $"payload {i}");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+
+            var probe = new HeadOverlapProbe();
+            var probed = new ProbedFactory(probe);
+            var checker = new BackupChecker(
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "cross-object-check"));
+
+            var result = await checker.CheckAsync(
+                account, name, null, null, new CheckOptions(), downloadConcurrency: 1, headConcurrency: 6);
+
+            Assert.True(result.Ok);
+            Assert.True(probe.Peak >= 2,
+                $"HEADs never overlapped across objects (peak {probe.Peak}) — the objects were probed one at a time");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>HEADs move no data, so their budget is not the download budget: a user sizing
     /// DownloadConcurrency against a bandwidth cap must not thereby strangle the existence+size stage,
     /// which is round-trip-bound, not bandwidth-bound. Probed with the download budget pinned to 1 —

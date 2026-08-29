@@ -481,48 +481,61 @@ public static class VolumeBlobIO
     public static async Task<(bool Present, bool SizeOk)> VerifyVolumesAsync(
         BlobContainerClient cc, string baseRef, int expectedVolumes, IReadOnlyList<long> expectedSizes, CancellationToken ct,
         int concurrency = 1)
+        => (await VerifyFamiliesAsync(cc, [(baseRef, expectedVolumes, expectedSizes)], concurrency, ct))[0];
+
+    /// <summary>
+    /// The existence+size check over many families at once, one flat pool of HEADs under a single concurrency
+    /// budget. A real container is dominated by single-volume objects (one HEAD each): probed family by family they
+    /// advance at one round-trip apiece no matter what any per-family budget says, so the parallelism has to span
+    /// the whole worklist, not one family. Per family the result is the same tuple as
+    /// <see cref="VerifyVolumesAsync"/>, in input order.
+    /// <para>
+    /// One missing volume settles its family's verdict, so remaining probes of a condemned family are skipped
+    /// rather than cancelled — only the in-flight handful is wasted, bounded by the budget. A size mismatch does
+    /// not settle: the family is bad either way, but which volumes exist is still worth knowing at HEAD prices.
+    /// </para>
+    /// </summary>
+    /// <param name="onFamilyDone">Called once per family, when its last probe completes (skips included) — the
+    /// progress hook. Called from worker threads, possibly concurrently; the index is into <paramref name="families"/>.</param>
+    public static async Task<(bool Present, bool SizeOk)[]> VerifyFamiliesAsync(
+        BlobContainerClient cc,
+        IReadOnlyList<(string BaseRef, int Volumes, IReadOnlyList<long> Sizes)> families,
+        int concurrency, CancellationToken ct, Action<int>? onFamilyDone = null)
     {
-        if (expectedVolumes <= 1)
-        {
-            var len = await LengthAsync(cc.GetBlobClient(baseRef), ct)
-                      ?? await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, 1)), ct);
-            if (len is null)
-                return (false, false);
-            return (true, expectedSizes.Count < 1 || len == expectedSizes[0]);
-        }
+        var missing = new bool[families.Count];   // "some volume is gone" — settles the family (§ skip above)
+        var sizeBad = new bool[families.Count];   // "a volume exists at the wrong size"
+        var pending = families.Select(f => Math.Max(1, f.Volumes)).ToArray();
 
-        // All volumes probed under a shared concurrency budget: a family past ~1000 volumes takes that many
-        // HEADs, and issued one at a time that is a round-trip per volume — minutes on a single object.
-        //
-        // The serial version's early return on the first missing volume is replaced by a shared flag: one missing
-        // volume settles the family's verdict, so tasks that take a slot after the flag is up skip their HEAD.
-        // What the flag cannot save is the in-flight handful, bounded by the budget — an accepted loss.
-        using var gate = new SemaphoreSlim(Math.Max(1, concurrency));
-        var missing = 0;
-        var lens = await Task.WhenAll(Enumerable.Range(1, expectedVolumes).Select(async i =>
-        {
-            await gate.WaitAsync(ct);
-            try
+        var work = families.SelectMany((f, fi) =>
+            Enumerable.Range(1, Math.Max(1, f.Volumes)).Select(vi => (Family: fi, Volume: vi)));
+        await Parallel.ForEachAsync(
+            work,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, concurrency), CancellationToken = ct },
+            async (item, token) =>
             {
-                if (Volatile.Read(ref missing) != 0)
-                    return null;
-                var len = await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, i)), ct);
-                if (len is null)
-                    Volatile.Write(ref missing, 1);
-                return len;
-            }
-            finally { gate.Release(); }
-        }));
+                var (fi, vi) = item;
+                var (baseRef, volumes, sizes) = families[fi];
+                if (!Volatile.Read(ref missing[fi]))
+                {
+                    long? len;
+                    if (volumes <= 1)
+                        // Two sequential probes, not a concurrent pair: the .001 fallback is only meaningful
+                        // once the base name is known to be absent.
+                        len = await LengthAsync(cc.GetBlobClient(baseRef), token)
+                              ?? await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, 1)), token);
+                    else
+                        len = await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, vi)), token);
 
-        var sizeOk = true;
-        for (var i = 1; i <= expectedVolumes; i++)
-        {
-            if (lens[i - 1] is not { } len)
-                return (false, false);
-            if (expectedSizes.Count >= i && len != expectedSizes[i - 1])
-                sizeOk = false;
-        }
-        return (true, sizeOk);
+                    if (len is null)
+                        Volatile.Write(ref missing[fi], true);
+                    else if (sizes.Count >= vi && len != sizes[vi - 1])
+                        sizeBad[fi] = true;
+                }
+                if (Interlocked.Decrement(ref pending[fi]) == 0)
+                    onFamilyDone?.Invoke(fi);
+            });
+
+        return [.. families.Select((_, i) => missing[i] ? (false, false) : (true, !sizeBad[i]))];
     }
 
     private static async Task<long?> LengthAsync(BlobClient blob, CancellationToken ct)
