@@ -119,6 +119,96 @@ public sealed class BackupRepairerTests : IDisposable
         },
     };
 
+    /// <summary>The field case behind this: a ~100 GB file was backed up, appended to, and then the backed-up
+    /// blob lost volumes in the cloud. The recorded content still exists — as the live file's prefix. Repair
+    /// must recognize that (prefix of the recorded length hashes to the recorded FullHash), materialize the
+    /// prefix itself and rebuild the blob from it, instead of ruling the file unrecoverable and making the user
+    /// truncate copies by hand. The live file is never touched.</summary>
+    [SkippableFact]
+    public async Task Repair_Recovers_An_Append_Only_File_From_Its_Prefix()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repx-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "grow.log"), "the content as of version 1\n");
+            await backup.RunAsync(Req(account, name));
+
+            // The cloud copy is destroyed, and only then does the file grow — v1's content is now the prefix.
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            await File.AppendAllTextAsync(Path.Combine(_src, "grow.log"), "appended after the backup\n");
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
+
+            Assert.Contains("grow.log", report.Repaired);
+            Assert.Empty(report.Unrecoverable);
+            // The live file kept its appended content — the prefix was taken from a copy, not by truncation.
+            Assert.Equal("the content as of version 1\nappended after the backup\n",
+                await File.ReadAllTextAsync(Path.Combine(_src, "grow.log")));
+            // And the rebuilt blob really holds v1's content: a content-level cloud check comes back clean.
+            var check = await checker.CheckAsync(
+                account, name, null, 1, new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.None });
+            Assert.True(check.Ok);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The mark is a verdict, and a verdict overturned must come off the record: a repair that heals a
+    /// blob whose path an earlier run ruled unrecoverable used to leave the mark in place forever — restore then
+    /// kept routing the healed file through version substitution as if it were still lost.</summary>
+    [SkippableFact]
+    public async Task A_Successful_Repair_Clears_The_Unrecoverable_Mark()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, tracked, indexCache, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repu-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            // First repair with the local content rewritten (not appended): rightly unrecoverable, mark written.
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "OMEGA");
+            var first = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
+            Assert.Contains("a.txt", first.Unrecoverable);
+
+            // The original content comes back (the user restored it from elsewhere): the second repair heals the
+            // blob, and the verdict must come off with it.
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            var second = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
+            Assert.Contains("a.txt", second.Repaired);
+
+            var info = await tracked.LoadAsync(account, name, null);
+            var v1 = info!.Versions.Single(x => x.Version == 1);
+            var index = await indexCache.ReadAsync(account, name, 1, info.Backup.CreatedAt.UtcTicks, v1.IndexBlob, null);
+            Assert.DoesNotContain("a.txt", index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task Repair_Updates_Local_Authoritative_State_So_Next_Write_Does_Not_Conflict()
     {

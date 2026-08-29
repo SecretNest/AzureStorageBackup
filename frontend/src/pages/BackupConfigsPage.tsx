@@ -2929,7 +2929,7 @@ function CheckModal({
                       {/* "unknown", not "no": without a local hash there is no verdict to print, and "no"
                           reads as "repair cannot help" when the question was simply never asked. */}
                       <td style={{ textAlign: 'center' }}>
-                        {f.repairable ? 'yes' : f.local === LocalState.NotChecked ? 'unknown' : 'no'}
+                        {f.repairable ? 'Yes' : f.local === LocalState.NotChecked ? 'Unknown' : 'No'}
                       </td>
                     </tr>
                   ))}

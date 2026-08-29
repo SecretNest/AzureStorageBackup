@@ -221,6 +221,66 @@ public sealed class BackupRepairer(
             }
         }
 
+        // Append-only recovery: no local file holds the recorded content whole, but one may hold it as its
+        // prefix — a file that only ever grows (a log, an archive journal, the field case's ~100 GB store) whose
+        // backed-up blob was damaged after the file grew. A candidate longer than the recorded length whose first
+        // Length bytes hash to the recorded FullHash IS the old content plus an append: the prefix is materialized
+        // into a temp copy and repaired from like any local match. The live file is never touched. The cheap
+        // prefix-hash pass filters first, so a non-matching candidate costs one read and no temp write; the copy
+        // is then re-hashed whole before upload, so a file rewritten in place mid-copy cannot smuggle wrong bytes
+        // into the cloud — the copy is what gets uploaded, so the copy is what must prove itself.
+        string? prefixDir = null;
+        if (localSource is null && fullHash is not null)
+        {
+            foreach (var (_, e) in refs)
+            {
+                var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
+                if (!PathBoundary.IsWithin(localRoot, local))
+                    continue; // the same import-oracle reasoning as the exact-match loop above
+                try
+                {
+                    if (!File.Exists(local) || new FileInfo(local).Length <= entry0.Length)
+                        continue;
+                    if (await hasher.PrefixHashAsync(local, entry0.Length, ct) != fullHash)
+                        continue;
+                    prefixDir = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(prefixDir);
+                    var copy = Path.Combine(prefixDir, Path.GetFileName(local));
+                    await using (var src = File.OpenRead(local))
+                    await using (var dst = File.Create(copy))
+                    {
+                        var buffer = new byte[81920];
+                        var remaining = entry0.Length;
+                        while (remaining > 0)
+                        {
+                            var read = await src.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
+                            if (read == 0)
+                                throw new IOException($"'{local}' shrank below the recorded {entry0.Length} bytes mid-copy.");
+                            await dst.WriteAsync(buffer.AsMemory(0, read), ct);
+                            remaining -= read;
+                        }
+                    }
+                    if (await hasher.FullHashAsync(copy, ct) != fullHash)
+                    {
+                        try { Directory.Delete(prefixDir, recursive: true); } catch { /* best effort */ }
+                        prefixDir = null;
+                        continue;
+                    }
+                    localSource = copy;
+                    sourcePath = e.Path;
+                    break;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    if (prefixDir is not null)
+                    {
+                        try { Directory.Delete(prefixDir, recursive: true); } catch { /* best effort */ }
+                        prefixDir = null;
+                    }
+                }
+            }
+        }
+
         if (localSource is null)
         {
             // Local cannot supply it → every entry referencing this blob is unrecoverable in its own version.
@@ -228,52 +288,60 @@ public sealed class BackupRepairer(
                 MarkUnrecoverable(indexes[vnum], e.Path, unrecoverable, changedVersions, vnum);
             return;
         }
-
-        // The collision-detection metadata must match a fresh backup exactly: reuse the length/head/tail already
-        // recorded on the entry (the content has not changed — it passed the fullHash check — so those values are
-        // unchanged) rather than recomputing them here, which would risk disagreeing with the metadata of the other
-        // references to the same content if the headBytes setting has drifted.
-        // When head/tail are null (a legacy index entry missing the fields) they are passed through as-is: Metadata
-        // omits the key rather than writing an empty string — an empty string would make later dedup treat identical
-        // content as a collision and report it falsely (see BlobAddressScheme.Metadata).
-        //
-        // Which one to take: the order of refs depends on dictionary enumeration order, so refs[0] may well be the
-        // legacy entry missing head/tail while a sibling reference to the same content has both — going by refs[0]
-        // would throw away collision protection we already hold, needlessly widening the window of degraded
-        // protection. Prefer the entry that has both; only when there is none fall back to entry0 (the content is
-        // identical, so length/head/tail ought to be the same on every referencing entry anyway).
-        var metaEntry = refs.Select(r => r.Entry)
-            .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
-        var meta = addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash);
-        // The same derivation as a fresh backup (BackupOrchestrator.HandleBlobAsync): a path that hits DontCompress is stored, not compressed.
-        var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
-        var newSizes = await ReplaceBlobAsync(
-            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct);
-
-        // Omitting the metadata = this object's collision protection is weakened (in keyed mode it switches to the
-        // narrow v1 check value, degrading to fullHash + length rather than to no protection at all — when head/tail
-        // are unknown, Metadata already emits v1, see BlobAddressScheme).
-        // That is the correct handling in itself (writing empty strings would be worse), but leaving no trace makes
-        // the degradation invisible: record an auditable Warning.
-        if (opLog is not null && (metaEntry.HeadHash is null || metaEntry.TailHash is null))
+        try
         {
-            var missing = metaEntry.HeadHash is null
-                ? (metaEntry.TailHash is null ? "head and tail" : "head")
-                : "tail";
-            await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{cc.Name}",
-                $"Collision guard degraded for {blobRef}: no index entry records the {missing} hash, " +
-                "so the repaired object was published without the omitted collision metadata.", ct, durable: true);
-        }
+            // The collision-detection metadata must match a fresh backup exactly: reuse the length/head/tail already
+            // recorded on the entry (the content has not changed — it passed the fullHash check — so those values are
+            // unchanged) rather than recomputing them here, which would risk disagreeing with the metadata of the other
+            // references to the same content if the headBytes setting has drifted.
+            // When head/tail are null (a legacy index entry missing the fields) they are passed through as-is: Metadata
+            // omits the key rather than writing an empty string — an empty string would make later dedup treat identical
+            // content as a collision and report it falsely (see BlobAddressScheme.Metadata).
+            //
+            // Which one to take: the order of refs depends on dictionary enumeration order, so refs[0] may well be the
+            // legacy entry missing head/tail while a sibling reference to the same content has both — going by refs[0]
+            // would throw away collision protection we already hold, needlessly widening the window of degraded
+            // protection. Prefer the entry that has both; only when there is none fall back to entry0 (the content is
+            // identical, so length/head/tail ought to be the same on every referencing entry anyway).
+            var metaEntry = refs.Select(r => r.Entry)
+                .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
+            var meta = addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash);
+            // The same derivation as a fresh backup (BackupOrchestrator.HandleBlobAsync): a path that hits DontCompress is stored, not compressed.
+            var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
+            var newSizes = await ReplaceBlobAsync(
+                account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct);
 
-        // Update the volume count/sizes in every referencing version (the content is unchanged, so the ref stays the same).
-        foreach (var (vnum, e) in refs)
-        {
-            var idx = indexes[vnum];
-            var i = idx.Entries.IndexOf(e);
-            idx.Entries[i] = e with { Storage = e.Storage! with { Volumes = newSizes.Count, VolumeSizes = [.. newSizes] } };
-            changedVersions.Add(vnum);
+            // Omitting the metadata = this object's collision protection is weakened (in keyed mode it switches to the
+            // narrow v1 check value, degrading to fullHash + length rather than to no protection at all — when head/tail
+            // are unknown, Metadata already emits v1, see BlobAddressScheme).
+            // That is the correct handling in itself (writing empty strings would be worse), but leaving no trace makes
+            // the degradation invisible: record an auditable Warning.
+            if (opLog is not null && (metaEntry.HeadHash is null || metaEntry.TailHash is null))
+            {
+                var missing = metaEntry.HeadHash is null
+                    ? (metaEntry.TailHash is null ? "head and tail" : "head")
+                    : "tail";
+                await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{cc.Name}",
+                    $"Collision guard degraded for {blobRef}: no index entry records the {missing} hash, " +
+                    "so the repaired object was published without the omitted collision metadata.", ct, durable: true);
+            }
+
+            // Update the volume count/sizes in every referencing version (the content is unchanged, so the ref stays the same).
+            foreach (var (vnum, e) in refs)
+            {
+                var idx = indexes[vnum];
+                var i = idx.Entries.IndexOf(e);
+                idx.Entries[i] = e with { Storage = e.Storage! with { Volumes = newSizes.Count, VolumeSizes = [.. newSizes] } };
+                changedVersions.Add(vnum);
+                ClearUnrecoverable(idx, e.Path, changedVersions, vnum);
+            }
+            repaired.AddRange(refs.Select(r => r.Entry.Path));
         }
-        repaired.AddRange(refs.Select(r => r.Entry.Path));
+        finally
+        {
+            if (prefixDir is not null)
+                try { Directory.Delete(prefixDir, recursive: true); } catch { /* best effort */ }
+        }
     }
 
     /// <summary>Repair a pack: aggregate the surviving members across all versions, rebuild from local (hash-verified)
@@ -381,6 +449,8 @@ public sealed class BackupRepairer(
                     Volumes = newSizes.Count,
                     VolumeSizes = newSizes,
                 };
+            foreach (var (vnum, path) in available.SelectMany(en => members[en].Refs))
+                ClearUnrecoverable(indexes[vnum], path, changedVersions, vnum);
             repaired.AddRange(available.SelectMany(en => members[en].Refs.Select(r => r.Path)));
         }
         finally
@@ -482,6 +552,16 @@ public sealed class BackupRepairer(
             changedVersions.Add(vnum);
         }
         unrecoverable.Add(path);
+    }
+
+    /// <summary>The inverse of <see cref="MarkUnrecoverable"/>: a path repaired in this run sheds the verdict a
+    /// previous run recorded. The mark is a verdict, and a verdict overturned must come off the record — left in
+    /// place, it outlives the damage, and restore keeps routing the healed file through version substitution as
+    /// if it were still lost.</summary>
+    private static void ClearUnrecoverable(VersionIndex index, string path, HashSet<int> changedVersions, int vnum)
+    {
+        if (index.UnrecoverablePaths.Remove(path))
+            changedVersions.Add(vnum);
     }
 
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
