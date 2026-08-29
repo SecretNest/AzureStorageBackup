@@ -307,13 +307,16 @@ public static class VolumeBlobIO
     /// asks the cloud. And that marker was never as cheap as the old comment computed: negligible measured against
     /// a thousand volumes, yes, but with the default 100 MB volumes and concurrency 5, a 100–500 MB file splits
     /// into exactly 2–5 volumes and that final serial single-volume trip doubled the item's upload time — and
-    /// that size band is the bulk of a real backup. Leftovers from interruptions are handled elsewhere: per-volume
-    /// if-missing fills in what is missing, and encrypted multi-volume archives are cleared before upload
-    /// (see BackupOrchestrator.ClearLeftoverVolumesAsync).
+    /// that size band is the bulk of a real backup. Leftovers from interruptions are handled elsewhere: with
+    /// <paramref name="existingVolumes"/> supplied, a proven volume skips and an unproven one is overwritten,
+    /// with over-count leftovers trimmed after the upload (see BackupOrchestrator.FetchFamilyLabelsAsync and
+    /// TrimFamilyAsync); without it, per-volume if-missing fills in what is missing.
     /// </para>
     /// </summary>
     /// <param name="scope">Per-volume concurrency slots and progress registration (see <see cref="VolumeUploadScope"/>).
-    /// When null it degrades to the old behaviour: serial, unthrottled, no progress reporting — for repair/replace calls that are not on the main backup path.</param>
+    /// When null it degrades to the old behaviour: serial, unthrottled, no progress reporting — for callers off any
+    /// run display, such as dead-weight compaction (repair passes a scope of its own, sized to the same
+    /// upload-concurrency setting as the backup's).</param>
     /// <param name="onVolumeUploaded">Called the moment a volume finishes, with its **local** file path.
     /// The backup path hangs per-volume staging release on this: if deletion waited for the whole family, the temp
     /// disk peak would equal the entire archive (a 100 GB file would need 100 GB of temp space), and the watermark would sit against the ceiling the whole time and choke compression.</param>
@@ -678,7 +681,7 @@ public static class VolumeBlobIO
     /// </para>
     /// Calling the factory once per volume for a brand new instance is exactly what keeps the previous volume's baseline from leaking into the next,
     /// the same reasoning as "one ItemProgress() per volume" in <see cref="VolumeUploadScope.RunAsync"/>.
-    /// When null no progress callback is attached — for call paths such as repair/compaction that are not registered as in-flight.</param>
+    /// When null no progress callback is attached — for call paths such as dead-weight compaction that are not registered as in-flight.</param>
     public static async Task<string> DownloadAsync(
         BlobContainerClient cc, string baseRef, string workDir, CancellationToken ct,
         Func<IProgress<long>>? progress = null)

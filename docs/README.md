@@ -17,6 +17,7 @@ document is a bug.
 |---|---|
 | [backup-engine.md](backup-engine.md) | One run end to end: scan, diff, plan, index, finalize, retention. Unreadable-input handling and the recheck rules. |
 | [content-identity.md](content-identity.md) | The three-segment hash. How "did this change?" and "does this already exist?" are decided, and why the same 4 KB hash means opposite things in the two chains. |
+| [volume-identity.md](volume-identity.md) | The per-volume xxh128 label, verified in-place skipping on resume and repair, damage marks as first-class facts, and repair as a run. Content-identity's volume-level counterpart. |
 | [pipeline.md](pipeline.md) | The three concurrent stages, the staging area and its backpressure, the raw in-place upload route, and the volume gate. |
 | [packing.md](packing.md) | Grouping small files, three layers of member dedup, and dead-weight compaction. |
 | [run-lifecycle.md](run-lifecycle.md) | Pause, suspend, stop and resume. The journal, graceful shutdown and automatic resume. |

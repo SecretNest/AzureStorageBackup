@@ -41,10 +41,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "alpha");
         var containerName = "imp-" + Guid.NewGuid().ToString("N")[..8];
 
-        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
-            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
-            false, ProxyMode.Independent, null, null, null, null)))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account an earlier test already registered.
+        var accountId = await TestAccounts.EnsureAsync(_client, new AccountRequest(
+            "azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null));
+        var account = (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == accountId);
 
         var config = await (await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
             account!.Id, containerName, "family-photos", "desc", _root, null,
@@ -99,10 +100,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         await File.WriteAllTextAsync(Path.Combine(_root, "a.txt"), "alpha");
         var containerName = "impenc-" + Guid.NewGuid().ToString("N")[..8];
 
-        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
-            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
-            false, ProxyMode.Independent, null, null, null, null)))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account an earlier test already registered.
+        var accountId = await TestAccounts.EnsureAsync(_client, new AccountRequest(
+            "azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null));
+        var account = (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == accountId);
 
         var config = await (await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
             account!.Id, containerName, "secret-photos", null, _root, "pw",
@@ -149,10 +151,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
 
-        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
-            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
-            false, ProxyMode.Independent, null, null, null, null)))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account an earlier test already registered.
+        var accountId = await TestAccounts.EnsureAsync(_client, new AccountRequest(
+            "azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null));
+        var account = (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == accountId);
 
         var empty = "empty-" + Guid.NewGuid().ToString("N")[..8];
         var factoryClient = new BlobClientFactory(TestSecrets.Reader);
@@ -181,10 +184,11 @@ public sealed class ImportBackupEndpointTests(TestWebAppFactory factory)
         Skip.IfNot(SevenZip(), "7z not found");
 
         var containerName = "imp-nohint-" + Guid.NewGuid().ToString("N")[..8];
-        var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
-            "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
-            false, ProxyMode.Independent, null, null, null, null)))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account an earlier test already registered.
+        var accountId = await TestAccounts.EnsureAsync(_client, new AccountRequest(
+            "azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+            false, ProxyMode.Independent, null, null, null, null));
+        var account = (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == accountId);
 
         var factoryClient = new BlobClientFactory(TestSecrets.Reader);
         var azurite = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };

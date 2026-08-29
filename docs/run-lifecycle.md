@@ -236,10 +236,14 @@ Two kinds, asked at the moment of cancelling:
 | `Stop now` | the abort token propagates, killing in-flight uploads. Fastest |
 | `Finish current files` | in-flight files finish, **including all their volumes**, then stop |
 
-> **Rationale.** The second matters most for large multi-volume files: a 50 GB file killed at volume
-> 19 wastes all 19, and an encrypted multi-volume archive has its leftovers deleted and re-uploaded
-> next time anyway. `Suspend` has no such choice — by definition it *is* "finish current files" — so
-> `Stop now` is the only path that ever kills an in-flight upload.
+> **Rationale.** The second matters most for large multi-volume files whose volumes cannot be
+> reused: an encrypted archive never label-matches across runs (fresh random salt/IV every
+> compression — see [volume-identity.md](volume-identity.md)), so a 50 GB encrypted file killed at
+> volume 19 wastes all 19 — the next attempt overwrites them. An unencrypted family loses less:
+> its landed volumes carry identity labels, and the next attempt verifies them in place and skips
+> them — though the recompression is paid in full either way. `Suspend` has no such choice — by
+> definition it *is* "finish current files" — so `Stop now` is the only path that ever kills an
+> in-flight upload.
 
 ### The kinds form a ladder, and a wind-down can be escalated
 
@@ -373,6 +377,11 @@ journal is consulted at three points, cheapest first:
    file may have been modified after the interruption.
 3. **`FindPack(members)`** — matched on the member set.
 
+All three tiers — and cross-version dedup behind them — refuse a hit whose ref is damage-marked
+(`IsDamagedRef`): a resume must not adopt a reference to a blob a check condemned, so the item falls
+through to the ordinary compress-and-upload, which heals the family in passing
+([volume-identity.md](volume-identity.md)).
+
 > **Why the cheap question was worth adding.** Measured on a real resume: 194.1 GB of source
 > processed, 704.4 MB actually uploaded. Better than 99% of that read was spent proving nothing
 > needed to be sent — and a resume happens after something already went wrong, with the operator
@@ -384,11 +393,13 @@ upload.
 > **Rationale.** Resume accounts by **path**. Suppose the previous run finished uploading A and
 > suspended before reaching B, which has the same content. This run reuses A directly, but B does not
 > recognise it, so it recompresses; `ResolveAsync` then hands B the **same** address (content
-> addressing), and the upload first clears every volume under that address before re-uploading — and
-> A's index entry points at exactly those. Interrupt that window and half a volume set is left in the
-> cloud, while the next run adopting the journal reuses A as usual and commits an index pointing at
-> content that is missing volumes. The error surfaces only at restore or check time. Fed in, B takes
-> the ordinary cross-version dedup path and those volumes are never touched.
+> addressing), and the upload writes over A's own volumes. Deterministic output makes that mostly
+> waste — the volumes label-match and are skipped — but an encrypted backup's output never matches
+> (fresh salt/IV), so every volume of A's family is overwritten, and an interruption mid-family
+> leaves the address a splice of two runs' volumes — unopenable, for an encrypted multi-volume
+> archive — while the next run adopting the journal reuses A as usual and commits an index pointing
+> at it. The error surfaces only at restore or check time. Fed in, B takes the ordinary
+> cross-version dedup path and those volumes are never touched.
 
 Resuming **keeps appending to the same journal**, so a second interruption is resumable too. Pack ids
 carry a per-run random prefix and never repeat across runs, so newly computed packs cannot collide
@@ -504,8 +515,12 @@ can never hold anyone again, so answering 204 would be a lie.
 
 ## Not covered
 
-- **Pause is not offered for restore, check or repair.** Those runs are short; the machinery is not
-  worth duplicating until one of them is measured to need it.
+- **Pause is not offered for restore or check.** Those runs are short; the machinery is not worth
+  duplicating until one of them is measured to need it. Repair earned its own — a field repair of
+  hundreds of GB is not short — as `POST /backup-configs/{id}/repair/pause` and `/repair/unpause`:
+  an in-memory hold like the backup's (a restart lifts it), awaited before each object **and each
+  volume**, so it answers in seconds even midway through a hundred-gigabyte family, and a paused
+  repair can still be stopped or suspended.
 - **Temp files compressed before an interruption are not reused.** Compression is cheap relative to
   upload, and reusing them would need another class of record plus an integrity check. They are
   garbage and are deleted.

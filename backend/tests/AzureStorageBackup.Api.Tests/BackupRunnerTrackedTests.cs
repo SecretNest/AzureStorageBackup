@@ -26,12 +26,12 @@ public class BackupRunnerTrackedTests(TestWebAppFactory factory) : IClassFixture
             UseProxy: false,
             ProxyMode: ProxyMode.Independent,
             ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null));
-        acctRes.EnsureSuccessStatusCode();
-        var acct = await acctRes.Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        var acctId = await TestAccounts.EnsureFromAsync(_client, acctRes, "http://127.0.0.1:10000/devstoreaccount1");
 
         var cfgRes = await _client.PostAsJsonAsync("/api/backup-configs", new
         {
-            AccountId = acct!.Id,
+            AccountId = acctId,
             ContainerName = container,
             Name = "runner-test",
             LocalRoot = Path.Combine(Path.GetTempPath(), "asb-runner-" + Guid.NewGuid().ToString("N")[..8]),
@@ -40,7 +40,7 @@ public class BackupRunnerTrackedTests(TestWebAppFactory factory) : IClassFixture
         });
         cfgRes.EnsureSuccessStatusCode();
         var cfg = await cfgRes.Content.ReadFromJsonAsync<BackupConfigResponse>();
-        return (acct.Id, cfg!.Id, container);
+        return (acctId, cfg!.Id, container);
     }
 
     [Fact]

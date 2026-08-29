@@ -73,16 +73,17 @@ public class UnreadableVisibilityTests(TestWebAppFactory factory) : IClassFixtur
         await File.WriteAllTextAsync(Path.Combine(_root, "plain.txt"), "always readable");
 
         var container = "vis-" + Guid.NewGuid().ToString("N")[..8];
-        var acct = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
+        var acctRes0 = await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "vis-" + Guid.NewGuid().ToString("N")[..8], Description: null,
             BlobEndpoint: "http://127.0.0.1:10000/devstoreaccount1", Region: AzureRegion.Global,
             AccountKey: AzuriteKey, UseProxy: false, ProxyMode: ProxyMode.Independent,
-            ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null)))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+            ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null));
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        var acctId = await TestAccounts.EnsureFromAsync(_client, acctRes0, "http://127.0.0.1:10000/devstoreaccount1");
 
         var cfg = await (await _client.PostAsJsonAsync("/api/backup-configs", new
         {
-            AccountId = acct!.Id,
+            AccountId = acctId,
             ContainerName = container,
             Name = "visibility-test",
             LocalRoot = _root,

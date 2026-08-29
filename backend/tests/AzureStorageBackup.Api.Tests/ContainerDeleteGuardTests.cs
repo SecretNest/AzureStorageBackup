@@ -38,12 +38,12 @@ public class ContainerDeleteGuardTests
         }
     }
 
-    private static async Task<int> CreateAccountAsync(HttpClient client)
+    private static async Task<int> CreateAccountAsync(HttpClient client, string? endpoint = null)
     {
         var res = await client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "guard-" + Guid.NewGuid().ToString("N")[..8],
             Description: null,
-            BlobEndpoint: "http://127.0.0.1:10000/devstoreaccount1",
+            BlobEndpoint: endpoint ?? "http://127.0.0.1:10000/devstoreaccount1",
             Region: AzureRegion.Global,
             AccountKey: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
             UseProxy: false,
@@ -52,8 +52,8 @@ public class ContainerDeleteGuardTests
             ProxyPort: null,
             ProxyUsername: null,
             ProxyPassword: null));
-        res.EnsureSuccessStatusCode();
-        return (await res.Content.ReadFromJsonAsync<AccountResponse>())!.Id;
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        return await TestAccounts.EnsureFromAsync(client, res, endpoint ?? "http://127.0.0.1:10000/devstoreaccount1");
     }
 
     private static (TestWebAppFactory Factory, HttpClient Client, RecordingContainerService Containers) Rig()
@@ -123,7 +123,9 @@ public class ContainerDeleteGuardTests
         using var _ = factory;
 
         var guarded = await CreateAccountAsync(client);
-        var other = await CreateAccountAsync(client);
+        // A genuinely different account means a different endpoint now (one endpoint, one record); the
+        // container service in this rig is a fake, so the endpoint can be fictitious.
+        var other = await CreateAccountAsync(client, "https://second-" + Guid.NewGuid().ToString("N")[..8] + ".blob.core.windows.net");
         const string container = "shared-name";
 
         using (var scope = factory.Services.CreateScope())

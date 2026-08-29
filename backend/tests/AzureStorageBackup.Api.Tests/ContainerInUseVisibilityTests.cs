@@ -30,12 +30,12 @@ public class ContainerInUseVisibilityTests
             Task.CompletedTask;
     }
 
-    private static async Task<int> CreateAccountAsync(HttpClient client)
+    private static async Task<int> CreateAccountAsync(HttpClient client, string? endpoint = null)
     {
         var res = await client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "inuse-" + Guid.NewGuid().ToString("N")[..8],
             Description: null,
-            BlobEndpoint: "http://127.0.0.1:10000/devstoreaccount1",
+            BlobEndpoint: endpoint ?? "http://127.0.0.1:10000/devstoreaccount1",
             Region: AzureRegion.Global,
             AccountKey: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
             UseProxy: false,
@@ -44,8 +44,8 @@ public class ContainerInUseVisibilityTests
             ProxyPort: null,
             ProxyUsername: null,
             ProxyPassword: null));
-        res.EnsureSuccessStatusCode();
-        return (await res.Content.ReadFromJsonAsync<AccountResponse>())!.Id;
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        return await TestAccounts.EnsureFromAsync(client, res, endpoint ?? "http://127.0.0.1:10000/devstoreaccount1");
     }
 
     private static (TestWebAppFactory Factory, HttpClient Client) Rig(params ContainerInfo[] listed)
@@ -93,7 +93,9 @@ public class ContainerInUseVisibilityTests
         using var _ = factory;
 
         var held = await CreateAccountAsync(client);
-        var other = await CreateAccountAsync(client);
+        // A genuinely different account means a different endpoint now (one endpoint, one record); this rig's
+        // container service is a fake, so the endpoint can be fictitious.
+        var other = await CreateAccountAsync(client, "https://second-" + Guid.NewGuid().ToString("N")[..8] + ".blob.core.windows.net");
         await AddConfigAsync(factory, held, "shared-name", "Held");
 
         var list = await client.GetFromJsonAsync<List<ContainerInfo>>($"/api/accounts/{other}/containers");

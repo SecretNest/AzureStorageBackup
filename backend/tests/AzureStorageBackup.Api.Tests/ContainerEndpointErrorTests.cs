@@ -46,9 +46,8 @@ public class ContainerEndpointErrorTests(TestWebAppFactory factory) : IClassFixt
             ProxyPort: null,
             ProxyUsername: null,
             ProxyPassword: null));
-        res.EnsureSuccessStatusCode();
-        var acct = await res.Content.ReadFromJsonAsync<AccountResponse>();
-        return acct!.Id;
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        return await TestAccounts.EnsureFromAsync(client, res, "http://127.0.0.1:10000/devstoreaccount1");
     }
 
     [Fact]

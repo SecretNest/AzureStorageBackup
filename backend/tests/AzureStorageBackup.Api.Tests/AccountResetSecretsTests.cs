@@ -96,10 +96,11 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         var post = await _client.PostAsJsonAsync(
             "/api/accounts",
             SampleRequest("reset-ok", "http://127.0.0.1:10000/devstoreaccount1", "placeholder-not-yet-verified"));
-        var created = await post.Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account another test in this class registered.
+        var createdId = await TestAccounts.EnsureFromAsync(_client, post, "http://127.0.0.1:10000/devstoreaccount1");
 
         var reset = await _client.PostAsJsonAsync(
-            $"/api/accounts/{created!.Id}/reset-secrets",
+            $"/api/accounts/{createdId}/reset-secrets",
             new { accountKey = AzuriteKey, proxyPassword = (string?)null });
 
         Assert.Equal(HttpStatusCode.NoContent, reset.StatusCode);
@@ -107,7 +108,7 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var encryption = scope.ServiceProvider.GetRequiredService<IEncryptionService>();
-        var row = await db.Accounts.AsNoTracking().FirstAsync(a => a.Id == created.Id);
+        var row = await db.Accounts.AsNoTracking().FirstAsync(a => a.Id == createdId);
 
         Assert.Equal(AzuriteKey, TestSecrets.Reveal(encryption, row.AccountKeyProtected));
     }
@@ -161,7 +162,7 @@ public class AccountResetSecretsTests(TestWebAppFactory factory) : IClassFixture
         var created = await (await client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "proxied",
             Description: null,
-            BlobEndpoint: "https://proxied.blob.core.windows.net",
+            BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
             Region: AzureRegion.Global,
             AccountKey: "dGVzdGtleQ==",
             UseProxy: true,

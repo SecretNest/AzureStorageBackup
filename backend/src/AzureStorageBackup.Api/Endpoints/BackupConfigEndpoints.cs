@@ -566,8 +566,10 @@ public static class BackupConfigEndpoints
             {
                 local = LocalState.Changed;
                 // A changed file that is LONGER than the recorded content may hold it as a prefix (append-only
-                // growth) — that is what repair's opt-in prefix recovery acts on, so the row can say so. Length
-                // alone cannot promise the prefix matches; it only makes the offer worth surfacing.
+                // growth). Repair no longer acts on that — prefix recovery was removed on review (see
+                // check-restore-repair.md, "deliberately not offered") — but the flag survives so the row can
+                // point at the manual escape hatch: restore a newer version and truncate to the recorded length.
+                // Length alone cannot promise the prefix matches; it only makes the hint worth surfacing.
                 grown = entry.FullHash is not null && new FileInfo(full).Length > entry.Length;
             }
             else

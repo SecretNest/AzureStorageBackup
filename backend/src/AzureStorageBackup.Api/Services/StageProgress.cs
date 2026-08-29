@@ -683,8 +683,8 @@ public sealed class StageTracker(
             // The items Advance has written off since the last refresh, and whether any of them moved a byte. This
             // is the only place that can tell: Advance runs first and is handed 0 bytes on this stage, and the
             // authoritative figure arrives here (the two are called as a pair for every item — see the note at
-            // BackupOrchestrator's ReportItem, and the case at ClearLeftoverVolumesAsync that states the pairing by
-            // pointing out where neither runs).
+            // BackupOrchestrator's ReportItem, and the dangling-alias re-run stretch there that states the pairing
+            // by pointing out where neither runs).
             //
             // Work that moved nothing consumed none of the elapsed time the estimate divides by, so it is booked
             // aside for Eta and nowhere else — the item is genuinely finished and must keep counting as progress.

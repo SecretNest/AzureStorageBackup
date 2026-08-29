@@ -116,12 +116,13 @@ public sealed class LocalDedupResolver
     /// **They must be fed in**, and not merely to avoid one extra upload. Resume accounts by **path**: the previous run
     /// finished uploading A and then suspended, before it reached B, which has the same content as A. This run reuses A
     /// directly without uploading, but B does not recognise that it already exists, so it recompresses, then
-    /// ResolveAsync hands it the **same** ref (content addressing: same content, same address), and then
-    /// <c>UploadStagedBlobAsync</c> first calls <c>ClearLeftoverVolumesAsync</c> to delete every volume under that ref
-    /// before re-uploading — and A's index entry is pointing at exactly those. If that delete-then-upload window is
-    /// interrupted by Stop now or by a process crash, only half a set of volumes is left in the cloud, and the next run
-    /// adopting the journal reuses A as usual and commits the index as usual,
-    /// pointing at content that is missing volumes. The error only becomes visible at restore or check time.
+    /// ResolveAsync hands it the **same** ref (content addressing: same content, same address), and
+    /// <c>UploadStagedBlobAsync</c> writes over A's own volumes. With deterministic output that is mostly waste —
+    /// the volumes label-match and skip (see FetchFamilyLabelsAsync) — but an encrypted backup's output never
+    /// matches (fresh salt/IV per compression), so every volume of A's family is overwritten, and an interruption
+    /// by Stop now or a process crash mid-family leaves the address a splice of two runs' volumes — unopenable,
+    /// for an encrypted multi-volume archive — while the next run adopting the journal reuses A as usual and
+    /// commits the index as usual, pointing at it. The error only becomes visible at restore or check time.
     /// </para>
     /// <para>
     /// Once they are fed in, B takes the cross-version dedup path: neither recompressed nor re-uploaded, and that set

@@ -25,8 +25,8 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
             UseProxy: false,
             ProxyMode: ProxyMode.Independent,
             ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null));
-        res.EnsureSuccessStatusCode();
-        return (await res.Content.ReadFromJsonAsync<AccountResponse>())!.Id;
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        return await TestAccounts.EnsureFromAsync(_client, res, "http://127.0.0.1:10000/devstoreaccount1");
     }
 
     private async Task<ConfigDto> CreateConfigAsync(int accountId)

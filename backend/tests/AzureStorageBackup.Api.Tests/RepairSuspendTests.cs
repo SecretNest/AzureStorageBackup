@@ -20,7 +20,7 @@ public class RepairSuspendTests(TestWebAppFactory factory) : IClassFixture<TestW
     {
         var account = await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "acct-" + name + "-" + Guid.NewGuid().ToString("N")[..6], Description: null,
-            BlobEndpoint: "https://example.blob.core.windows.net", Region: AzureRegion.Global,
+            BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net", Region: AzureRegion.Global,
             AccountKey: "dGVzdGtleQ==", UseProxy: false, ProxyMode: ProxyMode.Independent,
             ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null));
         var accountId = (await account.Content.ReadFromJsonAsync<AccountResponse>())!.Id;

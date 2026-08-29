@@ -10,8 +10,11 @@ public sealed record RepairReport(
 
 /// <summary>
 /// Repair blobs that are corrupt / missing / short of volumes in the cloud from **local files** (an explicit action,
-/// PRD check): if the local file is still there and its content hash matches → recompress and **fully replace** that
-/// blob (deleting all the old volumes first); the mtime inside the archive is irrelevant (what gets displayed is the
+/// PRD check): if the local file is still there and its content hash matches → recompress and **replace** that blob
+/// whole via <see cref="VolumeBlobIO.ReplaceAsync"/> — new volumes upload over the old family first (a surviving
+/// volume that proves itself by label, length and downloaded bytes is verified in place and skipped; an archived
+/// target is deleted-then-written, since Put Blob cannot overwrite an archived blob), and only then are leftovers
+/// outside the new set deleted. The mtime inside the archive is irrelevant (what gets displayed is the
 /// index metadata, and restore resets timestamps/permissions afterwards). If the local file is gone or its hash
 /// changed while the cloud copy is bad → mark that file **unrecoverable** in the versions concerned.
 /// Because blobs/packs are shared across versions: after a repair the volume count/sizes are updated in every

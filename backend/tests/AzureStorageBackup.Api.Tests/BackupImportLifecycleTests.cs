@@ -201,12 +201,12 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
                 : BackupDiscovery.EncryptedIndexBlobName).ExistsAsync());
 
             // ─── Empty environment: the host knows only the account and nothing about this container ───
-            var account = await (await _client.PostAsJsonAsync("/api/accounts", new AccountRequest(
-                "azurite", null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
-                false, ProxyMode.Independent, null, null, null, null)))
-                .Content.ReadFromJsonAsync<AccountResponse>();
-            Assert.NotNull(account);
-            await AssertLocalEnvironmentEmptyAsync(account!.Id, container);
+            // One endpoint, one record: adopt the Azurite account this class registered earlier.
+            var accountId = await TestAccounts.EnsureAsync(_client, new AccountRequest(
+                "azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint, AzureRegion.Global, AzuriteKey,
+                false, ProxyMode.Independent, null, null, null, null));
+            var account = (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == accountId);
+            await AssertLocalEnvironmentEmptyAsync(account.Id, container);
 
             // ─── Import ───
             var response = await _client.PostAsJsonAsync("/api/backup-configs/import",

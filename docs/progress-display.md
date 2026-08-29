@@ -162,7 +162,7 @@ display subtracts them when computing "starting upload", or one item gets report
 |---|---|---|
 | `waitingOnPeer` | items | the first uploader of identical content to finish its **whole item** |
 | `waitingOnSlot` | **volumes** | a slot on the global upload gate |
-| `checking` | items | local checking: pushes no bytes, waits on nothing |
+| `checking` | items | checking — a local read, or the family's cloud label listing: pushes no upload bytes |
 
 What the `checking` stretches share is that they **emit no progress event at all**, while the
 heartbeat only runs when a transfer is in flight. Without reporting them the screen shows a
@@ -173,7 +173,7 @@ motionless `1 object starting upload` for minutes — neither starting nor uploa
 | the dedup probe's whole-file read | a few GB on a NAS is tens of seconds |
 | `stat` every member before packing | up to twenty thousand members in one pack |
 | the post-compression recheck | as above, and a changed member means a full read |
-| clearing leftover cloud volumes | network round trips, noticeable with many volumes |
+| reading the family's label listing | a metadata listing round trip, registered only for multi-volume families — it replaced the old leftover-clearing deletes, and it is what the per-volume skip decides from |
 
 > **Why not fold it into `preparing`.** That term is defined as "holding the global compression
 > lock", and "always 0 or 1" is an invariant the code relies on. Mixing disk-reading work in breaks
@@ -306,9 +306,11 @@ single file's ref is its content address, and a pack's id is drawn *outside* the
 completing and the item settling there is still index and journal writing, and clearing there would
 make those bytes vanish between two segments for a moment when they are demonstrably in the cloud.
 
-Volumes with a null owner — the download side, repair paths bypassing the gate — never enter this
-ledger. Under-reporting a volume is preferable to creating an entry nobody owns and nobody can
-delete; that is precisely the shape of the old drift.
+Volumes with a null owner — the download side — never enter this ledger. Repair's volumes carry
+owners and ride the very same gate and window as the backup's, yet they stay out too, for a cleaner
+reason: only `BeginUpload` opens an entry, repair never calls it, and `EndItem` books into an entry
+that exists rather than inventing one. Under-reporting a volume is preferable to creating an entry
+nobody owns and nobody can delete; that is precisely the shape of the old drift.
 
 ### The pool is booked early, so the screen has to split it
 
@@ -318,8 +320,9 @@ blowing the temp disk. But that one number covers three completely different sta
 to take them apart or it will pair a total with the counts of one part.
 
 **Archives still being checked come out first**, in both units. At the moment of booking, the archive
-still has to pass the post-compression recheck, and a multi-volume one must first clear leftover cloud
-volumes. If the recheck finds a member changed, **the whole archive is discarded and recompressed** —
+still has to pass the post-compression recheck, and a multi-volume one first reads its family's label
+listing — the per-volume skip-or-overwrite decision is made from it, nothing is deleted up front.
+If the recheck finds a member changed, **the whole archive is discarded and recompressed** —
 not one byte goes up. Calling that ready to send over-promises, so the `checking` tier has a byte side,
 and its volumes come out alongside its bytes or the two waiting figures contradict each other.
 

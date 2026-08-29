@@ -72,6 +72,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.RetryMaxTotalMinutes = s.RetryMaxTotalMinutes;
         existing.DeadWeightThresholdPercent = s.DeadWeightThresholdPercent;
         existing.StagedLimitBytes = s.StagedLimitBytes;
+        existing.StagingFairShare = s.StagingFairShare;
         existing.ProcessingMaxAttempts = s.ProcessingMaxAttempts;
         existing.OverlapDiffAndUpload = s.OverlapDiffAndUpload;
         existing.AutoResumeInterruptedRuns = s.AutoResumeInterruptedRuns;

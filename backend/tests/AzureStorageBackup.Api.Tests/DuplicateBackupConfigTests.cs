@@ -19,12 +19,12 @@ public class DuplicateBackupConfigTests
 {
     private sealed record ErrorBody(string error);
 
-    private static async Task<int> CreateAccountAsync(HttpClient client)
+    private static async Task<int> CreateAccountAsync(HttpClient client, string? endpoint = null)
     {
         var res = await client.PostAsJsonAsync("/api/accounts", new AccountRequest(
             Name: "dup-" + Guid.NewGuid().ToString("N")[..8],
             Description: null,
-            BlobEndpoint: "http://127.0.0.1:10000/devstoreaccount1",
+            BlobEndpoint: endpoint ?? "http://127.0.0.1:10000/devstoreaccount1",
             Region: AzureRegion.Global,
             AccountKey: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
             UseProxy: false,
@@ -33,8 +33,8 @@ public class DuplicateBackupConfigTests
             ProxyPort: null,
             ProxyUsername: null,
             ProxyPassword: null));
-        res.EnsureSuccessStatusCode();
-        return (await res.Content.ReadFromJsonAsync<AccountResponse>())!.Id;
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        return await TestAccounts.EnsureFromAsync(client, res, endpoint ?? "http://127.0.0.1:10000/devstoreaccount1");
     }
 
     private static BackupConfigRequest Request(int accountId, string container, string name, string localRoot) =>
@@ -91,7 +91,9 @@ public class DuplicateBackupConfigTests
         using var factory = new TestWebAppFactory();
         var client = factory.CreateClient();
         var one = await CreateAccountAsync(client);
-        var two = await CreateAccountAsync(client);
+        // A genuinely different account means a different endpoint now (one endpoint, one record); the config
+        // POST never touches the cloud, so the second endpoint can be fictitious.
+        var two = await CreateAccountAsync(client, "https://second-" + Guid.NewGuid().ToString("N")[..8] + ".blob.core.windows.net");
 
         Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync("/api/backup-configs",
             Request(one, "shared-name", "First", "/data/first"))).StatusCode);

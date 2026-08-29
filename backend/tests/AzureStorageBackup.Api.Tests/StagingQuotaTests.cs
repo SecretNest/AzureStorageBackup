@@ -31,7 +31,7 @@ public sealed class StagingQuotaTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
-    private StagingArea Area(long limit) => new(_compressTemp, _stagedTemp, () => limit);
+    private StagingArea Area(long limit, bool fairShare = false) => new(_compressTemp, _stagedTemp, () => limit, () => fairShare);
 
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> Produce(string name, int size)
         => async (dir, ct) =>
@@ -282,4 +282,31 @@ public sealed class StagingQuotaTests : IDisposable
             await Task.Delay(20);
         Assert.True(reached(), because);
     }
+    /// <summary>An archive can legitimately exceed the whole ceiling (a single family cannot be split), and
+    /// once it has, its excess is sunk disk cost — the bytes are on the disk whether or not anyone else is
+    /// allowed to work. The old global gate read the raw total, so a 113.9 GB repair family froze a
+    /// concurrent backup's compression for the hours the family took to drain ("check把stage room全用掉了,
+    /// 并没有像backup一样分享"). Each seat's contribution to the GLOBAL gate is now capped at its fair share:
+    /// the oversized run still saturates its own allowance (it can stage nothing more), while the others
+    /// keep exactly the share the split promised them.</summary>
+    [Fact]
+    public async Task An_Oversized_Family_Does_Not_Starve_The_Other_Seats()
+    {
+        // Fair-share mode (Settings switch): 20% split as guarantees (100 each), 80% first-come shared.
+        using var area = Area(limit: 1000, fairShare: true);
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+
+        // A's single archive blows through the whole ceiling — legal, it cannot be split.
+        var itemA = await area.StageAsync(Produce("huge", 5000), a);
+        Assert.Equal(5000, area.StagedBytes);
+
+        // B must still get its own share: its small item stages promptly instead of waiting for A to drain.
+        var itemB = area.StageAsync(Produce("small", 100), b);
+        var winner = await Task.WhenAny(itemB, Task.Delay(Patience));
+        Assert.True(winner == itemB, "the other seat was starved by A's oversized family");
+        area.Release(await itemB);
+        area.Release(itemA);
+    }
+
 }

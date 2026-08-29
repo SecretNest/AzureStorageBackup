@@ -16,7 +16,7 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// backpressure. Delete each volume as it goes up and the peak shrinks to just "the few volumes not yet uploaded".
 /// </para>
 /// </summary>
-public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit) : IDisposable
+public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit, Func<bool>? fairShare = null) : IDisposable
 {
     private readonly SemaphoreSlim _compressLock = new(1, 1);
     private readonly SemaphoreSlim _releaseSignal = new(0);
@@ -27,8 +27,12 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         new(StringComparer.Ordinal);
     private long _stagedBytes;
 
-    /// <summary>Number of runs currently in flight (= the denominator of the quota). Configured-but-idle backups hold no seat.</summary>
-    private int _leases;
+    /// <summary>The runs currently in flight (their count is the denominator of the quota; their per-seat
+    /// occupancy feeds the share-capped global gate — see <see cref="EffectiveStagedBytes"/>). Configured-but-idle
+    /// backups hold no seat. A set rather than a bare count: the global gate has to ask each seat how much it
+    /// holds, and a count cannot answer that.</summary>
+    private readonly HashSet<StagingLease> _leaseSet = [];
+    private readonly Lock _leaseGate = new();
 
     /// <summary>Number of callers waiting for space to open up. A release must wake **all** of them, see <see cref="SignalRelease"/>.</summary>
     private int _waiting;
@@ -105,7 +109,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
-            Interlocked.Decrement(ref _area._leases);
+            lock (_area._leaseGate)
+                _area._leaseSet.Remove(this);
             // The moment a seat leaves, the remaining runs' allowance grows — they must be woken, otherwise they keep waiting
             // against the old quota until the next finished volume upload happens to wake them.
             _area.SignalRelease();
@@ -116,7 +121,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     public StagingLease AcquireLease()
     {
         var lease = new StagingLease(this);
-        Interlocked.Increment(ref _leases);
+        lock (_leaseGate)
+            _leaseSet.Add(lease);
         return lease;
     }
 
@@ -126,7 +132,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         var limit = stagedLimit();
         if (lease is null)
             return limit;
-        return limit / Math.Max(1, Volatile.Read(ref _leases));
+        lock (_leaseGate)
+            return limit / Math.Max(1, _leaseSet.Count);
     }
 
     /// <summary>
@@ -135,9 +142,33 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     /// while **current** usage is below the allowance", keeping the existing semantics — so an item starting from zero can always
     /// begin compressing even when its output is bound to exceed the allowance, otherwise a file bigger than the allowance could never be compressed at all.
     /// </summary>
-    private bool HasRoom(StagingLease? lease) =>
-        Interlocked.Read(ref _stagedBytes) < stagedLimit()
-        && (lease is null || lease.Bytes < QuotaFor(lease));
+    private bool HasRoom(StagingLease? lease)
+    {
+        var limit = stagedLimit();
+        if (lease is null)
+            return Interlocked.Read(ref _stagedBytes) < limit;
+        if (!(fairShare?.Invoke() ?? false))
+            // Strict (the default): the classic ceiling — a full pool blocks every seat until it drains.
+            // Disk safety first; one oversized family CAN freeze its neighbours for the hours it takes to
+            // upload, which is exactly the trade the fair-share switch exists to flip.
+            return Interlocked.Read(ref _stagedBytes) < limit && lease.Bytes < QuotaFor(lease);
+        // Fair-share (Settings → staging fair share): 20% of the limit is split evenly as a per-seat
+        // GUARANTEE and the other 80% is first-come shared. A run inside its guarantee may always proceed —
+        // an oversized family elsewhere never starves it completely — and beyond the guarantee it competes
+        // for the shared 80% like everyone else. The honest cost, stated on the switch: when EVERY run is
+        // handling huge files, the total can overshoot the limit further than strict mode would allow
+        // (each family lands whole; it cannot be split).
+        lock (_leaseGate)
+        {
+            var n = Math.Max(1, _leaseSet.Count);
+            var guaranteed = limit / 5 / n;
+            var sharedTotal = limit - limit / 5;
+            long sharedUsed = 0;
+            foreach (var l in _leaseSet)
+                sharedUsed += Math.Max(0, l.Bytes - guaranteed);
+            return lease.Bytes < guaranteed || sharedUsed < sharedTotal;
+        }
+    }
 
     /// <summary>
     /// Wake **every** waiter, not one. Each is waiting on its own allowance, so releasing one means the one that wakes up may

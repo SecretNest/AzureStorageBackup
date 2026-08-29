@@ -112,6 +112,14 @@ public class GlobalSettings
     /// <summary>Byte cap on the compression staging area (staged-temp), the backpressure threshold (decision 4, changeable live via Settings). Default 2GB.</summary>
     public long StagedLimitBytes { get; set; } = 2L * 1024 * 1024 * 1024;
 
+    /// <summary>How the staging pool behaves when it is FULL: false (default) = the classic strict ceiling —
+    /// nobody may start compressing until usage drops below the limit (disk safety first); true = fair-share —
+    /// 20% of the limit is split evenly as a per-run guarantee and the other 80% is first-come shared, so one
+    /// run's oversized family (a single archive can exceed the whole limit; it cannot be split) never starves
+    /// the others completely. The trade is honest and the operator's to make ("让用户自己去开关"): fair-share can
+    /// overshoot the limit further when EVERY run is handling huge files at once.</summary>
+    public bool StagingFairShare { get; set; }
+
     /// <summary>Cap on reprocessing attempts when the same member keeps changing during post-compression re-verification (PRD §5.1, M4 §9, default 5).</summary>
     public int ProcessingMaxAttempts { get; set; } = 5;
 

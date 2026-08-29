@@ -19,7 +19,10 @@ mtime and permissions. Three filters apply, in this order:
 1. **Scope rules** — the configured subset of the root ([configuration.md](configuration.md)).
 2. **Ignore rules** — gitignore syntax, shared engine (§ *The rule engine* below).
 3. **Symlink handling** — skipped by default; included as `kind: "symlink"` with a `target` when the
-   backup opts in.
+   backup opts in. A symlink's permissions are recorded as a fixed `"0777"`, never stat'd through
+   the link: resolving a dangling target throws, and the throw was being swallowed as "unreadable" —
+   silently dropping a legitimate entry whose target string has nothing to do with the target
+   existing. Diff compares symlinks by target alone, so the constant costs nothing.
 
 Empty directories are collected separately and recorded in the version index, because restore has to
 recreate them.
@@ -91,8 +94,13 @@ Deleting a version deletes its second-level index, plus any data blob or pack no
 
 > Delete a block when it is referenced by no retained version **and** by no active journal.
 
-Two details are load-bearing:
+Three details are load-bearing:
 
+- **Retirement commits the info file first, deletes after.** The info file without the retired
+  versions is written before their index volumes are touched; the deletes are then best-effort per
+  volume. Inverted, a crash between the two leaves an info file naming an index that is gone — an
+  unreadable backup — whereas committed-first the worst case is a retired index lingering as an
+  unreferenced blob, which the orphan sweep collects later.
 - **Volume families are deleted as a unit.** `data/{hash}.NNN` is normalised back to the base name
   when comparing references, and packs are grouped by pack id over the `packs/` prefix, so a
   referenced volume is never deleted by mistake.

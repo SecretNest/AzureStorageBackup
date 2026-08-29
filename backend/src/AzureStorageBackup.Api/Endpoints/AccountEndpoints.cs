@@ -35,7 +35,9 @@ public static class AccountEndpoints
             if (string.IsNullOrWhiteSpace(req.AccountKey))
                 return Results.BadRequest(new { error = "AccountKey is required." });
 
-            var created = await svc.CreateAsync(req.ToAccount(encryption), ct);
+            Account created;
+            try { created = await svc.CreateAsync(req.ToAccount(encryption), ct); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); } // duplicate endpoint
             // A freshly created account cannot be in use yet; passing an explicit empty list says "genuinely none" rather than "could not get it, so left blank".
             return Results.CreatedAtRoute("GetAccount", new { id = created.Id },
                 AccountResponse.From(created, Pending(keyring, encryption, created), []));
@@ -54,7 +56,9 @@ public static class AccountEndpoints
             if (string.IsNullOrEmpty(req.ProxyPassword))
                 update.ProxyPasswordProtected = existing.ProxyPasswordProtected;
 
-            var result = await svc.UpdateAsync(id, update, ct);
+            Account? result;
+            try { result = await svc.UpdateAsync(id, update, ct); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); } // duplicate endpoint
             if (result is null)
                 return Results.NotFound();
             var usage = await svc.GetBackupUsageAsync(ct);

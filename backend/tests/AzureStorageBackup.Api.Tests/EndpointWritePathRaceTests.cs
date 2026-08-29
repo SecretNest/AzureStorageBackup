@@ -127,7 +127,7 @@ public sealed class EndpointWritePathRaceTests
     private static AccountRequest SampleAccount(string name) => new(
         Name: name,
         Description: null,
-        BlobEndpoint: "https://example.blob.core.windows.net",
+        BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
         Region: AzureRegion.Global,
         AccountKey: "dGVzdGtleQ==",
         UseProxy: false,

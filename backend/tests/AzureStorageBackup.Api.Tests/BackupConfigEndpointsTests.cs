@@ -42,7 +42,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var req = new AccountRequest(
             Name: "acct-" + name + "-" + Guid.NewGuid().ToString("N")[..6],
             Description: null,
-            BlobEndpoint: "https://example.blob.core.windows.net",
+            BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
             Region: AzureRegion.Global,
             AccountKey: "dGVzdGtleQ==",
             UseProxy: false,
@@ -222,10 +222,8 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
 
         var containerName = "del-" + Guid.NewGuid().ToString("N")[..8];
 
-        var accountReq = new AccountRequest("azurite", null, AzuriteEndpoint, AzureRegion.Global,
-            AzuriteKey, false, ProxyMode.Independent, null, null, null, null);
-        var account = await (await _client.PostAsJsonAsync("/api/accounts", accountReq))
-            .Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record: adopt the Azurite account another test in this class registered.
+        var account = await CreateAzuriteAccountAsync();
 
         var factoryClient = new BlobClientFactory(TestSecrets.Reader);
         var azuriteAccount = new Account { BlobEndpoint = AzuriteEndpoint, AccountKeyProtected = TestSecrets.Protect(AzuriteKey), Region = AzureRegion.Global };
@@ -236,7 +234,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         {
             // deleteContainer=false (the default): the local config is deleted, the cloud container is still there.
             var config1 = await (await _client.PostAsJsonAsync("/api/backup-configs",
-                    SampleRequest("del-keep") with { AccountId = account!.Id, ContainerName = containerName }))
+                    SampleRequest("del-keep") with { AccountId = account.Id, ContainerName = containerName }))
                 .Content.ReadFromJsonAsync<BackupConfigResponse>();
 
             Assert.Equal(HttpStatusCode.NoContent,
@@ -448,7 +446,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
     {
         var req = new AccountRequest("azurite-" + Guid.NewGuid().ToString("N")[..6], null, AzuriteEndpoint,
             AzureRegion.Global, AzuriteKey, false, ProxyMode.Independent, null, null, null, null);
-        return (await (await _client.PostAsJsonAsync("/api/accounts", req)).Content.ReadFromJsonAsync<AccountResponse>())!;
+        // One endpoint, one record: after the first test in this class registers Azurite, later ones adopt it.
+        var id = await TestAccounts.EnsureAsync(_client, req);
+        return (await _client.GetFromJsonAsync<List<AccountResponse>>("/api/accounts"))!.Single(a => a.Id == id);
     }
 
     /// <summary>Writes the local authoritative info file directly (when TrackedInfoStore.LoadAsync hits locally it never reads the cloud), so the /versions, /tree,

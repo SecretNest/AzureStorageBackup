@@ -205,6 +205,19 @@ function BackupDefaults() {
       <Field label="Staging area size limit (MB)">
         <Num value={Math.round(s.stagedLimitBytes / MB)} onChange={(v) => set('stagedLimitBytes', v * MB)} />
       </Field>
+      {/* The trade is the operator's: strict protects the disk absolutely; fair-share keeps every run
+          moving when one stages a family bigger than the whole limit (a single archive cannot be split),
+          at the price of a larger possible overshoot when every run handles huge files at once. */}
+      <Field label="Staging fair share">
+        <input
+          type="checkbox"
+          checked={s.stagingFairShare}
+          onChange={(e) => set('stagingFairShare', e.target.checked)}
+        />
+        {' '}Reserve 20% of the limit as per-run guarantees (split evenly) and share the other 80%
+        first-come, so one oversized archive cannot completely starve concurrent runs. Off = the strict
+        ceiling: a full staging pool blocks every run until it drains.
+      </Field>
       <Field label="Processing re-verify max attempts">
         <Num value={s.processingMaxAttempts} onChange={(v) => set('processingMaxAttempts', v)} />
       </Field>

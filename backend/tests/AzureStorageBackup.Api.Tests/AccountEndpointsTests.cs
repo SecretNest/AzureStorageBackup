@@ -17,7 +17,7 @@ public class AccountEndpointsTests(TestWebAppFactory factory) : IClassFixture<Te
     private static AccountRequest SampleRequest(string name = "prod") => new(
         Name: name,
         Description: "primary",
-        BlobEndpoint: "https://prod.blob.core.windows.net",
+        BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
         Region: AzureRegion.Global,
         AccountKey: "dGVzdGtleQ==",
         UseProxy: false,

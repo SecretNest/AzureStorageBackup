@@ -300,6 +300,12 @@ The window governs which volumes are **queued**, not which exist: compression ha
 whole volume set to the pool before any of it is uploaded, and each volume is released from the pool as
 it lands. So the depth costs a few more waiters and nothing on disk.
 
+Not every volume reaches the gate at all: when the family's cloud listing proves an existing volume
+identical — identity label and length match, plus a downloaded-bytes proof on the repair path — the
+volume is **skipped** before it ever asks for a slot, releasing its staging file on the spot. A
+resumed run's salvaged volumes therefore cost the gate nothing and tick through instantly; see
+[volume-identity.md](volume-identity.md).
+
 ## Where this stops short
 
 **7z is not busy 100% of the time.** The post-compression re-verification stays on the compressor, so

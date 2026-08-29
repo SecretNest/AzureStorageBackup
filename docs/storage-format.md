@@ -11,8 +11,15 @@ azurestoragebackup.index.json.enc      # encrypted variant — one or the other,
 indexes/v{N}.json[.enc]                # second level: one file manifest per version
 data/{address}[.001,.002,...]          # single-file data blobs, content-addressed
 packs/{packId}.7z[.001,.002,...]       # grouped archives
+restore-tmp/{name}                     # transient Hot copies of archived volumes during a restore
 journal/                               # local only — see run-lifecycle.md; not in the container
 ```
+
+`restore-tmp/` exists only while a restore of Archive-tier data runs: the archived originals are
+never rehydrated in place — each volume is Copy-Blobbed here at an online tier, downloaded, and the
+copy deleted per group. Anything still under the prefix at process start is the leftover of a crash
+and is swept (`RestoreTempSweeper`), since it bills online-tier storage for nothing. See
+[check-restore-repair.md](check-restore-repair.md).
 
 **A container holds at most one backup.** The info file's presence is what marks a container as
 belonging to this tool.
@@ -138,6 +145,14 @@ raises an unrecoverable-error notification, because at 128 bits it should not ha
 **Volumes.** A blob or pack too large for one object is split: `.001`, `.002`, … A single-volume
 family uses the base name with no suffix. `VolumeBlobIO` treats a family as a unit for read, write
 and cleanup alike.
+
+Every volume small enough to buffer (≤ `BlobUploader.LabelMemoryLimit`, 256 MB) carries its own
+xxh128 in blob metadata — `x-ms-meta-xxh128`, value `xxh128:<32 hex>` — written **with** the upload
+request so the label commits atomically with the bytes it describes; larger files stream unlabelled
+unless the caller already holds the hash (the raw route). The label's only consumer is the upload
+path's skip decision — resume and repair verify a cloud volume in place instead of re-sending it;
+check never reads it. Legacy volumes carry none and therefore always read as "different". The full
+argument is [volume-identity.md](volume-identity.md).
 
 > **Rationale — why `.001` is not written last as a completeness marker.** It used to be, as an "the
 > family is complete" signal, and it was dropped together with cloud-side existence dedup: it doubled

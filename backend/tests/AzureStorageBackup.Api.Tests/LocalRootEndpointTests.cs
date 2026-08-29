@@ -25,7 +25,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         var req = new AccountRequest(
             Name: "acct-" + Guid.NewGuid().ToString("N")[..6],
             Description: null,
-            BlobEndpoint: "https://example.blob.core.windows.net",
+            BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
             Region: AzureRegion.Global,
             AccountKey: "dGVzdGtleQ==",
             UseProxy: false,

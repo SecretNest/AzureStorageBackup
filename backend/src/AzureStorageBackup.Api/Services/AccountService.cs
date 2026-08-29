@@ -19,9 +19,28 @@ public class AccountService(AppDbContext db) : IAccountService
         if (account.CreatedAt == default)
             account.CreatedAt = DateTimeOffset.UtcNow;
 
+        await RejectEndpointAliasAsync(account.BlobEndpoint, exceptId: null, ct);
         db.Accounts.Add(account);
         await db.SaveChangesAsync(ct);
         return account;
+    }
+
+    /// <summary>Two account records pointing at one endpoint are two names for the same real storage account —
+    /// and everything that serializes work per container (the busy tracker, most of all) keys on the LOCAL
+    /// record id, so the alias would let a backup on one record and a retention cleanup on the other run
+    /// against the literal same cloud container at once, the cleanup deleting what the backup is uploading.
+    /// The operator's ruling: one endpoint, one record ("直接禁止同一个endpoint被添加超过一次"). The comparison is
+    /// normalized (case, trailing slash) so a cosmetic variation cannot slip past. Existing duplicates in an
+    /// old database are left alone — only new additions and edits are gated.</summary>
+    private async Task RejectEndpointAliasAsync(string endpoint, int? exceptId, CancellationToken ct)
+    {
+        static string Normalize(string e) => e.TrimEnd('/').ToLowerInvariant();
+        var normalized = Normalize(endpoint);
+        var clash = (await db.Accounts.AsNoTracking().Select(a => new { a.Id, a.BlobEndpoint, a.Name }).ToListAsync(ct))
+            .FirstOrDefault(a => a.Id != exceptId && Normalize(a.BlobEndpoint) == normalized);
+        if (clash is not null)
+            throw new InvalidOperationException(
+                $"The endpoint {endpoint} is already registered by the account \"{clash.Name}\" — one storage account, one entry (a duplicate would let two operations run against the same container at once).");
     }
 
     public async Task<Account?> UpdateAsync(int id, Account update, CancellationToken ct = default)
@@ -30,6 +49,7 @@ public class AccountService(AppDbContext db) : IAccountService
         if (existing is null)
             return null;
 
+        await RejectEndpointAliasAsync(update.BlobEndpoint, exceptId: id, ct);
         existing.Name = update.Name;
         existing.Description = update.Description;
         existing.BlobEndpoint = update.BlobEndpoint;

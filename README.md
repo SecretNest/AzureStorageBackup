@@ -224,6 +224,8 @@ Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 - `compress/` — the archive currently being produced. Compression is global and serial: one archive at a time, across all backups.
 - `staged/` — finished archives waiting to be uploaded. This directory is what the **staging-area limit** on the Settings page (default **2 GB**) applies to: once it is full, the next compression waits until an upload frees space. A single archive is allowed to exceed the limit if it started below it, so the peak can be somewhat higher than the configured value — size the volume with that in mind.
 
+  When several runs share the pool, **Staging fair share** (Settings, off by default) decides what a full pool means. Off, the classic rule holds: a full pool blocks every run until it drains — absolute disk safety, but one run's oversized archive (a 100 GB media file's volume family lands whole) can freeze the others for the hours it takes to upload. On, 20% of the limit is reserved and split evenly as a per-run guarantee and the other 80% is shared first-come: nobody is ever starved completely, at the price of a larger possible overshoot when every run is handling huge files at once.
+
 Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
 
 **Upload and download concurrency are counted per operation, not shared between them.** They sit under a *Global* heading, next to the staging-area limit — which really is one budget split across the runs in flight — so it is easy to read them as a shared ceiling, and they are not. Each backup gets its own upload streams and each restore or deep check its own downloads, so two backups running at once open twice the configured number of connections. Divide by however many you expect to overlap if you are sizing this against a bandwidth cap. A backup also runs one stream above the number set, which is what keeps a split archive's volumes from stalling at the hand-off between them.
@@ -257,6 +259,14 @@ Neither button returns until the run has really settled — journal on disk, tem
 Both keep what finished uploading, and both keep the journal, so the next run picks those objects up rather than re-uploading them. The difference is what the UI offers next: a **Suspended** run shows **Resume** and **Discard**, a **Canceled** one goes back to a normal **Run** button. *Resume* is simply Run — every run adopts a still-valid journal on the way in, so there is no separate resume mode. *Discard* throws the recovery point away; the objects it was protecting stop being reserved and the next cleanup removes them.
 
 A journal is only adopted if the run it describes still matches: same local root, same baseline version, same encryption identity. If any of those changed, it is dropped rather than trusted, and a file only counts as already-uploaded when **both** its path and its content hash match — a file edited since the crash is uploaded again.
+
+#### Repairs pause and suspend too
+
+A running repair carries the same three buttons in the same order — **Pause · Suspend · Stop** — and its pause is even finer-grained than a backup's: the gate is checked before every volume, so a pause answers within seconds even in the middle of a 100 GB family. Suspend saves the repair's selection; Resume replays it against a fresh assessment, so anything healed in the meantime falls out on its own and volumes already uploaded are verified and skipped rather than re-sent. At the very start of a repair, every problem file is marked unrecoverable and the marks are persisted **before any work begins** — so however the run ends, backups and restores running afterwards always see the truth about which content is still broken; each repaired object then clears its own marks.
+
+#### Archive-tier restores never touch the originals
+
+Restoring content whose volumes sit in the **Archive** tier does not rehydrate them in place. Each archived volume is *copied* (Azure's Copy Blob) to a temporary Hot copy under the container's `restore-tmp/` directory, the download is served from the copies, and the copies are deleted when the group finishes — the originals never change tier, so their 180-day archive clock never resets and no re-archive step is ever owed. The copy out of Archive takes as long as a rehydration would (hours, at the rehydrate priority you chose) and the wait shrugs off transient network errors rather than failing the restore. Whatever a crash leaves under `restore-tmp/` is deleted automatically at the next startup — if you see that directory in your container, it is disposable by definition.
 
 #### Network trouble suspends the run instead of failing it
 
@@ -440,6 +450,8 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 > Every EF Core SQL statement is logged at `Information`, which is the framework default and makes `docker logs` almost unreadable — the app's own messages get lost among `Microsoft.EntityFrameworkCore.Database.Command[20101]` lines. It is therefore raised to `Warning` here. To turn it back on for a debugging session, set `Logging__LogLevel__Microsoft.EntityFrameworkCore.Database.Command=Information`. The same pattern works for any category: `Logging__LogLevel__<Category>=<Level>`.
 
 > Azure credentials are **not** configured through environment variables — each storage account is added in the UI and its key is encrypted at rest with the Data Protection key ring in `/keys`. If that directory is lost, the app starts in recovery mode and asks you to re-enter each credential; see [operations.md](docs/operations.md).
+>
+> **One endpoint, one account entry.** Adding the same storage endpoint twice is refused: two local entries for one real storage account would let two operations (say, a backup and a retention cleanup) run against the same cloud container at the same instant, each blind to the other. Existing duplicates in an old database are left alone, but new additions and edits are checked.
 
 > Tuning values such as the staging-area limit, retention defaults and the dead-weight compaction threshold live in the database, not in environment variables — change them on the **Settings** page and they take effect immediately, without a restart.
 

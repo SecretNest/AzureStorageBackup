@@ -2947,8 +2947,8 @@ public sealed class BackupOrchestrator(
     /// returns, the registration is what makes "Stop now" clear it (see <see cref="PurgeInFlightAsync"/>). Clearing
     /// it afterwards is not optional either — a stale registration on an address a **later** item may legitimately
     /// claim and upload would have Stop now delete that one's good blob. A hard crash inside that window still
-    /// leaves the object behind; it is the same window <see cref="ClearLeftoverVolumesAsync"/> has always had
-    /// between its delete and its re-upload.
+    /// leaves the object behind; it is the same shape of window the archived-target delete-then-write has (the
+    /// one deliberately inverted delete-before-write in <see cref="VolumeBlobIO.UploadAsync"/>).
     /// </para>
     /// <para>
     /// The delete is retried, because the failure it is most likely to meet is the same blip that brought the
@@ -3736,14 +3736,16 @@ public sealed class BackupOrchestrator(
         uploadTracker.BeginUpload(blobName, staged.Files.Count);   // for the gate and the in-flight registration see VolumeUploadScope; both live at the per-volume level
         try
         {
-            // Same discipline as for single-file blobs (see ClearLeftoverVolumesAsync): only for multi-volume, and
+            // Same discipline as for single-file blobs (see FetchFamilyLabelsAsync): only for multi-volume, and
             // what it does is keep this family of volumes from mixing in the previous attempt's output. Pack ids are
             // unique within a run, so leftovers can only come from **this run's own** retry — and a retry is exactly
             // the path taken every time the suspend gate lets something through. A pack's members are compressed by
-            // file name, so two runs usually produce byte-identical output, but "usually" is not something to gamble
-            // data on: a member's mtime changing between the two attempts (with the content unchanged, so
-            // re-verification does not exclude it) is enough to make the archive headers differ, and the spliced
-            // result is just as unopenable.
+            // file name, so two attempts usually produce byte-identical output, but "usually" is not something to
+            // gamble data on: a member's mtime changing between the two attempts (with the content unchanged, so
+            // re-verification does not exclude it) is enough to make the archive headers differ. The labels settle
+            // it per volume, by bytes rather than by theory: a leftover that hashes equal to its replacement IS the
+            // replacement and skips; one that differs is overwritten; over-count leftovers fall to the trim below —
+            // no splice can survive that, and whatever the first attempt landed unchanged is salvaged for free.
             var existingVolumes = await FetchFamilyLabelsAsync(request, blobName, staged.Files.Count, staged.Bytes, uploadTracker, ct);
             control?.TrackInFlight(blobName);
             await VolumeBlobIO.UploadAsync(

@@ -47,29 +47,30 @@ public class ContainerEndpointsTests(TestWebAppFactory factory) : IClassFixture<
         Skip.IfNot(AzuriteReachable(), "Azurite not running on 127.0.0.1:10000");
 
         var acctRes = await _client.PostAsJsonAsync("/api/accounts", AzuriteAccountRequest());
-        var acct = await acctRes.Content.ReadFromJsonAsync<AccountResponse>();
+        // One endpoint, one record now: adopt the account an earlier test already registered for Azurite.
+        var acctId = await TestAccounts.EnsureFromAsync(_client, acctRes, AzuriteAccountRequest().BlobEndpoint);
 
         var name = "api-" + Guid.NewGuid().ToString("N")[..8];
         try
         {
             var create = await _client.PostAsJsonAsync(
-                $"/api/accounts/{acct!.Id}/containers", new { name });
+                $"/api/accounts/{acctId}/containers", new { name });
             Assert.Equal(HttpStatusCode.Created, create.StatusCode);
 
             var list = await _client.GetFromJsonAsync<List<ContainerInfo>>(
-                $"/api/accounts/{acct.Id}/containers");
+                $"/api/accounts/{acctId}/containers");
             Assert.Contains(list!, c => c.Name == name);
 
-            var del = await _client.DeleteAsync($"/api/accounts/{acct.Id}/containers/{name}");
+            var del = await _client.DeleteAsync($"/api/accounts/{acctId}/containers/{name}");
             Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
 
             var after = await _client.GetFromJsonAsync<List<ContainerInfo>>(
-                $"/api/accounts/{acct.Id}/containers");
+                $"/api/accounts/{acctId}/containers");
             Assert.DoesNotContain(after!, c => c.Name == name);
         }
         finally
         {
-            await _client.DeleteAsync($"/api/accounts/{acct!.Id}/containers/{name}");
+            await _client.DeleteAsync($"/api/accounts/{acctId}/containers/{name}");
         }
     }
 

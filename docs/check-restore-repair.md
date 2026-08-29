@@ -64,10 +64,14 @@ levels.
 **What "repairable from local" means — and does not mean.** Repairable is a statement about the
 **local file against the version's recorded content**: the file at the entry's path hashes to the
 FullHash that version recorded, so repair can rebuild the cloud object from it. It says nothing
-about what survives in the cloud. Surviving volumes of a damaged family play no part in the verdict
-and are never reused in the repair — 7z output is not byte-reproducible, so a fresh compression
-cannot splice into an old family; replacement is always whole. A file can be repairable with zero
-volumes left in the cloud, and unrepairable with 999 of 1000 still there.
+about what survives in the cloud — surviving volumes play no part in the **verdict**. They do play a
+part in the **cost**: replacement goes through the per-volume identity labels
+([volume-identity.md](volume-identity.md)), and a surviving volume whose label, length and actual
+downloaded bytes all prove it identical to the freshly produced one is kept in place instead of
+re-sent (7z's streaming output is byte-reproducible under `-mtm=off`, so the fresh compression
+really does reproduce the old bytes). The local read and recompression are still paid in full. A
+file can be repairable with zero volumes left in the cloud, and unrepairable with 999 of 1000 still
+there.
 
 A problem whose local side was never checked reads **Unknown**, never "no": repairability is a
 verdict only where the local content was actually hashed, and printing "0 repairable" after a
@@ -126,8 +130,14 @@ unreferenced-blob scan, including when that scan ran and found nothing (`orphans
 
 An explicit action, not something a check does on its own.
 
-For a broken cloud blob, `BackupRepairer` recompresses from the local file — hash-verified first —
-and **replaces it completely**, deleting all old volumes before writing.
+For a broken cloud blob, `BackupRepairer` recompresses from the local file — hash-verified against
+the recorded content — and **replaces it whole**: the new volumes upload over the old family first
+(surviving volumes that prove themselves are verified in place and skipped), and only after every
+volume has landed are the leftovers outside the new set deleted. Upload first, delete after — the
+crash window is "old and new volumes mixed" (recoverable via check/repair), never "the whole blob is
+gone". The one inversion is per volume and forced by Azure: a target volume sitting in the Archive
+tier is deleted and then written, because Put Blob cannot overwrite an archived blob
+(409 `BlobArchived`).
 
 - **Single-file blobs** update size and volume count in **every** referencing version, since dedup
   means several versions can share one blob.
@@ -138,25 +148,36 @@ and permissions.
 
 ### The plan comes first, and consent is per file
 
-Clicking **Repair…** does not run anything: it prices the repair. The plan is built from the last
-check report, the local index and one stat per problem file — no cloud request and not a byte read,
-so it answers instantly even when every problem file is 100 GB. Each row states its fate:
+The plan loads by itself: the moment a check result with problems is on screen, it is fetched and
+**merged into the findings table** — same files, so one table, not a second near-identical one
+behind another click. It is priced from the last check report, the local index and one stat per
+problem file — no cloud request and not a byte read, so it answers instantly even when every problem
+file is 100 GB. Each row states its fate:
 
 - a file whose local length still matches the recorded length can be **re-uploaded now** (ticked by
-  default, its object size on the row — subject to the hash gate below once the repair actually runs);
+  default, its object size on the row — subject to the content verification once the repair actually
+  runs);
 - a file whose local content changed **cannot be repaired from local**, and is marked damaged and
   left to the next backup version.
 
 Everything unticked is deferred the same way: marked, not touched, no probing and no upload. The
-confirm button carries the bill ("re-uploads X, defers N") before anything is spent. The hash runs
-only inside the confirmed repair, only for ticked files — it answers "is this local byte-for-byte
-the content the version recorded", the one question a stat cannot, and the one that must be answered
-before any bytes may impersonate a recorded identity.
+confirm button carries the bill ("re-uploads X, defers N") before anything is spent, and it is aware
+of the live repair state: with a repair already running or suspended the table says so instead of
+offering a start that would be silently swallowed (running) or quietly supersede the saved selection
+(suspended). The full-content verification runs only inside the confirmed repair, only for ticked
+files — it answers "is this local byte-for-byte the content the version recorded", the one question
+a stat cannot, and the one that must be answered before any bytes may impersonate a recorded
+identity. On the recompression route the verdict rides the production read itself (the source is
+hashed while it feeds 7z, and nothing uploads unless the hash matches); only the raw route pays a
+separate up-front hash, because there the upload would stream straight from the source under a label
+that claims the recorded identity.
 
 **What "repairable" is about — and not about.** Repair rebuilds the version's recorded content from
-the local file and replaces the damaged object whole. Surviving cloud volumes play no part and are
-never reused: 7z output is not byte-reproducible, so a fresh compression cannot splice into an old
-family, and "just re-create the missing volume" does not exist.
+the local file and replaces the damaged object whole — "just re-create the missing volume" without
+the local read and recompression does not exist. Surviving cloud volumes decide none of that; what
+they can do is cheapen the upload half: each freshly produced volume is compared against the cloud's
+per-volume identity label, and a survivor whose label, length and actual downloaded bytes prove it
+identical is kept in place rather than re-sent (see [volume-identity.md](volume-identity.md)).
 
 ### Deferral is a promise, and the next backup keeps it
 
@@ -168,10 +189,15 @@ future backup would ever re-upload the broken blob on its own.
 So after every **completed** backup run (manual or scheduled), the marks across the retained
 versions are collected, filtered by a stat — only paths whose local length still matches their
 recorded length can heal, so nothing unhealable triggers a nightly repair-and-renotify loop — and
-handed to a repair scoped to exactly those paths. A healed blob is every referencing version's blob
-at once, and the marks come off with it (a verdict overturned comes off the record). A file whose
-content moved on never heals its old version this way; its current content is in the newer versions,
-which is where it lives now.
+handed to a repair scoped to exactly those paths. The candidates come from the **latest version's
+entries only** (`DeferredRepairs.HealCandidates`): marks are gathered across every retained version,
+but a marked path is a candidate only if the latest version still carries an entry for it, and the
+stat compares against that entry's recorded length. A path that exists only in older versions —
+deleted or renamed since — is never handed over; its damage stays marked and is restore
+substitution's problem, not this loop's. A healed blob is every referencing version's blob at once,
+and the marks come off with it (a verdict overturned comes off the record). A file whose content
+moved on never heals its old version this way; its current content is in the newer versions, which
+is where it lives now.
 
 ### Prefix recovery: deliberately not offered
 
@@ -224,6 +250,24 @@ The user picks a destination root, or restores in place.
 "Overwrite only if changed" compares hashes against the index, not timestamps.
 
 Empty directories are recreated. Permissions and modification times are restored.
+
+### Archived volumes are restored from copies, never rehydrated in place
+
+An Archive-tier volume cannot be read until it is online, and changing the original's tier is a
+write to the backup itself. So restore never touches the originals: `EnsureHotCopyAsync` Copy-Blobs
+each archived volume of a group to `restore-tmp/{name}` at the requested online tier — the rehydrate
+priority (Standard or High) rides the copy — polls the copies until they are readable (tolerating
+transient errors), downloads from the copies, and deletes them as each group finishes. The originals
+never change tier, so `ReArchiveAfterRestore` has nothing left to do and is a no-op. Copies a
+crashed restore leaves behind would bill online-tier storage forever; `RestoreTempSweeper` clears
+the `restore-tmp/` prefix at process start — the prefix is the whole bookkeeping.
+
+Restored content is verified before it can be seen: a pack member or raw blob is written to a
+`.asb-part` sibling, its length and hash checked against the index, and only then swapped into place
+atomically — a half-written or wrong file never sits at the destination path. A "skip existing"
+decision is re-checked at write time, not trusted from planning time. And a substitute version whose
+**own** copy is marked unrecoverable does not resolve — substitution never routes a broken version
+in as the fix for another broken version.
 
 ### Restore substitution
 
@@ -282,6 +326,8 @@ in-flight list and the speed clock. Their stage units differ:
 | Verifying (check) | objects, completion by bytes | a pack downloaded, extracted and re-hashed; the percentage comes from declared bytes, since one group can be a 100 GB file or a box of small ones |
 | Local (check) | files | one index entry |
 | Listing (check) | blobs | one blob in the container, orphan or not — it counts what it lists, not what it finds |
+| Assessing (repair) | volumes | one `HEAD` of the repair's scoped pre-check — the check's Cloud stage under the repair's own name (its Local pass is dropped; other stages pass through unrenamed) |
+| Repairing (repair) | objects, completion by bytes | one damaged object rebuilt and replaced; the count runs one ahead — it names the object *under* repair, not the ones finished — and the byte percentage moves mid-object as each landed or verified-skipped volume books its share of the declared source bytes |
 
 See [progress-display.md](progress-display.md).
 

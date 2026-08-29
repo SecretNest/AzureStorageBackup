@@ -122,7 +122,10 @@ public class AccountServiceTests : IDisposable
     public async Task List_Returns_All_Accounts()
     {
         await _sut.CreateAsync(SampleAccount());
-        await _sut.CreateAsync(SampleAccount());
+        var second = SampleAccount();
+        second.Name = "prod-2";
+        second.BlobEndpoint = "https://prod2.blob.core.windows.net"; // one endpoint, one record
+        await _sut.CreateAsync(second);
 
         var all = await _sut.ListAsync();
 
@@ -147,6 +150,33 @@ public class AccountServiceTests : IDisposable
         Assert.NotEqual("proxy-pass", fetched!.ProxyPasswordProtected);
         Assert.Equal("proxy-pass", TestSecrets.Reader.RevealProxyPassword(fetched));
         Assert.Equal(8080, fetched.ProxyPort);
+    }
+
+    /// <summary>The operator's ruling on the endpoint-alias hazard: one endpoint, one account record. Two
+    /// records for one real storage account would defeat the per-container serialization (the busy tracker
+    /// keys on the local record id), letting a cleanup delete what a concurrent backup is uploading.
+    /// Normalized comparison, so a cosmetic case/slash variation cannot slip past; an edit may keep its own
+    /// endpoint but may not steal another record's.</summary>
+    [Fact]
+    public async Task An_Account_Aliasing_An_Existing_Endpoint_Is_Refused()
+    {
+        var first = await _sut.CreateAsync(SampleAccount());
+
+        var alias = SampleAccount();
+        alias.Name = "another name";
+        alias.BlobEndpoint = first.BlobEndpoint.ToUpperInvariant() + "/";
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.CreateAsync(alias));
+
+        var second = SampleAccount();
+        second.Name = "second";
+        second.BlobEndpoint = "https://other.blob.core.windows.net";
+        second = await _sut.CreateAsync(second);
+        second.BlobEndpoint = first.BlobEndpoint;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => _sut.UpdateAsync(second.Id, second));
+
+        second.BlobEndpoint = "https://other.blob.core.windows.net";
+        second.Description = "edited";
+        Assert.NotNull(await _sut.UpdateAsync(second.Id, second));
     }
 
 }

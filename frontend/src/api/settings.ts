@@ -41,6 +41,9 @@ export interface GlobalSettings {
   retryMaxTotalMinutes: number
   deadWeightThresholdPercent: number
   stagedLimitBytes: number
+  // Staging pool policy when full: false = strict ceiling (everyone waits); true = 20% split as per-run
+  // guarantees + 80% first-come shared, so one oversized family cannot completely starve the others.
+  stagingFairShare: boolean
   processingMaxAttempts: number
   overlapDiffAndUpload: boolean
   autoResumeInterruptedRuns: boolean

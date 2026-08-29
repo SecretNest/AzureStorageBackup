@@ -32,7 +32,7 @@ public sealed class SentinelPathTests : IDisposable
 
     private static AccountRequest SampleAccount() => new(
         Name: "acct-" + Guid.NewGuid().ToString("N")[..6], Description: null,
-        BlobEndpoint: "https://x.blob.core.windows.net",
+        BlobEndpoint: "https://t" + Guid.NewGuid().ToString("N")[..12] + ".blob.core.windows.net",
         Region: AzureRegion.Global, AccountKey: "dGVzdA==",
         UseProxy: false, ProxyMode: ProxyMode.Independent,
         ProxyHost: null, ProxyPort: null, ProxyUsername: null, ProxyPassword: null);
