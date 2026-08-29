@@ -385,6 +385,20 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The start notification lands in a push message, so the levels are stated in words a person
+    /// reads, not enum identifiers: "cloud ExistenceSize, local Content" is code leaking into prose.</summary>
+    [Theory]
+    [InlineData(CloudCheckLevel.None, LocalCheckLevel.None, "cloud skipped; local skipped")]
+    [InlineData(CloudCheckLevel.Metadata, LocalCheckLevel.Attributes,
+        "cloud metadata only; local existence, size and permissions")]
+    [InlineData(CloudCheckLevel.ExistenceSize, LocalCheckLevel.Content,
+        "cloud existence and size; local content hash")]
+    [InlineData(CloudCheckLevel.Content, LocalCheckLevel.Content,
+        "cloud content (download and rehash); local content hash")]
+    public void The_Start_Notification_States_The_Levels_In_Plain_Words(
+        CloudCheckLevel cloud, LocalCheckLevel local, string expected)
+        => Assert.Equal(expected, BackupChecker.DescribeLevels(new CheckOptions { Cloud = cloud, Local = local }));
+
     /// <summary>The same client wiring as Build()'s factory, with the overlap probe spliced into the pipeline.</summary>
     private sealed class ProbedFactory(HeadOverlapProbe probe) : IBlobClientFactory
     {

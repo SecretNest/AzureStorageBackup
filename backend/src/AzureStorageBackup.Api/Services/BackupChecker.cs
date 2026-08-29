@@ -70,8 +70,8 @@ public sealed class BackupChecker(
         // which is the first question anyone asks of it.
         await Record(
             NotificationEvents.CheckStart, source, $"Check started: {container}",
-            $"cloud {options.Cloud}, local {options.Local}"
-                + (options.ListOrphans ? ", scanning for unreferenced blobs" : "")
+            DescribeLevels(options)
+                + (options.ListOrphans ? "; scanning for unreferenced blobs" : "")
                 + SkipNote(localSkipped), ct);
         try
         {
@@ -112,6 +112,28 @@ public sealed class BackupChecker(
     /// the same event differently. Empty when nothing was demoted.</summary>
     private static string SkipNote(string? localSkipped) =>
         localSkipped is null ? "" : $"; local check skipped: sentinel '{localSkipped}' does not exist";
+
+    /// <summary>The two check levels in plain words for the start notification: this line lands in a push message,
+    /// and enum identifiers such as "ExistenceSize" are code, not prose.</summary>
+    internal static string DescribeLevels(CheckOptions options)
+    {
+        var cloud = options.Cloud switch
+        {
+            CloudCheckLevel.None => "cloud skipped",
+            CloudCheckLevel.Metadata => "cloud metadata only",
+            CloudCheckLevel.ExistenceSize => "cloud existence and size",
+            CloudCheckLevel.Content => "cloud content (download and rehash)",
+            _ => $"cloud {options.Cloud}",
+        };
+        var local = options.Local switch
+        {
+            LocalCheckLevel.None => "local skipped",
+            LocalCheckLevel.Attributes => "local existence, size and permissions",
+            LocalCheckLevel.Content => "local content hash",
+            _ => $"local {options.Local}",
+        };
+        return cloud + "; " + local;
+    }
 
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)
     {
