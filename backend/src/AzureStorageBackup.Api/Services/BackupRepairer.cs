@@ -45,10 +45,12 @@ public sealed class BackupRepairer(
     public async Task<RepairReport> RepairAsync(
         Account account, string container, string? password, string localRoot, int? version,
         CheckOptions checkOptions, AccessTier dataTier, long? volumeBytes, IgnoreRuleSet? dontCompress,
-        // The plan's per-file selection: null = everything the pre-check finds. A path left out is deferred
-        // entirely — not repaired, not marked unrecoverable, not touched. Deselection is a scheduling decision;
-        // unrecoverable is a verdict, and nobody asked for one.
+        // The plan's per-file selection: null = everything the pre-check finds. A path in neither list is not
+        // even assessed. Ticked = repair now; listed in alsoMarkPaths = mark damaged and leave it to the next
+        // backup version. Together they scope the assessment: only their families are probed — in the field an
+        // unscoped assessment probed 194,630 volumes for a 4-file repair.
         IReadOnlyCollection<string>? onlyPaths = null,
+        IReadOnlyCollection<string>? alsoMarkPaths = null,
         Action<StageProgress>? onProgress = null,
         CancellationToken ct = default)
     {
@@ -89,7 +91,11 @@ public sealed class BackupRepairer(
                 notify: false,
                 // The pre-check's stages surface under the repair's own name: a user watching "Cloud: N volumes"
                 // concluded a check had started instead of their repair. Same work, but the label must say whose.
-                onProgress: onProgress is null ? null : d => onProgress(d with { Stage = "Assessing" }));
+                onProgress: onProgress is null ? null : d => onProgress(d with { Stage = "Assessing" }),
+                // Scoped to the two lists' union: a path in neither is not assessed at all. Under this scope the
+                // deferral formula below keeps its meaning for free — "bad findings not selected" can only be the
+                // alsoMark ones, because nothing else was looked at.
+                scopePaths: onlyPaths is null ? null : [.. onlyPaths.Concat(alsoMarkPaths ?? [])]);
         var badFindings = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .ToList();

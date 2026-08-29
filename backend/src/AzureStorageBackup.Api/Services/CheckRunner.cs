@@ -98,6 +98,28 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
         }
     }
 
+    /// <summary>Drop the last check result — in-memory state and persisted row both, or reopening the dialog
+    /// would resurrect what the user just dismissed. Refused (false) while a check is running: the result being
+    /// dropped does not exist yet, and the run owns the state.</summary>
+    public async Task<bool> DropAsync(int configId, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            if (_runs.TryGetValue(configId, out var live) && live.Status == RunStatus.Running)
+                return false;
+            _runs.Remove(configId);
+        }
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.LastCheckRuns.FirstOrDefaultAsync(x => x.BackupConfigId == configId, ct);
+        if (row is not null)
+        {
+            db.LastCheckRuns.Remove(row);
+            await db.SaveChangesAsync(ct);
+        }
+        return true;
+    }
+
     /// <summary>Persist a run's report as the config's last completed check. Best-effort: a failed write leaves
     /// the in-memory state serving this process, exactly as before persistence existed.</summary>
     internal async Task PersistAsync(int configId, CheckRunState state)

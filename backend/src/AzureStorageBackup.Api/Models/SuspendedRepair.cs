@@ -19,6 +19,10 @@ public sealed class SuspendedRepair
     /// <summary>The plan's selection, JSON array of paths. Empty array = "mark everything" (a legitimate choice).</summary>
     public string PathsJson { get; set; } = "[]";
 
+    /// <summary>The plan's unticked problems, JSON array of paths — marked damaged and left to the next backup
+    /// version. Together with <see cref="PathsJson"/> it scopes the resumed assessment to just these families.</summary>
+    public string DeferPathsJson { get; set; } = "[]";
+
     public CloudCheckLevel Cloud { get; set; }
     public StorageTier? RehydrateTier { get; set; }
     public bool CleanupOrphans { get; set; }

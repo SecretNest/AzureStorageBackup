@@ -60,7 +60,11 @@ public sealed class BackupChecker(
         // False for the repairer's internal pre-check: it is an implementation detail of a repair, and pushing
         // "Check started" for it made a user who had just clicked Repair wonder what was running. The repair
         // announces itself and summarizes its own outcome; a silent pre-check leaves exactly one story told.
-        bool notify = true)
+        bool notify = true,
+        // Limit the verdict to these paths. The repairer's assessment has no business probing the whole
+        // container: in the field a 4-file repair probed 194,630 volumes and priced a half-hour wait before any
+        // repairing began. Null = everything (every caller but the repairer).
+        IReadOnlyCollection<string>? scopePaths = null)
     {
         var source = $"check:{account.Id}/{container}";
         // Demoted before anything is recorded, so the "what was this asked to do" line below states what the run
@@ -83,7 +87,7 @@ public sealed class BackupChecker(
         {
             var report = await CheckCoreAsync(
                 account, container, password, version, options, localRoot, downloadConcurrency,
-                headConcurrency ?? downloadConcurrency, onProgress, ct);
+                headConcurrency ?? downloadConcurrency, onProgress, ct, scopePaths);
             if (localSkipped is not null)
                 report = report with { LocalSkippedSentinel = localSkipped };
             // The orphan scan is a separate axis from Ok (orphans are not corruption, so they never fail a check),
@@ -179,7 +183,8 @@ public sealed class BackupChecker(
 
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
-        int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
+        int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct,
+        IReadOnlyCollection<string>? scopePaths = null)
     {
         // How many entries the index holds is only known once it has been read through → report a total of 0, so
         // the UI shows "… so far" instead of a made-up percentage.
@@ -197,6 +202,14 @@ public sealed class BackupChecker(
             : info.Versions[^1];
 
         var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
+        // A scoped run sees a scoped index: every stage downstream (cloud groups, local comparison, findings)
+        // works off Entries, so one narrowing here scopes them all. Orphan listing is unrelated to scope and the
+        // scoped caller (the repairer) never asks for it.
+        if (scopePaths is not null)
+        {
+            var scope = scopePaths as IReadOnlySet<string> ?? new HashSet<string>(scopePaths, StringComparer.Ordinal);
+            index = index with { Entries = [.. index.Entries.Where(e => scope.Contains(e.Path))] };
+        }
         loading?.Advance(0);
         loading?.Complete();
 

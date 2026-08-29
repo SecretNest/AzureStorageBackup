@@ -91,7 +91,7 @@ public record ImportRequest(int AccountId, string ContainerName, string? Passwor
 
 /// <summary>Optional body of POST /repair: the plan's per-file selection. Null/empty = repair everything the
 /// pre-check finds (the pre-plan behavior, and what the parameterless POST of older UIs sends).</summary>
-public sealed record RepairStartBody(string[]? Paths);
+public sealed record RepairStartBody(string[]? Paths, string[]? DeferPaths = null);
 
 /// <summary>The result of an import: the config that was created, plus the two things the import itself discovered.</summary>
 /// <param name="CheckStarted">The cloud verification is already running in the background, so the frontend can open the check panel directly

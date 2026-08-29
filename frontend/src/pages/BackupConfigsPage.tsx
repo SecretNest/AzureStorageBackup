@@ -2767,6 +2767,18 @@ function CheckModal({
     }
   }
 
+  // The doorway from the result view back to "start a new check": the persisted report goes too, or the
+  // dialog would resurrect what the user just dismissed on next open.
+  const dropResult = async () => {
+    try {
+      await backupConfigsApi.checkDrop(config.id)
+      setCheckRun(null)
+      setPlan(null)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   const stopCheck = async () => {
     try {
       await backupConfigsApi.cancel(config.id, 'check')
@@ -2789,13 +2801,13 @@ function CheckModal({
     }
   }
 
-  const runRepair = async (paths: string[]) => {
+  const runRepair = async (paths: string[], deferPaths: string[]) => {
     setPlan(null)
     try {
       // A repair is a run, not a dialog's errand: start it and close — the backup list's row carries the
       // progress, the suspend button and the outcome, exactly like a backup's (a 100 GB file's repair is
       // hours, and holding a modal open for hours was the old check's mistake all over again).
-      await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, paths)
+      await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, paths, deferPaths)
       onClose()
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
@@ -2844,16 +2856,24 @@ function CheckModal({
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn-primary" onClick={runCheck} disabled={running}>
-            {running ? 'Checking…' : 'Run check'}
-          </button>
+          {/* Two modes, one rule the user set: a result exists → you look at it (repair or drop); no result →
+              you start a check. Options and result never share the screen. */}
+          {!report && (
+            <button type="button" className="btn-primary" onClick={runCheck} disabled={running}>
+              {running ? 'Checking…' : 'Run check'}
+            </button>
+          )}
           {running && (
             <button type="button" className="btn-danger" onClick={stopCheck}>Stop</button>
+          )}
+          {report && !running && (
+            <button type="button" onClick={dropResult}>Drop result &amp; new check</button>
           )}
           <button type="button" onClick={onClose}>Close</button>
         </>
       }
     >
+      {!report && (<>
       <Field label="Version">
         <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
           <option value="">Latest</option>
@@ -2892,6 +2912,7 @@ function CheckModal({
           Detect unreferenced blobs (repair deletes them)
         </span>
       </Field>
+      </>)}
 
       {/* Progress is not repeated here: the check runs in the background on the server and the table row
           already has the stage, the percentage and Details. The dialog only states that it is running (the
@@ -3053,32 +3074,40 @@ function CheckModal({
                 Tick what to re-upload now; everything unticked is marked damaged and left to the next backup
                 version.
               </div>
-              <ul style={{ margin: '0.3rem 0 0.3rem 1.2rem', listStyle: 'none', padding: 0 }}>
-                {plan.rows.map((r) => (
-                  <li key={r.path}>
-                    {r.action === 'reupload' ? (
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={planSelected.has(r.path)}
-                          onChange={(e) => {
-                            const next = new Set(planSelected)
-                            if (e.target.checked) next.add(r.path)
-                            else next.delete(r.path)
-                            setPlanSelected(next)
-                          }}
-                        />{' '}
-                        <span className="mono">{r.path}</span> — re-upload {formatBytes(r.uploadBytes)}
-                      </label>
-                    ) : (
-                      <span className="text-faint">
-                        <span className="mono">{r.path}</span> — local content changed; will be marked and left
-                        to the next backup version
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ul>
+              <div className="table-scroll" tabIndex={0}>
+                <table className="text-faint">
+                  <thead><tr><th></th><th>File</th><th>Action</th><th>Size</th></tr></thead>
+                  <tbody>
+                    {plan.rows.map((r) => (
+                      <tr key={r.path}>
+                        <td style={{ textAlign: 'center' }}>
+                          {r.action === 'reupload' && (
+                            <input
+                              type="checkbox"
+                              checked={planSelected.has(r.path)}
+                              onChange={(e) => {
+                                const next = new Set(planSelected)
+                                if (e.target.checked) next.add(r.path)
+                                else next.delete(r.path)
+                                setPlanSelected(next)
+                              }}
+                            />
+                          )}
+                        </td>
+                        <td className="mono">{r.path}</td>
+                        <td>
+                          {r.action === 'reupload'
+                            ? planSelected.has(r.path) ? 'Re-upload now' : 'Defer to the next backup version'
+                            : 'Changed locally — marked, next backup keeps the current content'}
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          {r.action === 'reupload' ? formatBytes(r.uploadBytes) : ''}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
               {(() => {
                 // Distinct by object: several paths can share one blob, and the bill must not double-count it.
                 const bytes = new Map<string, number>()
@@ -3088,7 +3117,15 @@ function CheckModal({
                 const deferred = plan.rows.length - [...planSelected].length
                 return (
                   <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                    <button type="button" className="btn-primary" onClick={() => runRepair([...planSelected])} disabled={running}>
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      onClick={() => runRepair(
+                        [...planSelected],
+                        plan.rows.filter((r) => !planSelected.has(r.path)).map((r) => r.path),
+                      )}
+                      disabled={running}
+                    >
                       {total > 0
                         ? `Repair now — re-uploads ${formatBytes(total)}${deferred > 0 ? `, defers ${deferred}` : ''}`
                         : `Mark all ${plan.rows.length} for the next backup version`}

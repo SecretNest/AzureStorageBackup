@@ -145,10 +145,32 @@ public sealed class BackupRepairerTests : IDisposable
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
 
+            // A whole-container distractor: many volumes that have nothing to do with the selection. The
+            // assessment must not probe them — in the field it probed 194,630 volumes for a 4-file repair and
+            // priced a ~32-minute wait before any repairing began.
+            await File.WriteAllBytesAsync(Path.Combine(_src, "bystander.bin"), new byte[3_000_000]);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
             var stages = new HashSet<string>(StringComparer.Ordinal);
+            var assessTotals = new List<int>();
             var report = await repairer.RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null, onlyPaths: ["one.txt"], onProgress: d => { lock (stages) stages.Add(d.Stage); });
+                dontCompress: null, onlyPaths: ["one.txt"], alsoMarkPaths: ["two.txt"],
+                onProgress: d =>
+                {
+                    lock (stages)
+                    {
+                        stages.Add(d.Stage);
+                        if (d.Stage == "Assessing" && d.Total > 0) assessTotals.Add(d.Total);
+                    }
+                });
 
             // The pre-check's stages surface under the repair's own name: a user watching "Cloud: N volumes"
             // concluded a check had started instead of their repair (field report). The work is the same; the
@@ -158,6 +180,10 @@ public sealed class BackupRepairerTests : IDisposable
                 Assert.Contains("Assessing", stages);
                 Assert.Contains("Repairing", stages);
                 Assert.DoesNotContain("Cloud", stages);
+                // Scoped assessment: only the selected and to-be-marked families are probed — the bystander's
+                // several volumes must not enter the total (in the field, the unscoped version probed the whole
+                // container: 194,630 volumes for a 4-file selection).
+                Assert.All(assessTotals, t => Assert.True(t <= 2, $"assessment probed {t} volumes — the bystander leaked in"));
             }
 
             Assert.Equal(["one.txt"], report.Repaired);
@@ -228,9 +254,12 @@ public sealed class BackupRepairerTests : IDisposable
             await foreach (var b in container.GetBlobsAsync(
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            // The plan's defer-everything choice under the two-list contract: nothing ticked, the problem
+            // listed for marking. (Scoping means an empty union assesses nothing — "mark all" is always an
+            // explicit list now, which is what the plan UI sends.)
             var deferAll = await repairer.RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null, onlyPaths: Array.Empty<string>());
+                dontCompress: null, onlyPaths: Array.Empty<string>(), alsoMarkPaths: ["a.txt"]);
             Assert.Contains("a.txt", deferAll.Unrecoverable);
             Assert.Empty(deferAll.Repaired);
 

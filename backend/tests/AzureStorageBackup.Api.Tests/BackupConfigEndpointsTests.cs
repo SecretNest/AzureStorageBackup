@@ -844,6 +844,32 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal("a.bin", Assert.Single(run.Report.Findings).Path);
     }
 
+    /// <summary>Dropping the last result is the doorway back to "start a new check" (the dialog shows the
+    /// result for as long as one exists): the persisted row goes too, or reopening the dialog would resurrect
+    /// what the user just dismissed.</summary>
+    [Fact]
+    public async Task Dropping_The_Last_Check_Result_Clears_It_For_Good()
+    {
+        var accountId = await CreateAccountAsync("check-drop");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-drop", accountId) with { ContainerName = "check-drop-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var runner = factory.Services.GetRequiredService<CheckRunner>();
+        await runner.PersistAsync(created!.Id, new CheckRunState
+        {
+            Status = RunStatus.Completed,
+            Report = new CheckReport(9, []),
+        });
+
+        var drop = await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check");
+        Assert.Equal(HttpStatusCode.NoContent, drop.StatusCode);
+
+        // 204 from the GET = there is no check to report — the dialog lands on the start view.
+        var after = await _client.GetAsync($"/api/backup-configs/{created.Id}/check");
+        Assert.Equal(HttpStatusCode.NoContent, after.StatusCode);
+    }
+
     /// <summary>The persisted row answers "what did the last finished check find", not "what happened most
     /// recently": a failed run (here, a busy click) carries no report and must leave the row untouched.</summary>
     [Fact]

@@ -678,13 +678,15 @@ export const backupConfigsApi = {
   },
   // When this backup has never been checked the backend answers 204 (not 404, which would leave a red error in the browser console), so this comes back empty.
   checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
-  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, paths: string[] | null = null) => {
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, paths: string[] | null = null, deferPaths: string[] | null = null) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (cleanupOrphans) p.set('cleanupOrphans', 'true')
-    return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, { paths })
+    // deferPaths: the plan's unticked problems — marked and left to the next backup version. Together with
+    // paths it scopes the assessment to just these families instead of the whole container.
+    return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, { paths, deferPaths })
   },
   // The repair's price tag before any consent is spent: stat-and-index only, so it answers instantly.
   repairPlan: (id: number, version: number | null = null) =>
@@ -692,6 +694,8 @@ export const backupConfigsApi = {
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
   // Suspend persists only the plan's selection; resume replays it against a fresh pre-check — healed files
   // fall out on their own, half-replaced families are salvaged volume by volume by the verified skip.
+  // Drop the last check result (in-memory and persisted) — the dialog's doorway back to "start a new check".
+  checkDrop: (id: number) => api.del(`/backup-configs/${id}/check`),
   repairSuspend: (id: number) => api.post<void>(`/backup-configs/${id}/repair/suspend`, {}),
   repairResume: (id: number) => api.post<RepairRun>(`/backup-configs/${id}/repair/resume`, {}),
   // Stop whatever is running. Omitting `what` stops every running operation on this configuration.

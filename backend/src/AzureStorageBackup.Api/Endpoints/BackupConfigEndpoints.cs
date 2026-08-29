@@ -754,8 +754,9 @@ public static class BackupConfigEndpoints
             var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false,
                 // The plan's selection: an absent body/array (older UIs, the bare POST) = everything; a PRESENT
                 // array is honored verbatim, empty included — empty means "repair nothing now, mark everything
-                // for the next backup version", which is a legitimate choice the plan UI can express.
-                body?.Paths);
+                // for the next backup version", which is a legitimate choice the plan UI can express. DeferPaths
+                // is the unticked half of the plan, and together they scope the assessment to just these families.
+                body?.Paths, body?.DeferPaths);
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 
@@ -855,6 +856,13 @@ public static class BackupConfigEndpoints
             // browser console that looks like a malfunction (which is exactly how a user reported it). 204 = there is no check to report.
             return state is null ? Results.NoContent() : Results.Ok(CheckRunResponse.From(state));
         });
+
+        // Drop the last check result (in-memory and persisted): the dialog's doorway back to "start a new
+        // check". 409 while a check is running — the run owns its state.
+        group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, CancellationToken ct) =>
+            await runner.DropAsync(id, ct)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "A check is running; stop it first." }));
 
         // Stop whatever operations are running on this backup. Omitting what = stop everything; otherwise stop only the specified kind
         // (one config may be backing up and restoring at the same time — restore deliberately does not take the busy lock, see the comment at the top of RestoreRunner).

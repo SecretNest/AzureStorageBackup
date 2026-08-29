@@ -20,7 +20,7 @@ public sealed class RepairRunState
 
     /// <summary>The run's original request, kept so a suspension can persist the intent (only the intent — the
     /// labels in the cloud are the actual resume state; see <see cref="Models.SuspendedRepair"/>).</summary>
-    internal (int? Version, CloudCheckLevel Cloud, StorageTier? Rehydrate, bool CleanupOrphans, IReadOnlyCollection<string>? OnlyPaths) Request { get; set; }
+    internal (int? Version, CloudCheckLevel Cloud, StorageTier? Rehydrate, bool CleanupOrphans, IReadOnlyCollection<string>? OnlyPaths, IReadOnlyCollection<string>? AlsoMarkPaths) Request { get; set; }
 
     /// <summary>Set by <see cref="RepairRunner.Suspend"/> before cancelling, so RunAsync's cancellation handler
     /// can tell "yield to other work, keep the intent" apart from "the user gave up on this run".</summary>
@@ -49,7 +49,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, RepairRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths = null)
+    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths = null, IReadOnlyCollection<string>? alsoMarkPaths = null)
     {
         lock (_lock)
         {
@@ -58,10 +58,10 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var state = new RepairRunState
             {
-                Request = (version, cloud, rehydrate, cleanupOrphans, onlyPaths),
+                Request = (version, cloud, rehydrate, cleanupOrphans, onlyPaths, alsoMarkPaths),
             };
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, onlyPaths, state));
+            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, onlyPaths, alsoMarkPaths, state));
             return state;
         }
     }
@@ -82,7 +82,8 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         if (row is null)
             return null;
         var paths = JsonSerializer.Deserialize<string[]>(row.PathsJson) ?? [];
-        return Start(configId, version: null, row.Cloud, row.RehydrateTier, row.CleanupOrphans, paths);
+        var defers = JsonSerializer.Deserialize<string[]>(row.DeferPathsJson) ?? [];
+        return Start(configId, version: null, row.Cloud, row.RehydrateTier, row.CleanupOrphans, paths, defers);
     }
 
     /// <summary>Suspend the running repair: persist the intent, then cancel. Returns false when nothing is
@@ -95,7 +96,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state = _runs.GetValueOrDefault(configId);
         if (state is not { Status: RunStatus.Running })
             return false;
-        var (_, cloud, rehydrateTier, cleanupOrphans, onlyPaths) = state.Request;
+        var (_, cloud, rehydrateTier, cleanupOrphans, onlyPaths, alsoMarkPaths) = state.Request;
         using (var scope = scopes.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -103,6 +104,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             if (row is null)
                 db.SuspendedRepairs.Add(row = new SuspendedRepair { BackupConfigId = configId });
             row.PathsJson = JsonSerializer.Serialize(onlyPaths ?? []);
+            row.DeferPathsJson = JsonSerializer.Serialize(alsoMarkPaths ?? []);
             row.Cloud = cloud;
             row.RehydrateTier = rehydrateTier;
             row.CleanupOrphans = cleanupOrphans;
@@ -175,7 +177,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
-    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths, RepairRunState state)
+    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths, IReadOnlyCollection<string>? alsoMarkPaths, RepairRunState state)
     {
         try
         {
@@ -216,7 +218,8 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
                     // compression mode a fresh backup writes.
                     BackupRequestMapper.OptionalRules(resolved.DontCompressRules),
-                    onlyPaths: onlyPaths, onProgress: d => state.Detail = d, ct: state.Cancellation.Token);
+                    onlyPaths: onlyPaths, alsoMarkPaths: alsoMarkPaths,
+                    onProgress: d => state.Detail = d, ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
                 // Completion is the only thing that retires a persisted suspension: the intent has been carried
                 // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
