@@ -2633,6 +2633,10 @@ function CheckModal({
   const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
   const [repairing, setRepairing] = useState(false)
   const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
+  // True until the on-open fetch of the last report answers. Without it the dialog opens empty and
+  // silently fills in whenever the fetch lands — on a phone that is seconds of "there is no report",
+  // which is exactly how a user read it.
+  const [loadingLast, setLoadingLast] = useState(true)
   // Polling has to stop when the dialog closes, or it keeps writing state into an unmounted component.
   const aliveRef = useRef(true)
   useEffect(() => () => { aliveRef.current = false }, [])
@@ -2677,6 +2681,7 @@ function CheckModal({
       .checkStatus(config.id)
       .then((s) => { if (!s) return; if (s.status === 'Running') void followRef.current(s); else setCheckRun(s) })
       .catch(() => {})
+      .finally(() => setLoadingLast(false))
   }, [config.id])
 
   const rehydrateArg = () => (cloud === CloudCheckLevel.Content ? rehydrate : null)
@@ -2838,6 +2843,11 @@ function CheckModal({
         <div className="text-faint" style={{ marginBottom: '0.6rem' }}>
           A check is running — progress is shown in the backup list. The report appears here when it finishes.
         </div>
+      )}
+      {/* Distinct from "no report": the last result is being fetched, and until this answered the dialog
+          opened empty and silently filled in — seconds of "there is no report" on a slow connection. */}
+      {loadingLast && !running && !checkRun && (
+        <div className="text-faint" style={{ marginBottom: '0.6rem' }}>Loading the last check result…</div>
       )}
       {checkRun?.status === 'Canceled' && (
         <div className="text-warn" style={{ marginBottom: '0.6rem' }}>Check stopped — no report was produced.</div>
