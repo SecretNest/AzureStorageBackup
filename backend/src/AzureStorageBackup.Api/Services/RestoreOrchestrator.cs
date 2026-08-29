@@ -477,7 +477,12 @@ public sealed class RestoreOrchestrator(
                 // publish is deliberately allowed to propagate (see the notes on BeginPacking in StageProgress.cs).
                 // Left outside the try, a throw here would mean _inPacking was incremented with no matching EndPacking,
                 // and preparing would sit at an inflated number for the rest of the run; moving it inside gives it the finally below as a backstop.
-                tracker?.BeginPacking(TransferLabel.Folders(needed.Select(e => e.Path)));
+                // A blob's extraction is counted into the preparing row (the sink below wraps in
+                // PackingProgressStream), so the byte total rides along: its one content, extracted once. A
+                // pack extracts to disk through 7z's own file IO where nothing of ours sees the bytes, so it
+                // declares no total and its row renders as before.
+                tracker?.BeginPacking(TransferLabel.Folders(needed.Select(e => e.Path)),
+                    storage.Kind == "blob" && !storage.Raw ? needed[0].Length : 0);
                 if (storage.Kind == "blob")
                 {
                     // Single-file blob: the content is exactly one file (raw = the original bytes; otherwise the sole entry inside the 7z).
@@ -489,7 +494,7 @@ public sealed class RestoreOrchestrator(
                     {
                         if (content is null)
                         {
-                            var streamed = await TryStreamRestoredFileAsync(request, realRoot, e, firstVolume, phase, ct);
+                            var streamed = await TryStreamRestoredFileAsync(request, realRoot, e, firstVolume, phase, tracker, ct);
                             if (streamed is null)
                             {
                                 failedEntries++;
@@ -699,7 +704,7 @@ public sealed class RestoreOrchestrator(
     /// </summary>
     private async Task<string?> TryStreamRestoredFileAsync(
         RestoreRequest request, string? realRoot, IndexEntry entry, string firstVolume,
-        IProgress<string>? phase, CancellationToken ct)
+        IProgress<string>? phase, StageTracker? tracker, CancellationToken ct)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
         // The escape check has to come before **any** write action: the temp file is a write too, and it will follow links out of the root just the same.
@@ -731,7 +736,9 @@ public sealed class RestoreOrchestrator(
             {
                 // No member name: after dedup the entry name inside the archive comes from the path that **uploaded this content first**,
                 // which isn't necessarily the current index entry's Path; a single-file archive has only one member, so the entire output is its content.
-                written = await compressor.ExtractToStreamAsync(firstVolume, entryName: null, request.Password, sink, ct);
+                // Counted into the preparing row: 7z writes the content into the sink WE hand it (PackingProgressStream).
+                written = await compressor.ExtractToStreamAsync(firstVolume, entryName: null, request.Password,
+                    tracker is null ? sink : new PackingProgressStream(tracker, sink), ct);
             }
 
             // When `7z x -so` can't find the member it produces empty output but **exit code 0**, so the exit code can't be the basis for passing —

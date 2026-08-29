@@ -2750,9 +2750,9 @@ public sealed class BackupOrchestrator(
 
         var name = StagedName(entryName);
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (compressTemp, token) => raw
-            ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, token)]
+            ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, uploadTracker, token)]
             : await CompressStreamingAsync(
-                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, token);
+                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, uploadTracker, token);
         // A single file names itself. Not the staged name a line above — that is a hash of the path, chosen for not
         // colliding in the temp area, and it says nothing to the person reading the row.
         var staged = bypassQuota
@@ -2775,19 +2775,22 @@ public sealed class BackupOrchestrator(
             System.Text.Encoding.UTF8.GetBytes(entryPath))).ToLowerInvariant()[..16];
 
     private static async Task<string> CopyRawStreamingAsync(
-        string localPath, string compressTemp, string name, StreamingHasher streaming, CancellationToken ct)
+        string localPath, string compressTemp, string name, StreamingHasher streaming, StageTracker? tracker,
+        CancellationToken ct)
     {
         var dest = Path.Combine(compressTemp, name);
         await using var source = FileHasher.OpenRead(localPath);
         await using var file = File.Create(dest);
         await using var sink = new HashingStream(streaming, file);
-        await source.CopyToAsync(sink, ct);
+        // The feed is counted into the preparing row (StageTracker.CopyWithPackingProgressAsync): a big raw
+        // prestage is exactly as long and as byteless-on-the-wire as a compression, and was exactly as silent.
+        await StageTracker.CopyWithPackingProgressAsync(source, sink, tracker, ct);
         return dest;
     }
 
     private async Task<IReadOnlyList<string>> CompressStreamingAsync(
         BackupRequest request, string compressTemp, string archiveName, string entryName, string localPath,
-        bool storeOnly, long expectedBytes, StreamingHasher streaming, CancellationToken ct)
+        bool storeOnly, long expectedBytes, StreamingHasher streaming, StageTracker? tracker, CancellationToken ct)
     {
         var output = Path.Combine(compressTemp, archiveName + ".7z");
         var result = await compressor.CompressStreamAsync(
@@ -2797,7 +2800,10 @@ public sealed class BackupOrchestrator(
             {
                 await using var source = FileHasher.OpenRead(localPath);
                 await using var sink = new HashingStream(streaming, stdin);
-                await source.CopyToAsync(sink, token);
+                // 7z reports nothing usable, but WE feed its stdin — counting the feed is honest packing
+                // progress (pipe backpressure keeps it within a buffer of what 7z consumed), and it is what
+                // puts a moving fraction on the preparing row instead of a name that sits still for an hour.
+                await StageTracker.CopyWithPackingProgressAsync(source, sink, tracker, token);
                 return streaming.Length;
             }, ct);
         return result.VolumeFiles;

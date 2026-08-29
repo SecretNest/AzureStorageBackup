@@ -2214,9 +2214,18 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           {detail.preparingItem}
           {/* A single file states its size; a pack states a member count inside its own label instead,
               there being no one size worth naming. An hour spent on this row is explained entirely by
-              how big the thing is, and without it the row leaves exactly that question open. */}
+              how big the thing is, and without it the row leaves exactly that question open.
+              When the route can count its feed (streaming compression, raw prestage, blob extraction) the
+              size becomes a moving fraction — 7z reports nothing itself, but we pipe its stdin/stdout, so
+              what we have fed or received IS the progress. Clamped: a pack's archive can hold more than
+              this version's members, so the numerator may legitimately pass the declared total. */}
           {detail.preparingBytes > 0 && (
-            <span className="text-faint"> — {formatBytes(detail.preparingBytes)}</span>
+            <span className="text-faint">
+              {' — '}
+              {detail.preparingDone > 0
+                ? `${formatBytes(Math.min(detail.preparingDone, detail.preparingBytes))} / ${formatBytes(detail.preparingBytes)} · ${Math.min(100, Math.round((100 * detail.preparingDone) / detail.preparingBytes))}%`
+                : formatBytes(detail.preparingBytes)}
+            </span>
           )}
         </div>
       )}

@@ -424,6 +424,35 @@ public sealed class StageProgressTests
         Assert.Equal(130, seen[^1].Bytes);
     }
 
+    /// <summary>The preparing row's byte progress: 7z itself reports nothing usable, but on the streaming
+    /// route the producer feeds the source into 7z's stdin and can count what it has fed — pipe backpressure
+    /// keeps that count within a buffer of what 7z has consumed, so it is honest packing progress. Without
+    /// it, "preparing: file — 113.949 GB" sits motionless for the whole production (field report). The
+    /// counter belongs to the packing stretch: it opens at zero with BeginPacking and dies with EndPacking.</summary>
+    [Fact]
+    public void Packing_Progress_Rides_The_Preparing_Row_And_Resets_With_It()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add);
+
+        tracker.BeginPacking("/src/big.mkv", 1000);
+        tracker.PackingProgress(300);
+        tracker.PackingProgress(300);
+        tracker.Complete();
+
+        Assert.Equal(600, seen[^1].PreparingDone);
+        Assert.Equal("/src/big.mkv", seen[^1].PreparingItem);
+        Assert.Equal(1000, seen[^1].PreparingBytes);
+
+        tracker.EndPacking();
+        tracker.Complete();
+        Assert.Equal(0, seen[^1].PreparingDone); // the stretch ended; nothing is preparing
+
+        tracker.BeginPacking("/src/next.mkv", 500);
+        tracker.Complete();
+        Assert.Equal(0, seen[^1].PreparingDone); // a new stretch starts from zero, not from the last one's total
+    }
+
     /// <summary>The two progress dialects must not be cross-wired. FileHasher.FullHashAsync reports
     /// **increments** (one Report per chunk read, carrying that chunk's size), while ItemProgress speaks
     /// the SDK's dialect of attempt-**cumulative** values. Fed straight into ItemProgress, the first chunk

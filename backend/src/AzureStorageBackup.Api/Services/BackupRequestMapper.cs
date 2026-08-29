@@ -42,7 +42,7 @@ public static class BackupRequestMapper
             Options = new BackupEngineOptions
             {
                 Ignore = Rules(r.IgnoreRules, r.IgnoreRulesCaseInsensitive) ?? new IgnoreRuleSet([]),
-                DontCompress = Rules(r.DontCompressRules, r.DontCompressRulesCaseInsensitive),
+                DontCompress = r.DontCompress(),
                 DontGroup = Rules(r.DontGroupRules, r.DontGroupRulesCaseInsensitive),
                 CrossDirGroup = Rules(r.CrossDirGroupRules, r.CrossDirGroupRulesCaseInsensitive),
                 // ScopeRules is not inheritable, so take it straight from config rather than from r (ResolvedBackupSettings).
@@ -134,12 +134,6 @@ public static class BackupRequestMapper
         StorageTier.Archive => AccessTier.Archive,
         _ => AccessTier.Hot,
     };
-
-    /// <summary>Maps an optional block of rule text to a rule set (empty/whitespace → null, meaning "no rules").
-    /// It is public because the repair path (RepairRunner → BackupRepairer) has to use the same DontCompress rules to decide store-only vs. compress,
-    /// otherwise a repaired archive ends up compressed differently from what a fresh backup writes.</summary>
-    public static IgnoreRuleSet? OptionalRules(string? text) =>
-        string.IsNullOrWhiteSpace(text) ? null : new IgnoreRuleSet(SplitLines(text));
 
     /// <summary>
     /// Joins a list's two halves into one rule set: the case-sensitive rules first, the case-insensitive ones

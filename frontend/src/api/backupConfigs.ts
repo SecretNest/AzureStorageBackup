@@ -218,6 +218,9 @@ export interface StageProgress {
   // Source size of preparingItem; 0 when there is none worth stating (a pack, whose label carries a member
   // count instead). A number rather than text, so this row size-formats the way the transfer rows beside it do.
   preparingBytes: number
+  // Of preparingBytes, how much has been fed through the producer/extractor so far; 0 on routes that
+  // cannot count (a pack compressed from a file list, a pack extracted to disk by 7z's own IO).
+  preparingDone: number
   queued: number // Not yet picked up — the queue only (those waiting on the archive lock are in waitingOnArchive)
   // Items picked up by a worker and queuing behind the **archive lock**. That lock is global
   // (StagingArea is a singleton, so production does not run concurrently across backups either), so one

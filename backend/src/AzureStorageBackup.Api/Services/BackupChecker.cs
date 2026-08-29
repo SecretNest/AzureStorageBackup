@@ -555,15 +555,19 @@ public sealed class BackupChecker(
                 // in StageProgress.cs). Left outside the try, a throw here would increment _inPacking with no matching
                 // EndPacking, and preparing would sit at an inflated number for the rest of the run; moved inside, the
                 // finally below backstops it.
-                tracker?.BeginPacking(TransferLabel.Folders(members.Select(m => m.Path)));
+                // The byte total rides along: a blob extracts its one content (members are the paths sharing
+                // it), a pack streams out every member once. The extraction sinks below count what 7z hands
+                // them, so the preparing row carries a moving fraction instead of a name that sits still.
+                tracker?.BeginPacking(TransferLabel.Folders(members.Select(m => m.Path)),
+                    members[0].Storage!.Kind == "blob" ? members[0].Length : members.Sum(m => m.Length));
                 // The shared contract of this stretch is "extraction/hashing happens after this item has already
                 // left ActiveItems", the same shape as in RestoreOrchestrator; on this side it is pinned by the
                 // identically named Extraction_Starts_After_Item_Is_Removed_From_ActiveItems in BackupCheckerTests
                 // (a mirror of the restore-side test, but the two are independent and neither substitutes for the
                 // other), so the restore-side test is no longer borrowed as a backstop.
                 corrupted.AddRange(members[0].Storage!.Kind == "blob"
-                    ? await VerifyBlobAsync(firstVolume, members, password, ct)
-                    : await VerifyPackAsync(firstVolume, groupDir, members, password, ct));
+                    ? await VerifyBlobAsync(firstVolume, members, password, tracker, ct)
+                    : await VerifyPackAsync(firstVolume, groupDir, members, password, tracker, ct));
             }
             finally
             {
@@ -625,7 +629,7 @@ public sealed class BackupChecker(
     /// </para>
     /// </summary>
     private async Task<IReadOnlyList<string>> VerifyBlobAsync(
-        string firstVolume, List<IndexEntry> members, string? password, CancellationToken ct)
+        string firstVolume, List<IndexEntry> members, string? password, StageTracker? tracker, CancellationToken ct)
     {
         string actualHash;
         long actualLength;
@@ -638,7 +642,10 @@ public sealed class BackupChecker(
         {
             var streamHasher = new StreamingHasher(0, 0);
             await using var sink = new HashingStream(streamHasher);
-            await compressor!.ExtractToStreamAsync(firstVolume, entryName: null, password, sink, ct);
+            // 7z writes the decompressed content into the sink WE hand it — counting those writes is the
+            // extraction's honest progress on the preparing row (see PackingProgressStream).
+            await compressor!.ExtractToStreamAsync(firstVolume, entryName: null, password,
+                tracker is null ? sink : new PackingProgressStream(tracker, sink), ct);
             actualHash = streamHasher.FullHash;
             actualLength = streamHasher.Length;
         }
@@ -662,7 +669,8 @@ public sealed class BackupChecker(
     /// </para>
     /// </summary>
     private async Task<IReadOnlyList<string>> VerifyPackAsync(
-        string firstVolume, string groupDir, List<IndexEntry> members, string? password, CancellationToken ct)
+        string firstVolume, string groupDir, List<IndexEntry> members, string? password, StageTracker? tracker,
+        CancellationToken ct)
     {
         var listing = await compressor!.ListEntriesAsync(firstVolume, password, ct);
         var files = listing.Where(e => !e.IsDirectory).Select(e => (e.Name, e.Size)).ToList();
@@ -671,7 +679,10 @@ public sealed class BackupChecker(
         var splitter = new SegmentHashingStream(files, (name, len, hash) => actual.TryAdd(name, (len, hash)));
         await using (splitter)
         {
-            await compressor.ExtractToStreamAsync(firstVolume, entryName: null, password, splitter, ct);
+            // Counted like the blob side. The declared total is this version's members, while the archive may
+            // hold more (other versions' content), so the fraction can top out early; the row clamps at 100%.
+            await compressor.ExtractToStreamAsync(firstVolume, entryName: null, password,
+                tracker is null ? splitter : new PackingProgressStream(tracker, splitter), ct);
             splitter.Finish();
         }
 

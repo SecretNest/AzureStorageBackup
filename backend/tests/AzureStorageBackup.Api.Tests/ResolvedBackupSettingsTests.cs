@@ -137,4 +137,31 @@ public class ResolvedBackupSettingsTests
         var r = ResolvedBackupSettings.From(new BackupConfig(), null);
         Assert.Equal(defaults.DefaultMaxVersions, r.MaxVersions);
     }
+    /// <summary>The repair path's field incident: the runner derived store-only from
+    /// OptionalRules(DontCompressRules) — the case-SENSITIVE half alone — while the backup path joins both
+    /// halves. A media rule set entered case-insensitively (*.mkv, the ordinary way) was therefore invisible
+    /// to repair, which re-compressed a 113.9 GB store-only file with real compression and pegged the NAS
+    /// CPU at 100%. DontCompress() is the single source both sides use now: both halves, joined the way
+    /// gitignore's last-match rule requires.</summary>
+    [Fact]
+    public void DontCompress_Joins_Both_Halves_So_An_Insensitive_Rule_Is_Not_Lost()
+    {
+        var resolved = ResolvedBackupSettings.From(new BackupConfig
+        {
+            AccountId = 1, ContainerName = "c", Name = "n", LocalRoot = "/data",
+            DontCompressRulesCaseInsensitive = "*.mkv",
+        }, new GlobalSettings());
+
+        var rules = resolved.DontCompress();
+        Assert.NotNull(rules);
+        Assert.True(rules!.MatchesFileOrAncestorDir("Movie/Big.MKV"),
+            "a case-insensitive rule must reach the repair's store-only decision");
+
+        // Both halves empty → null, the same "no rules" contract OptionalRules had.
+        Assert.Null(ResolvedBackupSettings.From(new BackupConfig
+        {
+            AccountId = 1, ContainerName = "c", Name = "n", LocalRoot = "/data",
+        }, new GlobalSettings { DefaultDontCompressRules = null, DefaultDontCompressRulesCaseInsensitive = null }).DontCompress());
+    }
+
 }

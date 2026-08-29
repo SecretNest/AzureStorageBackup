@@ -339,7 +339,13 @@ public sealed record StageProgress(
     /// <summary>Source size of <see cref="PreparingItem"/>; 0 when there is none to state (a pack, which reports a
     /// member count instead). Sent as a number, not formatted here — this row sits among the transfer rows and has
     /// to size-format the way they do, which is the frontend's business.</summary>
-    long PreparingBytes = 0)
+    long PreparingBytes = 0,
+    /// <summary>Of <see cref="PreparingBytes"/>, how much has been fed into the producer so far. 7z itself
+    /// reports nothing usable, but the streaming routes pipe the source into its stdin themselves and count as
+    /// they feed — pipe backpressure keeps the count within a buffer of what 7z has consumed, so it is honest
+    /// packing progress. 0 on the non-streaming routes (a pack compressed from a file list), whose row then
+    /// renders exactly as before. Lives and dies with the packing stretch (see StageTracker.PackingProgress).</summary>
+    long PreparingDone = 0)
 {
     /// <summary>How many are stuck right now in one particular kind of wait.</summary>
     public int Waiting(UploadWait kind) => kind switch
@@ -487,6 +493,8 @@ public sealed class StageTracker(
     private string? _preparingItem;
     /// <summary>The source size of <see cref="_preparingItem"/>, 0 when it has no single size to state.</summary>
     private long _preparingBytes;
+    /// <summary>Bytes fed to the producer within the current packing stretch (see StageProgress.PreparingDone).</summary>
+    private long _preparingDone;
     // Of those inside staging, the ones parked on the pool's byte ceiling rather than on the archive lock. A subset of _inStaging and disjoint from
     // _inPacking (backpressure is waited out **before** the lock is taken), so subtracting it out of the archive-lock column keeps that column's
     // arithmetic a straight split rather than a new term. See StageProgress.WaitingOnRoom for why the two must not share one number.
@@ -907,6 +915,7 @@ public sealed class StageTracker(
             Interlocked.Increment(ref _inPacking);
             _preparingItem = label;
             _preparingBytes = bytes;
+            Interlocked.Exchange(ref _preparingDone, 0); // a new stretch starts from zero
             // Forced when there is a name to show, throttled when there is not. The throttle is a 200ms window and
             // this row exists to say what a piece of work that can run for minutes actually is — but a piece that
             // finishes *inside* one window would never be published at all, so the row simply would not appear for
@@ -917,6 +926,35 @@ public sealed class StageTracker(
         }
     }
 
+    /// <summary>More source bytes fed into the producer within the current packing stretch. Deliberately not
+    /// booked into the speed ledger: the upload stages measure the wire, and mixing a local disk read into
+    /// that number would inflate it — this counter only moves the preparing row's own fraction. Throttled the
+    /// usual way; the feed loop reports one buffer at a time, which is plenty of events for a 200ms window.</summary>
+    public void PackingProgress(long bytes)
+    {
+        if (bytes <= 0)
+            return;
+        Interlocked.Add(ref _preparingDone, bytes);
+        lock (_gate)
+            PublishIfDue(force: false);
+    }
+
+    /// <summary>Feed <paramref name="source"/> into <paramref name="sink"/>, reporting each chunk to
+    /// <paramref name="tracker"/>'s preparing row. The shared copy loop of every streaming producer (backup's
+    /// streaming compress, its raw prestage, the repair's verified production) — one place, or the three
+    /// routes drift on whether their long read is visible.</summary>
+    public static async Task CopyWithPackingProgressAsync(
+        Stream source, Stream sink, StageTracker? tracker, CancellationToken ct)
+    {
+        var buffer = new byte[81920];
+        int read;
+        while ((read = await source.ReadAsync(buffer, ct)) > 0)
+        {
+            await sink.WriteAsync(buffer.AsMemory(0, read), ct);
+            tracker?.PackingProgress(read);
+        }
+    }
+
     public void EndPacking()
     {
         lock (_gate)
@@ -924,6 +962,7 @@ public sealed class StageTracker(
             Interlocked.Decrement(ref _inPacking);
             _preparingItem = null;
             _preparingBytes = 0;
+            Interlocked.Exchange(ref _preparingDone, 0);
             PublishIfDue(force: false);
         }
     }
@@ -1437,7 +1476,8 @@ public sealed class StageTracker(
             awaitingInPlace,
             awaitingRecording,
             _preparingItem,
-            _preparingBytes));
+            _preparingBytes,
+            Math.Max(0, Interlocked.Read(ref _preparingDone))));
     }
 
     /// <summary>
@@ -1568,4 +1608,39 @@ public sealed class StageTracker(
             StopHeartbeat();
         }
     }
+}
+
+/// <summary>
+/// A write-only wrapper that reports every byte written through it to the tracker's preparing row
+/// (<see cref="StageTracker.PackingProgress"/>). The extraction side's counterpart of the producers' shared
+/// copy loop: 7z reports nothing usable itself, but `x -so` writes the decompressed content into a sink WE
+/// hand it, so counting the writes is honest extraction progress. Owns nothing — disposing it does NOT
+/// dispose the inner sink, whose lifetime belongs to the call site's own using.
+/// </summary>
+public sealed class PackingProgressStream(StageTracker tracker, Stream inner) : Stream
+{
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() => inner.Flush();
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        inner.Write(buffer, offset, count);
+        tracker.PackingProgress(count);
+    }
+
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+    {
+        await inner.WriteAsync(buffer, ct);
+        tracker.PackingProgress(buffer.Length);
+    }
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+        WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
 }

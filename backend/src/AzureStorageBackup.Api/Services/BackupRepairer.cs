@@ -585,7 +585,7 @@ public sealed class BackupRepairer(
                             {
                                 await using var source = FileHasher.OpenRead(localSource);
                                 await using var sink = new HashingStream(streaming, stdin);
-                                await source.CopyToAsync(sink, tk);
+                                await StageTracker.CopyWithPackingProgressAsync(source, sink, tracker, tk);
                                 return streaming.Length;
                             }, token);
                         return result.VolumeFiles;

@@ -215,9 +215,10 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                     config.LocalRoot, version, options, BackupRequestMapper.MapTier(config.DataTier),
                     resolved.VolumeBytes is > 0 ? resolved.VolumeBytes : null,
-                    // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
-                    // compression mode a fresh backup writes.
-                    BackupRequestMapper.OptionalRules(resolved.DontCompressRules),
+                    // The same joined rule set BackupRequestMapper.From consumes: the repaired archive must use
+                    // the compression mode a fresh backup writes. OptionalRules(resolved.DontCompressRules) —
+                    // the case-sensitive half alone — is the field incident this line used to be.
+                    resolved.DontCompress(),
                     onlyPaths: onlyPaths, alsoMarkPaths: alsoMarkPaths,
                     onProgress: d => state.Detail = d, ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;

@@ -32,6 +32,14 @@ public sealed record ResolvedBackupSettings(
     long? VolumeBytes,
     bool VerboseLogging)
 {
+    /// <summary>The effective DontCompress rule set — **both halves joined** (case-sensitive first, then
+    /// case-insensitive), exactly as the backup path consumes them; null = no rules. The single source for
+    /// every store-only decision: the repair runner used to derive its own from the sensitive half alone,
+    /// so a media rule set entered case-insensitively (*.mkv, the ordinary way) was invisible to repair,
+    /// which re-compressed a 113.9 GB store-only file with real compression and pegged the NAS CPU at 100%.</summary>
+    public IgnoreRuleSet? DontCompress() =>
+        BackupRequestMapper.Rules(DontCompressRules, DontCompressRulesCaseInsensitive);
+
     /// <summary>When <paramref name="settings"/> is null, fall back to GlobalSettings' compile-time defaults,
     /// consistent with how existing callers handle <c>GlobalSettings?</c>.</summary>
     public static ResolvedBackupSettings From(BackupConfig config, GlobalSettings? settings)
