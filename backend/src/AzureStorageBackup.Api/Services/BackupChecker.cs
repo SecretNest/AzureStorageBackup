@@ -54,7 +54,8 @@ public sealed class BackupChecker(
     public async Task<CheckReport> CheckAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
         string? sentinelPath = null,
-        CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null)
+        CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null,
+        int? headConcurrency = null)
     {
         var source = $"check:{account.Id}/{container}";
         // Demoted before anything is recorded, so the "what was this asked to do" line below states what the run
@@ -74,7 +75,9 @@ public sealed class BackupChecker(
                 + SkipNote(localSkipped), ct);
         try
         {
-            var report = await CheckCoreAsync(account, container, password, version, options, localRoot, downloadConcurrency, onProgress, ct);
+            var report = await CheckCoreAsync(
+                account, container, password, version, options, localRoot, downloadConcurrency,
+                headConcurrency ?? downloadConcurrency, onProgress, ct);
             if (localSkipped is not null)
                 report = report with { LocalSkippedSentinel = localSkipped };
             var problems = report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
@@ -132,7 +135,7 @@ public sealed class BackupChecker(
 
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
-        int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
+        int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         // How many entries the index holds is only known once it has been read through → report a total of 0, so
         // the UI shows "… so far" instead of a made-up percentage.
@@ -167,7 +170,7 @@ public sealed class BackupChecker(
         // Cloud state (per file): data blobs are only actually queried at the ExistenceSize/Content levels.
         var cloudBad = new HashSet<string>(StringComparer.Ordinal);
         if (options.Cloud >= CloudCheckLevel.ExistenceSize)
-            cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, onProgress, ct);
+            cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, headConcurrency, onProgress, ct);
 
         // Local axis: compare each entry against its source file. The Content level reads every file end to end to
         // hash it — as slow as the backup's Diffing stage, so it likewise has to report progress entry by entry.
@@ -316,7 +319,7 @@ public sealed class BackupChecker(
     /// </summary>
     private async Task<HashSet<string>> CloudCheckAsync(
         BlobContainerClient cc, BackupInfoFile info, VersionIndex index, CheckOptions options, string? password,
-        int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
+        int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         var bad = new HashSet<string>(StringComparer.Ordinal);
 
@@ -336,7 +339,7 @@ public sealed class BackupChecker(
             tracker?.Touch(g.Key);
             var s = g.First().Storage!;
             var (vols, sizes) = ExpectedVolumes(info, s);
-            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct, downloadConcurrency);
+            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct, headConcurrency);
             if (!present || !sizeOk)
             {
                 foreach (var e in g)

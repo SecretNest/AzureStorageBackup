@@ -90,6 +90,11 @@ public class GlobalSettings
     public int UploadConcurrency { get; set; } = 5;
     public int DownloadConcurrency { get; set; } = 5; // Download concurrency for restore / deep check (PRD 3.4)
 
+    /// <summary>Concurrency for the check's HEAD-only probing (existence+size, rehydration estimates). Separate from
+    /// <see cref="DownloadConcurrency"/> because a HEAD moves no data: sizing the download budget against a bandwidth
+    /// cap must not strangle a stage that is round-trip-bound, not bandwidth-bound. Default 20.</summary>
+    public int CheckHeadConcurrency { get; set; } = 20;
+
     /// <summary>Retention in days for ephemeral (debug/info) logs (PRD 3.6, default 14). Durable audit logs are not subject to it.</summary>
     public int LogEphemeralMaxAgeDays { get; set; } = 14;
 

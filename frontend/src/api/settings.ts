@@ -34,6 +34,7 @@ export interface GlobalSettings {
   defaultCrossDirGroupRules: string | null
   uploadConcurrency: number
   downloadConcurrency: number
+  checkHeadConcurrency: number
   logEphemeralMaxAgeDays: number
   defaultVerboseLogging: boolean
   retryBackoffSeconds: string

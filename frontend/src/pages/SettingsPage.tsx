@@ -177,6 +177,15 @@ function BackupDefaults() {
         area below is the setting that <em>is</em> shared: its allowance is split evenly across the
         runs in flight.
       </p>
+      <Field label="Check HEAD concurrency">
+        <Num value={s.checkHeadConcurrency} onChange={(v) => set('checkHeadConcurrency', v)} />
+      </Field>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        Used by the check&apos;s existence+size probing and by rehydration estimates — requests that
+        ask about a blob without downloading it. They cost a round-trip each and no bandwidth, so
+        this runs higher than the download concurrency and sizing that against a bandwidth cap does
+        not slow checking down.
+      </p>
       <Field label="Ephemeral log retention (days)">
         <Num value={s.logEphemeralMaxAgeDays} onChange={(v) => set('logEphemeralMaxAgeDays', v)} />
       </Field>

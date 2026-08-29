@@ -14,6 +14,7 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         Assert.NotNull(s);
         Assert.Equal(100, s!.DefaultMaxVersions);
         Assert.Equal(14, s.LogEphemeralMaxAgeDays);
+        Assert.Equal(20, s.CheckHeadConcurrency);
     }
 
     [Fact]
@@ -40,10 +41,12 @@ public class SettingsEndpointsTests(TestWebAppFactory factory) : IClassFixture<T
         // after a restart an unwanted backup starts itself. This is a switch that **starts work on its own**,
         // and being unable to turn it off is its worst failure mode.
         back.AutoResumeInterruptedRuns = false;
+        back.CheckHeadConcurrency = 8;
         (await _client.PutAsJsonAsync("/api/settings", back)).EnsureSuccessStatusCode();
 
         var again = await _client.GetFromJsonAsync<GlobalSettings>("/api/settings");
         Assert.False(again!.AutoResumeInterruptedRuns);
         Assert.Equal(42, again.DefaultMaxVersions);
+        Assert.Equal(8, again.CheckHeadConcurrency);
     }
 }

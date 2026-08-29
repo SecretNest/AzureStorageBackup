@@ -65,6 +65,7 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         existing.DefaultCrossDirGroupRulesCaseInsensitive = s.DefaultCrossDirGroupRulesCaseInsensitive;
         existing.UploadConcurrency = s.UploadConcurrency;
         existing.DownloadConcurrency = s.DownloadConcurrency;
+        existing.CheckHeadConcurrency = s.CheckHeadConcurrency;
         existing.LogEphemeralMaxAgeDays = s.LogEphemeralMaxAgeDays;
         existing.DefaultVerboseLogging = s.DefaultVerboseLogging;
         existing.RetryBackoffSeconds = s.RetryBackoffSeconds;

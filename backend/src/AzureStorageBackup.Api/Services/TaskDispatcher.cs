@@ -148,7 +148,8 @@ public sealed class TaskDispatcher(
                         // failure notification in the middle of the night, night after night, for a backup that is
                         // perfectly healthy. The cloud half still runs.
                         .CheckAsync(account, container, password, null, options, config.LocalRoot, config.SentinelPath, ct,
-                            downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5);
+                            downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5,
+                            headConcurrency: checkSettings.CheckHeadConcurrency > 0 ? checkSettings.CheckHeadConcurrency : 20);
                     if (!result.Ok)
                         logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",
                             accountId, container, result.MissingRefs.Count);

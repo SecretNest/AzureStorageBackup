@@ -563,7 +563,8 @@ public static class BackupConfigEndpoints
 
             var container = factory.CreateServiceClient(account).GetBlobContainerClient(config.ContainerName);
             var settings = await settingsSvc.GetAsync(ct);
-            var concurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5;
+            // HEAD-only probing (GetProperties per object), so it runs on the head budget, not the download one.
+            var concurrency = settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20;
             using var gate = new SemaphoreSlim(Math.Max(1, concurrency));
             var archived = 0;
             var rehydratePending = 0;

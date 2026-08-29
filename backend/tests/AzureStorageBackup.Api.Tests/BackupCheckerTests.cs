@@ -447,6 +447,51 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>HEADs move no data, so their budget is not the download budget: a user sizing
+    /// DownloadConcurrency against a bandwidth cap must not thereby strangle the existence+size stage,
+    /// which is round-trip-bound, not bandwidth-bound. Probed with the download budget pinned to 1 —
+    /// overlap can then only come from the head budget.</summary>
+    [SkippableFact]
+    public async Task The_Head_Budget_Is_Separate_From_The_Download_Budget()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkh-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var buf = new byte[6_000_000];
+            new Random(29).NextBytes(buf);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var probe = new HeadOverlapProbe();
+            var probed = new ProbedFactory(probe);
+            var checker = new BackupChecker(
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "head-budget-check"));
+
+            var result = await checker.CheckAsync(
+                account, name, null, null, new CheckOptions(), downloadConcurrency: 1, headConcurrency: 6);
+
+            Assert.True(result.Ok);
+            Assert.True(probe.Peak >= 2,
+                $"volume HEADs never overlapped (peak {probe.Peak}) — the head budget was ignored");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     [SkippableFact]
     public async Task List_Check_Detects_Orphans_And_Repair_Deletes_Them_Keeping_Referenced()
     {

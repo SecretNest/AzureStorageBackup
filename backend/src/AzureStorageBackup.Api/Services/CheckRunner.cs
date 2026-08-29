@@ -102,7 +102,8 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
                     account, config.ContainerName, sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
                     version, options, config.LocalRoot, config.SentinelPath, state.Cancellation.Token,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
-                    onProgress: d => state.Detail = d);
+                    onProgress: d => state.Detail = d,
+                    headConcurrency: settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20);
                 state.Status = RunStatus.Completed;
             }
             finally
