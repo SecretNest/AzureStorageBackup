@@ -166,6 +166,39 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>Clicking repair used to push "Check started" — the repairer's internal pre-check notified as if
+    /// it were a user-initiated check, and the user who had just clicked Repair reasonably wondered what was
+    /// running. The pre-check is an implementation detail and stays silent; the repair announces itself.</summary>
+    [SkippableFact]
+    public async Task Repair_Announces_Itself_And_Its_Internal_Check_Stays_Silent()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var opLog = new RecordingOperationLog();
+        var (backup, _, repairer, _, _, factory) = Build(opLog);
+        var account = AzuriteAccount();
+        var name = RandomName("repn-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null);
+
+            List<(OperationLogLevel Level, string Source, string Message)> entries;
+            lock (opLog.Entries) entries = [.. opLog.Entries];
+            Assert.Contains(entries, e => e.Message.StartsWith("Repair started", StringComparison.Ordinal));
+            Assert.DoesNotContain(entries, e => e.Message.StartsWith("Check started", StringComparison.Ordinal));
+            Assert.DoesNotContain(entries, e => e.Message.StartsWith("Check passed", StringComparison.Ordinal));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The retention cleaner has honoured active journals all along; the repair-side orphan sweep did
     /// not, and it runs off the same "referenced by a retained version" set. With a backup suspended mid-run —
     /// the exact state in which a user repairs damage before resuming — its journalled uploads are in the cloud

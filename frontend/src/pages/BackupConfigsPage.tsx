@@ -2625,10 +2625,6 @@ function CheckModal({
   const [local, setLocal] = useState<number>(LocalCheckLevel.None)
   const [rehydrate, setRehydrate] = useState<number | null>(null)
   const [listOrphans, setListOrphans] = useState(false)
-  // The user's call, never a default: rebuilding an appended file from its prefix re-uploads the whole
-  // object — possibly hundreds of GB — and only the person paying for the transfer can weigh that against
-  // one version's snapshot (a later version of an append-only file contains it as a prefix anyway).
-  const [recoverPrefixes, setRecoverPrefixes] = useState(false)
   const [running, setRunning] = useState(false)
   const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
   const [repairing, setRepairing] = useState(false)
@@ -2707,7 +2703,7 @@ function CheckModal({
     }
   }
 
-  const runRepair = async () => {
+  const runRepair = async (recoverPrefixes: boolean) => {
     setRepairing(true)
     try {
       // Repair is a background job (holding the lock until it completes); poll for its state.
@@ -2776,14 +2772,6 @@ function CheckModal({
           {running && (
             <button type="button" className="btn-danger" onClick={stopCheck}>Stop</button>
           )}
-          {/* Offered whenever there are problems at all, not only proven-repairable ones: repair re-checks
-              the cloud and hashes locally per bad object on its own, so an unassessed local side (the check ran
-              without a content-level local pass) must not hide the one action that would assess it. */}
-          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && (
-            <button type="button" onClick={runRepair} disabled={repairing || running}>
-              {repairing ? 'Repairing…' : 'Repair from local'}
-            </button>
-          )}
           <button type="button" onClick={onClose}>Close</button>
         </>
       }
@@ -2824,15 +2812,6 @@ function CheckModal({
         <span className="field-check">
           <input type="checkbox" checked={listOrphans} onChange={(e) => setListOrphans(e.target.checked)} />
           Detect unreferenced blobs (repair deletes them)
-        </span>
-      </Field>
-      <Field label="">
-        {/* Off by default on purpose: this can mean re-uploading a very large object in full, and that cost
-            is the user's to accept, not a behavior to discover on the bill. Leaving it off leaves the file
-            unrecoverable in this version — a later version of an append-only file holds the content anyway. */}
-        <span className="field-check">
-          <input type="checkbox" checked={recoverPrefixes} onChange={(e) => setRecoverPrefixes(e.target.checked)} />
-          Rebuild grown (appended) files from their prefix — re-uploads those objects in full
         </span>
       </Field>
 
@@ -2935,9 +2914,9 @@ function CheckModal({
                   backup stores their current content as usual.
                 </li>
                 <li>
-                  A <strong>grown</strong> file is rebuilt from its prefix only when the checkbox above is
-                  ticked — that re-uploads the whole object. Left unticked it stays unrecoverable here, and
-                  loses nothing: a later backup of the grown file contains all of this content anyway.
+                  A <strong>grown</strong> file is rebuilt only by the second repair button — that re-uploads
+                  the whole object in full. The plain repair leaves it unrecoverable here, and loses nothing:
+                  a later backup of the grown file contains all of this content anyway.
                 </li>
               </ul>
             </div>
@@ -2992,6 +2971,23 @@ function CheckModal({
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+          {/* The repair actions live with the findings they act on, not in the footer among the check
+              controls — check options and repair actions in one pile is how the prefix toggle got read as
+              a check option. Two verbs instead of a button-plus-checkbox: what each click does is in its
+              own label, and there is no state to have set beforehand. Offered whenever there are problems
+              at all, not only proven-repairable ones — repair hashes locally per bad object on its own. */}
+          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && (
+            <div style={{ marginTop: '0.6rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <button type="button" onClick={() => runRepair(false)} disabled={repairing || running}>
+                {repairing ? 'Repairing…' : 'Repair from local'}
+              </button>
+              {problems.length > 0 && !repairing && (
+                <button type="button" onClick={() => runRepair(true)} disabled={running}>
+                  Repair + rebuild grown files (full re-upload)
+                </button>
+              )}
             </div>
           )}
         </div>

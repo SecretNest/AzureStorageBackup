@@ -56,7 +56,11 @@ public sealed class BackupChecker(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot = null,
         string? sentinelPath = null,
         CancellationToken ct = default, int downloadConcurrency = 5, Action<StageProgress>? onProgress = null,
-        int? headConcurrency = null)
+        int? headConcurrency = null,
+        // False for the repairer's internal pre-check: it is an implementation detail of a repair, and pushing
+        // "Check started" for it made a user who had just clicked Repair wonder what was running. The repair
+        // announces itself and summarizes its own outcome; a silent pre-check leaves exactly one story told.
+        bool notify = true)
     {
         var source = $"check:{account.Id}/{container}";
         // Demoted before anything is recorded, so the "what was this asked to do" line below states what the run
@@ -69,11 +73,12 @@ public sealed class BackupChecker(
         // switchable, and every one of them changes what a later "passed" is worth — a pass at Cloud=None/Local=None
         // establishes almost nothing. Without them recorded, the log cannot answer "what did that check cover?",
         // which is the first question anyone asks of it.
-        await Record(
-            NotificationEvents.CheckStart, source, $"Check started: {container}",
-            DescribeLevels(options)
-                + (options.ListOrphans ? "; scanning for unreferenced blobs" : "")
-                + SkipNote(localSkipped), ct);
+        if (notify)
+            await Record(
+                NotificationEvents.CheckStart, source, $"Check started: {container}",
+                DescribeLevels(options)
+                    + (options.ListOrphans ? "; scanning for unreferenced blobs" : "")
+                    + SkipNote(localSkipped), ct);
         try
         {
             var report = await CheckCoreAsync(
@@ -87,7 +92,8 @@ public sealed class BackupChecker(
             var orphanNote = report.OrphanScanIssue is { } issue
                 ? $"; unreferenced-blob scan abandoned: {issue}"
                 : report.OrphansChecked ? $"; {report.OrphanBlobs.Count} unreferenced blob(s)" : "";
-            await Record(
+            if (notify)
+                await Record(
                 report.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure, source,
                 $"Check {(report.Ok ? "passed" : "failed")}: {container}",
                 (report.Ok
@@ -103,7 +109,8 @@ public sealed class BackupChecker(
         }
         catch (Exception ex)
         {
-            await Record(NotificationEvents.CheckFailure, source, $"Check failed: {container}", ex.Message, ct);
+            if (notify)
+                await Record(NotificationEvents.CheckFailure, source, $"Check failed: {container}", ex.Message, ct);
             throw;
         }
     }

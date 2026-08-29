@@ -235,6 +235,48 @@ public sealed class UntrustedIndexPathTests : IDisposable
         Assert.Equal([Path.Combine(_local, "a.txt")], hasher.Hashed);
     }
 
+    /// <summary>A candidate whose length differs from the recorded content cannot hash-match, so it must not be
+    /// read at all. This is not a micro-optimization: in the field the candidate was a ~100 GB appended file, and
+    /// "give this file up" cost a full read of it before repair could conclude "does not match" — the user watched
+    /// a motionless Repairing state for the length of a 100 GB disk scan whose answer was knowable from a stat.</summary>
+    [Fact]
+    public async Task Repairing_A_Blob_Does_Not_Read_A_Candidate_Of_The_Wrong_Length()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_local, "grown.bin"), "much longer than the recorded five");
+
+        var index = new VersionIndex
+        {
+            Version = 1,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    // The hash deliberately does NOT match RecordingHasher's return value: today's behavior is
+                    // "hash it, find it different, mark unrecoverable" — the assertion pins that the hashing
+                    // step itself disappears once the length has already answered.
+                    Path = "grown.bin", Kind = "file", Permissions = "0644",
+                    Length = 5, FullHash = "someone-elses-hash",
+                    Storage = new StorageRef { Kind = "blob", Ref = "data/x" },
+                },
+            ],
+        };
+
+        var (repairer, hasher, _) = Repairer();
+        var unrecoverable = new List<string>();
+        await InvokeAsync(repairer, "RepairBlobAsync",
+        [
+            SampleAccount(), SampleContainer(), "data/x",
+            new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
+            new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
+            false, // recoverPrefixes off: the give-up path is exactly the one that must stay read-free
+            new List<string>(), unrecoverable, new HashSet<int>(),
+            StagingLease(), CancellationToken.None,
+        ]);
+
+        Assert.Contains("grown.bin", unrecoverable);
+        Assert.Empty(hasher.Hashed);
+    }
+
     /// <summary>
     /// Repairing a single-file blob: an index entry whose path escapes the local root → that candidate source is skipped outright, no usable local source remains,
     /// and the entry is marked unrecoverable. It was otherwise a confirmation oracle for "somewhere locally there is a file whose content hash equals X",

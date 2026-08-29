@@ -55,6 +55,11 @@ public sealed class BackupRepairer(
         // split evenly across the runs currently in flight (see StagingArea).
         using var lease = staging.AcquireLease();
 
+        // The user clicked Repair and deserves to hear that, not "Check started" from the internal pre-check.
+        await Record(NotificationEvents.CheckStart, $"repair:{account.Id}/{container}",
+            $"Repair started: {container}",
+            recoverPrefixes ? "prefix recovery enabled for grown files" : "from matching local files", ct);
+
         var info = (trackedInfo is not null
                 ? await trackedInfo.LoadAsync(account, container, password, ct)
                 : await store.ReadInfoAsync(account, container, password, ct))
@@ -73,8 +78,12 @@ public sealed class BackupRepairer(
             // would just be a value with no consequence. Repair itself needs no gate either: it rebuilds bad cloud
             // blobs *from* local content, one direction only, so an unmounted source means "nothing is repairable
             // from local" and the run does less, never something wrong.
+            // notify: false — this check is an implementation detail of the repair, and pushing "Check started"
+            // for it made a user who had just clicked Repair wonder what was running. The repair announces
+            // itself below; a silent pre-check leaves exactly one story told.
             .CheckAsync(account, container, password, target.Version,
-                checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct);
+                checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct,
+                notify: false);
         var badBlobs = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .Select(f => f.Ref!).Distinct(StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
@@ -222,7 +231,7 @@ public sealed class BackupRepairer(
             // tried, and when none of them is usable it falls through to "mark unrecoverable" as usual.
             if (!PathBoundary.IsWithin(localRoot, local))
                 continue;
-            if (await LocalMatchesAsync(local, fullHash, ct))
+            if (await LocalMatchesAsync(local, fullHash, entry0.Length, ct))
             {
                 localSource = local;
                 sourcePath = e.Path;
@@ -368,13 +377,13 @@ public sealed class BackupRepairer(
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
         // Aggregate the members referencing this pack across all versions: entryName → (fullHash, the versions + paths referencing it).
-        var members = new Dictionary<string, (string? Hash, List<(int Version, string Path)> Refs)>(StringComparer.Ordinal);
+        var members = new Dictionary<string, (string? Hash, long Length, List<(int Version, string Path)> Refs)>(StringComparer.Ordinal);
         foreach (var (vnum, idx) in indexes)
             foreach (var e in idx.Entries)
                 if (e.Storage is { Kind: "pack" } s && s.Ref == packId && s.EntryName is { } en)
                 {
                     if (!members.TryGetValue(en, out var m))
-                        m = members[en] = (e.FullHash, []);
+                        m = members[en] = (e.FullHash, e.Length, []);
                     m.Refs.Add((vnum, e.Path));
                 }
 
@@ -406,7 +415,7 @@ public sealed class BackupRepairer(
                         MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
                     continue;
                 }
-                if (await LocalMatchesAsync(local, m.Hash, ct))
+                if (await LocalMatchesAsync(local, m.Hash, m.Length, ct))
                 {
                     var dest = Path.Combine(composeDir, entryName.Replace('/', Path.DirectorySeparatorChar));
                     Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
@@ -541,12 +550,17 @@ public sealed class BackupRepairer(
     /// other references to the same content, and the grouped path marks that member unrecoverable outright — exactly
     /// the same handling as "there is no such file locally".
     /// </summary>
-    private async Task<bool> LocalMatchesAsync(string local, string? expectedHash, CancellationToken ct)
+    private async Task<bool> LocalMatchesAsync(string local, string? expectedHash, long expectedLength, CancellationToken ct)
     {
         if (expectedHash is null || !File.Exists(local))
             return false;
         try
         {
+            // The length answers first: a file of a different length cannot hash-match, and skipping the read is
+            // not a micro-optimization — in the field the candidate was a ~100 GB appended file, and "give this
+            // file up" cost a full disk scan of it before repair could conclude what a stat already knew.
+            if (new FileInfo(local).Length != expectedLength)
+                return false;
             return await hasher.FullHashAsync(local, ct) == expectedHash;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

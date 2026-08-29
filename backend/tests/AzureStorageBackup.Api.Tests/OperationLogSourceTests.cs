@@ -105,13 +105,12 @@ public sealed class OperationLogSourceTests
         Assert.Contains(log.Entries, e => e.Source == "check:3/photos");
     }
 
-    /// <summary>The repairer's very first step is to delegate to checker.CheckAsync (same account/container),
-    /// whose CheckStart source is already verified to carry the account dimension; here we recheck with a different account id
-    /// and confirm the failure-propagation path neither swallows nor mangles the source. BackupRepairer's own
-    /// "repair:{account.Id}/{container}" logging points (see the end of RepairAsync in BackupRepairer.cs plus DeleteOrphansAsync)
-    /// need real Azure interaction (factory.CreateServiceClient) before they are reached; code review confirmed they use the same format as this test (the §5.3 report lists every site).</summary>
+    /// <summary>The repairer's internal pre-check is an implementation detail and stays out of the log entirely
+    /// (it used to push "Check started" at a user who had just clicked Repair); what carries the account
+    /// dimension on this path is the repair's own announcement, written before the pre-check runs — so it is
+    /// present even when the pre-check then blows up, as it does here with the throwing fake store.</summary>
     [Fact]
-    public async Task Checker_Invoked_By_Repairer_Logs_Source_With_Account_Id()
+    public async Task Repairs_Own_Announcement_Carries_The_Account_Id_And_Its_Pre_Check_Stays_Silent()
     {
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
@@ -121,12 +120,13 @@ public sealed class OperationLogSourceTests
             uploader: null!, tempRoot: Path.GetTempPath(),
             // This case never reaches compression; the staging area is only here so the object can be constructed at all.
             staging: new StagingArea(Path.GetTempPath(), Path.GetTempPath(), () => long.MaxValue),
-            checker: checker);
+            checker: checker, opLog: log);
         var account = new Account { Id = 7, Name = "acct7" };
 
         try { await repairer.RepairAsync(account, "photos", null, "/tmp", null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null); }
         catch (InvalidOperationException) { /* expected: fake store throws inside checker.CheckAsync */ }
 
-        Assert.Contains(log.Entries, e => e.Source == "check:7/photos");
+        Assert.Contains(log.Entries, e => e.Source == "repair:7/photos");
+        Assert.DoesNotContain(log.Entries, e => e.Source == "check:7/photos");
     }
 }
