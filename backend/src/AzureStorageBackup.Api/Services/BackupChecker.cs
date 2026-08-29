@@ -336,7 +336,7 @@ public sealed class BackupChecker(
             tracker?.Touch(g.Key);
             var s = g.First().Storage!;
             var (vols, sizes) = ExpectedVolumes(info, s);
-            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct);
+            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(cc, g.Key, vols, sizes, ct, downloadConcurrency);
             if (!present || !sizeOk)
             {
                 foreach (var e in g)

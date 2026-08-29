@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -823,4 +824,99 @@ public sealed class VolumeBlobIOTests
     [InlineData("data/abc", "data/abc.", false)]
     public void IsVolumeOf_Matches_Only_Own_Volumes_Not_Collision_Siblings(string baseRef, string name, bool expected)
         => Assert.Equal(expected, VolumeBlobIO.IsVolumeOf(baseRef, name));
+
+    private static BlobContainerClient ProbedContainer(string name, HeadOverlapProbe probe)
+    {
+        var uri = new Uri("http://127.0.0.1:10000/devstoreaccount1");
+        var credential = new Azure.Storage.StorageSharedKeyCredential("devstoreaccount1", AzuriteKey);
+        var options = new Azure.Storage.Blobs.BlobClientOptions();
+        options.AddPolicy(probe, Azure.Core.HttpPipelinePosition.PerCall);
+        return new Azure.Storage.Blobs.BlobServiceClient(uri, credential, options).GetBlobContainerClient(name);
+    }
+
+    /// <summary>A family past ~1000 volumes takes that many HEADs; issued one at a time, the existence+size check
+    /// spends a round-trip per volume and the user waits minutes on a single object. The volumes are independent,
+    /// so within a family the HEADs run under a concurrency budget.</summary>
+    [SkippableFact]
+    public async Task VerifyVolumesAsync_Overlaps_HEADs_Within_A_Family()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var probe = new HeadOverlapProbe();
+        var name = RandomName("vvc-");
+        var cc = ProbedContainer(name, probe);
+        await cc.CreateIfNotExistsAsync();
+        try
+        {
+            var sizes = new List<long>();
+            for (var i = 1; i <= 8; i++)
+            {
+                await cc.GetBlobClient($"data/big.{i:D3}").UploadAsync(
+                    BinaryData.FromString(new string('x', i)), overwrite: true);
+                sizes.Add(i);
+            }
+
+            var (present, sizeOk) = await VolumeBlobIO.VerifyVolumesAsync(
+                cc, "data/big", 8, sizes, default, concurrency: 4);
+
+            Assert.True(present);
+            Assert.True(sizeOk);
+            Assert.True(probe.Peak >= 2,
+                $"HEADs never overlapped (peak {probe.Peak}) — the volumes were probed one at a time");
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Concurrent probing deliberately gives up the serial version's early return on the first missing
+    /// volume: the family is bad either way, and the in-flight tail it wastes is a handful of HEADs. What must
+    /// not change is the verdict.</summary>
+    [SkippableFact]
+    public async Task VerifyVolumesAsync_Still_Reports_A_Missing_Volume_When_Concurrent()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var probe = new HeadOverlapProbe();
+        var name = RandomName("vvm-");
+        var cc = ProbedContainer(name, probe);
+        await cc.CreateIfNotExistsAsync();
+        try
+        {
+            foreach (var i in new[] { 1, 2, 3, 5, 6 }) // .004 was never uploaded
+                await cc.GetBlobClient($"data/big.{i:D3}").UploadAsync(
+                    BinaryData.FromString("v"), overwrite: true);
+
+            var (present, _) = await VolumeBlobIO.VerifyVolumesAsync(
+                cc, "data/big", 6, [], default, concurrency: 4);
+
+            Assert.False(present);
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Once one volume of a family is found missing the family's verdict is settled, so the remaining
+    /// volumes are not worth a round-trip each — with ~1000 volumes that tail is the bulk of the work. A shared
+    /// flag replaces the serial version's early return: tasks that take a concurrency slot after the flag is up
+    /// skip their HEAD. Only the in-flight handful is wasted, bounded by the concurrency budget.</summary>
+    [SkippableFact]
+    public async Task A_Condemned_Family_Is_Not_Probed_To_The_End()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var probe = new HeadOverlapProbe();
+        var name = RandomName("vvs-");
+        var cc = ProbedContainer(name, probe);
+        await cc.CreateIfNotExistsAsync();
+        try
+        {
+            // Not a single volume uploaded: whichever HEAD lands first condemns the family.
+            var (present, _) = await VolumeBlobIO.VerifyVolumesAsync(
+                cc, "data/big", 40, [], default, concurrency: 4);
+
+            Assert.False(present);
+            // The exact count depends on how the first batch of 4 interleaves; what matters is the order of
+            // magnitude — well under the 40 a probe-everything implementation would issue.
+            Assert.True(probe.Heads <= 8, $"{probe.Heads} HEADs issued for a family condemned by the first");
+        }
+        finally { await cc.DeleteIfExistsAsync(); }
+    }
 }

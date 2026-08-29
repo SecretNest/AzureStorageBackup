@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using Azure.Storage.Blobs;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 
@@ -380,6 +381,68 @@ public sealed class BackupCheckerTests : IDisposable
 
             Assert.False(result.Ok);
             Assert.Contains($"data/{hash}", result.MissingRefs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The same client wiring as Build()'s factory, with the overlap probe spliced into the pipeline.</summary>
+    private sealed class ProbedFactory(HeadOverlapProbe probe) : IBlobClientFactory
+    {
+        public BlobServiceClient CreateServiceClient(Account account)
+        {
+            var uri = new Uri(account.BlobEndpoint);
+            var credential = new Azure.Storage.StorageSharedKeyCredential(
+                BlobClientFactory.ParseAccountName(uri), TestSecrets.Reader.RevealAccountKey(account));
+            var options = new BlobClientOptions();
+            options.AddPolicy(probe, Azure.Core.HttpPipelinePosition.PerCall);
+            return new BlobServiceClient(uri, credential, options);
+        }
+
+        public Task<ConnectionResult> TestConnectionAsync(Account account, CancellationToken ct = default)
+            => new BlobClientFactory(TestSecrets.Reader).TestConnectionAsync(account, ct);
+    }
+
+    /// <summary>The existence+size stage must hand its concurrency budget down to the volume probing: a family past
+    /// ~1000 volumes takes that many HEADs, and issued serially that is a round-trip per volume — minutes on a
+    /// single object. This pins the wiring, not just VolumeBlobIO's own capability (see VolumeBlobIOTests).</summary>
+    [SkippableFact]
+    public async Task ExistenceSize_Check_Overlaps_Volume_HEADs()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("chkc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // A 6MB random file at 1MB volumes → one data blob of several volumes.
+            var buf = new byte[6_000_000];
+            new Random(23).NextBytes(buf);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), buf);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var probe = new HeadOverlapProbe();
+            var probed = new ProbedFactory(probe);
+            var checker = new BackupChecker(
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "probed-check"));
+
+            var result = await checker.CheckAsync(
+                account, name, null, null, new CheckOptions(), downloadConcurrency: 4);
+
+            Assert.True(result.Ok);
+            Assert.True(probe.Peak >= 2,
+                $"volume HEADs never overlapped (peak {probe.Peak}) — the budget did not reach the probing");
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

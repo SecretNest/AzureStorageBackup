@@ -476,9 +476,11 @@ public static class VolumeBlobIO
     /// <summary>
     /// The "existence + size" check: verify that every volume exists, and when <paramref name="expectedSizes"/> is non-empty that each volume's size matches.
     /// Only HEAD requests (GetProperties), no downloads; Archive-tier blobs can have their properties read without rehydration. When the sizes are unknown (empty), only existence is verified.
+    /// Within one family the HEADs run <paramref name="concurrency"/> at a time (1 = the old serial probing); the volumes are independent, so ordering carries no meaning here.
     /// </summary>
     public static async Task<(bool Present, bool SizeOk)> VerifyVolumesAsync(
-        BlobContainerClient cc, string baseRef, int expectedVolumes, IReadOnlyList<long> expectedSizes, CancellationToken ct)
+        BlobContainerClient cc, string baseRef, int expectedVolumes, IReadOnlyList<long> expectedSizes, CancellationToken ct,
+        int concurrency = 1)
     {
         if (expectedVolumes <= 1)
         {
@@ -489,11 +491,33 @@ public static class VolumeBlobIO
             return (true, expectedSizes.Count < 1 || len == expectedSizes[0]);
         }
 
+        // All volumes probed under a shared concurrency budget: a family past ~1000 volumes takes that many
+        // HEADs, and issued one at a time that is a round-trip per volume — minutes on a single object.
+        //
+        // The serial version's early return on the first missing volume is replaced by a shared flag: one missing
+        // volume settles the family's verdict, so tasks that take a slot after the flag is up skip their HEAD.
+        // What the flag cannot save is the in-flight handful, bounded by the budget — an accepted loss.
+        using var gate = new SemaphoreSlim(Math.Max(1, concurrency));
+        var missing = 0;
+        var lens = await Task.WhenAll(Enumerable.Range(1, expectedVolumes).Select(async i =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                if (Volatile.Read(ref missing) != 0)
+                    return null;
+                var len = await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, i)), ct);
+                if (len is null)
+                    Volatile.Write(ref missing, 1);
+                return len;
+            }
+            finally { gate.Release(); }
+        }));
+
         var sizeOk = true;
         for (var i = 1; i <= expectedVolumes; i++)
         {
-            var len = await LengthAsync(cc.GetBlobClient(VolumeName(baseRef, i)), ct);
-            if (len is null)
+            if (lens[i - 1] is not { } len)
                 return (false, false);
             if (expectedSizes.Count >= i && len != expectedSizes[i - 1])
                 sizeOk = false;
