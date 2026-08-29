@@ -146,7 +146,12 @@ public sealed class RestoreOrchestrator(
             // falls back to the existing "intent declared but the substitute isn't available" skip semantics (the TryGetValue below simply doesn't find it).
             var srcByPath = IndexByPath(srcIndex.Entries, phase, out _);
             foreach (var kv in grp)
-                if (srcByPath.TryGetValue(kv.Key, out var se))
+                // "Resolved" must mean the substitute's content is actually available, not merely that a
+                // same-path entry exists: a version whose own copy is ALSO marked unrecoverable (the /file-versions
+                // endpoint filters those, but a raw API caller or a selection gone stale across a repair does not)
+                // would ride the normal download pipeline into a hard per-group failure with a message that never
+                // says the chosen version is damaged too. Unresolved falls back to the documented soft skip.
+                if (srcByPath.TryGetValue(kv.Key, out var se) && !srcIndex.UnrecoverablePaths.Contains(kv.Key))
                 {
                     byPath[kv.Key] = se;
                     resolved.Add(kv.Key);
@@ -305,7 +310,6 @@ public sealed class RestoreOrchestrator(
         // tempRoot may not exist yet, and a probe in a missing directory conservatively answers "folds", which would
         // arm this gate on every restore. Lazy so the probe is only paid for once a pack group actually gets there.
         var extractDirFolds = new Lazy<bool>(() => ProbeCaseInsensitive(work));
-        var rehydrated = new System.Collections.Concurrent.ConcurrentBag<string>(); // base names of the blobs that were rehydrated; re-archived once we're done
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
         {
@@ -331,7 +335,7 @@ public sealed class RestoreOrchestrator(
                 try
                 {
                     return await RestoreGroupAsync(
-                        container, request, realRoot, work, g.ToList(), gate, rehydrated, phase, tracker,
+                        container, request, realRoot, work, g.ToList(), gate, phase, tracker,
                         downloadSizes[g.Key], extractDirFolds, ct);
                 }
                 catch (OperationCanceledException) { throw; }
@@ -356,14 +360,12 @@ public sealed class RestoreOrchestrator(
         finally
         {
             TryDelete(work);
-        }
 
-        // After the restore, put the rehydrated blobs back into Archive (keeping the backup's original tier; best effort).
-        if (request.ReArchiveAfterRestore && !rehydrated.IsEmpty)
-        {
-            phase?.Report($"Re-archiving {rehydrated.Distinct().Count()} object(s)…");
-            foreach (var baseRef in rehydrated.Distinct())
-                await SetTierForVolumesAsync(container, baseRef, AccessTier.Archive, ct);
+            // No re-archive step exists any more: the sources never left Archive (EnsureHotCopyAsync serves
+            // the restore from disposable Hot COPIES under restore-tmp/), so ReArchiveAfterRestore has nothing
+            // left to do and the old crash window — rehydrated blobs stranded in the billed online tier — has
+            // no state to strand. The copies are deleted per group above; RestoreTempSweeper clears whatever a
+            // crash leaves behind at the next startup.
         }
 
         return new RestoreResult(version.Version, restored, skipped, restoredDirs, failed);
@@ -371,7 +373,7 @@ public sealed class RestoreOrchestrator(
 
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
         BlobContainerClient container, RestoreRequest request, string? realRoot, string work,
-        List<IndexEntry> group, SemaphoreSlim gate, System.Collections.Concurrent.ConcurrentBag<string> rehydrated,
+        List<IndexEntry> group, SemaphoreSlim gate,
         IProgress<string>? phase, StageTracker? tracker, long downloadBytes, Lazy<bool> extractDirFolds,
         CancellationToken ct)
     {
@@ -444,11 +446,21 @@ public sealed class RestoreOrchestrator(
                     // but polling re-reports it every RehydratePollSeconds, so it comes back on its own. That's the existing progress model,
                     // not something introduced here.
                     tracker?.EndItem(blobName, 0);
-                    await EnsureOnlineAsync(container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority), request.RehydratePollSeconds, phase, ct);
-                    rehydrated.Add(blobName);
-                    // Only reopen the window once rehydration is done and we're actually about to download — the same rhythm as the original BeginItem.
-                    tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
-                    firstVolume = await VolumeBlobIO.DownloadAsync(container, blobName, groupDir, ct, itemProgress);
+                    var tempBase = await EnsureHotCopyAsync(
+                        container, blobName, request.RehydrateTier, MapPriority(request.RehydratePriority),
+                        request.RehydratePollSeconds, phase, ct);
+                    try
+                    {
+                        // Only reopen the window once the copies are ready and we're actually about to download — the same rhythm as the original BeginItem.
+                        tracker?.BeginItem(blobName, TransferLabel.For(storage, needed), downloadBytes);
+                        firstVolume = await VolumeBlobIO.DownloadAsync(container, tempBase, groupDir, ct, itemProgress);
+                    }
+                    finally
+                    {
+                        // This group's copies have served their purpose the moment the download ends, success or
+                        // not; the startup sweeper covers a crash that never reaches this line.
+                        await DeleteTempCopiesAsync(container, blobName);
+                    }
                 }
             }
             finally
@@ -675,12 +687,14 @@ public sealed class RestoreOrchestrator(
     /// File.Copy throws UnauthorizedAccess/IOException), only fails this one entry and gets reported.
     /// It must never bubble up to the group handler — that would fail the group's entire set of legitimate entries. Returns whether the write succeeded.
     /// </summary>
-    private static bool TryWriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile, IProgress<string>? phase)
+    private bool TryWriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile, IProgress<string>? phase)
     {
         try
         {
-            WriteRestoredFile(request, realRoot, entry, sourceFile);
-            return true;
+            if (WriteRestoredFile(request, realRoot, entry, sourceFile))
+                return true;
+            phase?.Report($"{entry.Path}: extracted content does not match the recorded length/hash — the destination was left untouched");
+            return false;
         }
         catch (OperationCanceledException)
         {
@@ -776,8 +790,19 @@ public sealed class RestoreOrchestrator(
     }
 
     /// <summary>Writes the restored content to the destination path. RenameKeep with the target already present (getting this far means the content differs or can't be compared) →
-    /// rename the existing local file to {name}.bak-{ts} to preserve the old content, then write the restored content under the original name (the old content is never lost).</summary>
-    private static void WriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile)
+    /// rename the existing local file to {name}.bak-{ts} to preserve the old content, then write the restored content under the original name (the old content is never lost).
+    /// <para>
+    /// Verify-then-swap, the same discipline as the streamed path: the extracted bytes are checked against the
+    /// entry's recorded length (and hash, when recorded) INSIDE a same-directory temp file, and only a copy
+    /// that passes moves over the destination. A straight overwrite meant a subtle pack corruption 7z's CRC
+    /// let through, or an I/O fault partway through the copy, silently replaced the user's good file with a
+    /// truncated or wrong one — and the run reported success. Returns false = the content failed verification
+    /// (the caller counts the entry failed; the destination is untouched).
+    /// </para>
+    /// Skip is re-checked at this moment, not only at planning time: an Archive rehydration can put hours
+    /// between the two, and a file the user created at this path meanwhile must not be clobbered by a decision
+    /// made before it existed.</summary>
+    private bool WriteRestoredFile(RestoreRequest request, string? realRoot, IndexEntry entry, string sourceFile)
     {
         var dest = Path.Combine(request.TargetRoot, ToLocal(entry.Path));
 
@@ -788,12 +813,31 @@ public sealed class RestoreOrchestrator(
         // Skip that entry rather than aborting the whole restore — consistent with the existing per-group fault-tolerance semantics.
         if (!WriteStaysInsideRoot(realRoot, dest))
             throw new UnsafeRestorePathException(entry.Path);
+        if (request.Conflict == RestoreConflictMode.Skip && File.Exists(dest))
+            return true; // appeared during the wait; Skip's contract is "the target exists → leave it"
+
+        var actualLength = new FileInfo(sourceFile).Length;
+        if (actualLength != entry.Length)
+            return false;
+        if (entry.FullHash is not null && hasher.FullHashAsync(sourceFile).GetAwaiter().GetResult() != entry.FullHash)
+            return false;
 
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-        if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
-            RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
-        File.Copy(sourceFile, dest, overwrite: true);
+        // Same-directory part file so the final Move is a rename, never a cross-device copy.
+        var part = dest + ".asb-part";
+        try
+        {
+            File.Copy(sourceFile, part, overwrite: true);
+            if (request.Conflict == RestoreConflictMode.RenameKeep && File.Exists(dest))
+                RestoreConflict.RenameExisting(dest, DateTimeOffset.UtcNow);
+            File.Move(part, dest, overwrite: true);
+        }
+        finally
+        {
+            TryDeleteFile(part);
+        }
         ApplyMetadata(dest, entry);
+        return true;
     }
 
     /// <summary>The outcome of restoring a symlink entry. All three differ and none can stand in for another:
@@ -982,51 +1026,94 @@ public sealed class RestoreOrchestrator(
     private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>
         p == RestoreRehydratePriority.High ? RehydratePriority.High : RehydratePriority.Standard;
 
-    private static async Task EnsureOnlineAsync(
+    /// <summary>The cloud directory holding temporary Hot copies of archived volumes during a restore. The
+    /// prefix IS the bookkeeping: whatever sits under it is by definition disposable — the restore deletes its
+    /// own copies when the group finishes, and <see cref="RestoreTempSweeper"/> clears the whole directory at
+    /// startup, which is what makes a crash (or a restore run from another device) leave no bill behind.</summary>
+    public const string TempCopyPrefix = "restore-tmp/";
+
+    /// <summary>
+    /// Makes an archived family downloadable **without touching the originals**: each volume is Copy-Blob'd to
+    /// <see cref="TempCopyPrefix"/>{name} with the requested online tier, and the copies are polled until they
+    /// land. This replaced in-place rehydration on the user's call ("不是活化,而是直接复制一个副本来用"): the source
+    /// stays in Archive the whole time — its 180-day early-deletion clock never resets, no re-archive step is
+    /// owed afterwards — and cleanup collapses to "delete the directory", crash-safe and visible from any
+    /// device. Azure prices the copy's read like a rehydration (the same wait, the same priority knob), plus
+    /// the copies' online storage for the hours they exist; that trade buys never mutating the backup itself.
+    /// <para>Returns the temp base name to download from. Copies that already exist (a retried restore) are
+    /// reused rather than re-copied — the sweeper only runs at startup, so nothing else owns them.</para>
+    /// </summary>
+    private static async Task<string> EnsureHotCopyAsync(
         BlobContainerClient container, string baseRef, AccessTier tier, RehydratePriority priority, int pollSeconds,
         IProgress<string>? phase, CancellationToken ct)
     {
         var vols = new List<string>();
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
-            vols.Add(b.Name);
+            if (VolumeBlobIO.IsVolumeOf(baseRef, b.Name))
+                vols.Add(b.Name);
 
-        // Start rehydration for the volumes that haven't started yet (standard priority; all volumes, not just the first).
-        // Note: this deliberately does not reuse BlobRehydration.BeginAsync (which swallows SetAccessTierAsync exceptions per volume) —
-        // this method holds the download concurrency gate and polls indefinitely, so a failed rehydration request has to propagate quickly as a restore failure,
-        // otherwise it would hang indefinitely while holding the gate after the exception got swallowed.
-        foreach (var name in vols)
-        {
-            var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
-            if (props.AccessTier == "Archive" && string.IsNullOrEmpty(props.ArchiveStatus))
-                await container.GetBlobClient(name).SetAccessTierAsync(tier, rehydratePriority: priority, cancellationToken: ct);
-        }
-
-        // Poll until no volume is in Archive any more (rehydration complete, on the order of hours).
+        var tempBase = TempCopyPrefix + baseRef;
+        // One self-healing loop, because the wait is HOURS (a copy out of Archive is a rehydration under the
+        // hood) and a single transient failure hour three must not fail the group ("不要在这个等待时间出错"). Each
+        // cycle: volumes with no copy yet get one started, started ones get their status read; any network
+        // hiccup on either step is reported and simply retried next cycle. The only hard failures are the
+        // service SAYING the copy failed (CopyStatus.Failed/Aborted) and the caller's own cancellation — a
+        // stop during the wait leaves pending copies behind for the startup sweeper, by design.
+        var started = new HashSet<string>(StringComparer.Ordinal);
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             var pending = 0;
+            string? hiccup = null;
             foreach (var name in vols)
             {
-                var props = (await container.GetBlobClient(name).GetPropertiesAsync(cancellationToken: ct)).Value;
-                if (props.AccessTier == "Archive")
+                var dest = container.GetBlobClient(TempCopyPrefix + name);
+                try
+                {
+                    if (!started.Contains(name))
+                    {
+                        if (!(await dest.ExistsAsync(ct)).Value)
+                            await dest.StartCopyFromUriAsync(container.GetBlobClient(name).Uri, new BlobCopyFromUriOptions
+                            {
+                                AccessTier = tier,
+                                RehydratePriority = priority,
+                            }, ct);
+                        // An existing dest is an earlier attempt's copy — adopt it; the status read below judges it.
+                        started.Add(name);
+                    }
+                    var props = (await dest.GetPropertiesAsync(cancellationToken: ct)).Value;
+                    if (props.BlobCopyStatus == CopyStatus.Pending)
+                        pending++;
+                    else if (props.BlobCopyStatus is CopyStatus.Failed or CopyStatus.Aborted)
+                        throw new InvalidOperationException(
+                            $"Copying {name} out of the archive tier failed: {props.CopyStatusDescription}");
+                }
+                catch (RequestFailedException ex)
+                {
+                    // Transient (network, throttling, a 5xx): the copy service-side is unaffected — keep waiting.
                     pending++;
+                    hiccup = $"{name}: {ex.Status} {ex.ErrorCode}";
+                    started.Remove(name); // re-verify existence next cycle rather than trusting a failed round-trip
+                }
             }
             if (pending == 0)
-                return;
-            phase?.Report($"Waiting for rehydration of {baseRef} — {pending} volume(s) still archived…");
+                return tempBase;
+            phase?.Report(hiccup is null
+                ? $"Waiting for the Hot copies of {baseRef} — {pending} volume(s) still copying out of Archive…"
+                : $"Waiting for the Hot copies of {baseRef} — {pending} pending; last error (retrying): {hiccup}");
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, pollSeconds)), ct);
         }
     }
 
-    /// <summary>Sets all volumes of an archive to the given tier (best effort, used to re-archive after a restore).</summary>
-    private static async Task SetTierForVolumesAsync(BlobContainerClient container, string baseRef, AccessTier tier, CancellationToken ct)
+    /// <summary>Deletes the temp copies of one family (best effort — the startup sweeper is the backstop).</summary>
+    private static async Task DeleteTempCopiesAsync(BlobContainerClient container, string baseRef)
     {
-        await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
+        try
         {
-            try { await container.GetBlobClient(b.Name).SetAccessTierAsync(tier, cancellationToken: ct); }
-            catch { /* best effort */ }
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, TempCopyPrefix + baseRef, default))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
         }
+        catch { /* best effort */ }
     }
 
     private static string ToLocal(string relative) => relative.Replace('/', Path.DirectorySeparatorChar);

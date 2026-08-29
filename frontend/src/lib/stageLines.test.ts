@@ -83,7 +83,8 @@ describe('stageLines', () => {
 
     expect(pipeline.split(' · ')).toEqual([
       '+2.794 GB on the cloud',
-      '2 volumes uploading',
+      // No '2 volumes uploading' here any more: the in-flight heading above the stream rows says exactly
+      // that sentence, and the pipeline starts at the first thing the heading does not say.
       '2 objects waiting on the same content elsewhere',
       // The whole upload-side wait as one entry: the volumes on the disk, who owns them, and what they weigh —
       // one population stated three ways. No volume on the wire is in the volumes or the bytes, so neither
@@ -312,7 +313,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '1 volume uploading · 9 volumes (3 objects, 858.3 MB) waiting for uploading',
+      '9 volumes (3 objects, 858.3 MB) waiting for uploading',
     )
     expect(pipeline).not.toContain("uploaders' hands")
   })
@@ -402,7 +403,7 @@ describe('stageLines', () => {
       }),
     )
     expect(done).toBe('476.8 MB / 1.863 GB downloaded · 381.5 MB restored')
-    expect(pipeline).toBe('1 object downloading · 1.490 GB to go')
+    expect(pipeline).toBe('1.490 GB to go')
   })
 })
 
@@ -444,7 +445,7 @@ describe('a held pipeline', () => {
    */
   test('a wind-down says the queue is not going to be started', () => {
     expect(stageLines(held(), 'winding-down').pipeline).toBe(
-      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
         '4,374 objects left for the next run',
     )
   })
@@ -452,7 +453,7 @@ describe('a held pipeline', () => {
   /** A pause holds the same population rather than abandoning it, and the wording has to say which. */
   test('a pause says the queue is held', () => {
     expect(stageLines(held(), 'paused').pipeline).toBe(
-      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
         '4,374 objects held by the pause',
     )
   })
@@ -489,7 +490,7 @@ describe('a held pipeline', () => {
   /** Nothing changes for a run that is neither winding down nor paused. */
   test('an unheld run reads exactly as before', () => {
     expect(stageLines(held()).pipeline).toBe(
-      '1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
         '9 objects waiting for the compressor · 4,365 objects queued',
     )
   })
@@ -556,44 +557,59 @@ describe('stage labels', () => {
 
 describe('repairing in-flight wording', () => {
   /**
-   * A field report drove this: the repair's first hours are the hash gate — reading the LOCAL file to
-   * prove it still matches the recorded content — and the screen said "1 object downloading". The
-   * operator's backup lives in the Archive tier, where a download implies a rehydration they never
-   * consented to, so one wrong verb read as "the app is quietly pulling 113 GB out of Archive" and got
-   * a healthy repair stopped. The verb must follow what the item actually is: a local path is being
-   * hashed; a cloud volume name (data/… or packs/…) is being uploaded.
+   * The verb follows the item's own wire flag, not the label's shape. Two field incidents taught that:
+   * first "1 object downloading" over a local hash read (an Archive-tier operator read it as an
+   * unconsented rehydration and stopped a healthy repair), then — after repair uploads adopted
+   * source-path labels — five parallel uploads read as "5 objects hashing" because the label-prefix
+   * guess broke. The backend knows which streams cross the network; the display just repeats it.
    */
-  test('the hash gate reads as hashing, not downloading', () => {
+  test('a local read shows as hashing, not downloading', () => {
     const { inFlightPhrase } = stageLines(
       progress({
         stage: 'Repairing',
-        activeItems: [{ label: '/nas/movies/big.mkv', sent: 80_000, total: 113_949_000_000, percent: 0 }],
+        activeItems: [{ label: '/nas/movies/big.mkv', sent: 80_000, total: 113_949_000_000, percent: 0, wire: false }],
       }),
     )
     expect(inFlightPhrase).toBe('1 object hashing')
   })
 
-  test('volume replacement reads as uploading, counted in volumes', () => {
+  test('wire streams read as uploading, counted in volumes, whatever the labels look like', () => {
     const { inFlightPhrase } = stageLines(
       progress({
         stage: 'Repairing',
         activeItems: [
-          { label: 'data/xxh128:aa.1001', sent: 1, total: 2, percent: 50 },
-          { label: 'data/xxh128:aa.1002', sent: 0, total: 2, percent: 0 },
+          { label: '/nas/movies/big.mkv (50/1167)', sent: 1, total: 2, percent: 50, wire: true },
+          { label: '/nas/movies/big.mkv (51/1167)', sent: 0, total: 2, percent: 0, wire: true },
         ],
       }),
     )
     expect(inFlightPhrase).toBe('2 volumes uploading')
   })
 
-  test('a pack volume also counts as uploading', () => {
-    const { inFlightPhrase } = stageLines(
+  /** The user's reading of "Repairing: 0 of 4 objects" over a run visibly at work: the count should say
+   * which object is UNDER repair, not how many are finished — Repaired is the past tense, Repairing is
+   * not. So the stage counts one ahead while work remains, and lands exactly on N of N at the end. */
+  test('the count names the object under repair, not the finished ones', () => {
+    expect(stageLines(progress({ stage: 'Repairing', processed: 0, total: 4 })).counts)
+      .toBe('1 of 4 objects')
+    expect(stageLines(progress({ stage: 'Repairing', processed: 3, total: 4 })).counts)
+      .toBe('4 of 4 objects')
+    expect(stageLines(progress({ stage: 'Repairing', processed: 4, total: 4 })).counts)
+      .toBe('4 of 4 objects')
+  })
+
+  /** The pipeline's first segment used to repeat the in-flight heading word for word ("5 volumes
+   * uploading" twice on one screen); the heading owns that sentence now, and the pipeline starts at
+   * the first thing the heading does NOT say. */
+  test('the pipeline does not repeat the in-flight heading', () => {
+    const { pipeline } = stageLines(
       progress({
         stage: 'Repairing',
-        activeItems: [{ label: 'packs/abc.7z.001', sent: 0, total: 2, percent: 0 }],
+        activeItems: [{ label: 'x', sent: 1, total: 2, percent: 50, wire: true }],
+        queued: 3,
       }),
     )
-    expect(inFlightPhrase).toBe('1 volume uploading')
+    expect(pipeline).toBe('3 objects queued')
   })
 })
 
@@ -629,7 +645,7 @@ describe('diffing in-flight wording', () => {
     const { inFlightHeading } = stageLines(
       progress({
         stage: 'Repairing',
-        activeItems: [{ label: '/nas/movies/big.mkv', sent: 5, total: 10, percent: 50 }],
+        activeItems: [{ label: '/nas/movies/big.mkv', sent: 5, total: 10, percent: 50, wire: false }],
       }),
     )
     expect(inFlightHeading).toBe('1 object hashing:')

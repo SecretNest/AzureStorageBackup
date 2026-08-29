@@ -2395,7 +2395,8 @@ public sealed class BackupOrchestrator(
             // same thing the tier below hands over, just without having re-derived it from the file. A record missing
             // any of the three hashes cannot supply one, and falls through to the content test like any other miss.
             if (resume.FindUntouchedBlob(file.Path, mtime, info.Length)
-                is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched)
+                is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched
+                && !localResolver.IsDamagedRef(untouched.Ref))
                 return new BlobPlacement(
                     untouched.Ref, false, Math.Max(1, untouched.Volumes), [.. untouched.VolumeSizes],
                     new BlobContent(full, head, tail, untouched.Length, mtime, untouched.Raw),
@@ -2409,13 +2410,21 @@ public sealed class BackupOrchestrator(
             // write old content into the index as if it were new. (The tier above is not that: it reuses on path plus
             // metadata, and what it accepts is exactly what the diff accepts as unchanged. Anything it declines,
             // including every record written before the mtime field existed, arrives here.)
-            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done)
+            // A journal record for a ref a repair has since condemned adopts nothing: the journal vouches for
+            // what the interrupted run confirmed, but a mark landed between suspend and resume outranks it — the
+            // marks are the truth about which content is broken (volume-identity.md), and every tier that skips
+            // the upload path also skips the one place healing happens (the damagedTarget force-replacement).
+            // Falling through re-uploads and heals in passing. Same guard on all three tiers: without it, an
+            // adoption wrote a fresh index entry pointing at content already judged unrecoverable.
+            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done
+                && !localResolver.IsDamagedRef(done.Ref))
                 return new BlobPlacement(
                     done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
                     Resumed: true);
 
             // Second tier: an existing blob from another version (the original behavior, unchanged).
-            if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior)
+            if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior
+                && !localResolver.IsDamagedRef(prior.Ref))
                 return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
         }
 

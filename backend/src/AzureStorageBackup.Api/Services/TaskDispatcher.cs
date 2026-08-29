@@ -39,6 +39,10 @@ public sealed class TaskDispatcher(
             {
                 completedBackupConfigId = await ExecuteAsync(sp, task, accountId, container, ct);
             }
+            catch (OperationCanceledException)
+            {
+                // Routine shutdown, not a failure — see the matching catch inside ExecuteAsync.
+            }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Scheduled {Type} for {Account}/{Container} failed", task.TaskType, accountId, container);

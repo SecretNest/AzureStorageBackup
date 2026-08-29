@@ -98,8 +98,31 @@ public sealed class RetentionCleaner(
         var identity = info.Backup.CreatedAt.UtcTicks;
         long freedBytes = 0;
 
-        // Delete the second-level index of each retired version (cloud + local cache) and remove it from the info file.
-        foreach (var v in info.Versions.Where(v => deleted.Contains(v.Version)))
+        // Retirement commits BEFORE it deletes — the same "upload first, delete after" discipline every other
+        // destructive path in this codebase follows, and the one place that had it backwards. The old order
+        // deleted a retired version's index volumes first and wrote the info file last; a cancellation or crash
+        // in between (cleanup runs on every backup's tail, and the orchestrator deliberately swallows a Stop
+        // there as a harmless skipped cleanup) left the info file listing versions whose manifests were already
+        // gone — restore and check of those versions fail with a missing blob, discovered only when someone
+        // needs them. Committed first, a failure merely leaves the retired index behind as an unreferenced blob
+        // for a later sweep; the info file never lies. The second info write further down (pack pruning +
+        // compaction results) is untouched: one extra conditional write per retiring cleanup is the price of the
+        // crash window closing, and retirement is rare.
+        var retired = info.Versions.Where(v => deleted.Contains(v.Version)).ToList();
+        info.Versions.RemoveAll(v => deleted.Contains(v.Version));
+        if (retired.Count > 0)
+        {
+            if (trackedInfo is not null)
+                await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct);
+            else
+                await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
+        }
+
+        // Now the second-level indexes of the retired versions (cloud + local cache). Best-effort per volume:
+        // everything here is already unreferenced by the committed info file, so a failed delete is an orphan
+        // for a later sweep, never a lie — and one stubborn blob (a stray lease, a transient 5xx past the
+        // retries) must not abort the rest of the cleanup.
+        foreach (var v in retired)
         {
             // Every volume, not just the base name: deleting only the first one of a split index would leave the
             // rest behind as objects nothing references — invisible to the retention report, and reclaimed only if
@@ -107,18 +130,26 @@ public sealed class RetentionCleaner(
             foreach (var n in VolumeBlobIO.VolumeNames(v.IndexBlob, v.IndexVolumes))
             {
                 var indexBlob = container_.GetBlobClient(n);
-                // Ask for the size once before deleting. An index is not a negligibly small thing — a version index of a
-                // few hundred thousand entries can be tens of MB compressed, and missing it makes "how much space was
-                // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
-                // digit, so the cost is negligible.
-                var indexBytes = await TrySizeOfAsync(indexBlob, ct);
-                if ((await WithRetryAsync(t => indexBlob.DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
-                    freedBytes += indexBytes;
+                try
+                {
+                    // Ask for the size once before deleting. An index is not a negligibly small thing — a version index of a
+                    // few hundred thousand entries can be tens of MB compressed, and missing it makes "how much space was
+                    // freed" noticeably too low. One HEAD per retired version, and retired versions are usually a single
+                    // digit, so the cost is negligible.
+                    var indexBytes = await TrySizeOfAsync(indexBlob, ct);
+                    if ((await WithRetryAsync(t => indexBlob.DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
+                        freedBytes += indexBytes;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Unreferenced since the commit above; a later cleanup's delete attempt (or an orphan sweep)
+                    // reclaims it. Nothing to record: the committed info file is already telling the truth.
+                    _ = ex;
+                }
             }
             if (indexCache is not null)
                 await indexCache.RemoveAsync(account.Id, container, v.Version, ct);
         }
-        info.Versions.RemoveAll(v => deleted.Contains(v.Version));
 
         // Collect the data blobs and packs the remaining versions still reference, plus the still-live members of each pack (for dead-weight compaction).
         //

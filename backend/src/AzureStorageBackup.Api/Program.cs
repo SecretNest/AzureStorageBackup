@@ -253,6 +253,8 @@ if (autoResumeRegistered)
 // **Registered unconditionally**, and it has to come after the scheduler: the host stops services in reverse registration order, so registering later means stopping earlier —
 // otherwise the scheduler could start another run halfway through the suspension. This path must work with the scheduler off as well, so it does not sit inside that if.
 builder.Services.AddHostedService<GracefulSuspendService>();
+// Clears restore-tmp/ leftovers (Hot copies of archived volumes a crashed restore never deleted) — see RestoreTempSweeper.
+builder.Services.AddHostedService<RestoreTempSweeper>();
 
 // The default 5 seconds is not enough: the suspension itself only writes a few dozen bytes, but first every worker has to come out of its current step.
 // Raised to 30 seconds, to go with docker-compose's stop_grace_period — both sides have to be widened, because the shorter one gets the say.

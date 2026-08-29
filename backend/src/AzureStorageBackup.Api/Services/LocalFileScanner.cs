@@ -171,7 +171,13 @@ public sealed class LocalFileScanner
                     entries.Add(new ScannedEntry(
                         relative, EntryKind.Symlink, 0,
                         new DateTimeOffset(info.LastWriteTimeUtc),
-                        ReadPermissions(info.FullName),
+                        // NOT ReadPermissions: GetUnixFileMode(string) resolves the link, and on a dangling target it
+                    // throws FileNotFoundException — which the unreadable catch swallowed, so the symlink (a
+                    // legitimate piece of content whose target string has nothing to do with the target existing)
+                    // silently never entered the index at all: the worst-direction failure. The checker and the
+                    // compressor both special-case symlinks away from GetUnixFileMode for exactly this reason,
+                    // and the diff compares symlinks by Target alone, never by permissions.
+                    "0777",
                         Target: info.LinkTarget));
                     tracker?.Advance(0); // Scanning reads metadata only, never content, so zero bytes
                     continue;

@@ -2190,6 +2190,16 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
       {detail.currentItem && (
         <div className="mono" style={{ wordBreak: 'break-all' }}>
           {detail.currentItem}
+          {/* Diffing's read progress rides the current-item line instead of a separate in-flight block:
+              the block repeated the same path one line down, and for the small files that dominate a diff
+              the percentage carried nothing. A large file's read still shows — as this suffix. */}
+          {(() => {
+            if (detail.stage !== 'Diffing') return null
+            const a = detail.activeItems.find((x) => x.label === detail.currentItem) ?? detail.activeItems[0]
+            return a && a.total > 0
+              ? <span className="text-faint"> — {formatBytes(a.sent)} / {formatBytes(a.total)}{a.percent !== null && ` · ${a.percent}%`}</span>
+              : null
+          })()}
         </div>
       )}
       {/* Each transfer in flight gets its own line with its size and progress. This used to be crammed
@@ -2199,7 +2209,7 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           filenames at once suggests parallel compression, whereas compression is globally serialised
           (one lock — that N preparing above) and it is the transfers that run in parallel. Hashing is
           serial by design, so its heading drops the suffix. */}
-      {detail.activeItems.length > 0 && (
+      {detail.activeItems.length > 0 && detail.stage !== 'Diffing' && (
         <div className="text-faint">
           {inFlightHeading}
         </div>
@@ -2208,7 +2218,7 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           upload/download concurrency from settings (5 by default), and the gate issues slots per
           **volume**, so it does not grow with queue length or file size. Folding a few into "+2 more"
           hides the most useful thing: the stuck one is usually among those folded away. */}
-      {detail.activeItems.map((a) => (
+      {detail.stage !== 'Diffing' && detail.activeItems.map((a) => (
         <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
           {a.label}
           {a.total > 0 && (

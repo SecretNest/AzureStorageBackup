@@ -5,6 +5,7 @@ using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
 
@@ -378,4 +379,68 @@ public sealed class RetentionCleanerJournalTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+    /// <summary>Retirement must commit before it deletes — the one place in the codebase that had it backwards.
+    /// The old order deleted a retired version's index volumes from the cloud FIRST and wrote the info file (the
+    /// only record of which versions exist) LAST, so a cancellation or crash in between left the info file
+    /// pointing at manifests that no longer exist: restore and check of that version fail with a missing blob,
+    /// discovered only when someone needs it. And the window sits on every backup's tail — cleanup runs
+    /// automatically after each run, with a user-facing Stop able to cancel it mid-way (the orchestrator
+    /// swallows that cancellation as a harmless skipped cleanup). Committed-first, a failure merely leaves the
+    /// retired index behind as an unreferenced blob for a later sweep; the info file never lies.
+    /// The lease stands in for the crash: it makes the index delete fail after the commit point.</summary>
+    [SkippableFact]
+    public async Task Retirement_Commits_The_Info_File_Before_Deleting_Index_Volumes()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("cleanord");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var (idx1, vols1) = await store.WriteIndexAsync(account, name, 1, new VersionIndex { Version = 1 }, null);
+            var (idx2, vols2) = await store.WriteIndexAsync(account, name, 2, new VersionIndex { Version = 2 }, null);
+            var info = new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = name, CreatedAt = DateTimeOffset.UnixEpoch },
+                Versions =
+                [
+                    new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-2), IndexBlob = idx1, IndexVolumes = vols1, Stats = new VersionStats(0, 0, 0, 0) },
+                    new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = idx2, IndexVolumes = vols2, Stats = new VersionStats(0, 0, 0, 0) },
+                ],
+            };
+            await store.WriteInfoAsync(account, name, info, null);
+
+            // The stand-in for a crash/stop mid-deletion: the retired version's index cannot be deleted.
+            var lease = container.GetBlobClient(idx1).GetBlobLeaseClient();
+            await lease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+            try
+            {
+                try
+                {
+                    await Cleaner(factory).CleanupAsync(account, name, null, new CleanupOptions
+                    {
+                        Retention = new RetentionPolicy { MaxVersions = 1, Mode = RetentionMode.VersionOnly },
+                    }, info);
+                }
+                catch
+                {
+                    // A failed delete may still fail the cleanup; what must NOT happen is the commit going missing.
+                }
+
+                var after = await store.ReadInfoAsync(account, name, null);
+                Assert.NotNull(after);
+                Assert.Equal([2], after!.Versions.Select(v => v.Version));
+            }
+            finally
+            {
+                await lease.ReleaseAsync();
+            }
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
 }

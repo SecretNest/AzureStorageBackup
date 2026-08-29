@@ -148,4 +148,5 @@ public class AccountServiceTests : IDisposable
         Assert.Equal("proxy-pass", TestSecrets.Reader.RevealProxyPassword(fetched));
         Assert.Equal(8080, fetched.ProxyPort);
     }
+
 }

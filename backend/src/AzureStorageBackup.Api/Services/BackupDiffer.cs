@@ -362,7 +362,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
     {
         if (tracker is null)
             return await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
-        tracker.BeginItem(entry.Path, entry.Path, entry.Length);
+        tracker.BeginItem(entry.Path, entry.Path, entry.Length, wire: false); // a local read, not a transfer
         try
         {
             return await hasher.ContentIdentityAsync(

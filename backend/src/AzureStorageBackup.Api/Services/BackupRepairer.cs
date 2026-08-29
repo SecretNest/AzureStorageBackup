@@ -130,9 +130,12 @@ public sealed class BackupRepairer(
         // upload of a dedup-excluded twin, an earlier repair the marks never caught up with). The verdict is
         // overturned by the evidence, so the marks come off — this is what lets the deferred-repair loop converge
         // after a heal it did not itself perform.
-        var healedPaths = onlyPaths is null
+        var assessedScope = onlyPaths is null
+            ? null
+            : new HashSet<string>(onlyPaths.Concat(alsoMarkPaths ?? []), StringComparer.Ordinal);
+        var healedPaths = assessedScope is null
             ? []
-            : report.Findings.Where(f => f.Cloud == CloudState.Ok && onlyPaths.Contains(f.Path))
+            : report.Findings.Where(f => f.Cloud == CloudState.Ok && assessedScope.Contains(f.Path))
                 .Select(f => f.Path).ToList();
 
         // The same addressing scheme as the backup path: repairing a single-file blob has to reproduce exactly the
@@ -160,6 +163,7 @@ public sealed class BackupRepairer(
         // workload is the recorded source length (packs: their recorded original bytes).
         long WorkOf(string badRef) => badFindings.Where(f => f.Ref == badRef).Sum(f => f.Length);
 
+        var failures = new List<(string Ref, string Message)>();
         if (badBlobs.Count > 0 || deferredBlobs.Count > 0 || healedPaths.Count > 0)
         {
             // Load every version index (pack members are aggregated across versions, and after a repair the sizes
@@ -170,6 +174,40 @@ public sealed class BackupRepairer(
                 indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
 
             var changedVersions = new HashSet<int>();
+            var identity = info.Backup.CreatedAt.UtcTicks;
+            async Task PersistChangedAsync()
+            {
+                // Through the local-authoritative state machine, which keeps the ETag/cache consistent so the
+                // next backup does not hit a 412.
+                foreach (var vnum in changedVersions)
+                {
+                    await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
+                    if (indexCache is not null)
+                        await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
+                }
+                if (trackedInfo is not null)
+                    await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
+                else
+                    await store.WriteInfoAsync(account, container, info, password, ct: ct);
+            }
+
+            // MARKS LAND FIRST (volume-identity.md, designed with the user: "先废了这些文件.修一个,就恢复一个").
+            // Every problem path — selected or deferred — is marked and PERSISTED before the first object is
+            // touched. From this moment the marks state exactly which content is broken, whatever happens to
+            // this run: a backup beside a suspended repair reads them for dedup exclusion and heal-in-passing,
+            // restore reads them for substitution. Repairing an object then clears its marks (RepairBlobAsync's
+            // per-ref ClearUnrecoverable), and the end-of-run persistence records the clears.
+            // Scratch list: the pre-marks are the safety state, not the verdicts — the REPORT's unrecoverable
+            // list is owned by the end-of-run marking (deferred paths, and objects whose repair failed), or a
+            // successfully repaired path would be reported unrecoverable because it was pre-marked at start.
+            var preMarks = new List<string>();
+            foreach (var f in badFindings)
+                foreach (var (vnum, idx) in indexes)
+                    if (idx.Entries.Any(e => e.Path == f.Path))
+                        MarkUnrecoverable(idx, f.Path, preMarks, changedVersions, vnum);
+            if (changedVersions.Count > 0)
+                await PersistChangedAsync();
+
             if (tracker is not null)
                 foreach (var badRef in badBlobs)
                     tracker.Enqueue(WorkOf(badRef));
@@ -181,33 +219,62 @@ public sealed class BackupRepairer(
                 // queued subtraction (enqueued − processed − in hand) still counts the object being worked on,
                 // and the screen read "1 object hashing · 4 objects queued" over a four-object repair.
                 tracker?.BeginWork();
-                tracker?.Touch(badRef);
+                // The content-addressed ref means nothing to the person watching (the same rule as
+                // ActiveTransfer.Label): the object is named by the path(s) that reference it.
+                var faces = badFindings.Where(f => f.Ref == badRef).Select(f => f.Path).Distinct().ToList();
+                tracker?.Touch(faces.Count > 1 ? $"{faces[0]} (+{faces.Count - 1} more)" : faces.FirstOrDefault() ?? badRef);
+                // Mid-object workload progress: each landed (or verified-skipped) volume books its share, so the
+                // byte percentage and the remaining-time estimate move DURING a 100 GB object instead of at its
+                // end; the write-off below books only the remainder (never negative — shares are floored).
+                long counted = 0;
+                void WorkProgress(long share)
+                {
+                    Interlocked.Add(ref counted, share);
+                    tracker?.AdvanceWork(share);
+                }
                 try
                 {
                     if (badRef.StartsWith("packs/", StringComparison.Ordinal))
                         await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                            repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate);
+                            repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress);
                     else
                         await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate);
+                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // One object's failure must not discard the others' work: everything already repaired has
+                    // its replacement volumes in the cloud, and losing the bookkeeping meant a 10-hour run could
+                    // end with nothing recorded. The failed object keeps its start-of-run mark (truthful — it is
+                    // still broken), the loop moves on, and the run still surfaces the failure after persisting.
+                    failures.Add((badRef, ex.Message));
                 }
                 finally
                 {
                     tracker?.EndWork();
                 }
-                tracker?.Advance(0, WorkOf(badRef));
+                tracker?.Advance(0, Math.Max(0, WorkOf(badRef) - Interlocked.Read(ref counted)));
             }
 
+            // Healed verdicts span the whole assessed scope — selected AND deferred. The pre-check genuinely
+            // re-examined the deferred half (scopePaths is the union), and discarding its Ok verdicts left those
+            // paths marked forever: restore kept substituting and dedup kept excluding, deterministically, on
+            // every later cycle. Only the selected ones are REPORTED as repaired (that is what the caller asked
+            // for); a deferred heal is recorded silently.
+            var healedSet = new HashSet<string>(healedPaths, StringComparer.Ordinal);
             foreach (var path in healedPaths)
             {
                 foreach (var (vnum, idx) in indexes)
                     ClearUnrecoverable(idx, path, changedVersions, vnum);
-                // Reported as repaired: what the caller asked ("make this path whole") is true, whoever did the work.
-                repaired.Add(path);
+                if (onlyPaths!.Contains(path))
+                    repaired.Add(path);
             }
 
             // Deferred blobs: the mark and nothing else. Every path referencing the blob, in every version that
-            // does — the same aggregation the repair paths use, minus all the work.
+            // does — the same aggregation the repair paths use, minus all the work. Except the paths this very
+            // run proved healthy: a Content-level check delivers per-member verdicts inside one pack, and
+            // re-marking a healed member because it shares the archive with a damaged one reverts the heal the
+            // loop above just applied.
             foreach (var deferredRef in deferredBlobs)
             {
                 var bareRef = deferredRef.StartsWith("packs/", StringComparison.Ordinal)
@@ -215,23 +282,17 @@ public sealed class BackupRepairer(
                     : deferredRef;
                 foreach (var (vnum, idx) in indexes)
                     foreach (var e in idx.Entries)
-                        if (e.Storage is { } s && s.Ref == bareRef)
+                        if (e.Storage is { } s && s.Ref == bareRef && !healedSet.Contains(e.Path))
                             MarkUnrecoverable(idx, e.Path, unrecoverable, changedVersions, vnum);
             }
 
-            // Persist the changed version indexes + info file (through the local-authoritative state machine, which
-            // keeps the ETag/cache consistent so the next backup does not hit a 412).
-            var identity = info.Backup.CreatedAt.UtcTicks;
-            foreach (var vnum in changedVersions)
-            {
-                await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
-                if (indexCache is not null)
-                    await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
-            }
-            if (trackedInfo is not null)
-                await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
-            else
-                await store.WriteInfoAsync(account, container, info, password, ct: ct);
+            // Persist the changed version indexes + info file — successes and marks alike, whatever failed.
+            await PersistChangedAsync();
+
+            if (failures.Count > 0)
+                throw new InvalidOperationException(
+                    $"{failures.Count} object(s) failed to repair (the rest are recorded; the failed keep their marks). " +
+                    $"First: {failures[0].Ref}: {failures[0].Message}");
         }
 
         // Orphan reclamation (§4.8): done after the repair writes have landed — the reference set is built **again**
@@ -307,7 +368,8 @@ public sealed class BackupRepairer(
         IgnoreRuleSet? dontCompress, List<string> repaired,
         List<string> unrecoverable, HashSet<int> changedVersions,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
-        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null)
+        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
+        Action<long>? workProgress = null)
     {
         // The entries across all versions that reference this blob (identical content at different paths can yield several).
         var refs = indexes.SelectMany(kv => kv.Value.Entries
@@ -387,7 +449,7 @@ public sealed class BackupRepairer(
             var storeOnly = dontCompress?.MatchesFileOrAncestorDir(e.Path) ?? false;
             newSizes = await ReplaceFromVerifiedStreamAsync(
                 account, cc, blobRef, local, e.Path, fullHash, entry0.Length, dataTier, volumeBytes, password,
-                meta, storeOnly, lease, ct, tracker, uploadScope, pauseGate);
+                meta, storeOnly, lease, ct, tracker, uploadScope, pauseGate, workProgress);
             if (newSizes is not null)
                 break;
         }
@@ -435,7 +497,8 @@ public sealed class BackupRepairer(
         string localRoot, string? password, AccessTier dataTier, long? volumeBytes,
         List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
-        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null)
+        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
+        Action<long>? workProgress = null)
     {
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
@@ -494,7 +557,12 @@ public sealed class BackupRepairer(
 
             if (available.Count == 0)
             {
-                info.Packs.Remove(packId); // The whole pack cannot be rebuilt from local; every member is already marked unrecoverable
+                // The whole pack cannot be rebuilt from local; every member is already marked unrecoverable.
+                // The info.Packs entry STAYS: index entries still reference this packId, and removing its
+                // record made every later reference-set build throw ("referenced but missing from info.Packs"),
+                // which silently and permanently disabled orphan reclamation for the whole container — while an
+                // existence-level check saw the still-present pack blob and reported Ok, masking the damage.
+                // The marks are the truth here; the pack entry is the bookkeeping that keeps it tellable.
                 return;
             }
 
@@ -503,43 +571,34 @@ public sealed class BackupRepairer(
             // Through StagingArea: compression therefore shares the one global lock with backup (the two no longer
             // chew CPU at the same time), its output counts against the same budget, and it keeps the per-volume
             // release — each volume is deleted once uploaded, so the peak is only the volumes not yet uploaded.
-            // Staging/packing registration: same reasoning as the single-file path (see ReplaceBlobAsync).
-            tracker?.BeginStaging();
-            StagedItem staged;
-            try
-            {
-                staged = await staging.StageAsync(
-                    async (compressTemp, token) =>
-                    {
-                        tracker?.BeginPacking(packId);
-                        try
-                        {
-                            // The compression mode comes from the value the pack itself recorded (PackInfo.StoreOnly); the
-                            // don't-compress rules are not re-run: this rewrites the archive of the same packId in place, so
-                            // the repaired pack should match the one originally written.
-                            var result = await compressor.CompressAsync(
-                                new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
-                                    password, VolumeBytes: volumeBytes,
-                                    StoreOnly: info.Packs.TryGetValue(packId, out var packInfo) && packInfo.StoreOnly), token);
-                            return result.VolumeFiles;
-                        }
-                        finally
-                        {
-                            tracker?.EndPacking();
-                        }
-                    }, lease, ct);
-            }
-            finally
-            {
-                tracker?.EndStaging();
-            }
+            // Through StageAsync's own tracker registration — staging, the room wait, the archive lock and the
+            // packing stretch all surface exactly as the backup's do ("问题:in flight的内容比upload少").
+            var staged = await staging.StageAsync(
+                async (compressTemp, token) =>
+                {
+                    // The compression mode comes from the value the pack itself recorded (PackInfo.StoreOnly); the
+                    // don't-compress rules are not re-run: this rewrites the archive of the same packId in place, so
+                    // the repaired pack should match the one originally written.
+                    var result = await compressor.CompressAsync(
+                        new CompressionRequest(composeDir, available, Path.Combine(compressTemp, packId + ".7z"),
+                            password, VolumeBytes: volumeBytes,
+                            StoreOnly: info.Packs.TryGetValue(packId, out var packInfo) && packInfo.StoreOnly), token);
+                    return result.VolumeFiles;
+                }, lease, ct, tracker, packId);
             List<long> newSizes;
             try
             {
                 newSizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before releasing
+                var packShare = staged.Files.Count > 0
+                    ? members.Values.Sum(m => m.Length) / staged.Files.Count
+                    : 0;
                 await VolumeBlobIO.ReplaceAsync(
                     uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct,
-                    scope: uploadScope, onVolumeUploaded: staging.ReleaseFile, label: packId, beforeVolume: pauseGate);
+                    scope: uploadScope, onVolumeUploaded: f =>
+                    {
+                        staging.ReleaseFile(f);
+                        workProgress?.Invoke(packShare); // approximate per-volume share of the recorded source bytes
+                    }, label: packId, beforeVolume: pauseGate);
             }
             finally
             {
@@ -584,41 +643,33 @@ public sealed class BackupRepairer(
         string expectedHash, long expectedLength, AccessTier dataTier, long? volumeBytes, string? password,
         IReadOnlyDictionary<string, string> metadata, bool storeOnly,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker,
-        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null)
+        VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
+        Action<long>? workProgress = null)
     {
         // Segments 0/0: only the full hash and the length carry the verdict — the head/tail collision metadata
         // is reused from the index entry (see the metaEntry note in RepairBlobAsync), never recomputed here.
         var streaming = new StreamingHasher(0, 0);
         StagedItem staged;
-        // Staging/packing registration: producing the volumes for a 100 GB file is a long, byteless stretch,
-        // and unregistered it rendered as a silent gap; staging spans the wait for the global compression lock
-        // too, which is real and diagnosable ("waiting for the archive slot") only if the tracker knows.
-        tracker?.BeginStaging();
         try
         {
+            // Through StageAsync's own tracker registration — staging, the room wait, the archive lock and the
+            // packing stretch surface exactly as the backup's do, instead of the hand-rolled subset that left
+            // "waiting for staging room" invisible on the repair's in-flight line.
             staged = await staging.StageAsync(
                 async (compressTemp, token) =>
                 {
-                    tracker?.BeginPacking(localSource, expectedLength);
-                    try
-                    {
-                        var result = await compressor.CompressStreamAsync(
-                            new StreamCompressionRequest(entryName, Path.Combine(compressTemp, "b.7z"), password,
-                                VolumeBytes: volumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedLength),
-                            async (stdin, tk) =>
-                            {
-                                await using var source = FileHasher.OpenRead(localSource);
-                                await using var sink = new HashingStream(streaming, stdin);
-                                await StageTracker.CopyWithPackingProgressAsync(source, sink, tracker, tk);
-                                return streaming.Length;
-                            }, token);
-                        return result.VolumeFiles;
-                    }
-                    finally
-                    {
-                        tracker?.EndPacking();
-                    }
-                }, lease, ct);
+                    var result = await compressor.CompressStreamAsync(
+                        new StreamCompressionRequest(entryName, Path.Combine(compressTemp, "b.7z"), password,
+                            VolumeBytes: volumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedLength),
+                        async (stdin, tk) =>
+                        {
+                            await using var source = FileHasher.OpenRead(localSource);
+                            await using var sink = new HashingStream(streaming, stdin);
+                            await StageTracker.CopyWithPackingProgressAsync(source, sink, tracker, tk);
+                            return streaming.Length;
+                        }, token);
+                    return result.VolumeFiles;
+                }, lease, ct, tracker, localSource, expectedLength);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -626,10 +677,6 @@ public sealed class BackupRepairer(
             // the same event — this candidate cannot supply the content, and one bad file must not fail the
             // whole repair operation (see LocalMatchesAsync for the stakes).
             return null;
-        }
-        finally
-        {
-            tracker?.EndStaging();
         }
         try
         {
@@ -642,9 +689,16 @@ public sealed class BackupRepairer(
             // Per-volume release (staging.ReleaseFile): each volume leaves the temp disk the moment it lands,
             // so the pool drains during the upload instead of holding the whole family hostage to the end —
             // the wrap-up Release below then finds most of it already gone (ReleaseFile is idempotent).
+            // Each landed volume also books its share of the source workload, which is what keeps the byte
+            // percentage and the remaining-time estimate moving through a 100 GB object.
+            var share = staged.Files.Count > 0 ? expectedLength / staged.Files.Count : 0;
             await VolumeBlobIO.ReplaceAsync(
                 uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata,
-                uploadScope, onVolumeUploaded: staging.ReleaseFile, label: localSource, beforeVolume: pauseGate);
+                uploadScope, onVolumeUploaded: f =>
+                {
+                    staging.ReleaseFile(f);
+                    workProgress?.Invoke(share);
+                }, label: localSource, beforeVolume: pauseGate);
             return sizes;
         }
         finally
@@ -683,7 +737,7 @@ public sealed class BackupRepairer(
                 return false;
             // The read is registered as an in-flight item, so the hash gate over a 100 GB candidate shows as
             // moving bytes rather than a frozen row — the exact silence a user once read as a hang.
-            tracker?.BeginItem(local, local, expectedLength);
+            tracker?.BeginItem(local, local, expectedLength, wire: false); // a local read, not a transfer
             try
             {
                 // FullHashAsync reports increments, not cumulative values — the increments adapter is the

@@ -11,7 +11,11 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 /// <param name="Sent">Bytes of this stream that have already crossed the wire.</param>
 /// <param name="Total">Total bytes of this stream; 0 = unknown (the download path does not know until the response headers arrive).</param>
-public sealed record ActiveTransfer(string Label, long Sent, long Total)
+/// <param name="Wire">Whether this stream's bytes are crossing the network (an upload or download) rather
+/// than a local read (a hash gate, the diff's content hashing). The verb on screen is derived from it — the
+/// front end used to guess from the label's shape, and the guess broke the day repair uploads adopted
+/// source-path labels: five parallel uploads read as "5 objects hashing".</param>
+public sealed record ActiveTransfer(string Label, long Sent, long Total, bool Wire = true)
 {
     public int? Percent => Total > 0 ? (int)Math.Min(100, 100L * Sent / Total) : null;
 }
@@ -442,10 +446,11 @@ public sealed class StageTracker(
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     /// <summary>An in-flight stream: the key is the blob/volume name (unique), the value carries the human-facing label, bytes sent and total bytes.</summary>
-    private sealed class InFlight(string label, long total, string? owner, bool staged)
+    private sealed class InFlight(string label, long total, string? owner, bool staged, bool wire)
     {
         public string Label { get; } = label;
         public long Total { get; } = total;
+        public bool Wire { get; } = wire;
 
         /// <summary>Which family (blobRef) this volume belongs to. <see cref="EndItem"/> uses it to book the bytes into the right ledger
         /// instead of piling them onto one global scalar — see <see cref="StageTracker.BeginUpload"/>.
@@ -690,6 +695,23 @@ public sealed class StageTracker(
                 _skippedWork += _pendingWork;
             _pendingWork = 0;
             _transferred = total;
+            PublishIfDue(force: false);
+        }
+    }
+
+    /// <summary>Book source-side workload progress **without** finishing an item: the mid-object heartbeat of
+    /// a stage whose objects are enormous. Repair's per-object write-off (Advance at object end) left workDone
+    /// — and with it the byte percentage and the whole remaining-time estimate — frozen at zero for the many
+    /// hours the first 113.9 GB object took; each landed (or verified-skipped) volume now books its share as it
+    /// settles, and the object-end Advance books only the remainder. Touches no slot count and no transfer
+    /// ledger: those keep their exactly-once discipline.</summary>
+    public void AdvanceWork(long work)
+    {
+        if (work <= 0)
+            return;
+        lock (_gate)
+        {
+            _doneWork += work;
             PublishIfDue(force: false);
         }
     }
@@ -1024,7 +1046,8 @@ public sealed class StageTracker(
     /// it decides which ledger this volume's bytes go into; the download side and paths that skip the upload gate can just omit it.</param>
     /// <param name="staged">Whether this volume is a file in the staging pool, and so has to come out of the waiting-to-upload
     /// columns while it is on the wire. False for the raw in-place route, which sends the user's own file — see <see cref="InFlight.Staged"/>.</param>
-    public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null, bool staged = false)
+    public void BeginItem(string item, string? label = null, long totalBytes = 0, string? owner = null, bool staged = false,
+        bool wire = true)
     {
         lock (_gate)
         {
@@ -1035,7 +1058,7 @@ public sealed class StageTracker(
             // first volume is minutes. See Eta.
             if (_firstMoveMs < 0)
                 _firstMoveMs = NowMs();
-            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner, staged)))
+            if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner, staged, wire)))
                 return;
             // One more of this family's volumes has left the disk. Counted here rather than at the gate: what the waiting
             // columns mean by "not moving" is exactly "no stream open for it", which is this call.
@@ -1388,7 +1411,7 @@ public sealed class StageTracker(
         // negative that gets clamped back to 0, which on screen is a jump.
         var active = _active.Values.ToList();
         var inFlight = active
-            .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total))
+            .Select(f => new ActiveTransfer(f.Label, f.Sent, f.Total, f.Wire))
             .ToList();
         // Only the volumes that came out of the pool may be subtracted from it. The raw in-place route sends the user's
         // own file, which was never staged and never charged — subtract it and the waiting columns under-report for as

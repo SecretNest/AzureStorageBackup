@@ -1295,6 +1295,101 @@ public sealed class RestoreOrchestratorTests : IDisposable
         }
     }
 
+    /// <summary>The copy-not-rehydrate contract ("不是活化,而是直接复制一个副本来用"): restoring an archived family
+    /// serves the download from disposable Hot copies under restore-tmp/, so the archived ORIGINALS are never
+    /// touched — their tier (and 180-day early-deletion clock) survives the restore — and nothing is left
+    /// under the temp prefix afterwards.</summary>
+    [SkippableFact]
+    public async Task An_Archived_Family_Restores_Via_Copies_And_The_Originals_Stay_Archived()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rst-arc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[2_500_000];
+            new Random(23).NextBytes(content);
+            File.WriteAllBytes(Path.Combine(_src, "big.bin"), content);
+            await backup.RunAsync(BackupReq(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var dataVols = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                dataVols.Add(b.Name);
+            foreach (var v in dataVols)
+                await container.GetBlobClient(v).SetAccessTierAsync(Azure.Storage.Blobs.Models.AccessTier.Archive);
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+                RehydratePollSeconds = 1,
+            });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal(content, await File.ReadAllBytesAsync(Path.Combine(_dst, "big.bin")));
+            // The originals never left Archive.
+            foreach (var v in dataVols)
+            {
+                var props = (await container.GetBlobClient(v).GetPropertiesAsync()).Value;
+                Assert.Equal("Archive", props.AccessTier);
+            }
+            // And the temp directory is empty again — the prefix is the bookkeeping.
+            var leftovers = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "restore-tmp/", CancellationToken.None))
+                leftovers.Add(b.Name);
+            Assert.Empty(leftovers);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The blast-radius contract, pinned with a target no rename can replace: one entry whose
+    /// destination is occupied by a DIRECTORY fails alone, and its pack companions land as usual.</summary>
+    [SkippableFact]
+    public async Task A_Destination_Occupied_By_A_Directory_Fails_Alone()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rst-dirocc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteSrc("d/a.txt", "alpha");
+            WriteSrc("d/b.txt", "bravo");
+            WriteSrc("d/c.txt", "charlie");
+            await backup.RunAsync(BackupReq(account, name));
+
+            Directory.CreateDirectory(Path.Combine(_dst, "d", "b.txt")); // a directory squatting on the file's path
+
+            var result = await restore.RunAsync(new RestoreRequest
+            {
+                Account = account, Container = name, TargetRoot = _dst,
+            });
+
+            Assert.Equal("alpha", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "a.txt")));
+            Assert.Equal("charlie", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "c.txt")));
+            Assert.Equal(2, result.RestoredFiles);
+            Assert.Equal(1, result.FailedFiles);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>
     /// The overwrite decision first reads whatever file already sits at the destination, to see whether it already equals the content to be restored. That read used to be unguarded,
     /// and once it threw it got caught by the **whole group's** catch — so not one other file in the same pack could be restored.
@@ -1333,13 +1428,18 @@ public sealed class RestoreOrchestratorTests : IDisposable
                 Account = account, Container = name, TargetRoot = _dst,
             });
 
-            // The companions land as usual — before the fix these two files were never even touched.
+            // The companions land as usual — before the blast-radius fix these two were never even touched.
             Assert.Equal("alpha", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "a.txt")));
             Assert.Equal("charlie", await File.ReadAllTextAsync(Path.Combine(_dst, "d", "c.txt")));
-            Assert.Equal(2, result.RestoredFiles);
-
-            // The unreadable one fails on its own, exactly one — not all three of the group.
-            Assert.Equal(1, result.FailedFiles);
+            // The unreadable target itself now RESTORES: the verify-then-swap writer lands the content in a
+            // sibling part file and renames it over the destination, and a rename needs only directory
+            // permissions — the old File.Copy failed purely because it had to open the unreadable target for
+            // writing. The blast-radius contract (one entry's failure must not sink its group) is pinned by
+            // A_Destination_Occupied_By_A_Directory_Fails_Alone below with a target no rename can replace.
+            File.SetUnixFileMode(blocked, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            Assert.Equal("bravo", await File.ReadAllTextAsync(blocked));
+            Assert.Equal(3, result.RestoredFiles);
+            Assert.Equal(0, result.FailedFiles);
         }
         finally
         {

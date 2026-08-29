@@ -89,7 +89,7 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     private (BackupOrchestrator Backup, BackupChecker Checker, BackupRepairer Repairer, TrackedInfoStore Tracked, ILocalIndexCache IndexCache, BlobClientFactory Factory) Build(
-        IOperationLog? opLog = null, IFileHasher? repairHasher = null)
+        IOperationLog? opLog = null, IFileHasher? repairHasher = null, IBlobUploader? repairUploader = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -106,7 +106,7 @@ public sealed class BackupRepairerTests : IDisposable
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
             trackedInfo: tracked, journals: _journals);
         var repairer = new BackupRepairer(
-            factory, store, new SevenZipCompressor(), repairHasher ?? new FileHasher(), new BlobUploader(factory),
+            factory, store, new SevenZipCompressor(), repairHasher ?? new FileHasher(), repairUploader ?? new BlobUploader(factory),
             Path.Combine(_temp, "repair"), staging,
             opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache, journals: _journals);
         return (backup, checker, repairer, tracked, indexCache, factory);
@@ -417,6 +417,217 @@ public sealed class BackupRepairerTests : IDisposable
                 Assert.True((await container.GetBlobClient(v).ExistsAsync()).Value, $"family incomplete: {v} missing");
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The design's "marks land first" (volume-identity.md), never implemented until now: at repair
+    /// start, every problem path is marked unrecoverable and the marks are PERSISTED before the first object is
+    /// touched. This is what lets a backup running beside a suspended repair see the truth — dedup exclusion
+    /// and restore substitution read the marks, and a suspend that persisted nothing left them blind. The pause
+    /// gate stands in for the suspension: it fires before the first object and kills the run.</summary>
+    [SkippableFact]
+    public async Task Marks_Land_And_Persist_Before_The_First_Object_Is_Repaired()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, tracked, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repk-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "one.txt"), "first content here");
+            await File.WriteAllTextAsync(Path.Combine(_src, "two.txt"), "second content here");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                null, dontCompress: null, onlyPaths: ["one.txt", "two.txt"],
+                pauseGate: _ => throw new OperationCanceledException()));
+
+            var info = await tracked.LoadAsync(account, name, null);
+            var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+            var v1 = info!.Versions.Single();
+            var index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            Assert.Contains("one.txt", index.UnrecoverablePaths);
+            Assert.Contains("two.txt", index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>A pack whose every member is unrecoverable used to be removed from info.Packs while the index
+    /// entries still referenced it — and from then on every reference-set build for the container threw, which
+    /// silently and permanently disabled orphan reclamation AND masked the corruption (an existence check saw
+    /// the still-present pack blob and reported Ok). The pack entry stays; the marks tell the story; the
+    /// orphan scan keeps working.</summary>
+    [SkippableFact]
+    public async Task A_Pack_With_No_Recoverable_Members_Leaves_The_Reference_Set_Buildable()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repq-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "m1.txt"), "member one");
+            await File.WriteAllTextAsync(Path.Combine(_src, "m2.txt"), "member two");
+            // No SingleFileThresholdBytes override: small files group into a pack.
+            await backup.RunAsync(Req(account, name) with { Options = new BackupEngineOptions() });
+
+            // Damage the pack and remove the local sources: nothing is recoverable.
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "packs/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            File.Delete(Path.Combine(_src, "m1.txt"));
+            File.Delete(Path.Combine(_src, "m2.txt"));
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                null, dontCompress: null, onlyPaths: ["m1.txt", "m2.txt"]);
+            Assert.Equal(2, report.Unrecoverable.Distinct().Count());
+
+            // The container's safety net must survive: plant an orphan and let a full check's scan judge it.
+            await container.GetBlobClient("data/orphan").UploadAsync(new BinaryData("stray"), overwrite: true);
+            var check = await checker.CheckAsync(
+                account, name, null, null, new CheckOptions { ListOrphans = true }, _src, null, CancellationToken.None);
+            Assert.Null(check.OrphanScanIssue);
+            Assert.Contains("data/orphan", check.OrphanBlobs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>A deferred (unticked) path whose blob the repair's own pre-check proves healthy must shed its
+    /// mark — the pre-check genuinely re-examined it (the scope is onlyPaths ∪ deferPaths), and discarding the
+    /// Ok verdict left the path marked forever: restore kept substituting, dedup kept excluding, and every
+    /// later cycle reproduced the same dead end deterministically.</summary>
+    [SkippableFact]
+    public async Task A_Deferred_Path_Proven_Healthy_Sheds_Its_Mark()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, tracked, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repd-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "b.txt"), "content of b");
+            await backup.RunAsync(Req(account, name));
+            // Save the blob, damage it, defer-mark it, then put the blob back: the mark now outlives the damage.
+            string blobName = "";
+            BinaryData? saved = null;
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+            {
+                blobName = b.Name;
+                saved = (await container.GetBlobClient(b.Name).DownloadContentAsync()).Value.Content;
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            }
+            await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                null, dontCompress: null, onlyPaths: [], alsoMarkPaths: ["b.txt"]);
+            await container.GetBlobClient(blobName).UploadAsync(saved!, overwrite: true);
+
+            // The user defers it again; the pre-check finds it healthy; the verdict must overturn the mark.
+            await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                null, dontCompress: null, onlyPaths: [], alsoMarkPaths: ["b.txt"]);
+
+            var info = await tracked.LoadAsync(account, name, null);
+            var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+            var v1 = info!.Versions.Single();
+            var index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            Assert.DoesNotContain("b.txt", index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>One object's upload failure must not discard the index updates of objects already repaired in
+    /// the same run: their replacement volumes are long since in the cloud, and losing the bookkeeping meant a
+    /// 10-hour run could end with nothing recorded. The loop now backstops per object — the failed one keeps
+    /// its start-of-run mark, the successes persist, and the run still surfaces the failure.</summary>
+    [SkippableFact]
+    public async Task A_Mid_Run_Failure_Keeps_The_Objects_Already_Repaired()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var failing = new SecondFamilyFailsUploader(null!);
+        var (backup, _, repairer, tracked, _, factory) = Build(repairUploader: failing);
+        failing.Inner = new BlobUploader(factory);
+        var account = AzuriteAccount();
+        var name = RandomName("repf-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "one.txt"), "first content here");
+            await File.WriteAllTextAsync(Path.Combine(_src, "two.txt"), "second content here");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            await Assert.ThrowsAnyAsync<Exception>(() => repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                null, dontCompress: null, onlyPaths: ["one.txt", "two.txt"]));
+
+            var info = await tracked.LoadAsync(account, name, null);
+            var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+            var v1 = info!.Versions.Single();
+            var index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            // Exactly one object failed; the other's success must be on the record.
+            Assert.Single(index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Passes everything through, but the SECOND distinct volume family it is asked to upload fails
+    /// permanently — the shape of a network fault arriving mid-run.</summary>
+    private sealed class SecondFamilyFailsUploader(IBlobUploader inner) : IBlobUploader
+    {
+        public IBlobUploader Inner = inner;
+        private string? _first;
+
+        private bool Fails(string blobName)
+        {
+            var family = blobName.Split('.')[0];
+            var first = Interlocked.CompareExchange(ref _first, family, null) ?? family;
+            return family != first;
+        }
+
+        public Task<bool> UploadIfMissingAsync(Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null) =>
+            Fails(blobName) ? throw new IOException("injected fault") : Inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
+        public Task<bool> UploadIfMissingAsync(Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress) =>
+            Fails(blobName) ? throw new IOException("injected fault") : Inner.UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
+
+        public Task UploadOverwriteAsync(Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null) =>
+            Fails(blobName) ? throw new IOException("injected fault") : Inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
+        public Task UploadOverwriteAsync(Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress) =>
+            Fails(blobName) ? throw new IOException("injected fault") : Inner.UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
+
+        public Task DeleteIfExistsAsync(Account account, string container, string blobName, CancellationToken ct = default) =>
+            Inner.DeleteIfExistsAsync(account, container, blobName, ct);
     }
 
     /// <summary>Counts full-hash reads per path while behaving exactly like the real hasher.</summary>

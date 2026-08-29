@@ -200,6 +200,10 @@ export interface ActiveTransfer {
   sent: number
   total: number // 0 = unknown (a download does not know until the response headers arrive)
   percent: number | null
+  // Whether this stream's bytes cross the network (upload/download) rather than a local read (a hash
+  // gate, the diff's content hashing). The verb on screen derives from it — guessing from the label's
+  // shape broke the day repair uploads adopted source-path labels.
+  wire?: boolean
 }
 
 export interface StageProgress {

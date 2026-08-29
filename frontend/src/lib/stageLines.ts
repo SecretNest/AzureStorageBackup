@@ -112,9 +112,16 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
   // or a pack of several hundred 5 KB files). Real completion is by bytes, in the "60.618 GB / 191.000 GB
   // original (31%)" on the next line, which does use a slash because its percentage follows it and the
   // fraction is one you can legitimately form.
+  // Repairing counts one ahead: the stage's name is the present tense, and "0 of 4" over a run visibly at
+  // work read as a contradiction — the count names the object UNDER repair, landing exactly on N of N as
+  // the last one finishes (field wording: "既然是Repairing而不是Repaired,为什么不显示1 of 4").
+  const shown =
+    detail.stage === 'Repairing' && detail.total > 0
+      ? Math.min(detail.processed + 1, detail.total)
+      : detail.processed
   const counts =
     detail.total > 0
-      ? `${detail.processed.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
+      ? `${shown.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // Scanning does not know the total — computing it is what scanning is for
   // The in-flight breakdown. "N items processed" alone cannot distinguish work from a hang: during the
   // upload stage an item goes through 7z first (a 100 MB pack can take tens of seconds) before a single
@@ -230,21 +237,18 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
       ? `${waitingSubject}${waitingInner ? ` (${waitingInner})` : ''} waiting for uploading`
       : ''
   const idleOnStaging = detail.activeItems.length === 0 && detail.preparing > 0
-  // The repair stage's in-flight items are two different activities at two different times, and one static
-  // verb cannot cover both — worse, the old fallback ('downloading') was actively false for both of them.
-  // A field report shows the stakes: the hash gate (reading the LOCAL file to prove it still matches the
-  // recorded content) displayed as "1 object downloading", and to an operator whose backup lives in the
-  // Archive tier a download implies a rehydration they never consented to — one wrong verb got a healthy
-  // repair stopped. The item's label already says which activity it is: VolumeBlobIO registers cloud
-  // volume names (data/…, packs/…) while the hash gate registers the local source path, so the verb is
-  // read off the labels rather than invented per stage. The two phases never overlap (a repair handles
-  // one object at a time), so one verb per snapshot is enough.
+  // The verb follows each stream's own wire flag (does it cross the network?), stated by the backend at
+  // registration. It replaced two generations of guessing: a per-stage verb called the repair's local hash
+  // read "downloading" (an Archive-tier operator read that as an unconsented rehydration and stopped a
+  // healthy repair), and a label-prefix guess broke the day repair uploads adopted source-path labels
+  // ("5 objects hashing" over five parallel uploads). Absent flag counts as wire — every transfer-side
+  // registration sends true, and only the two local-read sites say false.
   const repairUploading =
     detail.stage === 'Repairing' &&
     detail.activeItems.length > 0 &&
-    detail.activeItems.every((a) => a.label.startsWith('data/') || a.label.startsWith('packs/'))
-  // Diffing joined the hashing club: its content reads register per file exactly like the repair's hash
-  // gate, and the fallback verb ('downloading') is just as false for them.
+    detail.activeItems.every((a) => a.wire !== false)
+  // Diffing's content reads register per file exactly like the repair's hash gate, and the fallback verb
+  // ('downloading') is just as false for them.
   const inFlightVerb =
     detail.stage === 'Uploading' || repairUploading
       ? 'uploading'
@@ -294,7 +298,9 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
     // the line already starts with "In flight", so repeating unfinished is redundant; "on the cloud"
     // states where they are.
     detail.unfinishedItemBytes > 0 && `+${formatBytes(detail.unfinishedItemBytes)} on the cloud`,
-    detail.activeItems.length > 0 && inFlightPhrase,
+    // No "N volumes uploading" here: the in-flight heading above the per-stream rows says exactly that
+    // sentence, and repeating it word for word on the next line read as two different numbers to check
+    // against each other. The pipeline starts at the first thing the heading does NOT say.
     // "right now" rather than "yet": this says **at this instant** nothing is in flight (the item in hand
     // holds the compression lock), not "it has not started". Mid-run the line above already shows
     // terabytes accumulated, so "yet" would be false.

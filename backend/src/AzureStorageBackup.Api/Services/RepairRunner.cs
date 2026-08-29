@@ -159,6 +159,15 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         }
         state.SuspendRequested = true;
         state.Cancellation.Cancel();
+        // The run can complete NATURALLY between the status check above and the cancel landing — its own
+        // completion path sets Completed and clears any persisted row it can see, but our row may land after
+        // that clear, leaving a ghost suspension: DeferredRepairs defers to it forever, and a restart offers a
+        // Resume button for a run that already finished. Completion is terminal, so one re-check settles it.
+        if (state.Status == RunStatus.Completed)
+        {
+            await ClearSuspendedAsync(configId);
+            return false;
+        }
         return true;
     }
 

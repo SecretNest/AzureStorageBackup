@@ -273,6 +273,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional StageTracker — progress is not what these boundary tests are about
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
+            null, // the optional per-volume work progress
         ]);
 
         Assert.Contains("grown.bin", unrecoverable);
@@ -322,6 +323,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional StageTracker — progress is not what these boundary tests are about
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
+            null, // the optional per-volume work progress
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -376,12 +378,16 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional StageTracker — progress is not what these boundary tests are about
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
+            null, // the optional per-volume work progress
         ]);
 
         Assert.Empty(hasher.Hashed);
         Assert.Null(compressor.LastRequest);
         Assert.Equal(["victim.txt"], unrecoverable);
-        Assert.False(info.Packs.ContainsKey("p0001"));
+        // The pack's info entry STAYS even when nothing was recoverable: index entries still reference the
+        // packId, and removing the record made every later reference-set build throw, silently disabling
+        // orphan reclamation for the whole container (see RepairPackAsync's available.Count == 0 branch).
+        Assert.True(info.Packs.ContainsKey("p0001"));
     }
 
     private static Account SampleAccount() => new()

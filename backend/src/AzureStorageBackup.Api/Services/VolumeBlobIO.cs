@@ -375,7 +375,15 @@ public static class VolumeBlobIO
             async Task Send(IProgress<long>? p)
             {
                 if (exists && existingVolumes![name].Archived)
+                {
+                    // The one deliberately inverted window (delete before write — Put Blob cannot overwrite an
+                    // archived blob): shrink it. Cancellation is honoured BEFORE the delete, so a stop/suspend
+                    // arriving now leaves the old volume in place rather than landing between the two calls; a
+                    // crash or exhausted upload retry after the delete still loses only content this very call
+                    // holds locally, and the family is already condemned/being replaced.
+                    ct.ThrowIfCancellationRequested();
                     await uploader.DeleteIfExistsAsync(account, container, name, ct);
+                }
                 await (exists
                     ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p)
                     : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p));
