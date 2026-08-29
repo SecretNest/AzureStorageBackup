@@ -629,7 +629,9 @@ public sealed class BackupRepairer(
             tracker?.BeginItem(local, local, expectedLength);
             try
             {
-                var progress = tracker?.ItemProgress(local);
+                // FullHashAsync reports increments, not cumulative values — the increments adapter is the
+                // difference between a moving byte count and the field's "stuck at 80.0 KB at 0 B/s".
+                var progress = tracker?.ItemProgressFromIncrements(local);
                 return await hasher.FullHashAsync(local, ct, progress) == expectedHash;
             }
             finally

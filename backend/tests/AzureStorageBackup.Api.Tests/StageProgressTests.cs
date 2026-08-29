@@ -424,6 +424,30 @@ public sealed class StageProgressTests
         Assert.Equal(130, seen[^1].Bytes);
     }
 
+    /// <summary>The two progress dialects must not be cross-wired. FileHasher.FullHashAsync reports
+    /// **increments** (one Report per chunk read, carrying that chunk's size), while ItemProgress speaks
+    /// the SDK's dialect of attempt-**cumulative** values. Fed straight into ItemProgress, the first chunk
+    /// lands and every following equal-sized chunk computes delta 0 and is swallowed — in the field a
+    /// 113.949 GB hash gate sat at exactly 80.0 KB (one 81920-byte buffer) for its entire read, at 0 B/s.
+    /// ItemProgressFromIncrements is the adapter increment-speaking producers must go through.</summary>
+    [Fact]
+    public void Increment_Reports_Accumulate_Into_The_Stream_Reading()
+    {
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Repairing", total: 1, seen.Add);
+
+        tracker.BeginItem("/src/big.mkv", "/src/big.mkv", totalBytes: 245760);
+        var progress = tracker.ItemProgressFromIncrements("/src/big.mkv");
+        progress.Report(81920);
+        progress.Report(81920);
+        progress.Report(81920);
+        tracker.Complete();
+
+        var flow = Assert.Single(seen[^1].ActiveItems);
+        Assert.Equal(245760, flow.Sent);       // three chunks, not one
+        Assert.Equal(245760, seen[^1].Bytes);  // and the speed numerator saw every chunk too
+    }
+
     /// <summary>In-flight begin/end **must not** count. The upload slot count carries an exactly-once constraint — a
     /// pack repacked because its members changed goes through several uploads, yet occupies exactly one slot of total.
     /// Let EndItem count on the side and the progress bar shoots past 100% (this repo already double-counted once on onItem).</summary>

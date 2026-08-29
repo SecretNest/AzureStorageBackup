@@ -1024,6 +1024,33 @@ public sealed class StageTracker(
         new DeltaProgress((delta, attemptCumulative) => AddBytes(item, delta, attemptCumulative));
 
     /// <summary>
+    /// <see cref="ItemProgress"/> for producers that report **increments** rather than attempt-cumulative
+    /// values — FileHasher.FullHashAsync reports one chunk size per read ("the caller accumulates as it
+    /// sees fit"). The two dialects must not be cross-wired: fed straight into <see cref="ItemProgress"/>,
+    /// the first chunk lands and every following equal-sized chunk computes a delta of 0 and is swallowed —
+    /// in the field, a 113.949 GB hash gate sat at exactly 80.0 KB (one 81920-byte buffer) for its entire
+    /// read, at 0 B/s, and the operator reasonably stopped a repair that was working fine.
+    /// </summary>
+    public IProgress<long> ItemProgressFromIncrements(string? item = null) =>
+        new IncrementProgress((increment, cumulative) => AddBytes(item, increment, cumulative));
+
+    /// <summary>The increments dialect: each Report carries one chunk's size, and this side does the
+    /// accumulating. Not built on <see cref="DeltaProgress"/> — that class interprets Report's argument as
+    /// cumulative and would swallow every equal-sized chunk after the first as a delta of zero, which is
+    /// the exact cross-wiring <see cref="ItemProgressFromIncrements"/> exists to prevent.</summary>
+    private sealed class IncrementProgress(Action<long, long> onProgress) : IProgress<long>
+    {
+        private long _sum;
+
+        public void Report(long increment)
+        {
+            if (increment <= 0)
+                return;
+            onProgress(increment, Interlocked.Add(ref _sum, increment));
+        }
+    }
+
+    /// <summary>
     /// Book some bytes. **Two units, two numbers**, deliberately not shared:
     /// <list type="bullet">
     /// <item>The stage total accumulates by **delta** — it is the numerator for the speed, and retransmitted bytes have to count again, because those bytes really did cross
