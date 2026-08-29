@@ -97,4 +97,29 @@ public class RepairSuspendTests(TestWebAppFactory factory) : IClassFixture<TestW
         var runner = factory.Services.GetRequiredService<RepairRunner>();
         Assert.Null(runner.Get(configId));
     }
+    /// <summary>The pause gate's three-way contract: it holds while paused, a lift releases the waiter, and a
+    /// cancellation (stop or suspend) tears through it — a paused run must still be stoppable and suspendable,
+    /// or Pause becomes a trap the operator can only escape by restarting the container.</summary>
+    [Fact]
+    public async Task The_Pause_Gate_Holds_Releases_And_Yields_To_Cancellation()
+    {
+        var state = new RepairRunState();
+
+        // Not paused: passes straight through.
+        await state.WaitWhilePausedAsync(CancellationToken.None);
+
+        state.Pause();
+        var waiting = state.WaitWhilePausedAsync(CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(waiting.IsCompleted); // held
+        state.Unpause();
+        await waiting; // released
+
+        state.Pause();
+        using var cts = new CancellationTokenSource();
+        var held = state.WaitWhilePausedAsync(cts.Token);
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => held);
+    }
+
 }

@@ -1480,6 +1480,20 @@ export function BackupConfigsPage() {
                           setRepairs((r) => ({ ...r, [c.id]: s }))
                         } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
                       }}
+                      onPause={async () => {
+                        try {
+                          await backupConfigsApi.repairPause(c.id)
+                          const s = await backupConfigsApi.repairStatus(c.id)
+                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                        } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                      }}
+                      onResumePause={async () => {
+                        try {
+                          await backupConfigsApi.repairUnpause(c.id)
+                          const s = await backupConfigsApi.repairStatus(c.id)
+                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                        } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                      }}
                       onResume={async () => {
                         try {
                           const s = await backupConfigsApi.repairResume(c.id)
@@ -2332,8 +2346,9 @@ function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => 
 // A repair is a run and displays like one: the same stage detail as the backup rows, plus suspend/resume.
 // Suspend persists only the plan's selection; resume replays it against a fresh pre-check, so files healed
 // in the meantime fall out on their own and half-replaced families are salvaged volume by volume.
-function RepairStatus({ run, onStop, onSuspend, onResume }: {
+function RepairStatus({ run, onStop, onSuspend, onResume, onPause, onResumePause }: {
   run: RepairRun; onStop: () => void; onSuspend: () => void; onResume: () => void
+  onPause: () => void; onResumePause: () => void
 }) {
   const [showDetail, setShowDetail] = useState(false)
 
@@ -2352,12 +2367,18 @@ function RepairStatus({ run, onStop, onSuspend, onResume }: {
       </div>
     )
   }
+  // Worded and styled like the backup's own suspended row ("Suspended — progress is saved · Resume"):
+  // the two rows sit one above the other, and two dialects for the same state read as two different
+  // features. The progress really is saved — the labels in the cloud are the resume state, and resuming
+  // re-checks and salvages what already uploaded.
   if (run.status === 'Suspended')
     return (
       <div className="text-warn">
-        Repair suspended — its selection is kept, and resuming re-checks and salvages what already uploaded
+        Repair suspended — progress is saved
         {' '}
-        <button type="button" onClick={onResume}>Resume repair</button>
+        <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={onResume}>
+          Resume
+        </button>
       </div>
     )
   if (run.status === 'Completed')
@@ -2376,9 +2397,25 @@ function RepairStatus({ run, onStop, onSuspend, onResume }: {
       {run.detail ? stageLabelOf(run.detail.stage) : 'Repairing'}
       {run.detail && (run.detail.workPercent ?? run.detail.percent) != null &&
         ` ${run.detail.workPercent ?? run.detail.percent}%`}
-      <StopButton onStop={onStop} />
+      {run.paused && <span className="text-warn"> · paused</span>}
+      {/* The same three controls in the same order and dress as the backup's row (Pause · Suspend · Stop):
+          the rows sit together and the controls must read as one vocabulary. Pause/Resume is one control in
+          two states, bordered so it does not vanish into text when it flips. */}
       {' '}
-      <button type="button" onClick={onSuspend}>Suspend</button>
+      <button
+        type="button"
+        className="btn-ghost btn-outline"
+        style={{ padding: '0 0.3rem' }}
+        onClick={run.paused ? onResumePause : onPause}
+      >
+        {run.paused ? 'Resume' : 'Pause'}
+      </button>{' '}
+      <button type="button" className="btn-ghost btn-outline" style={{ padding: '0 0.3rem' }} onClick={onSuspend}>
+        Suspend
+      </button>{' '}
+      <button type="button" className="btn-ghost btn-danger" style={{ padding: '0 0.3rem' }} onClick={onStop}>
+        Stop
+      </button>
       {run.detail && (
         <>
           {' '}

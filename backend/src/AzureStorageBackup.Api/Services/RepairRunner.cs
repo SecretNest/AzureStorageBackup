@@ -28,14 +28,36 @@ public sealed class RepairRunState
 
     /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
+
+    /// <summary>The run row's Pause — in-memory only, like the backup's own: a hold is a live decision, not an
+    /// intent worth surviving a restart (a restart lifts it, same as the backup's pause gate). The gate is
+    /// awaited before each object and before each volume (see BackupRepairer's pauseGate), so a pause answers
+    /// in seconds; whatever is already on the wire finishes its volume first.</summary>
+    private volatile TaskCompletionSource? _pauseGate;
+
+    public bool Paused => _pauseGate is not null;
+
+    internal void Pause() => Interlocked.CompareExchange(ref _pauseGate,
+        new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), null);
+
+    internal void Unpause() => Interlocked.Exchange(ref _pauseGate, null)?.TrySetResult();
+
+    /// <summary>Parked while paused; a cancellation (stop or suspend) tears through it — a paused run must
+    /// still be stoppable and suspendable, or Pause becomes a trap.</summary>
+    internal async Task WaitWhilePausedAsync(CancellationToken ct)
+    {
+        while (_pauseGate is { } gate)
+            await gate.Task.WaitAsync(ct);
+    }
 }
 
 public sealed record RepairRunResponse(
     string Status, IReadOnlyList<string>? Repaired, IReadOnlyList<string>? Unrecoverable,
-    IReadOnlyList<string>? DeletedOrphans, string? Error, StageProgress? Detail)
+    IReadOnlyList<string>? DeletedOrphans, string? Error, StageProgress? Detail, bool Paused = false)
 {
     public static RepairRunResponse From(RepairRunState s) => new(
-        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Report?.DeletedOrphans, s.Error, s.Detail);
+        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Report?.DeletedOrphans, s.Error, s.Detail,
+        s.Paused);
 }
 
 /// <summary>
@@ -89,6 +111,30 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// <summary>Suspend the running repair: persist the intent, then cancel. Returns false when nothing is
     /// running. The distinction from <see cref="Cancel"/> is exactly the persisted row — and the row is written
     /// **before** the cancel, so there is no window where the run has died and the intent exists nowhere.</summary>
+    /// <summary>Hold the running repair (see <see cref="RepairRunState.Pause"/>). False = nothing is running.</summary>
+    public bool Pause(int configId)
+    {
+        RepairRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running })
+            return false;
+        state.Pause();
+        return true;
+    }
+
+    /// <summary>Lift the operator's hold. False = the repair is not paused (or not running).</summary>
+    public bool Unpause(int configId)
+    {
+        RepairRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running, Paused: true })
+            return false;
+        state.Unpause();
+        return true;
+    }
+
     public async Task<bool> SuspendAsync(int configId)
     {
         RepairRunState? state;
@@ -220,7 +266,10 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     // the case-sensitive half alone — is the field incident this line used to be.
                     resolved.DontCompress(),
                     onlyPaths: onlyPaths, alsoMarkPaths: alsoMarkPaths,
-                    onProgress: d => state.Detail = d, ct: state.Cancellation.Token);
+                    onProgress: d => state.Detail = d,
+                    uploadConcurrency: settings.UploadConcurrency > 0 ? settings.UploadConcurrency : 5,
+                    pauseGate: state.WaitWhilePausedAsync,
+                    ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
                 // Completion is the only thing that retires a persisted suspension: the intent has been carried
                 // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).

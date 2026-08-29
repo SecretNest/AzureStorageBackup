@@ -322,12 +322,22 @@ public static class VolumeBlobIO
     /// whose cloud label **and length** equal its own is **skipped** (verified in place — a stopped run's landed
     /// volumes are salvaged instead of re-sent), and a volume whose name exists without proving itself is
     /// **overwritten** (an if-missing upload would keep the impostor on the grounds that something is there).</param>
+    /// <param name="cloudBytesVerify">Extra proof demanded before a label+length match may skip: given the
+    /// volume name and the matching label, answer whether the cloud's actual bytes hash to it. The repair path
+    /// supplies it — a family a check condemned gets nothing on trust — while the backup's resume leaves it
+    /// null and trusts the label (see volume-identity.md's trust split).</param>
+    /// <param name="beforeVolume">Awaited before each volume is taken up (skip or send alike) — the repair's
+    /// pause gate. Volume-granular on purpose: the backup's own pause holds only the front of its pipeline,
+    /// but a repair object can be a hundred-gigabyte family, and an object-granular hold would answer a pause
+    /// hours late.</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
         Action<string>? onVolumeUploaded = null, string? label = null,
-        IReadOnlyDictionary<string, CloudVolume>? existingVolumes = null)
+        IReadOnlyDictionary<string, CloudVolume>? existingVolumes = null,
+        Func<string, string, Task<bool>>? cloudBytesVerify = null,
+        Func<CancellationToken, Task>? beforeVolume = null)
     {
         // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
         // volumes, and showing only the path would repeat the same line thousands of times with no sign of
@@ -344,10 +354,13 @@ public static class VolumeBlobIO
 
         async Task One(string name, string file, int index)
         {
+            if (beforeVolume is not null)
+                await beforeVolume(ct);
             var exists = existingVolumes?.ContainsKey(name) == true;
             if (exists && existingVolumes![name] is { Label: { } cloudLabel } cloud
                 && cloud.Length == new FileInfo(file).Length
-                && cloudLabel == await VolumeIdentity.ComputeAsync(file, ct))
+                && cloudLabel == await VolumeIdentity.ComputeAsync(file, ct)
+                && (cloudBytesVerify is null || await cloudBytesVerify(name, cloudLabel)))
             {
                 // Verified in place: the cloud volume IS this volume, byte for byte. It still releases its
                 // staging seat below — the temp disk must not keep a skipped volume hostage.
@@ -436,66 +449,45 @@ public static class VolumeBlobIO
     }
 
     /// <summary>
-    /// Replace every volume of an archive: upload the new volumes with **overwrite** (single → baseRef;
-    /// multi → baseRef.001..M), and only after all of them succeed delete the leftover old volumes (the tail
-    /// .M+1..N, or the old base name when going from a single old volume to multiple new ones, and anything else
-    /// outside the new volume set).
+    /// Replace every volume of an archive: upload the new volumes (single → baseRef; multi → baseRef.001..M),
+    /// and only after all of them succeed delete the leftover old volumes (the tail .M+1..N, or the old base
+    /// name when going from a single old volume to multiple new ones, and anything else outside the new set).
     /// **Upload first, delete after** — the crash window drops from "the whole blob is gone" to "old and new
     /// volumes mixed" (recoverable via check/repair).
+    /// <para>
+    /// The volume transfer itself is <see cref="UploadAsync"/> — the same sliding window, gate slots, per-volume
+    /// in-flight registration and archived-target handling the backup's upload uses. It used to be a private
+    /// serial loop, and a field repair of 455.933 GB ran one volume at a time on a link the backup drives with
+    /// five ("问题1,不并发"). The one thing this path adds is distrust: <see cref="CloudBytesMatchAsync"/> is
+    /// passed as the skip's extra proof, so a volume of a condemned family is kept only when its **actual
+    /// cloud bytes** hash to the label — same-length bit rot under a preserved label is caught right here,
+    /// and the verification download stands in for a re-upload (downlink is the cheap direction).
+    /// </para>
     /// </summary>
     public static async Task ReplaceAsync(
         IBlobUploader uploader, Account account, BlobContainerClient container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? metadata = null, StageTracker? tracker = null)
+        IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
+        Action<string>? onVolumeUploaded = null, string? label = null,
+        Func<CancellationToken, Task>? beforeVolume = null)
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
-        // 0) One listing with metadata collects every existing volume's identity label — the whole compare side
-        //    of the skip decision in a single request (volume-identity.md).
+        // One listing with metadata collects every existing volume's identity label, length and tier — the
+        // whole compare side of the skip decision in a single request (volume-identity.md).
         var existing = await ListFamilyLabelsAsync(container, baseRef, ct);
 
-        // 1) Upload the new volumes — skipping any proven identical. This is the replacement of a blob a check
-        //    condemned, so nothing the cloud *says* about itself is trusted: label and length only nominate a
-        //    candidate cheaply, and the actual cloud bytes are then downloaded and hashed — same-length bit rot
-        //    under a preserved label (the one damage no metadata can see) is caught right here. The economics
-        //    still work in the incident's favor: a verification download stands in for a re-upload, and on the
-        //    asymmetric links this product lives on, downlink is the cheap direction. A kept volume is one whose
-        //    **bytes** matched, so any mix of kept and uploaded assembles into exactly the new family. For a
-        //    single volume the loop runs once and writes baseRef.
-        for (var i = 0; i < volumeFiles.Count; i++)
-        {
-            var known = existing.TryGetValue(newNames[i], out var cloud);
-            if (known && cloud.Label is not null
-                && cloud.Length == new FileInfo(volumeFiles[i]).Length
-                && cloud.Label == await VolumeIdentity.ComputeAsync(volumeFiles[i], ct)
-                && await CloudBytesMatchAsync(container, newNames[i], cloud.Label, ct))
-                continue;
-            // An archived target cannot be overwritten (Put Blob: "Overwriting an archive blob fails" — the 409
-            // BlobArchived that killed a field repair), but it can be deleted; delete first, write fresh. Only
-            // for archive: everywhere else the plain overwrite keeps the smaller crash window. The widened
-            // window here (deleted, not yet rewritten) is on a family a check already condemned, whose content
-            // this very call holds locally — a crash leaves it no less recoverable than the damage did.
-            if (known && cloud.Archived)
-                await container.GetBlobClient(newNames[i]).DeleteIfExistsAsync(cancellationToken: ct);
-            // Registered as an in-flight transfer so a repair's upload reads exactly like a backup's on screen.
-            tracker?.BeginItem(newNames[i], newNames[i], new FileInfo(volumeFiles[i]).Length);
-            try
-            {
-                await uploader.UploadOverwriteAsync(
-                    account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata,
-                    tracker?.ItemProgress(newNames[i]));
-            }
-            finally
-            {
-                tracker?.EndItem(newNames[i], 0);
-            }
-        }
+        await UploadAsync(
+            uploader, account, container.Name, baseRef, volumeFiles, tier, retry, ct, metadata,
+            scope, onVolumeUploaded, label, existing,
+            cloudBytesVerify: (name, expected) => CloudBytesMatchAsync(container, name, expected, ct),
+            beforeVolume: beforeVolume);
 
-        // 2) Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
-        //    one, or the old naming after a single↔multi switch).
-        //    Only this archive's own volumes are deleted (exactly baseRef, or the baseRef.<digits> volume suffix)
-        //    — a prefix scan would also match the collision-avoidance siblings data/{hash}~N (different content,
-        //    independently referenced), which must be excluded or someone else's data gets deleted by mistake.
+        // Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
+        // one, or the old naming after a single↔multi switch).
+        // Only this archive's own volumes are deleted (exactly baseRef, or the baseRef.<digits> volume suffix)
+        // — a prefix scan would also match the collision-avoidance siblings data/{hash}~N (different content,
+        // independently referenced), which must be excluded or someone else's data gets deleted by mistake.
         var keep = new HashSet<string>(newNames, StringComparer.Ordinal);
         await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, baseRef, ct))
             if (IsVolumeOf(baseRef, b.Name) && !keep.Contains(b.Name))

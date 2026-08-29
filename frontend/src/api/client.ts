@@ -52,9 +52,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(res.status, message, code)
   }
 
-  // 204, no content
+  // 204, no content — and any other success with an empty body (202 Accepted without a payload, say):
+  // res.json() on an empty body throws "Unexpected end of JSON input", which surfaced as a red banner the
+  // instant a suspend was accepted. An empty success simply has nothing to say.
   if (res.status === 204) return undefined as T
-  return (await res.json()) as T
+  const body = await res.text()
+  return (body ? JSON.parse(body) : undefined) as T
 }
 
 export const api = {

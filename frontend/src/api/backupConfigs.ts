@@ -545,6 +545,8 @@ export interface RepairRun {
   // The same stage detail the backup rows render — a repair is a run, and a 100 GB file's repair has an
   // honest floor of one full read plus one compression that must look like work, not a hang.
   detail: StageProgress | null
+  // The operator's hold on the running repair (in-memory, like the backup's pause).
+  paused: boolean
 }
 
 // Check is now a background job (202 plus polling): a content-level check downloads and re-hashes the
@@ -700,6 +702,8 @@ export const backupConfigsApi = {
   // fall out on their own, half-replaced families are salvaged volume by volume by the verified skip.
   // Drop the last check result (in-memory and persisted) — the dialog's doorway back to "start a new check".
   checkDrop: (id: number) => api.del(`/backup-configs/${id}/check`),
+  repairPause: (id: number) => api.post<void>(`/backup-configs/${id}/repair/pause`, {}),
+  repairUnpause: (id: number) => api.post<void>(`/backup-configs/${id}/repair/unpause`, {}),
   repairSuspend: (id: number) => api.post<void>(`/backup-configs/${id}/repair/suspend`, {}),
   repairResume: (id: number) => api.post<RepairRun>(`/backup-configs/${id}/repair/resume`, {}),
   // Stop whatever is running. Omitting `what` stops every running operation on this configuration.

@@ -771,6 +771,17 @@ public static class BackupConfigEndpoints
         // Suspend the running repair: persist the intent (the plan's selection), then yield. Resume re-derives
         // everything else — the pre-check runs fresh, healed files fall out, half-replaced families are salvaged
         // volume by volume by the verified skip. 409 when nothing is running.
+        // Hold / lift the hold on a running repair — the same pair the backup exposes as /pause and /resume.
+        group.MapPost("/{id:int}/repair/pause", (int id, RepairRunner runner) =>
+            runner.Pause(id)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "No repair is running." }));
+
+        group.MapPost("/{id:int}/repair/unpause", (int id, RepairRunner runner) =>
+            runner.Unpause(id)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "This repair is not paused." }));
+
         group.MapPost("/{id:int}/repair/suspend", async (int id, RepairRunner runner) =>
             await runner.SuspendAsync(id)
                 ? Results.Accepted()

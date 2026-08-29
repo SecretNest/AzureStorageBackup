@@ -271,6 +271,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
             new List<string>(), unrecoverable, new HashSet<int>(),
             StagingLease(), CancellationToken.None,
             null, // the optional StageTracker — progress is not what these boundary tests are about
+            null, // the optional VolumeUploadScope — parallel transfer, likewise
+            null, // the optional pause gate
         ]);
 
         Assert.Contains("grown.bin", unrecoverable);
@@ -318,6 +320,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
             // This case should be stopped by the boundary decision before it ever touches the staging area; the lease is only there to make the call go through.
             StagingLease(), CancellationToken.None,
             null, // the optional StageTracker — progress is not what these boundary tests are about
+            null, // the optional VolumeUploadScope — parallel transfer, likewise
+            null, // the optional pause gate
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -370,6 +374,8 @@ public sealed class UntrustedIndexPathTests : IDisposable
             AccessTier.Hot, null, new List<string>(), unrecoverable,
             new HashSet<int>(), StagingLease(), CancellationToken.None,
             null, // the optional StageTracker — progress is not what these boundary tests are about
+            null, // the optional VolumeUploadScope — parallel transfer, likewise
+            null, // the optional pause gate
         ]);
 
         Assert.Empty(hasher.Hashed);
