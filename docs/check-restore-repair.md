@@ -20,16 +20,29 @@ single `deep` boolean, which could not express the combinations that matter.
 > recorded per-volume sizes catches truncation and wrong blobs without downloading a byte. Existence
 > alone would pass a blob that had been replaced by something else of a different length.
 
+The `HEAD`s run as one flat pool across every object and volume, under the **Check HEAD
+concurrency** setting (default 20) — its own budget, separate from `DownloadConcurrency`, because a
+`HEAD` costs a round-trip and no bandwidth: sizing the download budget against a bandwidth cap must
+not throttle a stage that is latency-bound. One missing volume settles its family's verdict, and the
+family's remaining probes are skipped rather than paid for.
+
 ### Local axis (`LocalCheckLevel`)
 
 | Level | What it does |
 |---|---|
-| Skip | nothing |
+| Skip *(dialog default)* | nothing |
 | Existence + size + permissions | metadata only |
-| Content hash *(default)* | full comparison — and the criterion for "repairable from local" |
+| Content hash | full comparison — and the criterion for "repairable from local" |
 
 The local ladder is the same one the diff uses: length → mtime and permissions → head hash → full
 hash.
+
+> **Rationale — why the dialog defaults to Skip.** A content-level local pass reads the whole tree
+> and can run for hours, out of all proportion to a handful of findings; in practice a check is a
+> question about the cloud. Repairability of whatever the cloud half finds is answered afterwards,
+> per file, by the **Hash now** button in the findings table — or by repair itself, which hashes
+> every candidate before touching anything. (`CheckOptions` the record still defaults to Content,
+> so callers that ask for a full check get one.)
 
 **The sentinel demotes this axis and only this axis.** When the backup's sentinel path is absent —
 or, with none configured, its local root — the level is forced to Skip before the run starts, while
@@ -47,6 +60,29 @@ really did pass. See
 
 Every file gets a `CloudState`, a `LocalState` and a `Repairable` flag. Scheduled checks carry both
 levels.
+
+**What "repairable from local" means — and does not mean.** Repairable is a statement about the
+**local file against the version's recorded content**: the file at the entry's path hashes to the
+FullHash that version recorded, so repair can rebuild the cloud object from it. It says nothing
+about what survives in the cloud. Surviving volumes of a damaged family play no part in the verdict
+and are never reused in the repair — 7z output is not byte-reproducible, so a fresh compression
+cannot splice into an old family; replacement is always whole. A file can be repairable with zero
+volumes left in the cloud, and unrepairable with 999 of 1000 still there.
+
+A problem whose local side was never checked reads **Unknown**, never "no": repairability is a
+verdict only where the local content was actually hashed, and printing "0 repairable" after a
+cloud-only check is a verdict where there was only an unanswered question (it sent a real user away
+from the repair that would have fixed things). The summaries distinguish assessed counts,
+"N not assessed", and "not assessed" outright.
+
+**Hash now** answers the question for one file: the row's button hashes that single path against
+the version's recorded content, instead of demanding a content-level pass over the whole tree. The
+length is compared first, so a file that grew or shrank answers instantly without reading a byte —
+which matters when the file is 100 GB. A changed row that **grew** is additionally labelled
+*"grown — the recorded content may survive as this file's prefix"*: the length alone proves only
+growth, not that the first bytes are untouched, so the wording is *may*. The authoritative prefix
+hash happens inside repair (see below); ticking prefix recovery for a file that turns out rewritten
+costs one wasted read and nothing else.
 
 `LocalSkippedSentinel` names the path that was not there when the local axis was demoted, and is null
 otherwise. It has to be on the report rather than left for the caller to infer, for the same reason
@@ -76,8 +112,11 @@ path; `CheckRunner` owns the run, the same pattern restore and repair use.
 
 Two consequences are load-bearing and each is deliberate:
 
-- **The report outlives the run.** `GET` keeps returning the last report after the check finishes,
-  because the dialog closes the instant a check starts and reopening it has to bring the result back.
+- **The report outlives the run — and the process.** `GET` keeps returning the last report after the
+  check finishes, because the dialog closes the instant a check starts and reopening it has to bring
+  the result back. The last **completed** report is also persisted (`LastCheckRuns`), so pulling a
+  new image does not force a re-run just to see a result that was already computed; a failed run
+  carries no report and never clobbers the last real one.
 - **"Never checked" answers 204, not 404.** The dialog asks once as soon as it opens, and a 404 there
   leaves a red error in the browser console that reads like a malfunction — which is exactly how it
   was first reported.
@@ -101,8 +140,42 @@ and **replaces it completely**, deleting all old volumes before writing.
 The mtime inside the archive does not matter: display uses index metadata, and restore resets times
 and permissions.
 
+### Prefix recovery for append-only files (opt-in)
+
+A file that only ever grows — a log, a large append-only store — can outlive its own backup: the
+version's blob is damaged, the live file has grown past it, and no local file matches the recorded
+hash whole. The recorded content may still exist **as the live file's prefix**. With the dialog's
+*"Rebuild grown (appended) files from their prefix"* ticked, repair probes exactly that: a candidate
+longer than the recorded length gets its first `Length` bytes hashed (one read, no temp write); on a
+match the prefix is copied into the repair temp area, the copy is re-hashed whole (what gets
+uploaded is what must prove itself), and the blob is rebuilt from it. The live file is never
+touched, and the temp disk must hold one prefix copy.
+
+It is **off by default, deliberately**: recovery means re-uploading the whole object — for the case
+that motivated it, ~100 GB over a home uplink — and whether one version's snapshot is worth that
+belongs to the person paying for the transfer. Leaving it off is a sound choice: any later version
+of an append-only file contains the older content as a prefix anyway, so "restore the newer version,
+truncate to the recorded length" reproduces the old snapshot byte-for-byte without the upload. What
+is being recovered is **the version's recorded content**, not the leftover cloud volumes — those are
+overwritten or deleted by the replacement regardless (see above: fresh compression cannot splice
+into an old family).
+
+### Unrecoverable is a verdict, and verdicts can be overturned
+
 When repair is impossible — the local file was deleted or has changed — the path is recorded in
-`VersionIndex.UnrecoverablePaths` for the affected versions.
+`VersionIndex.UnrecoverablePaths` for the affected versions. A **later repair that heals the path
+removes the mark** in every version it repairs: left in place it would outlive the damage, and
+restore would keep routing the healed file through version substitution as if it were still lost.
+
+### Repair beside a suspended backup
+
+Repairing while a backup run sits suspended mid-flight is safe, and sequential: repair takes the
+same busy lock, so a resume attempted during a repair is refused until it finishes — nothing is
+corrupted, just queued behind a click. The suspended run's uploads are protected from the orphan
+sweep: they are in the cloud but in no version index, and only the journal records that they exist,
+so the sweep (and the check's orphan listing) honours **active journal refs** exactly as the
+retention cleaner always has. Deleting them would make the eventual resume re-upload everything it
+had already sent.
 
 > **Known limitation, shared with dedup.** Repair looks for exactly one local source, and that path
 > is the entry name. When several paths reference one member, only the entry-name path is probed —
@@ -176,9 +249,9 @@ in-flight list and the speed clock. Their stage units differ:
 
 | Stage | Unit | One unit is |
 |---|---|---|
-| Restoring | objects | one pack archive, or one single-file blob |
-| Cloud (check) | objects | one `HEAD` per pack, not per file |
-| Verifying (check) | objects | a pack downloaded, extracted and re-hashed |
+| Restoring | objects, completion by bytes | one pack archive, or one single-file blob; the percentage comes from declared source bytes |
+| Cloud (check) | volumes | one `HEAD` — the stage's unit of real work, so a thousand-volume object does not freeze the bar as one tick |
+| Verifying (check) | objects, completion by bytes | a pack downloaded, extracted and re-hashed; the percentage comes from declared bytes, since one group can be a 100 GB file or a box of small ones |
 | Local (check) | files | one index entry |
 | Listing (check) | blobs | one blob in the container, orphan or not — it counts what it lists, not what it finds |
 

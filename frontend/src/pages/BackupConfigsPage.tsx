@@ -2921,7 +2921,15 @@ function CheckModal({
                       <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
                       <td style={{ textAlign: 'center' }}>
                         {localStateLabel(f.local)}
-                        {f.grown && <span className="text-faint"> (grown — prefix may be recoverable)</span>}
+                        {/* "may": the length proves growth, not that the first bytes are untouched — the
+                            authoritative prefix hash happens inside repair, and a wrong guess costs one read.
+                            What would be recovered is the version's recorded content, rebuilt from the local
+                            file; surviving cloud volumes play no part either way. */}
+                        {f.grown && (
+                          <span className="text-faint">
+                            {' '}(grown — the recorded content may survive as this file&apos;s prefix)
+                          </span>
+                        )}
                         {/* The row's local side was never checked (the check ran cloud-only): offer to hash
                             just this file. The backend compares the length first, so an appended huge file
                             answers instantly; only a same-length file pays for a full read. */}
