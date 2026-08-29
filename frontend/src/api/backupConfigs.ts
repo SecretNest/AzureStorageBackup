@@ -477,6 +477,7 @@ export interface FileFinding {
   cloud: number // CloudState
   local: number // LocalState
   repairable: boolean
+  length: number
   // Filled in by the per-file hash: the local file is longer than the recorded content, so it may hold it
   // as a prefix — what repair's opt-in prefix recovery acts on. Absent until hashed.
   grown?: boolean

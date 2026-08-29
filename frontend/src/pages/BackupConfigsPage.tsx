@@ -2787,19 +2787,26 @@ function CheckModal({
     }
   }
 
-  const openPlan = async () => {
+  // The plan is fetched the moment a result with problems is on screen — it is priced from stats and
+  // answers instantly, and it belongs IN the findings table (same files, so one table), not behind a
+  // second click that opened a second, near-identical table just to hold the checkboxes.
+  const reportVersion = report?.version
+  const hasProblems = report != null && report.findings.some((f) => f.cloud === CloudState.MissingOrBad)
+  useEffect(() => {
+    if (reportVersion == null || !hasProblems) { setPlan(null); return }
+    let cancelled = false
     setPlanning(true)
-    try {
-      const p = await backupConfigsApi.repairPlan(config.id, report?.version ?? null)
-      setPlan(p)
-      // Ticked = repair now. Only stat-repairable rows start ticked; the rest are deferred by default.
-      setPlanSelected(new Set(p.rows.filter((r) => r.action === 'reupload').map((r) => r.path)))
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setPlanning(false)
-    }
-  }
+    backupConfigsApi.repairPlan(config.id, reportVersion)
+      .then((p) => {
+        if (cancelled) return
+        setPlan(p)
+        // Ticked = repair now. Only stat-repairable rows start ticked; the rest are deferred by default.
+        setPlanSelected(new Set(p.rows.filter((r) => r.action === 'reupload').map((r) => r.path)))
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setPlanning(false) })
+    return () => { cancelled = true }
+  }, [config.id, reportVersion, hasProblems])
 
   const runRepair = async (paths: string[], deferPaths: string[]) => {
     setPlan(null)
@@ -2858,7 +2865,7 @@ function CheckModal({
         <>
           {/* Two modes, one rule the user set: a result exists → you look at it (repair or drop); no result →
               you start a check. Options and result never share the screen. */}
-          {!report && (
+          {!report && !loadingLast && (
             <button type="button" className="btn-primary" onClick={runCheck} disabled={running}>
               {running ? 'Checking…' : 'Run check'}
             </button>
@@ -2873,7 +2880,7 @@ function CheckModal({
         </>
       }
     >
-      {!report && (<>
+      {!report && !loadingLast && (<>
       <Field label="Version">
         <select value={version ?? ''} onChange={(e) => setVersion(e.target.value === '' ? null : Number(e.target.value))}>
           <option value="">Latest</option>
@@ -3007,23 +3014,46 @@ function CheckModal({
                   exists locally — it turns Unknown into Yes or No without checking anything else.
                 </li>
                 <li>
-                  <strong>Repair…</strong> first shows the plan — which files can be re-uploaded from local and
-                  at what size, priced without reading a byte — and runs only what you tick. Everything
-                  unticked is marked damaged and left to the next backup version.
+                  Tick the files to <strong>re-upload from local now</strong> (the sizes are priced without
+                  reading a byte); everything unticked is marked damaged and left to the next backup version,
+                  which heals unchanged content automatically. The button below runs exactly that.
                 </li>
               </ul>
             </div>
           )}
           {problems.length > 0 && (
             <div className="table-scroll" tabIndex={0}>
+              {/* ONE table: the findings and the plan are the same files, and holding the checkboxes in a
+                  second, near-identical table was the confusion it looks like. The plan columns (tick, size,
+                  action) fill in as soon as the stat-priced plan answers — the tick means "re-upload now",
+                  untick means "marked, left to the next backup version". */}
               <table className="text-faint">
-                <thead><tr><th>File</th><th>Cloud</th><th>Local</th><th>Repairable</th></tr></thead>
+                <thead><tr><th></th><th>File</th><th>Size</th><th>Cloud</th><th>Local</th><th>Action</th></tr></thead>
                 <tbody>
-                  {problems.map((f) => (
+                  {problems.map((f) => {
+                    const row = plan?.rows.find((r) => r.path === f.path)
+                    return (
                     <tr key={f.path}>
+                      <td style={{ textAlign: 'center' }}>
+                        {row?.action === 'reupload' && (
+                          <input
+                            type="checkbox"
+                            checked={planSelected.has(f.path)}
+                            onChange={(e) => {
+                              const next = new Set(planSelected)
+                              if (e.target.checked) next.add(f.path)
+                              else next.delete(f.path)
+                              setPlanSelected(next)
+                            }}
+                          />
+                        )}
+                      </td>
                       <td className="mono">
                         {f.path}
                         {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {row?.action === 'reupload' ? formatBytes(row.uploadBytes) : f.length > 0 ? formatBytes(f.length) : ''}
                       </td>
                       <td className="text-danger" style={{ textAlign: 'center' }}>{cloudStateLabel(f.cloud)}</td>
                       <td style={{ textAlign: 'center' }}>
@@ -3046,68 +3076,22 @@ function CheckModal({
                           </>
                         )}
                       </td>
-                      {/* "unknown", not "no": without a local hash there is no verdict to print, and "no"
-                          reads as "repair cannot help" when the question was simply never asked. */}
-                      <td style={{ textAlign: 'center' }}>
-                        {f.repairable ? 'Yes' : f.local === LocalState.NotChecked ? 'Unknown' : 'No'}
+                      <td>
+                        {row == null
+                          ? planning ? 'pricing…' : ''
+                          : row.action === 'reupload'
+                            ? planSelected.has(f.path) ? 'Re-upload now' : 'Defer to the next backup version'
+                            : 'Changed locally — marked; the next backup keeps the current content'}
                       </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
           )}
-          {/* The repair flow: one button, then the plan, then consent. The plan is stat-and-index only, so
-              it answers instantly whatever the file sizes; nothing runs — and nothing is priced by reading a
-              byte — until the user confirms. Ticked = re-upload now; unticked = mark damaged, leave it to the
-              next backup version (which heals unchanged content by re-uploading it in place). */}
-          {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && !plan && (
-            <div style={{ marginTop: '0.6rem' }}>
-              <button type="button" onClick={openPlan} disabled={running || planning}>
-                {planning ? 'Pricing the repair…' : 'Repair…'}
-              </button>
-            </div>
-          )}
           {plan && (
-            <div style={{ marginTop: '0.6rem' }}>
-              <div className="text-faint">
-                Tick what to re-upload now; everything unticked is marked damaged and left to the next backup
-                version.
-              </div>
-              <div className="table-scroll" tabIndex={0}>
-                <table className="text-faint">
-                  <thead><tr><th></th><th>File</th><th>Action</th><th>Size</th></tr></thead>
-                  <tbody>
-                    {plan.rows.map((r) => (
-                      <tr key={r.path}>
-                        <td style={{ textAlign: 'center' }}>
-                          {r.action === 'reupload' && (
-                            <input
-                              type="checkbox"
-                              checked={planSelected.has(r.path)}
-                              onChange={(e) => {
-                                const next = new Set(planSelected)
-                                if (e.target.checked) next.add(r.path)
-                                else next.delete(r.path)
-                                setPlanSelected(next)
-                              }}
-                            />
-                          )}
-                        </td>
-                        <td className="mono">{r.path}</td>
-                        <td>
-                          {r.action === 'reupload'
-                            ? planSelected.has(r.path) ? 'Re-upload now' : 'Defer to the next backup version'
-                            : 'Changed locally — marked, next backup keeps the current content'}
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          {r.action === 'reupload' ? formatBytes(r.uploadBytes) : ''}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+            <div style={{ marginTop: '0.6rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
               {(() => {
                 // Distinct by object: several paths can share one blob, and the bill must not double-count it.
                 const bytes = new Map<string, number>()
@@ -3116,22 +3100,19 @@ function CheckModal({
                 const total = [...bytes.values()].reduce((a, b) => a + b, 0)
                 const deferred = plan.rows.length - [...planSelected].length
                 return (
-                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      className="btn-primary"
-                      onClick={() => runRepair(
-                        [...planSelected],
-                        plan.rows.filter((r) => !planSelected.has(r.path)).map((r) => r.path),
-                      )}
-                      disabled={running}
-                    >
-                      {total > 0
-                        ? `Repair now — re-uploads ${formatBytes(total)}${deferred > 0 ? `, defers ${deferred}` : ''}`
-                        : `Mark all ${plan.rows.length} for the next backup version`}
-                    </button>
-                    <button type="button" onClick={() => setPlan(null)}>Cancel</button>
-                  </div>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={() => runRepair(
+                      [...planSelected],
+                      plan.rows.filter((r) => !planSelected.has(r.path)).map((r) => r.path),
+                    )}
+                    disabled={running}
+                  >
+                    {total > 0
+                      ? `Repair now — re-uploads ${formatBytes(total)}${deferred > 0 ? `, defers ${deferred}` : ''}`
+                      : `Mark all ${plan.rows.length} for the next backup version`}
+                  </button>
                 )
               })()}
             </div>

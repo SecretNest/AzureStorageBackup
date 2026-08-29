@@ -63,6 +63,7 @@ describe('repairabilitySummary', () => {
     cloud: CloudState.MissingOrBad,
     local: LocalState.NotChecked,
     repairable: false,
+    length: 0,
     unreadableAt: null,
     ...over,
   })
