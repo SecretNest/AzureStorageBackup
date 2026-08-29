@@ -86,7 +86,10 @@ public sealed class BackupRepairer(
             // itself below; a silent pre-check leaves exactly one story told.
             .CheckAsync(account, container, password, target.Version,
                 checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct,
-                notify: false, onProgress: onProgress);
+                notify: false,
+                // The pre-check's stages surface under the repair's own name: a user watching "Cloud: N volumes"
+                // concluded a check had started instead of their repair. Same work, but the label must say whose.
+                onProgress: onProgress is null ? null : d => onProgress(d with { Stage = "Assessing" }));
         var badFindings = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .ToList();
@@ -121,6 +124,10 @@ public sealed class BackupRepairer(
         using var tracker = onProgress is null
             ? null
             : new StageTracker("Repairing", badBlobs.Count, onProgress, speedWhileInFlight: true);
+        // Headline completion by source bytes, the same reasoning as restore's: one object can be a 100 GB file
+        // or a small one, and an object count says nothing about how much of the evening is left. The per-blob
+        // workload is the recorded source length (packs: their recorded original bytes).
+        long WorkOf(string badRef) => badFindings.Where(f => f.Ref == badRef).Sum(f => f.Length);
 
         if (badBlobs.Count > 0 || deferredBlobs.Count > 0 || healedPaths.Count > 0)
         {
@@ -132,6 +139,9 @@ public sealed class BackupRepairer(
                 indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
 
             var changedVersions = new HashSet<int>();
+            if (tracker is not null)
+                foreach (var badRef in badBlobs)
+                    tracker.Enqueue(WorkOf(badRef));
             foreach (var badRef in badBlobs)
             {
                 tracker?.Touch(badRef);
@@ -141,7 +151,7 @@ public sealed class BackupRepairer(
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
                         dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker);
-                tracker?.Advance(0);
+                tracker?.Advance(0, WorkOf(badRef));
             }
 
             foreach (var path in healedPaths)

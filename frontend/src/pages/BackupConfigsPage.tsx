@@ -14,6 +14,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
 import { orphanSummary, repairabilitySummary } from '../lib/checkSummary'
+import { stageLabelOf } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
@@ -2349,7 +2350,9 @@ function RepairStatus({ run, onStop, onSuspend, onResume }: {
     )
   return (
     <div className="text-faint">
-      Repairing
+      {/* The headline names the phase actually underway (Assessing damage → Repairing), the way a backup's
+          distinguishes Diffing from Uploading — "Repairing" over a probe stage reads as the wrong operation. */}
+      {run.detail ? stageLabelOf(run.detail.stage) : 'Repairing'}
       {run.detail && (run.detail.workPercent ?? run.detail.percent) != null &&
         ` ${run.detail.workPercent ?? run.detail.percent}%`}
       <StopButton onStop={onStop} />

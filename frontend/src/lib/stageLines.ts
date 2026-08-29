@@ -12,6 +12,10 @@ const STAGE_UNITS: Record<string, string> = {
   // downloaded, extracted and re-hashed (its bytes carry the real progress), and Local counts index
   // entries — the three differ by orders of magnitude and cannot share one word.
   Cloud: 'volumes',
+  // The repair's own stages: the pre-check surfaces as Assessing (same HEAD probing, repair's name on it),
+  // and Repairing counts damaged objects with byte-based completion (declared source bytes, like restore).
+  Assessing: 'volumes',
+  Repairing: 'objects',
   Verifying: 'objects',
   Local: 'files',
   // The orphan scan's listing pass, named for the work rather than the quarry: it counts every blob it lists,
@@ -33,6 +37,14 @@ const STAGE_UNITS: Record<string, string> = {
  */
 const STAGE_LABELS: Record<string, string> = {
   LoadingIndex: 'Loading index',
+  Assessing: 'Assessing damage',
+}
+
+/** The on-screen name of a stage — exported so run headlines (the repair row) can say which phase is
+ * actually underway, the way a backup's headline distinguishes Diffing from Uploading. A row that says
+ * "Repairing" while the pre-check is still probing reads as the wrong operation entirely. */
+export function stageLabelOf(stage: string): string {
+  return STAGE_LABELS[stage] ?? stage
 }
 
 /**

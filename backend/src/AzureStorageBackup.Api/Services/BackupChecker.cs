@@ -233,7 +233,7 @@ public sealed class BackupChecker(
                     ? CloudState.NotChecked
                     : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
             var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
-            findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt });
+            findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt, Length = e.Length });
             // Only count bytes when the file was really read, or the Attributes/None levels report an astronomical "speed".
             localTracker?.Advance(options.Local == LocalCheckLevel.Content ? e.Length : 0);
         }

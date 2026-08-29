@@ -57,6 +57,10 @@ public enum LocalState { NotChecked = 0, Ok = 1, Missing = 2, Changed = 3 }
 /// <summary>Check verdict for a single file.</summary>
 public sealed record FileFinding(string Path, string? Ref, CloudState Cloud, LocalState Local)
 {
+    /// <summary>The entry's recorded source length. What a repair of this file costs is proportional to it, so
+    /// the repair's byte-based progress and the plan's sizing both read it from here.</summary>
+    public long Length { get; init; }
+
     /// <summary>The cloud copy is bad and the local content matches → repairable from local.</summary>
     public bool Repairable => Cloud == CloudState.MissingOrBad && Local == LocalState.Ok;
 

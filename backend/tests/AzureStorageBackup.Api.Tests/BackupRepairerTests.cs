@@ -145,9 +145,20 @@ public sealed class BackupRepairerTests : IDisposable
                 Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
                 await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
 
+            var stages = new HashSet<string>(StringComparer.Ordinal);
             var report = await repairer.RepairAsync(
                 account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null, onlyPaths: ["one.txt"]);
+                dontCompress: null, onlyPaths: ["one.txt"], onProgress: d => { lock (stages) stages.Add(d.Stage); });
+
+            // The pre-check's stages surface under the repair's own name: a user watching "Cloud: N volumes"
+            // concluded a check had started instead of their repair (field report). The work is the same; the
+            // label must say whose work it is.
+            lock (stages)
+            {
+                Assert.Contains("Assessing", stages);
+                Assert.Contains("Repairing", stages);
+                Assert.DoesNotContain("Cloud", stages);
+            }
 
             Assert.Equal(["one.txt"], report.Repaired);
             Assert.Equal(["two.txt"], report.Unrecoverable);
