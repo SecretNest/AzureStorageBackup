@@ -181,8 +181,8 @@ public sealed class CompressionContinuityTests : IDisposable
             inner.FullHashAsync(path, ct, onRead);
 
         public Task<ContentIdentity> ContentIdentityAsync(
-            string path, int segmentBytes, CancellationToken ct = default) =>
-            inner.ContentIdentityAsync(path, segmentBytes, ct);
+            string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null) =>
+            inner.ContentIdentityAsync(path, segmentBytes, ct, onRead);
     }
 
     /// <summary>

@@ -114,8 +114,8 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
             var deferFull = fullHashDeferred?.Invoke(entry.Path) ?? false;
             var change = prev is null
-                ? await AddedAsync(entry, full, options, deferFull, ct)
-                : await CompareAsync(entry, prev, full, kind, options, deferFull, ct);
+                ? await AddedAsync(entry, full, options, deferFull, tracker, ct)
+                : await CompareAsync(entry, prev, full, kind, options, deferFull, tracker, ct);
 
             changes.Add(change);
             if (change.Kind is ChangeKind.Added or ChangeKind.Modified)
@@ -123,15 +123,13 @@ public sealed class BackupDiffer(IFileHasher hasher)
                 changedFiles++;
                 changedBytes += entry.Length;
             }
-            // Count bytes read: only classifications that actually read content count. Unchanged files were never opened at all,
-            // and counting them makes the throughput look absurdly inflated. Same for a deferred full hash (FullHash is null) —
-            // only the file's head was touched here; counting a 100 GB file in full would spike the speed to tens of GB/s in an instant
-            // and turn the remaining time into a joke. Whether FullHash is null is precisely the accurate signal for "was it read in full".
-            tracker?.Advance(
-                change.Kind is ChangeKind.Added or ChangeKind.Modified or ChangeKind.MetadataOnly
-                && change.FullHash is not null
-                    ? entry.Length
-                    : 0);
+            // The byte ledger is fed by the read itself now (TrackedIdentityAsync's increments), not here:
+            // only classifications that actually read content report, chunk by chunk, so unchanged files and
+            // deferred full hashes still contribute nothing (counting a 100 GB deferred file in full would
+            // spike the speed to tens of GB/s and turn the remaining time into a joke — pinned by
+            // Deferred_Files_Do_Not_Inflate_The_Read_Byte_Count), and a large file's read moves the numbers
+            // while it runs instead of landing as one lump at the end. Advance only counts the entry.
+            tracker?.Advance(0);
 
             if (onChange is not null)
                 await onChange(change, ct);
@@ -181,11 +179,11 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
     private async Task<FileChange> CompareAsync(
         ScannedEntry entry, IndexEntry prev, string full, string kind, DiffOptions options, bool deferFull,
-        CancellationToken ct)
+        StageTracker? tracker, CancellationToken ct)
     {
         // A type change (file<->symlink) counts as a content change.
         if (prev.Kind != kind)
-            return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
+            return await ModifiedAsync(entry, prev, full, options, deferFull, tracker, ct);
 
         if (entry.Kind == EntryKind.Symlink)
             return entry.Target == prev.Target
@@ -194,7 +192,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
 
         // Different length → changed outright, no head pre-screen needed.
         if (entry.Length != prev.Length)
-            return await ModifiedAsync(entry, prev, full, options, deferFull, ct);
+            return await ModifiedAsync(entry, prev, full, options, deferFull, tracker, ct);
 
         // Same length, same mtime and same permissions → unchanged, skip hashing entirely.
         if (entry.ModifiedAt == prev.Mtime && entry.Permissions == prev.Permissions)
@@ -207,7 +205,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
         {
             var head = await hasher.HeadHashAsync(full, options.HeadHashBytes, ct);
             if (head != prev.HeadHash)
-                return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, null, ct);
+                return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, null, tracker, ct);
 
             // Head matches, so ask the tail. Only ask when **the full hash can be deferred**: files on that path are by definition over the
             // single-file threshold (a few MB up to hundreds of GB), so 4KB may buy out an entire full-file read — a sure win.
@@ -221,7 +219,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
             {
                 var tail = await hasher.TailHashAsync(full, options.HeadHashBytes, ct);
                 if (tail != prev.TailHash)
-                    return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, tail, ct);
+                    return await DecidedChangedAsync(entry, prev, full, options, deferFull, head, tail, tracker, ct);
             }
 
             // Head and tail both match: only a full read can tell "the content really changed" from "it just got touched".
@@ -230,7 +228,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
             //
             // Since the whole file is being read anyway, grab all three segments in one pass: the tail is picked up along the way, no extra IO.
             // Old entries missing a tail get filled in when they land in this branch — but that is free, not a trip made on purpose.
-            var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+            var id = await TrackedIdentityAsync(entry, full, options, tracker, ct);
             return id.FullHash == prev.FullHash
                 ? new FileChange(entry.Path, ChangeKind.MetadataOnly, entry, prev, id.HeadHash, id.FullHash,
                     prev.Storage, TailHash: id.TailHash)
@@ -253,32 +251,32 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// </summary>
     private async Task<FileChange> DecidedChangedAsync(
         ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, bool deferFull,
-        string head, string? tail, CancellationToken ct)
+        string head, string? tail, StageTracker? tracker, CancellationToken ct)
     {
         if (DeferrableFullHash(entry, deferFull))
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, head, null, null, TailHash: tail);
 
-        var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+        var id = await TrackedIdentityAsync(entry, full, options, tracker, ct);
         return new FileChange(
             entry.Path, ChangeKind.Modified, entry, prev, id.HeadHash, id.FullHash, null, TailHash: id.TailHash);
     }
 
     private async Task<FileChange> AddedAsync(
-        ScannedEntry entry, string full, DiffOptions options, bool deferFull, CancellationToken ct)
+        ScannedEntry entry, string full, DiffOptions options, bool deferFull, StageTracker? tracker, CancellationToken ct)
     {
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Added, entry, null, null, null, null);
 
         return await TryReadAsync(async () =>
         {
-            var id = await IdentityAsync(entry, full, options, deferFull, ct);
+            var id = await IdentityAsync(entry, full, options, deferFull, tracker, ct);
             return new FileChange(
                 entry.Path, ChangeKind.Added, entry, null, id.Head, id.Full, null, TailHash: id.Tail);
         }, entry, null);
     }
 
     private async Task<FileChange> ModifiedAsync(
-        ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, bool deferFull, CancellationToken ct)
+        ScannedEntry entry, IndexEntry prev, string full, DiffOptions options, bool deferFull, StageTracker? tracker, CancellationToken ct)
     {
         if (entry.Kind == EntryKind.Symlink)
             return new FileChange(entry.Path, ChangeKind.Modified, entry, prev, null, null, null);
@@ -289,7 +287,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
         // value the compression pass computes. So deferring is lossless.
         return await TryReadAsync(async () =>
         {
-            var id = await IdentityAsync(entry, full, options, deferFull, ct);
+            var id = await IdentityAsync(entry, full, options, deferFull, tracker, ct);
             return new FileChange(
                 entry.Path, ChangeKind.Modified, entry, prev, id.Head, id.Full, null, TailHash: id.Tail);
         }, entry, prev);
@@ -337,7 +335,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// </para>
     /// </summary>
     private async Task<(string? Head, string? Full, string? Tail)> IdentityAsync(
-        ScannedEntry entry, string full, DiffOptions options, bool deferFull, CancellationToken ct)
+        ScannedEntry entry, string full, DiffOptions options, bool deferFull, StageTracker? tracker, CancellationToken ct)
     {
         if (DeferrableFullHash(entry, deferFull))
             return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct), null, null);
@@ -347,8 +345,33 @@ public sealed class BackupDiffer(IFileHasher hasher)
             return (await hasher.HeadHashAsync(full, options.HeadHashBytes, ct),
                 await hasher.FullHashAsync(full, ct), null);
 
-        var id = await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+        var id = await TrackedIdentityAsync(entry, full, options, tracker, ct);
         return (id.HeadHash, id.FullHash, id.TailHash);
+    }
+
+    /// <summary>
+    /// The one full-content read of a diff decision, registered the way the repair's hash gate registers its
+    /// read: the file appears as an in-flight item with its size, and the read feeds cumulative bytes into it
+    /// (increments dialect — see ItemProgressFromIncrements). Without this, a first backup's hash of a 100 GB
+    /// file is a motionless file name for many minutes, indistinguishable from a hang — the exact silence the
+    /// repair side had a field incident over. This is also the diff stage's whole byte ledger now: chunks are
+    /// booked as they are read, so the speed is the disk's real pace instead of one lump per finished file.
+    /// </summary>
+    private async Task<ContentIdentity> TrackedIdentityAsync(
+        ScannedEntry entry, string full, DiffOptions options, StageTracker? tracker, CancellationToken ct)
+    {
+        if (tracker is null)
+            return await hasher.ContentIdentityAsync(full, options.HeadHashBytes, ct);
+        tracker.BeginItem(entry.Path, entry.Path, entry.Length);
+        try
+        {
+            return await hasher.ContentIdentityAsync(
+                full, options.HeadHashBytes, ct, tracker.ItemProgressFromIncrements(entry.Path));
+        }
+        finally
+        {
+            tracker.EndItem(entry.Path, 0);
+        }
     }
 
     /// <summary>

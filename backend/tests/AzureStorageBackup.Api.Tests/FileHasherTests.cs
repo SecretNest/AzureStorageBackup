@@ -40,6 +40,29 @@ public sealed class FileHasherTests : IDisposable
         Assert.Equal(Xxh128Hex(content), hash);
     }
 
+    /// <summary>The single-pass identity read reports its progress in **increments**, one Report per chunk
+    /// read — the same dialect FullHashAsync speaks, consumed through ItemProgressFromIncrements. This is what
+    /// lets the diff's content hashing of a huge file show a moving byte count instead of a frozen name.</summary>
+    [Fact]
+    public async Task ContentIdentity_Reports_Read_Increments_Summing_To_The_Length()
+    {
+        var content = new byte[200_000];
+        new Random(3).NextBytes(content);
+        var path = Write("big.bin", content);
+
+        // Not Progress<T>: that posts asynchronously and the test would race its own reads.
+        var reports = new List<long>();
+        await new FileHasher().ContentIdentityAsync(path, 4096, default, new SyncProgress(reports));
+
+        Assert.True(reports.Count >= 2, $"expected chunked increments, got {reports.Count} report(s)");
+        Assert.Equal(content.Length, reports.Sum());
+    }
+
+    private sealed class SyncProgress(List<long> sink) : IProgress<long>
+    {
+        public void Report(long value) => sink.Add(value);
+    }
+
     [Fact]
     public async Task HeadHash_Covers_Only_First_N_Bytes()
     {

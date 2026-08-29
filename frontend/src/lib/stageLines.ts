@@ -243,10 +243,12 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
     detail.stage === 'Repairing' &&
     detail.activeItems.length > 0 &&
     detail.activeItems.every((a) => a.label.startsWith('data/') || a.label.startsWith('packs/'))
+  // Diffing joined the hashing club: its content reads register per file exactly like the repair's hash
+  // gate, and the fallback verb ('downloading') is just as false for them.
   const inFlightVerb =
     detail.stage === 'Uploading' || repairUploading
       ? 'uploading'
-      : detail.stage === 'Repairing'
+      : detail.stage === 'Repairing' || detail.stage === 'Diffing'
         ? 'hashing'
         : 'downloading'
   // The in-flight number's unit **differs by direction**:
@@ -484,11 +486,12 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
   )
     .filter(Boolean)
     .join(' · ')
-  // Hand back inFlightPhrase rather than unit + inFlightVerb: the in-flight list's heading
-  // ("5 volumes uploading in parallel:") assembles exactly the same sentence, and letting the caller
-  // build it again would copy the "upload counts volumes, download counts items" rule into a second
-  // place — change one, miss the other.
-  return { counts, done, pipeline, speed, eta, inFlightPhrase, label }
+  // The in-flight list's heading, owned here so the caller cannot rebuild the sentence and drift. The
+  // "in parallel" suffix is a claim about transfers (they really do run concurrently) and must not be
+  // made over hashing: reading files for their hash is serial by design — one file at a time — and
+  // "1 object hashing in parallel" was read as a statement that hashes run concurrently.
+  const inFlightHeading = `${inFlightPhrase}${inFlightVerb === 'hashing' ? '' : ' in parallel'}:`
+  return { counts, done, pipeline, speed, eta, inFlightPhrase, inFlightHeading, label }
 }
 
 /**

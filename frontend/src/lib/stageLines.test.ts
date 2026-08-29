@@ -596,6 +596,55 @@ describe('repairing in-flight wording', () => {
   })
 })
 
+describe('diffing in-flight wording', () => {
+  /**
+   * The diff's content hashing gained the same per-file read registration as the repair's hash gate,
+   * so its verb needs the same honesty: a file being read end to end locally is hashing, not
+   * downloading. And hashing is serial by design (one file at a time, deliberately not concurrent),
+   * so the in-flight heading must not say "in parallel" over it — the user read "1 object hashing in
+   * parallel" as a claim that hashes run concurrently.
+   */
+  test('a diff-stage read is hashing, counted in files', () => {
+    const { inFlightPhrase } = stageLines(
+      progress({
+        stage: 'Diffing',
+        activeItems: [{ label: 'movies/big.mkv', sent: 5_000_000, total: 113_949_000_000, percent: 0 }],
+      }),
+    )
+    expect(inFlightPhrase).toBe('1 file hashing')
+  })
+
+  test('the hashing heading does not claim parallelism', () => {
+    const { inFlightHeading } = stageLines(
+      progress({
+        stage: 'Diffing',
+        activeItems: [{ label: 'movies/big.mkv', sent: 5, total: 10, percent: 50 }],
+      }),
+    )
+    expect(inFlightHeading).toBe('1 file hashing:')
+  })
+
+  test('the repair hash gate heading does not claim parallelism either', () => {
+    const { inFlightHeading } = stageLines(
+      progress({
+        stage: 'Repairing',
+        activeItems: [{ label: '/nas/movies/big.mkv', sent: 5, total: 10, percent: 50 }],
+      }),
+    )
+    expect(inFlightHeading).toBe('1 object hashing:')
+  })
+
+  test('transfers keep the parallel heading', () => {
+    const { inFlightHeading } = stageLines(
+      progress({
+        stage: 'Uploading',
+        activeItems: [{ label: 'a', sent: 1, total: 2, percent: 50 }],
+      }),
+    )
+    expect(inFlightHeading).toBe('1 volume uploading in parallel:')
+  })
+})
+
 describe('preparingLabelOf', () => {
   /**
    * The count and the row naming the item are two halves of one statement, so they read the word from one

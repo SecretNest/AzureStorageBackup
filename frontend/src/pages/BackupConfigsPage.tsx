@@ -2161,7 +2161,7 @@ function RunStatus({
 /// 0%, indistinguishable from a hang.
 
 function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineHold }) {
-  const { counts, done, pipeline, speed, eta, inFlightPhrase, label } = stageLines(detail, hold)
+  const { counts, done, pipeline, speed, eta, inFlightHeading, label } = stageLines(detail, hold)
 
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
@@ -2173,12 +2173,13 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
       {/* Each transfer in flight gets its own line with its size and progress. This used to be crammed
           with the content-addressed blob name (an HMAC when encrypted), which showed neither which file
           was transferring nor how much of it. */}
-      {/* The heading says "in parallel" explicitly: listing two or three filenames at once suggests
-          parallel compression, whereas compression is globally serialised (one lock — that N preparing
-          above) and it is the transfers that run in parallel. */}
+      {/* The heading (stageLines owns it): "in parallel" over transfers — listing two or three
+          filenames at once suggests parallel compression, whereas compression is globally serialised
+          (one lock — that N preparing above) and it is the transfers that run in parallel. Hashing is
+          serial by design, so its heading drops the suffix. */}
       {detail.activeItems.length > 0 && (
         <div className="text-faint">
-          {`${inFlightPhrase} in parallel:`}
+          {inFlightHeading}
         </div>
       )}
       {/* All of them are listed, no longer truncated at three. The in-flight count is bounded — it is the

@@ -39,9 +39,12 @@ public interface IFileHasher
     /// The real implementation (<see cref="FileHasher"/>) overrides it to a single read pass.
     /// </para>
     /// </summary>
+    /// <param name="onRead">Incremental read reporting, the same dialect as <see cref="FullHashAsync"/>'s:
+    /// one Report per chunk, carrying that chunk's size. The default implementation forwards it to the
+    /// full-hash pass (its read covers the whole file, so the increments still sum to the length).</param>
     async Task<ContentIdentity> ContentIdentityAsync(
-        string path, int segmentBytes, CancellationToken ct = default) =>
-        new(await FullHashAsync(path, ct),
+        string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null) =>
+        new(await FullHashAsync(path, ct, onRead),
             await HeadHashAsync(path, segmentBytes, ct),
             await TailHashAsync(path, segmentBytes, ct),
             new FileInfo(path).Length);
@@ -103,14 +106,17 @@ public sealed class FileHasher : IFileHasher
 
     /// <summary>Single read pass: the bytes are fed into all three segment hashers at once, with head and tail picked up along the way.</summary>
     public async Task<ContentIdentity> ContentIdentityAsync(
-        string path, int segmentBytes, CancellationToken ct = default)
+        string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null)
     {
         var streaming = new StreamingHasher(segmentBytes, segmentBytes);
         await using var stream = Open(path);
         var buffer = new byte[81920];
         int read;
         while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+        {
             streaming.Append(buffer.AsSpan(0, read));
+            onRead?.Report(read); // incremental, like FullHashAsync: the caller accumulates
+        }
         return new ContentIdentity(streaming.FullHash, streaming.HeadHash, streaming.TailHash, streaming.Length);
     }
 

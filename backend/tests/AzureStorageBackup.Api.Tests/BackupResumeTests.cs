@@ -158,10 +158,10 @@ public sealed class BackupResumeTests : IDisposable
         }
 
         public Task<ContentIdentity> ContentIdentityAsync(
-            string path, int segmentBytes, CancellationToken ct = default)
+            string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
             Note(path);
-            return inner.ContentIdentityAsync(path, segmentBytes, ct);
+            return inner.ContentIdentityAsync(path, segmentBytes, ct, onRead);
         }
     }
 

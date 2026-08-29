@@ -76,10 +76,10 @@ public sealed class BackupDifferTests : IDisposable
         public int IdentityCalls;
 
         public Task<ContentIdentity> ContentIdentityAsync(
-            string path, int segmentBytes, CancellationToken ct = default)
+            string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null)
         {
             Interlocked.Increment(ref IdentityCalls);
-            return inner.ContentIdentityAsync(path, segmentBytes, ct);
+            return inner.ContentIdentityAsync(path, segmentBytes, ct, onRead);
         }
 
         public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default)
@@ -434,6 +434,34 @@ public sealed class BackupDifferTests : IDisposable
 
         Assert.Equal(100, seen[^1].Bytes); // only the one that really was read in full counts
         Assert.Equal(2, seen[^1].Processed); // the entry count advances as usual; the progress bar is unaffected
+    }
+
+    /// <summary>The diff's content hashing shows the same per-file read the repair's hash gate shows: the
+    /// file registers as an in-flight item with its size, and the read feeds cumulative bytes into it. Without
+    /// this, a 100 GB first-backup hash is a motionless file name for many minutes — the exact silence the
+    /// repair side just had a field incident over. The clock is injected past the publish throttle so every
+    /// progress event lands in a snapshot.</summary>
+    [Fact]
+    public async Task Content_Hashing_Registers_The_File_As_An_In_Flight_Read()
+    {
+        var content = new byte[200_000]; // three 81920-byte chunks
+        new Random(5).NextBytes(content);
+        File.WriteAllBytes(Path.Combine(_root, "big.bin"), content);
+
+        var seen = new List<StageProgress>();
+        var t = 0L;
+        var tracker = new StageTracker("Diffing", total: 1, s => { lock (seen) seen.Add(s); }) { Clock = () => t += 300 };
+        await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous: null, tracker: tracker);
+        tracker.Complete();
+
+        lock (seen)
+        {
+            // The read surfaced with its true size and ran to the end of it.
+            Assert.Contains(seen, s => s.ActiveItems.Any(a => a.Label == "big.bin" && a.Total == content.Length));
+            Assert.Contains(seen, s => s.ActiveItems.Any(a => a.Label == "big.bin" && a.Sent == content.Length));
+            // And the byte ledger counted the read exactly once (the increments replace the per-file Advance).
+            Assert.Equal(content.Length, seen[^1].Bytes);
+        }
     }
 
     [Fact]
