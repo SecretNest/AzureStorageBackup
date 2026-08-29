@@ -2330,8 +2330,19 @@ function RepairStatus({ run, onStop, onSuspend, onResume }: {
 
   if (run.status === 'Failed')
     return <div className="text-danger">Repair failed: {run.error}</div>
-  if (run.status === 'Canceled')
-    return <div className="text-warn">Repair stopped — files already repaired are kept</div>
+  if (run.status === 'Canceled') {
+    // The reassurance is earned, not boilerplate: a stop during assessment or mid-first-object has
+    // repaired nothing, and "files already repaired are kept" over that read as a claim about work that
+    // never happened. Only a stop that left completed objects behind gets the suffix, with the count.
+    const kept = run.detail?.stage === 'Repairing' ? run.detail.processed : 0
+    return (
+      <div className="text-warn">
+        {kept > 0
+          ? `Repair stopped — the ${kept === 1 ? 'object' : `${kept.toLocaleString()} objects`} already repaired ${kept === 1 ? 'is' : 'are'} kept`
+          : 'Repair stopped'}
+      </div>
+    )
+  }
   if (run.status === 'Suspended')
     return (
       <div className="text-warn">

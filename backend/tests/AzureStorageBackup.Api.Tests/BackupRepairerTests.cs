@@ -89,7 +89,7 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     private (BackupOrchestrator Backup, BackupChecker Checker, BackupRepairer Repairer, TrackedInfoStore Tracked, ILocalIndexCache IndexCache, BlobClientFactory Factory) Build(
-        IOperationLog? opLog = null)
+        IOperationLog? opLog = null, IFileHasher? repairHasher = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -106,7 +106,7 @@ public sealed class BackupRepairerTests : IDisposable
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
             trackedInfo: tracked, journals: _journals);
         var repairer = new BackupRepairer(
-            factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
+            factory, store, new SevenZipCompressor(), repairHasher ?? new FileHasher(), new BlobUploader(factory),
             Path.Combine(_temp, "repair"), staging,
             opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache, journals: _journals);
         return (backup, checker, repairer, tracked, indexCache, factory);
@@ -259,6 +259,139 @@ public sealed class BackupRepairerTests : IDisposable
             }
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>A big store-only file's repair used to read the source twice: once for the hash gate, once
+    /// to produce the volumes. The user's call on seeing it live: "这种大文件也都是不用压缩的,读两遍而已,不如合并" —
+    /// so the single-file blob route now verifies **during** the volume production (the same
+    /// hash-rides-the-compression-read trick the backup path uses), and the separate full read is gone.
+    /// The hasher counts the proof: repairing this blob must not call FullHashAsync on its source at all.</summary>
+    [SkippableFact]
+    public async Task Blob_Repair_Verifies_During_Volume_Production_Without_A_Separate_Read()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var counting = new CountingHasher(new FileHasher());
+        var (backup, _, repairer, _, _, factory) = Build(repairHasher: counting);
+        var account = AzuriteAccount();
+        var name = RandomName("repm-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[2_500_000];
+            new Random(11).NextBytes(content);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), content);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var volumes = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                volumes.Add(b.Name);
+            var damaged = volumes.Order(StringComparer.Ordinal).ElementAt(1);
+            await container.GetBlobClient(damaged).DeleteIfExistsAsync();
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                1_000_000, dontCompress: null, onlyPaths: ["big.bin"]);
+
+            Assert.Equal(["big.bin"], report.Repaired);
+            // The verdict came from the production read itself — no separate hash pass over the source.
+            Assert.Equal(0, counting.FullCalls("big.bin"));
+            // And the family is whole again: the volume that was deleted exists once more.
+            Assert.True((await container.GetBlobClient(damaged).ExistsAsync()).Value,
+                $"the repaired family is missing {damaged}");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The merged verification must keep the hash gate's guarantee: a local file that changed since
+    /// the backup — same length, different bytes, the one change stat cannot see — must never be uploaded
+    /// under the recorded content's address. The verdict now falls out of the production read; a mismatch
+    /// discards the produced volumes, marks the path, and leaves the damaged family exactly as found.</summary>
+    [SkippableFact]
+    public async Task A_Locally_Changed_Same_Length_Source_Never_Overwrites_The_Cloud()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repn-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[2_500_000];
+            new Random(13).NextBytes(content);
+            var local = Path.Combine(_src, "big.bin");
+            await File.WriteAllBytesAsync(local, content);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var volumes = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                volumes.Add(b.Name);
+            var damaged = volumes.Order(StringComparer.Ordinal).ElementAt(1);
+            await container.GetBlobClient(damaged).DeleteIfExistsAsync();
+
+            content[1_234_567] ^= 0xFF; // bit rot / an in-place edit: same length, different content
+            await File.WriteAllBytesAsync(local, content);
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                1_000_000, dontCompress: null, onlyPaths: ["big.bin"]);
+
+            Assert.Empty(report.Repaired);
+            Assert.Equal(["big.bin"], report.Unrecoverable);
+            // Nothing was written: the damaged family is exactly as the repair found it.
+            Assert.False((await container.GetBlobClient(damaged).ExistsAsync()).Value,
+                "a mismatched source must not resurrect the family");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>Counts full-hash reads per path while behaving exactly like the real hasher.</summary>
+    private sealed class CountingHasher(IFileHasher inner) : IFileHasher
+    {
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _full = new(StringComparer.Ordinal);
+
+        public int FullCalls(string pathSuffix) =>
+            _full.Where(kv => kv.Key.EndsWith(pathSuffix, StringComparison.Ordinal)).Sum(kv => kv.Value);
+
+        public Task<string> HeadHashAsync(string path, int headBytes, CancellationToken ct = default) =>
+            inner.HeadHashAsync(path, headBytes, ct);
+
+        public Task<string> TailHashAsync(string path, int tailBytes, CancellationToken ct = default) =>
+            inner.TailHashAsync(path, tailBytes, ct);
+
+        public Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null)
+        {
+            _full.AddOrUpdate(path, 1, (_, n) => n + 1);
+            return inner.FullHashAsync(path, ct, onRead);
+        }
+
+        public Task<ContentIdentity> ContentIdentityAsync(
+            string path, int segmentBytes, CancellationToken ct = default, IProgress<long>? onRead = null)
+        {
+            _full.AddOrUpdate(path, 1, (_, n) => n + 1);
+            return inner.ContentIdentityAsync(path, segmentBytes, ct, onRead);
+        }
     }
 
     /// <summary>The retirement-interplay kernel (volume-identity.md § retirement needs no coordination): a

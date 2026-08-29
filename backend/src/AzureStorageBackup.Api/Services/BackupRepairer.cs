@@ -303,37 +303,6 @@ public sealed class BackupRepairer(
         var fullHash = entry0.FullHash;
         var raw = entry0.Storage!.Raw;
 
-        // Find a local file with matching content at any of the referencing paths, and record its backup-relative
-        // path along the way: DontCompress matches on paths, so StoreOnly has to be derived from the path actually
-        // taken for the recompression (when several paths with identical content share one blob, a fresh backup
-        // derives it from the one actually uploaded too).
-        string? localSource = null;
-        string? sourcePath = null;
-        foreach (var (_, e) in refs)
-        {
-            var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
-            // e.Path comes from the cloud index, which after /import is attacker-controlled (design §5): an entry
-            // that escapes localRoot turns "is there a local file whose content hash equals X" into a probeable
-            // confirmation oracle, and once probed it would also upload the content of that out-of-root file to the
-            // cloud. Skip this candidate path — the other legitimate references to the same content can still be
-            // tried, and when none of them is usable it falls through to "mark unrecoverable" as usual.
-            if (!PathBoundary.IsWithin(localRoot, local))
-                continue;
-            if (await LocalMatchesAsync(local, fullHash, entry0.Length, ct, tracker))
-            {
-                localSource = local;
-                sourcePath = e.Path;
-                break;
-            }
-        }
-
-        if (localSource is null)
-        {
-            // Local cannot supply it → every entry referencing this blob is unrecoverable in its own version.
-            foreach (var (vnum, e) in refs)
-                MarkUnrecoverable(indexes[vnum], e.Path, unrecoverable, changedVersions, vnum);
-            return;
-        }
         // The collision-detection metadata must match a fresh backup exactly: reuse the length/head/tail already
         // recorded on the entry (the content has not changed — it passed the fullHash check — so those values are
         // unchanged) rather than recomputing them here, which would risk disagreeing with the metadata of the other
@@ -351,14 +320,65 @@ public sealed class BackupRepairer(
             .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
         var meta = new Dictionary<string, string>(
             addressing.Metadata(fullHash!, metaEntry.Length, metaEntry.HeadHash, metaEntry.TailHash));
-        if (raw)
-            // The raw route's blob IS the source file, whose full hash is already verified this very repair — the
-            // uploader uses it verbatim instead of buffering and rehashing (see BlobUploader's caller-supplied-label rule).
-            meta[VolumeIdentity.MetaKey] = fullHash!;
-        // The same derivation as a fresh backup (BackupOrchestrator.HandleBlobAsync): a path that hits DontCompress is stored, not compressed.
-        var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
-        var newSizes = await ReplaceBlobAsync(
-            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct, tracker);
+
+        // Try the referencing paths as repair sources, one at a time, deriving StoreOnly from the path actually
+        // taken (DontCompress matches on paths — same derivation as a fresh backup, and the same rule as when a
+        // fresh backup picks which of several identical-content paths it uploads).
+        //
+        // The two routes verify the source at different moments, and the difference is the whole design:
+        // · 7z route — the verdict **rides the production read** ("这种大文件也都是不用压缩的,读两遍而已,不如合并"):
+        //   the old hash gate cost one extra end-to-end read of the source before a single volume was produced,
+        //   which on a store-only 100 GB media file is the larger half of the repair's local IO. Only the free
+        //   stat gate runs up front — a wrong-length candidate cannot hash-match and is rejected before any
+        //   production is paid for.
+        // · raw route — the gate stays: the upload streams straight from the source under a label that CLAIMS
+        //   the recorded hash, so the claim must be proven before the upload exists at all.
+        IReadOnlyList<long>? newSizes = null;
+        foreach (var (_, e) in refs)
+        {
+            var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
+            // e.Path comes from the cloud index, which after /import is attacker-controlled (design §5): an entry
+            // that escapes localRoot turns "is there a local file whose content hash equals X" into a probeable
+            // confirmation oracle, and once probed it would also upload the content of that out-of-root file to the
+            // cloud. Skip this candidate path — the other legitimate references to the same content can still be
+            // tried, and when none of them is usable it falls through to "mark unrecoverable" as usual.
+            if (!PathBoundary.IsWithin(localRoot, local))
+                continue;
+            if (raw)
+            {
+                if (!await LocalMatchesAsync(local, fullHash, entry0.Length, ct, tracker))
+                    continue;
+                // The raw route's blob IS the source file, whose full hash the gate just verified — the uploader
+                // uses it verbatim instead of buffering and rehashing (see BlobUploader's caller-supplied-label rule).
+                var rawMeta = new Dictionary<string, string>(meta)
+                {
+                    ["raw"] = "1",
+                    [VolumeIdentity.MetaKey] = fullHash!,
+                };
+                await VolumeBlobIO.ReplaceAsync(
+                    uploader, account, cc, blobRef, [local], dataTier, retry: null, ct, rawMeta, tracker);
+                newSizes = [new FileInfo(local).Length];
+                break;
+            }
+            // The stat gate (kept from LocalMatchesAsync): absent or wrong-length files cannot hash-match, and
+            // stat answers that for free — in the field this was a ~100 GB appended file settled instantly.
+            if (fullHash is null || !File.Exists(local) || new FileInfo(local).Length != entry0.Length)
+                continue;
+            var storeOnly = dontCompress?.MatchesFileOrAncestorDir(e.Path) ?? false;
+            newSizes = await ReplaceFromVerifiedStreamAsync(
+                account, cc, blobRef, local, e.Path, fullHash, entry0.Length, dataTier, volumeBytes, password,
+                meta, storeOnly, lease, ct, tracker);
+            if (newSizes is not null)
+                break;
+        }
+
+        if (newSizes is null)
+        {
+            // Local cannot supply it → every entry referencing this blob is unrecoverable in its own version.
+            foreach (var (vnum, e) in refs)
+                MarkUnrecoverable(indexes[vnum], e.Path, unrecoverable, changedVersions, vnum);
+            return;
+        }
 
         // Omitting the metadata = this object's collision protection is weakened (in keyed mode it switches to the
         // narrow v1 check value, degrading to fullHash + length rather than to no protection at all — when head/tail
@@ -520,79 +540,88 @@ public sealed class BackupRepairer(
         }
     }
 
-    /// <summary>Replace a single-file blob with newly uploaded content: upload the new volumes over the old ones
-    /// first, then delete the leftover old volumes (no longer "wipe it empty first"). Returns the new volume sizes.
-    /// <paramref name="metadata"/> is the collision-detection metadata matching a fresh backup (len/head/tail, or
-    /// v/v1 when encrypted); <paramref name="storeOnly"/> is likewise derived by the caller from the configured
-    /// DontCompress rules, matching a fresh backup.</summary>
-    private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
-        Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier,
-        long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, bool storeOnly,
-        StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null)
+    /// <summary>
+    /// Produce the replacement volumes for a single-file blob while hashing the source read, and — only when
+    /// the streamed hash proves the source still is the recorded content — upload them over the damaged
+    /// family. Returns the new volume sizes; null = the source turned out changed or unreadable, nothing was
+    /// uploaded and the produced volumes were discarded, so the caller can try the next referencing path.
+    /// <para>
+    /// The verdict is exactly the hash gate's — full xxh128 over the actual bytes against the recorded
+    /// fullHash, plus the length — it just rides the production read, the same trick the backup path uses
+    /// (the hash falls out of the compression read for free, see BackupOrchestrator.CompressStreamingAsync).
+    /// Streaming production also matches the backup's streaming output byte for byte (-si, -mtm=off), so a
+    /// retry of an interrupted repair can label-skip volumes this attempt already uploaded.
+    /// </para>
+    /// Through StagingArea like every producer: the global compression lock, the byte budget and the
+    /// per-volume release all apply; the original password is passed through, or objects of an encrypted
+    /// backup would be silently rewritten as plaintext 7z.
+    /// </summary>
+    private async Task<IReadOnlyList<long>?> ReplaceFromVerifiedStreamAsync(
+        Account account, BlobContainerClient cc, string blobRef, string localSource, string entryName,
+        string expectedHash, long expectedLength, AccessTier dataTier, long? volumeBytes, string? password,
+        IReadOnlyDictionary<string, string> metadata, bool storeOnly,
+        StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker)
     {
-        if (raw)
+        // Segments 0/0: only the full hash and the length carry the verdict — the head/tail collision metadata
+        // is reused from the index entry (see the metaEntry note in RepairBlobAsync), never recomputed here.
+        var streaming = new StreamingHasher(0, 0);
+        StagedItem staged;
+        // Staging/packing registration: producing the volumes for a 100 GB file is a long, byteless stretch,
+        // and unregistered it rendered as a silent gap; staging spans the wait for the global compression lock
+        // too, which is real and diagnosable ("waiting for the archive slot") only if the tracker knows.
+        tracker?.BeginStaging();
+        try
         {
-            // A raw upload (uncompressed) still carries the collision-detection metadata, with the raw marker
-            // layered on top — same as the backup path's UploadNewAsync.
-            var rawMeta = new Dictionary<string, string>(metadata) { ["raw"] = "1" };
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct, rawMeta, tracker);
-            return [new FileInfo(localSource).Length];
-        }
-
-        {
-            var srcDir = Path.GetDirectoryName(localSource)!;
-            var entry = Path.GetFileName(localSource);
-            // The original password must be passed to the recompression, otherwise objects in an encrypted backup
-            // get silently rewritten as plaintext 7z (a confidentiality defect).
-            // StoreOnly is derived per path by the caller from the configured DontCompress rules (the same set as
-            // BackupOrchestrator.HandleBlobAsync), so the repaired archive uses the same compression mode a fresh
-            // backup would write for that file.
-            // (The pack path does not do this: a pack's compression mode is fixed at packing time and recorded in
-            // PackInfo.StoreOnly, see RepairPackAsync — that reads the value recorded on the pack instead of
-            // re-running the rules.)
-            // The source file is fed straight to 7z, with no compose-style intermediates, so only the archive output
-            // needs accounting — StageAsync covers all of it: the global compression lock, the budget, and the
-            // per-volume release.
-            // Registered as staging + packing for the same reason the backup path registers them: producing
-            // the replacement volumes for a 100 GB file is a long, byteless stretch, and unregistered it
-            // rendered as a silent gap ("1 object starting upload" at best). Staging spans the wait for the
-            // global compression lock too — held by a concurrent backup, that wait is real and diagnosable
-            // ("waiting for the archive slot") only if the tracker knows the item is inside.
-            tracker?.BeginStaging();
-            StagedItem staged;
-            try
-            {
-                staged = await staging.StageAsync(
-                    async (compressTemp, token) =>
+            staged = await staging.StageAsync(
+                async (compressTemp, token) =>
+                {
+                    tracker?.BeginPacking(localSource, expectedLength);
+                    try
                     {
-                        tracker?.BeginPacking(localSource, new FileInfo(localSource).Length);
-                        try
-                        {
-                            var result = await compressor.CompressAsync(
-                                new CompressionRequest(srcDir, [entry], Path.Combine(compressTemp, "b.7z"), password,
-                                    VolumeBytes: volumeBytes, StoreOnly: storeOnly), token);
-                            return result.VolumeFiles;
-                        }
-                        finally
-                        {
-                            tracker?.EndPacking();
-                        }
-                    }, lease, ct);
-            }
-            finally
-            {
-                tracker?.EndStaging();
-            }
-            try
-            {
-                var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before releasing
-                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata, tracker);
-                return sizes;
-            }
-            finally
-            {
-                staging.Release(staged);
-            }
+                        var result = await compressor.CompressStreamAsync(
+                            new StreamCompressionRequest(entryName, Path.Combine(compressTemp, "b.7z"), password,
+                                VolumeBytes: volumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedLength),
+                            async (stdin, tk) =>
+                            {
+                                await using var source = FileHasher.OpenRead(localSource);
+                                await using var sink = new HashingStream(streaming, stdin);
+                                await source.CopyToAsync(sink, tk);
+                                return streaming.Length;
+                            }, token);
+                        return result.VolumeFiles;
+                    }
+                    finally
+                    {
+                        tracker?.EndPacking();
+                    }
+                }, lease, ct);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Unreadable mid-production (locked, permissions revoked, media error): the hash gate's verdict for
+            // the same event — this candidate cannot supply the content, and one bad file must not fail the
+            // whole repair operation (see LocalMatchesAsync for the stakes).
+            return null;
+        }
+        finally
+        {
+            tracker?.EndStaging();
+        }
+        try
+        {
+            // The verdict, before anything touches the cloud: a source that changed since the backup — same
+            // length, different bytes, the one change stat cannot see — must never be uploaded under the
+            // recorded content's address, or every version referencing it silently serves the wrong bytes.
+            if (streaming.FullHash != expectedHash || streaming.Length != expectedLength)
+                return null;
+            var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList();
+            await VolumeBlobIO.ReplaceAsync(
+                uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata, tracker);
+            return sizes;
+        }
+        finally
+        {
+            staging.Release(staged);
         }
     }
 
