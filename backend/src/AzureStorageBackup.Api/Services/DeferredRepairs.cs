@@ -24,6 +24,14 @@ public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner re
     {
         try
         {
+            // A suspended user repair outranks automation: the suspension is explicit intent, and its resume will
+            // re-derive everything this trigger would have found. Skip, with a line saying so.
+            if (await repairs.HasSuspendedAsync(configId, ct))
+            {
+                logger?.LogInformation(
+                    "Deferred repair for config {ConfigId} skipped: a suspended user repair exists and takes precedence.", configId);
+                return;
+            }
             using var scope = scopes.CreateScope();
             var sp = scope.ServiceProvider;
             var config = await sp.GetRequiredService<IBackupConfigService>().GetAsync(configId, ct);

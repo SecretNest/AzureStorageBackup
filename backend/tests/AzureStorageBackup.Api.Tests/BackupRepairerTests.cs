@@ -160,6 +160,37 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The retirement-interplay kernel (volume-identity.md § retirement needs no coordination): a
+    /// resumed repair replays its selection against a fresh pre-check, and a selected path that no longer exists
+    /// in any retained version — its only referencing version retired while the repair sat suspended — simply
+    /// falls out of the intersection: not repaired, not marked, not an error. Retention decided that content's
+    /// fate; repair does not resurrect it.</summary>
+    [SkippableFact]
+    public async Task A_Selected_Path_Absent_From_The_Retained_Versions_Falls_Out_Silently()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repg-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alive");
+            await backup.RunAsync(Req(account, name));
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["retired-away.bin"]);
+
+            Assert.Empty(report.Repaired);
+            Assert.Empty(report.Unrecoverable);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>The whole self-healing loop, end to end (volume-identity.md § damage is a first-class fact):
     /// a file's blob is damaged and marked (deferred); a NEW file with identical content joins the next backup.
     /// Dedup must not hand it the broken ref — excluded, it re-uploads to the same content address and heals the

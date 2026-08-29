@@ -49,6 +49,7 @@ public sealed class BackupRepairer(
         // entirely — not repaired, not marked unrecoverable, not touched. Deselection is a scheduling decision;
         // unrecoverable is a verdict, and nobody asked for one.
         IReadOnlyCollection<string>? onlyPaths = null,
+        Action<StageProgress>? onProgress = null,
         CancellationToken ct = default)
     {
         // Local-authoritative read first (same as the orchestrator/checker): if it is local, zero cloud reads; if
@@ -85,7 +86,7 @@ public sealed class BackupRepairer(
             // itself below; a silent pre-check leaves exactly one story told.
             .CheckAsync(account, container, password, target.Version,
                 checkOptions with { Local = LocalCheckLevel.None, ListOrphans = false }, localRoot, null, ct,
-                notify: false);
+                notify: false, onProgress: onProgress);
         var badFindings = report.Findings
             .Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)
             .ToList();
@@ -114,6 +115,12 @@ public sealed class BackupRepairer(
         var repaired = new List<string>();
         var unrecoverable = new List<string>();
         var deletedOrphans = new List<string>();
+        // The long half of the run, displayed the way the backup's rows are: per damaged object, with the local
+        // read (the hash gate), the rebuild and the upload each visible — a 100 GB file's repair has an honest
+        // floor of one full read plus one compression, and this is what makes that floor look like work.
+        using var tracker = onProgress is null
+            ? null
+            : new StageTracker("Repairing", badBlobs.Count, onProgress, speedWhileInFlight: true);
 
         if (badBlobs.Count > 0 || deferredBlobs.Count > 0 || healedPaths.Count > 0)
         {
@@ -127,12 +134,14 @@ public sealed class BackupRepairer(
             var changedVersions = new HashSet<int>();
             foreach (var badRef in badBlobs)
             {
+                tracker?.Touch(badRef);
                 if (badRef.StartsWith("packs/", StringComparison.Ordinal))
                     await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                        repaired, unrecoverable, changedVersions, lease, ct);
+                        repaired, unrecoverable, changedVersions, lease, ct, tracker);
                 else
                     await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                        dontCompress, repaired, unrecoverable, changedVersions, lease, ct);
+                        dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker);
+                tracker?.Advance(0);
             }
 
             foreach (var path in healedPaths)
@@ -243,7 +252,7 @@ public sealed class BackupRepairer(
         string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes,
         IgnoreRuleSet? dontCompress, List<string> repaired,
         List<string> unrecoverable, HashSet<int> changedVersions,
-        StagingArea.StagingLease lease, CancellationToken ct)
+        StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null)
     {
         // The entries across all versions that reference this blob (identical content at different paths can yield several).
         var refs = indexes.SelectMany(kv => kv.Value.Entries
@@ -272,7 +281,7 @@ public sealed class BackupRepairer(
             // tried, and when none of them is usable it falls through to "mark unrecoverable" as usual.
             if (!PathBoundary.IsWithin(localRoot, local))
                 continue;
-            if (await LocalMatchesAsync(local, fullHash, entry0.Length, ct))
+            if (await LocalMatchesAsync(local, fullHash, entry0.Length, ct, tracker))
             {
                 localSource = local;
                 sourcePath = e.Path;
@@ -311,7 +320,7 @@ public sealed class BackupRepairer(
         // The same derivation as a fresh backup (BackupOrchestrator.HandleBlobAsync): a path that hits DontCompress is stored, not compressed.
         var storeOnly = dontCompress?.MatchesFileOrAncestorDir(sourcePath!) ?? false;
         var newSizes = await ReplaceBlobAsync(
-            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct);
+            account, cc, blobRef, localSource, raw, dataTier, volumeBytes, password, meta, storeOnly, lease, ct, tracker);
 
         // Omitting the metadata = this object's collision protection is weakened (in keyed mode it switches to the
         // narrow v1 check value, degrading to fullHash + length rather than to no protection at all — when head/tail
@@ -347,7 +356,7 @@ public sealed class BackupRepairer(
         Account account, BlobContainerClient cc, string packBlobRef, BackupInfoFile info, Dictionary<int, VersionIndex> indexes,
         string localRoot, string? password, AccessTier dataTier, long? volumeBytes,
         List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions,
-        StagingArea.StagingLease lease, CancellationToken ct)
+        StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null)
     {
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
@@ -390,7 +399,7 @@ public sealed class BackupRepairer(
                         MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
                     continue;
                 }
-                if (await LocalMatchesAsync(local, m.Hash, m.Length, ct))
+                if (await LocalMatchesAsync(local, m.Hash, m.Length, ct, tracker))
                 {
                     var dest = Path.Combine(composeDir, entryName.Replace('/', Path.DirectorySeparatorChar));
                     Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
@@ -431,7 +440,7 @@ public sealed class BackupRepairer(
             try
             {
                 newSizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before releasing
-                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct);
+                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct, tracker: tracker);
             }
             finally
             {
@@ -463,14 +472,14 @@ public sealed class BackupRepairer(
     private async Task<IReadOnlyList<long>> ReplaceBlobAsync(
         Account account, BlobContainerClient cc, string blobRef, string localSource, bool raw, AccessTier dataTier,
         long? volumeBytes, string? password, IReadOnlyDictionary<string, string> metadata, bool storeOnly,
-        StagingArea.StagingLease lease, CancellationToken ct)
+        StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null)
     {
         if (raw)
         {
             // A raw upload (uncompressed) still carries the collision-detection metadata, with the raw marker
             // layered on top — same as the backup path's UploadNewAsync.
             var rawMeta = new Dictionary<string, string>(metadata) { ["raw"] = "1" };
-            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct, rawMeta);
+            await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, [localSource], dataTier, retry: null, ct, rawMeta, tracker);
             return [new FileInfo(localSource).Length];
         }
 
@@ -499,7 +508,7 @@ public sealed class BackupRepairer(
             try
             {
                 var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // grab the sizes before releasing
-                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata);
+                await VolumeBlobIO.ReplaceAsync(uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata, tracker);
                 return sizes;
             }
             finally
@@ -525,7 +534,8 @@ public sealed class BackupRepairer(
     /// other references to the same content, and the grouped path marks that member unrecoverable outright — exactly
     /// the same handling as "there is no such file locally".
     /// </summary>
-    private async Task<bool> LocalMatchesAsync(string local, string? expectedHash, long expectedLength, CancellationToken ct)
+    private async Task<bool> LocalMatchesAsync(
+        string local, string? expectedHash, long expectedLength, CancellationToken ct, StageTracker? tracker = null)
     {
         if (expectedHash is null || !File.Exists(local))
             return false;
@@ -536,7 +546,18 @@ public sealed class BackupRepairer(
             // file up" cost a full disk scan of it before repair could conclude what a stat already knew.
             if (new FileInfo(local).Length != expectedLength)
                 return false;
-            return await hasher.FullHashAsync(local, ct) == expectedHash;
+            // The read is registered as an in-flight item, so the hash gate over a 100 GB candidate shows as
+            // moving bytes rather than a frozen row — the exact silence a user once read as a hang.
+            tracker?.BeginItem(local, local, expectedLength);
+            try
+            {
+                var progress = tracker?.ItemProgress(local);
+                return await hasher.FullHashAsync(local, ct, progress) == expectedHash;
+            }
+            finally
+            {
+                tracker?.EndItem(local, 0);
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

@@ -270,6 +270,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
             new List<string>(), unrecoverable, new HashSet<int>(),
             StagingLease(), CancellationToken.None,
+            null, // the optional StageTracker — progress is not what these boundary tests are about
         ]);
 
         Assert.Contains("grown.bin", unrecoverable);
@@ -316,6 +317,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             // Repair's compression output now goes through the staging area (global compression lock + budget), hence the extra lease parameter.
             // This case should be stopped by the boundary decision before it ever touches the staging area; the lease is only there to make the call go through.
             StagingLease(), CancellationToken.None,
+            null, // the optional StageTracker — progress is not what these boundary tests are about
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -367,6 +369,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             AccessTier.Hot, null, new List<string>(), unrecoverable,
             new HashSet<int>(), StagingLease(), CancellationToken.None,
+            null, // the optional StageTracker — progress is not what these boundary tests are about
         ]);
 
         Assert.Empty(hasher.Hashed);

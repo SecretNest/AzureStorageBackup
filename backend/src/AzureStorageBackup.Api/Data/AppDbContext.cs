@@ -20,6 +20,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<LocalBackupState> LocalBackupStates => Set<LocalBackupState>();
     public DbSet<KeyringCanary> KeyringCanaries => Set<KeyringCanary>();
     public DbSet<LastCheckRun> LastCheckRuns => Set<LastCheckRun>();
+    public DbSet<SuspendedRepair> SuspendedRepairs => Set<SuspendedRepair>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -104,6 +105,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.BackupConfigId);
             e.Property(x => x.ReportJson).IsRequired();
+        });
+
+        modelBuilder.Entity<SuspendedRepair>(e =>
+        {
+            e.HasKey(x => x.BackupConfigId);
+            e.Property(x => x.PathsJson).IsRequired();
         });
     }
 }

@@ -759,10 +759,31 @@ public static class BackupConfigEndpoints
             return Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 
-        group.MapGet("/{id:int}/repair", (int id, RepairRunner runner) =>
+        group.MapGet("/{id:int}/repair", async (int id, RepairRunner runner, CancellationToken ct) =>
         {
-            var state = runner.Get(id);
+            // Falls back to the persisted suspension: a restart must not turn a suspended repair into "never
+            // happened" — the resume button has to come back with the process.
+            var state = await runner.GetOrSuspendedAsync(id, ct);
             return state is null ? Results.NotFound() : Results.Ok(RepairRunResponse.From(state));
+        });
+
+        // Suspend the running repair: persist the intent (the plan's selection), then yield. Resume re-derives
+        // everything else — the pre-check runs fresh, healed files fall out, half-replaced families are salvaged
+        // volume by volume by the verified skip. 409 when nothing is running.
+        group.MapPost("/{id:int}/repair/suspend", async (int id, RepairRunner runner) =>
+            await runner.SuspendAsync(id)
+                ? Results.Accepted()
+                : Results.Conflict(new { error = "No repair is running." }));
+
+        // Resume a suspended repair from its persisted intent. 409 when nothing is suspended (or the target is
+        // busy — that surfaces in the run state, same as /repair itself).
+        group.MapPost("/{id:int}/repair/resume", async (int id, RepairRunner runner, IKeyringHealth keyring, CancellationToken ct) =>
+        {
+            if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+            var state = await runner.ResumeAsync(id, ct);
+            return state is null
+                ? Results.Conflict(new { error = "No suspended repair to resume." })
+                : Results.Accepted($"/api/backup-configs/{id}/repair", RepairRunResponse.From(state));
         });
 
         group.MapGet("/{id:int}/restore", (int id, RestoreRunner runner) =>

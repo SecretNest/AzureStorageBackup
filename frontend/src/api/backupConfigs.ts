@@ -538,6 +538,9 @@ export interface RepairRun {
   unrecoverable: string[] | null
   deletedOrphans: string[] | null
   error: string | null
+  // The same stage detail the backup rows render — a repair is a run, and a 100 GB file's repair has an
+  // honest floor of one full read plus one compression that must look like work, not a hang.
+  detail: StageProgress | null
 }
 
 // Check is now a background job (202 plus polling): a content-level check downloads and re-hashes the
@@ -687,6 +690,10 @@ export const backupConfigsApi = {
   repairPlan: (id: number, version: number | null = null) =>
     api.get<RepairPlan>(`/backup-configs/${id}/repair-plan${version != null ? `?version=${version}` : ''}`),
   repairStatus: (id: number) => api.get<RepairRun>(`/backup-configs/${id}/repair`),
+  // Suspend persists only the plan's selection; resume replays it against a fresh pre-check — healed files
+  // fall out on their own, half-replaced families are salvaged volume by volume by the verified skip.
+  repairSuspend: (id: number) => api.post<void>(`/backup-configs/${id}/repair/suspend`, {}),
+  repairResume: (id: number) => api.post<RepairRun>(`/backup-configs/${id}/repair/resume`, {}),
   // Stop whatever is running. Omitting `what` stops every running operation on this configuration.
   //
   // On the backup path the backend **waits for the flush before answering**, so this promise resolving

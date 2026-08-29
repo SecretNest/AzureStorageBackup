@@ -195,6 +195,13 @@ export function BackupConfigsPage() {
       .then((list) => {
         setConfigs(list)
         refreshInterrupted(list)
+        // Hydrate repair states: a suspended repair must show its resume button after a page load or a
+        // container restart, and the row-level polling only runs while activity says Repairing. One quiet
+        // GET per config; "never repaired" 404s are part of the normal answer.
+        for (const c of list)
+          backupConfigsApi.repairStatus(c.id)
+            .then((s) => { if (s && s.status !== 'Completed') setRepairs((r) => ({ ...r, [c.id]: s })) })
+            .catch(() => {})
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       // finally, not then: a failed load must still end the "loading" state, or the table sits on
@@ -1460,7 +1467,26 @@ export function BackupConfigsPage() {
                     />
                   ),
                   restores[c.id] && <RestoreStatus key="restore" run={restores[c.id]} onStop={() => stopOp(c, 'restore', 'restore')} />,
-                  repairs[c.id] && <RepairStatus key="repair" run={repairs[c.id]} onStop={() => stopOp(c, 'repair', 'repair')} />,
+                  repairs[c.id] && (
+                    <RepairStatus
+                      key="repair"
+                      run={repairs[c.id]}
+                      onStop={() => stopOp(c, 'repair', 'repair')}
+                      onSuspend={async () => {
+                        try {
+                          await backupConfigsApi.repairSuspend(c.id)
+                          const s = await backupConfigsApi.repairStatus(c.id)
+                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                        } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                      }}
+                      onResume={async () => {
+                        try {
+                          const s = await backupConfigsApi.repairResume(c.id)
+                          setRepairs((r) => ({ ...r, [c.id]: s }))
+                        } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                      }}
+                    />
+                  ),
                   checks[c.id] && <CheckStatus key="check" run={checks[c.id]} onStop={() => stopOp(c, 'check', 'check')} />,
                 ].filter(Boolean)
                 return (
@@ -2292,15 +2318,54 @@ function ErrorModal({ config, onClose }: { config: BackupConfig; onClose: () => 
   )
 }
 
-// The same three-state display as RunStatus; RepairRun has no version or progress field (see api/backupConfigs.ts), so neither is shown.
-function RepairStatus({ run, onStop }: { run: RepairRun; onStop: () => void }) {
+// A repair is a run and displays like one: the same stage detail as the backup rows, plus suspend/resume.
+// Suspend persists only the plan's selection; resume replays it against a fresh pre-check, so files healed
+// in the meantime fall out on their own and half-replaced families are salvaged volume by volume.
+function RepairStatus({ run, onStop, onSuspend, onResume }: {
+  run: RepairRun; onStop: () => void; onSuspend: () => void; onResume: () => void
+}) {
+  const [showDetail, setShowDetail] = useState(false)
+
   if (run.status === 'Failed')
     return <div className="text-danger">Repair failed: {run.error}</div>
   if (run.status === 'Canceled')
     return <div className="text-warn">Repair stopped — files already repaired are kept</div>
+  if (run.status === 'Suspended')
+    return (
+      <div className="text-warn">
+        Repair suspended — its selection is kept, and resuming re-checks and salvages what already uploaded
+        {' '}
+        <button type="button" onClick={onResume}>Resume repair</button>
+      </div>
+    )
   if (run.status === 'Completed')
-    return <div className="text-ok">Repair completed</div>
-  return <div className="text-faint">Repairing…<StopButton onStop={onStop} /></div>
+    return (
+      <div className="text-ok">
+        Repair completed
+        {run.repaired && run.unrecoverable && (
+          <span className="text-faint"> — {run.repaired.length} repaired, {run.unrecoverable.length} left to the next backup version</span>
+        )}
+      </div>
+    )
+  return (
+    <div className="text-faint">
+      Repairing
+      {run.detail && (run.detail.workPercent ?? run.detail.percent) != null &&
+        ` ${run.detail.workPercent ?? run.detail.percent}%`}
+      <StopButton onStop={onStop} />
+      {' '}
+      <button type="button" onClick={onSuspend}>Suspend</button>
+      {run.detail && (
+        <>
+          {' '}
+          <button type="button" className="btn-ghost" style={{ padding: '0 0.3rem' }} onClick={() => setShowDetail((v) => !v)}>
+            {showDetail ? '▾ Details' : '▸ Details'}
+          </button>
+          {showDetail && <StageDetail detail={run.detail} />}
+        </>
+      )}
+    </div>
+  )
 }
 
 // A check's run state. The report itself is read in the Check/Repair dialog — this row only answers "is
@@ -2628,7 +2693,6 @@ function CheckModal({
   const [listOrphans, setListOrphans] = useState(false)
   const [running, setRunning] = useState(false)
   const [checkRun, setCheckRun] = useState<CheckRun | null>(null)
-  const [repairing, setRepairing] = useState(false)
   const [repairReport, setRepairReport] = useState<RepairRun | null>(null)
   // The repair plan under review: fetched when the user clicks Repair, executed only on confirm.
   const [plan, setPlan] = useState<RepairPlan | null>(null)
@@ -2723,24 +2787,15 @@ function CheckModal({
   }
 
   const runRepair = async (paths: string[]) => {
-    setRepairing(true)
     setPlan(null)
     try {
-      // Repair is a background job (holding the lock until it completes); poll for its state.
-      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, paths)
-      setRepairReport(run)
-      while (run.status === 'Running') {
-        await delay(1500)
-        run = await backupConfigsApi.repairStatus(config.id)
-        setRepairReport(run)
-      }
-      if (run.status === 'Completed')
-        await follow(await backupConfigsApi.check(config.id, cloud, local, version, rehydrateArg(), listOrphans))
-      else if (run.error) onError(run.error)
+      // A repair is a run, not a dialog's errand: start it and close — the backup list's row carries the
+      // progress, the suspend button and the outcome, exactly like a backup's (a 100 GB file's repair is
+      // hours, and holding a modal open for hours was the old check's mistake all over again).
+      await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, paths)
+      onClose()
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setRepairing(false)
     }
   }
 
@@ -2786,7 +2841,7 @@ function CheckModal({
       onClose={onClose}
       footer={
         <>
-          <button type="button" className="btn-primary" onClick={runCheck} disabled={running || repairing}>
+          <button type="button" className="btn-primary" onClick={runCheck} disabled={running}>
             {running ? 'Checking…' : 'Run check'}
           </button>
           {running && (
@@ -2984,12 +3039,12 @@ function CheckModal({
               next backup version (which heals unchanged content by re-uploading it in place). */}
           {(problems.length > 0 || (report?.orphanBlobs?.length ?? 0) > 0) && !plan && (
             <div style={{ marginTop: '0.6rem' }}>
-              <button type="button" onClick={openPlan} disabled={repairing || running || planning}>
-                {repairing ? 'Repairing…' : planning ? 'Pricing the repair…' : 'Repair…'}
+              <button type="button" onClick={openPlan} disabled={running || planning}>
+                {planning ? 'Pricing the repair…' : 'Repair…'}
               </button>
             </div>
           )}
-          {plan && !repairing && (
+          {plan && (
             <div style={{ marginTop: '0.6rem' }}>
               <div className="text-faint">
                 Tick what to re-upload now; everything unticked is marked damaged and left to the next backup

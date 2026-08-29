@@ -1,5 +1,8 @@
+using System.Text.Json;
 using Azure.Storage.Blobs.Models;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
+using Microsoft.EntityFrameworkCore;
 
 namespace AzureStorageBackup.Api.Services;
 
@@ -10,16 +13,29 @@ public sealed class RepairRunState
     public RepairReport? Report { get; set; }
     public string? Error { get; set; }
 
+    /// <summary>What the current stage is doing (which file, how many, how fast) — the same shape and rendering
+    /// the backup's rows use. A 100 GB file's repair has an honest floor of one full read plus one compression;
+    /// this is what makes that floor look like work instead of a hang.</summary>
+    public StageProgress? Detail { get; set; }
+
+    /// <summary>The run's original request, kept so a suspension can persist the intent (only the intent — the
+    /// labels in the cloud are the actual resume state; see <see cref="Models.SuspendedRepair"/>).</summary>
+    internal (int? Version, CloudCheckLevel Cloud, StorageTier? Rehydrate, bool CleanupOrphans, IReadOnlyCollection<string>? OnlyPaths) Request { get; set; }
+
+    /// <summary>Set by <see cref="RepairRunner.Suspend"/> before cancelling, so RunAsync's cancellation handler
+    /// can tell "yield to other work, keep the intent" apart from "the user gave up on this run".</summary>
+    internal volatile bool SuspendRequested;
+
     /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
 public sealed record RepairRunResponse(
     string Status, IReadOnlyList<string>? Repaired, IReadOnlyList<string>? Unrecoverable,
-    IReadOnlyList<string>? DeletedOrphans, string? Error)
+    IReadOnlyList<string>? DeletedOrphans, string? Error, StageProgress? Detail)
 {
     public static RepairRunResponse From(RepairRunState s) => new(
-        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Report?.DeletedOrphans, s.Error);
+        s.Status.ToString(), s.Report?.Repaired, s.Report?.Unrecoverable, s.Report?.DeletedOrphans, s.Error, s.Detail);
 }
 
 /// <summary>
@@ -40,10 +56,90 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
                 return existing;
 
-            var state = new RepairRunState();
+            var state = new RepairRunState
+            {
+                Request = (version, cloud, rehydrate, cleanupOrphans, onlyPaths),
+            };
             _runs[configId] = state;
             _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, onlyPaths, state));
             return state;
+        }
+    }
+
+    /// <summary>Resume a suspended repair from its persisted intent. Null when nothing is suspended. The
+    /// selection is replayed as-is; everything else is re-derived — the pre-check runs fresh, files healed in
+    /// the meantime fall out via the healed-mark clearing, and half-replaced families are salvaged volume by
+    /// volume by the verified skip. The row is deleted only when the resumed run completes, so a crash between
+    /// resume and completion leaves the intent intact.</summary>
+    public async Task<RepairRunState?> ResumeAsync(int configId, CancellationToken ct = default)
+    {
+        SuspendedRepair? row;
+        using (var scope = scopes.CreateScope())
+        {
+            row = await scope.ServiceProvider.GetRequiredService<AppDbContext>()
+                .SuspendedRepairs.AsNoTracking().FirstOrDefaultAsync(x => x.BackupConfigId == configId, ct);
+        }
+        if (row is null)
+            return null;
+        var paths = JsonSerializer.Deserialize<string[]>(row.PathsJson) ?? [];
+        return Start(configId, version: null, row.Cloud, row.RehydrateTier, row.CleanupOrphans, paths);
+    }
+
+    /// <summary>Suspend the running repair: persist the intent, then cancel. Returns false when nothing is
+    /// running. The distinction from <see cref="Cancel"/> is exactly the persisted row — and the row is written
+    /// **before** the cancel, so there is no window where the run has died and the intent exists nowhere.</summary>
+    public async Task<bool> SuspendAsync(int configId)
+    {
+        RepairRunState? state;
+        lock (_lock)
+            state = _runs.GetValueOrDefault(configId);
+        if (state is not { Status: RunStatus.Running })
+            return false;
+        var (_, cloud, rehydrateTier, cleanupOrphans, onlyPaths) = state.Request;
+        using (var scope = scopes.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var row = await db.SuspendedRepairs.FirstOrDefaultAsync(x => x.BackupConfigId == configId);
+            if (row is null)
+                db.SuspendedRepairs.Add(row = new SuspendedRepair { BackupConfigId = configId });
+            row.PathsJson = JsonSerializer.Serialize(onlyPaths ?? []);
+            row.Cloud = cloud;
+            row.RehydrateTier = rehydrateTier;
+            row.CleanupOrphans = cleanupOrphans;
+            row.SuspendedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync();
+        }
+        state.SuspendRequested = true;
+        state.Cancellation.Cancel();
+        return true;
+    }
+
+    /// <summary>Whether a suspended repair's intent is persisted for this config — the deference signal
+    /// <see cref="DeferredRepairs"/> checks before starting an automatic one.</summary>
+    public async Task<bool> HasSuspendedAsync(int configId, CancellationToken ct = default)
+    {
+        using var scope = scopes.CreateScope();
+        return await scope.ServiceProvider.GetRequiredService<AppDbContext>()
+            .SuspendedRepairs.AsNoTracking().AnyAsync(x => x.BackupConfigId == configId, ct);
+    }
+
+    private async Task ClearSuspendedAsync(int configId)
+    {
+        try
+        {
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var row = await db.SuspendedRepairs.FirstOrDefaultAsync(x => x.BackupConfigId == configId);
+            if (row is not null)
+            {
+                db.SuspendedRepairs.Remove(row);
+                await db.SaveChangesAsync();
+            }
+        }
+        catch
+        {
+            // Best effort: a leftover row makes the next resume re-run a repair that finds nothing to do — cheap
+            // and idempotent — while failing the completed run over bookkeeping would be absurd.
         }
     }
 
@@ -51,6 +147,18 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         lock (_lock)
             return _runs.GetValueOrDefault(configId);
+    }
+
+    /// <summary><see cref="Get"/>, synthesizing a Suspended state from the persisted intent when this process
+    /// holds no run — a restart must not turn a suspended repair into "never happened"; the resume button has to
+    /// come back with the process.</summary>
+    public async Task<RepairRunState?> GetOrSuspendedAsync(int configId, CancellationToken ct = default)
+    {
+        if (Get(configId) is { } live)
+            return live;
+        return await HasSuspendedAsync(configId, ct)
+            ? new RepairRunState { Status = RunStatus.Suspended }
+            : null;
     }
 
     /// <summary>Stop the repair that is currently running. Returns false = nothing is running right now.
@@ -108,8 +216,11 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
                     // compression mode a fresh backup writes.
                     BackupRequestMapper.OptionalRules(resolved.DontCompressRules),
-                    onlyPaths: onlyPaths, ct: state.Cancellation.Token);
+                    onlyPaths: onlyPaths, onProgress: d => state.Detail = d, ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
+                // Completion is the only thing that retires a persisted suspension: the intent has been carried
+                // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
+                await ClearSuspendedAsync(configId);
             }
             finally
             {
@@ -119,8 +230,11 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         }
         catch (OperationCanceledException)
         {
-            // The user pressed stop: not a failure, so no Error state is written (the same convention as BackupRunner).
-            state.Status = RunStatus.Canceled;
+            // Suspend and stop arrive on the same token; the flag tells them apart. Suspended keeps the persisted
+            // intent (written before the cancel, so it is already on disk) and the resume button; Canceled is the
+            // user giving up on this run — not a failure either way, so no Error state is written (the same
+            // convention as BackupRunner).
+            state.Status = state.SuspendRequested ? RunStatus.Suspended : RunStatus.Canceled;
         }
         catch (Exception ex)
         {

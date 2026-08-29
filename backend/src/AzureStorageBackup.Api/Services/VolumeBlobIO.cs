@@ -438,7 +438,7 @@ public static class VolumeBlobIO
     public static async Task ReplaceAsync(
         IBlobUploader uploader, Account account, BlobContainerClient container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? metadata = null)
+        IReadOnlyDictionary<string, string>? metadata = null, StageTracker? tracker = null)
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
@@ -461,7 +461,18 @@ public static class VolumeBlobIO
                 && cloud.Label == await VolumeIdentity.ComputeAsync(volumeFiles[i], ct)
                 && await CloudBytesMatchAsync(container, newNames[i], cloud.Label, ct))
                 continue;
-            await uploader.UploadOverwriteAsync(account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata);
+            // Registered as an in-flight transfer so a repair's upload reads exactly like a backup's on screen.
+            tracker?.BeginItem(newNames[i], newNames[i], new FileInfo(volumeFiles[i]).Length);
+            try
+            {
+                await uploader.UploadOverwriteAsync(
+                    account, container.Name, newNames[i], volumeFiles[i], tier, retry, ct, metadata,
+                    tracker?.ItemProgress(newNames[i]));
+            }
+            finally
+            {
+                tracker?.EndItem(newNames[i], 0);
+            }
         }
 
         // 2) Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
