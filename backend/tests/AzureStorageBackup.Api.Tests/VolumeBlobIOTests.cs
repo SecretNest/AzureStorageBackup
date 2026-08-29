@@ -407,6 +407,46 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(["data/h"], up.Order);
     }
 
+    /// <summary>The resume side of the BlobArchived fix (same rule as ReplaceAsync's): on an Archive-tier
+    /// config, an interrupted run's own volumes archived on landing, and the resume — overwriting the first
+    /// unlabelled one — died on Put Blob's "Overwriting an archive blob fails". An archived, unproven volume
+    /// is deleted first (permitted on archived blobs) and written fresh.</summary>
+    [SkippableFact]
+    public async Task An_Archived_Unproven_Volume_Is_Deleted_Before_The_Overwrite()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+
+        var account = AzuriteAccount();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(RandomName("volarc-"));
+        await container.CreateIfNotExistsAsync();
+        var dir = Path.Combine(Path.GetTempPath(), "asb-volarc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            // The leftover of the interrupted run: unlabelled (pre-label era) and archived.
+            await container.GetBlobClient("data/h").UploadAsync(new BinaryData("old bytes"), overwrite: true);
+            await container.GetBlobClient("data/h").SetAccessTierAsync(AccessTier.Archive);
+
+            var file = Path.Combine(dir, "v.7z");
+            await File.WriteAllTextAsync(file, "new bytes");
+            var existing = await VolumeBlobIO.ListFamilyLabelsAsync(container, "data/h", CancellationToken.None);
+            Assert.True(existing["data/h"].Archived, "the fixture's premise: the listing sees the archive tier");
+
+            await VolumeBlobIO.UploadAsync(
+                new BlobUploader(factory), account, container.Name, "data/h", [file], AccessTier.Hot,
+                existingVolumes: existing);
+
+            var landed = await container.GetBlobClient("data/h").DownloadContentAsync();
+            Assert.Equal("new bytes", landed.Value.Content.ToString());
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+            try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     /// <summary>A fake progress callback used to record whether each call returns a distinct instance.</summary>
     private sealed class SpyProgress : IProgress<long>
     {

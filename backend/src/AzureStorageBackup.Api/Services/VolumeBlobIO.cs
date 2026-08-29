@@ -355,10 +355,18 @@ public static class VolumeBlobIO
                 return;
             }
             // Existing but unproven → overwrite; absent → if-missing (the server-conditional upload keeps its
-            // idempotency for retries and its Archive-tier semantics).
-            Task Send(IProgress<long>? p) => exists
-                ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p)
-                : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p);
+            // idempotency for retries and its Archive-tier semantics). An archived unproven volume is deleted
+            // first — Put Blob cannot overwrite an archived blob (409 BlobArchived) — which is exactly the
+            // resumed-backup case on an Archive-tier config: the interrupted run's own volumes archived on
+            // landing, and the resume would die overwriting the first unlabelled one.
+            async Task Send(IProgress<long>? p)
+            {
+                if (exists && existingVolumes![name].Archived)
+                    await uploader.DeleteIfExistsAsync(account, container, name, ct);
+                await (exists
+                    ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p)
+                    : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p));
+            }
             if (scope is null)
                 await Send(null);
             else
@@ -456,11 +464,19 @@ public static class VolumeBlobIO
         //    single volume the loop runs once and writes baseRef.
         for (var i = 0; i < volumeFiles.Count; i++)
         {
-            if (existing.TryGetValue(newNames[i], out var cloud) && cloud.Label is not null
+            var known = existing.TryGetValue(newNames[i], out var cloud);
+            if (known && cloud.Label is not null
                 && cloud.Length == new FileInfo(volumeFiles[i]).Length
                 && cloud.Label == await VolumeIdentity.ComputeAsync(volumeFiles[i], ct)
                 && await CloudBytesMatchAsync(container, newNames[i], cloud.Label, ct))
                 continue;
+            // An archived target cannot be overwritten (Put Blob: "Overwriting an archive blob fails" — the 409
+            // BlobArchived that killed a field repair), but it can be deleted; delete first, write fresh. Only
+            // for archive: everywhere else the plain overwrite keeps the smaller crash window. The widened
+            // window here (deleted, not yet rewritten) is on a family a check already condemned, whose content
+            // this very call holds locally — a crash leaves it no less recoverable than the damage did.
+            if (known && cloud.Archived)
+                await container.GetBlobClient(newNames[i]).DeleteIfExistsAsync(cancellationToken: ct);
             // Registered as an in-flight transfer so a repair's upload reads exactly like a backup's on screen.
             tracker?.BeginItem(newNames[i], newNames[i], new FileInfo(volumeFiles[i]).Length);
             try
@@ -512,8 +528,12 @@ public static class VolumeBlobIO
     /// volume carries none — read as "different") and its length. A skip requires **both** to match: the label
     /// is a claim, and a blob rewritten under a preserved label betrays itself by its size — the label answers
     /// "whose bytes", the length answers "did anything replace them cheaply". Matching label with mismatched
-    /// length is a lie, and lies get overwritten.</summary>
-    public readonly record struct CloudVolume(string? Label, long Length);
+    /// length is a lie, and lies get overwritten.
+    /// <para><paramref name="Archived"/> decides HOW the overwrite happens: Put Blob is documented to fail
+    /// against an archived blob ("Overwriting an archive blob fails" — 409 BlobArchived, the exact error that
+    /// killed a field repair of an Archive-tier backup), while Delete Blob is permitted on one, so an archived
+    /// target is deleted first and written fresh.</para></summary>
+    public readonly record struct CloudVolume(string? Label, long Length, bool Archived = false);
 
     /// <summary>One listing, the whole compare side: every existing volume of this archive (IsVolumeOf-filtered,
     /// so collision-avoidance siblings stay out) with its identity label and length.</summary>
@@ -525,7 +545,8 @@ public static class VolumeBlobIO
             if (IsVolumeOf(baseRef, b.Name))
                 existing[b.Name] = new CloudVolume(
                     b.Metadata is { } m && m.TryGetValue(VolumeIdentity.MetaKey, out var v) ? v : null,
-                    b.Properties.ContentLength ?? -1);
+                    b.Properties.ContentLength ?? -1,
+                    b.Properties.AccessTier == AccessTier.Archive);
         return existing;
     }
 

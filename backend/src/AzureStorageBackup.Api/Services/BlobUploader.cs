@@ -17,6 +17,15 @@ namespace AzureStorageBackup.Api.Services;
 /// </summary>
 public interface IBlobUploader
 {
+    /// <summary>Delete a blob if it exists — the escape hatch for overwriting an **archived** volume: Put Blob
+    /// cannot overwrite an archived blob (409 BlobArchived, documented and field-hit), while Delete Blob is
+    /// permitted on one, so the overwrite paths delete an archived target first and write fresh.
+    /// The interface default THROWS rather than no-ops: an implementation that can upload can also delete, and a
+    /// silent no-op here would turn that fix into an invisible re-failure. Test doubles that never exercise the
+    /// archived path need not implement it; one that reaches it without an implementation fails loudly.</summary>
+    Task DeleteIfExistsAsync(Account account, string container, string blobName, CancellationToken ct = default) =>
+        throw new NotSupportedException($"{GetType().Name} does not implement DeleteIfExistsAsync (needed to replace an archived blob).");
+
     /// <summary>Upload a file to a blob (with Tier + optional metadata). If the blob already exists, skip it and return false (content-addressed idempotency).</summary>
     Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
@@ -58,6 +67,11 @@ public interface IBlobUploader
 
 public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
 {
+    public async Task DeleteIfExistsAsync(Account account, string container, string blobName, CancellationToken ct = default) =>
+        await factory.CreateServiceClient(account).GetBlobContainerClient(container)
+            .GetBlobClient(blobName).DeleteIfExistsAsync(cancellationToken: ct);
+
+
     /// <summary>Files at or under this size are read whole into memory, labelled (<see cref="VolumeIdentity"/>)
     /// and uploaded from that buffer — one disk read feeds both the hash and the wire. Files past it (the raw
     /// route can hand this uploader an arbitrarily large source file) stream exactly as before and go

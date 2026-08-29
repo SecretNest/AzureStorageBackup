@@ -366,6 +366,59 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>The field incident of 2026-08-29 (v9, Archive-tier backup): the repair produced its volumes,
+    /// then died on the first upload with 409 BlobArchived — Put Blob is documented to fail when overwriting
+    /// an archived blob ("Overwriting an archive blob fails", Put Blob § Remarks), while Delete Blob is
+    /// permitted on one. So an overwrite whose target sits in the archive tier must delete first and upload
+    /// fresh; every other tier keeps the plain overwrite (smaller crash window). The family here is condemned
+    /// and its content is reproduced locally, so delete-then-write risks nothing the damage has not already
+    /// taken.</summary>
+    [SkippableFact]
+    public async Task Repair_Replaces_Volumes_Whose_Old_Copies_Sit_In_The_Archive_Tier()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repa-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[2_500_000];
+            new Random(17).NextBytes(content);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), content);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+
+            var volumes = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                volumes.Add(b.Name);
+            var ordered = volumes.Order(StringComparer.Ordinal).ToList();
+            await container.GetBlobClient(ordered[1]).DeleteIfExistsAsync();
+            // The surviving volumes go to the archive tier — the exact state of a damaged Archive-tier backup.
+            foreach (var v in ordered.Where(v => v != ordered[1]))
+                await container.GetBlobClient(v).SetAccessTierAsync(Azure.Storage.Blobs.Models.AccessTier.Archive);
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                1_000_000, dontCompress: null, onlyPaths: ["big.bin"]);
+
+            Assert.Equal(["big.bin"], report.Repaired);
+            foreach (var v in ordered)
+                Assert.True((await container.GetBlobClient(v).ExistsAsync()).Value, $"family incomplete: {v} missing");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>Counts full-hash reads per path while behaving exactly like the real hasher.</summary>
     private sealed class CountingHasher(IFileHasher inner) : IFileHasher
     {
