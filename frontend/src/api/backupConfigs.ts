@@ -675,13 +675,12 @@ export const backupConfigsApi = {
   },
   // When this backup has never been checked the backend answers 204 (not 404, which would leave a red error in the browser console), so this comes back empty.
   checkStatus: (id: number) => api.get<CheckRun | null>(`/backup-configs/${id}/check`),
-  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, recoverPrefixes = false, paths: string[] | null = null) => {
+  repair: (id: number, cloud: number, version: number | null = null, rehydrate: number | null = null, cleanupOrphans = false, paths: string[] | null = null) => {
     const p = new URLSearchParams()
     p.set('cloud', String(cloud))
     if (version != null) p.set('version', String(version))
     if (rehydrate != null) p.set('rehydrate', String(rehydrate))
     if (cleanupOrphans) p.set('cleanupOrphans', 'true')
-    if (recoverPrefixes) p.set('recoverPrefixes', 'true')
     return api.post<RepairRun>(`/backup-configs/${id}/repair?${p.toString()}`, { paths })
   },
   // The repair's price tag before any consent is spent: stat-and-index only, so it answers instantly.

@@ -173,24 +173,20 @@ at once, and the marks come off with it (a verdict overturned comes off the reco
 content moved on never heals its old version this way; its current content is in the newer versions,
 which is where it lives now.
 
-### Prefix recovery for append-only files (API-level, not in the UI)
+### Prefix recovery: deliberately not offered
 
-A file that only ever grows — a log, a large append-only store — can outlive its own backup: the
-version's blob is damaged, the live file has grown past it, and no local file matches the recorded
-hash whole. The recorded content may still exist **as the live file's prefix**. With the dialog's
-*"Rebuild grown (appended) files from their prefix"* ticked, repair probes exactly that: a candidate
-longer than the recorded length gets its first `Length` bytes hashed (one read, no temp write); on a
-match the prefix is copied into the repair temp area, the copy is re-hashed whole (what gets
-uploaded is what must prove itself), and the blob is rebuilt from it. The live file is never
-touched, and the temp disk must hold one prefix copy.
+A file that only ever grows can hold a damaged version's content as its live prefix, and a repair
+could in principle rebuild the blob from a truncated copy. The feature existed briefly and was
+removed on review: in repair, prefix knowledge cannot shrink the work — losing volumes means the
+archive must be rebuilt and re-uploaded whole either way, so the choice collapses to "full re-upload
+or defer", which the plan already expresses without a special case. What the special case added was
+surface: another verdict for the UI to explain, and version-consistency edges (packs worst of all,
+where a member's prefix maps to nothing in the archive). If append-aware storage is ever worth
+having, it belongs in the backup engine as a first-class capability, not in a repair corner.
 
-It is **off by default and no longer surfaced in the dialog**: in repair, prefix knowledge cannot
-shrink the work — the archive must be rebuilt whole either way, so the choice collapses to "full
-re-upload or defer", which the plan already expresses. If append-aware storage is ever worth having,
-it belongs in the backup engine as a first-class capability, not as a repair special case. The
-`recoverPrefixes` API parameter remains for the rare deliberate rescue: any later version of an
-append-only file contains the older content as a prefix anyway, so "restore the newer version,
-truncate to the recorded length" reproduces the old snapshot byte-for-byte without the upload.
+The manual escape hatch costs nothing and needs no feature: any later version of an append-only file
+contains the older content as a prefix, so "restore the newer version, truncate to the recorded
+length" reproduces the old snapshot byte-for-byte without any upload.
 
 ### Unrecoverable is a verdict, and verdicts can be overturned
 

@@ -26,21 +26,6 @@ public interface IFileHasher
     Task<string> FullHashAsync(string path, CancellationToken ct = default, IProgress<long>? onRead = null);
 
     /// <summary>
-    /// Hash of the file's first <paramref name="length"/> bytes, formatted identically to <see cref="FullHashAsync"/>.
-    /// That identity is what lets repair recognize an append-only grown file: the old version's recorded FullHash
-    /// is the live file's prefix hash. Throws <see cref="IOException"/> when the file holds fewer bytes than asked —
-    /// a race shrank it, and hashing fewer bytes must not impersonate the recorded content.
-    /// <para>
-    /// The default implementation throws — the same reasoning as <see cref="ContentIdentityAsync"/>'s default,
-    /// pointed the other way: the many fake hashers in the tests intercept the three classic methods and never
-    /// reach this one, so they must not each be forced to write a stub; but a fake that DOES wander into the
-    /// prefix path has no honest generic answer, and a loud throw beats a silently wrong hash.
-    /// </para>
-    /// </summary>
-    Task<string> PrefixHashAsync(string path, long length, CancellationToken ct = default, IProgress<long>? onRead = null)
-        => throw new NotSupportedException($"{GetType().Name} does not hash prefixes; use {nameof(FileHasher)}.");
-
-    /// <summary>
     /// Compute the complete content identity (three-segment hash + length) in a single read pass.
     /// <para>
     /// Reading three separate times pays for two extra IO passes for nothing: the full-file pass already goes past the head
@@ -112,25 +97,6 @@ public sealed class FileHasher : IFileHasher
         {
             hash.Append(buffer.AsSpan(0, read));
             onRead?.Report(read);   // Incremental: the caller accumulates as it sees fit, without needing to know which chunk it started at
-        }
-        return Format(hash.GetCurrentHash());
-    }
-
-    public async Task<string> PrefixHashAsync(
-        string path, long length, CancellationToken ct = default, IProgress<long>? onRead = null)
-    {
-        await using var stream = Open(path);
-        var hash = new XxHash128();
-        var buffer = new byte[81920];
-        var remaining = length;
-        while (remaining > 0)
-        {
-            var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
-            if (read == 0)
-                throw new IOException($"'{path}' holds fewer than the {length} bytes asked of its prefix.");
-            hash.Append(buffer.AsSpan(0, read));
-            onRead?.Report(read);
-            remaining -= read;
         }
         return Format(hash.GetCurrentHash());
     }

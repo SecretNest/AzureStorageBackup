@@ -59,7 +59,7 @@ public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner re
                 return;
 
             repairs.Start(configId, version: null, CloudCheckLevel.ExistenceSize, rehydrate: null,
-                cleanupOrphans: false, recoverPrefixes: false, onlyPaths: candidates);
+                cleanupOrphans: false, onlyPaths: candidates);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

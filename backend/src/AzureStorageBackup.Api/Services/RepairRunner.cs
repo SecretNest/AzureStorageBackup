@@ -33,7 +33,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     private readonly Dictionary<int, RepairRunState> _runs = [];
     private readonly Lock _lock = new();
 
-    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, bool recoverPrefixes = false, IReadOnlyCollection<string>? onlyPaths = null)
+    public RepairRunState Start(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths = null)
     {
         lock (_lock)
         {
@@ -42,7 +42,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             var state = new RepairRunState();
             _runs[configId] = state;
-            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, recoverPrefixes, onlyPaths, state));
+            _ = Task.Run(() => RunAsync(configId, version, cloud, rehydrate, cleanupOrphans, onlyPaths, state));
             return state;
         }
     }
@@ -67,7 +67,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         return true;
     }
 
-    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, bool recoverPrefixes, IReadOnlyCollection<string>? onlyPaths, RepairRunState state)
+    private async Task RunAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths, RepairRunState state)
     {
         try
         {
@@ -108,7 +108,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     // Takes the same rule set as BackupRequestMapper.From: the repaired archive must use the same
                     // compression mode a fresh backup writes.
                     BackupRequestMapper.OptionalRules(resolved.DontCompressRules),
-                    recoverPrefixes: recoverPrefixes, onlyPaths: onlyPaths, ct: state.Cancellation.Token);
+                    onlyPaths: onlyPaths, ct: state.Cancellation.Token);
                 state.Status = RunStatus.Completed;
             }
             finally

@@ -2727,7 +2727,7 @@ function CheckModal({
     setPlan(null)
     try {
       // Repair is a background job (holding the lock until it completes); poll for its state.
-      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, false, paths)
+      let run = await backupConfigsApi.repair(config.id, cloud, version, rehydrateArg(), listOrphans, paths)
       setRepairReport(run)
       while (run.status === 'Running') {
         await delay(1500)

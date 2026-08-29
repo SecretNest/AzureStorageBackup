@@ -743,7 +743,7 @@ public static class BackupConfigEndpoints
         });
 
         // Repair corrupt/missing cloud blobs from local files (an explicit action, background job): holds the busy lock until it finishes, during which this backup can do nothing else. Whatever cannot be repaired is marked unrecoverable.
-        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, bool? recoverPrefixes, RepairStartBody? body, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
+        group.MapPost("/{id:int}/repair", async (int id, int? version, CloudCheckLevel? cloud, StorageTier? rehydrate, bool? cleanupOrphans, RepairStartBody? body, IBackupConfigService svc, RepairRunner runner, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -751,9 +751,7 @@ public static class BackupConfigEndpoints
             if (config is null)
                 return Results.NotFound();
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
-            // recoverPrefixes is the user's call, not a default: rebuilding an appended file from its prefix
-            // re-uploads the whole object, and that cost belongs to whoever pays for the transfer.
-            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false, recoverPrefixes ?? false,
+            var state = runner.Start(id, version, cloud ?? CloudCheckLevel.ExistenceSize, rehydrate, cleanupOrphans ?? false,
                 // The plan's selection: an absent body/array (older UIs, the bare POST) = everything; a PRESENT
                 // array is honored verbatim, empty included — empty means "repair nothing now, mark everything
                 // for the next backup version", which is a legitimate choice the plan UI can express.

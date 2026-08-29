@@ -268,7 +268,6 @@ public sealed class UntrustedIndexPathTests : IDisposable
             SampleAccount(), SampleContainer(), "data/x",
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
-            false, // recoverPrefixes off: the give-up path is exactly the one that must stay read-free
             new List<string>(), unrecoverable, new HashSet<int>(),
             StagingLease(), CancellationToken.None,
         ]);
@@ -313,10 +312,6 @@ public sealed class UntrustedIndexPathTests : IDisposable
             SampleAccount(), SampleContainer(), "data/x",
             new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
-            // recoverPrefixes true on purpose: the prefix-recovery pass walks the same candidate paths, so this
-            // proves the boundary decision guards that second pass too — an escaping path must not be probed
-            // (or prefix-hashed) by either.
-            true,
             new List<string>(), unrecoverable, new HashSet<int>(),
             // Repair's compression output now goes through the staging area (global compression lock + budget), hence the extra lease parameter.
             // This case should be stopped by the boundary decision before it ever touches the staging area; the lease is only there to make the call go through.

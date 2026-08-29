@@ -122,50 +122,6 @@ public sealed class BackupRepairerTests : IDisposable
         },
     };
 
-    /// <summary>The field case behind this: a ~100 GB file was backed up, appended to, and then the backed-up
-    /// blob lost volumes in the cloud. The recorded content still exists — as the live file's prefix. Repair
-    /// must recognize that (prefix of the recorded length hashes to the recorded FullHash), materialize the
-    /// prefix itself and rebuild the blob from it, instead of ruling the file unrecoverable and making the user
-    /// truncate copies by hand. The live file is never touched.</summary>
-    [SkippableFact]
-    public async Task Repair_Recovers_An_Append_Only_File_From_Its_Prefix()
-    {
-        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
-        Skip.IfNot(SevenZip(), "7z not found");
-
-        var (backup, checker, repairer, _, _, factory) = Build();
-        var account = AzuriteAccount();
-        var name = RandomName("repx-");
-        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
-        await container.CreateIfNotExistsAsync();
-        try
-        {
-            await File.WriteAllTextAsync(Path.Combine(_src, "grow.log"), "the content as of version 1\n");
-            await backup.RunAsync(Req(account, name));
-
-            // The cloud copy is destroyed, and only then does the file grow — v1's content is now the prefix.
-            await foreach (var b in container.GetBlobsAsync(
-                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
-                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
-            await File.AppendAllTextAsync(Path.Combine(_src, "grow.log"), "appended after the backup\n");
-
-            var report = await repairer.RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null, recoverPrefixes: true);
-
-            Assert.Contains("grow.log", report.Repaired);
-            Assert.Empty(report.Unrecoverable);
-            // The live file kept its appended content — the prefix was taken from a copy, not by truncation.
-            Assert.Equal("the content as of version 1\nappended after the backup\n",
-                await File.ReadAllTextAsync(Path.Combine(_src, "grow.log")));
-            // And the rebuilt blob really holds v1's content: a content-level cloud check comes back clean.
-            var check = await checker.CheckAsync(
-                account, name, null, 1, new CheckOptions { Cloud = CloudCheckLevel.Content, Local = LocalCheckLevel.None });
-            Assert.True(check.Ok);
-        }
-        finally { await container.DeleteIfExistsAsync(); }
-    }
-
     /// <summary>The plan's selection semantics, as the user defined them: ticked = repair now (re-upload);
     /// unticked = mark damaged and leave it to the next backup version — no probing, no hashing, no upload for
     /// it, just the mark that the heal-on-next-backup path acts on. Deselection is fast by construction.</summary>
@@ -289,40 +245,6 @@ public sealed class BackupRepairerTests : IDisposable
                 new CheckOptions { Local = LocalCheckLevel.None, ListOrphans = true }, _src);
             Assert.DoesNotContain("data/journaled", check.OrphanBlobs);
             Assert.DoesNotContain("packs/pjournal.7z", check.OrphanBlobs);
-        }
-        finally { await container.DeleteIfExistsAsync(); }
-    }
-
-    /// <summary>Prefix recovery re-uploads the whole object — for the field case that is ~100 GB over a home
-    /// uplink, hours of traffic the user may judge not worth one version's snapshot (any later version of an
-    /// append-only file contains it as a prefix anyway). That judgement belongs to the person paying for the
-    /// transfer: without the explicit opt-in, an appended file stays unrecoverable exactly as before.</summary>
-    [SkippableFact]
-    public async Task Prefix_Recovery_Is_Opt_In()
-    {
-        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
-        Skip.IfNot(SevenZip(), "7z not found");
-
-        var (backup, _, repairer, _, _, factory) = Build();
-        var account = AzuriteAccount();
-        var name = RandomName("repo-");
-        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
-        await container.CreateIfNotExistsAsync();
-        try
-        {
-            await File.WriteAllTextAsync(Path.Combine(_src, "grow.log"), "the content as of version 1\n");
-            await backup.RunAsync(Req(account, name));
-            await foreach (var b in container.GetBlobsAsync(
-                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
-                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
-            await File.AppendAllTextAsync(Path.Combine(_src, "grow.log"), "appended after the backup\n");
-
-            var report = await repairer.RepairAsync(
-                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
-                dontCompress: null);
-
-            Assert.Contains("grow.log", report.Unrecoverable);
-            Assert.Empty(report.Repaired);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

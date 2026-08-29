@@ -29,31 +29,6 @@ public sealed class FileHasherTests : IDisposable
     private static string Xxh128Hex(byte[] data) =>
         "xxh128:" + Convert.ToHexString(XxHash128.Hash(data)).ToLowerInvariant();
 
-    /// <summary>The prefix hash must equal FullHashAsync of a file holding just those bytes — that identity is
-    /// what lets repair recognize an append-only grown file: the recorded FullHash of the old version is the
-    /// prefix hash of the live file, byte-format included.</summary>
-    [Fact]
-    public async Task PrefixHash_Equals_FullHash_Of_The_Prefix()
-    {
-        var oldContent = Encoding.UTF8.GetBytes("the content as of version 9");
-        var appended = oldContent.Concat(Encoding.UTF8.GetBytes(" plus what was appended later")).ToArray();
-        var path = Write("grown.bin", appended);
-
-        var hash = await new FileHasher().PrefixHashAsync(path, oldContent.Length);
-
-        Assert.Equal(Xxh128Hex(oldContent), hash);
-    }
-
-    /// <summary>A file that shrank below the requested prefix between the length check and the read is a race,
-    /// not a shorter answer: hashing fewer bytes and returning it would let a truncated file impersonate the
-    /// recorded content of its own prefix length.</summary>
-    [Fact]
-    public async Task PrefixHash_Refuses_A_File_Shorter_Than_The_Prefix()
-    {
-        var path = Write("short.bin", Encoding.UTF8.GetBytes("tiny"));
-        await Assert.ThrowsAsync<IOException>(() => new FileHasher().PrefixHashAsync(path, 1000));
-    }
-
     [Fact]
     public async Task FullHash_Is_Xxh128_Of_Whole_File()
     {
