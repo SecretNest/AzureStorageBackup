@@ -108,7 +108,7 @@ public static class ContainerEndpoints
         group.MapDelete("/{name}", async (
             int accountId, string name,
             IAccountService accounts, IContainerService containers, IBackupConfigService configs,
-            IKeyringHealth keyring, CancellationToken ct) =>
+            IKeyringHealth keyring, BackupBusyTracker busy, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -116,36 +116,53 @@ public static class ContainerEndpoints
             if (account is null)
                 return Results.NotFound();
 
-            // A backup config still hangs off this container → deleting from here is not allowed. Wiping the cloud side while
-            // leaving the config in the database keeps a backup listed with nothing behind it, and every operation the user
-            // clicks into fails in some shape or another. The delete-the-backup path
-            // (DELETE /api/backups/{id}?deleteContainer=true) is the right one: it clears the local index cache, backup state
-            // and operation log along with it, and it also blocks "delete while an operation is running". All this does is
-            // close the shortcut around it and point the user back there.
-            // The check must happen **before touching the cloud**: delete first and report afterwards and the data is already gone; nothing you report then helps.
-            // Scoped exactly by (account, container) — BackupConfig has a unique index on those two columns, different accounts
-            // may hold containers of the same name, and matching by name alone would let one account's backup block an empty container of the same name in another.
-            if (await configs.FindAsync(accountId, name, ct) is { } config)
-            {
+            // Held from before the ownership check through the cloud delete: the config-create/import
+            // endpoints hold "Creating" across their own check-then-commit, and without this mark a config
+            // could be created for this container in the window between "no config owns it" below and the
+            // network-bound DeleteContainerAsync — the container then vanishes out from under a config that
+            // was legitimately committed. refuseWhenReaders also keeps a mid-download restore protected.
+            if (!busy.TryAcquire(accountId, name, "Deleting", refuseWhenReaders: true))
                 return Results.Conflict(new
                 {
-                    error = $"Container '{name}' holds the backup \"{config.Name}\". Delete that backup "
-                        + "instead — it offers to remove the container along with it, and only that path "
-                        + "also clears the local index cache, backup state and logs. Removing the container "
-                        + "here would leave the backup listed with nothing behind it.",
+                    error = $"Container '{name}' is busy with another operation; try again once it finishes.",
                 });
-            }
-
             try
             {
-                await containers.DeleteContainerAsync(account, name, ct);
-            }
-            catch (RequestFailedException ex)
-            {
-                return MapAzureFailure(ex);
-            }
+                // A backup config still hangs off this container → deleting from here is not allowed. Wiping the cloud side while
+                // leaving the config in the database keeps a backup listed with nothing behind it, and every operation the user
+                // clicks into fails in some shape or another. The delete-the-backup path
+                // (DELETE /api/backups/{id}?deleteContainer=true) is the right one: it clears the local index cache, backup state
+                // and operation log along with it, and it also blocks "delete while an operation is running". All this does is
+                // close the shortcut around it and point the user back there.
+                // The check must happen **before touching the cloud**: delete first and report afterwards and the data is already gone; nothing you report then helps.
+                // Scoped exactly by (account, container) — BackupConfig has a unique index on those two columns, different accounts
+                // may hold containers of the same name, and matching by name alone would let one account's backup block an empty container of the same name in another.
+                if (await configs.FindAsync(accountId, name, ct) is { } config)
+                {
+                    return Results.Conflict(new
+                    {
+                        error = $"Container '{name}' holds the backup \"{config.Name}\". Delete that backup "
+                            + "instead — it offers to remove the container along with it, and only that path "
+                            + "also clears the local index cache, backup state and logs. Removing the container "
+                            + "here would leave the backup listed with nothing behind it.",
+                    });
+                }
 
-            return Results.NoContent();
+                try
+                {
+                    await containers.DeleteContainerAsync(account, name, ct);
+                }
+                catch (RequestFailedException ex)
+                {
+                    return MapAzureFailure(ex);
+                }
+
+                return Results.NoContent();
+            }
+            finally
+            {
+                busy.Release(accountId, name);
+            }
         });
 
         return app;

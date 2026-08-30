@@ -33,6 +33,11 @@ public sealed class CheckRunState
 
     /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
+
+    /// <summary>True once RunAsync has fully exited — persistence done, busy lock back. See the same field on
+    /// <see cref="RepairRunState"/>: Start() must not replace a state whose run is still settling, or the
+    /// replacement's TryAcquire fails against the still-held busy lock and clobbers a finished result.</summary>
+    internal volatile bool Settled;
 }
 
 public sealed record CheckRunResponse(string Status, CheckReport? Report, string? Error, StageProgress? Detail,
@@ -63,7 +68,10 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     {
         lock (_lock)
         {
-            if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
+            // Not-Running is not enough: the run flips Completed just before releasing the busy lock, and a
+            // Start() admitted in that gap replaces this state with one that fails TryAcquire and clobbers
+            // the finished result with "Failed — busy" (see CheckRunState.Settled).
+            if (_runs.TryGetValue(configId, out var existing) && (existing.Status == RunStatus.Running || !existing.Settled))
                 return existing;
 
             var state = new CheckRunState();
@@ -142,7 +150,12 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     /// would resurrect what the user just dismissed. Refused (false) while a check is running: the result being
     /// dropped does not exist yet, and the run owns the state. Dropping is also how a clean verdict retires
     /// itself, and how a fully-successful repair retires the report it worked from.</summary>
-    public async Task<bool> DropAsync(int configId, CancellationToken ct = default)
+    /// <param name="observedPending">What the caller saw before deciding to drop: true = it observed a
+    /// PENDING report. If by the time the row is loaded here it is no longer Pending, a repair settled it
+    /// inside the caller's await gap — the row is then left alone rather than dismissed as "history", or the
+    /// just-written Repaired line would be erased by a click aimed at a report that no longer exists.
+    /// Null/false = the caller is knowingly dismissing whatever is there (the historical behavior).</param>
+    public async Task<bool> DropAsync(int configId, CancellationToken ct = default, bool? observedPending = null)
     {
         lock (_lock)
         {
@@ -160,6 +173,13 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
                 // Dropping a pending report keeps the HISTORY ("drop了,N个没修好"): the row flips to Dropped
                 // with the unrepaired count frozen, the gate opens, and the marks keep carrying the memory.
                 row.Resolution = CheckResolution.Dropped;
+            }
+            else if (observedPending == true)
+            {
+                // The caller aimed at a Pending report, but the row settled (most plausibly a deferred
+                // auto-repair reconciled it to Repaired) between their read and this write. The intent —
+                // "open the gate" — is already satisfied; keep the settled history line.
+                return true;
             }
             else
             {
@@ -241,6 +261,18 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     {
         try
         {
+            await RunCoreAsync(configId, version, options, state);
+        }
+        finally
+        {
+            state.Settled = true; // every exit path: Start() may hand out a replacement from here on
+        }
+    }
+
+    private async Task RunCoreAsync(int configId, int? version, CheckOptions options, CheckRunState state)
+    {
+        try
+        {
             using var scope = scopes.CreateScope();
             var sp = scope.ServiceProvider;
             var configs = sp.GetRequiredService<IBackupConfigService>();
@@ -265,17 +297,22 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
                     onProgress: d => state.Detail = d,
                     headConcurrency: settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20,
                     markFindings: true); // discovery IS the marking moment — "check出来就应该标错"
-                state.Status = RunStatus.Completed;
                 state.FinishedAt = DateTimeOffset.UtcNow;
+                // A check that ran to completion counts as success, whether or not it found problems; only an
+                // exception sets Error (decision 2).
+                await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<CheckRunner>>());
+                // Persisted BEFORE Completed becomes visible and before busy is released (the same ordering
+                // RepairRunner uses for its own rows): the persisted row is the check/repair gate, and while it
+                // has not landed the run must still look live — otherwise a Drop that arrives between "the UI
+                // shows Completed" and "the row exists" finds nothing to drop, and the late persist then
+                // resurrects the report the user just dismissed as a fresh Pending one.
+                await PersistAsync(configId, state);
+                state.Status = RunStatus.Completed;
             }
             finally
             {
                 busy.Release(account.Id, config.ContainerName);
             }
-            // A check that ran to completion counts as success, whether or not it found problems; only an
-            // exception sets Error (decision 2).
-            await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<CheckRunner>>());
-            await PersistAsync(configId, state);
         }
         catch (OperationCanceledException)
         {

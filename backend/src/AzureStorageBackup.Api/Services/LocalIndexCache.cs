@@ -100,18 +100,37 @@ public sealed class LocalIndexCache(
         var bytes = IndexSerializer.SerializeIndex(index);
         if (row is null)
         {
-            db.CachedVersionIndexes.Add(new CachedVersionIndex
+            var added = new CachedVersionIndex
             {
                 AccountId = accountId, Container = container, Version = version,
                 IdentityTicks = identityTicks, Bytes = bytes, UpdatedAt = DateTimeOffset.UtcNow,
-            });
+            };
+            db.CachedVersionIndexes.Add(added);
+            try
+            {
+                await db.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException)
+            {
+                // Two scopes cold-missed the same (account, container, version) — both read "no row", both
+                // downloaded, and the loser's insert hit the unique index. That is a harmless race on a
+                // CACHE, not an error: fall back to updating the winner's row rather than throwing out of a
+                // read path and failing a whole restore group or cleanup pass over cache bookkeeping.
+                db.Entry(added).State = EntityState.Detached;
+                var existing = await db.CachedVersionIndexes.FirstOrDefaultAsync(
+                    x => x.AccountId == accountId && x.Container == container && x.Version == version, ct);
+                if (existing is null)
+                    throw; // not the duplicate-insert race after all — surface the original failure
+                existing.IdentityTicks = identityTicks;
+                existing.Bytes = bytes;
+                existing.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+            return;
         }
-        else
-        {
-            row.IdentityTicks = identityTicks;
-            row.Bytes = bytes;
-            row.UpdatedAt = DateTimeOffset.UtcNow;
-        }
+        row.IdentityTicks = identityTicks;
+        row.Bytes = bytes;
+        row.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
     }
 }

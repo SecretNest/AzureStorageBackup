@@ -44,6 +44,10 @@ function BackupDefaults() {
   const [s, setS] = useState<GlobalSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+  // In-flight guard, same as NotificationsSection's `busy`: two overlapping updates each close over their
+  // own snapshot of `s`, and whichever RESPONSE lands last wins setS — the reply to the older edit can
+  // silently revert fields the newer request already stored.
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     settingsApi.get().then(setS).catch((e) => setError(e instanceof Error ? e.message : String(e)))
@@ -57,11 +61,17 @@ function BackupDefaults() {
   const save = async () => {
     setError(null)
     setSaved(false)
+    setBusy(true)
     try {
-      setS(await settingsApi.update(s))
+      // The response is deliberately NOT written back into `s` (same as NotificationsSection): the fields
+      // stay editable while the request is in flight, and echoing the request's snapshot back over them
+      // would silently revert an edit made mid-save — with "Saved." showing, so the loss goes unnoticed.
+      await settingsApi.update(s)
       setSaved(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -271,7 +281,7 @@ function BackupDefaults() {
       </p>
 
       <div className="row" style={{ marginTop: '1rem' }}>
-        <button type="button" className="btn-primary" onClick={save}>Save</button>
+        <button type="button" className="btn-primary" onClick={save} disabled={busy}>Save</button>
         {saved && <span className="text-ok">Saved.</span>}
       </div>
     </>

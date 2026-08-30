@@ -235,4 +235,64 @@ public sealed class LocalIndexCacheTests : IDisposable
         Assert.Equal("v2.txt", (await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null)).Entries[0].Path);
         Assert.Equal("cloud.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
     }
+
+    /// <summary>A fake store that parks every ReadIndexAsync caller until the expected number have arrived —
+    /// the deterministic way to hold two scopes inside the same cold-miss window.</summary>
+    private sealed class RendezvousStore(VersionIndex index, int parties) : IBackupInfoStore
+    {
+        private int _arrived;
+        private readonly TaskCompletionSource _allIn = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _arrived) >= parties)
+                _allIn.TrySetResult();
+            await _allIn.Task;
+            return index;
+        }
+        public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) => Task.FromResult<BackupInfoFile?>(null);
+        public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) => Task.FromResult<(BackupInfoFile, string)?>(null);
+        public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => Task.FromResult("etag");
+        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.FromResult(("indexes/v.bin", 1));
+    }
+
+    /// <summary>
+    /// Two scopes (their own DbContexts, as in production: a restore and a concurrent cleanup) both cold-miss
+    /// the same (account, container, version): both FirstOrDefault null, both download, both Add — and the
+    /// second SaveChanges hits the (AccountId, Container, Version) unique index. That is a harmless race, not
+    /// an error: the loser must fall back to updating the winner's row instead of throwing DbUpdateException
+    /// out of a read path (failing a whole restore group or cleanup pass over cache bookkeeping).
+    /// </summary>
+    [Fact]
+    public async Task Concurrent_Cold_Misses_Backfill_Once_Instead_Of_Throwing()
+    {
+        // A file database of its own: the fixture's in-memory database lives on one connection, and this
+        // test needs two contexts that genuinely interleave (see TestWebAppFactory for the same note).
+        var dbPath = Path.Combine(Path.GetTempPath(), "asb-idx-race-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite($"DataSource={dbPath}").Options;
+        try
+        {
+            using (var setup = new AppDbContext(options))
+                setup.Database.EnsureCreated();
+
+            var store = new RendezvousStore(Index(1, "raced.txt"), parties: 2);
+            using var db1 = new AppDbContext(options);
+            using var db2 = new AppDbContext(options);
+
+            var reads = await Task.WhenAll(
+                Task.Run(() => new LocalIndexCache(db1, store).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)),
+                Task.Run(() => new LocalIndexCache(db2, store).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)));
+
+            Assert.All(reads, r => Assert.Equal("raced.txt", r.Entries[0].Path));
+            using var verify = new AppDbContext(options);
+            Assert.Equal(1, await verify.CachedVersionIndexes.CountAsync(
+                x => x.AccountId == 1 && x.Container == "c" && x.Version == 1));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+                try { File.Delete(f); } catch { /* best effort */ }
+        }
+    }
 }

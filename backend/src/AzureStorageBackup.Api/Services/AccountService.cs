@@ -6,6 +6,13 @@ namespace AzureStorageBackup.Api.Services;
 
 public class AccountService(AppDbContext db) : IAccountService
 {
+    // One writer at a time through the alias check-then-save: the check reads on one context, the insert
+    // commits an await later, and two concurrent creates (a double-click, two admin sessions) could both
+    // pass the check before either lands. There is deliberately no DB unique index to backstop this —
+    // pre-existing duplicates in old databases must keep migrating (see RejectEndpointAliasAsync) — so the
+    // serialization has to happen here. Static: the service is scoped, one instance per request.
+    private static readonly SemaphoreSlim _endpointWriteGate = new(1, 1);
+
     public async Task<IReadOnlyList<Account>> ListAsync(CancellationToken ct = default) =>
         // NOCASE: SQLite compares by code point by default, sorting every uppercase letter before every lowercase one (see BackupConfigService.ListAsync).
         await db.Accounts.AsNoTracking()
@@ -19,9 +26,17 @@ public class AccountService(AppDbContext db) : IAccountService
         if (account.CreatedAt == default)
             account.CreatedAt = DateTimeOffset.UtcNow;
 
-        await RejectEndpointAliasAsync(account.BlobEndpoint, exceptId: null, ct);
-        db.Accounts.Add(account);
-        await db.SaveChangesAsync(ct);
+        await _endpointWriteGate.WaitAsync(ct);
+        try
+        {
+            await RejectEndpointAliasAsync(account.BlobEndpoint, exceptId: null, ct);
+            db.Accounts.Add(account);
+            await db.SaveChangesAsync(ct);
+        }
+        finally
+        {
+            _endpointWriteGate.Release();
+        }
         return account;
     }
 
@@ -49,20 +64,28 @@ public class AccountService(AppDbContext db) : IAccountService
         if (existing is null)
             return null;
 
-        await RejectEndpointAliasAsync(update.BlobEndpoint, exceptId: id, ct);
-        existing.Name = update.Name;
-        existing.Description = update.Description;
-        existing.BlobEndpoint = update.BlobEndpoint;
-        existing.Region = update.Region;
-        existing.AccountKeyProtected = update.AccountKeyProtected;
-        existing.UseProxy = update.UseProxy;
-        existing.ProxyMode = update.ProxyMode;
-        existing.ProxyHost = update.ProxyHost;
-        existing.ProxyPort = update.ProxyPort;
-        existing.ProxyUsername = update.ProxyUsername;
-        existing.ProxyPasswordProtected = update.ProxyPasswordProtected;
+        await _endpointWriteGate.WaitAsync(ct);
+        try
+        {
+            await RejectEndpointAliasAsync(update.BlobEndpoint, exceptId: id, ct);
+            existing.Name = update.Name;
+            existing.Description = update.Description;
+            existing.BlobEndpoint = update.BlobEndpoint;
+            existing.Region = update.Region;
+            existing.AccountKeyProtected = update.AccountKeyProtected;
+            existing.UseProxy = update.UseProxy;
+            existing.ProxyMode = update.ProxyMode;
+            existing.ProxyHost = update.ProxyHost;
+            existing.ProxyPort = update.ProxyPort;
+            existing.ProxyUsername = update.ProxyUsername;
+            existing.ProxyPasswordProtected = update.ProxyPasswordProtected;
 
-        await db.SaveChangesAsync(ct);
+            await db.SaveChangesAsync(ct);
+        }
+        finally
+        {
+            _endpointWriteGate.Release();
+        }
         return existing;
     }
 

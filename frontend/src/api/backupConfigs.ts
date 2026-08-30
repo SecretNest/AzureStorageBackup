@@ -59,7 +59,16 @@ export const restoreConflictModeLabels: Record<number, string> = {
 
 // Archive rehydrate priority (values match the backend enum)
 export const RestoreRehydratePriority = { Standard: 0, High: 1 } as const
-export type BackupActivity = 'Idle' | 'BackingUp' | 'Restoring' | 'Checking' | 'Repairing' | 'CleaningUp'
+export type BackupActivity =
+  | 'Idle'
+  | 'BackingUp'
+  | 'Restoring'
+  | 'Checking'
+  | 'Repairing'
+  | 'CleaningUp'
+  | 'ChangingRoot'
+  | 'Deleting'
+  | 'Creating'
 
 /** The readable form, used inside a sentence ("Currently backing up — …"). The counterpart of the backend's Humanize. */
 export const activityLabels: Record<BackupActivity, string> = {
@@ -69,6 +78,9 @@ export const activityLabels: Record<BackupActivity, string> = {
   Checking: 'checking',
   Repairing: 'repairing',
   CleaningUp: 'cleaning up',
+  ChangingRoot: 'changing the local root',
+  Deleting: 'being deleted',
+  Creating: 'being created',
 }
 
 /**
@@ -84,6 +96,9 @@ export const activityBadgeLabels: Record<BackupActivity, string> = {
   Checking: 'Checking',
   Repairing: 'Repairing',
   CleaningUp: 'Cleaning Up',
+  ChangingRoot: 'Changing Root',
+  Deleting: 'Deleting',
+  Creating: 'Creating',
 }
 
 /** The effective values after backend resolution (null fields filled in from the global settings). Read-only, for display. */

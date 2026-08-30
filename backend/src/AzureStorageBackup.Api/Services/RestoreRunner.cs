@@ -33,10 +33,14 @@ public sealed record RestoreRunResponse(
 
 /// <summary>
 /// Background restore runner: runs RestoreOrchestrator in the background per config id, keeping state in memory for polling.
-/// **Does not take BackupBusyTracker** — restore only reads from the cloud and can run alongside a backup; even a long one (e.g. waiting for Archive rehydration) must not block backups (user's requirement).
+/// **Does not take the exclusive busy mark** — restore only reads from the cloud and can run alongside a backup; even a long
+/// one (e.g. waiting for Archive rehydration) must not block backups (user's requirement). It registers as a READER instead
+/// (<see cref="BackupBusyTracker.TryAddReader"/>): repair and compaction rewrite volume families in place and retention deletes
+/// blobs, and any of those overlapping a restore hands it a mix of old and new volumes or a 404 mid-download — so readers and
+/// the rewriting activities exclude each other while backups continue to coexist.
 /// Limited to one restore per config at a time (to avoid concurrent writes to the same target).
 /// </summary>
-public sealed class RestoreRunner(IServiceScopeFactory scopes)
+public sealed class RestoreRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
 {
     private readonly Dictionary<int, RestoreRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -98,27 +102,42 @@ public sealed class RestoreRunner(IServiceScopeFactory scopes)
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await settingsSvc.GetAsync();
 
-            // No busy lock: restore and backup can run in parallel. On Archive, rehydration is started and polled automatically (possibly a long wait), then re-archived once done.
-            // Phase keeps "the most recent one" for the single-line summary; the same message also goes into the ring buffer, so skipped/failed entries
-            // don't get flushed away by the next one — those are exactly what you most want to read one by one after a restore.
-            var progress = new Progress<string>(p =>
+            // A reader, not the exclusive mark: restore and backup run in parallel, but a repair/compaction
+            // rewriting the volumes this restore streams (or a cleanup deleting them) must wait its turn.
+            if (!busy.TryAddReader(account.Id, config.ContainerName, out var conflicting))
             {
-                state.Phase = p;
-                state.Events.Add(p);
-            });
-            state.Result = await orchestrator.RunAsync(new RestoreRequest
+                state.Error = $"This backup is busy ({conflicting}); a restore cannot read while that rewrites the backup's data. Try again once it finishes.";
+                state.Status = RunStatus.Failed;
+                return;
+            }
+            try
             {
-                Account = account,
-                Container = config.ContainerName,
-                TargetRoot = targetRoot,
-                Password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
-                Version = version,
-                DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
-                Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
-                SelectedPaths = selectedPaths,
-                Conflict = conflict,
-                RehydratePriority = rehydratePriority,
-            }, ct: state.Cancellation.Token, phase: progress, onProgress: d => state.Detail = d);
+                // On Archive, rehydration is started and polled automatically (possibly a long wait), then re-archived once done.
+                // Phase keeps "the most recent one" for the single-line summary; the same message also goes into the ring buffer, so skipped/failed entries
+                // don't get flushed away by the next one — those are exactly what you most want to read one by one after a restore.
+                var progress = new Progress<string>(p =>
+                {
+                    state.Phase = p;
+                    state.Events.Add(p);
+                });
+                state.Result = await orchestrator.RunAsync(new RestoreRequest
+                {
+                    Account = account,
+                    Container = config.ContainerName,
+                    TargetRoot = targetRoot,
+                    Password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config),
+                    Version = version,
+                    DownloadConcurrency = settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
+                    Substitutions = substitutions ?? new Dictionary<string, int>(StringComparer.Ordinal),
+                    SelectedPaths = selectedPaths,
+                    Conflict = conflict,
+                    RehydratePriority = rehydratePriority,
+                }, ct: state.Cancellation.Token, phase: progress, onProgress: d => state.Detail = d);
+            }
+            finally
+            {
+                busy.RemoveReader(account.Id, config.ContainerName);
+            }
             state.Phase = null;
             state.Status = RunStatus.Completed;
             await configs.WriteStatusAsync(configId, error: null, sp.GetService<ILogger<RestoreRunner>>());

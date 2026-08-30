@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { latestWins } from '../lib/latestWins'
 import {
   containersApi,
   containerStatusLabel,
@@ -15,13 +16,22 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
+  // latestWins: load() fires from mount, Refresh, and the post-create/post-delete refreshes, with nothing
+  // stopping two from being in flight at once — and the OLDER response can resolve last, reverting the list
+  // to a snapshot from before the create/delete (the new container "vanishes" until the next refresh).
+  const loadGate = useRef(latestWins())
   const load = useCallback(() => {
+    const isLatest = loadGate.current.begin()
     setLoading(true)
     setError(null)
     containersApi
       .list(account.id)
-      .then(setContainers)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .then((r) => {
+        if (isLatest()) setContainers(r)
+      })
+      .catch((e) => {
+        if (isLatest()) setError(e instanceof Error ? e.message : String(e))
+      })
       .finally(() => setLoading(false))
   }, [account.id])
 
@@ -30,14 +40,20 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
   const trimmedName = newName.trim()
   const nameError = trimmedName ? validateContainerName(trimmedName) : null
 
+  // In-flight guard (same pattern as GroupsSection's `saving`): a double-click fires two concurrent
+  // creates of the same name, and the loser paints a spurious error banner over a successful creation.
+  const [creating, setCreating] = useState(false)
   const create = async () => {
     if (!trimmedName || nameError) return
+    setCreating(true)
     try {
       await containersApi.create(account.id, trimmedName)
       setNewName('')
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setCreating(false)
     }
   }
 
@@ -77,7 +93,7 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
           type="button"
           className="btn-primary"
           onClick={create}
-          disabled={!trimmedName || !!nameError}
+          disabled={!trimmedName || !!nameError || creating}
         >
           Create Container
         </button>

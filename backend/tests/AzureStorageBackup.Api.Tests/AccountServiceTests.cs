@@ -179,4 +179,62 @@ public class AccountServiceTests : IDisposable
         Assert.NotNull(await _sut.UpdateAsync(second.Id, second));
     }
 
+    /// <summary>
+    /// The alias check is check-then-act with an await in between, and there is deliberately no DB unique
+    /// index backing it up (old databases with pre-existing duplicates must keep migrating) — so two
+    /// requests racing through CreateAsync on separate DbContexts could both pass the check before either
+    /// commits, producing the exact two-records-one-endpoint alias the check exists to forbid. This drives
+    /// the race with a barrier over multiple rounds: every round, exactly one create may win.
+    /// </summary>
+    [Fact]
+    public async Task Concurrent_Creates_With_The_Same_Endpoint_Never_Both_Succeed()
+    {
+        // A file database of its own: the class fixture's in-memory database lives on one connection, and
+        // this test needs two contexts that genuinely interleave (see TestWebAppFactory for the same note).
+        var dbPath = Path.Combine(Path.GetTempPath(), "asb-acct-race-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite($"DataSource={dbPath}").Options;
+        try
+        {
+            using (var setup = new AppDbContext(options))
+                setup.Database.EnsureCreated();
+
+            for (var round = 0; round < 10; round++)
+            {
+                using var db1 = new AppDbContext(options);
+                using var db2 = new AppDbContext(options);
+                var endpoint = $"https://race{round}.blob.core.windows.net";
+                var barrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                async Task<bool> TryCreateAsync(AppDbContext db, string name)
+                {
+                    await barrier.Task;
+                    try
+                    {
+                        var account = SampleAccount();
+                        account.Name = name;
+                        account.BlobEndpoint = endpoint;
+                        await new AccountService(db).CreateAsync(account);
+                        return true;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        return false; // the alias check refused — the expected loser
+                    }
+                }
+
+                var first = Task.Run(() => TryCreateAsync(db1, "racer-a"));
+                var second = Task.Run(() => TryCreateAsync(db2, "racer-b"));
+                barrier.SetResult();
+                var outcomes = await Task.WhenAll(first, second);
+
+                Assert.Equal(1, outcomes.Count(won => won));
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+                try { File.Delete(f); } catch { /* best effort */ }
+        }
+    }
 }

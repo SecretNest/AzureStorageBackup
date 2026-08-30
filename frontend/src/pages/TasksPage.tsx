@@ -96,7 +96,12 @@ export function TasksPage() {
     if (!poolLoaded) loadPool()
   }
 
+  // In-flight guard for Create/Save (same pattern as runNow's `running` below): a scheduled task has no
+  // dedup key, so a double-click on Create would register two identical cron schedules that both fire
+  // independently forever after.
+  const [saving, setSaving] = useState(false)
   const save = async () => {
+    setSaving(true)
     try {
       if (editing) await tasksApi.update(editing.id, form)
       else await tasksApi.create(form)
@@ -104,6 +109,8 @@ export function TasksPage() {
       loadTasks()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -296,7 +303,7 @@ export function TasksPage() {
           </Field>
 
           <div className="row" style={{ marginTop: '1rem' }}>
-            <button type="button" className="btn-primary" onClick={save}>
+            <button type="button" className="btn-primary" onClick={save} disabled={saving}>
               {editing ? 'Save' : 'Create'}
             </button>
             <button type="button" onClick={() => setShowForm(false)}>

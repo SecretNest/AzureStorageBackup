@@ -76,15 +76,27 @@ public static class AccountEndpoints
             // BackupRunner/CheckRunner/RestoreRunner). For a scheduled task that means failing at 3am and noticing the
             // next day; restore is worse — you find out only when you actually need the data back.
             // The UI already disables the delete button; this is the server side of the same check — without it, that disabling is only decoration.
-            var usage = await svc.GetBackupUsageAsync(ct);
-            if (usage.GetValueOrDefault(id) is { Count: > 0 } inUse)
-                return Results.Conflict(new
-                {
-                    error = $"Account is used by {inUse.Count} backup(s): {string.Join(", ", inUse)}",
-                    usedByBackups = inUse,
-                });
+            // Under the topology gate: the usage snapshot and the delete must be one atomic step against the
+            // config-create/import endpoints (which re-check account existence under the same gate), or a
+            // config committed inside this gap ends up referencing an account that is gone.
+            bool ok;
+            await AccountTopologyGate.Gate.WaitAsync(ct);
+            try
+            {
+                var usage = await svc.GetBackupUsageAsync(ct);
+                if (usage.GetValueOrDefault(id) is { Count: > 0 } inUse)
+                    return Results.Conflict(new
+                    {
+                        error = $"Account is used by {inUse.Count} backup(s): {string.Join(", ", inUse)}",
+                        usedByBackups = inUse,
+                    });
 
-            var ok = await svc.DeleteAsync(id, ct);
+                ok = await svc.DeleteAsync(id, ct);
+            }
+            finally
+            {
+                AccountTopologyGate.Gate.Release();
+            }
             // What was just deleted may have been the only undecryptable ciphertext still pending a reset: without finishing
             // recovery the status never flips back to Healthy, and until the next restart the user is stuck in the dead end of "Lost, but nothing to re-enter" (design §3.4 fix).
             if (ok)

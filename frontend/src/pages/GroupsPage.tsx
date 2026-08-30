@@ -16,6 +16,9 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [name, setName] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
+  // In-flight guard for Create/Save: there is no uniqueness constraint on a group name, so a double-click
+  // (or a second click during a slow response) would silently create two identical groups.
+  const [saving, setSaving] = useState(false)
 
   const loadGroups = () =>
     groupsApi
@@ -75,6 +78,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
       setError('Select at least one backup.')
       return
     }
+    setSaving(true)
     try {
       const input = { name, members }
       if (editing) await groupsApi.update(editing.id, input)
@@ -84,6 +88,8 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
       onChanged?.()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -186,7 +192,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
           )}
 
           <div className="row" style={{ marginTop: '1rem' }}>
-            <button type="button" className="btn-primary" onClick={save}>
+            <button type="button" className="btn-primary" onClick={save} disabled={saving}>
               {editing ? 'Save' : 'Create'}
             </button>
             <button type="button" onClick={() => setShowForm(false)}>

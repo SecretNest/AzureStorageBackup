@@ -45,50 +45,81 @@ public static class BackupConfigEndpoints
         });
 
         // Import an existing backup: read the container's info file to rebuild the config, seed the local authoritative state, and pull every version index into the local cache (roadmap, PRD 1.5, §3.3)
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
                 return Results.BadRequest(new { error = "Account not found." });
-            // Ahead of any cloud read: a question the local database can answer should not cost a network round trip first, especially since that round trip would also
-            // seed the cloud info file into TrackedInfoStore — mutating the local authoritative state for an import that is bound to be rejected just leaves dirty data behind.
-            if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
-                return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
-            (BackupInfoFile Info, string ETag)? seeded;
+            // Held from before the ownership check until the config row is committed (the span includes a
+            // cloud read): the container-delete endpoint holds "Deleting" across its own check-then-delete,
+            // and without this mark an import could commit a config for a container that was deleted out
+            // from under it mid-flight. Released before the automatic check below — that check takes the
+            // busy mark itself.
+            if (!busy.TryAcquire(req.AccountId, req.ContainerName, "Creating"))
+                return Results.Conflict(new
+                {
+                    error = "This container is busy with another operation; try again in a moment.",
+                });
+            BackupConfig created;
+            BackupInfoFile info;
             try
             {
-                seeded = await trackedInfo.SeedFromCloudAsync(account, req.ContainerName, req.Password, ct);
-            }
-            catch (SecretUnavailableException)
-            {
-                // A lost keyring means the account key cannot be read, which has nothing to do with the backup password — do not pin the blame on what the user typed
-                // (handled the same way as reset-password).
-                return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Cancellation (client disconnect / process shutdown) is not "wrong password": swallowing it would disguise it as a user error.
-                // Consistent with the existing convention in this repo (see a3ac967 "orphan cleanup does not swallow cancellation"), always let it propagate.
-                return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
-            }
-            if (seeded is null)
-                return Results.NotFound(new { error = "No backup found in this container." });
-            var info = seeded.Value.Info;
+                // Ahead of any cloud read: a question the local database can answer should not cost a network round trip first, especially since that round trip would also
+                // seed the cloud info file into TrackedInfoStore — mutating the local authoritative state for an import that is bound to be rejected just leaves dirty data behind.
+                if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
+                    return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
-            var config = new BackupConfig
+                (BackupInfoFile Info, string ETag)? seeded;
+                try
+                {
+                    seeded = await trackedInfo.SeedFromCloudAsync(account, req.ContainerName, req.Password, ct);
+                }
+                catch (SecretUnavailableException)
+                {
+                    // A lost keyring means the account key cannot be read, which has nothing to do with the backup password — do not pin the blame on what the user typed
+                    // (handled the same way as reset-password).
+                    return Results.BadRequest(new { error = "Re-enter this account's credentials first." });
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Cancellation (client disconnect / process shutdown) is not "wrong password": swallowing it would disguise it as a user error.
+                    // Consistent with the existing convention in this repo (see a3ac967 "orphan cleanup does not swallow cancellation"), always let it propagate.
+                    return Results.BadRequest(new { error = $"Could not read info file (wrong password?): {ex.Message}" });
+                }
+                if (seeded is null)
+                    return Results.NotFound(new { error = "No backup found in this container." });
+                info = seeded.Value.Info;
+
+                var config = new BackupConfig
+                {
+                    AccountId = req.AccountId,
+                    ContainerName = req.ContainerName,
+                    Name = info.Backup.Name,
+                    Description = info.Backup.Description,
+                    LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
+                    // The password in the request body is plaintext; encrypt it the moment it lands on the entity (design §3.1).
+                    PasswordProtected = info.Backup.Encrypted && !string.IsNullOrEmpty(req.Password)
+                        ? encryption.Encrypt(req.Password)
+                        : null,
+                };
+                // Atomic against account deletion — see AccountTopologyGate and the same block on the create endpoint.
+                await AccountTopologyGate.Gate.WaitAsync(ct);
+                try
+                {
+                    if (await accounts.GetAsync(req.AccountId, ct) is null)
+                        return Results.BadRequest(new { error = "Account not found." });
+                    created = await svc.CreateAsync(config, ct);
+                }
+                finally
+                {
+                    AccountTopologyGate.Gate.Release();
+                }
+            }
+            finally
             {
-                AccountId = req.AccountId,
-                ContainerName = req.ContainerName,
-                Name = info.Backup.Name,
-                Description = info.Backup.Description,
-                LocalRoot = info.Backup.SourceRootHint ?? string.Empty,
-                // The password in the request body is plaintext; encrypt it the moment it lands on the entity (design §3.1).
-                PasswordProtected = info.Backup.Encrypted && !string.IsNullOrEmpty(req.Password)
-                    ? encryption.Encrypt(req.Password)
-                    : null,
-            };
-            var created = await svc.CreateAsync(config, ct);
+                busy.Release(req.AccountId, req.ContainerName);
+            }
 
             // B2: with no SourceRootHint, LocalRoot ends up an empty string, and once Backup__Root is set, every later operation
             // on this config hits exactly the same 409 path_outside_root as a genuinely out-of-bounds local root — IsInside gives the
@@ -99,7 +130,7 @@ public static class BackupConfigEndpoints
             {
                 await log.AppendAsync(
                     OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
-                    $"Imported '{config.Name}' without a local root hint (LocalRoot is empty); " +
+                    $"Imported '{created.Name}' without a local root hint (LocalRoot is empty); " +
                     "set Local Root on this backup before running it.",
                     ct);
             }
@@ -132,7 +163,7 @@ public static class BackupConfigEndpoints
             {
                 await log.AppendAsync(
                     OperationLogLevel.Warning, $"import:{req.AccountId}/{req.ContainerName}",
-                    $"Imported '{config.Name}' with {unreadable.Count} unreadable version file(s): "
+                    $"Imported '{created.Name}' with {unreadable.Count} unreadable version file(s): "
                     + string.Join(", ", unreadable.Select(v => $"v{v}")) + ".",
                     ct);
             }
@@ -158,7 +189,7 @@ public static class BackupConfigEndpoints
                 unreadable));
         });
 
-        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IAccountService accounts, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
+        group.MapPost("/", async (BackupConfigRequest req, IBackupConfigService svc, IAccountService accounts, IEncryptionService encryption, IKeyringHealth keyring, PathBoundary boundary, IGlobalSettingsService settingsSvc, BackupBusyTracker busy, CancellationToken ct) =>
         {
             // Paying off the debt of a wizard with no hard validation at all (found in review): do the cheap local string checks first,
             // then the path boundary check that touches neither the file system nor the database, and only then the account-existence check that needs a database query —
@@ -176,9 +207,38 @@ public static class BackupConfigEndpoints
             if (await svc.FindAsync(req.AccountId, req.ContainerName, ct) is { } holder)
                 return Results.Conflict(new { error = ContainerTaken(req.ContainerName, holder.Name) });
 
-            var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
-            var settings = await settingsSvc.GetAsync(ct);
-            return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, settings, secretsUnavailable: Pending(keyring, encryption, created)));
+            // The busy mark makes creation atomic against the container-delete endpoint (which holds
+            // "Deleting" across its own check-then-delete): without it, a delete passing its "no config owns
+            // this container" check could remove the container out from under the config this line is about
+            // to commit. The unique index on (AccountId, ContainerName) already referees create-vs-create.
+            if (!busy.TryAcquire(req.AccountId, req.ContainerName, "Creating"))
+                return Results.Conflict(new
+                {
+                    error = "This container is busy with another operation; try again in a moment.",
+                });
+            try
+            {
+                // The topology gate makes the account-exists check atomic against the account-delete
+                // endpoint's "no backups use it → delete" span — see AccountTopologyGate. The early check
+                // above gave the fast answer; this one inside the gate is the one that counts.
+                await AccountTopologyGate.Gate.WaitAsync(ct);
+                try
+                {
+                    if (await accounts.GetAsync(req.AccountId, ct) is null)
+                        return Results.BadRequest(new { error = "Account not found." });
+                    var created = await svc.CreateAsync(req.ToConfig(encryption), ct);
+                    var settings = await settingsSvc.GetAsync(ct);
+                    return Results.CreatedAtRoute("GetBackupConfig", new { id = created.Id }, BackupConfigResponse.From(created, settings, secretsUnavailable: Pending(keyring, encryption, created)));
+                }
+                finally
+                {
+                    AccountTopologyGate.Gate.Release();
+                }
+            }
+            finally
+            {
+                busy.Release(req.AccountId, req.ContainerName);
+            }
         });
 
         group.MapPut("/{id:int}", async (int id, BackupConfigRequest req, IBackupConfigService svc, IEncryptionService encryption, IKeyringHealth keyring, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
@@ -235,68 +295,85 @@ public static class BackupConfigEndpoints
             var accountId = config.AccountId;
             var container = config.ContainerName;
 
-            if (deleteContainer ?? false)
+            // The activity glance above is a snapshot; with deleteContainer there is a whole cloud round trip
+            // before the row goes, and a run/check/repair (or a scheduled tick) starting inside that window
+            // would acquire the target unopposed — then keep uploading into a container this handler just
+            // deleted, holding a lock the UI can never find again. So the lock is taken HERE and held through
+            // the last cleanup step; refuseWhenReaders keeps a mid-download restore protected the same way.
+            if (!busy.TryAcquire(accountId, container, "Deleting", refuseWhenReaders: true))
+                return Results.Conflict(new
+                {
+                    error = "This backup just became busy with another operation. Wait for it to finish before deleting it.",
+                });
+            try
             {
-                // Only the branch that also deletes the cloud container needs the account key → 409 when the keyring is lost.
-                // The deleteContainer=false branch is purely local and must stay ungated: under decision 6 it is the only way out of
-                // "I cannot remember the backup password", and it has to work in recovery mode too.
-                if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
+                if (deleteContainer ?? false)
+                {
+                    // Only the branch that also deletes the cloud container needs the account key → 409 when the keyring is lost.
+                    // The deleteContainer=false branch is purely local and must stay ungated: under decision 6 it is the only way out of
+                    // "I cannot remember the backup password", and it has to work in recovery mode too.
+                    if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
-                var account = await accounts.GetAsync(accountId, ct);
-                if (account is null)
-                    return Results.BadRequest(new { error = "Account not found." });
-                await containers.DeleteContainerAsync(account, container, ct);
+                    var account = await accounts.GetAsync(accountId, ct);
+                    if (account is null)
+                        return Results.BadRequest(new { error = "Account not found." });
+                    await containers.DeleteContainerAsync(account, container, ct);
+                }
+
+                var ok = await svc.DeleteAsync(id, ct);
+                if (ok)
+                {
+                    // Each cleanup step is best-effort on its own: the config row is already gone (the main operation succeeded), so a single failing step must not return 500 or block the remaining steps.
+                    // Leftover orphan logs/cache/state are harmless and get overwritten by a later cleanup/rebuild.
+                    var logger = loggerFactory.CreateLogger("BackupConfigDelete");
+                    await BestEffort(logger, "delete audit logs",
+                        () => log.DeleteForContainerAsync(accountId, container, ct)); // delete the audit logs along with it (PRD 3.6)
+                    // Purge the local authoritative cache/state along with it (local-authority principle, design §3.3): otherwise rebuilding a backup on the same
+                    // account+container hits orphan CachedVersionIndex/LocalBackupState rows whose version identity does not match the new backup.
+                    await BestEffort(logger, "evict local index cache",
+                        () => indexCache.RemoveForContainerAsync(accountId, container, ct));
+                    await BestEffort(logger, "remove local backup state",
+                        () => localState.RemoveAsync(accountId, container, ct));
+
+                    // With the config gone, nobody will ever adopt this container's journal again, and keeping it around only protects
+                    // that batch of blocks from cleanup forever (the cleanup criterion looks at journals, not at configId). **Delete the journal
+                    // files only, never the blobs they reference**: a journal records both real uploads and if-missing hits, and the latter may well
+                    // also be referenced by an already-committed version index — deleting them would punch a hole through a retained version.
+                    //
+                    // Who collects them once they lose that protection: when this container gets a config again, the **first backup run of that
+                    // config** does an orphan sweep on the way out, using the full criterion (index readable, references recognizable) to sweep the
+                    // real orphans away. That path only works because of the step immediately above — localState.RemoveAsync clears the local
+                    // authoritative state, which is how the rebuilt config recognizes it is on its first run (see firstRun in BackupOrchestrator and BackupRunControl.SweepNeeded).
+                    // The order of those two steps does not matter (both best-effort, neither depends on the other), but without that step all that
+                    // is left here is the hope that "the user happens to have configured a Cleanup scheduled task", and that is entirely up to them.
+                    await BestEffort(logger, "discard backup journals",
+                        () => { journals.DeleteAll(accountId, container); return Task.CompletedTask; });
+
+                    // What we just deleted may have been the one and only undecryptable ciphertext awaiting reset (the backup password): without
+                    // finishing up, the keyring never flips back to Healthy and the user is stuck in the "Lost but nothing left to reset" dead end until the next restart (design §3.4 fix).
+                    await recovery.TryCompleteAsync(ct);
+
+                    // The audit line is written **after** the cleanup: DeleteForContainerAsync wipes every log for that (account, container),
+                    // so writing it first would mean deleting itself. Deletion is the one operation here that erases history, and if it left no
+                    // trace of its own the log page would inexplicably go completely empty — a user reported exactly that.
+                    //
+                    // The source key carries accountId: this line used to be in the pre-revamp format "backup:{container}" and was missed in the
+                    // change. Without the account dimension, the same container name under two accounts writes identical lines and nobody can tell
+                    // which is which; the log page filters by exact source equality, so it shows up in neither backup's view. Writing it after the
+                    // cleanup does not affect this — that cleanup finished long before, and it cannot reach this line.
+                    await BestEffort(logger, "record deletion", () => log.AppendAsync(
+                        OperationLogLevel.Warning, $"backup:{accountId}/{container}",
+                        (deleteContainer ?? false)
+                            ? $"Backup config '{config.Name}' deleted, along with its cloud container."
+                            : $"Backup config '{config.Name}' deleted; the cloud container was kept.",
+                        ct, durable: true));
+                }
+                return ok ? Results.NoContent() : Results.NotFound();
             }
-
-            var ok = await svc.DeleteAsync(id, ct);
-            if (ok)
+            finally
             {
-                // Each cleanup step is best-effort on its own: the config row is already gone (the main operation succeeded), so a single failing step must not return 500 or block the remaining steps.
-                // Leftover orphan logs/cache/state are harmless and get overwritten by a later cleanup/rebuild.
-                var logger = loggerFactory.CreateLogger("BackupConfigDelete");
-                await BestEffort(logger, "delete audit logs",
-                    () => log.DeleteForContainerAsync(accountId, container, ct)); // delete the audit logs along with it (PRD 3.6)
-                // Purge the local authoritative cache/state along with it (local-authority principle, design §3.3): otherwise rebuilding a backup on the same
-                // account+container hits orphan CachedVersionIndex/LocalBackupState rows whose version identity does not match the new backup.
-                await BestEffort(logger, "evict local index cache",
-                    () => indexCache.RemoveForContainerAsync(accountId, container, ct));
-                await BestEffort(logger, "remove local backup state",
-                    () => localState.RemoveAsync(accountId, container, ct));
-
-                // With the config gone, nobody will ever adopt this container's journal again, and keeping it around only protects
-                // that batch of blocks from cleanup forever (the cleanup criterion looks at journals, not at configId). **Delete the journal
-                // files only, never the blobs they reference**: a journal records both real uploads and if-missing hits, and the latter may well
-                // also be referenced by an already-committed version index — deleting them would punch a hole through a retained version.
-                //
-                // Who collects them once they lose that protection: when this container gets a config again, the **first backup run of that
-                // config** does an orphan sweep on the way out, using the full criterion (index readable, references recognizable) to sweep the
-                // real orphans away. That path only works because of the step immediately above — localState.RemoveAsync clears the local
-                // authoritative state, which is how the rebuilt config recognizes it is on its first run (see firstRun in BackupOrchestrator and BackupRunControl.SweepNeeded).
-                // The order of those two steps does not matter (both best-effort, neither depends on the other), but without that step all that
-                // is left here is the hope that "the user happens to have configured a Cleanup scheduled task", and that is entirely up to them.
-                await BestEffort(logger, "discard backup journals",
-                    () => { journals.DeleteAll(accountId, container); return Task.CompletedTask; });
-
-                // What we just deleted may have been the one and only undecryptable ciphertext awaiting reset (the backup password): without
-                // finishing up, the keyring never flips back to Healthy and the user is stuck in the "Lost but nothing left to reset" dead end until the next restart (design §3.4 fix).
-                await recovery.TryCompleteAsync(ct);
-
-                // The audit line is written **after** the cleanup: DeleteForContainerAsync wipes every log for that (account, container),
-                // so writing it first would mean deleting itself. Deletion is the one operation here that erases history, and if it left no
-                // trace of its own the log page would inexplicably go completely empty — a user reported exactly that.
-                //
-                // The source key carries accountId: this line used to be in the pre-revamp format "backup:{container}" and was missed in the
-                // change. Without the account dimension, the same container name under two accounts writes identical lines and nobody can tell
-                // which is which; the log page filters by exact source equality, so it shows up in neither backup's view. Writing it after the
-                // cleanup does not affect this — that cleanup finished long before, and it cannot reach this line.
-                await BestEffort(logger, "record deletion", () => log.AppendAsync(
-                    OperationLogLevel.Warning, $"backup:{accountId}/{container}",
-                    (deleteContainer ?? false)
-                        ? $"Backup config '{config.Name}' deleted, along with its cloud container."
-                        : $"Backup config '{config.Name}' deleted; the cloud container was kept.",
-                    ct, durable: true));
+                busy.Release(accountId, container);
             }
-            return ok ? Results.NoContent() : Results.NotFound();
         });
 
         // Start one backup run (runs in the background, progress by polling)
@@ -881,12 +958,20 @@ public static class BackupConfigEndpoints
 
         // Drop the last check result (in-memory and persisted): the dialog's doorway back to "start a new
         // check". 409 while a check is running — the run owns its state.
-        group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, OrphanSweeper sweeper, CancellationToken ct) =>
+        group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, RepairRunner repairs, OrphanSweeper sweeper, CancellationToken ct) =>
         {
+            // A running repair owns this row just as much as a running check does: its completion path is
+            // about to reconcile it (ResolveAfterRepairAsync), and LastCheckRun carries no concurrency token
+            // — a drop landing mid-repair sets up last-write-wins, where the resolve overwrites Dropped and
+            // resurrects the report the user just dismissed.
+            if (repairs.Get(id) is { Status: RunStatus.Running })
+                return Results.Conflict(new { error = "A repair is running; stop it first." });
             // Only dropping a PENDING report owes the container the deferred sweep; dismissing a history
             // line (clean/repaired/dropped) remediated nothing and sweeps nothing.
             var wasPending = await runner.HasPersistedReportAsync(id, ct);
-            if (!await runner.DropAsync(id, ct))
+            // observedPending carries the snapshot into the drop: if a repair settles the row inside this
+            // request's await gap, DropAsync keeps the settled history line instead of erasing it.
+            if (!await runner.DropAsync(id, ct, observedPending: wasPending))
                 return Results.Conflict(new { error = "A check is running; stop it first." });
             if (wasPending)
                 sweeper.Kick(id);
@@ -1019,55 +1104,75 @@ public static class BackupConfigEndpoints
             IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, IOperationLog log,
             IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
-            // Do not trust the preview result the frontend sends; rerun the full validation ourselves — which is exactly why Inspect
-            // has to be a pure query that is safe to re-enter. The new root being unplugged after the preview, or the backup starting
-            // between the two calls, are both caught by this second pass.
-            var prepared = await PrepareLocalRootAsync(
-                id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct);
-            if (prepared.Failure is { } failure)
-                return failure;
-
-            var preview = prepared.Preview!;
-            var needsForce = preview.Verdict is nameof(LocalRootVerdict.NeedsConfirm)
-                or nameof(LocalRootVerdict.Rejected)
-                or nameof(LocalRootVerdict.BaselineUnreadable);
-            if (needsForce && !req.Force)
-                return Results.Json(
-                    new
-                    {
-                        error = "The new root does not match this backup's latest version index.",
-                        code = "local_root_mismatch",
-                        preview,
-                    },
-                    statusCode: StatusCodes.Status400BadRequest);
-
-            var oldRoot = prepared.Config!.LocalRoot;
-            var moved = await svc.ChangeLocalRootAsync(id, prepared.ResolvedRoot!, ct);
-            if (moved is null)
+            // Apply does not merely glance at IsBusy the way preview does: between that glance and the write sit
+            // the baseline load and the directory sampling (awaited I/O, hundreds of ms to seconds), and a scheduled
+            // backup firing inside that window would acquire the lock unopposed — the root then changes under a run
+            // that is actively reading the old directory. So the lock is taken HERE and held through the write; the
+            // busy check inside PrepareLocalRootAsync is skipped, or it would see our own hold and answer 409.
+            var target = await svc.GetAsync(id, ct);
+            if (target is null)
                 return Results.NotFound();
+            if (!busy.TryAcquire(target.AccountId, target.ContainerName, "ChangingRoot"))
+                return Results.Json(
+                    new { error = "This backup is busy; try again once the current operation finishes.", code = "backup_busy" },
+                    statusCode: StatusCodes.Status409Conflict);
+            try
+            {
+                // Do not trust the preview result the frontend sends; rerun the full validation ourselves — which is exactly why Inspect
+                // has to be a pure query that is safe to re-enter. The new root being unplugged after the preview, or the backup starting
+                // between the two calls, are both caught by this second pass.
+                var prepared = await PrepareLocalRootAsync(
+                    id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct,
+                    busyHeldByCaller: true);
+                if (prepared.Failure is { } failure)
+                    return failure;
 
-            // The source key must be the repo-wide "{op}:{accountId}/{container}" (OperationLogService.cs:91-96).
-            // Writing a bare "backup" breaks two things at once: DeleteForContainerAsync cleans up by the ":{accountId}/{container}"
-            // suffix, so this Warning-level (long-lived) audit line could never be deleted again; and QueryAsync filters by exact source
-            // equality, so when reading the log per backup, a root change — the thing that most deserves a trace — is nowhere to be seen.
-            //
-            // The NoBaseline / BaselineUnreadable verdicts sample nothing at all, so the sample count has to be dropped from the sentence
-            // entirely — "0/0 sampled entries matched" reads like "nothing matched at all", the exact opposite of the truth.
-            // Use reason instead: BaselineUnreadable's reason carries the underlying exception verbatim, and design §5 counts that as the
-            // only diagnostic available to the user on the NAS who cannot get to a command line. Writing it only into the HTTP response
-            // means it is gone the moment they close the dialog; it has to land in this long-lived audit line.
-            var compared = preview.Sampled > 0
-                ? $", {preview.Matched}/{preview.Sampled} sampled entries matched"
-                : string.IsNullOrEmpty(preview.Reason) ? "" : $", {preview.Reason}";
-            await log.AppendAsync(
-                OperationLogLevel.Warning, $"backup:{moved.AccountId}/{moved.ContainerName}",
-                $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
-                $"to '{moved.LocalRoot}' (verdict {preview.Verdict}{compared}" +
-                $"{(needsForce ? ", forced" : "")}).",
-                ct);
+                var preview = prepared.Preview!;
+                var needsForce = preview.Verdict is nameof(LocalRootVerdict.NeedsConfirm)
+                    or nameof(LocalRootVerdict.Rejected)
+                    or nameof(LocalRootVerdict.BaselineUnreadable);
+                if (needsForce && !req.Force)
+                    return Results.Json(
+                        new
+                        {
+                            error = "The new root does not match this backup's latest version index.",
+                            code = "local_root_mismatch",
+                            preview,
+                        },
+                        statusCode: StatusCodes.Status400BadRequest);
 
-            var settings = await settingsSvc.GetAsync(ct);
-            return Results.Ok(BackupConfigResponse.From(moved, settings));
+                var oldRoot = prepared.Config!.LocalRoot;
+                var moved = await svc.ChangeLocalRootAsync(id, prepared.ResolvedRoot!, ct);
+                if (moved is null)
+                    return Results.NotFound();
+
+                // The source key must be the repo-wide "{op}:{accountId}/{container}" (OperationLogService.cs:91-96).
+                // Writing a bare "backup" breaks two things at once: DeleteForContainerAsync cleans up by the ":{accountId}/{container}"
+                // suffix, so this Warning-level (long-lived) audit line could never be deleted again; and QueryAsync filters by exact source
+                // equality, so when reading the log per backup, a root change — the thing that most deserves a trace — is nowhere to be seen.
+                //
+                // The NoBaseline / BaselineUnreadable verdicts sample nothing at all, so the sample count has to be dropped from the sentence
+                // entirely — "0/0 sampled entries matched" reads like "nothing matched at all", the exact opposite of the truth.
+                // Use reason instead: BaselineUnreadable's reason carries the underlying exception verbatim, and design §5 counts that as the
+                // only diagnostic available to the user on the NAS who cannot get to a command line. Writing it only into the HTTP response
+                // means it is gone the moment they close the dialog; it has to land in this long-lived audit line.
+                var compared = preview.Sampled > 0
+                    ? $", {preview.Matched}/{preview.Sampled} sampled entries matched"
+                    : string.IsNullOrEmpty(preview.Reason) ? "" : $", {preview.Reason}";
+                await log.AppendAsync(
+                    OperationLogLevel.Warning, $"backup:{moved.AccountId}/{moved.ContainerName}",
+                    $"Local root of '{moved.Name}' changed from '{(string.IsNullOrEmpty(oldRoot) ? "(none)" : oldRoot)}' " +
+                    $"to '{moved.LocalRoot}' (verdict {preview.Verdict}{compared}" +
+                    $"{(needsForce ? ", forced" : "")}).",
+                    ct);
+
+                var settings = await settingsSvc.GetAsync(ct);
+                return Results.Ok(BackupConfigResponse.From(moved, settings));
+            }
+            finally
+            {
+                busy.Release(target.AccountId, target.ContainerName);
+            }
         });
 
         return app;
@@ -1218,7 +1323,8 @@ public static class BackupConfigEndpoints
     private static async Task<PreparedLocalRoot> PrepareLocalRootAsync(
         int id, string newRoot, IBackupConfigService svc, IAccountService accounts,
         ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
-        IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct)
+        IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct,
+        bool busyHeldByCaller = false)
     {
         if (KeyringGuard.Blocked(keyring) is { } blocked)
             return new PreparedLocalRoot(blocked, null, null, null);
@@ -1228,7 +1334,8 @@ public static class BackupConfigEndpoints
             return new PreparedLocalRoot(Results.NotFound(), null, null, null);
 
         // The busy check comes first: changing the root while a backup/restore/check is running is pulling the rug out from under a directory that is being read.
-        if (busy.IsBusy(config.AccountId, config.ContainerName))
+        // The apply endpoint holds the lock itself for the whole validate-then-write span (busyHeldByCaller) — checking here would see that very hold.
+        if (!busyHeldByCaller && busy.IsBusy(config.AccountId, config.ContainerName))
             return new PreparedLocalRoot(
                 Results.Json(
                     new { error = "This backup is busy; try again once the current operation finishes.", code = "backup_busy" },

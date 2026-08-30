@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
+import { latestWins } from '../lib/latestWins'
 import { systemApi } from '../api/system'
 import { EmptyRow } from '../components/EmptyRow'
 import { formatLocalDateTime, formatUtcOffset } from '../constants/format'
@@ -23,7 +24,13 @@ export function LogsPage() {
   const [paths, setPaths] = useState<Record<string, string>>({})
   const [version, setVersion] = useState('')
 
+  // latestWins, not a cancelled flag: every keystroke in Source and every filter change re-runs the
+  // query, and a broad earlier query (no filter) can return AFTER the narrower one that superseded it —
+  // without the gate the stale, larger result set overwrites the fresh one, and the table no longer
+  // matches the filter controls it sits under. See the note in latestWins.ts.
+  const loadGate = useRef(latestWins())
   const load = () => {
+    const isLatest = loadGate.current.begin()
     logsApi
       .query({
         minLevel: minLevel === '' ? undefined : minLevel,
@@ -32,8 +39,12 @@ export function LogsPage() {
         to: to ? new Date(to).toISOString() : undefined,
         limit: 300,
       })
-      .then(setLogs)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .then((r) => {
+        if (isLatest()) setLogs(r)
+      })
+      .catch((e) => {
+        if (isLatest()) setError(e instanceof Error ? e.message : String(e))
+      })
       // finally, not then: a failed query must still end the "loading" state, or the table sits on
       // "Loading…" forever with the real reason in the error line above it.
       // Deliberately never reset to false on a re-query: a filter change then leaves the previous

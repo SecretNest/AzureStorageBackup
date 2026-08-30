@@ -26,6 +26,12 @@ public sealed class RepairRunState
     /// can tell "yield to other work, keep the intent" apart from "the user gave up on this run".</summary>
     internal volatile bool SuspendRequested;
 
+    /// <summary>True once RunAsync has fully exited — settlement writes done, busy lock back. Distinct from
+    /// a terminal Status: the run flips Completed while its tail (suspension clearing, report reconciliation,
+    /// the busy release) is still in flight, and a Start() admitted in that window would replace this state
+    /// and then fail against the still-held busy lock, reporting a successful repair as "Failed — busy".</summary>
+    internal volatile bool Settled;
+
     /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 
@@ -75,7 +81,11 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         lock (_lock)
         {
-            if (_runs.TryGetValue(configId, out var existing) && existing.Status == RunStatus.Running)
+            // Not-Running is not enough: the run flips Completed while its settlement writes are still in
+            // flight and the busy lock is still held (see RepairRunState.Settled) — replacing the state in
+            // that window launches a run that fails TryAcquire and clobbers the finished result with
+            // "Failed — busy". The previous run's state answers until its RunAsync has fully exited.
+            if (_runs.TryGetValue(configId, out var existing) && (existing.Status == RunStatus.Running || !existing.Settled))
                 return existing;
 
             var state = new RepairRunState
@@ -236,6 +246,18 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         try
         {
+            await RunCoreAsync(configId, version, cloud, rehydrate, cleanupOrphans, onlyPaths, alsoMarkPaths, state);
+        }
+        finally
+        {
+            state.Settled = true; // every exit path: Start() may hand out a replacement from here on
+        }
+    }
+
+    private async Task RunCoreAsync(int configId, int? version, CloudCheckLevel cloud, StorageTier? rehydrate, bool cleanupOrphans, IReadOnlyCollection<string>? onlyPaths, IReadOnlyCollection<string>? alsoMarkPaths, RepairRunState state)
+    {
+        try
+        {
             using var scope = scopes.CreateScope();
             var sp = scope.ServiceProvider;
             var configs = sp.GetRequiredService<IBackupConfigService>();
@@ -245,7 +267,9 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 ?? throw new InvalidOperationException($"Account {config.AccountId} not found.");
             var settings = await sp.GetRequiredService<IGlobalSettingsService>().GetAsync();
 
-            if (!busy.TryAcquire(account.Id, config.ContainerName, "Repairing"))
+            // refuseWhenReaders: a repair REWRITES volume families in place (VolumeBlobIO.ReplaceAsync), and a
+            // restore streaming those very volumes would get a mix of old and new — readers exclude rewriters.
+            if (!busy.TryAcquire(account.Id, config.ContainerName, "Repairing", refuseWhenReaders: true))
             {
                 state.Error = "This backup is busy with another operation.";
                 state.Status = RunStatus.Failed;
@@ -279,14 +303,12 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     uploadConcurrency: settings.UploadConcurrency > 0 ? settings.UploadConcurrency : 5,
                     pauseGate: state.WaitWhilePausedAsync,
                     ct: state.Cancellation.Token);
-                state.Status = RunStatus.Completed;
-                // Completion is the only thing that retires a persisted suspension: the intent has been carried
-                // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
-                await ClearSuspendedAsync(configId);
-                // And when EVERYTHING came out whole — nothing left unrecoverable or deferred — the check
+                // When EVERYTHING came out whole — nothing left unrecoverable or deferred — the check
                 // report the repair worked from retires with it ("所有文件都完成上传修复了,那么应该自动Drop"):
                 // the row's button goes back to Check. Anything still marked keeps the report, and only a
                 // manual Drop dismisses it — the marks carry the memory either way.
+                // Reconciled BEFORE Completed becomes visible (the same ordering CheckRunner uses for its
+                // persist): the moment the poller shows Completed, the gate row must already say so.
                 if (checks is not null && state.Report is { } done)
                 {
                     // Reconcile the report the repair worked from: everything fixed → Repaired (history line,
@@ -297,6 +319,12 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     if (unrecoverable == 0)
                         sweeper?.Kick(configId);
                 }
+                state.Status = RunStatus.Completed;
+                // Completion is the only thing that retires a persisted suspension: the intent has been carried
+                // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
+                // Deliberately AFTER the Completed flip: SuspendAsync's ghost-row re-check relies on "if my row
+                // landed after this clear, the flip is already visible" — clearing first would reopen the window.
+                await ClearSuspendedAsync(configId);
             }
             finally
             {

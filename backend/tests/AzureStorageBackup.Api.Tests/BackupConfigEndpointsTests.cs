@@ -372,7 +372,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         // BackingUp/Checking/CleaningUp/Repairing: with no matching Runner record, DeriveActivity falls back to reading
         // BackupBusyTracker.CurrentActivity, and these literals are exactly the ones really passed by the switch in
         // TaskDispatcher.cs and by the TryAcquire calls in BackupRunner.cs / RepairRunner.cs.
-        foreach (var label in new[] { "BackingUp", "Checking", "CleaningUp", "Repairing" })
+        foreach (var label in new[] { "BackingUp", "Checking", "CleaningUp", "Repairing", "ChangingRoot", "Deleting", "Creating" })
         {
             Assert.True(busy.TryAcquire(created!.AccountId, created.ContainerName, label));
             try

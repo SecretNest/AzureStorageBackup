@@ -47,13 +47,21 @@ public sealed record CleanupReport(int RetiredVersions, int DeletedPacks, int De
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
     DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null,
-    BackupJournalStore? journals = null)
+    BackupJournalStore? journals = null, BackupBusyTracker? busy = null)
 {
     /// <summary>Standalone cleanup: reads the info file itself (preferring the locally authoritative copy).</summary>
     public async Task<CleanupReport> CleanupAsync(
         Account account, string container, string? password, CleanupOptions options, CancellationToken ct = default,
         StagingArea.StagingLease? lease = null, bool sweepOrphans = false)
     {
+        // A running restore resolved its blob set from the version it is downloading; retiring versions and
+        // deleting "unreferenced" objects mid-download 404s it, and the compaction along the way rewrites
+        // pack volumes it may be streaming. The cleanup is periodic — a skipped round costs nothing and the
+        // next one collects, so with readers active it does not even begin. (Null busy = the direct-construction
+        // test path, which stages no concurrent restores; production DI always passes the tracker.)
+        if (busy?.HasReaders(account.Id, container) == true)
+            return CleanupReport.Empty;
+
         var info = trackedInfo is not null
             ? await trackedInfo.LoadAsync(account, container, password, ct)
             : await store.ReadInfoAsync(account, container, password, ct);

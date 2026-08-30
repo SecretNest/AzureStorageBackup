@@ -12,6 +12,27 @@ public sealed class TaskDispatcher(
 {
     public async Task DispatchAsync(ScheduledTask task, CancellationToken ct = default)
     {
+        // Nothing may escape this method: SchedulerService fires it as `_ = DispatchAsync(...)` and the run-now
+        // endpoint counts on "DispatchAsync's catch reduces it to a log line" — an exception thrown by target
+        // resolution or the deferred-repair tail (both outside the per-target try below) would otherwise become
+        // an unobserved task exception, dropped with no trace at the exact moments it matters (a tick racing a
+        // planned shutdown most of all).
+        try
+        {
+            await DispatchCoreAsync(task, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Routine shutdown (or the run-now request being aborted), not a failure.
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Scheduled {Type} dispatch failed", task.TaskType);
+        }
+    }
+
+    private async Task DispatchCoreAsync(ScheduledTask task, CancellationToken ct)
+    {
         using var scope = scopes.CreateScope();
         var sp = scope.ServiceProvider;
 
@@ -26,7 +47,9 @@ public sealed class TaskDispatcher(
                 ScheduledTaskType.Cleanup => "CleaningUp",
                 _ => "Checking",
             };
-            if (!busy.TryAcquire(accountId, container, activity))
+            // A scheduled Cleanup deletes retired blobs and compacts packs in place, so it must not overlap a
+            // running restore (a reader); backups and checks coexist with restores as ever.
+            if (!busy.TryAcquire(accountId, container, activity, refuseWhenReaders: activity == "CleaningUp"))
             {
                 logger.LogWarning("Backup {Account}/{Container} is busy; skipping scheduled {Type}", accountId, container, task.TaskType);
                 await sp.GetRequiredService<IOperationLog>().AppendAsync(
