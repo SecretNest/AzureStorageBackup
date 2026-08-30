@@ -274,6 +274,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
             null, // the optional per-volume work progress
+            null, // the optional per-object uploaded-bytes callback
         ]);
 
         Assert.Contains("grown.bin", unrecoverable);
@@ -324,6 +325,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
             null, // the optional per-volume work progress
+            null, // the optional per-object uploaded-bytes callback
         ]);
 
         Assert.Empty(hasher.Hashed);
@@ -379,6 +381,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
             null, // the optional per-volume work progress
+            null, // the optional per-object uploaded-bytes callback
         ]);
 
         Assert.Empty(hasher.Hashed);

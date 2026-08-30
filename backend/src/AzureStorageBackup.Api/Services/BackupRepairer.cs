@@ -211,6 +211,13 @@ public sealed class BackupRepairer(
             if (changedVersions.Count > 0)
                 await PersistChangedAsync();
 
+            // The backup's ledger discipline, taken as-is (it was tuned over many rounds — "你参考下backup"):
+            // claim the authoritative per-item transferred reading up front, let each family's landed volumes
+            // ride the unfinished ledger ("+X on the cloud"), and fold them into "uploaded" only at the
+            // object's own write-off. Without it, per-volume completions inflated "uploaded" past the
+            // per-object workDone it is displayed against — the field's "118% of original" mid-object.
+            tracker?.SetTransferred(0);
+            long uploadedTotal = 0;
             if (tracker is not null)
                 foreach (var badRef in badBlobs)
                     tracker.Enqueue(WorkOf(badRef));
@@ -235,14 +242,15 @@ public sealed class BackupRepairer(
                     Interlocked.Add(ref counted, share);
                     tracker?.AdvanceWork(share);
                 }
+                void Uploaded(long bytes) => Interlocked.Add(ref uploadedTotal, bytes);
                 try
                 {
                     if (badRef.StartsWith("packs/", StringComparison.Ordinal))
                         await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                            repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress);
+                            repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
                     else
                         await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress);
+                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -257,7 +265,14 @@ public sealed class BackupRepairer(
                     tracker?.EndWork();
                 }
                 tracker?.Advance(0, Math.Max(0, WorkOf(badRef) - Interlocked.Read(ref counted)));
+                // Transferred and workload settle at the same moment, on the same item — the pairing the
+                // backup's ReportItem states is what keeps the "(N% of original)" readable.
+                tracker?.SetTransferred(Interlocked.Read(ref uploadedTotal));
             }
+            // The stage's wrap-up must force out the final state (the same rule Complete's own comment
+            // states): the last write-off's publish is throttled like any other, and without this the
+            // screen keeps the snapshot from just before it — folded bytes never shown as uploaded.
+            tracker?.Complete();
 
             // Healed verdicts span the whole assessed scope — selected AND deferred. The pre-check genuinely
             // re-examined the deferred half (scopePaths is the union), and discarding its Ok verdicts left those
@@ -372,7 +387,7 @@ public sealed class BackupRepairer(
         List<string> unrecoverable, HashSet<int> changedVersions,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
         VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
-        Action<long>? workProgress = null)
+        Action<long>? workProgress = null, Action<long>? onUploaded = null)
     {
         // The entries across all versions that reference this blob (identical content at different paths can yield several).
         var refs = indexes.SelectMany(kv => kv.Value.Entries
@@ -439,10 +454,20 @@ public sealed class BackupRepairer(
                 };
                 // No per-volume release: the raw route uploads the user's own file, never staged, never
                 // charged to the pool — and its label passthrough spares the uploader a rehash.
-                await VolumeBlobIO.ReplaceAsync(
-                    uploader, account, cc, blobRef, [local], dataTier, retry: null, ct, rawMeta,
-                    uploadScope, onVolumeUploaded: null, label: e.Path, beforeVolume: pauseGate);
-                newSizes = [new FileInfo(local).Length];
+                tracker?.BeginUpload(blobRef, 1);
+                try
+                {
+                    await VolumeBlobIO.ReplaceAsync(
+                        uploader, account, cc, blobRef, [local], dataTier, retry: null, ct, rawMeta,
+                        uploadScope, onVolumeUploaded: null, label: e.Path, beforeVolume: pauseGate);
+                    newSizes = [new FileInfo(local).Length];
+                    onUploaded?.Invoke(newSizes[0]);
+                    tracker?.ConfirmUpload(blobRef);
+                }
+                finally
+                {
+                    tracker?.EndUpload(blobRef);
+                }
                 break;
             }
             // The stat gate (kept from LocalMatchesAsync): absent or wrong-length files cannot hash-match, and
@@ -452,7 +477,7 @@ public sealed class BackupRepairer(
             var storeOnly = dontCompress?.MatchesFileOrAncestorDir(e.Path) ?? false;
             newSizes = await ReplaceFromVerifiedStreamAsync(
                 account, cc, blobRef, local, e.Path, fullHash, entry0.Length, dataTier, volumeBytes, password,
-                meta, storeOnly, lease, ct, tracker, uploadScope, pauseGate, workProgress);
+                meta, storeOnly, lease, ct, tracker, uploadScope, pauseGate, workProgress, onUploaded);
             if (newSizes is not null)
                 break;
         }
@@ -501,7 +526,7 @@ public sealed class BackupRepairer(
         List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
         VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
-        Action<long>? workProgress = null)
+        Action<long>? workProgress = null, Action<long>? onUploaded = null)
     {
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
@@ -595,13 +620,23 @@ public sealed class BackupRepairer(
                 var packShare = staged.Files.Count > 0
                     ? members.Values.Sum(m => m.Length) / staged.Files.Count
                     : 0;
-                await VolumeBlobIO.ReplaceAsync(
-                    uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct,
-                    scope: uploadScope, onVolumeUploaded: f =>
-                    {
-                        staging.ReleaseFile(f);
-                        workProgress?.Invoke(packShare); // approximate per-volume share of the recorded source bytes
-                    }, label: packId, beforeVolume: pauseGate);
+                tracker?.BeginUpload(packBlobRef, staged.Files.Count);
+                try
+                {
+                    await VolumeBlobIO.ReplaceAsync(
+                        uploader, account, cc, packBlobRef, staged.Files, dataTier, retry: null, ct,
+                        scope: uploadScope, onVolumeUploaded: f =>
+                        {
+                            staging.ReleaseFile(f);
+                            workProgress?.Invoke(packShare); // approximate per-volume share of the recorded source bytes
+                        }, label: packId, beforeVolume: pauseGate);
+                    onUploaded?.Invoke(newSizes.Sum()); // sizes were grabbed before the per-volume release deleted the files
+                    tracker?.ConfirmUpload(packBlobRef);
+                }
+                finally
+                {
+                    tracker?.EndUpload(packBlobRef);
+                }
             }
             finally
             {
@@ -647,7 +682,7 @@ public sealed class BackupRepairer(
         IReadOnlyDictionary<string, string> metadata, bool storeOnly,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker,
         VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
-        Action<long>? workProgress = null)
+        Action<long>? workProgress = null, Action<long>? onUploaded = null)
     {
         // Segments 0/0: only the full hash and the length carry the verdict — the head/tail collision metadata
         // is reused from the index entry (see the metaEntry note in RepairBlobAsync), never recomputed here.
@@ -695,13 +730,25 @@ public sealed class BackupRepairer(
             // Each landed volume also books its share of the source workload, which is what keeps the byte
             // percentage and the remaining-time estimate moving through a 100 GB object.
             var share = staged.Files.Count > 0 ? expectedLength / staged.Files.Count : 0;
-            await VolumeBlobIO.ReplaceAsync(
-                uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata,
-                uploadScope, onVolumeUploaded: f =>
-                {
-                    staging.ReleaseFile(f);
-                    workProgress?.Invoke(share);
-                }, label: localSource, beforeVolume: pauseGate);
+            // The family ledger bracket, exactly as the backup's UploadStagedBlobAsync writes it: landed
+            // volumes ride the unfinished ledger until the object's write-off folds them into uploaded.
+            tracker?.BeginUpload(blobRef, staged.Files.Count);
+            try
+            {
+                await VolumeBlobIO.ReplaceAsync(
+                    uploader, account, cc, blobRef, staged.Files, dataTier, retry: null, ct, metadata,
+                    uploadScope, onVolumeUploaded: f =>
+                    {
+                        staging.ReleaseFile(f);
+                        workProgress?.Invoke(share);
+                    }, label: localSource, beforeVolume: pauseGate);
+                onUploaded?.Invoke(sizes.Sum());
+                tracker?.ConfirmUpload(blobRef);
+            }
+            finally
+            {
+                tracker?.EndUpload(blobRef);
+            }
             return sizes;
         }
         finally

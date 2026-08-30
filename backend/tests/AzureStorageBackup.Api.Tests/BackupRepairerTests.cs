@@ -630,6 +630,62 @@ public sealed class BackupRepairerTests : IDisposable
             Inner.DeleteIfExistsAsync(account, container, blobName, ct);
     }
 
+    /// <summary>The "118% of original" field report: repair's per-volume completions were booked straight
+    /// into transferredBytes, so the object still in flight inflated "uploaded" past the per-object workDone
+    /// it is displayed against. The backup's ledger discipline applies now: an unfinished family's landed
+    /// volumes ride UnfinishedItemBytes ("+X on the cloud"), and transferred moves only at the object's own
+    /// write-off — so while the FIRST object is mid-upload, transferred stays zero.</summary>
+    [SkippableFact]
+    public async Task Uploaded_Bytes_Wait_For_The_Object_To_Finish()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("repl-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[30_000_000]; // 30 volumes: the upload phase spans many publishes
+            new Random(29).NextBytes(content);
+            await File.WriteAllBytesAsync(Path.Combine(_src, "big.bin"), content);
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                    VolumeBytes = 1_000_000,
+                },
+            });
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            var badSnapshots = 0;
+            var sawUnfinished = false;
+            long finalTransferred = -1;
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot,
+                1_000_000, dontCompress: null, onlyPaths: ["big.bin"],
+                onProgress: d =>
+                {
+                    if (d.Stage != "Repairing") return;
+                    // The single object has not been written off: nothing may claim to be "uploaded" yet.
+                    if (d.Processed == 0 && d.TransferredBytes > 0) Interlocked.Increment(ref badSnapshots);
+                    if (d.UnfinishedItemBytes > 0) sawUnfinished = true;
+                    Interlocked.Exchange(ref finalTransferred, d.TransferredBytes);
+                });
+
+            Assert.Equal(["big.bin"], report.Repaired);
+            Assert.Equal(0, badSnapshots);
+            Assert.True(sawUnfinished, "landed volumes of the in-flight object should ride the unfinished ledger");
+            Assert.True(finalTransferred > 0, "the write-off must fold the family into uploaded");
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>Counts full-hash reads per path while behaving exactly like the real hasher.</summary>
     private sealed class CountingHasher(IFileHasher inner) : IFileHasher
     {
