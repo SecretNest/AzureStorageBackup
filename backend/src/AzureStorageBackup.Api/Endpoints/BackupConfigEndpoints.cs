@@ -511,7 +511,9 @@ public static class BackupConfigEndpoints
             var fvIdentity = info?.Backup.CreatedAt.UtcTicks ?? 0;
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
             {
-                var idx = await indexCache.ReadAsync(account, config.ContainerName, v.Version, fvIdentity, v.IndexBlob, password, v.IndexVolumes, ct);
+                var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, v, fvIdentity, password, ct);
+                if (idx is null)
+                    continue; // retired between the info load and now — not a substitution candidate anymore
                 if (idx.UnrecoverablePaths.Contains(path))
                     continue;
                 var e = idx.Entries.FirstOrDefault(x => x.Path == path && x.Storage is not null);
@@ -548,9 +550,9 @@ public static class BackupConfigEndpoints
             var ver = info?.Versions.FirstOrDefault(x => x.Version == report.Version);
             if (info is null || ver is null)
                 return Results.NotFound();
-            var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks,
-                ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (idx is null)
+                return Results.NotFound();
             var entries = idx.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
 
             long UploadBytesOf(StorageRef s) =>
@@ -628,9 +630,9 @@ public static class BackupConfigEndpoints
                 : info?.Versions.Count > 0 ? info.Versions[^1] : null;
             if (info is null || ver is null)
                 return Results.NotFound();
-            var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks,
-                ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (idx is null)
+                return Results.NotFound();
             var entry = idx.Entries.FirstOrDefault(e => e.Path == path);
             if (entry is null)
                 return Results.NotFound();
@@ -682,8 +684,9 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<string>());
-            var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (idx is null)
+                return Results.Ok(Array.Empty<string>());
             return Results.Ok(idx.UnrecoverablePaths);
         });
 
@@ -708,8 +711,9 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<object>());
-            var idx = await indexCache.ReadAsync(
-                account, config.ContainerName, ver.Version, info.Backup.CreatedAt.UtcTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (idx is null)
+                return Results.Ok(Array.Empty<object>());
             return Results.Ok(idx.Entries
                 .Where(e => e.UnreadableAt is not null)
                 .Select(e => new { path = e.Path, unreadableAt = e.UnreadableAt })
@@ -740,7 +744,9 @@ public static class BackupConfigEndpoints
                 return Results.Ok(Array.Empty<TreeNode>()); // the requested version does not exist → empty result, same as /unrecoverable and /file-versions
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, identity, password, ct);
+            if (idx is null)
+                return Results.Ok(Array.Empty<TreeNode>()); // retired mid-request — same answer as a version that never existed
             return Results.Ok(VersionTreeService.Children(idx, path));
         });
 
@@ -768,7 +774,9 @@ public static class BackupConfigEndpoints
                 return Results.NotFound(new { error = "Version not found." });
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await indexCache.ReadAsync(account, config.ContainerName, ver.Version, identity, ver.IndexBlob, password, ver.IndexVolumes, ct);
+            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, identity, password, ct);
+            if (idx is null)
+                return Results.NotFound(new { error = "Version not found." }); // retired mid-request
             var estimate = RestoreEstimator.Compute(idx, info, body.Paths ?? []);
 
             // First-volume blob name + volume count for each deduplicated storage object (packs use PackInfo.Volumes; blobs use StorageRef.Volumes from the first entry with that Ref).
@@ -1423,6 +1431,30 @@ public static class BackupConfigEndpoints
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new BaselineLoad(null, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// A version's index read for the metadata-browse endpoints (/tree, /file-versions, /unrecoverable,
+    /// /unreadable, /hash-file, /repair-plan, /restore-estimate). These endpoints read without registering
+    /// as busy-tracker readers — deliberately: a browse must not stand a nightly cleanup down — which means
+    /// retention can retire the very version being browsed mid-request: the info file still listed it when
+    /// this request loaded, and the index blob is gone by the time this read reaches the cloud. That is not
+    /// an internal error, it is a state one refresh old, so the 404 comes back as null and each endpoint
+    /// answers exactly the way it answers a version that never existed. Every other failure still throws.
+    /// </summary>
+    private static async Task<VersionIndex?> ReadIndexOrGoneAsync(
+        ILocalIndexCache indexCache, Account account, string container, BackupVersion ver, long identityTicks,
+        string? password, CancellationToken ct)
+    {
+        try
+        {
+            return await indexCache.ReadAsync(
+                account, container, ver.Version, identityTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            return null;
         }
     }
 }

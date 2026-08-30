@@ -19,7 +19,9 @@ public sealed class BackupBusyTracker
 
     /// <summary>The activities that rewrite or delete objects a live version references — the ones a
     /// reader can never safely overlap. Everything else (BackingUp/Checking/ChangingRoot/Creating) only
-    /// adds new objects or touches nothing a restore reads.</summary>
+    /// adds new objects or touches nothing a restore reads — with one caveat that is not an exception but
+    /// a relabel: the backup run's own retention/compaction tail DOES delete and rewrite, so RetentionCleaner
+    /// swaps the label to "CleaningUp" for that stretch via <see cref="TryBeginRewrite"/> before touching anything.</summary>
     private static readonly string[] RewritingActivities = ["Repairing", "CleaningUp", "Deleting"];
 
     private readonly Lock _lock = new();
@@ -73,6 +75,43 @@ public sealed class BackupBusyTracker
                 _readers.Remove(key);
             else
                 _readers[key] = count - 1;
+        }
+    }
+
+    /// <summary>Enter a rewriting stretch on a target the caller may already hold under a NON-rewriting label —
+    /// the backup run's own retention/compaction tail, which runs as "BackingUp" yet deletes and rewrites
+    /// referenced blobs. Refused (nothing changes) while any reader is active; otherwise the label swaps to
+    /// <paramref name="activity"/> so no new reader is admitted for the duration, and <paramref name="priorActivity"/>
+    /// receives what to hand back to <see cref="EndRewrite"/> (null = the target was idle and the swap acquired it).
+    /// A plain HasReaders check cannot do this job: between the check and the first delete a reader may register,
+    /// because the standing label ("BackingUp") admits them — the swap and the reader check are one atom here.</summary>
+    public bool TryBeginRewrite(int accountId, string container, out string? priorActivity, string activity = "CleaningUp")
+    {
+        lock (_lock)
+        {
+            var key = Key(accountId, container);
+            if (_readers.ContainsKey(key))
+            {
+                priorActivity = null;
+                return false;
+            }
+            priorActivity = _busy.GetValueOrDefault(key);
+            _busy[key] = activity;
+            return true;
+        }
+    }
+
+    /// <summary>Leave the rewriting stretch: restore the label <see cref="TryBeginRewrite"/> displaced,
+    /// or release the target outright when the stretch acquired it (priorActivity null).</summary>
+    public void EndRewrite(int accountId, string container, string? priorActivity)
+    {
+        lock (_lock)
+        {
+            var key = Key(accountId, container);
+            if (priorActivity is null)
+                _busy.Remove(key);
+            else
+                _busy[key] = priorActivity;
         }
     }
 

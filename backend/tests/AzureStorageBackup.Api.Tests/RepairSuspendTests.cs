@@ -97,6 +97,41 @@ public class RepairSuspendTests(TestWebAppFactory factory) : IClassFixture<TestW
         var runner = factory.Services.GetRequiredService<RepairRunner>();
         Assert.Null(runner.Get(configId));
     }
+    /// <summary>A successful repair leaves two durable facts: the reconciled check gate (Repaired, history
+    /// line, button back to Check) and the retired suspension row. Written as two separate commits, a crash
+    /// between them left the gate already saying Repaired while the row still synthesized a Suspended state
+    /// with a Resume button on the next start — and DeferredRepairs deferring to a run that had finished.
+    /// The two facts commit as one transaction; the runner's post-flip clear stays as the ghost-row backstop.</summary>
+    [Fact]
+    public async Task The_Gate_Reconciliation_And_The_Suspension_Retirement_Commit_As_One()
+    {
+        var configId = await ConfigAsync("susp-atomic");
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.SuspendedRepairs.Add(new SuspendedRepair
+            {
+                BackupConfigId = configId, PathsJson = """["a.bin"]""",
+                Cloud = CloudCheckLevel.ExistenceSize, SuspendedAt = DateTimeOffset.UtcNow,
+            });
+            db.LastCheckRuns.Add(new LastCheckRun
+            {
+                BackupConfigId = configId, ReportJson = "{}", FinishedAt = DateTimeOffset.UtcNow,
+                Resolution = CheckResolution.Pending, UnrepairedCount = 1,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await factory.Services.GetRequiredService<CheckRunner>()
+            .ResolveAfterRepairAsync(configId, unrecoverable: 0, clearSuspendedRepair: true);
+
+        using var verify = factory.Services.CreateScope();
+        var vdb = verify.ServiceProvider.GetRequiredService<AppDbContext>();
+        var gate = await vdb.LastCheckRuns.AsNoTracking().SingleAsync(x => x.BackupConfigId == configId);
+        Assert.Equal(CheckResolution.Repaired, gate.Resolution);
+        Assert.False(await vdb.SuspendedRepairs.AsNoTracking().AnyAsync(x => x.BackupConfigId == configId));
+    }
+
     /// <summary>The pause gate's three-way contract: it holds while paused, a lift releases the waiter, and a
     /// cancellation (stop or suspend) tears through it — a paused run must still be stoppable and suspendable,
     /// or Pause becomes a trap the operator can only escape by restarting the container.</summary>

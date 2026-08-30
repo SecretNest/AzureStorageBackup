@@ -315,15 +315,19 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     // gate open) and the container gets the sweep the hold deferred; anything left → the row
                     // stays Pending with the fresh unrepaired count, red button and all.
                     var unrecoverable = done.Unrecoverable.Distinct().Count();
-                    await checks.ResolveAfterRepairAsync(configId, unrecoverable);
+                    // clearSuspendedRepair: the suspension row retires in the SAME transaction as the gate —
+                    // committed apart, a crash between the two left a durably-Repaired gate next to a row that
+                    // still synthesized Suspended (a Resume button for a finished repair) on the next start.
+                    await checks.ResolveAfterRepairAsync(configId, unrecoverable, clearSuspendedRepair: true);
                     if (unrecoverable == 0)
                         sweeper?.Kick(configId);
                 }
                 state.Status = RunStatus.Completed;
-                // Completion is the only thing that retires a persisted suspension: the intent has been carried
-                // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
-                // Deliberately AFTER the Completed flip: SuspendAsync's ghost-row re-check relies on "if my row
-                // landed after this clear, the flip is already visible" — clearing first would reopen the window.
+                // Completion is the only thing that retires a persisted suspension — normally it already
+                // happened atomically with the gate reconciliation above (and on the no-checks path, here).
+                // This second, post-flip clear is the ghost-row backstop, and its position is deliberate:
+                // SuspendAsync's re-check relies on "if my row landed after this clear, the flip is already
+                // visible" — a row written during the tail is caught either by this clear or by that re-check.
                 await ClearSuspendedAsync(configId);
             }
             finally

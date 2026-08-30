@@ -59,6 +59,35 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
         Assert.True(busy.TryAcquire(1, "c", "Repairing", refuseWhenReaders: true));
     }
 
+    [Fact]
+    public void Rewrite_Gate_Swaps_The_Label_And_Restores_It()
+    {
+        var busy = new BackupBusyTracker();
+
+        // Under a backup: swap to CleaningUp, readers refused for the duration, label restored afterwards.
+        Assert.True(busy.TryAcquire(1, "c", "BackingUp"));
+        Assert.True(busy.TryBeginRewrite(1, "c", out var prior));
+        Assert.Equal("BackingUp", prior);
+        Assert.Equal("CleaningUp", busy.CurrentActivity(1, "c"));
+        Assert.False(busy.TryAddReader(1, "c", out var conflict));
+        Assert.Equal("CleaningUp", conflict);
+        busy.EndRewrite(1, "c", prior);
+        Assert.Equal("BackingUp", busy.CurrentActivity(1, "c"));
+        Assert.True(busy.TryAddReader(1, "c", out _));
+
+        // With that reader active the rewrite gate refuses, leaving the label untouched — the same
+        // both-directions matrix TryAcquire(refuseWhenReaders) implements.
+        Assert.False(busy.TryBeginRewrite(1, "c", out _));
+        Assert.Equal("BackingUp", busy.CurrentActivity(1, "c"));
+
+        // On an idle target it acquires outright, and EndRewrite(null) releases.
+        Assert.True(busy.TryBeginRewrite(2, "c2", out var idlePrior));
+        Assert.Null(idlePrior);
+        Assert.Equal("CleaningUp", busy.CurrentActivity(2, "c2"));
+        busy.EndRewrite(2, "c2", idlePrior);
+        Assert.False(busy.IsBusy(2, "c2"));
+    }
+
     // ---- The runners honor the matrix ---------------------------------------------------------------
 
     private async Task<(int AccountId, int ConfigId, string Container)> CreateConfigAsync(HttpClient client, string tag)
@@ -132,13 +161,20 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
     private sealed class CountingStore : IBackupInfoStore
     {
         public int InfoReads;
+        public int InfoWrites;
+        public Action? OnInfoWrite;
         public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default)
         {
             Interlocked.Increment(ref InfoReads);
             return Task.FromResult<BackupInfoFile?>(null);
         }
         public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) => Task.FromResult<(BackupInfoFile, string)?>(null);
-        public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref InfoWrites);
+            OnInfoWrite?.Invoke();
+            return Task.CompletedTask;
+        }
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => Task.FromResult("etag");
         public Task<VersionIndex> ReadIndexAsync(Account a, string c, string i, string? p, int v = 1, CancellationToken ct = default) => Task.FromResult(new VersionIndex());
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.FromResult(("indexes/v.bin", 1));
@@ -162,5 +198,75 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
 
         Assert.True(report.IsEmpty);
         Assert.Equal(0, store.InfoReads); // stood down before touching anything
+    }
+
+    // ---- The CORE overload (the orchestrator's post-backup tail) is gated too -----------------------
+
+    /// <summary>Thrown by the fake store's first write to pin the test at the first destructive step —
+    /// the retirement commit — before the cleanup ever reaches for the network.</summary>
+    private sealed class StopBeforeTheCloud : Exception;
+
+    private static BackupInfoFile TwoVersionInfo() => new()
+    {
+        Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow.AddDays(-9) },
+        Versions =
+        {
+            new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-8), IndexBlob = "indexes/v1.bin", Stats = new VersionStats(1, 10, 1, 10) },
+            new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = "indexes/v2.bin", Stats = new VersionStats(1, 10, 1, 10) },
+        },
+    };
+
+    [Fact]
+    public async Task Core_Cleanup_Overload_Stands_Down_While_A_Restore_Is_Active()
+    {
+        // The overload the backup's own tail calls (info already in hand) retires versions and compacts
+        // packs exactly like the standalone one — with a restore reading, it must not even commit the
+        // retirement, or the deletes that follow 404 the reader.
+        var busy = new BackupBusyTracker();
+        var store = new CountingStore { OnInfoWrite = () => throw new StopBeforeTheCloud() };
+        var cleaner = new RetentionCleaner(
+            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy);
+        var account = new Account { Id = 8, Name = "a", BlobEndpoint = "http://127.0.0.1:1", AccountKeyProtected = TestSecrets.Protect("dGVzdGtleQ==") };
+
+        Assert.True(busy.TryAcquire(8, "held", "BackingUp")); // the backup run this tail belongs to
+        Assert.True(busy.TryAddReader(8, "held", out _));     // a live restore alongside it
+
+        var report = await cleaner.CleanupAsync(account, "held", null,
+            new CleanupOptions { Retention = new RetentionPolicy { MaxVersions = 1 } }, TwoVersionInfo());
+
+        Assert.True(report.IsEmpty);
+        Assert.Equal(0, store.InfoWrites); // the retirement commit never happened
+        Assert.Equal("BackingUp", busy.CurrentActivity(8, "held")); // and the run's own label is untouched
+    }
+
+    [Fact]
+    public async Task Core_Cleanup_Under_A_Backup_Excludes_New_Readers_And_Restores_The_Label()
+    {
+        // No reader yet: the tail may clean — but for its duration the target must read as a rewriter
+        // (a restore starting mid-delete is the same corruption as one that was already running), and
+        // the backup's own label must come back once the cleanup is done.
+        var busy = new BackupBusyTracker();
+        string? duringActivity = null;
+        bool? readerAdmittedDuring = null;
+        var store = new CountingStore();
+        store.OnInfoWrite = () =>
+        {
+            duringActivity = busy.CurrentActivity(9, "held");
+            readerAdmittedDuring = busy.TryAddReader(9, "held", out _);
+            if (readerAdmittedDuring == true)
+                busy.RemoveReader(9, "held");
+            throw new StopBeforeTheCloud(); // pinned at the first destructive step; nothing network runs
+        };
+        var cleaner = new RetentionCleaner(
+            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy);
+        var account = new Account { Id = 9, Name = "a", BlobEndpoint = "http://127.0.0.1:1", AccountKeyProtected = TestSecrets.Protect("dGVzdGtleQ==") };
+
+        Assert.True(busy.TryAcquire(9, "held", "BackingUp"));
+        await Assert.ThrowsAsync<StopBeforeTheCloud>(() => cleaner.CleanupAsync(account, "held", null,
+            new CleanupOptions { Retention = new RetentionPolicy { MaxVersions = 1 } }, TwoVersionInfo()));
+
+        Assert.Equal("CleaningUp", duringActivity);      // the tail reads as a rewriter while it works
+        Assert.False(readerAdmittedDuring);              // so a restore cannot slip in mid-delete
+        Assert.Equal("BackingUp", busy.CurrentActivity(9, "held")); // restored even on the throw path
     }
 }

@@ -193,20 +193,35 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     /// <summary>A completed repair reconciles the report it worked from: everything fixed → Repaired (the
     /// gate opens, the history line says so); anything left → the row stays Pending with the fresh unrepaired
     /// count, and only a manual Drop dismisses it.</summary>
-    internal async Task ResolveAfterRepairAsync(int configId, int unrecoverable, CancellationToken ct = default)
+    internal async Task ResolveAfterRepairAsync(int configId, int unrecoverable, bool clearSuspendedRepair = false, CancellationToken ct = default)
     {
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var row = await db.LastCheckRuns.FirstOrDefaultAsync(
             x => x.BackupConfigId == configId && x.Resolution == CheckResolution.Pending, ct);
-        if (row is null)
+        if (row is not null)
+        {
+            if (unrecoverable == 0)
+                row.Resolution = CheckResolution.Repaired;
+            row.UnrepairedCount = unrecoverable;
+        }
+        // The suspended-repair intent retires in the SAME transaction as the gate it served (the repair
+        // passes clearSuspendedRepair). Committed apart — the reconciliation here, the row's delete in the
+        // runner's own tail — a crash between the two left the gate durably saying Repaired while the row
+        // still synthesized a Suspended state (Resume button, DeferredRepairs standing down) on the next
+        // start, for a repair that had finished. The runner's post-Completed ClearSuspendedAsync stays as
+        // the backstop for a suspension row that lands during the tail itself.
+        var suspended = clearSuspendedRepair
+            ? await db.SuspendedRepairs.FirstOrDefaultAsync(x => x.BackupConfigId == configId, ct)
+            : null;
+        if (suspended is not null)
+            db.SuspendedRepairs.Remove(suspended);
+        if (row is null && suspended is null)
             return;
-        if (unrecoverable == 0)
-            row.Resolution = CheckResolution.Repaired;
-        row.UnrepairedCount = unrecoverable;
         await db.SaveChangesAsync(ct);
-        lock (_lock)
-            _runs.Remove(configId); // the in-memory report is a stale plan now; GET reloads the resolved row
+        if (row is not null)
+            lock (_lock)
+                _runs.Remove(configId); // the in-memory report is a stale plan now; GET reloads the resolved row
     }
 
     /// <summary>Persist a run's report as the config's last completed check. Best-effort: a failed write leaves

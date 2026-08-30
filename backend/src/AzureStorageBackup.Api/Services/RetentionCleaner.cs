@@ -100,6 +100,34 @@ public sealed class RetentionCleaner(
         if (toDelete.Count == 0 && !sweepOrphans)
             return CleanupReport.Empty;
 
+        // The overload above stands down for readers before it even loads the info file, and its two callers
+        // (the scheduled Cleanup, the orphan sweeper) hold "CleaningUp" before that check, so no reader can
+        // slip in behind it. THIS overload's caller is the backup's own wrap-up tail, and it arrives holding
+        // "BackingUp" — a label readers rightly coexist with, which means a bare HasReaders check here would
+        // be a check-then-act: a restore could register right after it and still meet the deletes. So the
+        // stretch swaps the label to "CleaningUp" atomically with the reader check (and puts it back when
+        // done): an active reader skips the round entirely — the next cleanup collects — and no new reader
+        // is admitted while versions retire and packs compact. (Null busy = the direct-construction test
+        // path, which stages no concurrent restores; production DI always passes the tracker.)
+        string? priorActivity = null;
+        if (busy is not null && !busy.TryBeginRewrite(account.Id, container, out priorActivity))
+            return CleanupReport.Empty;
+        try
+        {
+            return await CleanupLockedAsync(account, container, password, options, info, toDelete, ct, lease, sweepOrphans);
+        }
+        finally
+        {
+            busy?.EndRewrite(account.Id, container, priorActivity);
+        }
+    }
+
+    /// <summary>The destructive body of the overload above, entered only through its rewrite gate.</summary>
+    private async Task<CleanupReport> CleanupLockedAsync(
+        Account account, string container, string? password, CleanupOptions options,
+        BackupInfoFile info, IReadOnlyList<int> toDelete, CancellationToken ct,
+        StagingArea.StagingLease? lease, bool sweepOrphans)
+    {
         var container_ = factory.CreateServiceClient(account).GetBlobContainerClient(container);
         var deleted = new HashSet<int>(toDelete);
 
