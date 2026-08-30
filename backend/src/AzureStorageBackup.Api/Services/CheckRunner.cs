@@ -20,13 +20,26 @@ public sealed class CheckRunState
     /// <summary>What the current stage is doing (which object it is checking, how many so far, how fast).</summary>
     public StageProgress? Detail { get; set; }
 
+    /// <summary>When the run completed — the "checked at" the dialog shows next to a clean verdict, so a
+    /// report that found nothing still answers WHEN it found nothing.</summary>
+    public DateTimeOffset? FinishedAt { get; set; }
+
+    /// <summary>The persisted report's lifecycle state (see <see cref="Models.CheckResolution"/>); null for a
+    /// live run that has not persisted yet.</summary>
+    public CheckResolution? Resolution { get; set; }
+
+    /// <summary>Problem files still unrepaired, for the "dropped (N没修好)" line.</summary>
+    public int UnrepairedCount { get; set; }
+
     /// <summary>Internal machinery, not part of the HTTP contract: this run's cancellation source, used by the /cancel endpoint.</summary>
     internal CancellationTokenSource Cancellation { get; } = new();
 }
 
-public sealed record CheckRunResponse(string Status, CheckReport? Report, string? Error, StageProgress? Detail)
+public sealed record CheckRunResponse(string Status, CheckReport? Report, string? Error, StageProgress? Detail,
+    DateTimeOffset? FinishedAt = null, string? Resolution = null, int UnrepairedCount = 0)
 {
-    public static CheckRunResponse From(CheckRunState s) => new(s.Status.ToString(), s.Report, s.Error, s.Detail);
+    public static CheckRunResponse From(CheckRunState s) => new(
+        s.Status.ToString(), s.Report, s.Error, s.Detail, s.FinishedAt, s.Resolution?.ToString(), s.UnrepairedCount);
 }
 
 /// <summary>
@@ -87,7 +100,14 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             return new CheckRunState
             {
                 Status = RunStatus.Completed,
-                Report = JsonSerializer.Deserialize<CheckReport>(row.ReportJson),
+                // A resolved row is HISTORY, not a plan: the dialog shows its one-line summary and offers a
+                // fresh check; handing back the stale findings table would re-open a report already dealt with.
+                Report = row.Resolution == CheckResolution.Pending
+                    ? JsonSerializer.Deserialize<CheckReport>(row.ReportJson)
+                    : null,
+                FinishedAt = row.FinishedAt,
+                Resolution = row.Resolution,
+                UnrepairedCount = row.UnrepairedCount,
             };
         }
         catch (JsonException)
@@ -98,21 +118,24 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
         }
     }
 
-    /// <summary>Whether an actionable report is persisted for this config — the gate that refuses further
-    /// checks (manual and scheduled alike) until the report is repaired away or dropped.</summary>
+    /// <summary>Whether an ACTIONABLE report is persisted for this config — the gate that refuses further
+    /// checks (manual and scheduled alike) until the report is repaired away or dropped. A persisted clean
+    /// report gates nothing.</summary>
     public async Task<bool> HasPersistedReportAsync(int configId, CancellationToken ct = default)
     {
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        return await db.LastCheckRuns.AsNoTracking().AnyAsync(x => x.BackupConfigId == configId, ct);
+        return await db.LastCheckRuns.AsNoTracking()
+            .AnyAsync(x => x.BackupConfigId == configId && x.Resolution == CheckResolution.Pending, ct);
     }
 
-    /// <summary>The configs holding a persisted report, in one query — the list endpoint decorates every row.</summary>
+    /// <summary>The configs holding an ACTIONABLE report, in one query — the list endpoint decorates every row.</summary>
     public async Task<HashSet<int>> PersistedReportIdsAsync(CancellationToken ct = default)
     {
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        return (await db.LastCheckRuns.AsNoTracking().Select(x => x.BackupConfigId).ToListAsync(ct)).ToHashSet();
+        return (await db.LastCheckRuns.AsNoTracking()
+            .Where(x => x.Resolution == CheckResolution.Pending).Select(x => x.BackupConfigId).ToListAsync(ct)).ToHashSet();
     }
 
     /// <summary>Drop the last check result — in-memory state and persisted row both, or reopening the dialog
@@ -132,10 +155,38 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
         var row = await db.LastCheckRuns.FirstOrDefaultAsync(x => x.BackupConfigId == configId, ct);
         if (row is not null)
         {
-            db.LastCheckRuns.Remove(row);
+            if (row.Resolution == CheckResolution.Pending)
+            {
+                // Dropping a pending report keeps the HISTORY ("drop了,N个没修好"): the row flips to Dropped
+                // with the unrepaired count frozen, the gate opens, and the marks keep carrying the memory.
+                row.Resolution = CheckResolution.Dropped;
+            }
+            else
+            {
+                db.LastCheckRuns.Remove(row); // dismissing history removes it outright
+            }
             await db.SaveChangesAsync(ct);
         }
         return true;
+    }
+
+    /// <summary>A completed repair reconciles the report it worked from: everything fixed → Repaired (the
+    /// gate opens, the history line says so); anything left → the row stays Pending with the fresh unrepaired
+    /// count, and only a manual Drop dismisses it.</summary>
+    internal async Task ResolveAfterRepairAsync(int configId, int unrecoverable, CancellationToken ct = default)
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.LastCheckRuns.FirstOrDefaultAsync(
+            x => x.BackupConfigId == configId && x.Resolution == CheckResolution.Pending, ct);
+        if (row is null)
+            return;
+        if (unrecoverable == 0)
+            row.Resolution = CheckResolution.Repaired;
+        row.UnrepairedCount = unrecoverable;
+        await db.SaveChangesAsync(ct);
+        lock (_lock)
+            _runs.Remove(configId); // the in-memory report is a stale plan now; GET reloads the resolved row
     }
 
     /// <summary>Persist a run's report as the config's last completed check. Best-effort: a failed write leaves
@@ -144,26 +195,13 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     {
         if (state.Report is null)
             return; // failed runs carry no report, and must not clobber the last real result (see LastCheckRun)
-        // Only a report worth ACTING on persists ("有报告就修,没报告才能查" — the operator's design): problems to
-        // repair, or orphans to judge. A clean verdict auto-drops instead — a persisted report gates every
-        // further check, and a clean one would gate them forever with nothing to do about it. The in-memory
-        // report still serves this process's dialog until it closes.
-        var actionable = state.Report.Findings.Any(f => f.Cloud == CloudState.MissingOrBad)
-            || state.Report.OrphanBlobs.Count > 0;
-        if (!actionable)
-        {
-            // Row only: the in-memory report still serves this process's dialog until it closes; the GATE is
-            // the persisted row, and a clean verdict must not hold it.
-            using var cleanScope = scopes.CreateScope();
-            var cleanDb = cleanScope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var stale = await cleanDb.LastCheckRuns.FirstOrDefaultAsync(x => x.BackupConfigId == configId);
-            if (stale is not null)
-            {
-                cleanDb.LastCheckRuns.Remove(stale);
-                await cleanDb.SaveChangesAsync();
-            }
-            return;
-        }
+        // Every completed report persists — a clean one too, or "the last check ran on <date> and found
+        // nothing" would be visible nowhere after a restart ("没地方看到这个没有错误的报告"). What differs is the
+        // GATE: only an ACTIONABLE report (problems to repair, orphans to judge) refuses further checks,
+        // turns the button red and holds the orphan sweep; a clean one just sits there until the next check
+        // replaces it.
+        var problems = state.Report.Findings.Count(f => f.Cloud == CloudState.MissingOrBad);
+        var actionable = problems > 0 || state.Report.OrphanBlobs.Count > 0;
         try
         {
             using var scope = scopes.CreateScope();
@@ -172,7 +210,11 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
             if (row is null)
                 db.LastCheckRuns.Add(row = new LastCheckRun { BackupConfigId = configId });
             row.ReportJson = JsonSerializer.Serialize(state.Report);
-            row.FinishedAt = DateTimeOffset.UtcNow;
+            row.FinishedAt = state.FinishedAt ?? DateTimeOffset.UtcNow;
+            row.Resolution = actionable ? CheckResolution.Pending : CheckResolution.Clean;
+            row.UnrepairedCount = problems;
+            state.Resolution = row.Resolution;
+            state.UnrepairedCount = problems;
             await db.SaveChangesAsync();
         }
         catch
@@ -224,6 +266,7 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
                     headConcurrency: settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20,
                     markFindings: true); // discovery IS the marking moment — "check出来就应该标错"
                 state.Status = RunStatus.Completed;
+                state.FinishedAt = DateTimeOffset.UtcNow;
             }
             finally
             {

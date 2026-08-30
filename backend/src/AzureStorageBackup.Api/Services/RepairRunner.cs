@@ -287,11 +287,15 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 // report the repair worked from retires with it ("所有文件都完成上传修复了,那么应该自动Drop"):
                 // the row's button goes back to Check. Anything still marked keeps the report, and only a
                 // manual Drop dismisses it — the marks carry the memory either way.
-                if (checks is not null && state.Report is { } done && done.Unrecoverable.Count == 0)
+                if (checks is not null && state.Report is { } done)
                 {
-                    await checks.DropAsync(configId);
-                    // The report retired by full success: the container gets the sweep the hold deferred.
-                    sweeper?.Kick(configId);
+                    // Reconcile the report the repair worked from: everything fixed → Repaired (history line,
+                    // gate open) and the container gets the sweep the hold deferred; anything left → the row
+                    // stays Pending with the fresh unrepaired count, red button and all.
+                    var unrecoverable = done.Unrecoverable.Distinct().Count();
+                    await checks.ResolveAfterRepairAsync(configId, unrecoverable);
+                    if (unrecoverable == 0)
+                        sweeper?.Kick(configId);
                 }
             }
             finally

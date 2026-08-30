@@ -559,11 +559,21 @@ export interface RepairRun {
 // Check is now a background job (202 plus polling): a content-level check downloads and re-hashes the
 // entire backup, and as a synchronous endpoint the request was cut off by browser or reverse-proxy
 // timeouts first. The finished report stays on the server, so closing and reopening the dialog gets it back.
+// The resolution of a persisted check: Pending is the one that still gates (an actionable report waiting
+// for a repair or a manual drop); Clean/Repaired/Dropped are settled history, shown as a one-line status
+// and freely overwritten by a new check. Null when there is no persisted row (a fresh, never-run config).
+export type CheckResolution = 'Pending' | 'Clean' | 'Repaired' | 'Dropped'
+
 export interface CheckRun {
   status: RunStatus
   report: CheckReport | null
   error: string | null
   detail: StageProgress | null
+  // Settled-report history (§39b): present once a check has finished and been recorded. `report` is only
+  // filled for a Pending row; for a settled one it is null and these three carry the one-line summary.
+  finishedAt: string | null
+  resolution: CheckResolution | null
+  unrepairedCount: number
 }
 
 export interface FileVersionOption {

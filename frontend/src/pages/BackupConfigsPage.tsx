@@ -13,7 +13,7 @@ import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
-import { orphanSummary, repairabilitySummary } from '../lib/checkSummary'
+import { orphanSummary, repairabilitySummary, resolutionSummary } from '../lib/checkSummary'
 import { stageLabelOf } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
@@ -3043,6 +3043,26 @@ function CheckModal({
       {checkRun?.status === 'Failed' && (
         <div className="text-danger" style={{ marginBottom: '0.6rem' }}>Check failed: {checkRun.error}</div>
       )}
+
+      {/* Settled-report history (§39b): a finished check that is no longer the gate — Clean, or repaired, or
+          dropped — leaves no problem table (report is null), so without this line the dialog would look as if
+          no check had ever run. Wording lives in resolutionSummary so it can be tested; it returns null for
+          Pending (the findings table shows it) and for no report (the start view), so this renders nothing. */}
+      {checkRun?.status === 'Completed' && !report && (() => {
+        const line = resolutionSummary(
+          checkRun.resolution,
+          checkRun.unrepairedCount,
+          checkRun.finishedAt ? new Date(checkRun.finishedAt).toLocaleString() : null,
+        )
+        return line && (
+          <div
+            className={checkRun.resolution === 'Dropped' ? 'text-warn' : 'text-ok'}
+            style={{ marginBottom: '0.6rem' }}
+          >
+            {line}
+          </div>
+        )
+      })()}
 
       {repairReport && (
         <div style={{ marginBottom: '0.6rem' }}>

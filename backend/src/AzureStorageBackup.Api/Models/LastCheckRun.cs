@@ -19,4 +19,30 @@ public sealed class LastCheckRun
     public string ReportJson { get; set; } = "";
 
     public DateTimeOffset FinishedAt { get; set; }
+
+    /// <summary>How the last check ended up ("这个信息还是要进入db"). Only <see cref="CheckResolution.Pending"/>
+    /// GATES — refuses further checks, turns the row's button red, holds the orphan sweep. The other three are
+    /// the one-line history the dialog shows ("全部正常/已修好/drop了,N个没修好"), freely overwritten by the next
+    /// check, scheduled or manual.</summary>
+    public CheckResolution Resolution { get; set; }
+
+    /// <summary>How many problem files remain unrepaired — set when the report persists, updated by every
+    /// completed repair, frozen when the report is dropped. The number the "dropped" line carries.</summary>
+    public int UnrepairedCount { get; set; }
+}
+
+/// <summary>The lifecycle of a persisted check report.</summary>
+public enum CheckResolution
+{
+    /// <summary>Problems (or orphans) found and not yet dealt with: gates further checks, the button is red.</summary>
+    Pending = 0,
+
+    /// <summary>The check found nothing wrong.</summary>
+    Clean = 1,
+
+    /// <summary>A repair fixed everything the report listed.</summary>
+    Repaired = 2,
+
+    /// <summary>The operator dropped the report with problems still open; the marks carry the memory.</summary>
+    Dropped = 3,
 }

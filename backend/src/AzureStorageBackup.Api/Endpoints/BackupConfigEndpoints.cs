@@ -883,11 +883,13 @@ public static class BackupConfigEndpoints
         // check". 409 while a check is running — the run owns its state.
         group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, OrphanSweeper sweeper, CancellationToken ct) =>
         {
+            // Only dropping a PENDING report owes the container the deferred sweep; dismissing a history
+            // line (clean/repaired/dropped) remediated nothing and sweeps nothing.
+            var wasPending = await runner.HasPersistedReportAsync(id, ct);
             if (!await runner.DropAsync(id, ct))
                 return Results.Conflict(new { error = "A check is running; stop it first." });
-            // The report retired by the operator's hand: the container gets the sweep the hold deferred
-            // (fire-and-forget; a busy container skips and the next backup's tail collects instead).
-            sweeper.Kick(id);
+            if (wasPending)
+                sweeper.Kick(id);
             return Results.NoContent();
         });
 

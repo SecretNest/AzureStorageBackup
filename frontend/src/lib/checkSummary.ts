@@ -1,5 +1,39 @@
-import type { CheckReport } from '../api/backupConfigs'
+import type { CheckReport, CheckResolution } from '../api/backupConfigs'
 import { CloudState, LocalState } from '../api/backupConfigs'
+
+/**
+ * The one-line history of a **settled** check (§39b) — the only trace left once the findings table is
+ * gone. A clean, repaired, or dropped report persists but no longer gates: the dialog drops back to the
+ * start view, and without this line "the last check found nothing" would be visible nowhere at all
+ * ("没地方看到这个没有错误的报告"). Returns null for the two states that have their own on-screen home — a
+ * Pending report (the live findings table) and no report (the start view) — so the caller renders
+ * nothing in those cases.
+ *
+ * Extracted from the JSX for the same reason as the summaries below: this project has no component
+ * tests, so the wording of the three settled states can only be pinned here. `when` is the already
+ * locale-formatted timestamp (or null on an older row) — kept out of this function so the assertions
+ * stay free of the machine's timezone.
+ */
+export function resolutionSummary(
+  resolution: CheckResolution | null,
+  unrepairedCount: number,
+  when: string | null,
+): string | null {
+  const tail = ' You can start a new check to replace this.'
+  switch (resolution) {
+    case 'Clean':
+      return `The last check${when ? ` (${when})` : ''} found everything OK.${tail}`
+    case 'Repaired':
+      return `The last check found problems and they have all been repaired${when ? ` (checked ${when})` : ''}.${tail}`
+    case 'Dropped':
+      return (
+        `The last report was dropped — ${unrepairedCount} file(s) left unrepaired and still marked; ` +
+        `the next backup heals any whose content is unchanged.${tail}`
+      )
+    default:
+      return null // Pending (findings table shows it) or null (start view) — no history line here
+  }
+}
 
 /**
  * The unreferenced-blob half of a finished check's one-line result.

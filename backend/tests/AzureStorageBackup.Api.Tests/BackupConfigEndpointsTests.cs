@@ -844,11 +844,12 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         Assert.Equal("a.bin", Assert.Single(run.Report.Findings).Path);
     }
 
-    /// <summary>Dropping the last result is the doorway back to "start a new check" (the dialog shows the
-    /// result for as long as one exists): the persisted row goes too, or reopening the dialog would resurrect
-    /// what the user just dismissed.</summary>
+    /// <summary>Dropping an actionable report is a TWO-STEP dismissal (§39b): the first drop keeps the history
+    /// ("drop了,N个没修好" must remain visible so the operator knows files were left marked), flipping the row to
+    /// Dropped while opening the gate; only dropping THAT settled history a second time clears it for good and
+    /// lands the dialog back on the start view. This is the doorway back to "start a new check".</summary>
     [Fact]
-    public async Task Dropping_The_Last_Check_Result_Clears_It_For_Good()
+    public async Task Dropping_An_Actionable_Report_Keeps_History_Then_A_Second_Drop_Clears_It()
     {
         var accountId = await CreateAccountAsync("check-drop");
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
@@ -859,24 +860,33 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         await runner.PersistAsync(created!.Id, new CheckRunState
         {
             Status = RunStatus.Completed,
-            // Actionable: a clean report never persists in the first place (it retires itself).
             Report = new CheckReport(9,
                 [new FileFinding("bad.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked)]),
         });
 
-        var drop = await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check");
-        Assert.Equal(HttpStatusCode.NoContent, drop.StatusCode);
+        // First drop: gate opens, history remains as a Dropped summary.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check")).StatusCode);
+        var afterFirst = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+            .Content.ReadFromJsonAsync<CheckRunResponse>();
+        Assert.Equal("Dropped", afterFirst!.Resolution);
+
+        // Second drop dismisses the history itself.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check")).StatusCode);
 
         // 204 from the GET = there is no check to report — the dialog lands on the start view.
         var after = await _client.GetAsync($"/api/backup-configs/{created.Id}/check");
         Assert.Equal(HttpStatusCode.NoContent, after.StatusCode);
     }
 
-    /// <summary>A clean verdict retires itself instead of persisting: the persisted report GATES every
-    /// further check ("有报告就修,没报告才能查"), and a clean one would close that gate forever with nothing to
-    /// act on. Only reports with problems (or orphans) hold the gate.</summary>
+    /// <summary>A clean verdict PERSISTS as history but GATES nothing (§39b): "没地方看到这个没有错误的报告" —
+    /// a clean check has to be visible somewhere after the dialog closes, so the row is kept with
+    /// Resolution=Clean. What it must NOT do is hold the gate ("有报告就修,没报告才能查"): HasPersistedReport
+    /// stays false, the button stays Check (not red Repair), and a new check may overwrite it freely. The GET
+    /// returns the one-line summary (finished-at + Clean) with no findings table to act on.</summary>
     [Fact]
-    public async Task A_Clean_Report_Retires_Itself_And_Gates_Nothing()
+    public async Task A_Clean_Report_Persists_As_History_But_Gates_Nothing()
     {
         var accountId = await CreateAccountAsync("check-clean");
         var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
@@ -890,9 +900,18 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             Report = new CheckReport(9, [new FileFinding("fine.bin", "data/x", CloudState.Ok, LocalState.NotChecked)]),
         });
 
+        // Gates nothing: not an actionable report, so the button stays "Check" everywhere.
         Assert.False(await runner.HasPersistedReportAsync(created.Id));
         var list = await _client.GetFromJsonAsync<List<BackupConfigResponse>>("/api/backup-configs");
         Assert.False(list!.Single(c => c.Id == created.Id).HasCheckReport);
+
+        // But it is still visible: the GET carries the settled summary, with no findings table.
+        var run = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+            .Content.ReadFromJsonAsync<CheckRunResponse>();
+        Assert.Equal("Completed", run!.Status);
+        Assert.Equal("Clean", run.Resolution);
+        Assert.NotNull(run.FinishedAt);
+        Assert.Null(run.Report); // history, not a plan to repair from
     }
 
     /// <summary>With an actionable report persisted, a new check is refused — the report is the plan a repair
@@ -920,10 +939,17 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var list = await _client.GetFromJsonAsync<List<BackupConfigResponse>>("/api/backup-configs");
         Assert.True(list!.Single(c => c.Id == created.Id).HasCheckReport);
 
-        // Dropping reopens the door.
+        // Dropping reopens the door — but keeps the history: the row flips to Dropped, so the gate opens
+        // (HasPersistedReport false, a new check allowed) while the dialog can still say "dropped, N unrepaired".
         Assert.Equal(HttpStatusCode.NoContent,
             (await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check")).StatusCode);
         Assert.False(await runner.HasPersistedReportAsync(created.Id));
+
+        var afterDrop = await (await _client.GetAsync($"/api/backup-configs/{created.Id}/check"))
+            .Content.ReadFromJsonAsync<CheckRunResponse>();
+        Assert.Equal("Dropped", afterDrop!.Resolution);
+        Assert.Equal(1, afterDrop.UnrepairedCount); // the one bad.bin, frozen at drop time
+        Assert.Null(afterDrop.Report);
     }
 
     /// <summary>The persisted row answers "what did the last finished check find", not "what happened most

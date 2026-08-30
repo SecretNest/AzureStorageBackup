@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest'
 
 import type { CheckReport, FileFinding } from '../api/backupConfigs'
 import { CloudState, LocalState } from '../api/backupConfigs'
-import { orphanSummary, repairabilitySummary } from './checkSummary'
+import { orphanSummary, repairabilitySummary, resolutionSummary } from './checkSummary'
 
 function report(over: Partial<CheckReport> = {}): CheckReport {
   return {
@@ -53,6 +53,49 @@ describe('orphanSummary', () => {
         report({ orphansChecked: false, orphanScanIssue: 'reference set incomplete', orphanBlobs: [] }),
       ),
     ).toBe(' · unreferenced-blob scan abandoned')
+  })
+})
+
+describe('resolutionSummary', () => {
+  /**
+   * §39b: a settled check (clean, repaired, or dropped) leaves no findings table, so this one line is
+   * the only trace that a check ran — "没地方看到这个没有错误的报告" is exactly what it prevents. Pending and
+   * "no report at all" render nothing here: the dialog shows the live findings table or the start view.
+   */
+  test('a pending report shows no history line — the findings table does that job', () => {
+    expect(resolutionSummary('Pending', 0, 'Aug 30, 2026, 1:00 PM')).toBeNull()
+  })
+
+  test('no report at all shows no history line', () => {
+    expect(resolutionSummary(null, 0, null)).toBeNull()
+  })
+
+  test('a clean report says everything was OK, with the time it was checked', () => {
+    expect(resolutionSummary('Clean', 0, 'Aug 30, 2026, 1:00 PM')).toBe(
+      'The last check (Aug 30, 2026, 1:00 PM) found everything OK. You can start a new check to replace this.',
+    )
+  })
+
+  /** A missing timestamp (older row) must not print "(null)" — the clause is simply dropped. */
+  test('a clean report without a timestamp drops the time clause', () => {
+    expect(resolutionSummary('Clean', 0, null)).toBe(
+      'The last check found everything OK. You can start a new check to replace this.',
+    )
+  })
+
+  test('a repaired report says the problems were all fixed', () => {
+    expect(resolutionSummary('Repaired', 0, 'Aug 30, 2026, 1:00 PM')).toBe(
+      'The last check found problems and they have all been repaired (checked Aug 30, 2026, 1:00 PM). ' +
+        'You can start a new check to replace this.',
+    )
+  })
+
+  /** Dropped keeps the count of what was left marked — that is the whole reason history is preserved. */
+  test('a dropped report names how many files were left unrepaired', () => {
+    expect(resolutionSummary('Dropped', 4, 'Aug 30, 2026, 1:00 PM')).toBe(
+      'The last report was dropped — 4 file(s) left unrepaired and still marked; the next backup heals ' +
+        'any whose content is unchanged. You can start a new check to replace this.',
+    )
   })
 })
 

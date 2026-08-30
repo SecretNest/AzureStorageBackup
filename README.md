@@ -265,8 +265,14 @@ A journal is only adopted if the run it describes still matches: same local root
 The row's button reads **Check…** when nothing is pending and turns into a red **Repair…** the moment a
 check finds something. A report that finds problems (or orphans) persists — across dialog closes, restarts
 and upgrades — and while it exists **no new check may start**, manual or scheduled: the report is the plan
-the repair works from, and quietly replacing it is how selections go stale. A clean check retires itself,
-so the button only ever goes red for a reason.
+the repair works from, and quietly replacing it is how selections go stale. A clean check does **not** gate
+— the button stays Check — but it is still recorded, so the button only ever goes red for a reason.
+
+Every finished check leaves a **one-line verdict** in the dialog that outlives the findings table: *found
+everything OK* (with the time it ran), *problems all repaired*, or *dropped — N file(s) left unrepaired and
+still marked*. A settled verdict like this gates nothing, so a new check (manual or scheduled) freely
+overwrites it — it exists only so a clean or resolved result is visible somewhere instead of the dialog
+looking as if no check had ever run.
 
 A check also **writes its verdict down at the moment of discovery**: paths found damaged are marked
 unrecoverable in the checked version's index right away (and paths found healthy again shed their mark),
