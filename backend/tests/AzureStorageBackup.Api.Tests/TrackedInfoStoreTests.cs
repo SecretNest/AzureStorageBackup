@@ -114,4 +114,55 @@ public sealed class TrackedInfoStoreTests : IDisposable
 
         Assert.Null(await _state.TryGetAsync(1, "c")); // after a conflict the local state is cleared, and re-synced next time
     }
+
+    /// <summary>
+    /// Two scopes cold-miss the same (account, container) local state — an ETag conflict just cleared the
+    /// row, and two concurrent reads both took LoadAsync's backfill path: both query null, both insert, the
+    /// loser hits the (AccountId, Container) unique index. That is a harmless race on a locally cached copy,
+    /// not an error — surfaced live by the damage-repair chaos storm as a bare 500 out of /file-versions.
+    /// The loser must fall back to updating the winner's row (the same discipline LocalIndexCache.UpsertAsync
+    /// learned in the first audit round). The interleave is pinned deterministically: the winner's row is
+    /// inserted from a second context inside the loser's own SavingChanges window — after its null query,
+    /// before its insert executes.
+    /// </summary>
+    [Fact]
+    public async Task A_Concurrent_Cold_Backfill_Falls_Back_To_The_Winners_Row()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), "asb-state-race-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = new DbContextOptionsBuilder<AppDbContext>().UseSqlite($"DataSource={dbPath}").Options;
+        try
+        {
+            using (var setup = new AppDbContext(options))
+                setup.Database.EnsureCreated();
+
+            using var loser = new AppDbContext(options);
+            var raced = false;
+            loser.SavingChanges += (_, _) =>
+            {
+                if (raced)
+                    return; // only the first save (the doomed insert) gets the rival; the fallback must not
+                raced = true;
+                using var winner = new AppDbContext(options);
+                winner.LocalBackupStates.Add(new LocalBackupState
+                {
+                    AccountId = 1, Container = "c",
+                    InfoBytes = [1], ETag = "etag-winner", UpdatedAt = DateTimeOffset.UtcNow,
+                });
+                winner.SaveChanges();
+            };
+
+            await new LocalBackupStateStore(loser).PutAsync(1, "c", [2], "etag-loser");
+
+            using var verify = new AppDbContext(options);
+            var row = await verify.LocalBackupStates.SingleAsync(x => x.AccountId == 1 && x.Container == "c");
+            Assert.Equal("etag-loser", row.ETag); // the loser's (later) payload lands as an update
+            Assert.Equal([2], row.InfoBytes);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+                try { File.Delete(f); } catch { /* best effort */ }
+        }
+    }
 }

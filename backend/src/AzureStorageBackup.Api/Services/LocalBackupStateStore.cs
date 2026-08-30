@@ -27,18 +27,38 @@ public sealed class LocalBackupStateStore(AppDbContext db) : ILocalBackupStateSt
             .FirstOrDefaultAsync(x => x.AccountId == accountId && x.Container == container, ct);
         if (row is null)
         {
-            db.LocalBackupStates.Add(new LocalBackupState
+            var added = new LocalBackupState
             {
                 AccountId = accountId, Container = container,
                 InfoBytes = infoBytes, ETag = etag, UpdatedAt = DateTimeOffset.UtcNow,
-            });
+            };
+            db.LocalBackupStates.Add(added);
+            try
+            {
+                await db.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException)
+            {
+                // Two scopes cold-missed the same (account, container) — an ETag conflict had just cleared
+                // the row, both of LoadAsync's backfills read "no row", and the loser's insert hit the unique
+                // index. A harmless race on a locally cached copy, not an error (the same discipline as
+                // LocalIndexCache.UpsertAsync): fall back to updating the winner's row rather than throwing
+                // a bare 500 out of whatever read path happened to be backfilling.
+                db.Entry(added).State = EntityState.Detached;
+                var existing = await db.LocalBackupStates.FirstOrDefaultAsync(
+                    x => x.AccountId == accountId && x.Container == container, ct);
+                if (existing is null)
+                    throw; // not the duplicate-insert race after all — surface the original failure
+                existing.InfoBytes = infoBytes;
+                existing.ETag = etag;
+                existing.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+            return;
         }
-        else
-        {
-            row.InfoBytes = infoBytes;
-            row.ETag = etag;
-            row.UpdatedAt = DateTimeOffset.UtcNow;
-        }
+        row.InfoBytes = infoBytes;
+        row.ETag = etag;
+        row.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
     }
 

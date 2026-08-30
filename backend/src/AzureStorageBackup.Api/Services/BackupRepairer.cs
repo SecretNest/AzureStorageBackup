@@ -200,14 +200,22 @@ public sealed class BackupRepairer(
             // this run: a backup beside a suspended repair reads them for dedup exclusion and heal-in-passing,
             // restore reads them for substitution. Repairing an object then clears its marks (RepairBlobAsync's
             // per-ref ClearUnrecoverable), and the end-of-run persistence records the clears.
+            // Scoped by REF — "which CONTENT is broken" — never by bare path: the same path in an older
+            // version references its own, different object, and a path-wide mark voided that intact copy too.
+            // Left behind by a failed or suspended repair, the false verdict then soft-skipped restores of
+            // healthy history and made /file-versions and the substitution guard refuse the one copy that
+            // could recover the file (caught live by the damage-repair chaos storm). The deferred pass below
+            // has always scoped by ref; the pre-marks now tell the same truth — including dedup twins: any
+            // path, in any version, whose entry references a damaged object is equally broken.
             // Scratch list: the pre-marks are the safety state, not the verdicts — the REPORT's unrecoverable
             // list is owned by the end-of-run marking (deferred paths, and objects whose repair failed), or a
             // successfully repaired path would be reported unrecoverable because it was pre-marked at start.
+            var damagedRefs = badFindings.Select(f => BareRefOf(f.Ref!)).ToHashSet(StringComparer.Ordinal);
             var preMarks = new List<string>();
-            foreach (var f in badFindings)
-                foreach (var (vnum, idx) in indexes)
-                    if (idx.Entries.Any(e => e.Path == f.Path))
-                        MarkUnrecoverable(idx, f.Path, preMarks, changedVersions, vnum);
+            foreach (var (vnum, idx) in indexes)
+                foreach (var e in idx.Entries)
+                    if (e.Storage is { } sref && damagedRefs.Contains(sref.Ref))
+                        MarkUnrecoverable(idx, e.Path, preMarks, changedVersions, vnum);
             if (changedVersions.Count > 0)
                 await PersistChangedAsync();
 
@@ -295,9 +303,7 @@ public sealed class BackupRepairer(
             // loop above just applied.
             foreach (var deferredRef in deferredBlobs)
             {
-                var bareRef = deferredRef.StartsWith("packs/", StringComparison.Ordinal)
-                    ? deferredRef["packs/".Length..^".7z".Length]
-                    : deferredRef;
+                var bareRef = BareRefOf(deferredRef);
                 foreach (var (vnum, idx) in indexes)
                     foreach (var e in idx.Entries)
                         if (e.Storage is { } s && s.Ref == bareRef && !healedSet.Contains(e.Path))
@@ -756,6 +762,13 @@ public sealed class BackupRepairer(
             return false;
         }
     }
+
+    /// <summary>A finding's ref names the cloud object ("packs/{id}.7z" or the data blob name); index entries
+    /// store the pack's bare id. One conversion, shared by the pre-mark and deferred-mark passes.</summary>
+    private static string BareRefOf(string refName) =>
+        refName.StartsWith("packs/", StringComparison.Ordinal)
+            ? refName["packs/".Length..^".7z".Length]
+            : refName;
 
     private static void MarkUnrecoverable(
         VersionIndex index, string path, List<string> unrecoverable, HashSet<int> changedVersions, int vnum)

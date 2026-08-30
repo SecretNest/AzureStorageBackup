@@ -1322,4 +1322,65 @@ public sealed class BackupRepairerTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// The pre-mark pass says WHICH CONTENT is broken (volume-identity.md) — it must scope by the damaged
+    /// object, not by path. A path exists in many versions, each referencing its own object: when only the
+    /// newest version's object is damaged, an older version's same-named entry references a different,
+    /// intact object — and a path-wide pre-mark voids it anyway. If the repair then fails (the local file
+    /// has drifted), that false mark is never cleared: restores of the intact old version silently soft-skip
+    /// the file, and /file-versions plus the substitution guard both refuse the one healthy copy that could
+    /// recover it. Caught live by the damage-repair chaos storm (ChaosMatrixTests).
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Failed_Repair_Never_Marks_A_Bystander_Versions_Healthy_Copy()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("bystander-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // v1: doc.txt with content A → object R_A.
+            await File.WriteAllTextAsync(Path.Combine(_src, "doc.txt"), "version one body");
+            await backup.RunAsync(Req(account, name));
+            var afterV1 = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                afterV1.Add(b.Name);
+
+            // v2: same path, content B → object R_B. Only R_B gets damaged.
+            await File.WriteAllTextAsync(Path.Combine(_src, "doc.txt"), "version two body, different");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                if (!afterV1.Contains(b.Name))
+                    await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            // The local file drifts to content C: the repair of R_B has no source and must fail —
+            // which is exactly when a start-of-run mark, if over-broad, is never cleared again.
+            await File.WriteAllTextAsync(Path.Combine(_src, "doc.txt"), "version three, drifted well away");
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, 2, new CheckOptions(), AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["doc.txt"]);
+            Assert.Equal(["doc.txt"], report.Unrecoverable);
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single(x => x.Version == 1);
+            var v2 = info.Versions.Single(x => x.Version == 2);
+            var idx1 = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            var idx2 = await store.ReadIndexAsync(account, name, v2.IndexBlob, null, v2.IndexVolumes);
+
+            // v2's copy really is broken and unhealed: the mark is the truth and stays.
+            Assert.Contains("doc.txt", idx2.UnrecoverablePaths);
+            // v1's copy references R_A, which nobody touched: no verdict may land on it — this healthy
+            // copy is precisely what version substitution needs to recover the file.
+            Assert.Empty(idx1.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }
