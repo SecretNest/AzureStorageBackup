@@ -859,7 +859,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         await runner.PersistAsync(created!.Id, new CheckRunState
         {
             Status = RunStatus.Completed,
-            Report = new CheckReport(9, []),
+            // Actionable: a clean report never persists in the first place (it retires itself).
+            Report = new CheckReport(9,
+                [new FileFinding("bad.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked)]),
         });
 
         var drop = await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check");
@@ -868,6 +870,60 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         // 204 from the GET = there is no check to report — the dialog lands on the start view.
         var after = await _client.GetAsync($"/api/backup-configs/{created.Id}/check");
         Assert.Equal(HttpStatusCode.NoContent, after.StatusCode);
+    }
+
+    /// <summary>A clean verdict retires itself instead of persisting: the persisted report GATES every
+    /// further check ("有报告就修,没报告才能查"), and a clean one would close that gate forever with nothing to
+    /// act on. Only reports with problems (or orphans) hold the gate.</summary>
+    [Fact]
+    public async Task A_Clean_Report_Retires_Itself_And_Gates_Nothing()
+    {
+        var accountId = await CreateAccountAsync("check-clean");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-clean", accountId) with { ContainerName = "check-clean-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var runner = factory.Services.GetRequiredService<CheckRunner>();
+        await runner.PersistAsync(created!.Id, new CheckRunState
+        {
+            Status = RunStatus.Completed,
+            Report = new CheckReport(9, [new FileFinding("fine.bin", "data/x", CloudState.Ok, LocalState.NotChecked)]),
+        });
+
+        Assert.False(await runner.HasPersistedReportAsync(created.Id));
+        var list = await _client.GetFromJsonAsync<List<BackupConfigResponse>>("/api/backup-configs");
+        Assert.False(list!.Single(c => c.Id == created.Id).HasCheckReport);
+    }
+
+    /// <summary>With an actionable report persisted, a new check is refused — the report is the plan a repair
+    /// works from, and quietly replacing it is how selections go stale. The row exposes the state so the UI
+    /// can show the red Repair instead of Check.</summary>
+    [Fact]
+    public async Task A_Pending_Report_Gates_New_Checks()
+    {
+        var accountId = await CreateAccountAsync("check-gate");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("check-gate", accountId) with { ContainerName = "check-gate-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var runner = factory.Services.GetRequiredService<CheckRunner>();
+        await runner.PersistAsync(created!.Id, new CheckRunState
+        {
+            Status = RunStatus.Completed,
+            Report = new CheckReport(9,
+                [new FileFinding("bad.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked)]),
+        });
+
+        var refused = await _client.PostAsync($"/api/backup-configs/{created.Id}/check", null);
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+
+        var list = await _client.GetFromJsonAsync<List<BackupConfigResponse>>("/api/backup-configs");
+        Assert.True(list!.Single(c => c.Id == created.Id).HasCheckReport);
+
+        // Dropping reopens the door.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.DeleteAsync($"/api/backup-configs/{created.Id}/check")).StatusCode);
+        Assert.False(await runner.HasPersistedReportAsync(created.Id));
     }
 
     /// <summary>The persisted row answers "what did the last finished check find", not "what happened most
@@ -884,7 +940,9 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         await runner.PersistAsync(created!.Id, new CheckRunState
         {
             Status = RunStatus.Completed,
-            Report = new CheckReport(9, []),
+            // Actionable, or it would retire itself instead of persisting.
+            Report = new CheckReport(9,
+                [new FileFinding("bad.bin", "data/x", CloudState.MissingOrBad, LocalState.NotChecked)]),
         });
 
         var busy = factory.Services.GetRequiredService<BackupBusyTracker>();

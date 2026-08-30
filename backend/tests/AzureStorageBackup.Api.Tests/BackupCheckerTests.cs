@@ -644,7 +644,7 @@ public sealed class BackupCheckerTests : IDisposable
     }
 
     [SkippableFact]
-    public async Task List_Check_Detects_Orphans_And_Repair_Deletes_Them_Keeping_Referenced()
+    public async Task List_Check_Detects_Orphans_And_Repair_Leaves_Them_To_The_Cleanup()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -707,26 +707,21 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.Null(unscanned.OrphanScanIssue);
             Assert.Empty(unscanned.OrphanBlobs);
 
-            // Repair deletes the orphans (cleanupOrphans): the deletion runs even when no blob is broken.
+            // Repair no longer sweeps the container ("repair只清自己repair的那几个文件,不要对全backup做"): the
+            // orphans stay for the post-backup cleanup, which owns the reference set and journal protection.
+            // Repair's own garbage handling is the per-family keep-set trim of the objects it replaces.
             var report = await Repairer(factory, checker).RepairAsync(
                 account, name, null, _src, null,
                 new CheckOptions { ListOrphans = true }, Azure.Storage.Blobs.Models.AccessTier.Hot, null,
                 dontCompress: null);
 
-            Assert.Contains("data/ZZZ", report.DeletedOrphans);
-            Assert.Contains(stalePackVolume, report.DeletedOrphans);
-            Assert.Contains($"data/{hash}.099", report.DeletedOrphans);
-
-            // The orphans are gone.
-            Assert.False((await container.GetBlobClient("data/ZZZ").ExistsAsync()).Value);
-            Assert.False((await container.GetBlobClient(stalePackVolume).ExistsAsync()).Value);
-            Assert.False((await container.GetBlobClient($"data/{hash}.099").ExistsAsync()).Value);
-            // The referenced blobs + the info file are still there.
+            Assert.Empty(report.DeletedOrphans);
+            Assert.True((await container.GetBlobClient("data/ZZZ").ExistsAsync()).Value);
+            Assert.True((await container.GetBlobClient(stalePackVolume).ExistsAsync()).Value);
+            // The referenced blobs + the info file are untouched, and the backup is still intact.
             Assert.True((await container.GetBlobClient($"packs/{packId}.7z").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient($"data/{hash}.001").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync()).Value);
-
-            // The backup is still intact after the repair.
             Assert.True((await checker.CheckAsync(account, name, null, null, new CheckOptions())).Ok);
         }
         finally { await container.DeleteIfExistsAsync(); }
@@ -1061,4 +1056,59 @@ public sealed class BackupCheckerTests : IDisposable
             return inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
         }
     }
+    /// <summary>"check出来就应该标错": discovery IS the moment the marks must land — dedup exclusion, restore
+    /// substitution and next-version healing all read UnrecoverablePaths, and a gap between a check finding
+    /// damage and a repair starting used to leave them blind. Symmetrically, a check that finds a previously
+    /// marked path healthy again clears the mark, or a transient misread could never self-correct. Only the
+    /// checked version's index is written (the marks that drive dedup exclusion and DeferredRepairs both read
+    /// the latest version), and only when the marking flag is on — the repairer's internal pre-check manages
+    /// its own marks.</summary>
+    [SkippableFact]
+    public async Task A_Check_Marks_Its_Findings_And_Clears_What_Healed()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("chkmark-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "content of a");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+            string blobName = "";
+            BinaryData? saved = null;
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+            {
+                blobName = b.Name;
+                saved = (await container.GetBlobClient(b.Name).DownloadContentAsync()).Value.Content;
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            }
+
+            await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src, null, CancellationToken.None,
+                markFindings: true);
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single();
+            var index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            Assert.Contains("a.txt", index.UnrecoverablePaths);
+
+            // The blob comes back (an out-of-band heal); the next check overturns the verdict.
+            await container.GetBlobClient(blobName).UploadAsync(saved!, overwrite: true);
+            await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src, null, CancellationToken.None,
+                markFindings: true);
+            info = await store.ReadInfoAsync(account, name, null);
+            v1 = info!.Versions.Single();
+            index = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+            Assert.DoesNotContain("a.txt", index.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
 }

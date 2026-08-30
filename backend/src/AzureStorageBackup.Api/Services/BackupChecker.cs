@@ -61,6 +61,15 @@ public sealed class BackupChecker(
         // "Check started" for it made a user who had just clicked Repair wonder what was running. The repair
         // announces itself and summarizes its own outcome; a silent pre-check leaves exactly one story told.
         bool notify = true,
+        // "check出来就应该标错": with this on, the verdict is WRITTEN — paths found MissingOrBad are marked
+        // unrecoverable in the checked version's index and paths found Ok shed a mark they carry, both
+        // persisted before the report returns. Discovery is the moment dedup exclusion, restore substitution
+        // and next-version healing need the truth; waiting for a repair to start left them blind in between.
+        // Off for the repairer's internal pre-check (it runs its own marks-land-first with report semantics)
+        // and anywhere the index must not be touched. Only the checked version is written: the readers that
+        // matter (dedup exclusion, DeferredRepairs) read the latest version, and loading every retained index
+        // just to mirror marks would put a multi-second, hundreds-of-MB tax on every nightly check.
+        bool markFindings = false,
         // Limit the verdict to these paths. The repairer's assessment has no business probing the whole
         // container: in the field a 4-file repair probed 194,630 volumes and priced a half-hour wait before any
         // repairing began. Null = everything (every caller but the repairer).
@@ -87,7 +96,8 @@ public sealed class BackupChecker(
         {
             var report = await CheckCoreAsync(
                 account, container, password, version, options, localRoot, downloadConcurrency,
-                headConcurrency ?? downloadConcurrency, onProgress, ct, scopePaths);
+                headConcurrency ?? downloadConcurrency, onProgress, ct, scopePaths,
+                markFindings: markFindings && scopePaths is null);
             if (localSkipped is not null)
                 report = report with { LocalSkippedSentinel = localSkipped };
             // The orphan scan is a separate axis from Ok (orphans are not corruption, so they never fail a check),
@@ -184,7 +194,10 @@ public sealed class BackupChecker(
     private async Task<CheckReport> CheckCoreAsync(
         Account account, string container, string? password, int? version, CheckOptions options, string? localRoot,
         int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct,
-        IReadOnlyCollection<string>? scopePaths = null)
+        IReadOnlyCollection<string>? scopePaths = null,
+        // Only ever true with a null scope: the scoped index is a filtered COPY, and writing it back would
+        // silently drop every out-of-scope entry from the version.
+        bool markFindings = false)
     {
         // How many entries the index holds is only known once it has been read through → report a total of 0, so
         // the UI shows "… so far" instead of a made-up percentage.
@@ -255,6 +268,35 @@ public sealed class BackupChecker(
         var (orphans, orphanIssue) = options.ListOrphans
             ? await ListOrphansAsync(cc, account, container, password, info, onProgress, ct)
             : ([], null);
+
+        // "check出来就应该标错": the verdict lands in the checked version's index the moment it exists —
+        // marks for MissingOrBad findings, clears for Ok findings that carried one — persisted through the
+        // same local-authoritative machinery the repairer uses, so dedup exclusion, restore substitution and
+        // next-version healing see the truth without waiting for a repair to be clicked.
+        if (markFindings)
+        {
+            var changed = false;
+            foreach (var f in findings)
+            {
+                if (f.Cloud == CloudState.MissingOrBad && !index.UnrecoverablePaths.Contains(f.Path))
+                {
+                    index.UnrecoverablePaths.Add(f.Path);
+                    changed = true;
+                }
+                else if (f.Cloud == CloudState.Ok && index.UnrecoverablePaths.Remove(f.Path))
+                {
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                await store.WriteIndexAsync(account, container, ver.Version, index, password, ct: ct);
+                if (trackedInfo is not null)
+                    await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
+                else
+                    await store.WriteInfoAsync(account, container, info, password, ct: ct);
+            }
+        }
 
         return new CheckReport(ver.Version, findings, metaIssue)
         {

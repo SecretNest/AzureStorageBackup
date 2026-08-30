@@ -66,7 +66,7 @@ public sealed record RepairRunResponse(
 /// dedup-shared objects, so it must be exclusive: while it runs, that backup can do no backup, check or other repair
 /// (a user requirement). Fails outright when the target is busy.
 /// </summary>
-public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker busy)
+public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker busy, CheckRunner? checks = null, OrphanSweeper? sweeper = null)
 {
     private readonly Dictionary<int, RepairRunState> _runs = [];
     private readonly Lock _lock = new();
@@ -283,6 +283,16 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 // Completion is the only thing that retires a persisted suspension: the intent has been carried
                 // out (files healed meanwhile fell out via the healed-mark clearing; the rest were handled here).
                 await ClearSuspendedAsync(configId);
+                // And when EVERYTHING came out whole — nothing left unrecoverable or deferred — the check
+                // report the repair worked from retires with it ("所有文件都完成上传修复了,那么应该自动Drop"):
+                // the row's button goes back to Check. Anything still marked keeps the report, and only a
+                // manual Drop dismisses it — the marks carry the memory either way.
+                if (checks is not null && state.Report is { } done && done.Unrecoverable.Count == 0)
+                {
+                    await checks.DropAsync(configId);
+                    // The report retired by full success: the container gets the sweep the hold deferred.
+                    sweeper?.Kick(configId);
+                }
             }
             finally
             {

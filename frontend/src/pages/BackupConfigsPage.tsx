@@ -1585,14 +1585,17 @@ export function BackupConfigsPage() {
                     >
                       {c.activity === 'Restoring' ? 'Restoring…' : 'Restore…'}
                     </button>{' '}
+                    {/* One button, two states ("有报告就修,没报告才能查"): with an actionable report persisted,
+                        checking is closed until it is repaired away or dropped, and the red Repair IS the
+                        warning; without one, the same slot starts a check. */}
                     <button
                       type="button"
-                      className="btn-ghost"
+                      className={c.hasCheckReport ? 'btn-ghost btn-danger' : 'btn-ghost'}
                       onClick={() => setCheckModal(c)}
                       disabled={keyringLost}
                       title={keyringLostHint}
                     >
-                      Check / Repair…
+                      {c.hasCheckReport ? 'Repair…' : 'Check…'}
                     </button>{' '}
                     {/* Delete is not on this row: it lives inside Edit (see the form's form-actions
                         below). With five buttons in a row, the irreversible one sits right next to the

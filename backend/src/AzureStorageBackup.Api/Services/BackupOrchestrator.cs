@@ -2017,7 +2017,9 @@ public sealed class BackupOrchestrator(
                     // under way*, this must be interruptible too, not only at the single check before entering
                     // cleanup — which is exactly the behavior this stretch already enjoyed before Task 9, when the
                     // old Cancel() cancelled the run's own ct; this restores it.
-                }, info, stopProducing.Token, stagingLease, sweepOrphans: control?.SweepNeeded ?? false);
+                }, info, stopProducing.Token, stagingLease,
+                    // The remediation hold outranks the sweep triggers — see BackupRunControl.SweepSuppressed.
+                    sweepOrphans: (control?.SweepNeeded ?? false) && control?.SweepSuppressed != true);
             }
             catch (OperationCanceledException) when (stopProducing.IsCancellationRequested && !ct.IsCancellationRequested)
             {

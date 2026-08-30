@@ -198,6 +198,7 @@ builder.Services.AddScoped(sp => new RestoreOrchestrator(
 builder.Services.AddSingleton<RestoreRunner>();
 builder.Services.AddSingleton<RepairRunner>();
 builder.Services.AddSingleton<CheckRunner>();
+builder.Services.AddSingleton<OrphanSweeper>(); // the sweep owed when a check report retires
 builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),

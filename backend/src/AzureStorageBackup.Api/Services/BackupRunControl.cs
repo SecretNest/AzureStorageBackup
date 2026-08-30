@@ -38,6 +38,12 @@ public sealed class BackupRunControl(
     /// this container → the container most likely holds orphan blocks, so the closing cleanup should sweep once (Task 11).</summary>
     public bool SweepNeeded { get; private set; }
 
+    /// <summary>The remediation hold: while a check report awaits repair, the backup-tail orphan sweep is the
+    /// one deleter that judges by EXACT volume names — a suspended repair's replacement volumes can outnumber
+    /// the recorded family and would read as orphans to it. Retirement's own deletions normalize to base refs
+    /// and stay safe, so only the sweep is held; it fires once the report retires (drop or full repair).</summary>
+    public bool SweepSuppressed { get; set; }
+
     /// <summary>The pause gate for transient errors. Self-heals at 30s/1m/5m/every 5m by default, and downgrades if it has not recovered in 10 minutes.</summary>
     public PauseGate Gate { get; } = gate ?? new PauseGate();
 

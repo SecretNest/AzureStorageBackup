@@ -46,6 +46,10 @@ public record BackupConfigResponse(
     /// <summary>The path that must exist before this backup runs; null = no precondition. See <see cref="BackupConfig.SentinelPath"/>.</summary>
     string? SentinelPath = null)
 {
+    /// <summary>Whether an actionable check report is persisted for this config — the row's button reads
+    /// Repair (red) instead of Check while one exists ("有报告就修,没报告才能查").</summary>
+    public bool HasCheckReport { get; init; }
+
     /// <summary>
     /// <paramref name="secretsUnavailable"/> must be passed according to whether this config's ciphertext can actually be
     /// decrypted (see <see cref="SecretAvailability"/>); do not pass the global Lost status — halfway through recovery,

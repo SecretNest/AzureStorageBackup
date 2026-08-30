@@ -313,10 +313,12 @@ public sealed class BackupRepairer(
                     $"First: {failures[0].Ref}: {failures[0].Message}");
         }
 
-        // Orphan reclamation (§4.8): done after the repair writes have landed — the reference set is built **again**
-        // right before deleting (TOCTOU-safe).
-        if (checkOptions.ListOrphans)
-            await DeleteOrphansAsync(account, container, cc, password, deletedOrphans, ct);
+        // No full-container orphan sweep here any more ("repair只清自己repair的那几个文件,不要对全backup做"):
+        // the per-family keep-set trim inside ReplaceAsync already removes every leftover volume of the
+        // objects this run actually replaced — exact, scoped, and free. A whole-container sweep needs the
+        // full reference set (every retained version's index) and a complete listing, which is minutes of
+        // work that can shadow the NEXT repair; full garbage collection belongs to the post-backup cleanup,
+        // which owns the machinery (journal protection, reference set) and runs when nothing competes.
 
         await Record(NotificationEvents.CheckSuccess, $"repair:{account.Id}/{container}",
             $"Repair finished: {container}",
@@ -326,57 +328,6 @@ public sealed class BackupRepairer(
                 $"Unrecoverable files after repair: {container}", string.Join(", ", unrecoverable.Distinct().Take(20)), ct);
 
         return new RepairReport(repaired.Distinct().ToList(), unrecoverable.Distinct().ToList(), deletedOrphans);
-    }
-
-    /// <summary>
-    /// Delete the orphan blobs that no retained version references (§4.8). **TOCTOU-safe**: immediately before
-    /// deleting, the info file + every version index are **re-read** to build the reference set (so it reflects the
-    /// changes this repair just landed). If the complete reference set cannot be built (the info file is gone, or some
-    /// version index fails to read) → **give up on deleting**, log a Warning, delete not a single one. The info file /
-    /// the indexes / any referenced volume are never deleted (they are all inside the reference set).
-    /// </summary>
-    private async Task DeleteOrphansAsync(
-        Account account, string container, BlobContainerClient cc, string? password, List<string> deletedOrphans, CancellationToken ct)
-    {
-        HashSet<string> referenced;
-        try
-        {
-            var freshInfo = await store.ReadInfoAsync(account, container, password, ct)
-                ?? throw new InvalidOperationException("Info file not found.");
-            referenced = await (checker ?? throw new InvalidOperationException("Repair requires a checker."))
-                .BuildReferencedSetAsync(account, container, password, freshInfo, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            if (opLog is not null)
-                await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{container}",
-                    $"Orphan cleanup abandoned: could not build the full reference set ({ex.Message}). No blobs were deleted.", ct, durable: true);
-            return;
-        }
-
-        var active = journals is null
-            ? ActiveJournalRefs.Empty
-            : await journals.LoadActiveRefsAsync(account.Id, container, ct);
-        await foreach (var b in cc.GetBlobsAsync(cancellationToken: ct))
-        {
-            // Referenced by a retained version, or held by an active journal (a suspended run's uploads — deleting
-            // them makes the eventual resume re-upload everything it had already sent): both mean "not an orphan".
-            if (referenced.Contains(b.Name) || BackupChecker.JournalProtected(b.Name, active))
-                continue;
-            // Best effort per blob: one failed orphan deletion only logs a Warning and moves on without
-            // interrupting the rest (only blobs outside the reference set get here, so valid data is never deleted).
-            try
-            {
-                await cc.GetBlobClient(b.Name).DeleteIfExistsAsync(cancellationToken: ct);
-                deletedOrphans.Add(b.Name);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                if (opLog is not null)
-                    await opLog.AppendAsync(OperationLogLevel.Warning, $"repair:{account.Id}/{container}",
-                        $"Failed to delete orphan blob {b.Name}: {ex.Message}", ct, durable: true);
-            }
-        }
     }
 
     /// <summary>Repair a single-file data blob: rebuild and replace it from the local file at any referencing path (hash-verified), then update the sizes in every referencing version.</summary>

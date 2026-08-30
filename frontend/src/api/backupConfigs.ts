@@ -152,6 +152,9 @@ export interface BackupConfig {
    * something that only appears after the mount.
    */
   sentinelPath: string | null
+  // An actionable check report is persisted: the row's button reads Repair (red) instead of Check, and new
+  // checks (manual and scheduled alike) are refused until it is repaired away or dropped.
+  hasCheckReport: boolean
 }
 
 export interface BackupConfigInput {

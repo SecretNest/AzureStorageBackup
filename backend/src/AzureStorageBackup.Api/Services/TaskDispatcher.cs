@@ -153,6 +153,16 @@ public sealed class TaskDispatcher(
                         // Explicit cast to AccessTier?: see the same comment at the /check endpoint in BackupConfigEndpoints.cs (a real production bug fix).
                         RehydrateTier = task.CheckRehydrateTier is { } t ? (AccessTier?)BackupRequestMapper.MapTier(t) : null,
                     };
+                    // The operator's rule applies unattended too: an actionable report gates every further
+                    // check until it is repaired away or dropped. The scheduled slot simply skips — the red
+                    // Repair button (and the original notification) already say everything a re-check would.
+                    if (await sp.GetRequiredService<CheckRunner>().HasPersistedReportAsync(config.Id, ct))
+                    {
+                        logger.LogInformation(
+                            "Scheduled check for {Account}/{Container} skipped: a check report is awaiting repair",
+                            accountId, container);
+                        break;
+                    }
                     var result = await sp.GetRequiredService<BackupChecker>()
                         // The sentinel matters most on this path: a scheduled check runs unattended, so the
                         // "every file is Missing" report a check of an unmounted source produces would arrive as a
@@ -160,7 +170,8 @@ public sealed class TaskDispatcher(
                         // perfectly healthy. The cloud half still runs.
                         .CheckAsync(account, container, password, null, options, config.LocalRoot, config.SentinelPath, ct,
                             downloadConcurrency: checkSettings.DownloadConcurrency > 0 ? checkSettings.DownloadConcurrency : 5,
-                            headConcurrency: checkSettings.CheckHeadConcurrency > 0 ? checkSettings.CheckHeadConcurrency : 20);
+                            headConcurrency: checkSettings.CheckHeadConcurrency > 0 ? checkSettings.CheckHeadConcurrency : 20,
+                            markFindings: true); // discovery IS the marking moment, unattended or not
                     if (!result.Ok)
                         logger.LogWarning("Check for {Account}/{Container} found {Problems} problem(s)",
                             accountId, container, result.MissingRefs.Count);
@@ -177,7 +188,9 @@ public sealed class TaskDispatcher(
                     var cleanup = await sp.GetRequiredService<RetentionCleaner>().CleanupAsync(
                         account, container, password,
                         BackupRequestMapper.CleanupOf(config, cleanupSettings), ct, cleanupLease,
-                        sweepOrphans: true);
+                        // The remediation hold applies here too: while a report awaits repair, the orphan
+                        // sweep — the one exact-name deleter — stands down; retirement itself still runs.
+                        sweepOrphans: !await sp.GetRequiredService<CheckRunner>().HasPersistedReportAsync(config.Id, ct));
                     // The cleanup at the end of a backup writes what it deleted into the success summary; there is no reason for
                     // this standalone one to be quieter — in an unattended deployment the operation log is the only place to go
                     // back and check "how much space did the retention policy actually free up".

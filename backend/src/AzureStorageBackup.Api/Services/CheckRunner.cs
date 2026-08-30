@@ -98,9 +98,27 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
         }
     }
 
+    /// <summary>Whether an actionable report is persisted for this config — the gate that refuses further
+    /// checks (manual and scheduled alike) until the report is repaired away or dropped.</summary>
+    public async Task<bool> HasPersistedReportAsync(int configId, CancellationToken ct = default)
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.LastCheckRuns.AsNoTracking().AnyAsync(x => x.BackupConfigId == configId, ct);
+    }
+
+    /// <summary>The configs holding a persisted report, in one query — the list endpoint decorates every row.</summary>
+    public async Task<HashSet<int>> PersistedReportIdsAsync(CancellationToken ct = default)
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return (await db.LastCheckRuns.AsNoTracking().Select(x => x.BackupConfigId).ToListAsync(ct)).ToHashSet();
+    }
+
     /// <summary>Drop the last check result — in-memory state and persisted row both, or reopening the dialog
     /// would resurrect what the user just dismissed. Refused (false) while a check is running: the result being
-    /// dropped does not exist yet, and the run owns the state.</summary>
+    /// dropped does not exist yet, and the run owns the state. Dropping is also how a clean verdict retires
+    /// itself, and how a fully-successful repair retires the report it worked from.</summary>
     public async Task<bool> DropAsync(int configId, CancellationToken ct = default)
     {
         lock (_lock)
@@ -126,6 +144,26 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
     {
         if (state.Report is null)
             return; // failed runs carry no report, and must not clobber the last real result (see LastCheckRun)
+        // Only a report worth ACTING on persists ("有报告就修,没报告才能查" — the operator's design): problems to
+        // repair, or orphans to judge. A clean verdict auto-drops instead — a persisted report gates every
+        // further check, and a clean one would gate them forever with nothing to do about it. The in-memory
+        // report still serves this process's dialog until it closes.
+        var actionable = state.Report.Findings.Any(f => f.Cloud == CloudState.MissingOrBad)
+            || state.Report.OrphanBlobs.Count > 0;
+        if (!actionable)
+        {
+            // Row only: the in-memory report still serves this process's dialog until it closes; the GATE is
+            // the persisted row, and a clean verdict must not hold it.
+            using var cleanScope = scopes.CreateScope();
+            var cleanDb = cleanScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var stale = await cleanDb.LastCheckRuns.FirstOrDefaultAsync(x => x.BackupConfigId == configId);
+            if (stale is not null)
+            {
+                cleanDb.LastCheckRuns.Remove(stale);
+                await cleanDb.SaveChangesAsync();
+            }
+            return;
+        }
         try
         {
             using var scope = scopes.CreateScope();
@@ -183,7 +221,8 @@ public sealed class CheckRunner(IServiceScopeFactory scopes, BackupBusyTracker b
                     version, options, config.LocalRoot, config.SentinelPath, state.Cancellation.Token,
                     downloadConcurrency: settings.DownloadConcurrency > 0 ? settings.DownloadConcurrency : 5,
                     onProgress: d => state.Detail = d,
-                    headConcurrency: settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20);
+                    headConcurrency: settings.CheckHeadConcurrency > 0 ? settings.CheckHeadConcurrency : 20,
+                    markFindings: true); // discovery IS the marking moment — "check出来就应该标错"
                 state.Status = RunStatus.Completed;
             }
             finally

@@ -18,8 +18,10 @@ public static class BackupConfigEndpoints
         {
             var list = await svc.ListAsync(ct);
             var settings = await settingsSvc.GetAsync(ct);
+            var withReports = await checkRunner.PersistedReportIdsAsync(ct);
             return Results.Ok(list.Select(c =>
-                BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c))));
+                BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c))
+                    with { HasCheckReport = withReports.Contains(c.Id) }));
         });
 
         group.MapGet("/{id:int}", async (int id, IBackupConfigService svc, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, IKeyringHealth keyring, IEncryptionService encryption, IGlobalSettingsService settingsSvc, CancellationToken ct) =>
@@ -28,7 +30,8 @@ public static class BackupConfigEndpoints
             if (c is null)
                 return Results.NotFound();
             var settings = await settingsSvc.GetAsync(ct);
-            return Results.Ok(BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c)));
+            return Results.Ok(BackupConfigResponse.From(c, settings, DeriveActivity(c, backupRunner, restoreRunner, repairRunner, checkRunner, busy), Pending(keyring, encryption, c))
+                with { HasCheckReport = await checkRunner.HasPersistedReportAsync(id, ct) });
         })
         .WithName("GetBackupConfig");
 
@@ -844,6 +847,12 @@ public static class BackupConfigEndpoints
             if (config is null)
                 return Results.NotFound();
             if (PathBoundaryGuard.Blocked(boundary, config.LocalRoot) is { } outside) return outside;
+            // The operator's flow ("有报告就修,没报告才能查"): an actionable report must be repaired away or
+            // dropped before another check may run — a second check would only re-state what the big red
+            // Repair button already says, and quietly replacing the report a repair plan was built from is
+            // how selections go stale.
+            if (await runner.HasPersistedReportAsync(id, ct))
+                return Results.Conflict(new { error = "A check report is awaiting repair — repair it or drop it before checking again." });
 
             var options = new CheckOptions
             {
@@ -872,10 +881,15 @@ public static class BackupConfigEndpoints
 
         // Drop the last check result (in-memory and persisted): the dialog's doorway back to "start a new
         // check". 409 while a check is running — the run owns its state.
-        group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, CancellationToken ct) =>
-            await runner.DropAsync(id, ct)
-                ? Results.NoContent()
-                : Results.Conflict(new { error = "A check is running; stop it first." }));
+        group.MapDelete("/{id:int}/check", async (int id, CheckRunner runner, OrphanSweeper sweeper, CancellationToken ct) =>
+        {
+            if (!await runner.DropAsync(id, ct))
+                return Results.Conflict(new { error = "A check is running; stop it first." });
+            // The report retired by the operator's hand: the container gets the sweep the hold deferred
+            // (fire-and-forget; a busy container skips and the next backup's tail collects instead).
+            sweeper.Kick(id);
+            return Results.NoContent();
+        });
 
         // Stop whatever operations are running on this backup. Omitting what = stop everything; otherwise stop only the specified kind
         // (one config may be backing up and restoring at the same time — restore deliberately does not take the busy lock, see the comment at the top of RestoreRunner).

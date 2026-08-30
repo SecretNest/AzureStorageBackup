@@ -839,13 +839,12 @@ public sealed class BackupRepairerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>The retention cleaner has honoured active journals all along; the repair-side orphan sweep did
-    /// not, and it runs off the same "referenced by a retained version" set. With a backup suspended mid-run —
-    /// the exact state in which a user repairs damage before resuming — its journalled uploads are in the cloud
-    /// but in no version index, and a ticked "clean up orphans" would have deleted them, making the eventual
-    /// resume re-upload everything it had already sent.</summary>
+    /// <summary>Repair deletes nothing container-wide any more ("repair只清自己repair的那几个文件"): even with
+    /// cleanup requested, a true orphan AND a suspended run's journalled uploads all survive a repair — full
+    /// garbage collection belongs to the post-backup cleanup, which honours journals and runs only once no
+    /// check report is pending. The check's own orphan LISTING still honours journals (report-only).</summary>
     [SkippableFact]
-    public async Task Orphan_Cleanup_Spares_A_Suspended_Runs_Journalled_Blobs()
+    public async Task Repair_Deletes_Nothing_Container_Wide_Even_With_Cleanup_Requested()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite is not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -879,9 +878,8 @@ public sealed class BackupRepairerTests : IDisposable
                 account, name, null, _src, null, new CheckOptions { ListOrphans = true },
                 Azure.Storage.Blobs.Models.AccessTier.Hot, null, dontCompress: null);
 
-            Assert.Contains("data/trueorphan", report.DeletedOrphans);
-            Assert.DoesNotContain("data/journaled", report.DeletedOrphans);
-            Assert.DoesNotContain("packs/pjournal.7z", report.DeletedOrphans);
+            Assert.Empty(report.DeletedOrphans);
+            Assert.True((await container.GetBlobClient("data/trueorphan").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient("data/journaled").ExistsAsync()).Value);
             Assert.True((await container.GetBlobClient("packs/pjournal.7z").ExistsAsync()).Value);
 

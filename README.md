@@ -260,6 +260,28 @@ Both keep what finished uploading, and both keep the journal, so the next run pi
 
 A journal is only adopted if the run it describes still matches: same local root, same baseline version, same encryption identity. If any of those changed, it is dropped rather than trusted, and a file only counts as already-uploaded when **both** its path and its content hash match — a file edited since the crash is uploaded again.
 
+#### Check and Repair are one flow with two states
+
+The row's button reads **Check…** when nothing is pending and turns into a red **Repair…** the moment a
+check finds something. A report that finds problems (or orphans) persists — across dialog closes, restarts
+and upgrades — and while it exists **no new check may start**, manual or scheduled: the report is the plan
+the repair works from, and quietly replacing it is how selections go stale. A clean check retires itself,
+so the button only ever goes red for a reason.
+
+A check also **writes its verdict down at the moment of discovery**: paths found damaged are marked
+unrecoverable in the checked version's index right away (and paths found healthy again shed their mark),
+so restores substitute, dedup avoids the damaged copy, and the next backup heals unchanged content — all
+without waiting for you to click Repair.
+
+The report retires three ways: you repair everything and it **drops itself**; you press **Drop**; or the
+files you left unticked stay marked and the report stays until you drop it by hand. While a report is
+pending, the automatic orphan sweep at the end of each backup stands down (a mid-repair container holds
+volumes an exact-name sweep would misjudge); the moment the report retires, the deferred sweep runs once
+in the background. Repair itself deletes nothing container-wide — it only trims the leftover volumes of
+the exact objects it replaced. Damaged blobs that stay marked are kept deliberately: their surviving
+volumes are salvage material a later heal can skip re-uploading, and retention collects them when the
+last version referencing them retires.
+
 #### Repairs pause and suspend too
 
 A running repair carries the same three buttons in the same order — **Pause · Suspend · Stop** — and its pause is even finer-grained than a backup's: the gate is checked before every volume, so a pause answers within seconds even in the middle of a 100 GB family. Suspend saves the repair's selection; Resume replays it against a fresh assessment, so anything healed in the meantime falls out on its own and volumes already uploaded are verified and skipped rather than re-sent. At the very start of a repair, every problem file is marked unrecoverable and the marks are persisted **before any work begins** — so however the run ends, backups and restores running afterwards always see the truth about which content is still broken; each repaired object then clears its own marks.

@@ -685,6 +685,9 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
             await using var control = new BackupRunControl(
                 sp.GetRequiredService<BackupJournalStore>(), configId, state.RunId);
+            // The remediation hold: with a check report awaiting repair, this run's tail sweep stands down
+            // (see BackupRunControl.SweepSuppressed); the sweep fires when the report retires instead.
+            control.SweepSuppressed = await sp.GetRequiredService<CheckRunner>().HasPersistedReportAsync(configId, ct);
             state.Control = control;
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
