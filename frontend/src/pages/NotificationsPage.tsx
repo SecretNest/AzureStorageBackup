@@ -23,7 +23,10 @@ export function NotificationsSection() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const [test, setTest] = useState<TestResult | null>(null)
-  const [busy, setBusy] = useState(false)
+  // Which request is in flight, not merely whether one is. Both buttons disable on either, as before — but they now
+  // also name what they are doing, and a bare boolean would have put "Saving…" on the Save button while a *test* was
+  // the thing running.
+  const [busy, setBusy] = useState<null | 'save' | 'test'>(null)
 
   useEffect(() => {
     notificationsApi
@@ -32,14 +35,19 @@ export function NotificationsSection() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  const set = <K extends keyof NotificationConfig>(k: K, v: NotificationConfig[K]) =>
+  // Any edit retracts "Saved.", or it sits on screen next to fields that have since been changed and not saved.
+  const set = <K extends keyof NotificationConfig>(k: K, v: NotificationConfig[K]) => {
+    setSaved(false)
     setCfg((c) => ({ ...c, [k]: v }))
+  }
 
-  const toggleEvent = (bit: number, on: boolean) =>
+  const toggleEvent = (bit: number, on: boolean) => {
+    setSaved(false)
     setCfg((c) => ({ ...c, events: on ? c.events | bit : c.events & ~bit }))
+  }
 
   const save = async () => {
-    setBusy(true)
+    setBusy('save')
     setError(null)
     setSaved(false)
     try {
@@ -48,26 +56,26 @@ export function NotificationsSection() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setBusy(false)
+      setBusy(null)
     }
   }
 
   const runTest = async () => {
-    setBusy(true)
+    setBusy('test')
     setTest(null)
     try {
       setTest(await notificationsApi.test(cfg))
     } catch (e) {
       setTest({ success: false, error: e instanceof Error ? e.message : String(e) })
     } finally {
-      setBusy(false)
+      setBusy(null)
     }
   }
 
-  // Notification configuration is really just another global setting, so it is a section on the Settings page rather than a top-level tab of its own.
+  // Notification configuration is really just another global setting, so it is a sub-page of Settings rather than a
+  // top-level tab of its own. No heading of its own: the sub-nav tab above already names it.
   return (
     <>
-      <h2 style={{ marginTop: '2rem' }}>Notifications</h2>
       {error && <p className="text-danger">{error}</p>}
 
       <p className="text-muted">
@@ -143,11 +151,13 @@ export function NotificationsSection() {
       </fieldset>
 
       <div className="row" style={{ marginTop: '1rem' }}>
-        <button type="button" className="btn-primary" onClick={save} disabled={busy}>
-          Save
+        {/* Says "Saving…" rather than only greying out: on a loaded machine the round trip takes seconds, and a
+            disabled button with unchanged text does not confirm the click landed. Same treatment as Settings' Save. */}
+        <button type="button" className="btn-primary" onClick={save} disabled={busy !== null}>
+          {busy === 'save' ? 'Saving…' : 'Save'}
         </button>
-        <button type="button" onClick={runTest} disabled={busy}>
-          Send test
+        <button type="button" onClick={runTest} disabled={busy !== null}>
+          {busy === 'test' ? 'Sending…' : 'Send test'}
         </button>
         {saved && <span className="text-ok">Saved.</span>}
       </div>

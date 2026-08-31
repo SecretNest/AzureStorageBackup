@@ -296,8 +296,12 @@ tbody tr:hover {
 tbody tr.has-ops > td {
   border-bottom: none;
 }
+/* The same padding as every other cell, not zero. The zero was meant to keep this row attached to the backup above it,
+   but attachment is already carried by the missing border and the shared hover background - all the zero did was pin the
+   progress text against the top edge of that background while the bottom kept its full 8px, so the block sat visibly
+   high in its own highlight. Symmetric padding centres it; the rows still read as one. */
 tbody tr.ops-row > td {
-  padding-top: 0;
+  padding-top: var(--sp-2);
 }
 tbody tr.has-ops:hover,
 tbody tr.has-ops:hover + tr.ops-row,
@@ -752,6 +756,47 @@ tbody tr.edit-row > td > .panel {
   margin-bottom: var(--sp-3);
 }
 
+/* Second-level navigation inside a page (Settings' five sub-pages). Deliberately NOT nested inside .sidebar-nav: on the
+   phone tier that is a fixed four-slot bottom bar with no room for five more entries, so a strip that lives in the
+   content area is the only placement that works at every width.
+   It scrolls horizontally rather than wrapping - a wrapped strip changes height as the window narrows, which shifts the
+   whole page under the reader; nowrap keeps the content below it anchored. The underline is on the container so the
+   inactive tabs sit on a continuous rule. */
+.subnav {
+  display: flex;
+  gap: var(--sp-1);
+  align-items: stretch;
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.subnav-item {
+  height: auto;
+  line-height: inherit; /* Same reason as .nav-item: the global button rule fixes a height these do not want */
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  /* Transparent, not absent, so the active tab's underline does not add 2px and nudge every sibling upward. Sits on top
+     of the container's rule (hence the -1px) rather than under it. */
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.subnav-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.subnav-item-active,
+.subnav-item-active:hover:not(:disabled) {
+  border-bottom-color: var(--accent);
+  background: transparent;
+  color: var(--text);
+  font-weight: 600;
+}
+
 .row {
   display: flex;
   gap: var(--sp-2);
@@ -1121,9 +1166,11 @@ tbody tr.edit-row > td > .panel {
     border-top-right-radius: 0;
     padding-top: 0;
   }
+  /* Matches the desktop rule above: the card's own top padding stays at zero (the tr is the card), the content inside it
+     gets the ordinary cell padding so the progress block is not glued to the seam. */
   table.cards tr.ops-row td {
     display: block;
-    padding-top: 0;
+    padding-top: var(--sp-2);
   }
   table.cards tr.ops-row td::before {
     content: none;

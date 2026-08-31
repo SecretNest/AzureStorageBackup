@@ -4,43 +4,77 @@ import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfi
 import { Field } from '../components/Field'
 import { AccountsSection } from './AccountsPage'
 import { NotificationsSection } from './NotificationsPage'
+import { AboutSection } from './AboutPage'
 
 const MB = 1024 * 1024
 
-/// Settings is a shell around several sections. Accounts comes **first** and does **not** wait for
-/// global settings to load: a user with no accounts configured lands straight here (see the
-/// default-tab logic in App.tsx) and should see it immediately — putting it lower, or behind a
-/// "Loading…", hides the one thing a new user can actually do.
+/// The five sub-pages. Settings had grown into one page several screens tall, where finding a knob meant scrolling past
+/// every other knob; each of these is now a page you can read to the end of.
+export type SettingsTab = 'accounts' | 'defaults' | 'global' | 'notifications' | 'about'
+
+const settingsTabs: { key: SettingsTab; label: string }[] = [
+  // Accounts stays first: a user with no accounts configured lands on Settings (see the default-tab logic in App.tsx)
+  // and this is the one thing they can actually do.
+  { key: 'accounts', label: 'Accounts' },
+  { key: 'defaults', label: 'Backup defaults' },
+  { key: 'global', label: 'Global' },
+  { key: 'notifications', label: 'Notifications' },
+  { key: 'about', label: 'About' },
+]
+
 export function SettingsPage({
+  tab,
+  onTabChange,
   authRequired,
   onLogout,
 }: {
+  tab: SettingsTab
+  onTabChange: (t: SettingsTab) => void
   authRequired?: boolean
   onLogout?: () => void
 }) {
+  // Backup defaults and Global are two halves of ONE object: settingsApi.get/update serve the whole GlobalSettings, and
+  // splitting the page does not split the endpoint. So the state is held here, above both, rather than in each sub-page.
+  // Two independent copies would each save from their own snapshot, and whichever went last would silently overwrite the
+  // other half with values it read before the first save. Sharing it also means edits made on one tab survive a switch to
+  // the other and go up together.
+  const settings = useGlobalSettings()
+
   return (
     <section>
       <div className="page-header">
         <h1>Settings</h1>
       </div>
-      <AccountsSection />
-      <BackupDefaults />
-      <NotificationsSection />
-      {/* Log out moved here from the sidebar: the phone tier's bottom bar has four slots and no room
-          for a fifth. Desktop moved too — one function in two places is what later maintenance forgets to sync. */}
-      {authRequired && onLogout && (
-        <>
-          <h2>Session</h2>
-          <button type="button" onClick={onLogout}>
-            Log out
+
+      {/* A strip here rather than nested entries in the sidebar: on phones the sidebar is a fixed four-slot bottom bar,
+          which has no room for five more. Scrolls horizontally when it does not fit. */}
+      <nav className="subnav">
+        {settingsTabs.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => onTabChange(t.key)}
+            className={tab === t.key ? 'subnav-item subnav-item-active' : 'subnav-item'}
+            aria-current={tab === t.key ? 'page' : undefined}
+          >
+            {t.label}
           </button>
-        </>
-      )}
+        ))}
+      </nav>
+
+      {tab === 'accounts' && <AccountsSection />}
+      {tab === 'defaults' && <BackupDefaults settings={settings} />}
+      {tab === 'global' && <GlobalOptions settings={settings} />}
+      {tab === 'notifications' && <NotificationsSection />}
+      {tab === 'about' && <AboutSection authRequired={authRequired} onLogout={onLogout} />}
     </section>
   )
 }
 
-function BackupDefaults() {
+type SettingsState = ReturnType<typeof useGlobalSettings>
+
+/// Load, edit and save the global settings object, shared by the two sub-pages that each show half of it.
+function useGlobalSettings() {
   const [s, setS] = useState<GlobalSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -53,12 +87,15 @@ function BackupDefaults() {
     settingsApi.get().then(setS).catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  if (!s) return <><h2 style={{ marginTop: '2rem' }}>Backup defaults</h2><p>Loading…</p></>
-
-  const set = <K extends keyof GlobalSettings>(k: K, v: GlobalSettings[K]) =>
+  const set = <K extends keyof GlobalSettings>(k: K, v: GlobalSettings[K]) => {
+    // Any edit retracts "Saved." — otherwise it stays on screen next to fields that have since been changed and not
+    // saved, which is exactly the wrong moment to be reassuring.
+    setSaved(false)
     setS((cur) => (cur ? { ...cur, [k]: v } : cur))
+  }
 
   const save = async () => {
+    if (!s) return
     setError(null)
     setSaved(false)
     setBusy(true)
@@ -75,13 +112,37 @@ function BackupDefaults() {
     }
   }
 
+  return { s, set, save, busy, saved, error }
+}
+
+/// The Save row, rendered identically at the foot of both halves.
+///
+/// The button changes its own text rather than only greying out. On a loaded machine the round trip can take several
+/// seconds, and a disabled button with unchanged text says nothing about whether the click registered — the reported
+/// experience was pressing Save, seeing no change at all, and waiting for a "Saved." that took its time arriving.
+function SaveBar({ settings }: { settings: SettingsState }) {
+  return (
+    <div className="row" style={{ marginTop: '1rem' }}>
+      <button type="button" className="btn-primary" onClick={settings.save} disabled={settings.busy}>
+        {settings.busy ? 'Saving…' : 'Save'}
+      </button>
+      {settings.saved && <span className="text-ok">Saved.</span>}
+      {/* One object, one request: whichever of the two pages you press Save on writes both. Said out loud because the
+          tabs make them look like separate forms with separate buttons. */}
+      <span className="text-faint">Saves both Backup defaults and Global.</span>
+    </div>
+  )
+}
+
+function BackupDefaults({ settings }: { settings: SettingsState }) {
+  const { s, set, error } = settings
+  if (!s) return <p>Loading…</p>
+
   return (
     <>
-      <h2 style={{ marginTop: '2rem' }}>Backup defaults</h2>
       <p className="text-muted">Defaults for new backups, and for any existing backup field set to Use default.</p>
       {error && <p className="text-danger">{error}</p>}
 
-      <h2>Defaults</h2>
       <Field label="Index tier">
         <TierSelect value={s.defaultIndexTier} onChange={(v) => set('defaultIndexTier', v)} archive={false} />
       </Field>
@@ -169,7 +230,20 @@ function BackupDefaults() {
         this.
       </p>
 
-      <h2>Global</h2>
+      <SaveBar settings={settings} />
+    </>
+  )
+}
+
+function GlobalOptions({ settings }: { settings: SettingsState }) {
+  const { s, set, error } = settings
+  if (!s) return <p>Loading…</p>
+
+  return (
+    <>
+      <p className="text-muted">One shared setting each — these apply to the whole server, not to any single backup.</p>
+      {error && <p className="text-danger">{error}</p>}
+
       <Field label="Upload concurrency">
         <Num value={s.uploadConcurrency} onChange={(v) => set('uploadConcurrency', v)} />
       </Field>
@@ -280,10 +354,7 @@ function BackupDefaults() {
         only the BFQ disk scheduler acts on it — the startup log records whether it took.
       </p>
 
-      <div className="row" style={{ marginTop: '1rem' }}>
-        <button type="button" className="btn-primary" onClick={save} disabled={busy}>Save</button>
-        {saved && <span className="text-ok">Saved.</span>}
-      </div>
+      <SaveBar settings={settings} />
     </>
   )
 }
