@@ -17,6 +17,7 @@ import { orphanSummary, repairabilitySummary, resolutionSummary } from '../lib/c
 import { stageLabelOf } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
+import { etaLabel } from '../lib/etaLabel'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins, type LatestWins } from '../lib/latestWins'
 import { pauseDisplay } from '../lib/pauseDisplay'
@@ -2098,7 +2099,8 @@ function RunStatus({
       ? `${formatBytes(pace.bytesPerSecond)}/s`
       : null
   // Computed from the seconds rather than slicing the estimatedRemaining string — see formatDuration for why.
-  const eta = pace?.etaSeconds != null ? `~${formatDuration(pace.etaSeconds)} left` : null
+  // The outstanding source bytes ride along with the time; see etaLabel for why they belong together.
+  const eta = etaLabel(pace?.etaSeconds, pace?.workRemaining)
 
   const headline = [
     diffing && uploading

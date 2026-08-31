@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
 import { latestWins } from '../lib/latestWins'
-import { systemApi } from '../api/system'
 import { EmptyRow } from '../components/EmptyRow'
 import { formatLocalDateTime, formatUtcOffset } from '../constants/format'
 
@@ -21,8 +20,6 @@ export function LogsPage() {
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [paths, setPaths] = useState<Record<string, string>>({})
-  const [version, setVersion] = useState('')
 
   // latestWins, not a cancelled flag: every keystroke in Source and every filter change re-runs the
   // query, and a broad earlier query (no filter) can return AFTER the narrower one that superseded it —
@@ -53,11 +50,6 @@ export function LogsPage() {
       .finally(() => setLoaded(true))
   }
   useEffect(load, [minLevel, source, from, to])
-
-  useEffect(() => {
-    systemApi.paths().then(setPaths).catch(() => {})
-    systemApi.version().then((v) => setVersion(v.version)).catch(() => {})
-  }, [])
 
   const clear = async () => {
     if (!window.confirm('Clear all logs?')) return
@@ -170,17 +162,6 @@ export function LogsPage() {
           </tbody>
         </table>
       </div>
-
-      <h2>System</h2>
-      <p className="text-muted">Version: {version || '…'}</p>
-      <p className="text-muted">Temp directories (map these as docker volumes):</p>
-      <ul className="mono text-faint">
-        {Object.entries(paths).map(([k, v]) => (
-          <li key={k}>
-            {k}: {v}
-          </li>
-        ))}
-      </ul>
     </section>
   )
 }

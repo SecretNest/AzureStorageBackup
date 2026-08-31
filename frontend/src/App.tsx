@@ -4,7 +4,7 @@ import { LoginPage } from './components/LoginPage'
 import { BackupConfigsPage } from './pages/BackupConfigsPage'
 import { TasksPage } from './pages/TasksPage'
 import { LogsPage } from './pages/LogsPage'
-import { SettingsPage } from './pages/SettingsPage'
+import { SettingsPage, type SettingsTab } from './pages/SettingsPage'
 import { accountsApi } from './api/accounts'
 import { authApi, type AuthStatus } from './api/auth'
 import { setUnauthorizedHandler } from './api/client'
@@ -26,6 +26,10 @@ function App() {
   // Settings (the accounts section is at the top of it); otherwise default to Backups, the page
   // people actually look at every day.
   const [tab, setTab] = useState<Tab | null>(null)
+  // Which of Settings' five sub-pages is open. Held here, not inside SettingsPage, so that the keyring banner below can
+  // move both at once: it used to call setTab('settings') alone, which from a Settings sub-page other than Accounts is a
+  // no-op — the banner would look broken. It also means the sub-page survives a trip to Backups and back.
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('accounts')
   const [auth, setAuth] = useState<AuthStatus | null>(null)
 
   const refreshAuth = () => {
@@ -83,12 +87,24 @@ function App() {
       </aside>
 
       <main className="app-main">
-        <KeyringBanner onGoToAccounts={() => setTab('settings')} />
+        <KeyringBanner
+          onGoToAccounts={() => {
+            setTab('settings')
+            setSettingsTab('accounts')
+          }}
+        />
 
         {tab === 'backups' && <BackupConfigsPage />}
         {tab === 'schedules' && <TasksPage />}
         {tab === 'logs' && <LogsPage />}
-        {tab === 'settings' && <SettingsPage authRequired={auth.required} onLogout={logout} />}
+        {tab === 'settings' && (
+          <SettingsPage
+            tab={settingsTab}
+            onTabChange={setSettingsTab}
+            authRequired={auth.required}
+            onLogout={logout}
+          />
+        )}
       </main>
     </div>
   )
