@@ -91,7 +91,7 @@ public sealed class PackAliasDedupTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
-        var indexCache = new LocalIndexCache(_db, store);
+        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
         var compactor = deadWeightCompaction
             ? new DeadWeightCompactor(

@@ -95,7 +95,7 @@ public sealed class BackupRepairerTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var state = new LocalBackupStateStore(_db);
         var tracked = new TrackedInfoStore(store, state);
-        var indexCache = new LocalIndexCache(_db, store);
+        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),

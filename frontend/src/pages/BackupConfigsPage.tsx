@@ -62,6 +62,9 @@ import {
   type ContainerInfo,
 } from '../api/containers'
 
+/** How long Save/Create waits for the server before giving up and saying so. See save(). */
+const SAVE_TIMEOUT_MS = 60_000
+
 const cloudLevelLabels: Record<number, string> = {
   [CloudCheckLevel.None]: "Don't check cloud",
   [CloudCheckLevel.Metadata]: 'Metadata vs local cache',
@@ -197,29 +200,51 @@ export function BackupConfigsPage() {
       return list
     })
   }
+  // The latest-wins gate above decides who may WRITE; it does nothing about how many requests are in the
+  // air. This one is the second half, and it is the half that matters under load: this is a fan-out of one
+  // request per configuration, fired every 5 seconds, against an endpoint that walks a directory and opens
+  // every journal in it — precisely the endpoint that slows down when the disk is busy. With ten backups
+  // that is ten requests per round against the browser's six-connection budget for the origin, so once a
+  // round takes longer than the interval the rounds pile up on top of each other and the queue grows
+  // without bound. Everything the user then does — including pressing Save — lines up behind that queue.
+  // The 1-second tick below already guards against exactly this (see its `inFlight` and the note about the
+  // per-origin limit); this fan-out was the one that was left unguarded. A skipped round costs nothing: the
+  // next one is 5 seconds away and reads the same state.
+  const interruptedInFlight = useRef(false)
   const refreshInterrupted = (list: BackupConfig[]) => {
+    if (interruptedInFlight.current) return
+    interruptedInFlight.current = true
     const isLatest = interruptedGate.current.begin()
     void Promise.all(
       list.map(async (c) => [c.id, await backupConfigsApi.interrupted(c.id).catch(() => [])] as const),
     ).then((pairs) => {
       if (isLatest()) setInterrupted(Object.fromEntries(pairs))
+    }).finally(() => {
+      interruptedInFlight.current = false
     })
   }
 
   const load = () => {
     refreshConfigs()
-      .then((list) => {
-        if (list === null) return
-        // Hydrate repair states: a suspended repair must show its resume button after a page load or a
-        // container restart, and the row-level polling only runs while activity says Repairing. Routed
-        // through the per-config repair gate like every other writer of that map.
-        for (const c of list)
-          void refreshRepair(c.id)
-      })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       // finally, not then: a failed load must still end the "loading" state, or the table sits on
       // "Loading…" forever with the real reason in the error line above it.
       .finally(() => setLoaded(true))
+  }
+
+  // Hydrate repair states: a suspended repair must show its resume button after a page load or a container
+  // restart, and the row-level polling only runs while activity says Repairing. Routed through the
+  // per-config repair gate like every other writer of that map.
+  //
+  // On mount only, not on every load(). This is another per-configuration fan-out, and load() runs after
+  // every button on the page — Backup, Stop, Save, Delete, Reset — so it used to double the request burst
+  // of every single click for information that cannot have changed: a repair that starts or ends while the
+  // page is open is already tracked by the 1-second tick, whose departure handler fires one last
+  // refreshRepair for a repair that has just stopped being active (see the cleanup below). Only the state
+  // that predates this page had to be discovered, and that is what mounting means.
+  const hydrateRepairs = (list: BackupConfig[]) => {
+    for (const c of list)
+      void refreshRepair(c.id)
   }
 
   // --- The repair map's single write path. ---
@@ -260,7 +285,15 @@ export function BackupConfigsPage() {
     })
   }, [runs])
 
-  useEffect(load, [])
+  useEffect(() => {
+    refreshConfigs()
+      .then((list) => {
+        if (list !== null) hydrateRepairs(list)
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoaded(true))
+    // Mount only, deliberately — see hydrateRepairs.
+  }, [])
 
   // Lets the ticks and cleanups of the effects below read the **latest** configs/restores without putting
   // them in dependency arrays and rebuilding the interval — assigned during render, so after commit the
@@ -269,6 +302,14 @@ export function BackupConfigsPage() {
   configsRef.current = configs
   const restoresRef = useRef(restores)
   restoresRef.current = restores
+
+  // A write the user is waiting on outranks every background poll on this page. The polls are unattended
+  // refreshes of information that is at most a few seconds stale; the write is the one request whose
+  // latency the user is actually watching, and it has to share six connections per origin with a fan-out
+  // of one request per configuration. Skipping the polls for the seconds a save is in flight costs a
+  // slightly older reading; not skipping them costs the save its place in the queue. Both loops below
+  // check this, and save() calls load() the moment it returns, so nothing stays stale.
+  const writeInFlight = useRef(false)
 
   // Pressing Edit expands the form under that row, which on a long list is somewhere below the fold — on a phone
   // several screens down. Scrolling targets the row, not the form: landing on the form's first field leaves "which
@@ -292,7 +333,7 @@ export function BackupConfigsPage() {
   // could cover another error the user is reading, and there is nothing they can do about this refresh
   // anyway. The next tick retries naturally.
   useEffect(() => {
-    const refresh = () => refreshConfigs().catch(() => {})
+    const refresh = () => (writeInFlight.current ? Promise.resolve(null) : refreshConfigs()).catch(() => {})
     const t = setInterval(refresh, 5000)
     // Browsers throttle background-tab timers to minutes, so switching back shows the previous tick's
     // stale snapshot and waits a full period to update — with a long job running, that is half the reason
@@ -339,7 +380,7 @@ export function BackupConfigsPage() {
     let inFlight = false
 
     const tick = async () => {
-      if (inFlight) return
+      if (inFlight || writeInFlight.current) return
       inFlight = true
       try {
         await Promise.all(
@@ -529,6 +570,17 @@ export function BackupConfigsPage() {
   const set = <K extends keyof BackupConfigInput>(k: K, v: BackupConfigInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
 
+  // Closing the form has to clear BOTH flags. showForm alone decides whether the panel has any content;
+  // editing alone decides whether the <tr className="edit-row"> that holds it is in the table at all. Clearing
+  // only the first left that row behind, empty: a bare cell whose bottom padding and border added a few
+  // pixels under the backup it belonged to, and which — being a row of its own, deliberately excluded from
+  // the hover group because a form should not highlight — stayed white while the row above it went grey.
+  // Every exit from the form goes through here so no future one can clear just one of the two again.
+  const closeForm = () => {
+    setShowForm(false)
+    setEditing(null)
+  }
+
   const startNew = () => {
     setEditing(null)
     // The twelve inheritable fields stay null (= use default, PRD §3). The tiers are locked after
@@ -626,19 +678,37 @@ export function BackupConfigsPage() {
     }
     setBusy(true)
     setError(null)
+    // Bounded, and it says so when the bound is hit. Before this, the request had no deadline at all: if it
+    // never got through — queued behind the page's own polling against the six connections a browser gives
+    // an origin, or waiting on a server with its disk saturated — the await simply never settled, so the
+    // `finally` below never ran, and Save stayed greyed out with no message, no error and nothing saved for
+    // the rest of the session. A minute is far longer than this write can legitimately take (it is a handful
+    // of local SQLite rows) and short enough that the user has not yet walked away.
+    const timeout = AbortSignal.timeout(SAVE_TIMEOUT_MS)
+    writeInFlight.current = true
     try {
       if (editing) {
-        await backupConfigsApi.update(editing.id, form)
+        await backupConfigsApi.update(editing.id, form, timeout)
       } else {
         // §4.6: after a successful creation, do not just close — offer to run the first backup now.
-        const created = await backupConfigsApi.create(form)
+        const created = await backupConfigsApi.create(form, timeout)
         setPostCreate(created)
       }
-      setShowForm(false)
+      closeForm()
       load()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // AbortSignal.timeout aborts with a TimeoutError, which is distinguishable from an abort the user
+      // asked for — and worth distinguishing, because "the server said no" and "nothing came back at all"
+      // call for completely different things from the person reading it.
+      setError(
+        e instanceof DOMException && e.name === 'TimeoutError'
+          ? `No response after ${SAVE_TIMEOUT_MS / 1000} seconds, so nothing was saved. `
+            + 'This backup is unchanged. A busy disk can hold the request up that long — try again once the '
+            + 'running job has settled.'
+          : e instanceof Error ? e.message : String(e),
+      )
     } finally {
+      writeInFlight.current = false
       setBusy(false)
     }
   }
@@ -652,10 +722,7 @@ export function BackupConfigsPage() {
     setDeleteModal(null)
     // The delete was started from this configuration's edit form: leaving that form open faces the user
     // with a configuration that no longer exists, and pressing Save again only hits a 404.
-    if (editing?.id === c.id) {
-      setShowForm(false)
-      setEditing(null)
-    }
+    if (editing?.id === c.id) closeForm()
     load()
   }
 
@@ -1087,7 +1154,7 @@ export function BackupConfigsPage() {
             >
               Next
             </button>
-            <button type="button" onClick={() => setShowForm(false)}>
+            <button type="button" onClick={closeForm}>
               Cancel
             </button>
             {deleteButton}
@@ -1333,10 +1400,13 @@ export function BackupConfigsPage() {
             <button type="button" onClick={() => setStep(1)}>
               Back
             </button>
+            {/* A greyed-out button is the only thing this used to say while a save was in flight, which reads
+                as "the click did nothing" rather than "it is working on it" — and on a busy disk that wait is
+                seconds, not milliseconds. Same wording as the Settings pages. */}
             <button type="button" className="btn-primary" onClick={save} disabled={busy || !form.name.trim() || passwordMismatch}>
-              {editing ? 'Save' : 'Create'}
+              {busy ? (editing ? 'Saving…' : 'Creating…') : (editing ? 'Save' : 'Create')}
             </button>
-            <button type="button" onClick={() => setShowForm(false)} disabled={busy}>
+            <button type="button" onClick={closeForm} disabled={busy}>
               Cancel
             </button>
             {deleteButton}

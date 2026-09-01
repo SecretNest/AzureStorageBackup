@@ -192,7 +192,7 @@ public sealed class StreamingBackupTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor, new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store),
+            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
             trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
 
         var account = AzuriteAccount();

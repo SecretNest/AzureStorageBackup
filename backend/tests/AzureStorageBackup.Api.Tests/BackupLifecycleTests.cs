@@ -118,7 +118,7 @@ public sealed class BackupLifecycleTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
-        var indexCache = new LocalIndexCache(_db, store);
+        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(

@@ -568,7 +568,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 | Container path | Purpose | Persist? |
 | --- | --- | --- |
-| `/data` | SQLite database (`app.db`) **and the backup journals** (`journal/`). | **Yes** |
+| `/data` | SQLite database (`app.db`), the backup journals (`journal/`) **and the local version-index cache** (`index-cache/`). | **Yes** |
 | `/keys` | Data Protection key ring. Losing it makes stored account keys/passwords undecryptable. | **Yes** |
 | `/temp` | Backup/restore working area (compress, staged, diff-spill, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
 | *(your choice, e.g. `/backup-source`)* | Host directories to back up. Mount **read-only** if you only back up. A backup's *local root* is set to this in-container path. | Bind mount |
@@ -577,6 +577,8 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 `GET /api/system/paths` returns the resolved absolute paths at runtime (PRD §6 "Directories"), useful when configuring Docker volume mappings.
 
 > Journals live next to `app.db` rather than under `Backup__TempPath`, and that is on purpose: `/temp` is the one directory the deployment instructions call *safe to discard*, while the journal is the only thing that lets an interrupted backup pick up where it stopped. Following the database means it lands on a volume you were already persisting, without a second environment variable to get right. It is also never cleared at startup — its whole content is "already in the cloud, not yet in the index".
+
+> **`index-cache/` follows the same rule, and needs no mount of its own.** It holds the local copy of each version's file index, as `index-cache/{accountId}/{container}/{version}.idx`, and it lives beside `app.db` for the same reason the journal does — it must survive the container being recreated, and following the database puts it on a volume you already persist. Unlike the journal it is only a **cache**: deleting the directory costs a re-download of those indexes from the cloud on the next check, restore or backup, never data. It is also where these indexes moved *out of*: they used to be one row each in `app.db`, and a single row can hold 100 MB for a backup of half a million files. SQLite allows one writer at a time, so writing such a row took the database's write lock for as long as the write took — tens of seconds on a loaded disk — and every other writer waited behind it, including the Save button on the Backups page. A file needs no lock. Old rows are migrated to files the first time each index is read after the upgrade, so upgrading re-downloads nothing.
 
 ## Published image
 

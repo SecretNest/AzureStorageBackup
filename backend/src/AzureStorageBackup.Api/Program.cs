@@ -105,11 +105,15 @@ builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose
 // as soon as the container is recreated — and the entire reason the journal exists is to "still know where the last run got to after the container is recreated". Following the
 // database, it naturally lands on the same persistent volume, and the user does not have to set an extra environment variable just to make crash recovery work.
 // Also note it must **not** be cleared at startup: what it records is exactly the content that is "already in the cloud but not yet in the index", and clearing it makes recovery pointless.
-var journalRoot = Path.Combine(
-    Path.GetDirectoryName(Path.GetFullPath(
-        new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource)) ?? ".",
-    "journal");
-builder.Services.AddSingleton(new BackupJournalStore(journalRoot));
+var dbDir = Path.GetDirectoryName(Path.GetFullPath(
+    new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource)) ?? ".";
+builder.Services.AddSingleton(new BackupJournalStore(Path.Combine(dbDir, "journal")));
+
+// The version-index cache, beside the journal and for the same reasons: it must survive a container being recreated
+// (losing it means re-downloading every index from the cloud), and following the database puts it on a volume the
+// operator is already persisting without a second environment variable to get right. Also not cleared at startup.
+// It is a **cache**, not authority — deleting the directory costs downloads, never data.
+builder.Services.AddSingleton(new VersionIndexFileStore(Path.Combine(dbDir, "index-cache")));
 
 // Spill area for the diff→upload queue. The write side never blocks: whatever memory cannot hold spills here, so diff can run all the way to the end —
 // which is the precondition for showing a remaining time during the upload stage (the denominator, SetTotal, is only fixed once diff finishes, see StageProgress.Eta).
@@ -405,6 +409,10 @@ if (!autoResumeRegistered)
 // Defense in depth (design §3.1): any SecretUnavailableException that slips through is mapped uniformly to 409 keyring_lost
 // rather than a bare 500. It has to be queued before the endpoints in order to wrap their execution.
 app.UseSecretUnavailableMapping();
+
+// Likewise for SQLite's "database is locked": a write that lost the race against a running backup's index commit is
+// a 503 with an explanation, not a bare 500. Same placement requirement — it has to wrap the endpoints.
+app.UseDatabaseBusyMapping();
 
 app.MapAuthEndpoints();
 app.MapHealthEndpoints();

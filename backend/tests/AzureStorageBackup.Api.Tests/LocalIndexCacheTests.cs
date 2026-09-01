@@ -12,6 +12,10 @@ public sealed class LocalIndexCacheTests : IDisposable
     private readonly SqliteConnection _connection;
     private readonly AppDbContext _db;
 
+    // The persistent layer of this cache is files now, not a table, so this is the field the tests below reach for
+    // when they need to pull the rug out from under the in-process layer — the role _db used to play.
+    private readonly VersionIndexFileStore _files = TestIndexFiles.New();
+
     public LocalIndexCacheTests()
     {
         _connection = new SqliteConnection("DataSource=:memory:");
@@ -63,7 +67,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Miss_Downloads_And_Backfills_Then_Hit_Serves_From_Local()
     {
         var store = new FakeStore(Index(1, "a.txt"));
-        var cache = new LocalIndexCache(_db, store);
+        var cache = new LocalIndexCache(_db, store, _files);
 
         var first = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 100, "indexes/v1.bin", null);
         var second = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 100, "indexes/v1.bin", null);
@@ -77,7 +81,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Put_Populates_Cache_Without_Download()
     {
         var store = new FakeStore(Index(1, "should-not-download"));
-        var cache = new LocalIndexCache(_db, store);
+        var cache = new LocalIndexCache(_db, store, _files);
 
         await cache.PutAsync(1, "c", 1, identityTicks: 100, Index(1, "a.txt"));
         var got = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 100, "indexes/v1.bin", null);
@@ -90,7 +94,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Identity_Mismatch_Redownloads_And_Overwrites()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store);
+        var cache = new LocalIndexCache(_db, store, _files);
 
         await cache.PutAsync(1, "c", 1, identityTicks: 100, Index(1, "stale.txt")); // Old identity
         // Container rebuilt → new identity 200: the cache entry is stale, download from the cloud again.
@@ -108,7 +112,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Remove_Evicts_Entry()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store);
+        var cache = new LocalIndexCache(_db, store, _files);
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         await cache.RemoveAsync(1, "c", 1);
@@ -123,7 +127,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task RemoveForContainer_Evicts_All_Versions_But_Not_Other_Account_Or_Container()
     {
         var store = new FakeStore(Index(1, "x"));
-        var cache = new LocalIndexCache(_db, store);
+        var cache = new LocalIndexCache(_db, store, _files);
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         await cache.PutAsync(1, "c", 2, 100, Index(2, "b.txt"));
@@ -132,29 +136,32 @@ public sealed class LocalIndexCacheTests : IDisposable
 
         await cache.RemoveForContainerAsync(1, "c");
 
-        Assert.Equal(2, await _db.CachedVersionIndexes.CountAsync());
-        Assert.True(await _db.CachedVersionIndexes.AnyAsync(x => x.AccountId == 1 && x.Container == "other-c"));
-        Assert.True(await _db.CachedVersionIndexes.AnyAsync(x => x.AccountId == 2 && x.Container == "c"));
+        Assert.False(File.Exists(_files.PathFor(1, "c", 1)));
+        Assert.False(File.Exists(_files.PathFor(1, "c", 2)));
+        Assert.True(File.Exists(_files.PathFor(1, "other-c", 1)));
+        Assert.True(File.Exists(_files.PathFor(2, "c", 1)));
     }
 
     // ---- In-process index cache (Backup__IndexCacheSize) ----
     //
-    // SQLite holds serialized bytes, so even a hit still has to rebuild the whole index (measured at roughly 0.9 s / 350 MB
+    // The persistent layer holds serialized bytes, so even a hit still has to rebuild the whole index (measured at roughly 0.9 s / 350 MB
     // allocated for 500k entries), and the restore dialog goes through it every time a directory is expanded. This layer caches the deserialized objects.
-    // The test for it is always "delete the SQLite row, then read": if content still comes back, it can only have come from the in-process cache.
+    // The test for it is always "delete the cached file, then read": if content still comes back, it can only have come from the in-process cache.
+    // Note the deletion goes straight to the file store rather than through RemoveForContainerAsync — the latter also evicts
+    // the in-process copy, which is the very thing under test.
 
-    /// <summary>When enabled: a second read of the same version touches neither SQLite nor the cloud.</summary>
+    /// <summary>When enabled: a second read of the same version touches neither disk nor the cloud.</summary>
     [Fact]
     public async Task Memory_Cache_Serves_Repeat_Reads_Without_Touching_The_Row()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(2));
+        var cache = new LocalIndexCache(_db, store, _files, new VersionIndexMemoryCache(2));
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         var first = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
 
         // Pull the rug out: delete the row entirely. If a.txt still reads back after that, it proves it came from the in-process cache.
-        await _db.CachedVersionIndexes.ExecuteDeleteAsync();
+        _files.RemoveForContainer(1, "c");
 
         var second = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
 
@@ -168,11 +175,11 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Memory_Cache_Disabled_Falls_Back_To_The_Row_Every_Time()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(0));
+        var cache = new LocalIndexCache(_db, store, _files, new VersionIndexMemoryCache(0));
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "a.txt"));
         await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
-        await _db.CachedVersionIndexes.ExecuteDeleteAsync();
+        _files.RemoveForContainer(1, "c");
 
         // No in-process copy → falling back to the cloud is the only option.
         var second = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
@@ -186,7 +193,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Writing_A_Version_Invalidates_The_Memory_Copy()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(2));
+        var cache = new LocalIndexCache(_db, store, _files, new VersionIndexMemoryCache(2));
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "before.txt"));
         Assert.Equal("before.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
@@ -201,7 +208,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Removing_Evicts_The_Memory_Copy_Too()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(4));
+        var cache = new LocalIndexCache(_db, store, _files, new VersionIndexMemoryCache(4));
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "v1.txt"));
         await cache.PutAsync(1, "c", 2, 100, Index(2, "v2.txt"));
@@ -212,7 +219,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         Assert.Equal("cloud.txt", (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
 
         await cache.RemoveForContainerAsync(1, "c");
-        await _db.CachedVersionIndexes.ExecuteDeleteAsync();
+        _files.RemoveForContainer(1, "c");
         Assert.Equal("cloud.txt", (await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null)).Entries[0].Path);
     }
 
@@ -221,7 +228,7 @@ public sealed class LocalIndexCacheTests : IDisposable
     public async Task Memory_Cache_Evicts_The_Least_Recently_Used_At_Capacity()
     {
         var store = new FakeStore(Index(1, "cloud.txt"));
-        var cache = new LocalIndexCache(_db, store, new VersionIndexMemoryCache(1)); // Keep only one
+        var cache = new LocalIndexCache(_db, store, _files, new VersionIndexMemoryCache(1)); // Keep only one
 
         await cache.PutAsync(1, "c", 1, 100, Index(1, "v1.txt"));
         await cache.PutAsync(1, "c", 2, 100, Index(2, "v2.txt"));
@@ -229,7 +236,7 @@ public sealed class LocalIndexCacheTests : IDisposable
         await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null); // Into the cache
         await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null); // Evicts v1
 
-        await _db.CachedVersionIndexes.ExecuteDeleteAsync();
+        _files.RemoveForContainer(1, "c");
 
         // v2 is still in memory; v1 has been evicted → falls back to the cloud.
         Assert.Equal("v2.txt", (await cache.ReadAsync(Acc(), "c", 2, 100, "indexes/v2.bin", null)).Entries[0].Path);
@@ -257,11 +264,16 @@ public sealed class LocalIndexCacheTests : IDisposable
     }
 
     /// <summary>
-    /// Two scopes (their own DbContexts, as in production: a restore and a concurrent cleanup) both cold-miss
-    /// the same (account, container, version): both FirstOrDefault null, both download, both Add — and the
-    /// second SaveChanges hits the (AccountId, Container, Version) unique index. That is a harmless race, not
-    /// an error: the loser must fall back to updating the winner's row instead of throwing DbUpdateException
-    /// out of a read path (failing a whole restore group or cleanup pass over cache bookkeeping).
+    /// Two scopes (their own DbContexts, as in production: a restore and a concurrent cleanup) both cold-miss the same
+    /// (account, container, version), both download, and both backfill.
+    /// <para>
+    /// Back when the backfill was a row, the loser's INSERT hit the (AccountId, Container, Version) unique index and
+    /// threw <c>DbUpdateException</c> out of a read path, failing a whole restore group over cache bookkeeping; the fix
+    /// was a catch that fell back to an UPDATE. Backfilling a file removes the collision at the root — each writer
+    /// renames its own temporary file over the target, and a rename is last-one-wins, not an error. The behaviour worth
+    /// keeping is the one the caller cares about, so that is what is asserted: neither read throws, both get the right
+    /// index, exactly one cache file exists, and no temporary file is left behind.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Concurrent_Cold_Misses_Backfill_Once_Instead_Of_Throwing()
@@ -279,14 +291,16 @@ public sealed class LocalIndexCacheTests : IDisposable
             using var db1 = new AppDbContext(options);
             using var db2 = new AppDbContext(options);
 
+            // One shared file store, or the two would not be racing for the same entry at all.
             var reads = await Task.WhenAll(
-                Task.Run(() => new LocalIndexCache(db1, store).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)),
-                Task.Run(() => new LocalIndexCache(db2, store).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)));
+                Task.Run(() => new LocalIndexCache(db1, store, _files).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)),
+                Task.Run(() => new LocalIndexCache(db2, store, _files).ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)));
 
             Assert.All(reads, r => Assert.Equal("raced.txt", r.Entries[0].Path));
-            using var verify = new AppDbContext(options);
-            Assert.Equal(1, await verify.CachedVersionIndexes.CountAsync(
-                x => x.AccountId == 1 && x.Container == "c" && x.Version == 1));
+
+            var cached = _files.PathFor(1, "c", 1);
+            Assert.True(File.Exists(cached));
+            Assert.Empty(Directory.EnumerateFiles(Path.GetDirectoryName(cached)!, "*.tmp-*"));
         }
         finally
         {
@@ -294,5 +308,75 @@ public sealed class LocalIndexCacheTests : IDisposable
             foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
                 try { File.Delete(f); } catch { /* best effort */ }
         }
+    }
+
+    // ---- Draining what the previous version left in SQLite ----
+
+    /// <summary>
+    /// An index cached before this moved out of the database still has to be usable, or upgrading would silently
+    /// re-download every index from the cloud — bandwidth, and on an archived index tier a rehydration nobody asked
+    /// for. The row is handed to the file store on the read that needed it, and then dropped.
+    /// </summary>
+    [Fact]
+    public async Task A_Row_From_Before_The_Move_Is_Served_Then_Migrated_To_A_File()
+    {
+        var store = new FakeStore(Index(1, "cloud.txt"));
+        _db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = 1, Container = "c", Version = 1, IdentityTicks = 100,
+            Bytes = IndexSerializer.SerializeIndex(Index(1, "legacy.txt")), UpdatedAt = DateTimeOffset.UnixEpoch,
+        });
+        await _db.SaveChangesAsync();
+
+        var cache = new LocalIndexCache(_db, store, _files);
+        var got = await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null);
+
+        Assert.Equal("legacy.txt", got.Entries[0].Path);
+        Assert.Equal(0, store.Reads); // Served from the row, not re-downloaded
+        Assert.True(File.Exists(_files.PathFor(1, "c", 1)));
+        Assert.Empty(await _db.CachedVersionIndexes.ToListAsync()); // and the row is gone
+    }
+
+    /// <summary>
+    /// A pre-move row whose identity no longer matches is dead weight — the container was rebuilt under it. It gets
+    /// dropped rather than migrated, and the read goes to the cloud as it would have anyway.
+    /// </summary>
+    [Fact]
+    public async Task A_Stale_Row_From_Before_The_Move_Is_Dropped_Not_Migrated()
+    {
+        var store = new FakeStore(Index(1, "cloud.txt"));
+        _db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = 1, Container = "c", Version = 1, IdentityTicks = 100,
+            Bytes = IndexSerializer.SerializeIndex(Index(1, "legacy.txt")), UpdatedAt = DateTimeOffset.UnixEpoch,
+        });
+        await _db.SaveChangesAsync();
+
+        var cache = new LocalIndexCache(_db, store, _files);
+        var got = await cache.ReadAsync(Acc(), "c", 1, identityTicks: 200, "indexes/v1.bin", null);
+
+        Assert.Equal("cloud.txt", got.Entries[0].Path);
+        Assert.Equal(1, store.Reads);
+        Assert.Empty(await _db.CachedVersionIndexes.ToListAsync());
+    }
+
+    /// <summary>Committing a version also clears any pre-move row for it, so the database is not left holding a copy of
+    /// an index nothing will ever read again.</summary>
+    [Fact]
+    public async Task Writing_A_Version_Drops_Its_Pre_Move_Row()
+    {
+        _db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = 1, Container = "c", Version = 1, IdentityTicks = 100,
+            Bytes = IndexSerializer.SerializeIndex(Index(1, "legacy.txt")), UpdatedAt = DateTimeOffset.UnixEpoch,
+        });
+        await _db.SaveChangesAsync();
+
+        var cache = new LocalIndexCache(_db, new FakeStore(Index(1, "cloud.txt")), _files);
+        await cache.PutAsync(1, "c", 1, 100, Index(1, "fresh.txt"));
+
+        Assert.Empty(await _db.CachedVersionIndexes.ToListAsync());
+        Assert.Equal("fresh.txt",
+            (await cache.ReadAsync(Acc(), "c", 1, 100, "indexes/v1.bin", null)).Entries[0].Path);
     }
 }

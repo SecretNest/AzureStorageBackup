@@ -855,7 +855,11 @@ public static class BackupConfigEndpoints
             // Falls back to the persisted suspension: a restart must not turn a suspended repair into "never
             // happened" — the resume button has to come back with the process.
             var state = await runner.GetOrSuspendedAsync(id, ct);
-            return state is null ? Results.NotFound() : Results.Ok(RepairRunResponse.From(state));
+            // "No repair on this backup" is not an error, exactly as on the check endpoint above: the list page
+            // asks this once per configuration on every load (that is how a suspended repair's Resume button
+            // comes back), so a 404 here painted the console red once per row on a page where nothing is wrong.
+            // 204 = there is no repair to report.
+            return state is null ? Results.NoContent() : Results.Ok(RepairRunResponse.From(state));
         });
 
         // Suspend the running repair: persist the intent (the plan's selection), then yield. Resume re-derives

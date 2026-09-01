@@ -23,8 +23,13 @@ public class TestWebAppFactory : WebApplicationFactory<Program>
     // ('unable to delete/modify user-function due to active statements').
     // Any background job touching the database at the same time as the test main thread runs into this, showing up as randomly failing integration tests.
     // A file database lets each DbContext open its own connection so nobody blocks anybody, and it is closer to production too (production is file-backed SQLite).
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), "asb-test-" + Guid.NewGuid().ToString("N") + ".db");
+    // In a directory of its own rather than loose in /tmp, because the database file's directory is also where the
+    // app puts everything that has to live beside it — the backup journals, and the version-index cache. Sharing
+    // those between parallel test hosts means one host's cached index answering another's read.
+    private readonly string _dataPath = Path.Combine(
+        Path.GetTempPath(), "asb-test-data-" + Guid.NewGuid().ToString("N"));
+
+    private string _dbPath => Path.Combine(_dataPath, "app.db");
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -32,6 +37,9 @@ public class TestWebAppFactory : WebApplicationFactory<Program>
         builder.UseSetting("Scheduler:Enabled", "false");
         // Isolate the compression temp area (parallel test hosts share no disk)
         builder.UseSetting("Backup:TempPath", _tempPath);
+        // The connection string, not just the DbContext registration below: Program.cs derives the journal root and the
+        // version-index cache root from it, and left at the default those would land in one shared directory.
+        builder.UseSetting("ConnectionStrings:Sqlite", $"DataSource={_dbPath}");
 
         builder.ConfigureServices(services =>
         {
@@ -51,8 +59,8 @@ public class TestWebAppFactory : WebApplicationFactory<Program>
         {
             // The connection pool clings to the file handles: deleting outright fails on Windows and leaves -wal/-shm behind on Linux.
             SqliteConnection.ClearAllPools();
-            foreach (var f in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
-                try { File.Delete(f); } catch { /* best effort */ }
+            // The whole data directory, which takes the -wal/-shm files, the journals and the index cache with it.
+            try { Directory.Delete(_dataPath, recursive: true); } catch { /* best effort */ }
             try { Directory.Delete(_tempPath, recursive: true); } catch { /* best effort */ }
         }
     }

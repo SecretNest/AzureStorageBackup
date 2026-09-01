@@ -92,7 +92,7 @@ public sealed class PackMemberDedupTests : IDisposable
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         // Local-authoritative wiring: packed-member dedup decides from the locally cached index, never reading the cloud.
-        var indexCache = new LocalIndexCache(_db, store);
+        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),

@@ -198,7 +198,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
             new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, counting), trackedInfo: tracked);
+            indexCache: new LocalIndexCache(db, counting, TestIndexFiles.New()), trackedInfo: tracked);
 
         var account = AzuriteAccount();
         var name = RandomName("orchti-");
@@ -289,7 +289,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store),
+            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
             trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
         return (orchestrator, store);
     }
@@ -385,7 +385,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store), trackedInfo: tracked);
+            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()), trackedInfo: tracked);
 
         var account = AzuriteAccount();
         var name = RandomName("orchconf-");

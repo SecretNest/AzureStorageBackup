@@ -13,6 +13,7 @@ data/{address}[.001,.002,...]          # single-file data blobs, content-address
 packs/{packId}.7z[.001,.002,...]       # grouped archives
 restore-tmp/{name}                     # transient Hot copies of archived volumes during a restore
 journal/                               # local only — see run-lifecycle.md; not in the container
+index-cache/                           # local only — cached copies of indexes/v{N}; not in the container
 ```
 
 `restore-tmp/` exists only while a restore of Archive-tier data runs: the archived originals are
@@ -187,10 +188,22 @@ reading conditionally. Old files still read.
 The container is expensive to read — data may sit in Cold or Archive, where reads cost money — so
 local state is authoritative during normal operation.
 
-| Table | Holds |
+| Where | Holds |
 |---|---|
-| `LocalBackupState` | a serialised copy of the info file plus its cloud ETag |
-| `CachedVersionIndex` | serialised version indexes, keyed by `(AccountId, Container, Version)` |
+| `LocalBackupState` (SQLite) | a serialised copy of the info file plus its cloud ETag |
+| `index-cache/{accountId}/{container}/{version}.idx` (files beside `app.db`) | serialised version indexes |
+
+Version indexes are files, not rows, and the difference is not cosmetic. They used to be one row each
+in `CachedVersionIndex`, and one row can be 100 MB for a backup of half a million files — SQLite
+permits a single writer at a time (WAL only stops readers and the writer from blocking each other),
+so committing an index held the database's write lock for the whole write. On a loaded disk that was
+tens of seconds during which nothing else could write: the log-retention sweep failed with
+`database is locked`, and editing a backup in the UI appeared to do nothing. A file needs no lock.
+Each file carries a 24-byte header (magic, format, `IdentityTicks`, body length), so a stale or
+truncated entry is rejected by reading 24 bytes rather than by loading the whole index first, and it
+is replaced by writing a temporary file and renaming it over the target, which is atomic.
+Rows written before the move are handed to the file store on the first read of that index and then
+dropped, so upgrading re-downloads nothing.
 
 A version index is immutable once written, so a cache hit is valid by construction.
 `IdentityTicks` — the backup's creation timestamp — detects a container deleted and recreated, where

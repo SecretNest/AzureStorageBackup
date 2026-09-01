@@ -1112,6 +1112,21 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             (await _client.GetAsync($"/api/backup-configs/{created!.Id}/check")).StatusCode);
     }
 
+    /// <summary>The same rule for repair, and for a louder reason: the backups list asks this once per configuration on
+    /// every load (that is how a suspended repair's Resume button comes back), so a 404 filled the console with one red
+    /// line per row on a perfectly healthy page.</summary>
+    [Fact]
+    public async Task Repair_Status_Endpoint_Is_204_Until_A_Repair_Has_Been_Started()
+    {
+        var accountId = await CreateAccountAsync("repair-never-run");
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("repair-never-run", accountId) with { ContainerName = "repair-never-run-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await _client.GetAsync($"/api/backup-configs/{created!.Id}/repair")).StatusCode);
+    }
+
     /// <summary>Stopping: before this, the only way to stop a backup that had been running for hours was to restart the container. Stop per operation rather than
     /// stopping everything with one button — backup and restore can run concurrently, and accidentally stopping the other one is just as many hours lost.</summary>
     [Fact]

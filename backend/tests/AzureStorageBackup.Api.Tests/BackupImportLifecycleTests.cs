@@ -121,7 +121,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
-        var indexCache = new LocalIndexCache(db, store);
+        var indexCache = new LocalIndexCache(db, store, TestIndexFiles.New());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
@@ -281,10 +281,11 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         Assert.NotEmpty(state!.InfoBytes);
         Assert.NotEmpty(state.ETag); // an ETag is what makes the later conditional writes possible
 
-        var cached = await db.CachedVersionIndexes
-            .Where(c => c.AccountId == accountId && c.Container == container)
-            .Select(c => c.Version).ToListAsync();
-        Assert.Equal(Enumerable.Range(1, expectedVersions), cached.Order());
+        // The version indexes are cached in files beside the database, not in a table (see VersionIndexFileStore).
+        var files = scope.ServiceProvider.GetRequiredService<VersionIndexFileStore>();
+        var cached = Enumerable.Range(1, expectedVersions)
+            .Where(v => File.Exists(files.PathFor(accountId, container, v)));
+        Assert.Equal(Enumerable.Range(1, expectedVersions), cached);
     }
 
     /// <summary>Restores over HTTP into a brand-new empty directory and compares it against the snapshot byte for byte.</summary>

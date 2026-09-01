@@ -45,5 +45,5 @@ internal sealed class TestLocalAuthority
     internal TrackedInfoStore Tracked { get; }
 
     private static (LocalIndexCache, TrackedInfoStore) Wire(AppDbContext db, IBackupInfoStore store)
-        => (new LocalIndexCache(db, store), new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+        => (new LocalIndexCache(db, store, TestIndexFiles.New()), new TrackedInfoStore(store, new LocalBackupStateStore(db)));
 }
