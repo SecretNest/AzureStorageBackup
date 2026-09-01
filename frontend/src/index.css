@@ -787,24 +787,29 @@ tbody tr.edit-row > td > .panel {
    content area is the only placement that works at every width.
    It scrolls horizontally rather than wrapping - a wrapped strip changes height as the window narrows, which shifts the
    whole page under the reader; nowrap keeps the content below it anchored. The underline is on the container so the
-   inactive tabs sit on a continuous rule. */
+   inactive tabs sit on a continuous rule.
+   That rule is an inset shadow rather than a border because it has to live INSIDE the padding box. overflow-x: auto makes
+   a scroll container of this strip, and computes overflow-y from visible to auto with it: anything a child sticks out
+   vertically, even one pixel, raises a vertical scrollbar down the side of the tabs. With the rule painted on the
+   background, the active tab's underline covers it by simply being as tall as the strip - no negative margin reaching
+   past the edge, nothing to overflow. overflow-y: hidden then says no to the scrollbar for good. */
 .subnav {
   display: flex;
   gap: var(--sp-1);
   align-items: stretch;
   margin-bottom: var(--sp-4);
-  border-bottom: 1px solid var(--border);
+  box-shadow: inset 0 -1px 0 var(--border);
   overflow-x: auto;
+  overflow-y: hidden;
 }
 .subnav-item {
   height: auto;
   line-height: inherit; /* Same reason as .nav-item: the global button rule fixes a height these do not want */
   padding: var(--sp-2) var(--sp-3);
   border: none;
-  /* Transparent, not absent, so the active tab's underline does not add 2px and nudge every sibling upward. Sits on top
-     of the container's rule (hence the -1px) rather than under it. */
+  /* Transparent, not absent, so the active tab's underline does not add 2px and nudge every sibling upward. align-items:
+     stretch makes it as tall as the strip, so it paints over the container's inset rule instead of stacking below it. */
   border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
   border-radius: var(--r-md) var(--r-md) 0 0;
   background: transparent;
   color: var(--text-muted);
