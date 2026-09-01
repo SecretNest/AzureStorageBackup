@@ -10,14 +10,14 @@ const MB = 1024 * 1024
 
 /// The five sub-pages. Settings had grown into one page several screens tall, where finding a knob meant scrolling past
 /// every other knob; each of these is now a page you can read to the end of.
-export type SettingsTab = 'accounts' | 'defaults' | 'global' | 'notifications' | 'about'
+export type SettingsTab = 'accounts' | 'defaults' | 'performance' | 'notifications' | 'about'
 
 const settingsTabs: { key: SettingsTab; label: string }[] = [
   // Accounts stays first: a user with no accounts configured lands on Settings (see the default-tab logic in App.tsx)
   // and this is the one thing they can actually do.
   { key: 'accounts', label: 'Accounts' },
   { key: 'defaults', label: 'Backup defaults' },
-  { key: 'global', label: 'Global' },
+  { key: 'performance', label: 'Performance' },
   { key: 'notifications', label: 'Notifications' },
   { key: 'about', label: 'About' },
 ]
@@ -33,7 +33,7 @@ export function SettingsPage({
   authRequired?: boolean
   onLogout?: () => void
 }) {
-  // Backup defaults and Global are two halves of ONE object: settingsApi.get/update serve the whole GlobalSettings, and
+  // Backup defaults and Performance are two halves of ONE object: settingsApi.get/update serve the whole GlobalSettings, and
   // splitting the page does not split the endpoint. So the state is held here, above both, rather than in each sub-page.
   // Two independent copies would each save from their own snapshot, and whichever went last would silently overwrite the
   // other half with values it read before the first save. Sharing it also means edits made on one tab survive a switch to
@@ -64,7 +64,7 @@ export function SettingsPage({
 
       {tab === 'accounts' && <AccountsSection />}
       {tab === 'defaults' && <BackupDefaults settings={settings} />}
-      {tab === 'global' && <GlobalOptions settings={settings} />}
+      {tab === 'performance' && <PerformanceOptions settings={settings} />}
       {tab === 'notifications' && <NotificationsSection />}
       {tab === 'about' && <AboutSection authRequired={authRequired} onLogout={onLogout} />}
     </section>
@@ -129,7 +129,7 @@ function SaveBar({ settings }: { settings: SettingsState }) {
       {settings.saved && <span className="text-ok">Saved.</span>}
       {/* One object, one request: whichever of the two pages you press Save on writes both. Said out loud because the
           tabs make them look like separate forms with separate buttons. */}
-      <span className="text-faint">Saves both Backup defaults and Global.</span>
+      <span className="text-faint">Saves both Backup defaults and Performance.</span>
     </div>
   )
 }
@@ -235,7 +235,7 @@ function BackupDefaults({ settings }: { settings: SettingsState }) {
   )
 }
 
-function GlobalOptions({ settings }: { settings: SettingsState }) {
+function PerformanceOptions({ settings }: { settings: SettingsState }) {
   const { s, set, error } = settings
   if (!s) return <p>Loading…</p>
 
