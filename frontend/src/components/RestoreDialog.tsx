@@ -371,7 +371,11 @@ export function RestoreDialog({
         Leave nothing selected to restore the entire version. Checking a folder selects its whole subtree
         (fetched recursively — may take a moment for large folders).
       </div>
-      <div className="mono" style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--border)', padding: '0.4rem' }}>
+      {/* Monospace belongs to the names inside the tree (TreeBrowser sets it per node), not to the box: on
+          the box it also caught "Loading…", "Empty version", the byte sizes and the "older content (unread
+          since …)" warning. The tree's indentation is padding in pixels, not columns of characters, so
+          nothing here was relying on the container's advance width either. */}
+      <div style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--border)', padding: '0.4rem' }}>
         {loadingDirs.has('') ? (
           <div className="text-faint">Loading…</div>
         ) : (
@@ -482,14 +486,15 @@ function TreeBrowser({
                     disabled={cascading.has(node.path)}
                     onChange={() => onToggleFolder(node)}
                   />
-                  <span><strong>{node.name}</strong>/</span>
+                  {/* mono-inherit, not mono: the row is .text-sm already — see index.css. */}
+                  <span className="mono-inherit"><strong>{node.name}</strong>/</span>
                   {cascading.has(node.path) && <span className="text-muted">loading…</span>}
                 </>
               ) : (
                 <>
                   <span style={{ width: 18, display: 'inline-block' }} />
                   <input type="checkbox" checked={selected.has(node.path)} onChange={() => onToggleFile(node.path)} />
-                  <span>{node.name}</span>
+                  <span className="mono-inherit">{node.name}</span>
                   {node.length != null && <span className="text-muted" style={{ marginLeft: 6 }}>{formatBytes(node.length)}</span>}
                   {/* The moment of choosing what to restore is exactly when it matters most to know that this content is not from this version's timestamp. */}
                   {node.unreadableAt && (

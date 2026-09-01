@@ -84,7 +84,13 @@ export function ChangeLocalRootDialog({
         <div className="col" style={{ gap: 'var(--sp-3)' }}>
           <div>
             <div className="text-faint">Current</div>
-            <div className="mono">{currentRoot || '(none)'}</div>
+            {/* The fallback is a placeholder, not a path, so it does not take the path's typeface: set in
+                monospace it looked like a root literally named "(none)". */}
+            <div>
+              {currentRoot
+                ? <span className="mono">{currentRoot}</span>
+                : <span className="text-faint">(none)</span>}
+            </div>
           </div>
 
           {/* Keep .row's default 8px gap rather than tightening to 4px: a focused input's outline
