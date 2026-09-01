@@ -2279,8 +2279,10 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
   return (
     <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
       {detail.currentItem && (
-        <div className="mono" style={{ wordBreak: 'break-all' }}>
-          {detail.currentItem}
+        // Monospace on the filename only, not on the row — see .mono in index.css. Everything else on these
+        // rows is a measurement or a verb, and belongs to the same body text as the summary lines below.
+        <div>
+          <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.currentItem}</span>
           {/* Diffing's read progress rides the current-item line instead of a separate in-flight block:
               the block repeated the same path one line down, and for the small files that dominate a diff
               the percentage carried nothing. A large file's read still shows — as this suffix. */}
@@ -2310,8 +2312,8 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           **volume**, so it does not grow with queue length or file size. Folding a few into "+2 more"
           hides the most useful thing: the stuck one is usually among those folded away. */}
       {detail.stage !== 'Diffing' && detail.activeItems.map((a) => (
-        <div key={a.label} className="mono" style={{ wordBreak: 'break-all' }}>
-          {a.label}
+        <div key={a.label}>
+          <span className="mono" style={{ wordBreak: 'break-all' }}>{a.label}</span>
           {a.total > 0 && (
             <span className="text-faint">
               {' '}
@@ -2329,12 +2331,15 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           Last in the list on purpose: the transfers are the moving parts and should not shift down a row
           every time an archive starts. */}
       {detail.preparingItem && (
-        <div className="mono" style={{ wordBreak: 'break-all' }}>
+        <div>
           {/* The verb leads, the way "N volumes uploading in parallel:" leads the rows above. It used to
               trail the name instead, which made this the only row in the group whose suffix was a word
-              rather than a measurement. */}
+              rather than a measurement.
+              And it is body text, like that heading: it used to inherit monospace from the row, which made
+              this the only verb in the block set in a different family and a different size from every
+              other verb around it — for no reason but that it shared a div with a filename. */}
           <span className="text-faint">{preparingLabelOf(detail.stage)}: </span>
-          {detail.preparingItem}
+          <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.preparingItem}</span>
           {/* A single file states its size; a pack states a member count inside its own label instead,
               there being no one size worth naming. An hour spent on this row is explained entirely by
               how big the thing is, and without it the row leaves exactly that question open.
@@ -2623,8 +2628,14 @@ function RestoreStatus({ run, onStop }: { run: RestoreRun; onStop: () => void })
   const detailBlock = showDetail && (
     <>
       {run.detail && <StageDetail detail={run.detail} />}
+      {/* These are sentences, not literals — the restore's own progress messages, e.g. "Waiting for
+          rehydration of <ref> — 3 volume(s) still archived…" (RestoreOrchestrator's phase reports). They were
+          set in monospace wholesale, which is the container mistake .mono warns about; a blob ref embedded in
+          one does not make the sentence around it a machine string.
+          break-all went with it: on prose it hyphenlessly chops ordinary English mid-word. anywhere breaks
+          only what cannot fit on a line of its own, which is exactly the embedded ref. */}
       {events.length > 0 && (
-        <ul className="mono" style={{ margin: '0.2rem 0 0 1.2rem', wordBreak: 'break-all' }}>
+        <ul style={{ margin: '0.2rem 0 0 1.2rem', overflowWrap: 'anywhere' }}>
           {events.map((e, i) => (
             <li key={i}>{e}</li>
           ))}
@@ -3243,8 +3254,8 @@ function CheckModal({
                           />
                         )}
                       </td>
-                      <td className="mono">
-                        {f.path}
+                      <td>
+                        <span className="mono">{f.path}</span>
                         {f.unreadableAt && <span className="text-warn"> (carried forward)</span>}
                       </td>
                       <td style={{ textAlign: 'right' }}>

@@ -136,10 +136,36 @@ a {
   color: var(--accent);
 }
 
+/* Monospace marks a **verbatim machine string** - a path, a blob label, a glob, an env var name, a cron
+   expression: something the reader may need to copy, or to compare against another one character by
+   character. That is what the family buys (l/1/I and O/0 stop being the same glyph, and two paths one above
+   the other line up so the differing segment is findable), and it buys nothing at all for an English
+   sentence.
+
+   Hence the rule: **put .mono on the literal itself, never on a row, cell or list that also holds anything
+   else.** On such a container it captures every neighbour - the verb in front of the path, the size after
+   it, a "(none)" placeholder, a "Loading…" - and those come out in the wrong family and, because of the
+   0.9em below, a size adrift from the same words elsewhere on screen. The stage detail's preparing row was
+   the case that made this explicit: "preparing:" and the "12.3 GB / 45.6 GB" after it read in monospace
+   purely because they shared a div with the filename, while the identical verb and the identical byte
+   figures one line down were in body text.
+
+   A container holding nothing but the literal (a td that is only a path) keeps the class, and should: the
+   0.9em is relative, so pushing it onto an inner span of an element that already carries a size - the Local
+   Root cell is .text-faint, 12px - compounds to 10.8px and shrinks the path for no gain. The rule is about
+   what else is in the box, not about which tag wears the class. */
 code,
 .mono {
   font-family: var(--font-mono);
   font-size: 0.9em;
+}
+
+/* .mono for a literal that sits inside an element which has already been sized down. The restore tree's rows
+   are .text-sm (12px); marking the filename with .mono there would take 0.9em of that and render it at
+   10.8px - shrinking the one thing on the row worth reading, in a list people click through. Same family,
+   the row's own size. */
+.mono-inherit {
+  font-family: var(--font-mono);
 }
 
 code {
