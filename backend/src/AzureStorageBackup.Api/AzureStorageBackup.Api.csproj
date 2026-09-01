@@ -8,7 +8,7 @@
          docker-publish.yml reads it straight out of this file. Bump it before triggering a release.
          Publishing twice in one day takes a fourth segment (2026.8.9.1) — every segment has to stay
          below 65535, which the calendar parts always are. -->
-    <Version>2026.9.1.1</Version>
+    <Version>2026.9.1.2</Version>
   </PropertyGroup>
 
   <ItemGroup>
