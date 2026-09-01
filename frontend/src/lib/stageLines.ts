@@ -513,3 +513,24 @@ export function preparingLabelOf(stage: string): string {
   // work the upload stage calls preparing — "extracting" would claim the opposite direction.
   return stage === 'Uploading' || stage === 'Repairing' ? 'preparing' : 'extracting'
 }
+
+/**
+ * The same word where it **starts a line** — the row that names the item being produced, which leads with
+ * this label the way "Uploading:" and "In flight:" lead the two lines above it.
+ *
+ * A second register rather than one string used twice, following activityLabels / activityBadgeLabels in
+ * backupConfigs.ts and the rule stated there: lowercase for mid-sentence, capitalised standing alone.
+ * `preparingLabelOf` above is the mid-sentence half and is genuinely mid-sentence — "1 object preparing"
+ * sits inside the In flight line — so it cannot simply be capitalised in place. Without the split this was
+ * the only line-initial label in the interface in lower case, against Uploading:, In flight:, Version:,
+ * Check failed: and the rest.
+ *
+ * Derived rather than written out as its own map, unlike the activity pair: that one needed two literals
+ * because its standalone form is title case ("backing up" → "Backing Up"), a transformation no rule
+ * produces. This one is sentence case, which is exactly "capitalise the first letter" — a second literal
+ * would only be a second place to forget when a stage is added.
+ */
+export function preparingRowLabelOf(stage: string): string {
+  const label = preparingLabelOf(stage)
+  return label.charAt(0).toUpperCase() + label.slice(1)
+}

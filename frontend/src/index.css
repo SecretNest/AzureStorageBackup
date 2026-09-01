@@ -927,6 +927,37 @@ tbody tr.edit-row > td > .panel {
 .badge-danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); }
 .badge-info { color: var(--accent); border-color: var(--accent-border); background: var(--accent-subtle); }
 
+/* ── Stage detail ─────────────────────────────────────────────────────────── */
+/* One running stage, inside the Details fold: two summary lines, then the individual files they are
+   counting, hanging under them.
+   The summaries lead because the block is otherwise the only thing on this screen ordered specific-to-
+   general, against the grain of every line inside it (each of those runs total, then breakdown). Two
+   concrete consequences of the old order: the name identifying the group ("Uploading:") came AFTER the
+   paths it identified, which during a pipelined run - Diffing and Uploading both live, two of these blocks
+   stacked - left no way to tell whose paths you were reading until you had read past them; and the
+   summaries, whose line COUNT is fixed, sat below rows whose count is not (activeItems swings 0-5,
+   preparing and currentItem come and go), so the percentage and the ETA someone is watching jumped a row
+   every time a volume started or finished. */
+.stage-detail {
+  margin-top: 0.15rem;
+  line-height: 1.5;
+}
+
+/* Diffing + Uploading run at once, so two of these stack. Without a gap the second block's summary reads as
+   a third summary line of the first. */
+.stage-detail + .stage-detail {
+  margin-top: var(--sp-3);
+}
+
+/* The named items, subordinate to the two lines above them. A rule rather than plain indentation: it draws
+   the grouping instead of implying it, and costs a fraction of the horizontal room - which matters, because
+   what is inside is mostly paths, already breaking at arbitrary characters to fit. */
+.stage-items {
+  border-left: 2px solid var(--border);
+  padding-left: var(--sp-2);
+  margin: 2px 0 0 2px;
+}
+
 /* ── Text ─────────────────────────────────────────────────────────────────── */
 .text-muted { color: var(--text-muted); }
 .text-faint { color: var(--text-faint); font-size: 12px; }
