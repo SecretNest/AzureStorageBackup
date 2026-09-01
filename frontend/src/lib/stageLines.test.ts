@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 
 import type { StageProgress } from '../api/backupConfigs'
-import { pipelineHold, preparingLabelOf, stageLines } from './stageLines'
+import { pipelineHold, preparingLabelOf, preparingRowLabelOf, stageLines } from './stageLines'
 
 function progress(over: Partial<StageProgress> = {}): StageProgress {
   return {
@@ -674,5 +674,28 @@ describe('preparingLabelOf', () => {
     // upload stage calls preparing. "extracting" would claim the opposite direction.
     expect(preparingLabelOf('Repairing')).toBe('preparing')
     expect(preparingLabelOf('Verifying')).toBe('extracting')
+  })
+})
+
+describe('preparingRowLabelOf', () => {
+  /**
+   * Two registers of one word, the way activityLabels and activityBadgeLabels are two registers of one
+   * activity: lower case inside a sentence, capitalised where it opens a line. The row form leads its own
+   * line, next to "In flight:" and "Uploading:", and was the only line-initial label in the interface in
+   * lower case.
+   */
+  test('the row form is capitalised and the in-sentence form is not', () => {
+    expect(preparingRowLabelOf('Uploading')).toBe('Preparing')
+    expect(preparingRowLabelOf('Restoring')).toBe('Extracting')
+    expect(preparingRowLabelOf('Repairing')).toBe('Preparing')
+    expect(preparingRowLabelOf('Verifying')).toBe('Extracting')
+  })
+
+  /** The count inside the In flight line stays mid-sentence, and must not follow the row form up. */
+  test('the two forms differ only in the first letter', () => {
+    for (const stage of ['Uploading', 'Restoring', 'Repairing', 'Verifying', 'Scanning']) {
+      expect(preparingRowLabelOf(stage).toLowerCase()).toBe(preparingLabelOf(stage))
+      expect(preparingLabelOf(stage)[0]).toBe(preparingLabelOf(stage)[0].toLowerCase())
+    }
   })
 })

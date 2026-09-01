@@ -24,7 +24,7 @@ import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
-import { pipelineHold, preparingLabelOf, stageLines, type PipelineHold } from '../lib/stageLines'
+import { pipelineHold, preparingRowLabelOf, stageLines, type PipelineHold } from '../lib/stageLines'
 import { windDownFromServer } from '../lib/windDownControls'
 import { Modal } from '../components/Modal'
 import {
@@ -2276,90 +2276,22 @@ function RunStatus({
 function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineHold }) {
   const { counts, done, pipeline, speed, eta, inFlightHeading, label } = stageLines(detail, hold)
 
+  // Anything to name individually. Governs the indented group below: with nothing in it the rule would be a
+  // stub hanging off two summary lines, which is every stage that registers no items at all (Scanning, and
+  // the whole of Diffing until a file is large enough to report a read).
+  const hasItems =
+    Boolean(detail.currentItem) ||
+    Boolean(detail.preparingItem) ||
+    (detail.stage !== 'Diffing' && detail.activeItems.length > 0)
+
+  // Summaries first, then the items they are counting — see .stage-detail in index.css for why this order
+  // and not the reverse.
   return (
-    <div style={{ marginTop: '0.15rem', lineHeight: 1.5 }}>
-      {detail.currentItem && (
-        // Monospace on the filename only, not on the row — see .mono in index.css. Everything else on these
-        // rows is a measurement or a verb, and belongs to the same body text as the summary lines below.
-        <div>
-          <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.currentItem}</span>
-          {/* Diffing's read progress rides the current-item line instead of a separate in-flight block:
-              the block repeated the same path one line down, and for the small files that dominate a diff
-              the percentage carried nothing. A large file's read still shows — as this suffix. */}
-          {(() => {
-            if (detail.stage !== 'Diffing') return null
-            const a = detail.activeItems.find((x) => x.label === detail.currentItem) ?? detail.activeItems[0]
-            return a && a.total > 0
-              ? <span className="text-faint"> — {formatBytes(a.sent)} / {formatBytes(a.total)}{a.percent !== null && ` · ${a.percent}%`}</span>
-              : null
-          })()}
-        </div>
-      )}
-      {/* Each transfer in flight gets its own line with its size and progress. This used to be crammed
-          with the content-addressed blob name (an HMAC when encrypted), which showed neither which file
-          was transferring nor how much of it. */}
-      {/* The heading (stageLines owns it): "in parallel" over transfers — listing two or three
-          filenames at once suggests parallel compression, whereas compression is globally serialised
-          (one lock — that N preparing above) and it is the transfers that run in parallel. Hashing is
-          serial by design, so its heading drops the suffix. */}
-      {detail.activeItems.length > 0 && detail.stage !== 'Diffing' && (
-        <div className="text-faint">
-          {inFlightHeading}
-        </div>
-      )}
-      {/* All of them are listed, no longer truncated at three. The in-flight count is bounded — it is the
-          upload/download concurrency from settings (5 by default), and the gate issues slots per
-          **volume**, so it does not grow with queue length or file size. Folding a few into "+2 more"
-          hides the most useful thing: the stuck one is usually among those folded away. */}
-      {detail.stage !== 'Diffing' && detail.activeItems.map((a) => (
-        <div key={a.label}>
-          <span className="mono" style={{ wordBreak: 'break-all' }}>{a.label}</span>
-          {a.total > 0 && (
-            <span className="text-faint">
-              {' '}
-              — {formatBytes(a.sent)} / {formatBytes(a.total)}
-              {a.percent !== null && ` · ${a.percent}%`}
-            </span>
-          )}
-        </div>
-      ))}
-      {/* The one item being produced or unpacked, on a row of its own beside the transfers. It carries no
-          sent/total: nothing of it is on the wire, which is the whole reason it was invisible here before —
-          7z on a 100 MB pack runs for tens of seconds with an empty in-flight list above it. Named rather
-          than counted, because "1 object preparing" cannot say *which*, and a pack's id is content-addressed
-          and says nothing to a person either (see TransferLabel.Folders for what it is named after).
-          Last in the list on purpose: the transfers are the moving parts and should not shift down a row
-          every time an archive starts. */}
-      {detail.preparingItem && (
-        <div>
-          {/* The verb leads, the way "N volumes uploading in parallel:" leads the rows above. It used to
-              trail the name instead, which made this the only row in the group whose suffix was a word
-              rather than a measurement.
-              And it is body text, like that heading: it used to inherit monospace from the row, which made
-              this the only verb in the block set in a different family and a different size from every
-              other verb around it — for no reason but that it shared a div with a filename. */}
-          <span className="text-faint">{preparingLabelOf(detail.stage)}: </span>
-          <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.preparingItem}</span>
-          {/* A single file states its size; a pack states a member count inside its own label instead,
-              there being no one size worth naming. An hour spent on this row is explained entirely by
-              how big the thing is, and without it the row leaves exactly that question open.
-              When the route can count its feed (streaming compression, raw prestage, blob extraction) the
-              size becomes a moving fraction — 7z reports nothing itself, but we pipe its stdin/stdout, so
-              what we have fed or received IS the progress. Clamped: a pack's archive can hold more than
-              this version's members, so the numerator may legitimately pass the declared total. */}
-          {detail.preparingBytes > 0 && (
-            <span className="text-faint">
-              {' — '}
-              {detail.preparingDone > 0
-                ? `${formatBytes(Math.min(detail.preparingDone, detail.preparingBytes))} / ${formatBytes(detail.preparingBytes)} · ${Math.min(100, Math.round((100 * detail.preparingDone) / detail.preparingBytes))}%`
-                : formatBytes(detail.preparingBytes)}
-            </span>
-          )}
-        </div>
-      )}
+    <div className="stage-detail">
       <div>
         {/* The stage name has to be spelled out: with two details side by side, two rows of numbers alone do not say which is the diff and which is the upload.
-            Spelled out from the label map, never from detail.stage itself — that is the backend's own token, and printing it raw put "LoadingIndex:" on screen. */}
+            Spelled out from the label map, never from detail.stage itself — that is the backend's own token, and printing it raw put "LoadingIndex:" on screen.
+            It leads the block now, rather than closing it: it is what tells the reader whose files the rows below are. */}
         <span className="text-faint">{label}: </span>
         {counts}
         {/* The item-count percentage appears only when bytes cannot provide one (scanning and diffing
@@ -2374,8 +2306,98 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
           that none of it has settled — without it, "1.9 TB uploaded" on the first line and "+3.7 GB on
           the cloud" on the second become a puzzle again: both are bytes already in the cloud, so why two
           lines? Because the first belongs to items that have settled and will not change, while the
-          second belongs to items still running, whose volumes stop counting if the item starts over. */}
+          second belongs to items still running, whose volumes stop counting if the item starts over.
+          It stays up here with the first line rather than going down with the rows: every figure in it is a
+          COUNT over a population ("1 object preparing", "269 volumes waiting for uploading"), and the rows
+          below are what those counts are counting. Reading total → breakdown → names is the same order each
+          of these lines already uses inside itself. */}
       {pipeline && <div className="text-faint">In flight: {pipeline}</div>}
+      {hasItems && (
+        <div className="stage-items">
+          {detail.currentItem && (
+            // Monospace on the filename only, not on the row — see .mono in index.css. Everything else on these
+            // rows is a measurement or a verb, and belongs to the same body text as the summary lines above.
+            <div>
+              <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.currentItem}</span>
+              {/* Diffing's read progress rides the current-item line instead of a separate in-flight block:
+                  the block repeated the same path one line down, and for the small files that dominate a diff
+                  the percentage carried nothing. A large file's read still shows — as this suffix. */}
+              {(() => {
+                if (detail.stage !== 'Diffing') return null
+                const a = detail.activeItems.find((x) => x.label === detail.currentItem) ?? detail.activeItems[0]
+                return a && a.total > 0
+                  ? <span className="text-faint"> — {formatBytes(a.sent)} / {formatBytes(a.total)}{a.percent !== null && ` · ${a.percent}%`}</span>
+                  : null
+              })()}
+            </div>
+          )}
+          {/* Each transfer in flight gets its own line with its size and progress. This used to be crammed
+              with the content-addressed blob name (an HMAC when encrypted), which showed neither which file
+              was transferring nor how much of it. */}
+          {/* The heading (stageLines owns it): "in parallel" over transfers — listing two or three
+              filenames at once suggests parallel compression, whereas compression is globally serialised
+              (one lock — that N preparing above) and it is the transfers that run in parallel. Hashing is
+              serial by design, so its heading drops the suffix. */}
+          {detail.activeItems.length > 0 && detail.stage !== 'Diffing' && (
+            <div className="text-faint">
+              {inFlightHeading}
+            </div>
+          )}
+          {/* All of them are listed, no longer truncated at three. The in-flight count is bounded — it is the
+              upload/download concurrency from settings (5 by default), and the gate issues slots per
+              **volume**, so it does not grow with queue length or file size. Folding a few into "+2 more"
+              hides the most useful thing: the stuck one is usually among those folded away. */}
+          {detail.stage !== 'Diffing' && detail.activeItems.map((a) => (
+            <div key={a.label}>
+              <span className="mono" style={{ wordBreak: 'break-all' }}>{a.label}</span>
+              {a.total > 0 && (
+                <span className="text-faint">
+                  {' '}
+                  — {formatBytes(a.sent)} / {formatBytes(a.total)}
+                  {a.percent !== null && ` · ${a.percent}%`}
+                </span>
+              )}
+            </div>
+          ))}
+          {/* The one item being produced or unpacked, on a row of its own beside the transfers. It carries no
+              sent/total: nothing of it is on the wire, which is the whole reason it was invisible here before —
+              7z on a 100 MB pack runs for tens of seconds with an empty in-flight list above it. Named rather
+              than counted, because "1 object preparing" cannot say *which*, and a pack's id is content-addressed
+              and says nothing to a person either (see TransferLabel.Folders for what it is named after).
+              Last in the list on purpose: the transfers are the moving parts and should not shift down a row
+              every time an archive starts. */}
+          {detail.preparingItem && (
+            <div>
+              {/* The verb leads, the way "N volumes uploading in parallel:" leads the rows above. It used to
+                  trail the name instead, which made this the only row in the group whose suffix was a word
+                  rather than a measurement.
+                  And it is body text, like that heading: it used to inherit monospace from the row, which made
+                  this the only verb in the block set in a different family and a different size from every
+                  other verb around it — for no reason but that it shared a div with a filename.
+                  Capitalised, via the row-label register: it opens a line, like In flight: and Uploading: do.
+                  The lower-case form is the one inside those lines ("1 object preparing"); see
+                  preparingRowLabelOf, and activityLabels/activityBadgeLabels for the rule. */}
+              <span className="text-faint">{preparingRowLabelOf(detail.stage)}: </span>
+              <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.preparingItem}</span>
+              {/* A single file states its size; a pack states a member count inside its own label instead,
+                  there being no one size worth naming. An hour spent on this row is explained entirely by
+                  how big the thing is, and without it the row leaves exactly that question open.
+                  When the route can count its feed (streaming compression, raw prestage, blob extraction) the
+                  size becomes a moving fraction — 7z reports nothing itself, but we pipe its stdin/stdout, so
+                  what we have fed or received IS the progress. Clamped: a pack's archive can hold more than
+                  this version's members, so the numerator may legitimately pass the declared total. */}
+              {detail.preparingBytes > 0 && (
+                <span className="text-faint">
+                  {' — '}
+                  {detail.preparingDone > 0
+                    ? `${formatBytes(Math.min(detail.preparingDone, detail.preparingBytes))} / ${formatBytes(detail.preparingBytes)} · ${Math.min(100, Math.round((100 * detail.preparingDone) / detail.preparingBytes))}%`
+                    : formatBytes(detail.preparingBytes)}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
