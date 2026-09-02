@@ -206,6 +206,20 @@ button {
      The pairing to keep in mind when adding a variant: whoever resets height must reset this too (see .icon-btn,
      .nav-item and .browse-row) - their height comes from the text, so they need the inherited line-height back. */
   line-height: normal;
+  /* Aligned by the box, not by the baseline inside it. A baseline-aligned inline-block hangs off the baseline of its own
+     last line box, and where that baseline sits inside a fixed-height button depends on the metrics of every font on that
+     line - so a label carrying a glyph the sans stack does not have ("▸ Details", whose triangle comes from whatever
+     fallback the system picks) puts its baseline a fraction of a pixel off from a plain "Stop" beside it, and the two
+     boxes are laid out that fraction apart. It is invisible until the row lands on a half device pixel, and then the two
+     buttons round to different pixels and one sits a pixel lower than its neighbour - on that row only, which is what
+     made it look like a rendering glitch rather than a rule. middle takes the position from the box's own height, which
+     is var(--control-h) for every one of them, so buttons of one height now align with each other whatever is written on
+     them. Measured on this stylesheet with a label whose glyph falls back to another family: 0.5px of baseline drift,
+     painted a pixel low on 16 of 24 sub-pixel row offsets before the change, 0 of 24 after.
+     Same pairing as the line-height above: whoever resets height must reset this too (see .icon-btn) - a button sized by
+     its own text is meant to sit on the text baseline next to it. .nav-item, .subnav-item and .browse-row reset height as
+     well but are flex items, where vertical-align does not apply. */
+  vertical-align: middle;
   padding: 0 var(--sp-3);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
@@ -228,6 +242,7 @@ button:disabled {
 .icon-btn {
   height: auto;
   line-height: inherit; /* Height comes from the line box now, so take back the line-height the global button rule pinned */
+  vertical-align: baseline; /* And the baseline with it: this one is a glyph sitting in a sentence, not a control beside one */
   width: auto;
   padding: 0;
   border: none;
@@ -400,6 +415,15 @@ tbody tr.edit-row > td > .panel {
 .table-fluid tbody td.card-actions {
   text-align: right;
   line-height: calc(var(--control-h) + var(--sp-2));
+}
+/* The one column that keeps baseline alignment, against the global button rule. vertical-align: middle measures from the
+   parent font's baseline, not from the middle of the line box - and this is the only place that stretches its line box
+   past the buttons, so middle drops them 1.25px below the centre of the row while baseline leaves them within 0.5px of
+   it. The exchange the global rule makes is safe to decline here: what it buys is buttons that stay aligned with each
+   other when one of their labels pulls in a fallback font, and every label in this column is plain Latin (Run, Check,
+   Restore, Edit, Delete). Put a glyph like the "▸" on the status rows into one of them and this line has to go. */
+.table-fluid tbody td.card-actions button {
+  vertical-align: baseline;
 }
 
 /* Four: column width hints for narrow screens. The auto layout splits differently in the wide and the narrow regime: when
