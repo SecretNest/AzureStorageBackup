@@ -33,10 +33,16 @@ jobs:
           7zz | head -2
 
       - name: Start Azurite
+        # Installed first, on its own line, so the readiness wait below measures Azurite starting and not
+        # npm downloading it. The two used to share one 30-second budget, and on a slow registry day the
+        # download alone ate it twice in a row — the loop gave up on a process that had not even been
+        # handed its command line yet. Pinned, so a new Azurite release cannot change what the suite
+        # runs against without a commit saying so.
         run: |
-          npx -y -p azurite azurite-blob --skipApiVersionCheck --blobPort 10000 &
+          npm install -g azurite@3.37.0
+          azurite-blob --skipApiVersionCheck --blobPort 10000 --location "$RUNNER_TEMP/azurite" &
           ready=0
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if curl -s -o /dev/null http://127.0.0.1:10000/devstoreaccount1; then
               ready=1
               break
