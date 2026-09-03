@@ -21,6 +21,9 @@ const STAGE_UNITS: Record<string, string> = {
   // The orphan scan's listing pass, named for the work rather than the quarry: it counts every blob it lists,
   // not the orphans among them, and under the old name Orphans the container's own size read as an orphan count.
   Listing: 'blobs',
+  // The index write: the index goes up in 64 MB volumes and every one comes back down for verification (a
+  // single-blob index is three transfers), and each transfer is one tick.
+  WritingIndex: 'volumes',
 }
 
 /**
@@ -38,6 +41,7 @@ const STAGE_UNITS: Record<string, string> = {
 const STAGE_LABELS: Record<string, string> = {
   LoadingIndex: 'Loading index',
   Assessing: 'Assessing damage',
+  WritingIndex: 'Writing index',
 }
 
 /** The on-screen name of a stage — exported so run headlines (the repair row) can say which phase is
@@ -249,12 +253,17 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
     detail.activeItems.every((a) => a.wire !== false)
   // Diffing's content reads register per file exactly like the repair's hash gate, and the fallback verb
   // ('downloading') is just as false for them.
+  // The index write runs both directions — every volume goes up and then comes back for verification — and
+  // a stream carries no direction flag, so the verb is neutral rather than a guess: "uploading" is wrong for
+  // half of them, and "downloading" reads as a rehydration to an Archive-tier operator.
   const inFlightVerb =
     detail.stage === 'Uploading' || repairUploading
       ? 'uploading'
       : detail.stage === 'Repairing' || detail.stage === 'Diffing'
         ? 'hashing'
-        : 'downloading'
+        : detail.stage === 'WritingIndex'
+          ? 'transferring'
+          : 'downloading'
   // The in-flight number's unit **differs by direction**:
   // · upload: VolumeBlobIO registers one entry per volume, so a single large item can occupy the whole
   //   concurrency allowance (5 by default);

@@ -81,3 +81,30 @@ describe('windDownControls', () => {
     expect(windDownControls('now').suspendLabel).toBe('Suspend')
   })
 })
+
+describe('windDownControls while wrapping up', () => {
+  /**
+   * From the index write on, every upload is done and nothing left in the run consults the pause gate. Pause
+   * used to answer success and show "Paused" over a run that went on to Completed; Suspend used to hang for
+   * its cap and hand back a Completed run labelled "Suspending…". At a few million entries the index write is
+   * minutes, so this is a whole stage, not a race window. Stop stays: it still skips the cleanup.
+   */
+  test('the gate controls go quiet, Stop stays live', () => {
+    const c = windDownControls(undefined, true)
+    expect(c.canActOnGate).toBe(false)
+    expect(c.canStop).toBe(true)
+    expect(c.stopLabel).toBe('Stop')
+    expect(c.suspendLabel).toBe('Suspend')
+  })
+
+  test('the disabled buttons say why', () => {
+    expect(windDownControls(undefined, true).gateHint).toMatch(/writing its index/)
+    expect(windDownControls(undefined, false).gateHint).toBeUndefined()
+  })
+
+  // A wind-down already under way is not overwritten by the wrap-up: the labels keep telling the truth about it.
+  test('a suspend already under way keeps its label', () => {
+    expect(windDownControls('suspend', true).suspendLabel).toBe('Suspending…')
+    expect(windDownControls('now', true).canStop).toBe(false)
+  })
+})

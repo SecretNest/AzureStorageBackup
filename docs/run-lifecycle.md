@@ -513,6 +513,16 @@ files cleared, lease and busy lock released.
 Pause on a run that is already winding down is a conflict, not a no-op: the gate is downgraded and
 can never hold anyone again, so answering 204 would be a lie.
 
+Pause and Suspend on a run that is **wrapping up** are the same conflict for a different reason.
+From the index write on (`BackupRunState.WrappingUp`: stage ≥ `WritingIndex`) every upload is done
+and nothing left in the run consults the gate — the index write, the info-file commit and the
+retention cleanup all run straight through. Before the refusal, Pause answered 204 and the row said
+"Paused" over a run that went on to `Completed`; Suspend held the request for its cap and then handed
+back a `Completed` run labelled "Suspending…". At a few million entries the index write alone is
+minutes, so this is a whole stage rather than a race window. The UI greys the same four controls it
+greys during a wind-down (`windDownControls`), with a tooltip saying why. Stop is left alone: it still
+means "skip the cleanup", which is a real thing to ask for.
+
 ## Not covered
 
 - **Pause is not offered for restore or check.** Those runs are short; the machinery is not worth

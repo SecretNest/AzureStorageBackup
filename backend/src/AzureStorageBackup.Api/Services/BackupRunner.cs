@@ -47,6 +47,16 @@ public sealed class BackupRunState
     public BackupProgress? Progress { get; set; }
     public int? Version { get; set; }
 
+    /// <summary>
+    /// Past the point where Pause or Suspend can do what their labels say. From the index write on, every upload
+    /// is done and nothing in the wrap-up (index write, info file commit, retention cleanup) consults the pause
+    /// gate: a Pause answered success and showed "Paused" over a run that went on to Completed, and a Suspend
+    /// held the request for its cap and then handed back a Completed run labelled "Suspending…". At a few million
+    /// entries the index write alone is minutes, so this is not a race window but a whole stage. Stop is left
+    /// alone: it still means "skip the cleanup", which is a real thing to ask for.
+    /// </summary>
+    public bool WrappingUp => Progress is { Stage: >= BackupStage.WritingIndex };
+
     /// <summary>Number of files this round could not read and therefore carried the old index entry forward for. A
     /// "successful" backup may have stored nothing at all; leave this number off the UI and the operator has only the
     /// notification to go on — and notifications drown in other messages.</summary>
@@ -416,10 +426,24 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     public async Task<bool> SuspendAsync(
         int configId, SuspendReason reason = SuspendReason.UserRequested, CancellationToken ct = default)
     {
+        // Refused, not ignored, once the run is wrapping up — see BackupRunState.WrappingUp. Checked here and not
+        // inside RequestStop, which the shutdown path also goes through: a shutdown must still leave its stop
+        // intent on a run that is writing its index, because that is what makes the cleanup step skip itself
+        // rather than start a compaction the host is about to kill.
+        if (IsWrappingUp(configId))
+            return false;
         if (RequestStop(configId, StopKind.Suspend, reason) is not { } state)
             return false;
         await state.Completion.Task.WaitAsync(ct);
         return true;
+    }
+
+    /// <summary>Whether the run on this config is past the point where Pause and Suspend can act (<see cref="BackupRunState.WrappingUp"/>).
+    /// False when there is no run: the endpoints ask this only to choose the wording of a refusal.</summary>
+    public bool IsWrappingUp(int configId)
+    {
+        lock (_lock)
+            return _runs.GetValueOrDefault(configId) is { Status: RunStatus.Running, WrappingUp: true };
     }
 
     /// <summary>
@@ -613,6 +637,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         // into RunCoreAsync (config, account and settings are loaded first), and until then a run really is Running
         // with no gate to hold.
         if (state is not { Status: RunStatus.Running, Control: not null })
+            return false;
+        // Nothing past the upload stage waits on the gate, so a hold taken now would show "Paused" over a run
+        // that finishes regardless — see BackupRunState.WrappingUp.
+        if (state.WrappingUp)
             return false;
         return state.Control.Gate.PauseByUser();
     }

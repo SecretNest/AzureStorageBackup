@@ -1940,7 +1940,22 @@ public sealed class BackupOrchestrator(
 
         // 7. WriteIndex (upload the second-level index first)
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        var (indexBlob, indexVolumes) = await store.WriteIndexAsync(request.Account, request.Container, version, index, password, request.IndexTier, ct);
+        // Tracked like the scan: this is the stretch whose length grows with the file count — a few million entries
+        // is hundreds of MB up the uplink and back down for verification — and it used to run without a single
+        // report between the line above and Finalizing. The store books every volume as it moves.
+        var indexTracker = new StageTracker("WritingIndex", total: 0, d =>
+            progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
+        string indexBlob;
+        int indexVolumes;
+        try
+        {
+            (indexBlob, indexVolumes) = await store.WriteIndexAsync(
+                request.Account, request.Container, version, index, password, request.IndexTier, ct, indexTracker);
+        }
+        finally
+        {
+            indexTracker.Complete();
+        }
         // The local index cache Put is deferred until the info file commits successfully (see below), so that a write conflict on the info file does not leave a ghost cache entry for an uncommitted version.
 
         // 8/9. Finalize (atomically update the info file)

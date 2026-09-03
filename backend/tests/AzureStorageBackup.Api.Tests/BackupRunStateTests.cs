@@ -44,6 +44,27 @@ public class BackupRunStateTests
         Assert.True(response.PausedByUser, "the operator's hold is standing regardless of what Source says");
     }
 
+    /// <summary>
+    /// From the index write on, the run is past the point where Pause or Suspend can do what their labels say:
+    /// every upload is done, nothing in the wrap-up consults the pause gate, and the only thing left is to let it
+    /// finish. Pause used to answer success here and show "Paused" over a run that went on to Completed; Suspend
+    /// used to hang the request for its cap and then hand back a Completed run labelled "Suspending…". This is
+    /// the one predicate both refusals key off.
+    /// </summary>
+    [Fact]
+    public void WrappingUp_starts_at_the_index_write_and_never_before()
+    {
+        static BackupRunState At(BackupStage stage) =>
+            new() { Progress = new BackupProgress(stage, 0, 0, 0, 0) };
+
+        Assert.False(new BackupRunState().WrappingUp);   // nothing reported yet: a run still starting
+        Assert.False(At(BackupStage.Scanning).WrappingUp);
+        Assert.False(At(BackupStage.Uploading).WrappingUp);
+        Assert.True(At(BackupStage.WritingIndex).WrappingUp);
+        Assert.True(At(BackupStage.Finalizing).WrappingUp);
+        Assert.True(At(BackupStage.CleaningUp).WrappingUp);
+    }
+
     // While paused the status is still Running (a sub-state), or the scheduler would conclude the round had ended and start another one on top of it.
     [Fact]
     public async Task Paused_run_is_still_reported_as_running()

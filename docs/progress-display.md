@@ -65,6 +65,7 @@ work — a backup that packs 46,624 files into 4,995 archives is reporting both 
 | Verifying (check) | objects | a pack downloaded, extracted and re-hashed |
 | Local (check) | files | an index entry |
 | Listing (check) | blobs | a blob in the container, orphan or not |
+| Writing index | volumes | one transfer of one 64 MB index volume: up, or back down for verification. A single-blob index is three transfers (temp up, verify down, commit up) |
 
 > **The listing stage is named for the work, not for the quarry.** It counts every blob it lists on
 > the way to subtracting the reference set, so the number it reports is the container's size. Called

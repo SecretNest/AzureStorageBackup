@@ -403,6 +403,9 @@ public static class BackupConfigEndpoints
         group.MapPost("/{id:int}/suspend", async (int id, BackupRunner runner, CancellationToken ct) =>
             await StopAndWaitAsync(c => runner.SuspendAsync(id, ct: c), ct) switch
             {
+                // The wrap-up refusal is told apart from "nothing to suspend": from the operator's chair a run that
+                // is visibly working and will not suspend is a different question from an idle config.
+                StopOutcome.NothingRunning when runner.IsWrappingUp(id) => Results.Conflict(new { error = WrappingUpError }),
                 StopOutcome.NothingRunning => Results.Conflict(new { error = "No backup is running." }),
                 StopOutcome.StillStopping => Results.Accepted($"/api/backup-configs/{id}/run", new { stopping = true }),
                 _ => Results.NoContent(),
@@ -428,10 +431,17 @@ public static class BackupConfigEndpoints
         //     password have been loaded.
         // Answering 204 for any of them is the silent success this comment promises not to give. The third used to
         // be told it was not running, which is false on both counts the old wording offered.
+        //   · there is one past its uploads, writing the index or cleaning up — nothing left in it consults the
+        //     gate, and a hold taken now would label a run "Paused" that finishes regardless (BackupRunState.WrappingUp).
         group.MapPost("/{id:int}/pause", (int id, BackupRunner runner) =>
             runner.Pause(id)
                 ? Results.NoContent()
-                : Results.Conflict(new { error = "No backup is running, or it is still starting or already stopping." }));
+                : Results.Conflict(new
+                {
+                    error = runner.IsWrappingUp(id)
+                        ? WrappingUpError
+                        : "No backup is running, or it is still starting or already stopping.",
+                }));
 
         // Lift a user pause. If a transient error is also holding the gate, the run stays parked on that one —
         // see PauseInfo.Source / BackupRunResponse.PausedByUser for how the UI tells the two apart.
@@ -1283,6 +1293,10 @@ public static class BackupConfigEndpoints
     /// In production it is always 20 seconds; tests must remember to set it back in a finally block, since it is a static field shared across the process.
     /// </summary>
     internal static TimeSpan StopWaitCap = TimeSpan.FromSeconds(20);
+
+    /// <summary>The refusal Pause and Suspend share once a run is past its uploads (<see cref="BackupRunState.WrappingUp"/>).</summary>
+    private const string WrappingUpError =
+        "Every upload is done and the backup is writing its index; it can no longer be paused or suspended and will finish on its own. Stop still skips the cleanup.";
 
     /// <summary>
     /// Raise the stop request and wait for it to finish flushing to disk, but **for at most <see cref="StopWaitCap"/> (20 seconds in production)**.
