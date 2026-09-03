@@ -177,7 +177,7 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
         }
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => Task.FromResult("etag");
         public Task<VersionIndex> ReadIndexAsync(Account a, string c, string i, string? p, int v = 1, CancellationToken ct = default) => Task.FromResult(new VersionIndex());
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.FromResult(("indexes/v.bin", 1));
+        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("indexes/v.bin", 1));
     }
 
     [Fact]

@@ -37,5 +37,9 @@ public interface IBackupInfoStore
     /// versions[].indexBlob) together with the number of volumes it was split into (versions[].indexVolumes). An
     /// empty tier means the default.
     /// </summary>
-    Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default);
+    /// <param name="progress">Where the write reports each transfer it makes, when the caller has a screen to put it
+    /// on. Every volume goes up once and comes back once for verification (a single-blob index is three transfers:
+    /// temp up, verify down, commit up), and each is booked as it completes with its bytes — at a few million
+    /// entries the index is hundreds of MB, and this stage used to be minutes of "Writing index" with nothing moving.</param>
+    Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null);
 }

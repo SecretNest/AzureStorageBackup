@@ -132,6 +132,15 @@ public sealed class BackupProgressDetailTests : IDisposable
             // hanging on "N preparing" forever when nothing is actually running; a missed enqueue leaves "N queued".
             Assert.Equal(0, uploading[^1].Detail!.Preparing);
             Assert.Equal(0, uploading[^1].Detail!.Queued);
+
+            // The index write reports as a stage of its own, and runs to a settled end. It used to be the one blind
+            // stretch of the pipeline: a single stage report and then nothing until Finalizing, which at a few
+            // million entries is minutes of "Writing index" with nothing on screen.
+            var writing = progress.Reports.Where(r => r.Stage == BackupStage.WritingIndex && r.Detail is not null).ToList();
+            Assert.NotEmpty(writing);
+            Assert.Equal("WritingIndex", writing[^1].Detail!.Stage);
+            Assert.True(writing[^1].Detail!.Total > 0, "the transfer count is what the percentage is read off");
+            Assert.Equal(writing[^1].Detail!.Total, writing[^1].Detail!.Processed);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

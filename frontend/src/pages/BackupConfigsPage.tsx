@@ -1873,6 +1873,7 @@ function RunButtons({
   onPause,
   onResumePause,
   stopping,
+  wrappingUp,
 }: {
   onStop: () => void
   onSuspend: () => void
@@ -1884,12 +1885,15 @@ function RunButtons({
   onPause?: () => void
   onResumePause?: () => void
   stopping?: WindDownKind
+  // Past the uploads (index write onwards): the same four controls go quiet as during a wind-down, and the
+  // tooltip says why, since this time it was not the operator who pressed anything. See windDownControls.
+  wrappingUp?: boolean
 }) {
   // Which of these stay live once a wind-down is under way, and why Stop is not one of the ones that goes
   // quiet: see windDownControls. The short of it is that the backend's stop kinds form a ladder and
   // RequestStop only ever climbs it, so Stop on a suspending run is an escalation rather than a race —
   // and it is the only way out of a wait that can run to tens of minutes.
-  const { canStop, canActOnGate, stopLabel, suspendLabel } = windDownControls(stopping)
+  const { canStop, canActOnGate, gateHint, stopLabel, suspendLabel } = windDownControls(stopping, wrappingUp)
   const pending = !canActOnGate
   return (
     <>
@@ -1902,6 +1906,7 @@ function RunButtons({
             style={{ padding: '0 0.3rem' }}
             onClick={onRetryNow}
             disabled={pending}
+            title={gateHint}
           >
             Retry now
           </button>
@@ -1918,6 +1923,7 @@ function RunButtons({
             style={{ padding: '0 0.3rem' }}
             onClick={onResumePause}
             disabled={pending}
+            title={gateHint}
           >
             Resume
           </button>
@@ -1934,6 +1940,7 @@ function RunButtons({
             style={{ padding: '0 0.3rem' }}
             onClick={onPause}
             disabled={pending}
+            title={gateHint}
           >
             Pause
           </button>
@@ -1947,6 +1954,7 @@ function RunButtons({
         style={{ padding: '0 0.3rem' }}
         onClick={onSuspend}
         disabled={pending}
+        title={gateHint}
       >
         {suspendLabel}
       </button>{' '}
@@ -2237,6 +2245,9 @@ function RunStatus({
         onPause={!run.pausedByUser ? onPause : undefined}
         onResumePause={pd?.canResume ? onResumePause : undefined}
         stopping={stopping}
+        // Mirrors the backend's BackupRunState.WrappingUp, which refuses Pause and Suspend from here on;
+        // disabling them here is the half that keeps the operator from meeting that conflict at all.
+        wrappingUp={p.stage >= BackupStage.WritingIndex}
       />
       {/* Details are folded into an expandable area: the path being processed can be very long and would
           distort the table if laid out in the row. One line of overall progress by default, expanded when

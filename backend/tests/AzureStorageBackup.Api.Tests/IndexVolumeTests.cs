@@ -108,6 +108,93 @@ public sealed class IndexVolumeTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The index write is the one stretch of a big backup that used to run blind: at a few million entries the index
+    /// is hundreds of MB, and up a home uplink and back down again for verification is minutes of "Writing index"
+    /// with nothing moving on screen. Every volume goes up once and comes back once, so the stage has 2 × volumes
+    /// transfers to count, and it counts each one as it completes — with its bytes, which is what the speed and the
+    /// remaining time are read off.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_split_index_write_reports_every_volume_up_and_back()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("idxprog");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec()) { IndexVolumeBytes = 256 * 1024 };
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            await cc.CreateIfNotExistsAsync();
+            var snapshots = new List<StageProgress>();
+            // A clock that jumps a second per reading: local Azurite finishes the whole write inside the tracker's
+            // 200 ms throttle window, and without this the only snapshot is the forced final one.
+            var now = 0L;
+            var tracker = new StageTracker("WritingIndex", total: 0, d => { lock (snapshots) snapshots.Add(d); })
+            {
+                Clock = () => Interlocked.Add(ref now, 1_000),
+            };
+
+            var (_, volumes) = await store.WriteIndexAsync(
+                account, name, 1, BigIndex(20_000), password: null, tier: null, ct: default, progress: tracker);
+            tracker.Complete();
+
+            Assert.True(volumes > 1, $"expected a split index, got {volumes} volume(s)");
+            var last = snapshots[^1];
+            Assert.Equal(2 * volumes, last.Total);
+            Assert.Equal(last.Total, last.Processed);
+            Assert.Equal(100, last.Percent);
+            Assert.True(last.Bytes > 0, "the transferred bytes are what the speed readout is computed from");
+            Assert.Empty(last.ActiveItems);
+            // The volumes are counted one at a time, not all at once at the end: an intermediate snapshot with some
+            // but not all of them done is the whole point.
+            Assert.Contains(snapshots, d => d.Processed > 0 && d.Processed < d.Total);
+        }
+        finally
+        {
+            await cc.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// The single-blob layout is three transfers, not one: the temp blob goes up, comes back down for verification,
+    /// and the verified bytes go up again under the real name. Reported as such — a stage that says "1 of 1" while
+    /// the second and third transfer are still running is the same blind stretch in miniature.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_single_blob_index_write_reports_its_three_transfers()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("idxprog1");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        try
+        {
+            await cc.CreateIfNotExistsAsync();
+            var snapshots = new List<StageProgress>();
+            var tracker = new StageTracker("WritingIndex", total: 0, d => { lock (snapshots) snapshots.Add(d); });
+
+            var (_, volumes) = await store.WriteIndexAsync(
+                account, name, 1, BigIndex(50), password: null, tier: null, ct: default, progress: tracker);
+            tracker.Complete();
+
+            Assert.Equal(1, volumes);
+            var last = snapshots[^1];
+            Assert.Equal(3, last.Total);
+            Assert.Equal(3, last.Processed);
+            Assert.True(last.Bytes > 0);
+        }
+        finally
+        {
+            await cc.DeleteIfExistsAsync();
+        }
+    }
+
     /// <summary>A small index keeps the single-blob layout, which is what every existing backup already has on disk.</summary>
     [SkippableFact]
     public async Task A_small_index_stays_one_blob()

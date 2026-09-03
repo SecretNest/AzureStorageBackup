@@ -699,3 +699,27 @@ describe('preparingRowLabelOf', () => {
     }
   })
 })
+
+describe('the index write', () => {
+  /**
+   * The stage counts volumes: the index goes up in 64 MB volumes and every one comes back down for
+   * verification, so a stream in flight may be either direction. The verb is neutral rather than a guess —
+   * a per-stage "uploading" would be wrong for half the transfers, and "downloading" reads as a
+   * rehydration to an Archive-tier operator.
+   */
+  test('counts volumes and names the direction neutrally', () => {
+    const { inFlightPhrase, counts, label } = stageLines(
+      progress({
+        stage: 'WritingIndex',
+        processed: 3,
+        total: 14,
+        activeItems: [{ label: 'indexes/v9.json.enc (4/7) upload', sent: 1, total: 2, percent: 50 }],
+      }),
+    )
+    expect(inFlightPhrase).toBe('1 volume transferring')
+    expect(counts).toContain('3 of 14 volumes')
+    // The detail block leads with the stage name, and the backend's token is not one: "WritingIndex:" on
+    // screen is the same slip LoadingIndex made before it got its entry.
+    expect(label).toBe('Writing index')
+  })
+})
