@@ -1,4 +1,4 @@
-import type { BackupRun } from '../api/backupConfigs'
+import type { BackupActivity, BackupRun } from '../api/backupConfigs'
 
 /**
  * Whether a configuration's row should offer to pick up an interrupted run.
@@ -19,14 +19,24 @@ import type { BackupRun } from '../api/backupConfigs'
  *               and offering to resume it from this row would claim something untrue about this backup.
  * · Failed / Canceled — the journal outlives both, and neither renders a button. These are the ones that
  *               need the notice, and Failed is the case that was broken.
+ *
+ * "No run in memory" has one more reading than "the process restarted". On entering the page, `runs` is
+ * empty until the first status poll lands, while the journal list — which includes the **live** run's own
+ * journal, since the backend lists every volume on the container — can land first. In that gap the row
+ * said "Interrupted run … Resume Discard" in amber and then switched to the progress line: a claim of
+ * interrupted work about a backup that was running the whole time. The configuration list already knows
+ * the difference — `activity` is BackingUp — so when the server says a backup is in progress and its
+ * state simply has not arrived yet, wait for it rather than explaining the journal wrongly. Any other
+ * activity leaves the original rule alone: nothing is about to account for that journal.
  */
 export function showsInterruptedNotice(
   run: BackupRun | undefined,
   interruptedCount: number,
+  activity: BackupActivity = 'Idle',
 ): boolean {
   if (interruptedCount <= 0)
     return false
   if (!run)
-    return true
+    return activity !== 'BackingUp'
   return run.status === 'Failed' || run.status === 'Canceled'
 }
