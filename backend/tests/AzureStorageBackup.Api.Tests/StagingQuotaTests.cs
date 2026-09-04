@@ -31,7 +31,7 @@ public sealed class StagingQuotaTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
-    private StagingArea Area(long limit, bool fairShare = false) => new(_compressTemp, _stagedTemp, () => limit, () => fairShare);
+    private StagingArea Area(long limit) => new(_compressTemp, _stagedTemp, () => limit);
 
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> Produce(string name, int size)
         => async (dir, ct) =>
@@ -284,16 +284,14 @@ public sealed class StagingQuotaTests : IDisposable
     }
     /// <summary>An archive can legitimately exceed the whole ceiling (a single family cannot be split), and
     /// once it has, its excess is sunk disk cost — the bytes are on the disk whether or not anyone else is
-    /// allowed to work. The old global gate read the raw total, so a 113.9 GB repair family froze a
-    /// concurrent backup's compression for the hours the family took to drain ("check把stage room全用掉了,
-    /// 并没有像backup一样分享"). Each seat's contribution to the GLOBAL gate is now capped at its fair share:
-    /// the oversized run still saturates its own allowance (it can stage nothing more), while the others
-    /// keep exactly the share the split promised them.</summary>
+    /// allowed to work. A global gate reading the raw total froze a concurrent backup's compression for the
+    /// hours a 113.9 GB repair family took to drain ("check把stage room全用掉了, 并没有像backup一样分享").
+    /// Each seat's contribution to the global gate is capped at its share: the oversized run saturates its own
+    /// allowance and can stage nothing more, while the others keep exactly the share the split promised them.</summary>
     [Fact]
     public async Task An_Oversized_Family_Does_Not_Starve_The_Other_Seats()
     {
-        // Fair-share mode (Settings switch): 20% split as guarantees (100 each), 80% first-come shared.
-        using var area = Area(limit: 1000, fairShare: true);
+        using var area = Area(limit: 1000);
         using var a = area.AcquireLease();
         using var b = area.AcquireLease();
 
@@ -307,6 +305,116 @@ public sealed class StagingQuotaTests : IDisposable
         Assert.True(winner == itemB, "the other seat was starved by A's oversized family");
         area.Release(await itemB);
         area.Release(itemA);
+    }
+
+    /// <summary>
+    /// The scene that made the old "fair share" switch a misnomer: a run that had the disk to itself filled the pool,
+    /// then a second run started and sat at a fifth of it for the rest of the night. Fairness is judged on the
+    /// **result** — what each run holds — not on whose turn it is. So the moment the seat count doubles, the early
+    /// run is over its new share and stops compressing, and the late run keeps compressing until it holds as much.
+    /// </summary>
+    [Fact]
+    public async Task A_Late_Run_Catches_Up_While_The_Early_One_Waits()
+    {
+        using var area = Area(limit: 1000);
+        using var a = area.AcquireLease();
+
+        // Alone, A owns the whole pool and fills it.
+        var a1 = await area.StageAsync(Produce("a1", 500), a).WaitAsync(Patience);
+        var a2 = await area.StageAsync(Produce("a2", 500), a).WaitAsync(Patience);
+        Assert.Equal(1000, area.StagedBytes);
+
+        // B arrives: shares are now 500 each, and A holds twice that.
+        using var b = area.AcquireLease();
+        var blockedA = area.StageAsync(Produce("a3", 100), a);
+
+        // B compresses freely up to its share, even though the pool as a whole is past the ceiling.
+        var b1 = await area.StageAsync(Produce("b1", 300), b).WaitAsync(Patience);
+        var b2 = await area.StageAsync(Produce("b2", 200), b).WaitAsync(Patience);
+        Assert.Equal(500, b.Bytes);
+        Assert.False(blockedA.IsCompleted, "A is over its share and must not compress while B catches up");
+
+        // Now both are at their share: B is capped too.
+        var blockedB = area.StageAsync(Produce("b3", 100), b);
+        await Task.Delay(200);
+        Assert.False(blockedB.IsCompleted, "B has reached its share and must wait like A");
+        Assert.False(blockedA.IsCompleted);
+
+        // A drains below its share and may go again; B still cannot.
+        area.Release(a1);
+        area.Release(a2);
+        var resumedA = await blockedA.WaitAsync(Patience);
+        Assert.Equal(100, resumedA.Bytes);
+        Assert.False(blockedB.IsCompleted);
+
+        area.Release(b1);
+        await blockedB.WaitAsync(Patience);
+    }
+
+    /// <summary>
+    /// When more than one seat is allowed to compress, the lock is not first-come: it goes to the seat holding the
+    /// **least**. Order of arrival at the lock says nothing about who is behind; holdings do.
+    /// </summary>
+    [Fact]
+    public async Task When_Both_Have_Room_The_Seat_Holding_Less_Compresses_First()
+    {
+        using var area = Area(limit: 1000);
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+
+        var a1 = await area.StageAsync(Produce("a1", 400), a).WaitAsync(Patience);
+        var b1 = await area.StageAsync(Produce("b1", 100), b).WaitAsync(Patience);
+
+        // Park the compression lock so both seats have to queue for it, A first.
+        var releaseLock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holder = area.StageAsync(async (dir, ct) =>
+        {
+            await releaseLock.Task.WaitAsync(ct);
+            return await Produce("hold", 10)(dir, ct);
+        });
+        await Task.Delay(100);
+
+        var order = new List<string>();
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> Recording(string name) => (dir, ct) =>
+        {
+            lock (order) order.Add(name);
+            return Produce(name, 10)(dir, ct);
+        };
+        var nextA = area.StageAsync(Recording("a2"), a);
+        await Task.Delay(100);
+        var nextB = area.StageAsync(Recording("b2"), b);
+        await Task.Delay(100);
+
+        releaseLock.SetResult();
+        await Task.WhenAll(holder, nextA, nextB).WaitAsync(Patience);
+
+        Assert.Equal(["b2", "a2"], order);
+        area.Release(a1);
+        area.Release(b1);
+    }
+
+    /// <summary>
+    /// Bytes that belong to no seat (a lease-less staging, a reservation with no lease) are still on the same
+    /// physical disk, so the global gate must keep counting them at face value even though no share caps them.
+    /// </summary>
+    [Fact]
+    public async Task Bytes_Held_By_No_Seat_Still_Count_Against_The_Ceiling()
+    {
+        using var area = Area(limit: 1000);
+        using var a = area.AcquireLease();
+
+        var anon = await area.StageAsync(Produce("anon", 800)).WaitAsync(Patience);
+        var a1 = await area.StageAsync(Produce("a1", 300), a).WaitAsync(Patience);
+        Assert.Equal(1100, area.StagedBytes);
+
+        // A is far under its share (the whole limit, it is the only seat), yet the disk is over the ceiling.
+        var blocked = area.StageAsync(Produce("a2", 10), a);
+        await Task.Delay(200);
+        Assert.False(blocked.IsCompleted, "the ceiling is a physical disk; seat-less bytes fill it like any other");
+
+        area.Release(anon);
+        await blocked.WaitAsync(Patience);
+        area.Release(a1);
     }
 
 }

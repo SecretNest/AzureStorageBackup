@@ -91,12 +91,7 @@ builder.Services.AddSingleton(sp =>
         var settings = scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync().GetAwaiter().GetResult();
         return settings.StagedLimitBytes > 0 ? settings.StagedLimitBytes : 2L * 1024 * 1024 * 1024;
     }
-    bool FairShare()
-    {
-        using var scope = sp.GetRequiredService<IServiceScopeFactory>().CreateScope();
-        return scope.ServiceProvider.GetRequiredService<IGlobalSettingsService>().GetAsync().GetAwaiter().GetResult().StagingFairShare;
-    }
-    return new StagingArea(compress, staged, Limit, FairShare);
+    return new StagingArea(compress, staged, Limit);
 });
 // File backend for the verbose per-file debug log (text files per backup and per date, PRD 3.6).
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
