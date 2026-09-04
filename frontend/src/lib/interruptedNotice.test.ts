@@ -12,6 +12,22 @@ describe('showsInterruptedNotice', () => {
 
   test('no run in memory and a journal on disk: the original case', () => {
     expect(showsInterruptedNotice(undefined, 1)).toBe(true)
+    expect(showsInterruptedNotice(undefined, 1, 'Idle')).toBe(true)
+  })
+
+  /**
+   * The flicker on entering the page. The configuration list says a backup is running, but its run state
+   * has not been fetched yet, while the journal list (which includes the live run's own journal) has. That
+   * journal is not interrupted work — it is the run in progress — and the row must not spend the gap
+   * saying "Interrupted run … Resume Discard" before switching to the progress line.
+   */
+  test('a run the server says is in progress is not interrupted, even before its state is known', () => {
+    expect(showsInterruptedNotice(undefined, 1, 'BackingUp')).toBe(false)
+  })
+
+  test('other activities do not hide a journal: nothing is about to explain it', () => {
+    expect(showsInterruptedNotice(undefined, 1, 'Checking')).toBe(true)
+    expect(showsInterruptedNotice(undefined, 1, 'CleaningUp')).toBe(true)
   })
 
   /**

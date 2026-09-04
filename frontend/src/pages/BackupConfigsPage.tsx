@@ -1549,7 +1549,7 @@ export function BackupConfigsPage() {
                   // A journal on disk that this row is not already offering a way out of — see
                   // showsInterruptedNotice for which run states those are. Show it and wait for the user,
                   // rather than deciding for them whether to continue.
-                  showsInterruptedNotice(runs[c.id], interrupted[c.id]?.length ?? 0) && (
+                  showsInterruptedNotice(runs[c.id], interrupted[c.id]?.length ?? 0, c.activity) && (
                     <InterruptedNotice
                       key="interrupted"
                       runs={interrupted[c.id]}
