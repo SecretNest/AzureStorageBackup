@@ -286,11 +286,10 @@ public sealed record StageProgress(
     /// </summary>
     int WaitingToUploadVolumes = 0,
     /// <summary>
-    /// **Objects** owning something on the upload side that is not moving: parked in the hand-off channel
-    /// (<see cref="AwaitingUpload"/>), or past staging and still holding a volume no stream has opened.
-    /// Formally <c>AwaitingUpload + Uploading − WaitingOnPeer − Checking −</c> the number of **distinct** objects whose
-    /// every volume has already started (one object can hold several volumes at once, so the in-flight stream count is
-    /// not it).
+    /// **Objects** owning something on the staging disk that is not moving — the same basis as the two columns
+    /// above, counted positively: parked in the hand-off channel with an archive (<see cref="AwaitingUpload"/> minus
+    /// the two archiveless kinds), or with a volume family registered by <see cref="StageTracker.BeginUpload"/> that
+    /// still has a volume no stream has opened.
     /// <para>
     /// An object partway through its volumes is counted here **and** appears in <see cref="ActiveItems"/>, deliberately.
     /// The two say different things in different units — this one says "it still has volumes lying on the disk", the
@@ -300,15 +299,17 @@ public sealed record StageProgress(
     /// The UI leads with whichever unit carries information; see <c>stageLines</c>.
     /// </para>
     /// <para>
-    /// It comes from the item ledger rather than from counting archives on the disk, and that is deliberate: the three
-    /// entry kinds that own no archive at all (a dedup hit, a resume hit, a raw in-place item) have to keep showing up
-    /// here, since "many objects, few bytes" is exactly the signal that the wire, not the temp disk, is the constraint.
+    /// It used to be a subtraction — everything in hand past staging, minus checking, minus the owners fully on the
+    /// wire, minus the archiveless — and a subtraction counts whatever it has no exception for. One such state is
+    /// ordinary on every run: an object in an uploader's hands owning nothing on the disk (a hit being recorded, an
+    /// item whose last volume has already been released, an item between its reservation and its first stream). It
+    /// satisfied the UI's "starting upload" as well, so one object read as two entries — measured on a resumed run as
+    /// <c>1 object waiting for uploading · 1 object starting upload</c>, both the same hit.
     /// </para>
     /// <para>
-    /// Peer waiters are excluded — they have their own entry naming the reason. Their archives' volumes and bytes are
-    /// still counted in the two columns above, whose basis is "on the disk, not on the wire" rather than "which object
-    /// owns it". In the state where that shows (duplicate content inside one batch) the object count reads slightly
-    /// low against the volumes beside it; the alternative is reporting those objects in two entries at once.
+    /// Peer waiters are not in it — they reserve before <see cref="StageTracker.BeginUpload"/>, so they own no family
+    /// yet — while their archives stay in the volumes and bytes above. They have their own entry naming the reason,
+    /// and the UI drops the object term at 0 rather than printing "(0 objects" beside a disk that is not empty.
     /// </para>
     /// </summary>
     int WaitingToUploadObjects = 0,
@@ -565,6 +566,10 @@ public sealed class StageTracker(
         /// so it only waits for the next <see cref="SetTransferred"/> to fold it into uploaded.
         /// A family that finishes without the mark = this attempt was voided, and its volumes do not count.</summary>
         public bool Confirmed;
+        /// <summary>Held in checking — the cloud listing a multi-volume upload does between <see cref="StageTracker.BeginUpload"/>
+        /// and its first stream. Its bytes and volumes are already held out of the waiting columns for that stretch (<see cref="StageTracker.BeginChecking"/>
+        /// with sizes); this is what holds the object out with them, so it is named in the checking entry and nowhere else.</summary>
+        public bool Checking;
         /// <summary>How many volumes this family is made of, declared by <see cref="StageTracker.BeginUpload"/>.</summary>
         public int Volumes;
         /// <summary>How many of them have entered the wire (one <see cref="StageTracker.BeginItem"/> each; a per-item retry resets
@@ -761,14 +766,25 @@ public sealed class StageTracker(
     /// slot counting belongs to Advance alone, and bumping the progress bar here on the side would push it past 100%.</summary>
     public void EndWork()
     {
-        // Nothing in hand and nothing on the wire: stop the timer rather than let it publish identical snapshots
-        // forever. Both halves are required — an item can finish while other volumes are still transferring, and a
-        // stream can close while the stage still holds plenty of work. Complete()/Dispose() are not enough on their
-        // own: between the last item and the wrap-up a stage can idle for a long time waiting on the diff.
-        if (Interlocked.Decrement(ref _inWork) == 0)
-            lock (_gate)
-                if (_active.IsEmpty)
-                    Heartbeat(on: false);
+        if (Interlocked.Decrement(ref _inWork) != 0)
+            return;
+        lock (_gate)
+        {
+            // The state after the last item left hand has to reach the screen, and this is the only place that can
+            // send it: every publish on the item's way out (Advance, SetTransferred) ran while it was still counted,
+            // and the heartbeat is about to stop. Forced, because those publishes were milliseconds ago and the
+            // throttle would otherwise swallow exactly this one — leaving "1 object starting upload" on screen for
+            // as long as the diff takes to hand over the next item, which on a slow walk is minutes at a time. Not
+            // after Complete(): the final snapshot is final.
+            if (!_completed)
+                PublishIfDue(force: true);
+            // Nothing in hand and nothing on the wire: stop the timer rather than let it publish identical snapshots
+            // forever. Both halves are required — an item can finish while other volumes are still transferring, and
+            // a stream can close while the stage still holds plenty of work. Complete()/Dispose() are not enough on
+            // their own: between the last item and the wrap-up a stage can idle for a long time waiting on the diff.
+            if (_active.IsEmpty)
+                Heartbeat(on: false);
+        }
     }
 
     /// <summary>
@@ -1008,7 +1024,11 @@ public sealed class StageTracker(
     /// a pack's per-member stat **before** compression) — at that point there is not a single byte in the pool.</param>
     /// <param name="files">How many volume files those bytes are, subtracted out of the waiting-to-upload volume count for
     /// the same reason and on the same terms. Omitted wherever <paramref name="bytes"/> is.</param>
-    public void BeginChecking(long bytes = 0, int files = 0)
+    /// <param name="owner">The volume family this check belongs to, when it has one — the cloud listing a multi-volume
+    /// upload does after <see cref="BeginUpload"/>. Holds the object out of <see cref="StageProgress.WaitingToUploadObjects"/>
+    /// for the stretch, as <paramref name="bytes"/> and <paramref name="files"/> hold its archive out of the columns beside it.
+    /// The checks that run before any family exists (the dedup probe's read, a pack's member stats) pass nothing.</param>
+    public void BeginChecking(long bytes = 0, int files = 0, string? owner = null)
     {
         Interlocked.Increment(ref _inChecking);
         if (bytes > 0)
@@ -1016,13 +1036,17 @@ public sealed class StageTracker(
         if (files > 0)
             Interlocked.Add(ref _checkingFiles, files);
         lock (_gate)
+        {
+            if (owner is not null && _unfinished.TryGetValue(owner, out var family))
+                family.Checking = true;
             PublishIfDue(force: true);
+        }
     }
 
     /// <param name="bytes">Must pass the same number as the paired <see cref="BeginChecking"/> — miss one repayment and
     /// this column carries an entry that never goes away for the rest of the run, with the staged column permanently under-reporting along with it.</param>
     /// <param name="files">Same rule, same consequence.</param>
-    public void EndChecking(long bytes = 0, int files = 0)
+    public void EndChecking(long bytes = 0, int files = 0, string? owner = null)
     {
         Interlocked.Decrement(ref _inChecking);
         if (bytes > 0)
@@ -1030,7 +1054,11 @@ public sealed class StageTracker(
         if (files > 0)
             Interlocked.Add(ref _checkingFiles, -files);
         lock (_gate)
+        {
+            if (owner is not null && _unfinished.TryGetValue(owner, out var family))
+                family.Checking = false;
             PublishIfDue(force: true);
+        }
     }
 
     /// <summary>Register an in-flight transfer object. The upload stage registers **volumes** (<c>data/xxx.007</c>),
@@ -1434,43 +1462,33 @@ public sealed class StageTracker(
         var waitingVolumes = stagedFiles is null
             ? 0
             : Math.Max(0, stagedFiles() - inFlightStaged.Count - checkingFiles);
-        // The object side of the same entry, and the one number here that comes from the **item** ledger rather than
-        // from the disk: objects parked in the hand-off channel plus objects past staging that still own something on
-        // the disk with no stream open for it.
+        // The object side of the same entry: how many objects own the volumes and bytes just measured. Counted
+        // **positively**, on the same basis as the two columns beside it — "owns something on the staging disk that
+        // is not moving" — rather than as everything in hand minus a list of exceptions:
+        // · parked in the hand-off channel with an archive: the channel's depth minus the two archiveless kinds,
+        //   which own nothing there and leave by their own columns;
+        // · past that, with a registered volume family (BeginUpload) that still has a volume no stream has opened.
+        //   An object partway through its volumes is counted here *and* appears in the in-flight list, deliberately:
+        //   subtracting it whole is what produced "0 objects waiting for uploading (269 volumes on the staging disk,
+        //   26.260 GB)" on a single big file. Distinct owners by construction — one family per object, however many
+        //   of its volumes are moving at once. A family held in checking (the cloud listing before its first volume)
+        //   is out for the same reason its bytes are: not cleared to travel, and named in its own entry.
         //
-        // Subtracted are only the objects that have **nothing left to start** — every volume of theirs is either on the
-        // wire or already gone. An object with volumes in flight *and* volumes still on the disk stays counted, because
-        // those volumes are counted beside it: subtracting it whole is what produced "0 objects waiting for uploading
-        // (269 volumes on the staging disk, 26.260 GB)" on a single big file, an object count and a volume count of the
-        // same population disagreeing about whether the population was empty. The two columns now share one rule —
-        // "still has something on the disk that is not moving" — and an object partway through its volumes appears both
-        // here and in the in-flight list, correctly: it is doing both things at once, in different units.
+        // The subtraction this replaced (in hand − checking − fully started owners − archiveless) counted whatever
+        // it had no exception for, and one such state is ordinary on every run: an object in an uploader's hands
+        // owning nothing on the disk — a hit being recorded, an item whose last volume has already been released, an
+        // item between its reservation and its first stream. Every one of those satisfied "starting upload" as
+        // well, so the one object read as two entries: "1 object waiting for uploading · 1 object starting upload",
+        // measured on a resumed run whose items were all hits.
         //
-        // Distinct owners, not the in-flight stream count — one object can hold several volumes at once, and using the
-        // stream count would subtract the same object as many times as it has volumes moving. An owner with no ledger
-        // entry (nothing on the upload side registers one without BeginUpload) is treated as fully in flight, which is
-        // what this line did for every owner before.
-        //
-        // The two archiveless populations come **out**, into columns of their own: a raw in-place item has no volume
-        // and no pool bytes, and a dedup or resume hit has nothing to send at all. Counted here they made the entry
-        // read as five figures of objects against a handful of volumes, a ratio that looks like a merge and is really
-        // two populations printed as one. What is left is objects that own something on the staging disk — the same
-        // basis as the volumes and bytes beside them.
-        //
-        // Peer waiters are **not** subtracted, and that reversed with this split. Their archives are in the pool and
-        // counted in the two columns above, so striking the objects out left the entry able to read "0 objects" beside
-        // a non-empty disk. They are named in their own entry as well; with the object count now reading as "who owns
-        // these volumes" rather than "who is waiting", appearing in both is correct, in the same way an object partway
-        // through its volumes appears both here and in the in-flight list.
-        var settledObjects = active.Count == 0
-            ? 0
-            : active.Select(f => f.Owner).Where(o => o is not null).Distinct(StringComparer.Ordinal)
-                .Count(o => !_unfinished.TryGetValue(o!, out var family) || family.Started >= family.Volumes);
+        // Peer waiters are therefore not in this count — they reserve before BeginUpload, so they own no family yet
+        // — while their archives stay in the volumes and bytes. They have their own entry naming the reason, and the
+        // UI drops the object term at 0 rather than printing "(0 objects" beside a disk that is not empty.
         var awaitingInPlace = Math.Max(0, Volatile.Read(ref _archiveless[(int)ArchivelessUpload.InPlace]));
         var awaitingRecording = Math.Max(0, Volatile.Read(ref _archiveless[(int)ArchivelessUpload.AlreadyStored]));
-        var waitingObjects = Math.Max(0,
-            awaitingUpload + uploading - Math.Max(0, Volatile.Read(ref _inChecking))
-                - settledObjects - awaitingInPlace - awaitingRecording);
+        var parkedWithArchive = Math.Max(0, awaitingUpload - awaitingInPlace - awaitingRecording);
+        var familiesWithVolumesToStart = _unfinished.Values.Count(f => !f.Confirmed && !f.Checking && f.Started < f.Volumes);
+        var waitingObjects = parkedWithArchive + familiesWithVolumesToStart;
 
         // Bytes that have actually landed, this instant: completed items plus the part of the in-flight ones that
         // is already up. Stamped the first time it is non-zero — that moment is when this stage started doing the

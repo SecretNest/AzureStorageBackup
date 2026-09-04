@@ -171,17 +171,36 @@ public sealed class StageByteBreakdownTests
     }
 
     /// <summary>
-    /// A peer waiter stays counted, which reversed with the split above. It compressed before the name was decided
-    /// (the blob ref is only known once compression finishes), so its archive really is in the pool and counted in
-    /// the volumes and bytes beside it — striking the object out left the entry able to read "0 objects" against a
-    /// disk that was plainly not empty.
-    /// <para>
-    /// It is named in its own entry as well, and that is correct: this count reads as "who owns these volumes", not
-    /// "who is waiting", the same way an object partway through its volumes is in both this and the in-flight list.
-    /// </para>
+    /// An object in an uploader's hands that owns nothing on the staging disk is not waiting for uploading: a resume
+    /// or dedup hit being recorded, an item whose last volume has already been released, an item between its
+    /// reservation and its first stream. Counted here, it appeared twice on screen — once as "waiting for uploading"
+    /// (with no bytes beside it, the disk being empty) and once as "starting upload" — one object as two entries.
+    /// Measured in the field on a resumed run whose items were all hits:
+    /// <c>1 object waiting for uploading · 1 object starting upload</c>, both of them the same object.
     /// </summary>
     [Fact]
-    public void A_Peer_Waiter_Still_Owns_Its_Volumes()
+    public void An_Object_In_Hand_Owning_Nothing_On_The_Disk_Is_Not_Waiting()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 0, stagedFiles: () => 0);
+
+        tracker.BeginWork();   // past staging, in an uploader's hands, no archive: a hit being recorded
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.Uploading);                 // it is in hand, and the ledger says so…
+        Assert.Equal(0, s.WaitingToUploadObjects);    // …but nothing of it is lying on the disk
+    }
+
+    /// <summary>
+    /// A peer waiter is named in its own entry ("waiting on the same content elsewhere") and not here. Its archive is
+    /// in the pool and stays counted in the volumes and bytes beside this count — those are measured off the disk —
+    /// but the object has not registered a volume family yet (the reservation comes before
+    /// <see cref="StageTracker.BeginUpload"/>), and this count reads "objects with volumes on the disk that have not
+    /// started". The UI drops the object term at 0 rather than printing "(0 objects" beside a non-empty disk; see
+    /// <c>stageLines</c>.
+    /// </summary>
+    [Fact]
+    public void A_Peer_Waiter_Is_Named_In_Its_Own_Entry_Not_Here()
     {
         var (tracker, seen) = Rig(stagedBytes: () => 9_000, stagedFiles: () => 9);
 
@@ -191,30 +210,61 @@ public sealed class StageByteBreakdownTests
 
         var s = seen[^1];
         Assert.Equal(1, s.WaitingOnPeer);
-        Assert.Equal(1, s.WaitingToUploadObjects);   // ← was 0, against the 9 volumes below it
-        Assert.Equal(9, s.WaitingToUploadVolumes);
+        Assert.Equal(0, s.WaitingToUploadObjects);
+        Assert.Equal(9, s.WaitingToUploadVolumes);   // the disk does not care who is waiting on what
     }
 
     /// <summary>
-    /// The object count subtracts **distinct owners** in flight, not in-flight streams. One object can hold several
-    /// volumes on the wire at once (the per-item window is the gate's capacity plus one), and subtracting per stream
-    /// would strike the same object off as many times as it has volumes moving, driving the count to 0 while objects
-    /// were plainly still waiting.
+    /// A family listing the cloud before its first volume (the leftover check a multi-volume upload does after
+    /// <see cref="StageTracker.BeginUpload"/>) is checking, not waiting: its bytes and volumes are already held out of
+    /// the two columns beside this count, and it is named in its own entry. Counted here as well, it would be the one
+    /// object in two entries again — "1 object checking files · 1 object waiting for uploading" over one archive.
     /// </summary>
     [Fact]
-    public void The_Object_Count_Subtracts_Owners_Not_Streams()
+    public void A_Family_Listing_The_Cloud_Before_Its_First_Volume_Is_Checking_Not_Waiting()
+    {
+        var (tracker, seen) = Rig(stagedBytes: () => 4_000, stagedFiles: () => 4);
+
+        tracker.BeginWork();
+        tracker.BeginUpload("data/a", volumes: 4);
+        tracker.BeginChecking(4_000, 4, owner: "data/a");
+        tracker.Complete();
+
+        var s = seen[^1];
+        Assert.Equal(1, s.Checking);
+        Assert.Equal(0, s.WaitingToUploadObjects);
+        Assert.Equal(0, s.WaitingToUploadVolumes);   // held out already; the object now follows its volumes
+
+        tracker.EndChecking(4_000, 4, owner: "data/a");
+        tracker.Complete();
+
+        Assert.Equal(1, seen[^1].WaitingToUploadObjects);   // cleared to travel, nothing started: waiting
+        Assert.Equal(4, seen[^1].WaitingToUploadVolumes);
+    }
+
+    /// <summary>
+    /// The count is a positive one — objects whose registered volume family still has volumes to start — rather than
+    /// "everything in hand minus the exceptions". One object holding several volumes on the wire at once (the per-item
+    /// window is the gate's capacity plus one) is one object, and once every volume of it has started it is out,
+    /// however many streams it still holds.
+    /// </summary>
+    [Fact]
+    public void One_Owner_With_Several_Volumes_Moving_Counts_Once_And_Drops_Out_When_All_Have_Started()
     {
         var (tracker, seen) = Rig(stagedBytes: () => 0, stagedFiles: () => 0);
 
-        // Three objects in hand, past staging; one of them has three volumes on the wire.
-        for (var i = 0; i < 3; i++)
+        // Three objects past staging, each split in three; one of them has all three volumes on the wire.
+        foreach (var o in new[] { "data/a", "data/b", "data/c" })
+        {
             tracker.BeginWork();
+            tracker.BeginUpload(o, volumes: 3);
+        }
         tracker.BeginItem("d.001", "a", 10, owner: "data/a", staged: true);
         tracker.BeginItem("d.002", "a", 10, owner: "data/a", staged: true);
         tracker.BeginItem("d.003", "a", 10, owner: "data/a", staged: true);
         tracker.Complete();
 
-        Assert.Equal(2, seen[^1].WaitingToUploadObjects);   // 3 in hand − 1 owner on the wire, not − 3 streams
+        Assert.Equal(2, seen[^1].WaitingToUploadObjects);   // b and c; a has nothing left to start
     }
 
     /// <summary>

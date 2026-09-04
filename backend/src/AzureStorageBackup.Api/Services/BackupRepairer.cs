@@ -253,29 +253,37 @@ public sealed class BackupRepairer(
                 void Uploaded(long bytes) => Interlocked.Add(ref uploadedTotal, bytes);
                 try
                 {
-                    if (badRef.StartsWith("packs/", StringComparison.Ordinal))
-                        await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                            repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
-                    else
-                        await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                            dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    // One object's failure must not discard the others' work: everything already repaired has
-                    // its replacement volumes in the cloud, and losing the bookkeeping meant a 10-hour run could
-                    // end with nothing recorded. The failed object keeps its start-of-run mark (truthful — it is
-                    // still broken), the loop moves on, and the run still surfaces the failure after persisting.
-                    failures.Add((badRef, ex.Message));
+                    try
+                    {
+                        if (badRef.StartsWith("packs/", StringComparison.Ordinal))
+                            await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
+                                repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
+                        else
+                            await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
+                                dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        // One object's failure must not discard the others' work: everything already repaired has
+                        // its replacement volumes in the cloud, and losing the bookkeeping meant a 10-hour run could
+                        // end with nothing recorded. The failed object keeps its start-of-run mark (truthful — it is
+                        // still broken), the loop moves on, and the run still surfaces the failure after persisting.
+                        failures.Add((badRef, ex.Message));
+                    }
+                    // Written off **before** the item is handed back, the order the backup's ReportItem keeps: EndWork
+                    // publishes the state after the last item left hand, and a write-off landing after that publish
+                    // puts "1 object queued" on screen for an object that is finished (enqueued − processed − in hand,
+                    // with processed one short) — the very over-report BeginWork above exists to prevent. Not in the
+                    // finally: a cancelled object was not finished, and must not be counted as if it were.
+                    tracker?.Advance(0, Math.Max(0, WorkOf(badRef) - Interlocked.Read(ref counted)));
+                    // Transferred and workload settle at the same moment, on the same item — the pairing the
+                    // backup's ReportItem states is what keeps the "(N% of original)" readable.
+                    tracker?.SetTransferred(Interlocked.Read(ref uploadedTotal));
                 }
                 finally
                 {
                     tracker?.EndWork();
                 }
-                tracker?.Advance(0, Math.Max(0, WorkOf(badRef) - Interlocked.Read(ref counted)));
-                // Transferred and workload settle at the same moment, on the same item — the pairing the
-                // backup's ReportItem states is what keeps the "(N% of original)" readable.
-                tracker?.SetTransferred(Interlocked.Read(ref uploadedTotal));
             }
             // The stage's wrap-up must force out the final state (the same rule Complete's own comment
             // states): the last write-off's publish is throttled like any other, and without this the

@@ -465,6 +465,16 @@ the parentheses go with them.
 
 Nothing on the wire is in any of the three, so this entry and `5 volumes uploading` never overlap.
 
+The object count is on the **same basis** as the other two — owns something on the staging disk that is
+not moving — and is counted positively: parked for an uploader with an archive, or holding a registered
+volume family with a volume no stream has opened. It is not "everything in an uploader's hands minus the
+exceptions". That subtraction swept in an object owning nothing on the disk at all — a hit being recorded,
+an item whose last volume had already been released — which also satisfied `starting upload`, so one
+object read as two entries: `1 object waiting for uploading · 1 object starting upload`, measured on a
+resumed run whose items were all hits. A peer waiter is therefore not in the count (it reserves before its
+family is registered) while its archive still is in the volumes and bytes; it has its own entry, and the
+object term is dropped at 0 rather than printed beside a disk that is not empty.
+
 > **Why the volumes say where they were measured.** The two counts have different sources — objects
 > comes from the item ledger, volumes and bytes are measured off the staging pool — and a bare
 > `362 objects (119 volumes, 6.467 GB)` puts them in a ratio the reader will try to form. The only
