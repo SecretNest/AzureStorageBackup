@@ -10,16 +10,19 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// once over it, new compressions block until an upload calls <see cref="ReleaseFile"/> / <see cref="Release"/> and frees space.
 /// The one exception is <see cref="StageWithoutBackpressureAsync"/>, for callers the release itself depends on — see the reasoning there.
 /// <para>
+/// When several runs share the pool, each holds a <see cref="StagingLease"/> and the ceiling is split evenly across the seats
+/// (<see cref="HasRoom"/>). The compression lock is not first-come: <see cref="Dispatch"/> hands it to the eligible seat holding
+/// the <b>least</b>, so fairness is judged on what each run holds, not on whose turn it happens to be.
+/// </para>
+/// <para>
 /// Release granularity is a **single volume**, not the whole family: a large file splits into thousands of volumes, and deleting only
 /// after the whole family is uploaded makes peak usage equal the entire archive (a 100 GB file needs 100 GB of temp space — that one has
 /// already crashed a backup once), and the watermark stays pinned at the ceiling the whole time, with compression jammed behind
 /// backpressure. Delete each volume as it goes up and the peak shrinks to just "the few volumes not yet uploaded".
 /// </para>
 /// </summary>
-public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit, Func<bool>? fairShare = null) : IDisposable
+public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit) : IDisposable
 {
-    private readonly SemaphoreSlim _compressLock = new(1, 1);
-    private readonly SemaphoreSlim _releaseSignal = new(0);
     // Bytes each staged file occupies, together with whose account it is charged to. Per-volume release must debit exactly,
     // and it must be **idempotent** — the same volume is released once by the upload path volume by volume, then again by the
     // whole-family backstop at the tail; double-debiting drives the watermark negative, and after that backpressure never blocks compression again.
@@ -27,15 +30,35 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         new(StringComparer.Ordinal);
     private long _stagedBytes;
 
-    /// <summary>The runs currently in flight (their count is the denominator of the quota; their per-seat
-    /// occupancy feeds the share-capped global gate — see <see cref="EffectiveStagedBytes"/>). Configured-but-idle
-    /// backups hold no seat. A set rather than a bare count: the global gate has to ask each seat how much it
-    /// holds, and a count cannot answer that.</summary>
+    /// <summary>The runs currently in flight: their count is the denominator of the share, and their per-seat holdings
+    /// feed both the share-capped ceiling and the least-holdings-first lock (see <see cref="HasRoom"/> and
+    /// <see cref="Dispatch"/>). Configured-but-idle backups hold no seat.</summary>
     private readonly HashSet<StagingLease> _leaseSet = [];
-    private readonly Lock _leaseGate = new();
 
-    /// <summary>Number of callers waiting for space to open up. A release must wake **all** of them, see <see cref="SignalRelease"/>.</summary>
-    private int _waiting;
+    /// <summary>One gate over everything the dispatcher reads together: the seat set, the two queues, and whether the
+    /// compression lock is out. Byte counters stay interlocked so the hot paths (release, progress) need not take it.</summary>
+    private readonly Lock _gate = new();
+
+    /// <summary>Whether the compression lock is out. It is <b>granted</b> by <see cref="Dispatch"/>, never raced for:
+    /// a semaphore wakes whoever registered first, and arrival order says nothing about who is behind.</summary>
+    private bool _compressing;
+
+    /// <summary>Callers wanting the compression lock (every staging). Ordered by arrival, but <see cref="Dispatch"/> picks by holdings.</summary>
+    private readonly List<Waiter> _lockQueue = [];
+
+    /// <summary>Callers wanting room only (<see cref="ReserveAsync"/>): they manage their own temp space and take no lock.</summary>
+    private readonly List<Waiter> _roomQueue = [];
+
+    private sealed class Waiter(StagingLease? lease, bool needsRoom)
+    {
+        public readonly StagingLease? Lease = lease;
+        /// <summary>False only for <see cref="StageWithoutBackpressureAsync"/>: it queues for the lock alone.</summary>
+        public readonly bool NeedsRoom = needsRoom;
+        public readonly TaskCompletionSource Granted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>What this caller's seat holds right now — the dispatch key. A caller without a seat counts as holding
+        /// nothing: it is outside the split, and the only such callers are tests.</summary>
+        public long Holdings => Lease?.Bytes ?? 0;
+    }
 
     public long StagedBytes => Interlocked.Read(ref _stagedBytes);
 
@@ -109,11 +132,11 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
-            lock (_area._leaseGate)
+            lock (_area._gate)
                 _area._leaseSet.Remove(this);
-            // The moment a seat leaves, the remaining runs' allowance grows — they must be woken, otherwise they keep waiting
-            // against the old quota until the next finished volume upload happens to wake them.
-            _area.SignalRelease();
+            // The moment a seat leaves, the remaining runs' share grows — they must be re-dispatched, otherwise they keep waiting
+            // against the old share until the next finished volume upload happens to do it.
+            _area.Dispatch();
         }
     }
 
@@ -121,65 +144,190 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     public StagingLease AcquireLease()
     {
         var lease = new StagingLease(this);
-        lock (_leaseGate)
+        lock (_gate)
             _leaseSet.Add(lease);
         return lease;
     }
 
-    /// <summary>The allowance available to this call. Callers without a seat take no part in the split and are bounded only by the global ceiling.</summary>
-    private long QuotaFor(StagingLease? lease)
-    {
-        var limit = stagedLimit();
-        if (lease is null)
-            return limit;
-        lock (_leaseGate)
-            return limit / Math.Max(1, _leaseSet.Count);
-    }
-
     /// <summary>
-    /// Whether compression may start right now. Both gates have to pass: your own allowance (fairness), and the global ceiling
-    /// (the staging disk is a physical disk; filling it up fails the backup outright). Both use the same test, "let it through
-    /// while **current** usage is below the allowance", keeping the existing semantics — so an item starting from zero can always
-    /// begin compressing even when its output is bound to exceed the allowance, otherwise a file bigger than the allowance could never be compressed at all.
+    /// Whether this caller may start compressing right now. <b>Call with <see cref="_gate"/> held.</b>
+    /// <para>
+    /// A caller without a seat is bounded by the raw ceiling only. A seat's share is the limit split evenly across the seats
+    /// in flight, and two gates have to pass: the seat holds less than its share, and the pool — counting every seat at
+    /// <b>no more than its share</b> plus, at face value, whatever belongs to no seat — is below the limit.
+    /// </para>
+    /// <para>
+    /// The cap on what a seat contributes is what keeps one run's oversized family from freezing the others: a 100 GB
+    /// family cannot be split and lands whole, but it counts against the disk as one share, so the neighbours keep exactly
+    /// the share the split promised them. The disk itself can therefore be exceeded by at most one family per seat, the
+    /// same overshoot the single-run rule always allowed ("let it through while current usage is below the allowance", so
+    /// a file bigger than the allowance can be compressed at all).
+    /// </para>
+    /// <para>
+    /// Seat-less bytes (a reservation with no lease, a lease-less staging) sit on the same physical disk, so they count in
+    /// full — nothing caps them and nothing should.
+    /// </para>
     /// </summary>
     private bool HasRoom(StagingLease? lease)
     {
         var limit = stagedLimit();
+        var total = Interlocked.Read(ref _stagedBytes);
         if (lease is null)
-            return Interlocked.Read(ref _stagedBytes) < limit;
-        if (!(fairShare?.Invoke() ?? false))
-            // Strict (the default): the classic ceiling — a full pool blocks every seat until it drains.
-            // Disk safety first; one oversized family CAN freeze its neighbours for the hours it takes to
-            // upload, which is exactly the trade the fair-share switch exists to flip.
-            return Interlocked.Read(ref _stagedBytes) < limit && lease.Bytes < QuotaFor(lease);
-        // Fair-share (Settings → staging fair share): 20% of the limit is split evenly as a per-seat
-        // GUARANTEE and the other 80% is first-come shared. A run inside its guarantee may always proceed —
-        // an oversized family elsewhere never starves it completely — and beyond the guarantee it competes
-        // for the shared 80% like everyone else. The honest cost, stated on the switch: when EVERY run is
-        // handling huge files, the total can overshoot the limit further than strict mode would allow
-        // (each family lands whole; it cannot be split).
-        lock (_leaseGate)
+            return total < limit;
+        var share = limit / Math.Max(1, _leaseSet.Count);
+        if (lease.Bytes >= share)
+            return false;
+        long seated = 0, counted = 0;
+        foreach (var l in _leaseSet)
         {
-            var n = Math.Max(1, _leaseSet.Count);
-            var guaranteed = limit / 5 / n;
-            var sharedTotal = limit - limit / 5;
-            long sharedUsed = 0;
-            foreach (var l in _leaseSet)
-                sharedUsed += Math.Max(0, l.Bytes - guaranteed);
-            return lease.Bytes < guaranteed || sharedUsed < sharedTotal;
+            var held = l.Bytes;
+            seated += held;
+            counted += Math.Min(held, share);
         }
+        counted += Math.Max(0, total - seated);
+        return counted < limit;
     }
 
     /// <summary>
-    /// Wake **every** waiter, not one. Each is waiting on its own allowance, so releasing one means the one that wakes up may
-    /// not be the one that can proceed — and it consumes the signal on its way, so the one that should have woken misses it and
-    /// sits idle until the next release. Extra signals only make a later WaitAsync return once immediately; the wait loop re-tests the condition, so they are harmless.
+    /// Re-examine every waiter after anything that could have changed an answer: bytes released, a seat come or gone,
+    /// the compression lock handed back. Room-only waiters are released together, as many as have room. The compression
+    /// lock, if free, goes to <b>one</b> caller: of those allowed to start, the one whose seat holds the least (ties to the
+    /// earlier arrival). Holdings are the whole point — a run that fell behind while another filled the pool is the one
+    /// that catches up, however many items the other has queued ahead of it.
     /// </summary>
-    private void SignalRelease()
+    private void Dispatch()
     {
-        var waiters = Volatile.Read(ref _waiting);
-        if (waiters > 0)
-            _releaseSignal.Release(waiters);
+        List<Waiter>? granted = null;
+        lock (_gate)
+        {
+            for (var i = _roomQueue.Count - 1; i >= 0; i--)
+            {
+                var w = _roomQueue[i];
+                if (!HasRoom(w.Lease))
+                    continue;
+                _roomQueue.RemoveAt(i);
+                (granted ??= []).Add(w);
+            }
+            if (!_compressing)
+            {
+                Waiter? best = null;
+                foreach (var w in _lockQueue)
+                    if ((!w.NeedsRoom || HasRoom(w.Lease)) && (best is null || w.Holdings < best.Holdings))
+                        best = w;
+                if (best is not null)
+                {
+                    _lockQueue.Remove(best);
+                    _compressing = true;
+                    (granted ??= []).Add(best);
+                }
+            }
+        }
+        if (granted is null)
+            return;
+        foreach (var w in granted)
+            w.Granted.TrySetResult();
+    }
+
+    /// <summary>Park in a queue until <see cref="Dispatch"/> grants, or the token pulls the waiter out. A waiter the dispatcher
+    /// has already granted cannot be cancelled here — the grant stands and the caller deals with it (see <see cref="AcquireCompressLockAsync"/>).</summary>
+    private async Task WaitInQueueAsync(List<Waiter> queue, Waiter w, CancellationToken ct)
+    {
+        using var registration = ct.Register(static (state, token) =>
+        {
+            var (area, queue, w) = ((StagingArea, List<Waiter>, Waiter))state!;
+            bool removed;
+            lock (area._gate)
+                removed = queue.Remove(w);
+            if (removed)
+                w.Granted.TrySetCanceled(token);
+        }, (this, queue, w));
+        await w.Granted.Task;
+    }
+
+    /// <summary>Wait until there is space (room only, no lock). Used by reservations, which manage their own temp space.</summary>
+    private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct)
+    {
+        Waiter w;
+        lock (_gate)
+        {
+            if (HasRoom(lease))
+                return;
+            w = new Waiter(lease, needsRoom: true);
+            _roomQueue.Add(w);
+        }
+        await WaitInQueueAsync(_roomQueue, w, ct);
+    }
+
+    /// <summary>
+    /// Take the compression lock, waiting for room first unless <paramref name="waitForRoom"/> is false. The wait
+    /// <b>does not hold the lock</b> — that is the whole point, see the class remarks — and it is not first-come, see <see cref="Dispatch"/>.
+    /// </summary>
+    /// <param name="tracker">Optional progress accounting, for the caller's own tracker only (same rule as <see cref="StageAsync"/>).
+    /// A wait that began for lack of room is reported as its own phase rather than being left to read as "queueing for the archive lock":
+    /// that one ends only when an <b>upload</b> frees pool space, the lock's ends when a producer lets go, and the operator's response to
+    /// the two is opposite — see <see cref="StageProgress.WaitingOnRoom"/>. The phase is judged when the wait begins; room may come and
+    /// go while the lock stays busy, and re-publishing every flip would cost far more than the precision is worth.</param>
+    private async Task AcquireCompressLockAsync(StagingLease? lease, bool waitForRoom, CancellationToken ct, StageTracker? tracker)
+    {
+        Waiter w;
+        bool roomWait;
+        lock (_gate)
+        {
+            var hasRoom = !waitForRoom || HasRoom(lease);
+            // The overwhelmingly common case is that the lock is free and there is room, and it must stay free of progress
+            // events: registering unconditionally would force two publishes per item for a wait that never happened. Anyone
+            // still queued while the lock is free was found ineligible by the last dispatch, and every change since has dispatched again.
+            if (hasRoom && !_compressing)
+            {
+                _compressing = true;
+                return;
+            }
+            w = new Waiter(lease, waitForRoom);
+            roomWait = !hasRoom;
+            _lockQueue.Add(w);
+        }
+        try
+        {
+            // BeginRoomWait sits inside the try: it publishes, and publish is external code deliberately allowed to throw here.
+            if (roomWait)
+                tracker?.BeginRoomWait();
+            try
+            {
+                await WaitInQueueAsync(_lockQueue, w, ct);
+            }
+            finally
+            {
+                if (roomWait)
+                    tracker?.EndRoomWait();
+            }
+        }
+        catch
+        {
+            // Whatever threw, leave nothing behind: a waiter still queued is withdrawn; one the dispatcher granted in the
+            // meantime holds the lock, and it has to go back or compression stops for good.
+            bool stillQueued;
+            lock (_gate)
+                stillQueued = _lockQueue.Remove(w);
+            if (stillQueued)
+                w.Granted.TrySetCanceled();
+            else if (w.Granted.Task.IsCompletedSuccessfully)
+                ReleaseCompressLock();
+            throw;
+        }
+        // Granted and cancelled in the same instant: the grant cannot be withdrawn, so honour the token here instead of
+        // letting the caller compress into a cancelled run.
+        if (ct.IsCancellationRequested)
+        {
+            ReleaseCompressLock();
+            ct.ThrowIfCancellationRequested();
+        }
+    }
+
+    private void ReleaseCompressLock()
+    {
+        lock (_gate)
+            _compressing = false;
+        Dispatch();
     }
 
     /// <summary>
@@ -213,45 +361,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                 return;
             Interlocked.Add(ref area._stagedBytes, -bytes);
             lease?.Add(-bytes);
-            area.SignalRelease();
-        }
-    }
-
-    /// <summary>Wait until there is space. **Does not hold the compression lock** — that is the whole point, see the class remarks.</summary>
-    /// <param name="tracker">Optional progress accounting, for the caller's own tracker only (same rule as <see cref="StageAsync"/>).
-    /// A real wait is reported as its own phase rather than being left to read as "queueing for the archive lock": this one ends only when
-    /// an <b>upload</b> frees pool space, the lock's ends when a producer lets go, and the operator's response to the two is opposite —
-    /// see <see cref="StageProgress.WaitingOnRoom"/>.</param>
-    private async Task WaitForRoomAsync(StagingLease? lease, CancellationToken ct, StageTracker? tracker = null)
-    {
-        // The overwhelmingly common case is that there is room, and it must stay free of progress events: registering
-        // unconditionally would force two publishes per item for a wait that never happened, the same trade the upload
-        // gate makes when it finds itself free (see VolumeUploadScope.RunAsync).
-        if (HasRoom(lease))
-            return;
-        // BeginRoomWait sits inside the try: it raises the counter before it publishes, and publish is external code
-        // deliberately allowed to throw here, so the finally has to cover that case too.
-        try
-        {
-            tracker?.BeginRoomWait();
-            while (!HasRoom(lease))
-            {
-                Interlocked.Increment(ref _waiting);
-                try
-                {
-                    if (HasRoom(lease))   // look again after registering as a waiter, so we do not miss a release that just happened
-                        return;
-                    await _releaseSignal.WaitAsync(ct);
-                }
-                finally
-                {
-                    Interlocked.Decrement(ref _waiting);
-                }
-            }
-        }
-        finally
-        {
-            tracker?.EndRoomWait();
+            area.Dispatch();
         }
     }
 
@@ -325,27 +435,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             // the grounds that "we already hold the lock, nobody else can compress anyway" — true when a single backup runs. With
             // several backups in parallel that is the root of the disease: a run blocked by staging sits idle clutching the global
             // compression lock, and other runs cannot even start compressing. Handing anyone more quota saves nobody; it just deadlocks for a different reason.
-            while (true)
-            {
-                if (!waitForRoom)
-                {
-                    // The backpressure wait is the only thing skipped. The compression lock is still taken, so
-                    // compression stays globally serial and this caller queues behind whoever holds it — including
-                    // the compression stage, which is waiting for room outside the lock and therefore is not in the way.
-                    await _compressLock.WaitAsync(ct);
-                    break;
-                }
-
-                await WaitForRoomAsync(lease, ct, tracker);
-
-                await _compressLock.WaitAsync(ct);
-                // Between getting space and getting the lock there is a window in which somebody else may have used that space up.
-                // Once the lock is in hand we must look again, or we blow past the ceiling — drop the lock and wait again, letting whoever really has room go first.
-                if (HasRoom(lease))
-                    break;
-                _compressLock.Release();
-            }
-
+            // Room and lock are granted together by the dispatcher, so there is no window between them for someone else to use the room up.
+            await AcquireCompressLockAsync(lease, waitForRoom, ct, tracker);
             try
             {
                 try
@@ -375,7 +466,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             }
             finally
             {
-                _compressLock.Release();
+                // Hands the lock back and dispatches: the bytes just booked are what the next decision is made on.
+                ReleaseCompressLock();
             }
         }
         finally
@@ -398,7 +490,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         // One volume gone from the disk is one off the file count as well, and the idempotent TryRemove above is what
         // keeps that exact — the whole-family tail releases every volume a second time.
         entry.Lease?.Add(-entry.Bytes, -1);
-        SignalRelease();
+        Dispatch();
     }
 
     /// <summary>Whole-family tail: release everything not already released volume by volume (on a dedup hit not a single volume
@@ -413,8 +505,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             try { if (dir is not null && !Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir); }
             catch { /* best effort */ }
         }
-        // The whole-family tail signals once too: when every volume was already released one by one the loop above signalled nothing, and compressions waiting on backpressure would miss their wake-up.
-        SignalRelease();
+        // The whole-family tail dispatches once too: when every volume was already released one by one the loop above dispatched nothing, and compressions waiting on backpressure would miss their wake-up.
+        Dispatch();
     }
 
     private StagedItem MoveToStaged(IReadOnlyList<string> producedFiles, StagingLease? lease)
@@ -455,7 +547,6 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 
     public void Dispose()
     {
-        _compressLock.Dispose();
-        _releaseSignal.Dispose();
+        // Nothing unmanaged is held any more; kept so `using var area` at every construction site stays valid.
     }
 }
