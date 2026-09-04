@@ -3088,7 +3088,10 @@ public sealed class BackupOrchestrator(
         // TrimFamilyAsync **after** the upload, so the crash window shrinks the same way ReplaceAsync's does.
         // Strictly speaking this stretch inspects volumes in the cloud rather than local files, but it still counts
         // under the "checking" column — there is only one thing to say: this item is checking, not transferring.
-        uploadTracker.BeginChecking(archiveBytes, volumeCount);
+        // The owner goes with it: BeginUpload has already registered this family, and without the name the object
+        // would count as "waiting for uploading" for the length of the listing while its archive is held out as
+        // "being checked" — one object in two entries.
+        uploadTracker.BeginChecking(archiveBytes, volumeCount, owner: blobRef);
         try
         {
             var cc = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -3096,7 +3099,7 @@ public sealed class BackupOrchestrator(
         }
         finally
         {
-            uploadTracker.EndChecking(archiveBytes, volumeCount);
+            uploadTracker.EndChecking(archiveBytes, volumeCount, owner: blobRef);
         }
     }
 

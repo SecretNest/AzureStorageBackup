@@ -311,6 +311,36 @@ public sealed class StageProgressTests
         Assert.Equal(200, seen[^1].Bytes);
     }
 
+    /// <summary>
+    /// The last item leaving the stage's hands must be published, not merely counted. Every publish on an item's way
+    /// out — Advance, SetTransferred — runs while the item is still in hand, and EndWork then only stopped the
+    /// heartbeat; nothing published the state after it. The screen kept the photograph of "one item in hand" until the
+    /// next item arrived, which on a run fed slowly by the diff is minutes at a time. Field wording, on a resumed run
+    /// whose items were all hits: <c>1 object waiting for uploading · 1 object starting upload</c>, motionless, for an
+    /// object that had long since settled.
+    /// </summary>
+    [Fact]
+    public void The_Last_Item_Leaving_Hand_Is_Published()
+    {
+        var seen = new List<StageProgress>();
+        long now = 0;
+        var tracker = new StageTracker("Uploading", total: 1, seen.Add, speedWhileInFlight: true)
+        {
+            Clock = () => now,
+        };
+
+        tracker.Enqueue();
+        tracker.BeginWork();
+        now += 1_000;
+        tracker.Advance(0, 10);            // settled: published with the item still in hand
+        Assert.Equal(1, seen[^1].Uploading);
+
+        tracker.EndWork();                 // and out of hand — the throttle must not swallow this one
+
+        Assert.Equal(0, seen[^1].Uploading);
+        Assert.Equal(1, seen[^1].Processed);
+    }
+
     /// <summary>Queue depth must be able to drain to zero. Unpaired counters (a failure path missing its finally, say)
     /// leave a few items hanging as "preparing" or "queued" forever, when in fact nothing is running.</summary>
     [Fact]

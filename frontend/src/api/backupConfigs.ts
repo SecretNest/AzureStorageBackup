@@ -292,14 +292,15 @@ export interface StageProgress {
   // uniform except for its remainder, and one run mixes archives of wildly different sizes. It leads the rendered line,
   // and drops out of it when it equals waitingToUploadObjects — one volume per object means nothing was split.
   waitingToUploadVolumes: number
-  // And how many **objects** own them: parked in the hand-off channel, or past staging and still holding a volume no
-  // stream has opened. From the item ledger rather than by counting archives on disk, because the three entry kinds
-  // that own no archive at all (a dedup hit, a resume hit, a raw in-place item) have to keep showing here — "many
-  // objects, few bytes" is what says the wire is the constraint and the temp disk is not.
+  // And how many **objects** own them, on the same basis as the two figures above: parked in the hand-off channel with
+  // an archive, or holding a registered volume family with a volume no stream has opened. Counted positively — the
+  // subtraction it replaced ("everything in hand minus the exceptions") swept in an object in an uploader's hands
+  // owning nothing on the disk (a hit being recorded, an item whose last volume was already released), which also
+  // satisfied "starting upload" below, so one object read as two entries.
   // An object partway through its volumes counts here **and** shows in activeItems: it really is doing both, and
   // striking it out whole is what made a single big file read as "0 objects waiting (269 volumes on the staging disk)".
-  // Peer waiters are excluded (they have their own entry naming the reason) while their archives still count in the two
-  // figures above, whose basis is "on the disk, not on the wire" rather than "which object owns it".
+  // Peer waiters are not in it (they reserve before their family is registered, and have their own entry naming the
+  // reason) while their archives still count in the two figures above, which are measured off the disk.
   waitingToUploadObjects: number
   // Parked for an uploader owning no archive, but with the whole source file still to send from where it already sits
   // (the raw in-place route). Its own entry because the pool cannot describe it — never staged, never charged, so it
