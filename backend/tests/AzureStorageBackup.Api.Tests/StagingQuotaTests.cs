@@ -31,7 +31,7 @@ public sealed class StagingQuotaTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
     }
 
-    private StagingArea Area(long limit) => new(_compressTemp, _stagedTemp, () => limit);
+    private StagingArea Area(long limit, TimeSpan? handBackGrace = null) => new(_compressTemp, _stagedTemp, () => limit, handBackGrace);
 
     private static Func<string, CancellationToken, Task<IReadOnlyList<string>>> Produce(string name, int size)
         => async (dir, ct) =>
@@ -415,6 +415,163 @@ public sealed class StagingQuotaTests : IDisposable
         area.Release(anon);
         await blocked.WaitAsync(Patience);
         area.Release(a1);
+    }
+
+    /// <summary>
+    /// The decision about who compresses next must not be made in the instant the lock is handed back. A run's
+    /// compressor is a loop: it lets go, hands the archive to an uploader, takes the next item and comes straight
+    /// back — a few milliseconds during which it is in no queue at all. A neighbour that parked while it compressed
+    /// is the only candidate at that instant, and "least holdings first" degenerates into strict alternation: the
+    /// small-file run gets one item per big-file archive, its holdings never leave zero, and the big-file run fills
+    /// its share regardless. So the seat that just let go is counted as if it were still waiting, for a short
+    /// grace, and the parked seat only wins that comparison on holdings.
+    /// </summary>
+    [Fact]
+    public async Task The_Seat_That_Just_Let_Go_Is_Not_Overtaken_While_It_Comes_Back()
+    {
+        using var area = Area(limit: 1000, handBackGrace: TimeSpan.FromSeconds(1));
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+
+        var a1 = await area.StageAsync(Produce("a1", 400), a).WaitAsync(Patience);
+
+        var order = new List<string>();
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> Recording(string name) => (dir, ct) =>
+        {
+            lock (order) order.Add(name);
+            return Produce(name, 10)(dir, ct);
+        };
+
+        // B is compressing; A arrives and parks behind it with far more on the disk.
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b1 = area.StageAsync(async (dir, ct) =>
+        {
+            await releaseB.Task.WaitAsync(ct);
+            return await Produce("b1", 10)(dir, ct);
+        }, b);
+        await Task.Delay(100);
+        var nextA = area.StageAsync(Recording("a2"), a);
+        await Task.Delay(100);
+
+        // B lets go and comes back a moment later, the way a compressor loop does.
+        releaseB.SetResult();
+        await b1.WaitAsync(Patience);
+        await Task.Delay(20);
+        var nextB = area.StageAsync(Recording("b2"), b);
+
+        await Task.WhenAll(nextA, nextB).WaitAsync(Patience);
+        Assert.Equal(["b2", "a2"], order);
+
+        area.Release(a1);
+        foreach (var item in new[] { b1.Result, nextA.Result, nextB.Result })
+            area.Release(item);
+    }
+
+    /// <summary>The grace is a grace, not a reservation: a seat that does not come back forfeits the lock to whoever is parked.</summary>
+    [Fact]
+    public async Task A_Seat_That_Does_Not_Come_Back_Forfeits_The_Lock_After_The_Grace()
+    {
+        using var area = Area(limit: 1000, handBackGrace: TimeSpan.FromMilliseconds(50));
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+
+        var a1 = await area.StageAsync(Produce("a1", 400), a).WaitAsync(Patience);
+
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b1 = area.StageAsync(async (dir, ct) =>
+        {
+            await releaseB.Task.WaitAsync(ct);
+            return await Produce("b1", 10)(dir, ct);
+        }, b);
+        await Task.Delay(100);
+        var nextA = area.StageAsync(Produce("a2", 10), a);
+        await Task.Delay(100);
+
+        releaseB.SetResult();
+        var a2 = await nextA.WaitAsync(Patience);
+
+        area.Release(a1);
+        area.Release(a2);
+        area.Release(await b1);
+    }
+
+    /// <summary>
+    /// The grace exists to let holdings decide, so it is only extended when holdings would favour the seat letting go.
+    /// A seat handing back the lock with as much as (or more than) the parked one has no claim to come back first,
+    /// and the parked seat is granted on the spot — no idle wait on a lock nobody is using.
+    /// </summary>
+    [Fact]
+    public async Task A_Seat_Letting_Go_With_More_On_The_Disk_Does_Not_Hold_The_Lock_Up()
+    {
+        using var area = Area(limit: 1000, handBackGrace: TimeSpan.FromSeconds(5));
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+
+        var a1 = await area.StageAsync(Produce("a1", 100), a).WaitAsync(Patience);
+        var b1 = await area.StageAsync(Produce("b1", 300), b).WaitAsync(Patience);
+
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b2 = area.StageAsync(async (dir, ct) =>
+        {
+            await releaseB.Task.WaitAsync(ct);
+            return await Produce("b2", 10)(dir, ct);
+        }, b);
+        await Task.Delay(100);
+        var nextA = area.StageAsync(Produce("a2", 10), a);
+        await Task.Delay(100);
+
+        releaseB.SetResult();
+        // Well inside the five-second grace: A was granted at the hand-back, not after a wait.
+        var a2 = await nextA.WaitAsync(TimeSpan.FromSeconds(1));
+
+        foreach (var item in new[] { a1, b1, a2, await b2 })
+            area.Release(item);
+    }
+
+    /// <summary>
+    /// While the lock is being held for the seat that let go, a third seat arriving with **more** on the disk than
+    /// the parked one may not walk in through the free-lock fast path: the parked seat's claim on holdings stands,
+    /// and the newcomer queues behind it like anyone else.
+    /// </summary>
+    [Fact]
+    public async Task A_Newcomer_Holding_More_Cannot_Slip_In_During_The_Grace()
+    {
+        using var area = Area(limit: 3000, handBackGrace: TimeSpan.FromMilliseconds(300));
+        using var a = area.AcquireLease();
+        using var b = area.AcquireLease();
+        using var c = area.AcquireLease();
+
+        var a1 = await area.StageAsync(Produce("a1", 400), a).WaitAsync(Patience);
+        var c1 = await area.StageAsync(Produce("c1", 600), c).WaitAsync(Patience);
+
+        var order = new List<string>();
+        Func<string, CancellationToken, Task<IReadOnlyList<string>>> Recording(string name) => (dir, ct) =>
+        {
+            lock (order) order.Add(name);
+            return Produce(name, 10)(dir, ct);
+        };
+
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b1 = area.StageAsync(async (dir, ct) =>
+        {
+            await releaseB.Task.WaitAsync(ct);
+            return await Produce("b1", 10)(dir, ct);
+        }, b);
+        await Task.Delay(100);
+        var nextA = area.StageAsync(Recording("a2"), a);
+        await Task.Delay(100);
+
+        // B lets go (the lock is now held for B), and C — holding more than A — arrives during that grace.
+        releaseB.SetResult();
+        await b1.WaitAsync(Patience);
+        await Task.Delay(50);
+        var nextC = area.StageAsync(Recording("c2"), c);
+
+        await Task.WhenAll(nextA, nextC).WaitAsync(Patience);
+        Assert.Equal(["a2", "c2"], order);
+
+        foreach (var item in new[] { a1, c1, b1.Result, nextA.Result, nextC.Result })
+            area.Release(item);
     }
 
 }
