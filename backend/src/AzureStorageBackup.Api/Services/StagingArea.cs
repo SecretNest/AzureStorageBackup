@@ -12,7 +12,10 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// <para>
 /// When several runs share the pool, each holds a <see cref="StagingLease"/> and the ceiling is split evenly across the seats
 /// (<see cref="HasRoom"/>). The compression lock is not first-come: <see cref="Dispatch"/> hands it to the eligible seat holding
-/// the <b>least</b>, so fairness is judged on what each run holds, not on whose turn it happens to be.
+/// the <b>least</b>, so fairness is judged on what each run holds, not on whose turn it happens to be. And the seat that has
+/// just handed the lock back stays in that comparison for a short grace (<see cref="ReleaseCompressLock"/>): a compressor
+/// is a loop that comes straight back, and judging only whoever happened to be parked at the instant of hand-back would
+/// let a neighbour holding far more take every other turn regardless.
 /// </para>
 /// <para>
 /// Release granularity is a **single volume**, not the whole family: a large file splits into thousands of volumes, and deleting only
@@ -21,7 +24,7 @@ public sealed record StagedItem(IReadOnlyList<string> Files, long Bytes);
 /// backpressure. Delete each volume as it goes up and the peak shrinks to just "the few volumes not yet uploaded".
 /// </para>
 /// </summary>
-public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit) : IDisposable
+public sealed class StagingArea(string compressTempDir, string stagedTempDir, Func<long> stagedLimit, TimeSpan? handBackGrace = null) : IDisposable
 {
     // Bytes each staged file occupies, together with whose account it is charged to. Per-volume release must debit exactly,
     // and it must be **idempotent** — the same volume is released once by the upload path volume by volume, then again by the
@@ -45,6 +48,25 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
 
     /// <summary>Callers wanting the compression lock (every staging). Ordered by arrival, but <see cref="Dispatch"/> picks by holdings.</summary>
     private readonly List<Waiter> _lockQueue = [];
+
+    /// <summary>
+    /// The seat the free lock is being kept for, or null. Set by <see cref="Dispatch"/> when the seat handing the lock
+    /// back holds less than the best parked waiter, and cleared when that seat comes back and takes it, when anyone
+    /// holding even less takes it, or when <see cref="_handBackGrace"/> runs out (see <see cref="OnGraceExpired"/>).
+    /// </summary>
+    private StagingLease? _heldFor;
+
+    /// <summary>Identifies the grace in force, so a timer from an earlier grace that has since been cut short does nothing.</summary>
+    private int _graceSeq;
+
+    /// <summary>
+    /// How long the seat that let go is still counted as a candidate. It covers the compressor loop's round trip between
+    /// two stagings — hand the archive to the upload queue, take the next item, one stat of the source file — which is a
+    /// few milliseconds locally and a few tens on a busy NAS share. It is only ever paid when the seat does <b>not</b> come
+    /// back (its next item is a dedup hit, an in-place raw file, or there is none), and then at most once per archive that
+    /// seat produced, by a neighbour that was holding more; a single run never waits on it, having nobody to defer to.
+    /// </summary>
+    private readonly TimeSpan _handBackGrace = handBackGrace ?? TimeSpan.FromMilliseconds(250);
 
     /// <summary>Callers wanting room only (<see cref="ReserveAsync"/>): they manage their own temp space and take no lock.</summary>
     private readonly List<Waiter> _roomQueue = [];
@@ -133,7 +155,12 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             lock (_area._gate)
+            {
                 _area._leaseSet.Remove(this);
+                // A lock kept for a seat that has just left is kept for nobody: let the dispatch below grant it.
+                if (ReferenceEquals(_area._heldFor, this))
+                    _area._heldFor = null;
+            }
             // The moment a seat leaves, the remaining runs' share grows — they must be re-dispatched, otherwise they keep waiting
             // against the old share until the next finished volume upload happens to do it.
             _area.Dispatch();
@@ -188,14 +215,35 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         return counted < limit;
     }
 
+    /// <summary>Of the parked lock waiters allowed to start right now, the one whose seat holds the least (ties to the
+    /// earlier arrival); null when none may. <b>Call with <see cref="_gate"/> held.</b></summary>
+    private Waiter? BestParked()
+    {
+        Waiter? best = null;
+        foreach (var w in _lockQueue)
+            if ((!w.NeedsRoom || HasRoom(w.Lease)) && (best is null || w.Holdings < best.Holdings))
+                best = w;
+        return best;
+    }
+
     /// <summary>
     /// Re-examine every waiter after anything that could have changed an answer: bytes released, a seat come or gone,
     /// the compression lock handed back. Room-only waiters are released together, as many as have room. The compression
     /// lock, if free, goes to <b>one</b> caller: of those allowed to start, the one whose seat holds the least (ties to the
     /// earlier arrival). Holdings are the whole point — a run that fell behind while another filled the pool is the one
     /// that catches up, however many items the other has queued ahead of it.
+    /// <para>
+    /// <paramref name="handBackTo"/> is the seat that has just let go of the lock, and it takes part in that comparison
+    /// although it is in no queue: its compressor is on its way back, and it would be parked already if the round trip
+    /// between two stagings took no time at all. When it holds <b>less</b> than the best parked waiter the lock is kept
+    /// for it (<see cref="_heldFor"/>) for the grace, during which <see cref="AcquireCompressLockAsync"/> lets it — or
+    /// anyone holding less than the parked seat — walk in; if nobody has by the time the grace runs out, the parked seat
+    /// is granted after all. Without this, two runs alternate strictly whatever they hold: the one that parks while the
+    /// other compresses is the only candidate at the instant of hand-back, every time, so a small-file run gets exactly
+    /// one item per archive of a big-file run, its holdings never leave zero, and the big-file run fills its share.
+    /// </para>
     /// </summary>
-    private void Dispatch()
+    private void Dispatch(StagingLease? handBackTo = null)
     {
         List<Waiter>? granted = null;
         lock (_gate)
@@ -210,11 +258,30 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             }
             if (!_compressing)
             {
-                Waiter? best = null;
-                foreach (var w in _lockQueue)
-                    if ((!w.NeedsRoom || HasRoom(w.Lease)) && (best is null || w.Holdings < best.Holdings))
-                        best = w;
-                if (best is not null)
+                var best = BestParked();
+                if (best is null)
+                {
+                    // Nobody to defer to, so nothing to hold the lock for: whoever comes next takes the fast path.
+                    _heldFor = null;
+                }
+                else if (_heldFor is not null)
+                {
+                    // Being kept for a seat on its way back; the grace timer or that seat's return decides.
+                }
+                else if (handBackTo is not null && handBackTo.Bytes < best.Holdings && _leaseSet.Contains(handBackTo)
+                         && HasRoom(handBackTo))
+                {
+                    _heldFor = handBackTo;
+                    var seq = ++_graceSeq;
+                    _ = Task.Delay(_handBackGrace).ContinueWith(
+                        static (_, state) =>
+                        {
+                            var (area, seq) = ((StagingArea, int))state!;
+                            area.OnGraceExpired(seq);
+                        }, (this, seq), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+                else
                 {
                     _lockQueue.Remove(best);
                     _compressing = true;
@@ -226,6 +293,19 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             return;
         foreach (var w in granted)
             w.Granted.TrySetResult();
+    }
+
+    /// <summary>The seat the lock was kept for did not come back in time: stop holding it and grant the parked seat.
+    /// A stale timer — the grace it belongs to was already ended by an arrival — does nothing.</summary>
+    private void OnGraceExpired(int seq)
+    {
+        lock (_gate)
+        {
+            if (seq != _graceSeq || _heldFor is null)
+                return;
+            _heldFor = null;
+        }
+        Dispatch();
     }
 
     /// <summary>Park in a queue until <see cref="Dispatch"/> grants, or the token pulls the waiter out. A waiter the dispatcher
@@ -271,21 +351,36 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     {
         Waiter w;
         bool roomWait;
+        var dispatch = false;
         lock (_gate)
         {
             var hasRoom = !waitForRoom || HasRoom(lease);
             // The overwhelmingly common case is that the lock is free and there is room, and it must stay free of progress
             // events: registering unconditionally would force two publishes per item for a wait that never happened. Anyone
-            // still queued while the lock is free was found ineligible by the last dispatch, and every change since has dispatched again.
-            if (hasRoom && !_compressing)
+            // still queued while the lock is free was found ineligible by the last dispatch, and every change since has
+            // dispatched again — except while the lock is being kept for a seat on its way back (see Dispatch), when the
+            // parked seat is eligible and its claim on holdings stands: only a caller holding less than it may walk in.
+            // The seat the lock is kept for usually is that caller; a third seat holding even less is too, and rightly so.
+            if (hasRoom && !_compressing && (BestParked() is not { } parked || (lease?.Bytes ?? 0) < parked.Holdings))
             {
                 _compressing = true;
+                _heldFor = null;
                 return;
             }
             w = new Waiter(lease, waitForRoom);
             roomWait = !hasRoom;
             _lockQueue.Add(w);
+            // The seat the lock was kept for is back but may not take it (it ran out of room meanwhile, or ties the
+            // parked seat): the grace has served its purpose, so end it now rather than letting the parked seat idle
+            // through the rest of it.
+            if (_heldFor is not null && ReferenceEquals(_heldFor, lease))
+            {
+                _heldFor = null;
+                dispatch = true;
+            }
         }
+        if (dispatch)
+            Dispatch();
         try
         {
             // BeginRoomWait sits inside the try: it publishes, and publish is external code deliberately allowed to throw here.
@@ -323,11 +418,14 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         }
     }
 
-    private void ReleaseCompressLock()
+    /// <summary>Hand the lock back and dispatch. <paramref name="handBackTo"/> is the seat letting go when it is expected
+    /// straight back (a staging that ran to completion); null when it is leaving (cancelled, faulted), so the parked
+    /// seat is not kept waiting for a return that is not coming.</summary>
+    private void ReleaseCompressLock(StagingLease? handBackTo = null)
     {
         lock (_gate)
             _compressing = false;
-        Dispatch();
+        Dispatch(handBackTo);
     }
 
     /// <summary>
@@ -466,8 +564,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             }
             finally
             {
-                // Hands the lock back and dispatches: the bytes just booked are what the next decision is made on.
-                ReleaseCompressLock();
+                // Hands the lock back and dispatches: the bytes just booked are what the next decision is made on, and
+                // this seat is counted in it — its compressor is about to come back for the next item.
+                ReleaseCompressLock(lease);
             }
         }
         finally
