@@ -74,6 +74,12 @@ public sealed class PauseGate : IDisposable
     private bool _pausedByUser;
     private DateTimeOffset _userPausedSince;
 
+    /// <summary>
+    /// How many pieces of work are past a gate and still moving: a volume on the wire, the file under 7z, the item
+    /// the prober is hashing, the diff between two of its callbacks. See <see cref="BeginWork"/>.
+    /// </summary>
+    private int _inHand;
+
     public PauseGate(
         IReadOnlyList<TimeSpan>? schedule = null, TimeSpan? steady = null, TimeSpan? patience = null)
     {
@@ -86,6 +92,14 @@ public sealed class PauseGate : IDisposable
     public PauseInfo? Current { get { lock (_lock) return _current; } }
 
     public bool IsDowngraded { get { lock (_lock) return _downgraded; } }
+
+    /// <summary>
+    /// Is the gate closed right now, for either reason — the question a worker asks at a point where it cannot
+    /// afford to wait: an uploader that has just been handed an upload slot must not park while holding it
+    /// (the slot gate is shared by every run on the machine), so it asks, and if held gives the slot back before
+    /// it parks. See <c>VolumeUploadScope.RunAsync</c>.
+    /// </summary>
+    public bool IsHeld { get { lock (_lock) return _release is not null; } }
 
     /// <summary>
     /// Is the user's own hold standing? Ask this rather than reading <c>Current.Source</c>, which cannot answer it
@@ -110,10 +124,75 @@ public sealed class PauseGate : IDisposable
     /// <see cref="PauseSource.User"/> info beside <c>false</c> draws the transient-error branch, countdown and
     /// Retry-now button included, on a run the operator has simply paused.
     /// </summary>
-    public (PauseInfo? Current, bool ByUser) Snapshot()
+    public (PauseInfo? Current, bool ByUser, bool Settled) Snapshot()
     {
         lock (_lock)
-            return (_current, _pausedByUser);
+            return (_current, _pausedByUser, SettledLocked());
+    }
+
+    /// <summary>
+    /// Has the user's hold taken effect: it stands, and nothing is in hand any more, so nothing will move until
+    /// Resume.
+    /// <para>
+    /// The hold goes up the instant Pause is pressed, but it holds only what has not started. Every producing
+    /// loop finishes the piece in its hands first — the volume on the wire, the file under 7z — and on a slow
+    /// link that is minutes. For as long as it lasts the run is <b>pausing</b>, not paused, and the screen has to
+    /// say which: "Paused" over a run visibly uploading was read as the button having done nothing.
+    /// </para>
+    /// </summary>
+    public bool IsSettled { get { lock (_lock) return SettledLocked(); } }
+
+    private bool SettledLocked() => _pausedByUser && _inHand == 0;
+
+    /// <summary>
+    /// A piece of work has passed a gate and is moving. Dispose when it is done — or, for a worker that will go
+    /// on to wait for something the pause itself prevents, wrap the wait in <see cref="Idle"/>.
+    /// <para>
+    /// The unit is deliberately "what will produce bytes or CPU on its own", not "the item a loop holds": an
+    /// uploader holding a hundred-volume file has one item in hand and, once the hold is up, at most a handful of
+    /// volumes still moving. Counting the item would keep the run "pausing" until the whole file had gone up,
+    /// which is exactly the wait the per-volume gate exists to avoid; counting the volumes (each one takes its
+    /// own <see cref="BeginWork"/> after passing <see cref="WaitIfPausedAsync"/>, while the family-level stretch
+    /// around them sits in <see cref="Idle"/>) reports the truth: pausing while any is on the wire, paused once
+    /// the last one lands.
+    /// </para>
+    /// </summary>
+    public IDisposable BeginWork()
+    {
+        lock (_lock)
+            _inHand++;
+        return new Counted(this, +1);
+    }
+
+    /// <summary>
+    /// Step out of the in-hand count for a wait the pause itself may make endless: the compressor waiting for
+    /// staging room that only an upload can free, and no upload is coming while the hold stands. Dispose on the
+    /// way back into work. Only meaningful inside a <see cref="BeginWork"/> scope; outside one the count is left
+    /// alone rather than driven negative.
+    /// </summary>
+    public IDisposable Idle()
+    {
+        lock (_lock)
+        {
+            if (_inHand == 0)
+                return Counted.None;
+            _inHand--;
+        }
+        return new Counted(this, -1);
+    }
+
+    private sealed class Counted(PauseGate gate, int sign) : IDisposable
+    {
+        public static readonly Counted None = new(null!, 0);
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (sign == 0 || Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            lock (gate._lock)
+                gate._inHand -= sign;
+        }
     }
 
     /// <summary>
@@ -138,7 +217,12 @@ public sealed class PauseGate : IDisposable
             // of the second one riding free on the first one's coattails.
             release = _timer is null ? OpenLocked(cause) : _release!.Task;
         }
-        return await release.WaitAsync(ct);
+        // Parked is parked: a worker waiting here under a standing user hold is as still as one parked at
+        // WaitIfPausedAsync, and must not keep the run reading "pausing" for as long as it waits. The failure
+        // path is only ever reached from inside a BeginWork scope (a failure is something a piece of work did),
+        // which is what makes stepping out here sound.
+        using (Idle())
+            return await release.WaitAsync(ct);
     }
 
     /// <summary>The user clicked <c>Retry now</c>: don't wait for the timer, release now, and treat it as a fresh start (backoff and patience both reset).</summary>
@@ -283,6 +367,30 @@ public sealed class PauseGate : IDisposable
             release = _release.Task;
         }
         await release.WaitAsync(ct);
+    }
+
+    /// <summary>
+    /// <see cref="WaitIfPausedAsync"/> for a worker that is in the middle of its item: an uploader between two
+    /// volumes of one file, the pack loop between two groups, the diff between two of its callbacks. It parks the
+    /// same way, and steps out of the in-hand count while it is parked — a worker that has stopped moving is not
+    /// what keeps the run "pausing", however much of its item is still ahead of it.
+    /// <para>
+    /// The loop-top call stays <see cref="WaitIfPausedAsync"/>: a loop between two items holds nothing and is not
+    /// counted, so there is nothing for it to step out of.
+    /// </para>
+    /// </summary>
+    public async Task ParkAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        Task<bool> release;
+        lock (_lock)
+        {
+            if (_release is null)
+                return;
+            release = _release.Task;
+        }
+        using (Idle())
+            await release.WaitAsync(ct);
     }
 
     /// <summary>

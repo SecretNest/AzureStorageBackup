@@ -38,7 +38,8 @@ The UI distinguishes them by reason.
 | Status | Meaning | Resources | Buttons |
 |---|---|---|---|
 | `Running` | running normally | lease + busy lock | `Pause` `Suspend` `Cancel` |
-| `Running` + user pause | held by the operator | lease + busy lock | `Resume` `Suspend` `Stop` |
+| `Running` + pausing | the hold is up; the volumes on the wire and the file under 7z are finishing | lease + busy lock | `Resume` `Suspend` `Stop` |
+| `Running` + user pause | held by the operator, nothing in hand | lease + busy lock | `Resume` `Suspend` `Stop` |
 | `Running` + error pause | hit a network wall, self-healing | lease + busy lock | `Retry now` `Suspend` `Cancel` |
 | `Running` + `Suspending` | winding down, waiting for in-flight uploads | lease + busy lock | (none) |
 | `Running` + `Canceling` | winding down | lease + busy lock | (none) |
@@ -153,7 +154,7 @@ There is deliberately **no timeout on a user pause**. An automatic downgrade wou
 a suspend exactly when the operator is not watching. The cost is stated on screen instead —
 `Paused 23 minutes ago · holding 4.2 GB of staging` — and the operator decides.
 
-### Four gates, at the top of each loop
+### The gates: at the top of each loop, and between volumes and groups
 
 `WithPauseAsync` wraps an item's *failure* path. Pausing needs the *entry* path, so each producing
 loop takes the gate at the top: the diff's change handler, the prober, the compressor and the
@@ -162,10 +163,42 @@ uploader.
 The diff is included because "pause the backup" means the disk stops being read at all, not merely
 that the pipeline stops draining.
 
-Granularity is **finish the item in hand, then hold** — worst case, the time to compress one large
-file. Aborting mid-item and re-queueing would need 7z killed, partial output deleted and the item
-recompressed from scratch next time, trading a real recompression for a few seconds of
-responsiveness.
+Granularity is **finish the piece in hand, then hold**, and the piece is deliberately smaller than
+the item:
+
+- **The uploader holds between volumes.** Every volume asks the gate before it takes an upload slot,
+  and asks again once it has won one: the sliding window keeps a relief line of volumes queued at the
+  slot gate (see `VolumeUploadScope.WindowPerItem`), and one that queued while the gate was open
+  would otherwise go up after the hold went up. Held, it gives the slot straight back — the slot gate
+  is shared by every run on the machine, and a paused run must not sit on it — and parks. So what a
+  pause lets finish on the wire is exactly the volumes that were on it. Before this, the item was the
+  file, every volume of it: a hundred-gigabyte file pressed Pause against ran to its end while the row
+  said "Paused" (field report, 2026-09-07).
+- **The compressor finishes the file under 7z.** Aborting mid-item would need 7z killed, partial
+  output deleted and the item recompressed from scratch next time, trading a real recompression for
+  a few seconds of responsiveness. Its wait for staging room is a different matter — room is freed by
+  uploads, and none is coming while the hold stands — so that wait steps out of the accounting below.
+- **The pack loop asks at every group**, not only when it takes the item. A box is normally one group,
+  but the loop also grows: a member that changed under 7z is re-queued, and the wrap-up hands whole
+  subtrees of dangling aliases through it serially, after every pipeline loop has parked or exited.
+  Asked only at the item, a Pause pressed against that wrap-up held nothing while it compressed and
+  sent group after group with the progress bar sitting at 100%, and a Suspend against it ran on to
+  the index write. Both now stop at the next group, and a stop there settles the run the same way it
+  does before the wrap-up — a stopped run writes no index.
+- **The prober finishes the item it is hashing.** Its read is the cheap one to redo, but it is also
+  the short one.
+
+**"Pausing…" until it has taken effect.** The hold goes up the instant the button is pressed, but it
+holds only what has not started; on a slow link the pieces in hand take minutes to finish. The run
+response carries `pauseSettled` beside `pausedByUser`, false until nothing is in hand any more, and
+the row reads "Pausing…" across that stretch — the same way Suspend reads "Suspending…" for as long as
+it winds down. Resume is on offer throughout. What counts as in hand is what will produce bytes or
+CPU on its own (`PauseGate.BeginWork`): a volume past the hold check, the file under 7z, the item the
+prober is reading, the diff between two of its callbacks, the scan, the wrap-up's re-run. A worker
+parked at the gate mid-item, or blocked on a wait the pause itself makes endless (staging room, the
+compression lock), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`).
+Counting the volume rather than the file is what makes the two labels honest: an uploader holding a
+hundred-volume file has, once the hold is up, a handful of volumes still moving and not the file.
 
 > **One gate means these four also park on a transient-error pause**, which changes how the pipeline
 > behaves during a network blip and not only during a deliberate pause. Before, an upload that hit
@@ -512,6 +545,10 @@ files cleared, lease and busy lock released.
 
 Pause on a run that is already winding down is a conflict, not a no-op: the gate is downgraded and
 can never hold anyone again, so answering 204 would be a lie.
+
+The run response reports the hold as two facts: `pausedByUser` (the hold stands) and `pauseSettled`
+(it has taken effect — nothing is in hand any more). The browser draws "Pausing…" from the first
+without the second and "Paused" from both; a backend older than the second field is read as settled.
 
 Pause and Suspend on a run that is **wrapping up** are the same conflict for a different reason.
 From the index write on (`BackupRunState.WrappingUp`: stage ≥ `WritingIndex`) every upload is done

@@ -2096,7 +2096,7 @@ function RunStatus({
   }
   // Decides the label and which of Resume/Retry now apply — see pauseDisplay for why `source` alone
   // cannot make this call (pausedByUser is the tie-breaker for a hold pressed on top of a live backoff).
-  const pd = pauseDisplay(run.pause, run.pausedByUser)
+  const pd = pauseDisplay(run.pause, run.pausedByUser, run.pauseSettled ?? true)
   const p = run.progress
   if (!p)
     return (

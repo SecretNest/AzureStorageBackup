@@ -228,7 +228,7 @@ public sealed class CompressionContinuityTests : IDisposable
     /// first stage without touching the walk that feeds it.</param>
     private (BackupOrchestrator Orchestrator, StagingArea Staging, BackupRequest Request) Build(
         IBlobUploader? uploader, long stagingLimit, int uploadConcurrency, string container,
-        IFileHasher? hasher = null)
+        IFileHasher? hasher = null, long? volumeBytes = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -253,6 +253,7 @@ public sealed class CompressionContinuityTests : IDisposable
             {
                 UploadConcurrency = uploadConcurrency,
                 Plan = new PlanOptions { SingleFileThresholdBytes = 1 },
+                VolumeBytes = volumeBytes,
             },
         };
         return (orchestrator, staging, request);
@@ -623,6 +624,78 @@ public sealed class CompressionContinuityTests : IDisposable
                         return $"the run ended with processed={seen[^1].Processed} of total={seen[^1].Total}: "
                             + "work queued when the pause landed never came back.";
                 });
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
+    /// The pause is volume-granular on the wire. A hundred-gigabyte file used to run to its last volume after
+    /// Pause was pressed — "finish the item in hand" with the item being the file — while the screen said Paused.
+    /// Now the volumes on the wire land and the rest of the family holds where it is: the ones queued behind them
+    /// in the sliding window park at the gate, and the ones that had already won an upload slot give it back.
+    /// <para>
+    /// The other half is what the screen is told meanwhile. The hold is up from the button press, but it has not
+    /// <b>taken effect</b> until the last volume on the wire lands; <c>IsSettled</c> is false across that stretch
+    /// (the row reads "Pausing…") and true after it, and this case pins both readings against the uploader's own
+    /// count of what went past the slot gate.
+    /// </para>
+    /// <para>
+    /// One file of eight volumes on a two-slot gate, every upload blocked: two volumes are on the wire when the
+    /// hold goes up, two more sit queued for slots. The block is released <b>after</b> the pause, so the two on the
+    /// wire land and the count of volumes that went up must stop at exactly two — the two that had queued for
+    /// slots win them next and must not send. Resume, and every volume goes up.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Pause_Lets_The_Volumes_On_The_Wire_Land_And_Holds_The_Rest_Of_The_File()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        // Random bytes do not compress, so 2 MB in 256 KB volumes is eight of them.
+        WriteFile("big.bin", FileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var (orchestrator, _, request) = Build(
+            uploader, stagingLimit: 200_000_000, uploadConcurrency: 2, container: name, volumeBytes: 256 * 1024);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "pause-volume");
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, ct: default, control: control);
+            // Two slots, so exactly two volumes get as far as the uploader; the window queues two more for slots.
+            await WaitUntil(
+                () => uploader.Uploads >= 2, TimeSpan.FromSeconds(90),
+                () => $"only {uploader.Uploads} volumes reached the uploader; the file did not split or did not stage.");
+            await Task.Delay(300);
+            Assert.Equal(2, uploader.Uploads);
+
+            Assert.True(control.Gate.PauseByUser());
+            Assert.False(control.Gate.IsSettled, "two volumes are on the wire: the hold is up but has not taken effect");
+
+            block.SetResult();
+            await WaitUntil(
+                () => control.Gate.IsSettled, TimeSpan.FromSeconds(30),
+                () => $"the two volumes on the wire landed but the run never settled into the pause "
+                    + $"({uploader.Uploads} volumes went up).");
+            await Task.Delay(1000);   // long enough for a volume that was going to go up anyway to have done so
+            Assert.Equal(2, uploader.Uploads);
+            Assert.True(control.Gate.IsSettled);
+            Assert.False(run.IsCompleted);
+
+            control.Gate.ResumeByUser();
+            var result = await run.WaitAsync(TimeSpan.FromMinutes(3));
+            Assert.Equal(1, result.Version);
+            Assert.True(uploader.Uploads >= 8, $"{uploader.Uploads} volumes went up; the file should have had eight.");
         }
         finally
         {

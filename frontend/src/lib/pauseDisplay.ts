@@ -28,18 +28,29 @@ import { PauseSource, type PauseInfo } from '../api/backupConfigs'
  * A pause with no `source` at all comes from a backend older than this field, and reads as a transient
  * error because that is what every pause was before — assuming the other way would offer Resume on a run
  * nobody paused.
+ *
+ * `settled` is the third fact, and it is what decides between "Pausing…" and "Paused". The hold goes up the
+ * instant the button is pressed, but it holds only what has not started: the volumes on the wire land and
+ * the file under 7z finishes first, and on a slow link that is minutes. "Paused" over a row whose in-flight
+ * line was visibly still moving read as the button having done nothing (field report, 2026-09-07). The
+ * backend says when the last piece in hand has landed (`BackupRun.pauseSettled`), and until then the label
+ * says what is really happening — the same way Suspend reads "Suspending…" for as long as it winds down.
+ * Resume stays on offer throughout: lifting a hold that has not taken effect yet is exactly as safe as
+ * lifting one that has. A backend without the field is read as settled, the one reading it ever had.
  */
 export function pauseDisplay(
   pause: PauseInfo | null,
   pausedByUser: boolean,
+  settled = true,
 ): { label: string; canResume: boolean; canRetryNow: boolean } | null {
   if (!pause)
     return null
 
   if (pausedByUser) {
     const stillBackingOff = pause.source === PauseSource.TransientError
+    const state = settled ? 'Paused' : 'Pausing…'
     return {
-      label: stillBackingOff ? `Paused — also still hitting an error: ${pause.reason}` : 'Paused',
+      label: stillBackingOff ? `${state} — also still hitting an error: ${pause.reason}` : state,
       canResume: true,
       canRetryNow: false,
     }

@@ -543,9 +543,20 @@ In flight: 1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for up
 ```
 
 ```
-Paused
+Pausing…
 In flight: 1 volume uploading · 33 volumes (7 objects, 3.073 GB) waiting for uploading · 4,374 objects held by the pause
 ```
+
+```
+Paused
+In flight: 33 volumes (7 objects, 3.073 GB) waiting for uploading · 4,374 objects held by the pause
+```
+
+The pause has two labels because it has two moments. The hold goes up when the button is pressed, but
+the volume on the wire lands and the file under 7z finishes first; until the last piece in hand is
+done the row says "Pausing…", and only then "Paused" — the reading comes from `pauseSettled` on the run
+(see [run-lifecycle.md](run-lifecycle.md)). "Paused" over a row whose in-flight line was visibly still
+moving was read as the button having done nothing.
 
 `queued` and `waiting for the compressor` collapse into **one** entry, because the hold makes them one
 population — not started, and not going to be while it stands. The thing that told them apart, whether

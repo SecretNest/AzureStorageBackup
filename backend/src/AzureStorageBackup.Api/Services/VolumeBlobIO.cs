@@ -210,22 +210,70 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
     /// <param name="staged">Whether this volume is a file in the staging pool. It has to come out of the "waiting to upload"
     /// columns while it is on the wire, and only pool files may — the raw in-place route sends the user's own file, which
     /// was never charged to the pool (see <c>StageProgress</c>'s in-flight subtraction).</param>
+    /// <param name="held">Whether the run's pause gate is closed, asked <b>after</b> a slot has been won. A volume
+    /// that queued for its slot while the gate was open (the sliding window keeps a relief line of them queued,
+    /// see <see cref="WindowPerItem"/>) would otherwise go up after the hold went up, one relief line's worth per
+    /// family. Held, it gives the slot straight back — the slot gate is shared by every run on the machine, and a
+    /// paused run must not sit on it — parks at <paramref name="park"/>, and queues for a slot again when released.</param>
+    /// <param name="park">Where to wait while <paramref name="held"/> says so; the run's pause gate.</param>
+    /// <param name="work">The in-hand token for the pause accounting, taken once the volume is past the hold
+    /// check and disposed when it is done — see <c>PauseGate.BeginWork</c> for why the unit is the volume.</param>
     public async Task RunAsync(
         string blobName, Func<IProgress<long>, Task> upload, CancellationToken ct,
         long ticket = 0, int volumeIndex = 0, string? label = null, long volumeBytes = 0,
-        string? owner = null, bool staged = false)
+        string? owner = null, bool staged = false,
+        Func<bool>? held = null, Func<CancellationToken, Task>? park = null, Func<IDisposable?>? work = null)
     {
-        // When the gate is free AcquireAsync returns an already-completed Task, and in that case we do **not**
-        // report "waiting for a slot": marking it there would add one forced publish per volume for nothing — a
-        // big item with thousands of volumes means thousands of them. Only a real queue-up is reported, and when
-        // that happens not a byte is moving on screen, so that field is the only thing that can say what is
-        // being waited on.
-        // This line asks about cancellation first: without it, an already-cancelled run would happily finish
-        // uploading this volume while the gate is free, and only then notice it should stop.
-        ct.ThrowIfCancellationRequested();
-        var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
-        if (!acquire.IsCompletedSuccessfully)
+        while (true)
         {
+            await AcquireSlotAsync();
+            if (park is null || held?.Invoke() != true)
+                break;
+            gate.Release();
+            await park(ct);
+        }
+        using var inHand = work?.Invoke();
+        try
+        {
+            tracker.BeginItem(blobName, label, volumeBytes, owner, staged);
+            // One ItemProgress per volume: DeltaProgress's baseline is per call, so if parallel volumes share
+            // one instance each other's cumulative values look like a rewind. With the key, these bytes land on
+            // the account of the right stream.
+            await upload(tracker.ItemProgress(blobName));
+        }
+        finally
+        {
+            // Release needs a finally of its own; it cannot simply follow EndItem in the same block: EndItem
+            // also calls publish, and one throw from it skips the following statement entirely. And this leak is
+            // silent — the exception travels up into the "file cannot be read" catch-all and is swallowed there
+            // (MarkPostDiffUnreadableAsync catches IOException), the backup keeps running, just one stream short;
+            // accumulate as many as the configured concurrency and all uploads stall at the gate forever, showing
+            // "nothing is uploading while the staging pool is piled high", and it never heals itself. BeginItem
+            // moved into the try as well: if it throws, EndItem short-circuits because it cannot find the stream — harmless.
+            try
+            {
+                // The bytes were already counted report by report during transfer, so adding the total again here would double-count.
+                tracker.EndItem(blobName, 0);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        async Task AcquireSlotAsync()
+        {
+            // When the gate is free AcquireAsync returns an already-completed Task, and in that case we do **not**
+            // report "waiting for a slot": marking it there would add one forced publish per volume for nothing — a
+            // big item with thousands of volumes means thousands of them. Only a real queue-up is reported, and when
+            // that happens not a byte is moving on screen, so that field is the only thing that can say what is
+            // being waited on.
+            // This line asks about cancellation first: without it, an already-cancelled run would happily finish
+            // uploading this volume while the gate is free, and only then notice it should stop.
+            ct.ThrowIfCancellationRequested();
+            var acquire = gate.AcquireAsync(ticket, volumeIndex, ct);
+            if (acquire.IsCompletedSuccessfully)
+                return;
             // Count only. This volume's bytes need no ledger entry of their own: it is a file lying in the staging pool
             // with nothing on the wire, which is exactly what the pool's own file and byte counters already say, and
             // what StageProgress.WaitingToUploadBytes is derived from. Booking them here as well only created a second
@@ -254,33 +302,6 @@ public sealed class VolumeUploadScope(VolumeUploadGate gate, StageTracker tracke
                         gate.Release();
                     throw;
                 }
-            }
-        }
-        try
-        {
-            tracker.BeginItem(blobName, label, volumeBytes, owner, staged);
-            // One ItemProgress per volume: DeltaProgress's baseline is per call, so if parallel volumes share
-            // one instance each other's cumulative values look like a rewind. With the key, these bytes land on
-            // the account of the right stream.
-            await upload(tracker.ItemProgress(blobName));
-        }
-        finally
-        {
-            // Release needs a finally of its own; it cannot simply follow EndItem in the same block: EndItem
-            // also calls publish, and one throw from it skips the following statement entirely. And this leak is
-            // silent — the exception travels up into the "file cannot be read" catch-all and is swallowed there
-            // (MarkPostDiffUnreadableAsync catches IOException), the backup keeps running, just one stream short;
-            // accumulate as many as the configured concurrency and all uploads stall at the gate forever, showing
-            // "nothing is uploading while the staging pool is piled high", and it never heals itself. BeginItem
-            // moved into the try as well: if it throws, EndItem short-circuits because it cannot find the stream — harmless.
-            try
-            {
-                // The bytes were already counted report by report during transfer, so adding the total again here would double-count.
-                tracker.EndItem(blobName, 0);
-            }
-            finally
-            {
-                gate.Release();
             }
         }
     }
@@ -329,10 +350,18 @@ public static class VolumeBlobIO
     /// volume name and the matching label, answer whether the cloud's actual bytes hash to it. The repair path
     /// supplies it — a family a check condemned gets nothing on trust — while the backup's resume leaves it
     /// null and trusts the label (see volume-identity.md's trust split).</param>
-    /// <param name="beforeVolume">Awaited before each volume is taken up (skip or send alike) — the repair's
-    /// pause gate. Volume-granular on purpose: the backup's own pause holds only the front of its pipeline,
-    /// but a repair object can be a hundred-gigabyte family, and an object-granular hold would answer a pause
-    /// hours late.</param>
+    /// <param name="beforeVolume">Awaited before each volume is taken up (skip or send alike) — the pause gate,
+    /// the backup's and the repair's alike. Volume-granular on purpose: an object can be a hundred-gigabyte
+    /// family, and an object-granular hold answers a pause hours late. It sits <b>inside</b> the sliding window
+    /// rather than in front of it, so that what a pause lets finish is the volumes actually on the wire — the
+    /// ones queued behind them in the window park here without ever asking the gate for a slot.</param>
+    /// <param name="volumeHeld">Whether the pause gate is closed, asked once a volume has won its upload slot:
+    /// held, it gives the slot back and parks at <paramref name="beforeVolume"/> instead of sending — see
+    /// <see cref="VolumeUploadScope.RunAsync"/> for why the question has to be asked twice.</param>
+    /// <param name="volumeWork">Taken once a volume is past the hold and about to send, disposed when it has
+    /// landed — the backup's in-hand accounting (<c>PauseGate.BeginWork</c>). Counted per volume, not per family,
+    /// for the reason given there: once the hold is up, what is still moving is a handful of volumes and not the
+    /// file, and "pausing" has to end when they land.</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -340,7 +369,9 @@ public static class VolumeBlobIO
         Action<string>? onVolumeUploaded = null, string? label = null,
         IReadOnlyDictionary<string, CloudVolume>? existingVolumes = null,
         Func<string, string, Task<bool>>? cloudBytesVerify = null,
-        Func<CancellationToken, Task>? beforeVolume = null)
+        Func<CancellationToken, Task>? beforeVolume = null,
+        Func<bool>? volumeHeld = null,
+        Func<IDisposable?>? volumeWork = null)
     {
         // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
         // volumes, and showing only the path would repeat the same line thousands of times with no sign of
@@ -392,7 +423,10 @@ public static class VolumeBlobIO
                     : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p));
             }
             if (scope is null)
-                await Send(null);
+            {
+                using (volumeWork?.Invoke())
+                    await Send(null);
+            }
             else
                 await scope.RunAsync(
                     name,
@@ -401,7 +435,8 @@ public static class VolumeBlobIO
                     // The same discriminator the per-volume release uses two arguments down the call: a caller that
                     // wants its volumes released as they go is a caller whose volumes came out of the pool, and the raw
                     // in-place route — the only one that passes no callback — is uploading the user's own file.
-                    staged: onVolumeUploaded is not null);
+                    staged: onVolumeUploaded is not null,
+                    held: volumeHeld, park: beforeVolume, work: volumeWork);
             onVolumeUploaded?.Invoke(file);
         }
 

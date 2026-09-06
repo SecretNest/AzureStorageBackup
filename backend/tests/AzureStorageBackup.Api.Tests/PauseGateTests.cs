@@ -407,12 +407,12 @@ public class PauseGateTests
         using var gate = new PauseGate(
             schedule: [TimeSpan.FromHours(1)], steady: TimeSpan.FromHours(1), patience: TimeSpan.FromHours(1));
 
-        Assert.Equal((null, false), gate.Snapshot());
+        Assert.Equal((null, false, false), gate.Snapshot());
 
         var trouble = gate.WaitAsync(new IOException("network down"), CancellationToken.None);
         gate.PauseByUser();
 
-        var (current, byUser) = gate.Snapshot();
+        var (current, byUser, _) = gate.Snapshot();
         Assert.True(byUser, "the operator's hold is standing and one read of the gate has to say so");
         Assert.Equal(PauseSource.TransientError, current!.Source);   // ...even though the backoff owns Current
         Assert.False(trouble.IsCompleted);   // released by the gate's Dispose
@@ -468,5 +468,116 @@ public class PauseGateTests
         Assert.True(gate.PauseByUser(), "pressing Pause twice leaves the run held, which is a success");
         Assert.True(gate.ResumeByUser());
         Assert.False(gate.ResumeByUser(), "the hold was already lifted");
+    }
+
+    /// <summary>
+    /// "Paused" on screen used to mean only that the hold was up. It went up the instant the button was pressed,
+    /// while the volumes on the wire and the file under 7z ran on for as long as they took — minutes on a slow
+    /// link — and the operator was told the run was held when it plainly was not. Settled is the other half:
+    /// the hold stands <b>and</b> nothing is in hand any more, so nothing will move until Resume.
+    /// </summary>
+    [Fact]
+    public void Settled_Means_The_Hold_Stands_And_Nothing_Is_In_Hand()
+    {
+        using var gate = new PauseGate();
+        Assert.False(gate.IsSettled, "a run nobody paused is not settled into a pause");
+
+        var work = gate.BeginWork();
+        Assert.True(gate.PauseByUser());
+        Assert.False(gate.IsSettled, "a volume on the wire is in hand; the hold has not taken effect yet");
+
+        work.Dispose();
+        Assert.True(gate.IsSettled, "the last piece in hand landed and nothing else can start");
+
+        gate.ResumeByUser();
+        Assert.False(gate.IsSettled, "settled is a fact about a standing hold, and there is none");
+    }
+
+    /// <summary>
+    /// A worker that parks in the middle of its item — an uploader between two volumes of one file — has stopped
+    /// moving, and must not keep "Pausing…" on screen for as long as the file has volumes left.
+    /// </summary>
+    [Fact]
+    public async Task A_Worker_Parked_Mid_Item_Is_Not_In_Hand()
+    {
+        using var gate = new PauseGate();
+        using var work = gate.BeginWork();
+        gate.PauseByUser();
+
+        var parked = gate.ParkAsync(CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(parked.IsCompleted);
+        Assert.True(gate.IsSettled, "the only worker is parked at the gate");
+
+        gate.ResumeByUser();
+        await parked.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(gate.IsSettled, "resumed: the worker is back at work and the hold is down");
+    }
+
+    /// <summary>Parking at an open gate mid-item costs nothing and leaves the worker counted as at work.</summary>
+    [Fact]
+    public async Task Parking_Mid_Item_At_An_Open_Gate_Returns_At_Once()
+    {
+        using var gate = new PauseGate();
+        using var work = gate.BeginWork();
+        await gate.ParkAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(1));
+        gate.PauseByUser();
+        Assert.False(gate.IsSettled, "the worker never left its item");
+    }
+
+    /// <summary>
+    /// The failure path parks too: a volume that failed under a standing hold waits at the gate for the backoff
+    /// and the hold both to lift, and while it waits it is as still as one parked on purpose.
+    /// </summary>
+    [Fact]
+    public async Task A_Failure_Wait_Under_A_User_Pause_Is_Not_In_Hand()
+    {
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromMilliseconds(10)], steady: TimeSpan.FromMilliseconds(10),
+            patience: TimeSpan.FromHours(1));
+        using var work = gate.BeginWork();
+        gate.PauseByUser();
+
+        var waiting = gate.WaitAsync(new IOException("blip"), CancellationToken.None);
+        await Task.Delay(100);   // the backoff timer has fired by now; the hold keeps the worker parked
+        Assert.False(waiting.IsCompleted);
+        Assert.True(gate.IsSettled);
+
+        gate.ResumeByUser();
+        Assert.True(await waiting.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(gate.IsSettled);
+    }
+
+    /// <summary>
+    /// A worker blocked on something other than the gate — the compressor waiting for staging room that only an
+    /// upload can free, and no upload is coming while the hold stands — steps out of the count for the wait.
+    /// </summary>
+    [Fact]
+    public void Idling_Inside_An_Item_Steps_Out_Of_The_Count()
+    {
+        using var gate = new PauseGate();
+        using var work = gate.BeginWork();
+        gate.PauseByUser();
+        Assert.False(gate.IsSettled);
+
+        using (gate.Idle())
+            Assert.True(gate.IsSettled, "blocked on room nobody will free is as still as parked");
+        Assert.False(gate.IsSettled, "back from the wait, the item is in hand again");
+    }
+
+    /// <summary>The three halves the browser draws from come out of one read, for the reason Snapshot exists at all.</summary>
+    [Fact]
+    public void Snapshot_Reports_Settled_Beside_The_Other_Two()
+    {
+        using var gate = new PauseGate();
+        var work = gate.BeginWork();
+        gate.PauseByUser();
+        var (current, byUser, settled) = gate.Snapshot();
+        Assert.Equal(PauseSource.User, current!.Source);
+        Assert.True(byUser);
+        Assert.False(settled);
+
+        work.Dispose();
+        Assert.True(gate.Snapshot().Settled);
     }
 }

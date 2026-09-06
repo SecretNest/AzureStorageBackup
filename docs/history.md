@@ -58,6 +58,7 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 08-18 | A real Pause, and a stop that abandons the stages whose in-flight work it was about to discard | [run-lifecycle.md](run-lifecycle.md) |
 | 08-18 | A resume that answers "already uploaded?" from a `stat` instead of re-reading every candidate file | [content-identity.md](content-identity.md), [run-lifecycle.md](run-lifecycle.md) |
 | 08-18 | A store-only unencrypted blob uploaded from the source rather than from a staged copy | [pipeline.md](pipeline.md) |
+| 09-07 | A pause that takes effect within a volume rather than a file, reaches the pack loop's every group and the wrap-up, and reads "Pausing…" until it has taken effect | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
 
 ## Working conventions
 

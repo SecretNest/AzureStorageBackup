@@ -138,6 +138,14 @@ public sealed class BackupRunState
     public bool PausedByUser => Control?.Gate.IsPausedByUser ?? false;
 
     /// <summary>
+    /// Whether the operator's hold has taken effect: it stands and nothing is in hand any more. False while the
+    /// hold is up but the volumes on the wire and the file under 7z are still finishing — the run is
+    /// <b>pausing</b>, and the browser says so rather than "Paused" over a run visibly still uploading. See
+    /// <see cref="PauseGate.IsSettled"/>.
+    /// </summary>
+    public bool PauseSettled => Control?.Gate.IsSettled ?? false;
+
+    /// <summary>
     /// The strongest stop asked of this run so far, or <see cref="StopKind.None"/>. Read live off the control for
     /// the same reason <see cref="PausedByUser"/> is: it is the run's own state, and a copy would go stale.
     /// <para>
@@ -151,12 +159,13 @@ public sealed class BackupRunState
     public StopKind StopRequested => Control?.Stop ?? StopKind.None;
 
     /// <summary>
-    /// <see cref="Pause"/> and <see cref="PausedByUser"/> as of one instant. Use this wherever both are reported
-    /// together: read one after the other they come from two separate acquisitions of the gate's lock, and a
-    /// Pause or Resume landing in between yields a pair that was never true — see <see cref="PauseGate.Snapshot"/>
-    /// for what each mixture renders as. The two properties stay for callers that want only one of them.
+    /// <see cref="Pause"/>, <see cref="PausedByUser"/> and <see cref="PauseSettled"/> as of one instant. Use this
+    /// wherever they are reported together: read one after the other they come from separate acquisitions of the
+    /// gate's lock, and a Pause or Resume landing in between yields a mixture that was never true — see
+    /// <see cref="PauseGate.Snapshot"/> for what each mixture renders as. The properties stay for callers that
+    /// want only one of them.
     /// </summary>
-    internal (PauseInfo? Pause, bool ByUser) PauseView => Control?.Gate.Snapshot() ?? (null, false);
+    internal (PauseInfo? Pause, bool ByUser, bool Settled) PauseView => Control?.Gate.Snapshot() ?? (null, false, false);
 
     /// <summary>
     /// Internal machinery, not part of the HTTP contract: the original exception on failure. Set alongside Error in
@@ -188,6 +197,14 @@ public sealed record BackupRunResponse(
     // Sibling of Pause, not a field on it — see BackupRunState.PausedByUser for why the two can disagree.
     bool PausedByUser = false,
     /// <summary>
+    /// Whether that hold has taken effect (see <see cref="BackupRunState.PauseSettled"/>). Published beside
+    /// <see cref="PausedByUser"/> rather than folded into it because the browser draws two different labels from
+    /// the pair: "Pausing…" while the volumes on the wire and the file under 7z finish, "Paused" once they have.
+    /// A browser older than this field ignores it; a backend older than it sends nothing, which the browser reads
+    /// as settled — the only reading it had before.
+    /// </summary>
+    bool PauseSettled = false,
+    /// <summary>
     /// The strongest stop asked of this run so far, by name; <c>"None"</c> when nobody has. See
     /// <see cref="BackupRunState.StopRequested"/> for why a wind-down has to be reported separately from the
     /// status — the run says <see cref="RunStatus.Running"/> for the whole of it, and that is minutes.
@@ -218,11 +235,11 @@ public sealed record BackupRunResponse(
     {
         // One read, not two: this response is the only place the two halves are published side by side, and the
         // browser draws its pause label from the pair. See BackupRunState.PauseView.
-        var (pause, byUser) = s.PauseView;
+        var (pause, byUser, settled) = s.PauseView;
         return new(s.Status.ToString(), s.Progress, s.Version, s.UnreadableFiles, s.Error, s.StartedAt, s.CompletedAt,
             s.RunId, pause, s.SuspendReason?.ToString(),
             s.NewFiles, s.ModifiedFiles, s.DeletedFiles, s.ChangedBytes, s.UploadedBytes, s.DeletedBytes,
-            byUser, s.StopRequested.ToString(), s.SkipReason);
+            byUser, settled, s.StopRequested.ToString(), s.SkipReason);
     }
 }
 

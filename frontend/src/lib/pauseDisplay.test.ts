@@ -80,4 +80,45 @@ describe('pauseDisplay', () => {
     const d = pauseDisplay(pause(PauseSource.User, 'Paused by the user.'), true)!
     expect(d.label).toBe('Paused')
   })
+
+  /**
+   * The hold is up from the button press, but the volumes on the wire and the file under 7z finish first.
+   * Until the backend says the last of them has landed, the row says so — "Paused" over a run visibly still
+   * uploading read as the button having done nothing. Resume stays on offer: lifting a hold that has not
+   * taken effect is as safe as lifting one that has.
+   */
+  test('a hold that has not taken effect yet reads as Pausing, with Resume still on offer', () => {
+    const d = pauseDisplay(pause(PauseSource.User, 'Paused by the user.'), true, false)!
+    expect(d.label).toBe('Pausing…')
+    expect(d.canResume).toBe(true)
+    expect(d.canRetryNow).toBe(false)
+  })
+
+  test('once settled, the same hold reads as Paused', () => {
+    expect(pauseDisplay(pause(PauseSource.User, 'Paused by the user.'), true, true)!.label).toBe('Paused')
+  })
+
+  /** The composed case keeps both facts while the hold is still taking effect. */
+  test('a hold taking effect on top of a live backoff says Pausing and the error', () => {
+    const d = pauseDisplay(pause(PauseSource.TransientError, 'network down'), true, false)!
+    expect(d.label).toContain('Pausing…')
+    expect(d.label).toContain('network down')
+    expect(d.canResume).toBe(true)
+  })
+
+  /**
+   * A backend older than `pauseSettled` sends nothing, and the page passes `?? true`: that backend's pause
+   * reads "Paused" the moment the hold is up, which is the only reading it ever had. Settled-by-default is
+   * what keeps an old backend from showing "Pausing…" forever.
+   */
+  test('with no settled reading the hold reads as Paused, as it did before the field existed', () => {
+    expect(pauseDisplay(pause(PauseSource.User, 'Paused by the user.'), true)!.label).toBe('Paused')
+  })
+
+  /** A transient-error pause nobody pressed is never "pausing": nothing about it is waiting on the operator. */
+  test('settled does not touch the transient-error wording', () => {
+    const d = pauseDisplay(pause(PauseSource.TransientError, 'network down'), false, false)!
+    expect(d.label).toBe('Paused — network down')
+    expect(d.canRetryNow).toBe(true)
+  })
 })
