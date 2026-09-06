@@ -347,7 +347,13 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
     /// that one ends only when an <b>upload</b> frees pool space, the lock's ends when a producer lets go, and the operator's response to
     /// the two is opposite — see <see cref="StageProgress.WaitingOnRoom"/>. The phase is judged when the wait begins; room may come and
     /// go while the lock stays busy, and re-publishing every flip would cost far more than the precision is worth.</param>
-    private async Task AcquireCompressLockAsync(StagingLease? lease, bool waitForRoom, CancellationToken ct, StageTracker? tracker)
+    /// <param name="whileWaiting">Taken when this call really does queue up, and disposed once the lock is in hand
+    /// — the backup's way of stepping out of its pause accounting for the wait (<c>PauseGate.Idle</c>): a wait for
+    /// room is a wait for an upload, and under a standing pause no upload is coming. Not invoked on the common
+    /// path where the lock is free.</param>
+    private async Task AcquireCompressLockAsync(
+        StagingLease? lease, bool waitForRoom, CancellationToken ct, StageTracker? tracker,
+        Func<IDisposable?>? whileWaiting = null)
     {
         Waiter w;
         bool roomWait;
@@ -388,7 +394,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
                 tracker?.BeginRoomWait();
             try
             {
-                await WaitInQueueAsync(_lockQueue, w, ct);
+                using (whileWaiting?.Invoke())
+                    await WaitInQueueAsync(_lockQueue, w, ct);
             }
             finally
             {
@@ -475,8 +482,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         CancellationToken ct = default,
         StageTracker? tracker = null,
         string? label = null,
-        long labelBytes = 0)
-        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: true, label, labelBytes);
+        long labelBytes = 0,
+        Func<IDisposable?>? whileWaiting = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: true, label, labelBytes, whileWaiting);
 
     /// <summary>
     /// Stage an archive **without waiting for room**: same files, same accounting, same global compression lock —
@@ -510,8 +518,9 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         CancellationToken ct = default,
         StageTracker? tracker = null,
         string? label = null,
-        long labelBytes = 0)
-        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: false, label, labelBytes);
+        long labelBytes = 0,
+        Func<IDisposable?>? whileWaiting = null)
+        => StageCoreAsync(produce, lease, ct, tracker, waitForRoom: false, label, labelBytes, whileWaiting);
 
     private async Task<StagedItem> StageCoreAsync(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce,
@@ -522,7 +531,8 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
         // Opaque to this class on purpose: `produce` is a closure and this area has no idea what is inside it, so
         // the only place that can name the work is the caller that built both.
         string? label = null,
-        long labelBytes = 0)
+        long labelBytes = 0,
+        Func<IDisposable?>? whileWaiting = null)
     {
         // Count as "queued" the moment we enter here: the compression lock is global, so we will most likely idle a while, and
         // idling is indistinguishable to the user from "not picked up yet". Only flip to "preparing" once we hold the lock.
@@ -534,7 +544,7 @@ public sealed class StagingArea(string compressTempDir, string stagedTempDir, Fu
             // several backups in parallel that is the root of the disease: a run blocked by staging sits idle clutching the global
             // compression lock, and other runs cannot even start compressing. Handing anyone more quota saves nobody; it just deadlocks for a different reason.
             // Room and lock are granted together by the dispatcher, so there is no window between them for someone else to use the room up.
-            await AcquireCompressLockAsync(lease, waitForRoom, ct, tracker);
+            await AcquireCompressLockAsync(lease, waitForRoom, ct, tracker, whileWaiting);
             try
             {
                 try

@@ -397,6 +397,97 @@ public sealed class VolumeBlobIOTests
         Assert.Equal(1, up.Max);
     }
 
+    /// <summary>Each upload waits until it is let go, one gate per volume name.</summary>
+    private sealed class HeldUploader : IBlobUploader
+    {
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, TaskCompletionSource> _holds = new();
+
+        public TaskCompletionSource Hold(string name) =>
+            _holds.GetOrAdd(name, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+
+        public int Started => _holds.Count;
+
+        public async Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+        {
+            await Hold(blobName).Task.WaitAsync(ct);
+            return true;
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The backup's pause is volume-granular from here on, and this is the contract it rests on. A family of six
+    /// on a two-slot gate: two on the wire and two more queued for slots (the window's relief line) when the hold
+    /// goes up. The two on the wire finish; the two already queued win their slots next and must <b>give them
+    /// back</b> rather than send — nothing past the two on the wire goes up while the hold stands, and the slots
+    /// are free for other runs. The in-hand token (<c>volumeWork</c>) covers exactly the volumes that sent: taken
+    /// after the hold check, disposed when the volume lands, never taken for one that parked — so "pausing" on
+    /// screen ends when the last one on the wire lands, not when the whole file has gone up.
+    /// </summary>
+    [Fact]
+    public async Task A_Closed_Gate_Lets_The_Volumes_On_The_Wire_Finish_And_Holds_The_Rest()
+    {
+        var up = new HeldUploader();
+        var gate = new VolumeUploadGate(2);
+        var files = Enumerable.Range(1, 6).Select(i => $"/tmp/a.{i:000}").ToList();
+
+        var held = false;
+        var opened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var inHand = 0;
+        var taken = 0;
+        Task Park(CancellationToken ct) => Volatile.Read(ref held) ? opened.Task.WaitAsync(ct) : Task.CompletedTask;
+        IDisposable Work()
+        {
+            Interlocked.Increment(ref taken);
+            Interlocked.Increment(ref inHand);
+            return new Disposer(() => Interlocked.Decrement(ref inHand));
+        }
+
+        var run = VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", files, AccessTier.Hot, scope: Scope(gate, perItem: 2),
+            beforeVolume: Park, volumeHeld: () => Volatile.Read(ref held), volumeWork: Work);
+
+        // Two on the wire, two queued behind them at the slot gate, every one of them past beforeVolume.
+        for (var i = 0; i < 200 && up.Started < 2; i++) await Task.Delay(10);
+        await Task.Delay(100);
+        Assert.Equal(2, up.Started);
+        Assert.Equal(2, inHand);
+        Assert.Equal(0, gate.Free);
+
+        // The hold goes up, then the two on the wire land.
+        Volatile.Write(ref held, true);
+        up.Hold("data/h.001").SetResult();
+        up.Hold("data/h.002").SetResult();
+        for (var i = 0; i < 200 && Volatile.Read(ref inHand) > 0; i++) await Task.Delay(10);
+        await Task.Delay(200);
+        Assert.Equal(0, inHand);
+        Assert.Equal(2, up.Started);   // the relief line won its slots and gave them back instead of sending
+        Assert.Equal(2, taken);        // ...and was never counted as in hand
+        Assert.Equal(2, gate.Free);    // a paused family sits on no slot
+        Assert.False(run.IsCompleted);
+
+        Volatile.Write(ref held, false);
+        opened.SetResult();
+        for (var i = 0; i < 200 && up.Started < 6; i++) await Task.Delay(10);
+        foreach (var f in Enumerable.Range(3, 4)) up.Hold($"data/h.{f:000}").SetResult();
+        await run.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(6, taken);
+        Assert.Equal(0, inHand);
+        Assert.Equal(2, gate.Free);
+    }
+
+    private sealed class Disposer(Action onDispose) : IDisposable
+    {
+        public void Dispose() => onDispose();
+    }
+
     [Fact]
     public async Task Single_Volume_Uploads_Base_Name()
     {

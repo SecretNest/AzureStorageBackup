@@ -455,6 +455,11 @@ export interface BackupRun {
   // the operator's Pause had done nothing. This flag stays true for as long as the hold does, regardless of
   // what `pause.source` says at the moment.
   pausedByUser: boolean
+  // Whether that hold has taken effect: it stands and nothing is in hand any more. False from the button press
+  // until the volumes on the wire and the file under 7z have finished — minutes on a slow link — and the row says
+  // "Pausing…" across that stretch rather than "Paused" over a run visibly still uploading. Absent from a backend
+  // older than this field, which pauseDisplay reads as settled: the only reading that backend ever had.
+  pauseSettled?: boolean
   // The strongest stop asked of this run so far, 'None' when nobody has. Reported because winding down takes
   // minutes with the status still reading 'Running', and without it the fact that a stop had been asked for
   // lived only in the tab that asked — see windDownFromServer.

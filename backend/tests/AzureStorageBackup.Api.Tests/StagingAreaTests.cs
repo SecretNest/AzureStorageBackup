@@ -102,6 +102,60 @@ public sealed class StagingAreaTests : IDisposable
     }
 
     /// <summary>
+    /// A compressor queued behind the lock or the room ceiling is not moving, and under a standing pause it may
+    /// never move — room is freed by uploads, and no upload is coming. The hook is how it steps out of the pause
+    /// accounting for exactly that stretch: taken only when the call really queues, given back with the lock.
+    /// </summary>
+    [Fact]
+    public async Task A_Compressor_Queued_For_The_Lock_Steps_Aside_For_The_Wait()
+    {
+        using var area = Area(limit: 1_000_000);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holder = area.StageAsync(async (dir, ct) =>
+        {
+            await release.Task.WaitAsync(ct);
+            var path = Path.Combine(dir, "a");
+            await File.WriteAllBytesAsync(path, new byte[10], ct);
+            return (IReadOnlyList<string>)[path];
+        });
+
+        var waiting = 0;
+        var waited = 0;
+        var waitingWhenProduced = -1;
+        var queued = area.StageAsync(async (dir, ct) =>
+        {
+            waitingWhenProduced = Volatile.Read(ref waiting);
+            var path = Path.Combine(dir, "b");
+            await File.WriteAllBytesAsync(path, new byte[10], ct);
+            return (IReadOnlyList<string>)[path];
+        }, whileWaiting: () =>
+        {
+            Interlocked.Increment(ref waited);
+            Interlocked.Increment(ref waiting);
+            return new Stepped(() => Interlocked.Decrement(ref waiting));
+        });
+
+        for (var i = 0; i < 200 && Volatile.Read(ref waited) == 0; i++) await Task.Delay(10);
+        Assert.Equal(1, waiting);   // queued behind the holder, and says so
+        Assert.False(queued.IsCompleted);
+
+        release.SetResult();
+        await Task.WhenAll(holder, queued).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, waitingWhenProduced);   // back in hand before its own 7z ran
+        Assert.Equal(1, waited);
+
+        // The common path — lock free, room to spare — queues nothing and takes no token.
+        var direct = 0;
+        await area.StageAsync(Produce("c", 10), whileWaiting: () => { direct++; return null; });
+        Assert.Equal(0, direct);
+    }
+
+    private sealed class Stepped(Action back) : IDisposable
+    {
+        public void Dispose() => back();
+    }
+
+    /// <summary>
     /// "Preparing" in the progress report counts only the item that actually holds the archive lock; whatever queues behind it
     /// is neither "preparing" nor "queued", but a column of its own (<see cref="StageProgress.WaitingOnArchive"/>).
     /// <para>

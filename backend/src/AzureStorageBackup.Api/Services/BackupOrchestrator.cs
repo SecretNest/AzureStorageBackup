@@ -187,6 +187,10 @@ public sealed class BackupOrchestrator(
         /// <summary>This run's seat in the staging area: the staging-disk quota is split evenly across the **runs currently in flight**, and seats come and go with runs.</summary>
         public StagingArea.StagingLease Staging => staging;
 
+        /// <summary>The run's handle, for the staging helpers that reach the pause gate through nothing else: a
+        /// compressor queued for room steps out of the pause accounting for the wait (see <see cref="IdleOf"/>).</summary>
+        public BackupRunControl? Control { get; init; }
+
         private long _uploadedBytes;
         private readonly string _packTag = Guid.NewGuid().ToString("N")[..8];
         private int _packSeq;
@@ -636,8 +640,12 @@ public sealed class BackupOrchestrator(
         progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
         var scanTracker = new StageTracker("Scanning", total: 0, d =>   // the total is only known once the scan finishes, hence total=0
             progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0) { Detail = d }));
-        var scan = await BeforeUploadAsync(
-            t => scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, t, scanTracker));
+        // In hand for the pause accounting: the scan consults no gate and runs to its end, and for as long as it
+        // does a hold pressed against it is pausing rather than paused (the diff parks at its first callback).
+        ScanResult scan;
+        using (control?.Gate.BeginWork())
+            scan = await BeforeUploadAsync(
+                t => scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, t, scanTracker));
         scanTracker.Complete();
 
         // The scope filtered out every single file: diff would call everything in the previous version deleted and
@@ -740,7 +748,7 @@ public sealed class BackupOrchestrator(
 
         // The seat is held for the whole run: the staging-disk quota is split evenly across the runs currently holding a seat, and it is returned when the run ends.
         using var stagingLease = staging.AcquireLease();
-        var state = new RunState(stagingLease);
+        var state = new RunState(stagingLease) { Control = control };
         var reporter = new PipelineReporter(progress);
         // The diff declares no byte workload; remaining time is extrapolated from the **item count** (see
         // StageTracker.Eta): this stage's cost is mostly spread over "at least one stat per entry", and only the
@@ -1018,6 +1026,9 @@ public sealed class BackupOrchestrator(
                     var handed = false;
                     try
                     {
+                        // In hand from here to the hand-off: the probe reads the file, and that read runs to its
+                        // end whatever the gate says (see PauseGate.BeginWork).
+                        using var inHand = control?.Gate.BeginWork();
                         if (item.Single is { } single)
                         {
                             var localPath = Local(request, single.Path);
@@ -1308,7 +1319,11 @@ public sealed class BackupOrchestrator(
                         if (control is { Stop: not StopKind.None })
                             continue;
 
-                        await StageProbedAsync(probed, feeding.Token);
+                        // In hand for the length of the item: the file under 7z finishes whatever the gate says.
+                        // The one wait inside it the pause can make endless — for staging room, freed only by
+                        // uploads — steps out on its own (see IdleOf).
+                        using (control?.Gate.BeginWork())
+                            await StageProbedAsync(probed, feeding.Token);
                     }
                     finally
                     {
@@ -1383,7 +1398,10 @@ public sealed class BackupOrchestrator(
                         if (control is { Stop: not StopKind.None })
                             continue;
 
-                        await entry.RunAsync(working.Token);
+                        // In hand for the length of the item, with the family upload inside it counted per volume
+                        // instead (see PauseGate.BeginWork and the two VolumeBlobIO.UploadAsync calls).
+                        using (control?.Gate.BeginWork())
+                            await entry.RunAsync(working.Token);
                     }
                     finally
                     {
@@ -1532,8 +1550,12 @@ public sealed class BackupOrchestrator(
             //
             // Nothing is claimed at this point: the item this callback may go on to build does not exist yet, and
             // the local Enqueue that books it into the ledger is only ever reached from below this wait.
+            //
+            // ParkAsync rather than WaitIfPausedAsync: the diff is one long item (in hand from DiffAsync's first
+            // read to its last, see below), and a callback parked here has stopped reading the disk — it must not
+            // keep the run reading "pausing" for as long as the hold lasts.
             if (control is not null)
-                await control.Gate.WaitIfPausedAsync(token);
+                await control.Gate.ParkAsync(token);
 
             var changed = c.Kind is ChangeKind.Added or ChangeKind.Modified && c.Current is not null;
             if (changed)
@@ -1716,9 +1738,12 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                diff = await differ.DiffAsync(
-                    request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync,
-                    DeferFullHash);
+                // In hand for the whole walk: between two callbacks the differ is reading the disk (hashing a
+                // changed file can be minutes), and only the callback's own park (OnChangeAsync) steps out.
+                using (control?.Gate.BeginWork())
+                    diff = await differ.DiffAsync(
+                        request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync,
+                        DeferFullHash);
 
                 // Final sweep: seal the boxes that never filled up. The two cross-directory lanes may each have a
                 // remainder; the per-directory ones were in theory all sealed when their counter hit zero, and this
@@ -1916,10 +1941,18 @@ public sealed class BackupOrchestrator(
             // interleaved). Sorting here is purely for consistency with the file path's discipline — it affects the
             // solid compression ratio and the group split points, not correctness.
             var pool = side.OrderBy(f => f.Path, StringComparer.Ordinal).ToList();
-            await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
-                storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                uploadTracker, state, control, ct);
+            // In hand for the pause accounting — this stretch compresses and uploads on the run's own thread,
+            // with the pipeline's loops all gone — and ProcessPackAsync's group loop is where it parks.
+            using (control?.Gate.BeginWork())
+                await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
+                    storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
+                    uploadTracker, state, control, ct);
         }
+        // A stop pressed while the re-run above was going: its group loop broke off, and what it did not send
+        // has no storage reference — written into an index, that is silent data loss. Same rule as the check
+        // above the re-run: a stopped run writes no index. Nothing is in flight to purge; the journal is flushed.
+        if (control is { Stop: var stopAfterRerun } && stopAfterRerun != StopKind.None)
+            throw await SettleStopAsync(stopAfterRerun);
 
         // Same as with scanning/diffing: without forcing a terminal report, the bytes from the last batch would
         // never be published — throttling holds them inside the final window, and there is no further report after that.
@@ -2781,9 +2814,13 @@ public sealed class BackupOrchestrator(
                 request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, uploadTracker, token);
         // A single file names itself. Not the staged name a line above — that is a hash of the path, chosen for not
         // colliding in the temp area, and it says nothing to the person reading the row.
+        // The wait for room or for the lock steps out of the pause accounting (IdleOf): room is freed by uploads,
+        // and under a standing hold none is coming.
         var staged = bypassQuota
-            ? await staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, entryName, before.Length)
-            : await staging.StageAsync(produce, state.Staging, ct, uploadTracker, entryName, before.Length);
+            ? await staging.StageWithoutBackpressureAsync(
+                produce, state.Staging, ct, uploadTracker, entryName, before.Length, IdleOf(state.Control))
+            : await staging.StageAsync(
+                produce, state.Staging, ct, uploadTracker, entryName, before.Length, IdleOf(state.Control));
 
         return (Identity(streaming, mtime, raw), staged, null);
     }
@@ -2871,16 +2908,24 @@ public sealed class BackupOrchestrator(
                 existingVolumes = existingVolumes.ToDictionary(
                     kv => kv.Key, kv => kv.Value with { Label = null }, StringComparer.Ordinal);
             control?.TrackInFlight(blobRef);
-            await VolumeBlobIO.UploadAsync(
-                uploader, request.Account, request.Container, blobRef, files,
-                request.DataTier, request.Options.Upload, ct, meta, uploadScope,
-                // Drop each volume from the temp disk as soon as it is uploaded. Never on the raw route: what was
-                // "uploaded" there is the user's own file. (ReleaseFile ignores a path it never staged, so this is
-                // belt as well as braces — but a callback that deletes files should not be handed a path it has no
-                // business deleting on the strength of a lookup miss.)
-                onVolumeUploaded: inPlace is null ? staging.ReleaseFile : null,
-                label: sourceLabel,                      // show the source file path in the UI, not the content-addressed blob name
-                existingVolumes: existingVolumes);
+            // The pause is volume-granular here: each volume asks the gate before it takes a slot, so a hold lets
+            // the volumes on the wire land and holds the rest of the family where it is — a hundred-gigabyte file
+            // used to run to its end first. The family stretch steps out of the in-hand count and each volume
+            // steps in for itself, so "pausing" ends when the last one on the wire lands (PauseGate.BeginWork).
+            using (control?.Gate.Idle())
+                await VolumeBlobIO.UploadAsync(
+                    uploader, request.Account, request.Container, blobRef, files,
+                    request.DataTier, request.Options.Upload, ct, meta, uploadScope,
+                    // Drop each volume from the temp disk as soon as it is uploaded. Never on the raw route: what was
+                    // "uploaded" there is the user's own file. (ReleaseFile ignores a path it never staged, so this is
+                    // belt as well as braces — but a callback that deletes files should not be handed a path it has no
+                    // business deleting on the strength of a lookup miss.)
+                    onVolumeUploaded: inPlace is null ? staging.ReleaseFile : null,
+                    label: sourceLabel,                      // show the source file path in the UI, not the content-addressed blob name
+                    existingVolumes: existingVolumes,
+                    beforeVolume: ParkOf(control),
+                    volumeHeld: HeldOf(control),
+                    volumeWork: WorkOf(control));
 
             // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
             // half of that pair has moved since, the bytes just written under this content address are not
@@ -3164,6 +3209,23 @@ public sealed class BackupOrchestrator(
     /// <param name="ct">**The run's own** cancellation token, nothing else. The transient check uses it to tell
     /// "the network hiccuped" apart from "the user pressed cancel" — pass the wrong one and the cancel gets
     /// swallowed as a hiccup, silently making the button do nothing.</param>
+    /// <summary>
+    /// The three hooks the pause accounting reaches the shared helpers through, null when the run has no control
+    /// (tests that drive the orchestrator bare). See <see cref="PauseGate.BeginWork"/> for what is counted and why
+    /// the unit is the volume rather than the file.
+    /// </summary>
+    private static Func<IDisposable?>? IdleOf(BackupRunControl? control) =>
+        control is null ? null : () => control.Gate.Idle();
+
+    private static Func<IDisposable?>? WorkOf(BackupRunControl? control) =>
+        control is null ? null : () => control.Gate.BeginWork();
+
+    private static Func<CancellationToken, Task>? ParkOf(BackupRunControl? control) =>
+        control is null ? null : control.Gate.WaitIfPausedAsync;
+
+    private static Func<bool>? HeldOf(BackupRunControl? control) =>
+        control is null ? null : () => control.Gate.IsHeld;
+
     private static async Task WithPauseAsync(BackupRunControl? control, Func<Task> body, CancellationToken ct)
     {
         while (true)
@@ -3234,6 +3296,18 @@ public sealed class BackupOrchestrator(
 
         while (queue.Count > 0)
         {
+            // Every group asks the stop intent and the gate, not only the loop that took the item. A pool is
+            // normally one group — the diff seals boxes to the planner's limits — but this loop also grows: a
+            // member that changed under 7z is re-queued, and the wrap-up hands whole subtrees of dangling
+            // aliases through here at once, serially, after every pipeline loop has parked or exited. Asked
+            // only at the item, a Pause pressed against that wrap-up held nothing while it compressed and sent
+            // group after group, and a Suspend against it ran to the index write. The stop needs no settling
+            // here: a stopped run writes no index, and the caller that must settle it does (see the wrap-up).
+            if (control is { Stop: not StopKind.None })
+                break;
+            if (control is not null)
+                await control.Gate.ParkAsync(ct);
+
             // Take one group of unprocessed, within-limits files from the directory (at least one). All three
             // limits share GroupIsFull — this is the last check before handing off to 7z, and the MaxPackPathBytes
             // one directly decides whether argv blows up (E2BIG).
@@ -3740,9 +3814,11 @@ public sealed class BackupOrchestrator(
         var label = TransferLabel.Folders(entries);
         // An uploader recompressing a group it has to resend must not wait on the pool it is itself the only source
         // of releases for — see StagingArea.StageWithoutBackpressureAsync.
+        // The wait for room or for the lock steps out of the pause accounting — see StageBlobAsync.
         return bypassQuota
-            ? staging.StageWithoutBackpressureAsync(produce, state.Staging, ct, uploadTracker, label)
-            : staging.StageAsync(produce, state.Staging, ct, uploadTracker, label);
+            ? staging.StageWithoutBackpressureAsync(
+                produce, state.Staging, ct, uploadTracker, label, whileWaiting: IdleOf(state.Control))
+            : staging.StageAsync(produce, state.Staging, ct, uploadTracker, label, whileWaiting: IdleOf(state.Control));
     }
 
     /// <returns>The byte size of each of this pack's volumes (in .001..N order; recorded for verifying volume completeness/size).</returns>
@@ -3768,13 +3844,18 @@ public sealed class BackupOrchestrator(
             // no splice can survive that, and whatever the first attempt landed unchanged is salvaged for free.
             var existingVolumes = await FetchFamilyLabelsAsync(request, blobName, staged.Files.Count, staged.Bytes, uploadTracker, ct);
             control?.TrackInFlight(blobName);
-            await VolumeBlobIO.UploadAsync(
-                uploader, request.Account, request.Container, blobName, staged.Files,
-                request.DataTier, request.Options.Upload, ct, scope: uploadScope,
-                onVolumeUploaded: staging.ReleaseFile,   // drop each volume from the temp disk as soon as it is uploaded
-                // A box holds hundreds of files, too many to list — report the pack id and the member count.
-                label: $"pack {packId} ({memberCount} files)",
-                existingVolumes: existingVolumes);
+            // Volume-granular pause and per-volume in-hand accounting, as for a single file — see the note there.
+            using (control?.Gate.Idle())
+                await VolumeBlobIO.UploadAsync(
+                    uploader, request.Account, request.Container, blobName, staged.Files,
+                    request.DataTier, request.Options.Upload, ct, scope: uploadScope,
+                    onVolumeUploaded: staging.ReleaseFile,   // drop each volume from the temp disk as soon as it is uploaded
+                    // A box holds hundreds of files, too many to list — report the pack id and the member count.
+                    label: $"pack {packId} ({memberCount} files)",
+                    existingVolumes: existingVolumes,
+                    beforeVolume: ParkOf(control),
+                    volumeHeld: HeldOf(control),
+                    volumeWork: WorkOf(control));
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
             if (existingVolumes is not null)

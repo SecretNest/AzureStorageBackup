@@ -240,7 +240,7 @@ Three buttons sit on a running backup:
 
 | Button | What it does |
 | --- | --- |
-| **Pause** | Holds the run where it is. Each stage finishes the one item it has in hand and then stops; nothing is discarded and nothing is flushed. The run stays **Running**, holding its staged output, until you press **Resume**. |
+| **Pause** | Holds the run where it is. The volumes already on the wire land and the file 7z is working on finishes; everything else stops where it stands, including the rest of a file whose first volumes were sent. Nothing is discarded and nothing is flushed. The row reads **Pausing…** until the last piece in hand has landed, then **Paused**; the run stays **Running**, holding its staged output, until you press **Resume**. |
 | **Suspend** | Stops taking new work, lets the transfers already in flight finish, flushes the journal, and hands back the compression lock and the staging quota. The run ends as **Suspended**. |
 | **Cancel** | Asks how first. *Stop now* kills the in-flight transfers immediately and deletes the half-uploaded volumes they left behind; *Finish current files* lets each file that is already uploading finish all of its volumes. The run ends as **Canceled**. |
 
