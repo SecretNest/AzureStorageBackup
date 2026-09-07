@@ -76,6 +76,12 @@ public sealed partial class RunWorkDb
         $"SELECT {SelectResumeBlobColumns} FROM resume_blobs " +
         "WHERE full_hash=@full_hash AND length=@length AND head_hash=@head_hash AND tail_hash=@tail_hash";
 
+    /// <summary>The prescreen's journal half. It asks less than <c>JournalResume.ConfirmedBlobs</c> does — a record
+    /// with a head but no tail answers yes here and would not have been a confirmed block — because the prescreen is
+    /// allowed to be generous: a false positive costs one extra read of a file, a miss costs a whole compression.</summary>
+    private const string SelectResumeHeadSeenSql =
+        "SELECT EXISTS (SELECT 1 FROM resume_blobs WHERE length=@length AND head_hash=@head_hash)";
+
     private const string SelectResumePackSql =
         "SELECT ref, store_only, volumes, volume_sizes FROM resume_packs WHERE members_key=@members_key";
 
@@ -231,6 +237,18 @@ public sealed partial class RunWorkDb
         Set(command, "@tail_hash", tailHash);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadResumeBlob(reader) : null;
+    }
+
+    /// <summary>Whether the adopted journal already holds a block with this length and head hash: the second of the
+    /// dedup prescreen's three sources (the catalog's retained versions and this run's own reserved heads are the
+    /// other two).</summary>
+    public async Task<bool> ResumeHeadSeenAsync(long length, string headHash, CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectResumeHeadSeenSql);
+        Set(command, "@length", length);
+        Set(command, "@head_hash", headHash);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct)) != 0;
     }
 
     private async Task<JournalRecord?> ResumeBlobAsync(

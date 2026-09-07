@@ -3,9 +3,16 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
+/// <summary>
+/// The resolver's own behaviour, asked of a resolver built the way the pipeline builds it — over a catalog holding
+/// these versions and a work database holding the adopted journal (see <see cref="TestResolver"/>). What each test
+/// pins is unchanged from when those versions were dictionaries; only where the answers come from has moved.
+/// </summary>
 public sealed class LocalDedupResolverTests
 {
     private static readonly BlobAddressScheme Plain = new(null, null);
+
+    private static CancellationToken Ct => CancellationToken.None;
 
     private static VersionIndex IndexWith(params IndexEntry[] entries) =>
         new() { Version = 1, Entries = [.. entries] };
@@ -21,10 +28,11 @@ public sealed class LocalDedupResolverTests
     [Fact]
     public async Task Dedups_Against_Prior_Version_Content()
     {
-        var r = LocalDedupResolver.Build(Plain, [IndexWith(
-            Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h", raw: true, volumes: 3))]);
+        var (r, cleanup) = await TestResolver.From(Plain, [IndexWith(
+            Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h", raw: true, volumes: 3))], ct: Ct);
+        await using var _ = cleanup;
 
-        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl");
+        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl", Ct);
 
         Assert.True(res.Exists);
         Assert.Equal("data/xxh128:h", res.Ref);
@@ -44,8 +52,9 @@ public sealed class LocalDedupResolverTests
             Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h"));
         index.UnrecoverablePaths.Add("data/xxh128:h"); // the entry's Path (test helper names paths after refs)
 
-        var r = LocalDedupResolver.Build(Plain, [index]);
-        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl");
+        var (r, cleanup) = await TestResolver.From(Plain, [index], ct: Ct);
+        await using var _ = cleanup;
+        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl", Ct);
 
         Assert.False(res.Exists);                 // not a dedup hit: the content must upload afresh
         Assert.Equal("data/xxh128:h", res.Ref);   // to the same content address — that upload IS the heal
@@ -55,8 +64,9 @@ public sealed class LocalDedupResolverTests
     [Fact]
     public async Task New_Content_Claims_Base_Address()
     {
-        var r = LocalDedupResolver.Build(Plain, []);
-        var res = await r.ResolveAsync("xxh128:new", 10, "xxh128:h", "xxh128:t");
+        var (r, cleanup) = await TestResolver.From(Plain, [], ct: Ct);
+        await using var _ = cleanup;
+        var res = await r.ResolveAsync("xxh128:new", 10, "xxh128:h", "xxh128:t", Ct);
 
         Assert.False(res.Exists);                 // needs uploading
         Assert.Equal("data/xxh128:new", res.Ref);
@@ -67,10 +77,11 @@ public sealed class LocalDedupResolverTests
     public async Task Same_Hash_Different_Content_Avoids_To_Suffix()
     {
         // Existing blob: same hash, length 100. New file has the same hash but length 200 (a collision) → step aside to …~1.
-        var r = LocalDedupResolver.Build(Plain, [IndexWith(
-            Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h"))]);
+        var (r, cleanup) = await TestResolver.From(Plain, [IndexWith(
+            Blob("xxh128:h", 100, "xxh128:hd", "xxh128:tl", "data/xxh128:h"))], ct: Ct);
+        await using var _ = cleanup;
 
-        var res = await r.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2");
+        var res = await r.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2", Ct);
 
         Assert.False(res.Exists);
         Assert.Equal("data/xxh128:h~1", res.Ref); // the fallback name after stepping aside
@@ -78,9 +89,8 @@ public sealed class LocalDedupResolverTests
     }
 
     /// <summary>
-    /// Folded in when Task 10 adopts a journal: blocks in <c>confirmed</c> must get exactly the same dedup
-    /// treatment as blocks in the index. This one covers the first of the three — <c>byContent</c>: a direct
-    /// cross-version dedup hit.
+    /// Blocks in the adopted journal must get exactly the same dedup treatment as blocks in an index. This one
+    /// covers the first of the three — a direct cross-version dedup hit.
     /// </summary>
     [Fact]
     public async Task Confirmed_Blob_Dedups_Like_An_Indexed_One()
@@ -90,9 +100,10 @@ public sealed class LocalDedupResolverTests
             new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
                 new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 2, VolumeSizes: [60, 40])),
         };
-        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+        var (r, cleanup) = await TestResolver.From(Plain, [], confirmed, Ct);
+        await using var _ = cleanup;
 
-        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl");
+        var res = await r.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl", Ct);
 
         Assert.True(res.Exists);
         Assert.Equal("data/xxh128:h", res.Ref);
@@ -102,8 +113,8 @@ public sealed class LocalDedupResolverTests
     }
 
     /// <summary>
-    /// Second of the three — <c>refs</c>: the address a confirmed block occupies must fend off collisions just the
-    /// same. Feed in byContent but not refs and a new file with the same hash but different content will claim that
+    /// Second of the three — the address a confirmed block occupies must fend off collisions just the same. Let the
+    /// content be found but not the address and a new file with the same hash but different content will claim that
     /// address as if it were free instead of stepping aside to …~1 — which means writing the new content straight
     /// onto the address the confirmed block is holding.
     /// </summary>
@@ -115,10 +126,11 @@ public sealed class LocalDedupResolverTests
             new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
                 new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 1, VolumeSizes: [100])),
         };
-        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+        var (r, cleanup) = await TestResolver.From(Plain, [], confirmed, Ct);
+        await using var _ = cleanup;
 
         // Same hash (the address scheme only looks at fullHash), different content (length/head/tail all changed) → collision, must step aside.
-        var res = await r.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2");
+        var res = await r.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2", Ct);
 
         Assert.False(res.Exists);
         Assert.Equal("data/xxh128:h~1", res.Ref);
@@ -126,36 +138,38 @@ public sealed class LocalDedupResolverTests
     }
 
     /// <summary>
-    /// Third of the three — <c>heads</c>: the prescreen must be able to see confirmed blocks, otherwise a file with
-    /// the same content at a different path gets ruled "no candidate" right at the prescreen and is recompressed for
-    /// nothing (see the notes on JournalResume.ConfirmedBlobs).
+    /// Third of the three — the prescreen must be able to see confirmed blocks, otherwise a file with the same
+    /// content at a different path gets ruled "no candidate" right at the prescreen and is recompressed for nothing
+    /// (see the notes on JournalResume.ConfirmedBlobs).
     /// </summary>
     [Fact]
-    public void Confirmed_Blob_Participates_In_Prescreen()
+    public async Task Confirmed_Blob_Participates_In_Prescreen()
     {
         var confirmed = new[]
         {
             new ConfirmedBlob("xxh128:h", 100, "xxh128:hd", "xxh128:tl",
                 new ResolvedBlob("data/xxh128:h", Raw: true, Volumes: 1, VolumeSizes: [100])),
         };
-        var r = LocalDedupResolver.Build(Plain, [], confirmed);
+        var (r, cleanup) = await TestResolver.From(Plain, [], confirmed, Ct);
+        await using var _ = cleanup;
 
-        Assert.True(r.MayDeduplicate(100, "xxh128:hd"));
+        Assert.True(await r.MayDeduplicateAsync(100, "xxh128:hd", Ct));
     }
 
     [Fact]
     public async Task Same_Run_Duplicate_Waits_For_First_Uploader()
     {
-        var r = LocalDedupResolver.Build(Plain, []);
+        var (r, cleanup) = await TestResolver.From(Plain, [], ct: Ct);
+        await using var _ = cleanup;
 
-        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
         Assert.False(first.Exists); // the first one → claims and uploads
 
-        // The second one with the same content: it must not finish resolving before the first one Completes (it waits on the uploader).
-        var secondTask = r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        // The second one with the same content: it must not finish resolving before the first one completes (it waits on the uploader).
+        var secondTask = r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
         Assert.False(secondTask.IsCompleted);
 
-        first.Complete(raw: true, volumes: 2, volumeSizes: [111, 222]); // the first upload succeeded
+        await first.CompleteAsync(raw: true, volumes: 2, volumeSizes: [111, 222], Ct); // the first upload succeeded
         var second = await secondTask;
 
         Assert.True(second.Exists);                  // same-run dedup
@@ -168,9 +182,10 @@ public sealed class LocalDedupResolverTests
     [Fact]
     public async Task Same_Run_Duplicate_Fails_If_First_Upload_Fails()
     {
-        var r = LocalDedupResolver.Build(Plain, []);
-        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
-        var secondTask = r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        var (r, cleanup) = await TestResolver.From(Plain, [], ct: Ct);
+        await using var _ = cleanup;
+        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        var secondTask = r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
 
         first.Fail(new InvalidOperationException("upload boom"));
 
@@ -186,20 +201,21 @@ public sealed class LocalDedupResolverTests
     [Fact]
     public async Task Retry_After_Failure_Gets_A_Fresh_Claim_Not_The_Stale_One()
     {
-        var r = LocalDedupResolver.Build(Plain, []);
+        var (r, cleanup) = await TestResolver.From(Plain, [], ct: Ct);
+        await using var _ = cleanup;
 
-        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        var first = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
         Assert.False(first.Exists);
         first.Fail(new InvalidOperationException("upload boom"));
 
         // Whole-item retry: the same content identity comes round again and must get a brand-new claim that has
         // never failed, not a replay of last time's exception.
-        var retry = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+        var retry = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
         Assert.False(retry.Exists);
         Assert.Equal(first.Ref, retry.Ref);
 
         // This claim really can be completed by a later upload — proof it is not sharing the previous, already-dead TaskCompletionSource.
-        retry.Complete(raw: false, volumes: 1, volumeSizes: [5]);
+        await retry.CompleteAsync(raw: false, volumes: 1, volumeSizes: [5], Ct);
     }
 
     /// <summary>
@@ -222,11 +238,17 @@ public sealed class LocalDedupResolverTests
     /// Failure is decided by an assertion, not by a timeout: a single <see cref="KeyNotFoundException"/>
     /// turns it red.
     /// </para>
+    /// <para>
+    /// The reservation table is in memory on either kind of resolver — it holds claims that are still uploading, and
+    /// those exist nowhere but this process — so the window is the same one; the database only paces how fast the
+    /// workers come back round to it, which is what the real pipeline does too.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task Losing_The_Claim_Race_Survives_The_Holder_Failing_At_That_Instant()
     {
-        var r = LocalDedupResolver.Build(Plain, []);
+        var (r, cleanup) = await TestResolver.From(Plain, [], ct: Ct);
+        await using var _ = cleanup;
         var stop = DateTime.UtcNow.AddMilliseconds(1500);
         var workers = Math.Max(4, Environment.ProcessorCount);
 
@@ -239,7 +261,7 @@ public sealed class LocalDedupResolverTests
                 {
                     try
                     {
-                        var res = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t");
+                        var res = await r.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
                         // Claim it and kill it on the spot: that one call both withdraws the claim and releases every
                         // latecomer waiting on it, and the address is immediately free for the next taker — that is
                         // where the churn comes from.

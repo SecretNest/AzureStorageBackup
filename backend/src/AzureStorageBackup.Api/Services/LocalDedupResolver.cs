@@ -31,84 +31,48 @@ public sealed record ConfirmedBlob(
 public sealed record PackMemberRef(string PackId, string EntryName, string? TailHash);
 
 /// <summary>
-/// Purely local single-file blob dedup / collision resolution (no cloud reads). The self-hosted backup's local cache
-/// index already holds every blob's content identity (fullHash + length + head + tail) and its storage info, so dedup,
-/// collision avoidance, volume count and raw can all be decided locally.
+/// Purely local single-file blob dedup / collision resolution (no cloud reads). Every retained version's content
+/// identities (fullHash + length + head + tail) and storage info are in the container's <see cref="VersionCatalog"/>,
+/// and everything this run has claimed is in its <see cref="RunWorkDb"/>, so dedup, collision avoidance, volume count
+/// and raw can all be decided locally.
 /// <para>
-/// Across versions: look up the "content identity → existing blob" map built from the retained version indexes.
-/// Within one backup run: coordinate through the in-run reservation table (one
-/// <see cref="TaskCompletionSource{T}"/> per ref) — a latecomer with the same content waits for the first uploader to
-/// finish and gets the same (ref, raw, volume count); different content landing on the same address steps aside to …~N.
+/// Across versions: ask the catalog, then the run's adopted journal, then the uploads this run has already finished
+/// (<see cref="IDedupSource"/> holds that order in one place). Within one backup run: coordinate through the
+/// in-flight reservation table (one <see cref="TaskCompletionSource{T}"/> per ref) — a latecomer with the same
+/// content waits for the first uploader to finish and gets the same (ref, raw, volume count); different content
+/// landing on the same address steps aside to …~N.
 /// </para>
-/// Trusting the local index = the cloud truth (consistent with the "read the cloud as little as possible" design);
+/// <para>
+/// The table holds <b>only claims that are still uploading</b>. A finished one is written to the work database and
+/// leaves the table, so a run that uploads a million blobs holds a million rows in a file rather than a million
+/// objects in memory — which is the whole point of the move.
+/// </para>
+/// Trusting the local catalog = the cloud truth (consistent with the "read the cloud as little as possible" design);
 /// external modification of the cloud is for Check to discover.
 /// </summary>
 public sealed class LocalDedupResolver
 {
     private readonly BlobAddressScheme _addressing;
-    private readonly IReadOnlyDictionary<string, ResolvedBlob> _priorByContent; // content identity → existing blob (across versions)
-    private readonly IReadOnlyDictionary<string, string> _priorRefs;            // ref already taken → its content identity (collision avoidance)
+    private readonly IDedupSource _source;
     private readonly ConcurrentDictionary<string, Reservation> _run = new(StringComparer.Ordinal);
-    private readonly IReadOnlySet<string> _priorHeads;                                  // prescreen: existing content's "length\nhead"
-    private readonly ConcurrentDictionary<string, byte> _runHeads = new(StringComparer.Ordinal); // prescreen: what this run has started on
-    // A pack member's content identity (three fields) → which member of which pack it sits on. See the notes on TryFindPackMember.
-    private readonly IReadOnlyDictionary<string, PackMemberRef> _packMembers;
-    // Blob refs some retained version marks unrecoverable: occupied names holding broken bytes. They stay in
-    // _priorRefs (the name really is taken, by this very content), but the backstop below must not resurrect
-    // them as dedup hits — a same-content claim on such a name is the healing upload, not a reuse.
-    private readonly IReadOnlySet<string> _damagedRefs;
 
-    private LocalDedupResolver(
-        BlobAddressScheme addressing,
-        IReadOnlyDictionary<string, ResolvedBlob> priorByContent,
-        IReadOnlyDictionary<string, string> priorRefs,
-        IReadOnlySet<string> priorHeads,
-        IReadOnlyDictionary<string, PackMemberRef> packMembers,
-        IReadOnlySet<string> damagedRefs)
+    /// <summary>The resolver as the pipeline builds it: the container's catalog for the retained versions, the run's
+    /// work database for its journal, its reservations and the heads it has started on.</summary>
+    public LocalDedupResolver(BlobAddressScheme addressing, VersionCatalog catalog, RunWorkDb work)
+        : this(addressing, new CatalogDedupSource(catalog, work))
+    {
+    }
+
+    private LocalDedupResolver(BlobAddressScheme addressing, IDedupSource source)
     {
         _addressing = addressing;
-        _priorByContent = priorByContent;
-        _priorRefs = priorRefs;
-        _priorHeads = priorHeads;
-        _packMembers = packMembers;
-        _damagedRefs = damagedRefs;
+        _source = source;
     }
 
     /// <summary>
-    /// Might there **possibly** be an existing blob with the same content this round? It only looks at length + head
-    /// hash, so it can answer without reading the whole file.
-    /// <para>
-    /// Streaming compression only knows the full-content hash once compression is done, so "compute the full hash
-    /// first, then decide on dedup" means reading the file one extra time. This prescreen lets a first backup (not one
-    /// candidate anywhere) take the single-read fast path, and only pays for that extra pass when candidates really exist.
-    /// Better a false positive than a miss: a false positive only costs one extra read, whereas a miss makes content that could have been skipped entirely get compressed for nothing.
-    /// </para>
-    /// </summary>
-    public bool MayDeduplicate(long length, string headHash)
-    {
-        var key = HeadKey(length, headHash);
-        return _priorHeads.Contains(key) || _runHeads.ContainsKey(key);
-    }
-
-    /// <summary>Registers content this run has already started on (length + head): on the strength of this, a later
-    /// file with the same content takes the prescreen's slow path, looking it up once rather than compressing it for nothing.</summary>
-    public void NoteInFlight(long length, string headHash) => _runHeads.TryAdd(HeadKey(length, headHash), 0);
-
-    /// <summary>Only consults the cross-version map; it does **not** take a ref and creates no reservation. For the
-    /// prescreen path of "probe once, and on a hit skip compression entirely"; an actual upload must still go through <see cref="ResolveAsync"/> to get a reservation.</summary>
-    /// <summary>Whether some retained version marks this blob ref's content unrecoverable — the upload side's cue
-    /// to replace rather than trust: an if-missing upload would bounce off the broken family with "already
-    /// there", and a label-trusting skip would believe metadata a condemned blob has no right to.</summary>
-    public bool IsDamagedRef(string @ref) => _damagedRefs.Contains(@ref);
-
-    public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
-        _priorByContent.GetValueOrDefault(ContentKey(fullHash, length, headHash, tailHash));
-
-    private static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
-
-    /// <summary>
-    /// Builds the maps from the retained versions' second-level indexes (single-file blobs use content addressing;
-    /// pack members get a separate table, see below).
+    /// The in-memory maps, for the callers not yet rewired to the catalog (the orchestrator, until Task 13). A
+    /// resolver built this way answers the synchronous members below and nothing else changes about it; one built
+    /// from a catalog refuses them, because those answers cannot be produced without waiting on a database.
     /// </summary>
     /// <param name="confirmed">
     /// The blocks in an adopted journal that are "confirmed in the cloud but not yet in the index" (<see cref="ConfirmedBlob"/>).
@@ -126,89 +90,50 @@ public sealed class LocalDedupResolver
     /// </para>
     /// <para>
     /// Once they are fed in, B takes the cross-version dedup path: neither recompressed nor re-uploaded, and that set
-    /// of volumes never gets the chance to be touched. They also go into <c>refs</c> (different content landing on this
-    /// address still steps aside to …~N) and into the prescreen set.
+    /// of volumes never gets the chance to be touched. They also go into the collision table (different content
+    /// landing on this address still steps aside to …~N) and into the prescreen set.
     /// </para>
     /// </param>
     public static LocalDedupResolver Build(
         BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes,
-        IEnumerable<ConfirmedBlob>? confirmed = null)
-    {
-        var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
-        var refs = new Dictionary<string, string>(StringComparer.Ordinal);
-        var heads = new HashSet<string>(StringComparer.Ordinal);
-        var packMembers = new Dictionary<string, PackMemberRef>(StringComparer.Ordinal);
-        var damagedRefs = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var index in indexes)
-        {
-            // Damage is a first-class fact dedup must respect (volume-identity.md): an entry whose path this
-            // version marks unrecoverable references a broken blob, and offering it as a dedup target would hand
-            // a brand new file — its bytes sitting right there on disk — a reference to garbage, born dead.
-            // Excluded, the new file compresses and uploads through the replacement primitive to the same content
-            // address, and thereby heals the family in passing. The ref stays in the collision table below: the
-            // name really is occupied, by this very content, so a healing upload lands at the base address with
-            // no collision detour.
-            var marked = index.UnrecoverablePaths.Count == 0
-                ? null
-                : new HashSet<string>(index.UnrecoverablePaths, StringComparer.Ordinal);
-            foreach (var e in index.Entries)
-            {
-                if (e.FullHash is null)
-                    continue;
-                if (marked?.Contains(e.Path) == true)
-                {
-                    // Blob refs still occupy their name for collision avoidance; everything else is withheld.
-                    if (e.Storage is { Kind: "blob" } damaged)
-                    {
-                        refs.TryAdd(damaged.Ref, ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash));
-                        damagedRefs.Add(damaged.Ref);
-                    }
-                    continue;
-                }
+        IEnumerable<ConfirmedBlob>? confirmed = null) =>
+        new(addressing, LegacyDedupSource.Build(indexes, confirmed));
 
-                // Pack member: the content already sits inside some existing pack, so a new file with the same content
-                // points straight at it instead of packing another box. Duplicates within one pack are already
-                // eliminated by 7z's solid archive (the dictionary matches across members); what this really saves is
-                // the **cross-pack, cross-version** part — separate packs do not share a compression dictionary, so the
-                // same content really would be stored twice.
-                if (e.Storage is { Kind: "pack" } p)
-                {
-                    if (e.HeadHash is not null)
-                    {
-                        // Several retained versions may each hold a member with the same content. The **reference**
-                        // takes the first one encountered (versions are passed in oldest to newest): references pile
-                        // onto the old pack, where dead-weight compaction is less likely to rewrite it. Newer-version
-                        // entries with the same content point at the same content anyway, so any of them will do.
-                        packMembers.TryAdd(
-                            PackMemberKey(e.FullHash, e.Length, e.HeadHash),
-                            new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));
-                    }
-                    continue;
-                }
+    /// <summary>
+    /// Might there **possibly** be an existing blob with the same content this round? It only looks at length + head
+    /// hash, so it can answer without reading the whole file.
+    /// <para>
+    /// Streaming compression only knows the full-content hash once compression is done, so "compute the full hash
+    /// first, then decide on dedup" means reading the file one extra time. This prescreen lets a first backup (not one
+    /// candidate anywhere) take the single-read fast path, and only pays for that extra pass when candidates really exist.
+    /// Better a false positive than a miss: a false positive only costs one extra read, whereas a miss makes content that could have been skipped entirely get compressed for nothing.
+    /// </para>
+    /// <para>
+    /// The last of its three sources — the heads this run has started on — is a table in the work database, whose
+    /// writer batches, so a head noted a moment ago may not be visible yet. That can only produce a miss on content
+    /// whose first copy is still in flight, and a miss costs one compression; the address it eventually lands on is
+    /// <see cref="ResolveAsync"/>'s business, and that one never guesses.
+    /// </para>
+    /// </summary>
+    public Task<bool> MayDeduplicateAsync(long length, string headHash, CancellationToken ct) =>
+        _source.MayDeduplicateAsync(length, headHash, ct);
 
-                if (e.Storage is not { Kind: "blob" } s)
-                    continue;
-                var ck = ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
-                byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
-                refs[s.Ref] = ck;
-                // Old entries whose HeadHash is null do not join the prescreen set: head is null in their content
-                // identity too, so they match no new file that can compute a head, and could never have hit dedup anyway.
-                if (e.HeadHash is not null)
-                    heads.Add(HeadKey(e.Length, e.HeadHash));
-            }
-        }
-        foreach (var c in confirmed ?? [])
-        {
-            // TryAdd rather than overwrite: the copy already committed to a version index has the last word. When the
-            // two really do collide (same content identity) they record the same ref anyway, so it makes no difference
-            // who wins; the only way they differ is the case where the index is the more authoritative one.
-            var ck = ContentKey(c.FullHash, c.Length, c.HeadHash, c.TailHash);
-            byContent.TryAdd(ck, c.Blob);
-            refs.TryAdd(c.Blob.Ref, ck);
-            heads.Add(HeadKey(c.Length, c.HeadHash));
-        }
-        return new LocalDedupResolver(addressing, byContent, refs, heads, packMembers, damagedRefs);
-    }
+    /// <summary>Registers content this run has already started on (length + head): on the strength of this, a later
+    /// file with the same content takes the prescreen's slow path, looking it up once rather than compressing it for nothing.</summary>
+    public ValueTask NoteInFlightAsync(long length, string headHash, CancellationToken ct) =>
+        _source.NoteInFlightAsync(length, headHash, ct);
+
+    /// <summary>Whether some retained version marks this blob ref's content unrecoverable — the upload side's cue
+    /// to replace rather than trust: an if-missing upload would bounce off the broken family with "already
+    /// there", and a label-trusting skip would believe metadata a condemned blob has no right to.</summary>
+    public Task<bool> IsDamagedRefAsync(string @ref, CancellationToken ct) => _source.IsDamagedRefAsync(@ref, ct);
+
+    /// <summary>Only consults what is already stored; it does **not** take a ref and creates no reservation. For the
+    /// prescreen path of "probe once, and on a hit skip compression entirely"; an actual upload must still go through
+    /// <see cref="ResolveAsync"/> to get a reservation.</summary>
+    public Task<ResolvedBlob?> TryFindExistingAsync(
+        string fullHash, long length, string headHash, string tailHash, CancellationToken ct) =>
+        _source.TryFindExistingAsync(fullHash, length, headHash, tailHash, ct);
 
     /// <summary>
     /// Whether this content is already inside some existing pack. A hit lets a new entry point straight at it — no
@@ -227,14 +152,9 @@ public sealed class LocalDedupResolver
     /// Newly written entries all carry a tail; old entries merely do not take part in dedup, and the price is only that their content gets stored one more time.
     /// </para>
     /// </summary>
-    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
-        _packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash)) is { } member
-        && member.TailHash == tailHash
-            ? member
-            : null;
-
-    private static string PackMemberKey(string fullHash, long length, string head) =>
-        $"{fullHash}\n{length}\n{head}";
+    public Task<PackMemberRef?> TryFindPackMemberAsync(
+        string fullHash, long length, string headHash, string? tailHash, CancellationToken ct) =>
+        _source.TryFindPackMemberAsync(fullHash, length, headHash, tailHash, ct);
 
     /// <summary>Resolves a piece of content: a hit on something existing → dedup; otherwise claim a free ref for the caller to upload, and fill in (raw, volume count) once done.</summary>
     /// <param name="tracker">Optional progress bookkeeping. Within one run, a latecomer with the same content has to
@@ -242,10 +162,11 @@ public sealed class LocalDedupResolver
     /// compression and before upload, with neither a stream uploading nor an item compressing on screen.
     /// Without marking it, the UI is simply frozen solid, with no way even to say who is being waited on.</param>
     public async Task<Resolution> ResolveAsync(
-        string fullHash, long length, string headHash, string tailHash, StageTracker? tracker = null)
+        string fullHash, long length, string headHash, string tailHash, CancellationToken ct,
+        StageTracker? tracker = null)
     {
         var ck = ContentKey(fullHash, length, headHash, tailHash);
-        if (_priorByContent.TryGetValue(ck, out var prior))
+        if (await _source.TryFindExistingAsync(fullHash, length, headHash, tailHash, ct) is { } prior)
             return Resolution.ForExisting(prior, collision: false); // cross-version dedup
 
         var baseAddr = _addressing.DataAddress(fullHash);
@@ -254,12 +175,12 @@ public sealed class LocalDedupResolver
             var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
             var collision = n > 0;
 
-            if (_priorRefs.TryGetValue(refName, out var priorCk))
+            if (await _source.RefOwnerAsync(refName, ct) is { } priorCk)
             {
                 if (priorCk != ck)
                     continue;                                     // an older version's different content holds this address → step aside
-                if (!_damagedRefs.Contains(refName))
-                    return Resolution.ForExisting(                 // in theory _priorByContent already hit; a safe backstop
+                if (!await _source.IsDamagedRefAsync(refName, ct))
+                    return Resolution.ForExisting(                 // in theory the content lookup already hit; a safe backstop
                         new ResolvedBlob(refName, false, 1, []), collision);
                 // The name holds this very content, damaged: fall through and claim it — that upload is the heal,
                 // landing at the base address with no collision detour.
@@ -278,7 +199,7 @@ public sealed class LocalDedupResolver
                     ((ICollection<KeyValuePair<string, Reservation>>)_run)
                         .Remove(new KeyValuePair<string, Reservation>(refName, mine!)));
                 if (_run.TryAdd(refName, mine))
-                    return Resolution.ForClaim(refName, collision, mine); // I will do the upload
+                    return Resolution.ForClaim(this, refName, collision, mine); // I will do the upload
 
                 // The indexer `_run[refName]` **must not** be used here. It used to be total: once a reservation landed
                 // in the table it was never removed. But "give the ref back on upload failure" is exactly what this
@@ -318,6 +239,56 @@ public sealed class LocalDedupResolver
     public static string ContentKey(string fullHash, long length, string? head, string? tail) =>
         $"{fullHash}\n{length}\n{head}\n{tail}";
 
+    /// <summary>The prescreen's key: length + head hash. Shared with the sources, which store it as a row of its own
+    /// (<c>reserved_heads</c>) — one composition, so the two can never disagree about what "this head" means.</summary>
+    internal static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
+
+    // ---- the synchronous surface, for callers not yet rewired (deleted with Build in Task 13) ----------------
+
+    /// <inheritdoc cref="MayDeduplicateAsync"/>
+    public bool MayDeduplicate(long length, string headHash) => Legacy.MayDeduplicate(length, headHash);
+
+    /// <inheritdoc cref="NoteInFlightAsync"/>
+    public void NoteInFlight(long length, string headHash) => Legacy.NoteInFlight(length, headHash);
+
+    /// <inheritdoc cref="IsDamagedRefAsync"/>
+    public bool IsDamagedRef(string @ref) => Legacy.IsDamagedRef(@ref);
+
+    /// <inheritdoc cref="TryFindExistingAsync"/>
+    public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
+        Legacy.TryFindExisting(fullHash, length, headHash, tailHash);
+
+    /// <inheritdoc cref="TryFindPackMemberAsync"/>
+    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
+        Legacy.TryFindPackMember(fullHash, length, headHash, tailHash);
+
+    /// <summary>The token-less overload the not-yet-rewired callers use. It is the same call on either kind of
+    /// resolver — resolving is asynchronous in both worlds — so unlike the members above it does not refuse.</summary>
+    public Task<Resolution> ResolveAsync(
+        string fullHash, long length, string headHash, string tailHash, StageTracker? tracker = null) =>
+        ResolveAsync(fullHash, length, headHash, tailHash, CancellationToken.None, tracker);
+
+    /// <summary>The maps, or a refusal. A catalog-backed resolver cannot answer synchronously and must not pretend
+    /// to: blocking on the database here would be a deadlock waiting to happen, and a plausible-looking wrong answer
+    /// would be worse than either.</summary>
+    private LegacyDedupSource Legacy => _source as LegacyDedupSource ?? throw new InvalidOperationException(
+        "This resolver answers from the catalog and the run's work database; use the asynchronous members.");
+
+    /// <summary>
+    /// Records a finished upload and retires the claim: the reservation row goes in first, so that from the instant
+    /// the in-flight entry disappears there is already something for the next file with this content to find.
+    /// </summary>
+    private async Task CompleteAsync(
+        Reservation reservation, string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes,
+        CancellationToken ct)
+    {
+        var blob = new ResolvedBlob(refName, raw, volumes, volumeSizes);
+        var recorded = await _source.RecordUploadAsync(reservation.ContentKey, blob, ct);
+        reservation.Complete(blob);
+        if (recorded)
+            reservation.Release();
+    }
+
     /// <summary>An in-run reservation for a ref: content identity + upload-completion signal.</summary>
     internal sealed class Reservation(string contentKey, Action release)
     {
@@ -326,8 +297,13 @@ public sealed class LocalDedupResolver
 
         public string ContentKey => contentKey;
         public Task<ResolvedBlob> Completion => _tcs.Task;
-        public void Complete(string refName, bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
-            _tcs.TrySetResult(new ResolvedBlob(refName, raw, volumes, volumeSizes));
+
+        /// <summary>Hands the latecomers already waiting on this content their answer.</summary>
+        public void Complete(ResolvedBlob blob) => _tcs.TrySetResult(blob);
+
+        /// <summary>Withdraws the claim from the reservation table. Called once the upload's outcome is somewhere
+        /// else — a reservation row (success) or nowhere at all (failure).</summary>
+        public void Release() => release();
 
         /// <summary>Upload failed: first wake the latecomers already waiting on the same content in this run (they must
         /// never dedup onto a blob that was not uploaded successfully — that half of the behaviour is unchanged), then
@@ -345,10 +321,14 @@ public sealed class LocalDedupResolver
     /// <summary>The resolution result: a dedup hit (Exists) or a claim that needs uploading (Claim).</summary>
     public sealed class Resolution
     {
+        private readonly LocalDedupResolver? _owner;
         private readonly Reservation? _reservation;
 
-        private Resolution(string @ref, bool collision, bool exists, ResolvedBlob? existing, Reservation? reservation)
+        private Resolution(
+            LocalDedupResolver? owner, string @ref, bool collision, bool exists, ResolvedBlob? existing,
+            Reservation? reservation)
         {
+            _owner = owner;
             Ref = @ref;
             Collision = collision;
             Exists = exists;
@@ -362,14 +342,29 @@ public sealed class LocalDedupResolver
         public ResolvedBlob? Existing { get; }
 
         internal static Resolution ForExisting(ResolvedBlob blob, bool collision) =>
-            new(blob.Ref, collision, exists: true, blob, null);
+            new(null, blob.Ref, collision, exists: true, blob, null);
 
-        internal static Resolution ForClaim(string @ref, bool collision, Reservation reservation) =>
-            new(@ref, collision, exists: false, null, reservation);
+        internal static Resolution ForClaim(
+            LocalDedupResolver owner, string @ref, bool collision, Reservation reservation) =>
+            new(owner, @ref, collision, exists: false, null, reservation);
 
-        /// <summary>Called after a successful upload, so latecomers with the same content in this run get the same storage info.</summary>
-        public void Complete(bool raw, int volumes, IReadOnlyList<long> volumeSizes) =>
-            _reservation?.Complete(Ref, raw, volumes, volumeSizes);
+        /// <summary>Called after a successful upload, so latecomers with the same content in this run get the same
+        /// storage info, and so the next file with this content finds it without claiming the address again.</summary>
+        public Task CompleteAsync(bool raw, int volumes, IReadOnlyList<long> volumeSizes, CancellationToken ct) =>
+            _reservation is null
+                ? Task.CompletedTask
+                : _owner!.CompleteAsync(_reservation, Ref, raw, volumes, volumeSizes, ct);
+
+        /// <summary>The token-less form, for the callers not yet rewired. It cannot write the reservation row, so it
+        /// is only offered on a resolver built from the in-memory maps, where the claim itself is the record.</summary>
+        public void Complete(bool raw, int volumes, IReadOnlyList<long> volumeSizes)
+        {
+            if (_reservation is null)
+                return;
+
+            _ = _owner!.Legacy;   // refuses a catalog-backed resolver rather than leaving a claim nothing can retire
+            _reservation.Complete(new ResolvedBlob(Ref, raw, volumes, volumeSizes));
+        }
 
         /// <summary>Called when the upload fails, making the waiting latecomers fail with it (so they never wrongly dedup onto a blob that does not exist).</summary>
         public void Fail(Exception ex) => _reservation?.Fail(ex);
