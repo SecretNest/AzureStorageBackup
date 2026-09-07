@@ -27,14 +27,12 @@ public sealed class BackupDifferTests : IDisposable
         return full;
     }
 
-    private static Task<ScanResult> ScanAsync(string root) =>
-        new LocalFileScanner().ScanAsync(root, new IgnoreRuleSet([]));
-
     /// <summary>Produce a "previous version index" snapshot using the differ itself (previous=null, so everything comes out Added).</summary>
     private async Task<VersionIndex> SnapshotAsync()
     {
-        var scan = await ScanAsync(_root);
-        var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, scan, previous: null);
+        var (entries0, summary) = await DiffTestHarness.ScanSortedAsync(_root);
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(
+            _root, entries0, summary.Unreadable, previous: null);
 
         var entries = diff.Changes
             .Where(c => c.Current is not null)
@@ -52,7 +50,7 @@ public sealed class BackupDifferTests : IDisposable
             })
             .ToList();
 
-        return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = scan.EmptyDirs.ToList() };
+        return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = summary.EmptyDirs.ToList() };
     }
 
     /// <summary>Same as SnapshotAsync but also records the tail hash in each entry — the tail early exit needs it as its comparison baseline.</summary>
@@ -103,7 +101,7 @@ public sealed class BackupDifferTests : IDisposable
         }
     }
 
-    private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
+    private static FileChange Change(DiffOutcome d, string path) => d.Changes.Single(c => c.Path == path);
 
     /// <summary>
     /// A completely unchanged file **pays no IO at all**, and a missing tail is not backfilled. There used to be a backfill here so old backups
@@ -119,7 +117,7 @@ public sealed class BackupDifferTests : IDisposable
         Assert.Null(previous.Entries.Single(e => e.Path == "a.txt").TailHash);
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.Unchanged, c.Kind);
@@ -146,8 +144,8 @@ public sealed class BackupDifferTests : IDisposable
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous, fullHashDeferred: _ => true);
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.Modified, c.Kind);
@@ -170,8 +168,8 @@ public sealed class BackupDifferTests : IDisposable
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1)); // touch only the mtime
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous, fullHashDeferred: _ => true);
 
         Assert.Equal(ChangeKind.MetadataOnly, Change(diff, "big.bin").Kind);
         // One read — since the whole file is being read anyway, take all three segments, with the tail picked up along the way.
@@ -193,8 +191,8 @@ public sealed class BackupDifferTests : IDisposable
         File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(1));
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => false);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous, fullHashDeferred: _ => false);
 
         Assert.Equal(ChangeKind.Modified, Change(diff, "small.txt").Kind);
         Assert.Equal(0, counter.TailCalls);     // that extra probe was never made
@@ -211,7 +209,7 @@ public sealed class BackupDifferTests : IDisposable
         Write("a.txt", "aaa");
         var hasher = new CountingHasher(new FileHasher());
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous: null);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(_root, previous: null);
 
         Assert.Equal(1, hasher.IdentityCalls);
         Assert.Equal(0, hasher.HeadCalls);
@@ -232,8 +230,8 @@ public sealed class BackupDifferTests : IDisposable
         Write("big.bin", new string('x', 8192));
         var hasher = new CountingHasher(new FileHasher());
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(
-            _root, await ScanAsync(_root), previous: null, fullHashDeferred: _ => true);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(
+            _root, previous: null, fullHashDeferred: _ => true);
 
         Assert.Equal(1, hasher.HeadCalls);
         Assert.Equal(0, hasher.FullCalls);
@@ -249,7 +247,7 @@ public sealed class BackupDifferTests : IDisposable
         Write("a.txt", "aaa");
         Write("sub/b.txt", "bbbbb");
 
-        var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous: null);
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(_root, previous: null);
 
         Assert.All(diff.Changes, c => Assert.Equal(ChangeKind.Added, c.Kind));
         Assert.Equal(2, diff.ChangedFiles);
@@ -265,7 +263,7 @@ public sealed class BackupDifferTests : IDisposable
         var previous = await SnapshotAsync();
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(_root, previous);
 
         Assert.All(diff.Changes, c => Assert.Equal(ChangeKind.Unchanged, c.Kind));
         Assert.Equal(0, diff.ChangedFiles);
@@ -285,7 +283,7 @@ public sealed class BackupDifferTests : IDisposable
         File.WriteAllText(path, "world"); // same length, different content
         File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(5));
 
-        var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.Modified, c.Kind);
@@ -302,7 +300,7 @@ public sealed class BackupDifferTests : IDisposable
         File.WriteAllText(path, "hello world!"); // length changed
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.Modified, c.Kind);
@@ -325,7 +323,7 @@ public sealed class BackupDifferTests : IDisposable
         File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30));
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "a.txt");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
@@ -350,8 +348,8 @@ public sealed class BackupDifferTests : IDisposable
         Write("small.txt", "packed with others");
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous: null, fullHashDeferred: p => p == "big.bin");
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous: null, fullHashDeferred: p => p == "big.bin");
 
         var big = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.Added, big.Kind);
@@ -379,8 +377,8 @@ public sealed class BackupDifferTests : IDisposable
         File.WriteAllText(path, "hello world!"); // length changed → the content is already known to have changed, so the hash has only one use left: generating the address
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous, fullHashDeferred: _ => true);
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.Modified, c.Kind);
@@ -402,8 +400,8 @@ public sealed class BackupDifferTests : IDisposable
         File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(30)); // content untouched
 
         var counter = new CountingHasher(new FileHasher());
-        var diff = await new BackupDiffer(counter).DiffAsync(
-            _root, await ScanAsync(_root), previous, fullHashDeferred: _ => true);
+        var diff = await new BackupDiffer(counter).RunDiffAsync(
+            _root, previous, fullHashDeferred: _ => true);
 
         var c = Change(diff, "big.bin");
         Assert.Equal(ChangeKind.MetadataOnly, c.Kind);
@@ -427,8 +425,8 @@ public sealed class BackupDifferTests : IDisposable
 
         var seen = new List<StageProgress>();
         var tracker = new StageTracker("Diffing", total: 2, seen.Add);
-        await new BackupDiffer(new FileHasher()).DiffAsync(
-            _root, await ScanAsync(_root), previous: null, tracker: tracker,
+        await new BackupDiffer(new FileHasher()).RunDiffAsync(
+            _root, previous: null, tracker: tracker,
             fullHashDeferred: p => p == "big.bin");
         tracker.Complete();
 
@@ -451,7 +449,7 @@ public sealed class BackupDifferTests : IDisposable
         var seen = new List<StageProgress>();
         var t = 0L;
         var tracker = new StageTracker("Diffing", total: 1, s => { lock (seen) seen.Add(s); }) { Clock = () => t += 300 };
-        await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous: null, tracker: tracker);
+        await new BackupDiffer(new FileHasher()).RunDiffAsync(_root, previous: null, tracker: tracker);
         tracker.Complete();
 
         lock (seen)
@@ -473,7 +471,7 @@ public sealed class BackupDifferTests : IDisposable
 
         File.Delete(Path.Combine(_root, "gone.txt"));
 
-        var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(_root, previous);
 
         var gone = Change(diff, "gone.txt");
         Assert.Equal(ChangeKind.Deleted, gone.Kind);

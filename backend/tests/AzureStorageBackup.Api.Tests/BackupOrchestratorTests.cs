@@ -75,7 +75,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory);
     }
@@ -164,7 +164,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
             new RetentionCleaner(factory, counting, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(),
-            authority.IndexCache, authority.Tracked,
+            authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
@@ -202,7 +202,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
             new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, counting, TestIndexFiles.New()), trackedInfo: tracked,
+            catalogs: TestCatalogs.New(db, counting), trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
@@ -294,7 +294,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
+            catalogs: TestCatalogs.New(db, store),
             trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)),
             workFactory: TestWorkDbs.New());
         return (orchestrator, store);
@@ -391,7 +391,7 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()), trackedInfo: tracked,
+            catalogs: TestCatalogs.New(db, store), trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
@@ -895,7 +895,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(), opLog: log,
             verboseLog: verboseLog);
 
@@ -937,7 +937,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(), opLog: log);
 
         var account = AzuriteAccount();

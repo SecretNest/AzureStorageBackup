@@ -604,7 +604,7 @@ public sealed class AutoResumeIntegrationTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+            new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory);
     }

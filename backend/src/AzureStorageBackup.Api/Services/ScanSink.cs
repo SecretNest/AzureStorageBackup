@@ -2,10 +2,10 @@ namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
 /// Where <see cref="LocalFileScanner"/> hands each entry as it finds it. Collecting the whole tree into a <c>List</c>
-/// (the old <c>ScanResult</c> shape) put every scanned file in memory at once — proportional to file count, exactly
-/// the structure this branch is moving into SQLite. A sink lets the scanner stay ignorant of where an entry ends up:
-/// a test can keep the old in-memory list (<see cref="ListScanSink"/>), while a real run writes straight into the
-/// per-run work database (<see cref="WorkDbScanSink"/>) and never holds more than one entry at a time.
+/// — what the scanner used to return — put every scanned file in memory at once, proportional to file count. A sink
+/// lets the scanner stay ignorant of where an entry ends up: a test can keep an in-memory list
+/// (<see cref="ListScanSink"/>), while a real run writes straight into the per-run work database
+/// (<see cref="WorkDbScanSink"/>) and never holds more than one entry at a time.
 /// </summary>
 public interface IScanSink
 {
@@ -14,9 +14,9 @@ public interface IScanSink
 
 /// <summary>
 /// Keeps every entry in memory, in the order the walk produced them — this sink performs no sorting. Callers that
-/// need a stable order (tests comparing against the old sorted <c>ScanResult</c>, for instance) sort
-/// <see cref="Entries"/> themselves; ordering is no longer the scanner's job now that a sink can be something that
-/// has no notion of "the whole list" at all, such as <see cref="WorkDbScanSink"/>.
+/// need a stable order sort <see cref="Entries"/> themselves; ordering is no longer the scanner's job now that a sink
+/// can be something with no notion of "the whole list" at all, such as <see cref="WorkDbScanSink"/>, whose order
+/// comes from the <c>path_key</c> the database reads by.
 /// </summary>
 public sealed class ListScanSink : IScanSink
 {

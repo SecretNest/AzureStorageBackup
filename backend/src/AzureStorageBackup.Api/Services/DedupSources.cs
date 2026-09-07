@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -18,11 +17,10 @@ namespace AzureStorageBackup.Api.Services;
 internal sealed record DedupRefOwner(string ContentKey, ResolvedBlob? Blob);
 
 /// <summary>
-/// Where <see cref="LocalDedupResolver"/>'s answers about content that already exists come from. Two
-/// implementations, for exactly as long as the migration lasts: <see cref="CatalogDedupSource"/> asks the container's
-/// catalog and the run's work database, which is where those facts live now, and <see cref="LegacyDedupSource"/>
-/// holds the dictionaries <c>LocalDedupResolver.Build</c> used to build, keeping the callers that have not been
-/// rewired yet (the orchestrator, until Task 13) on exactly their old behaviour.
+/// Where <see cref="LocalDedupResolver"/>'s answers about content that already exists come from:
+/// <see cref="CatalogDedupSource"/> asks the container's catalog and the run's work database, which is where those
+/// facts live. It is an interface rather than a class so a test can hold one resolution still between two of its
+/// lookups and see what a peer sees in that gap — which is not something a database can be asked to do.
 /// <para>
 /// The in-flight reservation table is deliberately <em>not</em> behind this interface. It is the one piece of state
 /// that is the same on both paths — a claim that has not finished uploading exists only in this process — so the
@@ -171,178 +169,4 @@ internal sealed class CatalogDedupSource(VersionCatalog catalog, RunWorkDb work)
             _catalogGate.Release();
         }
     }
-}
-
-/// <summary>
-/// The dictionaries <c>LocalDedupResolver.Build</c> used to build from the retained versions' indexes, kept as a
-/// source of their own so that callers still on the synchronous surface answer out of exactly the same maps, with
-/// exactly the same precedence, as before the catalog existed. It dies with <c>Build</c> in Task 13.
-/// </summary>
-internal sealed class LegacyDedupSource : IDedupSource
-{
-    private readonly IReadOnlyDictionary<string, ResolvedBlob> _priorByContent; // content identity → existing blob (across versions)
-    private readonly IReadOnlyDictionary<string, string> _priorRefs;            // ref already taken → its content identity (collision avoidance)
-    private readonly IReadOnlySet<string> _priorHeads;                          // prescreen: existing content's "length\nhead"
-    private readonly ConcurrentDictionary<string, byte> _runHeads =
-        new(StringComparer.Ordinal);                                            // prescreen: what this run has started on
-    // A pack member's content identity (three fields) → which member of which pack it sits on.
-    private readonly IReadOnlyDictionary<string, PackMemberRef> _packMembers;
-    // Blob refs some retained version marks unrecoverable: occupied names holding broken bytes. They stay in
-    // _priorRefs (the name really is taken, by this very content), but a same-content claim on such a name is the
-    // healing upload, not a reuse.
-    private readonly IReadOnlySet<string> _damagedRefs;
-
-    private LegacyDedupSource(
-        IReadOnlyDictionary<string, ResolvedBlob> priorByContent,
-        IReadOnlyDictionary<string, string> priorRefs,
-        IReadOnlySet<string> priorHeads,
-        IReadOnlyDictionary<string, PackMemberRef> packMembers,
-        IReadOnlySet<string> damagedRefs)
-    {
-        _priorByContent = priorByContent;
-        _priorRefs = priorRefs;
-        _priorHeads = priorHeads;
-        _packMembers = packMembers;
-        _damagedRefs = damagedRefs;
-    }
-
-    /// <summary>Builds the maps from the retained versions' second-level indexes (single-file blobs use content
-    /// addressing; pack members get a separate table). The body is <c>LocalDedupResolver.Build</c>'s, unchanged —
-    /// see <see cref="LocalDedupResolver.Build"/> for what <paramref name="confirmed"/> is and why it must be fed in.</summary>
-    public static LegacyDedupSource Build(IEnumerable<VersionIndex> indexes, IEnumerable<ConfirmedBlob>? confirmed)
-    {
-        var byContent = new Dictionary<string, ResolvedBlob>(StringComparer.Ordinal);
-        var refs = new Dictionary<string, string>(StringComparer.Ordinal);
-        var heads = new HashSet<string>(StringComparer.Ordinal);
-        var packMembers = new Dictionary<string, PackMemberRef>(StringComparer.Ordinal);
-        var damagedRefs = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var index in indexes)
-        {
-            // Damage is a first-class fact dedup must respect (volume-identity.md): an entry whose path this
-            // version marks unrecoverable references a broken blob, and offering it as a dedup target would hand
-            // a brand new file — its bytes sitting right there on disk — a reference to garbage, born dead.
-            // Excluded, the new file compresses and uploads through the replacement primitive to the same content
-            // address, and thereby heals the family in passing. The ref stays in the collision table below: the
-            // name really is occupied, by this very content, so a healing upload lands at the base address with
-            // no collision detour.
-            var marked = index.UnrecoverablePaths.Count == 0
-                ? null
-                : new HashSet<string>(index.UnrecoverablePaths, StringComparer.Ordinal);
-            foreach (var e in index.Entries)
-            {
-                if (e.FullHash is null)
-                    continue;
-                if (marked?.Contains(e.Path) == true)
-                {
-                    // Blob refs still occupy their name for collision avoidance; everything else is withheld.
-                    if (e.Storage is { Kind: "blob" } damaged)
-                    {
-                        refs.TryAdd(damaged.Ref, LocalDedupResolver.ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash));
-                        damagedRefs.Add(damaged.Ref);
-                    }
-                    continue;
-                }
-
-                // Pack member: the content already sits inside some existing pack, so a new file with the same content
-                // points straight at it instead of packing another box. Duplicates within one pack are already
-                // eliminated by 7z's solid archive (the dictionary matches across members); what this really saves is
-                // the **cross-pack, cross-version** part — separate packs do not share a compression dictionary, so the
-                // same content really would be stored twice.
-                if (e.Storage is { Kind: "pack" } p)
-                {
-                    if (e.HeadHash is not null)
-                    {
-                        // Several retained versions may each hold a member with the same content. The **reference**
-                        // takes the first one encountered (versions are passed in oldest to newest): references pile
-                        // onto the old pack, where dead-weight compaction is less likely to rewrite it. Newer-version
-                        // entries with the same content point at the same content anyway, so any of them will do.
-                        packMembers.TryAdd(
-                            PackMemberKey(e.FullHash, e.Length, e.HeadHash),
-                            new PackMemberRef(p.Ref, p.EntryName ?? e.Path, e.TailHash));
-                    }
-                    continue;
-                }
-
-                if (e.Storage is not { Kind: "blob" } s)
-                    continue;
-                var ck = LocalDedupResolver.ContentKey(e.FullHash, e.Length, e.HeadHash, e.TailHash);
-                byContent[ck] = new ResolvedBlob(s.Ref, s.Raw, Math.Max(1, s.Volumes), s.VolumeSizes);
-                refs[s.Ref] = ck;
-                // Old entries whose HeadHash is null do not join the prescreen set: head is null in their content
-                // identity too, so they match no new file that can compute a head, and could never have hit dedup anyway.
-                if (e.HeadHash is not null)
-                    heads.Add(LocalDedupResolver.HeadKey(e.Length, e.HeadHash));
-            }
-        }
-
-        foreach (var c in confirmed ?? [])
-        {
-            // TryAdd rather than overwrite: the copy already committed to a version index has the last word. When the
-            // two really do collide (same content identity) they record the same ref anyway, so it makes no difference
-            // who wins; the only way they differ is the case where the index is the more authoritative one.
-            var ck = LocalDedupResolver.ContentKey(c.FullHash, c.Length, c.HeadHash, c.TailHash);
-            byContent.TryAdd(ck, c.Blob);
-            refs.TryAdd(c.Blob.Ref, ck);
-            heads.Add(LocalDedupResolver.HeadKey(c.Length, c.HeadHash));
-        }
-
-        return new LegacyDedupSource(byContent, refs, heads, packMembers, damagedRefs);
-    }
-
-    public bool MayDeduplicate(long length, string headHash)
-    {
-        var key = LocalDedupResolver.HeadKey(length, headHash);
-        return _priorHeads.Contains(key) || _runHeads.ContainsKey(key);
-    }
-
-    public void NoteInFlight(long length, string headHash) =>
-        _runHeads.TryAdd(LocalDedupResolver.HeadKey(length, headHash), 0);
-
-    public bool IsDamagedRef(string @ref) => _damagedRefs.Contains(@ref);
-
-    public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
-        _priorByContent.GetValueOrDefault(LocalDedupResolver.ContentKey(fullHash, length, headHash, tailHash));
-
-    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
-        _packMembers.GetValueOrDefault(PackMemberKey(fullHash, length, headHash)) is { } member
-        && member.TailHash == tailHash
-            ? member
-            : null;
-
-    /// <summary>Never carries a blob: on this path a finished upload stays in the resolver's in-flight table, which
-    /// answers its peers itself, so nothing this map knows about ever bypasses the damage check.</summary>
-    public DedupRefOwner? RefOwner(string @ref) =>
-        _priorRefs.GetValueOrDefault(@ref) is { } contentKey ? new DedupRefOwner(contentKey, null) : null;
-
-    // The asynchronous surface is the synchronous one wrapped: the maps are in memory, so there is nothing here to
-    // await, and answering both ways off one body is what keeps the two paths from drifting.
-    Task<bool> IDedupSource.MayDeduplicateAsync(long length, string headHash, CancellationToken ct) =>
-        Task.FromResult(MayDeduplicate(length, headHash));
-
-    ValueTask IDedupSource.NoteInFlightAsync(long length, string headHash, CancellationToken ct)
-    {
-        NoteInFlight(length, headHash);
-        return ValueTask.CompletedTask;
-    }
-
-    Task<bool> IDedupSource.IsDamagedRefAsync(string @ref, CancellationToken ct) => Task.FromResult(IsDamagedRef(@ref));
-
-    Task<ResolvedBlob?> IDedupSource.TryFindExistingAsync(
-        string fullHash, long length, string headHash, string tailHash, CancellationToken ct) =>
-        Task.FromResult(TryFindExisting(fullHash, length, headHash, tailHash));
-
-    Task<PackMemberRef?> IDedupSource.TryFindPackMemberAsync(
-        string fullHash, long length, string headHash, string? tailHash, CancellationToken ct) =>
-        Task.FromResult(TryFindPackMember(fullHash, length, headHash, tailHash));
-
-    Task<DedupRefOwner?> IDedupSource.RefOwnerAsync(string @ref, CancellationToken ct) =>
-        Task.FromResult(RefOwner(@ref));
-
-    /// <summary>Nowhere to record it: a completed reservation stays in the resolver's in-flight table and keeps
-    /// answering later arrivals off its completion, which is what this path has always done.</summary>
-    Task<bool> IDedupSource.RecordUploadAsync(string contentKey, ResolvedBlob blob, CancellationToken ct) =>
-        Task.FromResult(false);
-
-    private static string PackMemberKey(string fullHash, long length, string head) =>
-        $"{fullHash}\n{length}\n{head}";
 }

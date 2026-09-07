@@ -204,10 +204,15 @@ public sealed class ResumeLedgerTests : IDisposable
         }
         Assert.True(hits > 0, "the generated journal produced no FindPack hit at all: the comparison proved nothing");
 
-        // ConfirmedBlobs feeds the dedup table, so it is the same claim about the same rows in a fourth shape.
-        Assert.Equal(
-            legacy.ConfirmedBlobs().Select(b => b.Blob.Ref).Order(StringComparer.Ordinal),
-            (await ledger.ConfirmedBlobsAsync(Ct)).Select(b => b.Blob.Ref).Order(StringComparer.Ordinal));
+        // The dedup path reaches the very same rows by content instead of by path — the resolver probes
+        // resume_blobs directly, which is what the old ConfirmedBlobs list was assembled for. Same claim about the
+        // same rows in a fourth shape: everything the old dictionaries would have handed the dedup table is findable
+        // by its content identity, and nothing else is.
+        foreach (var b in legacy.ConfirmedBlobs())
+        {
+            var found = await work.ResumeBlobByContentAsync(b.FullHash, b.Length, b.HeadHash, b.TailHash, Ct);
+            Assert.Equal(b.Blob.Ref, found?.Ref);
+        }
     }
 
     /// <summary>A work database nobody fed a journal into: every lookup misses, and the caller's "is there anything to
@@ -224,6 +229,6 @@ public sealed class ResumeLedgerTests : IDisposable
         Assert.Null(await ledger.FindBlobAsync("a.bin", "aaa", 100, "haaa", "taaa", Ct));
         Assert.Null(await ledger.FindUntouchedBlobAsync("a.bin", DateTimeOffset.UnixEpoch, 100, Ct));
         Assert.Null(await ledger.FindPackAsync([new JournalMember("a.txt", "a.txt", "ha", 5)], Ct));
-        Assert.Empty(await ledger.ConfirmedBlobsAsync(Ct));
+        Assert.Null(await work.ResumeBlobByContentAsync("aaa", 100, "haaa", "taaa", Ct));
     }
 }

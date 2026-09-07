@@ -185,7 +185,7 @@ public sealed class BackupResumeTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            hasher ?? new FileHasher(), authority.IndexCache, authority.Tracked,
+            hasher ?? new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory);
     }

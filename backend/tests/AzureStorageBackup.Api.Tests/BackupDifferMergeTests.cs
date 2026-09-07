@@ -13,7 +13,7 @@ namespace AzureStorageBackup.Api.Tests;
 /// <para>
 /// Deleted changes are compared as a multiset rather than in sequence, on purpose. The merge emits a deletion the
 /// moment the previous cursor passes the path over, which is earlier than the old trailing sweep did — and it is
-/// allowed to, because a Deleted change produces no index entry (BuildEntries skips it) and only feeds counters, so
+/// allowed to, because a Deleted change produces no index entry (the run ledger drops it) and only feeds counters, so
 /// its position cannot reach the serialized index. Everything else must match position for position.
 /// </para>
 /// </summary>
@@ -35,7 +35,7 @@ public sealed class BackupDifferMergeTests
         var (scan, unreadable) = await ScanWithUnreadableAsync(rng, tree);
 
         var legacy = await new LegacyBackupDiffer(hasher).DiffAsync(
-            tree.Root, new ScanResult(scan, [], unreadable), previous,
+            tree.Root, new LegacyScanResult(scan, [], unreadable), previous,
             null, CancellationToken.None, null, null, Deferred);
 
         var merged = new List<FileChange>();
@@ -101,7 +101,7 @@ public sealed class BackupDifferMergeTests
     /// <summary>
     /// A path the scanner reported as an unreadable **file** while also emitting a scanned entry for it must not grow a
     /// second, previous-less Unreadable change on top of the one the scan already produced: that entry has no content
-    /// behind it, so BuildEntries would drop the real one's storage on the floor. The scanner does not do this today —
+    /// behind it, so the ledger would drop the real one's storage on the floor. The scanner does not do this today —
     /// this pins that the merge does not depend on it not doing it.
     /// </summary>
     [Fact]
@@ -265,7 +265,12 @@ public sealed class BackupDifferMergeTests
             File.WriteAllBytes(full, content);
         }
 
-        public Task<ScanResult> ScanAsync() => new LocalFileScanner().ScanAsync(Root, new IgnoreRuleSet([]));
+        /// <summary>The scan the way the oracle wants it: the whole tree, sorted, in one list.</summary>
+        public async Task<LegacyScanResult> ScanAsync()
+        {
+            var (entries, summary) = await DiffTestHarness.ScanSortedAsync(Root);
+            return new LegacyScanResult(entries, summary.EmptyDirs, summary.Unreadable);
+        }
 
         public void Dispose()
         {

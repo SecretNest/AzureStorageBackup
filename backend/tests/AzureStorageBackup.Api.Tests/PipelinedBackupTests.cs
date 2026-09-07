@@ -73,7 +73,7 @@ public sealed class PipelinedBackupTests : IDisposable
         return new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher ?? new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(),
             spillFactory: spill);
     }

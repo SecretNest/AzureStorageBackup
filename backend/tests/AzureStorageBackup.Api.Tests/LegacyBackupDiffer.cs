@@ -6,8 +6,22 @@ namespace AzureStorageBackup.Api.Tests;
 // A verbatim copy of BackupDiffer as it stood before the diff became a merge of two ordered cursors, kept only as the
 // oracle for BackupDifferMergeTests: the merge is a behaviour-preserving rewrite, and the only way to say that with a
 // straight face is to run both over the same generated trees and compare what comes out. It is deliberately NOT kept in
-// sync with the product class — it is the *old* behaviour, and freezing it is the whole point. It dies with the
-// compatibility overload in Task 13.
+// sync with the product class — it is the *old* behaviour, and freezing it is the whole point.
+
+/// <summary>The whole scan, resident: what <c>LocalFileScanner</c> used to return before it handed entries to a sink
+/// one at a time. It lives here rather than in the product because the oracle is the only thing left that wants
+/// it — which is the point of the rewrite it is the oracle for.</summary>
+internal sealed record LegacyScanResult(
+    IReadOnlyList<ScannedEntry> Entries,
+    IReadOnlyList<string> EmptyDirs,
+    IReadOnlyList<UnreadablePath> Unreadable);
+
+/// <summary>Every change the diff made, resident: what <c>BackupDiffer</c> used to return before the merge pushed
+/// each one out through the callback instead. Here for the same reason as <see cref="LegacyScanResult"/>.</summary>
+internal sealed record LegacyDiffResult(
+    IReadOnlyList<FileChange> Changes,
+    int ChangedFiles,
+    long ChangedBytes);
 /// <summary>
 /// Version comparison engine (M4 design §4.2): lazy two-level hashing.
 /// Decide on length+mtime+permissions first; only files with "same length but changed mtime/permissions" get a headHash,
@@ -15,9 +29,9 @@ namespace AzureStorageBackup.Api.Tests;
 /// </summary>
 internal sealed class LegacyBackupDiffer(IFileHasher hasher)
 {
-    public async Task<DiffResult> DiffAsync(
+    public async Task<LegacyDiffResult> DiffAsync(
         string rootPath,
-        ScanResult current,
+        LegacyScanResult current,
         VersionIndex? previous,
         DiffOptions? options = null,
         CancellationToken ct = default,
@@ -104,7 +118,7 @@ internal sealed class LegacyBackupDiffer(IFileHasher hasher)
                 changes.Add(new FileChange(prev.Path, ChangeKind.Deleted, null, prev, null, null, null));
         }
 
-        return new DiffResult(changes, changedFiles, changedBytes);
+        return new LegacyDiffResult(changes, changedFiles, changedBytes);
     }
 
     /// <summary>The previous-version entries covered by an unreadable path: a directory takes its whole subtree, a file takes just itself.</summary>

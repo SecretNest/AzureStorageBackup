@@ -148,7 +148,7 @@ public sealed class CleanupFailureTests : IDisposable
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(cleanerFactory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+            new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(),
             notifier: null, opLog: opLog);
         return (orchestrator, factory, cleanerFactory);

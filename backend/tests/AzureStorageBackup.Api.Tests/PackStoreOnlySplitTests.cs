@@ -102,7 +102,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             new RetentionCleaner(
                 factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+            new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();

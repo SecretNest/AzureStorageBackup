@@ -12,9 +12,13 @@ public sealed record ResolvedBlob(string Ref, bool Raw, int Volumes, IReadOnlyLi
 /// <para>
 /// There is exactly one source — a journal left by the previous run (or a few runs back) and adopted by this one.
 /// These blocks are in exactly the same situation as blocks in an existing version index (confirmed in the cloud,
-/// address already taken); the only difference is that it is a journal recording them rather than an index,
-/// so they must be fed into <see cref="LocalDedupResolver.Build"/> as well, so that dedup, collision avoidance and the
-/// prescreen can all three see them. The consequence of not seeing them is nowhere near as mild as "upload it again" — see the notes on Build.
+/// address already taken); the only difference is that it is a journal recording them rather than an index.
+/// </para>
+/// <para>
+/// The run's own <see cref="RunWorkDb"/> now holds them — <c>CatalogDedupSource</c> probes <c>resume_blobs</c> by
+/// content, so dedup, collision avoidance and the prescreen all see them without anybody assembling a set up front.
+/// This record survives as the shape the frozen pre-rewrite resolver in the test project is fed with, which is what
+/// pins the two against each other.
 /// </para>
 /// </summary>
 public sealed record ConfirmedBlob(
@@ -70,36 +74,6 @@ public sealed class LocalDedupResolver
         _addressing = addressing;
         _source = source;
     }
-
-    /// <summary>
-    /// The in-memory maps, for the callers not yet rewired to the catalog (the orchestrator, until Task 13). A
-    /// resolver built this way answers the synchronous members below and nothing else changes about it; one built
-    /// from a catalog refuses them, because those answers cannot be produced without waiting on a database.
-    /// </summary>
-    /// <param name="confirmed">
-    /// The blocks in an adopted journal that are "confirmed in the cloud but not yet in the index" (<see cref="ConfirmedBlob"/>).
-    /// <para>
-    /// **They must be fed in**, and not merely to avoid one extra upload. Resume accounts by **path**: the previous run
-    /// finished uploading A and then suspended, before it reached B, which has the same content as A. This run reuses A
-    /// directly without uploading, but B does not recognise that it already exists, so it recompresses, then
-    /// ResolveAsync hands it the **same** ref (content addressing: same content, same address), and
-    /// <c>UploadStagedBlobAsync</c> writes over A's own volumes. With deterministic output that is mostly waste —
-    /// the volumes label-match and skip (see FetchFamilyLabelsAsync) — but an encrypted backup's output never
-    /// matches (fresh salt/IV per compression), so every volume of A's family is overwritten, and an interruption
-    /// by Stop now or a process crash mid-family leaves the address a splice of two runs' volumes — unopenable,
-    /// for an encrypted multi-volume archive — while the next run adopting the journal reuses A as usual and
-    /// commits the index as usual, pointing at it. The error only becomes visible at restore or check time.
-    /// </para>
-    /// <para>
-    /// Once they are fed in, B takes the cross-version dedup path: neither recompressed nor re-uploaded, and that set
-    /// of volumes never gets the chance to be touched. They also go into the collision table (different content
-    /// landing on this address still steps aside to …~N) and into the prescreen set.
-    /// </para>
-    /// </param>
-    public static LocalDedupResolver Build(
-        BlobAddressScheme addressing, IEnumerable<VersionIndex> indexes,
-        IEnumerable<ConfirmedBlob>? confirmed = null) =>
-        new(addressing, LegacyDedupSource.Build(indexes, confirmed));
 
     /// <summary>
     /// Might there **possibly** be an existing blob with the same content this round? It only looks at length + head
@@ -247,37 +221,6 @@ public sealed class LocalDedupResolver
     /// (<c>reserved_heads</c>) — one composition, so the two can never disagree about what "this head" means.</summary>
     internal static string HeadKey(long length, string headHash) => $"{length}\n{headHash}";
 
-    // ---- the synchronous surface, for callers not yet rewired (deleted with Build in Task 13) ----------------
-
-    /// <inheritdoc cref="MayDeduplicateAsync"/>
-    public bool MayDeduplicate(long length, string headHash) => Legacy.MayDeduplicate(length, headHash);
-
-    /// <inheritdoc cref="NoteInFlightAsync"/>
-    public void NoteInFlight(long length, string headHash) => Legacy.NoteInFlight(length, headHash);
-
-    /// <inheritdoc cref="IsDamagedRefAsync"/>
-    public bool IsDamagedRef(string @ref) => Legacy.IsDamagedRef(@ref);
-
-    /// <inheritdoc cref="TryFindExistingAsync"/>
-    public ResolvedBlob? TryFindExisting(string fullHash, long length, string headHash, string tailHash) =>
-        Legacy.TryFindExisting(fullHash, length, headHash, tailHash);
-
-    /// <inheritdoc cref="TryFindPackMemberAsync"/>
-    public PackMemberRef? TryFindPackMember(string fullHash, long length, string headHash, string? tailHash) =>
-        Legacy.TryFindPackMember(fullHash, length, headHash, tailHash);
-
-    /// <summary>The token-less overload the not-yet-rewired callers use. It is the same call on either kind of
-    /// resolver — resolving is asynchronous in both worlds — so unlike the members above it does not refuse.</summary>
-    public Task<Resolution> ResolveAsync(
-        string fullHash, long length, string headHash, string tailHash, StageTracker? tracker = null) =>
-        ResolveAsync(fullHash, length, headHash, tailHash, CancellationToken.None, tracker);
-
-    /// <summary>The maps, or a refusal. A catalog-backed resolver cannot answer synchronously and must not pretend
-    /// to: blocking on the database here would be a deadlock waiting to happen, and a plausible-looking wrong answer
-    /// would be worse than either.</summary>
-    private LegacyDedupSource Legacy => _source as LegacyDedupSource ?? throw new InvalidOperationException(
-        "This resolver answers from the catalog and the run's work database; use the asynchronous members.");
-
     /// <summary>
     /// Records a finished upload and retires the claim: the reservation row goes in first, so that from the instant
     /// the in-flight entry disappears there is already something for the next file with this content to find.
@@ -371,17 +314,6 @@ public sealed class LocalDedupResolver
             _reservation is null
                 ? Task.CompletedTask
                 : _owner!.CompleteAsync(_reservation, Ref, raw, volumes, volumeSizes, ct);
-
-        /// <summary>The token-less form, for the callers not yet rewired. It cannot write the reservation row, so it
-        /// is only offered on a resolver built from the in-memory maps, where the claim itself is the record.</summary>
-        public void Complete(bool raw, int volumes, IReadOnlyList<long> volumeSizes)
-        {
-            if (_reservation is null)
-                return;
-
-            _ = _owner!.Legacy;   // refuses a catalog-backed resolver rather than leaving a claim nothing can retire
-            _reservation.Complete(new ResolvedBlob(Ref, raw, volumes, volumeSizes));
-        }
 
         /// <summary>Called when the upload fails, making the waiting latecomers fail with it (so they never wrongly dedup onto a blob that does not exist).</summary>
         public void Fail(Exception ex) => _reservation?.Fail(ex);

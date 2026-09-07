@@ -95,7 +95,7 @@ public sealed class EmptyFileRoundTripTests : IDisposable
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+            new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));

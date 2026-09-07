@@ -240,7 +240,7 @@ public sealed class CompressionContinuityTests : IDisposable
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            hasher ?? new FileHasher(), authority.IndexCache, authority.Tracked,
+            hasher ?? new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var request = new BackupRequest
         {

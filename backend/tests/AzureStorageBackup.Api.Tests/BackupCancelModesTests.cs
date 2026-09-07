@@ -106,14 +106,14 @@ public sealed class BackupCancelModesTests : IDisposable
     /// The "run one successful round first, then stop during the second round's version index read" cases cannot do
     /// without it: with a fresh one built each time, the second round cannot see the version the first round wrote, so
     /// there is no index to read.</param>
-    /// <param name="wrapIndexCache">Wraps only the index cache the **orchestrator** holds; retention cleanup still gets the real one.</param>
+    /// <param name="wrapCatalogs">Wraps only the catalogs the **orchestrator** holds; retention cleanup still gets the real index cache.</param>
     /// <param name="compactUploader">Dead-weight compaction's own uploader (kept entirely separate from the one the main
     /// backup uploads with). Builds a real one by default; the cases pinning "stop intent at the cleanup tail" push an
     /// artificially delayed double in here, using its elapsed time to tell the two outcomes apart: "compaction really
     /// was invoked" versus "compaction was skipped".</param>
     private (BackupOrchestrator Orchestrator, BlobClientFactory Factory, TestLocalAuthority Authority) Build(
         IBlobUploader uploader, IOperationLog? opLog = null, INotifier? notifier = null,
-        TestLocalAuthority? reuse = null, Func<ILocalIndexCache, ILocalIndexCache>? wrapIndexCache = null,
+        TestLocalAuthority? reuse = null, Func<IVersionCatalogs, IVersionCatalogs>? wrapCatalogs = null,
         IBlobUploader? compactUploader = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
@@ -129,7 +129,7 @@ public sealed class BackupCancelModesTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), wrapIndexCache?.Invoke(authority.IndexCache) ?? authority.IndexCache, authority.Tracked,
+            new FileHasher(), wrapCatalogs?.Invoke(authority.Catalogs) ?? authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(),
             notifier: notifier, opLog: opLog);
         return (orchestrator, factory, authority);
@@ -511,27 +511,34 @@ public sealed class BackupCancelModesTests : IDisposable
     /// A 500,000-entry index really does take several seconds to read (measured in this repo), and a few dozen versions
     /// add up to minutes; if the token is not wired into this step (still the run's own ct), this double hangs forever
     /// and the case goes red on timeout.</summary>
-    private sealed class BlockingIndexCache(ILocalIndexCache inner) : ILocalIndexCache
+    /// <summary>Parks forever inside the step that makes sure a retained version is in the catalog — the migration
+    /// that reads an <c>.idx</c> file, or downloads the index from the cloud, and is the pre-upload phase this test is
+    /// about. Only the token can end the wait, which is precisely the wiring under test.</summary>
+    private sealed class BlockingCatalogs(IVersionCatalogs inner) : IVersionCatalogs
     {
         public TaskCompletionSource Reading { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public async Task<VersionIndex> ReadAsync(
-            Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default)
+        public async Task EnsureVersionAsync(
+            Account account, string container, BackupVersion version, long identityTicks, string? password,
+            CancellationToken ct = default)
         {
             Reading.TrySetResult();
             await Task.Delay(Timeout.Infinite, ct);   // only the token can save it
-            return await inner.ReadAsync(account, container, version, identityTicks, indexBlob, password, indexVolumes, ct);
+            await inner.EnsureVersionAsync(account, container, version, identityTicks, password, ct);
         }
 
-        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index,
-            CancellationToken ct = default) => inner.PutAsync(accountId, container, version, identityTicks, index, ct);
+        public Task<VersionCatalog> OpenAsync(
+            int accountId, string container, bool readOnly, CancellationToken ct = default)
+            => inner.OpenAsync(accountId, container, readOnly, ct);
 
-        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
-            => inner.RemoveAsync(accountId, container, version, ct);
+        public Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
+            => inner.LockForWriteAsync(accountId, container, ct);
 
-        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
-            => inner.RemoveForContainerAsync(accountId, container, ct);
+        public Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => inner.RemoveVersionAsync(accountId, container, version, ct);
+
+        public Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)
+            => inner.RemoveContainerAsync(accountId, container, ct);
     }
 
     private static async Task<Exception> RunAndCatchAsync(Task run, StopKind kind) =>
@@ -813,9 +820,9 @@ public sealed class BackupCancelModesTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>Stop pressed halfway through reading the version indexes: it has to react right there, not wait for
-    /// every version's index to finish loading. After the user presses stop, SuspendAsync/CancelAsync do not return
-    /// until the terminal state, so not reacting on the spot means the HTTP request hangs dead.</summary>
+    /// <summary>Stop pressed halfway through getting the retained versions into the catalog: it has to react right
+    /// there, not wait for every version to be migrated. After the user presses stop, SuspendAsync/CancelAsync do not
+    /// return until the terminal state, so not reacting on the spot means the HTTP request hangs dead.</summary>
     [SkippableTheory]
     [InlineData(StopKind.Suspend)]
     [InlineData(StopKind.StopNow)]
@@ -836,12 +843,12 @@ public sealed class BackupCancelModesTests : IDisposable
             // Run one successful round first: only then does the second round have a version index to read.
             Assert.Equal(1, (await first.RunAsync(Request(account, name), null, default)).Version);
 
-            BlockingIndexCache? blocking = null;
+            BlockingCatalogs? blocking = null;
             var (second, _, _) = Build(
-                real, reuse: authority, wrapIndexCache: inner => blocking = new BlockingIndexCache(inner));
+                real, reuse: authority, wrapCatalogs: inner => blocking = new BlockingCatalogs(inner));
 
             await using var c = new BackupRunControl(_journals, 8, "run-index-" + (int)kind);
-            // This token is the only "release" mechanism this case has: BlockingIndexCache parks on
+            // This token is the only "release" mechanism this case has: BlockingCatalogs parks on
             // Task.Delay(Infinite, ct) and there is no separate Release signal. If Reading is never reached, or the stop
             // intent never makes it into that ct (exactly the regression this case pins down), run may still be parked in
             // the background — the finally block cancels it via the test's own CTS as a backstop.
@@ -852,7 +859,7 @@ public sealed class BackupCancelModesTests : IDisposable
                 await blocking!.Reading.Task.WaitAsync(TimeSpan.FromSeconds(30));
                 c.RequestStop(kind);
 
-                // If the token is not wired into the index read step, this line hangs until the timeout — exactly the regression this case pins down.
+                // If the token is not wired into the catalog step, this line hangs until the timeout — exactly the regression this case pins down.
                 await RunAndCatchAsync(run.WaitAsync(TimeSpan.FromSeconds(30)), kind);
 
                 // We stopped before the journal was opened, so no journal should be left on disk; nor should a second version be written.

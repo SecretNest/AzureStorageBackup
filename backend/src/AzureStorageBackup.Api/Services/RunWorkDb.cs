@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using AzureStorageBackup.Api.Models;
@@ -269,6 +270,11 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     /// <summary>The scratch file's path. Deleted, along with its <c>-wal</c> and <c>-shm</c> companions, by
     /// <see cref="DisposeAsync"/>.</summary>
     public string Path { get; }
+
+    /// <summary>The file's stem — the run id the factory named it after. It is what the run's other scratch files are
+    /// named from (the serialized index the finish writes beside this database), so that everything one run leaves on
+    /// the temp volume carries the same name and a leftover can be traced back to the run that made it.</summary>
+    public string Name => System.IO.Path.GetFileNameWithoutExtension(Path);
 
     /// <summary>Creates the file and its schema, then starts the writer. The schema is created here rather than on
     /// the writer task so that a broken path or an unwritable directory fails the caller directly instead of turning
@@ -841,5 +847,21 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         try { File.Delete(path); }
         catch (IOException) { /* a leftover scratch file wastes disk; failing the run over it would waste the run */ }
         catch (UnauthorizedAccessException) { /* same */ }
+    }
+}
+
+/// <summary>
+/// The one LINQ operator the streaming cursors need. <c>System.Linq.Async</c> would bring the whole set, and the
+/// whole point of these cursors is that nothing between the database and the consumer materializes — an operator
+/// library invites exactly the <c>ToList</c> that undoes it. Six lines, one call site, no dependency.
+/// </summary>
+internal static class AsyncEnumerableExtensions
+{
+    public static async IAsyncEnumerable<TResult> Select<TSource, TResult>(
+        this IAsyncEnumerable<TSource> source, Func<TSource, TResult> selector,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var item in source.WithCancellation(ct))
+            yield return selector(item);
     }
 }

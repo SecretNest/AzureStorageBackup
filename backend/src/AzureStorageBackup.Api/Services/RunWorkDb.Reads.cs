@@ -95,6 +95,12 @@ public sealed partial class RunWorkDb
     private const string SelectDraftPathsOfKindSql =
         "SELECT path FROM draft WHERE change_kind=@change_kind ORDER BY seq";
 
+    /// <summary>The same rows with the reason beside them. <c>reason</c> is only ever filled in for an unreadable
+    /// verdict, so <c>COALESCE</c> only stands in for a row of some other kind — which this statement is never asked
+    /// for.</summary>
+    private const string SelectDraftPathsAndReasonsOfKindSql =
+        "SELECT path, COALESCE(reason, '') FROM draft WHERE change_kind=@change_kind ORDER BY seq";
+
     /// <summary>A range scan over the primary key, not <c>LIKE</c>: "d" must take in "d/x" without also taking in
     /// "dd/x", and the upper bound is the byte right after '/'. Strictly <em>under</em> the directory, matching
     /// <c>PathUnder.IsUnder</c> — the directory's own row is not one of its contents.</summary>
@@ -151,11 +157,6 @@ public sealed partial class RunWorkDb
     /// allowed to be generous: a false positive costs one extra read of a file, a miss costs a whole compression.</summary>
     private const string SelectResumeHeadSeenSql =
         "SELECT EXISTS (SELECT 1 FROM resume_blobs WHERE length=@length AND head_hash=@head_hash)";
-
-    /// <summary>Ordered by the primary key, which is the order SQLite would walk this table in anyway — spelling it
-    /// out costs nothing and makes the one caller that materializes the whole table produce the same list twice.</summary>
-    private const string SelectResumeBlobsSql =
-        $"SELECT {SelectResumeBlobColumns} FROM resume_blobs ORDER BY path";
 
     private const string SelectResumePackSql =
         "SELECT ref, store_only, volumes, volume_sizes FROM resume_packs WHERE members_key=@members_key";
@@ -331,6 +332,20 @@ public sealed partial class RunWorkDb
             yield return reader.GetString(0);
     }
 
+    /// <summary>The same paths with the reason the diff gave for each, in emission order. The warning the operator
+    /// gets quotes the system's own words for every path — "in use", "permission denied" and "device read error" need
+    /// different things done about them — so the reason travels with the path rather than being fetched per row.</summary>
+    public async IAsyncEnumerable<(string Path, string Reason)> DraftPathsAndReasonsOfKindAsync(
+        ChangeKind kind, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftPathsAndReasonsOfKindSql);
+        Set(command, "@change_kind", (int)kind);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return (reader.GetString(0), reader.GetString(1));
+    }
+
     /// <summary>How many of them lie inside one directory subtree; the root ("" or ".") covers everything. A
     /// directory that could not be listed carries its whole subtree with it, which is why this is asked by prefix
     /// rather than one path at a time.</summary>
@@ -461,19 +476,6 @@ public sealed partial class RunWorkDb
         Set(command, "@length", length);
         Set(command, "@head_hash", headHash);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct)) != 0;
-    }
-
-    /// <summary>Every blob record the journal left, streamed. The one question here that is not a lookup: the dedup
-    /// resolver is still built up front as a dictionary, so somebody has to hand it the whole set (see
-    /// <c>ResumeLedger.ConfirmedBlobsAsync</c>). Streamed rather than returned as a list so that this file, and not
-    /// the reader, decides how much of the table is in memory at once.</summary>
-    public async IAsyncEnumerable<JournalRecord> ResumeBlobsAsync([EnumeratorCancellation] CancellationToken ct)
-    {
-        await using var connection = await OpenReadAsync(ct);
-        using var command = Command(connection, SelectResumeBlobsSql);
-        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return ReadResumeBlob(reader);
     }
 
     private async Task<JournalRecord?> ResumeBlobAsync(

@@ -184,7 +184,7 @@ public sealed class RunLedgerTests : IDisposable
         public Dictionary<string, string> PostDiffUnreadable { get; } = new(StringComparer.Ordinal);
 
         public List<IndexEntry> Entries() => LegacyBuildEntries(
-            new DiffResult(Changes, 0, 0), StorageByPath, TailByPath, Overrides, PostDiffUnreadable);
+            Changes, StorageByPath, TailByPath, Overrides, PostDiffUnreadable);
     }
 
     // ---- Test 1: the entries are the ones BuildEntries built ---------------------------------------------------
@@ -312,13 +312,15 @@ public sealed class RunLedgerTests : IDisposable
     /// it may not change what the index says.
     /// </summary>
     private static List<IndexEntry> LegacyBuildEntries(
-        DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
+        IReadOnlyList<FileChange> changes, IReadOnlyDictionary<string, StorageRef> storageByPath,
         IReadOnlyDictionary<string, string> tailByPath,
         IReadOnlyDictionary<string, EntryOverride> overrides,
         IReadOnlyDictionary<string, string> postDiffUnreadable)
     {
         var entries = new List<IndexEntry>();
-        foreach (var c in diff.Changes)
+        // The one edit to the copied body: it took the diff's whole result and walked `diff.Changes`, and that type
+        // is gone with the list it carried. The list itself is the same list, in the same order.
+        foreach (var c in changes)
         {
             if (c.Kind == ChangeKind.Unreadable || postDiffUnreadable.ContainsKey(c.Path))
             {

@@ -29,13 +29,23 @@ public sealed class VersionCatalogs(
     public async Task EnsureVersionAsync(
         Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
     {
+        // An <c>.idx</c> file existing at all means it was written **after** the catalog last held this version:
+        // TryImportFromIdxFileAsync deletes the file it consumes, and no run writes one any more. What is left
+        // writing them rewrites an index out of band — a repair marking content unrecoverable is the one that
+        // matters, and its marks are what the next backup reads to exclude a damaged address from dedup and heal it
+        // in passing. So a file, when there is one, outranks the row already in the catalog, and the probe below is
+        // not allowed to short-circuit past it. One File.Exists per version per run, which answers no on every
+        // ordinary run; the locked path is the one that reads it properly.
+        var rewritten = File.Exists(legacyFiles.PathFor(account.Id, container, version.Version));
+
         // Read-only probe: no quick_check, no write lock. A container whose catalog has never been opened for
         // writing in this process yet has no file at all — that is not an error here, just a sign the locked path
         // below has work to do.
         try
         {
             await using var probe = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
-            if (await probe.GetVersionAsync(version.Version, ct) is { } row && row.Identity == identityTicks)
+            if (!rewritten
+                && await probe.GetVersionAsync(version.Version, ct) is { } row && row.Identity == identityTicks)
                 return;
         }
         catch (FileNotFoundException)
@@ -45,12 +55,21 @@ public sealed class VersionCatalogs(
 
         using var _ = await catalogs.LockForWriteAsync(account.Id, container, ct);
         await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
-        if (await catalog.GetVersionAsync(version.Version, ct) is { } again && again.Identity == identityTicks)
-            return;   // another caller got here first while this one waited for the lock
 
-        // 1. the .idx file
+        // 1. the .idx file, ahead of the catalog row for the reason above
         if (await TryImportFromIdxFileAsync(catalog, account.Id, container, version.Version, identityTicks, ct))
             return;
+
+        if (await catalog.GetVersionAsync(version.Version, ct) is { } again && again.Identity == identityTicks)
+        {
+            // Either the catalog always had it, or another caller imported it while this one waited for the lock.
+            // Any file still sitting there survived the import attempt above, which means it is under a superseded
+            // identity — nobody can ever use it, and left in place it would send every later run down this locked
+            // path to be told the same thing. (An unparseable one is already deleted by the attempt itself.)
+            if (rewritten)
+                legacyFiles.Remove(account.Id, container, version.Version);
+            return;
+        }
 
         // 2. the legacy row (pre-.idx, still in app.db)
         var legacy = await db.CachedVersionIndexes.AsNoTracking().FirstOrDefaultAsync(

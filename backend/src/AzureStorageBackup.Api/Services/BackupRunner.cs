@@ -1,3 +1,4 @@
+using System.Runtime;
 using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
@@ -688,6 +689,10 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     /// <summary>The execution body shared by both entry points. **Does not touch the busy lock** — the lock is the caller's job.</summary>
     private async Task RunCoreAsync(int configId, BackupRunState state, CancellationToken ct)
     {
+        // Whether the orchestrator was ever entered. A round the sentinel gate turned away allocated nothing worth
+        // collecting, and paying for an aggressive compacting collection every five minutes for as long as a share
+        // stays unmounted would be a cost with nothing on the other side of it.
+        var ran = false;
         try
         {
             using var scope = scopes.CreateScope();
@@ -736,6 +741,7 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             // (see BackupRunControl.SweepSuppressed); the sweep fires when the report retires instead.
             control.SweepSuppressed = await sp.GetRequiredService<CheckRunner>().HasPersistedReportAsync(configId, ct);
             state.Control = control;
+            ran = true;
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
                 new StateProgress(state), ct, control);
@@ -790,6 +796,33 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                 .WriteStatusAsync(configId, ex.Message, logger);
             state.Completion.TrySetResult();
         }
+        finally
+        {
+            if (ran)
+                ReleaseRunMemory();
+        }
+    }
+
+    /// <summary>
+    /// Hand the run's heap back to the operating system now that the run is over.
+    /// <para>
+    /// A backup's peak is not its steady state: the scan, the diff and the index write each touch a great deal of
+    /// memory briefly and then let go of it, and the large object heap fragments badly under that pattern — a few
+    /// hundred MB of buffers and index volumes, allocated and released in a shape no compaction ever happens to run
+    /// against. On a NAS with 2 GB of RAM the process then sits at its high-water mark between backups, which is what
+    /// the operator sees and what the OOM killer counts, even though almost none of it is live.
+    /// </para>
+    /// <para>
+    /// So: once per run, at the one moment the run's own working set is provably dead and nothing is waiting on this
+    /// thread. <see cref="GCCollectionMode.Aggressive"/> also decommits, which is the half that makes the number in
+    /// the process list go down rather than merely the number inside the runtime, and LOH compaction is what deals
+    /// with the fragmentation itself. Both are far too expensive to do on any schedule other than this one.
+    /// </para>
+    /// </summary>
+    private static void ReleaseRunMemory()
+    {
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
     }
 
     private sealed class StateProgress(BackupRunState state) : IProgress<BackupProgress>

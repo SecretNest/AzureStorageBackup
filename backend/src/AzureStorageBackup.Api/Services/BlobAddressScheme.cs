@@ -49,7 +49,7 @@ public sealed class BlobAddressScheme
     /// Collision-detection metadata written on upload (head/tail segment hashes included, to catch the residual collisions where the content differs but fullHash+length agree).
     /// <para>
     /// A null <paramref name="headHash"/>/<paramref name="tailHash"/> means "that item is unknown" — an old index entry
-    /// may be missing those two fields (a fresh backup's BuildEntries always fills them in, so this only shows up when repairing an old backup). The affected key must then be **omitted**
+    /// may be missing those two fields (a fresh backup's index entries always carry them, so this only shows up when repairing an old backup). The affected key must then be **omitted**
     /// rather than written as an empty string: <see cref="MetadataMatches"/> treats "key absent" as not taking part in the decision and "key present
     /// but different" as a collision, so an empty string would make identical content look like a collision, divert it to a ~N fallback address and falsely report "collision avoided".
     /// </para>

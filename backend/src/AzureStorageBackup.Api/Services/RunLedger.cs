@@ -69,10 +69,21 @@ public sealed class RunLedger(RunWorkDb work)
     public IAsyncEnumerable<string> UnreadablePathsAsync(CancellationToken ct) =>
         work.DraftPathsOfKindAsync(ChangeKind.Unreadable, ct);
 
+    /// <summary>The same paths with the reason the system gave for each — "in use", "permission denied" and "device
+    /// read error" want different things done about them, and the warning quotes the words verbatim. Streamed for the
+    /// same reason as <see cref="UnreadablePathsAsync"/>: a dropped share makes this list as long as the share.</summary>
+    public IAsyncEnumerable<(string Path, string Reason)> UnreadableAsync(CancellationToken ct) =>
+        work.DraftPathsAndReasonsOfKindAsync(ChangeKind.Unreadable, ct);
+
     /// <summary>How many of them lie under one unreadable directory: that warning reports the subtree it took with
     /// it, rather than repeating itself for every file below.</summary>
     public Task<int> UnreadableUnderAsync(string dir, CancellationToken ct) =>
         work.DraftKindUnderCountAsync(ChangeKind.Unreadable, dir, ct);
+
+    /// <summary>How many there are altogether — the figure the run's result reports beside the paths that only
+    /// stopped being readable later. The empty prefix is the whole tree, not a directory named "".</summary>
+    public Task<int> UnreadableCountAsync(CancellationToken ct) =>
+        work.DraftKindUnderCountAsync(ChangeKind.Unreadable, "", ct);
 
     /// <summary>The run's summary line: paths added, changed and deleted, and the bytes that went with the
     /// deletions.</summary>

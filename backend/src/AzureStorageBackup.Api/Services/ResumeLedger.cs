@@ -146,33 +146,4 @@ public sealed class ResumeLedger(RunWorkDb work)
     /// </summary>
     public async Task<JournalRecord?> FindPackAsync(IReadOnlyList<JournalMember> members, CancellationToken ct)
         => members.Count > 0 ? await work.ResumePackAsync(RunWorkDb.MemberKey(members), ct) : null;
-
-    /// <summary>
-    /// Hand these single-file records over keyed by **content identity**, to feed <see cref="LocalDedupResolver.Build"/>.
-    /// <para>
-    /// Resume itself accounts by path (see the class remarks), but in the cloud these blocks are in exactly the same
-    /// position as blocks in the index: uploaded, address taken. Without telling the dedup table, a file with **the
-    /// same content at a different path** would not be recognised as it; after recompressing, ResolveAsync hands back
-    /// the same address, and the stale-volume cleanup just before upload deletes last run's work and uploads it all
-    /// over again. See the notes on the <c>confirmed</c> parameter of <c>LocalDedupResolver.Build</c>.
-    /// </para>
-    /// <para>All four content tests are required; records missing any are skipped — an incomplete identity has no
-    /// business taking part in dedup.</para>
-    /// <para>
-    /// This one materializes the whole table, which is the very thing this class exists to avoid, and it is the last
-    /// caller that does: the dedup resolver is still a dictionary built up front. It goes when the resolver learns to
-    /// probe <c>resume_blobs</c> by content itself (which <see cref="RunWorkDb.ResumeBlobByContentAsync"/> is already
-    /// there for), and this method goes with it.
-    /// </para>
-    /// </summary>
-    public async Task<IReadOnlyList<ConfirmedBlob>> ConfirmedBlobsAsync(CancellationToken ct)
-    {
-        var list = new List<ConfirmedBlob>();
-        await foreach (var r in work.ResumeBlobsAsync(ct))
-            if (r is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail })
-                list.Add(new ConfirmedBlob(
-                    full, r.Length, head, tail,
-                    new ResolvedBlob(r.Ref, r.Raw, Math.Max(1, r.Volumes), r.VolumeSizes)));
-        return list;
-    }
 }

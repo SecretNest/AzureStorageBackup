@@ -121,14 +121,15 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
-        var indexCache = new LocalIndexCache(db, store, TestIndexFiles.New());
+        var indexFiles = TestIndexFiles.New();
+        var indexCache = new LocalIndexCache(db, store, indexFiles);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(blobFactory), blobFactory, store, staging,
             new RetentionCleaner(blobFactory, store, new RetentionEvaluator(), indexCache: indexCache, trackedInfo: tracked),
-            hasher, indexCache: indexCache, trackedInfo: tracked,
+            hasher, catalogs: TestCatalogs.New(db, store, indexFiles), trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
 
         var account = new Account

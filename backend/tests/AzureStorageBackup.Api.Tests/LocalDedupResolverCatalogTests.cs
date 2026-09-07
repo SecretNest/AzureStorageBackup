@@ -13,8 +13,7 @@ namespace AzureStorageBackup.Api.Tests;
 /// input and require every answer to agree.
 /// <para>
 /// The few tests after it pin what the differential comparison cannot see, because the old implementation had no
-/// such thing: a finished upload leaving the in-flight table for a row in the work database, and the old synchronous
-/// surface refusing to answer at all from a catalog-backed resolver.
+/// such thing: a finished upload leaving the in-flight table for a row in the work database.
 /// </para>
 /// </summary>
 public sealed class LocalDedupResolverCatalogTests
@@ -241,30 +240,6 @@ public sealed class LocalDedupResolverCatalogTests
 
         Assert.True(await resolver.MayDeduplicateAsync(100, "xxh128:hd", Ct));
         Assert.False(await resolver.MayDeduplicateAsync(101, "xxh128:hd", Ct));   // length is part of the key
-    }
-
-    /// <summary>
-    /// The synchronous surface is the compatibility shim the orchestrator is still on until Task 13, and it can only
-    /// be answered out of the in-memory maps. Silently answering something plausible from a catalog-backed resolver
-    /// is the one outcome worth refusing: a sync Complete would set the waiters' result and never write the
-    /// reservation row, leaving a claim nothing can ever retire.
-    /// </summary>
-    [Fact]
-    public async Task The_Synchronous_Surface_Refuses_A_Catalog_Backed_Resolver()
-    {
-        var (catalog, work, cleanup) = await TestResolver.OpenAsync(Ct);
-        await using var _ = cleanup;
-        var resolver = new LocalDedupResolver(Plain, catalog, work);
-
-        Assert.Throws<InvalidOperationException>(() => resolver.MayDeduplicate(1, "xxh128:h"));
-        Assert.Throws<InvalidOperationException>(() => resolver.NoteInFlight(1, "xxh128:h"));
-        Assert.Throws<InvalidOperationException>(() => resolver.IsDamagedRef("data/x"));
-        Assert.Throws<InvalidOperationException>(() => resolver.TryFindExisting("xxh128:f", 1, "xxh128:h", "xxh128:t"));
-        Assert.Throws<InvalidOperationException>(() => resolver.TryFindPackMember("xxh128:f", 1, "xxh128:h", "xxh128:t"));
-
-        var claim = await resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
-        Assert.Throws<InvalidOperationException>(() => claim.Complete(raw: false, volumes: 1, volumeSizes: [5]));
-        claim.Fail(Boom);
     }
 
     /// <summary>

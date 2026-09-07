@@ -118,7 +118,8 @@ public sealed class BackupLifecycleTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
-        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
+        var indexFiles = TestIndexFiles.New();
+        var indexCache = new LocalIndexCache(_db, store, indexFiles);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
@@ -128,7 +129,7 @@ public sealed class BackupLifecycleTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), _uploader, factory, store, staging, cleaner, hasher,
-            indexCache: indexCache, trackedInfo: tracked,
+            catalogs: TestCatalogs.New(_db, store, indexFiles), trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);

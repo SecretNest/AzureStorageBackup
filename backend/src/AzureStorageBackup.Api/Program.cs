@@ -76,7 +76,6 @@ static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
 
 // Backup engine (M4): 7z codec + info file/index reading and writing. The codec is constructed on demand (7z is probed on the first resolve).
 builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
-builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
 builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
 // Cache of deserialized version indexes (singleton, shared across requests). The default of 2 entries favours responsiveness: tree browsing in the
 // restore dialog and version comparison hit the same index, so a click no longer rebuilds the whole index (measured at about 0.9 s / 350 MB for 500k entries).
@@ -108,6 +107,14 @@ builder.Services.AddSingleton(sp =>
 // File backend for the verbose per-file debug log (text files per backup and per date, PRD 3.6).
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
+// Registered here rather than up with the other stores because of its temp root, which is the one argument it takes:
+// the file-shaped index members encode the archive to a file and read it back to verify, and at a few million
+// entries that file is hundreds of MB. The default is the system temp dir, which on a NAS is quite often a small
+// tmpfs — this points it at the volume the operator sized for the job instead.
+builder.Services.AddScoped<IBackupInfoStore>(sp => new BackupInfoStore(
+    sp.GetRequiredService<IBlobClientFactory>(), sp.GetRequiredService<IArchiveCodec>(),
+    Path.Combine(tempPath, "index")));
+
 // The journal lives **next to the database file**, not under tempPath: without Backup:TempPath the latter is /tmp, which is gone
 // as soon as the container is recreated — and the entire reason the journal exists is to "still know where the last run got to after the container is recreated". Following the
 // database, it naturally lands on the same persistent volume, and the user does not have to set an extra environment variable just to make crash recovery work.
@@ -121,6 +128,17 @@ builder.Services.AddSingleton(new BackupJournalStore(Path.Combine(dbDir, "journa
 // operator is already persisting without a second environment variable to get right. Also not cleared at startup.
 // It is a **cache**, not authority — deleting the directory costs downloads, never data.
 builder.Services.AddSingleton(new VersionIndexFileStore(Path.Combine(dbDir, "index-cache")));
+
+// The container catalogs, in **the same directory** as the .idx files above and for the same reasons — they must
+// survive a container being recreated, and they migrate a version out of the .idx file beside them, so splitting the
+// two across volumes would mean the migration reads one mount and writes another. VersionCatalogStore mirrors
+// VersionIndexFileStore's container-name sanitising verbatim precisely so the two agree on the directory.
+// A catalog is likewise a **cache**, not authority: deleting the directory costs downloads, never data.
+builder.Services.AddSingleton(sp => new VersionCatalogStore(
+    Path.Combine(dbDir, "index-cache"), sp.GetService<ILogger<VersionCatalogStore>>()));
+// Scoped, because migrating a version into a catalog reads the app database (the pre-.idx rows) and the cloud, and
+// both of those come from the scope.
+builder.Services.AddScoped<IVersionCatalogs, VersionCatalogs>();
 
 // Spill area for the diff→upload queue. The write side never blocks: whatever memory cannot hold spills here, so diff can run all the way to the end —
 // which is the precondition for showing a remaining time during the upload stage (the denominator, SetTotal, is only fixed once diff finishes, see StageProgress.Eta).

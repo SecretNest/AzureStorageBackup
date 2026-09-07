@@ -201,7 +201,8 @@ public sealed class FixtureRecorderTests
         conn.Open();
         var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(conn).Options);
         db.Database.EnsureCreated();
-        var indexCache = new LocalIndexCache(db, store, new VersionIndexFileStore(indexRoot));
+        var indexFiles = new VersionIndexFileStore(indexRoot);
+        var indexCache = new LocalIndexCache(db, store, indexFiles);
         var localState = new LocalBackupStateStore(db);
         var tracked = new TrackedInfoStore(store, localState);
 
@@ -210,7 +211,7 @@ public sealed class FixtureRecorderTests
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: indexCache, trackedInfo: tracked, journals: journals),
-            new FileHasher(), indexCache, tracked,
+            new FileHasher(), TestCatalogs.New(db, store, indexFiles), tracked,
             workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory, localState);
     }

@@ -28,22 +28,34 @@ internal sealed class TestLocalAuthority
         conn.Open();
         Db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(conn).Options);
         Db.Database.EnsureCreated();
-        (IndexCache, Tracked) = Wire(Db, store);
+        (IndexCache, Catalogs, Tracked) = Wire(Db, store);
     }
 
     /// <summary>Reuses a database the test class already has — for when the orchestrator and the checker/repairer must see the same local state.</summary>
     internal TestLocalAuthority(AppDbContext db, IBackupInfoStore store)
     {
         Db = db;
-        (IndexCache, Tracked) = Wire(db, store);
+        (IndexCache, Catalogs, Tracked) = Wire(db, store);
     }
 
     internal AppDbContext Db { get; }
 
     internal LocalIndexCache IndexCache { get; }
 
+    /// <summary>The container catalogs the orchestrator reads the previous version and the dedup facts out of, over
+    /// the same <see cref="VersionIndexFileStore"/> the index cache writes to — which is the arrangement production
+    /// has (both stores share one directory), and what lets a catalog migrate a version out of an <c>.idx</c> file
+    /// some earlier run left there.</summary>
+    internal VersionCatalogs Catalogs { get; }
+
     internal TrackedInfoStore Tracked { get; }
 
-    private static (LocalIndexCache, TrackedInfoStore) Wire(AppDbContext db, IBackupInfoStore store)
-        => (new LocalIndexCache(db, store, TestIndexFiles.New()), new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+    private static (LocalIndexCache, VersionCatalogs, TrackedInfoStore) Wire(AppDbContext db, IBackupInfoStore store)
+    {
+        var files = TestIndexFiles.New();
+        return (
+            new LocalIndexCache(db, store, files),
+            TestCatalogs.New(db, store, files),
+            new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+    }
 }

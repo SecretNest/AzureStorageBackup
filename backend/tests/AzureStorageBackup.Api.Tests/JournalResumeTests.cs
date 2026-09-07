@@ -75,7 +75,11 @@ public sealed class JournalResumeTests : IDisposable
         Assert.Equal(1, await ledger.RecordCountAsync(Ct));
         Assert.Equal("data/zzz", (await ledger.FindBlobAsync("a.bin", "zzz", 100, "hzzz", "tzzz", Ct))!.Ref);
         Assert.Null(await ledger.FindBlobAsync("a.bin", "aaa", 100, "haaa", "taaa", Ct));
-        Assert.Equal(["data/zzz"], (await ledger.ConfirmedBlobsAsync(Ct)).Select(b => b.Blob.Ref));
+        // And by content too, which is how dedup reaches these rows: the shadowed record answers nothing there
+        // either, so a file with its content elsewhere in the tree is uploaded rather than pointed at bytes the
+        // newest volume has already overwritten.
+        Assert.Equal("data/zzz", (await work.ResumeBlobByContentAsync("zzz", 100, "hzzz", "tzzz", Ct))?.Ref);
+        Assert.Null(await work.ResumeBlobByContentAsync("aaa", 100, "haaa", "taaa", Ct));
     }
 
     [Fact]

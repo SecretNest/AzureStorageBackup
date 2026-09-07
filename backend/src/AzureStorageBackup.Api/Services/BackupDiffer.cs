@@ -39,7 +39,7 @@ public sealed record FileChange(
     /// <summary>
     /// Tail hash. The fourth component of content identity, used together with fullHash + length + head for dedup and collision checks.
     /// <para>
-    /// On the single-file blob path it falls out of the compression pass for free (see the orchestrator's tailByPath), so what it is really here
+    /// On the single-file blob path it falls out of the compression pass for free (the run ledger's SetTailAsync), so what it is really here
     /// for is **pack members** — they used to have none of it, so they could only dedup on three components. Since the criterion is four components
     /// everywhere else, it should be four here too; the two paths should not each have their own standard.
     /// </para>
@@ -57,14 +57,9 @@ public sealed record DiffOptions
     public int HeadHashBytes { get; init; } = 4096;
 }
 
-/// <summary>Diff summary. ChangedFiles/ChangedBytes count Added+Modified only (uncompressed, before grouping; deletions/metadata-only excluded, §4).</summary>
-public sealed record DiffResult(
-    IReadOnlyList<FileChange> Changes,
-    int ChangedFiles,
-    long ChangedBytes);
-
 /// <summary>
-/// What a diff adds up to, now that it no longer hands back every change it made. ChangedFiles/ChangedBytes count
+/// What a diff adds up to: it hands back no list of changes at all, only these three numbers — every change it made
+/// went out through the callback as it was decided. ChangedFiles/ChangedBytes count
 /// Added+Modified only (uncompressed, before grouping; deletions/metadata-only excluded, §4); Emitted is how many
 /// changes went through the callback, which is the only remaining way for a caller to know the diff really covered
 /// everything it was given.
@@ -89,9 +84,12 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// Compares the scan against the previous version, delivering every change to <paramref name="onChange"/> as it is
     /// decided and returning only the totals.
     /// <para>
-    /// Both cursors **must** be in <see cref="string.CompareOrdinal(string, string)"/> path order — the scanner sorts
-    /// its entries that way and the catalog reads ORDER BY path, so this costs the callers nothing, and it is what
-    /// lets the diff run in constant memory. A cursor that breaks it is refused by name rather than diffed wrongly.
+    /// Both cursors **must** be in <see cref="string.CompareOrdinal(string, string)"/> path order. Neither side
+    /// orders by the path text: the scan cursor reads the work database by <c>path_key</c> and the catalog reads its
+    /// entries by <c>path_key</c> too, both of which are the path's UTF-16 big-endian bytes, whose byte order *is*
+    /// ordinal order (the two part company at the first surrogate pair — see the remarks on <see cref="RunWorkDb"/>).
+    /// So this costs the callers nothing, and it is what lets the diff run in constant memory. A cursor that breaks
+    /// it is refused by name rather than diffed wrongly.
     /// </para>
     /// </summary>
     /// <param name="current">The scanned entries, in ordinal path order.</param>
@@ -300,71 +298,6 @@ public sealed class BackupDiffer(IFileHasher hasher)
     }
 
     /// <summary>
-    /// The pre-merge entry point, kept only so <see cref="BackupOrchestrator"/> keeps compiling while the scan and the
-    /// previous index are moved into SQLite; it and <see cref="DiffResult"/> are deleted once the orchestrator drives
-    /// the merge itself. It is exactly the shape the merge exists to replace — every scanned entry, every previous
-    /// entry and every change resident at once — so nothing new should be built on it.
-    /// </summary>
-    public async Task<DiffResult> DiffAsync(
-        string rootPath,
-        ScanResult current,
-        VersionIndex? previous,
-        DiffOptions? options = null,
-        CancellationToken ct = default,
-        StageTracker? tracker = null,
-        Func<FileChange, CancellationToken, Task>? onChange = null,
-        Func<string, bool>? fullHashDeferred = null)
-    {
-        var changes = new List<FileChange>();
-
-        var totals = await DiffAsync(
-            rootPath,
-            AsAsync(current.Entries),
-            previous is null ? null : AsAsync(InOrdinalOrder(previous.Entries)),
-            current.Unreadable,
-            options, ct, tracker,
-            async (change, token) =>
-            {
-                changes.Add(change);
-                // The old callback contract: only the changes produced from a **scanned** entry were reported, because
-                // the Unreadable/Deleted ones synthesized afterwards give the caller nothing to upload. Those are
-                // precisely the changes that carry a Current, so the caller's stream is unchanged by the rewrite.
-                if (onChange is not null && change.Current is not null)
-                    await onChange(change, token);
-            },
-            fullHashDeferred is null ? null : entry => fullHashDeferred(entry.Path));
-
-        return new DiffResult(changes, totals.ChangedFiles, totals.ChangedBytes);
-    }
-
-    /// <summary>
-    /// The merge needs the previous version in ordinal path order, and an in-memory <see cref="VersionIndex"/> is not
-    /// always in it: BuildEntries appends the entries carried forward from an unreadable directory after the
-    /// scan-ordered ones, so any index written by a run that hit one is out of order at its tail — and refusing that
-    /// index would turn a past permission error into a backup that can never run again. Checked before sorting because
-    /// the check is one pass and the sort is not, and the overwhelmingly common case is already ordered. Only the
-    /// compatibility path needs this; the SQLite catalog cursor that replaces it reads ORDER BY path.
-    /// </summary>
-    private static IEnumerable<IndexEntry> InOrdinalOrder(List<IndexEntry> entries)
-    {
-        for (var i = 1; i < entries.Count; i++)
-        {
-            if (string.CompareOrdinal(entries[i].Path, entries[i - 1].Path) <= 0)
-                return entries.OrderBy(e => e.Path, StringComparer.Ordinal);
-        }
-
-        return entries;
-    }
-
-    /// <summary>Lifts an already-materialized sequence into the cursor shape the merge consumes.</summary>
-    private static async IAsyncEnumerable<T> AsAsync<T>(IEnumerable<T> source)
-    {
-        await Task.CompletedTask; // the sequence is in memory; nothing in here actually goes async
-        foreach (var item in source)
-            yield return item;
-    }
-
-    /// <summary>
     /// Guards that a cursor really is in ascending ordinal path order. The merge's correctness rests entirely on that
     /// assumption, and a source that quietly breaks it does not fail — it produces a **wrong diff**: the entries the
     /// merge walked past come back as an Added/Deleted pair, so a file is re-uploaded and its history is dropped, and
@@ -536,7 +469,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// </para>
     /// <para>
     /// When the full hash is deferred (single-file blob) only the head is computed — **the tail is not computed here**: on that path all three
-    /// hash segments fall out of the compression pass for free and overwrite the values from here (see the orchestrator's tailByPath and
+    /// hash segments fall out of the compression pass for free and overwrite the values from here (see the run ledger's SetTailAsync and
     /// StreamAndStageAsync), so computing it here is a wasted read. The head is still computed; it also answers "can this file be opened right now",
     /// so an unreadable file is classified Unreadable here (carrying the old entry forward) instead of falling over inside compression hours later.
     /// </para>

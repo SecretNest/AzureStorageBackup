@@ -29,16 +29,19 @@ public sealed class RunWorkDbFactory(string rootDir)
         return RunWorkDb.CreateAsync(path, ct);
     }
 
-    /// <summary>Clears the scratch databases a previous abnormal exit left behind. The pattern covers the
-    /// <c>-wal</c> and <c>-shm</c> companions as well, because a WAL left next to a deleted database is not just
-    /// wasted disk — it is what SQLite would try to replay into the next file created under that name.</summary>
+    /// <summary>Clears the scratch files a previous abnormal exit left behind. The pattern covers the <c>-wal</c> and
+    /// <c>-shm</c> companions as well, because a WAL left next to a deleted database is not just wasted disk — it is
+    /// what SQLite would try to replay into the next file created under that name. The serialized indexes a run
+    /// writes beside its database (<c>{runId}.v{n}.idx</c>) go the same way: both are named for a run that is over,
+    /// and an index at a few million entries is hundreds of MB to leave lying about.</summary>
     public static void ClearStale(string rootDir)
     {
         try
         {
             Directory.CreateDirectory(rootDir);
-            foreach (var file in Directory.EnumerateFiles(rootDir, "*.db*"))
-                RunWorkDb.Delete(file);
+            foreach (var pattern in new[] { "*.db*", "*.idx" })
+                foreach (var file in Directory.EnumerateFiles(rootDir, pattern))
+                    RunWorkDb.Delete(file);
         }
         catch
         {
