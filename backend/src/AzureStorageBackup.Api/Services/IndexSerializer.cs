@@ -28,19 +28,19 @@ public static class IndexSerializer
 
         var b = info.Backup;
         w.Write(b.Name);
-        WriteNullableString(w, b.Description);
-        WriteNullableString(w, b.SourceRootHint);
+        IndexEncoding.WriteNullableString(w, b.Description);
+        IndexEncoding.WriteNullableString(w, b.SourceRootHint);
         w.Write(b.Encrypted);
-        WriteDto(w, b.CreatedAt);
-        WriteNullableString(w, b.Settings?.ToJsonString());
+        IndexEncoding.WriteDto(w, b.CreatedAt);
+        IndexEncoding.WriteNullableString(w, b.Settings?.ToJsonString());
         WriteNullableBytes(w, b.KdfSalt);
 
         w.Write(info.Versions.Count);
         foreach (var v in info.Versions)
         {
             w.Write(v.Version);
-            WriteDto(w, v.CreatedAt);
-            WriteNullableDto(w, v.StartedAt); // info format 3
+            IndexEncoding.WriteDto(w, v.CreatedAt);
+            IndexEncoding.WriteNullableDto(w, v.StartedAt); // info format 3
             w.Write(v.IndexBlob);
             w.Write(v.IndexVolumes); // info format 5
             w.Write(v.Stats.Files);
@@ -56,11 +56,11 @@ public static class IndexSerializer
             w.Write(pack.Blob);
             w.Write(pack.Members.Count);
             foreach (var m in pack.Members)
-                WriteHash(w, m);
+                IndexEncoding.WriteHash(w, m);
             w.Write(pack.OriginalBytes);
             w.Write(pack.DeadBytes);
             w.Write(pack.Volumes);
-            WriteLongs(w, pack.VolumeSizes); // info format 2
+            IndexEncoding.WriteLongs(w, pack.VolumeSizes); // info format 2
             w.Write(pack.StoreOnly); // info format 4
         }
 
@@ -85,11 +85,11 @@ public static class IndexSerializer
         var meta = new BackupMeta
         {
             Name = r.ReadString(),
-            Description = ReadNullableString(r),
-            SourceRootHint = ReadNullableString(r),
+            Description = IndexEncoding.ReadNullableString(r),
+            SourceRootHint = IndexEncoding.ReadNullableString(r),
             Encrypted = r.ReadBoolean(),
-            CreatedAt = ReadDto(r),
-            Settings = ReadNullableString(r) is { } s ? JsonNode.Parse(s)!.AsObject() : null,
+            CreatedAt = IndexEncoding.ReadDto(r),
+            Settings = IndexEncoding.ReadNullableString(r) is { } s ? JsonNode.Parse(s)!.AsObject() : null,
             KdfSalt = ReadNullableBytes(r),
         };
 
@@ -101,8 +101,8 @@ public static class IndexSerializer
             {
                 // Initializers evaluate in written order = the field order in the stream, matching the write side one for one; don't reorder.
                 Version = r.ReadInt32(),
-                CreatedAt = ReadDto(r),
-                StartedAt = format >= 3 ? ReadNullableDto(r) : null, // format 3+
+                CreatedAt = IndexEncoding.ReadDto(r),
+                StartedAt = format >= 3 ? IndexEncoding.ReadNullableDto(r) : null, // format 3+
                 IndexBlob = r.ReadString(),
                 // format 5+. Anything written earlier is a single blob by definition, so 1 is the historical
                 // behaviour rather than a guess — an old info file keeps reading exactly as it always did.
@@ -120,7 +120,7 @@ public static class IndexSerializer
             var memberCount = r.ReadInt32();
             var members = new List<string>(memberCount);
             for (var m = 0; m < memberCount; m++)
-                members.Add(ReadHash(r)!);
+                members.Add(IndexEncoding.ReadHash(r)!);
             var originalBytes = r.ReadInt64();
             var deadBytes = r.ReadInt64();
             packs[id] = new PackInfo
@@ -130,7 +130,7 @@ public static class IndexSerializer
                 OriginalBytes = originalBytes,
                 DeadBytes = deadBytes,
                 Volumes = r.ReadInt32(),
-                VolumeSizes = format >= 2 ? ReadLongs(r) : [],
+                VolumeSizes = format >= 2 ? IndexEncoding.ReadLongs(r) : [],
                 // format 4+. Packs in older info files were all compressed, so reading back false is exactly the historical behavior.
                 StoreOnly = format >= 4 && r.ReadBoolean(),
             };
@@ -161,23 +161,23 @@ public static class IndexSerializer
             w.Write(e.Path);
             w.Write((byte)(e.Kind == "symlink" ? 1 : 0));
             w.Write(e.Length);
-            WriteDto(w, e.Mtime);
+            IndexEncoding.WriteDto(w, e.Mtime);
             w.Write(e.Permissions);
-            WriteHash(w, e.HeadHash);
-            WriteHash(w, e.TailHash); // format 2
-            WriteHash(w, e.FullHash);
-            WriteNullableString(w, e.Target);
-            WriteNullableDto(w, e.UnreadableAt); // index format 4
+            IndexEncoding.WriteHash(w, e.HeadHash);
+            IndexEncoding.WriteHash(w, e.TailHash); // format 2
+            IndexEncoding.WriteHash(w, e.FullHash);
+            IndexEncoding.WriteNullableString(w, e.Target);
+            IndexEncoding.WriteNullableDto(w, e.UnreadableAt); // index format 4
 
             if (e.Storage is { } s)
             {
                 w.Write(true);
                 w.Write((byte)(s.Kind == "pack" ? 1 : 0));
                 w.Write(s.Ref);
-                WriteNullableString(w, s.EntryName);
+                IndexEncoding.WriteNullableString(w, s.EntryName);
                 w.Write(s.Volumes);
                 w.Write(s.Raw);
-                WriteLongs(w, s.VolumeSizes); // index format 3
+                IndexEncoding.WriteLongs(w, s.VolumeSizes); // index format 3
             }
             else
             {
@@ -215,13 +215,13 @@ public static class IndexSerializer
             var path = r.ReadString();
             var kind = r.ReadByte() == 1 ? "symlink" : "file";
             var length = r.ReadInt64();
-            var mtime = ReadDto(r);
+            var mtime = IndexEncoding.ReadDto(r);
             var permissions = r.ReadString();
-            var headHash = ReadHash(r);
-            var tailHash = format >= 2 ? ReadHash(r) : null; // format 2+
-            var fullHash = ReadHash(r);
-            var target = ReadNullableString(r);
-            var unreadableAt = format >= 4 ? ReadNullableDto(r) : null; // format 4+
+            var headHash = IndexEncoding.ReadHash(r);
+            var tailHash = format >= 2 ? IndexEncoding.ReadHash(r) : null; // format 2+
+            var fullHash = IndexEncoding.ReadHash(r);
+            var target = IndexEncoding.ReadNullableString(r);
+            var unreadableAt = format >= 4 ? IndexEncoding.ReadNullableDto(r) : null; // format 4+
 
             StorageRef? storage = null;
             if (r.ReadBoolean())
@@ -230,10 +230,10 @@ public static class IndexSerializer
                 {
                     Kind = r.ReadByte() == 1 ? "pack" : "blob",
                     Ref = r.ReadString(),
-                    EntryName = ReadNullableString(r),
+                    EntryName = IndexEncoding.ReadNullableString(r),
                     Volumes = r.ReadInt32(),
                     Raw = r.ReadBoolean(),
-                    VolumeSizes = format >= 3 ? ReadLongs(r) : [],
+                    VolumeSizes = format >= 3 ? IndexEncoding.ReadLongs(r) : [],
                 };
             }
 
@@ -276,31 +276,9 @@ public static class IndexSerializer
     }
 
     // ---- Encoding primitives ----
-
-    private static void WriteNullableString(BinaryWriter w, string? value)
-    {
-        w.Write(value is not null);
-        if (value is not null)
-            w.Write(value);
-    }
-
-    private static string? ReadNullableString(BinaryReader r) => r.ReadBoolean() ? r.ReadString() : null;
-
-    private static void WriteLongs(BinaryWriter w, IReadOnlyList<long> values)
-    {
-        w.Write(values.Count);
-        foreach (var v in values)
-            w.Write(v);
-    }
-
-    private static List<long> ReadLongs(BinaryReader r)
-    {
-        var count = r.ReadInt32();
-        var list = new List<long>(count);
-        for (var i = 0; i < count; i++)
-            list.Add(r.ReadInt64());
-        return list;
-    }
+    // Shared with IndexStreamWriter/IndexStreamReader via IndexEncoding (Services/IndexStreamWriter.cs) so there is
+    // one copy of the wire format, not two that could drift apart. KdfSalt is info-file-only, so its
+    // WriteNullableBytes/ReadNullableBytes pair stays local rather than moving.
 
     private static void WriteNullableBytes(BinaryWriter w, byte[]? value)
     {
@@ -313,67 +291,4 @@ public static class IndexSerializer
     }
 
     private static byte[]? ReadNullableBytes(BinaryReader r) => r.ReadBoolean() ? r.ReadBytes(r.ReadInt32()) : null;
-
-    private static void WriteDto(BinaryWriter w, DateTimeOffset value)
-    {
-        w.Write(value.UtcTicks);
-        w.Write((short)value.Offset.TotalMinutes);
-    }
-
-    private static DateTimeOffset ReadDto(BinaryReader r)
-    {
-        var utcTicks = r.ReadInt64();
-        var offset = TimeSpan.FromMinutes(r.ReadInt16());
-        return new DateTimeOffset(utcTicks + offset.Ticks, offset);
-    }
-
-    private static void WriteNullableDto(BinaryWriter w, DateTimeOffset? value)
-    {
-        w.Write(value.HasValue);
-        if (value.HasValue)
-            WriteDto(w, value.Value);
-    }
-
-    private static DateTimeOffset? ReadNullableDto(BinaryReader r) => r.ReadBoolean() ? ReadDto(r) : null;
-
-    // Hash encoding: 0 = null; 1 = the 16 raw bytes of an xxh128; 2 = an arbitrary string (fallback).
-    private const string HashPrefix = "xxh128:";
-
-    private static void WriteHash(BinaryWriter w, string? hash)
-    {
-        if (hash is null)
-        {
-            w.Write((byte)0);
-            return;
-        }
-
-        byte[]? raw = null;
-        if (hash.StartsWith(HashPrefix, StringComparison.Ordinal))
-        {
-            var hex = hash[HashPrefix.Length..];
-            if (hex.Length == 32)
-            {
-                try { raw = Convert.FromHexString(hex); }
-                catch (FormatException) { /* Not hex, take the fallback */ }
-            }
-        }
-
-        if (raw is { Length: 16 })
-        {
-            w.Write((byte)1);
-            w.Write(raw);
-        }
-        else
-        {
-            w.Write((byte)2);
-            w.Write(hash);
-        }
-    }
-
-    private static string? ReadHash(BinaryReader r) => r.ReadByte() switch
-    {
-        0 => null,
-        1 => HashPrefix + Convert.ToHexString(r.ReadBytes(16)).ToLowerInvariant(),
-        _ => r.ReadString(),
-    };
 }
