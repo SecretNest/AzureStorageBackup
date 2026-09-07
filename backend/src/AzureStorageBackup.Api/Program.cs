@@ -22,6 +22,18 @@ const string CorsPolicy = "frontend";
 var sqliteConn = builder.Configuration.GetConnectionString("Sqlite");
 if (string.IsNullOrWhiteSpace(sqliteConn))
     sqliteConn = "Data Source=data/app.db";
+// Microsoft.Data.Sqlite's connection pool is switched off, whatever the configured string says. Seen on the NAS
+// on 2026-09-07 with two backups running: queries dying inside SqliteConnection.Open() with "SQLite Error 5:
+// 'not an error'" and, interleaved, the generic "'database is locked'" text. Both wordings mean the same thing —
+// the library reads the handle's error code and then its message, and they only disagree when another thread is
+// changing that handle's error state in between. The pool is how a second thread gets onto a handle: an outer
+// connection garbage-collected without being closed is reclaimed as "leaked" and pushed straight back, with the
+// step that unregisters EF's user functions skipped because the outer object is gone, and the next Open()
+// re-registers those functions on a handle whose old statements are still being finalized on the finalizer
+// thread. Without a pool a leaked handle is finalized on its own and never handed to anyone. Cost, measured:
+// 0.33 ms per DbContext open-and-query pooled, 1.1 ms unpooled — nothing this application does opens contexts
+// at a rate where that shows. Pinned by SqliteConnectionPoolingTests on the hosted DbContext's live connection.
+sqliteConn = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn) { Pooling = false }.ToString();
 builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlite(sqliteConn));
 
 // --- Data Protection (reversible encryption of sensitive values), keyring persisted to a local volume ---

@@ -778,8 +778,16 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state.Status = RunStatus.Failed;
             // The original scope may already be disposed along with the exception (`using var scope` releases when the try block exits): open another one to write the status.
             using var scope = scopes.CreateScope();
+            var logger = scope.ServiceProvider.GetService<ILogger<BackupRunner>>();
+            // The exception itself, not just its message. The message is what the run state and the config's
+            // LastError carry, and for the pipeline's own errors it names the cause; but a failure raised beneath it
+            // says nothing about which call was on the wire — "SQLite Error 5: 'not an error'" is SQLite's wording
+            // for two threads on one connection, and only the stack says whose. A scheduled run gets its trace from
+            // TaskDispatcher's catch; a run pressed by hand had no equivalent, so the container log — the one place
+            // an operator on a NAS can read — was empty at the moment it mattered.
+            logger?.LogError(ex, "Backup run {RunId} for config {ConfigId} failed: {Error}", state.RunId, configId, ex.Message);
             await scope.ServiceProvider.GetRequiredService<IBackupConfigService>()
-                .WriteStatusAsync(configId, ex.Message, scope.ServiceProvider.GetService<ILogger<BackupRunner>>());
+                .WriteStatusAsync(configId, ex.Message, logger);
             state.Completion.TrySetResult();
         }
     }

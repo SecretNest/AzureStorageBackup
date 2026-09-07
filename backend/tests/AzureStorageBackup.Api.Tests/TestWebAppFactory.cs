@@ -1,9 +1,6 @@
-using AzureStorageBackup.Api.Data;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Data.Sqlite;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -37,19 +34,11 @@ public class TestWebAppFactory : WebApplicationFactory<Program>
         builder.UseSetting("Scheduler:Enabled", "false");
         // Isolate the compression temp area (parallel test hosts share no disk)
         builder.UseSetting("Backup:TempPath", _tempPath);
-        // The connection string, not just the DbContext registration below: Program.cs derives the journal root and the
-        // version-index cache root from it, and left at the default those would land in one shared directory.
+        // Through configuration only, no DbContext re-registration: Program.cs derives the journal root and the
+        // version-index cache root from this string, and it is also where the connection string is normalized
+        // (pooling off — see SqliteConnectionPoolingTests). A test host that registered its own DbContext would run
+        // a database setup production never sees, and the tests pinning that setup would pass against the wrong one.
         builder.UseSetting("ConnectionStrings:Sqlite", $"DataSource={_dbPath}");
-
-        builder.ConfigureServices(services =>
-        {
-            var descriptor = services.SingleOrDefault(
-                d => d.ServiceType == typeof(DbContextOptions<AppDbContext>));
-            if (descriptor is not null)
-                services.Remove(descriptor);
-
-            services.AddDbContext<AppDbContext>(o => o.UseSqlite($"DataSource={_dbPath}"));
-        });
     }
 
     protected override void Dispose(bool disposing)
