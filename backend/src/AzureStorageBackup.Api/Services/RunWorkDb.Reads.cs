@@ -57,6 +57,11 @@ public sealed partial class RunWorkDb
     private const string SelectReservationSql =
         "SELECT ref, raw, volumes, volume_sizes FROM reservations WHERE content_key=@content_key";
 
+    /// <summary>The same row from the other side. LIMIT 1 because content addressing gives one address one content,
+    /// so a second row on the same address cannot exist without dedup having already gone wrong.</summary>
+    private const string SelectReservationByRefSql =
+        "SELECT content_key, ref, raw, volumes, volume_sizes FROM reservations WHERE ref=@ref LIMIT 1";
+
     private const string SelectReservedHeadSql = "SELECT 1 FROM reserved_heads WHERE head_key=@head_key";
 
     private const string SelectResumeBlobColumns =
@@ -201,6 +206,24 @@ public sealed partial class RunWorkDb
             ? new ReservationRow(
                 reader.GetString(0), reader.GetInt64(1) != 0, reader.GetInt32(2),
                 EntryRowMapper.ParseVolumeSizes(EntryRowMapper.NullableString(reader, "volume_sizes")))
+            : null;
+    }
+
+    /// <summary>
+    /// Which content this run has already uploaded to an address, if any. Collision avoidance needs it from this
+    /// side: once a finished upload's claim has left the in-flight table, this row is the only thing standing
+    /// between a later file and an address whose volumes are already written.
+    /// </summary>
+    public async Task<(string ContentKey, ReservationRow Row)?> ReservationByRefAsync(string @ref, CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectReservationByRefSql);
+        Set(command, "@ref", @ref);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct)
+            ? (reader.GetString(0), new ReservationRow(
+                reader.GetString(1), reader.GetInt64(2) != 0, reader.GetInt32(3),
+                EntryRowMapper.ParseVolumeSizes(EntryRowMapper.NullableString(reader, "volume_sizes"))))
             : null;
     }
 

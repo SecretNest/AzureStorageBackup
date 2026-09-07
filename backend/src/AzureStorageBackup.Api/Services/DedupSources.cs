@@ -4,6 +4,20 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
+/// What holds a blob address: the content identity occupying it, and — when the holder is an upload <em>this run</em>
+/// has already finished — the blob itself.
+/// <para>
+/// <paramref name="Blob"/> is null for an address held by a retained version or by the adopted journal, because
+/// those two answer the address question without carrying the storage details, and a claim that matches one of them
+/// has to go through the damage check before it can be treated as a dedup hit. A non-null one is the opposite case
+/// and needs no such check: this run put those exact bytes at that address a moment ago (a heal included), so a
+/// later file with the same content deduplicates onto it, which is precisely what the in-flight table used to do
+/// with its completed reservations.
+/// </para>
+/// </summary>
+internal sealed record DedupRefOwner(string ContentKey, ResolvedBlob? Blob);
+
+/// <summary>
 /// Where <see cref="LocalDedupResolver"/>'s answers about content that already exists come from. Two
 /// implementations, for exactly as long as the migration lasts: <see cref="CatalogDedupSource"/> asks the container's
 /// catalog and the run's work database, which is where those facts live now, and <see cref="LegacyDedupSource"/>
@@ -35,10 +49,10 @@ internal interface IDedupSource
     Task<PackMemberRef?> TryFindPackMemberAsync(
         string fullHash, long length, string headHash, string? tailHash, CancellationToken ct);
 
-    /// <summary>The content identity occupying a blob ref, or null if the address is free — collision avoidance's
-    /// one question. Content identities are compared as <see cref="LocalDedupResolver.ContentKey"/> strings, so both
+    /// <summary>The content occupying a blob ref, or null if the address is free — collision avoidance's one
+    /// question. Content identities are compared as <see cref="LocalDedupResolver.ContentKey"/> strings, so both
     /// implementations answer in the same currency.</summary>
-    Task<string?> RefOwnerAsync(string @ref, CancellationToken ct);
+    Task<DedupRefOwner?> RefOwnerAsync(string @ref, CancellationToken ct);
 
     /// <summary>
     /// Records an upload this run has just finished. Returns whether it is now somewhere a later arrival with the
@@ -106,20 +120,30 @@ internal sealed class CatalogDedupSource(VersionCatalog catalog, RunWorkDb work)
             ? new PackMemberRef(member.PackId, member.EntryName, member.TailHash)
             : null;
 
-    public async Task<string?> RefOwnerAsync(string @ref, CancellationToken ct)
+    public async Task<DedupRefOwner?> RefOwnerAsync(string @ref, CancellationToken ct)
     {
-        // An entry with no full hash at all never took part in the in-memory build (it was skipped before its
-        // storage was even looked at), so an address only such an entry holds counts as free here too — otherwise
-        // brand new content would step aside from an address nothing can ever claim. The catalog reports a missing
-        // full hash as an empty string, which no real hash can be.
-        if (await CatalogAsync(() => catalog.FindRefOwnerAsync(@ref, ct), ct) is { FullHash.Length: > 0 } owner)
-            return LocalDedupResolver.ContentKey(owner.FullHash, owner.Length, owner.HeadHash, owner.TailHash);
+        // This run's own finished uploads come first, and they are the reason this lookup consults three places
+        // rather than two. A completed claim used to stay in the in-flight table for the life of the run, so an
+        // address this run had already written was never free again; the claim now leaves the table as soon as its
+        // row is committed, and without this row the next file with that content — arriving in the instant between
+        // the content probe and this one — would find the address free and upload straight over those volumes.
+        // First, too, and not merely present: an address the catalog declares damaged has already been healed by
+        // this very upload, so the peer must deduplicate onto it rather than heal it a second time.
+        if (await work.ReservationByRefAsync(@ref, ct) is { } reserved)
+        {
+            var (contentKey, row) = reserved;
+            return new DedupRefOwner(contentKey, new ResolvedBlob(row.Ref, row.Raw, row.Volumes, row.VolumeSizes));
+        }
+
+        if (await CatalogAsync(() => catalog.FindRefOwnerAsync(@ref, ct), ct) is { } owner)
+            return new DedupRefOwner(
+                LocalDedupResolver.ContentKey(owner.FullHash, owner.Length, owner.HeadHash, owner.TailHash), null);
 
         // Then the journal's record of the address. Head and tail are required for the same reason
         // JournalResume.ConfirmedBlobs requires them: without all four fields there is no content identity to
         // compare a claim against.
         return await work.ResumeBlobByRefAsync(@ref, ct) is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } record
-            ? LocalDedupResolver.ContentKey(full, record.Length, head, tail)
+            ? new DedupRefOwner(LocalDedupResolver.ContentKey(full, record.Length, head, tail), null)
             : null;
     }
 
@@ -285,7 +309,10 @@ internal sealed class LegacyDedupSource : IDedupSource
             ? member
             : null;
 
-    public string? RefOwner(string @ref) => _priorRefs.GetValueOrDefault(@ref);
+    /// <summary>Never carries a blob: on this path a finished upload stays in the resolver's in-flight table, which
+    /// answers its peers itself, so nothing this map knows about ever bypasses the damage check.</summary>
+    public DedupRefOwner? RefOwner(string @ref) =>
+        _priorRefs.GetValueOrDefault(@ref) is { } contentKey ? new DedupRefOwner(contentKey, null) : null;
 
     // The asynchronous surface is the synchronous one wrapped: the maps are in memory, so there is nothing here to
     // await, and answering both ways off one body is what keeps the two paths from drifting.
@@ -308,7 +335,8 @@ internal sealed class LegacyDedupSource : IDedupSource
         string fullHash, long length, string headHash, string? tailHash, CancellationToken ct) =>
         Task.FromResult(TryFindPackMember(fullHash, length, headHash, tailHash));
 
-    Task<string?> IDedupSource.RefOwnerAsync(string @ref, CancellationToken ct) => Task.FromResult(RefOwner(@ref));
+    Task<DedupRefOwner?> IDedupSource.RefOwnerAsync(string @ref, CancellationToken ct) =>
+        Task.FromResult(RefOwner(@ref));
 
     /// <summary>Nowhere to record it: a completed reservation stays in the resolver's in-flight table and keeps
     /// answering later arrivals off its completion, which is what this path has always done.</summary>

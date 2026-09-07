@@ -30,9 +30,12 @@ internal static class TestResolver
     /// work database, and returns a resolver over the two. Dispose the second item to close both files and remove
     /// them.
     /// </summary>
+    /// <param name="wrap">Puts something between the resolver and the two databases — the one way to hold a
+    /// resolution still between two of its lookups and see what a peer arriving in that gap gets told.</param>
     internal static async Task<(LocalDedupResolver Resolver, IAsyncDisposable Cleanup)> From(
         BlobAddressScheme addressing, IReadOnlyList<VersionIndex> indexes,
-        IReadOnlyList<ConfirmedBlob>? confirmed = null, CancellationToken ct = default)
+        IReadOnlyList<ConfirmedBlob>? confirmed = null, CancellationToken ct = default,
+        Func<IDedupSource, IDedupSource>? wrap = null)
     {
         var (catalog, work, cleanup) = await OpenAsync(ct);
         try
@@ -65,7 +68,8 @@ internal static class TestResolver
             // The work database's writer batches, so without this the rows just enqueued would still be invisible to
             // the first probe a test makes.
             await work.FlushAsync(ct);
-            return (new LocalDedupResolver(addressing, catalog, work), cleanup);
+            IDedupSource source = new CatalogDedupSource(catalog, work);
+            return (new LocalDedupResolver(addressing, wrap is null ? source : wrap(source)), cleanup);
         }
         catch
         {

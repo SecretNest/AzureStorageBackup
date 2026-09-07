@@ -139,6 +139,72 @@ public sealed class LocalDedupResolverCatalogTests
         Assert.Equal(first.Ref, (await resolver.TryFindExistingAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct))!.Ref);
     }
 
+    /// <summary>
+    /// The gap the reservation row exists to cover. A peer looks for the content, finds none because the first
+    /// uploader has not finished; the first uploader then commits its row and its claim leaves the in-flight table;
+    /// the peer carries on to the address question. If the answer there were only "what do the retained versions and
+    /// the journal say", the address would look free, the peer would win the claim and upload straight over the
+    /// volumes just written — the one thing the old resolver could never do, because its completed claim stayed in
+    /// the table for the life of the run.
+    /// <para>
+    /// Run twice, because the second case is what decides the order the address question asks in. With the address
+    /// marked unrecoverable by a retained version, the first upload <em>is</em> the heal, and the catalog still says
+    /// "damaged, replace me" — so an answer that consulted the catalog before this run's own uploads would send the
+    /// peer off to heal an address that was healed a moment ago, over the top of the new volumes.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_Peer_Arriving_In_The_Gap_Deduplicates_Onto_The_Finished_Upload(bool damagedTarget)
+    {
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        VersionIndex[] indexes = damagedTarget ? [DamagedAt("data/xxh128:d")] : [];
+        var (resolver, cleanup) = await TestResolver.From(
+            Plain, indexes, null, Ct,
+            inner => new HookedSource(inner) { PauseOnContentProbe = 2, Reached = reached, Release = release.Task });
+        await using var _ = cleanup;
+
+        var first = await resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        Assert.False(first.Exists);                  // a claim either way: brand new content, or the heal
+        Assert.Equal("data/xxh128:d", first.Ref);
+
+        var peer = resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        await reached.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);   // the peer has looked for the content and found none
+
+        await first.CompleteAsync(raw: true, volumes: 2, volumeSizes: [60, 40], Ct);   // row committed, claim withdrawn
+        release.SetResult();
+
+        var second = await peer;
+        Assert.True(second.Exists);                  // never a second claim on an address that already holds these bytes
+        Assert.Equal(first.Ref, second.Ref);
+        Assert.True(second.Existing!.Raw);           // and the real storage info, not a placeholder
+        Assert.Equal(2, second.Existing.Volumes);
+        Assert.Equal([60L, 40L], second.Existing.VolumeSizes);
+    }
+
+    /// <summary>The other half of the same address question: different content whose hash lands on an address this
+    /// run has already written must step aside, exactly as it does for an address a retained version holds.</summary>
+    [Fact]
+    public async Task A_Finished_Uploads_Address_Fends_Off_Different_Content()
+    {
+        var (catalog, work, cleanup) = await TestResolver.OpenAsync(Ct);
+        await using var _ = cleanup;
+        var resolver = new LocalDedupResolver(Plain, catalog, work);
+
+        var first = await resolver.ResolveAsync("xxh128:h", 100, "xxh128:hd", "xxh128:tl", Ct);
+        await first.CompleteAsync(raw: false, volumes: 1, volumeSizes: [100], Ct);
+
+        // Same full hash, everything else different: a residual collision, not a duplicate.
+        var second = await resolver.ResolveAsync("xxh128:h", 200, "xxh128:hd2", "xxh128:tl2", Ct);
+
+        Assert.False(second.Exists);
+        Assert.Equal("data/xxh128:h~1", second.Ref);
+        Assert.True(second.Collision);
+    }
+
     /// <summary>A latecomer that arrives while the first uploader is still going must still wait for it — the claim
     /// is in the table for exactly that stretch, and only leaves it once the reservation row can answer instead.</summary>
     [Fact]
@@ -201,7 +267,113 @@ public sealed class LocalDedupResolverCatalogTests
         claim.Fail(Boom);
     }
 
+    /// <summary>
+    /// The upload succeeded but its reservation could not be written. Whoever is waiting on that claim must be woken
+    /// with the failure — they would otherwise wait for the rest of the run on a claim that will never complete —
+    /// and the claim itself must go back, so the same content can be resolved afresh.
+    /// </summary>
+    [Fact]
+    public async Task A_Reservation_That_Cannot_Be_Recorded_Fails_The_Waiters_Instead_Of_Hanging_Them()
+    {
+        var fault = new InvalidOperationException("the work database is gone");
+        var (resolver, cleanup) = await TestResolver.From(
+            Plain, [], null, Ct, inner => new HookedSource(inner) { RecordFault = fault });
+        await using var _ = cleanup;
+
+        var first = await resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        var peer = resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        Assert.False(peer.IsCompleted);   // parked on the claim: everything on its way there is a local read
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => first.CompleteAsync(raw: false, volumes: 1, volumeSizes: [5], Ct));
+        Assert.Same(fault, thrown);   // the caller hears about it
+        // …and so does the waiter. Bounded, because the failure this pins is a wait that never ends, and a test that
+        // hangs the suite says far less than one that fails.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await peer.WaitAsync(TimeSpan.FromSeconds(30), Ct));
+
+        // And the address is free again, so the retry that follows a failed item is a real second attempt.
+        var retry = await resolver.ResolveAsync("xxh128:d", 5, "xxh128:h", "xxh128:t", Ct);
+        Assert.False(retry.Exists);
+        Assert.Equal(first.Ref, retry.Ref);
+        retry.Fail(Boom);
+    }
+
     private static InvalidOperationException Boom => new("upload boom");
+
+    /// <summary>A version holding exactly the content the tests upload, at <paramref name="ref"/>, declared
+    /// unrecoverable — so the first upload of that content is the heal rather than a fresh blob.</summary>
+    private static VersionIndex DamagedAt(string @ref)
+    {
+        var index = new VersionIndex
+        {
+            Version = 1,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    Path = "old/damaged.dat", Kind = "file", Length = 5, Mtime = DateTimeOffset.UnixEpoch,
+                    Permissions = "0644", FullHash = "xxh128:d", HeadHash = "xxh128:h", TailHash = "xxh128:t",
+                    Storage = new StorageRef { Kind = "blob", Ref = @ref, Volumes = 1 },
+                },
+            ],
+        };
+        index.UnrecoverablePaths.Add("old/damaged.dat");
+        return index;
+    }
+
+    /// <summary>
+    /// A source between the resolver and the two databases, so a test can hold one resolution still at a chosen
+    /// point — the only way to be standing in the gap between two of its lookups when a peer finishes uploading —
+    /// or make recording a finished upload fail. Everything it does not intercept passes straight through.
+    /// </summary>
+    private sealed class HookedSource(IDedupSource inner) : IDedupSource
+    {
+        private int _contentProbes;
+
+        /// <summary>Which content lookup to hold: the second one is the peer's, the first being the uploader's own.</summary>
+        public int PauseOnContentProbe { get; init; }
+
+        public TaskCompletionSource? Reached { get; init; }
+
+        public Task? Release { get; init; }
+
+        public Exception? RecordFault { get; init; }
+
+        public async Task<ResolvedBlob?> TryFindExistingAsync(
+            string fullHash, long length, string headHash, string tailHash, CancellationToken ct)
+        {
+            var answer = await inner.TryFindExistingAsync(fullHash, length, headHash, tailHash, ct);
+            if (Interlocked.Increment(ref _contentProbes) == PauseOnContentProbe)
+            {
+                Reached!.SetResult();
+                await Release!;
+            }
+
+            return answer;
+        }
+
+        public Task<bool> RecordUploadAsync(string contentKey, ResolvedBlob blob, CancellationToken ct) =>
+            RecordFault is { } fault
+                ? Task.FromException<bool>(fault)
+                : inner.RecordUploadAsync(contentKey, blob, ct);
+
+        public Task<bool> MayDeduplicateAsync(long length, string headHash, CancellationToken ct) =>
+            inner.MayDeduplicateAsync(length, headHash, ct);
+
+        public ValueTask NoteInFlightAsync(long length, string headHash, CancellationToken ct) =>
+            inner.NoteInFlightAsync(length, headHash, ct);
+
+        public Task<bool> IsDamagedRefAsync(string @ref, CancellationToken ct) =>
+            inner.IsDamagedRefAsync(@ref, ct);
+
+        public Task<PackMemberRef?> TryFindPackMemberAsync(
+            string fullHash, long length, string headHash, string? tailHash, CancellationToken ct) =>
+            inner.TryFindPackMemberAsync(fullHash, length, headHash, tailHash, ct);
+
+        public Task<DedupRefOwner?> RefOwnerAsync(string @ref, CancellationToken ct) =>
+            inner.RefOwnerAsync(@ref, ct);
+    }
 
     private static void AssertSame(ResolvedBlob? expected, ResolvedBlob? actual)
     {
@@ -231,6 +403,14 @@ public sealed class LocalDedupResolverCatalogTests
         IReadOnlyList<Content> Probes, IReadOnlyList<string> Refs)
     {
         private static readonly DateTimeOffset Mtime = new(2026, 1, 2, 3, 4, 5, TimeSpan.FromHours(8));
+
+        /// <summary>Content whose address is also carried by entries that have no content identity at all.</summary>
+        private static readonly Content Shadowed =
+            new("xxh128:shadow", 777, "xxh128:shead", "xxh128:stail", "data/xxh128:shadow");
+
+        /// <summary>The length and head hash those hash-less entries carry, and nothing else does.</summary>
+        private static readonly Content ShadowProbe =
+            new("xxh128:noowner", 4242, "xxh128:nohashhead", "xxh128:nohashtail", "data/xxh128:noowner");
 
         public static World Generate(int seed)
         {
@@ -313,6 +493,36 @@ public sealed class LocalDedupResolverCatalogTests
                     Path = $"v{v}/nohash.dat", Kind = "file", Length = 7, Mtime = Mtime, Permissions = "0644",
                     Storage = new StorageRef { Kind = "blob", Ref = strayRef },
                 });
+
+                // The same shape again, but this time sharing its address with an entry that *does* carry a content
+                // identity — hash-less in the oldest version and in the newest, hashed in the two between, so both
+                // orders are covered and the row that wins a newest-version-first lookup is the hash-less one. It
+                // owns no address (the address is Shadowed's), marks none damaged though it is declared
+                // unrecoverable, and puts nothing in the prescreen though it carries a head hash: an in-memory build
+                // skipped such an entry before it ever looked at any of that.
+                if (v is 1 or 4)
+                {
+                    var shadow = $"v{v}/shadow.dat";
+                    index.Entries.Add(new IndexEntry
+                    {
+                        Path = shadow, Kind = "file", Length = ShadowProbe.Length, Mtime = Mtime,
+                        Permissions = "0644", HeadHash = ShadowProbe.Head,
+                        Storage = new StorageRef { Kind = "blob", Ref = Shadowed.Ref, Volumes = 1 },
+                    });
+                    if (v == 1)
+                        index.UnrecoverablePaths.Add(shadow);
+                }
+                else
+                {
+                    index.Entries.Add(Entry($"v{v}/shadowed.dat", Shadowed) with
+                    {
+                        Storage = new StorageRef
+                        {
+                            Kind = "blob", Ref = Shadowed.Ref, Volumes = 2, VolumeSizes = [400, 377],
+                        },
+                    });
+                }
+
                 indexes.Add(index);
             }
 
@@ -347,6 +557,14 @@ public sealed class LocalDedupResolverCatalogTests
             // The last one is the near miss that walks past every twin of the last full hash and onto strayRef.
             foreach (var c in contents.Take(4).Append(contents[^1]))
                 probes.Add(c with { Length = c.Length + 1, Tail = c.Tail + "x" });
+
+            // The shadowed address: an exact hit, the near miss that has to step aside from it, and the identity the
+            // hash-less rows carry — the last one is what a prescreen reading rows that have no content identity
+            // would answer yes to.
+            probes.Add(Shadowed);
+            probes.Add(Shadowed with { Length = Shadowed.Length + 1, Tail = Shadowed.Tail + "x" });
+            probes.Add(ShadowProbe);
+            refs.Add(Shadowed.Ref);
 
             return new World(indexes, confirmed, probes, refs);
         }

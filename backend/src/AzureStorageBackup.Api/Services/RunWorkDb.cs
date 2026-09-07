@@ -96,6 +96,10 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         CREATE TABLE IF NOT EXISTS reservations (
           content_key TEXT PRIMARY KEY, ref TEXT NOT NULL, raw INTEGER NOT NULL, volumes INTEGER NOT NULL,
           volume_sizes TEXT) WITHOUT ROWID;
+        -- Dedup asks this table both ways round: by content ("has this run already uploaded this?") and by address
+        -- ("is this address already taken by something this run uploaded?"), the second being what stops a later
+        -- file from claiming an address whose volumes are already written.
+        CREATE INDEX IF NOT EXISTS reservations_ref ON reservations (ref);
         CREATE TABLE IF NOT EXISTS reserved_heads (head_key TEXT PRIMARY KEY) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS resume_blobs (

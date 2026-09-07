@@ -58,17 +58,26 @@ public sealed partial class VersionCatalog
 
     // Healthy rows first (latest wins among them), damaged rows only as a fallback (earliest wins) — the precedence
     // the in-memory build had from "normal rows overwrite, damaged rows TryAdd".
+    //
+    // The three lookups below all require a full hash, because the in-memory build skipped an entry that had none
+    // before it ever looked at its storage (`if (e.FullHash is null) continue;`): such an entry owns no address,
+    // marks no address damaged and puts nothing in the prescreen. Without the filter a hash-less row in a *newer*
+    // version wins the ORDER BY here and shadows the real owner, and an occupied address is reported free — which is
+    // how brand new content ends up written over somebody else's blob. (FindBlobByContent and FindPackMember need no
+    // such filter: they bind full_hash = @f, which a NULL never matches.)
     private const string FindRefOwnerSql = """
         SELECT full_hash, length, head_hash, tail_hash, unrecoverable FROM entries
-        WHERE storage_ref=@r AND storage_kind='blob'
+        WHERE storage_ref=@r AND storage_kind='blob' AND full_hash IS NOT NULL
         ORDER BY unrecoverable ASC, CASE WHEN unrecoverable THEN version ELSE -version END ASC LIMIT 1
         """;
 
     private const string IsDamagedRefSql =
-        "SELECT EXISTS (SELECT 1 FROM entries WHERE storage_ref=@r AND storage_kind='blob' AND unrecoverable=1)";
+        "SELECT EXISTS (SELECT 1 FROM entries WHERE storage_ref=@r AND storage_kind='blob' AND unrecoverable=1 " +
+        "AND full_hash IS NOT NULL)";
 
     private const string HeadSeenSql =
-        "SELECT EXISTS (SELECT 1 FROM entries WHERE length=@l AND head_hash=@h AND storage_kind='blob' AND unrecoverable=0)";
+        "SELECT EXISTS (SELECT 1 FROM entries WHERE length=@l AND head_hash=@h AND storage_kind='blob' " +
+        "AND unrecoverable=0 AND full_hash IS NOT NULL)";
 
     // First version wins: references pile onto the oldest pack holding the content, which is the one compaction is
     // least likely to rewrite.

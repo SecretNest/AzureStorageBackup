@@ -63,7 +63,9 @@ public sealed class LocalDedupResolver
     {
     }
 
-    private LocalDedupResolver(BlobAddressScheme addressing, IDedupSource source)
+    /// <summary>Internal so a test can put a source of its own in the middle — the one way to hold a resolution
+    /// still between two of its lookups and reproduce what a peer sees in that gap.</summary>
+    internal LocalDedupResolver(BlobAddressScheme addressing, IDedupSource source)
     {
         _addressing = addressing;
         _source = source;
@@ -175,10 +177,12 @@ public sealed class LocalDedupResolver
             var refName = n == 0 ? baseAddr : $"{baseAddr}~{n}";
             var collision = n > 0;
 
-            if (await _source.RefOwnerAsync(refName, ct) is { } priorCk)
+            if (await _source.RefOwnerAsync(refName, ct) is { } owner)
             {
-                if (priorCk != ck)
-                    continue;                                     // an older version's different content holds this address → step aside
+                if (owner.ContentKey != ck)
+                    continue;                                     // different content holds this address → step aside
+                if (owner.Blob is { } uploaded)
+                    return Resolution.ForExisting(uploaded, collision); // this run has already put this very content there
                 if (!await _source.IsDamagedRefAsync(refName, ct))
                     return Resolution.ForExisting(                 // in theory the content lookup already hit; a safe backstop
                         new ResolvedBlob(refName, false, 1, []), collision);
@@ -283,7 +287,20 @@ public sealed class LocalDedupResolver
         CancellationToken ct)
     {
         var blob = new ResolvedBlob(refName, raw, volumes, volumeSizes);
-        var recorded = await _source.RecordUploadAsync(reservation.ContentKey, blob, ct);
+        bool recorded;
+        try
+        {
+            recorded = await _source.RecordUploadAsync(reservation.ContentKey, blob, ct);
+        }
+        catch (Exception ex)
+        {
+            // The upload itself succeeded, but nothing can be told about it any more — and the peers waiting on this
+            // claim would wait for the rest of the run. Fail them, which also withdraws the claim, and let the
+            // caller's own error path take it from here: one item redone is nothing next to a wedged run.
+            reservation.Fail(ex);
+            throw;
+        }
+
         reservation.Complete(blob);
         if (recorded)
             reservation.Release();
