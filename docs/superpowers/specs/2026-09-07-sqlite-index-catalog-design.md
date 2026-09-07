@@ -201,7 +201,7 @@ Rule: read-only consumers become queries; consumers that rewrite an index go pat
 Read-only:
 
 - **Tree browsing** (`VersionTreeService`): `dirs` and `entries` by `(version, parent)`.
-- **Version compare**: two path-ordered cursors merged, instead of two whole indexes.
+- **Per-path history** (`/file-versions`): one point lookup per version instead of one whole index per version. (There is no version-compare endpoint; the earlier draft of this spec assumed one.)
 - **Single-file lookup, restore estimate, local-root migration preview**: point or prefix-range
   queries. `LocalRootMigration.Inspect` stays static and pure; its `baseline` parameter becomes a
   lookup delegate instead of a `VersionIndex`.
