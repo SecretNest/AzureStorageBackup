@@ -62,7 +62,7 @@ public sealed class SentinelCheckTests : IDisposable
             new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
         return (backup, checker, factory);
     }
 

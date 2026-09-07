@@ -244,6 +244,7 @@ builder.Services.AddSingleton<OrphanSweeper>(); // the sweep owed when a check r
 builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IVersionCatalogs>(),  // the version's index is read out of (and marked in) the container's catalog
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "check"),

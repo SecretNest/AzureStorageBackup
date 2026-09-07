@@ -15,6 +15,11 @@ public sealed class BackupCheckerTests : IDisposable
     private readonly string _src;
     private readonly string _temp;
 
+    /// <summary>The local-authority wiring the last <see cref="Build"/> handed to both the backup and the checker.
+    /// Held in a field rather than added to the tuple so the existing call sites of <c>Build()</c> stay as they are;
+    /// only the tests that want to look inside the catalog the checker just wrote reach for it.</summary>
+    private TestLocalAuthority? _authority;
+
     public BackupCheckerTests()
     {
         _base = Path.Combine(Path.GetTempPath(), "asb-check-" + Guid.NewGuid().ToString("N"));
@@ -58,13 +63,14 @@ public sealed class BackupCheckerTests : IDisposable
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
-        var authority = new TestLocalAuthority(store);
+        var authority = _authority = new TestLocalAuthority(store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, checkCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"))
+            factory, store, authority.Catalogs, checkCompressor ?? new SevenZipCompressor(), new FileHasher(),
+            Path.Combine(_temp, "check"))
         { Clock = checkerClock };
         return (backup, checker, factory);
     }
@@ -547,7 +553,7 @@ public sealed class BackupCheckerTests : IDisposable
             var probe = new HeadOverlapProbe();
             var probed = new ProbedFactory(probe);
             var checker = new BackupChecker(
-                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()), _authority!.Catalogs,
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "probed-check"));
 
             var result = await checker.CheckAsync(
@@ -590,7 +596,7 @@ public sealed class BackupCheckerTests : IDisposable
             var probe = new HeadOverlapProbe();
             var probed = new ProbedFactory(probe);
             var checker = new BackupChecker(
-                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()), _authority!.Catalogs,
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "cross-object-check"));
 
             var result = await checker.CheckAsync(
@@ -635,7 +641,7 @@ public sealed class BackupCheckerTests : IDisposable
             var probe = new HeadOverlapProbe();
             var probed = new ProbedFactory(probe);
             var checker = new BackupChecker(
-                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()),
+                probed, new BackupInfoStore(probed, new SevenZipArchiveCodec()), _authority!.Catalogs,
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "head-budget-check"));
 
             var result = await checker.CheckAsync(
@@ -1116,4 +1122,179 @@ public sealed class BackupCheckerTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+
+    /// <summary>A store that behaves exactly like the real one except that writing an index file always fails —
+    /// the cloud half of "mark the finding" refusing, so the test can pin what the catalog looks like afterwards.</summary>
+    private sealed class IndexWriteFailsStore(IBackupInfoStore inner) : IBackupInfoStore
+    {
+        public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) => inner.ReadInfoAsync(a, c, p, ct);
+        public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) => inner.ReadInfoWithETagAsync(a, c, p, ct);
+        public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
+        public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, Azure.Storage.Blobs.Models.AccessTier? t, string? e, CancellationToken ct = default) => inner.WriteInfoConditionalAsync(a, c, i, p, t, e, ct);
+        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, int volumes = 1, CancellationToken ct = default) => inner.ReadIndexAsync(a, c, b, p, volumes, ct);
+        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) =>
+            inner.WriteIndexAsync(a, c, v, i, p, t, ct, progress);
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) =>
+            throw new IOException("index upload refused");
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => inner.ReadIndexToFileAsync(a, c, b, p, volumes, dest, ct);
+    }
+
+    /// <summary>Reads the unrecoverable section straight out of the index blob the check just wrote, without going
+    /// through anything that could be reading a cache instead of the cloud.</summary>
+    private async Task<IReadOnlyList<string>> CloudUnrecoverableAsync(
+        IBackupInfoStore store, Account account, string container, BackupVersion ver)
+    {
+        Directory.CreateDirectory(_temp);
+        var path = Path.Combine(_temp, "readback-" + Guid.NewGuid().ToString("N") + ".idx");
+        try
+        {
+            await store.ReadIndexToFileAsync(account, container, ver.IndexBlob, null, ver.IndexVolumes, path);
+            await using var file = File.OpenRead(path);
+            using var reader = new IndexStreamReader(file);
+            foreach (var _ in reader.Entries()) { /* the sections below start where the entries end */ }
+            reader.ReadEmptyDirs();
+            return reader.ReadUnrecoverable();
+        }
+        finally { try { File.Delete(path); } catch { /* best effort */ } }
+    }
+
+    /// <summary>
+    /// The rewritten index has to be recorded at the size it actually went up as. Marking a version's findings makes
+    /// its index bigger, and an index that crosses the split threshold stops occupying the unsuffixed blob name
+    /// altogether — so an info file still claiming one volume reads the version back from a name that holds nothing,
+    /// and the check that was meant to record damage has instead destroyed the version.
+    /// </summary>
+    [SkippableFact]
+    public async Task Check_records_the_volume_count_of_the_index_it_rewrote()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        // The rewrite goes through a store whose split threshold is a kilobyte, so an ordinary little version comes
+        // back as several volumes without having to build a hundreds-of-MB index to get there.
+        var splitting = new BackupInfoStore(factory, new SevenZipArchiveCodec()) { IndexVolumeBytes = 1024 };
+        var checker = new BackupChecker(
+            factory, splitting, _authority!.Catalogs, new SevenZipCompressor(), new FileHasher(),
+            Path.Combine(_temp, "check-split"));
+        var account = AzuriteAccount();
+        var name = RandomName("chkvol-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // Random content per file so the hashes cannot be compressed back under the threshold.
+            for (var i = 0; i < 60; i++)
+                await File.WriteAllBytesAsync(
+                    Path.Combine(_src, $"v{i:D3}.bin"), Guid.NewGuid().ToByteArray());
+            await backup.RunAsync(Req(account, name));
+
+            // Every file's content goes missing at once, so the check has 60 findings to write down.
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "packs/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src, null, CancellationToken.None,
+                markFindings: true);
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single();
+            Assert.True(v1.IndexVolumes > 1, $"expected a split index, the info file records {v1.IndexVolumes}");
+
+            // And the count the info file now carries is the one that reads the version back.
+            var marks = await CloudUnrecoverableAsync(store, account, name, v1);
+            Assert.Contains("v000.bin", marks);
+            Assert.Equal(60, marks.Count);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The order the marks land in, now that the catalog — not a downloaded <c>VersionIndex</c> — is what the check
+    /// reads and writes: the cloud index is rewritten first, and only once that upload has succeeded is the same
+    /// verdict applied to the local catalog. The cloud is the source of truth; a catalog that claimed a mark the
+    /// cloud never received would survive a rebuild of nothing, and would tell the next backup to exclude content
+    /// that is still perfectly addressable.
+    /// </summary>
+    [SkippableFact]
+    public async Task Check_marks_unrecoverable_through_the_cloud_then_the_catalog()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, checker, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("chkcat-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "content of a");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            await checker.CheckAsync(account, name, null, null, new CheckOptions(), _src, null, CancellationToken.None,
+                markFindings: true);
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single();
+            Assert.Contains("a.txt", await CloudUnrecoverableAsync(store, account, name, v1));
+
+            await using var catalog = await _authority!.Catalogs.OpenAsync(account.Id, name, readOnly: true, CancellationToken.None);
+            Assert.Contains("a.txt", await catalog.UnrecoverableAsync(v1.Version, CancellationToken.None));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The other half of that ordering: when the cloud write fails, the catalog must be left exactly as it was. A
+    /// mark recorded locally on the strength of an upload that never landed is a lie that outlives the run — dedup
+    /// would exclude the content, restore would offer to substitute it, and nothing in the cloud would ever say why.
+    /// </summary>
+    [SkippableFact]
+    public async Task Check_that_fails_to_upload_leaves_the_catalog_unchanged()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("chkcatfail-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "content of a");
+            await backup.RunAsync(Req(account, name) with
+            {
+                Options = new BackupEngineOptions { Plan = new PlanOptions { SingleFileThresholdBytes = 1 } },
+            });
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            var refusing = new BackupChecker(
+                factory, new IndexWriteFailsStore(store), _authority!.Catalogs, new SevenZipCompressor(), new FileHasher(),
+                Path.Combine(_temp, "check-fail"));
+
+            await Assert.ThrowsAsync<IOException>(() => refusing.CheckAsync(
+                account, name, null, null, new CheckOptions(), _src, null, CancellationToken.None, markFindings: true));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single();
+            Assert.DoesNotContain("a.txt", await CloudUnrecoverableAsync(store, account, name, v1));
+
+            await using var catalog = await _authority!.Catalogs.OpenAsync(account.Id, name, readOnly: true, CancellationToken.None);
+            Assert.DoesNotContain("a.txt", await catalog.UnrecoverableAsync(v1.Version, CancellationToken.None));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

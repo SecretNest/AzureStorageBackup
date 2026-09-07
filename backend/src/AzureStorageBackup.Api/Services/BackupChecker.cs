@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
@@ -15,6 +16,7 @@ namespace AzureStorageBackup.Api.Services;
 public sealed class BackupChecker(
     IBlobClientFactory factory,
     IBackupInfoStore store,
+    IVersionCatalogs catalogs,
     IFileCompressor? compressor = null,
     IFileHasher? hasher = null,
     string? tempRoot = null,
@@ -214,98 +216,205 @@ public sealed class BackupChecker(
               ?? throw new InvalidOperationException($"Version {v} not found.")
             : info.Versions[^1];
 
-        var index = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
-        // A scoped run sees a scoped index: every stage downstream (cloud groups, local comparison, findings)
-        // works off Entries, so one narrowing here scopes them all. Orphan listing is unrelated to scope and the
-        // scoped caller (the repairer) never asks for it.
-        if (scopePaths is not null)
+        // The catalog is the index now: make sure this version is in it (migrated from an .idx file, the legacy
+        // row, or the cloud, whichever still holds it) and then read it through ONE read-only handle for the whole
+        // check. The identity stamp is the backup's creation timestamp — the same value every other cache in this
+        // codebase keys on — so a container deleted and rebuilt under the same version numbers is never mistaken
+        // for the one already in the file.
+        await catalogs.EnsureVersionAsync(account, container, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+
+        CheckReport report;
+        var patches = new List<CatalogPatch>();
+        // The rewritten index, serialized to disk while the read-only handle is still open and uploaded once it has
+        // been closed. Null when there is nothing to mark.
+        string? serializedIndex = null;
+        await using (var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct))
         {
-            var scope = scopePaths as IReadOnlySet<string> ?? new HashSet<string>(scopePaths, StringComparer.Ordinal);
-            index = index with { Entries = [.. index.Entries.Where(e => scope.Contains(e.Path))] };
-        }
-        loading?.Advance(0);
-        loading?.Complete();
+            // A scoped run reads only the entries it was given — bounded by the caller's list rather than by the
+            // version — and every stage downstream (cloud groups, local comparison, findings) works off that list,
+            // so one narrowing here scopes them all. Orphan listing is unrelated to scope and the scoped caller
+            // (the repairer) never asks for it.
+            // De-duplicated first: EntriesAtAsync chunks the list into IN (…) clauses, so a caller handing over
+            // overlapping lists would get the same entry back several times and have it checked, counted and
+            // reported once per copy.
+            var scope = scopePaths is null
+                ? null
+                : scopePaths as IReadOnlySet<string> ?? new HashSet<string>(scopePaths, StringComparer.Ordinal);
+            var scoped = scope is null ? null : await catalog.EntriesAtAsync(ver.Version, scope, ct);
+            // What the local axis walks: the scoped list, or a cursor that streams the version one entry at a time.
+            IAsyncEnumerable<IndexEntry> Entries() =>
+                scoped is null ? catalog.EntriesAsync(ver.Version, ct) : ToAsync(scoped, ct);
+            // The same content grouped by the object it lives in, for the cloud axis. Unscoped, the grouping folds a
+            // cursor SQLite has already ordered by storage object; scoped, the list is short enough to group in
+            // memory — by the same key, so the two paths cannot disagree on what one object is. A factory, because
+            // the cloud axis walks the groups twice (see CloudCheckAsync) and a cursor cannot be rewound.
+            var scopedGroups = scoped is null
+                ? null
+                : scoped.Where(e => e.Storage is not null)
+                    .GroupBy(e => CatalogSql.StorageKey(e.Storage!), StringComparer.Ordinal)
+                    .Select(g => g.ToList()).ToList();
+            IAsyncEnumerable<List<IndexEntry>> Groups() => scopedGroups is null
+                ? CatalogSql.GroupByStorageAsync(catalog.EntriesByStorageAsync(ver.Version, ct), ct)
+                : ToAsync(scopedGroups, ct);
 
-        string? metaIssue = null;
-        if (options.Cloud == CloudCheckLevel.Metadata)
-        {
-            var meta = Track(onProgress, "Metadata", 1);
-            metaIssue = await CheckMetadataDriftAsync(account, container, password, info, ct);
-            meta?.Advance(0);
-            meta?.Complete();
-        }
+            // One COUNT(*), not a walk: the trackers below want a denominator before the first entry is read.
+            var total = scoped?.Count ?? (int)(await catalog.StatsAsync(ver.Version, ct)).Files;
+            loading?.Advance(0);
+            loading?.Complete();
 
-        var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
-
-        // Cloud state (per file): data blobs are only actually queried at the ExistenceSize/Content levels.
-        var cloudBad = new HashSet<string>(StringComparer.Ordinal);
-        if (options.Cloud >= CloudCheckLevel.ExistenceSize)
-            cloudBad = await CloudCheckAsync(cc, info, index, options, password, downloadConcurrency, headConcurrency, onProgress, ct);
-
-        // Local axis: compare each entry against its source file. The Content level reads every file end to end to
-        // hash it — as slow as the backup's Diffing stage, so it likewise has to report progress entry by entry.
-        var localTracker = Track(onProgress, "Local", index.Entries.Count);
-        var findings = new List<FileFinding>(index.Entries.Count);
-        foreach (var e in index.Entries)
-        {
-            localTracker?.Touch(e.Path);
-            var refName = e.Storage is { } s ? BlobNameOf(s) : null;
-            // A zero-length regular file **is not supposed to have** a cloud object at all (the backup side never
-            // produces a storage ref for it, see BackupOrchestrator.IsEmptyFile). Reporting NotChecked would make a
-            // whole column of empty files look like the check skipped them; their cloud state is settled — it is fine.
-            var cloud = e.Storage is null && e.Kind == "file" && e.Length == 0
-                ? CloudState.Ok
-                : options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
-                    ? CloudState.NotChecked
-                    : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
-            var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
-            findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt, Length = e.Length });
-            // Only count bytes when the file was really read, or the Attributes/None levels report an astronomical "speed".
-            localTracker?.Advance(options.Local == LocalCheckLevel.Content ? e.Length : 0);
-        }
-        localTracker?.Complete();
-
-        var (orphans, orphanIssue) = options.ListOrphans
-            ? await ListOrphansAsync(cc, account, container, password, info, onProgress, ct)
-            : ([], null);
-
-        // "check出来就应该标错": the verdict lands in the checked version's index the moment it exists —
-        // marks for MissingOrBad findings, clears for Ok findings that carried one — persisted through the
-        // same local-authoritative machinery the repairer uses, so dedup exclusion, restore substitution and
-        // next-version healing see the truth without waiting for a repair to be clicked.
-        if (markFindings)
-        {
-            var changed = false;
-            foreach (var f in findings)
+            string? metaIssue = null;
+            if (options.Cloud == CloudCheckLevel.Metadata)
             {
-                if (f.Cloud == CloudState.MissingOrBad && !index.UnrecoverablePaths.Contains(f.Path))
-                {
-                    index.UnrecoverablePaths.Add(f.Path);
-                    changed = true;
-                }
-                else if (f.Cloud == CloudState.Ok && index.UnrecoverablePaths.Remove(f.Path))
-                {
-                    changed = true;
-                }
+                var meta = Track(onProgress, "Metadata", 1);
+                metaIssue = await CheckMetadataDriftAsync(account, container, password, info, ct);
+                meta?.Advance(0);
+                meta?.Complete();
             }
-            if (changed)
+
+            var cc = factory.CreateServiceClient(account).GetBlobContainerClient(container);
+
+            // Cloud state (per file): data blobs are only actually queried at the ExistenceSize/Content levels.
+            var cloudBad = new HashSet<string>(StringComparer.Ordinal);
+            if (options.Cloud >= CloudCheckLevel.ExistenceSize)
+                cloudBad = await CloudCheckAsync(
+                    cc, info, Groups, options, password, downloadConcurrency, headConcurrency, onProgress, ct);
+
+            // Local axis: compare each entry against its source file. The Content level reads every file end to end to
+            // hash it — as slow as the backup's Diffing stage, so it likewise has to report progress entry by entry.
+            var localTracker = Track(onProgress, "Local", total);
+            var findings = new List<FileFinding>(total);
+            await foreach (var e in Entries().WithCancellation(ct))
             {
-                await store.WriteIndexAsync(account, container, ver.Version, index, password, ct: ct);
+                localTracker?.Touch(e.Path);
+                var refName = e.Storage is { } s ? BlobNameOf(s) : null;
+                // A zero-length regular file **is not supposed to have** a cloud object at all (the backup side never
+                // produces a storage ref for it, see BackupOrchestrator.IsEmptyFile). Reporting NotChecked would make a
+                // whole column of empty files look like the check skipped them; their cloud state is settled — it is fine.
+                var cloud = e.Storage is null && e.Kind == "file" && e.Length == 0
+                    ? CloudState.Ok
+                    : options.Cloud < CloudCheckLevel.ExistenceSize || e.Storage is null
+                        ? CloudState.NotChecked
+                        : cloudBad.Contains(e.Path) ? CloudState.MissingOrBad : CloudState.Ok;
+                var local = await LocalCheckAsync(e, localRoot, options.Local, ct);
+                findings.Add(new FileFinding(e.Path, refName, cloud, local) { UnreadableAt = e.UnreadableAt, Length = e.Length });
+                // Only count bytes when the file was really read, or the Attributes/None levels report an astronomical "speed".
+                localTracker?.Advance(options.Local == LocalCheckLevel.Content ? e.Length : 0);
+            }
+            localTracker?.Complete();
+
+            var (orphans, orphanIssue) = options.ListOrphans
+                ? await ListOrphansAsync(cc, account, container, password, info, onProgress, ct)
+                : ([], null);
+
+            // "check出来就应该标错": the verdict lands in the checked version the moment it exists — marks for
+            // MissingOrBad findings, clears for Ok findings that carried one — so dedup exclusion, restore
+            // substitution and next-version healing see the truth without waiting for a repair to be clicked.
+            // Expressed as patches rather than by mutating an index in memory: the catalog writes the version back
+            // out with them applied (that is what goes to the cloud) and records them locally only afterwards.
+            if (markFindings)
+            {
+                // The version's existing marks, read once. Bounded by the damage an earlier check found, never by
+                // the file count — where asking per finding would be one round trip per file.
+                var marked = new HashSet<string>(await catalog.UnrecoverableAsync(ver.Version, ct), StringComparer.Ordinal);
+                foreach (var f in findings)
+                {
+                    if (f.Cloud == CloudState.MissingOrBad && !marked.Contains(f.Path))
+                        patches.Add(new CatalogPatch(ver.Version, f.Path, null, true, null));
+                    else if (f.Cloud == CloudState.Ok && marked.Contains(f.Path))
+                        patches.Add(new CatalogPatch(ver.Version, f.Path, null, false, null));
+                }
+
+                if (patches.Count > 0)
+                    serializedIndex = await SerializeForUploadAsync(catalog, ver.Version, patches, ct);
+            }
+
+            report = new CheckReport(ver.Version, findings, metaIssue)
+            {
+                OrphanBlobs = orphans,
+                // Whether it ran, carried on the report rather than left for the caller to infer from an empty list —
+                // see CheckReport.OrphansChecked. Abandoned counts as not run, and the reason travels with it.
+                OrphansChecked = options.ListOrphans && orphanIssue is null,
+                OrphanScanIssue = orphanIssue,
+            };
+        }
+
+        // The cloud FIRST, the catalog only after it: the index blobs are the source of truth and the catalog is a
+        // rebuildable cache of them. A mark recorded locally on the strength of an upload that never landed would
+        // outlive the run as a lie — dedup would exclude content that is still perfectly addressable, restore would
+        // offer to substitute it, and nothing in the cloud would ever say why. The read-only handle is already
+        // closed here (the block above ended): the container's write lock must not be taken while this run still
+        // holds a reader of the same catalog.
+        if (serializedIndex is not null)
+        {
+            try
+            {
+                var (indexBlob, indexVolumes) =
+                    await store.WriteIndexFileAsync(account, container, ver.Version, serializedIndex, password, ct: ct);
+                // What actually went up, recorded in the info file before it is written. A rewritten index can cross
+                // the split threshold the original was under, and a version whose info entry still claims one blob
+                // is read back from a name that no longer holds anything — the marks would have cost the version.
+                var slot = info.Versions.FindIndex(x => x.Version == ver.Version);
+                if (slot >= 0)
+                    info.Versions[slot] = ver with { IndexBlob = indexBlob, IndexVolumes = indexVolumes };
                 if (trackedInfo is not null)
                     await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
                 else
                     await store.WriteInfoAsync(account, container, info, password, ct: ct);
+
+                using var _ = await catalogs.LockForWriteAsync(account.Id, container, ct);
+                await using var writable = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
+                await writable.ApplyPatchesAsync(patches, ct);
+            }
+            finally
+            {
+                try { File.Delete(serializedIndex); } catch { /* temp space; not worth failing a check over */ }
             }
         }
 
-        return new CheckReport(ver.Version, findings, metaIssue)
+        return report;
+    }
+
+    /// <summary>Writes the version out with the findings applied, ready to be uploaded, and returns the file's path.
+    /// A half-written file is deleted on the way out: it can be hundreds of MB, and the run that produced it is
+    /// already failing, so nothing downstream will ever come back to clean it up.</summary>
+    private async Task<string> SerializeForUploadAsync(
+        VersionCatalog catalog, int version, IReadOnlyList<CatalogPatch> patches, CancellationToken ct)
+    {
+        var path = Path.Combine(MarkWorkRoot(), $"check-v{version}-{Guid.NewGuid():N}.idx");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
         {
-            OrphanBlobs = orphans,
-            // Whether it ran, carried on the report rather than left for the caller to infer from an empty list —
-            // see CheckReport.OrphansChecked. Abandoned counts as not run, and the reason travels with it.
-            OrphansChecked = options.ListOrphans && orphanIssue is null,
-            OrphanScanIssue = orphanIssue,
-        };
+            await using var file = File.Create(path);
+            await catalog.SerializeVersionAsync(version, file, patches, ct);
+        }
+        catch
+        {
+            try { File.Delete(path); } catch { /* the original failure is the one worth reporting */ }
+            throw;
+        }
+
+        return path;
+    }
+
+    /// <summary>Where the rewritten index is staged before it goes up: the checker's own temp root when it has one,
+    /// otherwise a directory of our own under the system temp — marking is not the content check, and must not be
+    /// refused for want of the workspace only the content check needs.</summary>
+    private string MarkWorkRoot() =>
+        string.IsNullOrEmpty(tempRoot) ? Path.Combine(Path.GetTempPath(), "asb-check-marks") : tempRoot;
+
+    /// <summary>Presents an already-materialized list (a scoped run's entries, or its groups) as the cursor the
+    /// streaming path hands the same stages, so no stage needs a second shape for the scoped case.</summary>
+    private static async IAsyncEnumerable<T> ToAsync<T>(
+        IEnumerable<T> items, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await Task.CompletedTask;
+        foreach (var item in items)
+        {
+            // A materialized list never awaits, so nothing else on this path would ever observe a cancellation:
+            // a scoped content check would keep verifying long after the user pressed Cancel.
+            ct.ThrowIfCancellationRequested();
+            yield return item;
+        }
     }
 
     /// <summary>
@@ -375,29 +484,33 @@ public sealed class BackupChecker(
     }
 
     /// <summary>
-    /// Build the set of blob names referenced by every retained version: read the second-level index of every version
-    /// (through the local-authoritative store), then call the pure function <see cref="ReferencedBlobNames"/>. If any
-    /// version index cannot be read (missing locally and the cloud read fails) this throws — which is the caller's cue
-    /// to give up on deleting.
+    /// Build the set of blob names referenced by every retained version. Every version is brought into the catalog
+    /// first (from whichever older home still holds it, the cloud last of all), then the refs are streamed out of it
+    /// once each and turned into names by the pure function below. If any version cannot be brought in (missing
+    /// locally and the cloud read fails) this throws — which is the caller's cue to give up on deleting.
     /// </summary>
     public async Task<HashSet<string>> BuildReferencedSetAsync(
         Account account, string container, string? password, BackupInfoFile info, CancellationToken ct = default)
     {
-        var indexes = new Dictionary<int, VersionIndex>();
+        var identity = info.Backup.CreatedAt.UtcTicks;
         foreach (var ver in info.Versions)
-            indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
-        return ReferencedBlobNames(info, indexes);
+            await catalogs.EnsureVersionAsync(account, container, ver, identity, password, ct);
+
+        await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
+        return await ReferencedBlobNamesAsync(info, catalog.DistinctRefsAsync(ct), ct);
     }
 
     /// <summary>
-    /// **Pure function**: given the info file + every retained version index, return every referenced blob name (the
-    /// load-bearing safety basis for deleting orphans). Covered: the info file (both the plaintext and the encrypted
-    /// name are protected); each version's <c>IndexBlob</c>; **every volume** of each <see cref="StorageRef"/>
-    /// (single-file blobs via <see cref="StorageRef.Volumes"/>, packs via <see cref="PackInfo.Volumes"/>) — across all
-    /// versions, including the ones only an older version references. A pack that is referenced but has no metadata in
-    /// <c>info.Packs</c> → its volume count cannot be determined → throw (forcing the caller to give up on deleting).
+    /// **Pure function**: given the info file and every storage object any retained version references, return every
+    /// referenced blob name (the load-bearing safety basis for deleting orphans). Covered: the info file (both the
+    /// plaintext and the encrypted name are protected); every volume of each version's <c>IndexBlob</c>; **every
+    /// volume** of each referenced object (single-file blobs via the volume count the ref carries, packs via
+    /// <see cref="PackInfo.Volumes"/>) — across all versions, including the ones only an older version references.
+    /// A pack that is referenced but has no metadata in <c>info.Packs</c> → its volume count cannot be determined →
+    /// throw (forcing the caller to give up on deleting).
     /// </summary>
-    public static HashSet<string> ReferencedBlobNames(BackupInfoFile info, IReadOnlyDictionary<int, VersionIndex> indexes)
+    public static async Task<HashSet<string>> ReferencedBlobNamesAsync(
+        BackupInfoFile info, IAsyncEnumerable<(string Kind, string Ref, int Volumes)> objects, CancellationToken ct = default)
     {
         var refs = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -406,29 +519,26 @@ public sealed class BackupChecker(
             BackupDiscovery.EncryptedIndexBlobName,
         };
 
-        // The second-level index blob of every version (its name must be protected even when that version's index was not supplied in indexes).
-        // Every volume of it, not just the base name: a split index whose .002 onwards were left out of this set
-        // would have them swept as orphans, and the version would stop being readable at all.
+        // The second-level index blob of every version. Every volume of it, not just the base name: a split index
+        // whose .002 onwards were left out of this set would have them swept as orphans, and the version would stop
+        // being readable at all.
         foreach (var v in info.Versions)
             foreach (var n in VolumeBlobIO.VolumeNames(v.IndexBlob, v.IndexVolumes))
                 refs.Add(n);
 
-        // Every volume of every storage ref of every version index.
-        foreach (var idx in indexes.Values)
-            foreach (var e in idx.Entries)
-            {
-                if (e.Storage is not { } s)
-                    continue;
-                var baseName = BlobNameOf(s);
-                var volumes = s.Kind == "pack"
-                    ? info.Packs.TryGetValue(s.Ref, out var pi)
-                        ? pi.Volumes
-                        : throw new InvalidOperationException(
-                            $"Pack '{s.Ref}' is referenced but missing from info.Packs; cannot determine its volumes.")
-                    : s.Volumes;
-                foreach (var name in VolumeBlobIO.VolumeNames(baseName, volumes))
-                    refs.Add(name);
-            }
+        // Every volume of every storage object any version references.
+        await foreach (var (kind, storageRef, volumes) in objects.WithCancellation(ct))
+        {
+            var baseName = BlobNameOf(kind, storageRef);
+            var count = kind == "pack"
+                ? info.Packs.TryGetValue(storageRef, out var pi)
+                    ? pi.Volumes
+                    : throw new InvalidOperationException(
+                        $"Pack '{storageRef}' is referenced but missing from info.Packs; cannot determine its volumes.")
+                : volumes;
+            foreach (var name in VolumeBlobIO.VolumeNames(baseName, count))
+                refs.Add(name);
+        }
 
         return refs;
     }
@@ -438,17 +548,18 @@ public sealed class BackupChecker(
     /// blob/volume to verify existence + size. Content: on top of that, download every readable blob and recompute its
     /// hash (a blob still in Archive without rehydration is skipped, not mistaken for corruption).
     /// </summary>
+    /// <param name="groups">The version's entries folded into one list per storage object, in a stable order.
+    /// Walked TWICE — once to build the probe worklist, once to read the verdicts back onto paths — because holding
+    /// every group between the two would be the whole version in memory again, which is exactly what reading the
+    /// index out of the catalog exists to stop. The worklist in between is one row per object, not per file. Hence a
+    /// factory rather than an enumerable: a SQLite cursor cannot be rewound, and both passes must see the same
+    /// groups in the same order for the verdict indexes to line up (the query's ORDER BY is what guarantees it).</param>
     private async Task<HashSet<string>> CloudCheckAsync(
-        BlobContainerClient cc, BackupInfoFile info, VersionIndex index, CheckOptions options, string? password,
+        BlobContainerClient cc, BackupInfoFile info, Func<IAsyncEnumerable<List<IndexEntry>>> groups,
+        CheckOptions options, string? password,
         int downloadConcurrency, int headConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         var bad = new HashSet<string>(StringComparer.Ordinal);
-
-        // Group by blob (blobName → the entries in that blob + the expected volume count/sizes).
-        var groups = index.Entries
-            .Where(e => e.Storage is not null)
-            .GroupBy(e => BlobNameOf(e.Storage!))
-            .ToList();
 
         // What gets counted are **volumes** (probes), not objects and not files: a probe is the stage's unit of
         // real work, and a thousand-volume object counted as one tick freezes the bar for minutes while a run of
@@ -456,32 +567,42 @@ public sealed class BackupChecker(
         //
         // All objects go to the prober as one worklist: the head budget spans the whole stage, so a container of
         // thousands of single-volume packs advances at budget×(1/RTT) objects a second, not one per round-trip.
-        var presentGroups = new List<IGrouping<string, IndexEntry>>();
-        var families = groups.Select(g =>
+        var families = new List<(string BaseRef, int Volumes, IReadOnlyList<long> Sizes)>();
+        await foreach (var group in groups().WithCancellation(ct))
         {
-            var (vols, sizes) = ExpectedVolumes(info, g.First().Storage!);
-            return (g.Key, vols, sizes);
-        }).ToList();
-        var tracker = Track(onProgress, "Cloud", families.Sum(f => Math.Max(1, f.vols)));
+            var (vols, sizes) = ExpectedVolumes(info, group[0].Storage!);
+            families.Add((BlobNameOf(group[0].Storage!), vols, sizes));
+        }
+
+        var tracker = Track(onProgress, "Cloud", families.Sum(f => Math.Max(1, f.Volumes)));
         var verdicts = await VolumeBlobIO.VerifyFamiliesAsync(
             cc, families, headConcurrency, ct,
             // HEAD downloads no content: count 0 bytes, or the reported "speed" has nothing to do with actual traffic.
-            onProbe: i => { tracker?.Touch(groups[i].Key); tracker?.Advance(0); });
+            onProbe: i => { tracker?.Touch(families[i].BaseRef); tracker?.Advance(0); });
         tracker?.Complete();
-        for (var i = 0; i < groups.Count; i++)
+
+        // Second pass: the verdicts back onto paths. Only a content-level run keeps the groups it will download;
+        // an existence check retains nothing but the paths that came back bad, which on a healthy backup is nothing.
+        var deep = options.Cloud >= CloudCheckLevel.Content;
+        var presentGroups = new List<List<IndexEntry>>();
+        var at = 0;
+        await foreach (var group in groups().WithCancellation(ct))
         {
-            if (verdicts[i] is { Present: true, SizeOk: true })
+            if (verdicts[at] is { Present: true, SizeOk: true })
             {
-                presentGroups.Add(groups[i]);
+                if (deep)
+                    presentGroups.Add(group);
             }
             else
             {
-                foreach (var e in groups[i])
+                foreach (var e in group)
                     bad.Add(e.Path);
             }
+
+            at++;
         }
 
-        if (options.Cloud >= CloudCheckLevel.Content)
+        if (deep)
         {
             var corrupted = await DeepVerifyAsync(cc, info, presentGroups, options, password, downloadConcurrency, onProgress, ct);
             foreach (var p in corrupted)
@@ -503,7 +624,7 @@ public sealed class BackupChecker(
     /// the info file, not on the entry — compaction rewrites them). The UI uses this to show "how much transferred /
     /// how much in total".</param>
     private async Task<IReadOnlyList<string>> DeepVerifyAsync(
-        BlobContainerClient cc, BackupInfoFile info, List<IGrouping<string, IndexEntry>> presentGroups,
+        BlobContainerClient cc, BackupInfoFile info, IReadOnlyList<List<IndexEntry>> presentGroups,
         CheckOptions options, string? password, int downloadConcurrency, Action<StageProgress>? onProgress, CancellationToken ct)
     {
         if (compressor is null || hasher is null || string.IsNullOrEmpty(tempRoot))
@@ -519,22 +640,24 @@ public sealed class BackupChecker(
         // progress — one group can be a single 100 GB file or a box of several hundred small ones. The download
         // total is only reported when every group can answer it (an old index without volume sizes must not hand
         // out an undersized denominator that pins the percentage at 100% early).
-        var groupWork = presentGroups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
-        var downloadSizes = presentGroups.ToDictionary(
-            g => g.Key, g => TransferLabel.DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
-        var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
-        foreach (var g in presentGroups)
-            tracker?.Enqueue(groupWork[g.Key], downloadTotalKnown ? downloadSizes[g.Key] : 0);
+        // Indexed by position rather than keyed by blob name: the groups now arrive keyed by storage object (kind +
+        // ref), which a bare blob name cannot always tell apart, and a duplicate key would throw here instead.
+        var names = presentGroups.Select(g => BlobNameOf(g[0].Storage!)).ToList();
+        var groupWork = presentGroups.Select(g => g.Sum(e => e.Length)).ToList();
+        var downloadSizes = presentGroups.Select(g => TransferLabel.DownloadBytesOf(g[0].Storage!, info)).ToList();
+        var downloadTotalKnown = downloadSizes.All(b => b > 0);
+        for (var i = 0; i < presentGroups.Count; i++)
+            tracker?.Enqueue(groupWork[i], downloadTotalKnown ? downloadSizes[i] : 0);
         try
         {
-            var perGroup = await Task.WhenAll(presentGroups.Select(async g =>
+            var perGroup = await Task.WhenAll(presentGroups.Select(async (g, i) =>
             {
-                try { return await VerifyGroupAsync(cc, info, work, g.Key, g.ToList(), options, password, gate, tracker, ct); }
+                try { return await VerifyGroupAsync(cc, info, work, names[i], g, options, password, gate, tracker, ct); }
                 finally
                 {
                     // Counting and in-flight are separate concerns: one group takes exactly one slot. Work is
                     // retired in one go — failed groups too, or the remainder never reaches zero and the ETA hangs.
-                    tracker?.Advance(0, groupWork[g.Key]);
+                    tracker?.Advance(0, groupWork[i]);
                 }
             }));
             return perGroup.SelectMany(x => x).ToList();
@@ -905,5 +1028,11 @@ public sealed class BackupChecker(
         return null;
     }
 
-    private static string BlobNameOf(StorageRef s) => s.Kind == "pack" ? $"packs/{s.Ref}.7z" : s.Ref;
+    private static string BlobNameOf(StorageRef s) => BlobNameOf(s.Kind, s.Ref);
+
+    /// <summary>The blob name (a pack's archive, or the data blob itself) an object of this kind and ref occupies.
+    /// Taken apart from <see cref="StorageRef"/> because the catalog answers the orphan sweep with a bare kind and
+    /// ref, and two spellings of "where does a pack live" is the kind of drift that ends with a live pack swept.</summary>
+    private static string BlobNameOf(string kind, string storageRef) =>
+        kind == "pack" ? $"packs/{storageRef}.7z" : storageRef;
 }

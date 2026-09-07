@@ -108,7 +108,9 @@ public sealed class OperationLogSourceTests
     {
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
-            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
+            // The catalog source is demanded by the constructor and never reached: the fake store throws first.
+            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(),
+            new TestLocalAuthority(new ThrowingBackupInfoStore()).Catalogs, opLog: log);
         var account = new Account { Id = 3, Name = "acct3" };
 
         try { await checker.CheckAsync(account, "photos", null, null, new CheckOptions()); }
@@ -126,7 +128,9 @@ public sealed class OperationLogSourceTests
     {
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
-            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
+            // The catalog source is demanded by the constructor and never reached: the fake store throws first.
+            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(),
+            new TestLocalAuthority(new ThrowingBackupInfoStore()).Catalogs, opLog: log);
         var store = new OneVersionBackupInfoStore();
         var repairer = new BackupRepairer(
             new UnusedBlobClientFactory(), store, compressor: null!, hasher: null!,

@@ -94,8 +94,16 @@ public sealed partial class VersionCatalog
         ORDER BY version ASC, seq ASC LIMIT 1
         """;
 
+    /// <summary>One row per (kind, ref, volume count), not per ref: the orphan sweep protects <b>every volume</b> of
+    /// a referenced object, and for a single-file blob the only place that count is recorded is the entry itself (a
+    /// pack's lives in the info file). Every distinct count is emitted rather than the largest, because the name
+    /// sets of two counts are DISJOINT, not nested: <see cref="VolumeBlobIO.VolumeNames"/> gives the bare
+    /// <c>data/h</c> for one volume and <c>data/h.001</c>… for more. Collapsing a version that records 1 and a
+    /// version that records 3 onto the larger would leave the live bare name out of the protected set entirely.
+    /// The caller unions the names, so emitting both counts closes the gap.</summary>
     private const string SelectDistinctRefsSql =
-        "SELECT DISTINCT storage_ref FROM entries WHERE storage_ref IS NOT NULL ORDER BY storage_ref";
+        "SELECT DISTINCT storage_kind, storage_ref, volumes FROM entries WHERE storage_ref IS NOT NULL " +
+        "ORDER BY storage_kind, storage_ref, volumes";
 
     private const string SelectLivePackMembersSql = """
         SELECT storage_ref, COALESCE(entry_name, path), length, full_hash FROM entries
@@ -426,9 +434,20 @@ public sealed partial class VersionCatalog
 
     // ---- maintenance ----------------------------------------------------------------------------------------
 
-    /// <summary>Every storage ref any retained version references, blobs and packs alike: the set an orphan sweep compares the container against.</summary>
-    public IAsyncEnumerable<string> DistinctRefsAsync(CancellationToken ct) =>
-        QueryStringsAsync(SelectDistinctRefsSql, ct);
+    /// <summary>Every storage object any retained version references, blobs and packs alike, once per volume count
+    /// it is recorded under: the set an
+    /// orphan sweep compares the container against. The kind travels with the ref because a pack and a blob may
+    /// perfectly well share one (they are addressed in different namespaces) and only the kind says which blob names
+    /// the object occupies; the volume count travels with it for the reason given on
+    /// <see cref="SelectDistinctRefsSql"/>.</summary>
+    public async IAsyncEnumerable<(string Kind, string Ref, int Volumes)> DistinctRefsAsync(
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        using var command = Command(SelectDistinctRefsSql);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return (reader.GetString(0), reader.GetString(1), reader.GetInt32(2));
+    }
 
     /// <summary>Refs these versions reference and no other version does — exactly what may be deleted when they are retired.</summary>
     public async Task<IReadOnlyList<string>> RefsOnlyInAsync(IReadOnlyCollection<int> versions, string kind, CancellationToken ct)

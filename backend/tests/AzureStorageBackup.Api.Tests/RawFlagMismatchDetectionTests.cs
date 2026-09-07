@@ -78,7 +78,7 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
 
         var account = AzuriteAccount();
         var name = RandomName("rawflag-");
@@ -126,6 +126,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                     : e)],
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
+            // The version index was rewritten out of band. The check reads the version out of the container's
+            // catalog now, so the rewrite has to announce itself the same way a repair's does — through the
+            // version's .idx file, which outranks the row already in the catalog.
+            await authority.IndexCache.PutAsync(account.Id, name, version.Version, info.Backup.CreatedAt.UtcTicks, tampered);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
@@ -159,7 +163,7 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check2"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check2"));
 
         var account = AzuriteAccount();
         var name = RandomName("rawflag2-");
@@ -202,6 +206,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                     : e)],
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
+            // The version index was rewritten out of band. The check reads the version out of the container's
+            // catalog now, so the rewrite has to announce itself the same way a repair's does — through the
+            // version's .idx file, which outranks the row already in the catalog.
+            await authority.IndexCache.PutAsync(account.Id, name, version.Version, info.Backup.CreatedAt.UtcTicks, tampered);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });

@@ -444,7 +444,10 @@ public sealed class RetentionCleaner(
         var blobs = new HashSet<string>(await catalog.RefsOnlyInAsync(retired, "blob", ct), StringComparer.Ordinal);
         var packs = new HashSet<string>(await catalog.RefsOnlyInAsync(retired, "pack", ct), StringComparer.Ordinal);
         var referenced = new HashSet<string>(StringComparer.Ordinal);
-        await foreach (var storageRef in catalog.DistinctRefsAsync(ct))
+        // Kind-agnostic on purpose (see the remarks above): the ref alone is what the candidate sets are compared
+        // against. The kind and volume count the query also carries are the orphan sweep's business, not this one's
+        // — a ref recorded under two different volume counts arrives twice and lands in the same set entry.
+        await foreach (var (_, storageRef, _) in catalog.DistinctRefsAsync(ct))
             referenced.Add(storageRef);
         return new CleanupCandidates(blobs, packs, referenced);
     }

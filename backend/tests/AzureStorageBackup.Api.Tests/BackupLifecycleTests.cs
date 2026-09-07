@@ -133,7 +133,7 @@ public sealed class BackupLifecycleTests : IDisposable
             catalogs: catalogs, trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
+            factory, store, catalogs, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
         var repairer = new BackupRepairer(
             factory, store, new SevenZipCompressor(), hasher, _uploader, Path.Combine(_temp, "repair"), staging,
             catalogs, checker: checker, trackedInfo: tracked);

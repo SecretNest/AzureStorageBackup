@@ -112,7 +112,7 @@ public sealed class BackupRepairerTests : IDisposable
             catalogs: catalogs, trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
+            factory, store, catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
             trackedInfo: tracked, journals: _journals);
         var repairStore = repairIndexVolumeBytes is { } volumeBytes
             ? new BackupInfoStore(factory, new SevenZipArchiveCodec()) { IndexVolumeBytes = volumeBytes }

@@ -197,9 +197,11 @@ public sealed class UntrustedIndexPathTests : IDisposable
         await File.WriteAllTextAsync(secret, "outside the root");
 
         var hasher = new RecordingHasher();
+        var store = new BackupInfoStore(new BlobClientFactory(TestSecrets.Reader), new StubCodec());
         var checker = new BackupChecker(
-            new BlobClientFactory(TestSecrets.Reader),
-            new BackupInfoStore(new BlobClientFactory(TestSecrets.Reader), new StubCodec()),
+            new BlobClientFactory(TestSecrets.Reader), store,
+            // Demanded by the constructor, never reached: these two exercise the local axis directly.
+            new TestLocalAuthority(store).Catalogs,
             hasher: hasher);
 
         var state = await LocalCheckAsync(checker, new IndexEntry
@@ -223,9 +225,11 @@ public sealed class UntrustedIndexPathTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(_local, "a.txt"), "alpha");
 
         var hasher = new RecordingHasher();
+        var store = new BackupInfoStore(new BlobClientFactory(TestSecrets.Reader), new StubCodec());
         var checker = new BackupChecker(
-            new BlobClientFactory(TestSecrets.Reader),
-            new BackupInfoStore(new BlobClientFactory(TestSecrets.Reader), new StubCodec()),
+            new BlobClientFactory(TestSecrets.Reader), store,
+            // Demanded by the constructor, never reached: these two exercise the local axis directly.
+            new TestLocalAuthority(store).Catalogs,
             hasher: hasher);
 
         var state = await LocalCheckAsync(checker, new IndexEntry

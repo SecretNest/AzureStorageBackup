@@ -315,10 +315,14 @@ public sealed class VersionCatalogTests : IDisposable
         await using var catalog = await OpenAsync();
         await ImportAsync(catalog, 1, [Entry("m.txt", 1, "H1", Pack("p1", "m.txt")), Entry("f.txt", 2, "F", Blob("data/f"))],
             unrecoverable: ["f.txt"]);
-        await ImportAsync(catalog, 2, [Entry("m.txt", 3, "H2", Pack("p1", "m.txt")), Entry("g.txt", 4, "G", Blob("data/g"))],
+        await ImportAsync(catalog, 2, [Entry("m.txt", 3, "H2", Pack("p1", "m.txt")), Entry("g.txt", 4, "G", Blob("data/g", volumes: 3))],
             unrecoverable: ["g.txt"]);
 
-        Assert.Equal(["data/f", "data/g", "p1"], await Collect(catalog.DistinctRefsAsync(CancellationToken.None)));
+        // Kind and volume count travel with the ref: the orphan sweep needs the kind to know which blob names an
+        // object occupies, and the count to protect every one of them (data/g is three volumes, not one).
+        Assert.Equal(
+            [("blob", "data/f", 1), ("blob", "data/g", 3), ("pack", "p1", 1)],
+            await CollectRefs(catalog.DistinctRefsAsync(CancellationToken.None)));
 
         // The latest version's copy of a member wins: its length and hash are what compaction has to weigh.
         Assert.Equal([("p1", "m.txt", 3L, "H2")], await CollectTuples(catalog.LivePackMembersAsync(CancellationToken.None)));
@@ -334,6 +338,25 @@ public sealed class VersionCatalogTests : IDisposable
         Assert.Equal([(1, "m.txt"), (2, "m.txt")], members);
 
         Assert.Equal(["f.txt", "g.txt"], await Collect(catalog.UnrecoverableAnyVersionAsync(CancellationToken.None)));
+    }
+
+
+    /// <summary>
+    /// Two versions that disagree about how many volumes one object has must BOTH be reported, never collapsed onto
+    /// the larger. One volume is the bare <c>data/h</c> and three are <c>data/h.001…003</c>, so the two name sets
+    /// are disjoint rather than nested: keeping only the larger leaves the live bare name out of the set the orphan
+    /// sweep protects, and the sweep then deletes it.
+    /// </summary>
+    [Fact]
+    public async Task Distinct_refs_report_every_volume_count_a_ref_is_recorded_under()
+    {
+        await using var catalog = await OpenAsync();
+        await ImportAsync(catalog, 1, [Entry("h.txt", 1, "H", Blob("data/h"))]);
+        await ImportAsync(catalog, 2, [Entry("h.txt", 2, "H", Blob("data/h", volumes: 3))]);
+
+        Assert.Equal(
+            [("blob", "data/h", 1), ("blob", "data/h", 3)],
+            await CollectRefs(catalog.DistinctRefsAsync(CancellationToken.None)));
     }
 
     [Fact]
@@ -432,6 +455,15 @@ public sealed class VersionCatalogTests : IDisposable
         var list = new List<string>();
         await foreach (var v in values)
             list.Add(v);
+        return list;
+    }
+
+    private static async Task<List<(string, string, int)>> CollectRefs(
+        IAsyncEnumerable<(string Kind, string Ref, int Volumes)> rows)
+    {
+        var list = new List<(string, string, int)>();
+        await foreach (var r in rows)
+            list.Add((r.Kind, r.Ref, r.Volumes));
         return list;
     }
 

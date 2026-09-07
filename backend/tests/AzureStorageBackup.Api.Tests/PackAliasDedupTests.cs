@@ -498,8 +498,9 @@ public sealed class PackAliasDedupTests : IDisposable
             Write("c/second.txt", payload);
             await backup.RunAsync(Request(account, name));
 
+            var checkStore = new BackupInfoStore(factory, new SevenZipArchiveCodec());
             var checker = new BackupChecker(
-                factory, new BackupInfoStore(factory, new SevenZipArchiveCodec()),
+                factory, checkStore, TestCatalogs.New(_db, checkStore),
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
             var report = await checker.CheckAsync(account, name, null, null, new CheckOptions());
 
