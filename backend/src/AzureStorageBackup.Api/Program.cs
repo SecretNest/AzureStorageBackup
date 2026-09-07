@@ -225,6 +225,7 @@ builder.Services.AddSingleton(sp => new BackupRunner(
 builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IVersionCatalogs>(),
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "restore"),

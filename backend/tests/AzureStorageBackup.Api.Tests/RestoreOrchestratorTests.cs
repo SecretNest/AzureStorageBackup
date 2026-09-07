@@ -22,6 +22,10 @@ public sealed class RestoreOrchestratorTests : IDisposable
     private readonly string _dst;
     private readonly string _temp;
 
+    /// <summary>The catalog store the restore under test reads its version through, kept from <see cref="Build"/> so a
+    /// test can reach the file itself — deleting it is the only way to ask "is the catalog really just a cache".</summary>
+    private VersionCatalogStore? _catalogStore;
+
     public RestoreOrchestratorTests()
     {
         _base = Path.Combine(Path.GetTempPath(), "asb-restore-" + Guid.NewGuid().ToString("N"));
@@ -80,8 +84,10 @@ public sealed class RestoreOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
+        _catalogStore = TestCatalogs.NewStore();
         var restore = new RestoreOrchestrator(
-            factory, store, restoreCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"))
+            factory, store, new VersionCatalogs(_catalogStore, TestIndexFiles.New(), authority.Db, store),
+            restoreCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"))
         { Clock = restoreClock, CaseProbe = caseProbe };
         return (backup, restore, store, factory);
     }
@@ -134,6 +140,112 @@ public sealed class RestoreOrchestratorTests : IDisposable
             });
 
             Assert.Equal("archived content", File.ReadAllText(Path.Combine(_dst, "a.txt")));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The catalog is a cache of the index blobs, never their replacement, and a restore is where that has to hold: the
+    /// version it walks may simply not be in the file yet (a fresh deployment, a container nobody has restored from
+    /// since the upgrade, an operator who wiped the directory to reclaim space). Deleting the file between two restores
+    /// is the cheapest way to reach exactly that state — the second run has to go back to the cloud for the version,
+    /// restore the same bytes, and leave the catalog rebuilt behind it.
+    /// </summary>
+    [SkippableFact]
+    public async Task Restore_of_a_version_not_in_the_catalog_imports_it_first()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstcat-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("a.txt", "alpha");
+            WriteSrc("dir/b.txt", "bravo");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var catalogFile = _catalogStore!.PathFor(account.Id, name);
+            Assert.False(File.Exists(catalogFile)); // nothing has asked for the version yet
+
+            // The first restore is what pulls the version in.
+            var first = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+            Assert.Equal(2, first.RestoredFiles);
+            Assert.True(File.Exists(catalogFile));
+
+            // Take the whole catalog away and restore into a clean target: the run must not quietly restore nothing.
+            Directory.Delete(Path.GetDirectoryName(catalogFile)!, recursive: true);
+            Assert.False(File.Exists(catalogFile));
+            Directory.Delete(_dst, recursive: true);
+
+            var second = await restore.RunAsync(new RestoreRequest { Account = account, Container = name, TargetRoot = _dst });
+
+            Assert.Equal(2, second.RestoredFiles);
+            Assert.Equal(0, second.FailedFiles);
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "a.txt")));
+            Assert.Equal("bravo", File.ReadAllText(Path.Combine(_dst, "dir", "b.txt")));
+            Assert.True(File.Exists(catalogFile)); // and the cache is back, rebuilt from the cloud
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The download denominator is all-or-nothing — it may only be published when every group can answer it — and an
+    /// entry a check gave up on must not be what makes it unanswerable. A damaged version's abandoned object is
+    /// typically gone from the info file as well, so its download size is unknowable; but that entry is never restored
+    /// (it is either substituted from another version's object, or skipped), so its object never becomes a group and
+    /// has no business in the accounting. Before the fix, one such entry cost the whole restore its download total and
+    /// the transfer row went blank for a run that was otherwise perfectly measurable.
+    /// </summary>
+    [SkippableFact]
+    public async Task An_Unrecoverable_Entry_Does_Not_Cost_The_Restore_Its_Download_Total()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, restore, store, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("rstunrec-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+
+        try
+        {
+            WriteSrc("dir/a.txt", "alpha");
+            await backup.RunAsync(BackupReq(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions[^1];
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null);
+            var aEntry = idx.Entries.Single(e => e.Path == "dir/a.txt");
+            // The shape damage leaves behind: an entry pointing at a pack the info file no longer describes, given up
+            // on by a check. DownloadBytesOf can say nothing about that pack, so it must not be asked about it.
+            idx.Entries.Add(aEntry with
+            {
+                Path = "gone.txt",
+                Storage = new StorageRef { Kind = "pack", Ref = "no-such-pack" },
+            });
+            idx.UnrecoverablePaths.Add("gone.txt");
+            await store.WriteIndexAsync(account, name, v1.Version, idx, null);
+
+            var reports = new List<StageProgress>();
+            var result = await restore.RunAsync(
+                new RestoreRequest { Account = account, Container = name, TargetRoot = _dst },
+                CancellationToken.None, phase: null, onProgress: p => { lock (reports) reports.Add(p); });
+
+            Assert.Equal(1, result.RestoredFiles);
+            Assert.Equal(1, result.SkippedFiles);   // the unrecoverable entry, with no substitute offered
+            Assert.Equal(0, result.FailedFiles);
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(_dst, "dir", "a.txt")));
+
+            var restoring = reports.Where(r => r.Stage == "Restoring").ToList();
+            Assert.NotEmpty(restoring);
+            Assert.True(restoring[^1].TransferTotal > 0,
+                "one abandoned entry pointing at an object the info file cannot size cost the whole restore its download denominator");
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

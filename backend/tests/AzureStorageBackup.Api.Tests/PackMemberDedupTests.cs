@@ -103,7 +103,8 @@ public sealed class PackMemberDedupTests : IDisposable
             new FileHasher(), catalogs: catalogs, trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
+            factory, store, TestCatalogs.New(_db, store), new SevenZipCompressor(), new FileHasher(),
+            Path.Combine(_temp, "restore"));
         return (backup, restore, store);
     }
 

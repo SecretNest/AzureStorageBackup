@@ -111,6 +111,29 @@ public sealed partial class VersionCatalog
 
     private const string SelectUnrecoverableAnyVersionSql = "SELECT DISTINCT path FROM unrecoverable ORDER BY path";
 
+    private const string SelectImportIssuesSql = "SELECT path, issue FROM import_issues WHERE version=@v ORDER BY path";
+
+    /// <summary>One row per storage object the version references. <c>entry_name</c> is selected as NULL on purpose:
+    /// a pack's members each carry their own name, so no single row's value is true of the group as a whole, and what
+    /// the caller wants here is the object (where to download it from, how many volumes, how big they are) rather than
+    /// any one member of it. The other three bare columns under the <c>GROUP BY</c> are safe precisely because they
+    /// are not per-member: <c>volumes</c>, <c>raw</c> and <c>volume_sizes</c> describe the object, so every row of a
+    /// group carries the same values and SQLite's choice of which row to read them from cannot matter.
+    /// <para>
+    /// <c>unrecoverable=0</c> is not a nicety. An entry a check gave up on is never restored — it is either
+    /// substituted, in which case the content comes from a different object entirely, or it has no substitute and is
+    /// skipped — so its object never becomes a download group, and counting it here would only distort what the
+    /// caller is about to plan. Worse, a damaged version's abandoned pack is typically gone from the info file too,
+    /// which makes its download size unknowable, and a single unknowable object is enough to cost the whole restore
+    /// its download denominator (that total is all-or-nothing by design).
+    /// </para>
+    /// Grouped, so the result is bounded by the number of packs and blobs rather than by the entry count.</summary>
+    private const string SelectStorageGroupSizesSql = """
+        SELECT storage_kind, storage_ref, NULL AS entry_name, volumes, raw, volume_sizes, SUM(length)
+        FROM entries WHERE version=@v AND storage_kind IS NOT NULL AND unrecoverable=0
+        GROUP BY storage_kind, storage_ref ORDER BY storage_kind, storage_ref
+        """;
+
     // ---- browsing -------------------------------------------------------------------------------------------
 
     public async Task<IndexEntry?> GetEntryAsync(int version, string path, CancellationToken ct)
@@ -308,6 +331,35 @@ public sealed partial class VersionCatalog
         while (await reader.ReadAsync(ct))
             rows.Add((reader.GetString(0), reader.GetInt32(1)));
         return rows;
+    }
+
+    /// <summary>What the import had to drop on the floor, path by path. Today that is only <c>duplicate</c>: the
+    /// primary key cannot hold the same path twice, so the first row won and the rest were recorded here — which is
+    /// how a reader still learns that the version contradicted itself at that path, rather than being handed the
+    /// arbitrary survivor as if it were authoritative.</summary>
+    public async Task<IReadOnlyList<(string Path, string Issue)>> ImportIssuesAsync(int version, CancellationToken ct)
+    {
+        using var command = Command(SelectImportIssuesSql);
+        Set(command, "@v", version);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        var rows = new List<(string, string)>();
+        while (await reader.ReadAsync(ct))
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+        return rows;
+    }
+
+    /// <summary>Every storage object the version references, with the source bytes its members add up to — the totals a
+    /// restore has to declare to its progress tracker <em>before</em> it starts walking, because the download
+    /// denominator is all-or-nothing (it may only be published when every group can answer it, and a streaming walk
+    /// only learns that after the last group has gone by).</summary>
+    public async IAsyncEnumerable<(StorageRef Storage, long Bytes)> StorageGroupSizesAsync(
+        int version, [EnumeratorCancellation] CancellationToken ct)
+    {
+        using var command = Command(SelectStorageGroupSizesSql);
+        Set(command, "@v", version);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return (EntryRowMapper.ReadStorage(reader)!, reader.GetInt64(6));
     }
 
     // ---- dedup, across every retained version ---------------------------------------------------------------

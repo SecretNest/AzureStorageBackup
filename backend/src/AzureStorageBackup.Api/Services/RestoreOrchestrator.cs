@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
@@ -57,6 +58,7 @@ public sealed record RestoreResult(int Version, int RestoredFiles, int SkippedFi
 public sealed class RestoreOrchestrator(
     IBlobClientFactory factory,
     IBackupInfoStore store,
+    IVersionCatalogs catalogs,
     IFileCompressor compressor,
     IFileHasher hasher,
     string tempRoot,
@@ -112,12 +114,40 @@ public sealed class RestoreOrchestrator(
         if (info.Versions.Count == 0)
             throw new InvalidOperationException("Backup has no versions.");
 
-        var version = request.Version is { } v
-            ? info.Versions.FirstOrDefault(x => x.Version == v)
-              ?? throw new InvalidOperationException($"Version {v} not found.")
+        var version = request.Version is { } requested
+            ? info.Versions.FirstOrDefault(x => x.Version == requested)
+              ?? throw new InvalidOperationException($"Version {requested} not found.")
             : info.Versions[^1];
+        var v = version.Version;
 
-        var index = await store.ReadIndexAsync(request.Account, request.Container, version.IndexBlob, request.Password, version.IndexVolumes, ct);
+        // Every version this run reads has to be in the catalog **before** the handle is opened, because the handle is
+        // read-only and a read-only open is precisely the one that migrates nothing: the target version, plus each
+        // version a substitution draws its content from. The identity stamp is the backup's creation timestamp — the
+        // same value every other cache in this codebase keys on — so a container that was deleted and rebuilt under
+        // the same version numbers is never mistaken for the one already in the file.
+        var identity = info.Backup.CreatedAt.UtcTicks;
+        await catalogs.EnsureVersionAsync(request.Account, request.Container, version, identity, request.Password, ct);
+        var substitutionSources = new HashSet<int>();
+        foreach (var source in request.Substitutions.Values.Distinct())
+        {
+            if (source == v)
+            {
+                substitutionSources.Add(source); // substituting from the version being restored: already in hand
+                continue;
+            }
+
+            // The substitute version was deleted by retention cleanup → the whole group falls back to being skipped.
+            if (info.Versions.FirstOrDefault(x => x.Version == source) is not { } sourceVersion)
+                continue;
+            await catalogs.EnsureVersionAsync(
+                request.Account, request.Container, sourceVersion, identity, request.Password, ct);
+            substitutionSources.Add(source);
+        }
+
+        // One handle for the whole restore. VersionCatalog wraps a single connection and is not thread-safe, which is
+        // fine here: every read below runs sequentially on this method's own thread of control, and the group tasks
+        // that do run concurrently never touch it — they only ever hold entries already read out of it.
+        await using var catalog = await catalogs.OpenAsync(request.Account.Id, request.Container, readOnly: true, ct);
 
         Directory.CreateDirectory(request.TargetRoot);
         var container = factory.CreateServiceClient(request.Account).GetBlobContainerClient(request.Container);
@@ -132,45 +162,56 @@ public sealed class RestoreOrchestrator(
         var skipped = 0;
         var failed = 0;
 
-        // The effective entry per path: by default the one from this version; a substituted path uses the same-path entry from the chosen version (content + metadata both from that version).
-        var byPath = IndexByPath(index.Entries, phase, out var duplicatePaths);
-        failed += duplicatePaths; // Index entries with a duplicate Path: neither is written, each such path counts as one failure, and the whole restore is not aborted.
-        var resolved = new HashSet<string>(StringComparer.Ordinal); // the substitution paths that actually resolved
-        foreach (var grp in request.Substitutions.GroupBy(kv => kv.Value))
+        // A path the index holds twice contradicts itself, and there is no telling which entry is authoritative, so we
+        // would rather write neither than guess. The import kept the first row (the primary key cannot hold the same
+        // path twice) and recorded the loss as an issue, which is what still makes the contradiction visible here.
+        // Handled under the existing per-entry fault-tolerance principle: fail only the duplicated path, one failure
+        // per path however many copies there were, and never abort the whole restore over it.
+        var duplicates = await DuplicatePathsAsync(catalog, v, ct);
+        foreach (var path in duplicates)
+            phase?.Report($"Skipped duplicate index entry (ambiguous which version is authoritative): {path}");
+        failed += duplicates.Count;
+
+        // Selective restore (requirement B): narrow the effective set down to the paths the user selected. The filter takes effect before grouping,
+        // so each pack is still downloaded only once but only the selected members get written — unselected members never enter a group at all, so no over-restore.
+        HashSet<string>? selected = request.SelectedPaths is null
+            ? null
+            : new HashSet<string>(request.SelectedPaths, StringComparer.Ordinal);
+
+        // The effective entry per path: by default the one from this version; a substituted path uses the same-path
+        // entry from the chosen version (content + metadata both from that version). Bounded by the substitution
+        // count — a list the user picked by hand — never by the size of the version.
+        var substituted = new Dictionary<string, IndexEntry>(StringComparer.Ordinal);
+        foreach (var group in request.Substitutions.GroupBy(kv => kv.Value))
         {
-            var sv = info.Versions.FirstOrDefault(x => x.Version == grp.Key);
-            if (sv is null)
-                continue; // the substitute version was deleted by retention cleanup → the whole group falls back to being skipped
-            var srcIndex = await store.ReadIndexAsync(request.Account, request.Container, sv.IndexBlob, request.Password, sv.IndexVolumes, ct);
-            // The substitute source version's index also comes from the cloud and can equally well contain duplicate Paths; a substitution path that can't be resolved
-            // falls back to the existing "intent declared but the substitute isn't available" skip semantics (the TryGetValue below simply doesn't find it).
-            var srcByPath = IndexByPath(srcIndex.Entries, phase, out _);
-            foreach (var kv in grp)
+            if (!substitutionSources.Contains(group.Key))
+                continue;
+
+            // The substitute source version can equally well contain duplicate Paths, and the same verdict applies:
+            // its copy of that path is not something to hand over as authoritative, so the substitution simply does
+            // not resolve and falls back to the documented soft skip.
+            var sourceDuplicates = await DuplicatePathsAsync(catalog, group.Key, ct);
+            foreach (var kv in group)
+            {
+                if (sourceDuplicates.Contains(kv.Key) || (selected is not null && !selected.Contains(kv.Key)))
+                    continue;
+
                 // "Resolved" must mean the substitute's content is actually available, not merely that a
                 // same-path entry exists: a version whose own copy is ALSO marked unrecoverable (the /file-versions
                 // endpoint filters those, but a raw API caller or a selection gone stale across a repair does not)
                 // would ride the normal download pipeline into a hard per-group failure with a message that never
                 // says the chosen version is damaged too. Unresolved falls back to the documented soft skip.
-                if (srcByPath.TryGetValue(kv.Key, out var se) && !srcIndex.UnrecoverablePaths.Contains(kv.Key))
-                {
-                    byPath[kv.Key] = se;
-                    resolved.Add(kv.Key);
-                }
+                if (await catalog.GetEntryAsync(group.Key, kv.Key, ct) is { } entry
+                    && !await catalog.IsUnrecoverableAsync(group.Key, kv.Key, ct))
+                    substituted[kv.Key] = entry;
+            }
         }
 
-        // Selective restore (requirement B): narrow the effective set down to the paths the user selected. The filter takes effect before grouping,
-        // so each pack is still downloaded only once but only the selected members get written — unselected members never enter fileEntries at all, so no over-restore.
-        HashSet<string>? selected = request.SelectedPaths is null
-            ? null
-            : new HashSet<string>(request.SelectedPaths, StringComparer.Ordinal);
-        if (selected is not null)
-            foreach (var key in byPath.Keys.Where(k => !selected.Contains(k)).ToList())
-                byPath.Remove(key);
-
         // Unrecoverable with no substitute that "resolved successfully" → skip (declaring the intent but not having the substitute available also falls back to skipping, not erroring).
-        // Under selective restore, only the selected unrecoverable paths are counted.
-        var unresolved = index.UnrecoverablePaths
-            .Where(p => !resolved.Contains(p) && (selected is null || selected.Contains(p)))
+        // Under selective restore, only the selected unrecoverable paths are counted. The list is bounded by the damage
+        // a check found, not by the file count.
+        var unresolved = (await catalog.UnrecoverableAsync(v, ct))
+            .Where(p => !substituted.ContainsKey(p) && (selected is null || selected.Contains(p)))
             .ToHashSet(StringComparer.Ordinal);
         skipped += unresolved.Count;
 
@@ -179,22 +220,22 @@ public sealed class RestoreOrchestrator(
         // restore target folds case, and that collapse used to be silent: NeedsRestoreAsync runs for a whole group
         // before anything is written, so at that moment neither destination exists yet and both entries are marked
         // "needed"; the second File.Copy then overwrites the first, and the run still reports both as restored.
-        // The verdict is the same one a duplicate Path already gets (see IndexByPath): two entries that contradict
-        // each other are both refused and reported — one visible failure beats one file's content silently replaced
-        // by another's.
+        // The verdict is the same one a duplicate Path gets (see above): two entries that contradict each other are
+        // both refused and reported — one visible failure beats one file's content silently replaced by another's.
         // Note this sits **after** the selective-restore filter, deliberately: picking exactly one member of a
         // colliding pair leaves a group of one, which restores normally. That is the only way to get the content out
         // onto a folding target, and it needs no special case here.
-        // Finding the collisions is one HashSet pass over keys we already hold; the filesystem probe only runs when
-        // that pass found something, which on a normal backup it does not.
-        var collisions = FindCaseCollisions(byPath.Keys, unresolved);
+        // The catalog answers "which paths collide" off its path_fold index and returns the colliding paths alone, so
+        // the list stays short even on a five-hundred-thousand-entry version — on a normal backup it is empty, and the
+        // filesystem probe is only paid for when it is not.
+        var collisions = CaseCollisionGroups(await catalog.CaseCollisionsAsync(v, ct), duplicates, unresolved, selected);
+        var collided = new HashSet<string>(StringComparer.Ordinal);
         if (collisions.Count > 0 && ProbeCaseInsensitive(request.TargetRoot))
             foreach (var group in collisions)
             {
                 phase?.Report(
                     $"Skipped {group.Count} entries whose paths differ only in case (the restore target is case-insensitive, so they would overwrite each other): {string.Join(", ", group)}");
-                foreach (var p in group)
-                    byPath.Remove(p);
+                collided.UnionWith(group);
                 failed += group.Count;
             }
 
@@ -205,7 +246,7 @@ public sealed class RestoreOrchestrator(
         // land outside it.
         var restoredDirs = 0;
         if (selected is null)
-            foreach (var dir in index.EmptyDirs)
+            foreach (var dir in await catalog.EmptyDirsAsync(v, ct))
             {
                 var dest = Path.Combine(request.TargetRoot, ToLocal(dir));
                 if (!WriteStaysInsideRoot(realRoot, dest))
@@ -234,66 +275,80 @@ public sealed class RestoreOrchestrator(
                 }
             }
 
-        // symlinks and files are handled separately
-        var fileEntries = new List<IndexEntry>();
-        foreach (var e in byPath.Values)
-        {
-            if (unresolved.Contains(e.Path))
-                continue;
-            if (e.Kind == "symlink")
-            {
-                // A malformed entry (e.g. Path is "" or ".") makes CreateSymbolicLink throw;
-                // catch it per entry here, otherwise one dirty entry aborts the whole restore.
-                SymlinkOutcome outcome;
-                try
-                {
-                    outcome = RestoreSymlink(request.TargetRoot, realRoot, e);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    phase?.Report($"Failed to restore symlink '{e.Path}': {ex.Message}");
-                    failed++;
-                    continue;
-                }
+        // Every path that is out of play, in every pass below: the version contradicts itself about it (duplicate), it
+        // is unrecoverable with no substitute, or the case gate refused it.
+        var excluded = new HashSet<string>(StringComparer.Ordinal);
+        excluded.UnionWith(duplicates);
+        excluded.UnionWith(unresolved);
+        excluded.UnionWith(collided);
 
-                switch (outcome)
-                {
-                    case SymlinkOutcome.Created:
-                        restored++;
-                        break;
-                    case SymlinkOutcome.Unchanged:
-                        skipped++;
-                        break;
-                    case SymlinkOutcome.Malformed:
-                        // entry.Target is missing: not the same thing as "unchanged" — unchanged means nothing happened,
-                        // whereas this one failed to restore, so the user has to be able to see it and it has to count as a failure, rather than being
-                        // quietly counted as Skipped under the guise of "already up to date" (M3).
-                        phase?.Report($"Skipped malformed symlink entry (missing target): {e.Path}");
-                        failed++;
-                        break;
-                    default:
-                        // A security check that fires must be visible: being as silent as "unchanged" would leave the user completely unaware of the entry that got blocked.
-                        phase?.Report(UnsafeRestorePathException.MessageFor(e.Path));
-                        failed++;
-                        break;
-                }
-            }
-            else
+        // Under a selection the cursor is replaced by the selection itself — bounded by what the user picked — so the
+        // unselected entries are never read out of the catalog at all, rather than read and then thrown away.
+        var selection = selected is null ? null : await catalog.EntriesAtAsync(v, selected, ct);
+        var substitutes = substituted.Values.Where(e => !excluded.Contains(e.Path)).ToList();
+
+        IAsyncEnumerable<IndexEntry> ByPath() => EffectiveAsync(
+            selection is not null ? Cursor(selection) : catalog.EntriesAsync(v, ct),
+            substitutes, excluded, substituted, ct);
+
+        // Symlinks, empty files and download groups are three passes over the cursor, in the same order the single
+        // in-memory pass used to run them in. Three scans of a SQLite index are cheaper than the thing they replace:
+        // holding every entry of the version in a dictionary purely so the same three questions can be asked of it.
+        await foreach (var e in ByPath().WithCancellation(ct))
+        {
+            if (e.Kind != "symlink")
+                continue;
+
+            // A malformed entry (e.g. Path is "" or ".") makes CreateSymbolicLink throw;
+            // catch it per entry here, otherwise one dirty entry aborts the whole restore.
+            SymlinkOutcome outcome;
+            try
             {
-                fileEntries.Add(e);
+                outcome = RestoreSymlink(request.TargetRoot, realRoot, e);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                phase?.Report($"Failed to restore symlink '{e.Path}': {ex.Message}");
+                failed++;
+                continue;
+            }
+
+            switch (outcome)
+            {
+                case SymlinkOutcome.Created:
+                    restored++;
+                    break;
+                case SymlinkOutcome.Unchanged:
+                    skipped++;
+                    break;
+                case SymlinkOutcome.Malformed:
+                    // entry.Target is missing: not the same thing as "unchanged" — unchanged means nothing happened,
+                    // whereas this one failed to restore, so the user has to be able to see it and it has to count as a failure, rather than being
+                    // quietly counted as Skipped under the guise of "already up to date" (M3).
+                    phase?.Report($"Skipped malformed symlink entry (missing target): {e.Path}");
+                    failed++;
+                    break;
+                default:
+                    // A security check that fires must be visible: being as silent as "unchanged" would leave the user completely unaware of the entry that got blocked.
+                    phase?.Report(UnsafeRestorePathException.MessageFor(e.Path));
+                    failed++;
+                    break;
             }
         }
 
         // A 0-byte file has no storage reference to group by — the backup side never produces one for it (see BackupOrchestrator.IsEmptyFile),
         // because it has no content that needs storing. Its entire information content is "length is zero", so the file is created directly from that here.
-        // This goes before the grouping: the Where(e => e.Storage is not null) below filters them out, and without this block
+        // This pass goes before the grouping: the grouping pass only ever sees entries that carry a storage reference, and without this one
         // the restored tree would be **silently missing a few files**, while every content-comparison check would still pass.
-        foreach (var e in fileEntries.Where(IsEmptyFileEntry))
+        await foreach (var e in ByPath().WithCancellation(ct))
         {
+            if (!IsEmptyFileEntry(e))
+                continue;
+
             switch (await TryCreateEmptyFileAsync(request, realRoot, e, phase, ct))
             {
                 case EmptyFileOutcome.Created: restored++; break;
@@ -313,49 +368,144 @@ public sealed class RestoreOrchestrator(
         using var gate = new SemaphoreSlim(Math.Max(1, request.DownloadConcurrency));
         try
         {
-            var groups = fileEntries.Where(e => e.Storage is not null).GroupBy(e => StorageKey(e.Storage!)).ToList();
-            // The total is only known once grouping is done (the same pack is downloaded once), which is why the tracker can't be built any earlier.
-            var tracker = onProgress is null
-                ? null
-                : new StageTracker("Restoring", groups.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
-
             // Declare two units of work: how many source bytes will be written out (after extraction), and how many bytes will come over the wire (compressed).
             // Reporting progress by group count alone is distorted — one group can be a single 100 GB file, or a box of several hundred small ones.
             // The download total **must only be reported if every single group can answer it**: handing out an undersized denominator when an old index lacks volume sizes
             // makes the percentage run high the whole way and then sit stuck at 100%, which is worse than showing nothing.
-            var groupWork = groups.ToDictionary(g => g.Key, g => g.Sum(e => e.Length), StringComparer.Ordinal);
-            var downloadSizes = groups.ToDictionary(
-                g => g.Key, g => TransferLabel.DownloadBytesOf(g.First().Storage!, info), StringComparer.Ordinal);
-            var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
-            foreach (var g in groups)
-                tracker?.Enqueue(groupWork[g.Key], downloadTotalKnown ? downloadSizes[g.Key] : 0);
-
-            var tasks = groups.Select(async g =>
+            // That verdict has to be reached BEFORE the first group is enqueued, and a streaming walk only learns it
+            // after the last one — hence this one grouped query up front. It returns a row per storage object, so it is
+            // bounded by the number of packs and blobs, never by the entry count.
+            var groupWork = new Dictionary<string, long>(StringComparer.Ordinal);
+            var downloadSizes = new Dictionary<string, long>(StringComparer.Ordinal);
+            await foreach (var (storage, bytes) in catalog.StorageGroupSizesAsync(v, ct))
             {
+                var key = CatalogSql.StorageKey(storage);
+                groupWork[key] = bytes;
+                downloadSizes[key] = TransferLabel.DownloadBytesOf(storage, info);
+            }
+
+            // A substitute's content lives in another version, so its object is not among the ones this version
+            // references and has to be weighed in separately — including in the all-or-nothing verdict above.
+            foreach (var entry in substitutes.Where(e => e.Storage is not null))
+            {
+                var key = CatalogSql.StorageKey(entry.Storage!);
+                if (groupWork.TryAdd(key, entry.Length))
+                    downloadSizes[key] = TransferLabel.DownloadBytesOf(entry.Storage!, info);
+            }
+            var downloadTotalKnown = downloadSizes.Values.All(b => b > 0);
+
+            // The opening denominator is every object the version references; the walk then settles it with SetTotal to
+            // the groups actually formed, which is fewer whenever a selection or the case gate took entries out.
+            // Opening at that upper bound rather than at zero is what keeps the percentage meaningful while the run is
+            // in flight — the same "declare, then settle" the upload stage does with its own growing total.
+            var tracker = onProgress is null
+                ? null
+                : new StageTracker("Restoring", downloadSizes.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
+
+            // The selection is sorted by storage key in memory (bounded by the selection); the whole-version cursor
+            // arrives already ordered by storage object, straight off the entries_storage index. Symlinks are dropped
+            // from both: pass one has already restored them, and a tampered index that hands a symlink entry a storage
+            // reference would otherwise get it restored twice — once as a link, then once more with the object's
+            // content written over it.
+            var byStorage = WithoutSymlinksAsync(
+                selection is not null
+                    ? Cursor(selection
+                        .Where(e => e.Storage is not null && !excluded.Contains(e.Path) && !substituted.ContainsKey(e.Path))
+                        .OrderBy(e => CatalogSql.StorageKey(e.Storage!), StringComparer.Ordinal))
+                    : EffectiveAsync(catalog.EntriesByStorageAsync(v, ct), [], excluded, substituted, ct),
+                ct);
+
+            // A substitute whose object the cursor visits anyway joins that group instead of forming a second one —
+            // the same pack would otherwise be downloaded and extracted twice for no gain.
+            var pendingSubstitutes = substitutes
+                .Where(e => e.Storage is not null && e.Kind != "symlink" && !IsEmptyFileEntry(e))
+                .GroupBy(e => CatalogSql.StorageKey(e.Storage!), StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+            // At most DownloadConcurrency group lists are alive at once, plus the one the cursor is folding. A group's
+            // entries stay reachable from its task's suspended state machine for as long as that task exists, so
+            // launching one per group as the cursor produced them and only awaiting at the end kept every
+            // storage-bearing entry of the version in memory — the exact retention this streaming walk exists to end.
+            // The price is that RestoreGroupAsync's "does this need restoring" pre-pass (a hash of each destination
+            // that already exists) now runs inside the concurrency window instead of ahead of it for every group at
+            // once; that is where the download it precedes waits anyway.
+            var inFlight = Math.Max(1, request.DownloadConcurrency);
+            var running = new List<Task<(int Restored, int Skipped, int Failed)>>();
+            var counts = new List<(int Restored, int Skipped, int Failed)>();
+            var groups = 0;
+            try
+            {
+                await foreach (var group in CatalogSql.GroupByStorageAsync(byStorage, ct))
+                {
+                    if (pendingSubstitutes.Remove(CatalogSql.StorageKey(group[0].Storage!), out var alsoHere))
+                        group.AddRange(alsoHere);
+                    await LaunchAsync(group);
+                }
+
+                // Whatever is left over points at an object this version does not reference at all.
+                foreach (var group in pendingSubstitutes.Values)
+                    await LaunchAsync(group);
+            }
+            finally
+            {
+                // Nothing may still be in the air when this scope unwinds: `work` is deleted and `gate` disposed on the
+                // way out, and a group still downloading into either would find them gone. The fault is deliberately
+                // not observed here — it is read back below, so a group's failure still surfaces exactly the way
+                // Task.WhenAll used to surface it, while an already-unwinding walk is not masked by it.
+                try { await Task.WhenAll(running); } catch { /* re-observed below, or already unwinding */ }
+            }
+
+            // The denominator settles here, now that the walk knows how many groups there really were.
+            tracker?.SetTotal(groups);
+            counts.AddRange(await Task.WhenAll(running)); // completed by the finally above; rethrows the first fault
+            tracker?.Complete(); // without forcing a terminal state, the last group's bytes get squashed by the throttle and never go out
+            restored += counts.Sum(c => c.Restored);
+            skipped += counts.Sum(c => c.Skipped);
+            failed += counts.Sum(c => c.Failed);
+
+            // Retires a finished group before starting the next, so the window never widens. Retiring reads the
+            // finished task's tally, which is also where a fault first surfaces — the walk then unwinds through the
+            // finally above, which settles the rest.
+            async Task LaunchAsync(List<IndexEntry> group)
+            {
+                if (running.Count >= inFlight)
+                {
+                    var finished = await Task.WhenAny(running);
+                    running.Remove(finished);
+                    counts.Add(await finished);
+                }
+
+                groups++;
+                running.Add(RunGroupAsync(group));
+            }
+
+            async Task<(int Restored, int Skipped, int Failed)> RunGroupAsync(List<IndexEntry> group)
+            {
+                var key = CatalogSql.StorageKey(group[0].Storage!);
+                // The pre-pass answers for every object of the version itself; a substituted group's object is only
+                // known from the entries in hand. Whichever it is, the same figure is enqueued and later retired.
+                var groupBytes = groupWork.TryGetValue(key, out var planned) ? planned : group.Sum(e => e.Length);
+                var downloadBytes = downloadSizes.TryGetValue(key, out var known) ? known : 0;
+                tracker?.Enqueue(groupBytes, downloadTotalKnown ? downloadBytes : 0);
                 try
                 {
                     return await RestoreGroupAsync(
-                        container, request, realRoot, work, g.ToList(), gate, phase, tracker,
-                        downloadSizes[g.Key], extractDirFolds, ct);
+                        container, request, realRoot, work, group, gate, phase, tracker,
+                        downloadBytes, extractDirFolds, ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
-                    phase?.Report($"Group failed ({g.Key}): {ex.Message}");
-                    return (Restored: 0, Skipped: 0, Failed: g.Count());
+                    phase?.Report($"Group failed ({key}): {ex.Message}");
+                    return (Restored: 0, Skipped: 0, Failed: group.Count);
                 }
                 finally
                 {
                     // Counting and in-flight are separate concerns: a group occupies exactly one slot. Work units are likewise retired in one go — failed groups have to retire too,
                     // otherwise the remaining amount never reaches zero and the ETA hangs there forever.
-                    tracker?.Advance(0, groupWork[g.Key]);
+                    tracker?.Advance(0, groupBytes);
                 }
-            });
-            var counts = await Task.WhenAll(tasks);
-            tracker?.Complete(); // without forcing a terminal state, the last group's bytes get squashed by the throttle and never go out
-            restored += counts.Sum(c => c.Restored);
-            skipped += counts.Sum(c => c.Skipped);
-            failed += counts.Sum(c => c.Failed);
+            }
         }
         finally
         {
@@ -368,7 +518,77 @@ public sealed class RestoreOrchestrator(
             // crash leaves behind at the next startup.
         }
 
-        return new RestoreResult(version.Version, restored, skipped, restoredDirs, failed);
+        return new RestoreResult(v, restored, skipped, restoredDirs, failed);
+    }
+
+    /// <summary>The paths this version holds more than once. The import kept the first row and recorded the rest as
+    /// issues rather than swallowing them, which is what still lets a reader tell "the index contradicts itself here"
+    /// apart from "this is the entry for that path".</summary>
+    private static async Task<HashSet<string>> DuplicatePathsAsync(
+        VersionCatalog catalog, int version, CancellationToken ct) =>
+        (await catalog.ImportIssuesAsync(version, ct))
+            .Where(issue => issue.Issue == "duplicate")
+            .Select(issue => issue.Path)
+            .ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Folds the colliding paths the catalog reported — distinct under <see cref="StringComparer.Ordinal"/>, equal once
+    /// case-folded — into the sets that would land on one and the same file if the target filesystem folds case. Paths
+    /// already out of play take no part: they are not going to be written either way, so they cannot collide with
+    /// anything, and a set left with a single member is no longer a collision at all — which is exactly what makes
+    /// "select one side of a colliding pair" restore normally.
+    /// <para>Sorted so the reported line reads the same way on every run — the messages end up in the operation log,
+    /// and a line whose order wanders between runs is one nobody can diff.</para>
+    /// </summary>
+    private static List<List<string>> CaseCollisionGroups(
+        IReadOnlyList<(string Path, int Version)> colliding, IReadOnlySet<string> duplicates,
+        IReadOnlySet<string> unresolved, IReadOnlySet<string>? selected) =>
+        [.. colliding
+            .Select(c => c.Path)
+            .Where(p => !duplicates.Contains(p) && !unresolved.Contains(p) && (selected is null || selected.Contains(p)))
+            .GroupBy(p => p.ToUpperInvariant(), StringComparer.Ordinal)
+            .Where(g => g.Skip(1).Any())
+            .Select(g => g.OrderBy(p => p, StringComparer.Ordinal).ToList())];
+
+    /// <summary>
+    /// The version's entries as one stream with this run's substitutions folded in: a substituted path is dropped where
+    /// the version has it and the chosen version's entry is handed over instead, and every path that is out of play is
+    /// left out entirely. The substitutes ride at the end rather than being spliced into place because their position
+    /// buys nothing — symlinks and empty files are each restored independently of one another, and the grouping pass
+    /// keys on the storage object rather than on the order entries arrive in.
+    /// </summary>
+    private static async IAsyncEnumerable<IndexEntry> EffectiveAsync(
+        IAsyncEnumerable<IndexEntry> cursor, IReadOnlyCollection<IndexEntry> substitutes,
+        IReadOnlySet<string> excluded, IReadOnlyDictionary<string, IndexEntry> substituted,
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        await foreach (var entry in cursor.WithCancellation(ct))
+            if (!excluded.Contains(entry.Path) && !substituted.ContainsKey(entry.Path))
+                yield return entry;
+
+        foreach (var entry in substitutes)
+            yield return entry;
+    }
+
+    /// <summary>Drops symlink entries from the stream the grouping pass sees. They were restored in the first pass, and
+    /// a tampered index (which <c>/import</c> can bring in from any container) may perfectly well give a symlink entry
+    /// a storage reference as well — after which the same entry would be restored twice, the second time with the
+    /// object's content written over the link that had just been created.</summary>
+    private static async IAsyncEnumerable<IndexEntry> WithoutSymlinksAsync(
+        IAsyncEnumerable<IndexEntry> entries, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await foreach (var entry in entries.WithCancellation(ct))
+            if (entry.Kind != "symlink")
+                yield return entry;
+    }
+
+    /// <summary>Adapts an in-memory sequence to the cursor's shape, so a selective restore and a whole-version restore
+    /// go through one set of passes instead of two copies of each.</summary>
+    private static async IAsyncEnumerable<T> Cursor<T>(IEnumerable<T> items)
+    {
+        await Task.CompletedTask;
+        foreach (var item in items)
+            yield return item;
     }
 
     private async Task<(int Restored, int Skipped, int Failed)> RestoreGroupAsync(
@@ -966,81 +1186,8 @@ public sealed class RestoreOrchestrator(
         }
     }
 
-    /// <summary>
-    /// Indexes by Path, with **every** entry under a duplicated Path taking no effect — when two entries contradict each other there is no telling which is authoritative,
-    /// so we would rather write neither than guess. The index comes from the cloud (<c>/import</c> can import any container), and a duplicate Path is the index
-    /// contradicting itself; handle it under the existing per-entry fault-tolerance principle: fail only the duplicated path, and never let <c>ToDictionary</c>'s
-    /// <see cref="ArgumentException"/> abort the whole restore.
-    /// </summary>
-    private static Dictionary<string, IndexEntry> IndexByPath(
-        List<IndexEntry> entries, IProgress<string>? phase, out int duplicateCount)
-    {
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var duplicates = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var e in entries)
-            if (!seen.Add(e.Path))
-                duplicates.Add(e.Path);
-
-        var map = new Dictionary<string, IndexEntry>(StringComparer.Ordinal);
-        foreach (var e in entries)
-            if (!duplicates.Contains(e.Path))
-                map[e.Path] = e;
-
-        foreach (var p in duplicates)
-            phase?.Report($"Skipped duplicate index entry (ambiguous which version is authoritative): {p}");
-        duplicateCount = duplicates.Count;
-        return map;
-    }
-
-    private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;
-
     /// <summary>The real case probe, or the test-injected one. Every probe site goes through here so a test only has to override one thing.</summary>
     private bool ProbeCaseInsensitive(string dir) => (CaseProbe ?? PathCaseSensitivity.IsCaseInsensitive)(dir);
-
-    /// <summary>
-    /// Groups of paths that are distinct under Ordinal but equal under OrdinalIgnoreCase — i.e. the sets that would
-    /// land on one and the same file if the target filesystem folds case. Paths in <paramref name="excluded"/>
-    /// (unrecoverable, no substitute) take no part: they are not going to be written either way, so they cannot
-    /// collide with anything.
-    /// <para>
-    /// Two passes, and the second one only ever runs when the first found something. The first is a single HashSet
-    /// holding references to strings we already have in hand; grouping straight away with a <c>GroupBy</c> would
-    /// build a whole lookup — over a five-hundred-thousand-entry index, tens of MB — to produce an empty answer,
-    /// which is the answer on every normal backup.
-    /// </para>
-    /// </summary>
-    private static List<List<string>> FindCaseCollisions(IEnumerable<string> paths, IReadOnlySet<string> excluded)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        HashSet<string>? duplicated = null;
-        foreach (var p in paths)
-        {
-            if (excluded.Contains(p))
-                continue;
-            if (!seen.Add(p))
-                (duplicated ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(p);
-        }
-        if (duplicated is null)
-            return [];
-
-        var groups = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in paths)
-        {
-            if (excluded.Contains(p) || !duplicated.Contains(p))
-                continue;
-            if (!groups.TryGetValue(p, out var members))
-                groups[p] = members = [];
-            members.Add(p);
-        }
-
-        // Sorted so the reported line reads the same way on every run — the messages end up in the operation log, and
-        // a line whose order wanders between runs is one nobody can diff.
-        foreach (var members in groups.Values)
-            members.Sort(StringComparer.Ordinal);
-        return [.. groups.Values];
-    }
-
-
 
     /// <summary>Ensures an archive (including all of its volumes) has been rehydrated out of Archive and is downloadable: starts rehydration for the ones that haven't, then polls until all are ready.</summary>
     private static RehydratePriority MapPriority(RestoreRehydratePriority p) =>

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using AzureStorageBackup.Api.Models;
 using Microsoft.Data.Sqlite;
@@ -64,6 +65,47 @@ public static class CatalogSql
         using var command = connection.CreateCommand();
         command.CommandText = Schema;
         command.ExecuteNonQuery();
+    }
+
+    /// <summary>The identity of the object an entry's content lives in: a pack and a blob may perfectly well share a
+    /// ref (they are addressed in different namespaces), so the kind has to be part of the key or two unrelated objects
+    /// would be downloaded as one group.</summary>
+    internal static string StorageKey(StorageRef storage) =>
+        storage.Kind == "pack" ? "pack:" + storage.Ref : "blob:" + storage.Ref;
+
+    /// <summary>
+    /// Folds a cursor that is <b>already ordered by storage object</b> (see
+    /// <see cref="VersionCatalog.EntriesByStorageAsync"/>) into one list per object, by comparing each entry's key with
+    /// the previous one. This is the streaming counterpart of <c>GroupBy</c>: a <c>GroupBy</c> cannot yield its first
+    /// group until it has seen the last entry, so it has to hold the whole version in memory to answer — which is the
+    /// one thing the catalog exists to stop the restore and the check from doing. Entries with no storage reference
+    /// (an empty file, a symlink) are dropped: they belong to no download group, and SQLite sorts their NULL kind to
+    /// the front, so they would otherwise arrive as one enormous leading "group".
+    /// </summary>
+    internal static async IAsyncEnumerable<List<IndexEntry>> GroupByStorageAsync(
+        IAsyncEnumerable<IndexEntry> entries, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        List<IndexEntry>? group = null;
+        string? key = null;
+        await foreach (var entry in entries.WithCancellation(ct))
+        {
+            if (entry.Storage is null)
+                continue;
+
+            var entryKey = StorageKey(entry.Storage);
+            if (group is null || !string.Equals(entryKey, key, StringComparison.Ordinal))
+            {
+                if (group is not null)
+                    yield return group;
+                group = [];
+                key = entryKey;
+            }
+
+            group.Add(entry);
+        }
+
+        if (group is not null)
+            yield return group;
     }
 
     /// <summary>UTF-16 big-endian bytes: their <c>memcmp</c> order is char-by-char order on the original string,

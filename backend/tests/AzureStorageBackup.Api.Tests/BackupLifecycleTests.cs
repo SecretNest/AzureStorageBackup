@@ -138,7 +138,8 @@ public sealed class BackupLifecycleTests : IDisposable
             factory, store, new SevenZipCompressor(), hasher, _uploader, Path.Combine(_temp, "repair"), staging,
             checker: checker, trackedInfo: tracked, indexCache: indexCache);
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "restore"));
+            factory, store, TestCatalogs.New(_db, store), new SevenZipCompressor(), hasher,
+            Path.Combine(_temp, "restore"));
         return new Rig(backup, checker, repairer, restore, store, factory);
     }
 
