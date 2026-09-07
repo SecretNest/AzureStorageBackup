@@ -1131,9 +1131,6 @@ public sealed class BackupCheckerTests : IDisposable
         public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) => inner.ReadInfoWithETagAsync(a, c, p, ct);
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, Azure.Storage.Blobs.Models.AccessTier? t, string? e, CancellationToken ct = default) => inner.WriteInfoConditionalAsync(a, c, i, p, t, e, ct);
-        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, int volumes = 1, CancellationToken ct = default) => inner.ReadIndexAsync(a, c, b, p, volumes, ct);
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) =>
-            inner.WriteIndexAsync(a, c, v, i, p, t, ct, progress);
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, Azure.Storage.Blobs.Models.AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) =>
             throw new IOException("index upload refused");
         public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => inner.ReadIndexToFileAsync(a, c, b, p, volumes, dest, ct);

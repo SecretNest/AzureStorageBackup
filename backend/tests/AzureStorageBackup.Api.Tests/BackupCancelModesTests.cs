@@ -507,13 +507,12 @@ public sealed class BackupCancelModesTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>Blocks in the version index read and never returns until **the token handed down** is canceled.
-    /// A 500,000-entry index really does take several seconds to read (measured in this repo), and a few dozen versions
-    /// add up to minutes; if the token is not wired into this step (still the run's own ct), this double hangs forever
-    /// and the case goes red on timeout.</summary>
     /// <summary>Parks forever inside the step that makes sure a retained version is in the catalog — the migration
-    /// that reads an <c>.idx</c> file, or downloads the index from the cloud, and is the pre-upload phase this test is
-    /// about. Only the token can end the wait, which is precisely the wiring under test.</summary>
+    /// that reads an <c>.idx</c> file, or downloads the index from the cloud, and is the pre-upload phase this test
+    /// is about. Only **the token handed down** can end the wait, which is precisely the wiring under test: a
+    /// 500,000-entry index really does take several seconds to migrate, and a few dozen versions add up to minutes,
+    /// so if the token is not wired into this step (still the run's own ct) this double hangs forever and the case
+    /// goes red on timeout.</summary>
     private sealed class BlockingCatalogs(IVersionCatalogs inner) : IVersionCatalogs
     {
         public TaskCompletionSource Reading { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

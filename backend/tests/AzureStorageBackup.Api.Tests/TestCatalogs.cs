@@ -32,7 +32,7 @@ internal static class TestCatalogs
 
     /// <summary>
     /// A throwaway catalog holding exactly one imported version — the shortest path from a hand-written
-    /// <see cref="VersionIndex"/> to the rows the read side answers from. It goes through the real serializer and the
+    /// <see cref="VersionIndex"/> to the rows the read side answers from. It goes through the wire format and the
     /// real stream importer on purpose: a test that hand-inserted rows would be free to invent a row shape the
     /// production import never produces, and would then happily pass against a query that only works on that
     /// invention. The caller disposes it.
@@ -45,7 +45,7 @@ internal static class TestCatalogs
         var catalog = await VersionCatalog.OpenAsync(Path.Combine(dir, "catalog.db"), readOnly: false, ct);
         try
         {
-            using var reader = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(index)));
+            using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index)));
             await catalog.ImportVersionAsync(index.Version, identity, reader, ct);
         }
         catch

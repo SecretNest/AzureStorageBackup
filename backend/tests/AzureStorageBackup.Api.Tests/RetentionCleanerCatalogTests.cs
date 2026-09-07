@@ -120,7 +120,7 @@ public sealed class RetentionCleanerCatalogTests : IDisposable
         var catalog = await VersionCatalog.OpenAsync(Path.Combine(_dir, "catalog.db"), readOnly: false, default);
         foreach (var index in versions)
         {
-            using var reader = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(index)));
+            using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index)));
             await catalog.ImportVersionAsync(index.Version, identity: index.Version, reader, default);
         }
 

@@ -54,8 +54,6 @@ public sealed class TrackedInfoStoreTests : IDisposable
         }
         public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) => Task.FromResult(CloudInfo?.Info);
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.CompletedTask;
-        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, int volumes = 1, CancellationToken ct = default) => Task.FromResult(new VersionIndex());
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("i", 1));
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
         public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => throw new NotSupportedException();
     }
@@ -122,8 +120,8 @@ public sealed class TrackedInfoStoreTests : IDisposable
     /// row, and two concurrent reads both took LoadAsync's backfill path: both query null, both insert, the
     /// loser hits the (AccountId, Container) unique index. That is a harmless race on a locally cached copy,
     /// not an error — surfaced live by the damage-repair chaos storm as a bare 500 out of /file-versions.
-    /// The loser must fall back to updating the winner's row (the same discipline LocalIndexCache.UpsertAsync
-    /// learned in the first audit round). The interleave is pinned deterministically: the winner's row is
+    /// The loser must fall back to updating the winner's row (the discipline the local caches learned in the first
+    /// audit round). The interleave is pinned deterministically: the winner's row is
     /// inserted from a second context inside the loser's own SavingChanges window — after its null query,
     /// before its insert executes.
     /// </summary>

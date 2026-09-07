@@ -4,10 +4,10 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// Reads a second-level version index (§3.2) from a <see cref="Stream"/> one entry at a time, mirroring
-/// <see cref="IndexSerializer.DeserializeIndex"/> field for field via the shared <see cref="IndexEncoding"/>
-/// primitives, but without materializing the whole <see cref="VersionIndex"/> — the SQLite catalog wants to insert
-/// each entry as it is read rather than hold every entry of a possibly million-file index in memory at once.
+/// Reads a second-level version index (§3.2) from a <see cref="Stream"/> one entry at a time, via the shared
+/// <see cref="IndexEncoding"/> primitives and without materializing the whole <see cref="VersionIndex"/> — the
+/// SQLite catalog wants to insert each entry as it is read rather than hold every entry of a possibly million-file
+/// index in memory at once.
 /// </summary>
 public sealed class IndexStreamReader : IDisposable
 {

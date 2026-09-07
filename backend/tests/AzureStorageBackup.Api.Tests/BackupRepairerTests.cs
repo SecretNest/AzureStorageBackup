@@ -1474,7 +1474,7 @@ public sealed class BackupRepairerTests : IDisposable
             var afterV2 = await store.ReadIndexAsync(account, name, v2.IndexBlob, null, v2.IndexVolumes);
             Assert.Contains("beta.txt", afterV2.UnrecoverablePaths);
             beforeV2.UnrecoverablePaths.Add("beta.txt");
-            Assert.Equal(IndexSerializer.SerializeIndex(beforeV2), IndexSerializer.SerializeIndex(afterV2));
+            Assert.Equal(LegacyIndexSerializer.SerializeIndex(beforeV2), LegacyIndexSerializer.SerializeIndex(afterV2));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -1583,7 +1583,7 @@ public sealed class BackupRepairerTests : IDisposable
             using (var writeLock = await catalogs.LockForWriteAsync(account.Id, name))
             {
                 await using var writable = await catalogs.OpenAsync(account.Id, name, readOnly: false);
-                using var import = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(stale)));
+                using var import = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(stale)));
                 await writable.ImportVersionAsync(99, info.Backup.CreatedAt.UtcTicks, import, CancellationToken.None);
             }
 

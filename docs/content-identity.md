@@ -126,7 +126,7 @@ settling the item outright on a hit:
 
 ### Tier 0 — metadata only, no read
 
-If this run adopted a journal, `JournalResume.FindUntouchedBlob` is asked first: **path + mtime +
+If this run adopted a journal, `ResumeLedger.FindUntouchedBlobAsync` is asked first: **path + mtime +
 length**. A hit means the previous run already uploaded this exact path and the file has not been
 touched since, so the recorded storage reference is reused directly.
 
@@ -169,7 +169,7 @@ A prescreen hit escalates to `ReadContentIdentityAsync`, which reads **the whole
 produces all four fields in that single pass. Two lookups then run, both requiring **all four fields
 strictly equal**:
 
-1. `JournalResume.FindBlob` — the copy the previous run already confirmed as uploaded. Path **and**
+1. `ResumeLedger.FindBlobAsync` — the copy the previous run already confirmed as uploaded. Path **and**
    content must both match: after an interruption the file may well have been modified, and reusing
    on path alone would write old content into the index as if it were new.
 2. `LocalDedupResolver.TryFindExisting` — an existing blob from any retained version.

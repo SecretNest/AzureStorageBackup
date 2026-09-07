@@ -7,10 +7,11 @@ using static AzureStorageBackup.Api.Tests.IndexAssert;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// The file-shaped half of <see cref="IBackupInfoStore"/>: an index is serialized to a file, encoded from that file
-/// and uploaded straight off disk, and comes back down as a file again — so an index of any size never has to sit
-/// in memory as a byte array. The bytes on the wire are the same as the in-memory members produce, which is what
-/// these tests pin: whatever the file path writes, the old <c>ReadIndexAsync</c> still reads, and vice versa.
+/// <see cref="IBackupInfoStore"/>'s index half: an index is serialized to a file, encoded from that file and
+/// uploaded straight off disk, and comes back down as a file again — so an index of any size never has to sit in
+/// memory as a byte array. The bytes on the wire are still the whole-index format, which is what these tests pin:
+/// whatever the file path writes, <see cref="LegacyIndexSerializer"/> — an independent reader of the same format —
+/// reads back entry for entry.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupInfoStoreFileIndexTests : IDisposable
@@ -97,12 +98,13 @@ public sealed class BackupInfoStoreFileIndexTests : IDisposable
     }
 
     /// <summary>
-    /// The file path and the byte-array path produce the same blob: an index uploaded from a file is read back by
-    /// the old in-memory <c>ReadIndexAsync</c> entry for entry. Both write the same format-4 bytes through the same
-    /// codec, and this is what says so — until Task 21 retires the old members, both are live and both must agree.
+    /// The streaming writer and the whole-index reader agree on the wire: an index uploaded from a file comes back
+    /// through <see cref="LegacyIndexSerializer.DeserializeIndex"/> entry for entry. The oracle is deliberately not
+    /// <see cref="IndexStreamReader"/> — a reader that shares the writer's implementation would agree with it about
+    /// a bug in the format.
     /// </summary>
     [SkippableFact]
-    public async Task WriteIndexFile_single_blob_matches_WriteIndexAsync()
+    public async Task WriteIndexFile_single_blob_reads_back_through_the_whole_index_reader()
     {
         var (store, cc, account, name) = Build();
         try
@@ -128,8 +130,7 @@ public sealed class BackupInfoStoreFileIndexTests : IDisposable
     }
 
     /// <summary>
-    /// Past the threshold the file path splits into volumes exactly as the byte-array path does — and the round
-    /// trip back to a file returns every entry. Reading with <see cref="IndexStreamReader"/> rather than
+    /// Past the threshold the index splits into volumes — and the round trip back to a file returns every entry. Reading with <see cref="IndexStreamReader"/> rather than
     /// materializing a <c>VersionIndex</c> is the whole point: 2 000 entries here stand in for the millions that
     /// made holding the index in memory untenable.
     /// </summary>

@@ -118,14 +118,6 @@ public enum FileCategory
 public sealed record FileClass(FileCategory Category, string? GroupKey);
 
 /// <summary>
-/// The classification of every scanned entry. <see cref="DirectoryCandidates"/> gives how many candidate members each directory group has —
-/// the pipeline uses it to know "how many entries in this directory are still un-diffed", and thereby when to seal the pack.
-/// </summary>
-public sealed record Classification(
-    IReadOnlyDictionary<string, FileClass> ByPath,
-    IReadOnlyDictionary<string, int> DirectoryCandidates);
-
-/// <summary>
 /// Grouping planner (M4 design §6): decides whether a changed file goes to a single-file blob or into a grouped pack.
 /// Over-sized / matched the don't-group list → single file; the remaining small files in the same directory (excluding subdirectories) are merged into a pack,
 /// split by the per-group cap. A pure function; it performs no actual compression or upload.
@@ -177,8 +169,8 @@ public sealed class GroupingPlanner
         || pathBytes >= options.MaxPackPathBytes;
 
     /// <summary>
-    /// The one-entry decision behind <see cref="Classify"/>: single file (over-sized or don't-group), cross-directory
-    /// group, or per-directory group. Looks only at <c>Path</c> and <c>Length</c> — no hash needed, so there is no
+    /// The per-entry classification: single file (over-sized or don't-group), cross-directory group, or
+    /// per-directory group. Looks only at <c>Path</c> and <c>Length</c> — no hash needed, so there is no
     /// need to wait for the diff. Pulled out on its own so <see cref="WorkDbScanSink"/> can classify an entry the
     /// instant the scanner produces it, rather than waiting for the whole scan to be collected in memory first and
     /// classifying it in bulk afterward (which is exactly the shape this branch is moving away from).
@@ -197,28 +189,6 @@ public sealed class GroupingPlanner
             return new FileClass(FileCategory.CrossDirectoryGroup, null);
 
         return new FileClass(FileCategory.DirectoryGroup, Directory(path));
-    }
-
-    /// <summary>
-    /// The classification of every scanned entry, settled the moment scanning ends — see <see cref="ClassifyOne"/>
-    /// for the per-entry decision this loops over.
-    /// </summary>
-    public Classification Classify(IReadOnlyList<ScannedEntry> entries, PlanOptions? options = null)
-    {
-        options ??= new PlanOptions();
-
-        var byPath = new Dictionary<string, FileClass>(entries.Count, StringComparer.Ordinal);
-        var dirCandidates = new Dictionary<string, int>(StringComparer.Ordinal);
-
-        foreach (var entry in entries)
-        {
-            var cls = ClassifyOne(entry.Path, entry.Length, options);
-            byPath[entry.Path] = cls;
-            if (cls.Category == FileCategory.DirectoryGroup)
-                dirCandidates[cls.GroupKey!] = dirCandidates.GetValueOrDefault(cls.GroupKey!) + 1;
-        }
-
-        return new Classification(byPath, dirCandidates);
     }
 
     public BackupPlan Plan(IReadOnlyList<PlannedFile> files, PlanOptions? options = null)

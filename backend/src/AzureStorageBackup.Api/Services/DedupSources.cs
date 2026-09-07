@@ -99,7 +99,7 @@ internal sealed class CatalogDedupSource(VersionCatalog catalog, RunWorkDb work)
 
         // The journal's confirmed blocks, which are in the same situation as an indexed blob (in the cloud, address
         // taken) and only differ in that it is a journal recording them. Normalised exactly as
-        // JournalResume.ConfirmedBlobs normalised them, volume count included.
+        // ResumeLedger.ConfirmedBlobsAsync normalises them, volume count included.
         if (await work.ResumeBlobByContentAsync(fullHash, length, headHash, tailHash, ct) is { } resumed)
             return new ResolvedBlob(resumed.Ref, resumed.Raw, Math.Max(1, resumed.Volumes), resumed.VolumeSizes);
 
@@ -138,7 +138,7 @@ internal sealed class CatalogDedupSource(VersionCatalog catalog, RunWorkDb work)
                 LocalDedupResolver.ContentKey(owner.FullHash, owner.Length, owner.HeadHash, owner.TailHash), null);
 
         // Then the journal's record of the address. Head and tail are required for the same reason
-        // JournalResume.ConfirmedBlobs requires them: without all four fields there is no content identity to
+        // ResumeLedger.ConfirmedBlobsAsync requires them: without all four fields there is no content identity to
         // compare a claim against.
         return await work.ResumeBlobByRefAsync(@ref, ct) is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } record
             ? new DedupRefOwner(LocalDedupResolver.ContentKey(full, record.Length, head, tail), null)

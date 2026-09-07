@@ -178,9 +178,9 @@ public sealed class FixtureRecorderTests
     }
 
     /// <summary>
-    /// Builds one orchestrator over a fresh in-memory local-authority database (dedup/index-cache/local-state all
+    /// Builds one orchestrator over a fresh in-memory local-authority database (dedup/catalog/local-state all
     /// backfill from the journal/cloud on first read, so a fresh db per round is fine — see
-    /// <see cref="TrackedInfoStore"/> and <see cref="LocalIndexCache"/>), but a <paramref name="journals"/> store and
+    /// <see cref="TrackedInfoStore"/> and <see cref="VersionCatalogs"/>), but a <paramref name="journals"/> store and
     /// <paramref name="indexRoot"/> that the caller controls and can snapshot, unlike the throwaway ones
     /// <c>TestLocalAuthority</c>/<c>TestIndexFiles</c> hide from the test. <paramref name="journals"/> is also wired
     /// into <see cref="RetentionCleaner"/> (production does the same via DI — see <c>Program.cs</c>), so the closing
@@ -201,9 +201,7 @@ public sealed class FixtureRecorderTests
         conn.Open();
         var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(conn).Options);
         db.Database.EnsureCreated();
-        var indexFiles = new VersionIndexFileStore(indexRoot);
-        var indexCache = new LocalIndexCache(db, store, indexFiles);
-        var catalogs = TestCatalogs.New(db, store, indexFiles);
+        var catalogs = TestCatalogs.New(db, store, new VersionIndexFileStore(indexRoot));
         var localState = new LocalBackupStateStore(db);
         var tracked = new TrackedInfoStore(store, localState);
 
@@ -305,7 +303,7 @@ public sealed class FixtureRecorderTests
 
             Directory.CreateDirectory(Path.Combine(fixture, "expected"));
             await File.WriteAllBytesAsync(
-                Path.Combine(fixture, "expected", "v2.idx"), IndexSerializer.SerializeIndex(index));
+                Path.Combine(fixture, "expected", "v2.idx"), LegacyIndexSerializer.SerializeIndex(index));
             await File.WriteAllBytesAsync(
                 Path.Combine(fixture, "expected", "info.bin"), IndexSerializer.SerializeInfoFile(info));
         }

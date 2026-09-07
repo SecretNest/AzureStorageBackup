@@ -20,14 +20,14 @@ public class IndexStreamTests
             w.WriteEmptyDirs(index.EmptyDirs);
             w.WriteUnrecoverable(index.UnrecoverablePaths);
         }
-        Assert.Equal(IndexSerializer.SerializeIndex(index), ms.ToArray());
+        Assert.Equal(LegacyIndexSerializer.SerializeIndex(index), ms.ToArray());
     }
 
     [Fact]
     public void Reader_reads_what_IndexSerializer_wrote()
     {
         var index = Sample();
-        using var r = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(index)));
+        using var r = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index)));
         Assert.Equal(7, r.Version);
         Assert.Equal(4, r.EntryCount);
         var entries = r.Entries().ToList();
@@ -41,7 +41,7 @@ public class IndexStreamTests
     [Fact]
     public void Reader_rejects_a_newer_format()
     {
-        var bytes = IndexSerializer.SerializeIndex(Sample());
+        var bytes = LegacyIndexSerializer.SerializeIndex(Sample());
         bytes[0] = 99;
         Assert.Throws<NotSupportedException>(() => new IndexStreamReader(new MemoryStream(bytes)));
     }
@@ -52,6 +52,6 @@ public class IndexStreamTests
         var index = new VersionIndex { Version = 1 };
         using var ms = new MemoryStream();
         using (var w = new IndexStreamWriter(ms)) { w.WriteHeader(1, 0); w.WriteEmptyDirs([]); w.WriteUnrecoverable([]); }
-        Assert.Equal(IndexSerializer.SerializeIndex(index), ms.ToArray());
+        Assert.Equal(LegacyIndexSerializer.SerializeIndex(index), ms.ToArray());
     }
 }

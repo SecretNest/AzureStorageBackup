@@ -37,9 +37,6 @@ public sealed class RetiredVersionBrowseTests(TestWebAppFactory factory) : IClas
             => Task.FromResult<(BackupInfoFile, string)?>((Info(), "etag-1"));
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => Task.FromResult("etag-2");
-        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string i, string? p, int v = 1, CancellationToken ct = default)
-            => throw new RequestFailedException(404, "The specified blob does not exist.", "BlobNotFound", null);
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("indexes/v.bin", 1));
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
         // The catalog migrates a version it has never seen by downloading its index to a file, so this is the call
         // that meets the deleted blob now — it is where the browse endpoints' 404 comes from.

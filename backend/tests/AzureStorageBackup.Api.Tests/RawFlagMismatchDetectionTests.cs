@@ -127,9 +127,9 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
             // The version index was rewritten out of band. The check reads the version out of the container's
-            // catalog now, so the rewrite has to announce itself the same way a repair's does — through the
-            // version's .idx file, which outranks the row already in the catalog.
-            await authority.IndexCache.PutAsync(account.Id, name, version.Version, info.Backup.CreatedAt.UtcTicks, tampered);
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await authority.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
@@ -207,9 +207,9 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
             // The version index was rewritten out of band. The check reads the version out of the container's
-            // catalog now, so the rewrite has to announce itself the same way a repair's does — through the
-            // version's .idx file, which outranks the row already in the catalog.
-            await authority.IndexCache.PutAsync(account.Id, name, version.Version, info.Backup.CreatedAt.UtcTicks, tampered);
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await authority.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });

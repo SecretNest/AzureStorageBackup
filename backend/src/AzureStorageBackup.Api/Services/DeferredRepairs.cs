@@ -18,7 +18,7 @@ namespace AzureStorageBackup.Api.Services;
 /// <para>
 /// Asks the catalog rather than loading every version's whole index into memory: <c>UnrecoverableAnyVersionAsync</c>
 /// is the DISTINCT set of marked paths across every retained version (the same question the old in-memory scan
-/// asked by opening one <see cref="ILocalIndexCache"/> index per version), and <c>EntriesAtAsync</c> is a single
+/// asked by opening one whole index per version), and <c>EntriesAtAsync</c> is a single
 /// chunked lookup for exactly those paths in the latest version — the two queries a repair-sized set of marks
 /// costs, instead of a pass over every entry of every version just to collect the marks.
 /// </para>

@@ -80,9 +80,6 @@ public sealed partial class RunWorkDb
     private const string DraftFinalLength =
         "CASE WHEN state=2 OR post_diff_reason IS NOT NULL THEN prev_length ELSE COALESCE(override_length, length) END";
 
-    private const string SelectDraftFinalCountSql =
-        $"SELECT COUNT(*) FROM draft WHERE {DraftFinalPredicate}";
-
     private const string SelectDraftFinalStatsSql =
         $"SELECT COUNT(*), COALESCE(SUM({DraftFinalLength}), 0) FROM draft WHERE {DraftFinalPredicate}";
 
@@ -152,7 +149,7 @@ public sealed partial class RunWorkDb
         $"SELECT {SelectResumeBlobColumns} FROM resume_blobs " +
         "WHERE full_hash=@full_hash AND length=@length AND head_hash=@head_hash AND tail_hash=@tail_hash";
 
-    /// <summary>The prescreen's journal half. It asks less than <c>JournalResume.ConfirmedBlobs</c> does — a record
+    /// <summary>The prescreen's journal half. It asks less than <c>ResumeLedger.ConfirmedBlobsAsync</c> does — a record
     /// with a head but no tail answers yes here and would not have been a confirmed block — because the prescreen is
     /// allowed to be generous: a false positive costs one extra read of a file, a miss costs a whole compression.</summary>
     private const string SelectResumeHeadSeenSql =
@@ -286,13 +283,6 @@ public sealed partial class RunWorkDb
         using var command = Command(connection, SelectDraftFinalStatsSql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
-    }
-
-    public async Task<int> DraftFinalCountAsync(CancellationToken ct)
-    {
-        await using var connection = await OpenReadAsync(ct);
-        using var command = Command(connection, SelectDraftFinalCountSql);
-        return (int)(long)(await command.ExecuteScalarAsync(ct))!;
     }
 
     /// <summary>The run's summary line: how many paths the diff added, changed and deleted, and how many bytes went

@@ -225,7 +225,6 @@ public sealed class RunLedgerTests : IDisposable
         var legacy = await SeedAsync(ledger, Cases());
         var expected = legacy.Entries();
 
-        Assert.Equal(expected.Count, await ledger.FinalEntryCountAsync(Ct));
         Assert.Equal(((long)expected.Count, expected.Sum(e => e.Length)), await ledger.FinalStatsAsync(Ct));
 
         // The same single pass the orchestrator's summary loop made over diff.Changes.

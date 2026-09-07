@@ -48,12 +48,6 @@ public sealed class OperationLogSourceTests
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
             => throw new NotImplementedException();
 
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
-            => throw new NotImplementedException();
-
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
-            => throw new NotImplementedException();
-
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotImplementedException();
 
@@ -81,12 +75,6 @@ public sealed class OperationLogSourceTests
             => throw new NotImplementedException();
 
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
-            => throw new NotImplementedException();
-
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
-            => throw new NotImplementedException();
-
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotImplementedException();
 
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)

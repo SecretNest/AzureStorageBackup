@@ -199,7 +199,6 @@ public sealed partial class RunWorkDb : IAsyncDisposable
           mtime_ticks=@mtime_ticks, mtime_offset=@mtime_offset WHERE path=@path
         """;
 
-    private const string MarkDraftUnreadableSql = "UPDATE draft SET state=@state, reason=@reason WHERE path=@path";
 
     /// <summary>The run's own values, in their own columns. The <c>UpdateDraft…</c> statements above overwrite what
     /// the diff recorded; these three keep both, because the final entry's tail hash falls back through the diff's
@@ -455,16 +454,6 @@ public sealed partial class RunWorkDb : IAsyncDisposable
             Set(command, "@length", length);
             Set(command, "@mtime_ticks", mtime.UtcTicks);
             Set(command, "@mtime_offset", (int)mtime.Offset.TotalMinutes);
-            command.ExecuteNonQuery();
-        }, ct);
-
-    public ValueTask MarkDraftUnreadableAsync(string path, string reason, CancellationToken ct) =>
-        EnqueueAsync(statements =>
-        {
-            var command = statements.For(MarkDraftUnreadableSql);
-            Set(command, "@path", path);
-            Set(command, "@state", (int)DraftState.Unreadable);
-            Set(command, "@reason", reason);
             command.ExecuteNonQuery();
         }, ct);
 

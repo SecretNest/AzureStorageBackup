@@ -4,12 +4,11 @@ using AzureStorageBackup.Api.Models;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
-/// Writes a second-level version index (§3.2) to a <see cref="Stream"/> one entry at a time, instead of building the
-/// whole <see cref="VersionIndex"/> in memory first the way <see cref="IndexSerializer.SerializeIndex"/> does. The
-/// SQLite catalog feeds entries in from a query one row at a time, so the index writer needs the same shape. The
-/// byte layout is identical to <see cref="IndexSerializer"/> field for field — the cloud format is a frozen
-/// contract, and later work compares the two byte-for-byte — so this and <see cref="IndexSerializer"/> both call
-/// the shared <see cref="IndexEncoding"/> primitives rather than keeping two copies that could drift apart.
+/// Writes a second-level version index (§3.2) to a <see cref="Stream"/> one entry at a time, never building the
+/// whole <see cref="VersionIndex"/> in memory: the SQLite catalog feeds entries in from a query one row at a time,
+/// so the index writer needs the same shape. The byte layout is the cloud format, which is a frozen contract, so
+/// this and <see cref="IndexSerializer"/> (still the info file's) both call the shared
+/// <see cref="IndexEncoding"/> primitives rather than keeping two copies that could drift apart.
 /// </summary>
 public sealed class IndexStreamWriter(Stream output) : IDisposable
 {

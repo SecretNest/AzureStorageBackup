@@ -85,7 +85,7 @@ public sealed class RunWorkDbTests : IDisposable
         await using var db = await OpenAsync();
         await db.InsertDraftAsync(0, "p", DraftState.Pending, Entry("p", 10), Ct);
         await db.InsertDraftAsync(1, "d/q", DraftState.Confirmed, Entry("d/q", 40), Ct);
-        await db.InsertDraftAsync(2, "d/r", DraftState.Pending, Entry("d/r", 5), Ct);
+        await db.InsertDraftAsync(2, "d/r", DraftState.Unreadable, Entry("d/r", 5), Ct);
 
         var storage = new StorageRef { Kind = "blob", Ref = "data/abc", Volumes = 2, Raw = true, VolumeSizes = [7, 3] };
         await db.UpdateDraftStorageAsync("p", storage, Ct);
@@ -94,7 +94,6 @@ public sealed class RunWorkDbTests : IDisposable
         await db.UpdateDraftTailAsync("p", "stale-tail-hash", Ct);
         await db.UpdateDraftTailAsync("p", "tail-hash", Ct);
         await db.UpdateDraftOverrideAsync("p", "full-hash", "head-hash", 99, Mtime.AddDays(1), Ct);
-        await db.MarkDraftUnreadableAsync("d/r", "permission denied", Ct);
         await db.FlushAsync(Ct);
 
         var row = await db.DraftAsync("p", Ct);

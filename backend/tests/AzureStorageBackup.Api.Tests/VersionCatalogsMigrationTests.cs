@@ -13,6 +13,11 @@ namespace AzureStorageBackup.Api.Tests;
 /// legacy <c>CachedVersionIndexes</c> row → the cloud. Each test picks the source that should answer a given
 /// <see cref="VersionCatalogs.EnsureVersionAsync"/> call and asserts that source (and only that source) was used,
 /// and that whatever it consumed on the way (a <c>.idx</c> file, a legacy row) is gone afterward.
+/// <para>
+/// The last section covers <see cref="VersionIndexFileStore"/> on its own — the reader the chain's second link goes
+/// through, and the two deletes retention and config removal call. Nothing writes those files any more, so the
+/// class has no test of its own left to belong to.
+/// </para>
 /// </summary>
 public sealed class VersionCatalogsMigrationTests
 {
@@ -69,7 +74,7 @@ public sealed class VersionCatalogsMigrationTests
         var infoStore = Substitute.For<IBackupInfoStore>();
         var catalogs = TestCatalogs.New(db, infoStore);
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
 
         await using (var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
         {
@@ -94,8 +99,8 @@ public sealed class VersionCatalogsMigrationTests
         var files = TestIndexFiles.New();
         var catalogs = TestCatalogs.New(db, infoStore, files);
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
-        await files.WriteAsync(AccountId, Container, 1, Identity, bytes, CancellationToken.None);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, Identity, bytes, CancellationToken.None);
 
         await catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None);
 
@@ -115,7 +120,7 @@ public sealed class VersionCatalogsMigrationTests
         using var db = NewDb();
         var infoStore = Substitute.For<IBackupInfoStore>();
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
         infoStore.ReadIndexToFileAsync(
                 Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
                 Arg.Any<CancellationToken>())
@@ -128,18 +133,19 @@ public sealed class VersionCatalogsMigrationTests
         var catalogs = TestCatalogs.New(db, infoStore, files);
 
         const long staleIdentity = Identity - 1;
-        await files.WriteAsync(AccountId, Container, 1, staleIdentity, bytes, CancellationToken.None);
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, staleIdentity, bytes, CancellationToken.None);
 
         await catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None);
 
         await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
         await AssertCatalogHasSampleAsync(catalog, 1, sample);
 
-        // The stale file is untouched: still there, and still readable under its own (old) identity — proof nothing
+        // The stale file is untouched: still there, and still openable under its own (old) identity — proof nothing
         // overwrote or deleted it, only that it was skipped.
         Assert.True(File.Exists(files.PathFor(AccountId, Container, 1)));
-        Assert.NotNull(await files.ReadAsync(AccountId, Container, 1, staleIdentity, CancellationToken.None));
-        Assert.Null(await files.ReadAsync(AccountId, Container, 1, Identity, CancellationToken.None));
+        await using (var stale = await files.OpenBodyAsync(AccountId, Container, 1, staleIdentity, CancellationToken.None))
+            Assert.NotNull(stale);
+        Assert.Null(await files.OpenBodyAsync(AccountId, Container, 1, Identity, CancellationToken.None));
     }
 
     // ---- Test 4: a legacy CachedVersionIndexes row is imported and dropped -------------------------------------------
@@ -151,7 +157,7 @@ public sealed class VersionCatalogsMigrationTests
         var infoStore = Substitute.For<IBackupInfoStore>();
         var catalogs = TestCatalogs.New(db, infoStore);
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
 
         db.CachedVersionIndexes.Add(new CachedVersionIndex
         {
@@ -183,7 +189,7 @@ public sealed class VersionCatalogsMigrationTests
         using var db = NewDb();
         var infoStore = Substitute.For<IBackupInfoStore>();
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
         infoStore.ReadIndexToFileAsync(
                 Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
                 Arg.Any<CancellationToken>())
@@ -228,7 +234,7 @@ public sealed class VersionCatalogsMigrationTests
         using var db = NewDb();
         var infoStore = Substitute.For<IBackupInfoStore>();
         var sample = IndexSamples.Sample();
-        var bytes = IndexSerializer.SerializeIndex(sample);
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
         infoStore.ReadIndexToFileAsync(
                 Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
                 Arg.Any<CancellationToken>())
@@ -243,7 +249,7 @@ public sealed class VersionCatalogsMigrationTests
         // A version already migrated into the catalog...
         await catalogs.EnsureVersionAsync(TestAccount, Container, Version(1), Identity, password: null, CancellationToken.None);
         // ...an .idx file for a version nobody has asked for yet...
-        await files.WriteAsync(AccountId, Container, 2, Identity, bytes, CancellationToken.None);
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 2, Identity, bytes, CancellationToken.None);
         // ...and a leftover pre-migration row that predates the .idx file store entirely.
         db.CachedVersionIndexes.Add(new CachedVersionIndex
         {
@@ -280,11 +286,11 @@ public sealed class VersionCatalogsMigrationTests
         var catalogs = new VersionCatalogs(TestCatalogs.NewStore(), files, db, infoStore, logger);
 
         var sample = IndexSamples.Sample();
-        var fullBytes = IndexSerializer.SerializeIndex(sample);
+        var fullBytes = LegacyIndexSerializer.SerializeIndex(sample);
         // format(1) + version(4) + entryCount(4): a header IndexStreamReader parses fine, claiming entries that
         // are not there — exactly what a file truncated mid-write would look like.
         var corrupt = fullBytes[..9];
-        await files.WriteAsync(AccountId, Container, 1, Identity, corrupt, CancellationToken.None);
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, Identity, corrupt, CancellationToken.None);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None));
@@ -294,5 +300,139 @@ public sealed class VersionCatalogsMigrationTests
 
         await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
         Assert.Null(await catalog.GetVersionAsync(1, CancellationToken.None));
+    }
+
+    // ---- The .idx file store itself: what the chain above reads through, and what deletes it ---------------------
+    // Moved here when VersionIndexFileStoreTests went away with the writer it was built around. What is left of
+    // VersionIndexFileStore is the reader this chain goes through plus the two deletes retention and config removal
+    // call, so its cases belong beside the chain that is now its only caller.
+
+    private static byte[] Body(string marker) => System.Text.Encoding.UTF8.GetBytes(marker);
+
+    /// <summary>Reads a body back through <see cref="VersionIndexFileStore.OpenBodyAsync"/> — null means the header
+    /// was rejected, which is what every "is a miss" case below asserts.</summary>
+    private static async Task<byte[]?> ReadBodyAsync(
+        VersionIndexFileStore files, int accountId, string container, int version, long identityTicks)
+    {
+        await using var body = await files.OpenBodyAsync(accountId, container, version, identityTicks, CancellationToken.None);
+        if (body is null)
+            return null;
+        using var ms = new MemoryStream();
+        await body.CopyToAsync(ms, CancellationToken.None);
+        return ms.ToArray();
+    }
+
+    [Fact]
+    public async Task OpenBody_returns_the_body_under_a_matching_identity()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 3, 100, Body("index-bytes"));
+
+        Assert.Equal(Body("index-bytes"), await ReadBodyAsync(files, 1, "photos", 3, 100));
+    }
+
+    [Fact]
+    public async Task OpenBody_treats_an_absent_entry_as_a_miss_rather_than_an_error()
+    {
+        var files = TestIndexFiles.New();
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 3, 100));
+        Assert.Null(await ReadBodyAsync(files, 9, "never-written", 1, 0));
+    }
+
+    /// <summary>The whole point of the header: a rebuilt container's identity moves, and the old entry must not be
+    /// served. Rejecting it costs 24 bytes of reading, where the row this replaced had to load the entire index
+    /// first.</summary>
+    [Fact]
+    public async Task OpenBody_treats_an_identity_mismatch_as_a_miss()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 3, 100, Body("old"));
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 3, 200));
+    }
+
+    /// <summary>A file cut short — a power failure mid-write, a filesystem that lost the tail — must read as a miss
+    /// and send the caller on down the chain, not hand over a body that imports as a plausible-looking version
+    /// missing half its entries.</summary>
+    [Fact]
+    public async Task OpenBody_treats_a_truncated_entry_as_a_miss()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 3, 100, Body("a much longer body than the header"));
+
+        using (var f = new FileStream(files.PathFor(1, "photos", 3), FileMode.Open, FileAccess.Write))
+            f.SetLength(f.Length - 5);
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 3, 100));
+    }
+
+    [Fact]
+    public async Task OpenBody_treats_a_file_that_is_not_ours_as_a_miss()
+    {
+        var files = TestIndexFiles.New();
+        var path = files.PathFor(1, "photos", 3);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, "this is not a version index at all");
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 3, 100));
+    }
+
+    [Fact]
+    public async Task Remove_drops_one_version_and_leaves_the_others()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 1, 100, Body("v1"));
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 2, 100, Body("v2"));
+
+        files.Remove(1, "photos", 1);
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 1, 100));
+        Assert.Equal(Body("v2"), await ReadBodyAsync(files, 1, "photos", 2, 100));
+    }
+
+    [Fact]
+    public void Removing_something_that_is_not_there_is_not_an_error()
+    {
+        var files = TestIndexFiles.New();
+        files.Remove(1, "photos", 1);
+        files.RemoveForContainer(1, "photos");
+    }
+
+    [Fact]
+    public async Task RemoveForContainer_spares_other_containers_and_other_accounts()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 1, 100, Body("target"));
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 2, 100, Body("target"));
+        await TestIndexFiles.WriteAsync(files, 1, "docs", 1, 100, Body("other container"));
+        await TestIndexFiles.WriteAsync(files, 2, "photos", 1, 100, Body("other account"));
+
+        files.RemoveForContainer(1, "photos");
+
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 1, 100));
+        Assert.Null(await ReadBodyAsync(files, 1, "photos", 2, 100));
+        Assert.Equal(Body("other container"), await ReadBodyAsync(files, 1, "docs", 1, 100));
+        Assert.Equal(Body("other account"), await ReadBodyAsync(files, 2, "photos", 1, 100));
+    }
+
+    /// <summary>
+    /// Container names are flattened before they become a path segment. Azure will not hand us a name containing a
+    /// separator today, but <see cref="VersionIndexFileStore.RemoveForContainer"/> is a recursive delete, and one
+    /// <c>..</c> reaching a path segment would take a sibling container's directory with it.
+    /// </summary>
+    [Fact]
+    public async Task Container_names_cannot_escape_their_own_directory()
+    {
+        var files = TestIndexFiles.New();
+        await TestIndexFiles.WriteAsync(files, 1, "photos", 1, 100, Body("must survive"));
+        await TestIndexFiles.WriteAsync(files, 1, "../photos", 1, 100, Body("hostile"));
+
+        files.RemoveForContainer(1, "../photos");
+
+        Assert.Equal(Body("must survive"), await ReadBodyAsync(files, 1, "photos", 1, 100));
+        // Both names resolve under the same account directory, so neither can reach the other's siblings.
+        var accountDir = Path.GetDirectoryName(Path.GetDirectoryName(files.PathFor(1, "photos", 1))!)!;
+        Assert.StartsWith(Path.GetFullPath(accountDir), Path.GetFullPath(files.PathFor(1, "../photos", 1)));
     }
 }

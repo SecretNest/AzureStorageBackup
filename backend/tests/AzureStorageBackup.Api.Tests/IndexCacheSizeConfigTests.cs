@@ -6,8 +6,8 @@ using Microsoft.Extensions.Logging;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// <c>Backup__IndexCacheSize</c> used to size the in-process <see cref="VersionIndexMemoryCache"/> that sat in
-/// front of the on-disk version index. That index is gone: <see cref="IVersionCatalogs"/> reads versions from the
+/// <c>Backup__IndexCacheSize</c> used to size the in-process cache of deserialized version indexes that sat in
+/// front of the on-disk version index. Both are gone: <see cref="IVersionCatalogs"/> reads versions from the
 /// SQLite catalog on demand, so there is nothing left for a deserialized-object cache to shortcut. The setting is
 /// retired, not removed from configuration binding — an operator's existing environment variable must not turn
 /// into a startup failure, so this asserts the host still starts and logs one line saying the value no longer

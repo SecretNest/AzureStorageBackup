@@ -3438,7 +3438,7 @@ public sealed class BackupOrchestrator(
     /// next box) rather than pulled out as single files; only members that grow past the threshold, or that keep
     /// changing up to the attempt limit, are demoted to single files (the latter raises a warning).
     /// <para>
-    /// The moment of sealing moved over to the diff side (see <see cref="GroupingPlanner.Classify"/> and the
+    /// The moment of sealing moved over to the diff side (see <see cref="GroupingPlanner.ClassifyOne"/> and the
     /// pipeline): this method used to receive "all groupable files of one directory" and pack them itself as it
     /// went; now it receives an already-packed box, so boxes can run concurrently instead of waiting for the
     /// previous box of the same directory to finish uploading.
@@ -3978,10 +3978,10 @@ public sealed class BackupOrchestrator(
     private async Task MarkPostDiffUnreadableAsync(
         BackupRequest request, string path, string reason, RunLedger ledger, CancellationToken ct)
     {
-        // Through the ledger, never through RunWorkDb.MarkDraftUnreadableAsync: the draft's `state` and its
-        // `change_kind` answer two different questions — which rows become an entry in the new version, and which
-        // paths the operator is warned about as unreadable **by the diff**. This one is neither the diff's verdict
-        // nor a warning of its own kind; it is a reason in its own column, counted on its own line.
+        // Through the ledger, and never by overwriting the draft row's `state`: `state` and `change_kind` answer two
+        // different questions — which rows become an entry in the new version, and which paths the operator is
+        // warned about as unreadable **by the diff**. This one is neither the diff's verdict nor a warning of its
+        // own kind; it is a reason in its own column, counted on its own line.
         await ledger.MarkPostDiffUnreadableAsync(path, reason, ct);
         await RecordPostDiffUnreadableAsync(request, path, reason, ct);
     }

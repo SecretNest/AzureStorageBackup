@@ -94,8 +94,6 @@ public sealed class RunLedger(RunWorkDb work)
     /// over the same rows, so nobody has to stream a million entries to count them.</summary>
     public Task<(long Files, long Bytes)> FinalStatsAsync(CancellationToken ct) => work.DraftFinalStatsAsync(ct);
 
-    public Task<int> FinalEntryCountAsync(CancellationToken ct) => work.DraftFinalCountAsync(ct);
-
     /// <summary>
     /// The new version's entries, in source order, one row at a time — the whole point of the exercise: the list this
     /// replaces held every entry of the new index in memory at once.

@@ -473,6 +473,21 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         return createdAt.UtcTicks;
     }
 
+    /// <summary>Puts a version index where the endpoints will find it, as a pre-migration
+    /// <see cref="CachedVersionIndex"/> row: the catalog's lazy migration imports it on the first read, which is
+    /// both the shortest way to seed a version without Azurite and a free exercise of that migration.</summary>
+    private async Task SeedVersionIndexAsync(int accountId, string container, int version, long identityTicks, VersionIndex index)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = accountId, Container = container, Version = version,
+            IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
+        });
+        await db.SaveChangesAsync();
+    }
+
     private sealed record VersionSummary(int version, DateTimeOffset createdAt, long files, long bytes, long changedFiles);
     private sealed record VersionSpanRow(int version, DateTimeOffset createdAt, DateTimeOffset? startedAt);
     private sealed record FileVersionCandidate(int version, DateTimeOffset createdAt, long length);
@@ -597,7 +612,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             db.CachedVersionIndexes.Add(new CachedVersionIndex
             {
                 AccountId = account.Id, Container = created.ContainerName, Version = 1,
-                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+                IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
             });
             await db.SaveChangesAsync();
         }
@@ -671,7 +686,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             db.CachedVersionIndexes.Add(new CachedVersionIndex
             {
                 AccountId = account.Id, Container = created.ContainerName, Version = 1,
-                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+                IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
             });
             await db.SaveChangesAsync();
         }
@@ -745,18 +760,18 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                 new CachedVersionIndex
                 {
                     AccountId = account.Id, Container = created.ContainerName, Version = 1, IdentityTicks = identityTicks,
-                    Bytes = IndexSerializer.SerializeIndex(Index(1, 5, storage: null, unrecoverable: false)),
+                    Bytes = LegacyIndexSerializer.SerializeIndex(Index(1, 5, storage: null, unrecoverable: false)),
                 },
                 new CachedVersionIndex
                 {
                     AccountId = account.Id, Container = created.ContainerName, Version = 2, IdentityTicks = identityTicks,
-                    Bytes = IndexSerializer.SerializeIndex(
+                    Bytes = LegacyIndexSerializer.SerializeIndex(
                         Index(2, 22, new StorageRef { Kind = "blob", Ref = "data/ok" }, unrecoverable: false)),
                 },
                 new CachedVersionIndex
                 {
                     AccountId = account.Id, Container = created.ContainerName, Version = 3, IdentityTicks = identityTicks,
-                    Bytes = IndexSerializer.SerializeIndex(
+                    Bytes = LegacyIndexSerializer.SerializeIndex(
                         Index(3, 22, new StorageRef { Kind = "blob", Ref = "data/broken" }, unrecoverable: true)),
                 });
             await db.SaveChangesAsync();
@@ -827,9 +842,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                     Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
                     Stats = new VersionStats(3, 30, 3, 30),
                 }]);
-            using (var scope = factory.Services.CreateScope())
-                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
-                    accountId, created.ContainerName, 9, identity,
+            await SeedVersionIndexAsync(accountId, created.ContainerName, 9, identity,
                     new VersionIndex
                     {
                         Version = 9,
@@ -1089,9 +1102,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                     Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
                     Stats = new VersionStats(1, 20, 1, 20),
                 }]);
-            using (var scope = factory.Services.CreateScope())
-                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
-                    accountId, created.ContainerName, 9, identity,
+            await SeedVersionIndexAsync(accountId, created.ContainerName, 9, identity,
                     new VersionIndex
                     {
                         Version = 9,

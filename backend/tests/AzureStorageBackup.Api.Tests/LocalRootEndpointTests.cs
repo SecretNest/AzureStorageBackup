@@ -159,7 +159,7 @@ public class LocalRootEndpointTests(TestWebAppFactory factory) : IClassFixture<T
         db.CachedVersionIndexes.Add(new CachedVersionIndex
         {
             AccountId = accountId, Container = container, Version = version,
-            IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+            IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
         });
         db.SaveChanges();
     }

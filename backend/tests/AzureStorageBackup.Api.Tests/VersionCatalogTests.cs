@@ -37,7 +37,7 @@ public sealed class VersionCatalogTests : IDisposable
         index.Entries.Add(Entry("b.bin", 5));
         index.Entries.Add(Entry("a.bin", 6));
         index.Entries.Add(Entry("a/c.bin", 7));
-        var expected = IndexSerializer.SerializeIndex(index);
+        var expected = LegacyIndexSerializer.SerializeIndex(index);
 
         await using var catalog = await OpenAsync();
         using (var reader = new IndexStreamReader(new MemoryStream(expected)))
@@ -62,7 +62,7 @@ public sealed class VersionCatalogTests : IDisposable
         var index = new VersionIndex { Version = 1, Entries = [Entry("dup.txt", 111), Entry("other.txt", 5), Entry("dup.txt", 222)] };
 
         await using var catalog = await OpenAsync();
-        using (var reader = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(index))))
+        using (var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index))))
             await catalog.ImportVersionAsync(1, identity: 1, reader, CancellationToken.None);
 
         var kept = await catalog.GetEntryAsync(1, "dup.txt", CancellationToken.None);
@@ -195,7 +195,7 @@ public sealed class VersionCatalogTests : IDisposable
         };
 
         await using var catalog = await OpenAsync();
-        using (var reader = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(index))))
+        using (var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index))))
             await catalog.ImportVersionAsync(1, identity: 1, reader, CancellationToken.None);
         foreach (var table in Tables)
             Assert.True(CountRows(table, 1) > 0, $"{table} should have rows before the version is removed");
@@ -440,7 +440,7 @@ public sealed class VersionCatalogTests : IDisposable
         return ms.ToArray();
     }
 
-    private static VersionIndex ReadBack(byte[] bytes) => IndexSerializer.DeserializeIndex(bytes);
+    private static VersionIndex ReadBack(byte[] bytes) => LegacyIndexSerializer.DeserializeIndex(bytes);
 
     private static async Task<List<string>> Collect(IAsyncEnumerable<IndexEntry> entries)
     {

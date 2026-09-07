@@ -46,13 +46,13 @@ internal static class TestResolver
             // two indexes still gets two versions instead of one overwriting the other.
             for (var i = 0; i < indexes.Count; i++)
             {
-                using var reader = new IndexStreamReader(new MemoryStream(IndexSerializer.SerializeIndex(indexes[i])));
+                using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(indexes[i])));
                 await catalog.ImportVersionAsync(i + 1, identity: i + 1, reader, ct);
             }
 
-            // The journal's confirmed blocks: the same rows JournalResume would have filed, each under a path of its
-            // own because that is what resume_blobs is keyed by (a ConfirmedBlob has dropped the path — from there
-            // on only the content identity matters).
+            // The journal's confirmed blocks: the same rows ResumeLedger reads back, each under a path of its own
+            // because that is what resume_blobs is keyed by (a ConfirmedBlob has dropped the path — from there on
+            // only the content identity matters).
             var seq = 0;
             foreach (var c in confirmed ?? [])
             {

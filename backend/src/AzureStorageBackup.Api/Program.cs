@@ -80,11 +80,8 @@ static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
 
 // Backup engine (M4): 7z codec + info file/index reading and writing. The codec is constructed on demand (7z is probed on the first resolve).
 builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
-// ILocalIndexCache still has consumers (BackupRepairer, until Task 20 moves it onto the catalog) but no longer gets a
-// VersionIndexMemoryCache singleton: version indexes are read from the SQLite catalog on demand now, so there is
-// nothing left for an in-process object cache to shortcut. LocalIndexCache's optional VersionIndexMemoryCache?
-// parameter falls back to capacity 0 when DI has none to hand it, which is exactly this case.
-builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
+// Version indexes are read from the SQLite catalog on demand, so the in-memory index cache the setting below used
+// to size is gone along with the cache itself. The setting is still read, only to say so.
 if (builder.Configuration["Backup:IndexCacheSize"] is { } retiredIndexCacheSize)
     startupNotes.Add($"Backup__IndexCacheSize={retiredIndexCacheSize} is no longer used: version indexes are read from the SQLite catalog on demand.");
 builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();

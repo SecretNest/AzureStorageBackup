@@ -121,9 +121,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
-        var indexFiles = TestIndexFiles.New();
-        var indexCache = new LocalIndexCache(db, store, indexFiles);
-        var catalogs = TestCatalogs.New(db, store, indexFiles);
+        var catalogs = TestCatalogs.New(db, store);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(

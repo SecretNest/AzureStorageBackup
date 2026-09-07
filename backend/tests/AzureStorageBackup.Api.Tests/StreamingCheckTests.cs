@@ -206,9 +206,9 @@ public sealed class StreamingCheckTests : IDisposable
             index.Entries[0] = entry with { FullHash = null, Length = entry.Length + 1 };
             await store.WriteIndexAsync(account, name, version.Version, index, null);
             // The version index was rewritten out of band. The check reads the version out of the container's
-            // catalog now, so the rewrite has to announce itself the same way a repair's does — through the
-            // version's .idx file, which outranks the row already in the catalog.
-            await _authority!.IndexCache.PutAsync(account.Id, name, version.Version, info.Backup.CreatedAt.UtcTicks, index);
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await _authority!.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
