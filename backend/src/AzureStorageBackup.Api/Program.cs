@@ -18,6 +18,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 const string CorsPolicy = "frontend";
 
+// Messages that belong at startup but are decided before app.Logger exists (during Services registration,
+// where several of them are). Flushed once the host is built — see the loop beside ioPriorityOutcome below.
+var startupNotes = new List<string>();
+
 // --- Data layer: SQLite ---
 var sqliteConn = builder.Configuration.GetConnectionString("Sqlite");
 if (string.IsNullOrWhiteSpace(sqliteConn))
@@ -76,14 +80,13 @@ static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
 
 // Backup engine (M4): 7z codec + info file/index reading and writing. The codec is constructed on demand (7z is probed on the first resolve).
 builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
+// ILocalIndexCache still has consumers (BackupRepairer, until Task 20 moves it onto the catalog) but no longer gets a
+// VersionIndexMemoryCache singleton: version indexes are read from the SQLite catalog on demand now, so there is
+// nothing left for an in-process object cache to shortcut. LocalIndexCache's optional VersionIndexMemoryCache?
+// parameter falls back to capacity 0 when DI has none to hand it, which is exactly this case.
 builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
-// Cache of deserialized version indexes (singleton, shared across requests). The default of 2 entries favours responsiveness: tree browsing in the
-// restore dialog and version comparison hit the same index, so a click no longer rebuilds the whole index (measured at about 0.9 s / 350 MB for 500k entries).
-// The cost is resident memory (about 190 MB per index @ 500k entries); on a low-memory machine set Backup__IndexCacheSize=0 to turn it off entirely.
-builder.Services.AddSingleton(new VersionIndexMemoryCache(
-    int.TryParse(builder.Configuration["Backup:IndexCacheSize"], out var indexCacheSize) && indexCacheSize >= 0
-        ? indexCacheSize
-        : 2));
+if (builder.Configuration["Backup:IndexCacheSize"] is { } retiredIndexCacheSize)
+    startupNotes.Add($"Backup__IndexCacheSize={retiredIndexCacheSize} is no longer used: version indexes are read from the SQLite catalog on demand.");
 builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();
 builder.Services.AddScoped<TrackedInfoStore>();
 
@@ -154,6 +157,9 @@ RunWorkDbFactory.ClearStale(workDbDir);
 // Same reasoning: compression intermediates and staged volumes left by the last abnormal exit are cleared here too.
 // Recovery leans on the journal (content confirmed in the cloud), not on these local half-products.
 StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
+// Same reasoning again: BackupInfoStore hands out one work directory per call (encode + read-back verification) and
+// deletes its own on a normal finish, so anything still under its temp root is residue from a killed process.
+BackupInfoStore.ClearStale(Path.Combine(tempPath, "index"));
 // The two packing limits that are set **per machine**. GroupCapBytes is each backup's own setting and does not belong here —
 // these two constrain the memory and the argv ceiling of the 7z process on this machine, and a different machine wants different values.
 builder.Services.AddSingleton(new PackLimits(
@@ -367,6 +373,10 @@ var app = builder.Build();
 // application — nothing it does can tell whether the kernel is acting on the value — so the startup log is the only
 // place an operator can find out that it was asked for at all, let alone that it was refused or ignored.
 app.Logger.LogInformation("{IoPriority}", ioPriorityOutcome);
+
+// Notes gathered during Services registration, before app.Logger existed — see startupNotes above.
+foreach (var note in startupNotes)
+    app.Logger.LogInformation("{StartupNote}", note);
 
 // Make sure the directory holding the SQLite file exists (the connection string looks like "Data Source=data/app.db").
 var dataSource = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource;

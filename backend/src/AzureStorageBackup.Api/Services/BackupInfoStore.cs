@@ -322,6 +322,27 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort; a leftover temp dir is not worth failing a write over */ }
     }
 
+    /// <summary>
+    /// Deletes everything under a store's temp root at process startup, the same reasoning as
+    /// <c>DiffWorkQueue.ClearStale</c> and <c>RunWorkDbFactory.ClearStale</c>: <see cref="NewWorkDir"/> hands out one
+    /// randomly-named directory per call and a normal finish deletes its own (<see cref="TryDeleteDir"/>), so
+    /// anything still here at startup is residue from a process that died mid-call. The root holds nothing else, so
+    /// the whole thing can go — no per-entry sifting needed.
+    /// </summary>
+    public static void ClearStale(string tempRoot)
+    {
+        try
+        {
+            if (Directory.Exists(tempRoot))
+                foreach (var dir in Directory.EnumerateDirectories(tempRoot))
+                    TryDeleteDir(dir);
+        }
+        catch
+        {
+            // A bit of wasted disk does not affect correctness; blocking startup over it would be the real problem.
+        }
+    }
+
     /// <summary>Declare the stage's size once the encoded length is known: one entry per transfer, each its byte
     /// count. The count is the item total the percentage is read off, and the bytes are the workload the
     /// remaining-time estimate extrapolates over — declared per transfer so the sum lands exactly on what
