@@ -90,6 +90,7 @@ public sealed class BackupPauseGateIntegrationTests : IDisposable
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
             new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New(),
             notifier: null, opLog: opLog);
         return (orchestrator, factory, staging);
     }

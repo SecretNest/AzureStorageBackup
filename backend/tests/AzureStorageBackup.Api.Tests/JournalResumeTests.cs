@@ -2,8 +2,46 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
-public class JournalResumeTests
+/// <summary>
+/// The resume's decision rules, one at a time: what counts as "the previous run already uploaded this" and what does
+/// not. They used to be asked of an in-memory <c>JournalResume</c> and are now asked of <see cref="ResumeLedger"/>
+/// over a real work database — the same questions, the same answers, and the reason each rule is drawn where it is has
+/// not moved either.
+/// <para>
+/// <see cref="ResumeLedgerTests"/> checks the two implementations against each other wholesale; these are the cases
+/// worth naming, so that a rule that changes says which rule it was.
+/// </para>
+/// </summary>
+public sealed class JournalResumeTests : IDisposable
 {
+    private readonly string _dir = Path.Combine(
+        Path.GetTempPath(), "asb-journalresume-tests", Guid.NewGuid().ToString("N"));
+
+    private static CancellationToken Ct => CancellationToken.None;
+
+    public JournalResumeTests() => Directory.CreateDirectory(_dir);
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); }
+        catch (IOException) { /* a leaked handle must not fail a test that already passed */ }
+    }
+
+    /// <summary>A fresh run id per call: a factory reuses the file named after the run id, so two databases in one
+    /// test have to be two runs or the second one deletes the first.</summary>
+    private Task<RunWorkDb> OpenAsync() =>
+        new RunWorkDbFactory(_dir).CreateAsync(Guid.NewGuid().ToString("N"), Ct);
+
+    /// <summary>Feed the records in exactly as <see cref="BackupRunControl.OpenJournalAsync"/> does, and hand back the
+    /// ledger reading them. The flush matters: the writer applies in batches, and an unflushed batch is invisible.</summary>
+    private static async Task<ResumeLedger> LedgerAsync(RunWorkDb work, params JournalRecord[] records)
+    {
+        foreach (var record in records)
+            await work.InsertResumeRecordAsync(record, Ct);
+        await work.FlushAsync(Ct);
+        return new ResumeLedger(work);
+    }
+
     /// <param name="mtimeTicks">Null by default, which is what every journal written before the field existed
     /// carries — see <see cref="Untouched_blob_needs_a_recorded_mtime_and_both_metadata_tests"/>.</param>
     private static JournalRecord Blob(string path, string full, long? mtimeTicks = null) => new()
@@ -18,82 +56,56 @@ public class JournalResumeTests
         Kind = "pack", Ref = packId, Members = members, VolumeSizes = [500], Volumes = 1,
     };
 
-    private static JournalContent Volume(int startedAtHour, params JournalRecord[] records) => new(
-        new JournalHeader
-        {
-            RunId = "r" + startedAtHour, ConfigId = 1, StartedAt = DateTimeOffset.UnixEpoch.AddHours(startedAtHour),
-            BaselineVersion = 0, LocalRoot = "/data/src", EncryptionIdentity = "plain",
-        },
-        records);
-
     /// <summary>
-    /// When the same path is recorded with different content in two volumes (the file was modified between two suspends), the
-    /// winner must be **the newer volume**, regardless of the order the two are handed in.
+    /// The same path recorded twice — repeated suspend/resume piles up several journal volumes, and the file may have
+    /// been modified in between. The record fed in **first** is the one that answers.
     /// <para>
-    /// Leaving it unordered loses no upload (if the content tests do not match we treat it as absent and upload anyway), but it
-    /// makes "does the version uploaded last run still count this run" a dice roll per run — the same input producing different re-upload volumes on two runs has no business on the resume path.
+    /// That is only half the rule: what makes "first" mean "the newest volume" is the order
+    /// <see cref="BackupRunControl.OpenJournalAsync"/> feeds the volumes in, and that half is pinned in
+    /// <c>JournalAdoptionTests.The_newest_volume_wins_a_path_recorded_twice</c>. Here it is the ledger's half — the
+    /// shadowed record is out of reach of every lookup, including the one that feeds dedup.
     /// </para>
     /// </summary>
     [Fact]
-    public void The_newest_volume_wins_a_path_recorded_twice()
+    public async Task The_first_record_for_a_path_wins()
     {
-        var older = Volume(0, Blob("a.bin", "aaa"));
-        var newer = Volume(1, Blob("a.bin", "zzz"));
+        await using var work = await OpenAsync();
+        var ledger = await LedgerAsync(work, Blob("a.bin", "zzz"), Blob("a.bin", "aaa"));
 
-        foreach (var volumes in new[] { new[] { older, newer }, [newer, older] })
-        {
-            var r = JournalResume.FromVolumes(volumes);
-            Assert.Equal(1, r.RecordCount);
-            Assert.Equal("data/zzz", r.FindBlob("a.bin", "zzz", 100, "hzzz", "tzzz")!.Ref);
-            Assert.Null(r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa"));
-            Assert.Equal(["data/zzz"], r.ConfirmedBlobs().Select(b => b.Blob.Ref));
-        }
+        Assert.Equal(1, await ledger.RecordCountAsync(Ct));
+        Assert.Equal("data/zzz", (await ledger.FindBlobAsync("a.bin", "zzz", 100, "hzzz", "tzzz", Ct))!.Ref);
+        Assert.Null(await ledger.FindBlobAsync("a.bin", "aaa", 100, "haaa", "taaa", Ct));
+        Assert.Equal(["data/zzz"], (await ledger.ConfirmedBlobsAsync(Ct)).Select(b => b.Blob.Ref));
     }
 
     [Fact]
-    public void No_volumes_gives_the_empty_resume()
-        => Assert.True(JournalResume.FromVolumes([]).IsEmpty);
-
-    [Fact]
-    public void Empty_resume_finds_nothing()
+    public async Task Blob_needs_path_and_content_to_both_match()
     {
-        Assert.True(JournalResume.Empty.IsEmpty);
-        Assert.Null(JournalResume.Empty.FindBlob("a.bin", "aaa", 100, "haaa", "taaa"));
-    }
+        await using var work = await OpenAsync();
+        var ledger = await LedgerAsync(work, Blob("a.bin", "aaa"));
 
-    [Fact]
-    public void Blob_needs_path_and_content_to_both_match()
-    {
-        var r = new JournalResume([Blob("a.bin", "aaa")]);
-        Assert.Equal("data/aaa", r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
+        Assert.Equal("data/aaa", (await ledger.FindBlobAsync("a.bin", "aaa", 100, "haaa", "taaa", Ct))!.Ref);
         // The file was modified after the interruption: the path is still there, the content is not that one any more, and it must never be reused.
-        Assert.Null(r.FindBlob("a.bin", "zzz", 100, "hzzz", "tzzz"));
+        Assert.Null(await ledger.FindBlobAsync("a.bin", "zzz", 100, "hzzz", "tzzz", Ct));
         // Same content at a different path: the journal records by path, and in the index these are two separate entries.
-        Assert.Null(r.FindBlob("copy.bin", "aaa", 100, "haaa", "taaa"));
+        Assert.Null(await ledger.FindBlobAsync("copy.bin", "aaa", 100, "haaa", "taaa", Ct));
     }
 
     [Fact]
-    public void Pack_matches_only_on_the_exact_member_set()
+    public async Task Pack_matches_only_on_the_exact_member_set()
     {
         var m1 = new JournalMember("a.txt", "0001_a.txt", "ha", 5);
         var m2 = new JournalMember("b.txt", "0002_b.txt", "hb", 7);
-        var r = new JournalResume([Pack("p000000010001", m1, m2)]);
+        await using var work = await OpenAsync();
+        var ledger = await LedgerAsync(work, Pack("p000000010001", m1, m2));
 
-        Assert.Equal("p000000010001", r.FindPack([m1, m2])!.Ref);
-        Assert.Null(r.FindPack([m1]));                                            // one member short
-        Assert.Null(r.FindPack([m1, m2, new JournalMember("c.txt", "0003_c.txt", "hc", 9)]));  // one member too many
-        Assert.Null(r.FindPack([m1, m2 with { FullHash = "changed" }]));           // a member's content changed
-        Assert.Null(r.FindPack([m1, m2 with { Length = 8 }]));                     // a member's length changed
-        Assert.Null(r.FindPack([m2, m1]));                                         // the same member set, in a different order
-    }
-
-    [Fact]
-    public void Duplicate_records_across_journals_take_the_first()
-    {
-        // Repeated suspend/resume piles up several journal volumes, and the same path may have been recorded more than once.
-        var r = new JournalResume([Blob("a.bin", "aaa"), Blob("a.bin", "aaa")]);
-        Assert.Equal(1, r.RecordCount);
-        Assert.Equal("data/aaa", r.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
+        Assert.Equal("p000000010001", (await ledger.FindPackAsync([m1, m2], Ct))!.Ref);
+        Assert.Null(await ledger.FindPackAsync([m1], Ct));                                            // one member short
+        Assert.Null(await ledger.FindPackAsync(
+            [m1, m2, new JournalMember("c.txt", "0003_c.txt", "hc", 9)], Ct));                        // one member too many
+        Assert.Null(await ledger.FindPackAsync([m1, m2 with { FullHash = "changed" }], Ct));          // a member's content changed
+        Assert.Null(await ledger.FindPackAsync([m1, m2 with { Length = 8 }], Ct));                    // a member's length changed
+        Assert.Null(await ledger.FindPackAsync([m2, m1], Ct));                                        // the same member set, in a different order
     }
 
     /// <summary>
@@ -114,30 +126,35 @@ public class JournalResumeTests
     /// </para>
     /// </summary>
     [Fact]
-    public void Untouched_blob_needs_a_recorded_mtime_and_both_metadata_tests()
+    public async Task Untouched_blob_needs_a_recorded_mtime_and_both_metadata_tests()
     {
         var mtime = DateTimeOffset.UnixEpoch.AddHours(3);
-        var r = new JournalResume([Blob("a.bin", "aaa", mtime.UtcTicks)]);
+        await using var work = await OpenAsync();
+        var ledger = await LedgerAsync(work, Blob("a.bin", "aaa", mtime.UtcTicks));
 
         // The positive control: without it the three refusals below could all be "the path is not in the table".
-        Assert.Equal("data/aaa", r.FindUntouchedBlob("a.bin", mtime, 100)!.Ref);
+        Assert.Equal("data/aaa", (await ledger.FindUntouchedBlobAsync("a.bin", mtime, 100, Ct))!.Ref);
 
-        Assert.Null(r.FindUntouchedBlob("a.bin", mtime.AddTicks(1), 100));  // touched: a different last-write time
-        Assert.Null(r.FindUntouchedBlob("a.bin", mtime, 101));              // touched: a different length
+        Assert.Null(await ledger.FindUntouchedBlobAsync("a.bin", mtime.AddTicks(1), 100, Ct));  // touched: a different last-write time
+        Assert.Null(await ledger.FindUntouchedBlobAsync("a.bin", mtime, 101, Ct));              // touched: a different length
 
         // The record predates the field. It cannot say whether the file has been touched, so it must not be read as
         // saying no.
-        var old = new JournalResume([Blob("a.bin", "aaa")]);
-        Assert.Null(old.FindUntouchedBlob("a.bin", mtime, 100));
+        await using var oldWork = await OpenAsync();
+        var old = await LedgerAsync(oldWork, Blob("a.bin", "aaa"));
+        Assert.Null(await old.FindUntouchedBlobAsync("a.bin", mtime, 100, Ct));
         // …and it still takes part in the content test, which is the route it took before the field existed.
-        Assert.Equal("data/aaa", old.FindBlob("a.bin", "aaa", 100, "haaa", "taaa")!.Ref);
+        Assert.Equal("data/aaa", (await old.FindBlobAsync("a.bin", "aaa", 100, "haaa", "taaa", Ct))!.Ref);
     }
 
     [Fact]
-    public void Records_without_a_path_are_ignored()
+    public async Task Records_without_a_path_are_ignored()
     {
         // A half-broken line with missing fields must not bring the lookup table down.
-        var r = new JournalResume([new JournalRecord { Kind = "blob", Ref = "data/x" }]);
-        Assert.Null(r.FindBlob("x", "x", 1, "x", "x"));
+        await using var work = await OpenAsync();
+        var ledger = await LedgerAsync(work, new JournalRecord { Kind = "blob", Ref = "data/x" });
+
+        Assert.Null(await ledger.FindBlobAsync("x", "x", 1, "x", "x", Ct));
+        Assert.True(await ledger.IsEmptyAsync(Ct));
     }
 }

@@ -102,7 +102,8 @@ public sealed class PackAliasDedupTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache, tracked),
-            new FileHasher(), indexCache: indexCache, trackedInfo: tracked);
+            new FileHasher(), indexCache: indexCache, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var restore = new RestoreOrchestrator(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
         return (backup, restore, store);

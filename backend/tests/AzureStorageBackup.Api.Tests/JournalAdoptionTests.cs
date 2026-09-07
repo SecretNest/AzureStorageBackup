@@ -10,7 +10,8 @@ namespace AzureStorageBackup.Api.Tests;
 /// the only branch that touches state **not belonging to this run**, and once Task 11's orphan sweep landed, getting it wrong
 /// amounts to "deleting the work a suspended run has already done". So the whole table is pinned down here, term by term.
 /// </para>
-/// <para>Pure temp directory: no cloud, no 7z, no Azurite.</para>
+/// <para>Pure temp directory: no cloud, no 7z, no Azurite. The work database is a temp file too — the adopted records are
+/// streamed into it, and <see cref="BackupRunControl.Resume"/> answers out of it.</para>
 /// </summary>
 public sealed class JournalAdoptionTests : IDisposable
 {
@@ -35,47 +36,59 @@ public sealed class JournalAdoptionTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }
 
-    private static JournalRecord Blob(string path) => new()
+    /// <summary>This run's scratch database. Held by the caller with <c>await using</c>, because the ledger keeps
+    /// reading from it for as long as the assertions do.</summary>
+    private Task<RunWorkDb> WorkAsync() =>
+        new RunWorkDbFactory(Path.Combine(_dir, "work")).CreateAsync(Guid.NewGuid().ToString("N"), default);
+
+    /// <param name="full">The content identity to record. Defaults to one derived from the path, so that a volume is
+    /// identified by which file it names; pass it explicitly to record **the same path with different content**.</param>
+    private static JournalRecord Blob(string path, string? full = null)
     {
-        Kind = "blob", Ref = "data/" + path, Path = path, FullHash = "f" + path, HeadHash = "h" + path,
-        TailHash = "t" + path, Length = 100, Volumes = 1, VolumeSizes = [100],
-    };
+        var id = full ?? path;
+        return new JournalRecord
+        {
+            Kind = "blob", Ref = "data/" + id, Path = path, FullHash = "f" + id, HeadHash = "h" + id,
+            TailHash = "t" + id, Length = 100, Volumes = 1, VolumeSizes = [100],
+        };
+    }
 
     /// <summary>Plant a ready-made journal volume on disk. All four header fields match by default; break them one at a time with named arguments.</summary>
     private async Task<string> PlantAsync(
         string runId, int configId = ConfigId, int baseline = Baseline, string localRoot = LocalRoot,
-        string identity = Identity, string path = "a.bin")
+        string identity = Identity, string path = "a.bin", string? full = null, DateTimeOffset? startedAt = null)
     {
         await using (var journal = await _store.CreateAsync(AccountId, Container, runId, new JournalHeader
         {
             RunId = runId,
             ConfigId = configId,
-            StartedAt = DateTimeOffset.UtcNow,
+            StartedAt = startedAt ?? DateTimeOffset.UtcNow,
             BaselineVersion = baseline,
             LocalRoot = localRoot,
             EncryptionIdentity = identity,
         }, default))
         {
-            await journal.AppendAsync(Blob(path), default);
+            await journal.AppendAsync(Blob(path, full), default);
         }
         return _store.PathFor(AccountId, Container, runId);
     }
 
     /// <summary>Start a new run and take it through opening the volume. All four terms use the values that match.</summary>
-    private async Task<BackupRunControl> OpenAsync(string runId = "run-new", bool firstRun = false)
+    private async Task<BackupRunControl> OpenAsync(RunWorkDb work, string runId = "run-new", bool firstRun = false)
     {
         var control = new BackupRunControl(_store, ConfigId, runId);
         await control.OpenJournalAsync(
-            AccountId, Container, Baseline, LocalRoot, Identity, DateTimeOffset.UtcNow, default, firstRun);
+            AccountId, Container, Baseline, LocalRoot, Identity, DateTimeOffset.UtcNow, work, default, firstRun);
         return control;
     }
 
     [Fact]
     public async Task Nothing_on_disk_means_nothing_to_resume_and_nothing_to_sweep()
     {
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.False(control.SweepNeeded);
     }
 
@@ -91,9 +104,10 @@ public sealed class JournalAdoptionTests : IDisposable
     [Fact]
     public async Task A_first_run_sweeps_even_with_no_journal_in_sight()
     {
-        await using var control = await OpenAsync(firstRun: true);
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work, firstRun: true);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.True(control.SweepNeeded);
     }
 
@@ -102,10 +116,11 @@ public sealed class JournalAdoptionTests : IDisposable
     {
         var planted = await PlantAsync("run-old");
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.Equal(1, control.Resume.RecordCount);
-        Assert.NotNull(control.Resume.FindBlob("a.bin", "fa.bin", 100, "ha.bin", "ta.bin"));
+        Assert.Equal(1, await control.Resume!.RecordCountAsync(default));
+        Assert.NotNull(await control.Resume.FindBlobAsync("a.bin", "fa.bin", 100, "ha.bin", "ta.bin", default));
         // Something was adopted → the container holds "in the cloud, not in the index" blocks, so the tail should sweep (Task 11).
         Assert.True(control.SweepNeeded);
         // Adoption is **read-only**: that volume stays on disk untouched — this run does not copy it, truncate it, or delete it.
@@ -119,9 +134,10 @@ public sealed class JournalAdoptionTests : IDisposable
         // which means this can only be the residue left by "a config deleted and then recreated on the same container".
         var planted = await PlantAsync("run-old", configId: ConfigId + 1);
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.False(File.Exists(planted), "a journal belonging to another config must be voided");
         Assert.True(control.SweepNeeded);
     }
@@ -132,9 +148,10 @@ public sealed class JournalAdoptionTests : IDisposable
         // The baseline changed = somebody else already completed a whole run, and the references in that volume should long since be the index's business.
         var planted = await PlantAsync("run-old", baseline: Baseline - 1);
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.False(File.Exists(planted), "a journal from another baseline must be voided");
         Assert.True(control.SweepNeeded);
     }
@@ -145,9 +162,10 @@ public sealed class JournalAdoptionTests : IDisposable
         // Change the root directory and the same relative path no longer means the same file.
         var planted = await PlantAsync("run-old", localRoot: LocalRoot + "-moved");
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.False(File.Exists(planted), "a journal taken under another local root must be voided");
         Assert.True(control.SweepNeeded);
     }
@@ -158,9 +176,10 @@ public sealed class JournalAdoptionTests : IDisposable
         // Change the key and the address space changes with it; not one ref in the old volume still lines up.
         var planted = await PlantAsync("run-old", identity: "keyed:abc");
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.True(control.Resume.IsEmpty);
+        Assert.Null(control.Resume);
         Assert.False(File.Exists(planted), "a journal written under another key must be voided");
         Assert.True(control.SweepNeeded);
     }
@@ -172,11 +191,43 @@ public sealed class JournalAdoptionTests : IDisposable
         await PlantAsync("run-old-1", path: "a.bin");
         await PlantAsync("run-old-2", path: "b.bin");
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.Equal(2, control.Resume.RecordCount);
-        Assert.NotNull(control.Resume.FindBlob("a.bin", "fa.bin", 100, "ha.bin", "ta.bin"));
-        Assert.NotNull(control.Resume.FindBlob("b.bin", "fb.bin", 100, "hb.bin", "tb.bin"));
+        Assert.Equal(2, await control.Resume!.RecordCountAsync(default));
+        Assert.NotNull(await control.Resume.FindBlobAsync("a.bin", "fa.bin", 100, "ha.bin", "ta.bin", default));
+        Assert.NotNull(await control.Resume.FindBlobAsync("b.bin", "fb.bin", 100, "hb.bin", "tb.bin", default));
+    }
+
+    /// <summary>
+    /// The same path recorded with different content in two volumes — the file was modified between two suspends —
+    /// and the **newer volume** must win, whichever order the volumes come back off disk in.
+    /// <para>
+    /// This is the half of the rule that lives here rather than in the ledger: volumes are read in file-name order,
+    /// and a file name is a runId, a freshly generated GUID prefix that says nothing about age. So the run has to sort
+    /// them by <see cref="JournalHeader.StartedAt"/> before feeding them in, or "which version of this path counts
+    /// this run" is decided by a dice roll — the same input re-uploading different files on two consecutive runs.
+    /// The theory runs it both ways round precisely so that passing by luck of the file names is not possible.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task The_newest_volume_wins_a_path_recorded_twice(bool newestSortsFirst)
+    {
+        var older = DateTimeOffset.UnixEpoch;
+        await PlantAsync(
+            newestSortsFirst ? "run-a" : "run-z", path: "a.bin", full: "zzz", startedAt: older.AddHours(1));
+        await PlantAsync(
+            newestSortsFirst ? "run-z" : "run-a", path: "a.bin", full: "aaa", startedAt: older);
+
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
+
+        Assert.Equal(1, await control.Resume!.RecordCountAsync(default));
+        Assert.Equal(
+            "data/zzz", (await control.Resume.FindBlobAsync("a.bin", "fzzz", 100, "hzzz", "tzzz", default))!.Ref);
+        Assert.Null(await control.Resume.FindBlobAsync("a.bin", "faaa", 100, "haaa", "taaa", default));
     }
 
     [Fact]
@@ -185,11 +236,12 @@ public sealed class JournalAdoptionTests : IDisposable
         var mine = await PlantAsync("run-old-mine", path: "a.bin");
         var foreign = await PlantAsync("run-old-foreign", configId: ConfigId + 1, path: "b.bin");
 
-        await using var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        await using var control = await OpenAsync(work);
 
-        Assert.Equal(1, control.Resume.RecordCount);
-        Assert.NotNull(control.Resume.FindBlob("a.bin", "fa.bin", 100, "ha.bin", "ta.bin"));
-        Assert.Null(control.Resume.FindBlob("b.bin", "fb.bin", 100, "hb.bin", "tb.bin"));
+        Assert.Equal(1, await control.Resume!.RecordCountAsync(default));
+        Assert.NotNull(await control.Resume.FindBlobAsync("a.bin", "fa.bin", 100, "ha.bin", "ta.bin", default));
+        Assert.Null(await control.Resume.FindBlobAsync("b.bin", "fb.bin", 100, "hb.bin", "tb.bin", default));
         Assert.True(File.Exists(mine));
         Assert.False(File.Exists(foreign));
     }
@@ -201,7 +253,8 @@ public sealed class JournalAdoptionTests : IDisposable
         // or the next run can never reuse the blocks it recorded again — and those blocks really are in the cloud.
         var planted = await PlantAsync("run-old");
 
-        var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        var control = await OpenAsync(work);
         await control.DisposeAsync();
 
         Assert.True(File.Exists(planted));
@@ -213,7 +266,7 @@ public sealed class JournalAdoptionTests : IDisposable
     /// <para>
     /// Today's RunId is a freshly generated GUID prefix, so it cannot collide; Task 15 "automatically carry on at startup" will
     /// reuse the runId of the suspended run (so the run's identity in the UI stays the same), and reusing it collides. After a
-    /// truncation the current run is still correct (Resume is already in memory); what breaks is the guarantee on disk — so this case pins **what is left in the file**, not what is in Resume.
+    /// truncation the current run is still correct (the records are already in the work database); what breaks is the guarantee on disk — so this case pins **what is left in the file**, not what is in Resume.
     /// </para>
     /// </summary>
     [Fact]
@@ -221,9 +274,10 @@ public sealed class JournalAdoptionTests : IDisposable
     {
         var planted = await PlantAsync("run-same");
 
-        await using (var control = await OpenAsync("run-same"))
+        await using var work = await WorkAsync();
+        await using (var control = await OpenAsync(work, "run-same"))
         {
-            Assert.Equal(1, control.Resume.RecordCount);
+            Assert.Equal(1, await control.Resume!.RecordCountAsync(default));
             await control.RecordBlobAsync(
                 "b.bin", "data/b", "fb", "hb", "tb", 7, DateTimeOffset.UnixEpoch, 1, false, [7], default);
         }
@@ -240,7 +294,8 @@ public sealed class JournalAdoptionTests : IDisposable
         // They only retire once the index commit succeeds — this is what keeps the "still there" case above from being an empty claim.
         var planted = await PlantAsync("run-old");
 
-        var control = await OpenAsync();
+        await using var work = await WorkAsync();
+        var control = await OpenAsync(work);
         await control.CompleteAsync();
         await control.DisposeAsync();
 

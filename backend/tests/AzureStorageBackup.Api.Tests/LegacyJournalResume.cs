@@ -1,4 +1,6 @@
-namespace AzureStorageBackup.Api.Services;
+using AzureStorageBackup.Api.Services;
+
+namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
 /// A lookup table built from however many journal volumes still count, answering "was this content already uploaded last run".
@@ -19,10 +21,16 @@ namespace AzureStorageBackup.Api.Services;
 /// Pure memory, purely local, no cloud reads. A record only enters the journal once "the upload has been confirmed returned", so
 /// there is no need (and no business) checking against the cloud again here — that would violate the "zero cloud reads during a backup" bottom line.
 /// </para>
+/// <para>
+/// <b>A frozen copy of the deleted <c>JournalResume</c>, kept as the oracle for <see cref="ResumeLedgerTests"/>.</b> The
+/// ledger that replaced it answers the same three questions out of a SQLite table, and "the table answers exactly what
+/// the dictionaries answered" is a claim that needs both implementations side by side to be checked at all. Nothing
+/// else may use this — it is not a second implementation to keep in step, it is the record of what the first one did.
+/// </para>
 /// </summary>
-public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
+internal sealed class LegacyJournalResume(IReadOnlyList<JournalRecord> records)
 {
-    public static readonly JournalResume Empty = new([]);
+    public static readonly LegacyJournalResume Empty = new([]);
 
     /// <summary>
     /// Build the table from however many journal volumes. Records are chained **newest to oldest by start time**, so that the "first hit wins" below lands as "the newer one wins".
@@ -37,10 +45,10 @@ public sealed class JournalResume(IReadOnlyList<JournalRecord> records)
     /// kind of nondeterminism has no business on the resume path.
     /// </para>
     /// </summary>
-    public static JournalResume FromVolumes(IReadOnlyList<JournalContent> volumes)
+    public static LegacyJournalResume FromVolumes(IReadOnlyList<JournalContent> volumes)
         => volumes.Count == 0
             ? Empty
-            : new JournalResume([..
+            : new LegacyJournalResume([..
                 volumes.OrderByDescending(v => v.Header.StartedAt).SelectMany(v => v.Records)]);
 
     /// <summary>Single-file blob records indexed by path. On a duplicate path the first hit wins; the caller

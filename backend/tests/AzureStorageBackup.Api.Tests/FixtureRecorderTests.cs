@@ -210,7 +210,8 @@ public sealed class FixtureRecorderTests
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: indexCache, trackedInfo: tracked, journals: journals),
-            new FileHasher(), indexCache, tracked);
+            new FileHasher(), indexCache, tracked,
+            workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory, localState);
     }
 

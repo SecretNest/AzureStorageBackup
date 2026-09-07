@@ -196,8 +196,8 @@ public sealed class RunWorkDbTests : IDisposable
     // ---- Test 5: the resume table keeps the first record for a path -------------------------------------------
 
     /// <summary>
-    /// <c>JournalResume.BuildBlobs</c> does this with <c>TryAdd</c> over volumes already sorted newest first, so the
-    /// first record wins. The table has to keep that rule, or a resume would answer with the older upload.
+    /// <c>LegacyJournalResume.BuildBlobs</c>, the dictionary this replaced, did this with <c>TryAdd</c> over
+    /// volumes already sorted newest first, so the first record wins. The table has to keep that rule, or a resume would answer with the older upload.
     /// </summary>
     [Fact]
     public async Task Resume_blob_by_path_keeps_the_first_record()

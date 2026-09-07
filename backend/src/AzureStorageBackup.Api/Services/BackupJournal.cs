@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
@@ -182,25 +183,76 @@ public sealed class BackupJournal : IAsyncDisposable
                 continue;
             if (header is null)
             {
-                try { header = JsonSerializer.Deserialize<JournalHeader>(line, JournalJson.Options); }
-                catch (JsonException) { return null; }   // broken header, the whole volume is void
+                header = Parse<JournalHeader>(line);
                 if (header is null)
-                    return null;
+                    return null;   // broken header, the whole volume is void
                 continue;
             }
-            try
-            {
-                if (JsonSerializer.Deserialize<JournalRecord>(line, JournalJson.Options) is { } record)
-                    records.Add(record);
-            }
-            catch (JsonException)
-            {
-                // A half-written line left by a crash. Normally it can only be the last line; if one really does show up in the
-                // middle we merely recognise a few records fewer, costing a few extra file uploads, not data loss. Keep reading to the end.
-            }
+            if (Parse<JournalRecord>(line) is { } record)
+                records.Add(record);
         }
 
         return header is null ? null : new JournalContent(header, records);
+    }
+
+    /// <summary>
+    /// The same read as <see cref="ReadAsync"/>, one record at a time and never a list.
+    /// <para>
+    /// This is the read the resume takes. A journal volume holds one line per confirmed block, so a run over millions
+    /// of files leaves millions of lines, and handing the caller a <see cref="JournalContent"/> means every one of
+    /// them resident at once purely so they can be copied somewhere else — the resume now streams them straight into
+    /// the run's work database (<see cref="BackupRunControl.OpenJournalAsync"/>), and nothing needs the whole volume
+    /// in hand. <see cref="ReadAsync"/> stays for the callers that genuinely want a whole small volume, header and all.
+    /// </para>
+    /// <para>
+    /// Same verdicts as <see cref="ReadAsync"/>, term for term: a missing file, an empty file or a broken header all
+    /// yield nothing at all (= this volume is void), and a line that does not parse is skipped while the read carries
+    /// on to the end — after a crash the last line may well be a half-written stub, and losing a few records costs a
+    /// few extra uploads, not data.
+    /// </para>
+    /// </summary>
+    public static async IAsyncEnumerable<JournalRecord> ReadRecordsAsync(
+        string path, [EnumeratorCancellation] CancellationToken ct)
+    {
+        // Opened exactly as ReadAsync opens it, and for the same reason: "it is gone" is not an error here, it is the
+        // same answer as "it was never there".
+        FileStream? stream = null;
+        try
+        {
+            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // stream stays null; the check below turns it into "no records".
+        }
+        if (stream is null)
+            yield break;
+
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        var headerRead = false;
+        while (await reader.ReadLineAsync(ct) is { } line)
+        {
+            if (line.Length == 0)
+                continue;
+            if (!headerRead)
+            {
+                if (Parse<JournalHeader>(line) is null)
+                    yield break;   // broken header, the whole volume is void
+                headerRead = true;
+                continue;
+            }
+            if (Parse<JournalRecord>(line) is { } record)
+                yield return record;
+        }
+    }
+
+    /// <summary>One line, or null when it does not parse. The single place the "skip what a crash half-wrote" rule
+    /// lives, so that the two readers above cannot drift apart on what counts as a broken line.</summary>
+    private static T? Parse<T>(string line) where T : class
+    {
+        try { return JsonSerializer.Deserialize<T>(line, JournalJson.Options); }
+        catch (JsonException) { return null; }
     }
 
     public async ValueTask DisposeAsync()

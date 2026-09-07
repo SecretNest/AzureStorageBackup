@@ -129,6 +129,10 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // This has to happen at **process startup**, not at the start of every backup: several backups can be running at once,
 // and clearing per run would delete files someone else is writing. A normal finish deletes its own (DiffWorkQueue.Dispose).
 DiffWorkQueue.ClearStale(spillDir);
+// The per-run scratch databases, cleared for exactly the same reason and at exactly the same moment: a run names its
+// file after its runId and deletes it on the way out, so anything still here is the residue of a killed process.
+var workDbDir = Path.Combine(tempPath, "work");
+RunWorkDbFactory.ClearStale(workDbDir);
 // Same reasoning: compression intermediates and staged volumes left by the last abnormal exit are cleared here too.
 // Recovery leans on the journal (content confirmed in the cloud), not on these local half-products.
 StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
@@ -150,6 +154,8 @@ int DiffQueueInt(string key, int fallback) =>
     int.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
 long DiffQueueLong(string key, long fallback) =>
     long.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
+
+builder.Services.AddSingleton(new RunWorkDbFactory(workDbDir));
 
 builder.Services.AddSingleton(new DiffWorkQueueFactory(spillDir, new DiffQueueLimits(
     // The r stage (in memory, waiting to be picked up): the item count is the main dial, the bytes are the backstop, whichever hits first wins.

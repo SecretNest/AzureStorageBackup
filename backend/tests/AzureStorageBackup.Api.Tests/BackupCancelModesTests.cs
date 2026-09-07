@@ -130,6 +130,7 @@ public sealed class BackupCancelModesTests : IDisposable
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
             new FileHasher(), wrapIndexCache?.Invoke(authority.IndexCache) ?? authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New(),
             notifier: notifier, opLog: opLog);
         return (orchestrator, factory, authority);
     }

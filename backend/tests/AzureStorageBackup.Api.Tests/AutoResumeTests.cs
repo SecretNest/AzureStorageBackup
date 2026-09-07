@@ -34,6 +34,11 @@ public class AutoResumeTests : IDisposable
 
     private BackupJournalStore Store() => new(_dir);
 
+    /// <summary>A scratch database for a run that opens its journal: that is where the adopted records go. These cases
+    /// are about the suspend markers, so nothing reads it back — but a run cannot open a journal without one.</summary>
+    private Task<RunWorkDb> WorkAsync() =>
+        new RunWorkDbFactory(Path.Combine(_dir, "work")).CreateAsync(Guid.NewGuid().ToString("N"), default);
+
     private static readonly (int ConfigId, int AccountId, string Container)[] OneConfig =
         [(7, 1, "photos")];
 
@@ -153,12 +158,13 @@ public class AutoResumeTests : IDisposable
     /// The criteria read per **volume**, and the relationship between volumes and marks only grows along this path — a hand-seeded scene
     /// always gives you "one volume, one mark", which sidesteps precisely what the cases below are trying to say.
     /// </summary>
-    private static async Task RunAndSuspendAsync(
+    private async Task RunAndSuspendAsync(
         BackupJournalStore store, string runId, SuspendReason reason)
     {
+        await using var work = await WorkAsync();
         await using var control = new BackupRunControl(store, 7, runId);
         await control.OpenJournalAsync(
-            1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, default);
+            1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, work, default);
         control.MarkSuspended(reason);
     }
 
@@ -216,8 +222,9 @@ public class AutoResumeTests : IDisposable
         var store = Store();
         await RunAndSuspendAsync(store, "run-old", SuspendReason.AutoSuspended);
 
+        await using var work = await WorkAsync();
         await using var control = new BackupRunControl(store, 7, "run-new");
-        await control.OpenJournalAsync(1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, default);
+        await control.OpenJournalAsync(1, "photos", 0, "/src", "plain", DateTimeOffset.UtcNow, work, default);
 
         // The old volume was **adopted**, not voided and deleted — otherwise "the mark is gone" would prove nothing.
         Assert.Equal(2, (await store.PeekAsync(1, "photos", default)).Count);
@@ -597,7 +604,8 @@ public sealed class AutoResumeIntegrationTests : IDisposable
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory);
     }
 
@@ -718,8 +726,11 @@ public sealed class AutoResumeIntegrationTests : IDisposable
             {
                 var result = await o2.RunAsync(Request(account, name), null, default, c2);
                 Assert.Equal(1, result.Version);
-                Assert.False(c2.Resume.IsEmpty, "the suspended run's journal was voided, not adopted");
-                Assert.Equal(done.Count, c2.Resume.RecordCount);
+                // Only "a journal was adopted" can still be asked here: the ledger reads out of the run's work
+                // database, and that file dies with the run (RunCoreAsync disposes it, which deletes it). How many
+                // records it held is settled by the upload count on the next line instead, which is the same claim
+                // made where it actually costs something.
+                Assert.NotNull(c2.Resume);
             }
 
             // Proof of adoption: not one of the items the previous run completed was re-uploaded. Had it been voided, this would be 3.

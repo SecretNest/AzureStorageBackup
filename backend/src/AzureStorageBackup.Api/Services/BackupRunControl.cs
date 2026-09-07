@@ -31,8 +31,16 @@ public sealed class BackupRunControl(
     /// <summary>The runIds of old journals adopted by this round. When this round commits its index successfully, they are deleted along with our own volume.</summary>
     private readonly List<string> _adopted = [];
 
-    /// <summary>What the previous round (or rounds) already confirmed as uploaded. Empty when there is no volume to adopt.</summary>
-    public JournalResume Resume { get; private set; } = JournalResume.Empty;
+    /// <summary>
+    /// What the previous round (or rounds) already confirmed as uploaded. <b>Null when no volume was adopted</b>,
+    /// which is every ordinary backup.
+    /// <para>
+    /// Null rather than an empty ledger: the ledger's answers come out of a database, so an empty one would still
+    /// charge every caller a query to be told there is nothing to resume — and the first of those callers asks once
+    /// per file, in front of the <c>stat</c>. A null reference costs nothing and cannot be asked by accident.
+    /// </para>
+    /// </summary>
+    public ResumeLedger? Resume { get; private set; }
 
     /// <summary>We adopted or voided an old volume when opening the journal, or this is this config's first round on
     /// this container → the container most likely holds orphan blocks, so the closing cleanup should sweep once (Task 11).</summary>
@@ -159,9 +167,14 @@ public sealed class BackupRunControl(
     /// created, or **the config was deleted and recreated**). It has to trigger an orphan sweep just the same; the
     /// reasoning is at the assignment to <see cref="SweepNeeded"/> below.
     /// </param>
+    /// <param name="work">
+    /// This run's scratch database. The records of every volume adopted here are streamed into it, and
+    /// <see cref="Resume"/> then answers out of it. It is a parameter rather than something this class owns because
+    /// the same file also carries the run's scan and draft — one run, one database.
+    /// </param>
     public async Task OpenJournalAsync(
         int accountId, string container, int baselineVersion, string localRoot, string encryptionIdentity,
-        DateTimeOffset startedAt, CancellationToken ct, bool firstRun = false)
+        DateTimeOffset startedAt, RunWorkDb work, CancellationToken ct, bool firstRun = false)
     {
         _accountId = accountId;
         _container = container;
@@ -177,22 +190,23 @@ public sealed class BackupRunControl(
         var voided = false;
         // The volume we adopted is this round's own volume (same runId) → append to it, never open a new one over it.
         var reopenMine = false;
-        var adopted = new List<JournalContent>();
+        // Headers only. The four terms below are all header fields, and reading the records of a volume that is about
+        // to be deleted as void is work spent on nothing; the ones that survive have their records streamed in below.
+        var adopted = new List<(string Path, JournalHeader Header)>();
         var myPath = store.PathFor(accountId, container, runId);
-        foreach (var (oldRunId, content) in await store.ListAsync(accountId, container, ct))
+        foreach (var (oldRunId, h) in await store.ListHeadersAsync(accountId, container, ct))
         {
-            var h = content.Header;
+            var oldPath = store.PathFor(accountId, container, oldRunId);
             // What is compared is **the path it lands on**, not the two runId strings: file names are flattened
             // through BackupJournalStore.Safe, and two different runIds can perfectly well land on the same file — at
             // which point they are the same volume.
-            var mine = string.Equals(
-                store.PathFor(accountId, container, oldRunId), myPath, StringComparison.Ordinal);
+            var mine = string.Equals(oldPath, myPath, StringComparison.Ordinal);
             if (h.ConfigId == configId
                 && h.BaselineVersion == baselineVersion
                 && string.Equals(h.LocalRoot, localRoot, StringComparison.Ordinal)
                 && string.Equals(h.EncryptionIdentity, encryptionIdentity, StringComparison.Ordinal))
             {
-                adopted.Add(content);
+                adopted.Add((oldPath, h));
                 // The same-name volume does **not** go into _adopted: it is this round's own volume, and CompleteAsync already deletes it by runId.
                 if (mine)
                 {
@@ -252,7 +266,24 @@ public sealed class BackupRunControl(
         // Adoption is **read-only**: this round still opens its own volume and leaves the old ones exactly as they
         // are. That way the reused records don't have to be copied over again, and there is no "crashed halfway through
         // copying" half-state. The old volumes get deleted once this round commits its index successfully.
-        Resume = JournalResume.FromVolumes(adopted);
+        //
+        // The records go **newest volume first**, and that ordering is the whole of the "the newer one wins" rule:
+        // the resume tables take the first record for a path (INSERT OR IGNORE) and the first pack for a member set,
+        // so feeding them in any other order makes "which version of this path counts this run" a dice roll — the
+        // file names are runIds, freshly generated GUID prefixes, so the order they come back in says nothing about
+        // age. Losing the roll loses no upload (a record that does not match all four content tests is treated as
+        // absent and uploaded again), but that kind of nondeterminism has no business on the resume path.
+        //
+        // Streamed one record at a time rather than read into a list: a volume left by a run over millions of files
+        // holds millions of lines, and the point of putting them in the database is precisely that the run does not
+        // hold them all at once.
+        foreach (var (path, _) in adopted.OrderByDescending(a => a.Header.StartedAt))
+            await foreach (var record in BackupJournal.ReadRecordsAsync(path, ct))
+                await work.InsertResumeRecordAsync(record, ct);
+        // Committed before anyone can ask: the writer applies in batches, and a lookup that raced the last uncommitted
+        // batch would report "not uploaded" for a block that is in the cloud, re-uploading it for nothing.
+        await work.FlushAsync(ct);
+        Resume = adopted.Count > 0 ? new ResumeLedger(work) : null;
 
         // When the runId collides with the volume just adopted, **append**; do not open a new one: CreateAsync is
         // FileMode.Create and would truncate the volume just adopted on the spot.
@@ -263,7 +294,8 @@ public sealed class BackupRunControl(
         // (_adopted) and opens its own volume.
         // This branch is here for the day someone really does make a round reuse an old runId: to keep the run identity
         // shown in the UI stable across a suspension, say.
-        // After truncation this round's in-memory Resume is still complete (it was read in above), so the round itself
+        // After truncation this round's Resume is still complete (the records were read into the work database
+        // above, and the ledger answers from there, not from the file), so the round itself
         // runs on without error; what breaks is the guarantee **on disk**: suspend once more and the new volume vouches
         // for none of those blocks, so the next round re-uploads all of them, and the cleanup/orphan sweep that decides
         // "is this block claimed by anyone" from the journal deletes them outright as garbage.

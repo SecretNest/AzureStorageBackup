@@ -439,6 +439,7 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
             new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New(),
             verboseLog: verboseLog);
         return (orchestrator, factory, store);
     }

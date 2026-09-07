@@ -128,7 +128,8 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(blobFactory), blobFactory, store, staging,
             new RetentionCleaner(blobFactory, store, new RetentionEvaluator(), indexCache: indexCache, trackedInfo: tracked),
-            hasher, indexCache: indexCache, trackedInfo: tracked);
+            hasher, indexCache: indexCache, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = new Account
         {

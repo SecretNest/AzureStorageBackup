@@ -94,7 +94,8 @@ public sealed class StagedReleaseTests : IDisposable
                 new BlobUploader(factory), factory, store, staging,
                 new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
                 new ThrowsOnTheRecheckHash(new FileHasher(), target, packed, new InvalidOperationException("boom")),
-                authority.IndexCache, authority.Tracked);
+                authority.IndexCache, authority.Tracked,
+                workFactory: TestWorkDbs.New());
 
             await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(new BackupRequest
             {

@@ -128,7 +128,8 @@ public sealed class BackupLifecycleTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), _uploader, factory, store, staging, cleaner, hasher,
-            indexCache: indexCache, trackedInfo: tracked);
+            indexCache: indexCache, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
         var repairer = new BackupRepairer(

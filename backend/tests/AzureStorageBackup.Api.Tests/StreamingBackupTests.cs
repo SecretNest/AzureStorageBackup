@@ -108,7 +108,8 @@ public sealed class StreamingBackupTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("sbk-");
@@ -193,7 +194,8 @@ public sealed class StreamingBackupTests : IDisposable
             compressor, new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
             indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
-            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)),
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("sbkd-");
@@ -506,7 +508,8 @@ public sealed class StreamingBackupTests : IDisposable
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), cloud ?? factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked, notifier: null, opLog: opLog);
+            new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New(), notifier: null, opLog: opLog);
         var request = new BackupRequest
         {
             Account = AzuriteAccount(),

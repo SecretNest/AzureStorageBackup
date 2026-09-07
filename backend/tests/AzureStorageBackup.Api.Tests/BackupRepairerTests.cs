@@ -101,7 +101,8 @@ public sealed class BackupRepairerTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: indexCache, trackedInfo: tracked);
+            indexCache: indexCache, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
             trackedInfo: tracked, journals: _journals);

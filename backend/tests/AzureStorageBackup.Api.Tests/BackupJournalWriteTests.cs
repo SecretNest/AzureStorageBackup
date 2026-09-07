@@ -76,7 +76,8 @@ public sealed class BackupJournalWriteTests : IDisposable
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
                 indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+            new FileHasher(), authority.IndexCache, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         return (orchestrator, factory);
     }
 

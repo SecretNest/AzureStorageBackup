@@ -158,7 +158,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
 
     private const string InsertReservedHeadSql = "INSERT OR IGNORE INTO reserved_heads (head_key) VALUES (@head_key)";
 
-    /// <summary>OR IGNORE keyed by <c>path</c>, matching <c>JournalResume.BuildBlobs</c>'s <c>TryAdd</c>: the caller
+    /// <summary>OR IGNORE keyed by <c>path</c>, matching the <c>TryAdd</c> of the dictionary this replaced: the caller
     /// feeds the volumes newest first, so the first record for a path is the newest one and must win.</summary>
     private const string InsertResumeBlobSql = """
         INSERT OR IGNORE INTO resume_blobs (path, ref, full_hash, head_hash, tail_hash, length, raw, mtime_ticks, volumes, volume_sizes)
@@ -359,7 +359,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Files one journal record. The filters are <c>JournalResume</c>'s, verbatim: a blob record needs a path and a
+    /// Files one journal record. The filters are the in-memory resume table's, verbatim: a blob record needs a path and a
     /// full hash (an incomplete identity has no business answering a resume question), and a pack record needs
     /// members. Anything else is dropped rather than stored as a row nothing can match.
     /// </summary>
@@ -407,7 +407,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
 
     /// <summary>
     /// Canonical key of a member set: path + full hash + length, joined in order. Copied verbatim from
-    /// <c>JournalResume.MemberKey</c> — the two must agree exactly, because a resume that reads its pack records out
+    /// the in-memory resume table's <c>MemberKey</c> — the two must agree exactly, because a resume that reads its pack records out
     /// of this database has to reach the same verdict the in-memory table reached.
     /// <para>
     /// <c>EntryName</c> is deliberately out: in this repo it is always the member's own path, so it adds nothing to

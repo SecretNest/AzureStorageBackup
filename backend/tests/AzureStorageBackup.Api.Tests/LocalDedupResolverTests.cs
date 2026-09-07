@@ -140,7 +140,7 @@ public sealed class LocalDedupResolverTests
     /// <summary>
     /// Third of the three — the prescreen must be able to see confirmed blocks, otherwise a file with the same
     /// content at a different path gets ruled "no candidate" right at the prescreen and is recompressed for nothing
-    /// (see the notes on JournalResume.ConfirmedBlobs).
+    /// (see the notes on ResumeLedger.ConfirmedBlobsAsync).
     /// </summary>
     [Fact]
     public async Task Confirmed_Blob_Participates_In_Prescreen()

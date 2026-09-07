@@ -170,6 +170,7 @@ public sealed class BackupOrchestrator(
     IFileHasher hasher,
     ILocalIndexCache indexCache,
     TrackedInfoStore trackedInfo,
+    RunWorkDbFactory workFactory,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     VerboseFileLog? verboseLog = null,
@@ -564,6 +565,15 @@ public sealed class BackupOrchestrator(
         var opts = request.Options;
         var password = request.Password;
 
+        // This run's scratch database, opened before anything that might want to put something in it. Named after the
+        // run so two runs in flight never share a file, and deleted by DisposeAsync — the `await using` is what makes
+        // "dies with the run" true on every exit from this method, including the throwing ones.
+        //
+        // A run with no control (the direct API callers and most tests) still gets one: it is the same pipeline, and
+        // making the file optional would mean every user of it carrying a null branch. Its name is then a fresh GUID,
+        // which cannot collide with a real runId.
+        await using var work = await workFactory.CreateAsync(control?.RunId ?? Guid.NewGuid().ToString("N"), ct);
+
         // An upload-side failure must stop the diff (reading more from disk is pointless), but must **not** abort
         // the other uploads already in flight — same way the old Task.WhenAll wrapped up: let the in-flight ones
         // finish, then throw the first real exception. Any stop the user issues goes through here as well:
@@ -713,12 +723,14 @@ public sealed class BackupOrchestrator(
         if (control is not null)
             await control.OpenJournalAsync(
                 request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
-                startedAt, ct, firstRun);
+                startedAt, work, ct, firstRun);
 
         // The dedup table is built **after** opening the journal: the adopted blocks (present in the cloud, not yet
         // in any index) have to go into the table alongside the indexed ones, otherwise a file with the same content
         // at a different path would delete and re-upload them. See the confirmed parameter of Build for the reasoning.
-        var localResolver = LocalDedupResolver.Build(addressing, indexes, control?.Resume.ConfirmedBlobs());
+        var localResolver = LocalDedupResolver.Build(
+            addressing, indexes,
+            control?.Resume is { } resume ? await resume.ConfirmedBlobsAsync(ct) : null);
 
         // 3./4./5. Pipeline the diff with "pack + compress + upload".
         // These three used to be strictly serial: Diffing runs to completion → Plan → Uploading. On a first backup
@@ -822,7 +834,7 @@ public sealed class BackupOrchestrator(
         //
         // With overlap turned off, spilling matters even more: nobody is consuming at all then, so all the work piles up until the diff ends.
         var overlap = opts.OverlapDiffAndUpload;
-        using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
+        using var queue = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
 
         // The stopProducing / working tokens are created at the very top of this method (see the note there): scanning and index reading must be able to see a stop too.
 
@@ -994,7 +1006,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                while (await work.DequeueAsync(feeding.Token) is { } item)
+                while (await queue.DequeueAsync(feeding.Token) is { } item)
                 {
                     // Work that has not started yet is not done after a stop.
                     //
@@ -1540,13 +1552,13 @@ public sealed class BackupOrchestrator(
             uploadTracker.Enqueue(item.Single?.Length ?? item.Pack!.Sum(f => f.Length));
 
             // Never blocks: what does not fit in memory spills to disk. That lets the diff run straight through, which is what gives SetTotal a chance to settle early.
-            work.Enqueue(item);
+            queue.Enqueue(item);
 
             // How much spilled has to be said out loud — it is the direct reading of "how far the diff is ahead of
             // the upload", something that used to show only indirectly by CurrentItem sitting still.
             // Report only when the number changes: SetSpilled takes the publish lock, and at normal scale nothing
             // spills at all, so reporting unconditionally would put a useless lock on every item of the diff's hot path.
-            var spilled = work.SpilledItems;
+            var spilled = queue.SpilledItems;
             if (spilled != reportedSpill)
             {
                 reportedSpill = spilled;
@@ -1782,7 +1794,7 @@ public sealed class BackupOrchestrator(
             finally
             {
                 diffTracker.Complete();
-                work.CompleteAdding(); // no matter what, the consumers must learn "there is no more work", or they wait forever
+                queue.CompleteAdding(); // no matter what, the consumers must learn "there is no more work", or they wait forever
             }
 
             // Everything from here to the settle below is inside this try for one reason: **it runs while the
@@ -2443,24 +2455,27 @@ public sealed class BackupOrchestrator(
         StageTracker uploadTracker, BackupRunControl? control, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
+        // Null unless this run adopted a journal, which is the common case; both resume tiers below start by saying so.
+        var resume = control?.Resume;
 
         // Zeroth tier, and the only one that costs no read at all: the previous run uploaded this path and the file has
         // not been touched since. It is asked **first**, in front of the probe, because everything below it opens the
         // file — the pre-filter reads the head, and a candidate escalates to reading the whole thing to get a content
         // identity. That is the read this tier exists to avoid, and asking afterwards would avoid nothing.
         // The judgement it makes is the diff's own (length + mtime), not a relaxation of the content test below; see
-        // JournalResume.FindUntouchedBlob for why that is sound and where its boundary lies.
-        // The empty table is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
+        // ResumeLedger.FindUntouchedBlobAsync for why that is sound and where its boundary lies.
+        // The empty ledger is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
         // a first one most of all) would otherwise pay one more stat per file to be told there is nothing to resume.
         // Exists is checked because FileInfo.Length throws on a file that has gone away, and where "the source
         // disappeared" gets settled is the existing route below, unchanged.
-        if (control?.Resume is { IsEmpty: false } resume && new FileInfo(localPath) is { Exists: true } info)
+        if (resume is not null && !await resume.IsEmptyAsync(ct)
+            && new FileInfo(localPath) is { Exists: true } info)
         {
             var mtime = new DateTimeOffset(info.LastWriteTimeUtc);
             // The identity comes from the record, which is the identity of the bytes that were actually uploaded — the
             // same thing the tier below hands over, just without having re-derived it from the file. A record missing
             // any of the three hashes cannot supply one, and falls through to the content test like any other miss.
-            if (resume.FindUntouchedBlob(file.Path, mtime, info.Length)
+            if (await resume.FindUntouchedBlobAsync(file.Path, mtime, info.Length, ct)
                 is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched
                 && !localResolver.IsDamagedRef(untouched.Ref))
                 return new BlobPlacement(
@@ -2482,7 +2497,8 @@ public sealed class BackupOrchestrator(
             // the upload path also skips the one place healing happens (the damagedTarget force-replacement).
             // Falling through re-uploads and heals in passing. Same guard on all three tiers: without it, an
             // adoption wrote a fresh index entry pointing at content already judged unrecoverable.
-            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done
+            if (resume is not null
+                && await resume.FindBlobAsync(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash, ct) is { } done
                 && !localResolver.IsDamagedRef(done.Ref))
                 return new BlobPlacement(
                     done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
@@ -2722,7 +2738,7 @@ public sealed class BackupOrchestrator(
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
             // The journal takes part in the pre-filter too: the adopted confirmed blocks were already folded into
-            // localResolver's pre-filter set inside LocalDedupResolver.Build (see JournalResume.ConfirmedBlobs), so
+            // localResolver's pre-filter set inside LocalDedupResolver.Build (see ResumeLedger.ConfirmedBlobsAsync), so
             // asking it alone is enough here.
             var may = localResolver.MayDeduplicate(length, head);
             localResolver.NoteInFlight(length, head);
@@ -3368,7 +3384,7 @@ public sealed class BackupOrchestrator(
             // run successfully commits the index, so there is no need to copy it again.
             var journalMembers = members
                 .Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length)).ToList();
-            if (control?.Resume.FindPack(journalMembers) is { } donePack)
+            if (control?.Resume is { } resume && await resume.FindPackAsync(journalMembers, ct) is { } donePack)
             {
                 await RecordPackAsync(
                     request, donePack.Ref, members, donePack.VolumeSizes, donePack.StoreOnly, info,

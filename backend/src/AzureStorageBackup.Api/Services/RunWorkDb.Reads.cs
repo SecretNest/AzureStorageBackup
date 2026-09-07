@@ -87,13 +87,18 @@ public sealed partial class RunWorkDb
     private const string SelectResumeHeadSeenSql =
         "SELECT EXISTS (SELECT 1 FROM resume_blobs WHERE length=@length AND head_hash=@head_hash)";
 
+    /// <summary>Ordered by the primary key, which is the order SQLite would walk this table in anyway — spelling it
+    /// out costs nothing and makes the one caller that materializes the whole table produce the same list twice.</summary>
+    private const string SelectResumeBlobsSql =
+        $"SELECT {SelectResumeBlobColumns} FROM resume_blobs ORDER BY path";
+
     private const string SelectResumePackSql =
         "SELECT ref, store_only, volumes, volume_sizes FROM resume_packs WHERE members_key=@members_key";
 
     private const string SelectResumePackMembersSql =
         "SELECT path, entry_name, full_hash, length FROM resume_pack_members WHERE members_key=@members_key ORDER BY seq";
 
-    /// <summary>Blobs plus packs, which is what <c>JournalResume.RecordCount</c> counts, so a resume ledger reading
+    /// <summary>Blobs plus packs, which is what the in-memory resume table counted, so <c>ResumeLedger</c> reading
     /// from here reports the same number the in-memory table reported.</summary>
     private const string SelectResumeRecordCountSql =
         "SELECT (SELECT COUNT(*) FROM resume_blobs) + (SELECT COUNT(*) FROM resume_packs)";
@@ -248,7 +253,7 @@ public sealed partial class RunWorkDb
         ResumeBlobAsync(SelectResumeBlobByRefSql, "@ref", @ref, ct);
 
     /// <summary>A record matched on the full content identity, so the same content at a <em>different</em> path can
-    /// reuse the address the last run already took (see <c>JournalResume.ConfirmedBlobs</c>).</summary>
+    /// reuse the address the last run already took (see <c>ResumeLedger.ConfirmedBlobsAsync</c>).</summary>
     public async Task<JournalRecord?> ResumeBlobByContentAsync(
         string fullHash, long length, string headHash, string tailHash, CancellationToken ct)
     {
@@ -272,6 +277,19 @@ public sealed partial class RunWorkDb
         Set(command, "@length", length);
         Set(command, "@head_hash", headHash);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct)) != 0;
+    }
+
+    /// <summary>Every blob record the journal left, streamed. The one question here that is not a lookup: the dedup
+    /// resolver is still built up front as a dictionary, so somebody has to hand it the whole set (see
+    /// <c>ResumeLedger.ConfirmedBlobsAsync</c>). Streamed rather than returned as a list so that this file, and not
+    /// the reader, decides how much of the table is in memory at once.</summary>
+    public async IAsyncEnumerable<JournalRecord> ResumeBlobsAsync([EnumeratorCancellation] CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectResumeBlobsSql);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return ReadResumeBlob(reader);
     }
 
     private async Task<JournalRecord?> ResumeBlobAsync(
