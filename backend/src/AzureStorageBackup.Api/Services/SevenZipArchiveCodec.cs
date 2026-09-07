@@ -89,6 +89,65 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
         }
     }
 
+    public async Task EncodeFileAsync(string inputPath, string archivePath, string? password, CancellationToken ct = default)
+    {
+        var work = NewWorkDir();
+        try
+        {
+            var input = Path.Combine(work, EntryName);
+            var archive = Path.Combine(work, "out.7z");
+            // 7z takes the entry name from the file name it is handed, so the source must be copied (not just
+            // pointed at) under the "content" name inside the work dir — same reason EncodeAsync writes the
+            // byte array out under that name rather than compressing it in place.
+            File.Copy(inputPath, input);
+
+            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // maximum compression (PRD 3.3.2.1)
+            if (!string.IsNullOrEmpty(password))
+            {
+                args.Add("-p" + password);
+                args.Add("-mhe=on");
+            }
+            args.Add(archive);
+            args.Add(input);
+
+            // Same silent-drop verification as EncodeAsync: see the comment there for why exit code 1 alone isn't trustworthy.
+            var run = await RunAsync(args, ct);
+            if (run.ExitCode == 1
+                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))
+            {
+                throw new ArchiveMembersMissingException([EntryName],
+                    "7-Zip left the payload out of the archive.");
+            }
+            File.Move(archive, archivePath, overwrite: true);
+        }
+        finally
+        {
+            TryDelete(work);
+        }
+    }
+
+    public async Task DecodeFileAsync(string archivePath, string outputPath, string? password, CancellationToken ct = default)
+    {
+        var work = NewWorkDir();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+
+            var args = new List<string> { "x", "-y", "-bso0", "-bsp0" };
+            if (!string.IsNullOrEmpty(password))
+                args.Add("-p" + password);
+            args.Add("-o" + outDir);
+            args.Add(archivePath);
+
+            await RunAsync(args, ct);
+            File.Move(Path.Combine(outDir, EntryName), outputPath, overwrite: true);
+        }
+        finally
+        {
+            TryDelete(work);
+        }
+    }
+
     private string NewWorkDir()
     {
         var dir = Path.Combine(_tempRoot, Guid.NewGuid().ToString("N"));

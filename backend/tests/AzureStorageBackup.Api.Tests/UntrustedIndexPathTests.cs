@@ -91,6 +91,12 @@ public sealed class UntrustedIndexPathTests : IDisposable
 
         public Task<byte[]> DecodeAsync(byte[] archive, string? password, CancellationToken ct = default)
             => throw new InvalidOperationException("codec must not be reached in these tests");
+
+        public Task EncodeFileAsync(string inputPath, string archivePath, string? password, CancellationToken ct = default)
+            => throw new InvalidOperationException("codec must not be reached in these tests");
+
+        public Task DecodeFileAsync(string archivePath, string outputPath, string? password, CancellationToken ct = default)
+            => throw new InvalidOperationException("codec must not be reached in these tests");
     }
 
     private sealed class ThrowingUploader : IBlobUploader
