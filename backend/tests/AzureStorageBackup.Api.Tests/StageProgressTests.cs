@@ -1156,4 +1156,80 @@ public sealed class StageProgressTests
         // are trivially equal), and the reader has to reason backwards to see what the assertion guards against.
         Assert.Equal(countAfterB, seen.Count);
     }
+
+    /// <summary>
+    /// The estimate is a whole-run average, and a pause is not part of the run. Two gigabytes moved in one second
+    /// with two to go is a second left — before the pause, and still after ten thousand seconds held, rather
+    /// than ten thousand and one. The pause's own time comes off the clock as the gate reports it, read live.
+    /// </summary>
+    [Fact]
+    public void Time_Held_At_The_Pause_Is_Not_Part_Of_The_Estimates_Clock()
+    {
+        var now = 0L;
+        var held = 0L;
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add, heldMs: () => held) { Clock = () => now };
+
+        const long gb = 1024L * 1024 * 1024;
+        tracker.Enqueue(2 * gb);
+        tracker.Enqueue(2 * gb);
+        tracker.SetTotal(2);
+        tracker.BeginWork();
+        tracker.SetTransferred(0);
+
+        now = 1000;
+        tracker.BeginUpload("data/first", volumes: 1);
+        tracker.BeginItem("data/first", owner: "data/first", totalBytes: 2 * gb);
+        tracker.ItemProgress("data/first").Report(2 * gb);
+        tracker.EndItem("data/first", 0);
+        tracker.ConfirmUpload("data/first");
+        tracker.EndUpload("data/first");
+        tracker.Advance(0, work: 2 * gb);
+        tracker.SetTransferred(2 * gb);
+        now = 2000;
+        tracker.Touch("data/second");   // a publish, forced by the new name
+        Assert.Equal(1.0, seen[^1].EtaSeconds!.Value, precision: 1);
+
+        // Paused for ten thousand seconds with nothing moving.
+        now = 12000;
+        held = 10000;
+        tracker.Touch("data/second/again");
+        Assert.Equal(1.0, seen[^1].EtaSeconds!.Value, precision: 1);
+
+        // Resumed; another second of real work, still with the two gigabytes to go.
+        now = 13000;
+        tracker.Touch("data/second/still");
+        Assert.Equal(2.0, seen[^1].EtaSeconds!.Value, precision: 1);
+    }
+
+    /// <summary>A pause that ended before the stage's clock started was never on that clock, so it is not taken off it.</summary>
+    [Fact]
+    public void Time_Held_Before_The_Stage_Started_Is_Left_Alone()
+    {
+        var now = 0L;
+        var held = 5000L;   // an earlier stage stood held for five seconds
+        var seen = new List<StageProgress>();
+        var tracker = new StageTracker("Uploading", total: 0, seen.Add, heldMs: () => held) { Clock = () => now };
+
+        const long gb = 1024L * 1024 * 1024;
+        tracker.Enqueue(2 * gb);
+        tracker.Enqueue(2 * gb);
+        tracker.SetTotal(2);
+        now = 20000;
+        tracker.BeginWork();
+        tracker.SetTransferred(0);
+
+        now = 21000;
+        tracker.BeginUpload("data/first", volumes: 1);
+        tracker.BeginItem("data/first", owner: "data/first", totalBytes: 2 * gb);
+        tracker.ItemProgress("data/first").Report(2 * gb);
+        tracker.EndItem("data/first", 0);
+        tracker.ConfirmUpload("data/first");
+        tracker.EndUpload("data/first");
+        tracker.Advance(0, work: 2 * gb);
+        tracker.SetTransferred(2 * gb);
+        now = 22000;
+        tracker.Touch("data/second");
+        Assert.Equal(1.0, seen[^1].EtaSeconds!.Value, precision: 1);
+    }
 }

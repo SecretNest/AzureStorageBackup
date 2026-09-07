@@ -754,7 +754,9 @@ public sealed class BackupOrchestrator(
         // StageTracker.Eta): this stage's cost is mostly spread over "at least one stat per entry", and only the
         // few changed files actually get read end to end — extrapolating by bytes would let an unchanged 100 GB
         // file fly by in a second and make the remaining time collapse on the spot.
-        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff);
+        // The diff parks at the gate too, so its estimate's clock stops with the hold the same way the upload's does.
+        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff,
+            heldMs: control is null ? null : () => control.Gate.HeldMs);
         // The upload total **grows as we go** (the diff is still pushing work into the queue), so report 0 = unknown
         // at first: computing a percentage against a still-growing denominator makes it shoot to 100 and fall back.
         // Same for the workload, which accumulates item by item via Enqueue.
@@ -766,9 +768,12 @@ public sealed class BackupOrchestrator(
         // the ones held in checking. Both halves are measured **here**, off the pool — which is why the UI names the
         // disk: the object count beside them comes from the item ledger instead, and objects owning no archive at all
         // never reach this seat to be counted.
+        // heldMs: the time the operator's pause has stood with nothing moving, taken out of the estimate's clock —
+        // see StageTracker.ElapsedMs. Read live off the gate, as the staging readings are read live off the seat.
         var uploadTracker = new StageTracker(
             "Uploading", total: 0, reporter.ReportUpload, speedWhileInFlight: true,
-            stagedBytes: () => stagingLease.Bytes, stagedFiles: () => stagingLease.Files);
+            stagedBytes: () => stagingLease.Bytes, stagedFiles: () => stagingLease.Files,
+            heldMs: control is null ? null : () => control.Gate.HeldMs);
         // "Bytes transferred" uses the item-level authoritative reading (RunState.UploadedBytes) rather than a
         // per-volume accumulation — it has to be read side by side with the raw bytes that are settled per item, so
         // the two must be measured the same way. This line claims ownership before the first item completes; see the note on SetTransferred.
@@ -1333,9 +1338,10 @@ public sealed class BackupOrchestrator(
                         if (control is { Stop: not StopKind.None })
                             continue;
 
-                        // In hand for the length of the item: the file under 7z finishes whatever the gate says.
-                        // The one wait inside it the pause can make endless — for staging room, freed only by
-                        // uploads — steps out on its own (see IdleOf).
+                        // In hand for the length of the item. The file under 7z does not finish whatever the gate
+                        // says any more: the hold stops the process where it is and counts it out for as long as
+                        // it is stopped (PauseGate.Processes). The one wait inside the item the pause can make
+                        // endless — for staging room, freed only by uploads — steps out on its own (see IdleOf).
                         using (control?.Gate.BeginWork())
                             await StageProbedAsync(probed, feeding.Token);
                     }
@@ -2825,7 +2831,8 @@ public sealed class BackupOrchestrator(
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = async (compressTemp, token) => raw
             ? [await CopyRawStreamingAsync(localPath, compressTemp, name, streaming, uploadTracker, token)]
             : await CompressStreamingAsync(
-                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, uploadTracker, token);
+                request, compressTemp, name, entryName, localPath, storeOnly, before.Length, streaming, uploadTracker,
+                state.Control?.Gate.Processes, token);
         // A single file names itself. Not the staged name a line above — that is a hash of the path, chosen for not
         // colliding in the temp area, and it says nothing to the person reading the row.
         // The wait for room or for the lock steps out of the pause accounting (IdleOf): room is freed by uploads,
@@ -2865,14 +2872,18 @@ public sealed class BackupOrchestrator(
         return dest;
     }
 
+    /// <param name="hold">The run's pause hold, so the 7z started here stops with the pause instead of finishing
+    /// the file first (<see cref="PauseGate.Processes"/>). Null when the run has no control to pause.</param>
     private async Task<IReadOnlyList<string>> CompressStreamingAsync(
         BackupRequest request, string compressTemp, string archiveName, string entryName, string localPath,
-        bool storeOnly, long expectedBytes, StreamingHasher streaming, StageTracker? tracker, CancellationToken ct)
+        bool storeOnly, long expectedBytes, StreamingHasher streaming, StageTracker? tracker, ProcessHold? hold,
+        CancellationToken ct)
     {
         var output = Path.Combine(compressTemp, archiveName + ".7z");
         var result = await compressor.CompressStreamAsync(
             new StreamCompressionRequest(entryName, output, request.Password,
-                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedBytes),
+                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly, ExpectedBytes: expectedBytes,
+                Hold: hold),
             async (stdin, token) =>
             {
                 await using var source = FileHasher.OpenRead(localPath);
@@ -3821,7 +3832,7 @@ public sealed class BackupOrchestrator(
     {
         var entries = members.Select(m => m.EntryName).ToList();
         Func<string, CancellationToken, Task<IReadOnlyList<string>>> produce = (compressTemp, token) => CompressAsync(
-            request, compressTemp, packId, entries, storeOnly, token);
+            request, compressTemp, packId, entries, storeOnly, state.Control?.Gate.Processes, token);
         // The pack id is content-addressed and means nothing to a person, so the row is named by where the members
         // come from. Built from `entries` — the members of *this* archive, which for a retry is the narrowed set
         // rather than the group the planner first put together.
@@ -3978,14 +3989,15 @@ public sealed class BackupOrchestrator(
         }
     }
 
+    /// <param name="hold">As on <see cref="CompressStreamingAsync"/>.</param>
     private async Task<IReadOnlyList<string>> CompressAsync(
         BackupRequest request, string compressTemp, string archiveName,
-        IReadOnlyList<string> entries, bool storeOnly, CancellationToken ct)
+        IReadOnlyList<string> entries, bool storeOnly, ProcessHold? hold, CancellationToken ct)
     {
         var output = Path.Combine(compressTemp, archiveName + ".7z");
         var result = await compressor.CompressAsync(
             new CompressionRequest(request.LocalRoot, entries, output, request.Password,
-                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly), ct);
+                VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly, Hold: hold), ct);
         return result.VolumeFiles;
     }
 

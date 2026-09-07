@@ -109,4 +109,87 @@ public sealed class SevenZipCliTests : IDisposable
         Directory.Delete(work, recursive: true);
         Assert.False(Directory.Exists(work));
     }
+
+    /// <summary>
+    /// The pause used to wait for the file under 7z. Now the hold stops the process where it is — the marker this
+    /// script writes after its sleep must not appear while the hold stands, and must appear once it is lifted,
+    /// with the run completing normally: nothing was killed, nothing is redone.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Held_Run_Stops_Where_It_Is_And_Finishes_On_Release()
+    {
+        Skip.IfNot(File.Exists("/bin/sh") && ProcessHold.Supported, "POSIX shell on Linux required.");
+        var marker = Path.Combine(_dir, "finished.txt");
+        var hold = new ProcessHold();
+
+        var run = SevenZipCli.RunAsync("/bin/sh", ["-c", $"sleep 0.5; echo done > '{marker}'"], default, hold: hold);
+        await Task.Delay(100);
+        hold.Hold();
+
+        await Task.Delay(1500); // well past the sleep: a running shell would have written by now
+        Assert.False(File.Exists(marker), "the process ran on under the hold");
+        Assert.False(run.IsCompleted);
+
+        hold.Release();
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(File.Exists(marker));
+    }
+
+    /// <summary>
+    /// The streaming path under a hold: the feed is blocked on a pipe the stopped process no longer drains, and the
+    /// bytes in the pipe are the bytes it picks up with on release — every byte written is a byte 7z reads, once.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Held_Streaming_Run_Resumes_Mid_Feed_Without_Losing_A_Byte()
+    {
+        Skip.IfNot(File.Exists("/bin/sh") && ProcessHold.Supported, "POSIX shell on Linux required.");
+        var counted = Path.Combine(_dir, "count.txt");
+        var hold = new ProcessHold();
+        var chunk = new byte[64 * 1024];
+        long written = 0;
+
+        var run = SevenZipCli.RunStreamingAsync("/bin/sh", ["-c", $"wc -c > '{counted}'"], default,
+            writeStdin: async (stdin, token) =>
+            {
+                for (var i = 0; i < 64; i++)   // 4 MB, far beyond the pipe buffer
+                {
+                    await stdin.WriteAsync(chunk, token);
+                    written += chunk.Length;
+                    if (i == 8)
+                    {
+                        hold.Hold();
+                        _ = Task.Delay(500).ContinueWith(_ => hold.Release(), TaskScheduler.Default);
+                    }
+                }
+            }, hold: hold);
+
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(64L * 64 * 1024, written);
+        Assert.Equal(written.ToString(), File.ReadAllText(counted).Trim());
+    }
+
+    /// <summary>Stop pressed against a held run: the kill goes through a stopped process as it does a running one.
+    /// (The run control releases the hold before it cancels, so in the product the process is already running by
+    /// then; this is the belt to that suspender.)</summary>
+    [SkippableFact]
+    public async Task Cancelling_A_Held_Run_Still_Kills_It()
+    {
+        Skip.IfNot(File.Exists("/bin/sh") && ProcessHold.Supported, "POSIX shell on Linux required.");
+        var marker = Path.Combine(_dir, "held-still-running.txt");
+        var hold = new ProcessHold();
+
+        using var cts = new CancellationTokenSource();
+        var run = SevenZipCli.RunAsync(
+            "/bin/sh", ["-c", $"( sleep 2; echo alive > '{marker}' ) & wait"], cts.Token, hold: hold);
+        await Task.Delay(300);
+        hold.Hold();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(TimeSpan.FromSeconds(5)));
+        hold.Release();   // the children of a stopped shell were not stopped with it; let them go, then check the parent is gone
+        await Task.Delay(2500);
+        Assert.False(File.Exists(marker), "the child process outlived the cancellation");
+    }
 }

@@ -30,8 +30,9 @@ import { PauseSource, type PauseInfo } from '../api/backupConfigs'
  * nobody paused.
  *
  * `settled` is the third fact, and it is what decides between "Pausing…" and "Paused". The hold goes up the
- * instant the button is pressed, but it holds only what has not started: the volumes on the wire land and
- * the file under 7z finishes first, and on a slow link that is minutes. "Paused" over a row whose in-flight
+ * instant the button is pressed, but it holds only what has not started: the volumes on the wire land
+ * first, and on a slow link that is minutes (the file under 7z is stopped where it is, so it is not what
+ * the row waits for — see `PauseGate.Processes`). "Paused" over a row whose in-flight
  * line was visibly still moving read as the button having done nothing (field report, 2026-09-07). The
  * backend says when the last piece in hand has landed (`BackupRun.pauseSettled`), and until then the label
  * says what is really happening — the same way Suspend reads "Suspending…" for as long as it winds down.

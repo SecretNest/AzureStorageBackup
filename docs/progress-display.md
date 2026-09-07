@@ -436,6 +436,15 @@ The denominators keep growing until the diff finishes, so the ETA — like the p
 until the total settles. Extrapolating from a growing denominator makes the remaining time shrink and
 then bounce back.
 
+The elapsed time is the wall clock since the first stream opened, **less the time the run has stood
+at the operator's pause with nothing moving** (`PauseGate.HeldMs`, read live on every publish). A
+whole-run average that counted an overnight pause as time spent moving bytes would print a remaining
+time stretched by the whole night and shrink it back only as the run wore the night down. Only the
+settled stretch comes off — while the volumes on the wire are still landing, the bytes are real and so
+is their time — and only what accrued after the stage's own clock started: a pause that ended before
+that was never on the clock. A transient-error backoff stays on it; that is time the run really spent
+not getting through.
+
 ## The display: two lines, one timeline
 
 The first line is what has **settled**; the second is what has not. The dividing line is a question

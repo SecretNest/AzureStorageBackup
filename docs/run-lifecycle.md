@@ -174,10 +174,17 @@ the item:
   pause lets finish on the wire is exactly the volumes that were on it. Before this, the item was the
   file, every volume of it: a hundred-gigabyte file pressed Pause against ran to its end while the row
   said "Paused" (field report, 2026-09-07).
-- **The compressor finishes the file under 7z.** Aborting mid-item would need 7z killed, partial
-  output deleted and the item recompressed from scratch next time, trading a real recompression for
-  a few seconds of responsiveness. Its wait for staging room is a different matter — room is freed by
-  uploads, and none is coming while the hold stands — so that wait steps out of the accounting below.
+- **The compressor stops within the file.** The hold sends the 7z process SIGSTOP where it is and
+  Resume sends SIGCONT (`ProcessHold`, owned by the gate as `PauseGate.Processes`; every 7z a run
+  starts registers there through its compression request). Nothing is killed and nothing is redone:
+  the kernel keeps the process's memory, its handles and the volumes written so far, and on the
+  streaming route the feed blocks on the full pipe within one buffer, so the source read stops with
+  it. A downgrade (Suspend, Stop, the shutdown path, patience) releases the process **before**
+  anything is cancelled: the feed is blocked on a pipe only that process drains, and a wind-down into
+  a stopped process would wait on a writer that never returns. Linux only; elsewhere the hold is a
+  no-op and the file finishes first. Its wait for staging room is a different matter — room is freed
+  by uploads, and none is coming while the hold stands — so that wait steps out of the accounting
+  below.
 - **The pack loop asks at every group**, not only when it takes the item. A box is normally one group,
   but the loop also grows: a member that changed under 7z is re-queued, and the wrap-up hands whole
   subtrees of dangling aliases through it serially, after every pipeline loop has parked or exited.
@@ -188,6 +195,13 @@ the item:
 - **The prober finishes the item it is hashing.** Its read is the cheap one to redo, but it is also
   the short one.
 
+> **Rationale.** Stopping the process rather than finishing or killing it. Finishing was the first
+> design — killing 7z would have meant deleting the partial output and recompressing the item from
+> scratch on Resume, a real recompression traded for a few seconds of responsiveness — and on a large
+> file it was the pause's worst case: a hundred-gigabyte file pressed Pause against ran on for hours.
+> A stopped process costs neither: the kernel holds everything where it was and SIGCONT picks up
+> mid-byte.
+
 **"Pausing…" until it has taken effect.** The hold goes up the instant the button is pressed, but it
 holds only what has not started; on a slow link the pieces in hand take minutes to finish. The run
 response carries `pauseSettled` beside `pausedByUser`, false until nothing is in hand any more, and
@@ -197,13 +211,20 @@ CPU on its own (`PauseGate.BeginWork`): a volume past the hold check, the file u
 prober is reading, the diff between two of its callbacks, the scan, the wrap-up's re-run. A worker
 parked at the gate mid-item, or blocked on a wait the pause itself makes endless (staging room, the
 compression lock, the prober's hand-off into a full probed queue whose only consumer is on the room
-wait), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`). The hand-off is
+wait), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`), and so does a
+7z the hold has stopped, for as long as it is stopped. The hand-off is
 the one that was missed at first: with the pool full the compressor waits for room, the nine-deep
 probed queue fills behind it, and the prober blocks on its write — room comes only from uploads, and a
 standing hold parks every uploader, so that write never lands and the run read "Pausing…" for as long
 as the hold stood (field report, 2026-09-07, 2026.9.7.1).
 Counting the volume rather than the file is what makes the two labels honest: an uploader holding a
 hundred-volume file has, once the hold is up, a handful of volumes still moving and not the file.
+
+**The estimate's clock stops with the run.** The gate keeps the time the hold has stood settled —
+"Paused", not "Pausing…", since while pieces are still landing their time is real work time — as
+`PauseGate.HeldMs`, and the upload stage's tracker reads it live and takes it off the elapsed time
+its remaining-time estimate extrapolates from (see [progress-display.md](progress-display.md) § ETA).
+The speed needs no such correction: its clock already runs only while a stream is open.
 
 > **One gate means these four also park on a transient-error pause**, which changes how the pipeline
 > behaves during a network blip and not only during a deliberate pause. Before, an upload that hit

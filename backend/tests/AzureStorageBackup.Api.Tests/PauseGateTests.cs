@@ -580,4 +580,167 @@ public class PauseGateTests
         work.Dispose();
         Assert.True(gate.Snapshot().Settled);
     }
+
+    /// <summary>Linux's process state letter from /proc, for asserting a process really is stopped ('T') or not.</summary>
+    private static string ProcState(System.Diagnostics.Process p)
+    {
+        // "pid (comm) S ..." — the comm may contain spaces, so read past its closing parenthesis.
+        var stat = File.ReadAllText($"/proc/{p.Id}/stat");
+        return stat[(stat.LastIndexOf(')') + 2)..].Split(' ')[0];
+    }
+
+    private static async Task<string> WaitForStateAsync(System.Diagnostics.Process p, params string[] any)
+    {
+        var state = "";
+        for (var i = 0; i < 200; i++)
+        {
+            state = ProcState(p);
+            if (any.Contains(state))
+                return state;
+            await Task.Delay(10);
+        }
+        return state;
+    }
+
+    private static System.Diagnostics.Process Sleeper() =>
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("sleep", "30") { UseShellExecute = false })!;
+
+    /// <summary>
+    /// The pause used to let the file under 7z finish. Now the hold stops the process where it is, and a stopped
+    /// process is not what keeps the run "pausing": it is in some loop's hand, but nothing in that hand is moving.
+    /// Resume lets it run again, and the run is back to unsettled.
+    /// </summary>
+    [SkippableFact]
+    public async Task The_Hold_Stops_An_Attached_Process_And_Counts_It_Out_Of_Hand()
+    {
+        Skip.IfNot(ProcessHold.Supported, "process stopping is Linux-only");
+        using var gate = new PauseGate();
+        using var proc = Sleeper();
+        try
+        {
+            using var work = gate.BeginWork();
+            using var attached = gate.Processes.Attach(proc);
+            Assert.Equal("S", await WaitForStateAsync(proc, "S"));
+
+            gate.PauseByUser();
+            Assert.Equal("T", await WaitForStateAsync(proc, "T"));
+            Assert.True(gate.IsSettled, "the file under 7z is stopped; nothing in hand is moving");
+
+            gate.ResumeByUser();
+            Assert.Equal("S", await WaitForStateAsync(proc, "S"));
+            Assert.False(gate.IsSettled);
+        }
+        finally
+        {
+            proc.Kill();
+        }
+    }
+
+    /// <summary>A 7z that starts while the hold stands is stopped the instant it is attached, before it gets going.</summary>
+    [SkippableFact]
+    public async Task A_Process_Attached_Under_A_Standing_Hold_Is_Stopped_At_Once()
+    {
+        Skip.IfNot(ProcessHold.Supported, "process stopping is Linux-only");
+        using var gate = new PauseGate();
+        gate.PauseByUser();
+        using var work = gate.BeginWork();
+        Assert.False(gate.IsSettled);
+
+        using var proc = Sleeper();
+        try
+        {
+            using var attached = gate.Processes.Attach(proc);
+            Assert.Equal("T", await WaitForStateAsync(proc, "T"));
+            Assert.True(gate.IsSettled);
+        }
+        finally
+        {
+            proc.Kill();
+        }
+    }
+
+    /// <summary>
+    /// A downgrade — Suspend, Stop, the shutdown path, patience — releases the process before anything is cancelled.
+    /// The compressor feeding it is blocked on a pipe only that process drains; left stopped, the wind-down would
+    /// wait on a writer that never returns.
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Downgrade_Lets_A_Stopped_Process_Run_Again()
+    {
+        Skip.IfNot(ProcessHold.Supported, "process stopping is Linux-only");
+        using var gate = new PauseGate();
+        using var proc = Sleeper();
+        try
+        {
+            using var work = gate.BeginWork();
+            using var attached = gate.Processes.Attach(proc);
+            gate.PauseByUser();
+            Assert.Equal("T", await WaitForStateAsync(proc, "T"));
+
+            gate.Downgrade();
+            Assert.Equal("S", await WaitForStateAsync(proc, "S"));
+            Assert.False(gate.Processes.IsHeld);
+        }
+        finally
+        {
+            proc.Kill();
+        }
+    }
+
+    /// <summary>
+    /// What the estimate subtracts: the time the hold stood with nothing in hand — "Paused", not "Pausing…". A
+    /// volume still landing is real work time, and so is a piece stopped only after the hold went up; the clock
+    /// runs from the moment the last piece settles to the moment Resume lets the first one move.
+    /// </summary>
+    [Fact]
+    public void Held_Time_Runs_Exactly_While_Settled()
+    {
+        var now = 0L;
+        using var gate = new PauseGate { Clock = () => now };
+        Assert.Equal(0, gate.HeldMs);
+
+        var work = gate.BeginWork();
+        now = 1000;
+        gate.PauseByUser();
+        now = 2000;
+        Assert.Equal(0, gate.HeldMs);   // pausing: a volume is still on the wire
+
+        work.Dispose();                 // it landed: paused
+        now = 5000;
+        Assert.Equal(3000, gate.HeldMs);
+
+        gate.ResumeByUser();
+        now = 9000;
+        Assert.Equal(3000, gate.HeldMs);   // resumed at 5000; nothing since counts
+
+        gate.PauseByUser();             // nothing in hand: settled on the spot
+        now = 10000;
+        Assert.Equal(4000, gate.HeldMs);
+
+        using (gate.BeginWork())        // the wrap-up's re-run, say: in hand under the hold
+        {
+            now = 12000;
+            Assert.Equal(4000, gate.HeldMs);
+        }
+        now = 13000;
+        Assert.Equal(5000, gate.HeldMs);
+    }
+
+    /// <summary>A transient-error backoff is not a pause the operator chose: its time stays on the estimate's clock.</summary>
+    [Fact]
+    public async Task Held_Time_Ignores_A_Backoff_Nobody_Pressed_Pause_For()
+    {
+        var now = 0L;
+        using var gate = new PauseGate(
+            schedule: [TimeSpan.FromSeconds(30)], steady: TimeSpan.FromSeconds(30),
+            patience: TimeSpan.FromMinutes(10)) { Clock = () => now };
+        var waiting = gate.WaitAsync(new IOException("blip"), default);
+        for (var i = 0; i < 200 && gate.Current is null; i++)
+            await Task.Delay(5);
+
+        now = 60000;
+        Assert.Equal(0, gate.HeldMs);
+        gate.Downgrade();
+        Assert.False(await waiting);
+    }
 }

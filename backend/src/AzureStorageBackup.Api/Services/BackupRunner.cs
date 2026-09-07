@@ -139,7 +139,7 @@ public sealed class BackupRunState
 
     /// <summary>
     /// Whether the operator's hold has taken effect: it stands and nothing is in hand any more. False while the
-    /// hold is up but the volumes on the wire and the file under 7z are still finishing — the run is
+    /// hold is up but the volumes on the wire are still finishing — the run is
     /// <b>pausing</b>, and the browser says so rather than "Paused" over a run visibly still uploading. See
     /// <see cref="PauseGate.IsSettled"/>.
     /// </summary>
@@ -199,7 +199,8 @@ public sealed record BackupRunResponse(
     /// <summary>
     /// Whether that hold has taken effect (see <see cref="BackupRunState.PauseSettled"/>). Published beside
     /// <see cref="PausedByUser"/> rather than folded into it because the browser draws two different labels from
-    /// the pair: "Pausing…" while the volumes on the wire and the file under 7z finish, "Paused" once they have.
+    /// the pair: "Pausing…" while the volumes on the wire finish, "Paused" once they have (the file under 7z
+    /// is stopped where it is — see <see cref="PauseGate.Processes"/> — so it is not what the row waits for).
     /// A browser older than this field ignores it; a backend older than it sends nothing, which the browser reads
     /// as settled — the only reading it had before.
     /// </summary>
@@ -620,7 +621,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
 
     /// <summary>
     /// The user pressed Pause: hold the run where it is. Each stage finishes the item in hand and then parks at the
-    /// gate, so it takes effect within one item per stage — worst case, the time to compress one large file.
+    /// gate, so it takes effect within one item per stage — worst case, the volumes already on the wire. The
+    /// file under 7z does not finish first: the hold stops the process where it is (<see cref="PauseGate.Processes"/>).
     /// <para>
     /// Nothing is discarded and nothing is flushed. The run stays alive, holding its staging quota — which is booked
     /// on a process-wide singleton, so a run paused overnight makes this machine's other backups wait overnight —

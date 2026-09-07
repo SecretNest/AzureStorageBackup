@@ -428,9 +428,15 @@ public sealed record StageProgress(
 /// <paramref name="stagedBytes"/>, and pointless without it: the pair is what the UI needs to say
 /// "M volumes on the staging disk, X GB", and neither half can be computed from the other.
 /// </param>
+/// <param name="heldMs">
+/// How long the run has stood at the operator's pause with nothing moving, in milliseconds so far
+/// (<c>PauseGate.HeldMs</c>). Read fresh on every publish like <paramref name="stagedBytes"/>, and taken out of
+/// the elapsed time the estimate extrapolates from — see <see cref="Eta"/>. The speed needs no such correction:
+/// its clock already runs only while a stream is open, and a held run has none. Null for a stage no pause reaches.
+/// </param>
 public sealed class StageTracker(
     string stage, int total, Action<StageProgress> publish, bool speedWhileInFlight = false,
-    Func<long>? stagedBytes = null, Func<int>? stagedFiles = null) : IDisposable
+    Func<long>? stagedBytes = null, Func<int>? stagedFiles = null, Func<long>? heldMs = null) : IDisposable
 {
     private const int ThrottleMs = 200;
     private const int SpeedWindowMs = 10_000;
@@ -591,6 +597,11 @@ public sealed class StageTracker(
     // idle waiting before the first item shows up; measuring the average speed from construction smears that idling in and stretches the ETA the whole way.
     // -1 = not started yet (stages where nobody calls BeginWork — diff, for one — are uniformly treated as "construction is the start", which is correct).
     private long _workStartMs = -1;
+    /// <summary>The held time already on the clock when <see cref="_workStartMs"/> and <see cref="_firstMoveMs"/>
+    /// were stamped. A pause that ended before the stage's clock started is not part of its elapsed time, so it
+    /// cannot be subtracted from it either: only what accrued since the stamp is.</summary>
+    private long _heldAtWorkStartMs;
+    private long _heldAtFirstMoveMs;
     /// <summary>When this stage first got a byte onto the wire; -1 until then. The remaining-time estimate divides
     /// by work that moved bytes, so it has to measure time from when bytes started moving — see <see cref="Eta"/>.</summary>
     private long _firstMoveMs = -1;
@@ -619,6 +630,18 @@ public sealed class StageTracker(
     internal Func<long>? Clock { get; init; }
 
     private long NowMs() => Clock?.Invoke() ?? _clock.ElapsedMilliseconds;
+
+    /// <summary>The held-time reading, 0 for a stage with no pause to be held at.</summary>
+    private long HeldMs() => heldMs?.Invoke() ?? 0;
+
+    /// <summary>
+    /// The elapsed time the estimate extrapolates from: wall-clock since <paramref name="startMs"/>, less the time
+    /// the run stood held at the pause since then. Held time is time in which no byte could move, so an average
+    /// that kept it would be the average of a run that had been slower than this one, and its answer longer.
+    /// Clamped at zero against the two readings being taken a beat apart.
+    /// </summary>
+    private long ElapsedMs(long now, long startMs, long heldAtStartMs) =>
+        Math.Max(0, now - startMs - Math.Max(0, HeldMs() - heldAtStartMs));
 
     /// <summary>The timestamp used for speed. Stages with the switch on use the "only advances while a stream is open" virtual axis; the rest stay on the wall clock.</summary>
     private long SpeedNow(long now) =>
@@ -753,7 +776,11 @@ public sealed class StageTracker(
     {
         Interlocked.Increment(ref _inWork);
         // The first item being picked up = this stage really started working; the average speed is measured from here.
-        Interlocked.CompareExchange(ref _workStartMs, NowMs(), -1);
+        // The held reading is taken first so it cannot be later than the stamp it is paired with: a hold ending in
+        // between would then be subtracted from a stretch it was never part of.
+        var heldNow = HeldMs();
+        if (Interlocked.CompareExchange(ref _workStartMs, NowMs(), -1) == -1)
+            Volatile.Write(ref _heldAtWorkStartMs, heldNow);
         // Work in hand is enough to keep the heartbeat running — it must not wait for a stream to open. The stretches
         // that settle without transferring a byte (a dedup hit, a resume hit, a raw in-place item) would otherwise
         // leave the stage publishing nothing at all, and the UI displaying the snapshot from the last volume that
@@ -1085,7 +1112,10 @@ public sealed class StageTracker(
             // first byte to *land* instead would throw away the time that produced it, which for one big item's
             // first volume is minutes. See Eta.
             if (_firstMoveMs < 0)
+            {
                 _firstMoveMs = NowMs();
+                _heldAtFirstMoveMs = HeldMs();
+            }
             if (!_active.TryAdd(item, new InFlight(label ?? item, totalBytes, owner, staged, wire)))
                 return;
             // One more of this family's volumes has left the disk. Counted here rather than at the gate: what the waiting
@@ -1579,7 +1609,7 @@ public sealed class StageTracker(
             if (_processed <= 0 || _processed >= _total)
                 return null;
             var since = Volatile.Read(ref _workStartMs);
-            var ms = now - (since < 0 ? 0 : since);
+            var ms = since < 0 ? now : ElapsedMs(now, since, Volatile.Read(ref _heldAtWorkStartMs));
             return ms <= 0 ? null : (double)ms * (_total - _processed) / _processed / 1000;
         }
 
@@ -1627,7 +1657,9 @@ public sealed class StageTracker(
         var startMs = firstMove >= 0 ? firstMove : Volatile.Read(ref _workStartMs);
         if (startMs < 0)
             return null;
-        var elapsedMs = now - startMs;
+        // Less the held time: a run paused overnight is not a run that took all night to move what it moved.
+        var elapsedMs = ElapsedMs(now, startMs,
+            firstMove >= 0 ? _heldAtFirstMoveMs : Volatile.Read(ref _heldAtWorkStartMs));
         if (elapsedMs <= 0)
             return null;
 
