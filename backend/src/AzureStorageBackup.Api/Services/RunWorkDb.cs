@@ -26,6 +26,21 @@ public enum DraftState
 /// back in, which is why the draft is read by <c>seq</c> and not by path.</summary>
 public sealed record DraftRow(int Seq, string Path, DraftState State, IndexEntry Entry);
 
+/// <summary>
+/// The same row with everything the final entry is decided from: the diff's verdict and the entry it produced, the
+/// previous version's entry (null when the path is new), and what the run recorded afterwards — the settled identity
+/// of a file that changed while it was being processed, the tail hash the compression pass produced, and the reason
+/// a path that was readable at diff time could not be reopened.
+/// <para>
+/// <see cref="HasCurrent"/> is not <c>Entry is not null</c>: every row has entry columns, because they cannot be
+/// null in the table, but a change under a directory that could not be listed never had a current entry at all and
+/// its columns stand in for one. Only <see cref="RunLedger.FinalEntriesAsync"/> knows the difference matters.
+/// </para>
+/// </summary>
+public sealed record DraftFullRow(
+    int Seq, string Path, DraftState State, ChangeKind Kind, bool HasCurrent, IndexEntry Entry,
+    IndexEntry? Previous, EntryOverride? Override, string? TailSet, string? PostDiffReason);
+
 /// <summary>A block of content this run has claimed an address for: what a later file with the same content must be
 /// pointed at instead of uploading it a second time.</summary>
 public sealed record ReservationRow(string Ref, bool Raw, int Volumes, IReadOnlyList<long> VolumeSizes);
@@ -69,16 +84,25 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     // ---- schema ---------------------------------------------------------------------------------------------
 
     /// <summary>
-    /// One <c>const</c> for the whole schema so the next task that adds a draft column (the previous version's
-    /// fields, the entry kind) has a single place to add it. The entry columns are spelled by
-    /// <see cref="EntryRowMapper"/>, the same list the catalog's <c>entries</c> table uses, so an
-    /// <see cref="IndexEntry"/> read out of either database goes through one mapping.
+    /// One string for the whole schema, so a task that adds a draft column has a single place to add it. The entry
+    /// columns are spelled by <see cref="EntryRowMapper"/>, the same list the catalog's <c>entries</c> table uses, so
+    /// an <see cref="IndexEntry"/> read out of either database goes through one mapping — and the previous version's
+    /// entry is the same list again under <c>prev_</c>, generated rather than copied.
+    /// <para>
+    /// A <c>draft</c> row holds everything the new version's entry is built from: the diff's verdict
+    /// (<c>change_kind</c>) and the entry it produced, the previous version's entry for the paths this run could not
+    /// read, and — in their own columns, never on top of the diff's — the facts the run establishes later (the
+    /// storage it uploaded to, the tail hash the compression pass fell out with, the identity a file that changed
+    /// mid-run settled on, and a path that stopped being readable after the diff had already passed it). Keeping the
+    /// two apart is what lets <c>RunLedger.FinalEntriesAsync</c> apply the same precedence the orchestrator's
+    /// dictionaries used to, rather than a lossy approximation of it.
+    /// </para>
     /// <para>
     /// <c>WITHOUT ROWID</c> everywhere the primary key <em>is</em> the row's identity: it drops the extra rowid index
     /// and clusters the rows by that key, which is the order every one of these tables is probed in.
     /// </para>
     /// </summary>
-    private const string Schema = $"""
+    private static readonly string Schema = $"""
         CREATE TABLE IF NOT EXISTS scan (
           path TEXT PRIMARY KEY, path_key BLOB NOT NULL, kind INTEGER NOT NULL, length INTEGER NOT NULL,
           mtime_ticks INTEGER NOT NULL, mtime_offset INTEGER NOT NULL, perms TEXT NOT NULL, target TEXT,
@@ -88,10 +112,16 @@ public sealed partial class RunWorkDb : IAsyncDisposable
 
         CREATE TABLE IF NOT EXISTS draft (
           seq INTEGER NOT NULL, state INTEGER NOT NULL, reason TEXT, storage_source INTEGER NOT NULL DEFAULT 0,
+          change_kind INTEGER NOT NULL DEFAULT {(int)ChangeKind.Unchanged},
+          has_current INTEGER NOT NULL DEFAULT 1, has_previous INTEGER NOT NULL DEFAULT 0,
+          override_full TEXT, override_head TEXT, override_length INTEGER, override_mtime_ticks INTEGER,
+          override_mtime_offset INTEGER, tail_set TEXT, post_diff_reason TEXT,
           {EntryRowMapper.ColumnDefinitions},
+          {EntryRowMapper.NullableColumnDefinitions(PrevPrefix)},
           PRIMARY KEY (path)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS draft_seq ON draft (seq);
         CREATE INDEX IF NOT EXISTS draft_state ON draft (state, path);
+        CREATE INDEX IF NOT EXISTS draft_change_kind ON draft (change_kind, path);
 
         CREATE TABLE IF NOT EXISTS reservations (
           content_key TEXT PRIMARY KEY, ref TEXT NOT NULL, raw INTEGER NOT NULL, volumes INTEGER NOT NULL,
@@ -118,6 +148,10 @@ public sealed partial class RunWorkDb : IAsyncDisposable
           PRIMARY KEY (members_key, seq)) WITHOUT ROWID;
         """;
 
+    /// <summary>The name the previous version's entry is stored under in <c>draft</c>, for
+    /// <see cref="EntryRowMapper.PrefixedColumns"/> and its siblings.</summary>
+    private const string PrevPrefix = "prev_";
+
     // ---- write statements -----------------------------------------------------------------------------------
 
     /// <summary>OR IGNORE, not OR REPLACE: the scanner emits a path once, and if it somehow emits one twice the first
@@ -129,10 +163,25 @@ public sealed partial class RunWorkDb : IAsyncDisposable
 
     /// <summary>OR REPLACE: a second insert for the same path is a deliberate restatement of the whole row, and it
     /// discards the updates applied to the previous one (<c>WITHOUT ROWID</c> replace is delete + insert, so
-    /// <c>reason</c> and <c>storage_source</c> go back to their defaults). The differ writes each path once.</summary>
+    /// <c>reason</c> and <c>storage_source</c> go back to their defaults). The differ writes each path once.
+    /// <para>
+    /// This one states the entry and nothing else, so the columns it does not name fall to their defaults: the row
+    /// counts as <see cref="ChangeKind.Unchanged"/> (nothing this run did) and as carrying a current entry (it was
+    /// just given one). <see cref="SeedDraftAsync"/> is the one that states a whole change.
+    /// </para></summary>
     private const string InsertDraftSql =
         $"INSERT OR REPLACE INTO draft (seq, state, {EntryRowMapper.Columns}) " +
         $"VALUES (@seq, @state, {EntryRowMapper.Parameters})";
+
+    /// <summary>The diff's whole verdict for one path: the entry it produced, the previous version's entry beside it,
+    /// and what kind of change it was. Everything the run establishes afterwards lands in the <c>override_*</c> /
+    /// <c>tail_set</c> / <c>post_diff_reason</c> columns, never on top of these, so the precedence
+    /// <c>RunLedger.FinalEntriesAsync</c> applies at the end is still there to be applied.</summary>
+    private static readonly string SeedDraftSql =
+        "INSERT OR REPLACE INTO draft (seq, state, reason, change_kind, has_current, has_previous, " +
+        $"{EntryRowMapper.Columns}, {EntryRowMapper.PrefixedColumns(PrevPrefix)}) " +
+        "VALUES (@seq, @state, @reason, @change_kind, @has_current, @has_previous, " +
+        $"{EntryRowMapper.Parameters}, {EntryRowMapper.PrefixedParameters(PrevPrefix)})";
 
     /// <summary><c>storage_source=1</c> marks the storage as this run's own, as opposed to the value carried over
     /// from the previous version when the file turned out to be unchanged — the two look identical in the entry, and
@@ -150,6 +199,23 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         """;
 
     private const string MarkDraftUnreadableSql = "UPDATE draft SET state=@state, reason=@reason WHERE path=@path";
+
+    /// <summary>The run's own values, in their own columns. The <c>UpdateDraft…</c> statements above overwrite what
+    /// the diff recorded; these three keep both, because the final entry's tail hash falls back through the diff's
+    /// value to the previous version's, and "the run set no tail hash" and "the diff found none" are two different
+    /// facts that an in-place update would flatten into one.</summary>
+    private const string SetDraftOverrideSql = """
+        UPDATE draft SET override_full=@override_full, override_head=@override_head, override_length=@override_length,
+          override_mtime_ticks=@override_mtime_ticks, override_mtime_offset=@override_mtime_offset WHERE path=@path
+        """;
+
+    private const string SetDraftTailSql = "UPDATE draft SET tail_set=@tail_set WHERE path=@path";
+
+    /// <summary>Deliberately leaves <c>state</c> alone: the diff's unreadable verdict is what the operator is warned
+    /// about path by path, and a file that only became unreadable when the upload stage reopened it is counted on its
+    /// own line (see <c>BackupRunResult</c>'s unreadable total, which adds the two).</summary>
+    private const string SetDraftPostDiffUnreadableSql =
+        "UPDATE draft SET post_diff_reason=@post_diff_reason WHERE path=@path";
 
     private const string InsertReservationSql = """
         INSERT OR IGNORE INTO reservations (content_key, ref, raw, volumes, volume_sizes)
@@ -293,6 +359,64 @@ public sealed partial class RunWorkDb : IAsyncDisposable
             command.ExecuteNonQuery();
         }, ct);
 
+    /// <summary>
+    /// Files one change of the diff as a draft row. The state is the diff's verdict: an unreadable path keeps the
+    /// previous version's content, a deleted one is not written into the new index at all, and everything else is
+    /// pending until the upload side settles it.
+    /// <para>
+    /// The entry columns hold what the new version would say if nothing else happened — the scanned metadata plus the
+    /// hashes the diff resolved and the storage carried over from the previous version. The <c>prev_</c> columns hold
+    /// the previous version's entry verbatim, so a path this run cannot read can be carried forward without going
+    /// back to the catalog for it, and a deleted path's size is still there to report. When the diff has no current
+    /// entry at all (everything under a directory that could not be listed, and every deletion), the previous entry
+    /// stands in for the columns that cannot be null and <c>has_current</c> is 0, so the stand-in is never mistaken
+    /// for something this run saw.
+    /// </para>
+    /// </summary>
+    public ValueTask SeedDraftAsync(int seq, FileChange change, CancellationToken ct) =>
+        EnqueueAsync(statements =>
+        {
+            var command = statements.For(SeedDraftSql);
+            EntryRowMapper.Bind(command, DraftEntry(change));
+            EntryRowMapper.BindOptional(command, change.Previous, PrevPrefix);
+            Set(command, "@path", change.Path);   // after Bind: the draft is keyed by the path the diff names
+            Set(command, "@seq", seq);
+            Set(command, "@state", (int)(change.Kind switch
+            {
+                ChangeKind.Unreadable => DraftState.Unreadable,
+                ChangeKind.Deleted => DraftState.Dropped,
+                _ => DraftState.Pending,
+            }));
+            Set(command, "@reason", change.UnreadableReason);
+            Set(command, "@change_kind", (int)change.Kind);
+            Set(command, "@has_current", change.Current is null ? 0 : 1);
+            Set(command, "@has_previous", change.Previous is null ? 0 : 1);
+            command.ExecuteNonQuery();
+        }, ct);
+
+    /// <summary>What the new version would say about this path on the diff's evidence alone. A change with neither a
+    /// current nor a previous entry is not something the differ emits today, but it still has to produce a row
+    /// rather than throw — the run counts every change it is given, and the placeholder can never be read back as an
+    /// entry: <c>has_current</c> is 0 and there is no previous to carry forward.</summary>
+    private static IndexEntry DraftEntry(FileChange change) => change.Current is { } current
+        ? new IndexEntry
+        {
+            Path = change.Path,
+            Kind = current.Kind == EntryKind.File ? "file" : "symlink",
+            Length = current.Length,
+            Mtime = current.ModifiedAt,
+            Permissions = current.Permissions,
+            HeadHash = change.HeadHash,
+            TailHash = change.TailHash,
+            FullHash = change.FullHash,
+            Target = current.Target,
+            Storage = change.CarriedStorage,
+        }
+        : change.Previous ?? new IndexEntry
+        {
+            Path = change.Path, Kind = "file", Length = 0, Mtime = default, Permissions = "",
+        };
+
     public ValueTask UpdateDraftStorageAsync(string path, StorageRef storage, CancellationToken ct) =>
         EnqueueAsync(statements =>
         {
@@ -335,6 +459,45 @@ public sealed partial class RunWorkDb : IAsyncDisposable
             Set(command, "@path", path);
             Set(command, "@state", (int)DraftState.Unreadable);
             Set(command, "@reason", reason);
+            command.ExecuteNonQuery();
+        }, ct);
+
+    /// <summary>The identity a file that changed while it was being processed finally settled on, kept beside the
+    /// diff's rather than over it (see <see cref="SetDraftOverrideSql"/>).</summary>
+    public ValueTask SetDraftOverrideAsync(
+        string path, string fullHash, string? headHash, long length, DateTimeOffset mtime, CancellationToken ct) =>
+        EnqueueAsync(statements =>
+        {
+            var command = statements.For(SetDraftOverrideSql);
+            Set(command, "@path", path);
+            Set(command, "@override_full", fullHash);
+            Set(command, "@override_head", headHash);
+            Set(command, "@override_length", length);
+            Set(command, "@override_mtime_ticks", mtime.UtcTicks);
+            Set(command, "@override_mtime_offset", (int)mtime.Offset.TotalMinutes);
+            command.ExecuteNonQuery();
+        }, ct);
+
+    /// <summary>The tail hash the compression pass produced for a single-file blob — the most authoritative one,
+    /// because those are the bytes that actually went into the archive.</summary>
+    public ValueTask SetDraftTailAsync(string path, string tailHash, CancellationToken ct) =>
+        EnqueueAsync(statements =>
+        {
+            var command = statements.For(SetDraftTailSql);
+            Set(command, "@path", path);
+            Set(command, "@tail_set", tailHash);
+            command.ExecuteNonQuery();
+        }, ct);
+
+    /// <summary>Readable when the diff passed it, unreadable when the compress/upload stage reopened it. The index
+    /// treats this exactly as diff-time unreadability — no blob was produced, so the previous version's entry is
+    /// carried forward — but the run counts it separately.</summary>
+    public ValueTask SetDraftPostDiffUnreadableAsync(string path, string reason, CancellationToken ct) =>
+        EnqueueAsync(statements =>
+        {
+            var command = statements.For(SetDraftPostDiffUnreadableSql);
+            Set(command, "@path", path);
+            Set(command, "@post_diff_reason", reason);
             command.ExecuteNonQuery();
         }, ct);
 

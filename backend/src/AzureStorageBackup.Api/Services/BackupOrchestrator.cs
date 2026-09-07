@@ -4013,9 +4013,6 @@ public sealed class BackupOrchestrator(
         return result.VolumeFiles;
     }
 
-    /// <summary>A file whose content changed during processing: the settled hash/metadata override the diff-time index entry (§9).</summary>
-    private sealed record EntryOverride(string FullHash, string? HeadHash, long Length, DateTimeOffset Mtime);
-
     private static List<IndexEntry> BuildEntries(
         DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
         IReadOnlyDictionary<string, string> tailByPath,

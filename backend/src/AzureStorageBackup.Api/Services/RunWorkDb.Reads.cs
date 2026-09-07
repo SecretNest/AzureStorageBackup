@@ -54,6 +54,71 @@ public sealed partial class RunWorkDb
     private const string SelectDraftUnreadableAllSql =
         "SELECT path FROM draft WHERE state=@state ORDER BY path";
 
+    /// <summary>Everything the new version's entry for one path is built from, in the order the index has to be
+    /// serialized back in: the diff's entry, the previous version's entry, and what the run recorded afterwards.
+    /// The order is the <c>draft_seq</c> index's, not the table's (which is clustered by path).</summary>
+    private static readonly string SelectDraftFullBySeqSql =
+        "SELECT seq, state, change_kind, has_current, has_previous, override_full, override_head, override_length, " +
+        "override_mtime_ticks, override_mtime_offset, tail_set, post_diff_reason, " +
+        $"{EntryRowMapper.Columns}, {EntryRowMapper.PrefixedColumns(PrevPrefix)} FROM draft ORDER BY seq";
+
+    /// <summary>Which draft rows become an entry in the new version, as one predicate the streaming read and the two
+    /// counts all share — a second copy of "which rows count" that drifted would make the run report a file total the
+    /// index it just wrote does not have. It is <c>RunLedger.FinalEntriesAsync</c>'s branches, in order: an entry that
+    /// could not be read (this run or after the diff) survives only if there is a previous version to carry forward,
+    /// and anything the run dropped, or never had a current entry for, is not written at all. The literals are
+    /// <see cref="DraftState.Unreadable"/> and <see cref="DraftState.Dropped"/>, spelled out because an enum cast
+    /// cannot go into a <c>const</c> string.</summary>
+    private const string DraftFinalPredicate = """
+        ((state=2 OR post_diff_reason IS NOT NULL) AND has_previous=1)
+          OR (state NOT IN (2, 3) AND post_diff_reason IS NULL AND has_current=1)
+        """;
+
+    /// <summary>The length of the entry that row yields: a carried-forward entry weighs what the previous version
+    /// said, and everything else weighs what finally went into the index — the override's length when the file
+    /// changed while it was being processed.</summary>
+    private const string DraftFinalLength =
+        "CASE WHEN state=2 OR post_diff_reason IS NOT NULL THEN prev_length ELSE COALESCE(override_length, length) END";
+
+    private const string SelectDraftFinalCountSql =
+        $"SELECT COUNT(*) FROM draft WHERE {DraftFinalPredicate}";
+
+    private const string SelectDraftFinalStatsSql =
+        $"SELECT COUNT(*), COALESCE(SUM({DraftFinalLength}), 0) FROM draft WHERE {DraftFinalPredicate}";
+
+    /// <summary>One pass for the whole summary. <c>prev_length</c> is summed for every kind and only read for
+    /// deletions, which is where a deleted file's size still exists: a deletion is synthesized from the previous
+    /// version's entry and has no current one.</summary>
+    private const string SelectDraftChangeCountsSql =
+        "SELECT change_kind, COUNT(*), COALESCE(SUM(prev_length), 0) FROM draft GROUP BY change_kind";
+
+    private const string SelectDraftPathsOfKindSql =
+        "SELECT path FROM draft WHERE change_kind=@change_kind ORDER BY seq";
+
+    /// <summary>A range scan over the primary key, not <c>LIKE</c>: "d" must take in "d/x" without also taking in
+    /// "dd/x", and the upper bound is the byte right after '/'. Strictly <em>under</em> the directory, matching
+    /// <c>PathUnder.IsUnder</c> — the directory's own row is not one of its contents.</summary>
+    private const string SelectDraftKindUnderCountSql =
+        "SELECT COUNT(*) FROM draft WHERE change_kind=@change_kind AND path>=@lo AND path<@hi";
+
+    private const string SelectDraftKindCountSql =
+        "SELECT COUNT(*) FROM draft WHERE change_kind=@change_kind";
+
+    /// <summary>The whole entry is selected for a question about six of its columns, so that the column list stays
+    /// <see cref="EntryRowMapper"/>'s one definition; this is a single-row lookup by primary key, and naming the
+    /// storage columns a second time here would cost more than the columns do.</summary>
+    private const string SelectDraftStorageSql =
+        $"SELECT {EntryRowMapper.Columns} FROM draft WHERE path=@path AND storage_source=1";
+
+    private const string SelectDraftHasOverrideSql =
+        "SELECT 1 FROM draft WHERE path=@path AND override_full IS NOT NULL";
+
+    private const string SelectDraftPostDiffUnreadableSql =
+        "SELECT 1 FROM draft WHERE path=@path AND post_diff_reason IS NOT NULL";
+
+    private const string SelectDraftPostDiffUnreadableCountSql =
+        "SELECT COUNT(*) FROM draft WHERE post_diff_reason IS NOT NULL";
+
     private const string SelectReservationSql =
         "SELECT ref, raw, volumes, volume_sizes FROM reservations WHERE content_key=@content_key";
 
@@ -197,6 +262,125 @@ public sealed partial class RunWorkDb
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return reader.GetString(0);
+    }
+
+    /// <summary>The draft in source order, every column of it: what <c>RunLedger.FinalEntriesAsync</c> turns into the
+    /// new version's entries, one row at a time.</summary>
+    public async IAsyncEnumerable<DraftFullRow> DraftFullOrderedBySeqAsync(
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftFullBySeqSql);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return ReadDraftFull(reader);
+    }
+
+    /// <summary>How many entries the new version will have, and what they weigh — computed over the same rows
+    /// <see cref="DraftFullOrderedBySeqAsync"/> would yield an entry for, in SQL, because the caller asking for the
+    /// numbers must not have to stream a million entries to count them.</summary>
+    public async Task<(long Files, long Bytes)> DraftFinalStatsAsync(CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftFinalStatsSql);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
+    }
+
+    public async Task<int> DraftFinalCountAsync(CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftFinalCountSql);
+        return (int)(long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    /// <summary>The run's summary line: how many paths the diff added, changed and deleted, and how many bytes went
+    /// with the deletions.</summary>
+    public async Task<(int New, int Modified, int Deleted, long DeletedBytes)> DraftChangeCountsAsync(
+        CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftChangeCountsSql);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+
+        var (added, modified, deleted, deletedBytes) = (0, 0, 0, 0L);
+        while (await reader.ReadAsync(ct))
+        {
+            var count = reader.GetInt32(1);
+            switch ((ChangeKind)reader.GetInt64(0))
+            {
+                case ChangeKind.Added: added = count; break;
+                case ChangeKind.Modified: modified = count; break;
+                case ChangeKind.Deleted: deleted = count; deletedBytes = reader.GetInt64(2); break;
+                default: break;   // MetadataOnly / Unchanged / Unreadable: nothing this run touched
+            }
+        }
+
+        return (added, modified, deleted, deletedBytes);
+    }
+
+    /// <summary>The paths the diff gave one verdict, in the order the diff emitted them.</summary>
+    public async IAsyncEnumerable<string> DraftPathsOfKindAsync(
+        ChangeKind kind, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftPathsOfKindSql);
+        Set(command, "@change_kind", (int)kind);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            yield return reader.GetString(0);
+    }
+
+    /// <summary>How many of them lie inside one directory subtree; the root ("" or ".") covers everything. A
+    /// directory that could not be listed carries its whole subtree with it, which is why this is asked by prefix
+    /// rather than one path at a time.</summary>
+    public async Task<int> DraftKindUnderCountAsync(ChangeKind kind, string dir, CancellationToken ct)
+    {
+        var wholeTree = dir is "" or ".";
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(
+            connection, wholeTree ? SelectDraftKindCountSql : SelectDraftKindUnderCountSql);
+        Set(command, "@change_kind", (int)kind);
+        if (!wholeTree)
+        {
+            Set(command, "@lo", dir + "/");
+            Set(command, "@hi", dir + "0");   // '0' is the byte right after '/'
+        }
+
+        return (int)(long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    /// <summary>Where <em>this run</em> put a path, or null. Storage carried over from the previous version sits in
+    /// the same columns and is deliberately not an answer: the callers ask this to find out what the run itself
+    /// uploaded.</summary>
+    public async Task<StorageRef?> DraftStorageAsync(string path, CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftStorageSql);
+        Set(command, "@path", path);
+        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? EntryRowMapper.ReadStorage(reader) : null;
+    }
+
+    public Task<bool> DraftHasOverrideAsync(string path, CancellationToken ct) =>
+        DraftFlagAsync(SelectDraftHasOverrideSql, path, ct);
+
+    public Task<bool> DraftPostDiffUnreadableAsync(string path, CancellationToken ct) =>
+        DraftFlagAsync(SelectDraftPostDiffUnreadableSql, path, ct);
+
+    public async Task<long> DraftPostDiffUnreadableCountAsync(CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, SelectDraftPostDiffUnreadableCountSql);
+        return (long)(await command.ExecuteScalarAsync(ct))!;
+    }
+
+    private async Task<bool> DraftFlagAsync(string sql, string path, CancellationToken ct)
+    {
+        await using var connection = await OpenReadAsync(ct);
+        using var command = Command(connection, sql);
+        Set(command, "@path", path);
+        return await command.ExecuteScalarAsync(ct) is not null;
     }
 
     // ---- reservations ---------------------------------------------------------------------------------------
@@ -388,6 +572,28 @@ public sealed partial class RunWorkDb
     private static DraftRow ReadDraft(SqliteDataReader reader) => new(
         reader.GetInt32(0), reader.GetString(reader.GetOrdinal("path")),
         (DraftState)reader.GetInt64(1), EntryRowMapper.Read(reader));
+
+    /// <summary>Read by name throughout: this row names forty-odd columns from three different sources, and an
+    /// ordinal list of that length is a transcription error waiting to happen.</summary>
+    private static DraftFullRow ReadDraftFull(SqliteDataReader reader) => new(
+        reader.GetInt32(reader.GetOrdinal("seq")),
+        reader.GetString(reader.GetOrdinal("path")),
+        (DraftState)reader.GetInt64(reader.GetOrdinal("state")),
+        (ChangeKind)reader.GetInt64(reader.GetOrdinal("change_kind")),
+        reader.GetInt64(reader.GetOrdinal("has_current")) != 0,
+        EntryRowMapper.Read(reader),
+        reader.GetInt64(reader.GetOrdinal("has_previous")) != 0 ? EntryRowMapper.Read(reader, PrevPrefix) : null,
+        EntryRowMapper.NullableString(reader, "override_full") is { } full
+            ? new EntryOverride(
+                full,
+                EntryRowMapper.NullableString(reader, "override_head"),
+                EntryRowMapper.NullableLong(reader, "override_length") ?? 0,
+                EntryRowMapper.Dto(
+                    EntryRowMapper.NullableLong(reader, "override_mtime_ticks") ?? 0,
+                    (int)(EntryRowMapper.NullableLong(reader, "override_mtime_offset") ?? 0)))
+            : null,
+        EntryRowMapper.NullableString(reader, "tail_set"),
+        EntryRowMapper.NullableString(reader, "post_diff_reason"));
 
     private static JournalRecord ReadResumeBlob(SqliteDataReader reader) => new()
     {

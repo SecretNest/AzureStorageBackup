@@ -135,38 +135,78 @@ internal static class EntryRowMapper
         "entry_name TEXT, volumes INTEGER NOT NULL DEFAULT 1, raw INTEGER NOT NULL DEFAULT 0, volume_sizes TEXT";
 
     /// <summary>
+    /// The same three lists under a name prefix, for a table that has to hold a <em>second</em> entry per row — the
+    /// run's draft keeps the previous version's entry next to the new one, so that an entry it could not read can be
+    /// carried forward without going back to the catalog. Derived from the lists above rather than written out again:
+    /// a hand-copied <c>prev_</c> list is a second definition of the same row, and the first column that only one of
+    /// them learns about is a silent mismatch between what is written and what is read back.
+    /// </summary>
+    public static string PrefixedColumns(string prefix) =>
+        string.Join(", ", Columns.Split(", ").Select(column => prefix + column));
+
+    public static string PrefixedParameters(string prefix) =>
+        string.Join(", ", Parameters.Split(", ").Select(parameter => "@" + prefix + parameter[1..]));
+
+    /// <summary>The prefixed columns for the <c>CREATE TABLE</c> side, with every constraint dropped: the second
+    /// entry is optional (a row whose path is new has no previous version at all), so the columns that are
+    /// <c>NOT NULL</c> for an entry that exists have to be nullable for one that may not.</summary>
+    public static string NullableColumnDefinitions(string prefix) =>
+        string.Join(", ", ColumnDefinitions.Split(", ").Select(definition =>
+        {
+            var words = definition.Split(' ');   // "name TYPE [NOT NULL] [DEFAULT x]" → "prefix_name TYPE"
+            return $"{prefix}{words[0]} {words[1]}";
+        }));
+
+    /// <summary>
     /// Binds <paramref name="entry"/> onto a command that may be reused for the next row: the parameter is created on
     /// the first call and only its value is replaced afterwards, which is what makes a million-entry import one
     /// prepared statement rather than a million.
     /// </summary>
-    public static void Bind(SqliteCommand command, IndexEntry entry)
+    /// <param name="prefix">Names the parameters for <see cref="PrefixedParameters"/>'s column list; empty for the
+    /// row's own entry.</param>
+    public static void Bind(SqliteCommand command, IndexEntry entry, string prefix = "")
     {
-        Set(command, "@path", entry.Path);
-        Set(command, "@kind", entry.Kind);
-        Set(command, "@length", entry.Length);
+        Set(command, $"@{prefix}path", entry.Path);
+        Set(command, $"@{prefix}kind", entry.Kind);
+        Set(command, $"@{prefix}length", entry.Length);
         // The mtime is split exactly the way the wire format splits it (UTC ticks + offset minutes) so that a version
         // imported from the cloud and serialized back out is byte-identical, down to the offset of a timestamp.
-        Set(command, "@mtime_ticks", entry.Mtime.UtcTicks);
-        Set(command, "@mtime_offset", (int)entry.Mtime.Offset.TotalMinutes);
-        Set(command, "@perms", entry.Permissions);
-        Set(command, "@head_hash", entry.HeadHash);
-        Set(command, "@tail_hash", entry.TailHash);
-        Set(command, "@full_hash", entry.FullHash);
-        Set(command, "@target", entry.Target);
-        Set(command, "@unreadable_ticks", entry.UnreadableAt?.UtcTicks);
-        Set(command, "@unreadable_offset", entry.UnreadableAt is { } u ? (int)u.Offset.TotalMinutes : null);
-        BindStorage(command, entry.Storage);
+        Set(command, $"@{prefix}mtime_ticks", entry.Mtime.UtcTicks);
+        Set(command, $"@{prefix}mtime_offset", (int)entry.Mtime.Offset.TotalMinutes);
+        Set(command, $"@{prefix}perms", entry.Permissions);
+        Set(command, $"@{prefix}head_hash", entry.HeadHash);
+        Set(command, $"@{prefix}tail_hash", entry.TailHash);
+        Set(command, $"@{prefix}full_hash", entry.FullHash);
+        Set(command, $"@{prefix}target", entry.Target);
+        Set(command, $"@{prefix}unreadable_ticks", entry.UnreadableAt?.UtcTicks);
+        Set(command, $"@{prefix}unreadable_offset", entry.UnreadableAt is { } u ? (int)u.Offset.TotalMinutes : null);
+        BindStorage(command, entry.Storage, prefix);
+    }
+
+    /// <summary>Binds an entry that may not exist: every parameter still has to be supplied, because
+    /// <see cref="SqliteParameter"/> fails a statement whose parameter was never set rather than treating it as
+    /// null. Only the prefixed (second) entry can be absent, which is why there is no unprefixed overload.</summary>
+    public static void BindOptional(SqliteCommand command, IndexEntry? entry, string prefix)
+    {
+        if (entry is not null)
+        {
+            Bind(command, entry, prefix);
+            return;
+        }
+
+        foreach (var column in Columns.Split(", "))
+            Set(command, $"@{prefix}{column}", null);
     }
 
     /// <summary>Binds just the storage columns; repair patches one entry's storage without touching the rest of the row.</summary>
-    public static void BindStorage(SqliteCommand command, StorageRef? storage)
+    public static void BindStorage(SqliteCommand command, StorageRef? storage, string prefix = "")
     {
-        Set(command, "@storage_kind", storage?.Kind);
-        Set(command, "@storage_ref", storage?.Ref);
-        Set(command, "@entry_name", storage?.EntryName);
-        Set(command, "@volumes", storage?.Volumes ?? 1);
-        Set(command, "@raw", storage?.Raw == true ? 1 : 0);
-        Set(command, "@volume_sizes", FormatVolumeSizes(storage?.VolumeSizes));
+        Set(command, $"@{prefix}storage_kind", storage?.Kind);
+        Set(command, $"@{prefix}storage_ref", storage?.Ref);
+        Set(command, $"@{prefix}entry_name", storage?.EntryName);
+        Set(command, $"@{prefix}volumes", storage?.Volumes ?? 1);
+        Set(command, $"@{prefix}raw", storage?.Raw == true ? 1 : 0);
+        Set(command, $"@{prefix}volume_sizes", FormatVolumeSizes(storage?.VolumeSizes));
     }
 
     /// <summary>The write side of <see cref="ParseVolumeSizes"/>: a variable-length list as one comma-joined column,
@@ -177,32 +217,42 @@ internal static class EntryRowMapper
             ? string.Join(',', sizes.Select(v => v.ToString(CultureInfo.InvariantCulture)))
             : null;
 
-    public static IndexEntry Read(SqliteDataReader reader) => new()
+    /// <param name="prefix">The name prefix the columns were selected under; empty for the row's own entry, and
+    /// <see cref="PrefixedColumns"/>'s prefix for a second entry stored beside it.</param>
+    public static IndexEntry Read(SqliteDataReader reader, string prefix = "") => new()
     {
-        Path = reader.GetString(reader.GetOrdinal("path")),
-        Kind = reader.GetString(reader.GetOrdinal("kind")),
-        Length = reader.GetInt64(reader.GetOrdinal("length")),
-        Mtime = Dto(reader.GetInt64(reader.GetOrdinal("mtime_ticks")), reader.GetInt32(reader.GetOrdinal("mtime_offset"))),
-        Permissions = reader.GetString(reader.GetOrdinal("perms")),
-        HeadHash = NullableString(reader, "head_hash"),
-        TailHash = NullableString(reader, "tail_hash"),
-        FullHash = NullableString(reader, "full_hash"),
-        Target = NullableString(reader, "target"),
-        UnreadableAt = NullableLong(reader, "unreadable_ticks") is { } ticks
-            ? Dto(ticks, (int)(NullableLong(reader, "unreadable_offset") ?? 0))
+        Path = reader.GetString(reader.GetOrdinal($"{prefix}path")),
+        Kind = reader.GetString(reader.GetOrdinal($"{prefix}kind")),
+        Length = reader.GetInt64(reader.GetOrdinal($"{prefix}length")),
+        Mtime = Dto(
+            reader.GetInt64(reader.GetOrdinal($"{prefix}mtime_ticks")),
+            reader.GetInt32(reader.GetOrdinal($"{prefix}mtime_offset"))),
+        Permissions = reader.GetString(reader.GetOrdinal($"{prefix}perms")),
+        HeadHash = NullableString(reader, $"{prefix}head_hash"),
+        TailHash = NullableString(reader, $"{prefix}tail_hash"),
+        FullHash = NullableString(reader, $"{prefix}full_hash"),
+        Target = NullableString(reader, $"{prefix}target"),
+        UnreadableAt = NullableLong(reader, $"{prefix}unreadable_ticks") is { } ticks
+            ? Dto(ticks, (int)(NullableLong(reader, $"{prefix}unreadable_offset") ?? 0))
             : null,
-        Storage = NullableString(reader, "storage_kind") is { } kind
+        Storage = ReadStorage(reader, prefix),
+    };
+
+    /// <summary>Reads just the storage columns. Split out of <see cref="Read"/> because the run's draft asks "where
+    /// did this run put that path" without wanting the rest of the row, and two readers of the same six columns is
+    /// the kind of duplication this class exists to avoid.</summary>
+    public static StorageRef? ReadStorage(SqliteDataReader reader, string prefix = "") =>
+        NullableString(reader, $"{prefix}storage_kind") is { } kind
             ? new StorageRef
             {
                 Kind = kind,
-                Ref = NullableString(reader, "storage_ref") ?? "",
-                EntryName = NullableString(reader, "entry_name"),
-                Volumes = (int)(NullableLong(reader, "volumes") ?? 1),
-                Raw = (NullableLong(reader, "raw") ?? 0) != 0,
-                VolumeSizes = [.. ParseVolumeSizes(NullableString(reader, "volume_sizes"))],
+                Ref = NullableString(reader, $"{prefix}storage_ref") ?? "",
+                EntryName = NullableString(reader, $"{prefix}entry_name"),
+                Volumes = (int)(NullableLong(reader, $"{prefix}volumes") ?? 1),
+                Raw = (NullableLong(reader, $"{prefix}raw") ?? 0) != 0,
+                VolumeSizes = [.. ParseVolumeSizes(NullableString(reader, $"{prefix}volume_sizes"))],
             }
-            : null,
-    };
+            : null;
 
     /// <summary>Reads back what <see cref="BindStorage"/> stored: the volume sizes as one comma-joined column, which
     /// keeps a variable-length list out of the schema without a second table nothing else would ever join to.</summary>
