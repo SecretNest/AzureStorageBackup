@@ -94,6 +94,62 @@ public sealed class VersionIndexFileStore(string rootDir)
     }
 
     /// <summary>
+    /// The streaming twin of <see cref="ReadAsync"/>: validates the same 24-byte header (magic, format, identity,
+    /// body length matching the file's real length) but, instead of buffering the whole body into a byte array,
+    /// returns the open file positioned right after the header — what <see cref="VersionCatalogs"/> wants to hand an
+    /// <see cref="IndexStreamReader"/> without holding a possibly-hundreds-of-MB index in memory just to move it into
+    /// the catalog. Null on any mismatch or a missing file, exactly like <see cref="ReadAsync"/>; the stream is
+    /// disposed before returning null so a caller never has to guess whether it owns a handle.
+    /// </summary>
+    public async Task<Stream?> OpenBodyAsync(
+        int accountId, string container, int version, long identityTicks, CancellationToken ct = default)
+    {
+        var path = PathFor(accountId, container, version);
+        FileStream stream;
+        try
+        {
+            stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+
+        try
+        {
+            var header = new byte[HeaderBytes];
+            if (!await ReadExactlyAsync(stream, header, ct))
+            {
+                await stream.DisposeAsync();
+                return null;
+            }
+
+            if (!header.AsSpan(0, 4).SequenceEqual(Magic)
+                || BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4)) != Format
+                || BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(8, 8)) != identityTicks)
+            {
+                await stream.DisposeAsync();
+                return null;
+            }
+
+            var bodyLength = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(16, 8));
+            if (bodyLength < 0 || bodyLength > int.MaxValue || stream.Length - HeaderBytes != bodyLength)
+            {
+                await stream.DisposeAsync();
+                return null;
+            }
+
+            return stream;
+        }
+        catch
+        {
+            await stream.DisposeAsync();
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Replace this version's entry, atomically. Written to a temporary name in the same directory and renamed over
     /// the target: a rename within one filesystem either happens or does not, so a reader never meets a half-written
     /// index and an interrupted write leaves the previous entry intact.
