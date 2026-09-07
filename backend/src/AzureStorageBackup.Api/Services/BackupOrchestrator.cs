@@ -2196,7 +2196,7 @@ public sealed class BackupOrchestrator(
 
         foreach (var dir in unreadableDirs)
         {
-            var affected = diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable && IsUnder(dir.Path, c.Path));
+            var affected = diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable && PathUnder.IsUnder(dir.Path, c.Path));
             await Record(NotificationEvents.UnrecoverableError, source,
                 $"Directory unreadable, skipped: {dir.Path}",
                 $"{affected} entr{(affected == 1 ? "y" : "ies")} carried forward from the previous version. {dir.Reason}", ct);
@@ -2204,16 +2204,12 @@ public sealed class BackupOrchestrator(
 
         foreach (var c in diff.Changes.Where(c => c.Kind == ChangeKind.Unreadable))
         {
-            if (unreadableDirs.Any(d => IsUnder(d.Path, c.Path)))
+            if (unreadableDirs.Any(d => PathUnder.IsUnder(d.Path, c.Path)))
                 continue; // already covered by the directory summary above
             await Record(NotificationEvents.UnrecoverableError, source,
                 $"File unreadable, skipped: {c.Path}", c.UnreadableReason ?? "", ct);
         }
     }
-
-    /// <summary>Whether path lies under dir. When dir is the root ("" or "."), it covers everything.</summary>
-    private static bool IsUnder(string dir, string path) =>
-        dir is "" or "." || path.StartsWith(dir + "/", StringComparison.Ordinal);
 
     /// <summary>The empty-directory list of the new version. An unreadable directory cannot have its contents
     /// listed this run, so neither it nor the empty directories below it appear in this scan — using the scan result
@@ -2229,7 +2225,7 @@ public sealed class BackupOrchestrator(
         var known = new HashSet<string>(dirs, StringComparer.Ordinal);
         foreach (var d in previous.EmptyDirs)
         {
-            if (unreadableDirs.Any(u => IsUnder(u.Path, d)) && known.Add(d))
+            if (unreadableDirs.Any(u => PathUnder.IsUnder(u.Path, d)) && known.Add(d))
                 dirs.Add(d);
         }
         dirs.Sort(StringComparer.Ordinal);

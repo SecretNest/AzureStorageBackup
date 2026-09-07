@@ -318,3 +318,18 @@ public sealed class PathBoundary
         }
     }
 }
+
+/// <summary>
+/// Whether an index-relative path lies under an index-relative directory, in the slash-separated form the index stores.
+/// Shared by the diff and the orchestrator because they have to agree on exactly one thing: which previous-version
+/// entries an unreadable directory covers. Two answers to that question and one of them classifies a whole subtree as
+/// deleted, which is data loss nobody sees until a restore comes up short.
+/// <para>Purely lexical and nothing to do with <see cref="PathBoundary"/>'s security checks, which work on absolute
+/// real paths — it lives here only so the two callers cannot drift apart.</para>
+/// </summary>
+internal static class PathUnder
+{
+    /// <summary>Whether path lies under dir. When dir is the root ("" or "."), it covers everything.</summary>
+    public static bool IsUnder(string dir, string path) =>
+        dir is "" or "." || path.StartsWith(dir + "/", StringComparison.Ordinal);
+}
