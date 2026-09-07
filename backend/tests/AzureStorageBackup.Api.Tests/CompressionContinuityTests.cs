@@ -704,6 +704,99 @@ public sealed class CompressionContinuityTests : IDisposable
     }
 
     /// <summary>
+    /// The prober's hand-off is a wait the pause can make endless, and it has to step out of the in-hand count for
+    /// it, as the compressor's wait for staging room and an uploader's park between two volumes already do.
+    /// <para>
+    /// The probed queue is nine deep and the compressor is its only consumer. Once the pool is full the compressor
+    /// parks on the room wait, the queue fills behind it, and the prober blocks on its tenth write — inside the
+    /// BeginWork it took for the probe. A Pause pressed then let the volumes on the wire land and read "Pausing…"
+    /// for as long as it stood: room is freed only by uploads, no upload is coming while the hold stands, so the
+    /// compressor never takes the item that would let the write land, and the prober's token held the count at one
+    /// for good (field report, 2026-09-07, 2026.9.7.1: "Pausing… · holding 10.781 GB of staging · 1 object waiting
+    /// for staging room", not a stream on the wire).
+    /// </para>
+    /// <para>
+    /// Sixteen eight-volume files on a 5 MB pool with every upload blocked: three archives stage (the third takes
+    /// the pool past its limit), one item waits in the compressor for room, nine fill the probed queue, and the
+    /// prober claims a fourteenth it cannot hand over. Pause, then release the block: the two volumes on the wire
+    /// land, the twenty-two held ones keep the pool over its limit, so the compressor stays on the room wait and
+    /// the prober stays blocked on its write — and the hold must still report itself settled. Resume, and every
+    /// volume goes up.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_Pause_Settles_While_The_Prober_Is_Blocked_On_A_Full_Probed_Queue()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+        Skip.IfNot(SevenZip(), "7z executable not available");
+
+        const int files = 16;
+        // Three archives in the pool, one item in the compressor waiting for room, nine in the probed queue, and
+        // the one the prober is blocked on: the least the prober must have claimed for its write to be blocked.
+        const int claimed = 3 + 1 + 9 + 1;
+        const long stagingLimit = 5L * 1024 * 1024;
+        for (var i = 0; i < files; i++)
+            WriteFile($"f{i:D2}.bin", FileSize);
+
+        var block = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Released from the start: this one only counts the probes, it holds nothing.
+        var hasher = new GatedHasher(Task.CompletedTask, new FileHasher());
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var name = RandomName("cont");
+        var uploader = new BlockingUploader(block.Task, new BlobUploader(factory));
+        var (orchestrator, staging, request) = Build(
+            uploader, stagingLimit, uploadConcurrency: 2, container: name, hasher: hasher, volumeBytes: 256 * 1024);
+
+        var journals = new BackupJournalStore(Path.Combine(_temp, "journal"));
+        await using var control = new BackupRunControl(journals, configId: 1, runId: "pause-probed-queue");
+
+        var container = factory.CreateServiceClient(AzuriteAccount()).GetBlobContainerClient(name);
+        try
+        {
+            var run = orchestrator.RunAsync(request, ct: default, control: control);
+            await WaitUntil(
+                () => staging.StagedBytes >= 3L * FileSize && hasher.Probes >= claimed,
+                TimeSpan.FromSeconds(90),
+                () => $"the pool reached {staging.StagedBytes} bytes and the prober claimed {hasher.Probes} items: "
+                    + $"the pipeline never backed up to the prober's write (limit {stagingLimit}, {files} files).");
+            // Steady: the compressor has no room, the queue is full, the prober is blocked on its write, and two
+            // volumes are on the wire waiting for the block.
+            await Task.Delay(1000);
+            var probedAtPause = hasher.Probes;
+            Assert.True(probedAtPause < files,
+                $"the prober claimed all {files} files, so its write was never blocked and this run proves nothing.");
+            Assert.Equal(2, uploader.Uploads);
+
+            Assert.True(control.Gate.PauseByUser());
+            Assert.False(control.Gate.IsSettled, "two volumes are on the wire: the hold is up but has not taken effect");
+
+            block.SetResult();
+            await WaitUntil(
+                () => control.Gate.IsSettled, TimeSpan.FromSeconds(30),
+                () => $"the two volumes on the wire landed but the run never settled into the pause "
+                    + $"({uploader.Uploads} volumes went up, the prober claimed {hasher.Probes} items, "
+                    + $"the pool holds {staging.StagedBytes} bytes).");
+            await Task.Delay(1000);
+            Assert.True(control.Gate.IsSettled);
+            Assert.Equal(2, uploader.Uploads);
+            // Still blocked on its write, not merely parked at the top of its loop: no item was taken past the
+            // one the pause found in its hands.
+            Assert.Equal(probedAtPause, hasher.Probes);
+            Assert.False(run.IsCompleted);
+
+            control.Gate.ResumeByUser();
+            var result = await run.WaitAsync(TimeSpan.FromMinutes(3));
+            Assert.Equal(1, result.Version);
+            Assert.True(uploader.Uploads >= files * 8,
+                $"{uploader.Uploads} volumes went up; {files} files of eight volumes each should have.");
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+        }
+    }
+
+    /// <summary>
     /// The two middle gates: with the hold up, the prober takes no further item out of the work queue and the
     /// compressor stages nothing out of the probed queue — however much work is put in front of them.
     /// <para>

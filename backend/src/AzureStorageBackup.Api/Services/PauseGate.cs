@@ -166,8 +166,8 @@ public sealed class PauseGate : IDisposable
 
     /// <summary>
     /// Step out of the in-hand count for a wait the pause itself may make endless: the compressor waiting for
-    /// staging room that only an upload can free, and no upload is coming while the hold stands. Dispose on the
-    /// way back into work. Only meaningful inside a <see cref="BeginWork"/> scope; outside one the count is left
+    /// staging room that only an upload can free, and no upload is coming while the hold stands; the prober
+    /// writing into a full probed queue whose only consumer is that compressor. Dispose on the way back into work. Only meaningful inside a <see cref="BeginWork"/> scope; outside one the count is left
     /// alone rather than driven negative.
     /// </summary>
     public IDisposable Idle()

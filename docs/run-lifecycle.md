@@ -196,7 +196,12 @@ it winds down. Resume is on offer throughout. What counts as in hand is what wil
 CPU on its own (`PauseGate.BeginWork`): a volume past the hold check, the file under 7z, the item the
 prober is reading, the diff between two of its callbacks, the scan, the wrap-up's re-run. A worker
 parked at the gate mid-item, or blocked on a wait the pause itself makes endless (staging room, the
-compression lock), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`).
+compression lock, the prober's hand-off into a full probed queue whose only consumer is on the room
+wait), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`). The hand-off is
+the one that was missed at first: with the pool full the compressor waits for room, the nine-deep
+probed queue fills behind it, and the prober blocks on its write — room comes only from uploads, and a
+standing hold parks every uploader, so that write never lands and the run read "Pausing…" for as long
+as the hold stood (field report, 2026-09-07, 2026.9.7.1).
 Counting the volume rather than the file is what makes the two labels honest: an uploader holding a
 hundred-volume file has, once the hold is up, a handful of volumes still moving and not the file.
 
