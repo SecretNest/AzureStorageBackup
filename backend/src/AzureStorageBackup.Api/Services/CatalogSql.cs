@@ -72,15 +72,12 @@ public static class CatalogSql
     /// ROWID</c> on the tables whose primary key is the whole row's identity saves the extra rowid index and stores
     /// entries clustered by (version, path), which is the order the diff walks.
     /// </summary>
-    private const string Schema = """
+    private const string Schema = $"""
         CREATE TABLE IF NOT EXISTS versions (
           version INTEGER PRIMARY KEY, identity INTEGER NOT NULL, entry_count INTEGER NOT NULL, imported_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS entries (
-          version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, parent TEXT NOT NULL, path_fold TEXT NOT NULL,
-          kind TEXT NOT NULL, length INTEGER NOT NULL, mtime_ticks INTEGER NOT NULL, mtime_offset INTEGER NOT NULL, perms TEXT NOT NULL,
-          head_hash TEXT, tail_hash TEXT, full_hash TEXT, target TEXT, unreadable_ticks INTEGER, unreadable_offset INTEGER,
-          storage_kind TEXT, storage_ref TEXT, entry_name TEXT, volumes INTEGER NOT NULL DEFAULT 1, raw INTEGER NOT NULL DEFAULT 0,
-          volume_sizes TEXT, unrecoverable INTEGER NOT NULL DEFAULT 0,
+          version INTEGER NOT NULL, seq INTEGER NOT NULL, parent TEXT NOT NULL, path_fold TEXT NOT NULL,
+          {EntryRowMapper.ColumnDefinitions}, unrecoverable INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS entries_seq     ON entries (version, seq);
         CREATE INDEX IF NOT EXISTS entries_parent  ON entries (version, parent);
@@ -114,6 +111,15 @@ internal static class EntryRowMapper
         "@path, @kind, @length, @mtime_ticks, @mtime_offset, @perms, @head_hash, @tail_hash, @full_hash, @target, " +
         "@unreadable_ticks, @unreadable_offset, @storage_kind, @storage_ref, @entry_name, @volumes, @raw, @volume_sizes";
 
+    /// <summary>The same columns with their declared types, for the <c>CREATE TABLE</c> side. Kept next to
+    /// <see cref="Columns"/> and in the same order, so a table that stores entries cannot end up declaring a column
+    /// the mapper does not know about, or missing one it does.</summary>
+    public const string ColumnDefinitions =
+        "path TEXT NOT NULL, kind TEXT NOT NULL, length INTEGER NOT NULL, mtime_ticks INTEGER NOT NULL, " +
+        "mtime_offset INTEGER NOT NULL, perms TEXT NOT NULL, head_hash TEXT, tail_hash TEXT, full_hash TEXT, " +
+        "target TEXT, unreadable_ticks INTEGER, unreadable_offset INTEGER, storage_kind TEXT, storage_ref TEXT, " +
+        "entry_name TEXT, volumes INTEGER NOT NULL DEFAULT 1, raw INTEGER NOT NULL DEFAULT 0, volume_sizes TEXT";
+
     /// <summary>
     /// Binds <paramref name="entry"/> onto a command that may be reused for the next row: the parameter is created on
     /// the first call and only its value is replaced afterwards, which is what makes a million-entry import one
@@ -146,10 +152,16 @@ internal static class EntryRowMapper
         Set(command, "@entry_name", storage?.EntryName);
         Set(command, "@volumes", storage?.Volumes ?? 1);
         Set(command, "@raw", storage?.Raw == true ? 1 : 0);
-        Set(command, "@volume_sizes", storage is { VolumeSizes.Count: > 0 }
-            ? string.Join(',', storage.VolumeSizes.Select(v => v.ToString(CultureInfo.InvariantCulture)))
-            : null);
+        Set(command, "@volume_sizes", FormatVolumeSizes(storage?.VolumeSizes));
     }
+
+    /// <summary>The write side of <see cref="ParseVolumeSizes"/>: a variable-length list as one comma-joined column,
+    /// which keeps it out of the schema without a second table nothing else would ever join to. Shared, because the
+    /// run's work database stores reservations and resume records with the same column.</summary>
+    public static string? FormatVolumeSizes(IReadOnlyList<long>? sizes) =>
+        sizes is { Count: > 0 }
+            ? string.Join(',', sizes.Select(v => v.ToString(CultureInfo.InvariantCulture)))
+            : null;
 
     public static IndexEntry Read(SqliteDataReader reader) => new()
     {
