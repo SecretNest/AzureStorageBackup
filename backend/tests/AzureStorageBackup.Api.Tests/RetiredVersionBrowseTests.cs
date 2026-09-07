@@ -10,9 +10,10 @@ namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
 /// The metadata-browse endpoints (/tree, /file-versions, /unrecoverable, /unreadable, /hash-file,
-/// /repair-plan, /restore-estimate) read a specific version's index without registering as readers —
-/// so a retention round can retire that exact version mid-request: the info file still listed it when
-/// the request loaded, and the index blob is already gone when the request reaches for it. That is not
+/// /repair-plan, /restore-estimate) read a specific version without registering as readers — so a
+/// retention round can retire that exact version mid-request: the info file still listed it when the
+/// request loaded, the version is in no local home, and the index blob is already gone by the time the
+/// catalog goes to the cloud to migrate it in. That is not
 /// an internal error, it is a state one refresh old — the endpoint must answer the way it answers a
 /// version that never existed, not surface a bare 500 from the uncaught 404.
 /// </summary>
@@ -40,18 +41,10 @@ public sealed class RetiredVersionBrowseTests(TestWebAppFactory factory) : IClas
             => throw new RequestFailedException(404, "The specified blob does not exist.", "BlobNotFound", null);
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("indexes/v.bin", 1));
         public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
-        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => throw new NotSupportedException();
-    }
-
-    /// <summary>What the cold path throws when retention deleted the index blob between the info load and this read.</summary>
-    private sealed class GoneIndexCache : ILocalIndexCache
-    {
-        public Task<VersionIndex> ReadAsync(Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default)
+        // The catalog migrates a version it has never seen by downloading its index to a file, so this is the call
+        // that meets the deleted blob now — it is where the browse endpoints' 404 comes from.
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default)
             => throw new RequestFailedException(404, "The specified blob does not exist.", "BlobNotFound", null);
-        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default) => Task.CompletedTask;
-        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default) => Task.CompletedTask;
-        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private async Task<(HttpClient Client, int ConfigId)> HostAsync(string tag)
@@ -60,8 +53,6 @@ public sealed class RetiredVersionBrowseTests(TestWebAppFactory factory) : IClas
         {
             s.Remove(s.Single(d => d.ServiceType == typeof(IBackupInfoStore)));
             s.AddScoped<IBackupInfoStore, CannedInfoStore>();
-            s.Remove(s.Single(d => d.ServiceType == typeof(ILocalIndexCache)));
-            s.AddScoped<ILocalIndexCache, GoneIndexCache>();
         }));
         var client = host.CreateClient();
         var account = await (await client.PostAsJsonAsync("/api/accounts", new AccountRequest(

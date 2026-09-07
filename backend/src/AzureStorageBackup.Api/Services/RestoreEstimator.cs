@@ -8,26 +8,36 @@ namespace AzureStorageBackup.Api.Services;
 public sealed record RestoreEstimate(long DownloadBytes, long UncompressedBytes, int FileCount, IReadOnlyList<string> DistinctObjects);
 
 /// <summary>
-/// Estimating a restore (pure logic, no network): selected paths → index entries → deduplicated by stored
-/// object (a shared pack or a deduplicated blob counts once), summing the download size (volume sizes) and
-/// the extracted size (the files' lengths).
+/// Estimating a restore (pure logic, no network): the selected entries, deduplicated by stored object (a shared pack
+/// or a deduplicated blob counts once), summing the download size (volume sizes) and the extracted size (the files'
+/// lengths).
+/// <para>
+/// It used to be handed the whole version index plus the selected paths and do the lookup itself, which meant an
+/// estimate for three files read a million entries. The caller now looks the selection up in the catalog
+/// (<see cref="VersionCatalog.EntriesAtAsync"/>) and passes only what it found; a path the version does not hold is
+/// simply absent, exactly as it was silently absent from the old filter.
+/// </para>
 /// </summary>
 public static class RestoreEstimator
 {
-    public static RestoreEstimate Compute(VersionIndex index, BackupInfoFile info, IReadOnlyCollection<string> paths)
+    /// <param name="selected">The entries at the selected paths. Entries with no storage are dropped here rather than
+    /// by the caller: they cost nothing to download and are not files a restore fetches, so counting them would
+    /// inflate the file count the user is shown before consenting.</param>
+    public static RestoreEstimate Compute(IReadOnlyList<IndexEntry> selected, BackupInfoFile info)
     {
-        var pathSet = new HashSet<string>(paths, StringComparer.Ordinal);
-        var selected = index.Entries.Where(e => pathSet.Contains(e.Path) && e.Storage is not null).ToList();
-
         long uncompressed = 0;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
         long download = 0;
+        var files = 0;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var e in selected)
         {
+            if (e.Storage is not { } storage)
+                continue;
+
+            files++;
             uncompressed += e.Length;
 
-            var storage = e.Storage!;
             var key = StorageKey(storage);
             if (!seen.Add(key))
                 continue;
@@ -37,7 +47,7 @@ public static class RestoreEstimator
                 : storage.VolumeSizes.Sum();
         }
 
-        return new RestoreEstimate(download, uncompressed, selected.Count, seen.ToList());
+        return new RestoreEstimate(download, uncompressed, files, seen.ToList());
     }
 
     private static string StorageKey(StorageRef s) => s.Kind == "pack" ? "pack:" + s.Ref : "blob:" + s.Ref;

@@ -42,6 +42,13 @@ public sealed partial class VersionCatalog
 
     private const string SelectStatsSql = "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM entries WHERE version=@v";
 
+    private const string IsUnrecoverableSql = "SELECT EXISTS (SELECT 1 FROM unrecoverable WHERE version=@v AND path=@path)";
+
+    /// <summary>The entries a local-root comparison may look at: everything except the ones whose size and mtime were
+    /// carried over from an earlier version and so were never guaranteed to match the disk.</summary>
+    private const string SelectComparableEntriesSql =
+        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND unreadable_ticks IS NULL ORDER BY seq";
+
     /// <summary>Paths that differ only in case: on a case-insensitive restore target they would overwrite one another, so a check has to report them.</summary>
     private const string SelectCaseCollisionsSql = """
         SELECT path, version FROM entries WHERE version=@v AND path_fold IN
@@ -216,6 +223,80 @@ public sealed partial class VersionCatalog
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
+    }
+
+    /// <summary>Whether this one path is among the version's unrecoverable ones. The whole list
+    /// (<see cref="UnrecoverableAsync"/>) is the wrong question when the caller only wants to know about a single
+    /// file — the restore dialog's "which versions can this path be substituted from" asks it once per retained
+    /// version, and a version can hold a million paths.</summary>
+    public Task<bool> IsUnrecoverableAsync(int version, string path, CancellationToken ct) =>
+        ExistsAsync(IsUnrecoverableSql, ct, ("@v", version), ("@path", path));
+
+    /// <summary>
+    /// A stratified sample of the version, for comparing a proposed new local root against what was backed up:
+    /// four buckets by length, each with a share of the budget, sampled evenly inside the bucket rather than from its
+    /// head. <see cref="SamplePlan"/> owns that arithmetic, so this and the preview's verdict cannot drift apart on
+    /// which rows a sample is made of.
+    /// </summary>
+    /// <remarks>
+    /// Bounded by the request, never by the version's size: four <c>COUNT(*)</c>s, then one single-row fetch per
+    /// allotted slot — at most <paramref name="max"/> of them, save for the degenerate case where <paramref name="max"/>
+    /// is smaller than the number of non-empty buckets and the one-slot-per-bucket guarantee wins (at most four rows
+    /// either way). Each fetch is an <c>OFFSET</c> into its bucket. A version whose entire
+    /// comparable set fits inside the budget is read in one streaming pass instead — the offsets would pick every row
+    /// anyway, and one scan is cheaper than N seeks to get the same answer.
+    /// </remarks>
+    public async Task<IReadOnlyList<IndexEntry>> SampleAsync(int version, int max, CancellationToken ct)
+    {
+        if (max <= 0)
+            return [];
+
+        var counts = new int[SamplePlan.BucketCount];
+        var pool = 0;
+        for (var bucket = 0; bucket < counts.Length; bucket++)
+        {
+            using var count = Command(
+                $"SELECT COUNT(*) FROM entries WHERE version=@v AND unreadable_ticks IS NULL AND {SamplePlan.Predicate(bucket)}");
+            Set(count, "@v", version);
+            counts[bucket] = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
+            pool += counts[bucket];
+        }
+
+        if (pool == 0)
+            return [];
+
+        if (pool <= max)
+        {
+            var all = new List<IndexEntry>(pool);
+            await foreach (var entry in QueryEntriesAsync(SelectComparableEntriesSql, version, ct))
+                all.Add(entry);
+            return all;
+        }
+
+        var quotas = SamplePlan.Quotas(counts, max);
+        var sample = new List<IndexEntry>(max);
+        for (var bucket = 0; bucket < counts.Length; bucket++)
+        {
+            if (quotas[bucket] <= 0)
+                continue;
+
+            // One prepared statement per bucket, re-bound per offset: the picked positions are spread across the
+            // bucket, so they cannot be collapsed into a single range.
+            using var pick = Command(
+                $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND unreadable_ticks IS NULL " +
+                $"AND {SamplePlan.Predicate(bucket)} ORDER BY seq LIMIT 1 OFFSET @n");
+            Set(pick, "@v", version);
+            foreach (var offset in SamplePlan.Offsets(counts[bucket], quotas[bucket]))
+            {
+                ct.ThrowIfCancellationRequested();
+                Set(pick, "@n", offset);
+                await using var reader = (SqliteDataReader)await pick.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                    sample.Add(EntryRowMapper.Read(reader));
+            }
+        }
+
+        return sample;
     }
 
     public async Task<IReadOnlyList<(string Path, int Version)>> CaseCollisionsAsync(int version, CancellationToken ct)

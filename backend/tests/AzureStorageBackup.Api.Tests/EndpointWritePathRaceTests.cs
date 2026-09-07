@@ -86,20 +86,22 @@ public sealed class EndpointWritePathRaceTests
     }
 
     /// <summary>The second of the delete-config cleanup steps: throws cancellation the moment it is called. These cases should not reach the other methods.</summary>
-    private sealed class CancelsOnEvictIndexCache : ILocalIndexCache
+    private sealed class CancelsOnDiscardCatalogs : IVersionCatalogs
     {
-        public Task<VersionIndex> ReadAsync(
-            Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default) => throw new NotSupportedException();
-
-        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default)
+        public Task<VersionCatalog> OpenAsync(int accountId, string container, bool readOnly, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
+        public Task EnsureVersionAsync(Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
+        public Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)
             => throw new OperationCanceledException();
+
+        public Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
+            => throw new NotSupportedException();
     }
 
     /// <summary>The third of the delete-config cleanup steps: only records whether it was called.</summary>
@@ -354,8 +356,8 @@ public sealed class EndpointWritePathRaceTests
         var stateStore = new RecordingStateStore();
         using var factory = new StubbedFactory(services =>
         {
-            services.RemoveAll<ILocalIndexCache>();
-            services.AddScoped<ILocalIndexCache, CancelsOnEvictIndexCache>();
+            services.RemoveAll<IVersionCatalogs>();
+            services.AddScoped<IVersionCatalogs, CancelsOnDiscardCatalogs>();
             services.RemoveAll<ILocalBackupStateStore>();
             services.AddScoped<ILocalBackupStateStore>(_ => stateStore);
         });
