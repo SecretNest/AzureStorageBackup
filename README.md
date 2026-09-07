@@ -454,7 +454,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 | Variable | Purpose | Default (image) |
 | --- | --- | --- |
-| `ConnectionStrings__Sqlite` | SQLite connection string (app database). | `Data Source=/data/app.db` |
+| `ConnectionStrings__Sqlite` | SQLite connection string (app database). Connection pooling is always switched off by the application, whatever the string says: a pooled handle reclaimed from a leaked connection was handed to new connections with its old statements still being finalized, surfacing as `SQLite Error 5: 'not an error'`. | `Data Source=/data/app.db` |
 | `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
 | `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
