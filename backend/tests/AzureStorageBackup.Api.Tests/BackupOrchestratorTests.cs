@@ -139,6 +139,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => inner.WriteInfoConditionalAsync(a, c, i, p, t, e, ct);
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => inner.WriteIndexAsync(a, c, v, i, p, t, ct, progress);
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => inner.WriteIndexFileAsync(a, c, v, s, p, t, ct, progress);
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => inner.ReadIndexToFileAsync(a, c, b, p, volumes, dest, ct);
     }
 
     [SkippableFact]

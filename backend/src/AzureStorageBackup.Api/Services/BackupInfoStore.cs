@@ -5,8 +5,14 @@ using AzureStorageBackup.Api.Models;
 
 namespace AzureStorageBackup.Api.Services;
 
-public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec codec) : IBackupInfoStore
+/// <param name="tempRoot">Where the file-shaped index members put the encoded archive and the file they read back
+/// for verification. Null means the system temp dir, which is right for tests and for anything constructed
+/// ad hoc; the app passes the configured temp path instead, because that is the volume the operator sized for
+/// the job — an index at a few million entries is hundreds of MB and the system temp dir may be a small tmpfs.</param>
+public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec codec, string? tempRoot = null) : IBackupInfoStore
 {
+    private readonly string _tempRoot = tempRoot ?? Path.Combine(Path.GetTempPath(), "asb-index");
+
     public async Task<BackupInfoFile?> ReadInfoAsync(
         Account account, string container, string? password, CancellationToken ct = default)
         => (await ReadInfoWithETagAsync(account, container, password, ct))?.Info;
@@ -107,7 +113,7 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
         CancellationToken ct = default, StageTracker? progress = null)
     {
         var cc = Container(account, container);
-        var name = $"indexes/v{version}.json" + (string.IsNullOrEmpty(password) ? "" : ".enc");
+        var name = IndexBlobName(version, password);
 
         // Serializing and encoding a few million entries is seconds of CPU before the first byte moves; the name on
         // the row says what is being produced in the meantime.
@@ -130,19 +136,8 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
             sizes[i] = Math.Min(IndexVolumeBytes, encoded.Length - i * IndexVolumeBytes);
         // Every volume goes up once and comes back once for verification.
         Plan(progress, [.. sizes, .. sizes]);
-        for (var i = 0; i < names.Count; i++)
-        {
-            var offset = i * IndexVolumeBytes;
-            var length = (int)sizes[i];
-            var blob = cc.GetBlobClient(names[i]);
-            await TransferAsync(progress, $"{names[i]} ({i + 1}/{volumes}) upload", length, p =>
-            {
-                var options = new BlobUploadOptions { ProgressHandler = p };
-                if (tier is { } t)
-                    options.AccessTier = t;
-                return blob.UploadAsync(new MemoryStream(encoded, offset, length), options, ct);
-            });
-        }
+        await UploadVolumesAsync(cc, names, sizes,
+            i => new MemoryStream(encoded, i * IndexVolumeBytes, (int)sizes[i]), tier, ct, progress);
 
         // Read the whole set back and deserialize it, the same guarantee WriteAtomicAsync gives the single-blob
         // path. There is no temp-then-rename dance here and none is needed: the version does not exist until the
@@ -150,6 +145,181 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
         // Verifying still matters — silent truncation would otherwise surface at restore time.
         VerifyRoundTrip(await ReadIndexCoreAsync(cc, names, password, progress, sizes, ct), index);
         return (name, volumes);
+    }
+
+    public async Task<(string Name, int Volumes)> WriteIndexFileAsync(
+        Account account, string container, int version, string serializedPath, string? password,
+        AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
+    {
+        var cc = Container(account, container);
+        var name = IndexBlobName(version, password);
+
+        // Encoding a few million entries is seconds of CPU before the first byte moves; the name on the row says
+        // what is being produced in the meantime.
+        progress?.Touch(name);
+        var work = NewWorkDir();
+        try
+        {
+            var encodedPath = Path.Combine(work, "index.7z");
+            await codec.EncodeFileAsync(serializedPath, encodedPath, password, ct);
+            var encodedLength = new FileInfo(encodedPath).Length;
+
+            if (encodedLength <= IndexVolumeBytes)
+            {
+                // Small enough to stay one blob, which keeps the overwhelming majority of backups on exactly the
+                // layout they had before indexes moved to files.
+                Plan(progress, [encodedLength, encodedLength, encodedLength]);
+                await WriteAtomicAsync(cc, name, () => File.OpenRead(encodedPath), encodedLength,
+                    (temp, p) => VerifyDownloadedIndexAsync(temp, p, work, serializedPath, password, ct),
+                    tier, ifMatch: null, ct, progress);
+                return (name, 1);
+            }
+
+            var volumes = (int)((encodedLength + IndexVolumeBytes - 1) / IndexVolumeBytes);
+            var names = VolumeBlobIO.VolumeNames(name, volumes);
+            var sizes = new long[volumes];
+            for (var i = 0; i < volumes; i++)
+                sizes[i] = Math.Min(IndexVolumeBytes, encodedLength - (long)i * IndexVolumeBytes);
+            // Every volume goes up once and comes back once for verification.
+            Plan(progress, [.. sizes, .. sizes]);
+            // A fresh handle per volume: the window owns it and closes it, so nothing shares a file position with
+            // a retry that seeks back to the start of its own range.
+            await UploadVolumesAsync(cc, names, sizes,
+                i => new RangeStream(File.OpenRead(encodedPath), (long)i * IndexVolumeBytes, sizes[i]), tier, ct, progress);
+
+            // The same guarantee WriteAtomicAsync gives the single-blob path, and for the same reason: there is no
+            // temp-then-rename dance here and none is needed (the version does not exist until the info file
+            // commits, so a half-written set is an orphan, not a corrupt version), but silent truncation would
+            // otherwise surface at restore time. Compared through the header alone — reading a hundreds-of-MB index
+            // back into memory just to count its entries is what this whole path exists to avoid.
+            var readBack = Path.Combine(work, "readback.idx");
+            await ReadIndexToFileCoreAsync(cc, names, password, readBack, progress, sizes, ct);
+            VerifyHeaders(serializedPath, readBack);
+            return (name, volumes);
+        }
+        finally
+        {
+            TryDeleteDir(work);
+        }
+    }
+
+    public Task ReadIndexToFileAsync(
+        Account account, string container, string indexBlob, string? password, int volumes, string destPath,
+        CancellationToken ct = default)
+        // volumes <= 1 takes VolumeNames straight back to [indexBlob], the single-blob layout every index written
+        // before info format 5 uses — no probing, no extra request.
+        => ReadIndexToFileCoreAsync(Container(account, container), VolumeBlobIO.VolumeNames(indexBlob, volumes),
+            password, destPath, progress: null, sizes: null, ct);
+
+    /// <summary>
+    /// Downloads the volumes into one archive file and decodes it to <paramref name="destPath"/>. The volumes are
+    /// concatenated **before** decoding for the same reason <see cref="ReadIndexCoreAsync"/> concatenates in
+    /// memory: the codec ran once over the whole payload, so a volume on its own is a fragment of an archive, not
+    /// an archive.
+    /// </summary>
+    private async Task ReadIndexToFileCoreAsync(
+        BlobContainerClient cc, IReadOnlyList<string> names, string? password, string destPath,
+        StageTracker? progress, IReadOnlyList<long>? sizes, CancellationToken ct)
+    {
+        var work = NewWorkDir();
+        try
+        {
+            var encoded = Path.Combine(work, "encoded.7z");
+            await using (var file = File.Create(encoded))
+            {
+                for (var i = 0; i < names.Count; i++)
+                {
+                    var blob = cc.GetBlobClient(names[i]);
+                    var label = names.Count == 1 ? $"{names[0]} verify" : $"{names[i]} ({i + 1}/{names.Count}) verify";
+                    await TransferAsync(progress, label, sizes?[i] ?? 0,
+                        p => blob.DownloadToAsync(file, new BlobDownloadToOptions { ProgressHandler = p }, ct));
+                    // DownloadTo writes from wherever the stream stands; leaving it at the end is what makes the
+                    // next volume land after this one instead of over it.
+                    file.Seek(0, SeekOrigin.End);
+                }
+            }
+            await codec.DecodeFileAsync(encoded, destPath, password, ct);
+        }
+        finally
+        {
+            TryDeleteDir(work);
+        }
+    }
+
+    /// <summary>The verification half of the single-blob file write: pull the temp blob down as a file, decode it,
+    /// and check its header against the index that went up.</summary>
+    private async Task VerifyDownloadedIndexAsync(
+        BlobClient temp, IProgress<long>? p, string work, string serializedPath, string? password, CancellationToken ct)
+    {
+        var archive = Path.Combine(work, "readback.7z");
+        var decoded = Path.Combine(work, "readback.idx");
+        await using (var file = File.Create(archive))
+            await temp.DownloadToAsync(file, new BlobDownloadToOptions { ProgressHandler = p }, ct);
+        await codec.DecodeFileAsync(archive, decoded, password, ct);
+        VerifyHeaders(serializedPath, decoded);
+    }
+
+    /// <summary>
+    /// The file path's answer to <see cref="VerifyRoundTrip"/>: version and entry count, read from the two files'
+    /// headers. It catches what the check is for — a volume short, out of order, or missing — without either file
+    /// being read past its first nine bytes.
+    /// </summary>
+    private static void VerifyHeaders(string writtenPath, string readBackPath)
+    {
+        var (writtenVersion, writtenCount) = ReadHeader(writtenPath);
+        var (readVersion, readCount) = ReadHeader(readBackPath);
+        if (writtenVersion != readVersion || writtenCount != readCount)
+            throw new InvalidOperationException(
+                $"Index volume verification failed: wrote version {writtenVersion} with {writtenCount} entries, read back version {readVersion} with {readCount}.");
+
+        static (int Version, int EntryCount) ReadHeader(string path)
+        {
+            using var fs = File.OpenRead(path);
+            using var reader = new IndexStreamReader(fs);
+            return (reader.Version, reader.EntryCount);
+        }
+    }
+
+    /// <summary>
+    /// Uploads a volume family, one volume at a time, each booked on the tracker. Shared by the byte-array and the
+    /// file write so the naming, the labels and the tier handling have exactly one implementation — the two differ
+    /// only in where a volume's bytes come from.
+    /// </summary>
+    /// <param name="openVolume">A fresh readable stream over volume <c>i</c>; disposed once its upload returns.</param>
+    private static async Task UploadVolumesAsync(
+        BlobContainerClient cc, IReadOnlyList<string> names, IReadOnlyList<long> sizes, Func<int, Stream> openVolume,
+        AccessTier? tier, CancellationToken ct, StageTracker? progress)
+    {
+        for (var i = 0; i < names.Count; i++)
+        {
+            var index = i;
+            var blob = cc.GetBlobClient(names[i]);
+            await TransferAsync(progress, $"{names[i]} ({i + 1}/{names.Count}) upload", sizes[i], async p =>
+            {
+                var options = new BlobUploadOptions { ProgressHandler = p };
+                if (tier is { } t)
+                    options.AccessTier = t;
+                await using var content = openVolume(index);
+                await blob.UploadAsync(content, options, ct);
+            });
+        }
+    }
+
+    /// <summary>The blob name of a version's index: the password decides only whether it carries <c>.enc</c>.</summary>
+    private static string IndexBlobName(int version, string? password)
+        => $"indexes/v{version}.json" + (string.IsNullOrEmpty(password) ? "" : ".enc");
+
+    /// <summary>A private directory under the store's temp root for one call's encoded archive and readback files.</summary>
+    private string NewWorkDir()
+    {
+        var dir = Path.Combine(_tempRoot, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void TryDeleteDir(string dir)
+    {
+        try { Directory.Delete(dir, recursive: true); } catch { /* best effort; a leftover temp dir is not worth failing a write over */ }
     }
 
     /// <summary>Declare the stage's size once the encoded length is known: one entry per transfer, each its byte
@@ -216,20 +386,39 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
     /// Takes the encoded bytes rather than encoding here: the index path has already encoded once to learn whether
     /// it fits in one blob, and encrypting tens of MB a second time bought nothing.
     /// </summary>
-    private async Task<string> WriteAtomicAsync(
+    private Task<string> WriteAtomicAsync(
         BlobContainerClient cc, string finalName, byte[] encoded, string? password, Action<byte[]> verify,
+        AccessTier? tier, string? ifMatch, CancellationToken ct, StageTracker? progress = null)
+        => WriteAtomicAsync(cc, finalName, () => new MemoryStream(encoded, writable: false), encoded.Length,
+            async (temp, p) => verify(await codec.DecodeAsync(await DownloadAsync(temp, p, ct), password, ct)),
+            tier, ifMatch, ct, progress);
+
+    /// <summary>
+    /// The same atomic write over a payload the caller opens on demand instead of holding as an array, so an index
+    /// of any size goes up straight off its encoded file. The three transfers are unchanged; only the source of the
+    /// bytes and the shape of the verification differ.
+    /// </summary>
+    /// <param name="open">A fresh readable stream over the payload each time it is called — twice, once for the
+    /// temp blob and once for the commit (and again per retry inside the SDK, which rewinds the stream it was
+    /// given). Each stream is disposed once its upload returns.</param>
+    /// <param name="verify">Hands over the temp blob and the progress reporter to book the download against: how
+    /// the read-back content is buffered and checked is the caller's business, because that is precisely what
+    /// differs between a few KB of info file and a possibly enormous index.</param>
+    private async Task<string> WriteAtomicAsync(
+        BlobContainerClient cc, string finalName, Func<Stream> open, long length,
+        Func<BlobClient, IProgress<long>?, Task> verify,
         AccessTier? tier, string? ifMatch, CancellationToken ct, StageTracker? progress = null)
     {
         var temp = cc.GetBlobClient(finalName + ".writing." + Guid.NewGuid().ToString("N"));
         try
         {
-            await TransferAsync(progress, $"{finalName} upload", encoded.Length,
-                p => temp.UploadAsync(new MemoryStream(encoded, writable: false), new BlobUploadOptions { ProgressHandler = p }, ct));
+            await TransferAsync(progress, $"{finalName} upload", length, async p =>
+            {
+                await using var content = open();
+                await temp.UploadAsync(content, new BlobUploadOptions { ProgressHandler = p }, ct);
+            });
 
-            byte[]? readBack = null;
-            await TransferAsync(progress, $"{finalName} verify", encoded.Length,
-                async p => readBack = await DownloadAsync(temp, p, ct));
-            verify(await codec.DecodeAsync(readBack!, password, ct));
+            await TransferAsync(progress, $"{finalName} verify", length, p => verify(temp, p));
 
             var options = new BlobUploadOptions();
             if (tier is { } t)
@@ -238,10 +427,11 @@ public sealed class BackupInfoStore(IBlobClientFactory factory, IArchiveCodec co
                 options.Conditions = new BlobRequestConditions { IfMatch = new ETag(ifMatch) };
 
             string? etag = null;
-            await TransferAsync(progress, $"{finalName} commit", encoded.Length, async p =>
+            await TransferAsync(progress, $"{finalName} commit", length, async p =>
             {
                 options.ProgressHandler = p;
-                var resp = await cc.GetBlobClient(finalName).UploadAsync(new MemoryStream(encoded, writable: false), options, ct);
+                await using var content = open();
+                var resp = await cc.GetBlobClient(finalName).UploadAsync(content, options, ct);
                 etag = resp.Value.ETag.ToString();
             });
             return etag!;

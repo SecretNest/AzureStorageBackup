@@ -77,6 +77,12 @@ public sealed class EndpointWritePathRaceTests
 
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotSupportedException();
+
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
+            => throw new NotSupportedException();
+
+        public Task ReadIndexToFileAsync(Account account, string container, string indexBlob, string? password, int volumes, string destPath, CancellationToken ct = default)
+            => throw new NotSupportedException();
     }
 
     /// <summary>The second of the delete-config cleanup steps: throws cancellation the moment it is called. These cases should not reach the other methods.</summary>

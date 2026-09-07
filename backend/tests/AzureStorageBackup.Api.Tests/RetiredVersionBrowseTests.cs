@@ -39,6 +39,8 @@ public sealed class RetiredVersionBrowseTests(TestWebAppFactory factory) : IClas
         public Task<VersionIndex> ReadIndexAsync(Account a, string c, string i, string? p, int v = 1, CancellationToken ct = default)
             => throw new RequestFailedException(404, "The specified blob does not exist.", "BlobNotFound", null);
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("indexes/v.bin", 1));
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     /// <summary>What the cold path throws when retention deleted the index blob between the info load and this read.</summary>

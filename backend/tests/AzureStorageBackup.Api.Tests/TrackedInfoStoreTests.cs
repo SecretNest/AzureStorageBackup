@@ -56,6 +56,8 @@ public sealed class TrackedInfoStoreTests : IDisposable
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, int volumes = 1, CancellationToken ct = default) => Task.FromResult(new VersionIndex());
         public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("i", 1));
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private static Account Acc() => new() { Id = 1, Name = "a", BlobEndpoint = "http://x", AccountKeyProtected = TestSecrets.Protect("k") };
