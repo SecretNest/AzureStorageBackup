@@ -38,25 +38,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             var archive = Path.Combine(work, "out.7z");
             await File.WriteAllBytesAsync(input, content, ct);
 
-            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // maximum compression (PRD 3.3.2.1)
-            if (!string.IsNullOrEmpty(password))
-            {
-                args.Add("-p" + password);
-                args.Add("-mhe=on");
-            }
-            args.Add(archive);
-            args.Add(input);
-
-            // The same verification as SevenZipCompressor: on exit code 1, 7z may already have silently dropped the
-            // only entry and left behind a valid but empty archive. The input here is a temp file we just wrote, so
-            // the odds of hitting it are tiny, but an index/info file losing its content makes the whole backup unreadable, which is not worth gambling to save one listing.
-            var run = await RunAsync(args, ct);
-            if (run.ExitCode == 1
-                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))
-            {
-                throw new ArchiveMembersMissingException([EntryName],
-                    "7-Zip left the payload out of the archive.");
-            }
+            await EncodeWorkDirAsync(work, password, ct);
             return await File.ReadAllBytesAsync(archive, ct);
         }
         finally
@@ -74,13 +56,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             var outDir = Path.Combine(work, "out");
             await File.WriteAllBytesAsync(input, archive, ct);
 
-            var args = new List<string> { "x", "-y", "-bso0", "-bsp0" };
-            if (!string.IsNullOrEmpty(password))
-                args.Add("-p" + password);
-            args.Add("-o" + outDir);
-            args.Add(input);
-
-            await RunAsync(args, ct);
+            await DecodeWorkDirAsync(work, password, ct);
             return await File.ReadAllBytesAsync(Path.Combine(outDir, EntryName), ct);
         }
         finally
@@ -101,23 +77,7 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
             // byte array out under that name rather than compressing it in place.
             File.Copy(inputPath, input);
 
-            var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // maximum compression (PRD 3.3.2.1)
-            if (!string.IsNullOrEmpty(password))
-            {
-                args.Add("-p" + password);
-                args.Add("-mhe=on");
-            }
-            args.Add(archive);
-            args.Add(input);
-
-            // Same silent-drop verification as EncodeAsync: see the comment there for why exit code 1 alone isn't trustworthy.
-            var run = await RunAsync(args, ct);
-            if (run.ExitCode == 1
-                && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))
-            {
-                throw new ArchiveMembersMissingException([EntryName],
-                    "7-Zip left the payload out of the archive.");
-            }
+            await EncodeWorkDirAsync(work, password, ct);
             File.Move(archive, archivePath, overwrite: true);
         }
         finally
@@ -131,21 +91,67 @@ public sealed class SevenZipArchiveCodec : IArchiveCodec
         var work = NewWorkDir();
         try
         {
+            var input = Path.Combine(work, "in.7z");
             var outDir = Path.Combine(work, "out");
+            File.Copy(archivePath, input);
 
-            var args = new List<string> { "x", "-y", "-bso0", "-bsp0" };
-            if (!string.IsNullOrEmpty(password))
-                args.Add("-p" + password);
-            args.Add("-o" + outDir);
-            args.Add(archivePath);
-
-            await RunAsync(args, ct);
+            await DecodeWorkDirAsync(work, password, ct);
             File.Move(Path.Combine(outDir, EntryName), outputPath, overwrite: true);
         }
         finally
         {
             TryDelete(work);
         }
+    }
+
+    /// <summary>
+    /// Compresses <c>{work}/content</c> into <c>{work}/out.7z</c> and verifies the result — the half of encoding
+    /// shared by <see cref="EncodeAsync"/> and <see cref="EncodeFileAsync"/>, which differ only in how the
+    /// payload gets into <c>{work}/content</c> and the archive bytes get to the caller.
+    /// </summary>
+    private async Task EncodeWorkDirAsync(string work, string? password, CancellationToken ct)
+    {
+        var input = Path.Combine(work, EntryName);
+        var archive = Path.Combine(work, "out.7z");
+
+        var args = new List<string> { "a", "-t7z", "-y", "-bso0", "-bsp0", "-mx9" }; // maximum compression (PRD 3.3.2.1)
+        if (!string.IsNullOrEmpty(password))
+        {
+            args.Add("-p" + password);
+            args.Add("-mhe=on");
+        }
+        args.Add(archive);
+        args.Add(input);
+
+        // The same verification as SevenZipCompressor: on exit code 1, 7z may already have silently dropped the
+        // only entry and left behind a valid but empty archive. The input here is a temp file we just wrote, so
+        // the odds of hitting it are tiny, but an index/info file losing its content makes the whole backup unreadable, which is not worth gambling to save one listing.
+        var run = await RunAsync(args, ct);
+        if (run.ExitCode == 1
+            && !(await SevenZipCli.ListEntriesAsync(_exe, archive, password, ct, _priority)).Contains(EntryName))
+        {
+            throw new ArchiveMembersMissingException([EntryName],
+                "7-Zip left the payload out of the archive.");
+        }
+    }
+
+    /// <summary>
+    /// Extracts <c>{work}/in.7z</c> into <c>{work}/out</c> — the half of decoding shared by
+    /// <see cref="DecodeAsync"/> and <see cref="DecodeFileAsync"/>, which differ only in how the archive gets
+    /// into <c>{work}/in.7z</c> and the extracted content gets to the caller.
+    /// </summary>
+    private async Task DecodeWorkDirAsync(string work, string? password, CancellationToken ct)
+    {
+        var input = Path.Combine(work, "in.7z");
+        var outDir = Path.Combine(work, "out");
+
+        var args = new List<string> { "x", "-y", "-bso0", "-bsp0" };
+        if (!string.IsNullOrEmpty(password))
+            args.Add("-p" + password);
+        args.Add("-o" + outDir);
+        args.Add(input);
+
+        await RunAsync(args, ct);
     }
 
     private string NewWorkDir()
