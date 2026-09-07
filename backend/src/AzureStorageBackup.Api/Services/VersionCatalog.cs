@@ -64,8 +64,8 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     // OR IGNORE, not OR REPLACE: a duplicate path inside one version keeps the first row (see ImportCoreAsync).
     private const string InsertEntrySql =
-        $"INSERT OR IGNORE INTO entries (version, seq, parent, path_fold, {EntryRowMapper.Columns}) " +
-        $"VALUES (@version, @seq, @parent, @path_fold, {EntryRowMapper.Parameters})";
+        $"INSERT OR IGNORE INTO entries (version, seq, parent, path_fold, path_key, {EntryRowMapper.Columns}) " +
+        $"VALUES (@version, @seq, @parent, @path_fold, @path_key, {EntryRowMapper.Parameters})";
 
     private const string InsertDirSql = "INSERT OR IGNORE INTO dirs (version, path, parent) VALUES (@v, @path, @parent)";
     private const string InsertEmptyDirSql = "INSERT OR IGNORE INTO empty_dirs (version, path, seq) VALUES (@v, @path, @seq)";
@@ -222,6 +222,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
                 Set(insert, "@seq", seen++);
                 Set(insert, "@parent", ParentOf(entry.Path));
                 Set(insert, "@path_fold", entry.Path.ToUpperInvariant());
+                Set(insert, "@path_key", CatalogSql.PathKey(entry.Path));
                 EntryRowMapper.Bind(insert, entry);
                 if (await insert.ExecuteNonQueryAsync(ct) != 1)
                 {

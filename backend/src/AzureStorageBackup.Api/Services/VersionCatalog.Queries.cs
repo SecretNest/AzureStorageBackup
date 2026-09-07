@@ -13,7 +13,11 @@ namespace AzureStorageBackup.Api.Services;
 public sealed partial class VersionCatalog
 {
     private const string SelectEntrySql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND path=@path";
-    private const string SelectEntriesByPathSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY path";
+
+    /// <summary>Ordered by the UTF-16BE <c>path_key</c>, not the <c>path</c> TEXT column: this is the cursor the diff
+    /// merges against the run's scan cursor (<c>RunWorkDb.ScanOrderedAsync</c>), and both have to agree on ordinal
+    /// order for a surrogate pair to land in the same place on each side. See <see cref="CatalogSql.PathKey"/>.</summary>
+    private const string SelectEntriesByPathSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY path_key";
 
     /// <summary>A range scan over the (version, path) primary key, not <c>LIKE</c>: "d" must take in "d/x" without
     /// also taking in "dd/x", and the bound is the byte right after '/'.</summary>
@@ -132,8 +136,10 @@ public sealed partial class VersionCatalog
         return children;
     }
 
-    /// <summary>Every entry of the version in path order — SQLite's default BINARY collation compares UTF-8 bytes,
-    /// which is <see cref="StringComparer.Ordinal"/>, the order the diff walks the local scan in.</summary>
+    /// <summary>Every entry of the version in <see cref="StringComparer.Ordinal"/> path order — the order the diff
+    /// walks the local scan in. Ordered by <c>path_key</c>, not the <c>path</c> TEXT column, because SQLite's default
+    /// BINARY collation compares UTF-8 bytes, which agrees with ordinal order only until a surrogate pair shows up.
+    /// See <see cref="CatalogSql.PathKey"/>.</summary>
     public IAsyncEnumerable<IndexEntry> EntriesAsync(int version, CancellationToken ct) =>
         QueryEntriesAsync(SelectEntriesByPathSql, version, ct);
 

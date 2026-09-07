@@ -1,5 +1,4 @@
 using System.Runtime.ExceptionServices;
-using System.Text;
 using System.Threading.Channels;
 using AzureStorageBackup.Api.Models;
 using Microsoft.Data.Sqlite;
@@ -262,7 +261,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     {
         var command = statements.For(InsertScanSql);
         Set(command, "@path", row.Path);
-        Set(command, "@path_key", PathKey(row.Path));
+        Set(command, "@path_key", CatalogSql.PathKey(row.Path));
         Set(command, "@kind", (int)row.Kind);
         Set(command, "@length", row.Length);
         Set(command, "@mtime_ticks", row.ModifiedAt.UtcTicks);
@@ -457,11 +456,6 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         _faultObserved = true;
         ExceptionDispatchInfo.Capture(fault).Throw();
     }
-
-    /// <summary>UTF-16 big-endian bytes: their <c>memcmp</c> order is char-by-char order on the original string,
-    /// which is exactly what <c>StringComparer.Ordinal</c> does. See the class remarks for why the TEXT column's own
-    /// collation will not do.</summary>
-    private static byte[] PathKey(string path) => Encoding.BigEndianUnicode.GetBytes(path);
 
     private static void Set(SqliteCommand command, string name, object? value) => EntryRowMapper.Set(command, name, value);
 

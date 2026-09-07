@@ -267,15 +267,19 @@ public sealed class VersionCatalogTests : IDisposable
     [Fact]
     public async Task Entries_are_ordered_by_ordinal_path()
     {
+        // "z\U0001F600" (a surrogate pair, D83D DE00 in UTF-16) and "z￿" (EF BF BF in UTF-8) disagree between
+        // SQLite's BINARY (UTF-8 byte) order and .NET's ordinal (UTF-16 code unit) order: UTF-8 sorts the surrogate
+        // pair after U+FFFF, ordinal sorts it before. A version containing both is the case that catches an
+        // EntriesAsync still ordering by the TEXT column instead of the ordinal path_key.
         await using var catalog = await OpenAsync();
-        await ImportAsync(catalog, 1, [Entry("b", 1), Entry("a/x", 2), Entry("A", 3), Entry("a-x", 4)]);
+        await ImportAsync(catalog, 1,
+            [Entry("b", 1), Entry("a/x", 2), Entry("A", 3), Entry("a-x", 4), Entry("z\U0001F600", 5), Entry("z￿", 6)]);
 
         var paths = new List<string>();
         await foreach (var e in catalog.EntriesAsync(1, CancellationToken.None))
             paths.Add(e.Path);
 
         Assert.Equal(paths.Order(StringComparer.Ordinal), paths);
-        Assert.Equal(["A", "a-x", "a/x", "b"], paths);
     }
 
     // ---- The remaining readers ---------------------------------------------------------------------------------

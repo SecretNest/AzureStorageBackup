@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using AzureStorageBackup.Api.Models;
 using Microsoft.Data.Sqlite;
 
@@ -65,27 +66,40 @@ public static class CatalogSql
         command.ExecuteNonQuery();
     }
 
+    /// <summary>UTF-16 big-endian bytes: their <c>memcmp</c> order is char-by-char order on the original string,
+    /// which is exactly what <see cref="StringComparer.Ordinal"/> does. SQLite's default <c>BINARY</c> collation on
+    /// a TEXT column compares UTF-8 bytes instead, and the two disagree the moment a surrogate pair appears (U+1F600
+    /// is <c>F0 9F 98 80</c> in UTF-8 but <c>D83D DE00</c> in UTF-16, so UTF-8 sorts it after U+FFFF while ordinal
+    /// sorts it before). The catalog's <c>entries.path_key</c> and the run's work database's <c>scan.path_key</c>
+    /// both store this, and both order by it, so the diff's two cursors agree on what "next" means. Shared here
+    /// rather than duplicated, because two independent implementations of "encode a path for ordering" is exactly
+    /// the kind of drift that turns into a phantom deletion.</summary>
+    internal static byte[] PathKey(string path) => Encoding.BigEndianUnicode.GetBytes(path);
+
     /// <summary>
     /// The secondary indexes are the whole point of the file: <c>entries_content</c> and <c>entries_head</c> answer
-    /// dedup, <c>entries_parent</c> answers browsing, <c>entries_ref</c> answers retention and repair, and
-    /// <c>entries_seq</c> preserves the source order a serialized index has to be written back in. <c>WITHOUT
-    /// ROWID</c> on the tables whose primary key is the whole row's identity saves the extra rowid index and stores
-    /// entries clustered by (version, path), which is the order the diff walks.
+    /// dedup, <c>entries_parent</c> answers browsing, <c>entries_ref</c> answers retention and repair,
+    /// <c>entries_seq</c> preserves the source order a serialized index has to be written back in, and
+    /// <c>entries_path_key</c> is the order <see cref="VersionCatalog.EntriesAsync"/> streams in — see
+    /// <see cref="PathKey"/> for why that is a BLOB column and not the <c>path</c> TEXT column's own collation.
+    /// <c>WITHOUT ROWID</c> on the tables whose primary key is the whole row's identity saves the extra rowid index
+    /// and stores entries clustered by (version, path), which is the order the diff walks.
     /// </summary>
     private const string Schema = $"""
         CREATE TABLE IF NOT EXISTS versions (
           version INTEGER PRIMARY KEY, identity INTEGER NOT NULL, entry_count INTEGER NOT NULL, imported_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS entries (
           version INTEGER NOT NULL, seq INTEGER NOT NULL, parent TEXT NOT NULL, path_fold TEXT NOT NULL,
-          {EntryRowMapper.ColumnDefinitions}, unrecoverable INTEGER NOT NULL DEFAULT 0,
+          path_key BLOB NOT NULL, {EntryRowMapper.ColumnDefinitions}, unrecoverable INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (version, path)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS entries_seq     ON entries (version, seq);
-        CREATE INDEX IF NOT EXISTS entries_parent  ON entries (version, parent);
-        CREATE INDEX IF NOT EXISTS entries_fold    ON entries (version, path_fold);
-        CREATE INDEX IF NOT EXISTS entries_content ON entries (full_hash, length);
-        CREATE INDEX IF NOT EXISTS entries_ref     ON entries (storage_ref);
-        CREATE INDEX IF NOT EXISTS entries_head    ON entries (length, head_hash);
-        CREATE INDEX IF NOT EXISTS entries_storage ON entries (version, storage_kind, storage_ref, seq);
+        CREATE INDEX IF NOT EXISTS entries_seq      ON entries (version, seq);
+        CREATE INDEX IF NOT EXISTS entries_parent   ON entries (version, parent);
+        CREATE INDEX IF NOT EXISTS entries_fold     ON entries (version, path_fold);
+        CREATE INDEX IF NOT EXISTS entries_path_key ON entries (version, path_key);
+        CREATE INDEX IF NOT EXISTS entries_content  ON entries (full_hash, length);
+        CREATE INDEX IF NOT EXISTS entries_ref      ON entries (storage_ref);
+        CREATE INDEX IF NOT EXISTS entries_head     ON entries (length, head_hash);
+        CREATE INDEX IF NOT EXISTS entries_storage  ON entries (version, storage_kind, storage_ref, seq);
         CREATE TABLE IF NOT EXISTS dirs (version INTEGER NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS dirs_parent ON dirs (version, parent);
         CREATE TABLE IF NOT EXISTS empty_dirs (version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
