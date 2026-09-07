@@ -25,9 +25,11 @@ internal static class SevenZipCli
     /// <summary>Runs 7z with the arguments passed through ArgumentList (safe even when the password contains special characters). An exit code >=2 counts as failure and throws.
     /// The exit code is returned so the caller can verify for itself: **1 does not mean "nothing happened"** — 7z uses it for warnings, and "a member that could not be read was silently
     /// dropped while a valid archive was produced all the same" is exactly this exit code, discoverable only by comparing what actually ended up in the archive.</summary>
+    /// <param name="hold">Where the run's pause freezes this process (<see cref="ProcessHold"/>); null for an
+    /// invocation no pause reaches — a restore, a check, a listing on the operator's behalf.</param>
     public static async Task<SevenZipRun> RunAsync(
         string exe, IReadOnlyList<string> args, CancellationToken ct, string? workingDirectory = null,
-        Func<ProcessPriorityClass>? priority = null)
+        Func<ProcessPriorityClass>? priority = null, ProcessHold? hold = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -46,6 +48,9 @@ internal static class SevenZipCli
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
         ApplyPriority(proc, priority);
+        // Attached for exactly the process's lifetime: the scope closes after the wait below, on every path, so a
+        // process killed under a hold leaves the hold's count with it. Under a standing hold this stops it here.
+        using var attached = hold?.Attach(proc);
 
         // Close stdin: if the archive is encrypted and no password was given, 7z waits for input — give it EOF so it fails instead of hanging.
         proc.StandardInput.Close();
@@ -99,7 +104,7 @@ internal static class SevenZipCli
         Func<Stream, CancellationToken, Task>? writeStdin = null,
         Func<Stream, CancellationToken, Task>? readStdout = null,
         string? workingDirectory = null,
-        Func<ProcessPriorityClass>? priority = null)
+        Func<ProcessPriorityClass>? priority = null, ProcessHold? hold = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -118,6 +123,9 @@ internal static class SevenZipCli
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{exe}'.");
         ApplyPriority(proc, priority);
+        // As in RunAsync. A stopped 7z stops draining stdin, so the writer below blocks on the full pipe within
+        // one buffer of where it was: the pause reaches the source read too, with nothing to redo on Resume.
+        using var attached = hold?.Attach(proc);
 
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
         var stdoutTask = Task.Run(async () =>
@@ -231,8 +239,8 @@ internal static class SevenZipCli
     /// For a split archive pass the first volume (.001) and 7z finds the remaining volumes itself.</summary>
     public static async Task<HashSet<string>> ListEntriesAsync(
         string exe, string firstVolumePath, string? password, CancellationToken ct,
-        Func<ProcessPriorityClass>? priority = null)
-        => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct, priority)).Select(e => e.Name)];
+        Func<ProcessPriorityClass>? priority = null, ProcessHold? hold = null)
+        => [.. (await ListEntryDetailsAsync(exe, firstVolumePath, password, ct, priority, hold)).Select(e => e.Name)];
 
     /// <summary>
     /// Lists archive members **keeping the in-archive order**, carrying sizes and a directory flag.
@@ -242,7 +250,7 @@ internal static class SevenZipCli
     /// </summary>
     public static async Task<IReadOnlyList<ArchiveEntry>> ListEntryDetailsAsync(
         string exe, string firstVolumePath, string? password, CancellationToken ct,
-        Func<ProcessPriorityClass>? priority = null)
+        Func<ProcessPriorityClass>? priority = null, ProcessHold? hold = null)
     {
         var args = new List<string> { "l", "-slt", "-y" };
         if (!string.IsNullOrEmpty(password))
@@ -250,7 +258,7 @@ internal static class SevenZipCli
         args.Add("--"); // file names are data, never grammar — see SevenZipCompressor.CompressAsync
         args.Add(Path.GetFullPath(firstVolumePath));
 
-        var run = await RunAsync(exe, args, ct, priority: priority);
+        var run = await RunAsync(exe, args, ct, priority: priority, hold: hold);
         return ParseEntryDetails(run.StdOut);
     }
 

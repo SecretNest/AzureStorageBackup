@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
@@ -80,12 +82,65 @@ public sealed class PauseGate : IDisposable
     /// </summary>
     private int _inHand;
 
+    /// <summary>
+    /// The child processes the user's hold freezes — see <see cref="Processes"/>. Shares this gate's lock, so a 7z
+    /// stopping or leaving is seen here in the same breath as any other change to what is in hand.
+    /// </summary>
+    private readonly ProcessHold _processes;
+
+    /// <summary>
+    /// Time the run has spent held with nothing moving — the stretch the row reads "Paused" for — up to the last
+    /// transition, and when that stretch started if it is still going (-1 when it is not). See <see cref="HeldMs"/>.
+    /// </summary>
+    private long _heldMs;
+    private long _settledSince = -1;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+
     public PauseGate(
         IReadOnlyList<TimeSpan>? schedule = null, TimeSpan? steady = null, TimeSpan? patience = null)
     {
         _schedule = schedule is { Count: > 0 } ? schedule : DefaultSchedule;
         _steady = steady ?? TimeSpan.FromMinutes(5);
         _patience = patience ?? TimeSpan.FromMinutes(10);
+        _processes = new ProcessHold(_lock, TrackSettledLocked);
+    }
+
+    /// <summary>Millisecond time source injected by tests, as on <c>StageTracker</c>; null in production, which
+    /// falls through to the internal <see cref="Stopwatch"/>.</summary>
+    internal Func<long>? Clock { get; init; }
+
+    private long NowMs() => Clock?.Invoke() ?? _clock.ElapsedMilliseconds;
+
+    /// <summary>
+    /// Where the run's 7z processes register themselves (<c>SevenZipCli</c>, through the compression request).
+    /// The user's hold stops every process attached here, and stops each one attached while it stands, the
+    /// instant it is attached; Resume and a downgrade both let them run again. A stopped process steps out of
+    /// the in-hand count for as long as it is stopped, the way a parked worker does (<see cref="Idle"/>): the
+    /// loop holding it is still inside its <see cref="BeginWork"/> scope, but nothing in that scope is moving.
+    /// <para>
+    /// The downgrade half is not a courtesy: <c>RequestStop</c> downgrades before it cancels, and the compressor
+    /// feeding a stopped 7z is blocked on a pipe that only that process drains. Released first, the feed sees the
+    /// cancellation on its next write and takes the kill-the-tree path it always took; still stopped, the run
+    /// would wind down into a process that never reads and a writer that never returns.
+    /// </para>
+    /// </summary>
+    public ProcessHold Processes => _processes;
+
+    /// <summary>
+    /// How long, in all, this run has stood held with nothing in hand — the "Paused" stretches, not the
+    /// "Pausing…" ones, since during those bytes are still landing and the time they take is real work time.
+    /// Read fresh on every publish by the upload stage's tracker and subtracted from the elapsed time its
+    /// estimate extrapolates from: a whole-run average that counted an overnight pause as time spent moving bytes
+    /// would print a remaining time stretched by the whole night, and shrink it back only as the run wore the
+    /// night down.
+    /// </summary>
+    public long HeldMs
+    {
+        get
+        {
+            lock (_lock)
+                return _heldMs + (_settledSince >= 0 ? NowMs() - _settledSince : 0);
+        }
     }
 
     /// <summary>The pause in effect right now; null when nothing is paused.</summary>
@@ -135,18 +190,41 @@ public sealed class PauseGate : IDisposable
     /// Resume.
     /// <para>
     /// The hold goes up the instant Pause is pressed, but it holds only what has not started. Every producing
-    /// loop finishes the piece in its hands first — the volume on the wire, the file under 7z — and on a slow
-    /// link that is minutes. For as long as it lasts the run is <b>pausing</b>, not paused, and the screen has to
-    /// say which: "Paused" over a run visibly uploading was read as the button having done nothing.
+    /// loop finishes the piece in its hands first — the volume on the wire, the item under the prober — and on a
+    /// slow link that is minutes. (The file under 7z is the exception: the hold stops its process where it is,
+    /// see <see cref="Processes"/>, and a stopped process is not in hand.) For as long as it lasts the run is
+    /// <b>pausing</b>, not paused, and the screen has to say which: "Paused" over a run visibly uploading was
+    /// read as the button having done nothing.
     /// </para>
     /// </summary>
     public bool IsSettled { get { lock (_lock) return SettledLocked(); } }
 
-    private bool SettledLocked() => _pausedByUser && _inHand == 0;
+    // A stopped process is in some loop's hand and moving nowhere, so it counts against what is in hand rather
+    // than for it. The difference can only reach zero, not cross it: a process is attached from inside a BeginWork
+    // scope, and stopping it takes out at most the one count that scope put in.
+    private bool SettledLocked() => _pausedByUser && _inHand - _processes.Stopped <= 0;
+
+    /// <summary>
+    /// Bring the held-time clock up to date with <see cref="SettledLocked"/>. Called after every change that can
+    /// move the answer — the hold, what is in hand, and the stopped processes — so the clock runs exactly while
+    /// the row reads "Paused".
+    /// </summary>
+    private void TrackSettledLocked()
+    {
+        var settled = SettledLocked();
+        if (settled && _settledSince < 0)
+            _settledSince = NowMs();
+        else if (!settled && _settledSince >= 0)
+        {
+            _heldMs += NowMs() - _settledSince;
+            _settledSince = -1;
+        }
+    }
 
     /// <summary>
     /// A piece of work has passed a gate and is moving. Dispose when it is done — or, for a worker that will go
-    /// on to wait for something the pause itself prevents, wrap the wait in <see cref="Idle"/>.
+    /// on to wait for something the pause itself prevents, wrap the wait in <see cref="Idle"/>. A 7z attached to
+    /// <see cref="Processes"/> steps out on its own for as long as the hold keeps it stopped.
     /// <para>
     /// The unit is deliberately "what will produce bytes or CPU on its own", not "the item a loop holds": an
     /// uploader holding a hundred-volume file has one item in hand and, once the hold is up, at most a handful of
@@ -160,7 +238,10 @@ public sealed class PauseGate : IDisposable
     public IDisposable BeginWork()
     {
         lock (_lock)
+        {
             _inHand++;
+            TrackSettledLocked();
+        }
         return new Counted(this, +1);
     }
 
@@ -177,6 +258,7 @@ public sealed class PauseGate : IDisposable
             if (_inHand == 0)
                 return Counted.None;
             _inHand--;
+            TrackSettledLocked();
         }
         return new Counted(this, -1);
     }
@@ -191,7 +273,10 @@ public sealed class PauseGate : IDisposable
             if (sign == 0 || Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             lock (gate._lock)
+            {
                 gate._inHand -= sign;
+                gate.TrackSettledLocked();
+            }
         }
     }
 
@@ -300,6 +385,9 @@ public sealed class PauseGate : IDisposable
                 _release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 _current = UserPauseInfo();
             }
+            // The file under 7z stops here, with the hold, rather than finishing first — see Processes.
+            _processes.Hold();
+            TrackSettledLocked();
             return true;
         }
     }
@@ -321,6 +409,10 @@ public sealed class PauseGate : IDisposable
             if (!_pausedByUser)
                 return false;
             _pausedByUser = false;
+            // Whatever trouble may still be holding the gate, the operator's hold is what stopped the process,
+            // and lifting it lets the file finish; the loop holding it then parks at the gate like any other.
+            _processes.Release();
+            TrackSettledLocked();
 
             // The patience budget starts over, exactly as it does for Retry now (see ReleaseNow), and for the
             // same reason: the run has not been given a single chance to retry since the hold went up, so
@@ -491,6 +583,10 @@ public sealed class PauseGate : IDisposable
         // unconditional either way, and nothing left behind can claim afterwards that the operator is holding
         // a run that has already gone.
         _pausedByUser = false;
+        // Before the release below and before the caller cancels anything: a stopped process is one the
+        // wind-down cannot reach. See Processes.
+        _processes.Release();
+        TrackSettledLocked();
 
         ReleaseLocked(false);
     }

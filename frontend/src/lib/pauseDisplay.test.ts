@@ -82,7 +82,7 @@ describe('pauseDisplay', () => {
   })
 
   /**
-   * The hold is up from the button press, but the volumes on the wire and the file under 7z finish first.
+   * The hold is up from the button press, but the volumes on the wire finish first.
    * Until the backend says the last of them has landed, the row says so — "Paused" over a run visibly still
    * uploading read as the button having done nothing. Resume stays on offer: lifting a hold that has not
    * taken effect is as safe as lifting one that has.

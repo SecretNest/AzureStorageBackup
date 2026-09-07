@@ -3,13 +3,16 @@ using System.Diagnostics;
 namespace AzureStorageBackup.Api.Services;
 
 /// <summary>One compression request. Entries are names relative to SourceDirectory (they decide the entry names inside the archive).</summary>
+/// <param name="Hold">Where the run's pause freezes the 7z this starts — see <see cref="ProcessHold"/>. Null
+/// for a compression no pause reaches.</param>
 public sealed record CompressionRequest(
     string SourceDirectory,
     IReadOnlyList<string> Entries,
     string OutputArchivePath,
     string? Password = null,
     long? VolumeBytes = null,
-    bool StoreOnly = false);
+    bool StoreOnly = false,
+    ProcessHold? Hold = null);
 
 /// <summary>Compression result: the volume files produced (sorted by name; just one when the archive is not split).</summary>
 public sealed record CompressionResult(IReadOnlyList<string> VolumeFiles);
@@ -37,13 +40,15 @@ public sealed record ArchiveEntry(string Name, long Size, bool IsDirectory);
 /// One streaming compression request: the caller writes the content into 7z's stdin, and the archive holds exactly one member, <paramref name="EntryName"/>.
 /// The entry name keeps the full relative path (same as when compressing by file), so restore and check do not need to tell the two kinds of output apart when locating a member.
 /// </summary>
+/// <param name="Hold">As on <see cref="CompressionRequest"/>.</param>
 public sealed record StreamCompressionRequest(
     string EntryName,
     string OutputArchivePath,
     string? Password = null,
     long? VolumeBytes = null,
     bool StoreOnly = false,
-    long? ExpectedBytes = null);
+    long? ExpectedBytes = null,
+    ProcessHold? Hold = null);
 
 /// <summary>Compresses files into 7z archives (optionally encrypted/split) and extracts them again. Used for data blobs and grouped packs (M4 §6, §13.1).</summary>
 public interface IFileCompressor
@@ -173,7 +178,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         IReadOnlyList<string> volumes;
         try
         {
-            var run = await SevenZipCli.RunAsync(_exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority);
+            var run = await SevenZipCli.RunAsync(
+                _exe, args, ct, workingDirectory: request.SourceDirectory, priority: _priority, hold: request.Hold);
             volumes = CollectVolumes(request.OutputArchivePath, request.VolumeBytes);
 
             // An archive that exited 0 is necessarily complete, so this extra listing is only paid for on 1 — and 1
@@ -221,7 +227,8 @@ public sealed class SevenZipCompressor : IFileCompressor
         if (volumes.Count == 0)
             return [.. request.Entries];
 
-        var present = await SevenZipCli.ListEntriesAsync(_exe, volumes[0], request.Password, ct, _priority);
+        // The listing is the same item's work as the compression and pauses with it.
+        var present = await SevenZipCli.ListEntriesAsync(_exe, volumes[0], request.Password, ct, _priority, request.Hold);
         return [.. request.Entries.Where(e => !present.Contains(SevenZipCli.NormalizeEntryName(e)))];
     }
 
@@ -273,7 +280,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         {
             await SevenZipCli.RunStreamingAsync(_exe, args, ct,
                 writeStdin: async (stdin, token) => written = await writeSource(stdin, token),
-                priority: _priority);
+                priority: _priority, hold: request.Hold);
             // Inside the same try as the run: collection is where an incomplete family is caught
             // (see EnsureFamilyComplete), and that verdict has to leave the temp area as clean as a failed run does,
             // or the fragments it rejected stay behind looking exactly like a finished product.
@@ -291,7 +298,7 @@ public sealed class SevenZipCompressor : IFileCompressor
         // Those fed bytes are exactly the bytes we hashed, so once this check passes there is no gap left between
         // "what the index records" and "what is in the archive".
         // One listing costs a single read of the archive header, negligible next to the compression itself.
-        var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct, _priority))
+        var entry = (await SevenZipCli.ListEntryDetailsAsync(_exe, volumes.Count > 0 ? volumes[0] : request.OutputArchivePath, request.Password, ct, _priority, request.Hold))
             .FirstOrDefault(e => e.Name == SevenZipCli.NormalizeEntryName(request.EntryName));
         if (volumes.Count == 0 || entry is null || entry.Size != written)
         {
