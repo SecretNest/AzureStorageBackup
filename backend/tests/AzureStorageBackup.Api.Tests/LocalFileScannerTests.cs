@@ -30,14 +30,26 @@ public sealed class LocalFileScannerTests : IDisposable
 
     private LocalFileScanner Scanner() => new();
 
+    /// <summary>Runs a scan through a <see cref="ListScanSink"/> and hands back the entries sorted ordinally
+    /// (the sink itself performs no sorting — see <see cref="LocalFileScannerSinkTests"/>) alongside the
+    /// <see cref="ScanSummary"/>, mirroring what the old list-returning <c>ScanResult</c> gave these tests directly.</summary>
+    private async Task<(List<ScannedEntry> Entries, ScanSummary Summary)> RunScanAsync(
+        IgnoreRuleSet ignore, ScanOptions? options = null)
+    {
+        var sink = new ListScanSink();
+        var summary = await Scanner().ScanAsync(_root, ignore, sink, options);
+        var entries = sink.Entries.OrderBy(e => e.Path, StringComparer.Ordinal).ToList();
+        return (entries, summary);
+    }
+
     [Fact]
     public async Task Scans_Single_File_With_Relative_Path_And_Length()
     {
         WriteText("hello.txt", "hello world");
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        var entry = Assert.Single(result.Entries);
+        var entry = Assert.Single(entries);
         Assert.Equal("hello.txt", entry.Path);
         Assert.Equal(EntryKind.File, entry.Kind);
         Assert.Equal(11, entry.Length);
@@ -48,9 +60,9 @@ public sealed class LocalFileScannerTests : IDisposable
     {
         WriteText("sub/dir/a.txt", "x");
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        var entry = Assert.Single(result.Entries);
+        var entry = Assert.Single(entries);
         Assert.Equal("sub/dir/a.txt", entry.Path);
     }
 
@@ -62,9 +74,9 @@ public sealed class LocalFileScannerTests : IDisposable
         File.SetUnixFileMode(full, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead); // 0644
 #pragma warning restore CA1416
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        var e = Assert.Single(result.Entries);
+        var e = Assert.Single(entries);
         Assert.Equal("0644", e.Permissions);
         Assert.Equal(File.GetLastWriteTimeUtc(full), e.ModifiedAt.UtcDateTime);
     }
@@ -76,9 +88,9 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("skip.log", "b");
         WriteText("nested/deep.log", "c");
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet(["*.log"]));
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet(["*.log"]));
 
-        Assert.Equal(["keep.txt"], result.Entries.Select(e => e.Path));
+        Assert.Equal(["keep.txt"], entries.Select(e => e.Path));
     }
 
     [Fact]
@@ -87,10 +99,10 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("keep.txt", "a");
         WriteText("node_modules/pkg/index.js", "b");
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet(["node_modules/"]));
+        var (entries, summary) = await RunScanAsync(new IgnoreRuleSet(["node_modules/"]));
 
-        Assert.Equal(["keep.txt"], result.Entries.Select(e => e.Path));
-        Assert.DoesNotContain(result.EmptyDirs, d => d.StartsWith("node_modules"));
+        Assert.Equal(["keep.txt"], entries.Select(e => e.Path));
+        Assert.DoesNotContain(summary.EmptyDirs, d => d.StartsWith("node_modules"));
     }
 
     [Fact]
@@ -99,9 +111,9 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("real.txt", "a");
         File.CreateSymbolicLink(Path.Combine(_root, "link.txt"), Path.Combine(_root, "real.txt"));
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        Assert.Equal(["real.txt"], result.Entries.Select(e => e.Path));
+        Assert.Equal(["real.txt"], entries.Select(e => e.Path));
     }
 
     [Fact]
@@ -110,9 +122,9 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("real.txt", "a");
         File.CreateSymbolicLink(Path.Combine(_root, "link.txt"), Path.Combine(_root, "real.txt"));
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]), new ScanOptions { IncludeSymlinks = true });
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { IncludeSymlinks = true });
 
-        var link = result.Entries.Single(e => e.Path == "link.txt");
+        var link = entries.Single(e => e.Path == "link.txt");
         Assert.Equal(EntryKind.Symlink, link.Kind);
         Assert.Equal(Path.Combine(_root, "real.txt"), link.Target);
     }
@@ -122,10 +134,10 @@ public sealed class LocalFileScannerTests : IDisposable
     {
         Directory.CreateDirectory(Path.Combine(_root, "emptydir"));
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (entries, summary) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        Assert.Empty(result.Entries);
-        Assert.Equal(["emptydir"], result.EmptyDirs);
+        Assert.Empty(entries);
+        Assert.Equal(["emptydir"], summary.EmptyDirs);
     }
 
     [Fact]
@@ -134,9 +146,9 @@ public sealed class LocalFileScannerTests : IDisposable
         // a/b/c empty chain: only the deepest leaf needs recording (mkdir -p recreates parents).
         Directory.CreateDirectory(Path.Combine(_root, "a", "b", "c"));
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (_, summary) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        Assert.Equal(["a/b/c"], result.EmptyDirs);
+        Assert.Equal(["a/b/c"], summary.EmptyDirs);
     }
 
     [Fact]
@@ -144,9 +156,9 @@ public sealed class LocalFileScannerTests : IDisposable
     {
         WriteText("dir/file.txt", "a");
 
-        var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+        var (_, summary) = await RunScanAsync(new IgnoreRuleSet([]));
 
-        Assert.Empty(result.EmptyDirs);
+        Assert.Empty(summary.EmptyDirs);
     }
 
     /// <summary>A directory whose contents cannot be listed used to crash the whole backup run in the scan stage. It has to be
@@ -163,19 +175,19 @@ public sealed class LocalFileScannerTests : IDisposable
 
         try
         {
-            var result = await Scanner().ScanAsync(_root, new IgnoreRuleSet([]));
+            var (entries, summary) = await RunScanAsync(new IgnoreRuleSet([]));
 
-            var reported = Assert.Single(result.Unreadable);
+            var reported = Assert.Single(summary.Unreadable);
             Assert.Equal("locked", reported.Path);
             Assert.True(reported.IsDirectory);
             Assert.NotEmpty(reported.Reason); // The verbatim reason has to come along, so the operator can tell a permission problem from a media one
 
             // It must never be treated as an empty directory — that would have restore recreate an empty shell, hiding the files inside it.
-            Assert.DoesNotContain("locked", result.EmptyDirs);
+            Assert.DoesNotContain("locked", summary.EmptyDirs);
 
             // The rest is scanned as usual, unaffected.
-            Assert.Contains(result.Entries, e => e.Path == "ok/keep.txt");
-            Assert.DoesNotContain(result.Entries, e => e.Path.StartsWith("locked/", StringComparison.Ordinal));
+            Assert.Contains(entries, e => e.Path == "ok/keep.txt");
+            Assert.DoesNotContain(entries, e => e.Path.StartsWith("locked/", StringComparison.Ordinal));
         }
         finally
         {
@@ -191,10 +203,9 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("music/b.mp3", "y");
 
         var scope = ScopeRuleSet.Parse("-\n+ photos");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
 
-        Assert.Equal(["photos/a.jpg"], result.Entries.Select(e => e.Path));
+        Assert.Equal(["photos/a.jpg"], entries.Select(e => e.Path));
     }
 
     [Fact]
@@ -205,10 +216,9 @@ public sealed class LocalFileScannerTests : IDisposable
 
         // Judging on IsInScope alone would prune the whole tree at docs, and 2026 would never be reached.
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
 
-        Assert.Equal(["docs/2026/q1.pdf"], result.Entries.Select(e => e.Path));
+        Assert.Equal(["docs/2026/q1.pdf"], entries.Select(e => e.Path));
     }
 
     [Fact]
@@ -220,11 +230,10 @@ public sealed class LocalFileScannerTests : IDisposable
         // docs itself is excluded and is only entered in order to descend to docs/2026. It must never enter EmptyDirs —
         // that would have restore conjure up a directory the user explicitly excluded. Same for docs/scratch.
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+        var (_, summary) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
 
-        Assert.DoesNotContain("docs", result.EmptyDirs);
-        Assert.DoesNotContain("docs/scratch", result.EmptyDirs);
+        Assert.DoesNotContain("docs", summary.EmptyDirs);
+        Assert.DoesNotContain("docs/scratch", summary.EmptyDirs);
     }
 
     [Fact]
@@ -238,11 +247,10 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("docs/other.txt", "x");
 
         var scope = ScopeRuleSet.Parse("- docs\n+ docs/2026");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+        var (entries, summary) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
 
-        Assert.DoesNotContain("docs", result.EmptyDirs);
-        Assert.Empty(result.Entries);
+        Assert.DoesNotContain("docs", summary.EmptyDirs);
+        Assert.Empty(entries);
     }
 
     [Fact]
@@ -251,10 +259,9 @@ public sealed class LocalFileScannerTests : IDisposable
         Directory.CreateDirectory(Path.Combine(_root, "photos", "empty"));
 
         var scope = ScopeRuleSet.Parse("-\n+ photos");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
+        var (_, summary) = await RunScanAsync(new IgnoreRuleSet([]), new ScanOptions { Scope = scope });
 
-        Assert.Contains("photos/empty", result.EmptyDirs);
+        Assert.Contains("photos/empty", summary.EmptyDirs);
     }
 
     [Fact]
@@ -265,10 +272,9 @@ public sealed class LocalFileScannerTests : IDisposable
         WriteText("music/c.mp3", "z");
 
         var scope = ScopeRuleSet.Parse("-\n+ photos");
-        var result = await Scanner().ScanAsync(
-            _root, new IgnoreRuleSet(["*.log"]), new ScanOptions { Scope = scope });
+        var (entries, _) = await RunScanAsync(new IgnoreRuleSet(["*.log"]), new ScanOptions { Scope = scope });
 
         // Scope keeps photos, then the ignore rules strip .log out of it — two layers in series, neither interfering with the other.
-        Assert.Equal(["photos/a.jpg"], result.Entries.Select(e => e.Path));
+        Assert.Equal(["photos/a.jpg"], entries.Select(e => e.Path));
     }
 }

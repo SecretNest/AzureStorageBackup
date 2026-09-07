@@ -177,13 +177,31 @@ public sealed class GroupingPlanner
         || pathBytes >= options.MaxPackPathBytes;
 
     /// <summary>
-    /// The classification that can be settled the moment scanning ends. All three decisions look only at <c>Path</c> and <c>Length</c> — they need **no** hash at all,
-    /// so there is no need to wait for the diff: <see cref="PlannedFile.FullHash"/> is only used to build the content address <c>data/{hash}</c>,
-    /// and has nothing to do with "single file or grouped". This is precisely what makes pipelining possible.
+    /// The one-entry decision behind <see cref="Classify"/>: single file (over-sized or don't-group), cross-directory
+    /// group, or per-directory group. Looks only at <c>Path</c> and <c>Length</c> — no hash needed, so there is no
+    /// need to wait for the diff. Pulled out on its own so <see cref="WorkDbScanSink"/> can classify an entry the
+    /// instant the scanner produces it, rather than waiting for the whole scan to be collected in memory first and
+    /// classifying it in bulk afterward (which is exactly the shape this branch is moving away from).
     /// <para>
     /// The decision order is word for word the same as in <see cref="Plan"/> (don't-group &gt; cross-path &gt; per-directory), otherwise the same file would be
     /// sent down different routes by classification and by packing.
     /// </para>
+    /// </summary>
+    public static FileClass ClassifyOne(string path, long length, PlanOptions options)
+    {
+        if (length >= options.SingleFileThresholdBytes
+            || (options.DontGroup?.MatchesFileOrAncestorDir(path) ?? false))
+            return new FileClass(FileCategory.SingleFile, null);
+
+        if (options.CrossDirGroup?.MatchesFileOrAncestorDir(path) ?? false)
+            return new FileClass(FileCategory.CrossDirectoryGroup, null);
+
+        return new FileClass(FileCategory.DirectoryGroup, Directory(path));
+    }
+
+    /// <summary>
+    /// The classification of every scanned entry, settled the moment scanning ends — see <see cref="ClassifyOne"/>
+    /// for the per-entry decision this loops over.
     /// </summary>
     public Classification Classify(IReadOnlyList<ScannedEntry> entries, PlanOptions? options = null)
     {
@@ -194,21 +212,10 @@ public sealed class GroupingPlanner
 
         foreach (var entry in entries)
         {
-            if (entry.Length >= options.SingleFileThresholdBytes
-                || (options.DontGroup?.MatchesFileOrAncestorDir(entry.Path) ?? false))
-            {
-                byPath[entry.Path] = new FileClass(FileCategory.SingleFile, null);
-            }
-            else if (options.CrossDirGroup?.MatchesFileOrAncestorDir(entry.Path) ?? false)
-            {
-                byPath[entry.Path] = new FileClass(FileCategory.CrossDirectoryGroup, null);
-            }
-            else
-            {
-                var dir = Directory(entry.Path);
-                byPath[entry.Path] = new FileClass(FileCategory.DirectoryGroup, dir);
-                dirCandidates[dir] = dirCandidates.GetValueOrDefault(dir) + 1;
-            }
+            var cls = ClassifyOne(entry.Path, entry.Length, options);
+            byPath[entry.Path] = cls;
+            if (cls.Category == FileCategory.DirectoryGroup)
+                dirCandidates[cls.GroupKey!] = dirCandidates.GetValueOrDefault(cls.GroupKey!) + 1;
         }
 
         return new Classification(byPath, dirCandidates);
