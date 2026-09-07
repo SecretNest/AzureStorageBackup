@@ -69,6 +69,9 @@ public sealed class BackupCheckerTests : IDisposable
         return (backup, checker, factory);
     }
 
+    /// <summary>The repairer reads its entries out of a container catalog, so it needs one; a throwaway of its own
+    /// is enough here, since these tests verify the repair through the cloud (a cold catalog simply migrates the
+    /// versions in from there, which is what production does on a machine that has not seen the container yet).</summary>
     private BackupRepairer Repairer(BlobClientFactory factory, BackupChecker checker)
     {
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -76,6 +79,7 @@ public sealed class BackupCheckerTests : IDisposable
             factory, store, new SevenZipCompressor(), new FileHasher(), new BlobUploader(factory),
             Path.Combine(_temp, "repair"),
             new StagingArea(Path.Combine(_temp, "rc"), Path.Combine(_temp, "rs"), () => 200_000_000),
+            new TestLocalAuthority(store).Catalogs,
             checker: checker);
     }
 

@@ -269,12 +269,14 @@ public sealed class UntrustedIndexPathTests : IDisposable
 
         var (repairer, hasher, _) = Repairer();
         var unrecoverable = new List<string>();
+        await using var catalog = await CatalogOfAsync(index);
+        var patches = new RepairPatchSet();
         await InvokeAsync(repairer, "RepairBlobAsync",
         [
             SampleAccount(), SampleContainer(), "data/x",
-            new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
+            catalog, new HashSet<int> { 1 }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
-            new List<string>(), unrecoverable, new HashSet<int>(),
+            new List<string>(), unrecoverable, patches,
             StagingLease(), CancellationToken.None,
             null, // the optional StageTracker — progress is not what these boundary tests are about
             null, // the optional VolumeUploadScope — parallel transfer, likewise
@@ -318,12 +320,14 @@ public sealed class UntrustedIndexPathTests : IDisposable
 
         var (repairer, hasher, compressor) = Repairer();
         var unrecoverable = new List<string>();
+        await using var catalog = await CatalogOfAsync(index);
+        var patches = new RepairPatchSet();
         await InvokeAsync(repairer, "RepairBlobAsync",
         [
             SampleAccount(), SampleContainer(), "data/x",
-            new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
+            catalog, new HashSet<int> { 1 }, _local, null,
             new BlobAddressScheme(null, null), AccessTier.Hot, null, null,
-            new List<string>(), unrecoverable, new HashSet<int>(),
+            new List<string>(), unrecoverable, patches,
             // Repair's compression output now goes through the staging area (global compression lock + budget), hence the extra lease parameter.
             // This case should be stopped by the boundary decision before it ever touches the staging area; the lease is only there to make the call go through.
             StagingLease(), CancellationToken.None,
@@ -337,7 +341,9 @@ public sealed class UntrustedIndexPathTests : IDisposable
         Assert.Empty(hasher.Hashed);
         Assert.Null(compressor.LastRequest);
         Assert.Equal(["../secret.txt"], unrecoverable);
-        Assert.Contains("../secret.txt", index.UnrecoverablePaths);
+        // The verdict is a patch aimed at v1's entry, waiting for the rewritten index to reach the cloud.
+        Assert.Equal([1], patches.ChangedVersions);
+        Assert.True(patches.IsMarkedPending(1, "../secret.txt"));
     }
 
     /// <summary>
@@ -377,12 +383,14 @@ public sealed class UntrustedIndexPathTests : IDisposable
 
         var (repairer, hasher, compressor) = Repairer();
         var unrecoverable = new List<string>();
+        await using var catalog = await CatalogOfAsync(index);
+        var patches = new RepairPatchSet();
         await InvokeAsync(repairer, "RepairPackAsync",
         [
             SampleAccount(), SampleContainer(), "packs/p0001.7z", info,
-            new Dictionary<int, VersionIndex> { [1] = index }, _local, null,
+            catalog, new HashSet<int> { 1 }, _local, null,
             AccessTier.Hot, null, new List<string>(), unrecoverable,
-            new HashSet<int>(), StagingLease(), CancellationToken.None,
+            patches, StagingLease(), CancellationToken.None,
             null, // the optional StageTracker — progress is not what these boundary tests are about
             null, // the optional VolumeUploadScope — parallel transfer, likewise
             null, // the optional pause gate
@@ -393,6 +401,7 @@ public sealed class UntrustedIndexPathTests : IDisposable
         Assert.Empty(hasher.Hashed);
         Assert.Null(compressor.LastRequest);
         Assert.Equal(["victim.txt"], unrecoverable);
+        Assert.True(patches.IsMarkedPending(1, "victim.txt"));
         // The pack's info entry STAYS even when nothing was recoverable: index entries still reference the
         // packId, and removing the record made every later reference-set build throw, silently disabling
         // orphan reclamation for the whole container (see RepairPackAsync's available.Count == 0 branch).
@@ -413,12 +422,20 @@ public sealed class UntrustedIndexPathTests : IDisposable
         var hasher = new RecordingHasher();
         var compressor = new RecordingCompressor();
         var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new StubCodec());
         return (new BackupRepairer(
-            factory, new BackupInfoStore(factory, new StubCodec()), compressor, hasher,
+            factory, store, compressor, hasher,
             new ThrowingUploader(), Path.Combine(_temp, "repair"),
-            new StagingArea(Path.Combine(_temp, "rc"), Path.Combine(_temp, "rs"), () => 200_000_000)),
+            new StagingArea(Path.Combine(_temp, "rc"), Path.Combine(_temp, "rs"), () => 200_000_000),
+            // Only the constructor needs it: these cases drive the two private repair methods directly, and hand
+            // each of them the catalog it is to read (see CatalogOfAsync).
+            new TestLocalAuthority(store).Catalogs),
             hasher, compressor);
     }
+
+    /// <summary>A throwaway catalog holding just this case's hand-written version, which is what the private repair
+    /// methods now read their entries out of in place of a dictionary of whole indexes.</summary>
+    private static Task<VersionCatalog> CatalogOfAsync(VersionIndex index) => TestCatalogs.ImportAsync(index);
 
     /// <summary>
     /// The local axis and both repair branches are private (their public entry points require a real container and a full check run respectively).

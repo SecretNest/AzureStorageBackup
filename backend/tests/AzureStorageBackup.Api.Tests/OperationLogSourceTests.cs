@@ -127,11 +127,14 @@ public sealed class OperationLogSourceTests
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
             new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
+        var store = new OneVersionBackupInfoStore();
         var repairer = new BackupRepairer(
-            new UnusedBlobClientFactory(), new OneVersionBackupInfoStore(), compressor: null!, hasher: null!,
+            new UnusedBlobClientFactory(), store, compressor: null!, hasher: null!,
             uploader: null!, tempRoot: Path.GetTempPath(),
             // This case never reaches compression; the staging area is only here so the object can be constructed at all.
             staging: new StagingArea(Path.GetTempPath(), Path.GetTempPath(), () => long.MaxValue),
+            // Likewise the catalogs: the pre-check throws long before anything opens one.
+            catalogs: new TestLocalAuthority(store).Catalogs,
             checker: checker, opLog: log);
         var account = new Account { Id = 7, Name = "acct7" };
 

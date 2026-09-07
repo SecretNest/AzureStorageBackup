@@ -31,11 +31,14 @@ public sealed class BackupRepairer(
     // temporary footprint counts against the same budget. tempRoot is still kept — the compose-side intermediate
     // inputs need somewhere to live, and they are accounted for through ReserveAsync.
     StagingArea staging,
+    // The container's SQLite catalog, in place of every version's whole index in memory. Repair reads its entries
+    // out of it (who references this damaged object, which members does this pack have, is this path already
+    // marked) and writes its verdicts back as patches — after the rewritten index is in the cloud, never before.
+    IVersionCatalogs catalogs,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     BackupChecker? checker = null,
     TrackedInfoStore? trackedInfo = null,
-    ILocalIndexCache? indexCache = null,
     // The other "don't call me an orphan" list, exactly as in the retention sweep: a suspended run's uploads are
     // in the cloud but in no version index, and only the journal records that they exist.
     BackupJournalStore? journals = null)
@@ -169,29 +172,90 @@ public sealed class BackupRepairer(
         var failures = new List<(string Ref, string Message)>();
         if (badBlobs.Count > 0 || deferredBlobs.Count > 0 || healedPaths.Count > 0)
         {
-            // Load every version index (pack members are aggregated across versions, and after a repair the sizes
-            // are synced / paths marked unrecoverable). Loaded for marking-only and unmarking-only runs too: an
+            // Every retained version has to be IN the catalog before anything is asked of it: pack members are
+            // aggregated across versions, and after a repair the sizes are synced / paths marked unrecoverable in
+            // every version that references the object. Ensured for marking-only and unmarking-only runs too — an
             // empty selection ("mark everything for the next version") is all marks and no repairs.
-            var indexes = new Dictionary<int, VersionIndex>();
-            foreach (var ver in info.Versions)
-                indexes[ver.Version] = await store.ReadIndexAsync(account, container, ver.IndexBlob, password, ver.IndexVolumes, ct);
-
-            var changedVersions = new HashSet<int>();
             var identity = info.Backup.CreatedAt.UtcTicks;
+            foreach (var ver in info.Versions)
+                await catalogs.EnsureVersionAsync(account, container, ver, identity, password, ct);
+
+            // The catalog can hold versions the info file no longer lists: a retired one whose removal never
+            // reached it, or one imported against an older info file. The queries below are keyed by storage REF,
+            // not by version, so they would hand those versions' entries back too — and marking one writes an index
+            // blob into the cloud for a version nothing claims, reports paths no retained version has, and leaves
+            // marks the next retention sweep has no reason to clean up. Bounded to what the info file lists, which
+            // is exactly what the dictionary of loaded indexes used to be bounded by.
+            var versions = info.Versions.Select(v => v.Version).ToHashSet();
+
+            // ONE read-only handle for the whole repair. Read-only deliberately: the container's write lock is
+            // taken only inside PersistChangedAsync, for the moment the patches are recorded, and this handle is
+            // not the one holding it — a reader alongside a short-lived writer on the same file is what the
+            // catalog's WAL mode is for, and each statement on this connection sees whatever the writer last
+            // committed, so the marks a persist recorded are visible here immediately afterwards.
+            await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
+            var patches = new RepairPatchSet();
+
             async Task PersistChangedAsync()
             {
-                // Through the local-authoritative state machine, which keeps the ETag/cache consistent so the
-                // next backup does not hit a 412.
-                foreach (var vnum in changedVersions)
+                // THE ORDER IS THE POINT. The cloud index is the source of truth and the catalog is a cache of it,
+                // so the cloud goes first: serialize the version with its pending patches applied on the way out,
+                // upload that, write the info file — and only then record the same patches in the catalog. Recording
+                // them first would leave the catalog claiming marks no index in the cloud carries, and since the
+                // version's identity does not change, nothing would ever re-import it to find out otherwise.
+                var changed = patches.ChangedVersions.ToList();
+                // Serialized to a file, never to a byte[]: at a few million entries an index is hundreds of MB, and
+                // holding a whole one in memory is exactly what moving the indexes into the catalog got rid of.
+                Directory.CreateDirectory(tempRoot);
+                foreach (var vnum in changed)
                 {
-                    await store.WriteIndexAsync(account, container, vnum, indexes[vnum], password, ct: ct);
-                    if (indexCache is not null)
-                        await indexCache.PutAsync(account.Id, container, vnum, identity, indexes[vnum], ct);
+                    // Named with a fresh guid, and deleted in the finally: two repairs of two containers share this
+                    // directory, and a version number alone would have them writing over each other.
+                    var serialized = Path.Combine(tempRoot, $"index-{vnum}-{Guid.NewGuid():N}.idx");
+                    try
+                    {
+                        await using (var file = File.Create(serialized))
+                            await catalog.SerializeVersionAsync(vnum, file, patches.PatchesFor(vnum), ct);
+                        var (indexBlob, indexVolumes) =
+                            await store.WriteIndexFileAsync(account, container, vnum, serialized, password, ct: ct);
+                        // The rewritten index is not the same length as the one it replaces — a mark makes it
+                        // longer, a repaired entry's new volume sizes longer still — so it can cross the split
+                        // threshold and come back as N volumes where the recorded number is 1. Every reader takes
+                        // versions[].indexVolumes as authoritative (restore, the checker, the lazy catalog
+                        // migration, retention's volume deletion), so a stale 1 leaves them reading the first
+                        // 64 MiB of an index and calling it the whole thing. Recorded with the index it describes,
+                        // in the info-file write immediately below. FindIndex cannot miss: the patched versions are
+                        // exactly the ones the info file lists (see the `versions` filter above).
+                        var at = info.Versions.FindIndex(v => v.Version == vnum);
+                        info.Versions[at] = info.Versions[at] with { IndexBlob = indexBlob, IndexVolumes = indexVolumes };
+                    }
+                    finally
+                    {
+                        try { File.Delete(serialized); } catch { /* temp space; nothing further to do about it */ }
+                    }
                 }
+
+                // Through the local-authoritative state machine, which keeps the ETag consistent so the next backup
+                // does not hit a 412.
                 if (trackedInfo is not null)
                     await trackedInfo.WriteAsync(account, container, info, password, tier: null, ct: ct);
                 else
                     await store.WriteInfoAsync(account, container, info, password, ct: ct);
+
+                if (changed.Count > 0)
+                {
+                    // The container's single write slot, held for the patching and nothing else — the uploads above
+                    // are minutes of work and must not sit inside it.
+                    using var writeLock = await catalogs.LockForWriteAsync(account.Id, container, ct);
+                    await using var writable = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
+                    foreach (var vnum in changed)
+                        await writable.ApplyPatchesAsync(patches.PatchesFor(vnum), ct);
+                }
+
+                // Recorded in both places now: the catalog answers for them from here on, and keeping them would
+                // rewrite the same versions again at the end-of-run persist.
+                foreach (var vnum in changed)
+                    patches.Forget(vnum);
             }
 
             // MARKS LAND FIRST (volume-identity.md, designed with the user: "先废了这些文件.修一个,就恢复一个").
@@ -199,7 +263,7 @@ public sealed class BackupRepairer(
             // touched. From this moment the marks state exactly which content is broken, whatever happens to
             // this run: a backup beside a suspended repair reads them for dedup exclusion and heal-in-passing,
             // restore reads them for substitution. Repairing an object then clears its marks (RepairBlobAsync's
-            // per-ref ClearUnrecoverable), and the end-of-run persistence records the clears.
+            // per-ref ClearUnrecoverableAsync), and the end-of-run persistence records the clears.
             // Scoped by REF — "which CONTENT is broken" — never by bare path: the same path in an older
             // version references its own, different object, and a path-wide mark voided that intact copy too.
             // Left behind by a failed or suspended repair, the false verdict then soft-skipped restores of
@@ -212,11 +276,10 @@ public sealed class BackupRepairer(
             // successfully repaired path would be reported unrecoverable because it was pre-marked at start.
             var damagedRefs = badFindings.Select(f => BareRefOf(f.Ref!)).ToHashSet(StringComparer.Ordinal);
             var preMarks = new List<string>();
-            foreach (var (vnum, idx) in indexes)
-                foreach (var e in idx.Entries)
-                    if (e.Storage is { } sref && damagedRefs.Contains(sref.Ref))
-                        MarkUnrecoverable(idx, e.Path, preMarks, changedVersions, vnum);
-            if (changedVersions.Count > 0)
+            foreach (var damaged in damagedRefs)
+                foreach (var (vnum, e) in await ReferencesAsync(catalog, damaged, versions, ct))
+                    await MarkUnrecoverableAsync(catalog, patches, vnum, e.Path, preMarks, ct);
+            if (patches.ChangedVersions.Count > 0)
                 await PersistChangedAsync();
 
             // The backup's ledger discipline, taken as-is (it was tuned over many rounds — "你参考下backup"):
@@ -256,11 +319,11 @@ public sealed class BackupRepairer(
                     try
                     {
                         if (badRef.StartsWith("packs/", StringComparison.Ordinal))
-                            await RepairPackAsync(account, cc, badRef, info, indexes, localRoot, password, dataTier, volumeBytes,
-                                repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
+                            await RepairPackAsync(account, cc, badRef, info, catalog, versions, localRoot, password, dataTier, volumeBytes,
+                                repaired, unrecoverable, patches, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
                         else
-                            await RepairBlobAsync(account, cc, badRef, indexes, localRoot, password, addressing, dataTier, volumeBytes,
-                                dontCompress, repaired, unrecoverable, changedVersions, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
+                            await RepairBlobAsync(account, cc, badRef, catalog, versions, localRoot, password, addressing, dataTier, volumeBytes,
+                                dontCompress, repaired, unrecoverable, patches, lease, ct, tracker, uploadScope, pauseGate, WorkProgress, Uploaded);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
@@ -298,8 +361,10 @@ public sealed class BackupRepairer(
             var healedSet = new HashSet<string>(healedPaths, StringComparer.Ordinal);
             foreach (var path in healedPaths)
             {
-                foreach (var (vnum, idx) in indexes)
-                    ClearUnrecoverable(idx, path, changedVersions, vnum);
+                // Every retained version is asked, and the ones that hold no such mark answer no and stay out of
+                // the changed set — the marks a version does hold are the only reason to rewrite its index.
+                foreach (var ver in info.Versions)
+                    await ClearUnrecoverableAsync(catalog, patches, ver.Version, path, ct);
                 if (onlyPaths!.Contains(path))
                     repaired.Add(path);
             }
@@ -312,10 +377,9 @@ public sealed class BackupRepairer(
             foreach (var deferredRef in deferredBlobs)
             {
                 var bareRef = BareRefOf(deferredRef);
-                foreach (var (vnum, idx) in indexes)
-                    foreach (var e in idx.Entries)
-                        if (e.Storage is { } s && s.Ref == bareRef && !healedSet.Contains(e.Path))
-                            MarkUnrecoverable(idx, e.Path, unrecoverable, changedVersions, vnum);
+                foreach (var (vnum, e) in await ReferencesAsync(catalog, bareRef, versions, ct))
+                    if (!healedSet.Contains(e.Path))
+                        await MarkUnrecoverableAsync(catalog, patches, vnum, e.Path, unrecoverable, ct);
             }
 
             // Persist the changed version indexes + info file — successes and marks alike, whatever failed.
@@ -346,18 +410,20 @@ public sealed class BackupRepairer(
 
     /// <summary>Repair a single-file data blob: rebuild and replace it from the local file at any referencing path (hash-verified), then update the sizes in every referencing version.</summary>
     private async Task RepairBlobAsync(
-        Account account, BlobContainerClient cc, string blobRef, Dictionary<int, VersionIndex> indexes, string localRoot,
+        Account account, BlobContainerClient cc, string blobRef, VersionCatalog catalog, IReadOnlySet<int> versions,
+        string localRoot,
         string? password, BlobAddressScheme addressing, AccessTier dataTier, long? volumeBytes,
         IgnoreRuleSet? dontCompress, List<string> repaired,
-        List<string> unrecoverable, HashSet<int> changedVersions,
+        List<string> unrecoverable, RepairPatchSet patches,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
         VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
         Action<long>? workProgress = null, Action<long>? onUploaded = null)
     {
-        // The entries across all versions that reference this blob (identical content at different paths can yield several).
-        var refs = indexes.SelectMany(kv => kv.Value.Entries
-                .Where(e => e.Storage is { Kind: "blob" } s && s.Ref == blobRef)
-                .Select(e => (Version: kv.Key, Entry: e)))
+        // The entries across all versions that reference this blob (identical content at different paths can yield
+        // several). Materialized rather than streamed: the list is walked several times below and is bounded by how
+        // many entries reference one object — in practice at most one per retained version per path.
+        var refs = (await ReferencesAsync(catalog, blobRef, versions, ct))
+            .Where(r => r.Entry.Storage is { Kind: "blob" })
             .ToList();
         if (refs.Count == 0)
             return;
@@ -373,11 +439,11 @@ public sealed class BackupRepairer(
         // omits the key rather than writing an empty string — an empty string would make later dedup treat identical
         // content as a collision and report it falsely (see BlobAddressScheme.Metadata).
         //
-        // Which one to take: the order of refs depends on dictionary enumeration order, so refs[0] may well be the
-        // legacy entry missing head/tail while a sibling reference to the same content has both — going by refs[0]
-        // would throw away collision protection we already hold, needlessly widening the window of degraded
-        // protection. Prefer the entry that has both; only when there is none fall back to entry0 (the content is
-        // identical, so length/head/tail ought to be the same on every referencing entry anyway).
+        // Which one to take: refs comes out oldest version first, so refs[0] may well be the legacy entry missing
+        // head/tail while a sibling reference to the same content has both — going by refs[0] would throw away
+        // collision protection we already hold, needlessly widening the window of degraded protection. Prefer the
+        // entry that has both; only when there is none fall back to entry0 (the content is identical, so
+        // length/head/tail ought to be the same on every referencing entry anyway).
         var metaEntry = refs.Select(r => r.Entry)
             .FirstOrDefault(e => e.HeadHash is not null && e.TailHash is not null) ?? entry0;
         var meta = new Dictionary<string, string>(
@@ -451,7 +517,7 @@ public sealed class BackupRepairer(
         {
             // Local cannot supply it → every entry referencing this blob is unrecoverable in its own version.
             foreach (var (vnum, e) in refs)
-                MarkUnrecoverable(indexes[vnum], e.Path, unrecoverable, changedVersions, vnum);
+                await MarkUnrecoverableAsync(catalog, patches, vnum, e.Path, unrecoverable, ct);
             return;
         }
 
@@ -470,14 +536,12 @@ public sealed class BackupRepairer(
                 "so the repaired object was published without the omitted collision metadata.", ct, durable: true);
         }
 
-        // Update the volume count/sizes in every referencing version (the content is unchanged, so the ref stays the same).
+        // Update the volume count/sizes in every referencing version (the content is unchanged, so the ref stays
+        // the same). One patch per entry, merged with the clear below into a single change to that path.
         foreach (var (vnum, e) in refs)
         {
-            var idx = indexes[vnum];
-            var i = idx.Entries.IndexOf(e);
-            idx.Entries[i] = e with { Storage = e.Storage! with { Volumes = newSizes.Count, VolumeSizes = [.. newSizes] } };
-            changedVersions.Add(vnum);
-            ClearUnrecoverable(idx, e.Path, changedVersions, vnum);
+            patches.SetStorage(vnum, e.Path, e.Storage! with { Volumes = newSizes.Count, VolumeSizes = [.. newSizes] });
+            await ClearUnrecoverableAsync(catalog, patches, vnum, e.Path, ct);
         }
         repaired.AddRange(refs.Select(r => r.Entry.Path));
     }
@@ -486,25 +550,26 @@ public sealed class BackupRepairer(
     /// whichever ones can be obtained, then recompress the whole pack and replace it; the members that cannot be
     /// obtained are marked unrecoverable in the versions that reference them.</summary>
     private async Task RepairPackAsync(
-        Account account, BlobContainerClient cc, string packBlobRef, BackupInfoFile info, Dictionary<int, VersionIndex> indexes,
-        string localRoot, string? password, AccessTier dataTier, long? volumeBytes,
-        List<string> repaired, List<string> unrecoverable, HashSet<int> changedVersions,
+        Account account, BlobContainerClient cc, string packBlobRef, BackupInfoFile info, VersionCatalog catalog,
+        IReadOnlySet<int> versions, string localRoot, string? password, AccessTier dataTier, long? volumeBytes,
+        List<string> repaired, List<string> unrecoverable, RepairPatchSet patches,
         StagingArea.StagingLease lease, CancellationToken ct, StageTracker? tracker = null,
         VolumeUploadScope? uploadScope = null, Func<CancellationToken, Task>? pauseGate = null,
         Action<long>? workProgress = null, Action<long>? onUploaded = null)
     {
         var packId = packBlobRef["packs/".Length..^".7z".Length];
 
-        // Aggregate the members referencing this pack across all versions: entryName → (fullHash, the versions + paths referencing it).
+        // Aggregate the members referencing this pack across all versions: entryName → (fullHash, the versions +
+        // paths referencing it). Read to the end before anything else queries the catalog: one catalog is one SQLite
+        // connection, and the marking below asks it questions of its own.
         var members = new Dictionary<string, (string? Hash, long Length, List<(int Version, string Path)> Refs)>(StringComparer.Ordinal);
-        foreach (var (vnum, idx) in indexes)
-            foreach (var e in idx.Entries)
-                if (e.Storage is { Kind: "pack" } s && s.Ref == packId && s.EntryName is { } en)
-                {
-                    if (!members.TryGetValue(en, out var m))
-                        m = members[en] = (e.FullHash, e.Length, []);
-                    m.Refs.Add((vnum, e.Path));
-                }
+        await foreach (var (vnum, e) in catalog.PackMembersAsync(packId, ct))
+            if (versions.Contains(vnum) && e.Storage is { EntryName: { } en })
+            {
+                if (!members.TryGetValue(en, out var m))
+                    m = members[en] = (e.FullHash, e.Length, []);
+                m.Refs.Add((vnum, e.Path));
+            }
 
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
         var composeDir = Path.Combine(work, "compose");
@@ -531,7 +596,7 @@ public sealed class BackupRepairer(
                 if (!PathBoundary.IsWithin(localRoot, local))
                 {
                     foreach (var (vnum, path) in m.Refs)
-                        MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
+                        await MarkUnrecoverableAsync(catalog, patches, vnum, path, unrecoverable, ct);
                     continue;
                 }
                 if (await LocalMatchesAsync(local, m.Hash, m.Length, ct, tracker))
@@ -544,7 +609,7 @@ public sealed class BackupRepairer(
                 else
                 {
                     foreach (var (vnum, path) in m.Refs)
-                        MarkUnrecoverable(indexes[vnum], path, unrecoverable, changedVersions, vnum);
+                        await MarkUnrecoverableAsync(catalog, patches, vnum, path, unrecoverable, ct);
                 }
             }
 
@@ -616,7 +681,7 @@ public sealed class BackupRepairer(
                     VolumeSizes = newSizes,
                 };
             foreach (var (vnum, path) in available.SelectMany(en => members[en].Refs))
-                ClearUnrecoverable(indexes[vnum], path, changedVersions, vnum);
+                await ClearUnrecoverableAsync(catalog, patches, vnum, path, ct);
             repaired.AddRange(available.SelectMany(en => members[en].Refs.Select(r => r.Path)));
         }
         finally
@@ -778,25 +843,49 @@ public sealed class BackupRepairer(
             ? refName["packs/".Length..^".7z".Length]
             : refName;
 
-    private static void MarkUnrecoverable(
-        VersionIndex index, string path, List<string> unrecoverable, HashSet<int> changedVersions, int vnum)
+    /// <summary>The entries of every RETAINED version that reference one storage ref, materialized. Bounded by how
+    /// many entries point at a single object (at most one per path per retained version), which is why this one
+    /// query is allowed to be a list where a version's entries as a whole never are.
+    /// <para><paramref name="versions"/> is what the info file lists: the catalog may still hold others, and they
+    /// are none of a repair's business — see the filter's rationale in <see cref="RepairAsync"/>.</para></summary>
+    private static async Task<List<(int Version, IndexEntry Entry)>> ReferencesAsync(
+        VersionCatalog catalog, string storageRef, IReadOnlySet<int> versions, CancellationToken ct)
     {
-        if (!index.UnrecoverablePaths.Contains(path))
-        {
-            index.UnrecoverablePaths.Add(path);
-            changedVersions.Add(vnum);
-        }
+        var refs = new List<(int Version, IndexEntry Entry)>();
+        await foreach (var reference in catalog.EntriesReferencingAsync(storageRef, ct))
+            if (versions.Contains(reference.Version))
+                refs.Add(reference);
+        return refs;
+    }
+
+    /// <summary>Whether (version, path) stands marked right now: what this run has already decided, and failing
+    /// that what the catalog holds. Both halves are needed — the run's own pending marks are not in the catalog
+    /// until they have been through the cloud, and the catalog's are not in the patch set at all.</summary>
+    private static async Task<bool> IsMarkedAsync(
+        VersionCatalog catalog, RepairPatchSet patches, int vnum, string path, CancellationToken ct) =>
+        patches.IsMarkedPending(vnum, path) ?? await catalog.IsUnrecoverableAsync(vnum, path, ct);
+
+    /// <summary>Rules a path unrecoverable in one version, and reports it. Already-marked paths raise no patch: the
+    /// mark is already the truth there, and raising one would put that version in the changed set and rewrite an
+    /// index that has nothing new to say. Reported either way — the report answers "which paths are unrecoverable
+    /// after this run", not "which marks this run happened to write".</summary>
+    private static async Task MarkUnrecoverableAsync(
+        VersionCatalog catalog, RepairPatchSet patches, int vnum, string path, List<string> unrecoverable, CancellationToken ct)
+    {
+        if (!await IsMarkedAsync(catalog, patches, vnum, path, ct))
+            patches.Mark(vnum, path);
         unrecoverable.Add(path);
     }
 
-    /// <summary>The inverse of <see cref="MarkUnrecoverable"/>: a path repaired in this run sheds the verdict a
+    /// <summary>The inverse of <see cref="MarkUnrecoverableAsync"/>: a path repaired in this run sheds the verdict a
     /// previous run recorded. The mark is a verdict, and a verdict overturned must come off the record — left in
     /// place, it outlives the damage, and restore keeps routing the healed file through version substitution as
-    /// if it were still lost.</summary>
-    private static void ClearUnrecoverable(VersionIndex index, string path, HashSet<int> changedVersions, int vnum)
+    /// if it were still lost. A version that never held the mark is left alone, so it is not rewritten for nothing.</summary>
+    private static async Task ClearUnrecoverableAsync(
+        VersionCatalog catalog, RepairPatchSet patches, int vnum, string path, CancellationToken ct)
     {
-        if (index.UnrecoverablePaths.Remove(path))
-            changedVersions.Add(vnum);
+        if (await IsMarkedAsync(catalog, patches, vnum, path, ct))
+            patches.Clear(vnum, path);
     }
 
     private async Task Record(NotificationEvents evt, string source, string title, string body, CancellationToken ct)

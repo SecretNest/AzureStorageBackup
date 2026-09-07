@@ -259,11 +259,11 @@ builder.Services.AddScoped(sp => new BackupRepairer(
     sp.GetRequiredService<IBlobUploader>(),
     Path.Combine(tempPath, "repair"),
     sp.GetRequiredService<StagingArea>(),
+    sp.GetRequiredService<IVersionCatalogs>(),  // repair reads entries from the catalog and patches its verdicts back, after the rewritten index is in the cloud
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
     sp.GetRequiredService<BackupChecker>(),
-    sp.GetRequiredService<TrackedInfoStore>(),
-    sp.GetRequiredService<ILocalIndexCache>(),  // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
+    sp.GetRequiredService<TrackedInfoStore>(),  // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
     journals: sp.GetRequiredService<BackupJournalStore>())); // active journals protect a suspended run's uploads from the orphan sweep
 
 // Operation log (M8) + global settings
