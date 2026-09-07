@@ -117,7 +117,15 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     public string Path { get; }
 
     /// <summary>Opens (and, for a writer, creates) the catalog. A read-only open neither creates the file nor touches
-    /// the schema, so a reader can never resurrect a catalog somebody just deleted.</summary>
+    /// the schema, so a reader can never resurrect a catalog somebody just deleted.
+    /// <para>
+    /// Does <b>not</b> run <c>PRAGMA quick_check</c> — that is <see cref="QuickCheckAsync"/>, a separate call the
+    /// caller opts into, because it is a full scan of the file and this method needs to stay cheap enough to call on
+    /// every open. <see cref="VersionCatalogStore"/> is the one caller that needs it, and only wants to pay for it
+    /// once per path per process (a real catalog can run to gigabytes), not on every open of an already-known-good
+    /// file.
+    /// </para>
+    /// </summary>
     public static async Task<VersionCatalog> OpenAsync(string path, bool readOnly, CancellationToken ct)
     {
         var connection = new SqliteConnection(CatalogSql.ConnectionString(path, readOnly));
@@ -126,15 +134,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
             await connection.OpenAsync(ct);
             CatalogSql.ApplyPragmas(connection, readOnly);
             if (!readOnly)
-            {
-                // A garbage or truncated file often trips over ApplyPragmas' own statements (SQLITE_NOTADB) before
-                // this ever runs, but a file that merely has a corrupt page deep inside it looks fine until
-                // something reads that page — which quick_check forces to happen now, rather than mid-import.
-                // Read-only opens skip it: a reader that finds a corrupt page fails the query that touches it, and
-                // is never the one to delete and recreate the file (VersionCatalogStore reserves that to a writer).
-                await QuickCheckAsync(connection, ct);
                 CatalogSql.EnsureSchema(connection);
-            }
         }
         catch
         {
@@ -145,12 +145,18 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         return new VersionCatalog(path, connection);
     }
 
-    /// <summary>Runs <c>PRAGMA quick_check</c> and turns anything other than a single "ok" row into the same
+    /// <summary>
+    /// Runs <c>PRAGMA quick_check</c> and turns anything other than a single "ok" row into the same
     /// <see cref="SqliteException"/> shape SQLite itself raises for a corrupt file (<c>SQLITE_CORRUPT</c>), so
-    /// <see cref="VersionCatalogStore"/> has one error code to catch regardless of which check caught the damage.</summary>
-    private static async Task QuickCheckAsync(SqliteConnection connection, CancellationToken ct)
+    /// <see cref="VersionCatalogStore"/> has one error code to catch regardless of which check caught the damage —
+    /// whether that is <see cref="CatalogSql.ApplyPragmas"/>'s own statements refusing a file that is not a database
+    /// at all (<c>SQLITE_NOTADB</c>, raised earlier, inside <see cref="OpenAsync"/> itself), or a page deep inside an
+    /// otherwise well-formed file that only this full scan would find. Public, not run automatically by
+    /// <see cref="OpenAsync"/>, so the caller controls when the scan happens.
+    /// </summary>
+    public async Task QuickCheckAsync(CancellationToken ct)
     {
-        using var command = connection.CreateCommand();
+        using var command = _connection.CreateCommand();
         command.CommandText = "PRAGMA quick_check";
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var ok = await reader.ReadAsync(ct) && reader.GetString(0) == "ok";
