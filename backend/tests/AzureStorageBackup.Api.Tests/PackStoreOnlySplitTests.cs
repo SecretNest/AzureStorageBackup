@@ -101,7 +101,7 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, Staging(),
             new RetentionCleaner(
                 factory, store, new RetentionEvaluator(),
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
             new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
 

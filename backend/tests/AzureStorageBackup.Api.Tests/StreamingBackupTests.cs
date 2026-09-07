@@ -108,7 +108,7 @@ public sealed class StreamingBackupTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
@@ -507,7 +507,7 @@ public sealed class StreamingBackupTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), cloud ?? factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
             new FileHasher(), authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(), notifier: null, opLog: opLog);
         var request = new BackupRequest

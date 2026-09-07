@@ -203,6 +203,7 @@ public sealed class FixtureRecorderTests
         db.Database.EnsureCreated();
         var indexFiles = new VersionIndexFileStore(indexRoot);
         var indexCache = new LocalIndexCache(db, store, indexFiles);
+        var catalogs = TestCatalogs.New(db, store, indexFiles);
         var localState = new LocalBackupStateStore(db);
         var tracked = new TrackedInfoStore(store, localState);
 
@@ -210,8 +211,8 @@ public sealed class FixtureRecorderTests
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
-                indexCache: indexCache, trackedInfo: tracked, journals: journals),
-            new FileHasher(), TestCatalogs.New(db, store, indexFiles), tracked,
+                catalogs: catalogs, trackedInfo: tracked, journals: journals),
+            new FileHasher(), catalogs, tracked,
             workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory, localState);
     }

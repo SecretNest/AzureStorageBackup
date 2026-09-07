@@ -120,16 +120,17 @@ public sealed class BackupLifecycleTests : IDisposable
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
         var indexFiles = TestIndexFiles.New();
         var indexCache = new LocalIndexCache(_db, store, indexFiles);
+        var catalogs = TestCatalogs.New(_db, store, indexFiles);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
             _uploader, new SevenZipCompressor(), hasher, Path.Combine(_temp, "compact"), staging);
         var cleaner = new RetentionCleaner(
-            factory, store, new RetentionEvaluator(), compactor, indexCache, tracked);
+            factory, store, new RetentionEvaluator(), compactor, catalogs, tracked);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), _uploader, factory, store, staging, cleaner, hasher,
-            catalogs: TestCatalogs.New(_db, store, indexFiles), trackedInfo: tracked,
+            catalogs: catalogs, trackedInfo: tracked,
             workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
             factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);

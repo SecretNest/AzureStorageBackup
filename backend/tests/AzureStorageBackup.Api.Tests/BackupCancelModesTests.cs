@@ -128,7 +128,7 @@ public sealed class BackupCancelModesTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
             new FileHasher(), wrapCatalogs?.Invoke(authority.Catalogs) ?? authority.Catalogs, authority.Tracked,
             workFactory: TestWorkDbs.New(),
             notifier: notifier, opLog: opLog);

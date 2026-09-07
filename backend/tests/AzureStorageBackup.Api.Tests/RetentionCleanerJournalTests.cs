@@ -61,9 +61,16 @@ public sealed class RetentionCleanerJournalTests : IDisposable
         return names;
     }
 
-    private RetentionCleaner Cleaner(IBlobClientFactory factory, DeadWeightCompactor? compactor = null)
-        => new(factory, new BackupInfoStore(factory, new SevenZipArchiveCodec()), new RetentionEvaluator(),
-            compactor, journals: _journals);
+    /// <summary>The catalog is thrown away with the test: every container here is created fresh, so the versions
+    /// the cleanup asks about are migrated into it from the cloud on the way through, exactly as they would be on
+    /// a container that had never been cleaned since the upgrade.</summary>
+    private RetentionCleaner Cleaner(
+        IBlobClientFactory factory, DeadWeightCompactor? compactor = null, IVersionCatalogs? catalogs = null)
+    {
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        return new(factory, store, new RetentionEvaluator(), compactor,
+            catalogs ?? new TestLocalAuthority(store).Catalogs, journals: _journals);
+    }
 
     /// <summary>Really not a single cloud request was sent — the sentence "no sweep asked for means no LIST" is only nailed down once it is actually counted.</summary>
     private sealed class CountingFactory(BlobClientFactory inner) : IBlobClientFactory
@@ -379,6 +386,152 @@ public sealed class RetentionCleanerJournalTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>
+    /// A version that is retiring anyway must not be able to block the cleanup by having an unreadable index.
+    /// <para>
+    /// The criterion is now read out of the catalog, which means every version in the info file gets migrated into
+    /// it on the way through — and a migration goes to the cloud when nothing local has the index. For a retained
+    /// version a failure there has to stop the round (its refs are what protects live content), but for a retiring
+    /// one it must not: its only contribution is naming what may go, and what it alone held is collected by the
+    /// orphan half of the criterion regardless — exactly as it was by the old code, which never read a retired
+    /// index at all. Otherwise one lost index blob would leave the container unable to free a byte, for good.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_retiring_version_whose_index_is_gone_does_not_block_the_cleanup()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("cleanmiss");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await PutAsync(container, "data/v1only", "only version 1 has this");
+            await PutAsync(container, "data/shared", "both versions have this");
+
+            var (idx1, _) = await store.WriteIndexAsync(account, name, 1, new VersionIndex
+            {
+                Version = 1,
+                Entries =
+                [
+                    Entry("a.bin", "data/v1only"),
+                    Entry("b.bin", "data/shared"),
+                ],
+            }, null);
+            var (idx2, _) = await store.WriteIndexAsync(account, name, 2, new VersionIndex
+            {
+                Version = 2,
+                Entries = [Entry("b.bin", "data/shared")],
+            }, null);
+
+            // The lost index: version 1 is still in the info file, but its manifest is no longer in the cloud and
+            // no local copy of it has ever existed (the catalog under this cleaner is brand new).
+            await container.GetBlobClient(idx1).DeleteAsync();
+
+            var info = new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = name, CreatedAt = DateTimeOffset.UnixEpoch },
+                Versions =
+                {
+                    new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-2), IndexBlob = idx1, Stats = new VersionStats(2, 2, 2, 2) },
+                    new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = idx2, Stats = new VersionStats(1, 1, 1, 1) },
+                },
+            };
+
+            var report = await Cleaner(factory).CleanupAsync(account, name, null, new CleanupOptions
+            {
+                Retention = new RetentionPolicy { MaxVersions = 1, Mode = RetentionMode.VersionOnly },
+            }, info);
+
+            Assert.Equal(1, report.RetiredVersions);
+            // Version 2 was migrated, so what it still references is known and survives; version 1's own block is
+            // referenced by nobody left and goes, as an orphan rather than as a named candidate.
+            Assert.Equal(["data/shared"], await NamesAsync(container, "data/"));
+            Assert.Equal(1, report.DeletedBlobs);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The catalog is a cache of what the info file says exists, and the info file is the authority: a version in
+    /// the catalog that the info file does not list must be dropped before anything is judged against it.
+    /// <para>
+    /// This is the state an earlier round leaves behind when it dies between its cloud deletes and the removal at
+    /// the end — the retirement commit went out first, so the info file has already forgotten the version while its
+    /// rows are still in the catalog. Nothing later retires it: the next round computes no retirement at all, so it
+    /// never reaches that removal, and those rows would go on answering "referenced" for exactly the objects the
+    /// failed round did not manage to delete — protecting them permanently. The old code could not get into this
+    /// state, because it rebuilt the referenced set from the info file's own version list every time.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task A_catalog_version_the_info_file_no_longer_lists_is_dropped_and_stops_protecting_its_blobs()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running on 127.0.0.1:10000");
+
+        var account = AzuriteAccount();
+        var name = RandomName("cleanrec");
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await PutAsync(container, "data/v1only", "the block the failed round did not delete");
+            await PutAsync(container, "data/shared", "still referenced by version 2");
+
+            var (idx1, _) = await store.WriteIndexAsync(account, name, 1, new VersionIndex
+            {
+                Version = 1,
+                Entries = [Entry("a.bin", "data/v1only"), Entry("b.bin", "data/shared")],
+            }, null);
+            var (idx2, _) = await store.WriteIndexAsync(account, name, 2, new VersionIndex
+            {
+                Version = 2,
+                Entries = [Entry("b.bin", "data/shared")],
+            }, null);
+
+            var created = DateTimeOffset.UnixEpoch;
+            var v1 = new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-2), IndexBlob = idx1, Stats = new VersionStats(2, 2, 2, 2) };
+            var v2 = new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow, IndexBlob = idx2, Stats = new VersionStats(1, 1, 1, 1) };
+
+            // The leftover state: both versions in the catalog, only version 2 in the info file.
+            var catalogs = new TestLocalAuthority(store).Catalogs;
+            await catalogs.EnsureVersionAsync(account, name, v1, created.UtcTicks, null, default);
+            await catalogs.EnsureVersionAsync(account, name, v2, created.UtcTicks, null, default);
+
+            var info = new BackupInfoFile
+            {
+                Backup = new BackupMeta { Name = name, CreatedAt = created },
+                Versions = { v2 },
+            };
+
+            // Nothing retires this round (50 versions kept, one version present) — precisely the round that would
+            // never reach the removal at the end of the cleanup.
+            var report = await Cleaner(factory, catalogs: catalogs).CleanupAsync(
+                account, name, null, Options(), info, default, sweepOrphans: true);
+
+            Assert.Equal(0, report.RetiredVersions);
+            Assert.Equal(1, report.DeletedBlobs);
+            Assert.Equal(["data/shared"], await NamesAsync(container, "data/"));
+
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true, default);
+            Assert.Equal([2], (await catalog.ListVersionsAsync(default)).Select(v => v.Version));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    private static IndexEntry Entry(string path, string reference) => new()
+    {
+        Path = path, Kind = "file", Length = 4, Permissions = "0644", FullHash = "xxh128:" + new string('e', 32),
+        Storage = new StorageRef { Kind = "blob", Ref = reference },
+    };
+
     /// <summary>Retirement must commit before it deletes — the one place in the codebase that had it backwards.
     /// The old order deleted a retired version's index volumes from the cloud FIRST and wrote the info file (the
     /// only record of which versions exist) LAST, so a cancellation or crash in between left the info file

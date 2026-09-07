@@ -322,7 +322,10 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
             // A real compactor (not null): CleanupAsync really runs the grouping code internally, instead of
             // hand-assembling liveByPack and feeding it straight to CompactAsync the way the case above does.
-            var cleaner = new RetentionCleaner(factory, store, new RetentionEvaluator(), Compactor());
+            // The catalog is part of "really runs the grouping code": that is where the live members now come
+            // from, and both index blobs above are migrated into it on the way through.
+            var cleaner = new RetentionCleaner(
+                factory, store, new RetentionEvaluator(), Compactor(), new TestLocalAuthority(store).Catalogs);
             var options = new CleanupOptions
             {
                 Retention = new RetentionPolicy { Mode = RetentionMode.VersionOnly, MaxVersions = 1 },

@@ -259,8 +259,11 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
                 busy.RemoveReader(9, "held");
             throw new StopBeforeTheCloud(); // pinned at the first destructive step; nothing network runs
         };
+        // A catalog only so the cleaner is wired the way production wires it: the info write below is still the
+        // first thing this round does, and the catalog is not touched until after it.
         var cleaner = new RetentionCleaner(
-            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy);
+            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy,
+            catalogs: new TestLocalAuthority(store).Catalogs);
         var account = new Account { Id = 9, Name = "a", BlobEndpoint = "http://127.0.0.1:1", AccountKeyProtected = TestSecrets.Protect("dGVzdGtleQ==") };
 
         Assert.True(busy.TryAcquire(9, "held", "BackingUp"));
