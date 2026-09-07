@@ -1055,7 +1055,10 @@ public sealed class BackupOrchestrator(
                                 // instant it lands, and unparking something that never parked leaves the reading
                                 // held for the rest of the run. See WorkShare.Park.
                                 share.Park(HandoffQueue.Compression);
-                                await probedQueue.Writer.WriteAsync(new ProbedItem(item, hit, share), feeding.Token);
+                                // The write steps out of the in-hand count (see the pack branch below for why).
+                                using (control?.Gate.Idle())
+                                    await probedQueue.Writer.WriteAsync(
+                                        new ProbedItem(item, hit, share), feeding.Token);
                                 handed = true;
                             }, feeding.Token);
                         }
@@ -1065,8 +1068,19 @@ public sealed class BackupOrchestrator(
                             // existing packs back on the diff side (see TryFindPackMember), and whatever is left has
                             // to be compressed before anything about it can be decided.
                             share.Park(HandoffQueue.Compression);   // before the write, as above
-                            await probedQueue.Writer.WriteAsync(
-                                new ProbedItem(item, Hit: null, share), feeding.Token);
+                            // The hand-off is a wait the pause can make endless, so it steps out of the in-hand
+                            // count the way the compressor's wait for staging room does (PauseGate.Idle). The
+                            // probed queue is nine deep and the compressor is its only consumer; with the pool
+                            // full the compressor sits on the room wait, the queue fills behind it, and this
+                            // write blocks. Room is freed only by uploads, and a standing hold parks every
+                            // uploader — so the compressor never takes the item that would let the write land,
+                            // and counted, the prober kept the run "pausing" for as long as the hold stood
+                            // (field report, 2026-09-07: "Pausing… · holding 10.781 GB of staging · 1 object
+                            // waiting for staging room", nothing on the wire). The probe itself stays counted:
+                            // that read runs to its end whatever the gate says.
+                            using (control?.Gate.Idle())
+                                await probedQueue.Writer.WriteAsync(
+                                    new ProbedItem(item, Hit: null, share), feeding.Token);
                             handed = true;
                         }
                     }

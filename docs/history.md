@@ -59,6 +59,7 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 08-18 | A resume that answers "already uploaded?" from a `stat` instead of re-reading every candidate file | [content-identity.md](content-identity.md), [run-lifecycle.md](run-lifecycle.md) |
 | 08-18 | A store-only unencrypted blob uploaded from the source rather than from a staged copy | [pipeline.md](pipeline.md) |
 | 09-07 | A pause that takes effect within a volume rather than a file, reaches the pack loop's every group and the wrap-up, and reads "Pausing…" until it has taken effect | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
+| 09-07 | The prober's hand-off into a full probed queue steps out of the pause accounting: "Pausing…" no longer stands for good when the pool is full and the compressor is waiting for room | [run-lifecycle.md](run-lifecycle.md) |
 
 ## Working conventions
 
