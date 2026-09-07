@@ -89,6 +89,9 @@ public sealed class RunWorkDbTests : IDisposable
 
         var storage = new StorageRef { Kind = "blob", Ref = "data/abc", Volumes = 2, Raw = true, VolumeSizes = [7, 3] };
         await db.UpdateDraftStorageAsync("p", storage, Ct);
+        // Twice, with different values: the writer applies these on a background task, and the row must end up
+        // holding what the *last* caller said, not whichever update the batch happened to run first.
+        await db.UpdateDraftTailAsync("p", "stale-tail-hash", Ct);
         await db.UpdateDraftTailAsync("p", "tail-hash", Ct);
         await db.UpdateDraftOverrideAsync("p", "full-hash", "head-hash", 99, Mtime.AddDays(1), Ct);
         await db.MarkDraftUnreadableAsync("d/r", "permission denied", Ct);
@@ -138,6 +141,38 @@ public sealed class RunWorkDbTests : IDisposable
         await Assert.ThrowsAsync<SqliteException>(() => db.FlushAsync(Ct));
     }
 
+    // ---- Test 3b: a fault outside the batch's own try still reaches the caller ---------------------------------
+
+    /// <summary>
+    /// Not every way a batch can fail is a failing statement. <c>BEGIN</c> itself can be refused — another writer
+    /// holds the file (<c>SQLITE_BUSY</c>), or the disk is gone (<c>SQLITE_IOERR</c>) — and that happens before a
+    /// single statement of the batch has run. An escape there would kill the writer task with nobody left reading
+    /// the channel: the caller inside <see cref="RunWorkDb.FlushAsync"/> would be waiting on a marker that can never
+    /// be completed, which is a hang, not an error.
+    /// <para>
+    /// The batch here carries <em>only</em> the flush marker, no statements at all, so the only step that can fail
+    /// is the <c>BEGIN</c> — if it ever stopped being the failing step, this test would go green by finishing rather
+    /// than by silently exercising something else. The timeout token is what turns a regression into a failure
+    /// instead of a hung test run.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Flush_surfaces_a_failure_to_open_the_batch()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var db = await OpenAsync();
+
+        // Refuse the writer's connection the right to write, through the same channel so it lands on that very
+        // connection. The batch carrying it has already taken its write lock, so it still commits; the *next*
+        // batch's BEGIN is the one that cannot start. A held lock from a second connection would say the same thing
+        // with SQLITE_BUSY, but Microsoft.Data.Sqlite retries busy for its 30 s command timeout first, and a test
+        // that has to outwait that is a test that fails by hanging.
+        await db.EnqueueRawSqlAsync("PRAGMA query_only=1", timeout.Token);
+        await db.FlushAsync(timeout.Token);
+
+        await Assert.ThrowsAsync<SqliteException>(() => db.FlushAsync(timeout.Token));
+    }
+
     // ---- Test 4: how many candidates each directory group still has -------------------------------------------
 
     [Fact]
@@ -171,6 +206,8 @@ public sealed class RunWorkDbTests : IDisposable
         await db.InsertResumeRecordAsync(Blob("p", "data/new", "full-new"), Ct);
         await db.InsertResumeRecordAsync(Blob("p", "data/old", "full-old"), Ct);
         await db.InsertResumeRecordAsync(Blob("q", "data/q", fullHash: null), Ct);   // no content identity: not a resume point
+        // Dedup points two paths at one address all the time, so a ref is not unique here.
+        await db.InsertResumeRecordAsync(Blob("a", "data/new", "full-new"), Ct);
         await db.FlushAsync(Ct);
 
         var kept = await db.ResumeBlobByPathAsync("p", Ct);
@@ -183,13 +220,15 @@ public sealed class RunWorkDbTests : IDisposable
         Assert.Equal<long[]>([7, 3], [.. kept.VolumeSizes]);
 
         Assert.Null(await db.ResumeBlobByPathAsync("q", Ct));
-        Assert.Equal(1, await db.ResumeRecordCountAsync(Ct));
+        Assert.Equal(2, await db.ResumeRecordCountAsync(Ct));   // "p" and "a"; "q" was never stored
 
         var byContent = await db.ResumeBlobByContentAsync("full-new", 10, "head", "tail", Ct);
         Assert.Equal("data/new", byContent?.Ref);
         Assert.Null(await db.ResumeBlobByContentAsync("full-new", 11, "head", "tail", Ct));
 
-        Assert.Equal("p", (await db.ResumeBlobByRefAsync("data/new", Ct))?.Path);
+        // Two paths hold "data/new", so the lookup must pick the same one every time rather than whichever row the
+        // index happened to reach first: the lowest path.
+        Assert.Equal("a", (await db.ResumeBlobByRefAsync("data/new", Ct))?.Path);
         Assert.Null(await db.ResumeBlobByRefAsync("data/old", Ct));
     }
 
@@ -243,6 +282,8 @@ public sealed class RunWorkDbTests : IDisposable
         Assert.False(File.Exists(path));
         Assert.False(File.Exists(path + "-wal"));
         Assert.False(File.Exists(path + "-shm"));
+        // The file is gone, so a flush cannot mean anything any more; it says so rather than pretending to succeed.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => db.FlushAsync(Ct));
 
         // What a killed process leaves behind is cleared at startup, the way DiffWorkQueue.ClearStale does it.
         await File.WriteAllTextAsync(Path.Combine(_dir, "stale.db"), "junk", Ct);

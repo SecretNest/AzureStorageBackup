@@ -65,8 +65,12 @@ public sealed partial class RunWorkDb
     private const string SelectResumeBlobByPathSql =
         $"SELECT {SelectResumeBlobColumns} FROM resume_blobs WHERE path=@path";
 
+    /// <summary>A ref is not unique in this table — the previous run may have pointed two paths at one address, and
+    /// dedup does exactly that. <c>ORDER BY path LIMIT 1</c> so the answer is the same row every time rather than
+    /// whichever the index happened to visit first: a lookup that changes its mind between calls is worse than one
+    /// that is merely arbitrary.</summary>
     private const string SelectResumeBlobByRefSql =
-        $"SELECT {SelectResumeBlobColumns} FROM resume_blobs WHERE ref=@ref";
+        $"SELECT {SelectResumeBlobColumns} FROM resume_blobs WHERE ref=@ref ORDER BY path LIMIT 1";
 
     private const string SelectResumeBlobByContentSql =
         $"SELECT {SelectResumeBlobColumns} FROM resume_blobs " +
@@ -290,7 +294,7 @@ public sealed partial class RunWorkDb
     private async Task<SqliteConnection> OpenReadAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var connection = new SqliteConnection(ConnectionString(Path));
+        var connection = new SqliteConnection(ConnectionString(Path, create: false));
         try
         {
             await connection.OpenAsync(ct);

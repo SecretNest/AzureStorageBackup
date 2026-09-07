@@ -209,7 +209,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
 
-        await using (var connection = new SqliteConnection(ConnectionString(path)))
+        await using (var connection = new SqliteConnection(ConnectionString(path, create: true)))
         {
             await connection.OpenAsync(ct);
             ApplyPragmas(connection, writer: true);
@@ -221,14 +221,19 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         return new RunWorkDb(path);
     }
 
-    /// <summary><c>Pooling=false</c> for the same reason the catalog turns it off: a pooled connection collected
-    /// without being disposed hands its live handle to the next Open of the same connection string, and the symptom
-    /// is a <c>SQLite Error 0: 'not an error'</c> from an unrelated statement. This class opens a connection per read,
-    /// so it would be the loudest possible place to get that wrong.</summary>
-    private static string ConnectionString(string path) => new SqliteConnectionStringBuilder
+    /// <summary>
+    /// <c>Pooling=false</c> for the same reason the catalog turns it off: a pooled connection collected without being
+    /// disposed hands its live handle to the next Open of the same connection string, and the symptom is a
+    /// <c>SQLite Error 0: 'not an error'</c> from an unrelated statement. This class opens a connection per read, so
+    /// it would be the loudest possible place to get that wrong.
+    /// </summary>
+    /// <param name="create">Only the writer may create the file. A reader opens <c>ReadWrite</c>, so that a read
+    /// racing <see cref="DisposeAsync"/> fails loudly instead of conjuring an empty database under the deleted name
+    /// and answering every question with "no rows" — a silent wrong answer where the run wanted an error.</param>
+    private static string ConnectionString(string path, bool create) => new SqliteConnectionStringBuilder
     {
         DataSource = path,
-        Mode = SqliteOpenMode.ReadWriteCreate,
+        Mode = create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
         Pooling = false,
         Cache = SqliteCacheMode.Private,
     }.ToString();
@@ -425,6 +430,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     /// reaches the caller.</summary>
     public async Task FlushAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ThrowIfFaulted();
         var marker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await _channel.Writer.WriteAsync(new WriteOp(null, marker), ct);
@@ -501,118 +507,133 @@ public sealed partial class RunWorkDb : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// The writer task, and the <b>only</b> place a fault is recorded. Nothing may escape this method: the pump is
+    /// the sole reader of the channel, so an exception that got out would leave <see cref="_fault"/> null with nobody
+    /// left to complete a marker — a caller already inside <see cref="FlushAsync"/> would wait forever on a marker
+    /// that can never be completed, and the next <see cref="FlushAsync"/> would sail past
+    /// <see cref="ThrowIfFaulted"/> and enqueue into a channel no one is reading.
+    /// <para>
+    /// So the capture is here, around the whole of <see cref="PumpCoreAsync"/>, rather than around the batch loop
+    /// alone. The steps outside a batch's own <c>try</c> are precisely the ones most likely to fail for reasons that
+    /// have nothing to do with the statements — opening the connection, <c>BEGIN</c> against a file another writer
+    /// holds (<c>SQLITE_BUSY</c>) or a failing disk (<c>SQLITE_IOERR</c>), and finalizing the transaction object.
+    /// </para>
+    /// </summary>
     private async Task PumpAsync()
     {
-        SqliteConnection connection;
+        // Shared with the core so that a batch killed by one of those steps still has its pending flush markers
+        // failed here, instead of being left hanging with the batch that was carrying them.
+        var markers = new List<TaskCompletionSource>();
         try
         {
-            connection = new SqliteConnection(ConnectionString(Path));
-            await connection.OpenAsync();
-            ApplyPragmas(connection, writer: true);
+            await PumpCoreAsync(markers).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _fault = ex;
-            await DrainFaultedAsync(ex);
-            return;
+            foreach (var pending in markers)
+                pending.TrySetException(ex);
+            await DrainFaultedAsync(ex).ConfigureAwait(false);
         }
+    }
 
-        await using (connection)
+    /// <summary>The loop itself. Faults are not handled here — every one of them, from the batch's statements to the
+    /// <c>BEGIN</c> that opened it, leaves through <see cref="PumpAsync"/>, which is the only place that records
+    /// one.</summary>
+    private async Task PumpCoreAsync(List<TaskCompletionSource> markers)
+    {
+        await using var connection = new SqliteConnection(ConnectionString(Path, create: false));
+        await connection.OpenAsync().ConfigureAwait(false);
+        ApplyPragmas(connection, writer: true);
+
+        using var statements = new Statements(connection);
+        var reader = _channel.Reader;
+
+        while (await reader.WaitToReadAsync().ConfigureAwait(false))
         {
-            using var statements = new Statements(connection);
-            var reader = _channel.Reader;
-            var markers = new List<TaskCompletionSource>();
+            markers.Clear();
+            var transaction = (SqliteTransaction)await connection.BeginTransactionAsync().ConfigureAwait(false);
+            statements.Transaction = transaction;
+            var deadline = Environment.TickCount64 + BatchMilliseconds;
+            var applied = 0;
+            var completed = false;
+            Exception? fault = null;
 
-            while (await reader.WaitToReadAsync().ConfigureAwait(false))
+            try
             {
-                markers.Clear();
-                var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
-                statements.Transaction = transaction;
-                var deadline = Environment.TickCount64 + BatchMilliseconds;
-                var applied = 0;
-                var completed = false;
-                Exception? fault = null;
-
-                try
+                while (applied < BatchItems)
                 {
-                    while (applied < BatchItems)
+                    if (reader.TryRead(out var op))
                     {
-                        if (reader.TryRead(out var op))
+                        if (op.Marker is { } marker)
+                            markers.Add(marker);
+                        else
                         {
-                            if (op.Marker is { } marker)
-                                markers.Add(marker);
-                            else
-                            {
-                                op.Apply!(statements);
-                                applied++;
-                            }
-
-                            continue;
+                            op.Apply!(statements);
+                            applied++;
                         }
 
-                        // Somebody is already awaiting this batch, so holding it open for the rest of the window
-                        // would only make them wait for rows nobody has written yet. Commit now.
-                        if (markers.Count > 0)
-                            break;
+                        continue;
+                    }
 
-                        // Nothing queued right now: hold the transaction open for the rest of the batch window, then
-                        // commit whatever it has. The cancellation source is what removes this waiter from the
-                        // channel when the window runs out, instead of leaving one behind per idle batch.
-                        var remaining = deadline - Environment.TickCount64;
-                        if (remaining <= 0)
-                            break;
-                        using var window = new CancellationTokenSource((int)remaining);
-                        try
+                    // Somebody is already awaiting this batch, so holding it open for the rest of the window would
+                    // only make them wait for rows nobody has written yet. Commit now.
+                    if (markers.Count > 0)
+                        break;
+
+                    // Nothing queued right now: hold the transaction open for the rest of the batch window, then
+                    // commit whatever it has. The cancellation source is what removes this waiter from the channel
+                    // when the window runs out, instead of leaving one behind per idle batch.
+                    var remaining = deadline - Environment.TickCount64;
+                    if (remaining <= 0)
+                        break;
+                    using var window = new CancellationTokenSource((int)remaining);
+                    try
+                    {
+                        if (!await reader.WaitToReadAsync(window.Token).ConfigureAwait(false))
                         {
-                            if (!await reader.WaitToReadAsync(window.Token).ConfigureAwait(false))
-                            {
-                                completed = true;
-                                break;
-                            }
-                        }
-                        catch (OperationCanceledException)
-                        {
+                            completed = true;
                             break;
                         }
                     }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
-                catch (Exception ex)
-                {
-                    fault = ex;
-                }
-
-                if (fault is null)
-                {
-                    try { await transaction.CommitAsync(); }
-                    catch (Exception ex) { fault = ex; }
-                }
-
-                if (fault is not null)
-                {
-                    try { await transaction.RollbackAsync(); }
-                    catch { /* the batch is lost either way; the fault below is the one that matters */ }
-                }
-
-                statements.Transaction = null;
-                await transaction.DisposeAsync();
-
-                if (fault is not null)
-                {
-                    // The batch rolled back, so its rows are gone and every later row would be written on top of a
-                    // draft nobody can trust. Stop applying, keep draining so no caller waits forever, and let the
-                    // fault out of the next flush.
-                    _fault = fault;
-                    foreach (var pending in markers)
-                        pending.TrySetException(fault);
-                    await DrainFaultedAsync(fault);
-                    return;
-                }
-
-                foreach (var pending in markers)
-                    pending.TrySetResult();
-                if (completed)
-                    return;
             }
+            catch (Exception ex)
+            {
+                fault = ex;
+            }
+
+            if (fault is null)
+            {
+                try { await transaction.CommitAsync().ConfigureAwait(false); }
+                catch (Exception ex) { fault = ex; }
+            }
+
+            if (fault is not null)
+            {
+                try { await transaction.RollbackAsync().ConfigureAwait(false); }
+                catch { /* the batch is lost either way; the fault below is the one that matters */ }
+            }
+
+            statements.Transaction = null;
+            await transaction.DisposeAsync().ConfigureAwait(false);
+
+            // The batch rolled back, so its rows are gone and every later row would be written on top of a draft
+            // nobody can trust. Stop applying and let the fault out to PumpAsync, the one place that records it,
+            // fails the markers this batch was carrying, and keeps draining so no caller waits forever. Rethrown
+            // through ExceptionDispatchInfo so the stack still points at the statement that failed.
+            if (fault is not null)
+                ExceptionDispatchInfo.Capture(fault).Throw();
+
+            foreach (var pending in markers)
+                pending.TrySetResult();
+            if (completed)
+                return;
         }
     }
 
