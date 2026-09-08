@@ -22,13 +22,13 @@ namespace AzureStorageBackup.Api.Tests;
 internal sealed class TestLocalAuthority
 {
     /// <summary>Brings its own in-memory database.</summary>
-    internal TestLocalAuthority(IBackupInfoStore store)
+    internal TestLocalAuthority(IBackupInfoStore store, VersionCatalogStore? catalogStore = null)
     {
         var conn = new SqliteConnection("DataSource=:memory:");
         conn.Open();
         Db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseSqlite(conn).Options);
         Db.Database.EnsureCreated();
-        (Catalogs, Tracked) = Wire(Db, store);
+        (Catalogs, Tracked) = Wire(Db, store, catalogStore);
     }
 
     /// <summary>Reuses a database the test class already has — for when the orchestrator and the checker/repairer must see the same local state.</summary>
@@ -47,6 +47,6 @@ internal sealed class TestLocalAuthority
 
     internal TrackedInfoStore Tracked { get; }
 
-    private static (VersionCatalogs, TrackedInfoStore) Wire(AppDbContext db, IBackupInfoStore store) =>
-        (TestCatalogs.New(db, store), new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+    private static (VersionCatalogs, TrackedInfoStore) Wire(AppDbContext db, IBackupInfoStore store, VersionCatalogStore? catalogStore = null) =>
+        (TestCatalogs.New(db, store, catalogStore: catalogStore), new TrackedInfoStore(store, new LocalBackupStateStore(db)));
 }

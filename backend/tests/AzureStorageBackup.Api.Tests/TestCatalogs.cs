@@ -33,8 +33,9 @@ internal static class TestCatalogs
     /// a test, a leftover under our own root is swept with everything else on exit.</summary>
     internal static string NewTempRoot() => Path.Combine(Root, "import", Guid.NewGuid().ToString("N"));
 
-    internal static VersionCatalogs New(AppDbContext db, IBackupInfoStore store, VersionIndexFileStore? legacyFiles = null) =>
-        new(NewStore(), legacyFiles ?? TestIndexFiles.New(), db, store, logger: null, NewTempRoot());
+    internal static VersionCatalogs New(
+        AppDbContext db, IBackupInfoStore store, VersionIndexFileStore? legacyFiles = null, VersionCatalogStore? catalogStore = null) =>
+        new(catalogStore ?? NewStore(), legacyFiles ?? TestIndexFiles.New(), db, store, logger: null, NewTempRoot());
 
     /// <summary>
     /// A throwaway catalog holding exactly one imported version — the shortest path from a hand-written

@@ -785,29 +785,28 @@ public sealed class BackupOrchestrator(
             loading.Complete();
         }
 
-        // The catalog's full-file quick_check, if this process has not paid it for this container yet. It would
-        // otherwise run silently inside the write open two steps down, for as long as the catalog is big: tens of
-        // seconds of "Loading versions 100%" on a big history, reported as a hang. Asked for beforehand so the stage
-        // line goes up before the read starts, and shown with the file size so the wait reads as "2 GB of catalog".
+        // The catalog's full-file quick_check, when it is owed: the last process that wrote this catalog did not exit
+        // cleanly, or a reader saw damage (VersionCatalogStore.NeedsCheck). It would otherwise run silently inside
+        // the write open two steps down, for as long as the catalog is big — minutes of "Loading versions 100%" on an
+        // 8 GB history, reported as a hang. Asked for beforehand so the stage line goes up before the read starts.
+        // The stage carries **no figures**: a total of 0 (no percentage), no in-flight item (no "1 catalog
+        // downloading"), no bytes (no 0 B/s). quick_check reports no progress, and a 0% that stands for minutes reads
+        // as a hang where "catalog.db (8.2 GB)" reads as the read it is.
         // Pause is greyed like the version load (one statement, nothing to park in), and counted as in hand for the
         // same reason; Suspend and Stop interrupt the statement (QuickCheckAsync) and end the run through
         // BeforeUploadAsync — nothing is lost, the check simply runs again next time.
         if (catalogs.NeedsCheck(request.Account.Id, request.Container))
         {
             progress?.Report(new BackupProgress(BackupStage.CheckingCatalog, 0, 0, 0, 0));
-            using var checking = new StageTracker("CheckingCatalog", 1, d =>
+            using var checking = new StageTracker("CheckingCatalog", 0, d =>
                 progress?.Report(new BackupProgress(BackupStage.CheckingCatalog, 0, 0, 0, 0) { Detail = d }));
-            var catalogBytes = catalogs.CatalogBytes(request.Account.Id, request.Container);
-            var catalogLabel = $"catalog.db ({ByteSize.Human(catalogBytes)})";
-            checking.BeginItem("catalog", catalogLabel, catalogBytes, wire: false);
-            checking.Touch(catalogLabel);
+            checking.Touch($"catalog.db ({ByteSize.Human(catalogs.CatalogBytes(request.Account.Id, request.Container))})");
             using (control?.Gate.BeginWork())
                 await BeforeUploadAsync(async t =>
                 {
                     await catalogs.EnsureCheckedAsync(request.Account.Id, request.Container, t);
                     return 0;
                 });
-            checking.EndItem("catalog", 0); // 0: the bytes were read, not moved — the stage has no transfer to book
             checking.Complete();
         }
 

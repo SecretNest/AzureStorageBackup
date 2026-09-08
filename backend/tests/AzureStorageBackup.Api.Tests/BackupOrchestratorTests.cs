@@ -62,7 +62,7 @@ public sealed class BackupOrchestratorTests : IDisposable
     }
 
     private (BackupOrchestrator Orchestrator, IBackupInfoStore Store, BlobClientFactory Factory) Build(
-        IBlobUploader? uploader = null, IFileCompressor? compressor = null)
+        IBlobUploader? uploader = null, IFileCompressor? compressor = null, VersionCatalogStore? catalogStore = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
@@ -71,7 +71,7 @@ public sealed class BackupOrchestratorTests : IDisposable
         var compactor = new DeadWeightCompactor(
             new BlobUploader(factory), new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "compact"),
             staging);
-        var authority = new TestLocalAuthority(store);
+        var authority = new TestLocalAuthority(store, catalogStore);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
@@ -1408,19 +1408,26 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>The catalog's once-per-process quick_check reads the whole file, and for a big history that is
-    /// tens of seconds with nothing on screen but "Loading versions 100%". It now runs as its own stage, between
-    /// the version load and the diff, and only when it is actually due: the first run after a start pays it and
-    /// says so, the next run on the same process does not mention it.</summary>
+    /// <summary>The catalog's full-file quick_check is owed only after an unclean exit (the marker a write open leaves
+    /// and a clean shutdown removes — see VersionCatalogStore), and for a big history it is minutes with nothing to
+    /// report. When it runs it has its own stage between the version load and the diff, and that stage carries no
+    /// progress figures at all: no total, no in-flight item, no bytes — a "0%" over a read that cannot report progress
+    /// read as a hang. The next run on the same process does not mention it.</summary>
     [SkippableFact]
-    public async Task The_Catalog_Check_Has_Its_Own_Stage_And_Runs_Once_Per_Process()
+    public async Task The_Catalog_Check_Has_Its_Own_Figureless_Stage_After_An_Unclean_Exit()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (orchestrator, _, factory) = Build();
         var account = AzuriteAccount();
         var name = RandomName("orchqc-");
+        // The previous process: opened the catalog for writing and never exited cleanly (never disposed).
+        var root = Path.Combine(_temp, "catalogs");
+        var crashed = new VersionCatalogStore(root);
+        using (var held = await crashed.LockForWriteAsync(account.Id, name, CancellationToken.None))
+        await using (var _ = await crashed.OpenForWriteAsync(held, account.Id, name, CancellationToken.None)) { }
+
+        var (orchestrator, _, factory) = Build(catalogStore: new VersionCatalogStore(root));
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
         try
@@ -1433,11 +1440,43 @@ public sealed class BackupOrchestratorTests : IDisposable
             var checking = stages.IndexOf(BackupStage.CheckingCatalog);
             Assert.True(checking > stages.IndexOf(BackupStage.LoadingVersions), "the check comes after the versions are loaded");
             Assert.True(checking < stages.IndexOf(BackupStage.Diffing), "the check comes before the diff");
-            Assert.Contains(first, p => p.Stage == BackupStage.CheckingCatalog && p.Detail is { Stage: "CheckingCatalog" });
+            var detail = first.Select(p => p.Detail).First(d => d is { Stage: "CheckingCatalog" })!;
+            Assert.Equal(0, detail.Total);          // no fraction to compute a percentage from
+            Assert.Empty(detail.ActiveItems);       // no "1 catalog downloading" block
+            Assert.Equal(0, detail.BytesPerSecond); // no speed
+            Assert.StartsWith("catalog.db (", detail.CurrentItem); // the file and its size are all it says
 
             var second = new List<BackupProgress>();
             await orchestrator.RunAsync(Request(account, name), new SyncProgress(second));
             Assert.DoesNotContain(second, p => p.Stage == BackupStage.CheckingCatalog);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>A catalog the last process closed cleanly is not re-read at the next start: no marker, no stage.</summary>
+    [SkippableFact]
+    public async Task A_Cleanly_Closed_Catalog_Is_Not_Checked_Again()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchqc-");
+        var root = Path.Combine(_temp, "catalogs");
+        var previous = new VersionCatalogStore(root);
+        using (var held = await previous.LockForWriteAsync(account.Id, name, CancellationToken.None))
+        await using (var _ = await previous.OpenForWriteAsync(held, account.Id, name, CancellationToken.None)) { }
+        previous.Dispose(); // the clean shutdown
+
+        var (orchestrator, _, factory) = Build(catalogStore: new VersionCatalogStore(root));
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("a.txt", "alpha");
+            var reports = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(reports));
+            Assert.DoesNotContain(reports, p => p.Stage == BackupStage.CheckingCatalog);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

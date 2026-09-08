@@ -215,7 +215,15 @@ it is open — which it always was. The reason is in [history.md](history.md) (2
 kernel refused the `-shm` locks for no visible cause, and there is nothing the catalog needs from a
 file that exists to share an index between processes. One consequence: the connections that only
 read are opened `ReadWrite` at the SQLite level, because a `ReadOnly` handle is excluded from
-`unix-excl` and would bring the `-shm` file back for every connection on the file. It holds:
+`unix-excl` and would bring the `-shm` file back for every connection on the file.
+
+Beside it, `catalog.db.open` is the clean-shutdown marker: a write open creates it, and disposing the
+store at host shutdown removes it. Found at the next start, it says the last process that wrote this
+catalog did not exit cleanly, and that — or a reader hitting `SQLITE_CORRUPT` — is the only thing that
+makes the next write open pay the full-file `PRAGMA quick_check` (the backup's "Checking catalog"
+stage). A catalog closed cleanly is not re-read; at 8 GB that read is minutes.
+
+It holds:
 
 - `versions` — one row per version the catalog knows: the version number, its identity stamp, its
   entry count and when it was imported.

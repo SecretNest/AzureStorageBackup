@@ -611,8 +611,8 @@ The button's tooltip says so. Suspend and Stop stay live: both end the run there
 path as during the scan, and every version already imported stays in the catalog — a resume picks up
 with only the version that was in flight left to import.
 
-**Checking catalog** (right after, when it runs at all: the once-per-process full-file `quick_check`,
-on the first run after the server starts) is treated the same way, for a simpler reason: it is one SQL
+**Checking catalog** (right after, when it runs at all: the full-file `quick_check`, owed only when the
+last process that wrote the catalog did not exit cleanly or a reader saw damage) is treated the same way, for a simpler reason: it is one SQL
 statement, and there is nothing inside it to park at. Pause is greyed with its own tooltip; Suspend and
 Stop stay live and take effect at once — the statement is interrupted (`sqlite3_interrupt`, since
 Microsoft.Data.Sqlite only consults the token before a statement starts), the path is left unchecked,
