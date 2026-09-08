@@ -62,6 +62,25 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-07 | The prober's hand-off into a full probed queue steps out of the pause accounting: "Pausing…" no longer stands for good when the pool is full and the compressor is waiting for room | [run-lifecycle.md](run-lifecycle.md) |
 | 09-07 | A pause stops the file under 7z where it is (SIGSTOP/SIGCONT) instead of waiting for it, and the time a run stands paused comes off the remaining-time estimate's clock | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
 | 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md), [operations.md](operations.md) |
+| 09-08 | The catalog and the work database opened through `unix-excl`: no `-shm` file, after a NAS kernel refused its locks; opt-in `fcntl` trace in the image | [storage-format.md](storage-format.md), [operations.md](operations.md) |
+
+### No `-shm` files for the catalog and the work database (2026.9.8.2)
+
+The first 2026.9.8.1 run on the NAS (QNAP QuTS hero, kernel 6.6.32-qnap, ZFS) failed three times out of
+three with `SQLite Error 15: 'locking protocol'` while committing the lazy import of a `.idx` into the
+catalog. SQLite returns that code from exactly one place: a WAL connection that has asked the kernel
+for a read-slot lock on the `-shm` file a hundred times over ten seconds and been refused every time.
+`/proc/locks`, sampled once a second through the failure, showed the writer's own WAL write lock and
+nothing at all on the read-slot bytes — nobody held what the kernel refused. The same SQLite library,
+copied out of the image and driven from a python process in the same container against the same
+directory, committed fine; so did a step-by-step `fcntl` replay of the lock sequence; the NAS is
+offline, so the refused call's errno could not be captured. The one fact every observation agreed on
+is that the failure lives in byte-range locks on a file whose only purpose is to share a WAL index
+between processes — and these two databases are never shared between processes. They are now
+opened through SQLite's `unix-excl` VFS: the WAL index lives in the heap, no `-shm` file exists,
+connections inside the process still run concurrently ([storage-format.md](storage-format.md)
+§ *The catalog*). The image also carries an opt-in `fcntl` trace (`ASB_FCNTL_TRACE=1`,
+[operations.md](operations.md) § *SQLite locks*) so that a recurrence arrives with its errno.
 
 ### The index catalog (2026.9.8)
 

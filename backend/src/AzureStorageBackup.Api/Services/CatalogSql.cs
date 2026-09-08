@@ -30,10 +30,13 @@ public static class CatalogSql
     /// database's own history). A catalog is opened per container and held for the length of an operation, so pooling
     /// buys nothing to weigh against that.
     /// </summary>
+    /// <param name="readOnly">A reader's open: never creates the file. It is <see cref="SqliteOpenMode.ReadWrite"/>
+    /// rather than <see cref="SqliteOpenMode.ReadOnly"/> on purpose — see <see cref="ProcessPrivateSqlite"/> for why a
+    /// read-only handle would bring the <c>-shm</c> file back for every connection on the catalog.</param>
     public static string ConnectionString(string path, bool readOnly) => new SqliteConnectionStringBuilder
     {
-        DataSource = path,
-        Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate,
+        DataSource = ProcessPrivateSqlite.DataSource(path),
+        Mode = readOnly ? SqliteOpenMode.ReadWrite : SqliteOpenMode.ReadWriteCreate,
         Pooling = false,
         Cache = SqliteCacheMode.Private,
     }.ToString();

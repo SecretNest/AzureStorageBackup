@@ -57,11 +57,23 @@ RUN set -eux; \
     tar -xJf /tmp/7z.tar.xz -C /out 7zz; \
     test -s /out/7zz
 
-# ---- 4. Runtime (pulls aspnet for the target architecture) ----
+# ---- 4. fcntl trace shim (target architecture; compiled under emulation for the other one) ----
+# A few dozen lines of C that log refused byte-range locks with their errno. Off unless the container is started
+# with ASB_FCNTL_TRACE=1 (see docker/entrypoint.sh); see ProcessPrivateSqlite for the failure it exists to explain.
+FROM debian:bookworm-slim AS fcntlspy
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/fcntlspy.c /src/fcntlspy.c
+RUN gcc -O2 -Wall -shared -fPIC -o /out-fcntlspy.so /src/fcntlspy.c -ldl
+
+# ---- 5. Runtime (pulls aspnet for the target architecture) ----
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 COPY --from=sevenzip /out/7zz /usr/local/bin/7zz
 WORKDIR /app
 COPY --from=build /app/publish ./
+COPY --from=fcntlspy /out-fcntlspy.so /app/fcntlspy.so
+COPY docker/entrypoint.sh /app/entrypoint.sh
 
 # The default paths point at the volume mount points (see "Docker" in the README).
 ENV ASPNETCORE_URLS=http://+:8080 \
@@ -72,4 +84,4 @@ ENV ASPNETCORE_URLS=http://+:8080 \
 EXPOSE 8080
 VOLUME ["/data", "/keys", "/temp"]
 
-ENTRYPOINT ["dotnet", "AzureStorageBackup.Api.dll"]
+ENTRYPOINT ["/app/entrypoint.sh"]

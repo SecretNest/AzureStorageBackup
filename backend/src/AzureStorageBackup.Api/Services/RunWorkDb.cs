@@ -322,7 +322,7 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     /// and answering every question with "no rows" — a silent wrong answer where the run wanted an error.</param>
     private static string ConnectionString(string path, bool create) => new SqliteConnectionStringBuilder
     {
-        DataSource = path,
+        DataSource = ProcessPrivateSqlite.DataSource(path),
         Mode = create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
         Pooling = false,
         Cache = SqliteCacheMode.Private,
