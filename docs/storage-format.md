@@ -311,6 +311,11 @@ the diff's verdict, the previous version's entry beside it, and the storage, tai
 the run settles on later), the content this run has already uploaded so a second file with the same
 content is deduplicated against it, and the journal's records read back at the start of a resume.
 
+One side file sits next to it, `{tempPath}/work/{runId}.aliases.db`: the run's "which path saw this
+content first" table for cross-pack dedup, a database of its own rather than a table in `work.db`
+because it holds one write transaction open across thousands of claims and the work database's single
+writer must never queue behind that. It is created, swept and deleted on exactly the same terms.
+
 It is deleted on every exit — Completed, Failed, Canceled and **Suspended** alike. Nothing in the
 draft has reached the cloud index, so discarding it is correct, and the resume does not need it:
 **the journal, not the work database, is the source of a resume** ([run-lifecycle.md](run-lifecycle.md)).

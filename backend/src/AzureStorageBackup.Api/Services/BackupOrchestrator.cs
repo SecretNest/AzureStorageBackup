@@ -593,6 +593,11 @@ public sealed class BackupOrchestrator(
         // making the file optional would mean every user of it carrying a null branch. Its name is then a fresh GUID,
         // which cannot collide with a real runId.
         await using var work = await workFactory.CreateAsync(control?.RunId ?? Guid.NewGuid().ToString("N"), ct);
+        // "Who saw this content first", for the run's cross-pack dedup. A side file rather than a table in the work
+        // database, because it holds one write transaction open across thousands of claims and work.db's single
+        // writer task must never queue behind that; see PackLeaderStore. Named from the same run id, so it is swept
+        // by the same ClearStale, and deleted by its own DisposeAsync.
+        await using var packLeaders = await PackLeaderStore.CreateAsync(workFactory.SidePath(work.Name, "aliases"), ct);
         // Everything this run learns about the version it is building — where each path was uploaded, the tail hash
         // the compression pass produced, the identity a file that changed mid-run settled on, the paths that stopped
         // being readable after the diff had passed them — goes in here rather than into four path-keyed dictionaries.
@@ -1555,7 +1560,7 @@ public sealed class BackupOrchestrator(
         // In-flight packing state. The diff advances single-threaded in scan order, so none of this needs a lock.
         // Cross-box dedup of pack members within this run: a later arrival with the same content does not enter a
         // box, it just hangs off the first one, and everything is backfilled at the end.
-        var aliasTable = new PackAliasTable();
+        var aliasTable = new PackAliasTable(packLeaders);
         var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
         // How many entries in each per-directory group are still un-diffed — the counter that decides when a box can
         // be sealed. One row per directory, which is bounded by the directory count rather than the file count, so
@@ -1710,7 +1715,7 @@ public sealed class BackupOrchestrator(
             // next run re-backs it up as soon as the mtime changes, but this silent exception has to be written down.
             if (file is not null && klass.Category != FileCategory.SingleFile
                 && file.FullHash is { } aliasHash && c.HeadHash is { } aliasHead && c.TailHash is { } aliasTail
-                && aliasTable.TryClaim(aliasHash, file.Length, aliasHead, aliasTail, c.Path))
+                && await aliasTable.TryClaimAsync(aliasHash, file.Length, aliasHead, aliasTail, c.Path, token))
             {
                 // Ends exactly like the tier above: take the existing "this entry did not change" path.
                 // The storage reference is left for the final backfill — which pack the leader lands in is not known yet.

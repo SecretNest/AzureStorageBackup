@@ -29,11 +29,23 @@ public sealed class RunWorkDbFactory(string rootDir)
         return RunWorkDb.CreateAsync(path, ct);
     }
 
+    /// <summary>
+    /// The path for one of the run's <b>other</b> scratch databases, named from the same run id:
+    /// <c>{root}/{runId}.{kind}.db</c>. Today the only one is <c>aliases</c>
+    /// (<see cref="PackLeaderStore"/>), which is a file of its own precisely so its long write transaction never
+    /// queues behind <c>work.db</c>'s writer. The naming lives here rather than at the call site so that everything
+    /// one run leaves on the temp volume carries the run's name — which is what makes <see cref="ClearStale"/>'s
+    /// sweep and "trace a leftover back to the run that made it" work for the side files too.
+    /// </summary>
+    public string SidePath(string runId, string kind) => Path.Combine(rootDir, $"{runId}.{kind}.db");
+
     /// <summary>Clears the scratch files a previous abnormal exit left behind. The pattern covers the <c>-wal</c> and
     /// <c>-shm</c> companions as well, because a WAL left next to a deleted database is not just wasted disk — it is
-    /// what SQLite would try to replay into the next file created under that name. The serialized indexes a run
-    /// writes beside its database (<c>{runId}.v{n}.idx</c>) go the same way: both are named for a run that is over,
-    /// and an index at a few million entries is hundreds of MB to leave lying about.</summary>
+    /// what SQLite would try to replay into the next file created under that name. The <c>*.db*</c> pattern also
+    /// covers the side databases <see cref="SidePath"/> names (<c>{runId}.aliases.db</c>) — they end in
+    /// <c>.db</c> like the rest, and they are as much "named for a run that is over" as the work database is. The
+    /// serialized indexes a run writes beside its database (<c>{runId}.v{n}.idx</c>) go the same way, and an index
+    /// at a few million entries is hundreds of MB to leave lying about.</summary>
     public static void ClearStale(string rootDir)
     {
         try

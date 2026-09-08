@@ -30,8 +30,13 @@ namespace AzureStorageBackup.Api.Tests;
 public sealed class MemoryBenchmarkTests : IDisposable
 {
     /// <summary>Identifies which checkout produced a given benchmark-unique.json/benchmark-identical.json entry — the only intentional difference
-    /// between this file and its BEFORE twin besides the constructor wiring in <see cref="Build"/>.</summary>
-    private const string Commit = "dd201d3";
+    /// between this file and its BEFORE twin besides the constructor wiring in <see cref="Build"/>.
+    /// <para>
+    /// Round 3 (Task 25, the pack alias table's leader map moving into a per-run SQLite file) is labelled by task
+    /// rather than by hash: the numbers are produced by the working tree, and the commit that carries them cannot
+    /// know its own hash. The benchmark doc's round-3 rows carry the same <c>task25</c> label for that reason.
+    /// </para></summary>
+    private const string Commit = "task25";
     private const string CheckoutLabel = "after";
 
     private const string AzuriteKey =

@@ -287,6 +287,10 @@ public sealed class RunWorkDbTests : IDisposable
         // What a killed process leaves behind is cleared at startup, the way DiffWorkQueue.ClearStale does it.
         await File.WriteAllTextAsync(Path.Combine(_dir, "stale.db"), "junk", Ct);
         await File.WriteAllTextAsync(Path.Combine(_dir, "stale.db-wal"), "junk", Ct);
+        // The side databases a run opens beside its work database (PackLeaderStore's {runId}.aliases.db, named by
+        // SidePath) are named from the same run id and are as much "left by a run that is over" as the work
+        // database itself — the same sweep has to take them.
+        await File.WriteAllTextAsync(factory.SidePath("run-a", "aliases"), "junk", Ct);
         RunWorkDbFactory.ClearStale(_dir);
         Assert.Empty(Directory.GetFiles(_dir));
     }
