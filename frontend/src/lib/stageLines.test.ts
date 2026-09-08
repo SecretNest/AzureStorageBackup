@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'vitest'
 
 import type { StageProgress } from '../api/backupConfigs'
-import { pipelineHold, preparingLabelOf, preparingRowLabelOf, stageLines } from './stageLines'
+import { formatVersionSpan } from '../constants/format'
+import { pipelineHold, preparingLabelOf, preparingRowLabelOf, stageLines, versionItemLabel } from './stageLines'
 
 function progress(over: Partial<StageProgress> = {}): StageProgress {
   return {
@@ -746,5 +747,26 @@ describe('the version-loading stage', () => {
   test('says nothing about entries when the history declares no counts', () => {
     const lines = stageLines(progress({ stage: 'LoadingVersions', processed: 1, total: 2, workTotal: 0, workDone: 0 }))
     expect(lines.done).toBe('')
+  })
+})
+
+describe('versionItemLabel', () => {
+  test('spells the version out with its dates on the browser clock, like the check and restore lists', () => {
+    const start = '2026-09-04T02:59:10.0000000Z'
+    const end = '2026-09-04T03:01:00.0000000Z'
+    expect(versionItemLabel(`version 11 @${start}→${end}`)).toBe(
+      `Version 11 — ${formatVersionSpan(start, end)}`,
+    )
+  })
+
+  test('a version without a recorded start keeps the em dash the lists use', () => {
+    const end = '2026-09-04T03:01:00.0000000Z'
+    expect(versionItemLabel(`version 3 @→${end}`)).toBe(`Version 3 — ${formatVersionSpan(null, end)}`)
+  })
+
+  test('anything else passes through untouched', () => {
+    expect(versionItemLabel('version 7')).toBe('version 7')
+    expect(versionItemLabel('photos/2026/a.jpg')).toBe('photos/2026/a.jpg')
+    expect(versionItemLabel('version 7 @garbage→garbage')).toBe('version 7 @garbage→garbage')
   })
 })

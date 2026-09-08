@@ -14,7 +14,7 @@ import { formatBytes, formatDuration, formatVersionSpan } from '../constants/for
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
 import { orphanSummary, repairabilitySummary, resolutionSummary } from '../lib/checkSummary'
-import { stageLabelOf } from '../lib/stageLines'
+import { stageLabelOf, versionItemLabel } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { etaLabel } from '../lib/etaLabel'
@@ -2338,7 +2338,11 @@ function StageDetail({ detail, hold }: { detail: StageProgress; hold?: PipelineH
             // Monospace on the filename only, not on the row — see .mono in index.css. Everything else on these
             // rows is a measurement or a verb, and belongs to the same body text as the summary lines above.
             <div>
-              <span className="mono" style={{ wordBreak: 'break-all' }}>{detail.currentItem}</span>
+              <span className="mono" style={{ wordBreak: 'break-all' }}>
+                {/* The version under import is spelled out with its dates, on the browser's clock like the
+                    version lists elsewhere — see versionItemLabel. Every other stage's item is a path. */}
+                {detail.stage === 'LoadingVersions' ? versionItemLabel(detail.currentItem) : detail.currentItem}
+              </span>
               {/* Diffing's read progress rides the current-item line instead of a separate in-flight block:
                   the block repeated the same path one line down, and for the small files that dominate a diff
                   the percentage carried nothing. A large file's read still shows — as this suffix. */}
