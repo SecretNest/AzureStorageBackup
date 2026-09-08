@@ -139,10 +139,10 @@ what makes a resume cheap.
 | Configuration, schedules, logs | SQLite `app.db` | — |
 | Secrets (account key, proxy and backup passwords) | SQLite, encrypted by the key ring | — |
 | Info file (versions, pack metadata, settings snapshot) | cached copy + ETag | authoritative for recovery |
-| Version indexes | cached, decrypted, in `data/index-cache/…` — files, not SQLite (see storage-format.md) | authoritative for recovery |
+| Version indexes | a SQLite catalog per container in `data/index-cache/…`, decrypted, rebuilt from the cloud on demand (see storage-format.md) | authoritative for recovery |
 | Data blobs and packs | — | the backup itself |
 | Journals | `data/journal/…`, plain text | — |
-| Temp (compress, staged, verbose logs) | `{tempPath}/…`, cleared at startup | — |
+| Temp (compress, staged, verbose logs, per-run work databases, index staging) | `{tempPath}/…`, cleared at startup | — |
 
 **Device-local configuration is deliberately not written to the cloud**: the local root, the ignore
 rules and the scope rules describe *this machine*, and a recovery on another machine will have

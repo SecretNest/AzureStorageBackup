@@ -217,7 +217,7 @@ Normally the list shows **one item's volumes at a time, in volume order**, becau
 
 ### Working space
 
-Diffing produces no files — it only reads. Its cost is memory: the file list and the previous index are held in RAM (roughly 190 MB per 500,000 files, proportional to the file count).
+Diffing produces no files of its own, and it holds neither the file list nor the previous version's index in memory: the scan is written to the run's work database and the previous version is read from the local catalog, and the two are merged as cursors. Its cost is the disk under `Backup__TempPath` described below.
 
 Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 
@@ -225,6 +225,9 @@ Disk is consumed by Uploading, under `Backup__TempPath` (`/temp` in the image):
 - `staged/` — finished archives waiting to be uploaded. This directory is what the **staging-area limit** on the Settings page (default **2 GB**) applies to: once it is full, the next compression waits until an upload frees space. A single archive is allowed to exceed the limit if it started below it, so the peak can be somewhat higher than the configured value — size the volume with that in mind.
 
   When several runs share the pool, the limit is split evenly across the runs in flight, and fairness is judged on what each run **holds**, not on whose turn it is. A run holding more than its share stops compressing until it has uploaded its way back under it; when more than one run may compress, the lock goes to the one holding the least — and the run that just let go of it still counts as a candidate for a moment, because its compressor is on its way back for the next item; otherwise two runs would simply alternate whatever they hold. So a backup started while another already fills the pool catches up to half of it, rather than living on whatever the first one leaves over. One run's oversized archive (a 100 GB media file's volume family lands whole; it cannot be split) counts against the disk as one share, so it cannot freeze the others for the hours it takes to upload — the price is that the pool can exceed the limit by up to one such archive per run.
+
+- `work/` — one scratch database per run (`{runId}.db`), holding the scan, the draft of the new version, this run's dedup reservations and the journal's records on a resume. Roughly **500 bytes per scanned file** — about 1.5 GB for three million files — and deleted when the run ends, however it ends. Beside it, while the new index is being written, sits that run's serialised index file.
+- `index/` — where an index archive is encoded before upload and decoded again to verify. Size it for roughly **two encoded index archives plus one decoded index per run** that may be writing or verifying an index at the same time.
 
 Uploads themselves run in parallel (the per-backup upload concurrency setting); only compression is serialised.
 
@@ -456,10 +459,9 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | --- | --- | --- |
 | `ConnectionStrings__Sqlite` | SQLite connection string (app database). Connection pooling is always switched off by the application, whatever the string says: a pooled handle reclaimed from a leaked connection was handed to new connections with its old statements still being finalized, surfacing as `SQLite Error 5: 'not an error'`. | `Data Source=/data/app.db` |
 | `DataProtection__KeysPath` | Directory for the Data Protection key ring used to encrypt secrets at rest (account keys, backup passwords). **Must be persisted** — losing it makes stored secrets undecryptable. | `/keys` |
-| `Backup__TempPath` | Working area root: compression, staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
+| `Backup__TempPath` | Working area root: compression, staging, the per-run work databases, index staging, restore, check, dead-weight compaction, and verbose logs live under here. Can grow large during a backup/restore. | `/temp` |
 | `Backup__Root` | Confines every local path — backup source, restore target, and the folder picker — to this directory. Unset = no limit. | *(unset)* |
 | `Backup__IoPriority` | Block-IO priority for the whole process: `Normal`, `Low` or `Idle`. Set it if backups make the rest of the machine unresponsive — but read the note below first, because most kernels ignore it. | `Normal` |
-| `Backup__IndexCacheSize` | How many deserialised version indexes to keep in memory. Trades RAM for responsiveness when browsing large backups — see below. `0` disables it. | `2` |
 | `Backup__SevenZipMethodArgs` | Compression method switches handed to `7zz` — see below. Only `-m…` switches are accepted. | `-mx9` |
 | `Backup__MaxPackMembers` | Largest number of files the app will put into one pack archive — see below. Caps how much memory `7zz` needs for member metadata. | `20000` |
 | `Backup__MaxPackPathBytes` | Largest total size, in bytes, of the member paths handed to `7zz` on one command line — see below. Guards against the kernel's argument-list limit. | `1000000` |
@@ -502,19 +504,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 >
 > The startup log records what was requested and whether the kernel accepted the call — but "accepted" is not "acted on", and only the two checks above can tell you that.
 
-> `Backup__IndexCacheSize` trades memory for responsiveness, and which way you want it depends entirely on how much RAM the machine has.
->
-> A version index lists every file in a backup. It is stored compactly on local disk, so reading one means rebuilding the whole list in memory — and the restore dialog does that every time you expand a folder, as do the check and version screens. On a 500,000-file backup one expansion measured **~0.9 s and ~350 MB of allocation** just to return the handful of entries in that folder. Keeping the rebuilt index around makes every later read of the same version nearly instant.
->
-> The cost is resident memory: roughly **190 MB per cached index at 500,000 files**, proportional to the file count (a 50,000-file backup is nearer 19 MB). The default of `2` keeps the version you are browsing plus one more, so comparing two versions stays fast.
->
-> | Situation | Suggested value | Effect |
-> | --- | --- | --- |
-> | Normal machine (default) | `2` | Browsing and version comparison stay fast. |
-> | Small-memory host (e.g. 1 GB NAS / Raspberry Pi) with a large backup | `0` | No index is held in memory. Every folder expansion rebuilds the index, so the restore dialog gets slower, but peak memory stays low. |
-> | Small-memory host, or only ever browsing one version at a time | `1` | Most of the speed-up for half the memory. |
->
-> Only browsing and reporting are affected. Backup, restore and check themselves read each index once and do not depend on this setting, so `0` never makes a backup slower — and it never changes what gets backed up or restored.
+> `Backup__IndexCacheSize` was removed in 2026.9.8: version indexes are answered from the local SQLite catalog on demand and nothing is held in memory between reads. If the variable is still set, a line in the startup log says it is ignored.
 
 > `Backup__SevenZipMethodArgs` replaces the compression settings the app passes to `7zz`, which are `-mx9` (maximum LZMA2 compression) by default. Anything 7-Zip accepts as a method switch works, so you can trade ratio for speed or memory:
 >
@@ -568,9 +558,9 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 | Container path | Purpose | Persist? |
 | --- | --- | --- |
-| `/data` | SQLite database (`app.db`), the backup journals (`journal/`) **and the local version-index cache** (`index-cache/`). | **Yes** |
+| `/data` | SQLite database (`app.db`), the backup journals (`journal/`) **and the local version-index catalogs** (`index-cache/`). | **Yes** |
 | `/keys` | Data Protection key ring. Losing it makes stored account keys/passwords undecryptable. | **Yes** |
-| `/temp` | Backup/restore working area (compress, staged, diff-spill, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
+| `/temp` | Backup/restore working area (compress, staged, diff-spill, per-run work databases, index staging, restore, check, compact, verbose logs). Safe to discard, but needs free space. | Optional (needs disk space) |
 | *(your choice, e.g. `/backup-source`)* | Host directories to back up. Mount **read-only** if you only back up. A backup's *local root* is set to this in-container path. | Bind mount |
 | *(your choice, e.g. `/restore-target`)* | Where restores write. Mount read-write. | Bind mount |
 
@@ -578,7 +568,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 
 > Journals live next to `app.db` rather than under `Backup__TempPath`, and that is on purpose: `/temp` is the one directory the deployment instructions call *safe to discard*, while the journal is the only thing that lets an interrupted backup pick up where it stopped. Following the database means it lands on a volume you were already persisting, without a second environment variable to get right. It is also never cleared at startup — its whole content is "already in the cloud, not yet in the index".
 
-> **`index-cache/` follows the same rule, and needs no mount of its own.** It holds the local copy of each version's file index, as `index-cache/{accountId}/{container}/{version}.idx`, and it lives beside `app.db` for the same reason the journal does — it must survive the container being recreated, and following the database puts it on a volume you already persist. Unlike the journal it is only a **cache**: deleting the directory costs a re-download of those indexes from the cloud on the next check, restore or backup, never data. It is also where these indexes moved *out of*: they used to be one row each in `app.db`, and a single row can hold 100 MB for a backup of half a million files. SQLite allows one writer at a time, so writing such a row took the database's write lock for as long as the write took — tens of seconds on a loaded disk — and every other writer waited behind it, including the Save button on the Backups page. A file needs no lock. Old rows are migrated to files the first time each index is read after the upgrade, so upgrading re-downloads nothing.
+> **`index-cache/` follows the same rule, and needs no mount of its own.** It holds one SQLite catalog per container, `index-cache/{accountId}/{container}/catalog.db`, with every retained version's file index in it, and it lives beside `app.db` for the same reason the journal does — it must survive the container being recreated, and following the database puts it on a volume you already persist. Unlike the journal it is only a **cache**: deleting the directory costs a re-download of those indexes from the cloud on the next check, restore or backup, never data. It is also where these indexes moved *out of*: they used to be one row each in `app.db`, and a single row can hold 100 MB for a backup of half a million files. SQLite allows one writer at a time, so writing such a row took the application database's write lock for as long as the write took — tens of seconds on a loaded disk — and every other writer waited behind it, including the Save button on the Backups page. A separate file has its own lock. Older caches are migrated into the catalog the first time each version is read after the upgrade, so upgrading re-downloads nothing.
 
 ## Published image
 
