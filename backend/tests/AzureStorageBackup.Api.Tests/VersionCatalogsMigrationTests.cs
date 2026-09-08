@@ -431,10 +431,11 @@ public sealed class VersionCatalogsMigrationTests
             await catalog.ImportVersionAsync(sample.Version, Identity, reader, CancellationToken.None);
         }
 
-        // One flipped byte inside a data page holding this exact import (found by scanning a byte at a time for a
-        // spot where opening and its own pragmas notice nothing but a SELECT against it does) — a bad sector or a
-        // torn write to a page nobody has re-read since, not something a header check or a fresh CREATE TABLE IF
-        // NOT EXISTS would ever see.
+        // One flipped byte at an offset found by scanning a byte at a time for a spot where opening and its own
+        // pragmas notice nothing but the first SELECT does. It lands on page 1, inside the stored CREATE TABLE text
+        // of the versions table, so it depends on the schema text as written today: an edit to that DDL moves the
+        // byte and this test must be re-scanned for a new offset. Open passes because the header is intact, and
+        // CREATE TABLE IF NOT EXISTS never re-parses stored DDL for a table whose name is present.
         var path = store.PathFor(AccountId, Container);
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite))
         {
