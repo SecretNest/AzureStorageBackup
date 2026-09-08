@@ -98,6 +98,9 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         CatalogWriteLock held, int accountId, string container, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(held);
+        if (held.IsReleased)
+            throw new ObjectDisposedException(
+                nameof(CatalogWriteLock), "The container's write lock was released before the catalog was opened for writing.");
         var path = PathFor(accountId, container);
         if (!string.Equals(held.Path, path, StringComparison.Ordinal))
             throw new InvalidOperationException(
@@ -151,6 +154,15 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         return await OpenCheckedAsync(path, ct);
     }
+
+    /// <summary>Forgets that this path passed <see cref="VersionCatalog.QuickCheckAsync"/>, so the next write open
+    /// runs it again. For when something other than that check found the damage: <see cref="VersionCatalogs"/>'s
+    /// read-only probe hits a <c>SQLITE_CORRUPT</c>/<c>SQLITE_NOTADB</c> row well after this process last opened the
+    /// path for writing, and without this the locked write open that follows would trust the stale "already
+    /// checked" marker, skip the scan, and hand back a catalog whose first real query throws the same error
+    /// uncaught instead of the write path recovering it.</summary>
+    internal void ForgetChecked(int accountId, string container) =>
+        _checkedPaths.TryRemove(PathFor(accountId, container), out _);
 
     /// <summary>
     /// Reserves the container's single write slot. The catalog's own writes (import, patch) go through one
@@ -238,6 +250,11 @@ public sealed class CatalogWriteLock : IDisposable
 
     /// <summary>The catalog file this slot was reserved for.</summary>
     internal string Path { get; }
+
+    /// <summary>True once <see cref="Dispose"/> has run. A handle proves nothing about who holds the semaphore once
+    /// it is released — <see cref="VersionCatalogStore.OpenForWriteAsync"/> checks this before trusting one, so a
+    /// `using` block that ended before the open call cannot be mistaken for the lock still being held.</summary>
+    internal bool IsReleased => Volatile.Read(ref _released) != 0;
 
     public void Dispose()
     {

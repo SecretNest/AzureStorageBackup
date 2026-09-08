@@ -245,9 +245,15 @@ public sealed class BackupRepairer(
                 if (changed.Count > 0)
                 {
                     // The container's single write slot, held for the patching and nothing else — the uploads above
-                    // are minutes of work and must not sit inside it. And if the patching cannot be written at all,
-                    // the versions leave the catalog rather than staying behind as pre-repair rows the cloud has
-                    // already moved past (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync).
+                    // are minutes of work and must not sit inside it. If the patching cannot be written at all, the
+                    // versions leave the catalog rather than staying behind as pre-repair rows the cloud has already
+                    // moved past — and this call still throws. PersistChangedAsync runs twice: here at the pre-marks
+                    // (patches.ChangedVersions.Count > 0 above), with the whole repair loop — RepairBlobAsync,
+                    // RepairPackAsync, everything they resolve out of `catalog` — still ahead of it and needing the
+                    // marks it just tried to record to actually be there; and again at end-of-run, where a swallowed
+                    // failure would report a repair that finished clean over a catalog that does not hold what it
+                    // claims. Either way, going on as if the write had landed is the one thing this must not do
+                    // (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync).
                     var all = changed.SelectMany(patches.PatchesFor).ToList();
                     await catalogs.ApplyPatchesOrInvalidateAsync(account.Id, container, all, log: null, ct);
                 }

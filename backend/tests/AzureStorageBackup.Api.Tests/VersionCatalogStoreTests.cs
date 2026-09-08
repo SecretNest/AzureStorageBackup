@@ -229,6 +229,20 @@ public sealed class VersionCatalogStoreTests : IDisposable
         Assert.False(File.Exists(store.PathFor(AccountId, Container)));
     }
 
+    // ---- Test 3e: a released lock is not proof of anything ------------------------------------------------------
+
+    [Fact]
+    public async Task OpenForWrite_refuses_a_lock_that_was_already_released()
+    {
+        var store = new VersionCatalogStore(_root);
+
+        var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None);
+        held.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None));
+    }
+
     // ---- Test 3f: a write open cannot be smuggled through the reader's door ---------------------------------------
 
     [Fact]

@@ -52,12 +52,15 @@ public interface IVersionCatalogs
     Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default);
 
     /// <summary>
-    /// Records patches whose index is already in the cloud, and — if that fails — makes sure the catalog cannot go
-    /// on answering with the pre-patch rows. The cloud write happened first (the checker and the repairer both
-    /// serialize → upload → info file → patch), so a failure here leaves the catalog holding an identity that says
-    /// "already imported" over rows the cloud has since moved past; nothing would ever re-import it, and the marks
-    /// the cloud carries would stay invisible to dedup exclusion, restore substitution and the next check. Dropping
-    /// the affected versions instead costs one re-download on next use and cannot lie.
+    /// Records patches whose index is already in the cloud. The cloud write happened first (the checker and the
+    /// repairer both serialize → upload → info file → patch), so a failure here would otherwise leave the catalog
+    /// holding an identity that says "already imported" over rows the cloud has since moved past; nothing would
+    /// ever re-import it, and the marks the cloud carries would stay invisible to dedup exclusion, restore
+    /// substitution and the next check. So on any non-cancellation failure the affected versions are dropped from
+    /// the catalog first — the marks are safe in the cloud already, dropping the stale rows costs one re-download
+    /// on next use and cannot lie — and only then does the original exception propagate. It still fails the
+    /// operation: a caller with more of this run's work still to do (the repairer's remaining patches, in
+    /// particular) must not carry on against a catalog that no longer holds what it opened expecting to find.
     /// </summary>
     Task ApplyPatchesOrInvalidateAsync(
         // Named `log` rather than `logger` so the implementation can still reach its own injected one; null means

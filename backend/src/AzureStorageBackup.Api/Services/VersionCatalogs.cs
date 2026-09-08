@@ -61,6 +61,12 @@ public sealed class VersionCatalogs(
             // for writing, which is where the recovery lives. Without this the container would be unusable until an
             // operator deleted the file by hand: every backup, check, restore, retention round and UI browse of it
             // goes through this probe.
+            //
+            // And if this process already opened this exact path for writing once before — quick_check paid for
+            // and passed, back when the file was still good — the write open below would trust that and skip the
+            // check, open the damaged file straight through, and hand back a catalog whose first real query throws
+            // this same error uncaught. Forgetting the mark makes the write open re-earn it.
+            catalogs.ForgetChecked(account.Id, container);
             logger?.LogWarning(ex,
                 "The catalog for account {AccountId} container {Container} is unreadable; rebuilding it from the cloud.",
                 account.Id, container);
@@ -228,6 +234,14 @@ public sealed class VersionCatalogs(
                     container, removal.Message);
                 await RemoveContainerAsync(accountId, container, ct);
             }
+
+            // The marks are safe — they are in the cloud already, and the catalog no longer holds the rows that
+            // disagreed with it — but the operation itself still failed, and a caller mid-repair or mid-check has
+            // more work queued that assumes those rows are still there to patch or to read back. Swallowing this
+            // used to let a repair run to "success" having repaired nothing past the first catalog write it could
+            // not make (see BackupRepairer's single long-lived read handle): rethrow so the run stops exactly where
+            // it always did before the catalog ever went local.
+            throw;
         }
     }
 

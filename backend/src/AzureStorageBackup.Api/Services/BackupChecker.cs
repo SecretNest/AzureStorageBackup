@@ -361,9 +361,10 @@ public sealed class BackupChecker(
                 else
                     await store.WriteInfoAsync(account, container, info, password, ct: ct);
 
-                // Or, if that write cannot be made, the version leaves the catalog: the marks are in the cloud
-                // already and a catalog that kept the pre-mark rows under an unchanged identity would be trusted
-                // forever (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync).
+                // If that write cannot be made, the version leaves the catalog rather than being trusted forever
+                // under an unchanged identity — and the check still fails, since the marks it was asked to record
+                // are not there to read back (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync). The marks
+                // themselves are not lost: they are already in the cloud index this method just uploaded.
                 // No logger of its own — the checker is constructed by hand in half a dozen places and has never
                 // taken one — so the catalogs' logger does the reporting.
                 await catalogs.ApplyPatchesOrInvalidateAsync(account.Id, container, patches, log: null, ct);

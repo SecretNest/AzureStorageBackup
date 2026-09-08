@@ -386,9 +386,12 @@ public sealed class VersionCatalogsMigrationTests
         var path = store.PathFor(AccountId, Container);
         File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
 
-        await catalogs.ApplyPatchesOrInvalidateAsync(
+        // The thrown type is SQLite's own (a read-only file), so ThrowsAny<Exception> is what fits — the point is
+        // that something comes out, not which exception shape.
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(() => catalogs.ApplyPatchesOrInvalidateAsync(
             AccountId, Container, [new CatalogPatch(1, "gone.txt", null, true, null)], log: null,
-            CancellationToken.None);
+            CancellationToken.None));
+        Assert.IsNotType<OperationCanceledException>(thrown);
 
         // Reported, not swallowed…
         Assert.NotEmpty(ErrorCalls(logger));
@@ -400,6 +403,56 @@ public sealed class VersionCatalogsMigrationTests
         await catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None);
         await using var rebuilt = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
         Assert.Equal(["gone.txt"], await rebuilt.UnrecoverableAsync(1, CancellationToken.None));
+    }
+
+    // ---- Test 11: the probe's self-heal still works once the path has already been checked in this process -------
+
+    [Fact]
+    public async Task Ensure_rebuilds_a_catalog_that_went_bad_after_a_prior_write_open_in_this_process()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        var store = TestCatalogs.NewStore();
+        var logger = Substitute.For<ILogger<VersionCatalogs>>();
+        var catalogs = new VersionCatalogs(
+            store, TestIndexFiles.New(), db, infoStore, logger, TestCatalogs.NewTempRoot());
+
+        var sample = IndexSamples.Sample();
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
+
+        // A write open puts this path in VersionCatalogStore's _checkedPaths, so quick_check runs once and never
+        // again for it in this process — the thing the read-only probe's SQLITE_CORRUPT/SQLITE_NOTADB catch has to
+        // undo, or the locked write path below opens the damaged file straight through (its own pragmas never touch
+        // the damaged page) and the first SELECT throws uncaught instead of self-healing.
+        using (var held = await catalogs.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await catalogs.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
+        {
+            using var reader = new IndexStreamReader(new MemoryStream(bytes));
+            await catalog.ImportVersionAsync(sample.Version, Identity, reader, CancellationToken.None);
+        }
+
+        // One flipped byte inside a data page holding this exact import (found by scanning a byte at a time for a
+        // spot where opening and its own pragmas notice nothing but a SELECT against it does) — a bad sector or a
+        // torn write to a page nobody has re-read since, not something a header check or a fresh CREATE TABLE IF
+        // NOT EXISTS would ever see.
+        var path = store.PathFor(AccountId, Container);
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(3993, SeekOrigin.Begin);
+            var b = (byte)fs.ReadByte();
+            fs.Seek(3993, SeekOrigin.Begin);
+            fs.WriteByte((byte)(b ^ 0xFF));
+        }
+        try { File.Delete(path + "-wal"); } catch { /* may not exist */ }
+        try { File.Delete(path + "-shm"); } catch { /* may not exist */ }
+
+        CloudReturns(infoStore, bytes);
+
+        await catalogs.EnsureVersionAsync(
+            TestAccount, Container, Version(sample.Version), Identity, password: null, CancellationToken.None);
+
+        await using var rebuilt = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        await AssertCatalogHasSampleAsync(rebuilt, sample.Version, sample);
     }
 
     // ---- The .idx file store itself: what the chain above reads through, and what deletes it ---------------------

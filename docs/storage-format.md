@@ -286,7 +286,13 @@ first read-write open of a path in a process runs `PRAGMA quick_check` once, and
 it — or that SQLite refuses as `SQLITE_CORRUPT` or `SQLITE_NOTADB` — is deleted with a warning and
 rebuilt from the cloud on demand. That holds on the read path too: the cheap read-only probe every
 reader starts with treats an unreadable file as a miss and falls through to the write path, which is
-where the rebuild happens. Deleting the whole `index-cache/` directory costs downloads, never data.
+where the rebuild happens — and if the probe is the one that finds the corruption, on a path this
+process already opened for writing earlier, it forgets that earlier pass so the write open re-runs
+the check instead of trusting it. Deleting the whole `index-cache/` directory costs downloads, never
+data. In a backup run, the first write open of a container's catalog is the start-of-run reconcile
+against the info file (below), so `quick_check`'s one-time cost lands there, before anything is
+scanned — not at end-of-run import, which is where a run's only other write of the catalog used to
+fall before the reconcile moved in front of it.
 
 **One writer per container.** Every writer — a run's finish, retention, the check's and the
 repairer's marks — takes the container's write lock for the duration, and the write open demands
