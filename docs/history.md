@@ -83,8 +83,9 @@ replays a half-finished run recorded on the old build, `.idx` cache and all, and
 What an operator needs to know:
 
 - **Downgrading past this release is not supported once a container's indexes have been migrated.**
-  A version is pulled into the catalog the first time something reads it, and its `.idx` file (or
-  its legacy `app.db` row) is deleted once that import commits. An older image would have to
+  A version is pulled into the catalog the first time something reads it, and the source it came
+  from goes: an `.idx` file once its import commits (or straight away if its body turns out to be
+  unparsable), a legacy `app.db` row as soon as it has been looked at. An older image would have to
   re-download every index from the cloud, which for an Archive-tier index means rehydration.
 - **`Backup__IndexCacheSize` is retired.** It sized the in-memory index cache, which no longer
   exists. If it is still set, one startup log line says it is ignored.

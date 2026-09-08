@@ -224,7 +224,8 @@ question that would otherwise be a scan of every entry in every version:
 | `(full_hash, length)` | dedup: "is this content already in the cloud?" |
 | `storage_ref` | collision avoidance ("is this address taken?") and retention ("does any retained version still reference this blob?") |
 | `(length, head_hash)` | the prescreen, before a full hash is paid for |
-| `(version, parent)` | browsing one level of the tree |
+| `(version, parent)` on `entries` | the files in one directory, when browsing one level of the tree |
+| `(version, parent)` on `dirs` | the subdirectories of that same directory, the other half of that listing |
 | `(version, path_key)` | the diff cursor, which streams a whole version in ordinal path order |
 | `(version, seq)` | serialising the version back out in its original order |
 | `(version, path_fold)` | restore's case-collision check |
@@ -253,9 +254,21 @@ eagerly, from whichever of the older homes still has it:
 4. the cloud.
 
 Each source is streamed into the catalog inside one transaction that verifies the identity and the
-entry count, and the `.idx` file or the legacy row is deleted only after that import commits. A
-failed import rolls back and leaves the old source in place for the next attempt. A container nobody
-has touched since the upgrade pays for no migration at all.
+entry count, and a transaction that fails rolls back, so a half-imported version is never left
+behind. What happens to the source it came from depends on why it was not used:
+
+- An `.idx` file whose identity does not match the version being asked for is a plain miss and is
+  left alone — clearing it away belongs to retention and to removing the container, not here.
+- An `.idx` file whose identity matches but whose body cannot be parsed (truncated by a crash
+  mid-write, say) is deleted: the rolled-back import gained nothing from it, and left in place it
+  would fail the same way on every later attempt. The next source is tried.
+- An `.idx` file that imports cleanly is deleted once that transaction commits.
+- A legacy `CachedVersionIndexes` row is dropped as soon as it has been looked at, whether or not it
+  was imported: a row under a superseded identity is dead weight when the catalog is about to go to
+  the cloud for the current one anyway.
+- The cloud is the last resort, and is never deleted from.
+
+A container nobody has touched since the upgrade pays for no migration at all.
 
 **The catalog is derived data.** The index blobs in the container are the recovery copy; the catalog
 is a queryable copy of them and can be rebuilt from them at any time. That is what lets it run with
