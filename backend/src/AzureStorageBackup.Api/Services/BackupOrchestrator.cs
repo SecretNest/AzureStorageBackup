@@ -122,6 +122,10 @@ public sealed record BackupRunResult(int Version, int ChangedFiles, long Changed
 public enum BackupStage
 {
     Scanning,
+    /// <summary>Between the scan and the diff: every retained version is being made sure of in the catalog. Nothing
+    /// on the first run after an upgrade — the lazy migration of a container's whole history — and its own stage
+    /// because for as long as it sat under Scanning, a migration that took hours read as a scan that had hung.</summary>
+    LoadingVersions,
     Diffing,
     Uploading,
     WritingIndex,
@@ -743,12 +747,31 @@ public sealed class BackupOrchestrator(
         // be. Trusting whatever is lying around in the cloud with no local authority is dangerous in itself: you do
         // not know who wrote those blobs, with what password, or whether the content is still correct — and one
         // wrong "already exists" silently records a file that was never uploaded as backed up.
-        foreach (var v in info.Versions)
+        //
+        // All of them in one call rather than one at a time: the call is what knows to take the content-keyed
+        // indexes down when it is about to import a whole history (see CatalogSql.GlobalIndexNames), and it is what
+        // can count versions for the stage line — the number the UI shows while this runs, in place of the scan's
+        // final count standing still for hours.
+        progress?.Report(new BackupProgress(BackupStage.LoadingVersions, 0, 0, 0, 0));
+        using (var loading = new StageTracker("LoadingVersions", info.Versions.Count, d =>
+                   progress?.Report(new BackupProgress(BackupStage.LoadingVersions, 0, 0, 0, 0) { Detail = d })))
+        {
+            var settled = 0;
+            var settledVersions = new Progress<int>(n =>
+            {
+                // The callback may see the same count twice (hits are reported as a block, then each import adds
+                // one); only the increase is work.
+                for (; settled < n; settled++)
+                    loading.Advance(0);
+            });
             await BeforeUploadAsync(async t =>
             {
-                await catalogs.EnsureVersionAsync(request.Account, request.Container, v, identity, password, t);
+                await catalogs.EnsureVersionsAsync(
+                    request.Account, request.Container, info.Versions, identity, password, settledVersions, t);
                 return 0;
             });
+            loading.Complete();
+        }
 
         // …and the other direction: everything the catalog holds that the info file does NOT list has to go, before
         // a single question is asked of it. Dedup, collision avoidance and the prescreen below all query the catalog

@@ -245,6 +245,103 @@ public sealed class VersionCatalogsMigrationTests
         Assert.Null(await catalog.GetVersionAsync(1, CancellationToken.None));
     }
 
+    // ---- Bulk: a whole history in one call takes the content-keyed indexes down and puts them back --------------------
+
+    [Fact]
+    public async Task EnsureVersions_imports_every_missing_version_and_ends_with_the_global_indexes_in_place()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        var files = TestIndexFiles.New();
+        var catalogs = TestCatalogs.New(db, infoStore, files);
+        var sample = IndexSamples.Sample();
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
+        var versions = new List<BackupVersion>();
+        for (var v = 1; v <= 3; v++)
+        {
+            await TestIndexFiles.WriteAsync(files, AccountId, Container, v, Identity, bytes, CancellationToken.None);
+            versions.Add(Version(v));
+        }
+
+        var reported = new List<int>();
+        // Progress<T> posts to the captured SynchronizationContext; a plain IProgress keeps the assertions in-line.
+        var progress = new InlineProgress(reported.Add);
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, progress, CancellationToken.None);
+
+        await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        for (var v = 1; v <= 3; v++)
+        {
+            await AssertCatalogHasSampleAsync(catalog, v, sample);
+            Assert.False(File.Exists(files.PathFor(AccountId, Container, v)));
+        }
+
+        // Three or more missing is the bulk path, and the bulk path is only correct if it rebuilds what it dropped.
+        Assert.Equal(CatalogSql.GlobalIndexNames.Count, await catalog.GlobalIndexCountAsync(CancellationToken.None));
+        Assert.Equal(3, reported[^1]);
+        Assert.Equal(reported.OrderBy(x => x), reported);   // never goes backwards
+        await infoStore.DidNotReceive().ReadIndexToFileAsync(
+            Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task EnsureVersions_finds_everything_present_and_reports_the_full_count_without_a_write_open()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        var files = TestIndexFiles.New();
+        var catalogs = TestCatalogs.New(db, infoStore, files);
+        var bytes = LegacyIndexSerializer.SerializeIndex(IndexSamples.Sample());
+        var versions = new List<BackupVersion> { Version(1), Version(2) };
+        foreach (var v in versions)
+            await TestIndexFiles.WriteAsync(files, AccountId, Container, v.Version, Identity, bytes, CancellationToken.None);
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, null, CancellationToken.None);
+
+        var reported = new List<int>();
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, new InlineProgress(reported.Add), CancellationToken.None);
+
+        Assert.Equal([2], reported);
+    }
+
+    /// <summary>A migration that dies halfway (here: the second version has no source left anywhere) must not leave
+    /// the catalog wrong — only slower. The versions that did import stay; the indexes it dropped are absent until
+    /// the next write open, whose schema pass puts them back.</summary>
+    [Fact]
+    public async Task EnsureVersions_interrupted_keeps_what_imported_and_the_next_write_open_rebuilds_the_indexes()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        infoStore.ReadIndexToFileAsync(
+                Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("cloud unavailable"));
+        var files = TestIndexFiles.New();
+        var catalogs = TestCatalogs.New(db, infoStore, files);
+        var sample = IndexSamples.Sample();
+        var bytes = LegacyIndexSerializer.SerializeIndex(sample);
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, Identity, bytes, CancellationToken.None);
+        // version 2: no .idx, no legacy row, and the cloud throws
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => catalogs.EnsureVersionsAsync(
+            TestAccount, Container, [Version(1), Version(2)], Identity, password: null, null, CancellationToken.None));
+
+        await using (var readOnly = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None))
+        {
+            await AssertCatalogHasSampleAsync(readOnly, 1, sample);
+            Assert.Null(await readOnly.GetVersionAsync(2, CancellationToken.None));
+            Assert.Equal(0, await readOnly.GlobalIndexCountAsync(CancellationToken.None));
+        }
+
+        using var held = await catalogs.LockForWriteAsync(AccountId, Container, CancellationToken.None);
+        await using var writer = await catalogs.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None);
+        Assert.Equal(CatalogSql.GlobalIndexNames.Count, await writer.GlobalIndexCountAsync(CancellationToken.None));
+    }
+
+    private sealed class InlineProgress(Action<int> report) : IProgress<int>
+    {
+        public void Report(int value) => report(value);
+    }
+
     // ---- Test 7: removing a container drops the catalog and every legacy row ------------------------------------------
 
     [Fact]

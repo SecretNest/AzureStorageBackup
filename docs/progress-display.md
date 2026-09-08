@@ -59,6 +59,7 @@ work — a backup that packs 46,624 files into 4,995 archives is reporting both 
 | Stage | Unit | One unit is |
 |---|---|---|
 | Scanning | entries | a filesystem entry found by the walk; the total is unknown until the scan ends |
+| Loading versions | versions | a retained version made sure of in the catalog before the diff. Nothing on an ordinary run; on the first run after an upgrade it is the migration of the container's whole history, which can take a long time — and for as long as it had no stage of its own it sat under Scanning, where a migration taking hours read as a scan that had hung |
 | Diffing | files | a source file, whether or not it later gets packed |
 | Uploading / Restoring | objects | a stored object: one pack archive, or one single-file blob |
 | Cloud (check) | objects | one `HEAD` per pack, not per file |

@@ -427,8 +427,9 @@ hold hundreds of thousands of records, and this is the startup path.
 journal when it opens one, so pressing Run manually is equivalent. The button says `Resume` only
 because that is what it means to the user.
 
-A resume is an ordinary run. Scanning and diffing happen as usual — they are local and fast — and the
-journal is consulted at three points, cheapest first:
+A resume is an ordinary run. Scanning and diffing happen as usual — they are local and fast (the
+version-loading pass between them finds every version already in the catalog, and costs one probe
+each) — and the journal is consulted at three points, cheapest first:
 
 1. **`FindUntouchedBlob(path, mtime, length)`** — no read at all. The rationale is in
    [content-identity.md](content-identity.md) § *Tier 0*.

@@ -63,6 +63,29 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-07 | A pause stops the file under 7z where it is (SIGSTOP/SIGCONT) instead of waiting for it, and the time a run stands paused comes off the remaining-time estimate's clock | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
 | 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md), [operations.md](operations.md) |
 | 09-08 | The catalog and the work database opened through `unix-excl`: no `-shm` file, after a NAS kernel refused its locks; opt-in `fcntl` trace in the image | [storage-format.md](storage-format.md), [operations.md](operations.md) |
+| 09-08 | A container's whole history migrates with the content-keyed indexes down and rebuilt once, instead of a random page read per row; the pass has its own stage, "Loading versions", instead of sitting under Scanning | [storage-format.md](storage-format.md), [progress-display.md](progress-display.md) |
+
+### The migration that read 30 GB to write 1 GB (2026.9.8.3)
+
+The first run of 2026.9.8.2 on the NAS appeared to hang: the UI stood at "Scanning: 110,402 entries
+so far" for hours with no error. It was not hung and it was not scanning. The scan had finished, and
+the run was in the step that follows it — making sure every retained version is in the container's
+catalog, which on the first run after the upgrade means importing the whole history — a step that
+reported nothing, so the last line the scan had published stayed on screen. `docker stats` told the
+rest: 37% CPU, 54 MB of memory, and a block-read counter that climbed 4 GB a minute to pass 29 GB,
+against 352 KB written, while `catalog.db-wal` grew.
+
+The reads were the three secondary indexes whose key does not start with `version`. The five that
+do append at the tail of their tree for a new version; `entries_content (full_hash, length)`,
+`entries_ref (storage_ref)` and `entries_head (length, head_hash)` scatter a new version's rows
+across the whole history, and each insert reads one random leaf page of a tree that no longer fits a
+64 MiB cache — reproduced with SQLite's own cache-miss counter: importing ten versions read 1.2 GB
+of pages with the three live and a single page without them. ZFS serving each 4 KiB page from a
+128 KiB record multiplied that into the 30 GB the NAS showed. Every consumer that needs a whole
+history now asks for it in one call, which takes those three indexes down for a bulk import and
+rebuilds them with one sort each at the end; a single missing version, the routine case, still
+inserts with the indexes live. The pass also got its own stage line, "Loading versions: N of M", so
+the next long migration says what it is.
 
 ### No `-shm` files for the catalog and the work database (2026.9.8.2)
 

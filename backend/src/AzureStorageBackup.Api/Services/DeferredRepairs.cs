@@ -58,8 +58,7 @@ public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner re
             // catalog before the DISTINCT-across-versions query below can see all of them — including a version
             // nobody has asked the catalog for yet.
             var identity = info.Backup.CreatedAt.UtcTicks;
-            foreach (var v in info.Versions)
-                await catalogs.EnsureVersionAsync(account, config.ContainerName, v, identity, password, ct);
+            await catalogs.EnsureVersionsAsync(account, config.ContainerName, info.Versions, identity, password, ct: ct);
 
             var latest = info.Versions[^1];
             List<string> candidates;

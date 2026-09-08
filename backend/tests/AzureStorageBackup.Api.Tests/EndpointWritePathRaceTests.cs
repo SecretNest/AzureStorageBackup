@@ -89,6 +89,11 @@ public sealed class EndpointWritePathRaceTests
         public Task EnsureVersionAsync(Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
             => throw new NotSupportedException();
 
+        public Task EnsureVersionsAsync(
+            Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
+            IProgress<int>? progress = null, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
         public Task<VersionCatalog> OpenForWriteAsync(
             CatalogWriteLock held, int accountId, string container, CancellationToken ct = default)
             => throw new NotSupportedException();
