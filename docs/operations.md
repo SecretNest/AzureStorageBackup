@@ -398,6 +398,12 @@ accumulates — the scan, the draft of the new version, its dedup reservations, 
 records, the pack leader map — lives in scratch databases on disk ([storage-format.md](storage-format.md)).
 What is left in memory that still grows with the file count is small, transient, and measured.
 
+The one deliberately sized buffer is the upload path's: a volume small enough is read whole into
+memory to be hashed and sent from that buffer, one per upload stream. The global **Upload memory
+limit** (1 GB by default) caps that product per task — each backup, repair and compaction splits it
+across its own streams, and a volume past its share is hashed from disk and re-read for the send
+instead ([volume-identity.md](volume-identity.md), "Writing the label").
+
 Measured with one backup run per row over a synthetic tree of unique-content files, sampling
 `Process.WorkingSet64` and the managed heap every two seconds (`MemoryBenchmarkTests`, which the
 suite runs only under `ASB_BENCH=1`). Two runs at each size, shown as *first / second*:
