@@ -108,3 +108,27 @@ describe('windDownControls while wrapping up', () => {
     expect(windDownControls('now', true).canStop).toBe(false)
   })
 })
+
+describe('loading the version history', () => {
+  test('Pause alone goes quiet, with its own reason; Suspend and Stop stay live', () => {
+    const c = windDownControls(undefined, false, true)
+    expect(c.canPause).toBe(false)
+    expect(c.pauseHint).toMatch(/cannot pause/)
+    expect(c.canActOnGate).toBe(true) // Suspend, Resume, Retry now
+    expect(c.canStop).toBe(true)
+  })
+
+  test('outside the stage Pause follows the gate controls, with the gate reason', () => {
+    expect(windDownControls(undefined).canPause).toBe(true)
+    expect(windDownControls(undefined).pauseHint).toBeUndefined()
+    const wrapping = windDownControls(undefined, true)
+    expect(wrapping.canPause).toBe(false)
+    expect(wrapping.pauseHint).toBe(wrapping.gateHint)
+  })
+
+  test('a wind-down already under way wins over the stage', () => {
+    const c = windDownControls('suspend', false, true)
+    expect(c.canPause).toBe(false)
+    expect(c.pauseHint).toBeUndefined()
+  })
+})
