@@ -1371,4 +1371,40 @@ public sealed class BackupOrchestratorTests : IDisposable
             await container.DeleteIfExistsAsync();
         }
     }
+
+    /// <summary>The global upload memory limit is spent per run: this run splits it across its own uploaders
+    /// (UploadConcurrency + 1 of them, see the pipeline) and every volume it sends carries that share to the
+    /// uploader, which is what decides between "label from memory" and "hash, then re-read" (volume-identity.md).</summary>
+    [SkippableFact]
+    public async Task Every_Volume_Upload_Carries_The_Runs_Per_Stream_Memory_Share()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var recording = new ShareRecordingUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+        var (orchestrator, _, factory) = Build(uploader: recording);
+        var account = AzuriteAccount();
+        var name = RandomName("orchmem-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("small.txt", "goes into a pack");
+            WriteBytes("big.bin", 6_000_000); // over the single-file threshold: its own family
+            await orchestrator.RunAsync(Request(account, name) with
+            {
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    UploadConcurrency = 5,
+                    UploadMemoryLimitBytes = 600L * 1024 * 1024,
+                },
+            });
+
+            var shares = recording.VolumeShares;
+            Assert.NotEmpty(shares);
+            Assert.All(shares, s => Assert.Equal(100L * 1024 * 1024, s)); // 600 MB across 5 + 1 uploaders
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

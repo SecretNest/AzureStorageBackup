@@ -147,10 +147,11 @@ raises an unrecoverable-error notification, because at 128 bits it should not ha
 family uses the base name with no suffix. `VolumeBlobIO` treats a family as a unit for read, write
 and cleanup alike.
 
-Every volume small enough to buffer (≤ `BlobUploader.LabelMemoryLimit`, 256 MB) carries its own
-xxh128 in blob metadata — `x-ms-meta-xxh128`, value `xxh128:<32 hex>` — written **with** the upload
-request so the label commits atomically with the bytes it describes; larger files stream unlabelled
-unless the caller already holds the hash (the raw route). The label's only consumer is the upload
+Every volume carries its own xxh128 in blob metadata — `x-ms-meta-xxh128`, value
+`xxh128:<32 hex>` — written **with** the upload request so the label commits atomically with the
+bytes it describes. A volume that fits its upload stream's share of the global upload memory limit
+is hashed and sent from one in-memory read; a bigger one is hashed from disk and re-read for the
+send (two-pass); the raw route supplies the hash it already holds. The label's only consumer is the upload
 path's skip decision — resume and repair verify a cloud volume in place instead of re-sending it;
 check never reads it. Legacy volumes carry none and therefore always read as "different". The full
 argument is [volume-identity.md](volume-identity.md).

@@ -37,7 +37,10 @@ public sealed class DeadWeightCompactor(
         IReadOnlyDictionary<string, Dictionary<string, LivePackMember>> liveByPack,
         AccessTier dataTier, long? volumeBytes, double threshold,
         string? localRoot, bool allowDownload, CancellationToken ct,
-        StagingArea.StagingLease? lease = null)
+        StagingArea.StagingLease? lease = null,
+        // The global upload memory limit, spent by this compaction as its own task. Compaction sends one family at
+        // a time, so its single stream gets the whole of it (UploadMemoryBudget).
+        long uploadMemoryLimitBytes = 1024L * 1024 * 1024)
     {
         foreach (var packId in info.Packs.Keys.ToList())
         {
@@ -63,7 +66,7 @@ public sealed class DeadWeightCompactor(
             {
                 var newSizes = await RecompactAsync(
                     account, container, password, packId, live, localRoot, dataTier, allowDownload, volumeBytes,
-                    packInfo.StoreOnly, lease, ct);
+                    packInfo.StoreOnly, lease, ct, uploadMemoryLimitBytes);
                 if (newSizes.Count > 0)
                 {
                     info.Packs[packId] = packInfo with
@@ -104,7 +107,8 @@ public sealed class DeadWeightCompactor(
     private async Task<IReadOnlyList<long>> RecompactAsync(
         Account account, BlobContainerClient container, string? password, string packId,
         Dictionary<string, LivePackMember> live, string? localRoot, AccessTier dataTier,
-        bool allowDownload, long? volumeBytes, bool storeOnly, StagingArea.StagingLease? lease, CancellationToken ct)
+        bool allowDownload, long? volumeBytes, bool storeOnly, StagingArea.StagingLease? lease, CancellationToken ct,
+        long uploadMemoryLimitBytes)
     {
         var baseRef = $"packs/{packId}.7z";
         var work = Path.Combine(tempRoot, Guid.NewGuid().ToString("N"));
@@ -187,7 +191,8 @@ public sealed class DeadWeightCompactor(
                 {
                     var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // take the sizes before releasing
                     await VolumeBlobIO.ReplaceAsync(
-                        uploader, account, container, baseRef, staged.Files, dataTier, retry: null, ct);
+                        uploader, account, container, baseRef, staged.Files, dataTier, retry: null, ct,
+                        inMemoryLimitBytes: UploadMemoryBudget.PerStream(uploadMemoryLimitBytes, streams: 1));
                     return sizes;
                 }
                 finally

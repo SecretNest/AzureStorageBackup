@@ -301,6 +301,7 @@ public sealed class RepairRunner(IServiceScopeFactory scopes, BackupBusyTracker 
                     onlyPaths: onlyPaths, alsoMarkPaths: alsoMarkPaths,
                     onProgress: d => state.Detail = d,
                     uploadConcurrency: settings.UploadConcurrency > 0 ? settings.UploadConcurrency : 5,
+                    uploadMemoryLimitBytes: settings.UploadMemoryLimitBytes,
                     pauseGate: state.WaitWhilePausedAsync,
                     ct: state.Cancellation.Token);
                 // When EVERYTHING came out whole — nothing left unrecoverable or deferred — the check

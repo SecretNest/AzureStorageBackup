@@ -1607,4 +1607,38 @@ public sealed class BackupRepairerTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>A repair is its own task under the global upload memory limit: it splits the limit across its
+    /// own upload streams and every volume it re-sends carries that share (volume-identity.md).</summary>
+    [SkippableFact]
+    public async Task Repair_Volumes_Carry_The_Repairs_Per_Stream_Memory_Share()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var recording = new ShareRecordingUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+        var (backup, _, repairer, _, _, factory) = Build(repairUploader: recording);
+        var account = AzuriteAccount();
+        var name = RandomName("repmem-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "one.txt"), "content of the first");
+            await backup.RunAsync(Req(account, name));
+            await foreach (var b in container.GetBlobsAsync(
+                Azure.Storage.Blobs.Models.BlobTraits.None, Azure.Storage.Blobs.Models.BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+
+            await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), Azure.Storage.Blobs.Models.AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["one.txt"],
+                uploadConcurrency: 4, uploadMemoryLimitBytes: 400L * 1024 * 1024);
+
+            var shares = recording.VolumeShares;
+            Assert.NotEmpty(shares);
+            Assert.All(shares, s => Assert.Equal(100L * 1024 * 1024, s)); // 400 MB across the repair's 4 streams
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

@@ -61,6 +61,9 @@ public static class BackupRequestMapper
                 VolumeBytes = r.VolumeBytes is > 0 ? r.VolumeBytes : null,
                 Retention = RetentionOf(config, settings),
                 UploadConcurrency = settings is { UploadConcurrency: > 0 } ? settings.UploadConcurrency : 5,
+                // No >0 fallback here: 0 is a real value ("never hold a volume in memory"), and the migration
+                // gives pre-existing rows the default, so a 0 read back is one the user wrote.
+                UploadMemoryLimitBytes = settings?.UploadMemoryLimitBytes ?? 1024L * 1024 * 1024,
                 Upload = RetryOf(settings),
                 DeadWeightThreshold = settings is { DeadWeightThresholdPercent: > 0 }
                     ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
@@ -122,6 +125,7 @@ public static class BackupRequestMapper
                 ? settings.DeadWeightThresholdPercent / 100.0 : 0.30,
             LocalRoot = config.LocalRoot,
             AllowRepackDownload = settings?.RepackDownloadAllowed(config.DataTier) ?? true,
+            UploadMemoryLimitBytes = settings?.UploadMemoryLimitBytes ?? 1024L * 1024 * 1024,
         };
     }
 

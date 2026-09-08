@@ -21,6 +21,10 @@ public sealed record CleanupOptions
 
     /// <summary>Whether downloading the cloud pack is allowed to fill in members that are missing locally (a per-data-tier switch; false by default for Archive).</summary>
     public bool AllowRepackDownload { get; init; } = true;
+
+    /// <summary>The global upload memory limit, handed to dead-weight compaction as the task's own budget
+    /// (<see cref="UploadMemoryBudget"/>). 0 = never hold a volume in memory.</summary>
+    public long UploadMemoryLimitBytes { get; init; } = 1024L * 1024 * 1024;
 }
 
 /// <summary>
@@ -337,7 +341,8 @@ public sealed class RetentionCleaner(
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
-                options.LocalRoot, options.AllowRepackDownload, ct, lease);
+                options.LocalRoot, options.AllowRepackDownload, ct, lease,
+                uploadMemoryLimitBytes: options.UploadMemoryLimitBytes);
         }
 
         // The info file is rewritten only when its content really changed. There are only two ways it can change:

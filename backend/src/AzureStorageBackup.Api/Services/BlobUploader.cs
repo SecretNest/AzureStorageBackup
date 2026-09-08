@@ -63,6 +63,26 @@ public interface IBlobUploader
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
         IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
         => UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
+
+    /// <summary>
+    /// The volume path's overload: <paramref name="inMemoryLimitBytes"/> is the calling task's per-stream share of
+    /// the global upload memory limit (<see cref="UploadMemoryBudget"/>), the most of the file the uploader may
+    /// hold in memory to label it. Null = the uploader's own fallback (<see cref="BlobUploader.DefaultInMemoryLimitBytes"/>).
+    /// Default-forwarding like the progress overload, and for the same reason: ten arguments select this one
+    /// uniquely, and test doubles that never look at the share change nothing.
+    /// </summary>
+    Task<bool> UploadIfMissingAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        => UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
+
+    /// <summary>Overwrite upload carrying the per-stream memory share — see the if-missing overload above.</summary>
+    Task UploadOverwriteAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        => UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
 }
 
 public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
@@ -72,43 +92,61 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
             .GetBlobClient(blobName).DeleteIfExistsAsync(cancellationToken: ct);
 
 
-    /// <summary>Files at or under this size are read whole into memory, labelled (<see cref="VolumeIdentity"/>)
-    /// and uploaded from that buffer — one disk read feeds both the hash and the wire. Files past it (the raw
-    /// route can hand this uploader an arbitrarily large source file) stream exactly as before and go
-    /// unlabelled: never a wrong label, never an unbounded buffer. The default clears the default volume size
-    /// (100 MB) with headroom; the bound on resident memory is this × upload concurrency.</summary>
-    public long LabelMemoryLimit { get; init; } = 256L * 1024 * 1024;
+    /// <summary>
+    /// The in-memory share for a caller that names none: the 8/9-argument overloads (index and info blobs, test
+    /// callers). Volume uploads never rely on it — every volume arrives with its task's per-stream share
+    /// (<see cref="UploadMemoryBudget"/>). It clears the default 100 MB volume with headroom, as the old fixed
+    /// cut-off did; but where a file past that cut-off used to go up **unlabelled**, it now goes up two-pass.
+    /// </summary>
+    public long DefaultInMemoryLimitBytes { get; init; } = 256L * 1024 * 1024;
+
+    /// <summary>Whether a file of this length is read whole into memory for its label (one disk read feeds the
+    /// hash and the wire) or goes two-pass (hashed from disk, then re-read from disk for the send). A share of 0 is
+    /// "never": only an empty file, which holds nothing, still takes the memory route.</summary>
+    public static bool HoldsInMemory(long fileLength, long inMemoryLimitBytes) => fileLength <= inMemoryLimitBytes;
 
     public Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null)
-        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata);
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, null, null);
 
     public Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
         IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
-        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress);
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress, null);
+
+    public Task<bool> UploadIfMissingAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress, inMemoryLimitBytes);
 
     public async Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null)
-        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata);
+        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, null, null);
 
     public async Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
         IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress)
-        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, progress);
+        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, progress, null);
+
+    public async Task UploadOverwriteAsync(
+        Account account, string container, string blobName, string filePath,
+        AccessTier tier, RetryOptions? retry, CancellationToken ct,
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, progress, inMemoryLimitBytes);
 
     /// <summary>Upload core: with overwrite=false, short-circuit and return false if the blob already exists (if-missing semantics);
     /// with overwrite=true, just overwrite-upload. Returns whether an upload actually happened.</summary>
     private async Task<bool> UploadCoreAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, bool overwrite, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress = null)
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
     {
         var blob = factory.CreateServiceClient(account)
             .GetBlobContainerClient(container)
@@ -118,25 +156,39 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         if (metadata is not null)
             options.Metadata = metadata.ToDictionary(kv => kv.Key, kv => kv.Value);
 
-        // The identity label rides the same request as the bytes it describes (volume-identity.md): read the
-        // file once into memory, hash it, and upload that very buffer, so the label can never describe anything
-        // but what went over the wire. Sized-out files stream below, unlabelled.
+        // The identity label rides the same request as the bytes it describes (volume-identity.md). Two ways to
+        // get there, chosen by whether the file fits the caller's per-stream memory share (UploadMemoryBudget):
+        //  - it fits: read the file once into memory, hash it, and upload that very buffer — the label can never
+        //    describe anything but what went over the wire, and the disk is read once;
+        //  - it does not: hash it from disk, then re-read it from disk for the send. The file is one this process
+        //    wrote into staged-temp and closed, so the two reads see the same bytes; the length+mtime bracket
+        //    below is what turns that "so" into a check, on the same principle as the raw route's stat-bracket.
         // A caller that already knows the bytes' hash supplies it in the metadata (the raw route: the blob IS the
         // source file, whose FullHash the backup computed in the same format) — used verbatim, no buffering, no
         // recompute, any size. Consistency with the bytes rides the caller's own guarantees (the raw route's
         // stat-bracket).
         byte[]? buffered = null;
-        if (metadata?.ContainsKey(VolumeIdentity.MetaKey) != true
-            && new FileInfo(filePath).Length <= LabelMemoryLimit)
+        FileBracket? bracket = null;
+        if (metadata?.ContainsKey(VolumeIdentity.MetaKey) != true)
         {
-            await using (var read = FileHasher.OpenRead(filePath))
-            using (var ms = new MemoryStream())
+            var info = new FileInfo(filePath);
+            if (HoldsInMemory(info.Length, inMemoryLimitBytes ?? DefaultInMemoryLimitBytes))
             {
-                await read.CopyToAsync(ms, ct);
-                buffered = ms.ToArray();
+                await using (var read = FileHasher.OpenRead(filePath))
+                using (var ms = new MemoryStream())
+                {
+                    await read.CopyToAsync(ms, ct);
+                    buffered = ms.ToArray();
+                }
+                options.Metadata ??= new Dictionary<string, string>();
+                options.Metadata[VolumeIdentity.MetaKey] = VolumeIdentity.Compute(buffered);
             }
-            options.Metadata ??= new Dictionary<string, string>();
-            options.Metadata[VolumeIdentity.MetaKey] = VolumeIdentity.Compute(buffered);
+            else
+            {
+                bracket = FileBracket.Of(info);
+                options.Metadata ??= new Dictionary<string, string>();
+                options.Metadata[VolumeIdentity.MetaKey] = await VolumeIdentity.ComputeAsync(filePath, ct);
+            }
         }
 
         // Let the **server** enforce the if-missing semantics, rather than relying on "Exists first, then upload".
@@ -186,7 +238,27 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
             return false;
         }
 
+        // The other half of the two-pass bracket. If the file changed shape between the hash and the send, the
+        // label just committed may describe bytes other than the blob's — and a wrong label is the one thing the
+        // skip machinery cannot survive (a later run would trust it and leave the wrong bytes in place). Take the
+        // blob back and fail this upload; the exception is not a transient one on purpose (not an IOException), so
+        // nothing above retries a file that is being rewritten under us.
+        if (bracket is { } before && FileBracket.Of(new FileInfo(filePath)) != before)
+        {
+            await blob.DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
+            throw new InvalidDataException(
+                $"'{filePath}' changed while it was being uploaded (length/mtime {before} → {FileBracket.Of(new FileInfo(filePath))}); the upload was taken back.");
+        }
+
         return true;
+    }
+
+    /// <summary>The length and mtime of a file at one instant — what the two-pass route compares across its two
+    /// reads to know they read the same bytes.</summary>
+    private readonly record struct FileBracket(long Length, DateTime MtimeUtc)
+    {
+        public static FileBracket Of(FileInfo info) => new(info.Length, info.LastWriteTimeUtc);
+        public override string ToString() => $"{Length} B @ {MtimeUtc:O}";
     }
 
     /// <summary>

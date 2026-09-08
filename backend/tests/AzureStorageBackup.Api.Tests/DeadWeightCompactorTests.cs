@@ -548,4 +548,33 @@ public sealed class DeadWeightCompactorTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>Compaction uploads one family at a time, so its one stream gets the whole of the task's upload
+    /// memory limit — and the rewritten pack's volumes carry it (volume-identity.md).</summary>
+    [SkippableFact]
+    public async Task Compacted_Pack_Volumes_Carry_The_Whole_Limit_As_Their_Share()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var name = RandomName("dwc-mem-");
+        var (info, live, container, account) = await SetupAsync(name);
+        try
+        {
+            Write(_local, "b.txt", new string('b', 2000));
+            Write(_local, "c.txt", new string('c', 2000));
+            var recording = new ShareRecordingUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+            var compactor = new DeadWeightCompactor(recording, new SevenZipCompressor(), new FileHasher(),
+                Path.Combine(_temp, "compact"), Staging());
+
+            await compactor.CompactAsync(account, container, null, info, live,
+                AccessTier.Hot, null, threshold: 0.30, _local, allowDownload: false, CancellationToken.None,
+                uploadMemoryLimitBytes: 300L * 1024 * 1024);
+
+            var shares = recording.VolumeShares;
+            Assert.NotEmpty(shares);
+            Assert.All(shares, s => Assert.Equal(300L * 1024 * 1024, s));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

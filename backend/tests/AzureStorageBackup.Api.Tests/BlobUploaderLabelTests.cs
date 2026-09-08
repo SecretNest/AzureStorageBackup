@@ -213,7 +213,7 @@ public sealed class BlobUploaderLabelTests : IDisposable
             await File.WriteAllBytesAsync(file, new byte[64]);
 
             // A sentinel value, deliberately not these bytes' hash: stored verbatim proves nothing rehashed.
-            await new BlobUploader(factory) { LabelMemoryLimit = 16 }.UploadIfMissingAsync(
+            await new BlobUploader(factory) { DefaultInMemoryLimitBytes = 16 }.UploadIfMissingAsync(
                 account, name, "data/raw", file, AccessTier.Hot,
                 metadata: new Dictionary<string, string> { [VolumeIdentity.MetaKey] = "xxh128:precomputed" });
 
@@ -223,31 +223,78 @@ public sealed class BlobUploaderLabelTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>Hashing in memory is bounded: a file past the limit (a raw-route source file can be arbitrarily
-    /// large) streams exactly as before and simply goes unlabelled — which the skip rules already treat as
-    /// "different", so the only cost is that such a blob is never skippable. Never a wrong label, never an
-    /// unbounded buffer.</summary>
+    /// <summary>The volume does not fit its stream's share of the upload memory limit, so it goes two-pass: hashed
+    /// from disk, then re-read from disk for the send. The label is still there and still describes the bytes —
+    /// the cut-off costs a second read, never the label (volume-identity.md).</summary>
     [SkippableFact]
-    public async Task A_File_Past_The_Memory_Limit_Uploads_Unlabelled()
+    public async Task A_Volume_Past_Its_Streams_Share_Is_Labelled_Without_Being_Held_In_Memory()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
 
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var account = AzuriteAccount();
-        var name = RandomName("labelxl-");
+        var name = RandomName("label-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
         try
         {
-            var file = Path.Combine(_dir, "big.bin");
-            await File.WriteAllBytesAsync(file, new byte[64]);
+            var content = new byte[300 * 1024];
+            Random.Shared.NextBytes(content);
+            var file = Path.Combine(_dir, "big.001");
+            await File.WriteAllBytesAsync(file, content);
 
-            await new BlobUploader(factory) { LabelMemoryLimit = 16 }.UploadIfMissingAsync(
-                account, name, "data/big", file, AccessTier.Hot);
+            await new BlobUploader(factory).UploadIfMissingAsync(
+                account, name, "data/big.001", file, AccessTier.Hot, retry: null, ct: default,
+                metadata: null, progress: null, inMemoryLimitBytes: 100 * 1024);
 
-            var props = (await container.GetBlobClient("data/big").GetPropertiesAsync()).Value;
-            Assert.False(props.Metadata.ContainsKey(VolumeIdentity.MetaKey));
+            var blob = container.GetBlobClient("data/big.001");
+            var props = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal("xxh128:" + Convert.ToHexString(XxHash128.Hash(content)).ToLowerInvariant(),
+                props.Metadata[VolumeIdentity.MetaKey]);
+            Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>A limit of 0 is "never hold a volume in memory": every volume goes two-pass, and every volume is
+    /// still labelled — turning the memory off must not turn the skip machinery off with it.</summary>
+    [SkippableFact]
+    public async Task A_Zero_Limit_Still_Labels_Every_Volume()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var account = AzuriteAccount();
+        var name = RandomName("label-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = Encoding.UTF8.GetBytes("small, but not held in memory either");
+            var file = Path.Combine(_dir, "z.001");
+            await File.WriteAllBytesAsync(file, content);
+
+            await new BlobUploader(factory).UploadOverwriteAsync(
+                account, name, "data/z.001", file, AccessTier.Hot, retry: null, ct: default,
+                metadata: null, progress: null, inMemoryLimitBytes: 0);
+
+            var props = (await container.GetBlobClient("data/z.001").GetPropertiesAsync()).Value;
+            Assert.Equal("xxh128:" + Convert.ToHexString(XxHash128.Hash(content)).ToLowerInvariant(),
+                props.Metadata[VolumeIdentity.MetaKey]);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The in-memory route is taken exactly when the file fits the share; the uploader's own fallback
+    /// applies when a caller names no share (index/info blobs, and the 8/9-argument overloads).</summary>
+    [Fact]
+    public void Holds_In_Memory_Exactly_When_The_File_Fits_The_Share()
+    {
+        Assert.True(BlobUploader.HoldsInMemory(fileLength: 100, inMemoryLimitBytes: 100));
+        Assert.False(BlobUploader.HoldsInMemory(fileLength: 101, inMemoryLimitBytes: 100));
+        Assert.False(BlobUploader.HoldsInMemory(fileLength: 1, inMemoryLimitBytes: 0));
+        Assert.True(BlobUploader.HoldsInMemory(fileLength: 0, inMemoryLimitBytes: 0)); // nothing to hold
+        var fallback = new BlobUploader(new BlobClientFactory(TestSecrets.Reader)).DefaultInMemoryLimitBytes;
+        Assert.Equal(256L * 1024 * 1024, fallback);
     }
 }
