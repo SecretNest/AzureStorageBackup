@@ -82,6 +82,13 @@ the current behaviour results, so there is no regression risk.
   the content and `position: fixed` pinning it to the bottom as a tab bar. The content area gains
   `padding-bottom` for the bar height plus the safe area, or the last row is permanently covered.
 
+**Backup defaults and Performance save separately.** The two settings pages are two resources on the API
+(`GET/PUT /api/settings/defaults`, `GET/PUT /api/settings/performance`) over one row, and each page's Save
+writes only its own half. There is no whole-object PUT any more: with one, whichever page saved last
+overwrote the other page's fields with values it had read before. `GET /api/settings` still returns the
+whole row for pages that only need to read it. Edits on one tab survive a switch to the other; they are
+saved by that tab's own button.
+
 **`Log out` lives on the settings page**, on desktop as well as phone.
 
 > **Rationale.** Four bottom-bar slots leave no room for a fifth entry. Making it "on Settings on

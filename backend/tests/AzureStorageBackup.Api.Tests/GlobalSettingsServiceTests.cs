@@ -120,4 +120,32 @@ public sealed class GlobalSettingsServiceTests : IDisposable
     {
         Assert.Equal(1024L * 1024 * 1024, (await _sut.GetAsync()).UploadMemoryLimitBytes);
     }
+
+    /// <summary>Each page saves its own half: writing one half through the service never touches the other, whether
+    /// the row already exists or this is the first save ever (the insert branch used to store a whole object).</summary>
+    [Fact]
+    public async Task Upserting_One_Half_Leaves_The_Other_Half_Alone()
+    {
+        // First save ever, from the defaults page: the performance half must come out as the model defaults.
+        var d = BackupDefaultsSettings.From(await _sut.GetAsync()) with { DefaultMaxVersions = 42 };
+        await _sut.UpsertDefaultsAsync(d);
+        var s = await _sut.GetAsync();
+        Assert.Equal(42, s.DefaultMaxVersions);
+        Assert.Equal(5, s.UploadConcurrency);
+
+        // Then the performance page, against the existing row: the defaults half stays as saved.
+        var p = PerformanceSettings.From(s) with { UploadConcurrency = 9, AutoResumeInterruptedRuns = false };
+        await _sut.UpsertPerformanceAsync(p);
+        s = await _sut.GetAsync();
+        Assert.Equal(9, s.UploadConcurrency);
+        Assert.False(s.AutoResumeInterruptedRuns);
+        Assert.Equal(42, s.DefaultMaxVersions);
+
+        // And the defaults page again, against the existing row: the performance half stays as saved.
+        await _sut.UpsertDefaultsAsync(BackupDefaultsSettings.From(s) with { DefaultIncludeSymlinks = true });
+        s = await _sut.GetAsync();
+        Assert.True(s.DefaultIncludeSymlinks);
+        Assert.Equal(9, s.UploadConcurrency);
+        Assert.False(s.AutoResumeInterruptedRuns);
+    }
 }

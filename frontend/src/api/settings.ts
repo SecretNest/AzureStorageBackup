@@ -10,7 +10,10 @@ export const sevenZipPriorityLabels: Record<number, string> = {
   2: 'Normal',
 }
 
-export interface GlobalSettings {
+// One settings row on the server, two resources on the API — one per settings page. Each page reads and writes its
+// own half, so a save on one page can never carry (and overwrite) the other page's fields; the whole object is
+// read-only, for the pages that only need to look (the backup form's inherited defaults).
+export interface BackupDefaultsSettings {
   defaultIndexTier: number
   defaultDataTier: number
   defaultMaxVersions: number
@@ -32,6 +35,9 @@ export interface GlobalSettings {
   defaultCrossDirGroupRulesCaseInsensitive: string | null
   defaultDontGroupRules: string | null
   defaultCrossDirGroupRules: string | null
+}
+
+export interface PerformanceSettings {
   uploadConcurrency: number
   uploadMemoryLimitBytes: number
   downloadConcurrency: number
@@ -48,7 +54,12 @@ export interface GlobalSettings {
   sevenZipPriority: number
 }
 
+export type GlobalSettings = BackupDefaultsSettings & PerformanceSettings
+
 export const settingsApi = {
   get: () => api.get<GlobalSettings>('/settings'),
-  update: (s: GlobalSettings) => api.put<GlobalSettings>('/settings', s),
+  getDefaults: () => api.get<BackupDefaultsSettings>('/settings/defaults'),
+  updateDefaults: (s: BackupDefaultsSettings) => api.put<BackupDefaultsSettings>('/settings/defaults', s),
+  getPerformance: () => api.get<PerformanceSettings>('/settings/performance'),
+  updatePerformance: (s: PerformanceSettings) => api.put<PerformanceSettings>('/settings/performance', s),
 }

@@ -9,6 +9,13 @@ public interface IGlobalSettingsService
 {
     Task<GlobalSettings> GetAsync(CancellationToken ct = default);
     Task<GlobalSettings> UpsertAsync(GlobalSettings settings, CancellationToken ct = default);
+
+    /// <summary>Writes the Backup defaults half only (<see cref="BackupDefaultsSettings"/>); the Performance half keeps
+    /// whatever the row holds — the model defaults, on the first save ever.</summary>
+    Task<GlobalSettings> UpsertDefaultsAsync(BackupDefaultsSettings half, CancellationToken ct = default);
+
+    /// <summary>Writes the Performance half only (<see cref="PerformanceSettings"/>); see <see cref="UpsertDefaultsAsync"/>.</summary>
+    Task<GlobalSettings> UpsertPerformanceAsync(PerformanceSettings half, CancellationToken ct = default);
 }
 
 public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
@@ -30,6 +37,32 @@ public class GlobalSettingsService(AppDbContext db) : IGlobalSettingsService
         if (s.ProcessingMaxAttempts <= 0)
             s.ProcessingMaxAttempts = defaults.ProcessingMaxAttempts;
         return s;
+    }
+
+    public Task<GlobalSettings> UpsertDefaultsAsync(BackupDefaultsSettings half, CancellationToken ct = default) =>
+        UpsertHalfAsync(half.ApplyTo, ct);
+
+    public Task<GlobalSettings> UpsertPerformanceAsync(PerformanceSettings half, CancellationToken ct = default) =>
+        UpsertHalfAsync(half.ApplyTo, ct);
+
+    /// <summary>One half onto the row: the tracked row when there is one, else a fresh model-default row that the half
+    /// is written over before the insert — so the first save from either page leaves the other half at its defaults
+    /// rather than at whatever a client happened to send.</summary>
+    private async Task<GlobalSettings> UpsertHalfAsync(Action<GlobalSettings> apply, CancellationToken ct)
+    {
+        var existing = await db.GlobalSettings.OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
+        if (existing is null)
+        {
+            existing = new GlobalSettings();
+            apply(existing);
+            db.GlobalSettings.Add(existing);
+        }
+        else
+        {
+            apply(existing);
+        }
+        await db.SaveChangesAsync(ct);
+        return existing;
     }
 
     public async Task<GlobalSettings> UpsertAsync(GlobalSettings s, CancellationToken ct = default)
