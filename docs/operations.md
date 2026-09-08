@@ -505,12 +505,34 @@ in the clear.
 | `Backup__SevenZipMethodArgs` | extra 7z arguments, e.g. `-mmt=N` |
 | `Backup__IoPriority` | block-IO priority for the whole process; see *Disk priority* above, including the two cases where it does nothing |
 | `Scheduler__Enabled` | whether the background scheduler runs |
+| `ASB_FCNTL_TRACE` | `1` preloads a shim that writes every refused `fcntl` byte-range lock (any file) and every lock call on a `catalog.db` to the container log, with the errno; diagnostic only, see *SQLite locks* below |
 
 Azure credentials are **not** configured through environment variables — each storage account is
 added in the UI and its key is encrypted at rest.
 
 `Backup__Root` constrains paths **inside the container**, so it works together with volume mounts:
 mount every host directory you want to back up beneath that root.
+
+## SQLite locks
+
+The catalogs and a run's work database are opened through SQLite's `unix-excl` VFS: no `-shm` file,
+no byte-range locks on one, the WAL index in the process's heap ([storage-format.md](storage-format.md)
+§ *The catalog*). That is the fix for a failure that could not be explained from outside the
+process: on a QNAP QuTS hero NAS (kernel 6.6.32-qnap, ZFS) every 2026.9.8.1 run failed at the same
+catalog import with `SQLite Error 15: 'locking protocol'`, the writer holding the WAL write lock for
+ten seconds while the kernel refused exclusive locks on the read-slot bytes of `catalog.db-shm` that
+`/proc/locks` showed nobody holding. The same library, directory and statement sequence succeeded
+from a python process in the same container, and a plain `fcntl` replay of SQLite's lock sequence
+succeeded too, so the refusal is specific to something in the application process that no probe has
+reproduced. Since the NAS is offline, the errno of the refused call was never captured.
+
+If the error ever comes back, start the container with `ASB_FCNTL_TRACE=1`: the image carries a
+small `LD_PRELOAD` shim (`docker/fcntlspy.c`) that logs each refused lock call as
+`fcntlspy fd=… cmd=… type=… start=… len=… rc=-1 errno=… <path>` — the one number this investigation
+was missing. It costs a `readlink` per lock call and is off by default.
+
+`app.db` (the application database, through EF Core) is not affected by any of this; it still uses
+the default VFS and its `-shm` file, and has never shown the failure.
 
 ## Shutdown timing
 

@@ -206,7 +206,15 @@ bounded by the pipeline's width rather than by the size of the backup — see
 
 One SQLite file per (account, container), in WAL mode, opened directly through
 `Microsoft.Data.Sqlite` with pooling off and entirely separate from `app.db` — no EF context, no
-migrations. It holds:
+migrations. On Unix it is opened through SQLite's `unix-excl` VFS (the data source is
+`file:…/catalog.db?vfs=unix-excl`), which keeps the WAL index in the process's heap instead of a
+memory-mapped `catalog.db-shm` file and takes no byte-range locks on such a file; connections inside
+the process still share the index and run concurrently, but the file is this process's alone while
+it is open — which it always was. The reason is in [history.md](history.md) (2026.9.8.2): a NAS
+kernel refused the `-shm` locks for no visible cause, and there is nothing the catalog needs from a
+file that exists to share an index between processes. One consequence: the connections that only
+read are opened `ReadWrite` at the SQLite level, because a `ReadOnly` handle is excluded from
+`unix-excl` and would bring the `-shm` file back for every connection on the file. It holds:
 
 - `versions` — one row per version the catalog knows: the version number, its identity stamp, its
   entry count and when it was imported.
@@ -339,7 +347,8 @@ holds the source files anyway.
 ## The run's work database
 
 A backup run keeps its own scratch database at `{tempPath}/work/{runId}.db` — `synchronous=OFF`, one
-writer task fed by a channel, readers on their own connections. It holds everything about a run that
+writer task fed by a channel, readers on their own connections, and, like the catalog, opened through
+`unix-excl` so that no `-shm` file is involved. It holds everything about a run that
 grows with the file count: the scan's rows, the draft of the new version (one row per path, carrying
 the diff's verdict, the previous version's entry beside it, and the storage, tail hash and identity
 the run settles on later), the content this run has already uploaded so a second file with the same
