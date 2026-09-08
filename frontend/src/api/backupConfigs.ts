@@ -28,16 +28,18 @@ export const retentionModeLabels: Record<number, string> = {
 // Stages of the backup pipeline
 export const BackupStage = {
   Scanning: 0,
-  Diffing: 1,
-  Uploading: 2,
-  WritingIndex: 3,
-  Finalizing: 4,
-  CleaningUp: 5,
-  Completed: 6,
+  LoadingVersions: 1,
+  Diffing: 2,
+  Uploading: 3,
+  WritingIndex: 4,
+  Finalizing: 5,
+  CleaningUp: 6,
+  Completed: 7,
 } as const
 
 export const backupStageLabels: Record<number, string> = {
   [BackupStage.Scanning]: 'Scanning',
+  [BackupStage.LoadingVersions]: 'Loading versions',
   [BackupStage.Diffing]: 'Diffing',
   [BackupStage.Uploading]: 'Uploading',
   [BackupStage.WritingIndex]: 'Writing index',

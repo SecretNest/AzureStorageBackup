@@ -177,8 +177,7 @@ public sealed class BackupRepairer(
             // every version that references the object. Ensured for marking-only and unmarking-only runs too — an
             // empty selection ("mark everything for the next version") is all marks and no repairs.
             var identity = info.Backup.CreatedAt.UtcTicks;
-            foreach (var ver in info.Versions)
-                await catalogs.EnsureVersionAsync(account, container, ver, identity, password, ct);
+            await catalogs.EnsureVersionsAsync(account, container, info.Versions, identity, password, ct: ct);
 
             // The catalog can hold versions the info file no longer lists: a retired one whose removal never
             // reached it, or one imported against an older info file. The queries below are keyed by storage REF,

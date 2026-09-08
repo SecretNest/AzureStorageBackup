@@ -28,6 +28,18 @@ public interface IVersionCatalogs
     /// for the migration; the rest find the row already there once they reach the write lock.</summary>
     Task EnsureVersionAsync(Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default);
 
+    /// <summary>
+    /// <see cref="EnsureVersionAsync"/> for every version a caller is about to ask the catalog about, in one
+    /// go. Same guarantee per version, one read-only probe for all of them — and when two or more are missing
+    /// (a container whose catalog has yet to be built), the content-keyed indexes come down for the duration and
+    /// are rebuilt once at the end, which is what turns a migration from a random page read per row into one sort
+    /// per index; see <c>CatalogSql.GlobalIndexNames</c>. <paramref name="progress"/> receives the number of
+    /// versions settled so far, out of <paramref name="versions"/>'s count, hits included.
+    /// </summary>
+    Task EnsureVersionsAsync(
+        Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
+        IProgress<int>? progress = null, CancellationToken ct = default);
+
     /// <summary>Drops one version from the catalog and every older home it might still occupy (the retention policy
     /// retiring it).</summary>
     Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default);

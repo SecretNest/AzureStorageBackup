@@ -503,8 +503,7 @@ public sealed class BackupChecker(
         Account account, string container, string? password, BackupInfoFile info, CancellationToken ct = default)
     {
         var identity = info.Backup.CreatedAt.UtcTicks;
-        foreach (var ver in info.Versions)
-            await catalogs.EnsureVersionAsync(account, container, ver, identity, password, ct);
+        await catalogs.EnsureVersionsAsync(account, container, info.Versions, identity, password, ct: ct);
 
         await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
         return await ReferencedBlobNamesAsync(info, catalog.DistinctRefsAsync(ct), ct);

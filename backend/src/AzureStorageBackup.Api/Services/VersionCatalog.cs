@@ -146,6 +146,38 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     }
 
     /// <summary>
+    /// Takes the content-keyed indexes (<see cref="CatalogSql.GlobalIndexNames"/>) down ahead of a bulk import, so
+    /// that the versions about to be imported are not inserted, row by row, at random into three B-trees that span
+    /// the whole history. <see cref="RebuildGlobalIndexesAsync"/> is the other half; if it never runs (a stop, a
+    /// crash), the next write open's schema pass rebuilds them, and until then queries are slower, never wrong.
+    /// </summary>
+    public async Task DropGlobalIndexesAsync(CancellationToken ct)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = CatalogSql.DropGlobalIndexesSql;
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Recreates whatever <see cref="DropGlobalIndexesAsync"/> took down: one sort and one sequential write
+    /// per index, in place of a random read per row per index.</summary>
+    public async Task RebuildGlobalIndexesAsync(CancellationToken ct)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = CatalogSql.GlobalIndexSchema;
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>How many of <see cref="CatalogSql.GlobalIndexNames"/> the file currently has — all of them on a
+    /// healthy catalog, none in the middle of a bulk import.</summary>
+    internal async Task<int> GlobalIndexCountAsync(CancellationToken ct)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN ("
+            + string.Join(", ", CatalogSql.GlobalIndexNames.Select(name => $"'{name}'")) + ")";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(ct));
+    }
+
+    /// <summary>
     /// Runs <c>PRAGMA quick_check</c> and turns anything other than a single "ok" row into the same
     /// <see cref="SqliteException"/> shape SQLite itself raises for a corrupt file (<c>SQLITE_CORRUPT</c>), so
     /// <see cref="VersionCatalogStore"/> has one error code to catch regardless of which check caught the damage —

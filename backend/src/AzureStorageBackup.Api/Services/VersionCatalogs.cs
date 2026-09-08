@@ -74,7 +74,85 @@ public sealed class VersionCatalogs(
 
         using var held = await catalogs.LockForWriteAsync(account.Id, container, ct);
         await using var catalog = await catalogs.OpenForWriteAsync(held, account.Id, container, ct);
+        await ImportMissingAsync(catalog, account, container, version, identityTicks, password, ct);
+    }
 
+    /// <summary>Versions missing from the catalog at or above which <see cref="EnsureVersionsAsync"/> takes the
+    /// content-keyed indexes down for the duration. One missing version is the routine case (the run that just
+    /// finished writes its own, and the next run's probe finds everything else in place); the indexes are kept
+    /// live for it, because rebuilding three trees over the whole history costs more than one version's random
+    /// inserts. Two or more is a migration — a container whose catalog has yet to be built — and there the trade
+    /// reverses: the rebuild is one sort per index, while the inserts are a random page read per row per index
+    /// over every version already in.</summary>
+    internal const int BulkImportThreshold = 2;
+
+    public async Task EnsureVersionsAsync(
+        Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
+        IProgress<int>? progress = null, CancellationToken ct = default)
+    {
+        // One read-only probe for the lot, on the same terms as EnsureVersionAsync's: a missing file and an
+        // unreadable one are both "everything is missing", and the write open below is where the latter is fixed.
+        var missing = new List<BackupVersion>();
+        try
+        {
+            await using var probe = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
+            foreach (var version in versions)
+                if (await probe.GetVersionAsync(version.Version, ct) is not { } row || row.Identity != identityTicks)
+                    missing.Add(version);
+        }
+        catch (FileNotFoundException)
+        {
+            missing = [.. versions];
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
+        {
+            catalogs.ForgetChecked(account.Id, container);
+            logger?.LogWarning(ex,
+                "The catalog for account {AccountId} container {Container} is unreadable; rebuilding it from the cloud.",
+                account.Id, container);
+            missing = [.. versions];
+        }
+
+        progress?.Report(versions.Count - missing.Count);
+        if (missing.Count == 0)
+            return;
+
+        var done = versions.Count - missing.Count;
+        if (missing.Count < BulkImportThreshold)
+        {
+            foreach (var version in missing)
+            {
+                await EnsureVersionAsync(account, container, version, identityTicks, password, ct);
+                progress?.Report(++done);
+            }
+
+            return;
+        }
+
+        using var held = await catalogs.LockForWriteAsync(account.Id, container, ct);
+        await using var catalog = await catalogs.OpenForWriteAsync(held, account.Id, container, ct);
+
+        // Dropped for the duration and rebuilt at the end — see CatalogSql.GlobalIndexNames for the measurement
+        // behind this. Not rebuilt on the way out of a failure or a stop: the rebuild takes as long as the
+        // history is big, and a stop pressed during a migration wants the run to end, not to sort three indexes
+        // first. The next write open's schema pass rebuilds them; in between, queries are slower and still right.
+        await catalog.DropGlobalIndexesAsync(ct);
+        foreach (var version in missing)
+        {
+            await ImportMissingAsync(catalog, account, container, version, identityTicks, password, ct);
+            progress?.Report(++done);
+        }
+
+        await catalog.RebuildGlobalIndexesAsync(ct);
+    }
+
+    /// <summary>The migration chain proper, on a catalog already open for writing under the container's lock:
+    /// <c>.idx</c> file → legacy row → cloud. A version another caller imported while this one waited for the
+    /// lock is found by the first check and costs nothing further.</summary>
+    private async Task ImportMissingAsync(
+        VersionCatalog catalog, Account account, string container, BackupVersion version, long identityTicks,
+        string? password, CancellationToken ct)
+    {
         // Either the catalog always had it, or another caller imported it while this one waited for the lock.
         if (await catalog.GetVersionAsync(version.Version, ct) is { } again && again.Identity == identityTicks)
             return;

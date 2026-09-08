@@ -4,6 +4,9 @@ import type { WindDownKind } from './windDownControls'
 
 const STAGE_UNITS: Record<string, string> = {
   Scanning: 'entries',
+  // The backup's pre-diff pass over the retained versions (its own token: the check's LoadingIndex counts
+  // entries of one index, this counts versions of a container's history).
+  LoadingVersions: 'versions',
   Diffing: 'files',
   Uploading: 'objects',
   Restoring: 'objects',
@@ -40,6 +43,7 @@ const STAGE_UNITS: Record<string, string> = {
  */
 const STAGE_LABELS: Record<string, string> = {
   LoadingIndex: 'Loading index',
+  LoadingVersions: 'Loading versions',
   Assessing: 'Assessing damage',
   WritingIndex: 'Writing index',
 }

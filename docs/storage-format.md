@@ -287,6 +287,28 @@ behind. What happens to the source it came from depends on why it was not used:
 
 A container nobody has touched since the upgrade pays for no migration at all.
 
+**A whole history at once.** Every consumer that is about to ask the catalog about all of a
+container's retained versions (a backup run before its diff, a check's reference set, a repair,
+retention, the deferred-repair sweep) asks for them in one call, `EnsureVersionsAsync`, rather than
+one version at a time. One read-only probe settles the versions already there. When two or more are
+missing — the first run after the upgrade, migrating a container's whole history — the three
+content-keyed indexes (`entries_content`, `entries_ref`, `entries_head`) are dropped for the
+duration and rebuilt with one `CREATE INDEX` each once the last version is in. Every other index is
+keyed by `version` first, so a new version (always the highest number) appends at the tail of the
+tree and costs nothing to maintain; those three are keyed by content hash, storage ref and length,
+so a new version's rows land at random across the whole history, and keeping them up row by row
+means a random page read per row per index over a tree that spans every version already imported.
+Measured with a 64 MiB page cache: importing ten versions read 1.2 GB of pages with the three live
+and one page without them; on the NAS this migration showed up as 30 GB of block reads (ZFS serves
+a 4 KiB page from a 128 KiB record) and hours of wall time for a single container. The rebuild is
+a sort and a sequential write per index. One missing version — the routine case — keeps the indexes
+live, since rebuilding them over the whole history would cost more than one version's inserts.
+
+A migration that stops halfway (a stop pressed, a crash, one version whose index blob cannot be
+read) leaves the versions that did import and no content-keyed indexes; the catalog is slower to
+query until the next write open, whose schema pass (`CREATE INDEX IF NOT EXISTS`) puts them back.
+It is never wrong: the indexes are derived from the rows, and no query depends on their presence.
+
 **The catalog is derived data.** The index blobs in the container are the recovery copy; the catalog
 is a queryable copy of them and can be rebuilt from them at any time. That is what lets it run with
 `synchronous=NORMAL`, and it is what makes corruption a cache miss rather than an incident: the

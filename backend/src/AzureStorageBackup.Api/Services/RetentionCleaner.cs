@@ -181,8 +181,7 @@ public sealed class RetentionCleaner(
             // The retained versions are mandatory. Their refs are the whole of what protects live content, so a
             // version whose index cannot be migrated leaves the criterion unable to tell "in use" from "orphan" —
             // and deleting on a half-known set is data loss. A failure here stops the round instead.
-            foreach (var v in info.Versions)
-                await catalogs_.EnsureVersionAsync(account, container, v, identity, password, ct);
+            await catalogs_.EnsureVersionsAsync(account, container, info.Versions, identity, password, ct: ct);
 
             // The retiring ones are best-effort, and can be: their only contribution is **naming** what may go, and
             // a retired version that never reaches the catalog simply leaves the refs it alone held to the orphan

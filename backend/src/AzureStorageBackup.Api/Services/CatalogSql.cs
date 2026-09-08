@@ -141,15 +141,47 @@ public static class CatalogSql
         CREATE INDEX IF NOT EXISTS entries_parent   ON entries (version, parent);
         CREATE INDEX IF NOT EXISTS entries_fold     ON entries (version, path_fold);
         CREATE INDEX IF NOT EXISTS entries_path_key ON entries (version, path_key);
-        CREATE INDEX IF NOT EXISTS entries_content  ON entries (full_hash, length);
-        CREATE INDEX IF NOT EXISTS entries_ref      ON entries (storage_ref);
-        CREATE INDEX IF NOT EXISTS entries_head     ON entries (length, head_hash);
         CREATE INDEX IF NOT EXISTS entries_storage  ON entries (version, storage_kind, storage_ref, seq);
+        {GlobalIndexSchema}
         CREATE TABLE IF NOT EXISTS dirs (version INTEGER NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS dirs_parent ON dirs (version, parent);
         CREATE TABLE IF NOT EXISTS empty_dirs (version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS unrecoverable (version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS import_issues (version INTEGER NOT NULL, path TEXT NOT NULL, issue TEXT NOT NULL, PRIMARY KEY (version, path, issue)) WITHOUT ROWID;
+        """;
+
+    /// <summary>
+    /// The three indexes whose key does <b>not</b> start with <c>version</c>. They are the dedup and retention
+    /// lookups' whole reason to exist, and they are also the one part of the schema that makes a bulk import slow:
+    /// every other index is keyed by version first, so a new version (always the highest number) appends at the
+    /// tail of each B-tree and costs nothing to keep up; these three are keyed by content hash, storage ref and
+    /// length, so a new version's rows land at random over the entire history, and each insert reads a random
+    /// page of a tree that spans every version already there. Measured (see history.md, 2026.9.8.3): with all
+    /// indexes live, importing ten versions read 1.2 GB of pages through a 64 MiB cache; with only the
+    /// version-keyed indexes live, one page. A NAS on spinning disks with ZFS's 128 KiB records turned that into
+    /// 30 GB of reads and hours of wall time for one container's migration.
+    /// <para>
+    /// <see cref="DropGlobalIndexes"/> and <see cref="EnsureSchema"/> are the pair a bulk import brackets its work
+    /// with: drop, import every missing version, rebuild — a <c>CREATE INDEX</c> sorts the rows once and writes
+    /// the tree sequentially. A process that dies between the two leaves a catalog without them, which is slower
+    /// to query but never wrong, and the next write open's <see cref="EnsureSchema"/> puts them back.
+    /// </para>
+    /// </summary>
+    internal static readonly IReadOnlyList<string> GlobalIndexNames = ["entries_content", "entries_ref", "entries_head"];
+
+    /// <summary>The <c>CREATE INDEX</c> half of the bracket, part of <see cref="Schema"/> so a plain open recreates
+    /// whatever a bulk import dropped.</summary>
+    internal const string GlobalIndexSchema = """
+        CREATE INDEX IF NOT EXISTS entries_content  ON entries (full_hash, length);
+        CREATE INDEX IF NOT EXISTS entries_ref      ON entries (storage_ref);
+        CREATE INDEX IF NOT EXISTS entries_head     ON entries (length, head_hash);
+        """;
+
+    /// <summary>The <c>DROP INDEX</c> half.</summary>
+    internal const string DropGlobalIndexesSql = """
+        DROP INDEX IF EXISTS entries_content;
+        DROP INDEX IF EXISTS entries_ref;
+        DROP INDEX IF EXISTS entries_head;
         """;
 }
 

@@ -527,6 +527,17 @@ public sealed class BackupCancelModesTests : IDisposable
             await inner.EnsureVersionAsync(account, container, version, identityTicks, password, ct);
         }
 
+        /// <summary>The run's pre-upload loop goes through this one now; it has to block on the same terms, or the
+        /// case would pass without the token ever being tested.</summary>
+        public async Task EnsureVersionsAsync(
+            Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
+            IProgress<int>? progress = null, CancellationToken ct = default)
+        {
+            Reading.TrySetResult();
+            await Task.Delay(Timeout.Infinite, ct);   // only the token can save it
+            await inner.EnsureVersionsAsync(account, container, versions, identityTicks, password, progress, ct);
+        }
+
         public Task<VersionCatalog> OpenAsync(
             int accountId, string container, bool readOnly, CancellationToken ct = default)
             => inner.OpenAsync(accountId, container, readOnly, ct);
