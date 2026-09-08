@@ -28,6 +28,26 @@ public sealed class VersionCatalogTests : IDisposable
 
     // ---- Test 1: the round trip that keeps the cloud format frozen -------------------------------------------
 
+
+    [Fact]
+    public async Task Import_reports_the_running_row_count_every_ten_thousand_rows()
+    {
+        var entries = new List<IndexEntry>();
+        for (var i = 0; i < 25_000; i++)
+            entries.Add(IndexSamples.Sample().Entries[0] with { Path = $"dir/{i:D6}.bin" });
+        var index = IndexSamples.Sample() with { Entries = entries };
+        var heard = new List<long>();
+
+        var dir = Path.Combine(Path.GetTempPath(), "asb-catalog-tests-" + Environment.ProcessId, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        await using var catalog = await VersionCatalog.OpenAsync(Path.Combine(dir, "catalog.db"), readOnly: false, CancellationToken.None);
+        using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index)));
+        await catalog.ImportVersionAsync(1, 1, reader, CancellationToken.None, heard.Add);
+
+        Assert.Equal([10_000, 20_000], heard);
+        Assert.Equal(25_000, (await catalog.GetVersionAsync(1, CancellationToken.None))!.EntryCount);
+    }
+
     [Fact]
     public async Task Import_then_serialize_is_byte_identical()
     {

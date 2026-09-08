@@ -74,7 +74,7 @@ public sealed class VersionCatalogs(
 
         using var held = await catalogs.LockForWriteAsync(account.Id, container, ct);
         await using var catalog = await catalogs.OpenForWriteAsync(held, account.Id, container, ct);
-        await ImportMissingAsync(catalog, account, container, version, identityTicks, password, ct);
+        await ImportMissingAsync(catalog, account, container, version, identityTicks, password, onEntries: null, ct);
     }
 
     /// <summary>Versions missing from the catalog at or above which <see cref="EnsureVersionsAsync"/> takes the
@@ -88,7 +88,7 @@ public sealed class VersionCatalogs(
 
     public async Task EnsureVersionsAsync(
         Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
-        IProgress<int>? progress = null, CancellationToken ct = default)
+        IProgress<VersionLoadProgress>? progress = null, CancellationToken ct = default)
     {
         // One read-only probe for the lot, on the same terms as EnsureVersionAsync's: a missing file and an
         // unreadable one are both "everything is missing", and the write open below is where the latter is fixed.
@@ -97,8 +97,12 @@ public sealed class VersionCatalogs(
         {
             await using var probe = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
             foreach (var version in versions)
-                if (await probe.GetVersionAsync(version.Version, ct) is not { } row || row.Identity != identityTicks)
+            {
+                if (await probe.GetVersionAsync(version.Version, ct) is { } row && row.Identity == identityTicks)
+                    progress?.Report(new VersionLoadProgress(version.Version, VersionLoadEvent.Present, 0));
+                else
                     missing.Add(version);
+            }
         }
         catch (FileNotFoundException)
         {
@@ -113,21 +117,8 @@ public sealed class VersionCatalogs(
             missing = [.. versions];
         }
 
-        progress?.Report(versions.Count - missing.Count);
         if (missing.Count == 0)
             return;
-
-        var done = versions.Count - missing.Count;
-        if (missing.Count < BulkImportThreshold)
-        {
-            foreach (var version in missing)
-            {
-                await EnsureVersionAsync(account, container, version, identityTicks, password, ct);
-                progress?.Report(++done);
-            }
-
-            return;
-        }
 
         using var held = await catalogs.LockForWriteAsync(account.Id, container, ct);
         await using var catalog = await catalogs.OpenForWriteAsync(held, account.Id, container, ct);
@@ -136,30 +127,38 @@ public sealed class VersionCatalogs(
         // behind this. Not rebuilt on the way out of a failure or a stop: the rebuild takes as long as the
         // history is big, and a stop pressed during a migration wants the run to end, not to sort three indexes
         // first. The next write open's schema pass rebuilds them; in between, queries are slower and still right.
-        await catalog.DropGlobalIndexesAsync(ct);
+        var bulk = missing.Count >= BulkImportThreshold;
+        if (bulk)
+            await catalog.DropGlobalIndexesAsync(ct);
         foreach (var version in missing)
         {
-            await ImportMissingAsync(catalog, account, container, version, identityTicks, password, ct);
-            progress?.Report(++done);
+            var imported = await ImportMissingAsync(catalog, account, container, version, identityTicks, password,
+                progress is null ? null : n => progress.Report(new VersionLoadProgress(version.Version, VersionLoadEvent.Importing, n)),
+                ct);
+            progress?.Report(imported is { } rows
+                ? new VersionLoadProgress(version.Version, VersionLoadEvent.Imported, rows)
+                : new VersionLoadProgress(version.Version, VersionLoadEvent.Present, 0));
         }
 
-        await catalog.RebuildGlobalIndexesAsync(ct);
+        if (bulk)
+            await catalog.RebuildGlobalIndexesAsync(ct);
     }
 
     /// <summary>The migration chain proper, on a catalog already open for writing under the container's lock:
     /// <c>.idx</c> file → legacy row → cloud. A version another caller imported while this one waited for the
-    /// lock is found by the first check and costs nothing further.</summary>
-    private async Task ImportMissingAsync(
+    /// lock is found by the first check and costs nothing further. Returns the imported version's row count, or
+    /// null when it was found already there.</summary>
+    private async Task<long?> ImportMissingAsync(
         VersionCatalog catalog, Account account, string container, BackupVersion version, long identityTicks,
-        string? password, CancellationToken ct)
+        string? password, Action<long>? onEntries, CancellationToken ct)
     {
         // Either the catalog always had it, or another caller imported it while this one waited for the lock.
         if (await catalog.GetVersionAsync(version.Version, ct) is { } again && again.Identity == identityTicks)
-            return;
+            return null;
 
         // 1. the .idx file an older build left behind
-        if (await TryImportFromIdxFileAsync(catalog, account.Id, container, version.Version, identityTicks, ct))
-            return;
+        if (await TryImportFromIdxFileAsync(catalog, account.Id, container, version.Version, identityTicks, onEntries, ct))
+            return await RowsOfAsync(catalog, version.Version, ct);
 
         // 2. the legacy row (pre-.idx, still in app.db)
         var legacy = await db.CachedVersionIndexes.AsNoTracking().FirstOrDefaultAsync(
@@ -169,14 +168,14 @@ public sealed class VersionCatalogs(
             if (legacy.IdentityTicks == identityTicks)
             {
                 using var reader = new IndexStreamReader(new MemoryStream(legacy.Bytes));
-                await catalog.ImportVersionAsync(version.Version, identityTicks, reader, ct);
+                await catalog.ImportVersionAsync(version.Version, identityTicks, reader, ct, onEntries);
             }
 
             // Dropped either way: a row under a superseded identity is dead weight once the catalog is about to go
             // to the cloud for the current one regardless.
             await db.CachedVersionIndexes.Where(x => x.Id == legacy.Id).ExecuteDeleteAsync(ct);
             if (legacy.IdentityTicks == identityTicks)
-                return;
+                return await RowsOfAsync(catalog, version.Version, ct);
         }
 
         // 3. the cloud — the source of truth every other branch above exists only to avoid re-downloading from.
@@ -191,13 +190,20 @@ public sealed class VersionCatalogs(
             await store.ReadIndexToFileAsync(account, container, version.IndexBlob, password, version.IndexVolumes, temp, ct);
             await using var file = File.OpenRead(temp);
             using var reader = new IndexStreamReader(file);
-            await catalog.ImportVersionAsync(version.Version, identityTicks, reader, ct);
+            await catalog.ImportVersionAsync(version.Version, identityTicks, reader, ct, onEntries);
         }
         finally
         {
             try { Directory.Delete(work, recursive: true); } catch { /* temp space; nothing further to do about a failed cleanup */ }
         }
+
+        return await RowsOfAsync(catalog, version.Version, ct);
     }
+
+    /// <summary>The row count the import just committed, read back rather than threaded out of three import
+    /// paths: it is one indexed lookup, and the version row is the one place the number is authoritative.</summary>
+    private static async Task<long> RowsOfAsync(VersionCatalog catalog, int version, CancellationToken ct) =>
+        (await catalog.GetVersionAsync(version, ct))?.EntryCount ?? 0;
 
     /// <summary>Tries the version's cached <c>.idx</c> file. Returns false (leaving the file untouched) when there is
     /// no file, or its identity does not match — a file under a superseded identity is a plain miss, and clearing it
@@ -207,7 +213,8 @@ public sealed class VersionCatalogs(
     /// bad file itself would keep failing forever if left in place — so that case, and only that case, deletes it
     /// before falling through.</summary>
     private async Task<bool> TryImportFromIdxFileAsync(
-        VersionCatalog catalog, int accountId, string container, int version, long identityTicks, CancellationToken ct)
+        VersionCatalog catalog, int accountId, string container, int version, long identityTicks, Action<long>? onEntries,
+        CancellationToken ct)
     {
         if (await legacyFiles.OpenBodyAsync(accountId, container, version, identityTicks, ct) is not { } body)
             return false;
@@ -216,7 +223,7 @@ public sealed class VersionCatalogs(
         {
             await using (body)
             using (var reader = new IndexStreamReader(body))
-                await catalog.ImportVersionAsync(version, identityTicks, reader, ct);
+                await catalog.ImportVersionAsync(version, identityTicks, reader, ct, onEntries);
         }
         catch (Exception ex) when (ex is EndOfStreamException or IOException or InvalidDataException)
         {

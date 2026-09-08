@@ -263,9 +263,8 @@ public sealed class VersionCatalogsMigrationTests
             versions.Add(Version(v));
         }
 
-        var reported = new List<int>();
-        // Progress<T> posts to the thread pool; the inline one keeps the assertions in-line.
-        var progress = new InlineProgress<int>(reported.Add);
+        var reported = new List<VersionLoadProgress>();
+        var progress = new InlineProgress<VersionLoadProgress>(reported.Add);
         await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, progress, CancellationToken.None);
 
         await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
@@ -277,8 +276,11 @@ public sealed class VersionCatalogsMigrationTests
 
         // Three or more missing is the bulk path, and the bulk path is only correct if it rebuilds what it dropped.
         Assert.Equal(CatalogSql.GlobalIndexNames.Count, await catalog.GlobalIndexCountAsync(CancellationToken.None));
-        Assert.Equal(3, reported[^1]);
-        Assert.Equal(reported.OrderBy(x => x), reported);   // never goes backwards
+        // Every version ends with an Imported event carrying its row count, in the order asked.
+        var ends = reported.Where(r => r.Event == VersionLoadEvent.Imported).ToList();
+        Assert.Equal([1, 2, 3], ends.Select(r => r.Version));
+        Assert.All(ends, r => Assert.Equal(sample.Entries.Count, r.Entries));
+        Assert.DoesNotContain(reported, r => r.Event == VersionLoadEvent.Present);
         await infoStore.DidNotReceive().ReadIndexToFileAsync(
             Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
             Arg.Any<CancellationToken>());
@@ -297,10 +299,11 @@ public sealed class VersionCatalogsMigrationTests
             await TestIndexFiles.WriteAsync(files, AccountId, Container, v.Version, Identity, bytes, CancellationToken.None);
         await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, null, CancellationToken.None);
 
-        var reported = new List<int>();
-        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, new InlineProgress<int>(reported.Add), CancellationToken.None);
+        var reported = new List<VersionLoadProgress>();
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, new InlineProgress<VersionLoadProgress>(reported.Add), CancellationToken.None);
 
-        Assert.Equal([2], reported);
+        Assert.Equal([1, 2], reported.Select(r => r.Version));
+        Assert.All(reported, r => Assert.Equal(VersionLoadEvent.Present, r.Event));
     }
 
     /// <summary>A migration that dies halfway (here: the second version has no source left anywhere) must not leave

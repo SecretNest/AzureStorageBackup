@@ -33,12 +33,13 @@ public interface IVersionCatalogs
     /// go. Same guarantee per version, one read-only probe for all of them — and when two or more are missing
     /// (a container whose catalog has yet to be built), the content-keyed indexes come down for the duration and
     /// are rebuilt once at the end, which is what turns a migration from a random page read per row into one sort
-    /// per index; see <c>CatalogSql.GlobalIndexNames</c>. <paramref name="progress"/> receives the number of
-    /// versions settled so far, out of <paramref name="versions"/>'s count, hits included.
+    /// per index; see <c>CatalogSql.GlobalIndexNames</c>. <paramref name="progress"/> receives one
+    /// <see cref="VersionLoadProgress"/> per event, synchronously on the calling thread: a hit, an import's
+    /// periodic entry count, an import's end.
     /// </summary>
     Task EnsureVersionsAsync(
         Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
-        IProgress<int>? progress = null, CancellationToken ct = default);
+        IProgress<VersionLoadProgress>? progress = null, CancellationToken ct = default);
 
     /// <summary>Drops one version from the catalog and every older home it might still occupy (the retention policy
     /// retiring it).</summary>
@@ -84,3 +85,20 @@ public interface IVersionCatalogs
     /// for what it protects and which calls must never be made while holding it.</summary>
     Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default);
 }
+
+/// <summary>What happened to one version during <see cref="IVersionCatalogs.EnsureVersionsAsync"/>.</summary>
+public enum VersionLoadEvent
+{
+    /// <summary>The version was already in the catalog; nothing was read.</summary>
+    Present,
+    /// <summary>An import is under way and has inserted <see cref="VersionLoadProgress.Entries"/> rows so far.
+    /// Raised every few thousand rows, so a stage line can move within a version rather than only between them —
+    /// versions differ in size by orders of magnitude, and a remaining-time estimate extrapolated from version
+    /// counts alone says nothing.</summary>
+    Importing,
+    /// <summary>The import committed; <see cref="VersionLoadProgress.Entries"/> is its final row count.</summary>
+    Imported,
+}
+
+/// <summary>One reading from <see cref="IVersionCatalogs.EnsureVersionsAsync"/>.</summary>
+public readonly record struct VersionLoadProgress(int Version, VersionLoadEvent Event, long Entries);

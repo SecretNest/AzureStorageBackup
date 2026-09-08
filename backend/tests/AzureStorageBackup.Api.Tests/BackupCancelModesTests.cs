@@ -531,7 +531,7 @@ public sealed class BackupCancelModesTests : IDisposable
         /// case would pass without the token ever being tested.</summary>
         public async Task EnsureVersionsAsync(
             Account account, string container, IReadOnlyList<BackupVersion> versions, long identityTicks, string? password,
-            IProgress<int>? progress = null, CancellationToken ct = default)
+            IProgress<VersionLoadProgress>? progress = null, CancellationToken ct = default)
         {
             Reading.TrySetResult();
             await Task.Delay(Timeout.Infinite, ct);   // only the token can save it

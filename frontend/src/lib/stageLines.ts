@@ -458,7 +458,18 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
             : detail.workDone > 0 &&
               `${formatBytes(detail.workDone)} ${detail.stage === 'Verifying' ? 'verified' : 'restored'}`,
         ]
-      : [
+      : detail.stage === 'LoadingVersions'
+        ? [
+            // The version-loading pass declares its workload in **entries** (index rows), not bytes: an import's
+            // cost is per row, and versions differ in rows by orders of magnitude, so the row fraction is what the
+            // percentage and the remaining time are computed from. Formatting it as bytes would print "1.2 MB /
+            // 5.0 MB original" over a stage that moves no bytes at all.
+            detail.workTotal > 0 &&
+              `${detail.workDone.toLocaleString()} / ${detail.workTotal.toLocaleString()} entries${
+                detail.workPercent != null ? ` (${detail.workPercent}%)` : ''
+              }`,
+          ]
+        : [
           // Completed and total **source** bytes, pre-compression. A fraction only means something when
           // both sides share a basis — using transferred bytes as the numerator does not work: the
           // denominator (the compressed total) does not exist until compression has run, and the ratio
