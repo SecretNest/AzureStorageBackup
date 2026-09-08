@@ -251,8 +251,23 @@ public sealed partial class RunWorkDb : IAsyncDisposable
     /// invisible to every reader until the next stage happens to push the count over the limit.</summary>
     private const int BatchMilliseconds = 200;
 
-    private readonly Channel<WriteOp> _channel = Channel.CreateUnbounded<WriteOp>(
-        new UnboundedChannelOptions { SingleReader = true });
+    /// <summary>
+    /// The queue depth between the producers (the scan, the differ, the pipeline stages) and the single writer
+    /// below. Bounded, because this is the one structure in a run whose size follows the file count rather than
+    /// anything the run controls: on a disk slower than the scan, closures queue faster than SQLite commits them
+    /// and the backlog is memory nobody budgeted for. 16k operations is far more than a 2000-statement batch needs
+    /// to stay fed — the writer never runs dry in practice — and <see cref="BoundedChannelFullMode.Wait"/> turns the
+    /// overflow into the only sane thing: the producer waits for the disk, which is exactly what it should do.
+    /// <para>
+    /// It cannot deadlock. The pump never awaits a producer — it only reads — and a fault does not strand anyone
+    /// either: <see cref="DrainFaultedAsync"/> keeps consuming after the fault is recorded, so a producer blocked on
+    /// a full channel is woken by the drain and its own <see cref="FlushAsync"/> is what reports the failure.
+    /// </para>
+    /// </summary>
+    private const int WriteQueueDepth = 16_384;
+
+    private readonly Channel<WriteOp> _channel = Channel.CreateBounded<WriteOp>(
+        new BoundedChannelOptions(WriteQueueDepth) { SingleReader = true, FullMode = BoundedChannelFullMode.Wait });
 
     private readonly Task _writer;
 
