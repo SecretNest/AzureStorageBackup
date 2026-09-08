@@ -362,6 +362,9 @@ public static class VolumeBlobIO
     /// landed — the backup's in-hand accounting (<c>PauseGate.BeginWork</c>). Counted per volume, not per family,
     /// for the reason given there: once the hold is up, what is still moving is a handful of volumes and not the
     /// file, and "pausing" has to end when they land.</param>
+    /// <param name="inMemoryLimitBytes">The calling task's per-stream share of the global upload memory limit
+    /// (<see cref="UploadMemoryBudget.PerStream"/>), handed to the uploader with every volume: a volume that fits
+    /// is labelled from memory, a bigger one two-pass. Null = the uploader's own fallback.</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -371,7 +374,8 @@ public static class VolumeBlobIO
         Func<string, string, Task<bool>>? cloudBytesVerify = null,
         Func<CancellationToken, Task>? beforeVolume = null,
         Func<bool>? volumeHeld = null,
-        Func<IDisposable?>? volumeWork = null)
+        Func<IDisposable?>? volumeWork = null,
+        long? inMemoryLimitBytes = null)
     {
         // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
         // volumes, and showing only the path would repeat the same line thousands of times with no sign of
@@ -419,8 +423,8 @@ public static class VolumeBlobIO
                     await uploader.DeleteIfExistsAsync(account, container, name, ct);
                 }
                 await (exists
-                    ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p)
-                    : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p));
+                    ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p, inMemoryLimitBytes)
+                    : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p, inMemoryLimitBytes));
             }
             if (scope is null)
             {
@@ -515,7 +519,8 @@ public static class VolumeBlobIO
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
         Action<string>? onVolumeUploaded = null, string? label = null,
-        Func<CancellationToken, Task>? beforeVolume = null)
+        Func<CancellationToken, Task>? beforeVolume = null,
+        long? inMemoryLimitBytes = null)
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
@@ -527,7 +532,8 @@ public static class VolumeBlobIO
             uploader, account, container.Name, baseRef, volumeFiles, tier, retry, ct, metadata,
             scope, onVolumeUploaded, label, existing,
             cloudBytesVerify: (name, expected) => CloudBytesMatchAsync(container, name, expected, ct),
-            beforeVolume: beforeVolume);
+            beforeVolume: beforeVolume,
+            inMemoryLimitBytes: inMemoryLimitBytes);
 
         // Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
         // one, or the old naming after a single↔multi switch).

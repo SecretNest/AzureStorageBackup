@@ -1085,4 +1085,53 @@ public sealed class VolumeBlobIOTests
         }
         finally { await cc.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>Records the per-stream memory share each upload was given — the run computes it once, and every
+    /// volume of every family must carry it to the uploader, or the cap is a number nobody reads.</summary>
+    private sealed class ShareRecordingUploader : IBlobUploader
+    {
+        public List<long?> Shares { get; } = [];
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new InvalidOperationException("the share-carrying overload must be the one called");
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
+            IReadOnlyDictionary<string, string>? metadata = null)
+            => throw new InvalidOperationException("the share-carrying overload must be the one called");
+
+        public Task<bool> UploadIfMissingAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        {
+            lock (Shares) Shares.Add(inMemoryLimitBytes);
+            return Task.FromResult(true);
+        }
+
+        public Task UploadOverwriteAsync(
+            Account account, string container, string blobName, string filePath,
+            AccessTier tier, RetryOptions? retry, CancellationToken ct,
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        {
+            lock (Shares) Shares.Add(inMemoryLimitBytes);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task Every_Volume_Carries_The_Runs_Per_Stream_Memory_Share_To_The_Uploader()
+    {
+        var up = new ShareRecordingUploader();
+
+        await VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002"], AccessTier.Hot,
+            inMemoryLimitBytes: 7 * 1024 * 1024);
+
+        Assert.Equal([7L * 1024 * 1024, 7L * 1024 * 1024], up.Shares);
+    }
 }

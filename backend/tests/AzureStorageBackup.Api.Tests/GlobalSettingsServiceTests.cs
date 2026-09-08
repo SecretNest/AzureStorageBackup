@@ -100,4 +100,24 @@ public sealed class GlobalSettingsServiceTests : IDisposable
         // is a small matter, wedging the machine is not — so the default branch has to fall to the lowest, not to Normal.
         Assert.Equal(ProcessPriorityClass.Idle, ((SevenZipCpuPriority)99).ToProcessPriorityClass());
     }
+
+    [Fact]
+    public async Task Upsert_Persists_UploadMemoryLimitBytes_Including_Zero()
+    {
+        var s = await _sut.GetAsync();
+        s.UploadMemoryLimitBytes = 0; // 0 is a real value: never hold a volume in memory
+        await _sut.UpsertAsync(s);
+        Assert.Equal(0, (await _sut.GetAsync()).UploadMemoryLimitBytes);
+
+        s = await _sut.GetAsync();
+        s.UploadMemoryLimitBytes = 3L * 1024 * 1024 * 1024;
+        await _sut.UpsertAsync(s);
+        Assert.Equal(3L * 1024 * 1024 * 1024, (await _sut.GetAsync()).UploadMemoryLimitBytes);
+    }
+
+    [Fact]
+    public async Task GetAsync_Defaults_UploadMemoryLimitBytes_To_One_GB()
+    {
+        Assert.Equal(1024L * 1024 * 1024, (await _sut.GetAsync()).UploadMemoryLimitBytes);
+    }
 }

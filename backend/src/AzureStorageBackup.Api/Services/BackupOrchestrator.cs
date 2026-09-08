@@ -24,6 +24,10 @@ public sealed record BackupEngineOptions
     /// <summary>Upload concurrency cap (PRD 3.4, default 5). Compression stays globally serial; only uploads run in parallel.</summary>
     public int UploadConcurrency { get; init; } = 5;
 
+    /// <summary>The global cap on memory spent holding volumes for labelled uploads, which this run splits across
+    /// its own upload streams (<see cref="UploadMemoryBudget"/>). 0 = never hold a volume in memory.</summary>
+    public long UploadMemoryLimitBytes { get; init; } = 1024L * 1024 * 1024;
+
     /// <summary>Network retry/backoff policy for uploads (PRD 4.1).</summary>
     public RetryOptions Upload { get; init; } = new();
 
@@ -983,7 +987,7 @@ public sealed class BackupOrchestrator(
         // The uploader count stays UploadConcurrency + 1: the extra consumer is what keeps the volume gate's
         // hand-off from stalling at item boundaries (see VolumeBlobIO), and that reasoning is untouched by the split.
         // The prober and the compressor are one each, for the reasons on the two channels below.
-        var uploaders = Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+        var uploaders = UploaderCount(opts);
         // How many of them are still alive. The trigger for "the upload side is gone" is the **last** one leaving,
         // not the first one faulting: one uploader dying of a permanently refused blob is an ordinary failure, and
         // the run's remaining work still gets compressed, uploaded and journalled by its siblings — that is how it
@@ -2228,6 +2232,7 @@ public sealed class BackupOrchestrator(
                     DeadWeightThreshold = request.Options.DeadWeightThreshold,
                     LocalRoot = request.LocalRoot,
                     AllowRepackDownload = request.Options.AllowRepackDownload,
+                    UploadMemoryLimitBytes = request.Options.UploadMemoryLimitBytes,
                     // The compaction tacked onto the wrap-up uses **this run's own** seat: taking a separate one
                     // would inflate the denominator of the even split and shrink the quota of other backups running
                     // in parallel.
@@ -3061,6 +3066,16 @@ public sealed class BackupOrchestrator(
     /// the hash is only known once compression finishes — this name lives for a few seconds in the temp area and its
     /// only requirement is not colliding at the same instant (compression is globally serial and the lock is only
     /// released after the output has been moved out).</summary>
+    /// <summary>How many uploaders a run with these options starts: UploadConcurrency + 1 (the extra one keeps the
+    /// volume gate's hand-off from stalling at item boundaries, see the pipeline), never fewer than two. One rule
+    /// for the pipeline that starts them and the memory share that is divided among them.</summary>
+    private static int UploaderCount(BackupEngineOptions opts) => Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
+
+    /// <summary>This run's per-stream share of the global upload memory limit (<see cref="UploadMemoryBudget"/>):
+    /// the most of a volume one of its uploaders may hold in memory to label it.</summary>
+    private static long PerStreamMemory(BackupRequest request) =>
+        UploadMemoryBudget.PerStream(request.Options.UploadMemoryLimitBytes, UploaderCount(request.Options));
+
     private static string StagedName(string entryPath) =>
         "b" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
             System.Text.Encoding.UTF8.GetBytes(entryPath))).ToLowerInvariant()[..16];
@@ -3157,7 +3172,8 @@ public sealed class BackupOrchestrator(
                     existingVolumes: existingVolumes,
                     beforeVolume: ParkOf(control),
                     volumeHeld: HeldOf(control),
-                    volumeWork: WorkOf(control));
+                    volumeWork: WorkOf(control),
+                    inMemoryLimitBytes: PerStreamMemory(request));
 
             // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
             // half of that pair has moved since, the bytes just written under this content address are not
@@ -4087,7 +4103,8 @@ public sealed class BackupOrchestrator(
                     existingVolumes: existingVolumes,
                     beforeVolume: ParkOf(control),
                     volumeHeld: HeldOf(control),
-                    volumeWork: WorkOf(control));
+                    volumeWork: WorkOf(control),
+                    inMemoryLimitBytes: PerStreamMemory(request));
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
             if (existingVolumes is not null)

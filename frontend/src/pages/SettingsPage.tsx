@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { settingsApi, sevenZipPriorityLabels, type GlobalSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
 import { Field } from '../components/Field'
+import { uploadMemoryNotice } from '../lib/uploadMemoryNotice'
 import { AccountsSection } from './AccountsPage'
 import { NotificationsSection } from './NotificationsPage'
 import { AboutSection } from './AboutPage'
@@ -260,6 +261,27 @@ function PerformanceOptions({ settings }: { settings: SettingsState }) {
         extra one is what keeps a split archive's volumes from stalling at the hand-off. The staging
         area below is the setting that <em>is</em> shared: its allowance is split evenly across the
         runs in flight.
+      </p>
+      <Field label="Upload memory limit (MB, 0=never hold in memory)">
+        <Num value={Math.round(s.uploadMemoryLimitBytes / MB)} onChange={(v) => set('uploadMemoryLimitBytes', Math.max(0, v) * MB)} />
+      </Field>
+      {/* The number the operator typed is not the number the engine uses: it is split per stream, floored, and
+          compared against the volume size. Spell out the effective reading so a setting that silently turned every
+          volume two-pass, or that never bites because the floor took over, is visible right here. */}
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        Before a volume is uploaded it is hashed, and the cheapest way to make that hash describe exactly the
+        bytes sent is to read the volume once into memory and upload from there. This caps the memory that
+        costs. It is spent <strong>per operation</strong>: every backup, repair or compaction gets this much,
+        split evenly across its own upload streams. A volume that fits its stream&apos;s share is sent from
+        memory; a bigger one is hashed from disk first and then read a second time for the send, so it costs
+        an extra read but is labelled all the same. <strong>0</strong> means never hold a volume in memory:
+        every volume takes the two-read route. Any non-zero limit grants each stream at least{' '}
+        <strong>80 KB</strong>, however many streams there are: below one read chunk the memory route would
+        hold less than the disk route&apos;s own buffer, so a limit that small still buffers 80 KB rather than
+        turning every tiny blob two-pass.
+      </p>
+      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+        {uploadMemoryNotice(s.uploadMemoryLimitBytes, s.uploadConcurrency, s.defaultVolumeBytes)}
       </p>
       <Field label="Check HEAD concurrency">
         <Num value={s.checkHeadConcurrency} onChange={(v) => set('checkHeadConcurrency', v)} />

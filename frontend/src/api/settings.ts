@@ -33,6 +33,7 @@ export interface GlobalSettings {
   defaultDontGroupRules: string | null
   defaultCrossDirGroupRules: string | null
   uploadConcurrency: number
+  uploadMemoryLimitBytes: number
   downloadConcurrency: number
   checkHeadConcurrency: number
   logEphemeralMaxAgeDays: number

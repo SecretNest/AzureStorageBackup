@@ -16,17 +16,32 @@ We use our own xxh128, not Content-MD5 — this project has no MD5 anywhere and 
 
 ## Writing the label
 
-A volume is compressed to disk first, so at upload time it is read **once into memory**: the same
-bytes feed the hash and the upload (no second disk read, no page-cache gamble). Memory bound:
-volume size × upload concurrency — ~600 MB at the defaults, acceptable because the ceiling is
-explicit. `BlobUploader.LabelMemoryLimit` (256 MB, clearing the default 100 MB volume with headroom)
-is the cut-off: a file past it streams exactly as before and goes **unlabelled** — never a wrong
-label, never an unbounded buffer. The consequence is a known limitation, not a degraded mode: with
-`VolumeBytes` set to GB-scale, the skip machinery is simply **off** for those volumes — the missing
-label reads as "different" on every later comparison and the family re-uploads in full. The one
-exception is a caller that already holds the bytes' hash — the raw route uploads the source file
-whose FullHash the backup computed in the same format — whose label is used verbatim: no buffering,
-no recompute, any size.
+A volume is compressed to disk first, so at upload time the uploader has two ways to label it, and a
+global setting decides which (**Settings → Performance → Upload memory limit**, default 1 GB):
+
+- **In memory.** The file is read once into memory; the same bytes feed the hash and the upload,
+  so the label can never describe anything but what went over the wire, and the disk is read once.
+  This costs one volume's worth of RAM per upload stream, and both factors are user-set — volume
+  size × upload streams is what the setting caps.
+- **Two-pass.** The file is hashed from disk, then re-read from disk for the send. One extra read,
+  never a missing label. The file is one this process wrote into staged-temp and closed, so the two
+  reads see the same bytes; a length+mtime bracket around the two passes turns that into a check
+  (same principle as the raw route's stat-bracket), and a file that moved between them has its blob
+  taken back and the upload fails non-transiently rather than leaving a label that lies.
+
+The setting is spent **per task**, like the concurrency it multiplies: every backup, repair and
+compaction splits the limit evenly across its own upload streams (`UploadMemoryBudget.PerStream`;
+a backup runs `UploadConcurrency + 1` streams, a repair `UploadConcurrency`, compaction one), and
+each volume carries its stream's share to the uploader. A volume that fits the share goes in
+memory, a bigger one two-pass. Two tasks running at once each get the full limit. **0** means no
+volume is ever held in memory; any non-zero limit grants a stream at least 80 KB (one read chunk —
+below that, the memory route would hold less than the streaming path's own buffer). Before this
+setting existed the cut-off was a fixed 256 MB and a volume past it went up **unlabelled**, which
+switched the skip machinery off for GB-scale volumes; the two-pass route retires that limitation.
+
+The one exception is a caller that already holds the bytes' hash — the raw route uploads the source
+file whose FullHash the backup computed in the same format — whose label is used verbatim: no
+buffering, no recompute, any size.
 
 ## The one comparison rule, and where the burden of proof sits
 

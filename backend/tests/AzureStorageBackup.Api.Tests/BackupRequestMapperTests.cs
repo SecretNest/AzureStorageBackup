@@ -86,4 +86,16 @@ public sealed class BackupRequestMapperTests
 
         Assert.True(request.Options.Scan.Scope.IsAll);
     }
+
+    [Fact]
+    public void Maps_Upload_Memory_Limit_From_Settings()
+    {
+        var settings = new GlobalSettings { UploadMemoryLimitBytes = 0 };
+        var request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
+        Assert.Equal(0, request.Options.UploadMemoryLimitBytes);
+
+        settings = new GlobalSettings { UploadMemoryLimitBytes = 512L * 1024 * 1024 };
+        request = BackupRequestMapper.From(Config(), Account(), password: null, settings);
+        Assert.Equal(512L * 1024 * 1024, request.Options.UploadMemoryLimitBytes);
+    }
 }
