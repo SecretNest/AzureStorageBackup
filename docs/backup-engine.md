@@ -103,7 +103,10 @@ Three details are load-bearing:
   unreferenced blob, which the orphan sweep collects later.
 - **Volume families are deleted as a unit.** `data/{hash}.NNN` is normalised back to the base name
   when comparing references, and packs are grouped by pack id over the `packs/` prefix, so a
-  referenced volume is never deleted by mistake.
+  referenced volume is never deleted by mistake. The protected set is built from every distinct
+  volume count a reference is recorded under, not the largest: a one-volume family occupies the bare
+  `data/{hash}` and a three-volume one occupies `.001`–`.003`, so the two name sets are disjoint, and
+  collapsing them onto the larger would leave a live bare name unprotected.
 - **The journal set is part of the criterion, not a separate pass.** There is no "look up a journal
   and delete what it references" operation; discarding or voiding a journal only removes it from the
   active set, after which an ordinary cleanup runs.

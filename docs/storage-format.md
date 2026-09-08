@@ -195,6 +195,15 @@ local state is authoritative during normal operation.
 
 ### The catalog
 
+Version indexes are queried, never resident. The catalog exists because they used to be deserialised
+whole into a process-wide cache: two indexes resident at a time, the dictionaries a run built out of
+them, the scan's list and the new version's entries — every one of them a structure whose size is the
+file count. At several million files that came to gigabytes, and an idle process never collects, so a
+container that had finished or suspended a backup hours earlier was still holding all of it. Every
+question those structures answered is an indexed lookup here, and what a run holds in memory is
+bounded by the pipeline's width rather than by the size of the backup — see
+[operations.md](operations.md) § *Memory* for what that costs and what it now measures.
+
 One SQLite file per (account, container), in WAL mode, opened directly through
 `Microsoft.Data.Sqlite` with pooling off and entirely separate from `app.db` — no EF context, no
 migrations. It holds:

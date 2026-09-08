@@ -22,6 +22,10 @@ A backup issues **no cloud read** to decide what changed, what already exists, o
 anything. The local SQLite cache holds a copy of the info file and every version index, and dedup,
 collision avoidance and volume counts are all decided from it.
 
+That authority is **queryable rather than resident**: the indexes live in a per-container SQLite
+catalog and are answered a row at a time, so being authoritative costs no memory proportional to the
+size of the backup ([storage-format.md](storage-format.md)).
+
 > **Rationale.** Data can sit in Cold or Archive, where reads cost money and Archive reads require
 > rehydration first. A design that asks the cloud "does this blob exist?" once per file turns a
 > routine incremental backup into a bill. Import pulls everything into the local store, so "no local

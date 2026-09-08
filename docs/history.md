@@ -61,7 +61,7 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-07 | A pause that takes effect within a volume rather than a file, reaches the pack loop's every group and the wrap-up, and reads "Pausing…" until it has taken effect | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
 | 09-07 | The prober's hand-off into a full probed queue steps out of the pause accounting: "Pausing…" no longer stands for good when the pool is full and the compressor is waiting for room | [run-lifecycle.md](run-lifecycle.md) |
 | 09-07 | A pause stops the file under 7z where it is (SIGSTOP/SIGCONT) instead of waiting for it, and the time a run stands paused comes off the remaining-time estimate's clock | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
-| 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md) |
+| 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md), [operations.md](operations.md) |
 
 ### The index catalog (2026.9.8)
 
@@ -95,8 +95,11 @@ What an operator needs to know:
   collection at the end of every run, so a machine that has just finished a backup gets the memory
   back instead of seeing the high-water mark until the next one.
 
-The measurement method and the numbers are in
-[superpowers/plans/2026-09-07-sqlite-index-catalog-benchmark.md](superpowers/plans/2026-09-07-sqlite-index-catalog-benchmark.md).
+Measured over a 200,000-file run: peak managed heap fell from 550.0 MB to 94.3 MB, and the heap the
+run genuinely holds — read after a forced collection — to 47.0 MB, while the working set left behind
+after the run rose from 191.4 MB to about 380 MB, live managed data traded for native residue, with
+no change in how long the run took. [operations.md](operations.md) § *Memory* has the whole table,
+the remaining ~150 bytes per file, and the budget to watch.
 
 ## Working conventions
 

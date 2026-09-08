@@ -444,6 +444,13 @@ ends, **Suspended included**. The journal is the only thing a resume reads back 
 of what is already in the cloud but not yet in any index, and it lives beside `app.db` precisely so
 that it survives what `/temp` does not.
 
+**A journal outlives the build that wrote it.** Its format, the directory it lives in and the order
+its records are written in are held stable across releases, so a run suspended by one build is
+resumed by the next — and commits the index the interrupted run would have committed, in the same
+entry order, referencing the objects it had already uploaded. What keeps that true is a fixture
+recorded on the previous release and replayed to completion by the suite. [history.md](history.md)
+records what the move to the index catalog had to leave untouched to pass it.
+
 All three tiers — and cross-version dedup behind them — refuse a hit whose ref is damage-marked
 (`IsDamagedRef`): a resume must not adopt a reference to a blob a check condemned, so the item falls
 through to the ordinary compress-and-upload, which heals the family in passing
