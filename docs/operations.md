@@ -376,6 +376,20 @@ nothing for it.
 > number is not a failed call, it is a *different* call. Neither level needs privileges: lowering your
 > own priority is always allowed, and `IOPRIO_CLASS_IDLE` dropped its privilege requirement in 2.6.25.
 
+## Temp space
+
+`Backup__TempPath` is where everything a run stages lands: the compression intermediates and staged
+volumes, the 7z codec's extraction directories, the index staging the info store and the catalogs'
+cloud import share, and the per-run work databases. Everything under it is scratch — a normal finish
+deletes its own, and startup sweeps whatever a killed process left.
+
+The part that scales with the backup is the run's work database, at **roughly 500 bytes per scanned
+file**. Budget **about twice that while a run is in flight**: the diff reads the scan through a
+cursor, and that cursor pins a read snapshot for as long as it is open, so SQLite cannot restart the
+write-ahead log underneath it. Every draft row the diff writes therefore accumulates in `-wal`
+alongside the scan rows already in the file, and the pair only collapses back to one copy when the
+diff's cursor closes. Both go when the run ends, whichever way it ends.
+
 ## Memory
 
 A run's memory is bounded by the pipeline's width rather than by the size of the backup: version
@@ -393,18 +407,31 @@ suite runs only under `ASB_BENCH=1`). Two runs at each size, shown as *first / s
 | 100,000 | 385.6 / 371.7 MB | 47.5 / 38.9 MB | 32.5 / 32.7 MB | 308.1 / 306.1 MB |
 | 200,000 | 478.4 / 479.6 MB | 94.3 / 58.2 MB | 47.0 / 47.5 MB | 378.9 / 389.4 MB |
 
+…and again after the work database's write channel was bounded (one run at each size):
+
+| Files in the run | Peak working set | Peak managed heap | Live heap (forced collection) | Working set after the run |
+|---|---|---|---|---|
+| 100,000 | 375 MB | 39 MB | 32 MB | 288 MB |
+| 200,000 | 501 MB | 92 MB | 39 MB | 379 MB |
+
 **The two heap columns answer different questions.** *Peak managed heap* is whatever the heap
 happened to measure, garbage the collector had not got to included. *Live heap* is read immediately
 after a full blocking collection, so it is what the run is genuinely **holding** — and it is the
 column any claim about scaling has to be judged on. It is sampled every ten seconds rather than
 continuously, so it catches the peak only approximately: differences of a few MB between rows are
-the instrument, not the build. It still rises with the file count: about
-**14.5 MB per additional 100,000 files**, or roughly **150 bytes per file** once the process's ~18 MB
-fixed floor is subtracted. The likeliest remaining home for that is the work database's write
-channel, which is unbounded: every row the scan and the diff produce is handed to a single writer
-task as a closure, so a backlog is per-file live data at exactly the moment of peak. That is a
-hypothesis and nothing more — bounding the channel and re-measuring is the experiment that would
-settle it, and it has not been run.
+the instrument, not the build. It still rises with the file count, and the write channel turned out
+to be about half of it. On the unbounded channel the live heap grew **14.5 MB per additional 100,000
+files** — roughly **150 bytes per file** once the process's ~18 MB fixed floor is subtracted. With
+the channel bounded at 16k operations the same measurement gives **7 MB per additional 100,000
+files**, about **70 bytes per file**: the backlog of queued write closures was real per-file live
+data at the moment of peak, and capping it removed roughly half the residue. What is left is
+someone else's, and unattributed. Read the difference for what it is — one run at each size against
+a sampler that fires every ten seconds, so a few MB either way is the instrument; the direction and
+the halved slope are the finding, not the third decimal. Post-run heap and post-run working set
+landed inside the spread of the earlier pairs. Peak working set at 200,000 files did not: 501 MB
+against 478.4 / 479.6 MB before. Peak working set is the noisiest column here (it counts whatever
+the allocator had not returned yet, and the 100,000-file row moved the other way), but it is the one
+the 400 MB post-run budget's headroom is judged from, so it is worth a second look if it stays high.
 
 **Nothing survives the run.** Post-run managed heap sits at 18–21 MB regardless of file count, so
 whatever holds the per-file share at peak is transient. The working set after a run is higher than

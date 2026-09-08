@@ -90,16 +90,20 @@ What an operator needs to know:
 - **`Backup__IndexCacheSize` is retired.** It sized the in-memory index cache, which no longer
   exists. If it is still set, one startup log line says it is ignored.
 - **`/temp` needs a little more room**: roughly 500 bytes per scanned file for the run's work
-  database, released when the run ends.
+  database — and about **twice that while the run is in flight**, because the diff holds a cursor
+  over the scan and that cursor pins a read snapshot, so the draft rows written beside it pile up in
+  the write-ahead log instead of being folded back into the file. All of it is released when the run
+  ends. [operations.md](operations.md) § *Temp space*.
 - The process runs workstation GC rather than server GC, and does one compacting, decommitting
   collection at the end of every run, so a machine that has just finished a backup gets the memory
   back instead of seeing the high-water mark until the next one.
 
 Measured over a 200,000-file run: peak managed heap fell from 550.0 MB to 94.3 MB, and the heap the
-run genuinely holds — read after a forced collection — to 47.0 MB, while the working set left behind
-after the run rose from 191.4 MB to about 380 MB, live managed data traded for native residue, with
-no change in how long the run took. [operations.md](operations.md) § *Memory* has the whole table,
-the remaining ~150 bytes per file, and the budget to watch.
+run genuinely holds — read after a forced collection — to 47.0 MB, and then to 39 MB once the work
+database's write queue was bounded, while the working set left behind after the run rose from
+191.4 MB to about 380 MB, live managed data traded for native residue, with no change in how long
+the run took. [operations.md](operations.md) § *Memory* has both tables, the remaining ~70 bytes per
+file, and the budget to watch.
 
 ## Working conventions
 
