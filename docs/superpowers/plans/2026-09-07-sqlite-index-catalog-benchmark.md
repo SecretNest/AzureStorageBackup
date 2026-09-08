@@ -61,6 +61,16 @@ that carries them (a commit cannot contain its own hash); the commit is the one 
 `feat(pack): keep the alias table's leader map in a per-run SQLite file`, the sole commit on this branch after
 `b0378c4`. The identical-content (worst-case) table was **not** re-measured — see the note under it.
 
+**Round 3, follow-up: four more benchmark invocations to answer two questions the first one raised.** The first
+round-3 run came back ~10 s slower than round 2 at both file counts, and it is not visible in a memory table, so
+it was chased down rather than left in a cell: (a) the unique-content pair was re-run unchanged, (b) the same pair
+was run from a detached checkout of **`b0378c4` — this branch's parent, i.e. the build immediately before Task 25 —
+in the same session, on the same machine, within the same hour**, which is the only comparison that separates "the
+code got slower" from "the machine is in a different state than it was in round 2", and (c) the store's
+`cache_size` was swept over 4 MiB, 16 MiB and 64 MiB, one full pair of runs each, because a per-claim SQLite cost
+would be the obvious suspect for a slowdown and cache size is the one knob that changes it. All of it is reported
+below under "round 3, durations" and "round 3, cache size".
+
 ## Machine facts
 
 - 15 GiB RAM, 8 logical CPUs, `/` on a real disk (not the 7.6 GB `/tmp` tmpfs used for scratch work only).
@@ -81,6 +91,10 @@ that carries them (a commit cannot contain its own hash); the commit is the one 
 | `dd201d3` | after, before Task 25 | 200,000 | 534.2 MB | 171.4 MB | **119.7 MB** | 340.3 MB | 20.7 MB | 63.1 s |
 | `task25` | after | 100,000 | 385.6 MB | 47.5 MB | **32.5 MB** | 308.1 MB | 18.6 MB | 46.6 s |
 | `task25` | after | 200,000 | 478.4 MB | 94.3 MB | **47.0 MB** | 378.9 MB | 21.0 MB | 73.9 s |
+| `task25` (2nd run) | after | 100,000 | 371.7 MB | 38.9 MB | **32.7 MB** | 306.1 MB | 18.6 MB | 47.2 s |
+| `task25` (2nd run) | after | 200,000 | 479.6 MB | 58.2 MB | **47.5 MB** | 389.4 MB | 20.9 MB | 73.1 s |
+| `b0378c4` | before Task 25, **same session** | 100,000 | 390.4 MB | 101.9 MB | **67.8 MB** | 289.5 MB | 18.5 MB | 47.0 s |
+| `b0378c4` | before Task 25, **same session** | 200,000 | 517.4 MB | 175.8 MB | **117.8 MB** | 323.6 MB | 20.8 MB | 73.2 s |
 
 The `task25` rows are the current AFTER measurement; the `dd201d3` rows are kept as the same build **before**
 Task 25, so the effect of moving the leader map out of memory can be read straight off the table (live heap
@@ -123,7 +137,32 @@ Raw `benchmark-unique.json` (AFTER, round 3 — Task 25, from
 ]
 ```
 
-Raw `benchmark-unique.json` (AFTER, round 2 — the same build before Task 25):
+Raw `benchmark-unique.json` (**`b0378c4`, the commit before Task 25, run in the same session as round 3** — this
+is the A/B that separates Task 25's effect from the machine's state; its `Commit` field reads `dd201d3` because that
+is the label the constant carried at that commit):
+
+```json
+[
+  {
+    "Commit": "dd201d3", "Checkout": "after", "Files": 100000, "Dirs": 1000,
+    "PeakWorkingSetBytes": 409407488, "PeakManagedHeapBytes": 106811976,
+    "PeakForcedHeapBytes": 71141128, "PeakForcedHeapCommittedBytes": 91569520,
+    "PostRunForcedHeapPreCleanupBytes": 19378488,
+    "PostRunWorkingSetBytes": 303558656, "PostRunManagedHeapBytes": 19378360,
+    "DurationSeconds": 47.0054966
+  },
+  {
+    "Commit": "dd201d3", "Checkout": "after", "Files": 200000, "Dirs": 2000,
+    "PeakWorkingSetBytes": 542507008, "PeakManagedHeapBytes": 184296808,
+    "PeakForcedHeapBytes": 123544536, "PeakForcedHeapCommittedBytes": 161111392,
+    "PostRunForcedHeapPreCleanupBytes": 21851112,
+    "PostRunWorkingSetBytes": 339275776, "PostRunManagedHeapBytes": 21846840,
+    "DurationSeconds": 73.1767712
+  }
+]
+```
+
+Raw `benchmark-unique.json` (AFTER, round 2 — the same build before Task 25, measured in an earlier session):
 
 ```json
 [
@@ -283,7 +322,9 @@ per-run SQLite file cut the live (forced-collection) heap from 64.1 MB to **32.5
 that structure changed. More to the point, it cut the *slope*: live data now grows **+14.5 MB per additional
 100 000 files** (32.5 → 47.0 MB, ~1.45x) where it grew +55.6 MB per 100 000 (~1.87x) before, a 3.8x flatter curve.
 The leader map was the dominant per-file live structure, exactly as the code owner's reading of
-`PackAliasTable.cs:97` predicted. Fitting the two points to `live ≈ a + b·files` gives an intercept of ~18 MB —
+`PackAliasTable.cs:97` predicted. The same-session `b0378c4` pair reproduces this independently of anything that
+changed between sessions: 67.8 → 32.5/32.7 MB at 100k and 117.8 → 47.0/47.5 MB at 200k, measured within the same
+hour on the same machine. Fitting the two points to `live ≈ a + b·files` gives an intercept of ~18 MB —
 which is precisely the post-run steady state this process settles at (18.6–21.0 MB, and unchanged by any of this) —
 leaving ~29 MB of per-file live data at 200 000 files, or **~150 bytes per file at peak**. The next suspect for that
 residue, with the evidence available: the work database's write channel, `Channel.CreateUnbounded<WriteOp>` at
@@ -298,35 +339,86 @@ and the leader map is now on disk. The cheap experiment that would settle it is 
 producer flattens the remaining slope; if the slope survives, the suspect is wrong and the search continues
 elsewhere. That experiment is not part of Task 25 and has not been run.
 
+**Round 3, durations: there is no slowdown, and the four extra runs are what says so.** Round 3's first pair came
+in at 46.6 s / 73.9 s where round 2 recorded 36.7 s / 63.1 s — about +10 s at *both* file counts, which is already
+the wrong shape for a per-file cost (a per-claim SQLite cost would roughly double from 100k to 200k, not stay
+constant). A second round-3 pair reproduced it (47.2 s / 73.1 s), so it was not a one-off. The measurement that
+settles it is the same-session run of **`b0378c4`, the commit immediately before Task 25**, in the same hour on the
+same machine: **47.0 s at 100k and 73.2 s at 200k** — statistically identical to the Task 25 runs (46.6–47.2 s and
+73.1–73.9 s). The ~10 s is a between-session property of this machine, not of this change. The same run confirms
+the rest of the comparison is sound: `b0378c4` reproduced round 2's *memory* figures closely (live heap 67.8 MB vs
+64.1 MB at 100k, 117.8 MB vs 119.7 MB at 200k) while not reproducing its durations at all, which is the signature
+of a machine-state difference (clock/thermal state, page cache, background load) rather than of a code change.
+Comparisons of *duration* across sessions in this document should be treated as unreliable for that reason; the
+memory readings are reproducible to within a few MB.
+
+**Round 3, cache size: measured, and left at 16 MiB.** `PackLeaderStore`'s `cache_size` is the one knob that would
+change a per-claim SQLite cost, and there was a plausible argument for raising it: with production-length keys (the
+~124-char `ContentKey` plus a real path) 200 000 rows is 40+ MB of b-tree, so 16 MiB cannot hold it, and the unit
+test that claims 200 000 times in well under a second uses much shorter keys than production does. It was swept
+over three values, a full 100k+200k pair at each:
+
+| Store `cache_size` | Duration 200k | Post-run working set 200k | Live heap 200k |
+|---|---|---|---|
+| 4 MiB (`-4096`) | 73.7 s | 377.5 MB | 39.7 MB |
+| 16 MiB (`-16384`, shipped) | 73.9 s / 73.1 s | 378.9 MB / 389.4 MB | 47.0 MB / 47.5 MB |
+| 64 MiB (`-65536`) | 73.7 s | 415.0 MB | 44.6 MB |
+
+Duration does not move at all across a 16x range of cache size — consistent with the access pattern being one probe
+per file over keys with no locality, where a cache four times too small and one sixteen times too small miss at
+nearly the same rate. Post-run working set, in contrast, tracks the cache upwards, and at 64 MiB it **breaks the
+400 MB acceptance target** (415.0 MB). Below 16 MiB the gain is inside the noise (377.5 vs 378.9 MB). The value
+stays at the 16 MiB the task specified. (The live-heap column varies by ~8 MB across rows that should not differ in
+managed memory at all — the forced-collection sampler fires every 10 s, so it catches the peak only approximately;
+that spread is the resolution of this instrument, and it is worth remembering when reading small differences
+anywhere in this document.)
+
+**Round 3, the cost side: post-run working set went up, and that is real.** The same-session `b0378c4` pair makes
+one regression visible that cross-session comparison had blurred: post-run working set at 200 000 files is
+**323.6 MB before Task 25 and 378.9 / 389.4 MB after it**, a consistent **+55 to +66 MB**, while the post-run
+*managed* heap is unchanged (20.8 vs 20.9–21.0 MB). The extra is native, and the obvious candidate — the store's
+SQLite page cache — is not enough of it: dropping the cache from 16 MiB to 4 MiB recovered only ~1.4 MB, so most of
+it is allocator residue from 200 000 inserts into a 40+ MB b-tree rather than the cache itself. This is the trade
+Task 25 makes: ~70 MB less *live managed* data at peak in exchange for ~60 MB more *native* residue after the run.
+The acceptance target is still met (378.9–389.4 MB against 400 MB) but the margin is now 11–21 MB rather than the
+77 MB `b0378c4` had in this session, and that is the number to watch. What would settle where the residue lives:
+sample RSS immediately before and after `PackLeaderStore.DisposeAsync` inside the run, and try one `malloc_trim`
+(or equivalent) after the run's aggressive collect to see how much of it the allocator is merely holding rather
+than using. Not run; out of Task 25's scope.
+
 The post-run managed heap stays flat regardless of checkout, generator, or file count (15.5–22.0 MB across all
-ten runs, no correlation with file count) — whatever holds the per-file-proportional amount at peak is entirely
-transient and nothing proportional to file count survives a full collection once the run ends, in either checkout.
-The new `PostRunForcedHeapPreCleanupBytes` reading (18.7 MB at 100k, 20.7 MB at 200k) confirms this independently:
+runs in this document — the eight of rounds 1–2 and all of round 3's, no correlation with file count) — whatever
+holds the per-file-proportional amount at peak is entirely transient and nothing proportional to file count survives
+a full collection once the run ends, in either checkout.
+The `PostRunForcedHeapPreCleanupBytes` reading (**round 2**: 18.7 MB at 100k, 20.7 MB at 200k; **round 3**: 18.6 MB
+and 21.0 MB) confirms this independently:
 it is indistinguishable from `PostRunManagedHeapBytes`, meaning even a single ordinary forced collection right at
 run's end — before the production-mirroring aggressive/compacting cleanup runs — already reclaims essentially all
 of the per-file-proportional growth.
 
-The AFTER post-run working set is 308.1 MB at 100k and 378.9 MB at 200k files under unique content (round 3) —
-both under the 400 MB acceptance target, but with less margin than round 2's 285.8/340.3 MB. Across the three AFTER
-measurements of 200 000 files this figure has read 379.1 MB (round 1), 340.3 MB (round 2) and 378.9 MB (round 3)
-while the post-run *managed* heap held at 20.7–21.0 MB throughout: the ~40 MB spread is in native/unmanaged
-residue (allocator arenas, SQLite page cache the run touched, loader and JIT state), not in anything the run still
-holds, and it is larger than the round-to-round difference — so neither the round-2 dip nor the round-3 rise is
-distinguishable from noise, and the honest reading is "this number sits around 340–380 MB at 200 000 files, close
-enough to the 400 MB target that it deserves watching".
+The AFTER post-run working set is 308.1 / 306.1 MB at 100k and 378.9 / 389.4 MB at 200k files under unique content
+(round 3's two runs) — under the 400 MB acceptance target, but by less than before, and the same-session `b0378c4`
+pair shows this is a genuine cost of Task 25 rather than the run-to-run noise an earlier draft of this paragraph
+took it for: 323.6 MB before, 378.9–389.4 MB after, at 200 000 files, in the same session, with the post-run
+*managed* heap unmoved (20.8 → 20.9–21.0 MB). See "round 3, the cost side" above for what is known about where the
+extra native residue lives and what would settle it.
 
 ## Acceptance check (task brief / controller ruling), evaluated against the primary (unique-content) table
 
-- **AFTER post-run working set at 200k files < 400 MB: met** — 378.9 MB (round 3), a 21.1 MB margin under target.
-  The criterion as stated is satisfied, but the margin is thinner than round 2's 59.7 MB and the three AFTER
-  measurements of this figure span 340.3–379.1 MB with a post-run managed heap that never moves (20.7–21.0 MB), so
-  the margin is inside the measurement's own spread. Worth re-checking on any future change that touches native
-  allocation, rather than treated as settled.
+- **AFTER post-run working set at 200k files < 400 MB: met, with a caveat that is now measured rather than
+  guessed** — 378.9 MB and 389.4 MB across round 3's two runs, an 11–21 MB margin. Task 25 *raised* this figure:
+  the same-session run of `b0378c4` (the commit before it) reads 323.6 MB, so the change costs +55 to +66 MB of
+  native, post-run residue while removing ~70 MB of live managed data at peak. The store's page cache accounts for
+  only ~1.4 MB of it (measured by dropping `cache_size` from 16 MiB to 4 MiB), and raising the cache to 64 MiB
+  pushes the figure to 415.0 MB, which would fail this criterion — which is why the cache stays at 16 MiB. The
+  criterion as stated is satisfied; the margin is thin enough that any future change touching native allocation on
+  this path should re-measure it rather than assume it.
 - **AFTER peak managed heap does not scale with file count between 100k and 200k, within noise: still not met
   after Task 25, but the slope is 3.8x flatter and the reading itself is 2.0–2.6x smaller.** Against the
   forced-collection (live-data) reading, which is the column this criterion has to be judged on:
   `PeakForcedHeapBytes` now grows ~1.45x (32.5 MB → 47.0 MB), **+14.5 MB per additional 100,000 files**, where
-  before Task 25 it grew ~1.87x (64.1 MB → 119.7 MB), +55.6 MB per 100,000. The ordinary
+  before Task 25 it grew ~1.87x (64.1 MB → 119.7 MB), +55.6 MB per 100,000 — and the same-session `b0378c4` run
+  puts the "before" figures at 67.8 MB and 117.8 MB, i.e. the cross-session comparison was not misleading here. The ordinary
   (`GC.GetTotalMemory(false)`) reading grows ~1.98x (47.5 MB → 94.3 MB) — it is now the *looser* of the two, i.e.
   a larger share of what it counts is allocation-rate garbage rather than live data, which is what one expects once
   the live structure it was tracking has gone. The committed-heap cross-check (49.7 MB → 58.5 MB, ~1.18x) still

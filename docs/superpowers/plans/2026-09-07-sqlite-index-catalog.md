@@ -1347,7 +1347,7 @@ Every helper that takes `ConcurrentDictionary<string, StorageRef> storageByPath,
 | `postDiffUnreadable.ContainsKey(p)` | `await ledger.IsPostDiffUnreadableAsync(p, ct)` |
 | `postDiffUnreadable.Count` | `await ledger.PostDiffUnreadableCountAsync(ct)` |
 
-The alias backfill (lines 1884-1915) reads `storageByPath` for each leader and writes for each alias; it becomes `await ledger.FlushAsync(ct)` first (so reads see everything), then the same loop with the async calls. `aliasTable`, `dirPending`, `crossPending` stay in memory (spec: bounded by duplicates and by directory count).
+The alias backfill (lines 1884-1915) reads `storageByPath` for each leader and writes for each alias; it becomes `await ledger.FlushAsync(ct)` first (so reads see everything), then the same loop with the async calls. `aliasTable`, `dirPending`, `crossPending` stay in memory (spec: bounded by duplicates and by directory count). **Superseded for `aliasTable` by Task 25:** only its `_aliasesByLeader` half is bounded by duplicates — the leader map took one entry per packed member and now lives in a per-run SQLite file (`PackLeaderStore`); see `2026-09-07-sqlite-index-catalog-benchmark.md`, round 3.
 
 - [ ] **Step 7: The finish** (lines 1985-2030)
 
@@ -1807,6 +1807,7 @@ git commit -m "docs: describe the SQLite index catalog and the work database; ve
 - Spec §Storage layout → Tasks 2, 3, 7. §Backup pipeline → 8–13. §Browsing and maintenance → 15–20. §Serialization, migration, compatibility → 1, 5, 6, 21, 22. §Error handling → 3 (corruption), 13 step 7 (catalog write after cloud), 7 (`FlushAsync` faults). §Concurrency → 3 (lock), 7 (writer channel). §Testing → every task's step 1, plus 22 and 23. §Delivery → 24.
 - Spec item not carried over verbatim: "version compare" — the repository has no such endpoint; `/file-versions` (Task 15) is the cross-version query. The spec file should be corrected to say so (one line) in Task 24.
 - Known bounded-by-something-other-than-file-count structures left in memory, by design: `ScanSummary.EmptyDirs` and `Unreadable`, `dirRemaining`, `aliasTable`, `dirPending`, `crossPending`, `pendingUnreadablePrev` (Task 9), the check report's `List<FileFinding>` (Task 18), restore substitutions and selections.
+  - **`aliasTable` was only half right, corrected by Task 25:** its leader map was one entry per packed member, not per duplicate, and it moved to a per-run SQLite file (`PackLeaderStore`); the rest of the list stands. See `2026-09-07-sqlite-index-catalog-benchmark.md`, round 3.
 
 ---
 

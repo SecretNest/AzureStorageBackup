@@ -120,6 +120,35 @@ public sealed class PackAliasTableTests : IDisposable
     }
 
     /// <summary>
+    /// A leader survives the commit that ends its batch. The store keeps one transaction open across thousands of
+    /// claims, so every claim is answered partly from committed rows and partly from the transaction's own
+    /// uncommitted ones, and the boundary between the two moves as the run goes on. What must never happen is that
+    /// crossing it changes the answer — a leader that stops being found is a second copy of content already packed,
+    /// and worse, a leader with aliases already hanging off it that a later duplicate would now lead a second group
+    /// of aliases to. The run never calls <see cref="PackLeaderStore.Flush"/>, but it commits on exactly the same
+    /// code path every 2 000 claims, which is what this drives directly rather than by claiming 2 000 times.
+    /// </summary>
+    [Fact]
+    public async Task A_Leader_Is_Still_Found_After_The_Batch_Is_Committed()
+    {
+        await using var store = await NewStoreAsync();
+        var table = new PackAliasTable(store);
+        Assert.False(await table.TryClaimAsync("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "a/x.txt", default));
+
+        store.Flush();
+
+        Assert.True(await table.TryClaimAsync("xxh128:aa", 100, "xxh128:hh", "xxh128:tt", "c/z.txt", default));
+        var (leader, aliases) = Assert.Single(table.AliasesByLeader);
+        Assert.Equal("a/x.txt", leader);
+        Assert.Equal(["c/z.txt"], aliases.Select(a => a.Path));
+
+        // ...and a *new* leader claimed after that commit opens the next batch rather than being lost with the
+        // closed one: two committed rows, the one from before the flush and the one from after.
+        Assert.False(await table.TryClaimAsync("xxh128:bb", 100, "xxh128:hh", "xxh128:tt", "b/y.txt", default));
+        Assert.Equal(2, CountRows(store));
+    }
+
+    /// <summary>
     /// The reason the leader map moved into SQLite (Task 25): a first backup makes every packed file its own
     /// leader, so the in-memory dictionary this replaced held one entry per file — Task 23's benchmark measured
     /// ~56 MB of live managed heap per 100 000 files. What is pinned here is the structural property behind that

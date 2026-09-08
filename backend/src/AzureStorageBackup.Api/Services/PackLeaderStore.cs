@@ -80,10 +80,17 @@ public sealed class PackLeaderStore : IAsyncDisposable
             using var command = connection.CreateCommand();
             // journal_mode=OFF and synchronous=OFF because this file is scratch twice over: it is deleted at the end
             // of the run, and a crash mid-run ends the run, so there is nothing for a journal or an fsync to protect
-            // — and with no rollback journal a commit is a write to the page cache and nothing else. 16 MiB of page
-            // cache (negative = KiB) keeps the hot part of the index resident; the table is small (a ~124-char key
-            // and a path per row) and the access pattern is one probe per file, so this is about right and it is a
-            // sixteenth of what work.db asks for.
+            // — and with no rollback journal a commit is a write to the page cache and nothing else.
+            // 16 MiB of page cache (negative = KiB), a quarter of what work.db and the catalog ask for, and a
+            // **measured** value rather than an estimate. The arithmetic argues for more — production keys are the
+            // four-part ContentKey at ~124 chars plus a real path, so 200 000 rows is 40+ MB of b-tree that 16 MiB
+            // cannot hold — but the benchmark was run at 4, 16 and 64 MiB, at 100k and 200k files, and the run's
+            // wall-clock time did not move (73.7 / 73.1-73.9 / 73.7 s at 200k), because the access pattern is one
+            // probe per file over keys with no locality: a cache that is four times too small and one that is
+            // sixteen times too small miss at nearly the same rate. Post-run working set, on the other hand, does
+            // track it (377 / 379-389 / 415 MB), and at 64 MiB it breaks the 400 MB acceptance target this plan is
+            // held to. So: nothing to gain above this, nothing measurable to gain below it. See the "round 3, cache
+            // size" note in the benchmark document.
             // WITHOUT ROWID: the primary key *is* the whole row's identity, so the extra rowid index would double the
             // write cost for nothing.
             command.CommandText = """
@@ -158,25 +165,43 @@ public sealed class PackLeaderStore : IAsyncDisposable
         _sinceCommit = 0;
     }
 
-    /// <summary>Commits the tail of the last batch, closes the connection and deletes the file. The commit is not
-    /// for durability (nobody reads this file after the run) but so that the connection closes with no transaction
+    /// <summary>
+    /// Commits the tail of the last batch, closes the connection and deletes the file. The commit is not for
+    /// durability (nobody reads this file after the run) but so that the connection closes with no transaction
     /// open, which is the difference between "closed" and "rolled back with journal_mode=OFF", a state SQLite
-    /// explicitly does not define.</summary>
+    /// explicitly does not define.
+    /// <para>
+    /// The commit is in a <c>try</c> and everything else in the <c>finally</c>, and that is not defensive style for
+    /// its own sake: a commit can fail for reasons this class does not enumerate (<see cref="SqliteException"/> from
+    /// the engine, <see cref="InvalidOperationException"/> from a connection ADO.NET considers in the wrong state),
+    /// and an exception that escaped before the close would leak this connection — which is precisely the shape of
+    /// bug this repository has already paid for once, where a connection collected without being disposed handed its
+    /// live handle to the next Open and produced <c>SQLite Error 0: 'not an error'</c> somewhere else entirely.
+    /// The failure is swallowed rather than rethrown for the same reason: the file is on its way to being deleted,
+    /// nothing downstream reads it, and failing the run over its last commit would waste the run.
+    /// </para>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
             return;
         _disposed = true;
 
-        try { Commit(); }
-        catch (SqliteException) { /* the file is about to be deleted; failing the run over it would waste the run */ }
+        try
+        {
+            Commit();
+        }
+        catch (SqliteException) { /* see the remarks: the file is about to be deleted */ }
+        catch (InvalidOperationException) { /* same */ }
+        finally
+        {
+            _insert.Dispose();
+            _select.Dispose();
+            await _connection.DisposeAsync().ConfigureAwait(false);
 
-        _insert.Dispose();
-        _select.Dispose();
-        await _connection.DisposeAsync().ConfigureAwait(false);
-
-        RunWorkDb.Delete(Path);
-        // journal_mode=OFF leaves no companion behind, but a pragma that failed to take would; one syscall.
-        RunWorkDb.Delete(Path + "-journal");
+            RunWorkDb.Delete(Path);
+            // journal_mode=OFF leaves no companion behind, but a pragma that failed to take would; one syscall.
+            RunWorkDb.Delete(Path + "-journal");
+        }
     }
 }
