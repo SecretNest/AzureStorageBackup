@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { settingsApi, sevenZipPriorityLabels, type GlobalSettings } from '../api/settings'
+import { settingsApi, sevenZipPriorityLabels, type BackupDefaultsSettings, type PerformanceSettings } from '../api/settings'
 import { StorageTier, tierLabels, retentionModeLabels } from '../api/backupConfigs'
 import { Field } from '../components/Field'
 import { uploadMemoryNotice } from '../lib/uploadMemoryNotice'
@@ -34,12 +34,11 @@ export function SettingsPage({
   authRequired?: boolean
   onLogout?: () => void
 }) {
-  // Backup defaults and Performance are two halves of ONE object: settingsApi.get/update serve the whole GlobalSettings, and
-  // splitting the page does not split the endpoint. So the state is held here, above both, rather than in each sub-page.
-  // Two independent copies would each save from their own snapshot, and whichever went last would silently overwrite the
-  // other half with values it read before the first save. Sharing it also means edits made on one tab survive a switch to
-  // the other and go up together.
-  const settings = useGlobalSettings()
+  // Backup defaults and Performance are one row on the server but two resources on the API, each the shape of one
+  // page: a page saves its own half and cannot carry the other page's fields along. The two states still live here,
+  // above both pages, so edits made on one tab survive a switch to the other — they just no longer go up together.
+  const defaults = useSettingsHalf(settingsApi.getDefaults, settingsApi.updateDefaults)
+  const performance = useSettingsHalf(settingsApi.getPerformance, settingsApi.updatePerformance)
 
   return (
     <section>
@@ -64,19 +63,21 @@ export function SettingsPage({
       </nav>
 
       {tab === 'accounts' && <AccountsSection />}
-      {tab === 'defaults' && <BackupDefaults settings={settings} />}
-      {tab === 'performance' && <PerformanceOptions settings={settings} />}
+      {tab === 'defaults' && <BackupDefaults settings={defaults} />}
+      {tab === 'performance' && (
+        <PerformanceOptions settings={performance} defaultVolumeBytes={defaults.s?.defaultVolumeBytes} />
+      )}
       {tab === 'notifications' && <NotificationsSection />}
       {tab === 'about' && <AboutSection authRequired={authRequired} onLogout={onLogout} />}
     </section>
   )
 }
 
-type SettingsState = ReturnType<typeof useGlobalSettings>
+type SettingsState<T> = ReturnType<typeof useSettingsHalf<T>>
 
-/// Load, edit and save the global settings object, shared by the two sub-pages that each show half of it.
-function useGlobalSettings() {
-  const [s, setS] = useState<GlobalSettings | null>(null)
+/// Load, edit and save one half of the settings — the resource behind one page.
+function useSettingsHalf<T>(get: () => Promise<T>, update: (s: T) => Promise<T>) {
+  const [s, setS] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   // In-flight guard, same as NotificationsSection's `busy`: two overlapping updates each close over their
@@ -85,10 +86,12 @@ function useGlobalSettings() {
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    settingsApi.get().then(setS).catch((e) => setError(e instanceof Error ? e.message : String(e)))
-  }, [])
+    get()
+      .then(setS)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+  }, [get])
 
-  const set = <K extends keyof GlobalSettings>(k: K, v: GlobalSettings[K]) => {
+  const set = <K extends keyof T>(k: K, v: T[K]) => {
     // Any edit retracts "Saved." — otherwise it stays on screen next to fields that have since been changed and not
     // saved, which is exactly the wrong moment to be reassuring.
     setSaved(false)
@@ -104,7 +107,7 @@ function useGlobalSettings() {
       // The response is deliberately NOT written back into `s` (same as NotificationsSection): the fields
       // stay editable while the request is in flight, and echoing the request's snapshot back over them
       // would silently revert an edit made mid-save — with "Saved." showing, so the loss goes unnoticed.
-      await settingsApi.update(s)
+      await update(s)
       setSaved(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -116,26 +119,23 @@ function useGlobalSettings() {
   return { s, set, save, busy, saved, error }
 }
 
-/// The Save row, rendered identically at the foot of both halves.
+/// The Save row, rendered identically at the foot of both pages; each saves its own page and nothing else.
 ///
 /// The button changes its own text rather than only greying out. On a loaded machine the round trip can take several
 /// seconds, and a disabled button with unchanged text says nothing about whether the click registered — the reported
 /// experience was pressing Save, seeing no change at all, and waiting for a "Saved." that took its time arriving.
-function SaveBar({ settings }: { settings: SettingsState }) {
+function SaveBar<T>({ settings }: { settings: SettingsState<T> }) {
   return (
     <div className="row" style={{ marginTop: '1rem' }}>
       <button type="button" className="btn-primary" onClick={settings.save} disabled={settings.busy}>
         {settings.busy ? 'Saving…' : 'Save'}
       </button>
       {settings.saved && <span className="text-ok">Saved.</span>}
-      {/* One object, one request: whichever of the two pages you press Save on writes both. Said out loud because the
-          tabs make them look like separate forms with separate buttons. */}
-      <span className="text-faint">Saves both Backup defaults and Performance.</span>
     </div>
   )
 }
 
-function BackupDefaults({ settings }: { settings: SettingsState }) {
+function BackupDefaults({ settings }: { settings: SettingsState<BackupDefaultsSettings> }) {
   const { s, set, error } = settings
   if (!s) return <p>Loading…</p>
 
@@ -236,7 +236,15 @@ function BackupDefaults({ settings }: { settings: SettingsState }) {
   )
 }
 
-function PerformanceOptions({ settings }: { settings: SettingsState }) {
+function PerformanceOptions({
+  settings,
+  defaultVolumeBytes,
+}: {
+  settings: SettingsState<PerformanceSettings>
+  // The other page's volume size, read-only, for the memory limit's live reading: which route a default-sized
+  // volume takes depends on both pages. undefined until that page's half has loaded.
+  defaultVolumeBytes: number | null | undefined
+}) {
   const { s, set, error } = settings
   if (!s) return <p>Loading…</p>
 
@@ -280,9 +288,11 @@ function PerformanceOptions({ settings }: { settings: SettingsState }) {
         hold less than the disk route&apos;s own buffer, so a limit that small still buffers 80 KB rather than
         turning every tiny blob two-pass.
       </p>
-      <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
-        {uploadMemoryNotice(s.uploadMemoryLimitBytes, s.uploadConcurrency, s.defaultVolumeBytes)}
-      </p>
+      {defaultVolumeBytes !== undefined && (
+        <p className="text-muted" style={{ marginTop: '-0.4rem' }}>
+          {uploadMemoryNotice(s.uploadMemoryLimitBytes, s.uploadConcurrency, defaultVolumeBytes)}
+        </p>
+      )}
       <Field label="Check HEAD concurrency">
         <Num value={s.checkHeadConcurrency} onChange={(v) => set('checkHeadConcurrency', v)} />
       </Field>

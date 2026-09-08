@@ -47,9 +47,9 @@ public class BackupDefaultsInheritanceTests(TestWebAppFactory factory) : IClassF
 
     private async Task SetGlobalMaxVersionsAsync(int value)
     {
-        var current = await _client.GetFromJsonAsync<Dictionary<string, object?>>("/api/settings");
+        var current = await _client.GetFromJsonAsync<Dictionary<string, object?>>("/api/settings/defaults");
         current!["defaultMaxVersions"] = value;
-        var res = await _client.PutAsJsonAsync("/api/settings", current);
+        var res = await _client.PutAsJsonAsync("/api/settings/defaults", current);
         res.EnsureSuccessStatusCode();
     }
 
