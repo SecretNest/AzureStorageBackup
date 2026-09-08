@@ -224,19 +224,26 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// <summary>Imports a version's index straight off the stream it was downloaded as. One transaction: either the
     /// version is wholly in the catalog or it is not there at all, so an interrupted import cannot leave half a
     /// version for dedup to trust.</summary>
-    public Task ImportVersionAsync(int version, long identity, IndexStreamReader reader, CancellationToken ct) =>
+    public Task ImportVersionAsync(int version, long identity, IndexStreamReader reader, CancellationToken ct, Action<long>? onEntries = null) =>
         // The empty-dirs and unrecoverable sections sit after the last entry in the stream, so they can only be read
         // once the entries have been consumed — hence the callback rather than two arguments.
         ImportCoreAsync(version, identity, reader.EntryCount, ToAsync(reader.Entries()),
-            () => (reader.ReadEmptyDirs(), reader.ReadUnrecoverable()), ct);
+            () => (reader.ReadEmptyDirs(), reader.ReadUnrecoverable()), ct, onEntries);
 
     /// <summary>Imports the version a finishing run just produced, straight from the emission order, without building an index object first.</summary>
     public Task ImportVersionAsync(int version, long identity, int entryCount, IAsyncEnumerable<IndexEntry> entries,
         IReadOnlyList<string> emptyDirs, IReadOnlyList<string> unrecoverable, CancellationToken ct) =>
-        ImportCoreAsync(version, identity, entryCount, entries, () => (emptyDirs, unrecoverable), ct);
+        ImportCoreAsync(version, identity, entryCount, entries, () => (emptyDirs, unrecoverable), ct, onEntries: null);
 
+    /// <summary>How often <c>onEntries</c> hears from an import, in rows. Coarse enough to cost nothing against the
+    /// insert itself, fine enough that a million-row version moves the line a hundred times.</summary>
+    internal const int EntryProgressEvery = 10_000;
+
+    /// <param name="onEntries">Called with the running row count every <see cref="EntryProgressEvery"/> rows, on the
+    /// importing thread; null when nobody is watching.</param>
     private async Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
-        Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct)
+        Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct,
+        Action<long>? onEntries)
     {
         await using var transaction = (SqliteTransaction)await _connection.BeginTransactionAsync(ct);
         _transaction = transaction;
@@ -255,6 +262,8 @@ public sealed partial class VersionCatalog : IAsyncDisposable
                 ct.ThrowIfCancellationRequested();
                 Set(insert, "@version", version);
                 Set(insert, "@seq", seen++);
+                if (onEntries is not null && seen % EntryProgressEvery == 0)
+                    onEntries(seen);
                 Set(insert, "@parent", ParentOf(entry.Path));
                 Set(insert, "@path_fold", entry.Path.ToUpperInvariant());
                 Set(insert, "@path_key", CatalogSql.PathKey(entry.Path));

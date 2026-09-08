@@ -723,3 +723,28 @@ describe('the index write', () => {
     expect(label).toBe('Writing index')
   })
 })
+
+describe('the version-loading stage', () => {
+  test('states its workload in entries, with the percentage on that fraction, never in bytes', () => {
+    const lines = stageLines(
+      progress({
+        stage: 'LoadingVersions',
+        processed: 3,
+        total: 13,
+        workTotal: 5_000_000,
+        workDone: 1_250_000,
+        workPercent: 25,
+        currentItem: 'version 11',
+      }),
+    )
+    expect(lines.label).toBe('Loading versions')
+    expect(lines.counts).toBe('3 of 13 versions')
+    expect(lines.done).toBe('1,250,000 / 5,000,000 entries (25%)')
+    expect(lines.done).not.toContain('B')
+  })
+
+  test('says nothing about entries when the history declares no counts', () => {
+    const lines = stageLines(progress({ stage: 'LoadingVersions', processed: 1, total: 2, workTotal: 0, workDone: 0 }))
+    expect(lines.done).toBe('')
+  })
+})

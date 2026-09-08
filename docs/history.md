@@ -64,6 +64,7 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md), [operations.md](operations.md) |
 | 09-08 | The catalog and the work database opened through `unix-excl`: no `-shm` file, after a NAS kernel refused its locks; opt-in `fcntl` trace in the image | [storage-format.md](storage-format.md), [operations.md](operations.md) |
 | 09-08 | A container's whole history migrates with the content-keyed indexes down and rebuilt once, instead of a random page read per row; the pass has its own stage, "Loading versions", instead of sitting under Scanning | [storage-format.md](storage-format.md), [progress-display.md](progress-display.md) |
+| 09-08 | "Loading versions" counts entries: each version's file count is its share of the workload, an import books rows as they land, and the completion and remaining time extrapolate from rows rather than from a version count that says nothing when versions differ a hundredfold | [progress-display.md](progress-display.md) |
 
 ### The migration that read 30 GB to write 1 GB (2026.9.8.3)
 

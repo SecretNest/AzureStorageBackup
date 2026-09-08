@@ -754,6 +754,15 @@ public sealed class StageTracker(
         }
     }
 
+    /// <summary>Adds to the declared workload without queueing an item: for a stage whose items are all known up
+    /// front and never wait in a queue (the version-loading pass declares every version's entry count at its
+    /// start), where <see cref="Enqueue"/>'s slot count would put "N queued" on a line that has no queue.</summary>
+    public void DeclareWork(long work)
+    {
+        if (work > 0)
+            Interlocked.Add(ref _totalWork, work);
+    }
+
     /// <summary>One item queued. Called single-threaded by the producer side (diff), but concurrently with the consumer side, hence Interlocked.
     /// Do **not** use it to touch <c>_total</c>: that denominator keeps growing until diff wraps up, and a percentage off it races to 100 and falls back.</summary>
     /// <param name="work">This item's workload — its **source-side** bytes, before compression — accumulated into the stage's
