@@ -59,12 +59,25 @@ export function windDownFromServer(stop: StopRequested | string | null | undefin
  * answer success and show "Paused" over a run that went on to Completed, and Suspend hung for its cap and
  * then handed back a Completed run labelled "Suspending…". At a few million entries the index write is
  * minutes, a whole stage rather than a race window. Stop stays live: it still skips the cleanup.
+ * @param loadingVersions The run is between its scan and its diff, making sure every retained version is in
+ * the catalog — on the first run after an upgrade, the migration of the container's whole history, hours
+ * for a big one. The pass consults no gate: an import is one transaction per version, so a Pause pressed
+ * against it would read "Pausing…" for the rest of the stage. Pause alone goes grey; Suspend and Stop stay
+ * live, since both end the run here and keep every version already imported.
  */
-export function windDownControls(kind: WindDownKind | undefined, wrappingUp = false): {
+export function windDownControls(
+  kind: WindDownKind | undefined,
+  wrappingUp = false,
+  loadingVersions = false,
+): {
   /** Stop stays pressable while anything weaker than StopNow is winding down. */
   canStop: boolean
   /** Retry now / Resume / Pause / Suspend — none of them can act once a wind-down is under way. */
   canActOnGate: boolean
+  /** Pause specifically: everything canActOnGate says, and not while the versions are loading. */
+  canPause: boolean
+  /** The Pause button's tooltip: the gate's reason when there is one, else the version-loading one. */
+  pauseHint: string | undefined
   /** Why the gate controls are disabled when it is the wrap-up and not a wind-down that disabled them, for
    * the buttons' tooltip: a wind-down was the operator's own doing, the wrap-up is not, and a button that
    * went grey on its own owes an explanation. */
@@ -72,16 +85,24 @@ export function windDownControls(kind: WindDownKind | undefined, wrappingUp = fa
   stopLabel: string
   suspendLabel: string
 } {
+  const canActOnGate = kind === undefined && !wrappingUp
+  const gateHint =
+    kind === undefined && wrappingUp
+      ? 'Every upload is done and the backup is writing its index; it will finish on its own. Stop still skips the cleanup.'
+      : undefined
   return {
     // Only the top of the ladder has nothing left to escalate to. Note that this is deliberately not
     // "no stop requested yet": 'finish' is a stop, and going from it to StopNow is the escalation most
     // likely to be wanted, since Finish current files is the choice whose wait surprises people.
     canStop: kind !== 'now',
-    canActOnGate: kind === undefined && !wrappingUp,
-    gateHint:
-      kind === undefined && wrappingUp
-        ? 'Every upload is done and the backup is writing its index; it will finish on its own. Stop still skips the cleanup.'
-        : undefined,
+    canActOnGate,
+    gateHint,
+    canPause: canActOnGate && !loadingVersions,
+    pauseHint:
+      gateHint ??
+      (canActOnGate && loadingVersions
+        ? 'The backup is loading its version history and cannot pause until the diff starts. Suspend or Stop end it now and keep every version already loaded.'
+        : undefined),
     // 'Stopping…' is claimed only where it is the whole truth. Under 'finish' a stop is indeed running,
     // but the button is still live and pressing it still does something, and a disabled-looking label on
     // a live button is the same lie in the other direction.

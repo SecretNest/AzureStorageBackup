@@ -208,7 +208,8 @@ response carries `pauseSettled` beside `pausedByUser`, false until nothing is in
 the row reads "Pausing…" across that stretch — the same way Suspend reads "Suspending…" for as long as
 it winds down. Resume is on offer throughout. What counts as in hand is what will produce bytes or
 CPU on its own (`PauseGate.BeginWork`): a volume past the hold check, the file under 7z, the item the
-prober is reading, the diff between two of its callbacks, the scan, the wrap-up's re-run. A worker
+prober is reading, the diff between two of its callbacks, the scan, the version-loading pass between
+scan and diff, the wrap-up's re-run. A worker
 parked at the gate mid-item, or blocked on a wait the pause itself makes endless (staging room, the
 compression lock, the prober's hand-off into a full probed queue whose only consumer is on the room
 wait), steps out of the count for the wait (`PauseGate.ParkAsync`, `PauseGate.Idle`), and so does a
@@ -601,6 +602,14 @@ back a `Completed` run labelled "Suspending…". At a few million entries the in
 minutes, so this is a whole stage rather than a race window. The UI greys the same four controls it
 greys during a wind-down (`windDownControls`), with a tooltip saying why. Stop is left alone: it still
 means "skip the cleanup", which is a real thing to ask for.
+
+**Loading versions** (between the scan and the diff) greys Pause alone. The pass consults no gate —
+an import is one transaction per version, and parking inside one would hold the container's write
+lock for the length of the pause — so it is counted as in hand like the scan, and a Pause pressed
+against it would read "Pausing…" for the rest of the stage, hours on the first run after an upgrade.
+The button's tooltip says so. Suspend and Stop stay live: both end the run there, through the same
+path as during the scan, and every version already imported stays in the catalog — a resume picks up
+with only the version that was in flight left to import.
 
 ## Not covered
 

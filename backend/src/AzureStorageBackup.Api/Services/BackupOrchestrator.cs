@@ -760,12 +760,19 @@ public sealed class BackupOrchestrator(
             // thread: Progress<T> would post to the thread pool, and a pass where every version is a hit ends within
             // milliseconds, before a posted callback runs (the line stood at "0 of 9" for the seconds it was up).
             var accounting = new VersionLoadAccounting(loading, info.Versions);
-            await BeforeUploadAsync(async t =>
-            {
-                await catalogs.EnsureVersionsAsync(
-                    request.Account, request.Container, info.Versions, identity, password, accounting, t);
-                return 0;
-            });
+            // In hand like the scan: the pass consults no gate and runs to its end (an import is one transaction
+            // per version, and parking inside one would hold the container's write lock for the length of the
+            // pause), so a hold pressed against it is pausing rather than paused — the diff parks at its first
+            // callback. Left out of the count, a Pause pressed here answered "Paused" over a migration still
+            // reading at full speed. The UI greys Pause for the stage; Suspend and Stop stay live, and both end
+            // the run here through BeforeUploadAsync, keeping every version that has already committed.
+            using (control?.Gate.BeginWork())
+                await BeforeUploadAsync(async t =>
+                {
+                    await catalogs.EnsureVersionsAsync(
+                        request.Account, request.Container, info.Versions, identity, password, accounting, t);
+                    return 0;
+                });
             loading.Complete();
         }
 
